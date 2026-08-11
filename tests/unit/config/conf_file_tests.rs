@@ -299,6 +299,28 @@ fn test_parse_invalid_line() {
 }
 
 #[test]
+fn conf_file_missing_equals_error_omits_secret_bearing_line() {
+    let secret_line = "FERRUM_ADMIN_JWT_SECRET_super_secret_value_do_not_leak";
+    let err = ConfFile::parse(secret_line).expect_err("missing '='");
+    assert!(
+        err.contains("missing '='"),
+        "expected missing-'=' reason, got: {err}"
+    );
+    assert!(
+        err.contains("line 1"),
+        "expected line number, got: {err}"
+    );
+    assert!(
+        !err.contains(secret_line),
+        "malformed-line diagnostic must not echo the secret-bearing line: {err}"
+    );
+    assert!(
+        !err.contains("super_secret_value_do_not_leak"),
+        "malformed-line diagnostic must not echo secret material: {err}"
+    );
+}
+
+#[test]
 fn test_empty_file() {
     let conf = ConfFile::parse("").unwrap();
     assert!(conf.is_empty());

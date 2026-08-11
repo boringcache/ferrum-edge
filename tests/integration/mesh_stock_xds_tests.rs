@@ -33,11 +33,13 @@ use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 
 use ferrum_edge::modes::mesh::config::MeshConfig;
+use ferrum_edge::modes::mesh::config_consumer::file_source::MeshLocalSourceRecovery;
 use ferrum_edge::modes::mesh::config_consumer::stock_xds_client::{
     StockXdsClientConfig, load_stock_policy_baseline, start_stock_xds_client_with_shutdown,
 };
 use ferrum_edge::modes::mesh::runtime::MeshRuntimeState;
 use ferrum_edge::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
+use std::sync::atomic::AtomicBool;
 use ferrum_edge::xds::proto::aggregated_discovery_service_server::{
     AggregatedDiscoveryService, AggregatedDiscoveryServiceServer,
 };
@@ -342,6 +344,7 @@ impl StockHarness {
             None,
             None,
             policy_rx,
+            MeshLocalSourceRecovery::new(Arc::new(AtomicBool::new(false))),
         ));
 
         Self {

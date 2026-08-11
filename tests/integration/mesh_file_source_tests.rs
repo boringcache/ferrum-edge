@@ -366,82 +366,246 @@ fn mesh_reload_generation_advances_on_signal_and_stales_inflight_candidate() {
     assert_eq!(gen3, 3);
     assert!(!mesh_reload_generation_is_current(gen2, 3));
     assert!(mesh_reload_generation_is_current(gen3, 3));
+    // Exact equality only: a future/out-of-contract generation is not current.
+    assert!(!mesh_reload_generation_is_current(4, 3));
 }
 
 #[test]
-fn mesh_file_reload_rejects_raise_and_accepted_clears_config_rejected() {
+fn simultaneous_shutdown_and_completion_chooses_shutdown_and_does_not_publish() {
     use ferrum_edge::modes::mesh::config_consumer::file_source::{
-        MeshLocalReloadApply, apply_mesh_file_reload_candidate,
+        MeshReloadSelectReady, mesh_reload_completion_may_publish, mesh_reload_select_priority,
+    };
+
+    assert_eq!(
+        mesh_reload_select_priority(false, true, true),
+        Some(MeshReloadSelectReady::Shutdown),
+        "tied shutdown+completion must choose shutdown"
+    );
+    assert!(!mesh_reload_completion_may_publish(
+        true,
+        MeshReloadSelectReady::Shutdown
+    ));
+    assert!(mesh_reload_completion_may_publish(
+        true,
+        MeshReloadSelectReady::Completion
+    ));
+    assert!(!mesh_reload_completion_may_publish(
+        false,
+        MeshReloadSelectReady::Completion
+    ));
+    assert_eq!(
+        mesh_reload_select_priority(true, true, false),
+        Some(MeshReloadSelectReady::Hangup)
+    );
+}
+
+#[test]
+fn mesh_local_source_recovery_requires_proxy_accept_and_fences_generations() {
+    use ferrum_edge::modes::mesh::config_consumer::file_source::{
+        MeshLocalReloadApply, MeshLocalSourceRecovery, apply_mesh_file_reload_candidate,
     };
     use ferrum_edge::modes::mesh::runtime::MeshRuntimeState;
+    use ferrum_edge::modes::mesh::slice::MeshSlice;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     let path = write_temp("yaml", VALID_MESH_YAML);
     let slice = load_mesh_slice_from_file(&path, request_for_namespace("ferrum")).unwrap();
     let state = MeshRuntimeState::new();
     state.install_slice(slice.clone());
-    let flag = AtomicBool::new(false);
+    let flag = Arc::new(AtomicBool::new(false));
+    let recovery = MeshLocalSourceRecovery::new(flag.clone());
 
+    // Failure raises sticky health and retains last-good.
     let rejected = apply_mesh_file_reload_candidate(
         &state,
-        &flag,
+        &recovery,
         load_mesh_slice_from_file(
             std::path::Path::new("/nonexistent/ferrum-mesh-reload.yaml"),
             request_for_namespace("ferrum"),
         ),
     );
     assert_eq!(rejected, MeshLocalReloadApply::Rejected);
-    assert!(flag.load(Ordering::Relaxed));
-    let retained = state.snapshot().as_ref().as_ref().cloned().unwrap();
-    assert!(retained.content_eq(&slice));
+    assert!(recovery.is_rejected());
+    assert!(
+        state
+            .snapshot()
+            .as_ref()
+            .as_ref()
+            .unwrap()
+            .content_eq(&slice)
+    );
 
-    let recovered = apply_mesh_file_reload_candidate(&state, &flag, Ok(slice.clone()));
+    // Valid candidate installs but must NOT clear until proxy accept.
+    let recovered = apply_mesh_file_reload_candidate(&state, &recovery, Ok(slice.clone()));
     assert!(matches!(
         recovered,
         MeshLocalReloadApply::Applied | MeshLocalReloadApply::Unchanged
     ));
     assert!(
-        !flag.load(Ordering::Relaxed),
-        "accepted reload must clear config_rejected"
+        recovery.is_rejected(),
+        "provisional install_slice must leave config_rejected set"
+    );
+    assert_ne!(recovery.pending_epoch(), 0);
+
+    // Exact current accepted recovery clears.
+    recovery.note_proxy_apply_success(&slice);
+    assert!(!recovery.is_rejected());
+    assert_eq!(recovery.pending_epoch(), 0);
+
+    // Unchanged recovery also clears only after proxy no-op accept.
+    recovery.mark_rejected();
+    let unchanged = apply_mesh_file_reload_candidate(&state, &recovery, Ok(slice.clone()));
+    assert_eq!(unchanged, MeshLocalReloadApply::Unchanged);
+    assert!(recovery.is_rejected());
+    recovery.note_proxy_apply_success(&slice);
+    assert!(!recovery.is_rejected());
+
+    // Newer failure cancels an older pending success.
+    recovery.mark_rejected();
+    let older_pending = apply_mesh_file_reload_candidate(&state, &recovery, Ok(slice.clone()));
+    assert!(matches!(
+        older_pending,
+        MeshLocalReloadApply::Applied | MeshLocalReloadApply::Unchanged
+    ));
+    let older_epoch = recovery.pending_epoch();
+    assert_ne!(older_epoch, 0);
+    recovery.mark_rejected();
+    assert_eq!(recovery.pending_epoch(), 0);
+    recovery.note_proxy_apply_success(&slice);
+    assert!(
+        recovery.is_rejected(),
+        "older success must not clear after a newer failure"
     );
 
-    let unchanged = apply_mesh_file_reload_candidate(&state, &flag, Ok(slice));
-    assert_eq!(unchanged, MeshLocalReloadApply::Unchanged);
-    assert!(!flag.load(Ordering::Relaxed));
+    // Unrelated overlay / ordinary activity (different slice content) does not
+    // clear a local-source failure.
+    recovery.mark_rejected();
+    let _ = apply_mesh_file_reload_candidate(&state, &recovery, Ok(slice.clone()));
+    let unrelated = MeshSlice {
+        version: "unrelated-overlay".to_string(),
+        labels: [("k".into(), "v".into())].into(),
+        ..slice.clone()
+    };
+    recovery.note_proxy_apply_success(&unrelated);
+    assert!(
+        recovery.is_rejected(),
+        "unrelated overlay/content must not clear local-source failure"
+    );
+
+    // Proxy rejection of the pending recovery stays degraded.
+    recovery.mark_rejected();
+    let _ = apply_mesh_file_reload_candidate(&state, &recovery, Ok(slice.clone()));
+    recovery.note_proxy_apply_rejection(&slice);
+    assert!(recovery.is_rejected());
+    assert_eq!(recovery.pending_epoch(), 0);
 }
 
 #[test]
-fn production_mesh_startup_wires_off_thread_loads_for_file_and_stock() {
-    // Behavioral seam for production wiring: the mesh runtime must await the
-    // off-thread wrappers rather than calling the synchronous loaders on a
-    // Tokio worker during startup / policy-watcher setup.
-    let mesh_mod = include_str!("../../src/modes/mesh/mod.rs");
-    assert!(
-        mesh_mod.contains("load_mesh_slice_from_file_off_thread"),
-        "file protocol startup must use the off-thread loader"
-    );
-    assert!(
-        mesh_mod.contains("load_stock_policy_baseline_off_thread"),
-        "stock_xds startup must use the off-thread policy loader"
-    );
-    assert!(
-        mesh_mod.contains("config_rejected.clone()"),
-        "mesh admin health must receive the shared config_rejected signal"
-    );
+fn stock_policy_recovery_pending_until_bound_slice_proxy_accept() {
+    use ferrum_edge::modes::mesh::config_consumer::file_source::{
+        MeshLocalReloadApply, MeshLocalSourceRecovery,
+    };
+    use ferrum_edge::modes::mesh::config_consumer::stock_xds_client::{
+        apply_stock_policy_reload_candidate, load_stock_policy_baseline,
+    };
+    use ferrum_edge::modes::mesh::slice::MeshSlice;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
 
-    let stock = include_str!("../../src/modes/mesh/config_consumer/stock_xds_client.rs");
-    assert!(
-        stock.contains("spawn_blocking"),
-        "stock policy watcher must isolate filesystem/parse work"
+    const VALID_STOCK_POLICY_YAML: &str = r#"
+version: "1"
+mesh:
+  peer_authentications:
+    - name: strict-default
+      namespace: ferrum
+      mtls_mode: strict
+"#;
+    let path = write_temp("yaml", VALID_STOCK_POLICY_YAML);
+    let baseline = load_stock_policy_baseline(&path).expect("policy baseline");
+    let (tx, _rx) = tokio::sync::watch::channel(Arc::new(baseline.clone()));
+    let recovery = MeshLocalSourceRecovery::new(Arc::new(AtomicBool::new(false)));
+
+    let rejected = apply_stock_policy_reload_candidate(
+        &tx,
+        &recovery,
+        load_stock_policy_baseline(std::path::Path::new("/nonexistent/stock-policy.yaml")),
     );
+    assert_eq!(rejected, MeshLocalReloadApply::Rejected);
+    assert!(recovery.is_rejected());
+
+    let recovered = apply_stock_policy_reload_candidate(&tx, &recovery, Ok(baseline.clone()));
+    assert_eq!(recovered, MeshLocalReloadApply::Unchanged);
     assert!(
-        stock.contains("record_mesh_reload_request"),
-        "stock policy watcher must share generation fencing with file mode"
+        recovery.is_rejected(),
+        "channel send must not clear config_rejected"
     );
-    assert!(
-        stock.contains("stop_accepting_stock_policy_candidates"),
-        "stock watcher shutdown must stop accepting without awaiting blocking work"
-    );
+    assert_ne!(recovery.pending_epoch(), 0);
+
+    // Rebuild failure leaves/sets degraded and cancels pending clear.
+    recovery.mark_rejected();
+    assert_eq!(recovery.pending_epoch(), 0);
+
+    let again = apply_stock_policy_reload_candidate(&tx, &recovery, Ok(baseline));
+    assert_eq!(again, MeshLocalReloadApply::Unchanged);
+    let bound = MeshSlice {
+        version: "stock-recovery".to_string(),
+        ..MeshSlice::default()
+    };
+    recovery.bind_installed_slice_if_policy_recovery(&bound);
+    recovery.note_proxy_apply_success(&bound);
+    assert!(!recovery.is_rejected());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn off_thread_mesh_and_stock_loaders_keep_tokio_heartbeat_alive() {
+    // Behavioral replacement for source-string wiring checks: both off-thread
+    // loaders must leave the Tokio runtime free to make progress.
+    use ferrum_edge::modes::mesh::config_consumer::file_source::load_mesh_slice_from_file_off_thread;
+    use ferrum_edge::modes::mesh::config_consumer::stock_xds_client::load_stock_policy_baseline_off_thread;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let mesh_path = write_temp("yaml", VALID_MESH_YAML);
+    let stock_yaml = r#"
+version: "1"
+mesh:
+  peer_authentications:
+    - name: strict-default
+      namespace: ferrum
+      mtls_mode: strict
+"#;
+    let stock_path = write_temp("yaml", stock_yaml);
+
+    let heartbeat = Arc::new(AtomicBool::new(false));
+    let beat = heartbeat.clone();
+    let ticker = tokio::spawn(async move {
+        loop {
+            beat.store(true, Ordering::SeqCst);
+            tokio::task::yield_now().await;
+        }
+    });
+
+    let mesh_load = tokio::spawn(load_mesh_slice_from_file_off_thread(
+        mesh_path.to_path_buf(),
+        request_for_namespace("ferrum"),
+    ));
+    let stock_load = tokio::spawn(load_stock_policy_baseline_off_thread(
+        stock_path.to_path_buf(),
+    ));
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !heartbeat.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("Tokio heartbeat must advance while off-thread loads run");
+
+    mesh_load.await.expect("join").expect("mesh load");
+    stock_load.await.expect("join").expect("stock load");
+    ticker.abort();
+    let _ = ticker.await;
 }
 
 #[cfg(unix)]

@@ -20,10 +20,14 @@
 //! awaiting a non-cancellable started blocking job, and a late completion
 //! cannot publish. A failed reload raises the shared `config_rejected`
 //! admin-health signal (authenticated `/health` degraded) while retaining
-//! the last-good slice; the next accepted Applied/Unchanged reload clears it.
+//! the last-good slice; sticky recovery clears only when the exact current
+//! recovery candidate is accepted (or content-identical no-op accepted) by
+//! the proxy apply lifecycle — not on channel send or provisional
+//! [`MeshRuntimeState::install_slice`].
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use serde::Deserialize;
@@ -34,7 +38,8 @@ use crate::config::stable_file::{
     read_stable_file, stable_file_error_anyhow,
 };
 use crate::config::types::{CURRENT_CONFIG_VERSION, GatewayConfig};
-use crate::modes::mesh::runtime::{MeshRuntimeState, MeshSliceInstall};
+use crate::modes::mesh::revision::MeshRevisionContentIdentity;
+use crate::modes::mesh::runtime::{MeshRuntimeState, MeshSliceInstall, slice_content_identity};
 use crate::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
 
 /// On-disk shape of the localized mesh config document.
@@ -185,32 +190,267 @@ pub fn record_mesh_reload_request(latest_requested: &AtomicU64) -> u64 {
     latest_requested.fetch_add(1, Ordering::AcqRel) + 1
 }
 
-/// A completed candidate may install only when it is still current relative to
-/// the latest requested generation.
+/// A completed candidate may install only when it still owns the latest
+/// requested generation (exact equality). A future/out-of-contract generation
+/// must not be treated as current.
 pub fn mesh_reload_generation_is_current(generation: u64, latest_requested: u64) -> bool {
-    generation >= latest_requested
+    generation == latest_requested
+}
+
+/// Which reload-loop arm wins when one or more are simultaneously ready.
+///
+/// Shutdown is ordered first so a tied completion cannot publish after the
+/// gate should already be closed. Production loops use a `biased;`
+/// `tokio::select!` with the shutdown arm listed first; this helper is the
+/// behavioral contract those loops implement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeshReloadSelectReady {
+    Hangup,
+    Completion,
+    Shutdown,
+}
+
+/// Deterministic winner for the localized file / stock-policy reload loop.
+///
+/// When shutdown and completion are both ready, shutdown wins. Hangup is only
+/// selected when shutdown is not ready.
+pub fn mesh_reload_select_priority(
+    hangup_ready: bool,
+    completion_ready: bool,
+    shutdown_ready: bool,
+) -> Option<MeshReloadSelectReady> {
+    if shutdown_ready {
+        return Some(MeshReloadSelectReady::Shutdown);
+    }
+    if hangup_ready {
+        return Some(MeshReloadSelectReady::Hangup);
+    }
+    if completion_ready {
+        return Some(MeshReloadSelectReady::Completion);
+    }
+    None
+}
+
+/// Whether a completed load may publish after the select winner is known.
+///
+/// Shutdown winners never publish, even if `publish_allowed` has not flipped
+/// yet — callers must stop accepting before returning from the shutdown arm.
+pub fn mesh_reload_completion_may_publish(
+    publish_allowed: bool,
+    select_winner: MeshReloadSelectReady,
+) -> bool {
+    publish_allowed && matches!(select_winner, MeshReloadSelectReady::Completion)
+}
+
+/// Sticky local-source health + race-safe recovery handshake (issue #3776).
+///
+/// `config_rejected` is the authenticated `/health` surface held by
+/// [`crate::admin::AdminState`]. Clearing that flag is gated on the exact
+/// current recovery candidate being accepted by the proxy apply lifecycle —
+/// provisional `install_slice` / policy channel send must not clear it, and an
+/// older success must not clear after a newer failure.
+#[derive(Debug)]
+pub struct MeshLocalSourceRecovery {
+    config_rejected: Arc<AtomicBool>,
+    /// Monotonic epoch advanced on reject and on every new pending recovery.
+    epoch: AtomicU64,
+    /// Epoch currently allowed to clear `config_rejected` after proxy apply.
+    /// `0` means no pending recovery.
+    pending_epoch: AtomicU64,
+    /// Active stock-policy recovery epoch (`0` when none). While set, stock
+    /// installs rebind the pending slice identity so a discovery update that
+    /// incorporates the recovered policy can still clear.
+    policy_recovery_epoch: AtomicU64,
+    /// Content digest of the pending recovery slice. `None` until bound.
+    pending_digest: Mutex<Option<[u8; 32]>>,
+}
+
+impl MeshLocalSourceRecovery {
+    /// Share one recovery handshake across the source watcher, stock install
+    /// path, and mesh apply task while exposing the same `Arc<AtomicBool>` to
+    /// AdminState.
+    pub fn new(config_rejected: Arc<AtomicBool>) -> Arc<Self> {
+        Arc::new(Self {
+            config_rejected,
+            epoch: AtomicU64::new(0),
+            pending_epoch: AtomicU64::new(0),
+            policy_recovery_epoch: AtomicU64::new(0),
+            pending_digest: Mutex::new(None),
+        })
+    }
+
+    /// Authenticated `/health` sticky signal (unchanged AdminState surface).
+    pub fn config_rejected_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.config_rejected)
+    }
+
+    /// Whether authenticated health currently reports local-source rejection.
+    pub fn is_rejected(&self) -> bool {
+        self.config_rejected.load(Ordering::Relaxed)
+    }
+
+    /// Epoch currently pending proxy acceptance (`0` = none).
+    pub fn pending_epoch(&self) -> u64 {
+        self.pending_epoch.load(Ordering::Acquire)
+    }
+
+    /// Raise `config_rejected` and cancel any older pending recovery so it can
+    /// no longer clear health.
+    pub fn mark_rejected(&self) {
+        self.config_rejected.store(true, Ordering::Relaxed);
+        let _ = self.epoch.fetch_add(1, Ordering::AcqRel);
+        self.pending_epoch.store(0, Ordering::Release);
+        self.policy_recovery_epoch.store(0, Ordering::Release);
+        if let Ok(mut guard) = self.pending_digest.lock() {
+            *guard = None;
+        }
+    }
+
+    /// Mark a provisionally installed file-source recovery candidate.
+    ///
+    /// Does **not** clear `config_rejected`. An uncomputable content identity
+    /// fails closed (stays/sets degraded) because recovery cannot be proven.
+    pub fn mark_slice_recovery_pending(&self, slice: &MeshSlice) -> Option<u64> {
+        match slice_content_identity(slice) {
+            MeshRevisionContentIdentity::Digest(digest) => {
+                let epoch = self.epoch.fetch_add(1, Ordering::AcqRel) + 1;
+                if let Ok(mut guard) = self.pending_digest.lock() {
+                    *guard = Some(digest);
+                }
+                self.pending_epoch.store(epoch, Ordering::Release);
+                self.policy_recovery_epoch.store(0, Ordering::Release);
+                Some(epoch)
+            }
+            MeshRevisionContentIdentity::Unavailable => {
+                warn!(
+                    "Mesh local reload candidate has uncomputable content identity; raising \
+                     config_rejected because recovery cannot be proven"
+                );
+                self.mark_rejected();
+                None
+            }
+        }
+    }
+
+    /// Begin a stock-policy recovery after a valid baseline is published to the
+    /// watch channel. Does **not** clear `config_rejected`; the pending slice
+    /// identity is bound later when the stock client installs a rebuilt slice.
+    pub fn begin_policy_recovery(&self) -> u64 {
+        let epoch = self.epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        if let Ok(mut guard) = self.pending_digest.lock() {
+            *guard = None;
+        }
+        self.pending_epoch.store(epoch, Ordering::Release);
+        self.policy_recovery_epoch.store(epoch, Ordering::Release);
+        epoch
+    }
+
+    /// Rebind the pending recovery identity when the stock client installs a
+    /// slice that incorporates the active policy recovery (including a later
+    /// discovery update on that same recovered baseline).
+    pub fn bind_installed_slice_if_policy_recovery(&self, slice: &MeshSlice) {
+        let epoch = self.policy_recovery_epoch.load(Ordering::Acquire);
+        if epoch == 0 || self.pending_epoch.load(Ordering::Acquire) != epoch {
+            return;
+        }
+        match slice_content_identity(slice) {
+            MeshRevisionContentIdentity::Digest(digest) => {
+                if let Ok(mut guard) = self.pending_digest.lock() {
+                    *guard = Some(digest);
+                }
+            }
+            MeshRevisionContentIdentity::Unavailable => {
+                warn!(
+                    "Stock policy recovery slice has uncomputable content identity; raising \
+                     config_rejected because recovery cannot be proven"
+                );
+                self.mark_rejected();
+            }
+        }
+    }
+
+    /// Clear sticky rejection only when the proxy accepted the exact current
+    /// pending recovery identity (Applied or content-identical no-op).
+    pub fn note_proxy_apply_success(&self, slice: &MeshSlice) {
+        let pending = self.pending_epoch.load(Ordering::Acquire);
+        if pending == 0 {
+            return;
+        }
+        let expected = match self.pending_digest.lock() {
+            Ok(guard) => *guard,
+            Err(_) => return,
+        };
+        let Some(expected) = expected else {
+            return;
+        };
+        match slice_content_identity(slice) {
+            MeshRevisionContentIdentity::Digest(digest) if digest == expected => {
+                if self.pending_epoch.load(Ordering::Acquire) != pending {
+                    return;
+                }
+                crate::modes::clear_config_rejected_after_accepted_full_reload(
+                    &self.config_rejected,
+                    "mesh local-source recovery",
+                );
+                self.pending_epoch.store(0, Ordering::Release);
+                self.policy_recovery_epoch.store(0, Ordering::Release);
+                if let Ok(mut guard) = self.pending_digest.lock() {
+                    *guard = None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Proxy rejection / quarantine of a pending recovery leaves degraded and
+    /// cancels that pending clear.
+    pub fn note_proxy_apply_rejection(&self, slice: &MeshSlice) {
+        let pending = self.pending_epoch.load(Ordering::Acquire);
+        if pending == 0 {
+            return;
+        }
+        let expected = match self.pending_digest.lock() {
+            Ok(guard) => *guard,
+            Err(_) => {
+                self.mark_rejected();
+                return;
+            }
+        };
+        let matches_pending = match (expected, slice_content_identity(slice)) {
+            (Some(expected), MeshRevisionContentIdentity::Digest(digest)) => digest == expected,
+            // Unbound stock policy recovery (install not yet bound) still
+            // cancels when any apply under that epoch fails closed.
+            (None, _) => self.policy_recovery_epoch.load(Ordering::Acquire) == pending,
+            _ => false,
+        };
+        if matches_pending {
+            self.mark_rejected();
+        }
+    }
 }
 
 /// Apply outcome for a localized mesh file/policy reload candidate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MeshLocalReloadApply {
-    /// Candidate replaced (or was admitted into) live state.
+    /// Candidate replaced (or was admitted into) live received state.
+    /// Sticky health clears only after proxy apply accepts this recovery.
     Applied,
     /// Candidate was valid and content-identical to the live generation.
+    /// Sticky health clears only after proxy apply accepts this recovery.
     Unchanged,
     /// Candidate was refused; last-good retained and `config_rejected` raised.
     Rejected,
 }
 
-/// Apply a loaded mesh-file reload candidate and update `config_rejected`.
+/// Apply a loaded mesh-file reload candidate through the recovery handshake.
 ///
-/// Mirrors file-mode [`crate::modes::file::apply_file_config_candidate`]: load
-/// failure or apply quarantine raises the sticky degraded signal; Applied and
-/// Unchanged clear it. Last-good slice retention is handled by skipping
-/// install on Err / Quarantined.
+/// Load failure or revision quarantine raises the sticky degraded signal and
+/// cancels any older pending recovery. A provisionally installed candidate
+/// marks recovery pending but does **not** clear `config_rejected` — only the
+/// mesh apply task does, once the exact current recovery is proxy-accepted.
 pub fn apply_mesh_file_reload_candidate(
     state: &MeshRuntimeState,
-    config_rejected: &AtomicBool,
+    recovery: &MeshLocalSourceRecovery,
     candidate: Result<MeshSlice, anyhow::Error>,
 ) -> MeshLocalReloadApply {
     match candidate {
@@ -220,18 +460,17 @@ pub fn apply_mesh_file_reload_candidate(
                 .as_ref()
                 .as_ref()
                 .is_some_and(|live| live.content_eq(&slice));
+            let installed = slice.clone();
             match state.install_slice(slice) {
                 MeshSliceInstall::Installed => {
-                    let outcome = if unchanged {
+                    if recovery.mark_slice_recovery_pending(&installed).is_none() {
+                        return MeshLocalReloadApply::Rejected;
+                    }
+                    if unchanged {
                         MeshLocalReloadApply::Unchanged
                     } else {
                         MeshLocalReloadApply::Applied
-                    };
-                    crate::modes::clear_config_rejected_after_accepted_full_reload(
-                        config_rejected,
-                        "mesh file reload",
-                    );
-                    outcome
+                    }
                 }
                 MeshSliceInstall::Quarantined(rejection) => {
                     warn!(
@@ -239,7 +478,7 @@ pub fn apply_mesh_file_reload_candidate(
                         "Mesh file reload quarantined by the revision gate; keeping the last \
                          good mesh slice and raising config_rejected"
                     );
-                    config_rejected.store(true, Ordering::Relaxed);
+                    recovery.mark_rejected();
                     MeshLocalReloadApply::Rejected
                 }
             }
@@ -250,16 +489,16 @@ pub fn apply_mesh_file_reload_candidate(
                 "Failed to reload mesh config file; keeping the last good mesh slice and \
                  raising config_rejected"
             );
-            config_rejected.store(true, Ordering::Relaxed);
+            recovery.mark_rejected();
             MeshLocalReloadApply::Rejected
         }
     }
 }
 
 /// Mark a localized mesh reload failure (join panic, worker failure) on the
-/// shared `config_rejected` signal without mutating the live slice.
-pub fn mark_mesh_local_reload_rejected(config_rejected: &AtomicBool) {
-    config_rejected.store(true, Ordering::Relaxed);
+/// shared recovery handshake without mutating the live slice.
+pub fn mark_mesh_local_reload_rejected(recovery: &MeshLocalSourceRecovery) {
+    recovery.mark_rejected();
 }
 
 /// Reload the mesh document on SIGHUP (Unix), keeping the last good slice
@@ -273,11 +512,13 @@ pub fn mark_mesh_local_reload_rejected(config_rejected: &AtomicBool) {
 /// requested generation advances when the signal is observed so an older
 /// completed load cannot install. Watcher shutdown stops accepting candidates
 /// immediately and does not await a started (non-cancellable) blocking job.
+/// The select is `biased` with shutdown first so a simultaneous completion
+/// cannot publish.
 pub async fn start_mesh_file_source_with_shutdown(
     path: String,
     request: MeshSliceRequest,
     state: MeshRuntimeState,
-    config_rejected: Arc<AtomicBool>,
+    recovery: Arc<MeshLocalSourceRecovery>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     #[cfg(unix)]
@@ -308,7 +549,15 @@ pub async fn start_mesh_file_source_with_shutdown(
         )> = None;
 
         loop {
+            // `biased;` + shutdown first: when shutdown and completion are both
+            // ready, shutdown wins and completion cannot publish.
             tokio::select! {
+                biased;
+                _ = super::common::wait_for_shutdown(&mut shutdown_rx) => {
+                    info!("Mesh file source shutting down");
+                    stop_accepting_reload_candidates(&publish_allowed, &mut in_flight);
+                    return;
+                }
                 received = hangup.recv() => {
                     if received.is_none() {
                         warn!(
@@ -347,7 +596,10 @@ pub async fn start_mesh_file_source_with_shutdown(
                         continue;
                     };
 
-                    if !publish_allowed.load(Ordering::Acquire) {
+                    if !mesh_reload_completion_may_publish(
+                        publish_allowed.load(Ordering::Acquire),
+                        MeshReloadSelectReady::Completion,
+                    ) {
                         // Shutdown already stopped accepting candidates.
                         continue;
                     }
@@ -366,7 +618,7 @@ pub async fn start_mesh_file_source_with_shutdown(
                                 let version = slice.version.clone();
                                 let outcome = apply_mesh_file_reload_candidate(
                                     &state,
-                                    &config_rejected,
+                                    &recovery,
                                     Ok(slice),
                                 );
                                 if matches!(
@@ -393,7 +645,7 @@ pub async fn start_mesh_file_source_with_shutdown(
                                 "Failed to reload mesh config file on SIGHUP; keeping the last \
                                  good mesh slice"
                             );
-                            mark_mesh_local_reload_rejected(&config_rejected);
+                            mark_mesh_local_reload_rejected(&recovery);
                         }
                         Err(join_error) if join_error.is_cancelled() => {
                             info!(
@@ -409,7 +661,7 @@ pub async fn start_mesh_file_source_with_shutdown(
                                 error = %join_error,
                                 "Mesh file reload worker panicked; keeping the last good mesh slice"
                             );
-                            mark_mesh_local_reload_rejected(&config_rejected);
+                            mark_mesh_local_reload_rejected(&recovery);
                         }
                     }
 
@@ -420,11 +672,6 @@ pub async fn start_mesh_file_source_with_shutdown(
                         let generation = latest_requested.load(Ordering::Acquire);
                         in_flight = Some(spawn_mesh_reload(generation, &path, request.clone()));
                     }
-                }
-                _ = super::common::wait_for_shutdown(&mut shutdown_rx) => {
-                    info!("Mesh file source shutting down");
-                    stop_accepting_reload_candidates(&publish_allowed, &mut in_flight);
-                    return;
                 }
             }
         }
@@ -439,7 +686,7 @@ pub async fn start_mesh_file_source_with_shutdown(
         );
         let _ = &request;
         let _ = &state;
-        let _ = &config_rejected;
+        let _ = &recovery;
         super::common::wait_for_shutdown(&mut shutdown_rx).await;
     }
 }

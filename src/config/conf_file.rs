@@ -122,9 +122,8 @@ impl ConfFile {
 
             let Some(eq_pos) = trimmed.find('=') else {
                 return Err(format!(
-                    "Invalid conf file syntax at line {}: missing '=' in '{}'",
-                    line_num + 1,
-                    trimmed
+                    "Invalid conf file syntax at line {}: missing '='",
+                    line_num + 1
                 ));
             };
 

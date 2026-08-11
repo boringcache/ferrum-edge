@@ -11683,9 +11683,12 @@ pub async fn run(
     });
     let federation_activation = FederationActivation::from_env_config(&env_config);
     // Localized mesh file / stock-xDS policy reload rejection signal (issue
-    // #3776). Shared with AdminState so authenticated `/health` reports
-    // degraded + `config_rejected` while the last-good slice/policy serves.
+    // #3776). Shared recovery handshake clears sticky health only after the
+    // exact current recovery is accepted by the proxy apply lifecycle.
+    // AdminState still receives the authenticated-only `Arc<AtomicBool>`.
     let config_rejected = Arc::new(AtomicBool::new(false));
+    let local_source_recovery =
+        config_consumer::file_source::MeshLocalSourceRecovery::new(config_rejected.clone());
 
     let mut background_handles = Vec::new();
     if runtime.config_protocol == MeshConfigProtocol::File {
@@ -11730,7 +11733,7 @@ pub async fn run(
                 file_path.clone(),
                 runtime.mesh_slice_request(),
                 mesh_state.clone(),
-                config_rejected.clone(),
+                local_source_recovery.clone(),
                 shutdown_tx.subscribe(),
             ),
         );
@@ -11788,7 +11791,7 @@ pub async fn run(
             config_consumer::stock_xds_client::start_stock_policy_watcher_with_shutdown(
                 policy_path.clone(),
                 policy_tx,
-                config_rejected.clone(),
+                local_source_recovery.clone(),
                 shutdown_tx.subscribe(),
             ),
         ));
@@ -11801,6 +11804,7 @@ pub async fn run(
                 grpc_tls,
                 grpc_tls_reload,
                 policy_rx,
+                local_source_recovery.clone(),
             ),
         ));
         info!(
@@ -13403,6 +13407,7 @@ async fn arm_mesh_runtime_startup(
         },
         shutdown_tx.subscribe(),
         dns_proxy_handle,
+        Some(local_source_recovery),
     ));
 
     info!(
@@ -16872,6 +16877,9 @@ fn start_mesh_slice_apply_task(
     mut inbound_tls_reload: MeshInboundTlsReloadState,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     dns_proxy: Option<Arc<MeshDnsProxy>>,
+    local_source_recovery: Option<
+        Arc<config_consumer::file_source::MeshLocalSourceRecovery>,
+    >,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         // Topology is process-fixed, so whether this data plane has an inbound
@@ -16913,6 +16921,9 @@ fn start_mesh_slice_apply_task(
                         true,
                         revision_apply_token,
                     );
+                    if let Some(recovery) = local_source_recovery.as_ref() {
+                        recovery.note_proxy_apply_success(slice);
+                    }
                     debug!(
                         mesh_slice_version = %slice.version,
                         "Skipping no-op mesh slice update"
@@ -16951,8 +16962,15 @@ fn start_mesh_slice_apply_task(
                     // revision beneath it and block recovery. Roll back to the
                     // last APPLIED revision, keyed to this exact received
                     // candidate so a newer one received mid-apply is untouched.
-                    if !received_accepted {
+                    if received_accepted {
+                        if let Some(recovery) = local_source_recovery.as_ref() {
+                            recovery.note_proxy_apply_success(slice);
+                        }
+                    } else {
                         mesh_state.record_rejected_slice(&snapshot);
+                        if let Some(recovery) = local_source_recovery.as_ref() {
+                            recovery.note_proxy_apply_rejection(slice);
+                        }
                     }
                     // Finding 3 (accepted-remote/federation update vs rejected
                     // received slice): the discovery + federation pollers are
@@ -16981,7 +16999,7 @@ fn start_mesh_slice_apply_task(
                             last_accepted_slice_version = %base.version,
                             "Received mesh slice rejected; re-applying federation/remote overlay against last-accepted slice"
                         );
-                        apply_mesh_slice_generation(
+                        let overlay_accepted = apply_mesh_slice_generation(
                             &mesh_state,
                             &proxy_state,
                             &runtime,
@@ -16995,6 +17013,14 @@ fn start_mesh_slice_apply_task(
                             &dns_proxy,
                         )
                         .await;
+                        // Overlay re-apply of last-accepted must NOT clear a
+                        // sticky local-source failure unless that base is the
+                        // exact pending recovery identity.
+                        if overlay_accepted
+                            && let Some(recovery) = local_source_recovery.as_ref()
+                        {
+                            recovery.note_proxy_apply_success(base.as_ref());
+                        }
                     }
                 }
                 // Federation / remote-endpoint revisions are consumed after
@@ -29745,6 +29771,7 @@ mod tests {
             },
             shutdown_rx,
             None,
+            None,
         );
 
         mesh_state.install_slice(MeshSlice {
@@ -29794,6 +29821,7 @@ mod tests {
                 production: false,
             },
             shutdown_rx,
+            None,
             None,
         );
 
@@ -29962,6 +29990,7 @@ mod tests {
             },
             shutdown_rx,
             None,
+            None,
         );
 
         mesh_state.install_slice(MeshSlice {
@@ -30041,6 +30070,7 @@ mod tests {
                 production: false,
             },
             shutdown_rx,
+            None,
             None,
         );
 
@@ -30154,6 +30184,7 @@ mod tests {
                 production: false,
             },
             shutdown_rx,
+            None,
             None,
         );
 
@@ -31331,6 +31362,7 @@ mod tests {
                 production: false,
             },
             shutdown_rx,
+            None,
             None,
         );
 

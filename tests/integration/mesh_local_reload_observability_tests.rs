@@ -4,10 +4,11 @@
 //! A failed reload must raise the shared `config_rejected` signal, keep the
 //! last-good slice/policy, surface authenticated `/health` as `degraded` +
 //! `config_rejected: true`, redact the boolean from unauthenticated probes, and
-//! clear on a later Applied or Unchanged reload.
+//! clear only after the exact current recovery is accepted by the proxy apply
+//! lifecycle (not on provisional install / channel send).
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 
 use arc_swap::ArcSwap;
 use chrono::Utc;
@@ -21,7 +22,8 @@ use ferrum_edge::config::types::GatewayConfig;
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::modes::mesh::config::MeshConfig;
 use ferrum_edge::modes::mesh::config_consumer::file_source::{
-    MeshLocalReloadApply, apply_mesh_file_reload_candidate, load_mesh_slice_from_file,
+    MeshLocalReloadApply, MeshLocalSourceRecovery, apply_mesh_file_reload_candidate,
+    load_mesh_slice_from_file,
 };
 use ferrum_edge::modes::mesh::config_consumer::stock_xds_client::apply_stock_policy_reload_candidate;
 use ferrum_edge::modes::mesh::runtime::MeshRuntimeState;
@@ -211,6 +213,7 @@ async fn mesh_file_reload_rejection_surfaces_authenticated_health_and_clears() {
     state.install_slice(slice.clone());
 
     let flag = Arc::new(AtomicBool::new(false));
+    let recovery = MeshLocalSourceRecovery::new(flag.clone());
     let admin = build_mesh_admin_state(flag.clone());
     let (port, shutdown) = start_test_admin(admin).await;
     let token = mint_admin_token();
@@ -222,14 +225,14 @@ async fn mesh_file_reload_rejection_surfaces_authenticated_health_and_clears() {
 
     let rejected = apply_mesh_file_reload_candidate(
         &state,
-        &flag,
+        &recovery,
         load_mesh_slice_from_file(
             std::path::Path::new("/nonexistent/mesh-reload.yaml"),
             request(),
         ),
     );
     assert_eq!(rejected, MeshLocalReloadApply::Rejected);
-    assert!(flag.load(Ordering::Relaxed));
+    assert!(recovery.is_rejected());
     assert!(
         state
             .snapshot()
@@ -251,12 +254,21 @@ async fn mesh_file_reload_rejection_surfaces_authenticated_health_and_clears() {
         "config_rejected must stay authenticated-only: {unauth:?}"
     );
 
-    let cleared = apply_mesh_file_reload_candidate(&state, &flag, Ok(slice));
+    let submitted = apply_mesh_file_reload_candidate(&state, &recovery, Ok(slice.clone()));
     assert!(matches!(
-        cleared,
+        submitted,
         MeshLocalReloadApply::Applied | MeshLocalReloadApply::Unchanged
     ));
-    assert!(!flag.load(Ordering::Relaxed));
+    assert!(
+        recovery.is_rejected(),
+        "valid candidate pending proxy accept must remain degraded"
+    );
+    let (_, health) = get_health(port, Some(&token)).await;
+    assert_eq!(health["status"], "degraded");
+    assert_eq!(health["config_rejected"], true);
+
+    recovery.note_proxy_apply_success(&slice);
+    assert!(!recovery.is_rejected());
 
     let (_, health) = get_health(port, Some(&token)).await;
     assert_eq!(health["status"], "ok");
@@ -266,31 +278,44 @@ async fn mesh_file_reload_rejection_surfaces_authenticated_health_and_clears() {
 }
 
 #[test]
-fn stock_policy_reload_rejection_raises_and_recovery_clears() {
+fn stock_policy_reload_rejection_raises_and_recovery_clears_only_after_proxy() {
     use ferrum_edge::modes::mesh::config_consumer::stock_xds_client::load_stock_policy_baseline;
+    use ferrum_edge::modes::mesh::slice::MeshSlice;
 
     let path = write_temp("yaml", VALID_STOCK_POLICY_YAML);
     let baseline = load_stock_policy_baseline(&path).expect("policy baseline");
     let (tx, _rx) = tokio::sync::watch::channel(Arc::new(baseline.clone()));
-    let flag = AtomicBool::new(false);
+    let recovery = MeshLocalSourceRecovery::new(Arc::new(AtomicBool::new(false)));
 
     let rejected = apply_stock_policy_reload_candidate(
         &tx,
-        &flag,
+        &recovery,
         load_stock_policy_baseline(std::path::Path::new("/nonexistent/stock-policy.yaml")),
     );
     assert_eq!(rejected, MeshLocalReloadApply::Rejected);
-    assert!(flag.load(Ordering::Relaxed));
+    assert!(recovery.is_rejected());
     assert_eq!(tx.borrow().as_ref(), &baseline);
 
-    let recovered = apply_stock_policy_reload_candidate(&tx, &flag, Ok(baseline.clone()));
+    let recovered = apply_stock_policy_reload_candidate(&tx, &recovery, Ok(baseline.clone()));
     assert_eq!(recovered, MeshLocalReloadApply::Unchanged);
-    assert!(!flag.load(Ordering::Relaxed));
+    assert!(
+        recovery.is_rejected(),
+        "policy channel send must not clear config_rejected"
+    );
+
+    let bound = MeshSlice {
+        version: "stock-obs-recovery".to_string(),
+        ..MeshSlice::default()
+    };
+    recovery.bind_installed_slice_if_policy_recovery(&bound);
+    recovery.note_proxy_apply_success(&bound);
+    assert!(!recovery.is_rejected());
 
     let mut changed = baseline.clone();
     changed.peer_authentications.clear();
-    let applied = apply_stock_policy_reload_candidate(&tx, &flag, Ok(changed.clone()));
+    let applied = apply_stock_policy_reload_candidate(&tx, &recovery, Ok(changed.clone()));
     assert_eq!(applied, MeshLocalReloadApply::Applied);
-    assert!(!flag.load(Ordering::Relaxed));
+    // No prior rejection: sticky flag stays clear, but pending is still set for
+    // the new recovery epoch until proxy accept (idempotent clear).
     assert_eq!(tx.borrow().as_ref(), &changed);
 }
