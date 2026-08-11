@@ -147,10 +147,7 @@ impl TlsEventLog {
         }
         let max_document_bytes =
             crate::config::env_config::tls_store_max_document_bytes_from_env()?;
-        let mut events = match load_event_log_events(&path, max_document_bytes) {
-            Ok(events) => events,
-            Err(error) => return Err(error),
-        };
+        let mut events = load_event_log_events(&path, max_document_bytes)?;
         while events.len() > capacity {
             events.pop_front();
         }
