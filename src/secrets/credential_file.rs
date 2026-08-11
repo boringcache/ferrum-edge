@@ -1,9 +1,10 @@
 //! Shared bounded reader for small file-backed credentials.
 //!
-//! Used by generic `_FILE` startup secrets and `FERRUM_DP_CP_GRPC_TOKEN_FILE`
-//! (and any future scalar credential path that must not allocate or block on a
-//! non-regular source). TLS material sources keep their own caps in
-//! `tls::source` (#3754); this module is the non-TLS credential surface.
+//! Used by generic `_FILE` startup secrets, `FERRUM_DP_CP_GRPC_TOKEN_FILE`, and
+//! `FERRUM_MESH_STOCK_XDS_TOKEN_FILE` (and any future scalar credential path
+//! that must not allocate or block on a non-regular source). TLS material
+//! sources keep their own caps in `tls::source` (#3754); this module is the
+//! non-TLS credential surface.
 //!
 //! Contract:
 //! - Open the path (Unix: `O_NONBLOCK` so FIFO/device open cannot stall).
@@ -197,12 +198,40 @@ pub async fn read_credential_file_detached(
     trim: CredentialTrim,
     thread_name: &str,
 ) -> Result<String, CredentialFileError> {
+    read_credential_file_detached_inner(path, max_bytes, trim, thread_name, None).await
+}
+
+/// Detached credential read whose caller-supplied permit remains owned by the
+/// OS thread until the kernel open/read actually returns. This lets reconnect
+/// loops bound abandoned readers even after their async timeout drops the
+/// receiving future.
+pub(crate) async fn read_credential_file_detached_guarded(
+    path: &str,
+    max_bytes: usize,
+    trim: CredentialTrim,
+    thread_name: &str,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) -> Result<String, CredentialFileError> {
+    read_credential_file_detached_inner(path, max_bytes, trim, thread_name, Some(permit)).await
+}
+
+async fn read_credential_file_detached_inner(
+    path: &str,
+    max_bytes: usize,
+    trim: CredentialTrim,
+    thread_name: &str,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+) -> Result<String, CredentialFileError> {
     let path = path.to_string();
     let thread_name = thread_name.to_string();
     let (sender, receiver) = tokio::sync::oneshot::channel();
     let join_handle = std::thread::Builder::new()
         .name(thread_name)
         .spawn(move || {
+            // The permit belongs to the blocking operation, not the awaiting
+            // future. If the caller times out, later attempts remain fenced
+            // until this detached read really exits.
+            let _permit = permit;
             let _ = sender.send(read_credential_file(&path, max_bytes, trim));
         })
         .map_err(CredentialFileError::Io)?;
@@ -223,7 +252,7 @@ pub async fn read_credential_file_detached(
 /// logical size exceeds the payload (sparse / holey file). Used by external
 /// tests to prove metadata fast-reject without allocating the full length.
 #[doc(hidden)]
-pub fn write_sparse_credential_fixture(
+pub(crate) fn write_sparse_credential_fixture(
     path: &Path,
     prefix: &[u8],
     logical_len: u64,

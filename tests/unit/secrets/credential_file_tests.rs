@@ -10,11 +10,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use ferrum_edge::_test_support::write_sparse_credential_fixture_for_test;
 use ferrum_edge::secrets::credential_file::{
     CredentialFileError, CredentialTrim, DEFAULT_CREDENTIAL_FILE_MAX_BYTES,
     HARD_MAX_CREDENTIAL_FILE_MAX_BYTES, read_bounded_credential_bytes, read_credential_file,
     read_credential_file_detached, validate_credential_file_max_bytes,
-    write_sparse_credential_fixture,
 };
 use ferrum_edge::secrets::file::{read_secret, read_secret_detached};
 
@@ -150,7 +150,7 @@ fn concurrent_growth_is_capped_by_streaming_budget() {
 fn sparse_large_file_is_rejected_without_full_allocation() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("sparse");
-    write_sparse_credential_fixture(&path, b"tok", (LIMIT as u64) + 1).expect("sparse");
+    write_sparse_credential_fixture_for_test(&path, b"tok", (LIMIT as u64) + 1).expect("sparse");
     let before = {
         #[cfg(target_os = "linux")]
         {

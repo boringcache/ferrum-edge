@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use ferrum_edge::grpc::dp_client::{
     DpCpConnectionState, GrpcJwtSecret, generate_dp_jwt, generate_dp_jwt_with_issuer,
 };
+use serial_test::serial;
 
 #[test]
 fn connection_state_new_disconnected() {
@@ -187,6 +188,7 @@ fn grpc_jwt_external_token_rotation_between_reconnect_mints() {
 }
 
 #[test]
+#[serial(dp_cp_token_file_read_limit)]
 fn grpc_jwt_mint_async_reads_token_file_off_worker() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("async-token");
@@ -202,6 +204,45 @@ fn grpc_jwt_mint_async_reads_token_file_off_worker() {
         .block_on(secret.mint_async("node-1", Some("ns"), None))
         .unwrap();
     assert_eq!(token, "async-external-token");
+}
+
+#[test]
+#[serial(dp_cp_token_file_read_limit)]
+fn grpc_jwt_mint_async_bounds_detached_reader_occupancy() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("serialized-token");
+    std::fs::write(&path, b"serialized-external-token\n").unwrap();
+    let secret = GrpcJwtSecret::new("unused".to_string())
+        .with_token_file(Some(path.to_string_lossy().into_owned()));
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let permit =
+            ferrum_edge::_test_support::acquire_dp_cp_token_file_read_permit_for_test().await;
+
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                secret.mint_async("node-1", Some("ns"), None),
+            )
+            .await
+            .is_err(),
+            "a concurrent reconnect must wait instead of spawning another detached reader"
+        );
+
+        drop(permit);
+        let token = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            secret.mint_async("node-1", Some("ns"), None),
+        )
+        .await
+        .expect("token read should resume after the in-flight reader exits")
+        .expect("bounded token read");
+        assert_eq!(token, "serialized-external-token");
+    });
 }
 
 #[test]
@@ -267,8 +308,8 @@ fn grpc_jwt_projected_symlink_rotation_is_visible_on_next_mint() {
 fn grpc_jwt_consumers_use_mint_async_for_reconnect_paths() {
     // Native mesh, DP ConfigSync, and Ferrum xDS ADS are the production
     // GrpcJwtSecret::mint consumers on reconnect. They must call mint_async so
-    // token-file I/O never runs on a Tokio core worker. Stock xDS uses a
-    // separate token-file helper and is out of this issue's shared seam.
+    // token-file I/O never runs on a Tokio core worker. Stock xDS uses the same
+    // bounded credential primitive through its separate bearer-token helper.
     let native = include_str!("../../../src/modes/mesh/config_consumer/native_client.rs");
     let dp = include_str!("../../../src/grpc/dp_client.rs");
     let xds = include_str!("../../../src/modes/mesh/config_consumer/xds_client.rs");

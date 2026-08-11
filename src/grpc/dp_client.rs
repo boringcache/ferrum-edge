@@ -28,10 +28,10 @@ use chrono::{DateTime, Utc};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde::Serialize;
 use serde_json::json;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::{Notify, watch};
+use tokio::sync::{Notify, Semaphore, watch};
 use tonic::metadata::MetadataValue;
 use tonic::transport::channel::ClientTlsConfig;
 use tonic::transport::{Certificate, Channel, Endpoint, Identity};
@@ -310,6 +310,15 @@ impl GrpcJwtSecret {
 /// multi-CP failover can proceed.
 pub const DP_CP_TOKEN_FILE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// One token-file read may remain blocked in the kernel after its async caller
+/// times out. The permit moves into that detached OS thread, so reconnects
+/// cannot accumulate abandoned readers during a persistent mount outage.
+static DP_CP_TOKEN_FILE_READ_LIMIT: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+pub(crate) fn dp_cp_token_file_read_limit() -> Arc<Semaphore> {
+    Arc::clone(DP_CP_TOKEN_FILE_READ_LIMIT.get_or_init(|| Arc::new(Semaphore::new(1))))
+}
+
 fn map_external_cp_token_error(
     error: crate::secrets::credential_file::CredentialFileError,
 ) -> anyhow::Error {
@@ -337,14 +346,25 @@ fn read_external_cp_token_file(path: &str) -> Result<String, anyhow::Error> {
 
 async fn read_external_cp_token_file_detached(path: &str) -> Result<String, anyhow::Error> {
     use crate::secrets::credential_file::{
-        CredentialTrim, DEFAULT_CREDENTIAL_FILE_MAX_BYTES, read_credential_file_detached,
+        CredentialTrim, DEFAULT_CREDENTIAL_FILE_MAX_BYTES,
+        read_credential_file_detached_guarded,
     };
-    let read = read_credential_file_detached(
-        path,
-        DEFAULT_CREDENTIAL_FILE_MAX_BYTES,
-        CredentialTrim::Ends,
-        "ferrum-cp-token-file",
-    );
+    let read = async {
+        let permit = dp_cp_token_file_read_limit()
+            .acquire_owned()
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!("failed to read FERRUM_DP_CP_GRPC_TOKEN_FILE: reader unavailable")
+            })?;
+        read_credential_file_detached_guarded(
+            path,
+            DEFAULT_CREDENTIAL_FILE_MAX_BYTES,
+            CredentialTrim::Ends,
+            "ferrum-cp-token-file",
+            permit,
+        )
+        .await
+    };
     match tokio::time::timeout(DP_CP_TOKEN_FILE_READ_TIMEOUT, read).await {
         Ok(result) => result.map_err(map_external_cp_token_error),
         Err(_) => Err(anyhow::anyhow!(
