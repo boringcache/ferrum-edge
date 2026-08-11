@@ -25,6 +25,15 @@
 //!   permit ends;
 //! - permits come back on every close path a test can drive: the watchdog's
 //!   initial-connection deadline, a client disconnect, and shutdown;
+//! - **both** connection-deadline branches, not just the first: a peer that
+//!   never speaks is closed on the initial deadline, and a peer that speaks once
+//!   and then stops is closed on the *idle* deadline — the post-first-read
+//!   branch, reached with a truncated HTTP/2 preface because a completed
+//!   handshake would be closed by HTTP/2 keepalive first;
+//! - and the property that deadline must not break: an application-idle but
+//!   keepalive-refreshed `FetchX509SVID` stream survives well past the idle
+//!   deadline and still receives a later rotation, which is exactly what a
+//!   healthy Workload API client looks like;
 //! - shutdown completes inside its bounded deadline while clients hold an idle
 //!   socket, a half-finished HTTP/2 session, and a long-lived Workload API
 //!   stream — the shape that hangs a purely graceful drain forever;
@@ -716,11 +725,19 @@ async fn a_stream_past_the_advertised_ceiling_is_refused_at_the_protocol_level()
 }
 
 #[tokio::test]
-async fn the_service_wide_rpc_ceiling_sheds_rather_than_queueing_and_releases_exactly() {
+async fn the_rpc_ceiling_sheds_rather_than_queueing_and_releases_exactly() {
+    // The bound observed here is the **per-UID RPC quota**, and it says so: the
+    // test process has one UID, and a fair configuration keeps that quota
+    // strictly below the service-wide ceiling, so a single-UID client can never
+    // reach the service-wide bound. Both halves are pinned against the same
+    // accounting in the unit suite, including the fair-share property that a
+    // *different* UID keeps being served — which a single-uid process cannot
+    // produce through real sockets.
     let harness = Harness::start(
         "rpccap",
         WorkloadApiAdmissionConfig {
-            max_concurrent_rpcs: 1,
+            max_concurrent_rpcs: 2,
+            max_concurrent_rpcs_per_uid: 1,
             ..limits()
         },
     )
@@ -744,9 +761,11 @@ async fn the_service_wide_rpc_ceiling_sheds_rather_than_queueing_and_releases_ex
         "the held RPC must be doing real work, or it is not holding a real permit"
     );
 
-    // The next call is shed immediately. The bound matters as much as the code:
-    // a queued identity request served far too late is worse than a refusal the
-    // client can retry, and an unbounded backlog is the exhaustion itself.
+    // The next call is shed immediately — from a *second connection*, so the
+    // refusal is the RPC bound rather than anything per-connection. The
+    // promptness matters as much as the code: a queued identity request served
+    // far too late is worse than a refusal the client can retry, and an
+    // unbounded backlog is the exhaustion itself.
     let mut second = connect(&harness.path).await;
     let started = Instant::now();
     let shed = tokio::time::timeout(
@@ -826,6 +845,167 @@ async fn a_connection_that_never_speaks_is_closed_on_its_deadline_and_returns_it
     .expect("a connection that never sends a byte must be closed on its initial deadline");
 
     wait_for_service(&harness.path, Duration::from_secs(15)).await;
+    harness.shutdown_within(Duration::from_secs(30)).await;
+}
+
+#[tokio::test]
+async fn a_connection_that_speaks_once_and_then_goes_silent_is_closed_on_its_idle_deadline() {
+    // The *post-first-read* branch, which the never-spoke test above cannot
+    // reach: once a byte has been read the initial deadline no longer applies,
+    // and only the idle deadline can end the connection.
+    //
+    // The shape is a peer that writes a **truncated** HTTP/2 preface and then
+    // stops. That is deliberate rather than incidental: a peer that completes
+    // the handshake and then goes quiet is closed by HTTP/2's own keepalive
+    // first (the interval is derived from the idle deadline, so an unanswered
+    // PING always expires earlier), so the transport deadline would never be
+    // what was observed. With the handshake never finished there is no HTTP/2
+    // connection to ping, and the transport-level idle deadline is the only
+    // thing standing between this peer and an indefinitely held slot.
+    const INITIAL_SECS: u64 = 1;
+    const IDLE_SECS: u64 = 4;
+    let harness = Harness::start(
+        "idle",
+        WorkloadApiAdmissionConfig {
+            max_connections: 2,
+            max_connections_per_uid: 1,
+            initial_connection_timeout: Duration::from_secs(INITIAL_SECS),
+            idle_timeout: Duration::from_secs(IDLE_SECS),
+            ..limits()
+        },
+    )
+    .await;
+
+    let mut speaks_once = UnixStream::connect(&harness.path)
+        .await
+        .expect("the socket accepts a connection");
+    let started = Instant::now();
+    speaks_once
+        .write_all(&H2_PREFACE[..12])
+        .await
+        .expect("a truncated preface is written");
+
+    // Drain whatever the server flushes and wait for the close, exactly as the
+    // never-spoke test does: the first byte is not evidence of a half-open
+    // socket, EOF is.
+    const MAX_SERVER_BYTES: usize = 512;
+    const READ_CHUNK: usize = 64;
+    let mut total_read = 0usize;
+    let mut buf = [0u8; READ_CHUNK];
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if total_read >= MAX_SERVER_BYTES {
+                panic!(
+                    "server sent {total_read} bytes without closing; a connection idle since its \
+                     first byte must be closed on the idle deadline (cap {MAX_SERVER_BYTES})"
+                );
+            }
+            let remaining = MAX_SERVER_BYTES - total_read;
+            let read_len = remaining.min(READ_CHUNK);
+            let read = speaks_once
+                .read(&mut buf[..read_len])
+                .await
+                .expect("the close is a clean transport teardown");
+            if read == 0 {
+                break;
+            }
+            total_read += read;
+        }
+    })
+    .await
+    .expect("a connection that stops speaking must be closed on its idle deadline");
+    let elapsed = started.elapsed();
+
+    // The discriminator between the two branches, and the whole point of this
+    // test: a peer that has spoken must get the *idle* budget. Being closed on
+    // the initial deadline instead would land at roughly one second, so the
+    // threshold sits comfortably above it and comfortably below the idle
+    // deadline, leaving both directions unambiguous on a slow runner.
+    assert!(
+        elapsed >= Duration::from_secs(2),
+        "a connection that has already been read from must be judged against the idle deadline \
+         ({IDLE_SECS}s), not the initial one ({INITIAL_SECS}s); it closed after {elapsed:?}"
+    );
+
+    wait_for_service(&harness.path, Duration::from_secs(15)).await;
+    harness.shutdown_within(Duration::from_secs(30)).await;
+}
+
+#[tokio::test]
+async fn a_keepalive_refreshed_svid_stream_outlives_the_idle_deadline_and_still_rotates() {
+    // The complement, and the property the idle deadline would otherwise break:
+    // a Workload API client is *designed* to hold `FetchX509SVID` open across
+    // rotations, so it is application-idle for as long as nothing rotates. If
+    // the deadline counted application traffic, that healthy client would be
+    // closed on a timer and every workload on the node would churn its
+    // identity stream.
+    //
+    // What keeps it alive is that the deadline counts bytes **read from the
+    // peer**, and the HTTP/2 keepalive interval is derived from the deadline
+    // (a third of it): the server pings, a live peer ACKs, and the ACK is a
+    // read. Nothing here writes application traffic — the client sends its
+    // request and then does nothing at all — so surviving past the deadline can
+    // only be the keepalive relationship holding.
+    const IDLE_SECS: u64 = 4;
+    let harness = Harness::start(
+        "keepalive",
+        WorkloadApiAdmissionConfig {
+            initial_connection_timeout: Duration::from_secs(1),
+            idle_timeout: Duration::from_secs(IDLE_SECS),
+            ..limits()
+        },
+    )
+    .await;
+    assert!(
+        harness.listener.socket_path().exists(),
+        "the listener is serving before the idle window opens"
+    );
+
+    let mut client = connect(&harness.path).await;
+    let mut svids = client
+        .fetch_x509svid(workload_request(X509svidRequest {}))
+        .await
+        .expect("the long-lived SVID stream is established")
+        .into_inner();
+    let first = tokio::time::timeout(Duration::from_secs(10), svids.next())
+        .await
+        .expect("the SVID stream produces its first frame")
+        .expect("the SVID stream did not end")
+        .expect("the first frame is not an error");
+    assert_eq!(first.svids.len(), 1);
+
+    // Application-idle well past the deadline. Half again the idle window, so a
+    // regression that closed the stream on the deadline cannot be explained by
+    // runner slowness in either direction.
+    let idle_started = Instant::now();
+    tokio::time::sleep(Duration::from_secs(IDLE_SECS + IDLE_SECS / 2)).await;
+    assert!(
+        idle_started.elapsed() > Duration::from_secs(IDLE_SECS),
+        "the stream must actually have been idle past the deadline for this to prove anything"
+    );
+
+    // Still live, and still doing its job: a rotation published after the idle
+    // deadline elapsed is delivered on the same stream.
+    harness
+        .rotation_signal
+        .send_modify(|revision| *revision += 1);
+    let rotated = tokio::time::timeout(Duration::from_secs(15), svids.next())
+        .await
+        .expect(
+            "a keepalive-refreshed SVID stream must survive past the idle deadline; closing it \
+             would churn the identity stream of every healthy workload on the node",
+        )
+        .expect("the SVID stream did not end")
+        .expect("the rotated frame is not an error");
+    assert_eq!(rotated.svids.len(), 1);
+    assert_eq!(rotated.svids[0].spiffe_id, workload_id().as_str());
+    assert!(
+        !rotated.svids[0].x509_svid.is_empty() && !rotated.svids[0].x509_svid_key.is_empty(),
+        "the rotation delivers real material, not an empty frame"
+    );
+
+    drop(svids);
+    drop(client);
     harness.shutdown_within(Duration::from_secs(30)).await;
 }
 
@@ -913,6 +1093,7 @@ async fn normal_identity_service_is_unchanged_under_tight_limits() {
             max_connections_per_uid: 3,
             max_concurrent_streams: 8,
             max_concurrent_rpcs: 8,
+            max_concurrent_rpcs_per_uid: 7,
             shutdown_grace: Duration::from_secs(5),
             ..limits()
         },

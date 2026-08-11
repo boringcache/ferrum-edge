@@ -700,8 +700,10 @@ pub async fn serve_workload_api(
 /// lifetime. tonic itself is then configured with an explicit HTTP/2
 /// `max_concurrent_streams`, a matching per-connection request-concurrency limit
 /// with load shedding (reject, never queue), and keepalive derived from the idle
-/// deadline; the service-wide RPC ceiling is applied inside
-/// [`WorkloadApiService`], before attestation, CA work, or any spawned producer.
+/// deadline; the concurrent-RPC bounds — service-wide **and** per kernel-attested
+/// peer UID — are applied inside [`WorkloadApiService`], before attestation, CA
+/// work, or any spawned producer, and each permit is held for the whole life of
+/// its response stream.
 ///
 /// Shutdown is bounded in three steps: admission stops immediately, the serve
 /// future is given [`WorkloadApiAdmissionConfig::shutdown_grace`] to drain, and
@@ -733,7 +735,7 @@ pub async fn serve_workload_api_with_admission(
     let mut drain_observer = shutdown_tx.subscribe();
     let service = service
         .with_service_shutdown(shutdown_tx.subscribe())
-        .with_max_concurrent_rpcs(limits.max_concurrent_rpcs);
+        .with_rpc_admission(&limits);
     let (listener, bound_identity) = bind_and_publish_socket(&path, config.socket_mode)?;
 
     let (terminated_tx, terminated_rx) = watch::channel(false);
@@ -843,6 +845,7 @@ pub async fn serve_workload_api_with_admission(
         max_connections_per_uid = limits.max_connections_per_uid,
         max_concurrent_streams = limits.max_concurrent_streams,
         max_concurrent_rpcs = limits.max_concurrent_rpcs,
+        max_concurrent_rpcs_per_uid = limits.max_concurrent_rpcs_per_uid,
         initial_connection_timeout_secs = limits.initial_connection_timeout.as_secs(),
         idle_timeout_secs = limits.idle_timeout.as_secs(),
         shutdown_grace_secs = limits.shutdown_grace.as_secs(),

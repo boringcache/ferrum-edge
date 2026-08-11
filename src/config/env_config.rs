@@ -1575,7 +1575,17 @@ pub struct EnvConfig {
     /// Service-wide concurrently admitted Workload API RPCs. Bounds the product
     /// of the connection and stream ceilings; a call over the limit is shed with
     /// `RESOURCE_EXHAUSTED` before attestation, CA work, or any producer task.
+    /// A **streaming** RPC holds its permit for the whole life of its response
+    /// stream, so this bounds concurrently open Workload API streams rather than
+    /// request rate.
     pub mesh_workload_api_max_concurrent_rpcs: usize,
+    /// Concurrently admitted Workload API RPCs per kernel-attested peer UID.
+    /// Keeps one socket-group member from occupying every RPC permit — which the
+    /// per-connection quota alone does not prevent, since the bundle RPCs need
+    /// only the mandatory metadata header — and so denying SVID renewal to every
+    /// other workload on the node. Must be **strictly below**
+    /// `mesh_workload_api_max_concurrent_rpcs`.
+    pub mesh_workload_api_max_concurrent_rpcs_per_uid: usize,
     /// Seconds a newly admitted Workload API connection may go without sending
     /// its first byte. Bounds the connect-and-say-nothing flood a per-request
     /// timeout cannot see.
@@ -2992,6 +3002,8 @@ impl Default for EnvConfig {
                 crate::identity::workload_api::admission::DEFAULT_MAX_CONCURRENT_STREAMS,
             mesh_workload_api_max_concurrent_rpcs:
                 crate::identity::workload_api::admission::DEFAULT_MAX_CONCURRENT_RPCS,
+            mesh_workload_api_max_concurrent_rpcs_per_uid:
+                crate::identity::workload_api::admission::DEFAULT_MAX_CONCURRENT_RPCS_PER_UID,
             mesh_workload_api_initial_connection_timeout_seconds: 10,
             mesh_workload_api_idle_timeout_seconds: 900,
             mesh_workload_api_shutdown_grace_seconds: 10,
@@ -3527,6 +3539,7 @@ impl EnvConfig {
             mesh_workload_api_max_connections_per_uid: usize = "FERRUM_MESH_WORKLOAD_API_MAX_CONNECTIONS_PER_UID" => crate::identity::workload_api::admission::DEFAULT_MAX_CONNECTIONS_PER_UID;
             mesh_workload_api_max_concurrent_streams: u32 = "FERRUM_MESH_WORKLOAD_API_MAX_CONCURRENT_STREAMS" => crate::identity::workload_api::admission::DEFAULT_MAX_CONCURRENT_STREAMS;
             mesh_workload_api_max_concurrent_rpcs: usize = "FERRUM_MESH_WORKLOAD_API_MAX_CONCURRENT_RPCS" => crate::identity::workload_api::admission::DEFAULT_MAX_CONCURRENT_RPCS;
+            mesh_workload_api_max_concurrent_rpcs_per_uid: usize = "FERRUM_MESH_WORKLOAD_API_MAX_CONCURRENT_RPCS_PER_UID" => crate::identity::workload_api::admission::DEFAULT_MAX_CONCURRENT_RPCS_PER_UID;
             mesh_workload_api_initial_connection_timeout_seconds: u64 = "FERRUM_MESH_WORKLOAD_API_INITIAL_CONNECTION_TIMEOUT_SECONDS" => 10u64;
             mesh_workload_api_idle_timeout_seconds: u64 = "FERRUM_MESH_WORKLOAD_API_IDLE_TIMEOUT_SECONDS" => 900u64;
             mesh_workload_api_shutdown_grace_seconds: u64 = "FERRUM_MESH_WORKLOAD_API_SHUTDOWN_GRACE_SECONDS" => 10u64;
@@ -4305,6 +4318,7 @@ impl EnvConfig {
             mesh_workload_api_max_connections_per_uid,
             mesh_workload_api_max_concurrent_streams,
             mesh_workload_api_max_concurrent_rpcs,
+            mesh_workload_api_max_concurrent_rpcs_per_uid,
             mesh_workload_api_initial_connection_timeout_seconds,
             mesh_workload_api_idle_timeout_seconds,
             mesh_workload_api_shutdown_grace_seconds,
@@ -6519,6 +6533,7 @@ impl EnvConfig {
             self.mesh_workload_api_max_connections_per_uid,
             self.mesh_workload_api_max_concurrent_streams,
             self.mesh_workload_api_max_concurrent_rpcs,
+            self.mesh_workload_api_max_concurrent_rpcs_per_uid,
             self.mesh_workload_api_initial_connection_timeout_seconds,
             self.mesh_workload_api_idle_timeout_seconds,
             self.mesh_workload_api_shutdown_grace_seconds,

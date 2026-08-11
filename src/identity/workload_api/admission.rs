@@ -40,11 +40,39 @@
 //!    the permit, and all cancel the watchdog immediately rather than leaving a
 //!    detached task asleep until its next tick.
 //!
-//! HTTP/2 stream and service-wide RPC ceilings are applied on top of that, in
+//! HTTP/2 stream and RPC ceilings are applied on top of that, in
 //! [`super::listener`] (`max_concurrent_streams` + a per-connection concurrency
-//! limit with load shedding) and in [`super::server`] (a service-wide RPC permit
-//! taken at the top of every RPC, before attestation, CA work, or any spawned
-//! producer). Both reject rather than queue.
+//! limit with load shedding) and in [`super::server`] (an [`RpcAdmission`]
+//! permit taken at the top of every RPC, before attestation, CA work, or any
+//! spawned producer). Both reject rather than queue.
+//!
+//! ## Fair share applies twice, not once
+//!
+//! A per-UID *connection* quota alone does not bound a UID's share of the
+//! *service*. At the shipped defaults one socket-group UID may hold 32
+//! connections × 64 streams = 2048 concurrent RPCs, which is more than the
+//! service-wide ceiling — and the two bundle RPCs (`FetchX509Bundles`,
+//! `FetchJWTBundles`) require only the mandatory `workload.spiffe.io` metadata
+//! header, so occupying every permit costs an attacker no attestation and no
+//! entitlement. Every other workload's SVID renewal would then be shed with
+//! `RESOURCE_EXHAUSTED`.
+//!
+//! So [`RpcAdmission`] applies the identical two-level decision one layer up,
+//! keyed on the same kernel-attested peer UID (read from `UdsConnectInfo`,
+//! which tonic populates from the accepted socket): the per-UID quota is judged
+//! first, then the service-wide ceiling, as one non-blocking decision under one
+//! lock (one shared helper implements that ordering for both gates, so the
+//! invariant has exactly one implementation). A refused RPC creates **no** map
+//! entry, so a shed flood cannot grow per-UID state, and an entry is removed
+//! when its last permit drops, so the map is bounded by peers *currently
+//! holding* permits. An RPC whose peer UID cannot be established is refused:
+//! the connection gate already refuses an unattributable socket, so this is
+//! defence in depth rather than a reachable path, and it fails closed.
+//!
+//! The permit rides the **response stream**, not the method future, so it is
+//! held for exactly as long as the producer task, rotation subscription, and
+//! pending private-key slot exist — which is what a Workload API client
+//! actually occupies.
 //!
 //! ## Lifetime bounds
 //!
@@ -81,13 +109,21 @@
 //! "disabled" spelling for any of them: an unbounded Workload API transport is
 //! the defect this module exists to remove.
 //!
-//! The per-UID quota is additionally required to be **strictly below** the
-//! global ceiling, by both gates. A quota equal to the global ceiling is not a
-//! fair share at all — one UID may then hold every slot, which is exactly the
-//! posture the per-UID bound is documented to prevent — so a globally fair
-//! configuration necessarily has room for at least two connections. That is the
-//! finite floor: [`MIN_MAX_CONNECTIONS`] is `2`, and `clamped` never produces
-//! equality, for zero, one, or over-ceiling input.
+//! Each per-UID quota is additionally required to be **strictly below** its
+//! shared ceiling, by both gates, for connections and for RPCs alike. A quota
+//! equal to the shared ceiling is not a fair share at all — one UID may then
+//! hold every slot, which is exactly the posture the per-UID bound is
+//! documented to prevent — so a fair configuration necessarily has room for at
+//! least two. Those are the finite floors: [`MIN_MAX_CONNECTIONS`] and
+//! [`MIN_MAX_CONCURRENT_RPCS`] are `2`, and `clamped` never produces equality,
+//! for zero, one, or over-ceiling input.
+//!
+//! The RPC defaults are derived rather than picked:
+//! [`LONG_LIVED_RPCS_PER_CONNECTION`] states how many streams a *legitimate*
+//! client holds open at once, and both RPC defaults are at least that many per
+//! default connection. A service-wide ceiling below that would make the shipped
+//! configuration contradict itself — the connection ceiling would admit peers
+//! the RPC ceiling had to shed, and the shed would land on SVID renewal.
 //!
 //! ## Metrics
 //!
@@ -109,10 +145,16 @@
 //! **service-dispatched** Workload API RPC streams, not the live stream count,
 //! and `rpcs_rejected_total` counts RPCs shed *after* their stream was already
 //! opened and accepted by h2 — a `RESOURCE_EXHAUSTED` gRPC result on a live
-//! stream, not a protocol-level stream refusal. The help text says exactly that
-//! rather than the stronger converse, and there is deliberately no *second*
-//! stream family: transport-level excess streams are not observable from this
-//! layer, so a counter claiming them would claim coverage that does not exist.
+//! stream, not a protocol-level stream refusal. It is deliberately **unlabelled**
+//! and covers both RPC bounds together: splitting it by which bound refused would
+//! be useful, but the only honest key for the per-UID half is the peer UID, and
+//! a synthetic stand-in label that operators would learn to map back to a
+//! principal is the same disclosure with extra steps. Which of the two bounds
+//! refused is stated only in the (off-by-default, UID-free) `debug!`. The help
+//! text says exactly that rather than the stronger converse, and there is
+//! deliberately no *second* stream family: transport-level excess streams are
+//! not observable from this layer, so a counter claiming them would claim
+//! coverage that does not exist.
 
 use std::collections::HashMap;
 use std::io;
@@ -123,6 +165,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use futures_util::task::AtomicWaker;
+use pin_project_lite::pin_project;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::time::Instant;
 use tokio_stream::Stream;
@@ -173,11 +216,50 @@ pub const DEFAULT_MAX_CONCURRENT_STREAMS: u32 = 64;
 /// Hard ceiling on per-connection HTTP/2 streams.
 pub const MAX_CONCURRENT_STREAMS_CEILING: u32 = 1024;
 
+/// Long-lived Workload API streams a *legitimate* client holds at once.
+///
+/// A normal workload keeps `FetchX509SVID` open for SVID rotation,
+/// `FetchX509Bundles` open for X.509 trust-material rotation, and — when it uses
+/// JWT-SVIDs — `FetchJWTBundles` open as well. Each of those occupies its RPC
+/// permit for the whole life of its response stream, so the *steady state* of
+/// one connection is three permits, not one. Both RPC defaults below are sized
+/// from this number rather than guessed, so the shipped configuration cannot
+/// shed a workload that is behaving exactly as the SPIFFE Workload API
+/// specification describes.
+pub const LONG_LIVED_RPCS_PER_CONNECTION: usize = 3;
+
 /// Default service-wide ceiling on concurrently admitted RPCs.
-pub const DEFAULT_MAX_CONCURRENT_RPCS: usize = 512;
+///
+/// At least [`LONG_LIVED_RPCS_PER_CONNECTION`] per default connection
+/// (`256 * 3 = 768`), rounded up to a power of two. Sizing it below that would
+/// make the *default* configuration internally contradictory: the connection
+/// ceiling would admit peers the RPC ceiling then had to shed, and the shed
+/// would land on SVID renewal rather than on anything abusive.
+pub const DEFAULT_MAX_CONCURRENT_RPCS: usize = 1024;
 
 /// Hard ceiling on service-wide concurrent RPCs.
 pub const MAX_CONCURRENT_RPCS_CEILING: usize = 8192;
+
+/// Smallest service-wide RPC ceiling a *fair* configuration can express.
+///
+/// Same reasoning as [`MIN_MAX_CONNECTIONS`]: the per-UID RPC quota must stay
+/// strictly below the service-wide ceiling, and a quota is at least `1`.
+pub const MIN_MAX_CONCURRENT_RPCS: usize = 2;
+
+/// Default per-peer-UID ceiling on concurrently admitted RPCs.
+///
+/// At least [`LONG_LIVED_RPCS_PER_CONNECTION`] per default per-UID connection
+/// (`32 * 3 = 96`), rounded up to a power of two, and comfortably below
+/// [`DEFAULT_MAX_CONCURRENT_RPCS`]. Without this bound the connection quota is
+/// not actually a fair share of the *service*: one UID may hold 32 connections
+/// × 64 streams and take every service-wide RPC permit, and the bundle RPCs
+/// need only the mandatory metadata header to do it — no attestation, no
+/// entitlement — so a single socket-group member could deny SVID renewal to
+/// every other workload on the node.
+pub const DEFAULT_MAX_CONCURRENT_RPCS_PER_UID: usize = 128;
+
+/// Hard ceiling on the per-UID RPC quota.
+pub const MAX_CONCURRENT_RPCS_PER_UID_CEILING: usize = 4096;
 
 /// Default deadline from admission to the first byte read from the peer.
 pub const DEFAULT_INITIAL_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
@@ -208,15 +290,26 @@ pub const SHUTDOWN_GRACE_CEILING: Duration = Duration::from_secs(300);
 /// property of the runtime rather than of the deployment.
 pub const FORCE_CLOSE_SETTLE: Duration = Duration::from_secs(5);
 
+/// Fraction of the shorter deadline one watchdog tick covers.
+///
+/// Detection latency is therefore at most a quarter of the deadline being
+/// enforced, whatever that deadline is — a *relative* bound rather than an
+/// absolute one, which is what keeps the wakeup rate proportional to the
+/// configuration instead of to the connection count.
+pub const WATCHDOG_TICK_DIVISOR: u32 = 4;
+
 /// Longest a watchdog sleeps between deadline checks.
 ///
 /// The deadline itself is evaluated against a monotonic clock, so this only
-/// bounds detection latency, never accuracy.
-const WATCHDOG_MAX_TICK: Duration = Duration::from_secs(1);
+/// bounds detection latency, never accuracy. It is deliberately far above one
+/// second: the tick is *per connection*, so a fixed one-second floor would cost
+/// one wakeup per second per admitted connection — 4096 wakeups a second at the
+/// hard connection ceiling — to notice a deadline that is measured in minutes.
+pub const WATCHDOG_MAX_TICK: Duration = Duration::from_secs(30);
 
 /// Shortest watchdog tick, so a very small configured deadline cannot turn the
 /// watchdog into a busy loop.
-const WATCHDOG_MIN_TICK: Duration = Duration::from_millis(25);
+pub const WATCHDOG_MIN_TICK: Duration = Duration::from_millis(25);
 
 /// First backoff step after a resource-exhaustion accept error.
 ///
@@ -272,7 +365,14 @@ pub struct WorkloadApiAdmissionConfig {
     /// the per-connection request concurrency limit paired with load shedding.
     pub max_concurrent_streams: u32,
     /// Service-wide concurrently admitted RPCs.
+    ///
+    /// A streaming RPC holds its permit for the **whole life of its response
+    /// stream**, not for the duration of the method call, so this is a bound on
+    /// concurrently *open* Workload API streams rather than on request rate.
     pub max_concurrent_rpcs: usize,
+    /// Concurrently admitted RPCs per kernel-attested peer UID. Must be
+    /// strictly below `max_concurrent_rpcs`.
+    pub max_concurrent_rpcs_per_uid: usize,
     /// Deadline from admission to the first byte read from the peer.
     pub initial_connection_timeout: Duration,
     /// Deadline since the last byte read from the peer.
@@ -288,6 +388,7 @@ impl Default for WorkloadApiAdmissionConfig {
             max_connections_per_uid: DEFAULT_MAX_CONNECTIONS_PER_UID,
             max_concurrent_streams: DEFAULT_MAX_CONCURRENT_STREAMS,
             max_concurrent_rpcs: DEFAULT_MAX_CONCURRENT_RPCS,
+            max_concurrent_rpcs_per_uid: DEFAULT_MAX_CONCURRENT_RPCS_PER_UID,
             initial_connection_timeout: DEFAULT_INITIAL_CONNECTION_TIMEOUT,
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
             shutdown_grace: DEFAULT_SHUTDOWN_GRACE,
@@ -306,6 +407,7 @@ impl WorkloadApiAdmissionConfig {
         max_connections_per_uid: usize,
         max_concurrent_streams: u32,
         max_concurrent_rpcs: usize,
+        max_concurrent_rpcs_per_uid: usize,
         initial_connection_timeout_seconds: u64,
         idle_timeout_seconds: u64,
         shutdown_grace_seconds: u64,
@@ -315,6 +417,7 @@ impl WorkloadApiAdmissionConfig {
             max_connections_per_uid,
             max_concurrent_streams,
             max_concurrent_rpcs,
+            max_concurrent_rpcs_per_uid,
             initial_connection_timeout: Duration::from_secs(initial_connection_timeout_seconds),
             idle_timeout: Duration::from_secs(idle_timeout_seconds),
             shutdown_grace: Duration::from_secs(shutdown_grace_seconds),
@@ -358,6 +461,19 @@ impl WorkloadApiAdmissionConfig {
             self.max_concurrent_rpcs,
             MAX_CONCURRENT_RPCS_CEILING,
         )?;
+        if self.max_concurrent_rpcs < MIN_MAX_CONCURRENT_RPCS {
+            return Err(WorkloadApiListenerError::Admission(format!(
+                "FERRUM_MESH_WORKLOAD_API_MAX_CONCURRENT_RPCS ({}) must be at least \
+                 {MIN_MAX_CONCURRENT_RPCS}: the per-UID RPC quota has to stay strictly below it, \
+                 so a fair Workload API service needs room for at least two concurrent RPCs",
+                self.max_concurrent_rpcs
+            )));
+        }
+        check_range(
+            "FERRUM_MESH_WORKLOAD_API_MAX_CONCURRENT_RPCS_PER_UID",
+            self.max_concurrent_rpcs_per_uid,
+            MAX_CONCURRENT_RPCS_PER_UID_CEILING,
+        )?;
         check_duration(
             "FERRUM_MESH_WORKLOAD_API_INITIAL_CONNECTION_TIMEOUT_SECONDS",
             self.initial_connection_timeout,
@@ -390,6 +506,20 @@ impl WorkloadApiAdmissionConfig {
                 self.max_connections_per_uid, self.max_connections
             )));
         }
+        // The same fair-share rule, one layer up. A per-UID RPC quota at or
+        // above the service-wide ceiling lets one peer UID occupy every RPC
+        // permit — and because the bundle RPCs require only the mandatory
+        // metadata header, doing so costs an attacker no attestation and no
+        // entitlement. Every other workload's SVID renewal is then shed.
+        if self.max_concurrent_rpcs_per_uid >= self.max_concurrent_rpcs {
+            return Err(WorkloadApiListenerError::Admission(format!(
+                "FERRUM_MESH_WORKLOAD_API_MAX_CONCURRENT_RPCS_PER_UID ({}) must be strictly below \
+                 FERRUM_MESH_WORKLOAD_API_MAX_CONCURRENT_RPCS ({}); at or above it one peer UID \
+                 may hold every concurrent RPC permit and no other workload on the node can \
+                 obtain or renew an identity",
+                self.max_concurrent_rpcs_per_uid, self.max_concurrent_rpcs
+            )));
+        }
         if self.idle_timeout <= self.initial_connection_timeout {
             return Err(WorkloadApiListenerError::Admission(format!(
                 "FERRUM_MESH_WORKLOAD_API_IDLE_TIMEOUT_SECONDS ({}s) must be greater than \
@@ -414,11 +544,17 @@ impl WorkloadApiAdmissionConfig {
     /// the belt: the total is floored at [`MIN_MAX_CONNECTIONS`] and the per-UID
     /// quota is capped at `max_connections - 1`, so no input — `0`, `1`, or a
     /// value far over either ceiling — can produce a quota equal to the global
-    /// ceiling and hand one UID the entire pool.
+    /// ceiling and hand one UID the entire pool. The RPC pair is clamped by the
+    /// identical rule ([`MIN_MAX_CONCURRENT_RPCS`], then
+    /// `max_concurrent_rpcs - 1`), because a per-UID RPC quota equal to the
+    /// service-wide ceiling is the same denial of identity service one level up.
     pub fn clamped(&self) -> Self {
         let max_connections = self
             .max_connections
             .clamp(MIN_MAX_CONNECTIONS, MAX_CONNECTIONS_CEILING);
+        let max_concurrent_rpcs = self
+            .max_concurrent_rpcs
+            .clamp(MIN_MAX_CONCURRENT_RPCS, MAX_CONCURRENT_RPCS_CEILING);
         Self {
             max_connections,
             max_connections_per_uid: self
@@ -427,9 +563,10 @@ impl WorkloadApiAdmissionConfig {
             max_concurrent_streams: self
                 .max_concurrent_streams
                 .clamp(1, MAX_CONCURRENT_STREAMS_CEILING),
-            max_concurrent_rpcs: self
-                .max_concurrent_rpcs
-                .clamp(1, MAX_CONCURRENT_RPCS_CEILING),
+            max_concurrent_rpcs,
+            max_concurrent_rpcs_per_uid: self
+                .max_concurrent_rpcs_per_uid
+                .clamp(1, MAX_CONCURRENT_RPCS_PER_UID_CEILING.min(max_concurrent_rpcs - 1)),
             initial_connection_timeout: clamp_duration(
                 self.initial_connection_timeout,
                 INITIAL_CONNECTION_TIMEOUT_CEILING,
@@ -612,11 +749,24 @@ impl ConnectionActivity {
 /// point: there is no close path — clean, error, cancelled, or panicking — that
 /// can return the connection object to the allocator without also returning its
 /// capacity.
-#[derive(Debug)]
 pub struct ConnectionPermit {
     _total: OwnedSemaphorePermit,
-    per_uid: Arc<Mutex<HashMap<u32, usize>>>,
+    per_uid: PerUidCounts,
     uid: u32,
+}
+
+impl std::fmt::Debug for ConnectionPermit {
+    /// Deliberately **non-identifying**, and hand-written rather than derived.
+    ///
+    /// A derived `Debug` renders `uid` — a kernel-attested principal identifier
+    /// — and, through the `Arc<Mutex<HashMap<..>>>`, the live per-UID map of
+    /// *every* peer currently connected. `{:?}` on a permit inside an unrelated
+    /// diagnostic would then disclose the node's whole Workload API client
+    /// census, which is exactly what the metric-label and log rules forbid. The
+    /// same discipline applies to [`RpcPermit`] and to the two admission gates.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectionPermit").finish_non_exhaustive()
+    }
 }
 
 impl Drop for ConnectionPermit {
@@ -626,7 +776,65 @@ impl Drop for ConnectionPermit {
     }
 }
 
-fn release_uid(per_uid: &Arc<Mutex<HashMap<u32, usize>>>, uid: u32) {
+/// Live per-UID occupancy for one accounting dimension.
+///
+/// A plain map behind a `Mutex` on purpose: every critical section below is a
+/// lookup and an integer update with no `.await` in it, and the map is bounded
+/// by the number of UIDs currently *holding* a permit rather than by the number
+/// that have ever asked for one.
+type PerUidCounts = Arc<Mutex<HashMap<u32, usize>>>;
+
+/// Which half of a two-level admission decision refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuotaRefusal {
+    /// The peer UID is at its own quota; no global capacity was taken.
+    PerUid,
+    /// The shared ceiling is saturated.
+    Total,
+}
+
+/// Take one unit of a two-level (per-UID quota, then shared ceiling) bound.
+///
+/// **One decision, one lock**, and the order is load-bearing rather than
+/// incidental: the per-UID quota is judged *before* any shared capacity is
+/// taken, and the shared permit and the per-UID increment are published
+/// together, so an over-quota caller can never hold a shared slot even
+/// transiently.
+///
+/// Taking the shared permit first — the obvious ordering — is a fair-share
+/// defect. A burst of concurrent reservations from an already-saturated UID
+/// would each acquire a shared permit and then queue on this lock, and for as
+/// long as that queue drained the shared pool would read as empty and a
+/// *different*, innocent UID would be refused for the wrong reason. The per-UID
+/// bound exists to make that impossible.
+///
+/// Nothing inside the critical section can block: `try_acquire_owned` is
+/// non-blocking by definition and there is no `.await` here, so the lock is
+/// held for a few instructions and never across a suspension point. A refused
+/// UID leaves **no** map entry behind, so a probing flood cannot grow the map.
+fn reserve_per_uid_then_total(
+    per_uid: &PerUidCounts,
+    total: &Arc<Semaphore>,
+    uid: u32,
+    max_per_uid: usize,
+) -> Result<OwnedSemaphorePermit, QuotaRefusal> {
+    let mut guard = match per_uid.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let current = guard.get(&uid).copied().unwrap_or(0);
+    if current >= max_per_uid {
+        return Err(QuotaRefusal::PerUid);
+    }
+    let permit = match Arc::clone(total).try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => return Err(QuotaRefusal::Total),
+    };
+    guard.insert(uid, current + 1);
+    Ok(permit)
+}
+
+fn release_uid(per_uid: &PerUidCounts, uid: u32) {
     // A poisoned lock would mean a panic inside the few statements below, none
     // of which can panic; recovering the guard keeps a single unrelated panic
     // from wedging admission for the whole process.
@@ -644,48 +852,172 @@ fn release_uid(per_uid: &Arc<Mutex<HashMap<u32, usize>>>, uid: u32) {
     }
 }
 
-/// The service-wide RPC permit, held for an RPC's full lifetime — including a
-/// streaming RPC's response stream, which is where a Workload API caller
-/// actually consumes resources.
-#[derive(Debug)]
+/// The RPC permit, held for an RPC's full lifetime — including a streaming
+/// RPC's response stream, which is where a Workload API caller actually
+/// consumes resources.
+///
+/// It carries **both** halves of the two-level bound: the service-wide permit
+/// is released when `_total` drops, and the peer UID's own occupancy is
+/// decremented in `Drop`. Exactly once, on every path — a clean end, a client
+/// disconnect, a cancelled task, or a panic unwind — because the release is
+/// tied to the object's lifetime rather than to any code path.
 pub struct RpcPermit {
-    _permit: OwnedSemaphorePermit,
+    _total: OwnedSemaphorePermit,
+    per_uid: PerUidCounts,
+    uid: u32,
 }
 
-impl RpcPermit {
-    /// Take ownership of an acquired service-wide RPC permit and count it.
-    ///
-    /// The gauge is moved here, next to the `Drop` that decrements it, so the
-    /// two can never be applied on different paths.
-    pub fn new(permit: OwnedSemaphorePermit) -> Self {
-        mesh_metrics::increment_workload_api_active_rpcs();
-        Self { _permit: permit }
+impl std::fmt::Debug for RpcPermit {
+    /// Non-identifying for the same reason as [`ConnectionPermit`]'s: the peer
+    /// UID and the live per-UID occupancy map are both credential-adjacent and
+    /// belong in no diagnostic rendering.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RpcPermit").finish_non_exhaustive()
     }
 }
 
 impl Drop for RpcPermit {
     fn drop(&mut self) {
+        release_uid(&self.per_uid, self.uid);
         mesh_metrics::decrement_workload_api_active_rpcs();
     }
 }
 
-/// A response stream that keeps its RPC permit alive until the stream ends or is
-/// dropped.
+/// Non-blocking RPC admission: a service-wide ceiling and a per-peer-UID quota,
+/// taken as one decision before any RPC work begins.
 ///
-/// Attaching the permit to the *stream* rather than to the RPC method's future
-/// is deliberate: `fetch_x509svid` returns as soon as the first response is
-/// staged, while the resources the caller is actually holding — the producer
-/// task, the rotation subscription, the pending private-key slot — live for as
-/// long as the stream does.
-pub struct PermitStream<S> {
-    inner: Pin<Box<S>>,
-    _permit: Option<RpcPermit>,
+/// The transport gate above bounds connections and per-connection streams; this
+/// bounds their *product*, and bounds it **per principal** as well as in total.
+/// Without the per-UID half, one socket-group UID at the default limits may hold
+/// `32 × 64 = 2048` streams and occupy every service-wide permit — and the
+/// bundle RPCs need only the mandatory metadata header to do it, so the attack
+/// requires neither attestation nor entitlement. The result would be that no
+/// other workload on the node can renew its SVID.
+#[derive(Clone)]
+pub struct RpcAdmission {
+    total: Arc<Semaphore>,
+    per_uid: PerUidCounts,
+    max_concurrent_rpcs: usize,
+    max_concurrent_rpcs_per_uid: usize,
+}
+
+impl std::fmt::Debug for RpcAdmission {
+    /// Limits and live occupancy only — never the per-UID map, for the same
+    /// reason [`ConnectionAdmission`]'s rendering withholds it.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RpcAdmission")
+            .field("max_concurrent_rpcs", &self.max_concurrent_rpcs)
+            .field(
+                "max_concurrent_rpcs_per_uid",
+                &self.max_concurrent_rpcs_per_uid,
+            )
+            .field("available", &self.total.available_permits())
+            .finish_non_exhaustive()
+    }
+}
+
+impl RpcAdmission {
+    /// Build an RPC gate from already-[`WorkloadApiAdmissionConfig::clamped`]
+    /// limits, clamping again defensively so no caller can construct one that
+    /// exceeds a ceiling or hands a single UID every permit.
+    pub fn new(limits: &WorkloadApiAdmissionConfig) -> Self {
+        let limits = limits.clamped();
+        Self {
+            total: Arc::new(Semaphore::new(limits.max_concurrent_rpcs)),
+            per_uid: Arc::new(Mutex::new(HashMap::new())),
+            max_concurrent_rpcs: limits.max_concurrent_rpcs,
+            max_concurrent_rpcs_per_uid: limits.max_concurrent_rpcs_per_uid,
+        }
+    }
+
+    /// The effective service-wide ceiling.
+    pub fn max_concurrent_rpcs(&self) -> usize {
+        self.max_concurrent_rpcs
+    }
+
+    /// The effective per-peer-UID quota.
+    pub fn max_concurrent_rpcs_per_uid(&self) -> usize {
+        self.max_concurrent_rpcs_per_uid
+    }
+
+    /// RPCs currently admitted, across every peer.
+    pub fn active_rpcs(&self) -> usize {
+        self.max_concurrent_rpcs
+            .saturating_sub(self.total.available_permits())
+    }
+
+    /// Reserve one RPC for `uid`, or return `None` when either bound is
+    /// saturated.
+    ///
+    /// **Never waits.** An over-limit caller is refused immediately so it cannot
+    /// grow a queue of pending identity requests behind the ceiling — the queue
+    /// is itself the resource exhaustion this exists to prevent, and an identity
+    /// request served far too late is worse than a refusal the client can retry.
+    ///
+    /// Public so the policy — service ceiling, per-UID quota, fair availability
+    /// to a second UID, release on drop — can be exercised directly, which a
+    /// single-uid test process cannot do through real sockets.
+    pub fn reserve(&self, uid: u32) -> Option<RpcPermit> {
+        match reserve_per_uid_then_total(
+            &self.per_uid,
+            &self.total,
+            uid,
+            self.max_concurrent_rpcs_per_uid,
+        ) {
+            Ok(total) => {
+                mesh_metrics::increment_workload_api_active_rpcs();
+                Some(RpcPermit {
+                    _total: total,
+                    per_uid: Arc::clone(&self.per_uid),
+                    uid,
+                })
+            }
+            Err(refusal) => {
+                mesh_metrics::increment_workload_api_rpc_rejected();
+                // Fixed context only: a limit the operator configured, and which
+                // of the two bounds refused. Never the peer UID.
+                match refusal {
+                    QuotaRefusal::PerUid => debug!(
+                        limit = self.max_concurrent_rpcs_per_uid,
+                        "SPIFFE Workload API RPC shed: peer UID is at its concurrent-RPC quota"
+                    ),
+                    QuotaRefusal::Total => debug!(
+                        limit = self.max_concurrent_rpcs,
+                        "SPIFFE Workload API RPC shed: service-wide concurrency ceiling saturated"
+                    ),
+                }
+                None
+            }
+        }
+    }
+}
+
+pin_project! {
+    /// A response stream that keeps its RPC permit alive until the stream ends
+    /// or is dropped.
+    ///
+    /// Attaching the permit to the *stream* rather than to the RPC method's
+    /// future is deliberate: `fetch_x509svid` returns as soon as the first
+    /// response is staged, while the resources the caller is actually holding —
+    /// the producer task, the rotation subscription, the pending private-key
+    /// slot — live for as long as the stream does.
+    ///
+    /// The inner stream is stored **inline** and pin-projected rather than
+    /// boxed. Every call site immediately boxes the wrapper for tonic's
+    /// `Pin<Box<dyn Stream>>` associated type, so an inner `Pin<Box<S>>` was a
+    /// second heap allocation and a second pointer indirection on every
+    /// admitted RPC, for nothing.
+    pub struct PermitStream<S> {
+        #[pin]
+        inner: S,
+        _permit: Option<RpcPermit>,
+    }
 }
 
 impl<S> PermitStream<S> {
     pub fn new(inner: S, permit: Option<RpcPermit>) -> Self {
         Self {
-            inner: Box::pin(inner),
+            inner,
             _permit: permit,
         }
     }
@@ -695,9 +1027,7 @@ impl<S: Stream> Stream for PermitStream<S> {
     type Item = S::Item;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        // `Pin<Box<S>>` and `Option<RpcPermit>` are both `Unpin`, so the wrapper
-        // is too and the projection is trivially sound.
-        self.get_mut().inner.as_mut().poll_next(cx)
+        self.project().inner.poll_next(cx)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -710,7 +1040,7 @@ impl<S: Stream> Stream for PermitStream<S> {
 pub struct ConnectionAdmission {
     limits: WorkloadApiAdmissionConfig,
     total: Arc<Semaphore>,
-    per_uid: Arc<Mutex<HashMap<u32, usize>>>,
+    per_uid: PerUidCounts,
     force_close: watch::Receiver<bool>,
     /// Retained only by [`ConnectionAdmission::detached`], and cloned into every
     /// watchdog it starts.
@@ -793,32 +1123,17 @@ impl ConnectionAdmission {
     /// to a second UID, release on drop — can be exercised directly, which a
     /// single-uid test process cannot do through real sockets.
     pub fn reserve(&self, uid: u32) -> Option<ConnectionPermit> {
-        // One decision, one lock. The per-UID quota is judged *before* any
-        // global capacity is taken, and the global permit and the per-UID
-        // increment are published together, so an over-quota caller can never
-        // hold a global slot even transiently.
-        //
-        // Taking the global permit first — the obvious ordering — is a
-        // fair-share defect rather than a style preference: a burst of `max`
-        // concurrent reservations from an already-saturated UID would each
-        // acquire a global permit and then queue on this lock, and for as long
-        // as that queue drained the shared pool would read as empty and a
-        // *different*, innocent UID would be refused with `max_connections`.
-        // The per-UID bound exists to make that impossible.
-        //
-        // Nothing inside the critical section can block: `try_acquire_owned` is
-        // non-blocking by definition and there is no `.await` here, so the lock
-        // is held for a few instructions and never across a suspension point.
-        let permit = {
-            let mut guard = match self.per_uid.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            let current = guard.get(&uid).copied().unwrap_or(0);
-            if current >= self.limits.max_connections_per_uid {
-                // No entry is created for a refused uid, so a probing flood
-                // cannot grow the map, and no global slot was ever taken.
-                drop(guard);
+        // One decision, one lock, per-UID quota first — see
+        // `reserve_per_uid_then_total`, which owns that ordering invariant for
+        // both this gate and the RPC gate.
+        let permit = match reserve_per_uid_then_total(
+            &self.per_uid,
+            &self.total,
+            uid,
+            self.limits.max_connections_per_uid,
+        ) {
+            Ok(permit) => permit,
+            Err(QuotaRefusal::PerUid) => {
                 mesh_metrics::increment_workload_api_connection_rejected(
                     reject_reason::MAX_CONNECTIONS_PER_UID,
                 );
@@ -828,23 +1143,16 @@ impl ConnectionAdmission {
                 );
                 return None;
             }
-            let total = match Arc::clone(&self.total).try_acquire_owned() {
-                Ok(permit) => permit,
-                Err(_) => {
-                    drop(guard);
-                    mesh_metrics::increment_workload_api_connection_rejected(
-                        reject_reason::MAX_CONNECTIONS,
-                    );
-                    debug!(
-                        limit = self.limits.max_connections,
-                        "SPIFFE Workload API connection refused: total connection ceiling \
-                         saturated"
-                    );
-                    return None;
-                }
-            };
-            guard.insert(uid, current + 1);
-            total
+            Err(QuotaRefusal::Total) => {
+                mesh_metrics::increment_workload_api_connection_rejected(
+                    reject_reason::MAX_CONNECTIONS,
+                );
+                debug!(
+                    limit = self.limits.max_connections,
+                    "SPIFFE Workload API connection refused: total connection ceiling saturated"
+                );
+                return None;
+            }
         };
 
         mesh_metrics::increment_workload_api_active_connections();
@@ -957,6 +1265,37 @@ impl Drop for ConnectionWatchdog {
     }
 }
 
+/// How often one connection's watchdog wakes, derived from the deadlines it
+/// enforces.
+///
+/// The derivation is exactly
+/// `clamp(min(initial_connection_timeout, idle_timeout) / WATCHDOG_TICK_DIVISOR,
+/// WATCHDOG_MIN_TICK, WATCHDOG_MAX_TICK)`, and each of the three parts is
+/// load-bearing:
+///
+/// - **the shorter of the two deadlines**, because a connection that has not
+///   spoken yet is judged against the initial one and a connection that has is
+///   judged against the idle one, and the same task enforces both;
+/// - **a quarter of it**, so detection latency is a bounded *fraction* of the
+///   deadline rather than a fixed interval. At the shipped defaults
+///   (`min(10s, 900s) / 4`) that is a 2.5-second tick, so a deadline is noticed
+///   within 2.5 seconds of expiring — while a fixed one-second tick would have
+///   woken every admitted connection once a second regardless, which at the
+///   4096-connection hard ceiling is 4096 wakeups a second to enforce deadlines
+///   measured in seconds and minutes. The tick is per connection, so the cost of
+///   the floor is multiplied by the connection count; the accuracy of the
+///   deadline is not affected either way, because expiry is evaluated against a
+///   monotonic clock rather than counted in ticks;
+/// - **the floor and the ceiling**, so a one-second compressed test deadline
+///   still ticks fast enough to be observable (250ms) without a sub-25ms
+///   deadline turning the watchdog into a busy loop, and a
+///   deliberately long idle deadline does not stretch detection past
+///   [`WATCHDOG_MAX_TICK`].
+pub fn watchdog_tick(limits: &WorkloadApiAdmissionConfig) -> Duration {
+    let deadline = limits.initial_connection_timeout.min(limits.idle_timeout);
+    (deadline / WATCHDOG_TICK_DIVISOR).clamp(WATCHDOG_MIN_TICK, WATCHDOG_MAX_TICK)
+}
+
 /// Watch a single connection's deadlines and the listener's force-close signal.
 ///
 /// Holds only a [`Weak`] reference, so it can never keep the connection alive,
@@ -969,12 +1308,7 @@ fn spawn_connection_watchdog(
     mut force_close: watch::Receiver<bool>,
     force_close_retainer: Option<Arc<watch::Sender<bool>>>,
 ) -> ConnectionWatchdog {
-    let tick = limits
-        .initial_connection_timeout
-        .min(limits.idle_timeout)
-        .max(WATCHDOG_MIN_TICK * 4)
-        / 4;
-    let tick = tick.clamp(WATCHDOG_MIN_TICK, WATCHDOG_MAX_TICK);
+    let tick = watchdog_tick(&limits);
 
     let handle = tokio::spawn(async move {
         // Held for the task's whole life. In detached mode this is what keeps
@@ -1404,33 +1738,58 @@ pub enum AcceptFailure {
     /// A per-connection failure an accept loop is expected to retry at once:
     /// the peer went away, or the call was interrupted. The listener is fine.
     Transient,
-    /// A resource exhaustion that persists until something unrelated releases
-    /// capacity. Retryable, but only behind a backoff.
+    /// A condition that may persist until something unrelated changes — a
+    /// resource exhaustion, or any errno not positively identified as one of
+    /// the other two classes. Retryable, but only behind a bounded backoff.
     Resource,
     /// The listener itself is unusable — a closed or invalid descriptor, a
-    /// socket that is not a socket. Retrying is a spin that can never succeed,
-    /// so admission ends and [`FatalAcceptSignal`] is raised, which is what
-    /// actually drives the bounded drain and the serve task's termination guard.
+    /// descriptor that is not a socket, a socket that cannot accept, or an
+    /// error with no OS code to reason about. Retrying is a spin that can never
+    /// succeed, so admission ends and [`FatalAcceptSignal`] is raised, which is
+    /// what actually drives the bounded drain and the serve task's termination
+    /// guard. Deliberately a closed list rather than the default arm: this
+    /// class costs the node its identity surface.
     Fatal,
 }
 
 /// Classify an `accept(2)` failure.
 ///
-/// An error with no OS code is classified `Fatal`: it is not one of the
-/// enumerated recoverable conditions, and ending the listener surfaces it
-/// through mesh mode's termination path rather than hiding it in a retry loop.
+/// `Fatal` is deliberately a **short, closed list plus one fail-closed case**,
+/// not the default arm. Terminating the accept loop tears down the whole mesh
+/// runtime's identity surface, so it is reserved for errors that say the
+/// *listener itself* is unusable — a closed or invalid descriptor
+/// (`EBADF`/`EINVAL`), a descriptor that is not a socket (`ENOTSOCK`), or a
+/// socket that does not implement `accept` (`EOPNOTSUPP`/`ENOTSUP`) — and for
+/// an error carrying no OS code at all, which cannot be reasoned about and so
+/// surfaces through mesh mode's termination path rather than hiding in a retry
+/// loop.
+///
+/// Every other errno is `Resource`: retryable behind the bounded, doubling
+/// backoff. That covers the exhaustion set explicitly, and it is also the right
+/// answer for the unenumerated remainder. `EPERM` is the concrete example — a
+/// firewall or LSM hook can make `accept(2)` return it *per connection* while
+/// the listener stays perfectly valid, so classifying it `Fatal` would let one
+/// rejected peer terminate identity service for the whole node. An unknown
+/// errno is far more likely to be that shape than a broken descriptor, and the
+/// bounded backoff makes being wrong cheap: a persistent condition costs a small
+/// fraction of one runtime worker and a rate-limited warning, rather than the
+/// surface.
 #[cfg(unix)]
 pub fn classify_accept_error(error: &io::Error) -> AcceptFailure {
     let Some(code) = error.raw_os_error() else {
         return AcceptFailure::Fatal;
     };
-    if code == libc::EMFILE || code == libc::ENFILE || code == libc::ENOBUFS || code == libc::ENOMEM
+    // Compared rather than matched: several of these constants are equal on
+    // Linux (`EAGAIN`/`EWOULDBLOCK`, `ENOTSUP`/`EOPNOTSUPP`), and two equal
+    // constants in one match are an unreachable pattern.
+    if code == libc::EBADF
+        || code == libc::ENOTSOCK
+        || code == libc::EINVAL
+        || code == libc::EOPNOTSUPP
+        || code == libc::ENOTSUP
     {
-        return AcceptFailure::Resource;
+        return AcceptFailure::Fatal;
     }
-    // Compared rather than matched: `EAGAIN` and `EWOULDBLOCK` are the same
-    // value on Linux, and two equal constants in one match are an unreachable
-    // pattern.
     if code == libc::ECONNABORTED
         || code == libc::EINTR
         || code == libc::EAGAIN
@@ -1441,7 +1800,8 @@ pub fn classify_accept_error(error: &io::Error) -> AcceptFailure {
     {
         return AcceptFailure::Transient;
     }
-    AcceptFailure::Fatal
+    // `EMFILE`/`ENFILE`/`ENOBUFS`/`ENOMEM` and every unenumerated errno alike.
+    AcceptFailure::Resource
 }
 
 /// What the accept loop should do about one failure.

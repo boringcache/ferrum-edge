@@ -986,8 +986,14 @@ pub fn decrement_workload_api_active_rpcs() {
         });
 }
 
-/// Count a Workload API RPC shed by the service-wide concurrency ceiling.
-/// Label-free: the shed is a service-level condition, not a per-caller one.
+/// Count a Workload API RPC shed by RPC admission — the service-wide ceiling,
+/// the per-peer-UID quota, or an unattributable peer.
+///
+/// Label-free **deliberately**, including for the per-UID case: the only honest
+/// key for that half is the peer UID, and a synthetic stand-in operators would
+/// learn to map back to a principal is the same disclosure with extra steps.
+/// Which of the two bounds refused is stated only in the off-by-default,
+/// UID-free `debug!`.
 pub fn increment_workload_api_rpc_rejected() {
     WORKLOAD_API_RPCS_REJECTED.fetch_add(1, Ordering::Relaxed);
 }
@@ -1337,7 +1343,7 @@ pub fn render_mesh_observability_metrics_with_gateway_namespace(
         );
 
         output.push_str(
-            "# HELP ferrum_mesh_workload_api_active_rpcs SPIFFE Workload API RPCs currently admitted by the service-wide concurrency ceiling; counts service-dispatched RPC streams only — each occupies one HTTP/2 stream, but streams refused inside HTTP/2 or rejected before service dispatch are not observable here.\n",
+            "# HELP ferrum_mesh_workload_api_active_rpcs SPIFFE Workload API RPCs currently admitted by RPC admission (service-wide ceiling and per-peer-UID quota); counts service-dispatched RPC streams only — each occupies one HTTP/2 stream, but streams refused inside HTTP/2 or rejected before service dispatch are not observable here.\n",
         );
         output.push_str("# TYPE ferrum_mesh_workload_api_active_rpcs gauge\n");
         render_mesh_process_metric(
@@ -1412,7 +1418,7 @@ pub fn render_mesh_observability_metrics_with_gateway_namespace(
     let workload_api_rpcs_rejected = WORKLOAD_API_RPCS_REJECTED.load(Ordering::Relaxed);
     if workload_api_rpcs_rejected > 0 {
         output.push_str(
-            "# HELP ferrum_mesh_workload_api_rpcs_rejected_total SPIFFE Workload API RPCs shed by the service-wide concurrency ceiling before any producer work was spawned; the HTTP/2 stream is already open and carries a RESOURCE_EXHAUSTED result, so this is not a protocol-level stream refusal.\n",
+            "# HELP ferrum_mesh_workload_api_rpcs_rejected_total SPIFFE Workload API RPCs shed by RPC admission — the service-wide concurrency ceiling or the per-peer-UID quota — before any producer work was spawned; the HTTP/2 stream is already open and carries a RESOURCE_EXHAUSTED result, so this is not a protocol-level stream refusal.\n",
         );
         output.push_str("# TYPE ferrum_mesh_workload_api_rpcs_rejected_total counter\n");
         render_mesh_process_metric(
