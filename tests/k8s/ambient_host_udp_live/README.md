@@ -19,11 +19,13 @@ placement (`FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true` →
 ## Skip-or-fail
 
 `FERRUM_LIVE_TESTS_REQUIRED=1` (set by the workflow) converts missing root,
-`unshare`/`ip`/`iptables`/`ip6tables`, or TPROXY primitives into hard failure.
+`unshare`/`ip`/`iptables`/`ip6tables` (including both save tools), or TPROXY
+primitives into hard failure.
 Local ad-hoc runs without that flag may still print `SKIP:`.
 
 ## Diagnostics
 
 Bounded, redacted snapshots of `ip rule` / table `33135`, Ferrum mangle chains,
 interface indexes, and UDP bind state are written under
-`target/ambient-host-udp-live/` and uploaded by the workflow.
+`target/ambient-host-udp-live/` and uploaded by the workflow. Raw test output is
+kept in temporary files outside the artifact tree and removed by the exit trap.

@@ -265,7 +265,7 @@ fn attach_veth_pair(
             "set -e; \
              ip link set {host_if} up; \
              ip addr add {host_v4}/32 dev {host_if}; \
-             ip -6 addr add {host_v6}/128 dev {host_if}; \
+             ip -6 addr add {host_v6}/128 dev {host_if} nodad; \
              ip route add {pod_v4}/32 dev {host_if}; \
              ip -6 route add {pod_v6}/128 dev {host_if}; \
              printf '0\\n' > /proc/sys/net/ipv4/conf/{host_if}/rp_filter; \
@@ -279,7 +279,9 @@ fn attach_veth_pair(
             "set -e; \
              ip link set {pod_if} up; \
              ip addr add {pod_v4}/32 dev {pod_if}; \
-             ip -6 addr add {pod_v6}/128 dev {pod_if}; \
+             ip -6 addr add {pod_v6}/128 dev {pod_if} nodad; \
+             ip route add {host_v4}/32 dev {pod_if}; \
+             ip -6 route add {host_v6}/128 dev {pod_if}; \
              ip route add default via {host_v4} dev {pod_if}; \
              ip -6 route add default via {host_v6} dev {pod_if}; \
              ip neigh add {remote_v4} lladdr 02:00:00:00:00:aa dev {pod_if} nud permanent || true; \
@@ -481,8 +483,13 @@ fn transparent_reply(
     payload: &'static [u8],
 ) -> Result<(), String> {
     run_in_netns(host_pid, move || {
+        let domain = if captured_destination.is_ipv4() {
+            socket2::Domain::IPV4
+        } else {
+            socket2::Domain::IPV6
+        };
         let socket = socket2::Socket::new(
-            socket2::Domain::IPV4,
+            domain,
             socket2::Type::DGRAM,
             Some(socket2::Protocol::UDP),
         )
@@ -490,8 +497,13 @@ fn transparent_reply(
         socket
             .set_reuse_address(true)
             .map_err(|error| format!("SO_REUSEADDR: {error}"))?;
-        crate::socket_opts::set_ip_transparent(socket.as_raw_fd())
-            .map_err(|error| format!("IP_TRANSPARENT: {error}"))?;
+        if captured_destination.is_ipv4() {
+            crate::socket_opts::set_ip_transparent(socket.as_raw_fd())
+                .map_err(|error| format!("IP_TRANSPARENT: {error}"))?;
+        } else {
+            crate::socket_opts::set_ipv6_transparent(socket.as_raw_fd())
+                .map_err(|error| format!("IPV6_TRANSPARENT: {error}"))?;
+        }
         socket
             .bind(&captured_destination.into())
             .map_err(|error| format!("non-local bind {captured_destination}: {error}"))?;
@@ -504,32 +516,74 @@ fn transparent_reply(
 }
 
 fn assert_no_ferrum_host_state(host_pid: u32) -> Result<(), String> {
-    let rules = nsenter_sh(
+    let netfilter = nsenter_sh(
         host_pid,
-        "iptables-save -t mangle; ip6tables-save -t mangle; ip rule show; \
-         ip route show table 33135 2>/dev/null; ip -6 route show table 33135 2>/dev/null",
+        "iptables-save -t mangle; ip6tables-save -t mangle",
     )?;
     for owned in [
         UDP_HOST_CAPTURE_CHAIN,
         UDP_HOST_GUARD_CHAIN_A,
         UDP_HOST_GUARD_CHAIN_B,
-        &format!("lookup {TPROXY_HOST_ROUTE_TABLE}"),
-        &format!("priority {TPROXY_HOST_ROUTE_RULE_PRIORITY} "),
     ] {
-        if rules.contains(owned) {
+        if netfilter.contains(owned) {
             return Err(format!(
                 "Ferrum-owned host UDP state still present after teardown ({owned}): {}",
-                redact_diag(&rules)
+                redact_diag(&netfilter)
             ));
         }
     }
-    // Must never touch the pod-netns table/priority or Istio's table 133.
-    for foreign in ["lookup 33133", "lookup 33134", "lookup 133", "table 133"] {
-        if rules.contains(foreign) {
-            return Err(format!(
-                "cleanup diagnostic unexpectedly named foreign routing object {foreign}"
-            ));
-        }
+
+    let policy_rules = nsenter_sh(host_pid, "ip rule show; ip -6 rule show")?;
+    let owned_lookup = format!("lookup {TPROXY_HOST_ROUTE_TABLE}");
+    if policy_rules.contains(&owned_lookup) {
+        return Err(format!(
+            "Ferrum-owned host UDP policy rule still present after teardown: {}",
+            redact_diag(&policy_rules)
+        ));
+    }
+
+    let routes = nsenter_sh(
+        host_pid,
+        &format!(
+            "ip route show table {TPROXY_HOST_ROUTE_TABLE} 2>/dev/null; \
+             ip -6 route show table {TPROXY_HOST_ROUTE_TABLE} 2>/dev/null"
+        ),
+    )?;
+    if !routes.trim().is_empty() {
+        return Err(format!(
+            "Ferrum-owned host UDP routes still present after teardown: {}",
+            redact_diag(&routes)
+        ));
+    }
+    Ok(())
+}
+
+fn install_unrelated_sentinel(host_pid: u32) -> Result<(), String> {
+    nsenter_sh(
+        host_pid,
+        "set -e; \
+         iptables -t mangle -N FERRUM_LIVE_UNRELATED; \
+         iptables -t mangle -A FERRUM_LIVE_UNRELATED -j RETURN; \
+         ip6tables -t mangle -N FERRUM_LIVE_UNRELATED; \
+         ip6tables -t mangle -A FERRUM_LIVE_UNRELATED -j RETURN; \
+         ip rule add priority 32001 lookup 33134; \
+         ip -6 rule add priority 32001 lookup 33134",
+    )
+    .map(|_| ())
+}
+
+fn assert_unrelated_sentinel_present(host_pid: u32) -> Result<(), String> {
+    let state = nsenter_sh(
+        host_pid,
+        "iptables-save -t mangle; ip6tables-save -t mangle; ip rule show; ip -6 rule show",
+    )?;
+    let chain_mentions = state.matches("FERRUM_LIVE_UNRELATED").count();
+    let route_mentions = state.matches("32001:").count();
+    if chain_mentions < 4 || route_mentions < 2 {
+        return Err(format!(
+            "host teardown changed unrelated netfilter/routing state: {}",
+            redact_diag(&state)
+        ));
     }
     Ok(())
 }
@@ -602,6 +656,17 @@ impl LiveTopology {
             POD_A_V6,
             REMOTE_V4,
             REMOTE_V6,
+        )?;
+
+        // Give node-originated traffic a real output route. Pod egress reaches
+        // PREROUTING first and is captured before this route; host traffic uses
+        // OUTPUT and must leave without ever reaching the capture socket.
+        nsenter_sh(
+            host_pid,
+            &format!(
+                "set -e; ip route add {REMOTE_V4}/32 dev {if_a}; \
+                 ip -6 route add {REMOTE_V6}/128 dev {if_a}"
+            ),
         )?;
         attach_veth_pair(
             host_pid,
@@ -693,6 +758,7 @@ fn host_udp_live_kernel_multi_pod_dual_stack_attribution_and_replies() {
         "iptables",
         "ip6tables",
         "iptables-save",
+        "ip6tables-save",
     ] {
         let present = Command::new("sh")
             .args(["-c", &format!("command -v {binary} >/dev/null 2>&1")])
@@ -714,6 +780,10 @@ fn host_udp_live_kernel_multi_pod_dual_stack_attribution_and_replies() {
             return;
         }
     };
+
+    // Seed unrelated state before production setup so install, restart, and
+    // teardown all have to preserve it.
+    install_unrelated_sentinel(topo.host_pid).expect("install unrelated cleanup sentinel");
 
     if let Err(error) =
         install_production_host_capture(topo.host_pid, &[topo.if_a.clone(), topo.if_b.clone()])
@@ -808,6 +878,27 @@ fn host_udp_live_kernel_multi_pod_dual_stack_attribution_and_replies() {
             .pod_uid,
         POD_B_UID
     );
+
+    // IPv6 transparent reply sourced from the captured destination reaches
+    // pod B. This separately proves IPV6_TRANSPARENT and the return route; an
+    // IPv6 capture-only assertion would not exercise the reply contract.
+    let captured_v6_dst = SocketAddr::new(IpAddr::V6(REMOTE_V6), DIAL_PORT);
+    let pod_b_reply = SocketAddr::new(IpAddr::V6(POD_B_V6), 43002);
+    let waiter = spawn_reply_waiter(topo.pod_b_pid, pod_b_reply);
+    std::thread::sleep(Duration::from_millis(100));
+    transparent_reply(host_pid, captured_v6_dst, pod_b_reply, b"reply-b6")
+        .unwrap_or_else(|error| {
+            panic!(
+                "IPv6 transparent reply failed: {error}\n{}",
+                bounded_host_diag(host_pid)
+            );
+        });
+    let got = waiter
+        .join()
+        .expect("IPv6 reply waiter thread")
+        .expect("pod B must receive transparent IPv6 reply");
+    assert_eq!(got.0, b"reply-b6");
+    assert_eq!(got.1.ip(), IpAddr::V6(REMOTE_V6));
 
     // Identical 4-tuple isolation by ingress interface: both pods use the same
     // source port and destination, remaining distinct by ifindex.
@@ -935,15 +1026,18 @@ fn host_udp_live_kernel_multi_pod_dual_stack_attribution_and_replies() {
 
     // Node-originated / hostNetwork traffic: send from the host-shaped netns
     // itself. No OUTPUT chain exists, so the capture socket must not receive it.
-    let _ = run_in_netns(host_pid, || {
-        let socket = std::net::UdpSocket::bind("127.0.0.1:0")
+    run_in_netns(host_pid, || {
+        let socket = std::net::UdpSocket::bind((HOST_A_V4, 0))
             .map_err(|error| format!("host bind: {error}"))?;
-        let _ = socket.send_to(
-            b"node-origin",
-            SocketAddr::new(IpAddr::V4(REMOTE_V4), DIAL_PORT),
-        );
+        socket
+            .send_to(
+                b"node-origin",
+                SocketAddr::new(IpAddr::V4(REMOTE_V4), DIAL_PORT),
+            )
+            .map_err(|error| format!("host send: {error}"))?;
         Ok(())
-    });
+    })
+    .expect("node-originated control datagram must be sent successfully");
     let absence_window = Duration::from_millis(500);
     if let Err(error) = assert_not_captured(capture_fd, b"node-origin", absence_window) {
         panic!(
@@ -956,12 +1050,18 @@ fn host_udp_live_kernel_multi_pod_dual_stack_attribution_and_replies() {
     // netns. That traffic leaves via the pod's host-side interface (OUTPUT /
     // forward out) and never matches `PREROUTING -i <pod iface>` for that pod's
     // egress, so it must not land on the capture socket.
-    let _ = run_in_netns(host_pid, || {
+    run_in_netns(host_pid, || {
         let socket = std::net::UdpSocket::bind("0.0.0.0:0")
             .map_err(|error| format!("inbound bind: {error}"))?;
-        let _ = socket.send_to(b"inbound-to-pod", SocketAddr::new(IpAddr::V4(POD_A_V4), 9));
+        socket
+            .send_to(
+                b"inbound-to-pod",
+                SocketAddr::new(IpAddr::V4(POD_A_V4), 9),
+            )
+            .map_err(|error| format!("inbound send: {error}"))?;
         Ok(())
-    });
+    })
+    .expect("inbound-to-pod control datagram must be sent successfully");
     if let Err(error) = assert_not_captured(capture_fd, b"inbound-to-pod", absence_window) {
         panic!(
             "inbound-to-pod traffic must not be captured on the host UDP path: {error}\n{}",
@@ -1063,6 +1163,8 @@ fn host_udp_live_kernel_multi_pod_dual_stack_attribution_and_replies() {
     teardown_production_host_capture(host_pid)
         .unwrap_or_else(|error| panic!("final teardown: {error}\n{}", bounded_host_diag(host_pid)));
     assert_no_ferrum_host_state(host_pid)
+        .unwrap_or_else(|error| panic!("{error}\n{}", bounded_host_diag(host_pid)));
+    assert_unrelated_sentinel_present(host_pid)
         .unwrap_or_else(|error| panic!("{error}\n{}", bounded_host_diag(host_pid)));
 
     // Self-linked loopback must still fail the dedicated-peer check through the

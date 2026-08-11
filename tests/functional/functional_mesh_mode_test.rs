@@ -12169,6 +12169,7 @@ impl LiveHostUdpVethPod {
                 format!("{host_v6}/128"),
                 "dev".to_string(),
                 host_if.clone(),
+                "nodad".to_string(),
             ],
             vec![
                 "link".to_string(),
@@ -12208,8 +12209,10 @@ impl LiveHostUdpVethPod {
             &format!(
                 "set -e; \
                  ip addr add {pod_v4}/32 dev {pod_if}; \
-                 ip -6 addr add {pod_v6}/128 dev {pod_if}; \
+                 ip -6 addr add {pod_v6}/128 dev {pod_if} nodad; \
                  ip link set {pod_if} up; \
+                 ip route add {host_v4}/32 dev {pod_if}; \
+                 ip -6 route add {host_v6}/128 dev {pod_if}; \
                  ip route add default via {host_v4} dev {pod_if}; \
                  ip -6 route add default via {host_v6} dev {pod_if}"
             ),
@@ -12276,26 +12279,39 @@ fn seed_host_udp_placement_state(registry_dir: &std::path::Path) -> Result<(), S
 }
 
 #[cfg(target_os = "linux")]
-fn host_udp_capture_snapshot(capture_port: u16) -> Result<(usize, usize, usize), String> {
-    let rules = Command::new("iptables-save")
-        .args(["-t", "mangle"])
+fn checked_command_stdout(program: &str, args: &[&str]) -> Result<String, String> {
+    let output = Command::new(program)
+        .args(args)
         .output()
-        .map_err(|error| format!("iptables-save: {error}"))?;
-    if !rules.status.success() {
-        return Err("iptables-save failed".to_string());
+        .map_err(|error| format!("{program} spawn failed: {error}"))?;
+    if !output.status.success() {
+        return Err(format!("{program} {args:?} failed with {}", output.status));
     }
-    let text = String::from_utf8_lossy(&rules.stdout);
-    let host_jumps = text
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+#[cfg(target_os = "linux")]
+fn capture_jump_count(rules: &str) -> usize {
+    rules
         .lines()
         .filter(|line| line.starts_with("-A PREROUTING ") && line.contains("FERRUM_MESH_UDP_HOST"))
         .filter(|line| !line.contains("GUARD"))
+        .count()
+}
+
+#[cfg(target_os = "linux")]
+fn host_udp_capture_snapshot(
+    capture_port: u16,
+) -> Result<(usize, usize, usize, usize, usize), String> {
+    let v4_rules = checked_command_stdout("iptables-save", &["-t", "mangle"])?;
+    let v6_rules = checked_command_stdout("ip6tables-save", &["-t", "mangle"])?;
+    let v4_route_rules = checked_command_stdout("ip", &["rule", "show"])?;
+    let v6_route_rules = checked_command_stdout("ip", &["-6", "rule", "show"])?;
+    let v4_routes = v4_route_rules
+        .lines()
+        .filter(|line| line.contains("lookup 33135"))
         .count();
-    let route_rules = Command::new("ip")
-        .args(["rule", "show"])
-        .output()
-        .map_err(|error| format!("ip rule: {error}"))?;
-    let route_text = String::from_utf8_lossy(&route_rules.stdout);
-    let routes = route_text
+    let v6_routes = v6_route_rules
         .lines()
         .filter(|line| line.contains("lookup 33135"))
         .count();
@@ -12314,7 +12330,13 @@ fn host_udp_capture_snapshot(capture_port: u16) -> Result<(usize, usize, usize),
                 .is_some_and(|local| local.ends_with(&port_suffix))
         })
         .count();
-    Ok((host_jumps, routes, listeners))
+    Ok((
+        capture_jump_count(&v4_rules),
+        capture_jump_count(&v6_rules),
+        v4_routes,
+        v6_routes,
+        listeners,
+    ))
 }
 
 #[cfg(target_os = "linux")]
@@ -12326,18 +12348,28 @@ fn wait_for_host_udp_capture(
     let deadline = Instant::now() + timeout;
     loop {
         match host_udp_capture_snapshot(capture_port) {
-            Ok((jumps, routes, listeners)) => {
+            Ok((v4_jumps, v6_jumps, v4_routes, v6_routes, listeners)) => {
                 let ready = if active {
-                    jumps >= 1 && routes >= 1 && listeners >= 1
+                    v4_jumps >= 1
+                        && v6_jumps >= 1
+                        && v4_routes >= 1
+                        && v6_routes >= 1
+                        && listeners >= 1
                 } else {
-                    jumps == 0 && routes == 0 && listeners == 0
+                    v4_jumps == 0
+                        && v6_jumps == 0
+                        && v4_routes == 0
+                        && v6_routes == 0
+                        && listeners == 0
                 };
                 if ready {
                     return Ok(());
                 }
                 if Instant::now() >= deadline {
                     return Err(format!(
-                        "host UDP capture did not become {} (jumps={jumps} routes={routes} listeners={listeners})",
+                        "host UDP capture did not become {} (v4_jumps={v4_jumps} \
+                         v6_jumps={v6_jumps} v4_routes={v4_routes} \
+                         v6_routes={v6_routes} listeners={listeners})",
                         if active { "active" } else { "absent" }
                     ));
                 }
@@ -12359,7 +12391,7 @@ async fn functional_mesh_live_host_udp_capture_proxy_backend_round_trip() {
     if !live_source_capture_prerequisites() {
         return;
     }
-    for binary in ["ip6tables"] {
+    for binary in ["ip6tables", "ip6tables-save"] {
         let present = Command::new("sh")
             .args(["-c", &format!("command -v {binary} >/dev/null 2>&1")])
             .status()
@@ -12581,17 +12613,13 @@ async fn functional_mesh_live_host_udp_capture_proxy_backend_round_trip() {
         );
     }
 
-    let mangle = Command::new("iptables-save")
-        .args(["-t", "mangle"])
-        .output()
-        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
-        .expect("read the mangle table after host-UDP shutdown");
-    for foreign in ["33133", "33134", "table 133"] {
-        assert!(
-            !mangle.contains(foreign),
-            "host-UDP shutdown must not name foreign object {foreign}\n{mangle}"
-        );
-    }
+    let mangle = format!(
+        "{}\n{}",
+        checked_command_stdout("iptables-save", &["-t", "mangle"])
+            .expect("read the IPv4 mangle table after host-UDP shutdown"),
+        checked_command_stdout("ip6tables-save", &["-t", "mangle"])
+            .expect("read the IPv6 mangle table after host-UDP shutdown")
+    );
     assert!(
         !mangle.lines().any(|line| {
             line.starts_with("-A PREROUTING ")

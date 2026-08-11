@@ -13,16 +13,29 @@ mkdir -p "$RESULTS"
 LIVE_REQUIRED="${FERRUM_LIVE_TESTS_REQUIRED:-0}"
 LIB_BIN="${FERRUM_HOST_UDP_LIB_TEST_BIN:?FERRUM_HOST_UDP_LIB_TEST_BIN must point at the lib test binary}"
 FUNC_BIN="${FERRUM_HOST_UDP_FUNCTIONAL_TEST_BIN:?FERRUM_HOST_UDP_FUNCTIONAL_TEST_BIN must point at the functional test binary}"
+lib_raw=""
+func_raw=""
 
 redact() {
-  # Bound and scrub diagnostics: drop token/secret/bearer lines, cap size.
-  sed -E \
-    -e '/[Tt]oken=/d' \
-    -e '/[Ss]ecret/d' \
-    -e '/[Bb]earer/d' \
-    -e '/[Aa]uthorization:/d' \
-    | head -n 200 \
-    | head -c 16384
+  # Bound and scrub diagnostics in one consumer. Avoid a sed|head pipeline:
+  # under pipefail, head closing early can turn an intentionally truncated
+  # diagnostic into a false test failure.
+  LC_ALL=C awk '
+    BEGIN { lines = 0; bytes = 0 }
+    {
+      lower = tolower($0)
+      if (lower ~ /token=/ || lower ~ /secret/ || lower ~ /bearer/ || lower ~ /authorization:/) {
+        next
+      }
+      rendered = $0 ORS
+      if (lines >= 200 || bytes + length(rendered) > 16384) {
+        next
+      }
+      printf "%s", rendered
+      lines++
+      bytes += length(rendered)
+    }
+  '
 }
 
 collect_diag() {
@@ -46,7 +59,7 @@ collect_diag() {
 }
 
 cleanup_trap() {
-  collect_diag "$RESULTS/post-run-diagnostics.txt" || true
+  collect_diag "$RESULTS/pre-cleanup-diagnostics.txt" || true
   # Best-effort exact Ferrum-owned cleanup if a test left host state behind.
   iptables -t mangle -D PREROUTING -j FERRUM_MESH_UDP_HOST 2>/dev/null || true
   iptables -t mangle -D PREROUTING -j FERRUM_MESH_UDP_HOST_GUARD_A 2>/dev/null || true
@@ -70,6 +83,13 @@ cleanup_trap() {
   ip -6 rule del priority 101 lookup 33135 2>/dev/null || true
   ip route del local 0.0.0.0/0 dev lo table 33135 2>/dev/null || true
   ip -6 route del local ::/0 dev lo table 33135 2>/dev/null || true
+  collect_diag "$RESULTS/post-cleanup-diagnostics.txt" || true
+  if [[ -n "$lib_raw" ]]; then
+    rm -f -- "$lib_raw"
+  fi
+  if [[ -n "$func_raw" ]]; then
+    rm -f -- "$func_raw"
+  fi
 }
 trap cleanup_trap EXIT
 
@@ -86,7 +106,7 @@ if [[ "$(id -u)" -ne 0 ]]; then
   exit 0
 fi
 
-for bin in unshare nsenter ip iptables ip6tables iptables-save timeout; do
+for bin in unshare nsenter ip iptables ip6tables iptables-save ip6tables-save timeout mktemp; do
   if ! command -v "$bin" >/dev/null 2>&1; then
     if [[ "$LIVE_REQUIRED" == "1" || "$LIVE_REQUIRED" == "true" ]]; then
       fail_required "FERRUM_LIVE_TESTS_REQUIRED=1 requires $bin"
@@ -96,14 +116,12 @@ for bin in unshare nsenter ip iptables ip6tables iptables-save timeout; do
   fi
 done
 
-# Prove TPROXY / policy routing are usable in a throwaway netns before the suite.
-# Keep the entire netns body as one correctly quoted -c argument so iptables,
-# ip6tables, and the readiness echo cannot detach onto the host shell, and chain
-# the probes with `&&` so a failing probe fails the whole unit: with `;` the exit
-# status would be `echo ready`'s, and an unusable mangle table would read as
-# preflight success.
-preflight_netns='set -e; ip link set lo up && iptables -t mangle -L >/dev/null && ip6tables -t mangle -L >/dev/null && echo ready'
-if ! unshare --net sh -c "$preflight_netns" >"$RESULTS/preflight.txt" 2>&1; then
+# Prove both mangle implementations are usable in throwaway network namespaces
+# before the suite. Invoke fixed executables directly: generated `sh -c` input
+# is intentionally forbidden in automation surfaces by the trusted Cross
+# policy. Production setup below performs the full TPROXY/policy-route proof.
+if ! unshare --net -- iptables -t mangle -L >"$RESULTS/preflight.txt" 2>&1 \
+  || ! unshare --net -- ip6tables -t mangle -L >>"$RESULTS/preflight.txt" 2>&1; then
   if [[ "$LIVE_REQUIRED" == "1" || "$LIVE_REQUIRED" == "true" ]]; then
     fail_required "host-UDP live preflight failed under required mode"
   fi
@@ -115,44 +133,48 @@ fi
 collect_diag "$RESULTS/pre-run-diagnostics.txt"
 
 echo "Running ambient host-UDP live-kernel lib tests via $LIB_BIN"
+lib_raw="$(mktemp "${TMPDIR:-/tmp}/ferrum-host-udp-lib.XXXXXX")"
 set +e
-lib_output="$(
-  FERRUM_LIVE_TESTS_REQUIRED=1 \
-    timeout --signal=KILL 180s \
-    "$LIB_BIN" proxy::host_udp_capture_live_tests --ignored --nocapture --test-threads=1 2>&1
-)"
+FERRUM_LIVE_TESTS_REQUIRED=1 \
+  timeout --signal=KILL 180s \
+  "$LIB_BIN" proxy::host_udp_capture_live_tests --ignored --nocapture --test-threads=1 \
+  >"$lib_raw" 2>&1
 lib_status=$?
 set -e
-printf '%s\n' "$lib_output" | tee "$RESULTS/lib-tests.log"
+redact <"$lib_raw" | tee "$RESULTS/lib-tests.log"
 if [[ "$lib_status" -ne 0 ]]; then
   exit "$lib_status"
 fi
-if grep -q '^SKIP:' <<<"$lib_output"; then
+if grep -q '^SKIP:' "$lib_raw"; then
   fail_required "ambient host-UDP lib live tests skipped under required CI mode"
 fi
-if ! grep -Eq '^test result: ok\. 2 passed; 0 failed;' <<<"$lib_output"; then
+if ! grep -Eq '^test result: ok\. 2 passed; 0 failed;' "$lib_raw"; then
   fail_required "expected exactly 2 ambient host-UDP lib live tests to pass"
 fi
+rm -f -- "$lib_raw"
+lib_raw=""
 
 echo "Running ambient host-UDP production ProxyHostUdpBackend functional live test via $FUNC_BIN"
+func_raw="$(mktemp "${TMPDIR:-/tmp}/ferrum-host-udp-functional.XXXXXX")"
 set +e
-func_output="$(
-  FERRUM_LIVE_TESTS_REQUIRED=1 \
+FERRUM_LIVE_TESTS_REQUIRED=1 \
   FERRUM_SKIP_GATEWAY_BUILD=1 \
-    timeout --signal=KILL 300s \
-    "$FUNC_BIN" functional_mesh_live_host_udp_capture --ignored --nocapture --test-threads=1 2>&1
-)"
+  timeout --signal=KILL 300s \
+  "$FUNC_BIN" functional_mesh_live_host_udp_capture --ignored --nocapture --test-threads=1 \
+  >"$func_raw" 2>&1
 func_status=$?
 set -e
-printf '%s\n' "$func_output" | tee "$RESULTS/functional-tests.log"
+redact <"$func_raw" | tee "$RESULTS/functional-tests.log"
 if [[ "$func_status" -ne 0 ]]; then
   exit "$func_status"
 fi
-if grep -q '^SKIP:' <<<"$func_output"; then
+if grep -q '^SKIP:' "$func_raw"; then
   fail_required "ambient host-UDP functional live tests skipped under required CI mode"
 fi
-if ! grep -Eq '^test result: ok\. 1 passed; 0 failed;' <<<"$func_output"; then
+if ! grep -Eq '^test result: ok\. 1 passed; 0 failed;' "$func_raw"; then
   fail_required "expected exactly 1 ambient host-UDP functional live test to pass"
 fi
+rm -f -- "$func_raw"
+func_raw=""
 
 echo "ambient-host-udp-live: ok"

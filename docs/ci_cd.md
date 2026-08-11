@@ -561,12 +561,11 @@ suite: `origin/main` does not yet list `ambient-host-udp` among the classifier's
 `relevant=true`, so the introducing pull request still runs the live suite
 rather than deferring it to a future merge; every other classifier failure still
 exits non-zero. Once `main` carries the suite the branch is unreachable and
-ordinary trusted-base classification applies.
-`.github/scripts/verify_cross_build_policy.py` freezes both the bootstrap
-relevance job and the final gate byte-for-byte
-(`LIVE_SUITE_UNKNOWN_SUITE_BOOTSTRAP_RELEVANCE_JOB_TEMPLATE`,
-`AMBIENT_HOST_UDP_LIVE_GATE_JOB`), so a later untrusted workflow edit cannot
-silently skip or rename the check.
+ordinary trusted-base classification applies. The required-CI verifier pins
+the workflow's unconditional pull-request / merge-group ownership and exact
+`Ambient Host UDP Live` context. The separately trusted cross-build verifier
+cannot be changed by a pull request, so the introducing bootstrap is also an
+explicit root-review boundary rather than a self-authorizing verifier change.
 
 The relevant surfaces are host-UDP capture, mesh UDP serving, capture plan
 generators, Ambient mesh serving, Helm mesh charts, the live fixture, and

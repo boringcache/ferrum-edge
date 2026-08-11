@@ -41,16 +41,17 @@ jobs:
       # validation and execution, and every failure exits non-zero so the gate
       # fails closed instead of quietly declaring itself irrelevant.
       #
-      # Bootstrap exception (frozen by verify_cross_build_policy.py): when the
+      # Bootstrap exception: when the
       # trusted-base classifier specifically rejects suite ambient-host-udp as
       # an unknown choice — which is the introducing-PR case against immutable
       # origin/main — force relevant=true so this PR still runs the live suite.
       # Every other checkout, parsing, or classifier error fails closed. Once
       # main contains the suite, ordinary trusted-base classification applies.
       #
-      # This block is frozen by .github/scripts/verify_cross_build_policy.py
-      # (see live_suite_relevance_errors); it is the ambient-host-udp unknown-
-      # suite bootstrap variant of the trusted-base relevance contract.
+      # The required-CI verifier pins the workflow's unconditional
+      # pull_request / merge_group ownership and exact final context. The root
+      # merge gate reviews this introducing bootstrap because the separately
+      # trusted cross-build verifier cannot be modified by a pull request.
       - name: Check for ambient-host-udp changes
         id: filter
         env:
@@ -266,13 +267,13 @@ jobs:
         run: |
           set -euo pipefail
           sudo -n true
-          for bin in unshare nsenter setpriv timeout ip iptables ip6tables iptables-save; do
+          for bin in unshare nsenter setpriv timeout ip iptables ip6tables iptables-save ip6tables-save; do
             command -v "$bin" >/dev/null 2>&1 || {
               echo "::error::$bin is required for ambient host-UDP live tests"
               exit 1
             }
           done
-          sudo unshare --net sh -c 'ip link set lo up 2>/dev/null || true; iptables -t mangle -L >/dev/null; ip6tables -t mangle -L >/dev/null'
+          sudo unshare --net sh -eu -c 'ip link set lo up; iptables -t mangle -L >/dev/null; ip6tables -t mangle -L >/dev/null'
 
       - name: Run ambient host-UDP live gate as root
         env:

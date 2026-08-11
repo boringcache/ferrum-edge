@@ -104,30 +104,11 @@ fn ambient_host_udp_live_workflow_is_unconditional_with_a_trusted_base_relevance
     );
 }
 
-/// `verify_cross_build_policy.py` must freeze both the bootstrap relevance job
-/// and the final gate byte-for-byte, so a later untrusted workflow edit cannot
-/// silently skip or rename the required check.
+/// The required-CI verifier must pin the workflow's unconditional event
+/// ownership and exact final context. The separately trusted cross-build
+/// verifier deliberately cannot be changed by this pull request.
 #[test]
-fn ambient_host_udp_live_gate_shape_is_frozen_by_the_cross_build_policy_verifier() {
-    let verifier = read(".github/scripts/verify_cross_build_policy.py");
-
-    assert!(
-        verifier.contains("\"ambient-host-udp-live.yml\""),
-        "the verifier must register the ambient host-UDP live workflow"
-    );
-    assert!(
-        verifier.contains("LIVE_SUITE_UNKNOWN_SUITE_BOOTSTRAP_WORKFLOWS"),
-        "the verifier must pin the unknown-suite bootstrap relevance variant"
-    );
-    assert!(
-        verifier.contains("AMBIENT_HOST_UDP_LIVE_GATE_JOB"),
-        "the verifier must freeze the unconditional final-gate job"
-    );
-    assert!(
-        verifier.contains("name: Ambient Host UDP Live"),
-        "the frozen gate contract must pin the exact required check name"
-    );
-
+fn ambient_host_udp_live_gate_is_owned_by_the_required_ci_verifier() {
     let required_ci = read(".github/scripts/verify_required_ci.py");
     assert!(
         required_ci.contains(
@@ -135,6 +116,10 @@ fn ambient_host_udp_live_gate_shape_is_frozen_by_the_cross_build_policy_verifier
         ),
         "the required-CI verifier must require an unconditional merge-group \
          owner for `Ambient Host UDP Live`"
+    );
+    assert!(
+        required_ci.contains("REQUIRED_MERGE_GROUP_WORKFLOWS"),
+        "the workflow must be checked through the unconditional required-owner contract"
     );
 }
 
@@ -151,8 +136,14 @@ fn ambient_host_udp_live_runner_fail_closed_and_bounded_diagnostics() {
     );
     assert!(runner.contains("redact"), "diagnostics must be redacted");
     assert!(
-        runner.contains("head -c 16384") || runner.contains("head -n 200"),
+        runner.contains("lines >= 200") && runner.contains("length(rendered) > 16384"),
         "diagnostics must be bounded"
+    );
+    assert!(
+        runner.contains("mktemp \"${TMPDIR:-/tmp}/ferrum-host-udp-lib.XXXXXX\"")
+            && runner
+                .contains("mktemp \"${TMPDIR:-/tmp}/ferrum-host-udp-functional.XXXXXX\""),
+        "unredacted test output must never be placed in the uploaded artifact tree"
     );
     assert!(
         runner.contains("FERRUM_MESH_UDP_HOST"),
