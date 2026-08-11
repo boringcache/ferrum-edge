@@ -359,7 +359,7 @@ fn dr_connection_pool_http_http1_max_pending_requests_supported() {
         category = CATEGORY,
         feature = "trafficPolicy.connectionPool.http.http1MaxPendingRequests",
         status = Status::Supported,
-        notes = "Projected onto port_overrides[port].http1_max_pending_requests → Proxy.pool_http1_max_pending_requests; honestly reinterpreted as a 503-on-overflow concurrent in-flight-request gate on the reqwest/HTTP-1.1 dispatch path (and H3→plain bridge), keyed by logical destination (namespace, upstream/Service identity including K8s UID/generation when stamped, policy port, selected subset) rather than selected endpoint host (src/backend_pending_limit.rs, issue #3778).",
+        notes = "Projected onto port_overrides[port].http1_max_pending_requests → Proxy.pool_http1_max_pending_requests; honestly reinterpreted as a 503-on-overflow concurrent in-flight-request gate on the reqwest/HTTP-1.1 dispatch path (and H3→plain bridge), keyed by logical destination (namespace, stable upstream/service id, optional K8s Service UID when stamped, policy port, selected subset) rather than selected endpoint host (src/backend_pending_limit.rs, issue #3778).",
     );
     let dr = translated(json!({
         "host": "echo.default.svc.cluster.local",
@@ -945,7 +945,6 @@ fn admitted_names_with_entries(
             workloads: Vec::new(),
             protocol_overrides: std::collections::HashMap::new(),
             uid: None,
-            generation: None,
         }],
         sidecars: vec![MeshSidecar {
             name: "default-sc".to_string(),

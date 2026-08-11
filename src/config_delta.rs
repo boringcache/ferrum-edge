@@ -480,7 +480,7 @@ mod tests {
 
         fn updated_at(&self) -> DateTime<Utc> {
             self.updated_at
-            }
+        }
     }
 
     fn ts(seconds: i64) -> DateTime<Utc> {

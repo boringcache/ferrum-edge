@@ -31,15 +31,18 @@
 //! [`BackendPendingScopeBase`] plus the effective DestinationRule policy port:
 //!
 //! ```text
-//! (namespace/tenant, upstream or Kubernetes Service identity, policy port, selected subset)
+//! (namespace/tenant, stable upstream/service id, optional Kubernetes Service UID,
+//!  policy port, selected subset)
 //! ```
 //!
-//! Kubernetes Service `metadata.uid` (and `metadata.generation` when present)
-//! participate in the identity so delete/recreate cannot inherit a stale
-//! counter. Native/file/database config falls back to the stable
-//! `(namespace, upstream_id)` identity already used by config-delta / pool
-//! lifecycle code. Direct-backend proxies without an upstream use
-//! `(namespace, proxy id)`.
+//! The stable upstream/service identity is **always** present. When a Kubernetes
+//! Service `metadata.uid` is stamped, it is added alongside that identity so
+//! delete/recreate opens a fresh lane while an injected/reused UID cannot
+//! collapse otherwise distinct logical destinations. Ordinary Service *spec*
+//! updates (including DestinationRule cap changes) retain one shared counter —
+//! `metadata.generation` is intentionally **not** part of the lane. Native /
+//! file / database config omits the UID and uses `(namespace, upstream_id)`
+//! alone. Direct-backend proxies without an upstream use `(namespace, proxy id)`.
 //!
 //! The selected endpoint host/IP is **not** part of the key: load-balanced
 //! endpoint selection, DNS refresh, pod rotation, and retries to sibling
@@ -49,10 +52,9 @@
 //!
 //! Cap updates are deterministic: each acquire checks against the requesting
 //! epoch's effective cap while reading/writing the shared count. Existing
-//! guards release exactly once onto that same counter (no generation fork on
-//! a mere cap change). When the Service identity itself changes (new UID /
-//! generation), a new lane is opened and old guards drain the prior counter
-//! under the existing race-safe zero-count retirement.
+//! guards release exactly once onto that same counter. When the Service UID
+//! itself changes (delete/recreate), a new lane is opened and old guards drain
+//! the prior counter under the existing race-safe zero-count retirement.
 //!
 //! This scope is intentionally reusable by later cross-protocol active-request
 //! work (#3775 / `http2MaxRequests`) but is **not** that breaker: this module
@@ -120,10 +122,12 @@
 //!   That keeps retired scopes from accumulating unbounded zero-count keys over
 //!   the gateway lifetime, with no acquire/evict race.
 //!
-//! Observability stays fixed-cardinality: rejection metrics/logs never emit raw
-//! Service, namespace, upstream, subset, or host labels. A bounded opaque scope
-//! digest is available on [`BackendPendingScopeBase::digest`] for admin/debug
-//! correlation only.
+//! Observability stays fixed-cardinality: rejection metrics never emit raw
+//! Service, namespace, upstream, subset, or host labels. Structured rejection
+//! logs carry a bounded opaque FNV-1a scope digest plus the effective
+//! DestinationRule policy port (distinct from the dial/backend port under
+//! `targetPort` remapping) so operators can correlate the lane without an
+//! admin diagnostic endpoint exposing raw identifiers.
 //!
 //! The implementation is deliberately a counting gate (a `CachePadded` atomic
 //! mutated under the shard lock), not a `tokio::sync::Semaphore`: a semaphore
@@ -135,7 +139,6 @@
 
 use std::cell::RefCell;
 use std::fmt::Write;
-use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -161,23 +164,25 @@ pub struct BackendPendingScopeBase {
     /// Length-prefixed identity prefix ending with `|` so a port can be
     /// appended without delimiter ambiguity.
     prefix: Arc<str>,
-    /// Bounded opaque digest of the logical identity (not the port). Safe for
-    /// admin/debug correlation; never used as a Prometheus label.
+    /// Bounded opaque FNV-1a digest of the logical identity (not the port).
+    /// Structured rejection logs only; never a Prometheus label or
+    /// authorization input.
     digest: u64,
 }
 
 impl BackendPendingScopeBase {
     /// Build a scope base from logical destination components.
     ///
-    /// `upstream_id` is the stable config/upstream id when no Kubernetes
-    /// Service UID is available. `k8s_service_uid` / `k8s_service_generation`
-    /// isolate delete/recreate generations when the K8s translator stamped
-    /// them. `subset == None` is a distinct lane from every named subset.
+    /// `upstream_id` is always the stable config/upstream (or proxy) identity.
+    /// `k8s_service_uid`, when stamped by the Kubernetes translator, is added
+    /// alongside that identity so delete/recreate isolates lanes without letting
+    /// a reused UID collapse distinct upstreams. `subset == None` is a distinct
+    /// lane from every named subset. Kubernetes `metadata.generation` is never
+    /// part of this key.
     pub fn new(
         namespace: &str,
         upstream_id: &str,
         k8s_service_uid: Option<&str>,
-        k8s_service_generation: Option<i64>,
         subset: Option<&str>,
     ) -> Self {
         let mut buf = String::with_capacity(
@@ -188,16 +193,10 @@ impl BackendPendingScopeBase {
         );
         write_length_prefixed(&mut buf, "ns", namespace);
         buf.push('|');
-        match k8s_service_uid {
-            Some(uid) if !uid.is_empty() => {
-                write_length_prefixed(&mut buf, "uid", uid);
-                if let Some(generation) = k8s_service_generation {
-                    let _ = write!(buf, "|g{generation}");
-                }
-            }
-            _ => {
-                write_length_prefixed(&mut buf, "id", upstream_id);
-            }
+        write_length_prefixed(&mut buf, "id", upstream_id);
+        if let Some(uid) = k8s_service_uid.filter(|u| !u.is_empty()) {
+            buf.push('|');
+            write_length_prefixed(&mut buf, "uid", uid);
         }
         buf.push('|');
         match subset {
@@ -207,14 +206,15 @@ impl BackendPendingScopeBase {
             None => buf.push('n'),
         }
         buf.push('|');
-        let digest = digest_bytes(buf.as_bytes());
+        let digest = fnv1a64(buf.as_bytes());
         Self {
             prefix: Arc::from(buf),
             digest,
         }
     }
 
-    /// Opaque digest of the logical identity (excluding policy port).
+    /// Opaque FNV-1a digest of the logical identity (excluding policy port).
+    /// Diagnostics / structured rejection logs only — never authorization.
     #[inline]
     pub fn digest(&self) -> u64 {
         self.digest
@@ -234,13 +234,18 @@ fn write_length_prefixed(buf: &mut String, tag: &str, value: &str) {
     buf.push_str(value);
 }
 
+/// FNV-1a 64-bit: deterministic across Rust versions (unlike `DefaultHasher`).
+/// Cold-path / diagnostics only; never used for authorization.
 #[inline]
-fn digest_bytes(bytes: &[u8]) -> u64 {
-    // Stable, allocation-free, fixed-width digest for diagnostics only.
-    // Not a cryptographic hash; never used for authorization.
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    bytes.hash(&mut hasher);
-    hasher.finish()
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x00000100000001B3;
+    let mut h = FNV_OFFSET;
+    for byte in bytes {
+        h ^= u64::from(*byte);
+        h = h.wrapping_mul(FNV_PRIME);
+    }
+    h
 }
 
 /// Append the policy port onto a scope base into `buf`.
@@ -269,11 +274,6 @@ pub struct BackendPendingLimiter {
 struct BackendPendingCounter {
     key: String,
     count: CachePadded<AtomicU64>,
-    /// Last observed effective cap for diagnostics. Updated on every successful
-    /// acquire so admin/debug can report the lane's current policy without
-    /// storing raw scope identifiers in metrics. Not consulted for admission —
-    /// each acquire always checks against the requesting epoch's own cap.
-    observed_cap: CachePadded<AtomicU64>,
 }
 
 impl Default for BackendPendingLimiter {
@@ -344,7 +344,6 @@ impl BackendPendingLimiter {
                     });
                 }
                 existing.count.fetch_add(1, Ordering::Relaxed);
-                existing.observed_cap.store(cap_u64, Ordering::Relaxed);
                 return Ok(existing.clone());
             }
             // Cold path: a new scope — allocate the owned key once and take
@@ -356,7 +355,6 @@ impl BackendPendingLimiter {
                 Arc::new(BackendPendingCounter {
                     key: buf.clone(),
                     count: CachePadded::new(AtomicU64::new(0)),
-                    observed_cap: CachePadded::new(AtomicU64::new(cap_u64)),
                 })
             });
             let current = entry.count.load(Ordering::Relaxed);
@@ -367,7 +365,6 @@ impl BackendPendingLimiter {
                 });
             }
             entry.count.fetch_add(1, Ordering::Relaxed);
-            entry.observed_cap.store(cap_u64, Ordering::Relaxed);
             Ok(entry.clone())
         })?;
         Ok(Some(BackendPendingGuard {
@@ -387,18 +384,6 @@ impl BackendPendingLimiter {
                 .get(buf.as_str())
                 .map(|c| c.count.load(Ordering::Relaxed))
                 .unwrap_or(0)
-        })
-    }
-
-    /// Last observed effective cap for a lane (diagnostics / tests).
-    pub fn observed_cap(&self, scope: &BackendPendingScopeBase, port: u16) -> Option<u64> {
-        PENDING_KEY_BUF.with(|buf| {
-            let mut buf = buf.borrow_mut();
-            buf.clear();
-            write_pending_key(&mut buf, scope, port);
-            self.inner
-                .get(buf.as_str())
-                .map(|c| c.observed_cap.load(Ordering::Relaxed))
         })
     }
 
@@ -469,17 +454,11 @@ mod tests {
     use super::*;
 
     fn scope(ns: &str, id: &str, subset: Option<&str>) -> BackendPendingScopeBase {
-        BackendPendingScopeBase::new(ns, id, None, None, subset)
+        BackendPendingScopeBase::new(ns, id, None, subset)
     }
 
-    fn scope_uid(
-        ns: &str,
-        id: &str,
-        uid: &str,
-        generation: Option<i64>,
-        subset: Option<&str>,
-    ) -> BackendPendingScopeBase {
-        BackendPendingScopeBase::new(ns, id, Some(uid), generation, subset)
+    fn scope_uid(ns: &str, id: &str, uid: &str, subset: Option<&str>) -> BackendPendingScopeBase {
+        BackendPendingScopeBase::new(ns, id, Some(uid), subset)
     }
 
     #[test]
@@ -692,8 +671,8 @@ mod tests {
     #[test]
     fn k8s_uid_isolates_delete_recreate_generations() {
         let limiter = BackendPendingLimiter::new();
-        let old = scope_uid("default", "reviews", "uid-old", Some(1), Some("v1"));
-        let new = scope_uid("default", "reviews", "uid-new", Some(1), Some("v1"));
+        let old = scope_uid("default", "reviews", "uid-old", Some("v1"));
+        let new = scope_uid("default", "reviews", "uid-new", Some("v1"));
 
         let _g = limiter
             .try_acquire(&old, 80, Some(1))
@@ -708,47 +687,67 @@ mod tests {
     }
 
     #[test]
-    fn k8s_generation_isolates_old_guard_drain() {
+    fn matching_uid_does_not_collapse_distinct_upstreams() {
+        // Optional UID is additive to the stable upstream id — a reused or
+        // cross-cluster UID must not merge otherwise distinct destinations.
         let limiter = BackendPendingLimiter::new();
-        let g1 = scope_uid("default", "reviews", "uid-1", Some(1), None);
-        let g2 = scope_uid("default", "reviews", "uid-1", Some(2), None);
+        let a = scope_uid("default", "reviews-a", "shared-uid", Some("v1"));
+        let b = scope_uid("default", "reviews-b", "shared-uid", Some("v1"));
+        let _ga = limiter
+            .try_acquire(&a, 80, Some(1))
+            .expect("a")
+            .expect("guard");
+        let _gb = limiter
+            .try_acquire(&b, 80, Some(1))
+            .expect("distinct upstream id must stay isolated despite matching UID")
+            .expect("guard");
+        assert_eq!(limiter.current(&a, 80), 1);
+        assert_eq!(limiter.current(&b, 80), 1);
+        assert_ne!(a.prefix(), b.prefix());
+        assert!(a.prefix().contains("id"), "stable upstream id always present");
+        assert!(a.prefix().contains("uid"), "optional UID is additive");
+    }
 
-        let old_guard = limiter
-            .try_acquire(&g1, 80, Some(1))
-            .expect("gen1")
+    #[test]
+    fn same_upstream_and_uid_shares_lane_across_endpoint_churn() {
+        let limiter = BackendPendingLimiter::new();
+        let lane = scope_uid("default", "reviews", "uid-1", Some("v1"));
+        // Host never enters the key; repeated acquires for the same logical
+        // identity share one counter through endpoint/config churn.
+        let _g = limiter
+            .try_acquire(&lane, 80, Some(1))
+            .expect("first")
             .expect("guard");
-        let _new = limiter
-            .try_acquire(&g2, 80, Some(1))
-            .expect("new generation lane")
-            .expect("guard");
-        drop(old_guard);
-        assert_eq!(limiter.current(&g1, 80), 0);
-        assert_eq!(limiter.resident_counters(), 1, "only the live generation remains");
-        assert_eq!(limiter.current(&g2, 80), 1);
+        limiter
+            .try_acquire(&lane, 80, Some(1))
+            .expect_err("endpoint rotation must retain the same lane");
+        assert!(!lane.prefix().contains("10.0.0.5"));
     }
 
     #[test]
     fn cap_update_uses_request_cap_against_shared_count() {
         // Same logical identity; raising the cap admits more while preserving
         // the existing count. Lowering rejects until the count drains.
+        // Rejection diagnostics use the requesting epoch's cap (`limit.cap`),
+        // never a retained observed-cap claim from an earlier higher epoch.
         let limiter = BackendPendingLimiter::new();
         let s = scope("default", "reviews", None);
         let _g1 = limiter
             .try_acquire(&s, 80, Some(1))
             .expect("cap1")
             .expect("guard");
-        assert_eq!(limiter.observed_cap(&s, 80), Some(1));
 
         let _g2 = limiter
             .try_acquire(&s, 80, Some(2))
             .expect("raised cap admits against preserved count")
             .expect("guard");
         assert_eq!(limiter.current(&s, 80), 2);
-        assert_eq!(limiter.observed_cap(&s, 80), Some(2));
 
-        limiter
+        let err = limiter
             .try_acquire(&s, 80, Some(1))
             .expect_err("lowered cap must reject while count is above it");
+        assert_eq!(err.cap, 1, "rejection reports the requesting epoch's cap");
+        assert_eq!(err.current, 2);
     }
 
     #[test]
@@ -888,8 +887,8 @@ mod tests {
 
     #[test]
     fn delimiter_bearing_names_do_not_collide() {
-        let a = BackendPendingScopeBase::new("a|b", "c", None, None, Some("d"));
-        let b = BackendPendingScopeBase::new("a", "b|c", None, None, Some("d"));
+        let a = BackendPendingScopeBase::new("a|b", "c", None, Some("d"));
+        let b = BackendPendingScopeBase::new("a", "b|c", None, Some("d"));
         assert_ne!(a.prefix(), b.prefix());
         assert_ne!(a.digest(), b.digest());
     }

@@ -4300,7 +4300,6 @@ mod tests {
             workloads: Vec::new(),
             protocol_overrides: HashMap::new(),
             uid: None,
-            generation: None,
         }
     }
 
@@ -4314,9 +4313,7 @@ mod tests {
             .into_iter()
             .map(|spiffe_id| WorkloadRef { spiffe_id })
             .collect();
-        service,
-        uid: None,
-        generation: None,
+        service
     }
 
     #[test]
@@ -7056,7 +7053,6 @@ mod tests {
                 workloads: Vec::new(),
                 protocol_overrides: HashMap::new(),
                 uid: None,
-                generation: None,
             }],
             ..MeshSlice::default()
         };
@@ -7083,7 +7079,6 @@ mod tests {
                 workloads: Vec::new(),
                 protocol_overrides: HashMap::new(),
                 uid: None,
-                generation: None,
             }],
             ..MeshSlice::default()
         };
@@ -7117,7 +7112,6 @@ mod tests {
                     workloads: Vec::new(),
                     protocol_overrides: HashMap::new(),
                     uid: None,
-                    generation: None,
                 },
                 MeshService {
                     cluster_ips: Vec::new(),
@@ -7127,7 +7121,6 @@ mod tests {
                     workloads: Vec::new(),
                     protocol_overrides: HashMap::new(),
                     uid: None,
-                    generation: None,
                 },
             ],
             ..MeshSlice::default()
@@ -7159,7 +7152,6 @@ mod tests {
                 workloads: Vec::new(),
                 protocol_overrides: HashMap::new(),
                 uid: None,
-                generation: None,
             }],
             ..MeshSlice::default()
         };
@@ -7298,7 +7290,6 @@ mod tests {
                     workloads: Vec::new(),
                     protocol_overrides: HashMap::new(),
                     uid: None,
-                    generation: None,
                 },
                 MeshService {
                     cluster_ips: Vec::new(),
@@ -7313,7 +7304,6 @@ mod tests {
                     workloads: Vec::new(),
                     protocol_overrides: HashMap::new(),
                     uid: None,
-                    generation: None,
                 },
             ],
             ..MeshSlice::default()

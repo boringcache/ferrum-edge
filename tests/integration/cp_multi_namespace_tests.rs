@@ -160,7 +160,6 @@ fn mesh_service(name: &str, namespace: &str) -> MeshService {
         protocol_overrides: HashMap::new(),
         cluster_ips: Vec::new(),
         uid: None,
-        generation: None,
     }
 }
 

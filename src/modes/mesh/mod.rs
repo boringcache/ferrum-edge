@@ -3119,7 +3119,6 @@ fn build_east_west_service_proxies_and_upstreams(
                 created_at: now,
                 updated_at: now,
                 k8s_service_uid: None,
-                k8s_service_generation: None,
             };
             upstreams.push(upstream);
 
@@ -5126,7 +5125,6 @@ fn mesh_ingress_unix_upstream(
         created_at: now,
         updated_at: now,
         k8s_service_uid: None,
-        k8s_service_generation: None,
     }
 }
 
@@ -5634,7 +5632,6 @@ fn materialize_mesh_outbound_proxies(
                 &service_fqdn,
                 targets,
                 service.uid.clone(),
-                service.generation,
                 now,
             );
             if let Some(existing) = config
@@ -5694,7 +5691,6 @@ fn materialize_mesh_outbound_proxies(
                 &service_fqdn,
                 vec![target],
                 spec.service.uid.clone(),
-                spec.service.generation,
                 now,
             );
             let proxy = mesh_outbound_http_bywl_route_proxy(&spec, now);
@@ -5848,7 +5844,6 @@ fn materialize_mesh_outbound_tcp_upstreams(
                 &service_fqdn,
                 targets,
                 service.uid.clone(),
-                service.generation,
                 now,
             );
             if let Some(existing) = config
@@ -5949,7 +5944,6 @@ fn materialize_mesh_outbound_tcp_upstreams(
             &service_fqdn,
             vec![target],
             spec.service.uid.clone(),
-            spec.service.generation,
             now,
         );
         if let Some(existing) = config
@@ -6075,7 +6069,6 @@ fn materialize_mesh_outbound_udp_upstreams(
                 &service_fqdn,
                 targets,
                 service.uid.clone(),
-                service.generation,
                 now,
             );
             if let Some(existing) = config
@@ -6367,7 +6360,6 @@ fn materialize_mesh_external_udp_egress_upstreams(
                     &entry.namespace,
                     &service_fqdn,
                     vec![target],
-                    None,
                     None,
                     now,
                 ));
@@ -8033,7 +8025,6 @@ fn mesh_outbound_route_upstream(
     service_fqdn: &str,
     targets: Vec<UpstreamTarget>,
     k8s_service_uid: Option<String>,
-    k8s_service_generation: Option<i64>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Upstream {
     Upstream {
@@ -8066,7 +8057,6 @@ fn mesh_outbound_route_upstream(
         dispatch_port_override_fallback: None,
         api_spec_id: None,
         k8s_service_uid,
-        k8s_service_generation,
         created_at: now,
         updated_at: now,
     }
@@ -10508,7 +10498,6 @@ fn build_egress_upstream(
         created_at: now,
         updated_at: now,
         k8s_service_uid: None,
-        k8s_service_generation: None,
     }
 }
 
@@ -19333,7 +19322,6 @@ mod tests {
             }],
             protocol_overrides: HashMap::new(),
             uid: None,
-            generation: None,
         }
     }
 
@@ -19466,7 +19454,6 @@ mod tests {
             }],
             protocol_overrides: HashMap::new(),
             uid: None,
-            generation: None,
         };
         let slice = MeshSlice {
             node_id: "node-a".to_string(),
@@ -19525,7 +19512,6 @@ mod tests {
             }],
             protocol_overrides: HashMap::new(),
             uid: None,
-            generation: None,
         }
     }
 
@@ -22557,7 +22543,6 @@ mod tests {
                 }],
                 protocol_overrides: HashMap::new(),
                 uid: None,
-                generation: None,
             }],
             ..MeshSlice::default()
         };
@@ -23683,7 +23668,6 @@ mod tests {
             created_at: now,
             updated_at: now,
             k8s_service_uid: None,
-            k8s_service_generation: None,
         }
     }
 
@@ -26238,7 +26222,6 @@ mod tests {
                 workloads: Vec::new(),
                 protocol_overrides: HashMap::new(),
                 uid: None,
-                generation: None,
             }],
             outbound_traffic_policy: Some(
                 crate::modes::mesh::config::OutboundTrafficPolicy::RegistryOnly,
@@ -26403,7 +26386,6 @@ mod tests {
                     protocol_overrides: HashMap::new(),
                     cluster_ips: Vec::new(),
                     uid: None,
-                    generation: None,
                 }],
                 ..MeshSlice::default()
             };
@@ -26740,7 +26722,6 @@ mod tests {
                 workloads: Vec::new(),
                 protocol_overrides: HashMap::new(),
                 uid: None,
-                generation: None,
             }],
             outbound_traffic_policy: None,
             ..MeshSlice::default()
@@ -26952,7 +26933,6 @@ mod tests {
                 workloads: Vec::new(),
                 protocol_overrides: HashMap::new(),
                 uid: None,
-                generation: None,
             }],
             outbound_traffic_policy: None,
             ..MeshSlice::default()
@@ -27933,7 +27913,6 @@ mod tests {
                             }],
                             protocol_overrides: HashMap::new(),
                             uid: None,
-                            generation: None,
                         }],
                         workloads: vec![{
                             let mut wl = workload("reviews", "reviews");
@@ -28037,7 +28016,6 @@ mod tests {
                             }],
                             protocol_overrides: HashMap::new(),
                             uid: None,
-                            generation: None,
                         }],
                         workloads: vec![{
                             let mut wl = workload("reviews", "reviews");
@@ -28141,7 +28119,6 @@ mod tests {
                             }],
                             protocol_overrides: HashMap::new(),
                             uid: None,
-                            generation: None,
                         }],
                         workloads: vec![{
                             let mut wl = workload("reviews", "reviews");
@@ -28205,7 +28182,6 @@ mod tests {
                             }],
                             protocol_overrides: HashMap::new(),
                             uid: None,
-                            generation: None,
                         }],
                         // Workload exists but has no addresses (pod IP not yet assigned).
                         workloads: vec![workload("pending", "pending")],
@@ -28268,7 +28244,6 @@ mod tests {
                                 }],
                                 protocol_overrides: HashMap::new(),
                                 uid: None,
-                                generation: None,
                             },
                             MeshService {
                                 cluster_ips: Vec::new(),
@@ -28288,7 +28263,6 @@ mod tests {
                                 }],
                                 protocol_overrides: HashMap::new(),
                                 uid: None,
-                                generation: None,
                             },
                         ],
                         workloads: vec![
@@ -28379,7 +28353,6 @@ mod tests {
             ],
             protocol_overrides: HashMap::new(),
             uid: None,
-            generation: None,
         };
 
         let targets =
@@ -28450,7 +28423,6 @@ mod tests {
             created_at: loaded_at,
             updated_at: loaded_at,
             k8s_service_uid: None,
-            k8s_service_generation: None,
         });
         let mesh_slice = MeshSlice {
             namespace: "default".to_string(),
@@ -28678,7 +28650,6 @@ mod tests {
             created_at: now,
             updated_at: now,
             k8s_service_uid: None,
-            k8s_service_generation: None,
         }
     }
 
@@ -29159,7 +29130,6 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             k8s_service_uid: None,
-            k8s_service_generation: None,
         });
         let mut config_b = config_a.clone();
 
@@ -29319,7 +29289,6 @@ mod tests {
             workloads: vec![crate::modes::mesh::config::WorkloadRef { spiffe_id: spiffe }],
             protocol_overrides: HashMap::new(),
             uid: None,
-            generation: None,
         };
 
         let targets = build_east_west_service_targets(&service, &service.ports[0], &[wl], None);
@@ -29350,7 +29319,6 @@ mod tests {
             workloads: vec![crate::modes::mesh::config::WorkloadRef { spiffe_id: spiffe }],
             protocol_overrides: HashMap::new(),
             uid: None,
-            generation: None,
         };
 
         let targets = build_east_west_service_targets(&service, &service.ports[0], &[legacy], None);
@@ -29415,7 +29383,6 @@ mod tests {
                             ],
                             protocol_overrides: HashMap::new(),
                             uid: None,
-                            generation: None,
                         }],
                         workloads: vec![local, remote, clusterless],
                         multi_cluster: Some(MultiClusterConfig {
@@ -29477,7 +29444,6 @@ mod tests {
             workloads: vec![crate::modes::mesh::config::WorkloadRef { spiffe_id: spiffe }],
             protocol_overrides: HashMap::new(),
             uid: None,
-            generation: None,
         };
 
         let workloads = vec![remote, local];
@@ -29899,7 +29865,6 @@ mod tests {
                 }],
                 protocol_overrides: HashMap::new(),
                 uid: None,
-                generation: None,
             }],
             multi_cluster: Some(multi_cluster),
             ..MeshSlice::default()
@@ -30380,7 +30345,6 @@ mod tests {
                 workloads: Vec::new(),
                 protocol_overrides: HashMap::new(),
                 uid: None,
-                generation: None,
             }],
             ..MeshSlice::default()
         });
@@ -31161,7 +31125,6 @@ mod tests {
             }],
             protocol_overrides: HashMap::new(),
             uid: None,
-            generation: None,
         };
         // The remote cluster's view of svc-b (refs the remote workload).
         let svc_remote = MeshService {

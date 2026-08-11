@@ -357,7 +357,6 @@ fn create_test_upstream(id: &str, targets: Vec<UpstreamTarget>) -> Upstream {
         created_at: Utc::now(),
         updated_at: Utc::now(),
         k8s_service_uid: None,
-        k8s_service_generation: None,
     }
 }
 

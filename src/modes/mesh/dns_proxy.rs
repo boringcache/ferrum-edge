@@ -2661,7 +2661,6 @@ mod tests {
                 .collect(),
             protocol_overrides: HashMap::new(),
             uid: None,
-            generation: None,
         }
     }
 

@@ -96,7 +96,6 @@ fn sticky_upstream(targets: Vec<UpstreamTarget>) -> Upstream {
         created_at: now,
         updated_at: now,
         k8s_service_uid: None,
-        k8s_service_generation: None,
     }
 }
 

@@ -582,7 +582,7 @@ async fn plugin_cache_reload_removes_udp_fault_injection() {
         version: "1".to_string(),
         proxies: vec![Proxy {
             plugins: vec![],
-            ..proxy,
+            ..proxy
         }],
         consumers: vec![],
         plugin_configs: vec![],

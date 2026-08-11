@@ -4,8 +4,9 @@
 //! Inline `backend_pending_limit` tests already exercise concurrent acquire /
 //! drop / zero-count eviction. This module focuses on cross-Service isolation,
 //! endpoint-fan-out non-multiplication, namespace isolation, UID recreate
-//! fencing, and deterministic cap-update semantics that the acceptance
-//! contract requires to be visible outside the production module.
+//! fencing, additive UID+upstream identity, and deterministic cap-update
+//! semantics that the acceptance contract requires to be visible outside the
+//! production module.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -17,17 +18,16 @@ fn scope(
     ns: &str,
     id: &str,
     uid: Option<&str>,
-    generation: Option<i64>,
     subset: Option<&str>,
 ) -> BackendPendingScopeBase {
-    BackendPendingScopeBase::new(ns, id, uid, generation, subset)
+    BackendPendingScopeBase::new(ns, id, uid, subset)
 }
 
 #[test]
 fn independent_services_same_endpoint_and_subset_stay_isolated() {
     let limiter = BackendPendingLimiter::new();
-    let public = scope("shop", "checkout-public", None, None, Some("v1"));
-    let internal = scope("shop", "checkout-internal", None, None, Some("v1"));
+    let public = scope("shop", "checkout-public", None, Some("v1"));
+    let internal = scope("shop", "checkout-internal", None, Some("v1"));
 
     let _a = limiter
         .try_acquire(&public, 8080, Some(1))
@@ -58,8 +58,8 @@ fn independent_services_same_endpoint_and_subset_stay_isolated() {
 #[test]
 fn saturating_high_cap_service_does_not_reject_low_cap_sibling() {
     let limiter = BackendPendingLimiter::new();
-    let low = scope("shop", "a", None, None, Some("v1"));
-    let high = scope("shop", "b", None, None, Some("v1"));
+    let low = scope("shop", "a", None, Some("v1"));
+    let high = scope("shop", "b", None, Some("v1"));
 
     let mut high_guards = Vec::new();
     for _ in 0..5 {
@@ -79,8 +79,8 @@ fn saturating_high_cap_service_does_not_reject_low_cap_sibling() {
 #[test]
 fn namespaces_sharing_endpoint_subset_string_remain_isolated() {
     let limiter = BackendPendingLimiter::new();
-    let a = scope("tenant-a", "reviews", None, None, Some("v1"));
-    let b = scope("tenant-b", "reviews", None, None, Some("v1"));
+    let a = scope("tenant-a", "reviews", None, Some("v1"));
+    let b = scope("tenant-b", "reviews", None, Some("v1"));
     let _ga = limiter
         .try_acquire(&a, 9080, Some(1))
         .expect("a")
@@ -96,7 +96,7 @@ fn namespaces_sharing_endpoint_subset_string_remain_isolated() {
 #[test]
 fn multi_endpoint_selection_shares_one_logical_lane() {
     let limiter = BackendPendingLimiter::new();
-    let svc = scope("default", "reviews", None, None, Some("v1"));
+    let svc = scope("default", "reviews", None, Some("v1"));
     // Endpoint rotation is not part of the key — only scope + policy port.
     let _g = limiter
         .try_acquire(&svc, 9080, Some(1))
@@ -111,7 +111,7 @@ fn multi_endpoint_selection_shares_one_logical_lane() {
 fn intentional_shared_upstream_shares_one_lane_across_proxies() {
     let limiter = BackendPendingLimiter::new();
     // Two proxies intentionally targeting the same upstream/subset/port.
-    let shared = scope("default", "reviews-upstream", None, None, Some("v1"));
+    let shared = scope("default", "reviews-upstream", None, Some("v1"));
     let _from_proxy_a = limiter
         .try_acquire(&shared, 80, Some(1))
         .expect("a")
@@ -122,10 +122,27 @@ fn intentional_shared_upstream_shares_one_lane_across_proxies() {
 }
 
 #[test]
+fn same_upstream_and_uid_shares_lane_across_endpoint_and_config_churn() {
+    let limiter = BackendPendingLimiter::new();
+    let lane = scope("default", "reviews", Some("uid-1"), Some("v1"));
+    let _g = limiter
+        .try_acquire(&lane, 80, Some(1))
+        .expect("first")
+        .expect("guard");
+    // Same upstream + UID across churn retains one counter; host is absent.
+    limiter
+        .try_acquire(&lane, 80, Some(1))
+        .expect_err("endpoint/config churn must retain the same lane");
+    assert!(!lane.prefix().contains("10.0.0.5"));
+    assert!(lane.prefix().contains("id"));
+    assert!(lane.prefix().contains("uid"));
+}
+
+#[test]
 fn k8s_uid_recreate_does_not_inherit_stale_lane() {
     let limiter = BackendPendingLimiter::new();
-    let old = scope("default", "reviews", Some("uid-old"), Some(3), Some("v1"));
-    let new = scope("default", "reviews", Some("uid-new"), Some(1), Some("v1"));
+    let old = scope("default", "reviews", Some("uid-old"), Some("v1"));
+    let new = scope("default", "reviews", Some("uid-new"), Some("v1"));
     let old_guard = limiter
         .try_acquire(&old, 80, Some(1))
         .expect("old")
@@ -140,20 +157,41 @@ fn k8s_uid_recreate_does_not_inherit_stale_lane() {
 }
 
 #[test]
+fn matching_optional_uid_does_not_collapse_distinct_upstreams() {
+    let limiter = BackendPendingLimiter::new();
+    let a = scope("default", "reviews-a", Some("shared-uid"), Some("v1"));
+    let b = scope("default", "reviews-b", Some("shared-uid"), Some("v1"));
+    let _ga = limiter
+        .try_acquire(&a, 80, Some(1))
+        .expect("a")
+        .expect("guard");
+    let _gb = limiter
+        .try_acquire(&b, 80, Some(1))
+        .expect("distinct upstream ids stay isolated even when optional UID matches")
+        .expect("guard");
+    assert_eq!(limiter.current(&a, 80), 1);
+    assert_eq!(limiter.current(&b, 80), 1);
+    assert_ne!(a.prefix(), b.prefix());
+}
+
+#[test]
 fn cap_update_preserves_count_and_releases_exactly_once() {
     let limiter = BackendPendingLimiter::new();
-    let svc = scope("default", "reviews", None, None, None);
+    let svc = scope("default", "reviews", None, None);
     let g1 = limiter
         .try_acquire(&svc, 80, Some(1))
         .expect("cap1")
         .expect("guard");
-    assert_eq!(limiter.observed_cap(&svc, 80), Some(1));
     let g2 = limiter
         .try_acquire(&svc, 80, Some(2))
         .expect("raised cap")
         .expect("guard");
     assert_eq!(limiter.current(&svc, 80), 2);
-    assert_eq!(limiter.observed_cap(&svc, 80), Some(2));
+    let err = limiter
+        .try_acquire(&svc, 80, Some(1))
+        .expect_err("lowered cap rejects against shared count");
+    assert_eq!(err.cap, 1, "rejection reports the requesting epoch's cap");
+    assert_eq!(err.current, 2);
     drop(g1);
     assert_eq!(limiter.current(&svc, 80), 1);
     drop(g2);
@@ -168,7 +206,6 @@ fn concurrent_mixed_scope_churn_evicts_idle_keys() {
             Arc::new(scope(
                 "default",
                 &format!("svc-{i}"),
-                None,
                 None,
                 Some("v1"),
             ))
@@ -204,19 +241,23 @@ fn concurrent_mixed_scope_churn_evicts_idle_keys() {
 }
 
 #[test]
-fn resolve_pending_limit_scopes_interns_upstream_identity_not_host() {
+fn resolve_pending_limit_scopes_interns_upstream_and_optional_uid_not_host() {
     // Mirror GatewayConfig::resolve_pending_limit_scopes identity selection:
-    // K8s UID wins over display name; selected host never enters the key.
+    // stable upstream id is always present; optional UID is additive; host
+    // never enters the key.
     let scope = BackendPendingScopeBase::new(
         "default",
         "reviews",
         Some("uid-reviews"),
-        Some(7),
         Some("v1"),
     );
     assert!(
+        scope.prefix().contains("id"),
+        "stable upstream id must always participate in the interned identity"
+    );
+    assert!(
         scope.prefix().contains("uid"),
-        "K8s Service UID must participate in the interned identity"
+        "K8s Service UID must participate alongside the upstream id"
     );
     assert!(
         !scope.prefix().contains("10.0.0.5"),
@@ -225,7 +266,6 @@ fn resolve_pending_limit_scopes_interns_upstream_identity_not_host() {
     let host_keyed_collision = BackendPendingScopeBase::new(
         "default",
         "10.0.0.5",
-        None,
         None,
         Some("v1"),
     );

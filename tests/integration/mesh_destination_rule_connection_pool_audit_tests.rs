@@ -610,9 +610,9 @@ fn subset_http1_pending_admission_lanes_do_not_leak() {
     use ferrum_edge::backend_pending_limit::{BackendPendingLimiter, BackendPendingScopeBase};
 
     let limiter = BackendPendingLimiter::new();
-    let stable = BackendPendingScopeBase::new("default", "reviews", None, None, Some("stable"));
-    let canary = BackendPendingScopeBase::new("default", "reviews", None, None, Some("canary"));
-    let unmatched = BackendPendingScopeBase::new("default", "reviews", None, None, None);
+    let stable = BackendPendingScopeBase::new("default", "reviews", None, Some("stable"));
+    let canary = BackendPendingScopeBase::new("default", "reviews", None, Some("canary"));
+    let unmatched = BackendPendingScopeBase::new("default", "reviews", None, None);
 
     let stable_guard = limiter
         .try_acquire(&stable, 8080, Some(1))
@@ -649,7 +649,6 @@ async fn subset_http1_pending_guard_releases_on_cancellation() {
     let scope = Arc::new(BackendPendingScopeBase::new(
         "default",
         "reviews",
-        None,
         None,
         Some("stable"),
     ));

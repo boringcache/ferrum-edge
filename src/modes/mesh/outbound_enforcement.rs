@@ -328,7 +328,6 @@ mod tests {
             workloads: Vec::new(),
             protocol_overrides: HashMap::new(),
             uid: None,
-            generation: None,
         }
     }
 

@@ -133,7 +133,6 @@ fn make_upstream(id: &str) -> Upstream {
         created_at: Utc::now(),
         updated_at: Utc::now(),
         k8s_service_uid: None,
-        k8s_service_generation: None,
     }
 }
 
@@ -3704,7 +3703,6 @@ fn retry_proxy_allows_mesh_service_discovery_when_selected_policy_port_caps_retr
             protocol_overrides: HashMap::new(),
             cluster_ips: Vec::new(),
             uid: None,
-            generation: None,
         }],
         ..MeshConfig::default()
     }));
@@ -4831,7 +4829,6 @@ fn mesh_block_for_uniqueness(
                 workloads: Vec::new(),
                 protocol_overrides: std::collections::HashMap::new(),
                 uid: None,
-                generation: None,
             })
             .collect(),
         ..MeshConfig::default()

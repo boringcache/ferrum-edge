@@ -226,7 +226,7 @@ need them, or because they are blocked upstream / architecturally:
   (`http1MaxPendingRequests` IS enforced through Ferrum's documented honest
   reinterpretation — a 503-on-overflow concurrent in-flight-request gate on the
   HTTP/1.1 dispatch path, keyed by logical destination
-  `(namespace, upstream/Service identity including K8s UID/generation when
+  `(namespace, stable upstream/service id, optional K8s Service UID when
   stamped, policy port, selected subset)` rather than selected endpoint host;
   see the DR table in `docs/mesh.md` and issue #3778.)
 - **DR `subsets[].trafficPolicy.portLevelSettings`** — detected and listed in

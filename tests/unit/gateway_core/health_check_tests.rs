@@ -918,7 +918,6 @@ fn make_upstream_with_active_probe(
         created_at: Utc::now(),
         updated_at: Utc::now(),
         k8s_service_uid: None,
-        k8s_service_generation: None,
     }
 }
 
@@ -1451,7 +1450,6 @@ fn make_upstream_passive_only(
         created_at: Utc::now(),
         updated_at: Utc::now(),
         k8s_service_uid: None,
-        k8s_service_generation: None,
     }
 }
 

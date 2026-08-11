@@ -71,7 +71,6 @@ fn mesh_config_round_trips_through_serde() {
                 workloads: vec![WorkloadRef { spiffe_id: id }],
                 protocol_overrides: HashMap::new(),
                 uid: None,
-                generation: None,
             }],
             ..Default::default()
         })),

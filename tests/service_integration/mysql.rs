@@ -165,7 +165,6 @@ fn make_namespace_upstream(namespace: &str, id: &str) -> Upstream {
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
         k8s_service_uid: None,
-        k8s_service_generation: None,
     }
 }
 

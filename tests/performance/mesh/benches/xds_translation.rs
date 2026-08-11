@@ -58,7 +58,6 @@ fn build_slice(n_workloads: usize) -> MeshSlice {
             workloads: vec![WorkloadRef { spiffe_id }],
             protocol_overrides: HashMap::new(),
             uid: None,
-            generation: None,
         });
     }
 

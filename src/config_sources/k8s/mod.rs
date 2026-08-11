@@ -3782,7 +3782,6 @@ pub(crate) fn upstream_for_route_with_session(
         created_at: now,
         updated_at: now,
         k8s_service_uid: None,
-        k8s_service_generation: None,
     };
     if let Some(session) = session {
         apply_session_persistence_to_upstream(&mut upstream, session);

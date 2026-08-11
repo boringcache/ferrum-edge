@@ -105,7 +105,6 @@ fn mesh_with_service(name: &str) -> Box<MeshConfig> {
             workloads: Vec::new(),
             protocol_overrides: HashMap::new(),
             uid: None,
-            generation: None,
         }],
         ..Default::default()
     })

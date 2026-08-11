@@ -104,7 +104,6 @@ fn make_upstream(id: &str, targets: Vec<UpstreamTarget>, updated_at: DateTime<Ut
         created_at: updated_at,
         updated_at,
         k8s_service_uid: None,
-        k8s_service_generation: None,
     }
 }
 

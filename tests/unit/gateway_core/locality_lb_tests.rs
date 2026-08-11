@@ -83,7 +83,6 @@ fn make_upstream(
         created_at: now,
         updated_at: now,
         k8s_service_uid: None,
-        k8s_service_generation: None,
     }
 }
 
@@ -95,7 +94,6 @@ fn upstream(source_locality: &str, targets: Vec<UpstreamTarget>) -> Upstream {
         targets,
     ),
     k8s_service_uid: None,
-    k8s_service_generation: None,
 }
 
 fn config(upstream: Upstream) -> GatewayConfig {

@@ -2365,7 +2365,6 @@ mod tests {
             workloads,
             protocol_overrides: HashMap::new(),
             uid: None,
-            generation: None,
         }
     }
 
@@ -2803,7 +2802,6 @@ mod tests {
                 workloads: Vec::new(),
                 protocol_overrides: std::collections::HashMap::new(),
                 uid: None,
-                generation: None,
             },
         );
 

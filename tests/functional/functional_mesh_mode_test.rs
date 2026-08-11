@@ -368,7 +368,6 @@ fn east_west_service_slice(node_id: &str) -> MeshSlice {
             workloads: vec![WorkloadRef { spiffe_id }],
             protocol_overrides: HashMap::new(),
             uid: None,
-            generation: None,
         }],
         ..MeshSlice::default()
     }
@@ -3311,7 +3310,6 @@ fn inbound_authz_slice(
         }],
         protocol_overrides: HashMap::new(),
         uid: None,
-        generation: None,
     };
     let policy = MeshPolicy {
         name: if allow { "allow-client" } else { "deny-client" }.to_string(),
@@ -3563,7 +3561,6 @@ fn cross_namespace_workload_entry_inbound_slice(
         }],
         protocol_overrides: HashMap::new(),
         uid: None,
-        generation: None,
     };
     // Decoy: same service name in the WorkloadEntry identity namespace. Membership
     // includes the workload SPIFFE so a wrong-namespace host match would be a
@@ -3583,7 +3580,6 @@ fn cross_namespace_workload_entry_inbound_slice(
         }],
         protocol_overrides: HashMap::new(),
         uid: None,
-        generation: None,
     };
     let policy = MeshPolicy {
         name: "allow-client".to_string(),
@@ -4070,7 +4066,6 @@ fn egress_service_slice(node_id: &str, b_spiffe: &str, backend_port: u16) -> Mes
             workloads: vec![WorkloadRef { spiffe_id: b_id }],
             protocol_overrides: HashMap::new(),
             uid: None,
-            generation: None,
         }],
         peer_authentications: vec![PeerAuthentication {
             name: "mesh-strict".to_string(),
@@ -6090,7 +6085,6 @@ fn cross_cluster_dest_slice(
             workloads: vec![WorkloadRef { spiffe_id: c_id }],
             protocol_overrides: HashMap::new(),
             uid: None,
-            generation: None,
         }],
         peer_authentications: vec![PeerAuthentication {
             name: "mesh-strict".to_string(),
@@ -6173,7 +6167,6 @@ fn cross_cluster_east_west_slice(node_id: &str, c_spiffe: &str, c_inbound_port: 
             workloads: vec![WorkloadRef { spiffe_id: c_id }],
             protocol_overrides: HashMap::new(),
             uid: None,
-            generation: None,
         }],
         ..MeshSlice::default()
     }
@@ -6238,7 +6231,6 @@ fn cross_cluster_client_slice(
             workloads: vec![WorkloadRef { spiffe_id: c_id }],
             protocol_overrides: HashMap::new(),
             uid: None,
-            generation: None,
         }],
         multi_cluster: Some(MultiClusterConfig {
             local_cluster: Some("cluster-a".to_string()),
@@ -7241,7 +7233,6 @@ fn cross_cluster_ambient_dest_slice(
             workloads: vec![WorkloadRef { spiffe_id: c_id }],
             protocol_overrides: HashMap::new(),
             uid: None,
-            generation: None,
         }],
         // STRICT inbound: the HBONE listener requires + verifies the peer SVID.
         peer_authentications: vec![PeerAuthentication {
@@ -7320,7 +7311,6 @@ fn cross_cluster_ambient_east_west_slice(
             workloads: vec![WorkloadRef { spiffe_id: c_id }],
             protocol_overrides: HashMap::new(),
             uid: None,
-            generation: None,
         }],
         ..MeshSlice::default()
     }
@@ -7390,7 +7380,6 @@ fn cross_cluster_ambient_client_slice(
             workloads: vec![WorkloadRef { spiffe_id: c_id }],
             protocol_overrides: HashMap::new(),
             uid: None,
-            generation: None,
         }],
         multi_cluster: Some(MultiClusterConfig {
             local_cluster: Some("cluster-a".to_string()),
@@ -9355,7 +9344,6 @@ fn udp_dest_slice(node_id: &str, b_spiffe: &str, udp_port: u16) -> MeshSlice {
             workloads: vec![WorkloadRef { spiffe_id: b_id }],
             protocol_overrides: HashMap::new(),
             uid: None,
-            generation: None,
         }],
         peer_authentications: vec![PeerAuthentication {
             name: "mesh-strict".to_string(),
@@ -9985,7 +9973,6 @@ fn sidecar_ingress_local_workload(
         }],
         protocol_overrides: HashMap::new(),
         uid: None,
-        generation: None,
     };
     (workload, service)
 }
@@ -10731,7 +10718,6 @@ fn waypoint_destination_service(service: &str, port: u16) -> MeshService {
         }],
         protocol_overrides: HashMap::new(),
         uid: None,
-        generation: None,
     }
 }
 
@@ -11652,7 +11638,6 @@ fn live_source_capture_slice(
             workloads: vec![WorkloadRef { spiffe_id: b_id }],
             protocol_overrides: HashMap::new(),
             uid: None,
-            generation: None,
         }],
         peer_authentications: vec![PeerAuthentication {
             name: "mesh-strict".to_string(),
@@ -12650,7 +12635,6 @@ fn live_xc_service(
         }],
         protocol_overrides: HashMap::new(),
         uid: None,
-        generation: None,
     }
 }
 
@@ -14757,7 +14741,6 @@ fn unix_ingress_mesh_document(server_spiffe: &str, entries: &[UnixIngressEntry])
         }],
         protocol_overrides: HashMap::new(),
         uid: None,
-        generation: None,
     };
     let sidecar = MeshSidecar {
         name: "echo-ingress".to_string(),

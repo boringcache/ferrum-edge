@@ -70,7 +70,6 @@ fn service(name: &str) -> MeshService {
         }],
         protocol_overrides: HashMap::new(),
         uid: None,
-        generation: None,
     }
 }
 

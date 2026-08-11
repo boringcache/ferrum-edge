@@ -112,7 +112,6 @@ fn upstream_with_overrides(
         created_at: now,
         updated_at: now,
         k8s_service_uid: None,
-        k8s_service_generation: None,
     }
 }
 

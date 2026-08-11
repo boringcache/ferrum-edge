@@ -189,7 +189,6 @@ fn test_upstream(id: &str, host: &str, port: u16) -> Upstream {
         created_at: Utc::now(),
         updated_at: Utc::now(),
         k8s_service_uid: None,
-        k8s_service_generation: None,
     }
 }
 

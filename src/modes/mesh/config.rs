@@ -245,16 +245,17 @@ pub struct MeshService {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cluster_ips: Vec<String>,
     /// Kubernetes Service `metadata.uid` when translated from a cluster
-    /// object. Isolates H1 pending-admission lanes across delete/recreate of
-    /// the same `(namespace, name)` (issue #3778). Absent for native/file
-    /// sources and for payloads that omit the field.
+    /// object. Carried on the MeshSlice CP↔DP / native mesh wire so the data
+    /// plane can stamp `Upstream.k8s_service_uid` and isolate H1 pending-
+    /// admission lanes across delete/recreate of the same `(namespace, name)`
+    /// (issue #3778). Absent for native/file sources that omit the field.
+    ///
+    /// Not an admin OpenAPI Upstream field — MeshService is mesh/slice
+    /// transport, not the public Upstream config schema. Optional on native
+    /// MeshSlice JSON so operators/tests can supply a carrier when needed;
+    /// Kubernetes translation stamps it from `metadata.uid`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uid: Option<String>,
-    /// Kubernetes Service `metadata.generation` when available. A generation
-    /// bump opens a fresh admission lane while old guards drain the prior
-    /// counter; absent when the translator/source did not stamp one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub generation: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -3102,7 +3103,8 @@ pub struct MeshConnectionPoolHttp {
     /// maximum concurrent in-flight requests for a logical backend destination
     /// on the HTTP/1.1 dispatch path. Projects onto the inherited/per-port
     /// dispatch policy and is enforced per
-    /// `(namespace, upstream/Service identity, policy port, selected subset)`
+    /// `(namespace, stable upstream/service id, optional K8s Service UID,
+    /// policy port, selected subset)`
     /// (issue #3778): when full a new H1 request is shed with a 503 ("upstream
     /// overflow" in Envoy terms). The selected endpoint host is not part of
     /// the key.

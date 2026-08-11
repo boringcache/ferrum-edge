@@ -34813,7 +34813,6 @@ pub(crate) fn pending_limit_scope_for_proxy(
             proxy.namespace.as_str(),
             logical_id,
             None,
-            None,
             proxy.upstream_subset.as_deref(),
         ),
     )
@@ -35369,6 +35368,7 @@ pub(crate) async fn proxy_to_backend_retry(
                 proxy_id = %proxy.id,
                 backend_host = %effective_host,
                 backend_port = retry_dial_port,
+                pending_policy_port = retry_policy_port,
                 pending_scope_digest = retry_pending_scope.digest(),
                 in_flight_requests = limit.current,
                 max_in_flight_requests = limit.cap,
@@ -38112,6 +38112,7 @@ async fn proxy_to_backend(
                 proxy_id = %proxy.id,
                 backend_host = %effective_host,
                 backend_port = pending_dial_port,
+                pending_policy_port = pending_policy_port,
                 pending_scope_digest = pending_scope.digest(),
                 in_flight_requests = limit.current,
                 max_in_flight_requests = limit.cap,
@@ -45943,7 +45944,6 @@ mod tests {
             protocol_overrides: HashMap::new(),
             cluster_ips: Vec::new(),
             uid: None,
-            generation: None,
         };
         let wl = Workload {
             spiffe_id: SpiffeId::new(spiffe).unwrap(),
@@ -46085,7 +46085,6 @@ mod tests {
             protocol_overrides: HashMap::new(),
             cluster_ips: vec!["10.96.0.10".to_string()],
             uid: None,
-            generation: None,
         };
         let udp_id = crate::modes::mesh::mesh_outbound_udp_upstream_id("default", "dns", 53);
         // Same-namespace as the owning Service; see the TCP by-workload case.
@@ -50255,7 +50254,6 @@ mod tests {
                 protocol_overrides: HashMap::new(),
                 cluster_ips: vec!["10.96.0.10".to_string()],
                 uid: None,
-                generation: None,
             }],
             ..MeshConfig::default()
         };
@@ -50327,7 +50325,6 @@ mod tests {
                 protocol_overrides: HashMap::new(),
                 cluster_ips: vec!["10.96.0.20".to_string()],
                 uid: None,
-                generation: None,
             }],
             ..MeshConfig::default()
         };
@@ -50411,7 +50408,6 @@ mod tests {
             protocol_overrides: HashMap::new(),
             cluster_ips: Vec::new(),
             uid: None,
-            generation: None,
         };
         let workload = Workload {
             spiffe_id: SpiffeId::new(spiffe).unwrap(),
@@ -50939,7 +50935,6 @@ mod tests {
             protocol_overrides: HashMap::new(),
             cluster_ips: vec![cluster_ip.to_string()],
             uid: None,
-            generation: None,
         };
         let mesh = MeshConfig {
             services: vec![
@@ -56774,7 +56769,6 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             k8s_service_uid: None,
-            k8s_service_generation: None,
         };
         upstream.port_overrides.insert(
             8080,
@@ -56834,7 +56828,6 @@ mod tests {
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
                 k8s_service_uid: None,
-                k8s_service_generation: None,
             }],
             ..GatewayConfig::default()
         };
@@ -57454,7 +57447,6 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             k8s_service_uid: None,
-            k8s_service_generation: None,
         };
         // The fallback projects even when the per-port map is empty (the SD case).
         assert!(upstream.port_overrides.is_empty());
@@ -57533,7 +57525,6 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             k8s_service_uid: None,
-            k8s_service_generation: None,
         };
         upstream.normalize_fields();
 

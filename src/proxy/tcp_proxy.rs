@@ -2758,8 +2758,7 @@ async fn handle_tcp_connection_inner(
     // Look up the proxy config and extract only the fields we need.
     let proxy = epoch
         .proxy_by_namespaced_id(proxy_namespace, proxy_id)
-        .ok_or_else(|| anyhow::anyhow!("Proxy {proxy_namespace
-}/{proxy_id} not found in config"))?;
+        .ok_or_else(|| anyhow::anyhow!("Proxy {proxy_namespace}/{proxy_id} not found in config"))?;
 
     // Single-listener proxies still enforce stream_match before dialing.
     // A configured but uncompiled matcher fails closed (never match by

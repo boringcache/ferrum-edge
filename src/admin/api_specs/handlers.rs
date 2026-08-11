@@ -1742,7 +1742,8 @@ async fn validate_bundle(
                 id: proxy.id.clone(),
                 errors: proxy_errors,
             });
-        },
+        }
+    }
 
     // Plugins
     let known_plugins = crate::plugins::available_plugins();

@@ -1423,13 +1423,14 @@ where
     // Cap lookup AND lane key use the DR policy port (`dispatch_policy_port`),
     // never the dial port — same identity `proxy_to_backend` /
     // `proxy_to_backend_retry` derive via `dispatch_policy_port_for_target`. A
-    // `targetPort`-remapped Service (80 → 8080) otherwise gives the H3 bridge
-    // its own policy-port-keyed lane while H1/H2 counts on a different port,
-    // so a cap of N admits 2N combined, and an explicit
+    // `targetPort`-remapped Service (80 → 8080) otherwise gives the H3→plain
+    // bridge its own dial-port-keyed lane while the H1/reqwest path counts on
+    // the policy port, so a cap of N admits 2N combined, and an explicit
     // `portLevelSettings[{port: 80}]` cap would be invisible here.
     //
     // The lane itself is the precomputed logical destination scope (issue
-    // #3778), not the selected endpoint host — matching the H1/H2 path.
+    // #3778), not the selected endpoint host — matching the H1/reqwest
+    // `http1MaxPendingRequests` gate. Direct H2 does not consume this gate.
     let pending_cap = crate::proxy::resolve_backend_http1_max_pending_requests(
         dispatch_proxy,
         dispatch_policy_port,
@@ -1452,6 +1453,7 @@ where
                 proxy_id = %dispatch_proxy.id,
                 backend_host = %effective_host,
                 backend_port = dispatch_dial_port,
+                pending_policy_port = dispatch_policy_port,
                 pending_scope_digest = pending_scope.digest(),
                 in_flight_requests = limit.current,
                 max_in_flight_requests = limit.cap,
@@ -2337,9 +2339,10 @@ where
                     .as_deref()
                     .map(|t| t.port)
                     .unwrap_or(dispatch_proxy.backend_port);
-                // Same DR policy-port identity the H1/H2 path uses, so the
-                // streaming bridge shares one H1 admission lane per destination
-                // instead of opening a dial-port-keyed second one.
+                // Same DR policy-port identity the H1/reqwest path uses, so the
+                // streaming H3→plain bridge shares one H1 admission lane per
+                // destination instead of opening a dial-port-keyed second one.
+                // Direct H2 does not consume this gate.
                 let dispatch_policy_port = crate::proxy::dispatch_policy_port_for_target(
                     dispatch_proxy,
                     current_target.as_deref(),

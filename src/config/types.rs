@@ -1770,15 +1770,18 @@ pub struct Upstream {
     pub api_spec_id: Option<String>,
     /// Kubernetes Service `metadata.uid` stamped from the owning
     /// [`crate::modes::mesh::config::MeshService`] when materializing mesh
-    /// egress upstreams. Participates in the H1 pending-admission scope so a
-    /// delete/recreate of the same Service name cannot inherit a stale lane
-    /// (issue #3778). Absent for non-mesh / native upstreams.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// egress upstreams. Participates in the H1 pending-admission scope
+    /// **alongside** the stable upstream id so a delete/recreate of the same
+    /// Service name cannot inherit a stale lane, while a reused UID cannot
+    /// collapse distinct upstreams (issue #3778). Absent for non-mesh /
+    /// native upstreams.
+    ///
+    /// Runtime-only carrier: `#[serde(skip)]` so the file/admin/API/
+    /// OpenAPI config surface neither accepts nor emits it (no schema
+    /// migration). Stamped in-process during mesh materialization / slice
+    /// apply; never an operator input field.
+    #[serde(skip)]
     pub k8s_service_uid: Option<String>,
-    /// Kubernetes Service `metadata.generation` when available. A generation
-    /// bump opens a fresh pending-admission lane while old guards drain.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub k8s_service_generation: Option<i64>,
     #[serde(default = "Utc::now")]
     pub created_at: DateTime<Utc>,
     #[serde(default = "Utc::now")]
@@ -3976,12 +3979,12 @@ impl GatewayConfig {
 
     /// Intern each proxy's logical H1 pending-admission scope (issue #3778).
     ///
-    /// Built from `(namespace, upstream/Service identity including K8s UID /
-    /// generation when stamped, selected subset)`. The DestinationRule policy
-    /// port is appended at acquire time. Must run after upstreams/proxies are
-    /// settled (including mesh materialization that stamps
-    /// `Upstream.k8s_service_uid`). Invoked from `normalize_fields` beside
-    /// `resolve_dispatch_port_overrides`.
+    /// Built from `(namespace, stable upstream/service id, optional K8s
+    /// Service UID when stamped, selected subset)`. The DestinationRule
+    /// policy port is appended at acquire time. Must run after
+    /// upstreams/proxies are settled (including mesh materialization that
+    /// stamps `Upstream.k8s_service_uid`). Invoked from `normalize_fields`
+    /// beside `resolve_dispatch_port_overrides`.
     pub fn resolve_pending_limit_scopes(&mut self) {
         let upstream_by_key: HashMap<(&str, &str), &Upstream> = self
             .upstreams
@@ -3990,27 +3993,25 @@ impl GatewayConfig {
             .collect();
 
         for proxy in &mut self.proxies {
-            let (logical_id, uid, generation) = if let Some(ref upstream_id) = proxy.upstream_id {
+            let (logical_id, uid) = if let Some(ref upstream_id) = proxy.upstream_id {
                 match upstream_by_key.get(&(proxy.namespace.as_str(), upstream_id.as_str())) {
                     Some(upstream) => (
                         upstream.id.as_str(),
                         upstream.k8s_service_uid.as_deref(),
-                        upstream.k8s_service_generation,
                     ),
-                    None => (upstream_id.as_str(), None, None),
+                    None => (upstream_id.as_str(), None),
                 }
             } else {
                 // Direct-backend proxy: the proxy itself is the logical
                 // destination. Distinct proxies do not share a lane unless
                 // they intentionally share an upstream_id.
-                (proxy.id.as_str(), None, None)
+                (proxy.id.as_str(), None)
             };
             proxy.pending_limit_scope = Some(std::sync::Arc::new(
                 crate::backend_pending_limit::BackendPendingScopeBase::new(
                     proxy.namespace.as_str(),
                     logical_id,
                     uid,
-                    generation,
                     proxy.upstream_subset.as_deref(),
                 ),
             ));

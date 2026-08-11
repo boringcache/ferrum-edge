@@ -30,8 +30,7 @@ fn make_ctx(proxy_id: &str, ip: &str, consumer: Option<&str>) -> StreamConnectio
         ip.to_string(),
         ip.to_string(),
         proxy_id.to_string(),
-        Some(format!("TCP Proxy {proxy_id
-}")),
+        Some(format!("TCP Proxy {proxy_id}")),
         5432,
         BackendScheme::Tcp,
         Arc::new(ferrum_edge::ConsumerIndex::new(&[])),

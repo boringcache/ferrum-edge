@@ -5067,7 +5067,6 @@ mod tests {
                     workloads: Vec::new(),
                     protocol_overrides: std::collections::HashMap::new(),
                     uid: None,
-                    generation: None,
                 })
                 .collect(),
             ..MeshConfig::default()
@@ -6163,7 +6162,6 @@ mod tests {
             protocol_overrides: std::collections::HashMap::new(),
             cluster_ips: vec!["10.96.0.1".to_string()],
             uid: None,
-            generation: None,
         };
         let upstream: crate::config::types::Upstream = serde_json::from_value(serde_json::json!({
             "id": "__mesh-out-tcp-upstream-default-redis-6379",
@@ -6390,7 +6388,6 @@ mod tests {
             protocol_overrides: std::collections::HashMap::new(),
             cluster_ips: vec!["10.96.0.10".to_string()],
             uid: None,
-            generation: None,
         };
         let upstream: crate::config::types::Upstream = serde_json::from_value(serde_json::json!({
             "id": "__mesh-out-udp-upstream-default-dns-53",
@@ -6547,7 +6544,6 @@ mod tests {
             // Headless: no VIP at all — the whole point of the by-workload path.
             cluster_ips: Vec::new(),
             uid: None,
-            generation: None,
         };
         let workload = Workload {
             spiffe_id: SpiffeId::new(spiffe).unwrap(),
@@ -6675,7 +6671,6 @@ mod tests {
             protocol_overrides: std::collections::HashMap::new(),
             cluster_ips: Vec::new(),
             uid: None,
-            generation: None,
         };
         let workload = Workload {
             spiffe_id: SpiffeId::new(spiffe).unwrap(),
@@ -6813,7 +6808,6 @@ mod tests {
             protocol_overrides: std::collections::HashMap::new(),
             cluster_ips: Vec::new(),
             uid: None,
-            generation: None,
         };
 
         let canonical_ip = "10.0.0.7".parse().unwrap();
