@@ -19,6 +19,19 @@ use ferrum_edge::service_discovery::{
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::unit::env_lock::EnvGuard;
+
+/// Checked-in one-line nonsecret SA token for mock Kubernetes `discover()` tests.
+/// Keeps those tests off the host/in-cluster default path and out of `KUBE_TOKEN`.
+const K8S_MOCK_DISCOVERY_SA_TOKEN_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/k8s_discovery_sa_token.txt"
+);
+
+fn with_mock_sa_token(discoverer: KubernetesDiscoverer) -> KubernetesDiscoverer {
+    discoverer.with_sa_token_path(K8S_MOCK_DISCOVERY_SA_TOKEN_PATH.to_string())
+}
+
 // ── Helper: build a minimal GatewayConfig with upstreams ──────────────
 
 fn make_config_with_upstreams(upstreams: Vec<Upstream>) -> GatewayConfig {
@@ -779,15 +792,17 @@ async fn test_kubernetes_discover_parses_endpointslice() {
         .mount(&mock_server)
         .await;
 
-    let discoverer = KubernetesDiscoverer::new(
-        reqwest::Client::new(),
-        "default".to_string(),
-        "my-service".to_string(),
-        Some("http".to_string()), // select by port name
-        None,
-        1,
-    )
-    .with_api_url(mock_server.uri());
+    let discoverer = with_mock_sa_token(
+        KubernetesDiscoverer::new(
+            reqwest::Client::new(),
+            "default".to_string(),
+            "my-service".to_string(),
+            Some("http".to_string()), // select by port name
+            None,
+            1,
+        )
+        .with_api_url(mock_server.uri()),
+    );
 
     let targets = discoverer.discover().await.unwrap();
 
@@ -1334,15 +1349,17 @@ async fn test_kubernetes_discover_no_port_name_uses_first_port() {
         .mount(&mock_server)
         .await;
 
-    let discoverer = KubernetesDiscoverer::new(
-        reqwest::Client::new(),
-        "default".to_string(),
-        "my-service".to_string(),
-        None, // no port_name → first port
-        None,
-        1,
-    )
-    .with_api_url(mock_server.uri());
+    let discoverer = with_mock_sa_token(
+        KubernetesDiscoverer::new(
+            reqwest::Client::new(),
+            "default".to_string(),
+            "my-service".to_string(),
+            None, // no port_name → first port
+            None,
+            1,
+        )
+        .with_api_url(mock_server.uri()),
+    );
 
     let targets = discoverer.discover().await.unwrap();
     assert_eq!(targets.len(), 1);
@@ -1373,15 +1390,17 @@ async fn test_kubernetes_discover_port_name_not_found() {
         .mount(&mock_server)
         .await;
 
-    let discoverer = KubernetesDiscoverer::new(
-        reqwest::Client::new(),
-        "default".to_string(),
-        "my-service".to_string(),
-        Some("http".to_string()), // not in the ports list
-        None,
-        1,
-    )
-    .with_api_url(mock_server.uri());
+    let discoverer = with_mock_sa_token(
+        KubernetesDiscoverer::new(
+            reqwest::Client::new(),
+            "default".to_string(),
+            "my-service".to_string(),
+            Some("http".to_string()), // not in the ports list
+            None,
+            1,
+        )
+        .with_api_url(mock_server.uri()),
+    );
 
     let targets = discoverer.discover().await.unwrap();
     // Port name "http" not found, so no targets should be returned
@@ -1400,15 +1419,17 @@ async fn test_kubernetes_discover_empty_items() {
         .mount(&mock_server)
         .await;
 
-    let discoverer = KubernetesDiscoverer::new(
-        reqwest::Client::new(),
-        "default".to_string(),
-        "my-service".to_string(),
-        None,
-        None,
-        1,
-    )
-    .with_api_url(mock_server.uri());
+    let discoverer = with_mock_sa_token(
+        KubernetesDiscoverer::new(
+            reqwest::Client::new(),
+            "default".to_string(),
+            "my-service".to_string(),
+            None,
+            None,
+            1,
+        )
+        .with_api_url(mock_server.uri()),
+    );
 
     let targets = discoverer.discover().await.unwrap();
     assert!(targets.is_empty());
@@ -1436,15 +1457,17 @@ async fn test_kubernetes_discover_missing_conditions_defaults_ready() {
         .mount(&mock_server)
         .await;
 
-    let discoverer = KubernetesDiscoverer::new(
-        reqwest::Client::new(),
-        "default".to_string(),
-        "my-service".to_string(),
-        None,
-        None,
-        1,
-    )
-    .with_api_url(mock_server.uri());
+    let discoverer = with_mock_sa_token(
+        KubernetesDiscoverer::new(
+            reqwest::Client::new(),
+            "default".to_string(),
+            "my-service".to_string(),
+            None,
+            None,
+            1,
+        )
+        .with_api_url(mock_server.uri()),
+    );
 
     let targets = discoverer.discover().await.unwrap();
     // Missing conditions defaults to ready=true
@@ -1499,15 +1522,17 @@ async fn test_kubernetes_discover_rejects_terminating_and_non_serving_endpoints(
         .mount(&mock_server)
         .await;
 
-    let discoverer = KubernetesDiscoverer::new(
-        reqwest::Client::new(),
-        "default".to_string(),
-        "my-service".to_string(),
-        None,
-        None,
-        1,
-    )
-    .with_api_url(mock_server.uri());
+    let discoverer = with_mock_sa_token(
+        KubernetesDiscoverer::new(
+            reqwest::Client::new(),
+            "default".to_string(),
+            "my-service".to_string(),
+            None,
+            None,
+            1,
+        )
+        .with_api_url(mock_server.uri()),
+    );
 
     let targets = discoverer.discover().await.unwrap();
     let hosts: Vec<&str> = targets.iter().map(|t| t.host.as_str()).collect();
@@ -1549,15 +1574,17 @@ async fn test_kubernetes_discover_multiple_endpointslice_items() {
         .mount(&mock_server)
         .await;
 
-    let discoverer = KubernetesDiscoverer::new(
-        reqwest::Client::new(),
-        "default".to_string(),
-        "my-service".to_string(),
-        None, // first port from each item
-        None,
-        1,
-    )
-    .with_api_url(mock_server.uri());
+    let discoverer = with_mock_sa_token(
+        KubernetesDiscoverer::new(
+            reqwest::Client::new(),
+            "default".to_string(),
+            "my-service".to_string(),
+            None, // first port from each item
+            None,
+            1,
+        )
+        .with_api_url(mock_server.uri()),
+    );
 
     let targets = discoverer.discover().await.unwrap();
     assert_eq!(targets.len(), 3);
@@ -1578,15 +1605,17 @@ async fn test_kubernetes_discover_error_response() {
         .mount(&mock_server)
         .await;
 
-    let discoverer = KubernetesDiscoverer::new(
-        reqwest::Client::new(),
-        "default".to_string(),
-        "my-service".to_string(),
-        None,
-        None,
-        1,
-    )
-    .with_api_url(mock_server.uri());
+    let discoverer = with_mock_sa_token(
+        KubernetesDiscoverer::new(
+            reqwest::Client::new(),
+            "default".to_string(),
+            "my-service".to_string(),
+            None,
+            None,
+            1,
+        )
+        .with_api_url(mock_server.uri()),
+    );
 
     let result = discoverer.discover().await;
     assert!(result.is_err());
@@ -1615,15 +1644,17 @@ async fn test_kubernetes_discover_uses_default_weight() {
         .mount(&mock_server)
         .await;
 
-    let discoverer = KubernetesDiscoverer::new(
-        reqwest::Client::new(),
-        "default".to_string(),
-        "my-service".to_string(),
-        None,
-        None,
-        15, // custom default weight
-    )
-    .with_api_url(mock_server.uri());
+    let discoverer = with_mock_sa_token(
+        KubernetesDiscoverer::new(
+            reqwest::Client::new(),
+            "default".to_string(),
+            "my-service".to_string(),
+            None,
+            None,
+            15, // custom default weight
+        )
+        .with_api_url(mock_server.uri()),
+    );
 
     let targets = discoverer.discover().await.unwrap();
     assert_eq!(targets.len(), 1);
@@ -1660,8 +1691,8 @@ fn k8s_discoverer_for_token_path(
     .with_sa_token_path(token_path.to_string())
 }
 
-#[tokio::test]
-#[serial_test::serial(k8s_sa_token_file_read_limit, kube_token_env)]
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(k8s_sa_token_file_read_limit)]
 async fn kubernetes_missing_sa_token_falls_back_to_kube_token() {
     use wiremock::matchers::{header, method};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1677,25 +1708,20 @@ async fn kubernetes_missing_sa_token_falls_back_to_kube_token() {
         .mount(&mock_server)
         .await;
 
-    // SAFETY: serialized on kube_token_env; restored before leaving the test.
-    let previous = std::env::var("KUBE_TOKEN").ok();
-    unsafe { std::env::set_var("KUBE_TOKEN", "env-kube-token-value") };
+    let env = EnvGuard::new(&["KUBE_TOKEN"]);
+    env.set("KUBE_TOKEN", "env-kube-token-value");
 
     let discoverer = k8s_discoverer_for_token_path(mock_server.uri(), missing.to_str().unwrap());
-    let result = discoverer.discover().await;
-
-    match previous {
-        Some(value) => unsafe { std::env::set_var("KUBE_TOKEN", value) },
-        None => unsafe { std::env::remove_var("KUBE_TOKEN") },
-    }
-
-    let targets = result.expect("missing SA file may fall back to KUBE_TOKEN");
+    let targets = discoverer
+        .discover()
+        .await
+        .expect("missing SA file may fall back to KUBE_TOKEN");
     assert_eq!(targets.len(), 1);
     assert_eq!(targets[0].host, "10.244.0.5");
 }
 
-#[tokio::test]
-#[serial_test::serial(k8s_sa_token_file_read_limit, kube_token_env)]
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(k8s_sa_token_file_read_limit)]
 async fn kubernetes_invalid_sa_token_fails_closed_before_api_request() {
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1715,8 +1741,8 @@ async fn kubernetes_invalid_sa_token_fails_closed_before_api_request() {
         .mount(&mock_server)
         .await;
 
-    let previous = std::env::var("KUBE_TOKEN").ok();
-    unsafe { std::env::set_var("KUBE_TOKEN", "must-not-be-used-when-sa-exists") };
+    let env = EnvGuard::new(&["KUBE_TOKEN"]);
+    env.set("KUBE_TOKEN", "must-not-be-used-when-sa-exists");
 
     let discoverer =
         k8s_discoverer_for_token_path(mock_server.uri(), oversized.to_str().unwrap());
@@ -1724,11 +1750,6 @@ async fn kubernetes_invalid_sa_token_fails_closed_before_api_request() {
         .discover()
         .await
         .expect_err("existing-but-oversized SA token must fail closed");
-
-    match previous {
-        Some(value) => unsafe { std::env::set_var("KUBE_TOKEN", value) },
-        None => unsafe { std::env::remove_var("KUBE_TOKEN") },
-    }
 
     let rendered = error.to_string();
     assert!(
@@ -1744,8 +1765,8 @@ async fn kubernetes_invalid_sa_token_fails_closed_before_api_request() {
     );
 }
 
-#[tokio::test]
-#[serial_test::serial(k8s_sa_token_file_read_limit, kube_token_env)]
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(k8s_sa_token_file_read_limit)]
 async fn kubernetes_empty_sa_token_fails_closed_without_kube_token_fallback() {
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1761,19 +1782,14 @@ async fn kubernetes_empty_sa_token_fails_closed_without_kube_token_fallback() {
         .mount(&mock_server)
         .await;
 
-    let previous = std::env::var("KUBE_TOKEN").ok();
-    unsafe { std::env::set_var("KUBE_TOKEN", "must-not-be-used-for-empty-sa") };
+    let env = EnvGuard::new(&["KUBE_TOKEN"]);
+    env.set("KUBE_TOKEN", "must-not-be-used-for-empty-sa");
 
     let discoverer = k8s_discoverer_for_token_path(mock_server.uri(), empty.to_str().unwrap());
     let error = discoverer
         .discover()
         .await
         .expect_err("empty existing SA token must fail closed");
-
-    match previous {
-        Some(value) => unsafe { std::env::set_var("KUBE_TOKEN", value) },
-        None => unsafe { std::env::remove_var("KUBE_TOKEN") },
-    }
 
     let rendered = error.to_string();
     assert!(
@@ -1783,6 +1799,93 @@ async fn kubernetes_empty_sa_token_fails_closed_without_kube_token_fallback() {
     assert!(rendered.contains("empty"), "{rendered}");
     assert!(!rendered.contains("empty-sa-token-sentinel"), "{rendered}");
     assert!(!rendered.contains("must-not-be-used-for-empty-sa"), "{rendered}");
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(k8s_sa_token_file_read_limit)]
+async fn kubernetes_broken_projected_sa_token_symlink_fails_closed_without_kube_token_fallback() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let temp = tempfile::tempdir().unwrap();
+    let missing_target = temp.path().join("missing-projected-sa-target-sentinel");
+    let link = temp.path().join("broken-projected-sa-token-link-sentinel");
+    std::os::unix::fs::symlink(&missing_target, &link).unwrap();
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&k8s_endpointslice_fixture()))
+        .expect(0)
+        .mount(&mock_server)
+        .await;
+
+    let env = EnvGuard::new(&["KUBE_TOKEN"]);
+    env.set("KUBE_TOKEN", "must-not-be-used-for-broken-symlink");
+
+    let discoverer = k8s_discoverer_for_token_path(mock_server.uri(), link.to_str().unwrap());
+    let error = discoverer
+        .discover()
+        .await
+        .expect_err("broken projected SA symlink must fail closed");
+
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("failed to read Kubernetes service-account token"),
+        "{rendered}"
+    );
+    assert!(
+        !rendered.contains("broken-projected-sa-token-link-sentinel"),
+        "{rendered}"
+    );
+    assert!(
+        !rendered.contains("missing-projected-sa-target-sentinel"),
+        "{rendered}"
+    );
+    assert!(
+        !rendered.contains("must-not-be-used-for-broken-symlink"),
+        "{rendered}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(k8s_sa_token_file_read_limit)]
+async fn kubernetes_invalid_utf8_sa_token_fails_closed_before_api_request() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("invalid-utf8-sa-token-sentinel");
+    std::fs::write(&path, b"valid-prefix-\xff-trailing").unwrap();
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&k8s_endpointslice_fixture()))
+        .expect(0)
+        .mount(&mock_server)
+        .await;
+
+    let env = EnvGuard::new(&["KUBE_TOKEN"]);
+    env.set("KUBE_TOKEN", "must-not-be-used-for-invalid-utf8");
+
+    let discoverer = k8s_discoverer_for_token_path(mock_server.uri(), path.to_str().unwrap());
+    let error = discoverer
+        .discover()
+        .await
+        .expect_err("invalid UTF-8 SA token must fail closed");
+
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("failed to read Kubernetes service-account token"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("not valid UTF-8"), "{rendered}");
+    assert!(!rendered.contains("invalid-utf8-sa-token-sentinel"), "{rendered}");
+    assert!(!rendered.contains("valid-prefix-"), "{rendered}");
+    assert!(
+        !rendered.contains("must-not-be-used-for-invalid-utf8"),
+        "{rendered}"
+    );
 }
 
 #[tokio::test]

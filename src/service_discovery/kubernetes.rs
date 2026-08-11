@@ -188,8 +188,10 @@ impl KubernetesDiscoverer {
     /// Re-reads on every call so Kubernetes projected-token symlink rotation is
     /// visible without restart. Open/read run on a detached OS thread through
     /// the shared 64 KiB regular-file credential boundary. `Ok(None)` means the
-    /// configured path is genuinely absent ([`std::io::ErrorKind::NotFound`]);
-    /// every other failure fails closed before the Kubernetes API request.
+    /// configured pathname is genuinely absent
+    /// ([`crate::secrets::credential_file::CredentialFileError::PathNotFound`]);
+    /// every other failure — including a broken projected symlink — fails
+    /// closed before the Kubernetes API request.
     async fn read_sa_token(path: &str) -> Result<Option<String>, anyhow::Error> {
         use crate::secrets::credential_file::{
             CredentialFileError, CredentialTrim, DEFAULT_CREDENTIAL_FILE_MAX_BYTES,
@@ -215,11 +217,7 @@ impl KubernetesDiscoverer {
             .await
             {
                 Ok(token) => Ok(Some(token)),
-                Err(CredentialFileError::Io(error))
-                    if error.kind() == std::io::ErrorKind::NotFound =>
-                {
-                    Ok(None)
-                }
+                Err(CredentialFileError::PathNotFound) => Ok(None),
                 Err(error) => Err(map_sa_token_error(error)),
             }
         };
@@ -272,9 +270,11 @@ impl super::ServiceDiscoverer for KubernetesDiscoverer {
         let mut request = self.client.get(&url);
 
         // Add bearer token auth (re-read each poll — projected tokens rotate).
-        // Only a genuinely absent SA token file may fall back to KUBE_TOKEN;
-        // an existing-but-invalid/oversized/stalled source fails closed here
-        // before the Kubernetes API request, preserving last-admitted targets.
+        // Only genuine pathname absence (`CredentialFileError::PathNotFound`)
+        // may fall back to KUBE_TOKEN; an existing-but-invalid source
+        // (oversized, empty, invalid UTF-8, broken projected symlink, stall)
+        // fails closed here before the Kubernetes API request, preserving
+        // last-admitted targets.
         match Self::read_sa_token(self.sa_token_path()).await? {
             Some(token) => {
                 request = request.bearer_auth(token);

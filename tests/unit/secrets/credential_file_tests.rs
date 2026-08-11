@@ -275,9 +275,45 @@ fn projected_secret_symlink_and_atomic_target_rotation() {
 fn missing_path_errors_are_source_redacted() {
     let missing = "/nonexistent/ferrum-credential-source-sentinel";
     let error = read_credential_file(missing, LIMIT, CredentialTrim::Ends).expect_err("missing");
+    assert!(
+        matches!(error, CredentialFileError::PathNotFound),
+        "genuine pathname absence must be PathNotFound, got: {error:?}"
+    );
+    assert_eq!(error.to_string(), "credential path not found");
     assert_no_leak(
         &error.to_string(),
         &["ferrum-credential-source-sentinel", missing],
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn broken_projected_symlink_is_open_time_not_found_not_path_absent() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing_target = dir.path().join("missing-projected-target-sentinel");
+    let link = dir.path().join("broken-projected-token-link-sentinel");
+    std::os::unix::fs::symlink(&missing_target, &link).unwrap();
+
+    let error = read_credential_file(link.to_str().unwrap(), LIMIT, CredentialTrim::Ends)
+        .expect_err("broken projected symlink");
+    assert!(
+        !matches!(error, CredentialFileError::PathNotFound),
+        "an existing symlink pathname must not map to PathNotFound"
+    );
+    assert!(
+        matches!(
+            error,
+            CredentialFileError::Io(ref io) if io.kind() == std::io::ErrorKind::NotFound
+        ),
+        "broken target must surface as open-time Io(NotFound), got: {error:?}"
+    );
+    assert_no_leak(
+        &error.to_string(),
+        &[
+            "broken-projected-token-link-sentinel",
+            "missing-projected-target-sentinel",
+            link.to_str().unwrap(),
+        ],
     );
 }
 

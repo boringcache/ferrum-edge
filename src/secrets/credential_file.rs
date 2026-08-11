@@ -46,7 +46,15 @@ pub enum CredentialTrim {
 pub enum CredentialFileError {
     /// Open or read failed. The `io::Error` reason is safe to forward: Rust's
     /// `File::open` / `Read` errors do not embed the pathname.
+    ///
+    /// Open-time [`std::io::ErrorKind::NotFound`] (broken projected symlink,
+    /// raced unlink of an existing pathname) stays here — distinct from
+    /// [`Self::PathNotFound`].
     Io(std::io::Error),
+    /// Configured pathname was absent at the pre-open `symlink_metadata` step.
+    /// Callers that treat absence as optional (Kubernetes `KUBE_TOKEN` fallback)
+    /// must match only this variant; an existing-but-invalid source must not.
+    PathNotFound,
     /// Opened descriptor is not a regular file (FIFO, socket, device, dir, …).
     NotRegularFile,
     /// Content exceeded `max_bytes` (metadata precheck or limit+1 read).
@@ -63,6 +71,7 @@ impl std::fmt::Display for CredentialFileError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(source) => write!(f, "{source}"),
+            Self::PathNotFound => f.write_str("credential path not found"),
             Self::NotRegularFile => f.write_str("not a regular file"),
             Self::Oversized { max_bytes } => {
                 write!(
@@ -155,8 +164,19 @@ fn open_credential_file(path: &Path) -> Result<File, CredentialFileError> {
 /// devices, and directories fail as [`CredentialFileError::NotRegularFile`]
 /// without a blocking open. Symlinked credential pathnames are left to open so
 /// the opened target remains authoritative against races.
+///
+/// [`CredentialFileError::PathNotFound`] is reserved for genuine pathname
+/// absence at this `symlink_metadata` step. A projected-secret symlink whose
+/// target is missing still reaches `open` and surfaces as
+/// [`CredentialFileError::Io`] with [`std::io::ErrorKind::NotFound`].
 fn reject_non_regular_path_before_open(path: &Path) -> Result<(), CredentialFileError> {
-    let metadata = std::fs::symlink_metadata(path).map_err(CredentialFileError::Io)?;
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(CredentialFileError::PathNotFound);
+        }
+        Err(error) => return Err(CredentialFileError::Io(error)),
+    };
     if metadata.file_type().is_symlink() {
         return Ok(());
     }
