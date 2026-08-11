@@ -292,10 +292,10 @@ fn test_registry_records_websocket_completion_metrics() {
 
     let output = registry.render_uncached();
     assert!(output.contains(
-        r#"ferrum_websocket_sessions_total{proxy_id="ws-metrics",result="success",direction="unknown",io_side="unknown",error_class="none"} 1"#
+        r#"ferrum_websocket_sessions_total{proxy_id="ws-metrics",result="success",direction="unknown",io_side="unknown",error_class="none",termination_reason="normal_peer_close"} 1"#
     ));
     assert!(output.contains(
-        r#"ferrum_websocket_sessions_total{proxy_id="ws-metrics",result="error",direction="backend_to_client",io_side="read",error_class="connection_reset"} 1"#
+        r#"ferrum_websocket_sessions_total{proxy_id="ws-metrics",result="error",direction="backend_to_client",io_side="read",error_class="connection_reset",termination_reason="relay_error"} 1"#
     ));
     assert!(output.contains(
         r#"ferrum_websocket_bytes_total{proxy_id="ws-metrics",direction="client_to_backend"} 60"#
@@ -304,8 +304,36 @@ fn test_registry_records_websocket_completion_metrics() {
         r#"ferrum_websocket_frames_total{proxy_id="ws-metrics",direction="backend_to_client"} 10"#
     ));
     assert!(output.contains(
-        r#"ferrum_websocket_session_duration_ms_count{proxy_id="ws-metrics",result="error",direction="backend_to_client",io_side="read",error_class="connection_reset"} 1"#
+        r#"ferrum_websocket_session_duration_ms_count{proxy_id="ws-metrics",result="error",direction="backend_to_client",io_side="read",error_class="connection_reset",termination_reason="relay_error"} 1"#
     ));
+}
+
+/// A gateway-initiated policy close (credential expiry, absolute lifetime,
+/// graceful drain) is not a relay fault: it must stay on `result="success"` /
+/// `error_class="none"` and be identified only by `termination_reason`, so
+/// `result="error"` keeps meaning a real transport or hook failure.
+#[test]
+fn test_registry_records_policy_websocket_closes_as_non_error_sessions() {
+    let registry = MetricsRegistry::new();
+    for reason in ["credential_expired", "max_lifetime", "drain"] {
+        let mut policy_close = make_ws_summary("ws-policy");
+        policy_close.metadata.insert(
+            "websocket.termination_reason".to_string(),
+            reason.to_string(),
+        );
+        registry.record_ws_session(&policy_close);
+    }
+
+    let output = registry.render_uncached();
+    for reason in ["credential_expired", "max_lifetime", "drain"] {
+        assert!(
+            output.contains(&format!(
+                r#"ferrum_websocket_sessions_total{{proxy_id="ws-policy",result="success",direction="unknown",io_side="unknown",error_class="none",termination_reason="{reason}"}} 1"#
+            )),
+            "policy close {reason} must not be counted as a failed session"
+        );
+    }
+    assert!(!output.contains(r#"proxy_id="ws-policy",result="error""#));
 }
 
 #[tokio::test]
@@ -570,6 +598,14 @@ async fn test_registry_renders_node_agent_metrics_when_registered() {
     assert!(output.contains("# TYPE ferrum_node_agent_capture_state gauge"));
     assert!(output.contains("ferrum_node_agent_capture_state{state=\"starting\"} 1"));
     assert!(output.contains("ferrum_node_agent_capture_state{state=\"ready\"} 0"));
+    assert!(output.contains(
+        "ferrum_node_agent_ingress_interface_topology{state=\"disabled\",reason=\"disabled\"} 1"
+    ));
+    assert!(output.contains("ferrum_node_agent_ingress_interface_configured_interfaces 0"));
+    assert!(output.contains("ferrum_node_agent_ingress_interface_expected_interfaces 0"));
+    assert!(
+        output.contains("ferrum_node_agent_ingress_interface_family_required{family=\"ipv4\"} 0")
+    );
     // Nominal topology: gauge emitted as 0 with reason=none so dashboards
     // can always pin the expected value.
     assert!(output.contains("# TYPE ferrum_mesh_node_topology_degraded gauge"));

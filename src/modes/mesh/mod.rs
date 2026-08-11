@@ -14694,9 +14694,9 @@ async fn start_mesh_workload_api_server(
 /// Two sources, in chain order:
 ///
 /// 1. `FERRUM_MESH_WORKLOAD_API_UNIX_IDENTITY_RULES` — kernel-attested
-///    `SO_PEERCRED` rules (`uid:<uid>=<spiffe-id>` or
-///    `sha256:<hex>=<spiffe-id>`). This is the production path: the evidence
-///    comes from the accepted socket, not from anything the caller says.
+///    `SO_PEERCRED` rules (`uid:<uid>=<spiffe-id>`). This is the production
+///    path: the evidence comes from the accepted socket, not from anything the
+///    caller says.
 /// 2. The dev-only [`StaticAttestor`](crate::identity::attestation::static_id::StaticAttestor),
 ///    which is itself double-gated on `FERRUM_MESH_ALLOW_STATIC_ID=true` and
 ///    refused under `FERRUM_MESH_PRODUCTION_MODE=true`. It is placed *last* so a
@@ -14760,7 +14760,7 @@ fn build_mesh_workload_api_attestors(
         anyhow::bail!(
             "FERRUM_MESH_WORKLOAD_API_ENABLED=true requires at least one attestor: set \
              FERRUM_MESH_WORKLOAD_API_UNIX_IDENTITY_RULES to map peer credentials \
-             (uid:<uid>=<spiffe-id> or sha256:<hex>=<spiffe-id>) to SPIFFE IDs. Without a rule the \
+             (uid:<uid>=<spiffe-id>) to SPIFFE IDs. Without a rule the \
              Workload API can only refuse every caller, which looks healthy but serves nothing"
         );
     }

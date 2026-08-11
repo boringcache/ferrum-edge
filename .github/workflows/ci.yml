@@ -806,6 +806,7 @@ jobs:
               integration::mesh_telemetry_k8s_provider_lookup_tests
               integration::mesh_telemetry_tracing_tests
               integration::mesh_bpf_metrics_scrape_tests
+              integration::node_agent_topology_metrics_tests
               integration::mesh_federation_poller_tests
               integration::mesh_file_source_tests
               integration::mesh_multicluster_discovery_tests
@@ -856,6 +857,7 @@ jobs:
               integration::grpc_proxy_tests
               integration::policy_path_canonicalization_tests
               integration::scripted_backend_smoke_tests
+              integration::service_discovery_endpointslice_lifecycle_tests
               integration::dtls_integration_tests
               integration::dtls_accept_isolation_tests
               integration::backend_mtls_tests

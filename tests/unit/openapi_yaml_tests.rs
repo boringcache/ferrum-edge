@@ -2963,6 +2963,62 @@ fn ldap_cache_documentation_and_openapi_defaults_match_runtime_constants() {
 }
 
 #[test]
+fn oauth2_introspection_cache_schema_and_docs_match_runtime_constants() {
+    use ferrum_edge::plugins::utils::introspection_cache::{
+        DEFAULT_MAX_CACHE_ENTRIES, DEFAULT_MAX_CACHE_ENTRY_BYTES, DEFAULT_MAX_CACHE_TOTAL_BYTES,
+        HARD_MAX_CACHE_ENTRIES, HARD_MAX_CACHE_ENTRY_BYTES, HARD_MAX_CACHE_TOTAL_BYTES,
+        MIN_MAX_CACHE_ENTRIES, MIN_MAX_CACHE_ENTRY_BYTES, MIN_MAX_CACHE_TOTAL_BYTES,
+    };
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let properties = spec
+        .pointer(
+            "/components/schemas/Oauth2IntrospectionConfig/properties/providers/items/properties",
+        )
+        .expect("OAuth2 introspection provider properties exist");
+    for (field, default, minimum, maximum) in [
+        (
+            "max_cache_entries",
+            DEFAULT_MAX_CACHE_ENTRIES,
+            MIN_MAX_CACHE_ENTRIES,
+            HARD_MAX_CACHE_ENTRIES,
+        ),
+        (
+            "max_cache_entry_bytes",
+            DEFAULT_MAX_CACHE_ENTRY_BYTES,
+            MIN_MAX_CACHE_ENTRY_BYTES,
+            HARD_MAX_CACHE_ENTRY_BYTES,
+        ),
+        (
+            "max_cache_total_bytes",
+            DEFAULT_MAX_CACHE_TOTAL_BYTES,
+            MIN_MAX_CACHE_TOTAL_BYTES,
+            HARD_MAX_CACHE_TOTAL_BYTES,
+        ),
+    ] {
+        assert_eq!(properties[field]["default"], json!(default));
+        assert_eq!(properties[field]["minimum"], json!(minimum));
+        assert_eq!(properties[field]["maximum"], json!(maximum));
+    }
+
+    let cache_guide = include_str!("../../docs/cache_management.md");
+    assert!(
+        cache_guide
+            .contains("| `oauth2_introspection` | `providers[].max_cache_entries` | `10000` |")
+    );
+    assert!(
+        cache_guide
+            .contains("| `oauth2_introspection` | `providers[].max_cache_entry_bytes` | `16384` |")
+    );
+    assert!(
+        cache_guide.contains(
+            "| `oauth2_introspection` | `providers[].max_cache_total_bytes` | `16777216` |"
+        )
+    );
+}
+
+#[test]
 fn jwks_auth_schema_and_cache_guide_match_runtime_contract() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");

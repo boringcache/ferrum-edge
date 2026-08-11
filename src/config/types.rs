@@ -2592,8 +2592,8 @@ pub struct Proxy {
     /// H1/H2/H3 frontends.
     /// Per-proxy override; when `None`, uses the global
     /// `FERRUM_WEBSOCKET_IDLE_TIMEOUT_SECONDS` (default: 300s / 5 min).
-    /// Set to `0` to disable for this proxy (idle sessions live forever, bounded
-    /// only by `FERRUM_WEBSOCKET_MAX_CONNECTIONS`).
+    /// Set to `0` to disable only the idle bound for this proxy; the global
+    /// absolute WebSocket lifetime still applies.
     ///
     /// HTTP/3 caveat: on QUIC frontends the transport-level connection idle
     /// timeout (`FERRUM_HTTP3_IDLE_TIMEOUT`, default 30s) can close an
@@ -8694,9 +8694,9 @@ impl Upstream {
 
     /// Reject mesh-PROJECTED fields that an OPERATOR must not set directly.
     ///
-    /// `port_overrides`, `source_locality`, `source_labels`, `locality_lb_strict`,
-    /// `locality_lb_setting`, and the mesh-derived fields nested under
-    /// `subsets[].traffic_policy` are
+    /// Reserved `mesh.*` target tags, `port_overrides`, `source_locality`,
+    /// `source_labels`, `locality_lb_strict`, `locality_lb_setting`, and the
+    /// mesh-derived fields nested under `subsets[].traffic_policy` are
     /// all populated by the mesh slice-apply layer (from DestinationRules / the
     /// workload locality / labels / `FERRUM_MESH_LOCALITY_LB_STRICT`), NOT by operators.
     /// The top-level projected fields are not persisted by the SQL / MongoDB
@@ -8717,6 +8717,15 @@ impl Upstream {
     /// wrapper the file loader uses.
     pub fn validate_operator_provided_fields(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
+
+        for (target_index, target) in self.targets.iter().enumerate() {
+            if target.tags.keys().any(|key| key.starts_with("mesh.")) {
+                errors.push(format!(
+                    "targets[{target_index}].tags contains a key in the reserved mesh.* namespace \
+                     and cannot be set directly via operator-provided config"
+                ));
+            }
+        }
 
         if !self.port_overrides.is_empty() {
             errors.push(
@@ -9614,8 +9623,8 @@ impl GatewayConfig {
 
     /// Reject mesh-PROJECTED upstream fields on operator-PROVIDED config loads.
     ///
-    /// `Upstream.{port_overrides, source_locality, source_labels,
-    /// locality_lb_strict, locality_lb_setting}` and mesh-only fields under
+    /// Reserved `mesh.*` target tags, `Upstream.{port_overrides, source_locality,
+    /// source_labels, locality_lb_strict, locality_lb_setting}`, and mesh-only fields under
     /// `Upstream.subsets[].traffic_policy` are owned by the mesh slice-apply layer
     /// (Destination rules / workload locality /
     /// `FERRUM_MESH_LOCALITY_LB_STRICT`); an operator must never set them directly.

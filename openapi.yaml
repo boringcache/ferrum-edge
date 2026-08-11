@@ -7683,8 +7683,8 @@ components:
             produces activity (frames, including Ping/Pong, or transport bytes) within the
             window; activity from either side keeps it open. When omitted, uses the global
             FERRUM_WEBSOCKET_IDLE_TIMEOUT_SECONDS (default: 300s / 5 min). Set to 0 to
-            disable for this proxy (idle sessions then live forever, bounded only by
-            FERRUM_WEBSOCKET_MAX_CONNECTIONS). Maximum 86400 (24h).
+            disable only the idle bound for this proxy; the finite global WebSocket
+            maximum lifetime still applies. Maximum 86400 (24h).
             HTTP/3 caveat: on QUIC frontends the transport idle timeout
             FERRUM_HTTP3_IDLE_TIMEOUT (default 30s) also applies. On an
             otherwise-idle H3 connection, QUIC may close before a longer WebSocket
@@ -10604,7 +10604,11 @@ components:
           default: {}
           additionalProperties:
             type: string
-          description: Arbitrary key-value tags
+          description: |
+            Operator-defined key-value tags. Keys beginning with `mesh.` are
+            reserved for Ferrum's trusted mesh projection and are rejected on
+            upstream create/update, API-spec import, restore, and file-config
+            admission; ordinary operator tag keys remain supported.
         locality:
           type: [string, "null"]
           maxLength: 255
@@ -16291,7 +16295,36 @@ components:
                 default: 5000
               max_cache_entries:
                 type: integer
+                format: uint64
                 default: 10000
+                minimum: 100
+                maximum: 100000
+                description: >-
+                  Per-provider hard entry ceiling. Active and negative entries
+                  receive independent 75/25 count partitions, so one result
+                  class cannot evict the other class.
+              max_cache_entry_bytes:
+                type: integer
+                format: uint64
+                default: 16384
+                minimum: 256
+                maximum: 65536
+                description: >-
+                  Maximum normalized active authorization-result bytes retained
+                  for one token. A larger valid result is used for the current
+                  request but is not cached.
+              max_cache_total_bytes:
+                type: integer
+                format: uint64
+                default: 16777216
+                minimum: 1048576
+                maximum: 67108864
+                description: >-
+                  Per-provider hard retained-byte ceiling covering fixed
+                  eviction indexes, token digests, entry state, and normalized
+                  authorization data. Must be at least the constructor-reported
+                  minimum footprint for max_cache_entries plus one
+                  max_cache_entry_bytes result.
               token_hint_param:
                 type: [string, "null"]
               required_scopes:
