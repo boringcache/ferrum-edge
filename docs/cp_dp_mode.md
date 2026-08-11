@@ -139,14 +139,114 @@ This matrix covers persistence and change detection for the local, CP-authoritat
 | Configuration source | Supplies `GatewayConfig.trust_bundles`? | Detects a runtime change? | Namespace-partitioned? |
 |---|---|---|---|
 | File (YAML/JSON) | Yes, through serde deserialization | Full file reload only (`SIGHUP` on Unix); no narrow trust-bundle poll | No |
-| PostgreSQL | No | No | No |
-| MySQL | No | No | No |
-| SQLite | No | No | No |
-| MongoDB | No | No | No |
+| PostgreSQL | Yes, from the `gateway_trust_bundles` resource | Yes, through `config_changes` | Yes, one record per namespace |
+| MySQL | Yes, from the `gateway_trust_bundles` resource | Yes, through `config_changes` | Yes, one record per namespace |
+| SQLite | Yes, from the `gateway_trust_bundles` resource | Yes, through `config_changes` | Yes, one record per namespace |
+| MongoDB | Yes, from the `gateway_trust_bundles` collection | Yes, through `config_changes` | Yes, one record per namespace |
 
-The built-in SQL and MongoDB stores persist gateway resources separately and have no storage shape or change detector for the top-level trust-bundle value. The former `GatewayTrustBundlePoll::Current` consumer was therefore unreachable and has been removed together with the unused database-backend poll hook. A future backend may reintroduce runtime updates only with dedicated persistence and a narrow query or change detector that can identify trust-bundle-only changes during ordinary incremental polling. It must return the authoritative current value, including an explicit clear, without performing a full gateway-config reload; validate before swapping; and broadcast the accepted value through `trust_bundles_json`. Namespace-aware distribution also requires a partitioned storage key and lookup rather than one CP-wide value.
+#### The `gateway_trust_bundles` resource (issue #3727)
 
-Trust bundles are currently CP-level and non-partitioned. A single-namespace CP can distribute its configured value to its DPs, but CPs in `Set` or `All` multi-namespace scope force the side channel to JSON `null` so trust roots cannot cross tenant boundaries. Tenant-isolated roots require separate CP and config-store instances. See the [CP namespace-tenancy protocol matrix](cp_namespace_tenancy.md#protocol-matrix) and the enforcement coverage in [`cp_multi_namespace_tests.rs`](../tests/integration/cp_multi_namespace_tests.rs).
+Every database backend persists a first-class, **namespace-keyed** gateway
+trust-bundle resource. It is a thin envelope around the same serializable
+`TrustBundleSet` the mesh model and the `trust_bundles_json` side channel
+already use — there is no second representation that can drift.
+
+- **Singleton per namespace.** SQL makes `namespace` the primary key and MongoDB
+  keys documents by `_id = <namespace>`, so a namespace's projected trust state
+  is never ambiguous and a concurrent create from a second admin replica loses on
+  a duplicate key rather than silently replacing another writer's roots.
+- **Stored fields.** Resource `id`, `namespace`, `trust_domain` (must equal
+  `bundle.local.trust_domain`), the bounded `bundle`, a monotonic `revision`,
+  `updated_by` (the verified admin JWT subject — never a client-supplied value),
+  and `created_at` / `updated_at`.
+- **Bounded, validated material.** Admission caps authority counts (16 X.509 and
+  16 JWT per bundle, 32 federated bundles), per-authority size (16 KiB), and the
+  encoded bundle as a whole (256 KiB). Every `x509_authorities` entry must be
+  valid base64 *and* parse as an X.509 certificate; every JWT authority needs a
+  unique non-empty `key_id` and a PEM public-key block; duplicate trust domains
+  are rejected. The same validation runs on write, on every full load, and again
+  before publication.
+- **Change detection.** Writes record a `gateway_trust_bundle` row in
+  `config_changes`, so ordinary incremental polling sees rotations and
+  revocations. A trust change escalates that poll to a full reload
+  (`IncrementalFullReloadReason::GatewayTrustBundleChanges`) — the same mechanism
+  consumer mutations already use — so the resources and the trust side channel
+  are always published from one authoritative read and a subscriber can never see
+  new configuration paired with the previous generation's roots. Full loads read
+  the trust record on the *same* snapshot transaction/session as the resources.
+- **Validate before swap.** A stored bundle that no longer passes admission
+  (oversized, malformed, identity mismatch, undecodable row) rejects the whole
+  load. The control plane keeps its previous valid generation serving and
+  surfaces a redacted diagnostic — messages name field, index, and size only.
+- **Admin surface.** `GET/POST /gateway-trust-bundles`,
+  `GET/PUT/DELETE /gateway-trust-bundles/{id}`, and `GET /gateway-trust/status`.
+  Reads require `operator`, writes require `admin`. `PUT` takes the `revision`
+  you read as an optimistic-concurrency expectation and returns `409` with
+  `expected_revision` / `current_revision` on a lost race. `DELETE` is an
+  explicit revocation and is distinguishable on the wire from "no change".
+- **Backup/restore.** Database-backed exports always carry a
+  `gateway_trust_bundles` section (possibly empty). Restore treats an **absent**
+  section as "this backup says nothing about trust" and leaves existing roots
+  alone; a **present** section is authoritative and reconciles exactly, including
+  the empty case, which revokes. The namespace clear that precedes an import
+  deliberately does not touch trust, so restoring an older config backup can
+  never silently revoke a namespace's roots.
+
+##### Publication semantics
+
+The `trust_bundles_json` side channel carries three distinct states, and the CP
+now states exactly one of them per message:
+
+| State | Wire value | Meaning |
+|---|---|---|
+| Unchanged | empty string | Say nothing; the subscriber keeps what it applied. |
+| Clear | `null` | Withdraw previously delivered trust material. |
+| Replace | serialized `TrustBundleSet` | Install this material. |
+
+Full snapshots always state the complete current state (`Replace` when the
+namespace has a record, `Clear` when it does not), so a reconnecting data plane
+reconstructs trust from the snapshot alone. Resource deltas always state
+`Unchanged`: before issue #3727 the delta path passed `None`, which encoded as
+`null`, so **every** ordinary configuration change silently revoked the
+subscriber's trust.
+
+##### Precedence and ambiguity
+
+The database resource is the authority. If a namespace somehow presents *both* a
+database record and a file-sourced `GatewayConfig.trust_bundles`, neither wins:
+publication withdraws trust, logs the redacted
+`AMBIGUOUS_TRUST_AUTHORITY_MESSAGE`, and increments
+`ferrum_gateway_trust_bundle_ambiguous_authority_total`. Preferring one silently
+would let two replicas diverge if only one could see the file value — exactly the
+failure this resource exists to remove. The behaviour is deterministic on every
+replica, so an ambiguous deployment fails closed rather than splitting.
+
+##### Observability
+
+`/metrics` exposes label-free process counters —
+`ferrum_gateway_trust_bundle_loads_total`,
+`..._load_rejections_total`, `..._ambiguous_authority_total`,
+`ferrum_gateway_trust_bundle_revision`, and
+`ferrum_gateway_trust_bundle_last_load_unix_seconds`. Cardinality is fixed by
+construction: there are no namespace, trust-domain, or resource-id labels. The
+namespace-scoped view is on the authenticated `GET /gateway-trust/status`, which
+returns the trust domain, authority counts, revision, timestamps, and a bounded
+failure-reason enum — never PEM/DER/JWKS bytes, key ids, or secret/provider URIs.
+
+##### Namespace isolation
+
+`CpGrpcServer::filter_config_to_namespace_for_scope` prunes
+`gateway_trust_bundles` to the subscribing namespace at the primary
+authorization boundary, then projects that namespace's own record into the
+unpartitioned slot the side channel reads. The pre-existing defense that clears
+unpartitioned trust on a claim-requiring scope runs *before* the projection and
+is preserved, not replaced: a namespace with no record still receives nothing.
+The vector itself is `#[serde(skip)]` on `GatewayConfig`, so a multi-namespace
+CP's full set of tenant records can never ride the ConfigSync `config_json`
+wire.
+
+Tenant-isolated roots no longer require separate CP and config-store instances.
+See the [CP namespace-tenancy protocol matrix](cp_namespace_tenancy.md#protocol-matrix) and the enforcement coverage in [`cp_multi_namespace_tests.rs`](../tests/integration/cp_multi_namespace_tests.rs).
 
 DP persistence is memory-only on every path: received bundles are stored in lock-free `ArcSwap` runtime state and are not written to disk or a database. A restarted DP must reconnect and fetch the value from its CP again.
 

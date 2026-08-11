@@ -829,6 +829,8 @@ impl MultiNsFullLoadAcc {
                 acc.consumers.append(&mut next.consumers);
                 acc.plugin_configs.append(&mut next.plugin_configs);
                 acc.upstreams.append(&mut next.upstreams);
+                acc.gateway_trust_bundles
+                    .append(&mut next.gateway_trust_bundles);
             }
         }
     }
@@ -878,6 +880,9 @@ impl MultiNsFullLoadAcc {
         // Preserve non-namespaced mesh overlay ownership: mesh comes from the
         // K8s overlay re-merge at publication time, not from DB full loads.
         config.mesh = None;
+        // Canonical ordering so two CP replicas that loaded the same store
+        // produce byte-identical snapshots (issue #3727).
+        config.sort_gateway_trust_bundles();
         Ok(FullLoadMultiOutcome {
             config,
             rejected_namespaces: self.rejected_namespaces,
@@ -907,6 +912,15 @@ fn clear_namespaced_resources(config: &mut GatewayConfig) {
     config.consumers.clear();
     config.plugin_configs.clear();
     config.upstreams.clear();
+    // Gateway trust bundles are namespace-keyed resources, so they are rebuilt
+    // per namespace exactly like the four above (issue #3727). Leaving a stale
+    // record here would let a namespace that failed to reload keep publishing
+    // trust it no longer owns.
+    config.gateway_trust_bundles.clear();
+    // The unpartitioned slot is a per-subscriber PROJECTION, never combined-CP
+    // state: a multi-namespace snapshot must not carry any namespace's trust in
+    // it. `filter_config_to_namespace_for_scope` re-derives it per subscriber.
+    config.trust_bundles = None;
 }
 
 fn remove_namespace_resources(config: &mut GatewayConfig, namespace: &str) {
@@ -914,6 +928,9 @@ fn remove_namespace_resources(config: &mut GatewayConfig, namespace: &str) {
     config.consumers.retain(|c| c.namespace != namespace);
     config.plugin_configs.retain(|pc| pc.namespace != namespace);
     config.upstreams.retain(|u| u.namespace != namespace);
+    config
+        .gateway_trust_bundles
+        .retain(|record| record.namespace != namespace);
 }
 
 fn append_namespace_resources_from(
@@ -947,6 +964,13 @@ fn append_namespace_resources_from(
             .upstreams
             .iter()
             .filter(|u| u.namespace == namespace)
+            .cloned(),
+    );
+    target.gateway_trust_bundles.extend(
+        source
+            .gateway_trust_bundles
+            .iter()
+            .filter(|record| record.namespace == namespace)
             .cloned(),
     );
     if !target.known_namespaces.iter().any(|ns| ns == namespace) {
@@ -1510,7 +1534,13 @@ pub(crate) fn publish_cp_incremental(
                 namespace_delta,
                 version,
                 dp_registry,
-                None,
+                // Resource deltas say nothing about trust. A trust rotation or
+                // revocation escalates to a full reload
+                // (`IncrementalFullReloadReason::GatewayTrustBundleChanges`) and
+                // is published as a FULL_SNAPSHOT whose side channel carries the
+                // complete new state, so an incremental tick must leave the
+                // subscriber's applied trust untouched (issue #3727).
+                crate::config::gateway_trust::GatewayTrustPublication::Unchanged,
                 cp_scope,
             );
         }

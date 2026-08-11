@@ -2887,6 +2887,22 @@ pub struct GatewayConfig {
     /// certificates without loading the entire mesh model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trust_bundles: Option<Box<crate::modes::mesh::config::TrustBundleSet>>,
+    /// Namespace-keyed gateway trust-bundle resources loaded from the
+    /// authoritative configuration store (issue #3727).
+    ///
+    /// DERIVED, CONTROL-PLANE-IN-MEMORY ONLY: `#[serde(skip)]`, exactly like
+    /// `mesh_config_revision`. It must never ride the ConfigSync `config_json`
+    /// wire — both peers are `deny_unknown_fields`, and more importantly a
+    /// multi-namespace CP holds EVERY served namespace's trust material here.
+    /// Publication is per-subscriber through the `trust_bundles_json` side
+    /// channel, which carries at most the subscribing namespace's own record;
+    /// see `CpGrpcServer::filter_config_to_namespace_for_scope`.
+    ///
+    /// At most one record per namespace (the store enforces it with the
+    /// namespace primary key / `_id`), kept sorted by namespace so snapshot
+    /// comparisons and checksums are stable.
+    #[serde(skip)]
+    pub gateway_trust_bundles: Vec<crate::config::gateway_trust::GatewayTrustBundleRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mesh: Option<Box<crate::modes::mesh::config::MeshConfig>>,
     /// `(namespace, listen_port)` pairs whose Gateway API listener terminates
@@ -3291,6 +3307,28 @@ fn non_canonical_listen_path_reason(path: &str) -> Option<&'static str> {
 }
 
 impl GatewayConfig {
+    /// The authoritative gateway trust-bundle record for `namespace`, if the
+    /// configuration store holds one.
+    ///
+    /// The lookup is namespace-exact: a multi-namespace control plane holds
+    /// every served namespace's record in this vector, and every publication
+    /// path must go through here rather than reading index `0`.
+    pub fn gateway_trust_bundle_for(
+        &self,
+        namespace: &str,
+    ) -> Option<&crate::config::gateway_trust::GatewayTrustBundleRecord> {
+        self.gateway_trust_bundles
+            .iter()
+            .find(|record| record.namespace == namespace)
+    }
+
+    /// Keep the trust-bundle vector in a canonical order so two replicas that
+    /// loaded the same store produce byte-identical snapshots and checksums.
+    pub fn sort_gateway_trust_bundles(&mut self) {
+        self.gateway_trust_bundles
+            .sort_by(|a, b| a.namespace.cmp(&b.namespace).then_with(|| a.id.cmp(&b.id)));
+    }
+
     /// Validate that all proxy (host, listen_path, listen_port) combinations are unique.
     ///
     /// HTTP-family proxies can conflict in two ways:

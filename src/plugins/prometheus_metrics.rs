@@ -3884,6 +3884,69 @@ impl MetricsRegistry {
             );
         }
 
+        // Gateway trust bundles (issue #3727). Fixed cardinality: no namespace,
+        // trust-domain, or resource-id labels — the namespace-scoped view is on
+        // the authenticated admin status surface. Nothing here can carry
+        // PEM/JWKS bytes or a secret/provider URI.
+        {
+            let trust = crate::config::gateway_trust::observability_snapshot();
+            output.push_str(
+                "# HELP ferrum_gateway_trust_bundle_loads_total Gateway trust-bundle generations that loaded, validated, and published.\n",
+            );
+            output.push_str("# TYPE ferrum_gateway_trust_bundle_loads_total counter\n");
+            render_process_counter(
+                &mut output,
+                "ferrum_gateway_trust_bundle_loads_total",
+                trust.loads_total,
+                &ns_label,
+            );
+
+            output.push_str(
+                "# HELP ferrum_gateway_trust_bundle_load_rejections_total Gateway trust-bundle candidates refused before the live swap; the previous valid generation stays active.\n",
+            );
+            output.push_str("# TYPE ferrum_gateway_trust_bundle_load_rejections_total counter\n");
+            render_process_counter(
+                &mut output,
+                "ferrum_gateway_trust_bundle_load_rejections_total",
+                trust.load_rejections_total,
+                &ns_label,
+            );
+
+            output.push_str(
+                "# HELP ferrum_gateway_trust_bundle_ambiguous_authority_total Publications that found both a database record and a file-sourced trust value and withdrew trust.\n",
+            );
+            output
+                .push_str("# TYPE ferrum_gateway_trust_bundle_ambiguous_authority_total counter\n");
+            render_process_counter(
+                &mut output,
+                "ferrum_gateway_trust_bundle_ambiguous_authority_total",
+                trust.ambiguous_authority_total,
+                &ns_label,
+            );
+
+            output.push_str(
+                "# HELP ferrum_gateway_trust_bundle_revision Monotonic revision of the most recently published gateway trust-bundle generation; 0 when none.\n",
+            );
+            output.push_str("# TYPE ferrum_gateway_trust_bundle_revision gauge\n");
+            render_process_counter(
+                &mut output,
+                "ferrum_gateway_trust_bundle_revision",
+                trust.published_revision,
+                &ns_label,
+            );
+
+            output.push_str(
+                "# HELP ferrum_gateway_trust_bundle_last_load_unix_seconds Unix time of the most recent successful gateway trust-bundle load; 0 when none.\n",
+            );
+            output.push_str("# TYPE ferrum_gateway_trust_bundle_last_load_unix_seconds gauge\n");
+            render_process_counter(
+                &mut output,
+                "ferrum_gateway_trust_bundle_last_load_unix_seconds",
+                trust.last_successful_load_unix_seconds,
+                &ns_label,
+            );
+        }
+
         let admin_conn_metrics = self.admin_conn_metrics.load_full();
         if let Some(limiter) = admin_conn_metrics.as_ref() {
             let snapshot = limiter.snapshot();

@@ -57,6 +57,7 @@ use super::cp_trust::{CpDpVerifier, CpGrpcConnectInfo};
 use super::proto::config_sync_server::{ConfigSync, ConfigSyncServer};
 use super::proto::{ConfigUpdate, FullConfigRequest, FullConfigResponse, SubscribeRequest};
 use crate::FERRUM_VERSION;
+use crate::config::gateway_trust::GatewayTrustPublication;
 use crate::config::types::{GatewayConfig, default_namespace};
 use crate::modes::mesh::config::{
     MeshConfig, MeshSidecar, MeshSidecarEgress, PeerAuthentication, PolicyScope,
@@ -809,8 +810,58 @@ impl CpGrpcServer {
         config
             .http_tls_listen_ports
             .retain(|(entry_namespace, _)| entry_namespace == namespace);
+        // Namespace-keyed trust records are tenant material. Pruning them at
+        // this PRIMARY authorization boundary means no later step — projection,
+        // serialization, error text, or a future addition — can observe another
+        // tenant's roots on this subscriber's path (issue #3727).
+        config
+            .gateway_trust_bundles
+            .retain(|record| record.namespace == namespace);
         config.known_namespaces = vec![namespace.to_string()];
         filter_frontend_tls_sources_to_namespace(config, namespace);
+    }
+
+    /// Resolve the single authoritative trust value for `namespace` and project
+    /// it into the unpartitioned `trust_bundles` slot the side channel reads
+    /// (issue #3727).
+    ///
+    /// Ordering matters: this runs AFTER
+    /// [`Self::clear_unpartitioned_trust_material`], so on a multi-namespace CP
+    /// the pre-existing global value is already gone and the only thing that can
+    /// reach a subscriber is that subscriber's own database record. The existing
+    /// defense is preserved, not replaced — a namespace with no record still
+    /// receives nothing.
+    ///
+    /// Precedence when a deployment somehow presents both authorities: neither
+    /// wins. Silently preferring one would let two replicas disagree if only one
+    /// of them could see the file value, which is the exact divergence this
+    /// resource exists to eliminate. The projection instead withdraws trust
+    /// (deterministic on every replica) and reports a redacted diagnostic.
+    fn project_namespace_trust_material(config: &mut GatewayConfig, namespace: &str) {
+        let record_bundle = config
+            .gateway_trust_bundle_for(namespace)
+            .map(|record| record.bundle.clone());
+        let resolution = crate::config::gateway_trust::resolve_trust_authority(
+            config.gateway_trust_bundle_for(namespace),
+            config.trust_bundles.as_deref(),
+        );
+        match resolution {
+            crate::config::gateway_trust::TrustAuthorityResolution::Database => {
+                config.trust_bundles = record_bundle.map(Box::new);
+            }
+            crate::config::gateway_trust::TrustAuthorityResolution::File => {
+                // No database record: the file-sourced value stands unchanged.
+            }
+            crate::config::gateway_trust::TrustAuthorityResolution::Ambiguous => {
+                error!(
+                    namespace = %namespace,
+                    "{}",
+                    crate::config::gateway_trust::AMBIGUOUS_TRUST_AUTHORITY_MESSAGE
+                );
+                crate::config::gateway_trust::record_ambiguous_authority();
+                config.trust_bundles = None;
+            }
+        }
     }
 
     #[cfg(test)]
@@ -842,6 +893,7 @@ impl CpGrpcServer {
         if scope.requires_namespace_claim_by_default() {
             Self::clear_unpartitioned_trust_material(&mut filtered);
         }
+        Self::project_namespace_trust_material(&mut filtered, &request.namespace);
         filtered
     }
 
@@ -1091,7 +1143,10 @@ impl CpGrpcServer {
             .retain(|extension| visible_namespaces.contains(&extension.namespace));
     }
 
-    pub(crate) fn filter_config_to_namespace_for_scope(
+    /// `pub` so external integration tests can assert the namespace
+    /// projection directly; this is the primary tenant boundary for every
+    /// full-snapshot publication path.
+    pub fn filter_config_to_namespace_for_scope(
         config: &GatewayConfig,
         namespace: &str,
         scope: &CpScope,
@@ -1100,6 +1155,11 @@ impl CpGrpcServer {
         if scope.requires_namespace_claim_by_default() {
             Self::clear_unpartitioned_trust_material(&mut filtered);
         }
+        // Publish the subscriber's own namespace-keyed record (issue #3727).
+        // Runs for every scope: a single-namespace CP with a database record
+        // must distribute it too, and the multi-namespace clear above has
+        // already removed anything that was not partitioned.
+        Self::project_namespace_trust_material(&mut filtered, namespace);
         filtered
     }
 
@@ -1444,18 +1504,27 @@ impl CpGrpcServer {
         result: &crate::config::db_loader::IncrementalResult,
         version: &str,
         registry: &DpNodeRegistry,
-        trust_bundles: Option<&crate::modes::mesh::config::TrustBundleSet>,
+        trust: GatewayTrustPublication<'_>,
         scope: &CpScope,
     ) {
         let Some(tx) = broadcasts.try_sender_for(namespace) else {
             return;
         };
-        let trust_bundles = if scope.requires_namespace_claim_by_default() {
-            None
+        // Defense in depth: a multi-namespace CP must never put an
+        // unpartitioned trust value on a namespace-scoped stream. The caller
+        // supplies a namespace-resolved publication, so a `Replace` that
+        // survived to here should already be this namespace's own record; on a
+        // claim-requiring scope we still refuse to forward one, and we refuse it
+        // as `Unchanged` rather than `Clear` so an unrelated resource delta can
+        // never revoke trust the subscriber legitimately holds (issue #3727).
+        let trust = if scope.requires_namespace_claim_by_default()
+            && matches!(trust, GatewayTrustPublication::Replace(_))
+        {
+            GatewayTrustPublication::Unchanged
         } else {
-            trust_bundles
+            trust
         };
-        Self::broadcast_delta_with_trust_bundles(&tx, result, version, trust_bundles);
+        Self::broadcast_delta_with_trust_bundles(&tx, result, version, trust);
         registry.touch_namespace(namespace);
     }
 
@@ -1529,9 +1598,9 @@ impl CpGrpcServer {
         result: &crate::config::db_loader::IncrementalResult,
         version: &str,
         registry: &DpNodeRegistry,
-        trust_bundles: Option<&crate::modes::mesh::config::TrustBundleSet>,
+        trust: GatewayTrustPublication<'_>,
     ) {
-        Self::broadcast_delta_with_trust_bundles(tx, result, version, trust_bundles);
+        Self::broadcast_delta_with_trust_bundles(tx, result, version, trust);
         registry.touch_all();
     }
 
@@ -1548,14 +1617,22 @@ impl CpGrpcServer {
         Self::broadcast_delta_with_trust_bundles_json(tx, result, version, String::new());
     }
 
-    /// Broadcast an incremental delta with optional gateway trust bundles.
+    /// Broadcast an incremental delta with an explicit gateway trust
+    /// publication.
+    ///
+    /// The three-way [`GatewayTrustPublication`] is the whole point: before
+    /// issue #3727 this took an `Option`, and `None` encoded as JSON `null` —
+    /// an explicit CLEAR — so every ordinary resource delta silently revoked
+    /// whatever trust the subscriber had been given. `Unchanged` now encodes as
+    /// an empty side channel, which the DP leaves alone, and only a real
+    /// revocation produces `null`.
     pub fn broadcast_delta_with_trust_bundles(
         tx: &broadcast::Sender<ConfigUpdate>,
         result: &crate::config::db_loader::IncrementalResult,
         version: &str,
-        trust_bundles: Option<&crate::modes::mesh::config::TrustBundleSet>,
+        trust: GatewayTrustPublication<'_>,
     ) {
-        let trust_bundles_json = match Self::trust_bundles_json(trust_bundles) {
+        let trust_bundles_json = match Self::trust_publication_json(&trust) {
             Ok(json) => json,
             Err(e) => {
                 error!(
@@ -1592,6 +1669,22 @@ impl CpGrpcServer {
             heartbeat_negotiated: false,
         };
         let _ = tx.send(update);
+    }
+
+    /// Encode a [`GatewayTrustPublication`] for the side channel.
+    ///
+    /// `Unchanged` short-circuits to an empty string before any validation:
+    /// there is nothing to validate and nothing to say. `Replace` runs the same
+    /// semantic validation as a snapshot, so invalid material degrades to an
+    /// explicit clear rather than being published.
+    fn trust_publication_json(
+        trust: &GatewayTrustPublication<'_>,
+    ) -> Result<String, serde_json::Error> {
+        match trust {
+            GatewayTrustPublication::Unchanged => Ok(String::new()),
+            GatewayTrustPublication::Clear => Ok("null".to_string()),
+            GatewayTrustPublication::Replace(bundle) => Self::trust_bundles_json(Some(*bundle)),
+        }
     }
 
     fn trust_bundles_json(

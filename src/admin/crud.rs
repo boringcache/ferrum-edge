@@ -24,6 +24,7 @@ use crate::config::db_backend::{
     validate_api_spec_restore_inputs,
 };
 use crate::config::db_loader::{is_proxy_plugin_association_load_error, is_row_decode_rejection};
+use crate::config::gateway_trust::GatewayTrustBundleRecord;
 use crate::config::types::{
     Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, Upstream, validate_resource_id,
 };
@@ -1768,6 +1769,14 @@ pub(crate) trait AdminResource:
     fn validate(&self, ctx: &ValidationCtx<'_>) -> Result<(), ValidationError>;
     fn cached_items(config: &GatewayConfig) -> &[Self];
 
+    /// Stamp the authenticated admin subject onto the resource, for resources
+    /// that persist server-side attribution alongside the durable audit log.
+    ///
+    /// Called after `normalize()` so a client-supplied value can never survive:
+    /// attribution must come from the verified JWT, not the request body.
+    /// Default is a no-op.
+    fn set_actor(&mut self, _actor: &str) {}
+
     fn response_body(resource: &Self) -> Value {
         json!(resource)
     }
@@ -2830,6 +2839,173 @@ impl AdminResource for Upstream {
         }
     }
 }
+
+/// Namespace-keyed gateway trust bundles (issue #3727).
+///
+/// The resource is a SINGLETON per namespace: a namespace's projected trust
+/// state must be unambiguous, so a second create in the same namespace is a
+/// 409. That rule is enforced in three places on purpose — here as a friendly
+/// precheck, in the store's transaction, and finally by the SQL `namespace`
+/// primary key / MongoDB `_id`, which is the only tier a concurrent writer on
+/// another admin replica cannot race past.
+///
+/// There is deliberately no cached-config read fallback: trust state gates peer
+/// verification, so answering from a possibly-stale in-memory snapshot when the
+/// database is unreachable would be worse than reporting the outage.
+#[async_trait::async_trait]
+impl AdminResource for GatewayTrustBundleRecord {
+    const RESOURCE_NAME: &'static str = "gateway trust bundle";
+    const RESOURCE_LABEL: &'static str = "Gateway trust bundle";
+    const VALIDATION_ERROR_LABEL: &'static str = "gateway trust bundle fields";
+    const NOT_FOUND_MESSAGE: &'static str = "Gateway trust bundle not found";
+    // Serialize same-namespace writes through the durable namespace config
+    // admission lease so the singleton precheck is authoritative across admin
+    // instances, exactly like upstream name uniqueness.
+    const SERIALIZE_NAMESPACE_CONFIG_ADMISSION: bool = true;
+
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn set_id(&mut self, id: String) {
+        self.id = id;
+    }
+
+    fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    fn set_namespace(&mut self, ns: String) {
+        self.namespace = ns;
+    }
+
+    fn set_created_at(&mut self, now: DateTime<Utc>) {
+        self.created_at = now;
+    }
+
+    fn set_updated_at(&mut self, now: DateTime<Utc>) {
+        self.updated_at = now;
+    }
+
+    fn updated_at(&self) -> DateTime<Utc> {
+        self.updated_at
+    }
+
+    fn normalize(&mut self) {
+        // Attribution is server-assigned in `set_actor`; drop anything the
+        // client tried to author so the stored value is always the verified
+        // admin subject.
+        self.updated_by = None;
+        self.normalize_fields();
+    }
+
+    fn set_actor(&mut self, actor: &str) {
+        self.updated_by = Some(actor.to_string());
+    }
+
+    fn validate(&self, _ctx: &ValidationCtx<'_>) -> Result<(), ValidationError> {
+        self.validate_fields().map_err(ValidationError::Fields)
+    }
+
+    fn cached_items(config: &GatewayConfig) -> &[Self] {
+        &config.gateway_trust_bundles
+    }
+
+    fn allow_cached_read_fallback(_error: &anyhow::Error) -> bool {
+        false
+    }
+
+    fn prepare_for_update(&mut self, existing: &Self) {
+        // `created_at` belongs to the resource, not to this request.
+        self.created_at = existing.created_at;
+    }
+
+    fn map_persist_db_error(
+        error: &anyhow::Error,
+        _action: WriteAction<'_>,
+    ) -> Response<Full<Bytes>> {
+        if let Some(conflict) =
+            crate::config::db_backend::gateway_trust_bundle_revision_conflict(error)
+        {
+            // Render the typed conflict, never the chain's outer message: that
+            // message can carry driver/DSN context.
+            return super::json_response(
+                StatusCode::CONFLICT,
+                &json!({
+                    "error": crate::config::db_backend::GATEWAY_TRUST_BUNDLE_REVISION_CONFLICT_MESSAGE,
+                    "expected_revision": conflict.expected,
+                    "current_revision": conflict.current,
+                }),
+            );
+        }
+        if super::chain_has_unique_constraint_violation(error) {
+            // The namespace primary key rejected a second record: another admin
+            // replica won the create race.
+            return super::json_response(
+                StatusCode::CONFLICT,
+                &json!({"error": GATEWAY_TRUST_BUNDLE_SINGLETON_CONFLICT_MESSAGE}),
+            );
+        }
+        super::json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &super::db_error_response(error),
+        )
+    }
+
+    async fn db_get(db: &dyn DatabaseBackend, namespace: &str, id: &str) -> DbResult<Option<Self>> {
+        db.get_gateway_trust_bundle(namespace, id).await
+    }
+
+    async fn db_list(
+        db: &dyn DatabaseBackend,
+        namespace: &str,
+        pagination: &super::PaginationParams,
+    ) -> DbResult<PaginatedResult<Self>> {
+        db.list_gateway_trust_bundles_paginated(
+            namespace,
+            pagination.query_limit_i64(),
+            pagination.query_offset_i64(),
+        )
+        .await
+    }
+
+    async fn db_create(db: &dyn DatabaseBackend, resource: &Self) -> DbResult<()> {
+        db.create_gateway_trust_bundle(resource).await
+    }
+
+    async fn db_update(db: &dyn DatabaseBackend, resource: &Self) -> DbResult<bool> {
+        // `revision` on the request body is the client's expectation, not the
+        // value to store: the store assigns the next revision itself. `0` (or
+        // an omitted field) means "no expectation" and skips the compare-and-set
+        // so a first-party tool can still force a write, while any non-zero
+        // value makes a lost race a 409 instead of a silent overwrite.
+        let expected = (resource.revision != 0).then_some(resource.revision);
+        db.update_gateway_trust_bundle(resource, expected).await
+    }
+
+    async fn db_delete(db: &dyn DatabaseBackend, namespace: &str, id: &str) -> DbResult<bool> {
+        db.delete_gateway_trust_bundle(namespace, id).await
+    }
+
+    async fn check_uniqueness(
+        db: &dyn DatabaseBackend,
+        namespace: &str,
+        _resource: &Self,
+        exclude_id: Option<&str>,
+    ) -> DbResult<Option<String>> {
+        match db.get_namespace_gateway_trust_bundle(namespace).await? {
+            Some(existing) if Some(existing.id.as_str()) != exclude_id => Ok(Some(
+                GATEWAY_TRUST_BUNDLE_SINGLETON_CONFLICT_MESSAGE.to_string(),
+            )),
+            _ => Ok(None),
+        }
+    }
+}
+
+/// Operator-facing message when a namespace already holds a trust-bundle
+/// record. Names no ids and no material.
+pub(crate) const GATEWAY_TRUST_BUNDLE_SINGLETON_CONFLICT_MESSAGE: &str =
+    "namespace already has a gateway trust bundle; update or delete the existing resource instead";
 
 #[async_trait::async_trait]
 impl AdminResource for PluginConfig {
@@ -4251,6 +4427,7 @@ async fn handle_write<R: AdminResource>(
 
     resource.normalize();
     resource.set_namespace(namespace.to_string());
+    resource.set_actor(&actor.sub);
 
     let validation_ctx = ValidationCtx::from_state(state);
     if let Err(validation_error) = resource.validate(&validation_ctx) {

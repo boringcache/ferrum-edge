@@ -2820,6 +2820,7 @@ mod tests {
             http_tls_listen_ports: Default::default(),
             mesh_revision: None,
             k8s_mesh_overlay: Default::default(),
+            gateway_trust_bundles: Vec::new(),
         };
 
         let filtered = filter_config_to_namespace(&mut cfg, "production");
@@ -2862,6 +2863,7 @@ mod tests {
             .collect(),
             mesh_revision: None,
             k8s_mesh_overlay: Default::default(),
+            gateway_trust_bundles: Vec::new(),
         };
 
         assert_eq!(
@@ -2896,6 +2898,7 @@ mod tests {
             http_tls_listen_ports: Default::default(),
             mesh_revision: None,
             k8s_mesh_overlay: Default::default(),
+            gateway_trust_bundles: Vec::new(),
         };
         assert_eq!(filter_config_to_namespace(&mut cfg, "production"), 0);
         assert_eq!(cfg.proxies.len(), 1);

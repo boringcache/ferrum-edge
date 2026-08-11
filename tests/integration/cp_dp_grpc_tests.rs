@@ -15,6 +15,7 @@ use tonic::transport::server::ServerTlsConfig;
 use tonic::transport::{Certificate, Identity, Server};
 
 use ferrum_edge::config::db_loader::{IncrementalResult, NamespacedResourceId};
+use ferrum_edge::config::gateway_trust::GatewayTrustPublication;
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, Consumer, DispatchKind, GatewayConfig, LoadBalancerAlgorithm,
     PluginConfig, PluginScope, Proxy, Upstream, UpstreamTarget,
@@ -663,7 +664,7 @@ async fn test_dp_stores_gateway_trust_bundles_from_delta_side_channel() {
         &update_tx,
         &delta,
         &version,
-        Some(&trust_bundles),
+        GatewayTrustPublication::Replace(&trust_bundles),
     );
 
     let received_trust = timeout(Duration::from_secs(5), async {
@@ -750,7 +751,7 @@ async fn test_dp_rejects_gateway_trust_bundles_from_rejected_delta() {
         &update_tx,
         &delta,
         &version,
-        Some(&trust_bundles),
+        GatewayTrustPublication::Replace(&trust_bundles),
     );
 
     // The CP fixes only the bad member in a later delta. Because the original

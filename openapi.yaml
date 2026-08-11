@@ -154,6 +154,8 @@ tags:
     description: Submit, retrieve, replace, and delete OpenAPI/Swagger spec bundles that create proxy + upstream + plugin resources atomically
   - name: TLS
     description: TLS inventory/events/validation/forced reload require operator; persisted certificate, key, trust, JWKS, and ACME state mutations require admin
+  - name: Gateway Trust
+    description: Namespace-keyed gateway/mesh trust bundles distributed to data planes through CP/DP ConfigSync; reads require operator, writes require admin
 
 paths:
   # ── Health ──────────────────────────────────────────────────────────
@@ -5305,6 +5307,200 @@ paths:
         "503":
           $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
+  # ── Gateway trust bundles ───────────────────────────────────────────
+  /gateway-trust-bundles:
+    parameters:
+      - $ref: "#/components/parameters/XFerrumNamespace"
+    get:
+      operationId: listGatewayTrustBundles
+      summary: List the namespace's gateway trust bundle (paginated)
+      description: |
+        Returns a paginated envelope with `data` and `pagination` fields. The
+        resource is a singleton per namespace, so `data` holds either zero or
+        one item. Requires the `operator` role.
+
+        Only the namespace selected by `X-Ferrum-Namespace` is ever returned.
+        When `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=true` the token's `ns` claim
+        must authorize that namespace.
+      tags: [Gateway Trust]
+      parameters:
+        - $ref: "#/components/parameters/PaginationOffset"
+        - $ref: "#/components/parameters/PaginationLimit"
+      responses:
+        "200":
+          description: Paginated gateway trust bundle records
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, pagination]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/GatewayTrustBundle"
+                  pagination:
+                    $ref: "#/components/schemas/Pagination"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+    post:
+      operationId: createGatewayTrustBundle
+      summary: Create the namespace's gateway trust bundle
+      description: |
+        Creates the namespace's single gateway trust-bundle resource. Requires
+        the `admin` role. A namespace that already holds a record returns `409`.
+      tags: [Gateway Trust]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GatewayTrustBundleCreate"
+      responses:
+        "201":
+          description: Created gateway trust bundle
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GatewayTrustBundle"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/ReadOnly"
+        "408":
+          $ref: "#/components/responses/RequestTimeout"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "503":
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
+
+  /gateway-trust-bundles/{id}:
+    parameters:
+      - $ref: "#/components/parameters/ResourceId"
+      - $ref: "#/components/parameters/XFerrumNamespace"
+    get:
+      operationId: getGatewayTrustBundle
+      summary: Get the gateway trust bundle by ID
+      tags: [Gateway Trust]
+      responses:
+        "200":
+          description: Gateway trust bundle record
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GatewayTrustBundle"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+    put:
+      operationId: updateGatewayTrustBundle
+      summary: Rotate or replace the gateway trust bundle
+      description: |
+        Replaces the stored trust material. Requires the `admin` role.
+
+        Optimistic concurrency: send the `revision` you read. A mismatch returns
+        `409` with `expected_revision` and `current_revision` and writes
+        nothing. Omitting `revision` (or sending `0`) skips the check.
+
+        The store assigns the next revision itself; the value in the request
+        body is only the expectation.
+      tags: [Gateway Trust]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GatewayTrustBundleCreate"
+      responses:
+        "200":
+          description: Updated gateway trust bundle
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GatewayTrustBundle"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/ReadOnly"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "408":
+          $ref: "#/components/responses/RequestTimeout"
+        "409":
+          description: |
+            The namespace already holds a record (create), or the supplied
+            `revision` no longer matches the stored one (update).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GatewayTrustBundleConflict"
+        "503":
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
+    delete:
+      operationId: deleteGatewayTrustBundle
+      summary: Revoke the namespace's gateway trust bundle
+      description: |
+        Explicit revocation. Requires the `admin` role. This is distinguishable
+        from "no change" on the wire: subscribed data planes receive an explicit
+        clear on the ConfigSync trust side channel and withdraw the roots.
+      tags: [Gateway Trust]
+      responses:
+        "204":
+          description: Gateway trust bundle deleted
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/ReadOnly"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
+
+  /gateway-trust/status:
+    parameters:
+      - $ref: "#/components/parameters/XFerrumNamespace"
+    get:
+      operationId: getGatewayTrustStatus
+      summary: Gateway trust load and convergence status
+      description: |
+        Namespace trust summary plus process-wide load/convergence counters.
+        Requires the `operator` role.
+
+        Redaction contract: the payload carries the trust domain, authority
+        counts, the revision, timestamps, and a bounded failure-reason enum. It
+        never carries PEM/DER/JWKS bytes, key ids, or secret/provider URIs.
+      tags: [Gateway Trust]
+      responses:
+        "200":
+          description: Gateway trust status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GatewayTrustStatus"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
   # ── Namespaces ──────────────────────────────────────────────────────
   /namespaces:
     get:
@@ -10410,6 +10606,219 @@ components:
       required:
         - targets
 
+    GatewayTrustBundle:
+      type: object
+      description: |
+        Authoritative, namespace-keyed gateway/mesh trust-bundle resource
+        (issue #3727). At most one record exists per namespace.
+      required: [id, namespace, trust_domain, bundle, revision]
+      properties:
+        id:
+          type: string
+          maxLength: 255
+          description: >-
+            Stable resource identity. Defaults to the namespace when omitted on
+            create.
+        namespace:
+          type: string
+          description: >-
+            Owning namespace. Always forced to the `X-Ferrum-Namespace` value;
+            a value in the body is ignored.
+        trust_domain:
+          type: string
+          description: >-
+            Bundle identity. Must equal `bundle.local.trust_domain`; a
+            conflicting value is rejected rather than silently corrected.
+        bundle:
+          $ref: "#/components/schemas/TrustBundleSet"
+        revision:
+          type: integer
+          format: int64
+          minimum: 0
+          description: >-
+            Server-assigned monotonic revision. On update, the value sent is the
+            expected current revision (`0` or omitted = no expectation).
+        updated_by:
+          type: string
+          nullable: true
+          description: >-
+            Admin JWT subject that last wrote the record. Server-assigned from
+            the verified token; a value in the request body is discarded.
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    GatewayTrustBundleCreate:
+      type: object
+      required: [trust_domain, bundle]
+      properties:
+        id:
+          type: string
+          maxLength: 255
+        trust_domain:
+          type: string
+        bundle:
+          $ref: "#/components/schemas/TrustBundleSet"
+        revision:
+          type: integer
+          format: int64
+          minimum: 0
+          description: >-
+            Expected current revision for optimistic concurrency on update.
+            Ignored on create.
+
+    TrustBundleSet:
+      type: object
+      description: |
+        SPIFFE trust material, in the same shape the mesh configuration model
+        uses. Bounded on admission: at most 16 X.509 authorities and 16 JWT
+        authorities per bundle, at most 32 federated bundles, at most 16 KiB per
+        authority, and at most 256 KiB for the encoded value as a whole.
+      required: [local]
+      properties:
+        local:
+          $ref: "#/components/schemas/TrustBundle"
+        federated:
+          type: array
+          maxItems: 32
+          items:
+            $ref: "#/components/schemas/TrustBundle"
+
+    TrustBundle:
+      type: object
+      description: |
+        One trust domain's authorities. Every `x509_authorities` entry must be
+        valid base64 AND parse as an X.509 certificate; every
+        `jwt_authorities.public_key_pem` must be a PEM public-key block. At
+        least one authority is required.
+      required: [trust_domain]
+      properties:
+        trust_domain:
+          type: string
+          description: SPIFFE trust domain (no `spiffe://` scheme).
+        x509_authorities:
+          type: array
+          maxItems: 16
+          items:
+            type: string
+            description: Base64-encoded DER certificate.
+        jwt_authorities:
+          type: array
+          maxItems: 16
+          items:
+            type: object
+            required: [key_id, public_key_pem]
+            properties:
+              key_id:
+                type: string
+                maxLength: 256
+              public_key_pem:
+                type: string
+        refresh_hint_seconds:
+          type: integer
+          format: int64
+          minimum: 0
+
+    GatewayTrustBundleConflict:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+        expected_revision:
+          type: integer
+          format: int64
+          description: Present on a lost optimistic-concurrency race.
+        current_revision:
+          type: integer
+          format: int64
+          description: Present on a lost optimistic-concurrency race.
+
+    GatewayTrustBundleSummary:
+      type: object
+      description: >-
+        Material-free description of a namespace's trust state. Counts and
+        identity only — never PEM/DER/JWKS bytes.
+      required:
+        [
+          namespace,
+          trust_domain,
+          revision,
+          x509_authority_count,
+          jwt_authority_count,
+          federated_count,
+          updated_at,
+        ]
+      properties:
+        namespace:
+          type: string
+        trust_domain:
+          type: string
+        revision:
+          type: integer
+          format: int64
+        x509_authority_count:
+          type: integer
+        jwt_authority_count:
+          type: integer
+        federated_count:
+          type: integer
+        updated_at:
+          type: string
+          format: date-time
+
+    GatewayTrustStatus:
+      type: object
+      required: [namespace, configured, process]
+      properties:
+        namespace:
+          type: string
+        configured:
+          type: boolean
+          description: Whether the namespace holds a trust-bundle record.
+        bundle:
+          allOf:
+            - $ref: "#/components/schemas/GatewayTrustBundleSummary"
+          nullable: true
+        process:
+          type: object
+          description: >-
+            Process-wide, label-free counters. Reset on process restart.
+          required:
+            [
+              loads_total,
+              load_rejections_total,
+              ambiguous_authority_total,
+              published_revision,
+              last_successful_load_unix_seconds,
+              last_failure_reason,
+            ]
+          properties:
+            loads_total:
+              type: integer
+              format: int64
+            load_rejections_total:
+              type: integer
+              format: int64
+              description: >-
+                Candidates refused before the live swap; the previous valid
+                generation stayed active.
+            ambiguous_authority_total:
+              type: integer
+              format: int64
+            published_revision:
+              type: integer
+              format: int64
+            last_successful_load_unix_seconds:
+              type: integer
+              format: int64
+            last_failure_reason:
+              type: string
+              enum: [none, invalid_material, undecodable, ambiguous_authority]
+
     Upstream:
       type: object
       required: [targets]
@@ -13765,7 +14174,15 @@ components:
           description: Where the config was read from
         counts:
           type: object
-          required: [proxies, consumers, plugin_configs, upstreams, api_specs]
+          required:
+            [
+              proxies,
+              consumers,
+              plugin_configs,
+              upstreams,
+              api_specs,
+              gateway_trust_bundles,
+            ]
           properties:
             proxies:
               type: integer
@@ -13776,6 +14193,8 @@ components:
             upstreams:
               type: integer
             api_specs:
+              type: integer
+            gateway_trust_bundles:
               type: integer
         proxies:
           type: array
@@ -13793,6 +14212,18 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/Upstream"
+        gateway_trust_bundles:
+          type: array
+          description: |
+            Namespace-keyed gateway trust bundles (issue #3727). Present on
+            database-backed exports (possibly empty). ABSENT on cached-fallback
+            exports and on backups that predate the resource — restore treats an
+            absent section as "say nothing about trust" and leaves the
+            namespace's existing roots in place, while a present section is
+            authoritative and reconciles to exactly what it lists (an empty
+            array revokes).
+          items:
+            $ref: "#/components/schemas/GatewayTrustBundle"
         api_specs:
           $ref: "#/components/schemas/ApiSpecsBackupSection"
 
@@ -13944,7 +14375,15 @@ components:
       properties:
         restored:
           type: object
-          required: [proxies, consumers, plugin_configs, upstreams, api_specs]
+          required:
+            [
+              proxies,
+              consumers,
+              plugin_configs,
+              upstreams,
+              api_specs,
+              gateway_trust_bundles,
+            ]
           properties:
             proxies:
               type: integer
@@ -13961,6 +14400,12 @@ components:
             api_specs:
               type: integer
               description: Number of API specs restored
+            gateway_trust_bundles:
+              type: integer
+              description: >-
+                Number of gateway trust-bundle records reconciled from the
+                payload's `gateway_trust_bundles` section. `0` when the backup
+                omits the section, which leaves existing trust untouched.
     # ── Shared: Transaction-Log Schema Customization ──────────────────
     # Shape of the `schema:` block (and the entries inside
     # `transaction_log_schema.schemas`). See docs/log_schema.md for the

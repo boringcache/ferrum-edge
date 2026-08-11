@@ -938,6 +938,7 @@ fn config_with_upstreams(upstreams: Vec<Upstream>) -> GatewayConfig {
         http_tls_listen_ports: Default::default(),
         mesh_revision: None,
         k8s_mesh_overlay: Default::default(),
+        gateway_trust_bundles: Vec::new(),
     }
 }
 
