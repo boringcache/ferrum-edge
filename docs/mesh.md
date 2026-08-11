@@ -50,6 +50,7 @@ Concepts map directly to the Istio service mesh model: `Workload` corresponds to
   - [Workload API JWT-SVID](#workload-api-jwt-svid)
     - [Serving the Workload API](#serving-the-workload-api)
     - [JWT signing material, restart, and HA](#jwt-signing-material-restart-and-ha)
+    - [Workload API CA error status contract](#workload-api-ca-error-status-contract)
     - [SPIRE backend: serving a Workload API is refused](#spire-backend-serving-a-workload-api-is-refused)
   - [Internal Dev CA and Production Guardrails](#internal-dev-ca-and-production-guardrails)
 - [Node Agent Mode](#node-agent-mode)
@@ -3433,6 +3434,19 @@ The `internal` CA loads that ES256 JWT signing key at startup. Behaviour:
 - **Federated trust domains are bounded at configuration, not per response.** The configured federated set is deduplicated, stripped of the local trust domain, and capped once when the service is built; an over-cap list is an error rather than a silent truncation, so the number of CA calls one bundle RPC can make is fixed before any of them is issued. Counting successfully published bundles instead would have let arbitrarily many empty or failing aliases drive unbounded CA work.
 
 Like `FetchX509Bundles`, the bundle and validate RPCs require the mandatory `workload.spiffe.io: true` metadata header but do not run the attestor chain — they consume public trust material and mint nothing. Private-key and token issuance stay gated on `FetchX509SVID` / `FetchJWTSVID`.
+
+#### Workload API CA error status contract
+
+When a Workload API RPC fails because the configured certificate authority returned a `CaError`, Ferrum converts that failure **once** at the Workload API boundary into a stable gRPC status. Clients must not couple to provider, configuration, filesystem, trust-domain, or OS diagnostics — those details stay server-side in structured logs that carry only fixed-cardinality `operation` and `error_class` fields.
+
+| `CaError` variant | gRPC code | Fixed client message |
+|---|---|---|
+| `BadCsr` | `INVALID_ARGUMENT` | `certificate request rejected` |
+| `UnknownTrustDomain` | `PERMISSION_DENIED` | `trust domain not authorized` |
+| `Upstream` | `UNAVAILABLE` | `certificate authority unavailable` |
+| `Config` / `Internal` / `Io` | `INTERNAL` | `certificate authority operation failed` |
+
+This mapping applies to initial `FetchX509SVID` construction, the static/rotation response helpers shared by stream refresh, local and federated X.509 bundle fetches, the bundle-only `FetchX509Bundles` RPC (which still requires the mandatory metadata header but does not run attestation), and the JWT-authority collection path used by `FetchJWTBundles` / `ValidateJWTSVID`. Transient CA failures on an already-open rotation stream stay server-side and do not terminate a healthy stream; entitlement denials from re-attestation remain terminal `PERMISSION_DENIED` as before. Workload attestation failures keep their own fixed `PERMISSION_DENIED` / `workload attestation failed` contract and are unchanged by this mapping.
 
 #### SPIRE backend: serving a Workload API is refused
 
