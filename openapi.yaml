@@ -6258,7 +6258,10 @@ components:
           schema:
             $ref: "#/components/schemas/Error"
     PayloadTooLarge:
-      description: Request body or admitted TLS material exceeds its configured byte limit
+      description: >
+        Request body, admitted TLS material, or a candidate managed/ACME store
+        document exceeds its configured byte limit; a rejected candidate store
+        write leaves the previous authoritative document intact
       content:
         application/json:
           schema:
@@ -6283,10 +6286,10 @@ components:
     InternalServerError:
       description: >
         Internal server error. For managed TLS and ACME routes this also covers a
-        shared store document that cannot be opened, read, or parsed, including
-        one that exceeds `FERRUM_TLS_STORE_MAX_DOCUMENT_BYTES` in either
-        direction; no request can fix that state, so it is never reported as a
-        4xx
+        shared authoritative store document that cannot be opened, read, or
+        parsed, including one that already exceeds
+        `FERRUM_TLS_STORE_MAX_DOCUMENT_BYTES`; no request can fix that read-side
+        state, so it is never reported as a 4xx
       content:
         application/json:
           schema:

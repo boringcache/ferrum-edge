@@ -46,7 +46,8 @@ use x509_parser::prelude::*;
 use crate::config::types::validate_resource_id;
 use crate::tls::shared_store::{
     SharedStoreError, SharedStoreFile, TlsPersistentStoreKind, TlsStoreAdmissionReason,
-    VersionedStoreFile, record_store_admission_rejected, record_store_pruned,
+    TlsStoreIoDirection, VersionedStoreFile, record_store_admission_rejected,
+    record_store_pruned,
 };
 use crate::tls::source::MaterialKind;
 
@@ -554,7 +555,9 @@ pub enum AcmeError {
     MaterialTooLarge,
     /// Whole-document serialized size exceeded `FERRUM_TLS_STORE_MAX_DOCUMENT_BYTES`.
     #[error("ACME store document exceeds the configured byte ceiling")]
-    DocumentTooLarge,
+    DocumentTooLarge {
+        direction: TlsStoreIoDirection,
+    },
     /// Creating a new certificate/account would exceed the configured logical limit.
     #[error("ACME store has reached the configured record limit")]
     RecordLimitReached,
@@ -591,7 +594,9 @@ impl From<SharedStoreError> for AcmeError {
             // configuration failure, not a missing record: fail closed with the
             // rule that was broken so the operator can see it.
             SharedStoreError::InvalidConfig { .. } => Self::InvalidConfiguration(error.to_string()),
-            SharedStoreError::Oversized { .. } => Self::DocumentTooLarge,
+            SharedStoreError::Oversized { direction, .. } => Self::DocumentTooLarge {
+                direction: *direction,
+            },
         }
     }
 }

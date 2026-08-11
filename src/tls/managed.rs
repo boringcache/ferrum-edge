@@ -27,7 +27,7 @@ use x509_parser::prelude::*;
 use crate::config::types::validate_resource_id;
 use crate::tls::shared_store::{
     SharedStoreError, SharedStoreFile, TlsPersistentStoreKind, TlsStoreAdmissionReason,
-    VersionedStoreFile, record_store_admission_rejected,
+    TlsStoreIoDirection, VersionedStoreFile, record_store_admission_rejected,
 };
 use crate::tls::source::MaterialKind;
 
@@ -170,7 +170,9 @@ pub enum ManagedTlsError {
     ///
     /// Deliberately content-free: diagnostics must not echo store payloads.
     #[error("managed TLS store document exceeds the configured byte ceiling")]
-    DocumentTooLarge,
+    DocumentTooLarge {
+        direction: TlsStoreIoDirection,
+    },
     /// Creating a new record would exceed `FERRUM_TLS_MANAGED_MAX_RECORDS`.
     ///
     /// Overwrite and delete remain available. Never echoes record payloads.
@@ -203,7 +205,9 @@ impl From<SharedStoreError> for ManagedTlsError {
             // configuration failure, not a missing record: fail closed with the
             // rule that was broken so the operator can see it.
             SharedStoreError::InvalidConfig { .. } => Self::InvalidConfiguration(error.to_string()),
-            SharedStoreError::Oversized { .. } => Self::DocumentTooLarge,
+            SharedStoreError::Oversized { direction, .. } => Self::DocumentTooLarge {
+                direction: *direction,
+            },
         }
     }
 }
