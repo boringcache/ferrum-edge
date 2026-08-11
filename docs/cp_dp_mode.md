@@ -351,6 +351,42 @@ wire.
 Tenant-isolated roots no longer require separate CP and config-store instances.
 See the [CP namespace-tenancy protocol matrix](cp_namespace_tenancy.md#protocol-matrix) and the enforcement coverage in [`cp_multi_namespace_tests.rs`](../tests/integration/cp_multi_namespace_tests.rs).
 
+##### Acceptance coverage
+
+The store contract, the admission validation, the publication accounting, and
+the ConfigSync projection are asserted in-process by
+[`gateway_trust_bundle_store_tests.rs`](../tests/integration/gateway_trust_bundle_store_tests.rs),
+[`gateway_trust_bundle_admin_tests.rs`](../tests/integration/gateway_trust_bundle_admin_tests.rs),
+and [`gateway_trust_bundle_tests.rs`](../tests/unit/config/gateway_trust_bundle_tests.rs).
+
+Live, backend-by-backend acceptance runs in the hosted `Functional Tests
+(data-plane)` job through
+[`functional_gateway_trust_bundle_ha_test.rs`](../tests/functional/functional_gateway_trust_bundle_ha_test.rs):
+
+| Acceptance criterion | Where it is proved live |
+|---|---|
+| Create / read / rotate with overlap / explicit revoke on every provisioned backend | `test_gateway_trust_bundle_acceptance_{sqlite,postgres,mysql,mongodb_standalone,mongodb_replica_set}` |
+| Optimistic concurrency (a stale expectation is a typed `409`, never an overwrite) | the same acceptance cells |
+| A malformed or oversized candidate is refused before publication and the prior valid bundle survives | the same acceptance cells |
+| A rotation reaches the publication boundary (`published_generations_total` advances at the swap) | the same acceptance cells |
+| Namespace A cannot read, write, delete, list, or infer namespace B's record | the same acceptance cells |
+| A restart reconstructs the identical generation, revision, and material from the database alone | the same acceptance cells, plus the CP restart in the HA cells |
+| Two CP replicas observe and publish the same committed revision **without a restart** | `test_two_control_plane_replicas_converge_{postgres,mongodb}` |
+| Concurrent writers racing from one read leave exactly one winner | the same HA cells |
+| MongoDB never commits a trust mutation no poller can see, including through an interrupted write | `test_mongodb_{standalone,replica_set}_never_commits_an_invisible_trust_mutation` |
+
+The MongoDB invisibility cells `SIGKILL` the control plane mid-rotation and then
+read the collection directly: the committed document's `revision` must still be
+a `config_changes` sequence that exists, which is exactly the property the
+standalone signal-first ordering buys. A redundant change row is allowed by
+contract and costs one wasted full reload.
+
+Two gaps remain, and are not claimed as covered: the CP still publishes a
+rotation as a FULL_SNAPSHOT rather than a trust-carrying DELTA (deliberate — the
+`IncrementalResult` body is a same-major.minor wire contract), and the DP-side
+apply of `Replace`/`Clear` is exercised by the existing ConfigSync suites rather
+than by a new end-to-end CP→DP datapath cell in this matrix.
+
 DP persistence is memory-only on every path: received bundles are stored in lock-free `ArcSwap` runtime state and are not written to disk or a database. A restarted DP must reconnect and fetch the value from its CP again.
 
 Federated remote-cluster roots have a separate runtime mechanism. The [mesh federation poller](../src/modes/mesh/federation.rs) fetches each configured federation endpoint at `FERRUM_MESH_FEDERATION_POLL_INTERVAL_SECONDS` and overlays the validated result onto the `TrustBundleSet.federated` subset. That poller is independent of this local/CP-authoritative config-store matrix and its `trust_bundles_json` delivery path.

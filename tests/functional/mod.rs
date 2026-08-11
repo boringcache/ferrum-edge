@@ -43,6 +43,7 @@ mod functional_file_mode_test;
 mod functional_forwarded_via_headers_test;
 mod functional_gateway_backend_tls_policy_test;
 mod functional_gateway_service_import_test;
+mod functional_gateway_trust_bundle_ha_test;
 mod functional_graceful_shutdown_test;
 mod functional_grpc_message_metrics_test;
 mod functional_grpc_method_pre_hook_test;

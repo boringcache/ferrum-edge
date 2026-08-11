@@ -15,7 +15,8 @@ missing/unreachable expected backend fails the job instead of silently skipping.
 The shard runs four mongod instances: the standalone on `27017` (the required
 backend for the cells below, and for the documented `POST /batch` 501 refusal),
 a single-node replica set on `27020` for the multi-document transactional batch
-path, TLS on `27018` (verify-full and require modes), and mTLS on `27019`. The
+and gateway trust-bundle paths, TLS on `27018` (verify-full and require modes),
+and mTLS on `27019`. The
 replica set is opt-in through `FERRUM_TEST_MONGO_REPLICA_SET` rather than
 `FERRUM_DB_BACKENDS_REQUIRED`, but once declared an unreachable member fails the
 cell instead of skipping. Mongo TLS/mTLS cells fail closed under
@@ -40,12 +41,25 @@ sqlx-Any BLOB mapping cannot turn a successful write into a false admin 404.
 | Migrate up + idempotency | `functional_migrate_*` (application shard) | `test_postgres_migrate_up_is_idempotent` | `test_mysql_migrate_up_is_idempotent` | N/A (index ensure path in Mongo lifecycle) |
 | Connectivity recovery | `functional_db_outage_test` (debug-only `FERRUM_TEST_DB_FAULT_CONTROL` file seam; never corrupts live SQLite/WAL/SHM) / `functional_db_failover_test` | `test_postgres_connectivity_recovery_after_container_pause` | `test_mysql_connectivity_recovery_after_container_pause` | proxy continues on cached config in Mongo lifecycle |
 | Supported TLS modes | `test_sqlite_without_tls_settings` (N/A network TLS) | `test_postgresql_tls_verify_full`, `test_postgresql_tls_require` | `test_mysql_tls_verify_identity`, `test_mysql_tls_required` | `test_mongodb_tls_connection` (verify-full), `test_mongodb_tls_require_connection` (require), `test_mongodb_mtls_connection` (mTLS); hosted inline in data-plane CI |
+| Gateway trust-bundle acceptance (issue #3727) | `test_gateway_trust_bundle_acceptance_sqlite` | `test_gateway_trust_bundle_acceptance_postgres` | `test_gateway_trust_bundle_acceptance_mysql` | `test_gateway_trust_bundle_acceptance_mongodb_standalone`, `test_gateway_trust_bundle_acceptance_mongodb_replica_set` |
+| Two-replica CP convergence + concurrent writers | N/A (single-writer embedded store) | `test_two_control_plane_replicas_converge_postgres` | covered by the PostgreSQL cell (shared `DatabaseStore`) | `test_two_control_plane_replicas_converge_mongodb` |
+| Interrupted trust mutation stays visible to a poller | N/A (SQL writes are transactional) | N/A (SQL writes are transactional) | N/A (SQL writes are transactional) | `test_mongodb_standalone_never_commits_an_invisible_trust_mutation`, `test_mongodb_replica_set_never_commits_an_invisible_trust_mutation` |
+
+All of the gateway trust-bundle cells live in
+`tests/functional/functional_gateway_trust_bundle_ha_test.rs`. They run the same
+backend-agnostic acceptance body — create, read, singleton refusal, refused
+malformed/oversized candidate, rotation with overlap, lost compare-and-set,
+publication at the `ArcSwap` swap, redaction of `/gateway-trust/status` and
+`/metrics`, namespace isolation, restart reconstruction, explicit revocation —
+so a dialect, driver, or concurrency difference between backends shows up as a
+diff in one place. The replica-set cells are opt-in through
+`FERRUM_TEST_MONGO_REPLICA_SET` and fail closed once it is declared.
 
 ### CI job mapping
 
 | Hosted job | Required backends | Required behaviors |
 |---|---|---|
-| `Functional Tests (data-plane)` | sqlite, postgres, mysql, mongodb, redis | admin-crud, polling-delete, namespace-isolation, migrate-idempotent, concurrent-mutations, connectivity-recovery, tls-modes |
+| `Functional Tests (data-plane)` | sqlite, postgres, mysql, mongodb, redis | admin-crud, polling-delete, namespace-isolation, migrate-idempotent, concurrent-mutations, connectivity-recovery, tls-modes, gateway-trust-bundle acceptance + two-replica CP convergence |
 | `Functional Tests (application)` | sqlite (migrate/file/admin) | migrate baseline on SQLite; no network DB URLs |
 | `Plugin Hardening Redis Regression` | redis (`FERRUM_REDIS_REQUIRED=1`) | request-dedup cross-instance |
 
@@ -60,8 +74,8 @@ sqlx-Any BLOB mapping cannot turn a successful write into a false admin 404.
 | `FERRUM_TEST_MONGO_TLS_REQUIRE_URL` | `mongodb://127.0.0.1:27018/ferrum_test` | MongoDB TLS require (encryption without cert verification) |
 | `FERRUM_TEST_MONGO_MTLS_URL` | `mongodb://127.0.0.1:27019/ferrum_test` | MongoDB mTLS client authentication |
 | `FERRUM_TEST_MONGO_CERT_DIR` | `${RUNNER_TEMP}/ferrum-mongo-tls-certs` | Certs provisioned inline by data-plane CI (`ca.crt`, `client.crt`, `client.key`) |
-| `FERRUM_TEST_MONGO_REPLICA_SET` | `rs0` | Enables the transactional `POST /batch` MongoDB cell |
-| `FERRUM_TEST_MONGO_REPLICA_SET_URL` | `mongodb://localhost:27020/ferrum_test` | Replica-set member for that cell |
+| `FERRUM_TEST_MONGO_REPLICA_SET` | `rs0` | Enables the transactional `POST /batch` cell and the transactional gateway trust-bundle cells |
+| `FERRUM_TEST_MONGO_REPLICA_SET_URL` | `mongodb://localhost:27020/ferrum_test` | Replica-set member for those cells |
 | `FERRUM_TEST_CERT_DIR` | `${RUNNER_TEMP}/ferrum-db-tls-certs` | SQL TLS certs provisioned inline by data-plane CI (local: `tests/scripts/setup_db_tls.sh`) |
 | `FERRUM_DB_BACKENDS_REQUIRED` | `1` | Fail when an expected plaintext backend is missing |
 | `FERRUM_DB_TLS_REQUIRED` | `1` | Fail when PostgreSQL/MySQL/MongoDB TLS fixtures are missing |

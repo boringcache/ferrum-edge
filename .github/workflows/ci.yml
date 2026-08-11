@@ -1262,6 +1262,7 @@ jobs:
               functional_db_outage_test
               functional_db_tls_test
               functional_db_upstream_test
+              functional_gateway_trust_bundle_ha_test
               functional_mesh_mode_test
               functional_mongodb_test
               functional_namespace_test
@@ -1312,8 +1313,10 @@ jobs:
         if: matrix.shard == 'data-plane'
         #
         # Four mongod instances on purpose:
-        # - standalone 27017: documented `POST /batch` 501 refusal + plaintext matrix
-        # - replica set 27020: transactional `POST /batch` (issue #2401)
+        # - standalone 27017: documented `POST /batch` 501 refusal + plaintext matrix,
+        #   plus the signal-first gateway-trust-bundle ordering proof (issue #3727)
+        # - replica set 27020: transactional `POST /batch` (issue #2401) and the
+        #   transactional gateway-trust-bundle acceptance cell (issue #3727)
         # - TLS 27018: verify-full + require modes (issue #2399)
         # - mTLS 27019: client certificate authentication (issue #2399)
         # Neither plaintext topology can substitute for the TLS fixtures.
