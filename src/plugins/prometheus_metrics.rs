@@ -3900,7 +3900,7 @@ impl MetricsRegistry {
             const NO_LABELS: &str = "";
             let trust = crate::config::gateway_trust::observability_snapshot();
             output.push_str(
-                "# HELP ferrum_gateway_trust_bundle_published_generations_total Gateway trust-bundle generations that reached the live configuration swap.\n",
+                "# HELP ferrum_gateway_trust_bundle_published_generations_total Gateway trust-bundle generations carrying a database-sourced record that reached the live configuration swap; a generation refused by the ambiguous-authority rule is not counted.\n",
             );
             output.push_str(
                 "# TYPE ferrum_gateway_trust_bundle_published_generations_total counter\n",

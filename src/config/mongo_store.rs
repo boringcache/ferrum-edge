@@ -9262,6 +9262,14 @@ mod inner {
                     },
                 ));
             }
+            // Checked, never clamped: the observed revision has to be
+            // representable before it can be asserted as a CAS predicate at
+            // all. Silently substituting `i64::MAX` would turn an
+            // unrepresentable revision into a predicate that matches the wrong
+            // document (or no document) instead of surfacing an error.
+            let Ok(current_revision_sql) = i64::try_from(current_revision) else {
+                return Err(anyhow::anyhow!("gateway trust bundle revision exceeds Int64 range"));
+            };
             let next_revision =
                 i64::try_from(current_revision.saturating_add(1)).map_err(|_| {
                     anyhow::anyhow!("gateway trust bundle revision exceeds BSON Int64 range")
@@ -9277,7 +9285,7 @@ mod inner {
                 "_id": &record.namespace,
                 "namespace": &record.namespace,
                 "id": &record.id,
-                "revision": i64::try_from(current_revision).unwrap_or(i64::MAX),
+                "revision": current_revision_sql,
             };
             let matched = if self.replica_set_configured() {
                 let connection = self.connection();
@@ -9342,16 +9350,45 @@ mod inner {
                 replaced.matched_count != 0
             };
             if !matched {
+                // Lost the compare-and-set. The pre-race read above is NOT the
+                // answer: zero matched documents means either a competing
+                // writer bumped the revision past the one we asserted (so the
+                // real current revision is newer than what we read) or a
+                // competing delete removed the document entirely (so this is a
+                // not-found, not a conflict). Reporting the stale revision
+                // would hand the client `current == expected`, which reads as a
+                // fabricated conflict, and would assert existence for a record
+                // that had just been revoked.
+                //
+                // Re-read authoritatively instead, keeping every namespace/id
+                // predicate so the observation stays inside this tenant. The
+                // transaction, if there was one, has already ended, so this
+                // read is not serving that transaction's snapshot. It is still
+                // a best-effort report — a third writer may commit in between —
+                // but the single-document CAS is what protects the data; this
+                // read only decides what to tell the caller.
+                let readdressed = doc! {
+                    "_id": &record.namespace,
+                    "namespace": &record.namespace,
+                    "id": &record.id,
+                };
+                let observed = self.gateway_trust_bundles().find_one(readdressed).await?;
+                let conflict = match observed {
+                    Some(document) => Some(strict_stored_revision(&document)?),
+                    None => None,
+                };
                 self.check_slow_query("update_gateway_trust_bundle", start);
-                // The document still exists (we read it above) but its revision
-                // moved, so this is a lost optimistic-concurrency race rather
-                // than a not-found.
-                return Err(anyhow::Error::new(
-                    crate::config::db_backend::GatewayTrustBundleRevisionConflict {
-                        expected: expected_revision.unwrap_or(current_revision),
-                        current: current_revision,
-                    },
-                ));
+                return match conflict {
+                    Some(current) => Err(anyhow::Error::new(
+                        crate::config::db_backend::GatewayTrustBundleRevisionConflict {
+                            expected: expected_revision.unwrap_or(current_revision),
+                            current,
+                        },
+                    )),
+                    // Concurrent revocation: a PUT racing a DELETE is a
+                    // not-found, exactly as it is on the pre-read path above.
+                    None => Ok(false),
+                };
             }
             self.check_slow_query("update_gateway_trust_bundle", start);
             Ok(true)

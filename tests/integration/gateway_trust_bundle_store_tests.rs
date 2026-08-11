@@ -696,6 +696,99 @@ async fn an_unexpecting_writer_still_compares_and_sets() {
     );
 }
 
+/// A lost compare-and-set must be CLASSIFIED from an authoritative re-read, not
+/// from the value the transaction read before the race.
+///
+/// The store re-reads after ending the failed transaction, which is what makes
+/// the classification backend-independent: MySQL's default REPEATABLE READ
+/// serves every later consistent read in a transaction from the snapshot the
+/// first SELECT established, so an in-transaction re-read would report the
+/// pre-race revision on MySQL while PostgreSQL and SQLite reported the winner's.
+/// Two consequences are asserted here because they are observable on every
+/// backend and are exactly what the stale report produced:
+///
+/// 1. a conflict must never say `current == expected` — that is a conflict with
+///    itself, and it tells an admin client to retry with the revision that just
+///    failed;
+/// 2. a PUT that lost to a concurrent DELETE must report not-found, never a
+///    conflict, because asserting a revision for a revoked record claims the
+///    trust material still exists.
+///
+/// The interleaving is genuinely racy, so every assertion is an invariant that
+/// must hold for whichever outcome the round produced. It is deliberately not
+/// written to require a particular winner: pinning one would make the test
+/// flaky, and a test that only ever passes because the writer won would be
+/// asserting nothing. The deterministic halves of the same contract are covered
+/// by `an_update_that_matches_no_row_reports_not_found_instead_of_a_phantom_success`
+/// (pre-read not-found) and `a_stale_revision_loses_the_race_without_overwriting`
+/// (pre-read conflict). MySQL's snapshot behaviour itself is not reproducible on
+/// the SQLite path this suite runs; the store avoids it structurally by
+/// re-reading outside the failed transaction.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lost_compare_and_set_is_classified_from_an_authoritative_re_read() {
+    let (store, _temp_dir) = sqlite_store().await;
+    let store = std::sync::Arc::new(store);
+
+    for round in 0..24 {
+        // Each round starts from a known-absent record so the revision the
+        // writer expects is the one this round created.
+        let _ = store.delete_gateway_trust_bundle("ferrum", "ferrum").await;
+        let created = record(
+            "ferrum",
+            "cluster.local",
+            vec![root_ca_der_base64(&format!("root-{round}"))],
+        );
+        store
+            .create_gateway_trust_bundle(&created)
+            .await
+            .expect("create must succeed");
+        let read = store
+            .get_namespace_gateway_trust_bundle("ferrum")
+            .await
+            .expect("read")
+            .expect("exists");
+
+        let mut writer = read.clone();
+        writer.bundle.local.x509_authorities = vec![root_ca_der_base64("rotation")];
+        let expected = read.revision;
+        let store_writer = std::sync::Arc::clone(&store);
+        let store_revoker = std::sync::Arc::clone(&store);
+        let (update_result, _) = tokio::join!(
+            async move {
+                store_writer
+                    .update_gateway_trust_bundle(&writer, Some(expected))
+                    .await
+            },
+            async move {
+                store_revoker
+                    .delete_gateway_trust_bundle("ferrum", "ferrum")
+                    .await
+            }
+        );
+
+        match update_result {
+            // Committed, or lost to the revocation and reported not-found.
+            Ok(_) => {}
+            Err(error) => {
+                if let Some(conflict) = gateway_trust_bundle_revision_conflict(&error) {
+                    assert_eq!(
+                        conflict.expected, expected,
+                        "the reported expectation must be the one the caller stated"
+                    );
+                    assert_ne!(
+                        conflict.current, conflict.expected,
+                        "a conflict reporting the expectation back as the current revision is \
+                         the stale pre-race read, not an authoritative observation"
+                    );
+                }
+                // A backend that refuses the interleaving outright (SQLite can
+                // return a snapshot-busy error rather than letting the second
+                // transaction upgrade) is equally safe: it did not commit.
+            }
+        }
+    }
+}
+
 // ── Fail-closed stored-row decoding ─────────────────────────────────────────
 
 /// Security metadata must fail closed. A revision that is not a positive

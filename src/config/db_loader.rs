@@ -4620,19 +4620,34 @@ impl DatabaseStore {
             .execute(&mut *tx)
             .await?;
         if result.rows_affected() == 0 {
-            // Lost the compare-and-set. Re-read inside the same transaction to
-            // tell a concurrent rotation (row still there, revision moved) from
-            // a concurrent revocation (row gone).
+            // Lost the compare-and-set. End the failed transaction FIRST, then
+            // re-read: a re-read inside this transaction is not authoritative.
+            // MySQL's default REPEATABLE READ serves every later consistent
+            // read from the snapshot the SELECT above established, so the
+            // in-transaction re-read would return the revision we already know
+            // (reporting `current == expected`, which reads as a fabricated
+            // conflict) and could not observe a concurrent DELETE at all.
+            // PostgreSQL READ COMMITTED and SQLite would have seen the winner,
+            // so the same statement had three different meanings per backend.
+            //
+            // A fresh statement on the pool, after the rollback released this
+            // transaction's snapshot and locks, is authoritative on all three:
+            // it observes committed state at the moment it runs. It is still a
+            // best-effort *report* — another writer may commit between the lost
+            // CAS and this read, so `current` is the newest revision this call
+            // could see, and absence means the record was revoked. Both are
+            // strictly better than echoing the stale pre-race value, and the
+            // CAS predicate is what actually protects the data either way.
+            tx.rollback().await?;
             let observed = sqlx::query(&select_sql)
                 .bind(&record.namespace)
                 .bind(&record.id)
-                .fetch_optional(&mut *tx)
+                .fetch_optional(&self.pool())
                 .await?;
             let conflict = match observed {
                 Some(row) => Some(strict_stored_revision(&row)?),
                 None => None,
             };
-            tx.rollback().await?;
             self.check_slow_query("update_gateway_trust_bundle", start);
             return match conflict {
                 Some(current) => Err(anyhow::Error::new(GatewayTrustBundleRevisionConflict {

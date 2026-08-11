@@ -480,10 +480,10 @@ fn observability_counters_are_bounded_and_material_free() {
 
     // A publication that carries no database trust record is not a trust
     // generation and must not move the counters.
-    record_trust_generation_published(&[], 1_700_000_000);
+    record_trust_generation_published(&[], None, 1_700_000_000);
     assert_eq!(observability_snapshot().published_generations_total, 0);
 
-    record_trust_generation_published(std::slice::from_ref(&valid_record()), 1_700_000_000);
+    record_trust_generation_published(std::slice::from_ref(&valid_record()), None, 1_700_000_000);
     let after_publish = observability_snapshot();
     assert_eq!(after_publish.published_generations_total, 1);
     assert_eq!(after_publish.last_published_unix_seconds, 1_700_000_000);
@@ -511,6 +511,63 @@ fn observability_counters_are_bounded_and_material_free() {
     record_ambiguous_authority();
     let after_ambiguous = observability_snapshot();
     assert_eq!(after_ambiguous.ambiguous_authority_total, 1);
+    assert_eq!(after_ambiguous.last_failure_reason, "ambiguous_authority");
+
+    // ── The publication counter must not outrun the ambiguity refusal ───────
+    //
+    // The refusal is resolved per namespace AFTER the swap, during broadcast,
+    // so the swap consults the unpartitioned file/overlay slot directly. A
+    // generation whose every database record is about to be refused must not
+    // report a successful trust publication.
+    let file_authority = bundle_with(vec![root_ca_der_base64("file-root")]);
+    let before_ambiguous_publication = observability_snapshot();
+    record_trust_generation_published(
+        std::slice::from_ref(&valid_record()),
+        Some(&file_authority),
+        1_800_000_000,
+    );
+    let after_ambiguous_publication = observability_snapshot();
+    assert_eq!(
+        after_ambiguous_publication.published_generations_total,
+        before_ambiguous_publication.published_generations_total,
+        "an all-ambiguous generation must not count as a published trust generation"
+    );
+    assert_eq!(
+        after_ambiguous_publication.last_published_unix_seconds,
+        before_ambiguous_publication.last_published_unix_seconds,
+        "a refused generation must not advance the last-published timestamp"
+    );
+    assert_eq!(
+        after_ambiguous_publication.last_failure_reason, "ambiguous_authority",
+        "the refusal must not be cleared by the swap it refused"
+    );
+
+    // A genuinely accepted generation spanning several namespaces is still ONE
+    // generation reaching the swap, counted exactly once — the counter is not
+    // per record, and it is not per subscriber either (its call site is the
+    // swap, so a data plane reconnecting cannot inflate it).
+    let mut second_namespace = valid_record();
+    second_namespace.namespace = "staging".to_string();
+    second_namespace.id = "staging".to_string();
+    let multi_namespace = vec![valid_record(), second_namespace];
+    record_trust_generation_published(&multi_namespace, None, 1_900_000_000);
+    let after_multi = observability_snapshot();
+    assert_eq!(
+        after_multi.published_generations_total,
+        before_ambiguous_publication.published_generations_total + 1,
+        "a multi-namespace generation is one publication, not one per record"
+    );
+    assert_eq!(after_multi.last_published_unix_seconds, 1_900_000_000);
+    assert_eq!(
+        after_multi.last_failure_reason, "none",
+        "an accepted publication clears the standing failure reason"
+    );
+
+    // Re-run the ambiguity refusal so the trailing snapshot assertions below
+    // still observe the bounded reason they were written for.
+    record_ambiguous_authority();
+    let after_ambiguous = observability_snapshot();
+    assert_eq!(after_ambiguous.ambiguous_authority_total, 2);
     assert_eq!(after_ambiguous.last_failure_reason, "ambiguous_authority");
 
     // The whole snapshot is a fixed set of integers plus a bounded enum, so it

@@ -10705,8 +10705,10 @@ components:
       description: |
         One trust domain's authorities. Every `x509_authorities` entry must be
         valid base64 AND parse as an X.509 certificate; every
-        `jwt_authorities.public_key_pem` must be a PEM public-key block. At
-        least one authority is required.
+        `jwt_authorities.public_key_pem` must parse as a public key the JWT-SVID
+        validator can actually use — either an SPKI `PUBLIC KEY` PEM or a
+        SPIFFE-federation JWK object, matching `TrustBundleSet`. At least one
+        authority is required.
       required: [trust_domain]
       properties:
         trust_domain:
@@ -10730,6 +10732,11 @@ components:
                 maxLength: 256
               public_key_pem:
                 type: string
+                description: |
+                  SPKI `PUBLIC KEY` PEM, or a SPIFFE-federation JWK object
+                  preserved verbatim from a JWKS document. Both are proved by
+                  running the real parser, so a private-key paste, a truncated
+                  body, or an unsupported key type is rejected.
         refresh_hint_seconds:
           type: integer
           format: int64

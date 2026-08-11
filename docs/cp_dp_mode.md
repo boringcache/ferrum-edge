@@ -282,7 +282,25 @@ publication boundary** — the `ArcSwap` store that makes a configuration
 generation live — not candidates that merely loaded. A load still has
 validation, overlay composition, the atomic swap, and broadcast ahead of it, so
 counting there would report generations that were never published. A
-publication carrying no database trust record is not counted at all.
+publication carrying no database trust record is not counted at all, and neither
+is one the **ambiguous-authority rule refuses**: the per-namespace projection
+runs after the swap, during broadcast, so the swap consults the unpartitioned
+file/overlay slot directly. That slot is a single value compared against every
+namespace, so the refusal is all-or-nothing — an all-ambiguous generation
+increments `..._ambiguous_authority_total` and leaves
+`published_generations_total` alone, while a genuinely accepted generation
+spanning several namespaces still counts exactly **once**, as one generation
+reaching the swap.
+
+The counter is incremented at the swap, never per subscriber, so a data plane
+reconnecting and re-receiving the same generation does not inflate it.
+
+`ambiguous_authority_total` counts **refusals, not withdrawals**. The projection
+is `KeepPrevious`: the side channel says nothing and every subscriber retains
+the trust generation it already accepted. Nothing is revoked, which is why the
+refusal needs a counter and a bounded `last_failure_reason`
+(`ambiguous_authority`) to be visible at all — by design it changes nothing on
+the wire.
 
 There is deliberately **no process-wide revision gauge**. Revisions are per
 namespace, so a single process atomic would be last-writer-wins and actively

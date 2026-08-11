@@ -1432,8 +1432,17 @@ pub(crate) fn publish_cp_full_reload(
         // here rather than inside each namespace's database load, which still
         // had validation, overlay composition, and this swap ahead of it
         // (issue #3727).
+        //
+        // The unpartitioned file/overlay slot is passed in because the
+        // per-namespace ambiguity refusal is resolved BELOW this point, during
+        // `broadcast_namespace_update`. Without it this counter would claim a
+        // successful trust publication for a generation whose every database
+        // record the projection was about to refuse. That slot is one value
+        // compared against every namespace, so the refusal is all-or-nothing
+        // and a genuinely accepted multi-namespace generation still counts once.
         crate::config::gateway_trust::record_trust_generation_published(
             &published.gateway_trust_bundles,
+            published.trust_bundles.as_deref(),
             chrono::Utc::now().timestamp().max(0) as u64,
         );
         for namespace in refreshed_namespaces {

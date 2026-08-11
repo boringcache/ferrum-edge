@@ -572,7 +572,10 @@ pub enum GatewayTrustFailureReason {
     InvalidMaterial,
     /// The stored row/document could not be decoded at all.
     Undecodable,
-    /// Two authorities disagreed; publication withdrew trust.
+    /// Two authorities were visible at once, so the publication was REFUSED.
+    /// Trust is not withdrawn: the side channel says nothing and every
+    /// subscriber keeps the last generation it accepted
+    /// ([`NamespaceTrustProjection::KeepPrevious`]).
     AmbiguousAuthority,
 }
 
@@ -615,15 +618,35 @@ impl GatewayTrustFailureReason {
 /// counted either — this counter answers "did a stored trust generation go
 /// live", not "did any config swap happen".
 ///
+/// It is also not counted per subscriber: the call site is the swap, not a
+/// stream, so a data plane reconnecting and receiving the same generation again
+/// never inflates the counter.
+///
+/// `file_sourced` is the publication's unpartitioned `GatewayConfig.trust_bundles`
+/// slot, and it is what keeps the counter honest about the ambiguity refusal.
+/// The per-namespace projection that refuses an ambiguous authority runs later,
+/// during broadcast, so counting here without consulting it would report a
+/// successful trust publication for a generation whose every database record
+/// was about to be refused. That slot is a SINGLE unpartitioned value compared
+/// against every namespace's record by [`resolve_trust_authority`], so the
+/// outcome is all-or-nothing: when it is `Some`, every database record in this
+/// generation is ambiguous and nothing distributable is published (the
+/// refusal's own counter and bounded reason are recorded by
+/// [`record_ambiguous_authority`] at the projection); when it is `None`, no
+/// record is ambiguous and a mixed generation — some namespaces accepted, some
+/// refused — cannot arise. Multi-namespace generations therefore still count
+/// exactly once, as one generation reaching the swap.
+///
 /// There is deliberately no process-wide "published revision": revisions are
 /// per namespace and a last-writer-wins process atomic would be actively
 /// misleading on a multi-namespace control plane. The per-namespace revision is
 /// on the authenticated `GET /gateway-trust/status` view instead.
 pub fn record_trust_generation_published(
     records: &[GatewayTrustBundleRecord],
+    file_sourced: Option<&TrustBundleSet>,
     now_unix_seconds: u64,
 ) {
-    if records.is_empty() {
+    if records.is_empty() || file_sourced.is_some() {
         return;
     }
     PUBLISHED_GENERATIONS_TOTAL.fetch_add(1, Ordering::Relaxed);
@@ -677,7 +700,13 @@ pub fn record_trust_load_rejection(reason: GatewayTrustFailureReason) {
     LAST_FAILURE_REASON.store(reason.code(), Ordering::Relaxed);
 }
 
-/// Record a publication that found two authorities and withdrew trust.
+/// Record a publication that found two authorities and was therefore refused.
+///
+/// Nothing is withdrawn by this outcome: the projection is
+/// [`NamespaceTrustProjection::KeepPrevious`], the side channel is empty, and
+/// subscribers retain the last trust generation they accepted. The counter and
+/// the bounded failure reason exist precisely so a refusal that changes nothing
+/// on the wire is still visible to an operator.
 pub fn record_ambiguous_authority() {
     AMBIGUOUS_AUTHORITY_TOTAL.fetch_add(1, Ordering::Relaxed);
     LAST_FAILURE_REASON.store(

@@ -2381,6 +2381,15 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
     /// namespace admission lease). Returns `Ok(false)` when no record matched
     /// `(namespace, id)` so a PUT racing a delete surfaces as not-found rather
     /// than a phantom success.
+    ///
+    /// Both outcomes must also hold when the race is lost at the compare-and-set
+    /// itself rather than at the pre-read: an implementation whose atomic write
+    /// matches zero rows must re-read authoritatively — outside the failed
+    /// transaction, so no backend's snapshot isolation can serve the pre-race
+    /// value back — and report the revision it actually observes, or `Ok(false)`
+    /// when the record is gone. Echoing the pre-race revision would produce a
+    /// conflict whose `current` equals `expected` and would claim existence for
+    /// a record a concurrent revocation had already removed.
     async fn update_gateway_trust_bundle(
         &self,
         record: &GatewayTrustBundleRecord,

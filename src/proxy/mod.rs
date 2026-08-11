@@ -10154,9 +10154,13 @@ impl ProxyState {
         self.config.store(Arc::clone(&published.config));
         // Trust acceptance is counted at the swap that makes a generation live,
         // not at load time (issue #3727). A publication carrying no
-        // database-sourced trust record is not counted at all.
+        // database-sourced trust record is not counted at all, and neither is
+        // one that also carries an unpartitioned file/overlay trust value —
+        // that pair is the ambiguous-authority refusal, which keeps the
+        // previously accepted trust rather than publishing this generation's.
         crate::config::gateway_trust::record_trust_generation_published(
             &published.config.gateway_trust_bundles,
+            published.config.trust_bundles.as_deref(),
             chrono::Utc::now().timestamp().max(0) as u64,
         );
         // Config publications can add, remove, or repoint certificate-family
