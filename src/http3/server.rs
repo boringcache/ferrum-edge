@@ -14870,7 +14870,8 @@ mod native_h3_retry_refinement_tests {
         assert!(handler.contains("(!has_retry || retry_response_needs_header_refinement)"));
         assert!(handler.contains("backend_http_flavor == HttpFlavor::Plain"));
         assert!(handler.contains("&& !forces_reqwest_dispatch"));
-        assert!(handler.contains("&& backend_supports_native_h3;"));
+        assert!(handler.contains("&& backend_supports_native_h3"));
+        assert!(handler.contains("&& !mesh_egress_required;"));
         assert!(handler.contains("let refined_body_data = if has_retry"));
         assert!(handler.contains("body_data.clone()"));
 

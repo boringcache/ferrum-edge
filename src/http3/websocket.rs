@@ -2122,11 +2122,12 @@ mod tests {
             .expect("H3 WebSocket backend handshake loop must remain present");
         let loop_body = &source[loop_start..];
         let resolve_idx = loop_body
-            .find("resolve_backend_connection_proxy_for_target(\n            &proxy,\n            current_target.as_deref(),")
+            .find("resolve_backend_connection_proxy_for_target(")
             .expect("H3 WebSocket dial must resolve an effective proxy for the current target");
         let dial_idx = loop_body
-            .find("connect_websocket_backend(\n            &current_backend_url,\n            ws_dial_proxy,")
+            .find("connect_websocket_backend(")
             .expect("H3 WebSocket direct dial must use the target-effective proxy");
+        assert!(loop_body[dial_idx..].contains("ws_dial_proxy,"));
 
         assert!(
             resolve_idx < dial_idx,

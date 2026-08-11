@@ -6136,6 +6136,7 @@ impl LoadBalancer {
         )
     }
 
+    #[allow(clippy::too_many_arguments)] // Mirrors the bounded bitset lane's explicit inputs.
     fn select_excluding_port_subset_vec_fallback(
         &self,
         ctx_key: &str,
