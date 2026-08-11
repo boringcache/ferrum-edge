@@ -109,6 +109,11 @@ fn host_capture_config() -> CaptureConfig {
     config.host_netns = true;
     config.proxy_uid = None;
     config.ip6tables_mode = Ip6TablesMode::Required;
+    // Production `host_udp_for_config` emits ip6tables only when a v6 CIDR is
+    // configured. The dual-stack live gate must request that scope explicitly —
+    // `Required` alone does not synthesize `::/0`.
+    config.include_cidrs = vec!["0.0.0.0/0".to_string(), "::/0".to_string()];
+    config.include_cidrs_explicit = true;
     config.udp_outbound_port = CAPTURE_PORT;
     config
 }
@@ -370,11 +375,13 @@ fn teardown_production_host_capture(host_pid: u32) -> Result<(), String> {
 fn bounded_host_diag(host_pid: u32) -> String {
     let script = format!(
         "echo '=== ip rule ==='; ip rule show | head -n 40; \
+         echo '=== ip -6 rule ==='; ip -6 rule show | head -n 40; \
          echo '=== table {TPROXY_HOST_ROUTE_TABLE} ==='; \
          ip route show table {TPROXY_HOST_ROUTE_TABLE} 2>/dev/null | head -n 20; \
          ip -6 route show table {TPROXY_HOST_ROUTE_TABLE} 2>/dev/null | head -n 20; \
-         echo '=== Ferrum mangle ==='; \
+         echo '=== Ferrum iptables mangle ==='; \
          iptables-save -t mangle 2>/dev/null | grep -E 'FERRUM_MESH_UDP_HOST|FERRUM_UDP' | head -n 40; \
+         echo '=== Ferrum ip6tables mangle ==='; \
          ip6tables-save -t mangle 2>/dev/null | grep -E 'FERRUM_MESH_UDP_HOST|FERRUM_UDP' | head -n 40; \
          echo '=== ifindexes ==='; \
          for i in /sys/class/net/*/ifindex; do echo \"$i=$(cat \"$i\")\"; done | head -n 20; \
@@ -1189,6 +1196,10 @@ fn host_udp_live_kernel_fail_closed_prerequisites_and_partial_install() {
         setup.contains("command -v ip"),
         "setup must fatally preflight iproute2 before installing jumps"
     );
+    assert!(
+        setup.contains("ip6tables") && setup.contains("ip -6"),
+        "dual-stack Required host capture must emit IPv6 mangle + routing commands: {setup}"
+    );
     let jump_pos = setup.find("-A PREROUTING");
     let ip_pos = setup.find("command -v ip");
     if let (Some(ip_pos), Some(jump_pos)) = (ip_pos, jump_pos) {
@@ -1205,6 +1216,10 @@ fn host_udp_live_kernel_fail_closed_prerequisites_and_partial_install() {
     assert!(
         guard.contains("-j DROP") || guard.contains("DROP"),
         "guard must drop enrolled scope during rebuild/partial install"
+    );
+    assert!(
+        guard.contains("ip6tables"),
+        "dual-stack Required host guard must cover the IPv6 capture scope: {guard}"
     );
     let capture_teardown = IptablesPlan::host_udp_capture_rules_teardown_script();
     assert!(
