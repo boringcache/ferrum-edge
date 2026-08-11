@@ -4446,7 +4446,10 @@ async fn discovery_body_limits_install_accepts_identical_and_rejects_mismatch() 
         body_budget_bytes: 0,
     })
     .expect_err("install must not accept 0");
-    assert!(zero.contains("0 is not unlimited") || zero.contains("must be >= 1"), "{zero}");
+    assert!(
+        zero.contains("0 is not unlimited") || zero.contains("must be >= 1"),
+        "{zero}"
+    );
 }
 
 #[test]
@@ -4514,16 +4517,20 @@ async fn discovery_collector_rejects_disagreeing_repeated_content_length() {
         &vec![b'x'; 32],
     )
     .await;
-    let client_result = reqwest::Client::new().get(format!("{base}/dup")).send().await;
+    let client_result = reqwest::Client::new()
+        .get(format!("{base}/dup"))
+        .send()
+        .await;
     match client_result {
         Err(_) => {
             // Client rejected conflicting Content-Length before collection.
         }
         Ok(response) => {
-            let err =
-                ferrum_edge::_test_support::collect_discovery_response_body_for_test(response, true)
-                    .await
-                    .expect_err("disagreeing CL must fail closed");
+            let err = ferrum_edge::_test_support::collect_discovery_response_body_for_test(
+                response, true,
+            )
+            .await
+            .expect_err("disagreeing CL must fail closed");
             assert_eq!(err, "ambiguous_content_length");
             assert!(registry.service_discovery_response_oversized_total() > before);
         }
@@ -4548,17 +4555,21 @@ async fn discovery_collector_accepts_agreeing_repeated_content_length() {
         &body,
     )
     .await;
-    let client_result = reqwest::Client::new().get(format!("{base}/ok")).send().await;
+    let client_result = reqwest::Client::new()
+        .get(format!("{base}/ok"))
+        .send()
+        .await;
     match client_result {
         Err(_) => {
             // Some HTTP stacks reject even agreeing repeats; that still keeps
             // the collector boundary fail-closed for malformed framing.
         }
         Ok(response) => {
-            let accepted =
-                ferrum_edge::_test_support::collect_discovery_response_body_for_test(response, true)
-                    .await
-                    .expect("agreeing repeated CL must be accepted when the client delivers it");
+            let accepted = ferrum_edge::_test_support::collect_discovery_response_body_for_test(
+                response, true,
+            )
+            .await
+            .expect("agreeing repeated CL must be accepted when the client delivers it");
             assert_eq!(accepted, 16);
         }
     }
