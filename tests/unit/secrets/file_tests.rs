@@ -130,6 +130,33 @@ fn read_secret_error_for_whitespace_only_file() {
 }
 
 #[test]
+fn read_secret_error_for_non_regular_directory_redacts_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_str().unwrap();
+    let err = read_secret(path, "DIR_KEY").expect_err("directory");
+    assert!(err.contains("Failed to read DIR_KEY_FILE"));
+    assert!(
+        !err.contains(path),
+        "source path must not be disclosed, got: {err}"
+    );
+}
+
+#[test]
+fn read_secret_rejects_oversized_file_without_leaking_value() {
+    use ferrum_edge::secrets::credential_file::DEFAULT_CREDENTIAL_FILE_MAX_BYTES;
+
+    let mut tmp = tempfile::NamedTempFile::new().unwrap();
+    let payload = vec![b'Z'; DEFAULT_CREDENTIAL_FILE_MAX_BYTES + 1];
+    tmp.write_all(&payload).unwrap();
+    let path = tmp.path().to_str().unwrap();
+    let err = read_secret(path, "BIG_KEY").expect_err("oversize");
+    assert!(err.contains("Failed to read BIG_KEY_FILE"));
+    assert!(err.contains("exceeds the maximum"));
+    assert!(!err.contains(path), "path leaked: {err}");
+    assert!(!err.contains(&"Z".repeat(16)), "value leaked: {err}");
+}
+
+#[test]
 fn resolve_ref_returns_none_when_not_set() {
     let _guard = ENV_LOCK
         .lock()
