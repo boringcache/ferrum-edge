@@ -9,11 +9,11 @@
 //! that re-introduces mesh-tag fail-closed (or drops Unix filtering) fails here
 //! without needing a full QUIC frontend.
 
-use ferrum_edge::config::types::UpstreamTarget;
 use ferrum_edge::_test_support::{
     direct_http_mesh_transport_refusal_for_test, h3_bridge_transport_refusal_for_test,
     h3_dispatch_target_eligible_for_test, target_requires_http_mesh_egress_for_test,
 };
+use ferrum_edge::config::types::UpstreamTarget;
 use ferrum_edge::proxy::hbone_pool::HBONE_TARGET_TAG;
 use ferrum_edge::proxy::mesh_mtls_pool::MESH_MTLS_TARGET_TAG;
 use ferrum_edge::proxy::unix_backend::MESH_UNIX_SOCKET_TAG;

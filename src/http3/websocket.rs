@@ -840,9 +840,9 @@ pub(crate) async fn handle_h3_websocket(
         // WebSocket egress (issue #3620) instead of failing closed here.
         // Sits at the loop top so the initial target AND every retry-rotated
         // target re-entering the loop are screened.
-        if let Some(reason) = crate::proxy::backend_dispatch::h3_bridge_transport_refusal(
-            current_target.as_deref(),
-        ) {
+        if let Some(reason) =
+            crate::proxy::backend_dispatch::h3_bridge_transport_refusal(current_target.as_deref())
+        {
             warn!(
                 proxy_id = %proxy.id,
                 target_host = current_target.as_deref().map(|target| target.host.as_str()).unwrap_or(""),
@@ -1017,13 +1017,13 @@ pub(crate) async fn handle_h3_websocket(
                 ) && crate::proxy::hbone_pool::target_hbone_cross_cluster(target) =>
             {
                 match crate::proxy::hbone_pool::target_hbone_authority_host(target) {
-                    Ok(app_host) => std::borrow::Cow::Owned(
-                        crate::proxy::rewrite_backend_url_authority_host(
+                    Ok(app_host) => {
+                        std::borrow::Cow::Owned(crate::proxy::rewrite_backend_url_authority_host(
                             &current_backend_url,
                             &target.host,
                             app_host,
-                        ),
-                    ),
+                        ))
+                    }
                     Err(_) => std::borrow::Cow::Borrowed(current_backend_url.as_str()),
                 }
             }

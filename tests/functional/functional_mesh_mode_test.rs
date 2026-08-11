@@ -17779,9 +17779,7 @@ async fn functional_h3_websocket_dispatches_over_same_cluster_ambient_hbone() {
         }
     };
 
-    ws.send_text("h3-ws-hbone")
-        .await
-        .expect("send H3 WS text");
+    ws.send_text("h3-ws-hbone").await.expect("send H3 WS text");
     let reply = ws.recv_text().await.expect("recv H3 WS text");
     assert_eq!(
         reply, "backend-ws:h3-ws-hbone",

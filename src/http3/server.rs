@@ -4374,10 +4374,8 @@ async fn handle_h3_request(
             &state.env_config.backend_allow_ips,
         )
         .is_some()
-        || crate::proxy::backend_dispatch::h3_bridge_transport_refusal(
-            upstream_target.as_deref(),
-        )
-        .is_some();
+        || crate::proxy::backend_dispatch::h3_bridge_transport_refusal(upstream_target.as_deref())
+            .is_some();
     if reevaluate_response_policy_after_request_body
         && !request_body_prepared
         && !preparation_blocked_by_dispatch_policy
@@ -4827,9 +4825,8 @@ async fn handle_h3_request(
     // either native branch can open the H3 backend pool.
     let native_h3_direct_dispatch = use_native_h3_pool || use_native_h3_grpc;
     if native_h3_direct_dispatch
-        && let Some(reason) = crate::proxy::backend_dispatch::h3_bridge_transport_refusal(
-            upstream_target.as_deref(),
-        )
+        && let Some(reason) =
+            crate::proxy::backend_dispatch::h3_bridge_transport_refusal(upstream_target.as_deref())
     {
         warn!(
             proxy_id = %proxy.id,
@@ -7329,11 +7326,9 @@ async fn handle_h3_request(
                 // native-H3 loop has no Unix dialer, and the host/port is only
                 // a schema placeholder. Mesh HBONE / Sidecar mTLS targets are
                 // eligible via the shared mesh pools below (issue #3620).
-                if let Some(reason) =
-                    crate::proxy::backend_dispatch::h3_bridge_transport_refusal(
-                        current_target.as_deref(),
-                    )
-                {
+                if let Some(reason) = crate::proxy::backend_dispatch::h3_bridge_transport_refusal(
+                    current_target.as_deref(),
+                ) {
                     warn!(
                         proxy_id = %proxy.id,
                         reason,
@@ -7386,9 +7381,10 @@ async fn handle_h3_request(
                     &selected_base_proxy,
                     current_target.as_deref(),
                 );
-                result = if let Some(target) = current_target.as_deref().filter(|target| {
-                    crate::proxy::target_requires_http_mesh_egress(target)
-                }) {
+                result = if let Some(target) = current_target
+                    .as_deref()
+                    .filter(|target| crate::proxy::target_requires_http_mesh_egress(target))
+                {
                     // Mesh-tagged rotation: share the H1/H2 HBONE /
                     // Sidecar mesh-mTLS pools (issue #3620).
                     h3_buffered_result_from_backend_response(
@@ -7450,7 +7446,6 @@ async fn handle_h3_request(
                     )
                 };
             }
-
 
             (
                 result.status,

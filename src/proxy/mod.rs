@@ -13487,7 +13487,11 @@ fn backend_url_authority_host_is(url: &str, host: &str) -> bool {
 /// not depend on its callers for the property it exists to provide. Bracketed
 /// IPv6 is unaffected: the closing `]` is part of the rendered host, so the
 /// remainder is `` or `:{port}` exactly as for a DNS name.
-pub(crate) fn rewrite_backend_url_authority_host(url: &str, from_host: &str, to_host: &str) -> String {
+pub(crate) fn rewrite_backend_url_authority_host(
+    url: &str,
+    from_host: &str,
+    to_host: &str,
+) -> String {
     let Some(scheme_end) = url.find("://") else {
         return url.to_string();
     };
@@ -35818,8 +35822,7 @@ async fn proxy_to_backend_mesh_retry(
 /// cross-cluster). Unix-socket targets are NOT mesh egress here — they are
 /// refused by [`backend_dispatch::h3_bridge_transport_refusal`].
 pub(crate) fn target_requires_http_mesh_egress(target: &UpstreamTarget) -> bool {
-    hbone_pool::target_hbone_enabled(target)
-        || mesh_mtls_pool::target_mesh_mtls_enabled(target)
+    hbone_pool::target_hbone_enabled(target) || mesh_mtls_pool::target_mesh_mtls_enabled(target)
 }
 
 /// Dispatch a buffered plain-HTTP attempt over the mesh transport required by

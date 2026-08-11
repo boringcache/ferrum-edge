@@ -253,9 +253,7 @@ pub(crate) fn h3_dispatch_target_eligible(target: &UpstreamTarget) -> bool {
 /// schema-only loopback placeholder). Use this on the H3 bridges; keep
 /// [`direct_network_http_transport_refusal`] for truly network-only surfaces
 /// such as the native H3 QUIC pool.
-pub(crate) fn h3_bridge_transport_refusal(
-    target: Option<&UpstreamTarget>,
-) -> Option<&'static str> {
+pub(crate) fn h3_bridge_transport_refusal(target: Option<&UpstreamTarget>) -> Option<&'static str> {
     target
         .is_some_and(crate::proxy::unix_backend::target_is_unix_backend)
         .then_some("Unix socket dispatch required for this backend target")
@@ -1678,10 +1676,8 @@ mod tests {
     #[test]
     fn h3_bridge_transport_refusal_allows_mesh_tagged_targets() {
         let hbone = target_with_tags(&[(crate::proxy::hbone_pool::HBONE_TARGET_TAG, "true")]);
-        let mtls = target_with_tags(&[(
-            crate::proxy::mesh_mtls_pool::MESH_MTLS_TARGET_TAG,
-            "true",
-        )]);
+        let mtls =
+            target_with_tags(&[(crate::proxy::mesh_mtls_pool::MESH_MTLS_TARGET_TAG, "true")]);
         assert_eq!(h3_bridge_transport_refusal(Some(&hbone)), None);
         assert_eq!(h3_bridge_transport_refusal(Some(&mtls)), None);
         assert!(h3_dispatch_target_eligible(&hbone));

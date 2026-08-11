@@ -645,11 +645,7 @@ fn select_next_cross_protocol_retry_target(
                 );
                 let next_cb_target_key =
                     crate::circuit_breaker::target_key(&candidate.host, candidate.port);
-                return CrossProtocolRetryTarget::Selected(
-                    candidate,
-                    next_cb_target_key,
-                    next_url,
-                );
+                return CrossProtocolRetryTarget::Selected(candidate, next_cb_target_key, next_url);
             }
             exclude = candidate;
         }
@@ -2050,9 +2046,10 @@ where
                     // keys, and fail-closed refusal when the secured
                     // transport cannot materialize are owned by those
                     // pools — never fall back to a direct dial here.
-                    if let Some(target) = current_target.as_deref().filter(|target| {
-                        crate::proxy::target_requires_http_mesh_egress(target)
-                    }) {
+                    if let Some(target) = current_target
+                        .as_deref()
+                        .filter(|target| crate::proxy::target_requires_http_mesh_egress(target))
+                    {
                         drop(pending_slot);
                         let attempt_result = crate::proxy::proxy_h3_plain_http_mesh_buffered(
                             state,
@@ -2300,8 +2297,7 @@ where
                             RejectBodyDisposition::WireBody,
                         )
                         .await?;
-                        outcome.backend_target =
-                            Some(strip_query_from_backend_url(&current_url));
+                        outcome.backend_target = Some(strip_query_from_backend_url(&current_url));
                         outcome.connection_error = mesh_connection_error;
                         outcome.error_class = mesh_error_class;
                         outcome.backend_resolved_ip = mesh_resolved_ip;
