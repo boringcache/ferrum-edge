@@ -170,9 +170,7 @@ pub enum ManagedTlsError {
     ///
     /// Deliberately content-free: diagnostics must not echo store payloads.
     #[error("managed TLS store document exceeds the configured byte ceiling")]
-    DocumentTooLarge {
-        direction: TlsStoreIoDirection,
-    },
+    DocumentTooLarge { direction: TlsStoreIoDirection },
     /// Creating a new record would exceed `FERRUM_TLS_MANAGED_MAX_RECORDS`.
     ///
     /// Overwrite and delete remain available. Never echoes record payloads.
