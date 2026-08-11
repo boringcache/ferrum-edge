@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **BREAKING (dp mode):** a data plane's last-known-good configuration now has
+  a bounded age (issue #3726). `FERRUM_DP_CONFIG_MAX_STALE_SECONDS` (default
+  `3600`) bounds how long a DP may keep serving its last **validated and
+  successfully applied** CP snapshot once every control plane is unreachable,
+  measured on a monotonic clock so a wall-clock/NTP step cannot extend the
+  window. Heartbeats, reconnect attempts, CP transport success, fenced or
+  rejected snapshots, rejected deltas, and snapshots that fail to apply do not
+  reset the age; only an applied snapshot does, and only an applied snapshot
+  restores service — a reconnect alone does not. At the bound (and after a short
+  reconnect grace, so a routine CP restart or failover does not blip traffic)
+  `/health` reports `ready: false` with `status: "unavailable"`, and under the
+  default `FERRUM_DP_CONFIG_STALE_ACTION=fail_closed` new HTTP/1.1, HTTP/2,
+  HTTP/3, and TCP stream admissions are refused while already-accepted
+  connections and in-flight requests drain normally. `readiness_only` is the
+  named compatibility mode that degrades readiness only, and
+  `FERRUM_DP_CONFIG_MAX_STALE_SECONDS=0` restores the previous unbounded
+  behavior as an explicit, deliberately unsafe opt-in that logs a startup
+  warning. Authenticated `/health` gains a fixed-cardinality `dp_config`
+  diagnostic distinguishing `cp_disconnected`, `snapshot_stale`,
+  `snapshot_rejected`, and `snapshot_apply_failed`, mirrored by nine
+  `ferrum_dp_config_*` Prometheus families. See
+  [docs/cp_dp_mode.md](docs/cp_dp_mode.md#bounded-last-known-good-configuration-age).
+
 - Port-aware Gateway API HTTP-family route representation and real listener
   binding (issue #3612). Materialized proxies carry the admitting listener's
   `listen_port` plus a namespace-qualified TLS class, and a new

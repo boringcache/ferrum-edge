@@ -24801,6 +24801,28 @@ async fn handle_proxy_request_on_frontend_port(
         ));
     }
 
+    // Stale-configuration admission fence (issue #3726). One relaxed atomic
+    // load on a process-global flag that only a data plane whose applied CP
+    // snapshot aged past `FERRUM_DP_CONFIG_MAX_STALE_SECONDS` — with no CP
+    // connected — ever sets; every other mode reads a constant `false`. New
+    // work fails closed because the gateway can no longer be told that a route,
+    // policy, or credential was revoked; already-accepted connections and
+    // in-flight requests are untouched and drain normally.
+    if crate::dp_config_freshness::new_traffic_blocked() {
+        let is_grpc = grpc_proxy::is_grpc_request(&req);
+        record_request(&state, 503);
+        if is_grpc {
+            return Ok(grpc_proxy::build_grpc_error_response(
+                grpc_proxy::grpc_status::UNAVAILABLE,
+                "Gateway configuration stale",
+            ));
+        }
+        return Ok(build_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            r#"{"error":"Gateway configuration stale"}"#,
+        ));
+    }
+
     // Track this request for overload monitoring and graceful drain.
     // The guard is attached to the response body so it lives as long as hyper
     // is sending the response — critical for H2/gRPC streaming where the body

@@ -1022,6 +1022,11 @@ fn update_state_disconnected(
     cp_url: &str,
     is_primary: bool,
 ) {
+    // Start (or continue) the CP-outage window that bounds how long the last
+    // applied snapshot may keep serving (issue #3726). Called once per failed
+    // attempt across multi-CP failover; the tracker keeps the first stamp, and
+    // a successful connect to any CP clears it.
+    crate::dp_config_freshness::record_cp_disconnected();
     if let Some(cs) = connection_state {
         let prev = cs.load();
         cs.store(Arc::new(DpCpConnectionState {
@@ -1039,6 +1044,11 @@ fn update_state_disconnected(
 
 /// Helper: update last_config_received_at timestamp on successful config application.
 fn update_state_config_received(connection_state: Option<&Arc<ArcSwap<DpCpConnectionState>>>) {
+    // The single freshness-resetting event (issue #3726): a snapshot or delta
+    // that passed every validation/authority check AND applied. Called on the
+    // accepted paths only, so heartbeats, reconnects, fenced snapshots, and
+    // failed applies leave the bound accruing.
+    crate::dp_config_freshness::record_snapshot_applied();
     if let Some(cs) = connection_state {
         let prev = cs.load();
         cs.store(Arc::new(DpCpConnectionState {
@@ -1060,6 +1070,9 @@ fn update_state_config_diverged(
     metrics: &ConfigSyncDivergenceMetrics,
 ) {
     metrics.record_rejection();
+    // A rejected delta is received-but-not-applied: it must not reset the
+    // stale bound, only classify the reason (issue #3726).
+    crate::dp_config_freshness::record_snapshot_rejected();
     crate::plugins::prometheus_metrics::global_registry()
         .invalidate_configsync_divergence_metrics_cache();
     if let Some(cs) = connection_state {
@@ -1085,6 +1098,8 @@ fn update_state_config_diverged(
 /// delta-rejection divergence.
 fn record_fenced_full_snapshot(metrics: &ConfigSyncDivergenceMetrics) {
     metrics.record_fenced_snapshot();
+    // Refused before apply — freshness is unchanged (issue #3726).
+    crate::dp_config_freshness::record_snapshot_rejected();
     crate::plugins::prometheus_metrics::global_registry()
         .invalidate_configsync_divergence_metrics_cache();
 }
@@ -1680,6 +1695,11 @@ async fn connect_and_subscribe_with_startup_ready_inner(
         let prev = cs.load();
         cs.store(Arc::new(prev.reconnected(cp_url, is_primary, Utc::now())));
     }
+    // An authoritative source is reachable again, so the stale-config bound
+    // stops accruing (issue #3726). Reachability is NOT freshness: this never
+    // resets the applied-snapshot age and never clears an already-raised stale
+    // state — only an applied snapshot does that.
+    crate::dp_config_freshness::record_cp_connected();
 
     loop {
         let silence_remaining = timings
@@ -1756,7 +1776,7 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                     "Refusing ConfigSync heartbeat before an accepted, negotiated \
                      FULL_SNAPSHOT base; terminating stream"
                 );
-                return Ok(react_to_unusable_snapshot(subscription.base_applied));
+                return Ok(refuse_unusable_snapshot(subscription.base_applied));
             }
             debug!(
                 version = %update.version,
@@ -1773,7 +1793,7 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                 update_type = update.update_type,
                 cp_url, "Refusing heartbeat capability confirmation outside a FULL_SNAPSHOT"
             );
-            return Ok(react_to_unusable_snapshot(subscription.base_applied));
+            return Ok(refuse_unusable_snapshot(subscription.base_applied));
         }
         if update.heartbeat_negotiated && !heartbeats_negotiated {
             heartbeats_negotiated = true;
@@ -1801,7 +1821,7 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                     Ok(config) => config,
                     Err(e) => {
                         error!("Failed to parse full config update: {}", e);
-                        return Ok(react_to_unusable_snapshot(subscription.base_applied));
+                        return Ok(refuse_unusable_snapshot(subscription.base_applied));
                     }
                 };
                 let gateway_trust_bundle_update =
@@ -1810,7 +1830,7 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                         Err(msg) => {
                             error!("CP config rejected — {}", msg);
                             error!("Ignoring config update with invalid gateway trust bundles");
-                            return Ok(react_to_unusable_snapshot(subscription.base_applied));
+                            return Ok(refuse_unusable_snapshot(subscription.base_applied));
                         }
                     };
                 // Gateway trust material is delivered via the ConfigUpdate
@@ -1847,56 +1867,56 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                         error!("CP config rejected — {}", msg);
                     }
                     error!("Ignoring config update with invalid field values");
-                    return Ok(react_to_unusable_snapshot(subscription.base_applied));
+                    return Ok(refuse_unusable_snapshot(subscription.base_applied));
                 }
                 if let Err(errors) = config.validate_hosts() {
                     for msg in &errors {
                         error!("CP config rejected — {}", msg);
                     }
                     error!("Ignoring config update with invalid hosts");
-                    return Ok(react_to_unusable_snapshot(subscription.base_applied));
+                    return Ok(refuse_unusable_snapshot(subscription.base_applied));
                 }
                 if let Err(errors) = config.validate_regex_listen_paths() {
                     for msg in &errors {
                         error!("CP config rejected — {}", msg);
                     }
                     error!("Ignoring config update with invalid regex listen_paths");
-                    return Ok(react_to_unusable_snapshot(subscription.base_applied));
+                    return Ok(refuse_unusable_snapshot(subscription.base_applied));
                 }
                 if let Err(errors) = config.validate_listen_path_encodings() {
                     for msg in &errors {
                         error!("CP config rejected — {}", msg);
                     }
                     error!("Ignoring config update with encoded-slash listen_paths");
-                    return Ok(react_to_unusable_snapshot(subscription.base_applied));
+                    return Ok(refuse_unusable_snapshot(subscription.base_applied));
                 }
                 if let Err(errors) = config.validate_unique_listen_paths() {
                     for msg in &errors {
                         error!("CP config rejected — {}", msg);
                     }
                     error!("Ignoring config update with conflicting listen paths");
-                    return Ok(react_to_unusable_snapshot(subscription.base_applied));
+                    return Ok(refuse_unusable_snapshot(subscription.base_applied));
                 }
                 if let Err(errors) = config.validate_stream_proxies() {
                     for msg in &errors {
                         error!("CP config rejected — {}", msg);
                     }
                     error!("Ignoring config update with invalid stream proxy config");
-                    return Ok(react_to_unusable_snapshot(subscription.base_applied));
+                    return Ok(refuse_unusable_snapshot(subscription.base_applied));
                 }
                 if let Err(errors) = config.validate_upstream_references() {
                     for msg in &errors {
                         error!("CP config rejected — {}", msg);
                     }
                     error!("Ignoring config update with invalid upstream references");
-                    return Ok(react_to_unusable_snapshot(subscription.base_applied));
+                    return Ok(refuse_unusable_snapshot(subscription.base_applied));
                 }
                 if let Err(errors) = config.validate_plugin_references() {
                     for msg in &errors {
                         error!("CP config rejected — {}", msg);
                     }
                     error!("Ignoring config update with invalid plugin references");
-                    return Ok(react_to_unusable_snapshot(subscription.base_applied));
+                    return Ok(refuse_unusable_snapshot(subscription.base_applied));
                 }
                 if let Err(errors) =
                     crate::proxy::validate_mesh_route_dispatch_upstream_references(&config)
@@ -1907,7 +1927,7 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                     error!(
                         "Ignoring config update with invalid mesh_route_dispatch upstream references"
                     );
-                    return Ok(react_to_unusable_snapshot(subscription.base_applied));
+                    return Ok(refuse_unusable_snapshot(subscription.base_applied));
                 }
                 // Freshness describes the committed body: envelope version must
                 // agree with GatewayConfig.loaded_at. Fail closed otherwise —
@@ -2021,7 +2041,7 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                     Err(error) => {
                         error!("CP config rejected — {}", error);
                         error!("Ignoring config update with unusable frontend TLS material");
-                        return Ok(react_to_unusable_snapshot(subscription.base_applied));
+                        return Ok(refuse_unusable_snapshot(subscription.base_applied));
                     }
                 };
 
@@ -2106,6 +2126,10 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                         info!("Full configuration snapshot accepted from CP");
                     }
                     ConfigApplyOutcome::Rejected { .. } => {
+                        // Distinct from a fenced/refused snapshot: this one was
+                        // admitted and failed to apply. Either way the applied
+                        // config — and therefore its age — is unchanged (#3726).
+                        crate::dp_config_freshness::record_snapshot_apply_failed();
                         error!(
                             "Full configuration snapshot rejected during apply; keeping previous config"
                         );
@@ -2397,10 +2421,22 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                     "Refusing unknown ConfigSync update type; terminating stream so an \
                      unrecognized authoritative message cannot be skipped before later deltas"
                 );
-                return Ok(react_to_unusable_snapshot(subscription.base_applied));
+                return Ok(refuse_unusable_snapshot(subscription.base_applied));
             }
         }
     }
+}
+
+/// [`react_to_unusable_snapshot`] for a CP payload refused **before** apply
+/// (protocol shape, parse, validation, trust side channel, or TLS staging).
+///
+/// Nothing new is serving, so the stale bound keeps accruing; only the reason
+/// label changes (issue #3726). The apply-failure path deliberately does NOT
+/// route through here — it reports `snapshot_apply_failed` so operators can
+/// tell an admitted-then-failed snapshot from one the DP never accepted.
+fn refuse_unusable_snapshot(subscription_base_applied: bool) -> DpStreamEnd {
+    crate::dp_config_freshness::record_snapshot_rejected();
+    react_to_unusable_snapshot(subscription_base_applied)
 }
 
 /// An unusable FULL_SNAPSHOT always terminates the subscription so later

@@ -31,6 +31,31 @@ pub async fn run(
 ) -> Result<(), anyhow::Error> {
     info!("DP mode: starting with empty config, waiting for CP");
 
+    // Bounded last-known-good configuration age (issue #3726). Installed before
+    // anything can accept a snapshot or report readiness, so the very first
+    // CP event is already accounted for. The action string was validated in
+    // `EnvConfig::validate()`; re-parsing here keeps the failure explicit
+    // instead of silently choosing a weaker mode.
+    let stale_action = env_config
+        .dp_config_stale_action_parsed()
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let config_freshness =
+        crate::dp_config_freshness::install(env_config.dp_config_max_stale(), stale_action);
+    if config_freshness.enabled() {
+        info!(
+            max_stale_seconds = config_freshness.max_stale().as_secs(),
+            stale_action = stale_action.as_str(),
+            "DP last-known-good configuration age is bounded; readiness degrades and the \
+             configured stale action applies once the bound is exceeded with no CP connected"
+        );
+    } else {
+        warn!(
+            "FERRUM_DP_CONFIG_MAX_STALE_SECONDS=0 — the DP will serve its last applied \
+             configuration indefinitely during a total control-plane outage, with no \
+             readiness or admission bound. This is an explicit, unsafe opt-in."
+        );
+    }
+
     // Open the observability delivery lifecycle for this serving cycle before
     // any plugin activation registers a queue worker. Re-running this mode in
     // one process after a completed drain otherwise targets the closed
@@ -143,6 +168,14 @@ pub async fn run(
         env_config.runtime_metrics_window_5m_seconds,
         shutdown_tx.subscribe(),
     );
+
+    // Config-staleness evaluator (issue #3726). The threshold is a time-based
+    // edge with no event to hang it on, so a 1s tick advances it; every CP
+    // event (connect, disconnect, applied snapshot) also evaluates inline, and
+    // `/health` evaluates on demand, so the tick only bounds how long the
+    // admission gate lags the boundary.
+    let staleness_handle =
+        start_config_staleness_monitor(config_freshness.clone(), shutdown_tx.subscribe());
 
     // Spawn the DP gRPC client to connect to CP and receive config updates
     let cp_urls = env_config.resolved_dp_cp_grpc_urls();
@@ -912,6 +945,7 @@ pub async fn run(
         background_handles.push(h);
     }
     background_handles.push(overload_handle);
+    background_handles.push(staleness_handle);
     background_handles.push(metrics_handle);
     background_handles.push(runtime_system_handle);
     background_handles.push(runtime_window_handle);
@@ -959,6 +993,55 @@ pub(crate) async fn await_dp_listener_handles(
         let _ = shutdown_tx.send(true);
     };
     crate::modes::file::await_listener_handles(listener_handles, shutdown_on_panic).await
+}
+
+/// Advance the DP config-staleness boundary on a fixed 1s tick (issue #3726).
+///
+/// Every state change the DP can observe (CP connect/disconnect, applied
+/// snapshot) evaluates inline, and `/health` evaluates on demand. What neither
+/// covers is the passage of time itself: a DP that is disconnected and idle has
+/// no event at the moment its snapshot crosses the bound. This tick supplies
+/// it, so the admission gate closes within a second of the boundary rather than
+/// at the next request or probe.
+///
+/// Evaluation is a handful of relaxed atomic loads with no allocation, so the
+/// tick is free even when the bound is disabled — but skip the task entirely in
+/// that case, since there is no boundary to cross.
+fn start_config_staleness_monitor(
+    freshness: Arc<crate::dp_config_freshness::DpConfigFreshness>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        if !freshness.enabled() {
+            return;
+        }
+        let mut ticker = tokio::time::interval(Duration::from_secs(1));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut logged_transitions = 0u64;
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    let snapshot = freshness.evaluate();
+                    if snapshot.stale && snapshot.stale_transitions_total > logged_transitions {
+                        logged_transitions = snapshot.stale_transitions_total;
+                        // Once per transition into stale, not once per tick. No
+                        // CP URL, token, or config content — closed-set labels
+                        // and counters only.
+                        tracing::warn!(
+                            reason = snapshot.reason,
+                            stale_action = snapshot.stale_action,
+                            new_traffic_blocked = snapshot.new_traffic_blocked,
+                            snapshot_age_seconds = snapshot.snapshot_age_seconds,
+                            max_stale_seconds = snapshot.max_stale_seconds,
+                            "DP configuration is stale beyond the configured bound with no \
+                             control plane connected; readiness is degraded"
+                        );
+                    }
+                }
+                _ = shutdown_rx.changed() => break,
+            }
+        }
+    })
 }
 
 fn proxy_frontend_tls_slot_from_operator(

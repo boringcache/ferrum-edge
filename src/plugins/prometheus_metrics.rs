@@ -2571,6 +2571,13 @@ impl MetricsRegistry {
             } else {
                 0
             }
+            // Nine fixed-cardinality DP config-freshness series (issue #3726),
+            // rendered only in DP mode.
+            + if crate::dp_config_freshness::global().is_some() {
+                1600
+            } else {
+                0
+            }
             + if self.node_agent_metrics.load().is_some() {
                 2600
             } else {
@@ -3880,6 +3887,111 @@ impl MetricsRegistry {
                 &mut output,
                 "ferrum_configsync_fenced_full_snapshots_total",
                 snapshot.fenced_full_snapshots_total,
+                &ns_label,
+            );
+        }
+
+        // Bounded DP last-known-good configuration age (issue #3726). Present
+        // only in DP mode. Every series is fixed-cardinality: no CP endpoint,
+        // credential, namespace, node id, or reason string is used as a label —
+        // the closed-set reason is exposed on authenticated `/health` instead.
+        if let Some(freshness) = crate::dp_config_freshness::snapshot() {
+            output.push_str(
+                "# HELP ferrum_dp_config_snapshot_age_seconds Age of the DP's last validated and successfully applied CP configuration snapshot, on a monotonic clock.\n",
+            );
+            output.push_str("# TYPE ferrum_dp_config_snapshot_age_seconds gauge\n");
+            render_process_counter(
+                &mut output,
+                "ferrum_dp_config_snapshot_age_seconds",
+                freshness.snapshot_age_seconds,
+                &ns_label,
+            );
+
+            output.push_str(
+                "# HELP ferrum_dp_config_max_stale_seconds Configured maximum applied-snapshot age before the DP degrades readiness (0 = bound disabled).\n",
+            );
+            output.push_str("# TYPE ferrum_dp_config_max_stale_seconds gauge\n");
+            render_process_counter(
+                &mut output,
+                "ferrum_dp_config_max_stale_seconds",
+                freshness.max_stale_seconds,
+                &ns_label,
+            );
+
+            output.push_str(
+                "# HELP ferrum_dp_config_stale Whether the DP's applied configuration is past its bound with no CP connected (1) or not (0).\n",
+            );
+            output.push_str("# TYPE ferrum_dp_config_stale gauge\n");
+            render_process_counter(
+                &mut output,
+                "ferrum_dp_config_stale",
+                u64::from(freshness.stale),
+                &ns_label,
+            );
+
+            output.push_str(
+                "# HELP ferrum_dp_config_new_traffic_blocked Whether the DP is refusing new request/connection admissions because its configuration is stale (1) or not (0).\n",
+            );
+            output.push_str("# TYPE ferrum_dp_config_new_traffic_blocked gauge\n");
+            render_process_counter(
+                &mut output,
+                "ferrum_dp_config_new_traffic_blocked",
+                u64::from(freshness.new_traffic_blocked),
+                &ns_label,
+            );
+
+            output.push_str(
+                "# HELP ferrum_dp_config_cp_connected Whether the DP currently has a ConfigSync stream to some control plane (1) or none (0).\n",
+            );
+            output.push_str("# TYPE ferrum_dp_config_cp_connected gauge\n");
+            render_process_counter(
+                &mut output,
+                "ferrum_dp_config_cp_connected",
+                u64::from(freshness.cp_connected),
+                &ns_label,
+            );
+
+            output.push_str(
+                "# HELP ferrum_dp_config_stale_transitions_total Transitions into the stale state since process start.\n",
+            );
+            output.push_str("# TYPE ferrum_dp_config_stale_transitions_total counter\n");
+            render_process_counter(
+                &mut output,
+                "ferrum_dp_config_stale_transitions_total",
+                freshness.stale_transitions_total,
+                &ns_label,
+            );
+
+            output.push_str(
+                "# HELP ferrum_dp_config_snapshots_applied_total CP snapshots/deltas validated and successfully applied since process start.\n",
+            );
+            output.push_str("# TYPE ferrum_dp_config_snapshots_applied_total counter\n");
+            render_process_counter(
+                &mut output,
+                "ferrum_dp_config_snapshots_applied_total",
+                freshness.applied_total,
+                &ns_label,
+            );
+
+            output.push_str(
+                "# HELP ferrum_dp_config_snapshots_rejected_total CP payloads refused before apply since process start.\n",
+            );
+            output.push_str("# TYPE ferrum_dp_config_snapshots_rejected_total counter\n");
+            render_process_counter(
+                &mut output,
+                "ferrum_dp_config_snapshots_rejected_total",
+                freshness.rejected_total,
+                &ns_label,
+            );
+
+            output.push_str(
+                "# HELP ferrum_dp_config_snapshot_apply_failures_total CP snapshots that were admitted and then failed to apply since process start.\n",
+            );
+            output.push_str("# TYPE ferrum_dp_config_snapshot_apply_failures_total counter\n");
+            render_process_counter(
+                &mut output,
+                "ferrum_dp_config_snapshot_apply_failures_total",
+                freshness.apply_failed_total,
                 &ns_label,
             );
         }
