@@ -1037,13 +1037,13 @@ impl XdsAdsServer {
         if !request.response_nonce.is_empty() {
             match self.record_sotw_ack(cache_key, request) {
                 AckOutcome::Acked => debug!(
-                    node_id = %node_id,
+                    node = %redacted_identifier(node_id),
                     type_url = %request.type_url,
                     "xDS ACK accepted"
                 ),
                 AckOutcome::Nacked { message } => {
                     warn!(
-                        node_id = %node_id,
+                        node = %redacted_identifier(node_id),
                         type_url = %request.type_url,
                         error = %message,
                         "xDS NACK received"
@@ -1051,7 +1051,7 @@ impl XdsAdsServer {
                 }
                 outcome => {
                     warn!(
-                        node_id = %node_id,
+                        node = %redacted_identifier(node_id),
                         type_url = %request.type_url,
                         outcome = ?outcome,
                         "xDS ACK ignored"
@@ -1221,13 +1221,13 @@ impl XdsAdsServer {
         let outcome = self.record_delta_ack(node_id, request);
         match &outcome {
             AckOutcome::Acked | AckOutcome::VersionDrift { .. } => debug!(
-                node_id = %node_id,
+                node = %redacted_identifier(node_id),
                 type_url = %request.type_url,
                 "xDS delta ACK accepted"
             ),
             AckOutcome::Nacked { message } => {
                 warn!(
-                    node_id = %node_id,
+                    node = %redacted_identifier(node_id),
                     type_url = %request.type_url,
                     error = %message,
                     "xDS delta NACK received"
@@ -1235,7 +1235,7 @@ impl XdsAdsServer {
             }
             outcome => {
                 warn!(
-                    node_id = %node_id,
+                    node = %redacted_identifier(node_id),
                     type_url = %request.type_url,
                     outcome = ?outcome,
                     "xDS delta ACK ignored"

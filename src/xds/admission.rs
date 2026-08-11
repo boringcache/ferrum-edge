@@ -259,6 +259,8 @@ impl XdsAdmissionLimits {
             || self.max_streams_per_principal == 0
             || self.max_streams_per_node == 0
             || self.max_active_nodes == 0
+            || self.max_node_id_bytes == 0
+            || self.first_request_timeout.is_zero()
     }
 
     /// Names of the unbounded scopes, for a startup warning / validation error.
