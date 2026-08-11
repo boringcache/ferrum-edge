@@ -12547,6 +12547,10 @@ async fn functional_mesh_live_host_udp_capture_proxy_backend_round_trip() {
                     "true".to_string(),
                 ),
                 ("FERRUM_MESH_CAPTURE_UDP_PORT", capture_port.to_string()),
+                (
+                    "FERRUM_MESH_CAPTURE_INCLUDE_CIDRS",
+                    "0.0.0.0/0,::/0".to_string(),
+                ),
                 ("FERRUM_MESH_IP6TABLES_ENABLED", "true".to_string()),
                 ("FERRUM_MESH_EGRESS_HBONE_PORT", b_hbone_port.to_string()),
             ],
