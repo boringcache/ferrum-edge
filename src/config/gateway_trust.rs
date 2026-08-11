@@ -42,8 +42,10 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use arc_swap::ArcSwap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock};
 use x509_parser::prelude::{FromDer, X509Certificate};
 
 use crate::identity::TrustDomain;
@@ -418,6 +420,20 @@ pub struct GatewayTrustBundleSummary {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Material-free identity of the trust state that actually reached the live
+/// configuration swap for one namespace.
+///
+/// This is deliberately separate from the current database row. An admin write
+/// is only a candidate until the poller reloads, validates, and publishes it;
+/// an invalid out-of-band row may never publish at all. Status must therefore
+/// report this snapshot instead of pairing a database revision with an
+/// unrelated process-wide publication counter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PublishedGatewayTrustState {
+    pub generation: String,
+    pub bundle: GatewayTrustBundleSummary,
+}
+
 /// Publication semantics for one namespace's gateway trust state.
 ///
 /// This is the CP-side mirror of the DP's `GatewayTrustBundleUpdate` and the
@@ -584,6 +600,8 @@ static LOAD_REJECTIONS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static AMBIGUOUS_AUTHORITY_TOTAL: AtomicU64 = AtomicU64::new(0);
 static LAST_PUBLISHED_UNIX_SECONDS: AtomicU64 = AtomicU64::new(0);
 static LAST_FAILURE_REASON: AtomicU8 = AtomicU8::new(0);
+static PUBLISHED_NAMESPACE_STATES: LazyLock<ArcSwap<HashMap<String, PublishedGatewayTrustState>>> =
+    LazyLock::new(|| ArcSwap::from_pointee(HashMap::new()));
 
 /// Bounded reason for the most recent trust-load failure. Deliberately an enum,
 /// not a message: a free-form reason could echo stored material into `/metrics`.
@@ -668,12 +686,64 @@ pub fn record_trust_generation_published(
     file_sourced: Option<&TrustBundleSet>,
     now_unix_seconds: u64,
 ) {
-    if records.is_empty() || file_sourced.is_some() {
+    if file_sourced.is_some() {
+        // Every CURRENT database record is ambiguous and keeps its prior live
+        // state. A namespace whose database record was revoked is no longer
+        // ambiguous, though: its projection resolves to the file-only/clear
+        // outcome, so it must not keep advertising the removed database
+        // revision. Retain only prior states that still have a current record;
+        // do not insert newly ambiguous records that never published.
+        let current_namespaces: HashSet<&str> =
+            records.iter().map(|record| record.namespace.as_str()).collect();
+        let mut retained = PUBLISHED_NAMESPACE_STATES.load().as_ref().clone();
+        retained.retain(|namespace, _| current_namespaces.contains(namespace.as_str()));
+        PUBLISHED_NAMESPACE_STATES.store(Arc::new(retained));
+        return;
+    }
+
+    // Replace the complete namespace view at the same publication boundary as
+    // the live GatewayConfig swap. This also records explicit revocation: an
+    // empty accepted generation clears every previously published database
+    // record even though it deliberately does not increment the
+    // database-record publication counter below.
+    let published = records
+        .iter()
+        .map(|record| {
+            (
+                record.namespace.clone(),
+                PublishedGatewayTrustState {
+                    generation: trust_generation_fingerprint(std::slice::from_ref(record)),
+                    bundle: record.summary(),
+                },
+            )
+        })
+        .collect();
+    PUBLISHED_NAMESPACE_STATES.store(Arc::new(published));
+
+    if records.is_empty() {
         return;
     }
     PUBLISHED_GENERATIONS_TOTAL.fetch_add(1, Ordering::Relaxed);
     LAST_PUBLISHED_UNIX_SECONDS.store(now_unix_seconds, Ordering::Relaxed);
     LAST_FAILURE_REASON.store(GatewayTrustFailureReason::None.code(), Ordering::Relaxed);
+}
+
+/// Return the material-free state that actually reached the live configuration
+/// swap for `namespace`.
+pub fn published_namespace_state(namespace: &str) -> Option<PublishedGatewayTrustState> {
+    PUBLISHED_NAMESPACE_STATES.load().get(namespace).cloned()
+}
+
+/// Generation identity for the currently published namespace state.
+///
+/// The empty-state fingerprint is stable and changes on both a first
+/// publication and an explicit revocation, which lets two control-plane
+/// replicas compare the complete live state without treating absence as an
+/// unknown value.
+pub fn published_namespace_generation(namespace: &str) -> String {
+    published_namespace_state(namespace)
+        .map(|state| state.generation)
+        .unwrap_or_else(|| trust_generation_fingerprint(&[]))
 }
 
 /// Stable fingerprint of a trust generation.
@@ -771,4 +841,5 @@ pub fn reset_observability_for_tests() {
     AMBIGUOUS_AUTHORITY_TOTAL.store(0, Ordering::Relaxed);
     LAST_PUBLISHED_UNIX_SECONDS.store(0, Ordering::Relaxed);
     LAST_FAILURE_REASON.store(0, Ordering::Relaxed);
+    PUBLISHED_NAMESPACE_STATES.store(Arc::new(HashMap::new()));
 }

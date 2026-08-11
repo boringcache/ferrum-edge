@@ -22,6 +22,9 @@ use ferrum_edge::admin::{
     serve_admin_on_listener,
 };
 use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig};
+use ferrum_edge::config::gateway_trust::{
+    GatewayTrustBundleRecord, record_trust_generation_published, reset_observability_for_tests,
+};
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::{Value, json};
 use std::net::SocketAddr;
@@ -443,6 +446,7 @@ async fn a_stale_pre_delete_revision_is_refused_over_the_admin_api() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_backup_round_trips_the_trust_resource_with_server_assigned_revisions() {
+    reset_observability_for_tests();
     let dir = TempDir::new().expect("temp dir");
     let (base, _shutdown) = start_admin(admin_state(make_store(&dir).await)).await;
     let authority = root_ca_der_base64("root");
@@ -486,11 +490,27 @@ async fn a_backup_round_trips_the_trust_resource_with_server_assigned_revisions(
         after["revision"]
     );
 
-    // The status view reports a namespace-safe generation identity and no
-    // process-wide revision.
+    // A committed row is still only a candidate. This admin-only fixture has no
+    // polling/publication loop, so status must not claim the restored revision
+    // is live merely because it can read it from the database.
+    let (status, view) = get_json(&base, "/gateway-trust/status", "ferrum").await;
+    assert_eq!(status, 200);
+    assert_eq!(view["configured"], false);
+    assert!(view["bundle"].is_null());
+
+    // Record the same seam the CP poller reaches after validation + ArcSwap.
+    // Only then may status expose this revision as the live generation.
+    let published: GatewayTrustBundleRecord =
+        serde_json::from_value(after.clone()).expect("stored record decodes");
+    record_trust_generation_published(
+        std::slice::from_ref(&published),
+        None,
+        Utc::now().timestamp().max(0) as u64,
+    );
     let (status, view) = get_json(&base, "/gateway-trust/status", "ferrum").await;
     assert_eq!(status, 200);
     assert_eq!(view["configured"], true);
+    assert_eq!(view["bundle"]["revision"], after["revision"]);
     let generation = view["generation"].as_str().expect("a generation identity");
     assert!(!generation.is_empty());
     assert!(
@@ -498,6 +518,7 @@ async fn a_backup_round_trips_the_trust_resource_with_server_assigned_revisions(
         "the generation identity is a digest and must not carry material"
     );
     assert!(view["process"]["published_revision"].is_null());
+    reset_observability_for_tests();
 }
 
 #[tokio::test(flavor = "multi_thread")]

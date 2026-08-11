@@ -666,7 +666,7 @@ restart, and certificate/key generations are never mixed because the resources
 and the trust side channel publish from one snapshot.
 
 **Status payload.** `GET /gateway-trust/status` returns the trust domain,
-authority counts, this namespace's revision, timestamps, a bounded
+authority counts, this namespace's **live published** revision, timestamps, a bounded
 failure-reason enum (`none`, `invalid_material`, `undecodable`,
 `ambiguous_authority`), and a `generation` digest — a stable configuration
 identity for the namespace's trust state that two control-plane replicas
@@ -677,7 +677,12 @@ also returns label-free process counters
 generations that reached the live-configuration swap rather than candidates
 that merely loaded. There is no process-wide revision: revisions are per
 namespace. The payload never returns PEM/DER/JWKS bytes, key ids, or
-secret/provider URIs.
+secret/provider URIs. `configured` and `bundle` describe the generation that
+actually reached that swap, not the newest database row: a freshly committed
+candidate remains absent/at the prior revision until the poller validates and
+publishes it, and a rejected candidate never replaces the reported
+last-known-good generation. Use the CRUD endpoints to inspect persisted
+candidate state.
 
 See [CP/DP mode](cp_dp_mode.md#the-gateway_trust_bundles-resource-issue-3727)
 for the storage shape, propagation semantics, precedence rule, and metrics.

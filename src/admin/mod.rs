@@ -6339,8 +6339,8 @@ async fn handle_delete_credential_by_index(
 
 // ---- Gateway trust bundles (issue #3727) ----
 
-/// `GET /gateway-trust/status` — namespace trust state plus process-wide
-/// load/convergence counters.
+/// `GET /gateway-trust/status` — namespace trust state that reached the live
+/// publication boundary, plus process-wide load/convergence counters.
 ///
 /// Redaction contract: the payload carries the trust domain (already public
 /// configuration), authority COUNTS, the monotonic revision, timestamps, and a
@@ -6352,41 +6352,35 @@ async fn handle_gateway_trust_status(
     namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let process = crate::config::gateway_trust::observability_snapshot();
-    let Some(db) = state.db.as_ref() else {
+    if state.db.is_none() {
         return Ok(json_response(
             StatusCode::SERVICE_UNAVAILABLE,
             &json!({"error": "No database"}),
         ));
-    };
-    // Namespace-predicated at the query level: this cannot observe another
-    // tenant's record even to report its absence.
-    match db.get_namespace_gateway_trust_bundle(namespace).await {
-        Ok(record) => {
-            // `generation` is the namespace-safe configuration identity for
-            // trust: a digest over (namespace, id, trust domain, revision,
-            // canonical material). Two control-plane replicas that
-            // reconstructed the same committed state report the same value, and
-            // any rotation or revocation changes it. It is a digest, so it
-            // carries no material. There is deliberately no process-wide
-            // "published revision" here — revisions are per namespace.
-            let generation =
-                crate::config::gateway_trust::trust_generation_fingerprint(record.as_slice());
-            Ok(json_response(
-                StatusCode::OK,
-                &json!({
-                    "namespace": namespace,
-                    "configured": record.is_some(),
-                    "generation": generation,
-                    "bundle": record.as_ref().map(|record| record.summary()),
-                    "process": process,
-                }),
-            ))
-        }
-        Err(error) => Ok(json_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            &db_error_response(&error),
-        )),
     }
+
+    // Read the per-namespace snapshot recorded at the SAME ArcSwap boundary as
+    // the live configuration. Reading the database here would let a freshly
+    // committed (or invalid out-of-band) revision appear as published before
+    // the poller had validated and swapped it, while an unrelated increment of
+    // the process-wide counter made the two values look converged.
+    let published = crate::config::gateway_trust::published_namespace_state(namespace);
+    let generation = published
+        .as_ref()
+        .map(|state| state.generation.clone())
+        .unwrap_or_else(|| {
+            crate::config::gateway_trust::published_namespace_generation(namespace)
+        });
+    Ok(json_response(
+        StatusCode::OK,
+        &json!({
+            "namespace": namespace,
+            "configured": published.is_some(),
+            "generation": generation,
+            "bundle": published.map(|state| state.bundle),
+            "process": process,
+        }),
+    ))
 }
 
 // ---- Plugin CRUD ----

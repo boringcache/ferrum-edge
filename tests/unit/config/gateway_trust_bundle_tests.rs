@@ -17,8 +17,9 @@ use ferrum_edge::config::gateway_trust::{
     GatewayTrustPublication, MAX_FEDERATED_BUNDLES, MAX_JWT_AUTHORITIES_PER_BUNDLE,
     MAX_TRUST_BUNDLE_JSON_BYTES, MAX_X509_AUTHORITIES_PER_BUNDLE, NamespaceTrustProjection,
     TrustAuthorityResolution, observability_snapshot, project_namespace_trust,
-    record_ambiguous_authority, record_trust_generation_published, record_trust_load_rejection,
-    reset_observability_for_tests, resolve_trust_authority, trust_generation_fingerprint,
+    published_namespace_generation, published_namespace_state, record_ambiguous_authority,
+    record_trust_generation_published, record_trust_load_rejection, reset_observability_for_tests,
+    resolve_trust_authority, trust_generation_fingerprint,
 };
 use ferrum_edge::identity::TrustDomain;
 use ferrum_edge::modes::mesh::config::{JwtAuthority, TrustBundle, TrustBundleSet};
@@ -488,6 +489,10 @@ fn observability_counters_are_bounded_and_material_free() {
     assert_eq!(after_publish.published_generations_total, 1);
     assert_eq!(after_publish.last_published_unix_seconds, 1_700_000_000);
     assert_eq!(after_publish.last_failure_reason, "none");
+    let published = published_namespace_state("production")
+        .expect("the exact namespace publication must be observable");
+    assert_eq!(published.bundle.revision, valid_record().revision);
+    assert_eq!(published.generation, published_namespace_generation("production"));
 
     // A rejected candidate must NOT look like a publication: the previous valid
     // generation is still the one serving.
@@ -503,6 +508,11 @@ fn observability_counters_are_bounded_and_material_free() {
         "a refused candidate must not advance the last-published timestamp"
     );
     assert_eq!(after_rejection.last_failure_reason, "invalid_material");
+    assert_eq!(
+        published_namespace_state("production"),
+        Some(published.clone()),
+        "a refused candidate must retain the exact prior namespace generation"
+    );
 
     // An undecodable stored row is its own bounded reason.
     record_trust_load_rejection(GatewayTrustFailureReason::Undecodable);
@@ -541,6 +551,16 @@ fn observability_counters_are_bounded_and_material_free() {
         after_ambiguous_publication.last_failure_reason, "ambiguous_authority",
         "the refusal must not be cleared by the swap it refused"
     );
+    assert_eq!(
+        published_namespace_state("production"),
+        Some(published),
+        "an ambiguous publication must retain the exact prior namespace generation"
+    );
+    record_trust_generation_published(&[], Some(&file_authority), 1_850_000_000);
+    assert!(
+        published_namespace_state("production").is_none(),
+        "removing the database record resolves ambiguity and must clear its prior database publication"
+    );
 
     // A genuinely accepted generation spanning several namespaces is still ONE
     // generation reaching the swap, counted exactly once — the counter is not
@@ -561,6 +581,19 @@ fn observability_counters_are_bounded_and_material_free() {
     assert_eq!(
         after_multi.last_failure_reason, "none",
         "an accepted publication clears the standing failure reason"
+    );
+    assert!(published_namespace_state("staging").is_some());
+
+    // An accepted empty generation is an explicit live revocation. It does not
+    // increment the database-record counter, but status must stop reporting
+    // either namespace's previously published revision.
+    let before_revoke = observability_snapshot().published_generations_total;
+    record_trust_generation_published(&[], None, 1_950_000_000);
+    assert!(published_namespace_state("production").is_none());
+    assert!(published_namespace_state("staging").is_none());
+    assert_eq!(
+        observability_snapshot().published_generations_total,
+        before_revoke
     );
 
     // Re-run the ambiguity refusal so the trailing snapshot assertions below

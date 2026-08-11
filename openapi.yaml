@@ -10837,19 +10837,29 @@ components:
           type: string
         configured:
           type: boolean
-          description: Whether the namespace holds a trust-bundle record.
+          description: >-
+            Whether this namespace has a database trust-bundle generation at
+            the live configuration publication boundary. A committed candidate
+            is not reported here until the poller validates and publishes it;
+            a rejected candidate leaves the previous value unchanged.
         generation:
           type: string
           description: >-
             Namespace-safe configuration identity for trust: a SHA-256 digest
             over (namespace, id, trust domain, revision, canonical material).
-            Two control-plane replicas that reconstructed the same committed
-            state report the same value, and any rotation or revocation changes
-            it. Being a digest, it carries no trust material.
+            This identifies the live-published state, not merely the newest
+            database row. Two control-plane replicas that published the same
+            committed state report the same value, and any published rotation
+            or revocation changes it. Being a digest, it carries no trust
+            material.
         bundle:
           oneOf:
             - $ref: "#/components/schemas/GatewayTrustBundleSummary"
             - type: "null"
+          description: >-
+            Material-free summary of the live-published namespace generation.
+            Use the gateway-trust-bundle CRUD endpoints to inspect a persisted
+            candidate that has not yet reached publication.
         process:
           type: object
           description: >-

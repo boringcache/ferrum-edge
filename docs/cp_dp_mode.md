@@ -331,10 +331,14 @@ There is deliberately **no process-wide revision gauge**. Revisions are per
 namespace, so a single process atomic would be last-writer-wins and actively
 misleading on a multi-namespace CP. The namespace-scoped view is on the
 authenticated `GET /gateway-trust/status`, which returns that namespace's
-revision, its authority counts, timestamps, a bounded failure-reason enum, and
+live-published revision, its authority counts, timestamps, a bounded failure-reason enum, and
 a `generation` digest that is stable across replicas and changes on every
 rotation or revocation — never PEM/DER/JWKS bytes, key ids, or secret/provider
-URIs.
+URIs. The namespace value is captured at the same `ArcSwap` publication
+boundary as the live configuration; status does not combine the newest
+database row with a process-wide counter. A candidate that has not yet polled,
+or that validation rejected, therefore cannot masquerade as converged and the
+previous published generation remains visible.
 
 ##### Namespace isolation
 
