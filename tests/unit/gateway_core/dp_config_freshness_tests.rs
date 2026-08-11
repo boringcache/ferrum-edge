@@ -365,6 +365,27 @@ fn astronomical_max_stale_bound_does_not_panic_or_schedule_unrepresentable_deadl
     );
 }
 
+/// [`Duration::MAX`] is the largest representable [`Duration`]; adding it to any
+/// [`Instant`] still overflows the platform monotonic range. The tracker must
+/// treat that like any other unrepresentable deadline: no panic, no timer armed,
+/// and no premature stale latch while the bound remains astronomically far away.
+#[test]
+fn duration_max_bound_does_not_panic_or_schedule_unrepresentable_deadline() {
+    let epoch = epoch();
+    let freshness = DpConfigFreshness::new_at(epoch, Duration::MAX, StaleAction::FailClosed);
+    freshness.record_cp_authority_lost_at(epoch);
+
+    let now = at(epoch, 1);
+    assert!(
+        !freshness.evaluate_at(now).stale,
+        "Duration::MAX must not latch stale at an ordinary current instant"
+    );
+    assert!(
+        freshness.next_stale_deadline_at(now).is_none(),
+        "epoch + Duration::MAX is not representable as an Instant"
+    );
+}
+
 /// The monitor is deadline-driven, not tick-driven: the deadline it arms is the
 /// exact instant the applied snapshot crosses the configured bound, and it is
 /// armed only while the DP has actually lost authority.

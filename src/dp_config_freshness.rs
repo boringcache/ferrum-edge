@@ -558,8 +558,9 @@ impl DpConfigFreshness {
     /// [`Instant`] because an astronomical configured bound overflows the
     /// platform monotonic clock range. An unrepresentable deadline cannot occur
     /// within that range, so returning `None` is correct rather than panicking
-    /// on unchecked `Instant + Duration`. The monitor waits on
-    /// [`Self::wait_for_change`] alone in that case, so it never busy-polls.
+    /// on unchecked `Instant + Duration` or arming a shorter substitute timer.
+    /// The monitor then waits on [`Self::wait_for_change`] alone until a CP
+    /// event or `/health` evaluation moves state; it never busy-polls.
     pub fn next_stale_deadline_at(&self, now: Instant) -> Option<Instant> {
         if !self.enabled() {
             return None;
