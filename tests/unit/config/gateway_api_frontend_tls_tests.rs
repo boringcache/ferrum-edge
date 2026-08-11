@@ -753,6 +753,52 @@ fn snapshot_certificate_count_is_capped() {
 }
 
 #[test]
+fn certificate_cap_is_isolated_per_serving_namespace() {
+    let attacker_listeners: Vec<Value> = (0..MAX_FRONTEND_TLS_CERTIFICATE_SOURCES)
+        .map(|index| {
+            https_listener(
+                &format!("listener-{index}"),
+                (10000 + index) as u64,
+                Some(&format!("host-{index}.attacker.example.com")),
+                &["attacker-cert"],
+            )
+        })
+        .collect();
+    let result = translate(&[
+        gateway("aaa-attacker", "edge", attacker_listeners),
+        gateway(
+            "zzz-victim",
+            "edge",
+            vec![https_listener(
+                "https",
+                443,
+                Some("victim.example.com"),
+                &["victim-cert"],
+            )],
+        ),
+        tls_secret("attacker-cert", "aaa-attacker"),
+        tls_secret("victim-cert", "zzz-victim"),
+        route("zzz-victim", "victim-route", "edge", "https", "/"),
+    ]);
+
+    assert_eq!(
+        result.config.frontend_tls_certificate_sources.len(),
+        MAX_FRONTEND_TLS_CERTIFICATE_SOURCES + 1
+    );
+    assert!(result.config.frontend_tls_certificate_sources.iter().any(
+        |source| source.namespace == "zzz-victim" && source.gateway == "edge"
+    ));
+    assert!(
+        result
+            .config
+            .proxies
+            .iter()
+            .any(|proxy| proxy.namespace == "zzz-victim" && proxy.id.contains("victim-route")),
+        "another namespace filling its budget must not withdraw the victim route"
+    );
+}
+
+#[test]
 fn cap_promotion_is_rechecked_for_physical_port_conflicts() {
     let fill_listeners: Vec<Value> = (0..MAX_FRONTEND_TLS_CERTIFICATE_SOURCES - 1)
         .map(|index| {
