@@ -330,7 +330,7 @@ pub async fn collect_discovery_response_body(
     if let Some(declared) = discovery_declared_content_length(response.headers()) {
         match declared {
             ContentLength::Exact(declared) => {
-                if declared as usize > max_bytes {
+                if declared > max_bytes as u64 {
                     record_body_failure(DiscoveryBodyError::Oversized, role);
                     return Err(DiscoveryBodyError::Oversized);
                 }
