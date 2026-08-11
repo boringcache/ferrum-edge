@@ -200,17 +200,12 @@ async fn start_two_same_protocol_gateway_listeners(
     backend_a: u16,
     backend_b: u16,
 ) -> TwoSameProtocolListenersStartup {
-    use std::sync::Arc;
-
-    use ferrum_edge::proxy::gateway_listener::GatewayListenerBindFailure;
-
-    let mut last_bind_failures: Arc<Vec<GatewayListenerBindFailure>> =
-        Arc::new(Vec::new());
-
     for attempt in 1..=GATEWAY_LISTENER_STARTUP_ATTEMPTS {
         let listener_a_port = reserve_free_port().await;
         let listener_b_port = reserve_free_port().await;
-        assert_ne!(listener_a_port, listener_b_port);
+        if listener_a_port == listener_b_port {
+            continue;
+        }
 
         let config = config_with(vec![
             port_scoped_proxy("gw-a", backend_a, Some(listener_a_port)),
@@ -235,6 +230,7 @@ async fn start_two_same_protocol_gateway_listeners(
         {
             Ok(handles) => handles,
             Err(error) => {
+                let _ = shutdown_tx.send(true);
                 eprintln!(
                     "two-listener startup attempt {attempt}/{GATEWAY_LISTENER_STARTUP_ATTEMPTS} \
                      failed before serve returned: {error}"
@@ -264,24 +260,30 @@ async fn start_two_same_protocol_gateway_listeners(
             };
         }
 
-        last_bind_failures = handles.gateway_listeners.bind_failures();
+        let bind_failures = handles.gateway_listeners.bind_failures();
         eprintln!(
             "two-listener startup attempt {attempt}/{GATEWAY_LISTENER_STARTUP_ATTEMPTS} \
              lost an ephemeral-port race: want active {expected:?}, actual {active:?}, \
-             refusals: {last_bind_failures:?}"
+             refusals: {bind_failures:?}"
         );
         let _ = shutdown_tx.send(true);
-        let _ = tokio::time::timeout(Duration::from_secs(5), handles.join()).await;
+        tokio::time::timeout(Duration::from_secs(5), handles.join())
+            .await
+            .expect("a failed two-listener startup attempt must drain before retrying")
+            .expect("a failed two-listener startup attempt must join cleanly before retrying");
         if attempt == GATEWAY_LISTENER_STARTUP_ATTEMPTS {
             panic!(
                 "both Gateway listener ports must be bound by the gateway after \
                  {GATEWAY_LISTENER_STARTUP_ATTEMPTS} attempts; want {expected:?}, \
-                 actual {active:?}, refusals: {last_bind_failures:?}"
+                 actual {active:?}, refusals: {bind_failures:?}"
             );
         }
     }
 
-    unreachable!("startup loop always returns or panics")
+    panic!(
+        "could not reserve two distinct Gateway listener ports in \
+         {GATEWAY_LISTENER_STARTUP_ATTEMPTS} attempts"
+    )
 }
 
 /// `Ok((status, body))`, or `Err` when the port is not accepting at all.
