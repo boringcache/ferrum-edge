@@ -34343,15 +34343,16 @@ pub(crate) fn resolve_effective_proxy_for_target<'a>(
     let Some(target) = upstream_target else {
         return std::borrow::Cow::Borrowed(proxy);
     };
-    // Per-port override for the LB-selected target's policy port and the service-discovery
-    // top-level `connectionPool.http` overlay (`Proxy.dispatch_port_override_fallback`)
+    // Per-port override for the LB-selected target's policy port and the
+    // inherited top-level/selected-subset `connectionPool.http` overlay
+    // (`Proxy.dispatch_port_override_fallback`)
     // are FIELD-MERGED, not wholesale-replaced: a per-port `connectionPool.http`
-    // field wins when set, otherwise the top-level overlay's value is inherited —
+    // field wins when set, otherwise the selected-subset/top-level value is inherited —
     // so an unrelated per-port field (`connectTimeout`/`tls`) no longer wipes the
     // inherited top-level `idleTimeout`/`http2MaxRequests`/`maxRetries`. This
-    // matches the NON-SD apply-time layering exactly (top-level fan-out, then a
-    // partial per-port overlay; see `apply_connection_pool_http_to_port_override`
-    // in `src/modes/mesh/mod.rs`). Resolve each field through borrowed references:
+    // matches the cold-path tiering exactly (inherited fallback, then a partial
+    // per-port overlay; see `apply_connection_pool_http_to_port_override` in
+    // `src/modes/mesh/mod.rs`). Resolve each field through borrowed references:
     // cloning the whole per-port value here would allocate on EVERY request for
     // an SD destination that combines an explicit port entry with a fallback.
     let per_port = proxy

@@ -9054,14 +9054,16 @@ fn apply_traffic_policy_to_port_override(
 /// Project an HTTP connection-pool overlay onto a per-port slot.
 ///
 /// Each field is overlaid independently — `None` (field absent) leaves the
-/// existing slot value untouched so a per-port partial overlay can layer over
-/// a top-level fan-out without clearing fields the operator did not respecify.
+/// existing slot value untouched. The per-port slot remains separate from the
+/// inherited top-level/subset fallback; dispatch merges them field-by-field so
+/// omitted per-port fields inherit without being cleared.
 ///
 /// **Field-level merge — intentional Ferrum semantics.** Istio treats a matching
 /// `portLevelSettings` entry as a COMPLETE REPLACEMENT of the destination-level
 /// `connectionPool` for that port; Ferrum instead does a per-field merge
-/// (top-level fan-out, then this additive per-port overlay). This is the
-/// documented product contract across every applied `connectionPool` knob.
+/// (inherited fallback first, then this additive per-port overlay at dispatch).
+/// This is the documented product contract across every applied
+/// `connectionPool` knob.
 ///
 /// `h2_upgrade_policy` carries an explicit `H2UpgradePolicy::Default` rather
 /// than collapsing Istio's `DEFAULT` to `None`. That distinction matters HERE:

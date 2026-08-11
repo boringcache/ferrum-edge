@@ -899,8 +899,8 @@ fn destination_rule_port_level_explicit_default_clears_inherited_h2_upgrade_poli
     use ferrum_edge::config::types::H2UpgradePolicy;
     use ferrum_edge::modes::mesh::config::MeshConnectionPoolHttp;
 
-    // codex round-1 Finding 3: a top-level `UPGRADE` fans out to every port,
-    // but an EXPLICIT port-level `DEFAULT` on 8080 must CLEAR the inherited
+    // A top-level `UPGRADE` supplies the inherited fallback, but an EXPLICIT
+    // port-level `DEFAULT` on 8080 must CLEAR the inherited
     // `UPGRADE` for that port (operator explicitly chose probe-driven), not
     // leave it inherited. `H2UpgradePolicy::Default` is carried (not collapsed
     // to `None`) precisely so the apply layer can distinguish explicit-DEFAULT

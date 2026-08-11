@@ -3920,10 +3920,10 @@ impl GatewayConfig {
             .filter(|(_, m)| !m.is_empty())
             .collect();
 
-        // Inherited top-level `connectionPool.http` fallback. The three fields
-        // supported at subset scope are overlaid per proxy via the shared
-        // selected-subset helper so admission and runtime stay aligned. The
-        // per-port map stays separate and is consulted first at dispatch,
+        // Inherited top-level `connectionPool.http` fallback. All five applied
+        // HTTP fields supported at subset scope are overlaid per proxy via the
+        // shared selected-subset helper so admission and runtime stay aligned.
+        // The per-port map stays separate and is consulted first at dispatch,
         // preserving port > subset > top-level.
         let upstream_by_key: HashMap<(&str, &str), &Upstream> = self
             .upstreams
