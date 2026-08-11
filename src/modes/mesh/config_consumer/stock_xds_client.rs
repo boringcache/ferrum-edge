@@ -602,8 +602,7 @@ async fn connect_stock_ads(
 
 pub(crate) async fn read_bearer_token(path: &str) -> Result<BearerToken, anyhow::Error> {
     use crate::secrets::credential_file::{
-        CredentialTrim, DEFAULT_CREDENTIAL_FILE_MAX_BYTES,
-        read_credential_file_detached_guarded,
+        CredentialTrim, DEFAULT_CREDENTIAL_FILE_MAX_BYTES, read_credential_file_detached_guarded,
     };
 
     let read = async {
@@ -619,10 +618,10 @@ pub(crate) async fn read_bearer_token(path: &str) -> Result<BearerToken, anyhow:
             permit,
         )
         .await
+        .map_err(|error| anyhow::anyhow!("failed to read stock xDS bearer token: {error}"))
     };
     let token = match tokio::time::timeout(STOCK_XDS_TOKEN_FILE_READ_TIMEOUT, read).await {
-        Ok(result) => result
-            .map_err(|error| anyhow::anyhow!("failed to read stock xDS bearer token: {error}"))?,
+        Ok(result) => result?,
         Err(_) => anyhow::bail!("timed out reading stock xDS bearer token"),
     };
     format!("Bearer {token}")

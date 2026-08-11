@@ -120,9 +120,7 @@ pub mod _test_support {
 
     /// Exercise the crate-private stock-xDS credential boundary while keeping
     /// its metadata representation out of the public production API.
-    pub async fn read_stock_xds_bearer_token_for_test(
-        path: &str,
-    ) -> Result<String, anyhow::Error> {
+    pub async fn read_stock_xds_bearer_token_for_test(path: &str) -> Result<String, anyhow::Error> {
         let token =
             crate::modes::mesh::config_consumer::stock_xds_client::read_bearer_token(path).await?;
         token
@@ -138,11 +136,7 @@ pub mod _test_support {
         prefix: &[u8],
         logical_len: u64,
     ) -> std::io::Result<()> {
-        crate::secrets::credential_file::write_sparse_credential_fixture(
-            path,
-            prefix,
-            logical_len,
-        )
+        crate::secrets::credential_file::write_sparse_credential_fixture(path, prefix, logical_len)
     }
 
     /// Exercise DP's crate-private concurrent listener supervisor without

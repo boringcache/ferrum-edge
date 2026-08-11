@@ -28,8 +28,8 @@ use chrono::{DateTime, Utc};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde::Serialize;
 use serde_json::json;
-use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{Notify, Semaphore, watch};
 use tonic::metadata::MetadataValue;
@@ -346,8 +346,7 @@ fn read_external_cp_token_file(path: &str) -> Result<String, anyhow::Error> {
 
 async fn read_external_cp_token_file_detached(path: &str) -> Result<String, anyhow::Error> {
     use crate::secrets::credential_file::{
-        CredentialTrim, DEFAULT_CREDENTIAL_FILE_MAX_BYTES,
-        read_credential_file_detached_guarded,
+        CredentialTrim, DEFAULT_CREDENTIAL_FILE_MAX_BYTES, read_credential_file_detached_guarded,
     };
     let read = async {
         let permit = dp_cp_token_file_read_limit()
@@ -364,9 +363,10 @@ async fn read_external_cp_token_file_detached(path: &str) -> Result<String, anyh
             permit,
         )
         .await
+        .map_err(map_external_cp_token_error)
     };
     match tokio::time::timeout(DP_CP_TOKEN_FILE_READ_TIMEOUT, read).await {
-        Ok(result) => result.map_err(map_external_cp_token_error),
+        Ok(result) => result,
         Err(_) => Err(anyhow::anyhow!(
             "failed to read FERRUM_DP_CP_GRPC_TOKEN_FILE: timed out after {}s",
             DP_CP_TOKEN_FILE_READ_TIMEOUT.as_secs()
