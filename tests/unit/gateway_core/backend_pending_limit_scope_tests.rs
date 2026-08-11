@@ -41,11 +41,14 @@ fn independent_services_same_endpoint_and_subset_stay_isolated() {
         .try_acquire(&internal, 8080, Some(10))
         .expect("internal must remain independent under cap 10")
         .expect("guard");
+    let mut internal_guards = Vec::new();
     for _ in 0..9 {
-        let _ = limiter
-            .try_acquire(&internal, 8080, Some(10))
-            .expect("internal admits up to 10")
-            .expect("guard");
+        internal_guards.push(
+            limiter
+                .try_acquire(&internal, 8080, Some(10))
+                .expect("internal admits up to 10")
+                .expect("guard"),
+        );
     }
     limiter
         .try_acquire(&internal, 8080, Some(10))
