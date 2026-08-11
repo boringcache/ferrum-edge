@@ -2564,7 +2564,15 @@ fn listenersets_in_different_namespaces_cannot_overlap_hostnames() {
         victim,
         attacker,
     ];
-    let translation = translate_k8s_objects(&objects, options()).expect("translate");
+    let translation = translate_k8s_objects(
+        &objects,
+        options().with_source_namespaces(vec![
+            "default".to_string(),
+            "tenant-a".to_string(),
+            "tenant-b".to_string(),
+        ]),
+    )
+    .expect("translate");
     let attacker_status = translation
         .listenerset_statuses
         .iter()
