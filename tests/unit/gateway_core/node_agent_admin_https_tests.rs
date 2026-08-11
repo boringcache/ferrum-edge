@@ -158,16 +158,16 @@ fn plan_admin_https_listener_enables_with_valid_material() {
     let policy = load_tls_policy(&env).unwrap();
     let crls = load_crls_from_env(&env).unwrap();
     let addr: SocketAddr = "127.0.0.1:9443".parse().unwrap();
-    let plan = plan_admin_https_listener(&env, &policy, &crls, "Invalid test admin TLS", addr, None)
-        .expect("valid material must plan HTTPS");
+    let plan =
+        plan_admin_https_listener(&env, &policy, &crls, "Invalid test admin TLS", addr, None)
+            .expect("valid material must plan HTTPS");
     match plan {
         AdminHttpsListenerPlan::Enabled(planned) => {
             assert_eq!(planned.addr, addr);
             assert!(planned.reload.slot.is_none());
             assert!(planned.reload.watcher_handle.is_none());
         }
-        AdminHttpsListenerPlan::DisabledByPort
-        | AdminHttpsListenerPlan::DisabledByMissingTls => {
+        AdminHttpsListenerPlan::DisabledByPort | AdminHttpsListenerPlan::DisabledByMissingTls => {
             panic!("expected Enabled plan")
         }
     }
@@ -268,13 +268,10 @@ async fn invalid_tls_fails_before_plaintext_fallback() {
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);
     let startup_ready = Arc::new(AtomicBool::new(false));
 
-    let err = start_node_agent_admin_listeners_for_test(
-        &env_config,
-        &shutdown_tx,
-        startup_ready.clone(),
-    )
-    .await
-    .expect_err("invalid TLS must fail node-agent admin startup");
+    let err =
+        start_node_agent_admin_listeners_for_test(&env_config, &shutdown_tx, startup_ready.clone())
+            .await
+            .expect_err("invalid TLS must fail node-agent admin startup");
     let msg = format!("{err:#}");
     assert!(
         msg.contains("Invalid node_agent admin TLS configuration"),
@@ -312,13 +309,10 @@ async fn https_bind_failure_rolls_back_http_listener() {
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);
     let startup_ready = Arc::new(AtomicBool::new(false));
 
-    let err = start_node_agent_admin_listeners_for_test(
-        &env_config,
-        &shutdown_tx,
-        startup_ready.clone(),
-    )
-    .await
-    .expect_err("occupied HTTPS port must abort startup");
+    let err =
+        start_node_agent_admin_listeners_for_test(&env_config, &shutdown_tx, startup_ready.clone())
+            .await
+            .expect_err("occupied HTTPS port must abort startup");
     let msg = err.to_string();
     assert!(
         msg.contains("Node agent admin HTTPS listener exited before completing startup")
