@@ -24,15 +24,15 @@ pub mod listener;
 pub mod proto;
 pub mod server;
 
-#[cfg(unix)]
-#[allow(unused_imports)]
-pub use admission::{AdmittedUnixStream, classify_accept_error};
 #[allow(unused_imports)]
 pub use admission::{
     AcceptDecision, AcceptFailure, AcceptRetryPolicy, ActivitySnapshot, AdmittedStream,
     ConnectionActivity, ConnectionAdmission, ConnectionPermit, ConnectionWatchdog, RpcPermit,
     WorkloadApiAdmissionConfig, close_reason, reject_reason,
 };
+#[cfg(unix)]
+#[allow(unused_imports)]
+pub use admission::{AdmittedUnixStream, classify_accept_error};
 #[allow(unused_imports)]
 pub use client::{DEFAULT_WORKLOAD_API_SOCKET, WorkloadApiClient, WorkloadApiClientError};
 #[allow(unused_imports)]

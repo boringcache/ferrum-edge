@@ -1345,10 +1345,7 @@ pub fn classify_accept_error(error: &io::Error) -> AcceptFailure {
     let Some(code) = error.raw_os_error() else {
         return AcceptFailure::Fatal;
     };
-    if code == libc::EMFILE
-        || code == libc::ENFILE
-        || code == libc::ENOBUFS
-        || code == libc::ENOMEM
+    if code == libc::EMFILE || code == libc::ENFILE || code == libc::ENOBUFS || code == libc::ENOMEM
     {
         return AcceptFailure::Resource;
     }

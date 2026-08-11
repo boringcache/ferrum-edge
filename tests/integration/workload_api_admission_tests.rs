@@ -529,7 +529,10 @@ fn hpack_literal(name_index: u8, value: &str) -> Vec<u8> {
 /// An HPACK literal header field without indexing, **new** name, raw strings.
 fn hpack_literal_new_name(name: &str, value: &str) -> Vec<u8> {
     let mut out = vec![0x00];
-    assert!(name.len() < 128 && value.len() < 128, "lengths stay one octet");
+    assert!(
+        name.len() < 128 && value.len() < 128,
+        "lengths stay one octet"
+    );
     out.push(name.len() as u8);
     out.extend_from_slice(name.as_bytes());
     out.push(value.len() as u8);
@@ -988,8 +991,14 @@ async fn the_exported_admission_metrics_stay_fixed_cardinality() {
     // text has to say so, or an operator reading `/metrics` cannot tell that no
     // separate stream family is missing.
     for (family, expected) in [
-        ("# HELP ferrum_mesh_workload_api_active_rpcs", "one HTTP/2 stream"),
-        ("# HELP ferrum_mesh_workload_api_rpcs_rejected_total", "HTTP/2 stream"),
+        (
+            "# HELP ferrum_mesh_workload_api_active_rpcs",
+            "one HTTP/2 stream",
+        ),
+        (
+            "# HELP ferrum_mesh_workload_api_rpcs_rejected_total",
+            "HTTP/2 stream",
+        ),
     ] {
         if let Some(line) = rendered.lines().find(|line| line.starts_with(family)) {
             assert!(
