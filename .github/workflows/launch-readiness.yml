@@ -1,0 +1,107 @@
+name: Launch Readiness
+
+# Fail-closed live launch gate for PRODUCTION_READINESS.md.
+# Evaluates paginated GitHub issue state + redacted private-advisory counts
+# against docs/launch-blocker-policy.json. Synthetic self-tests always run first.
+
+on:
+  pull_request:
+  merge_group:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  schedule:
+    # Daily — catch label/issue drift between PRs without relying on a stale PASS.
+    - cron: "15 6 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.event_name == 'merge_group' && format('launch-readiness-merge-group-{0}', github.event.merge_group.head_sha) || github.event_name == 'pull_request' && format('launch-readiness-pr-{0}', github.event.pull_request.number) || format('launch-readiness-{0}-{1}', github.event_name, github.sha) }}
+  cancel-in-progress: ${{ github.event_name != 'merge_group' }}
+
+permissions:
+  contents: read
+
+jobs:
+  launch-readiness:
+    name: Launch Readiness Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+      # Repo security advisories (private/draft) — count only; never published here.
+      security-events: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          # Evaluate the exact commit under test — PR head, merge-group head, or
+          # the push/schedule/tag SHA — never a synthetic merge commit alone.
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event_name == 'merge_group' && github.event.merge_group.head_sha || github.sha }}
+
+      - name: Resolve exact target SHA
+        id: sha
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          MERGE_GROUP_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          case "$EVENT_NAME" in
+            merge_group)
+              if [[ ! "$MERGE_GROUP_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+                echo "::error::merge_group head SHA missing or malformed"
+                exit 1
+              fi
+              target="$MERGE_GROUP_HEAD_SHA"
+              ;;
+            pull_request)
+              if [[ ! "$PR_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+                echo "::error::pull_request head SHA missing or malformed"
+                exit 1
+              fi
+              target="$PR_HEAD_SHA"
+              ;;
+            *)
+              target="$(git rev-parse HEAD)"
+              ;;
+          esac
+          if [[ ! "$target" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::target SHA malformed"
+            exit 1
+          fi
+          checked_out="$(git rev-parse HEAD)"
+          if [ "$checked_out" != "$target" ]; then
+            echo "::error::checkout ${checked_out} is not target ${target}"
+            exit 1
+          fi
+          echo "target=${target}" >> "$GITHUB_OUTPUT"
+          echo "Evaluating launch readiness for ${target}"
+
+      - name: Synthetic policy/checker self-tests
+        run: python3 -I scripts/check_launch_readiness.py --self-test
+
+      - name: Verify live launch verdict
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+          TARGET_SHA: ${{ steps.sha.outputs.target }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          require_pass_args=()
+          # Tag pushes and scheduled main ticks demand PASS; PR/merge_group only
+          # require claim/computed parity (honest FAIL is allowed while blockers open).
+          if [[ "$EVENT_NAME" == "push" && "$GITHUB_REF" == refs/tags/v* ]]; then
+            require_pass_args=(--require-pass)
+          fi
+          python3 -I scripts/check_launch_readiness.py \
+            --verify \
+            --launch-tier ga \
+            --target-sha "$TARGET_SHA" \
+            "${require_pass_args[@]}"
