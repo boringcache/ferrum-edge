@@ -3621,9 +3621,12 @@ recovery-then-reap, so a switched-away node cannot keep a jump into a chain no
 socket serves. Reconciliation rebuilds the chain's contents behind a scope-exact
 DROP guard while the `PREROUTING` jump stays constant; guard install, capture install,
 socket bind, or guard release failing all leave the node dropping enrolled UDP
-egress rather than leaking it. Shutdown retracts readiness, waits (bounded) for
-the node-agent to acknowledge that its BPF gates closed, and only then removes
-everything; without the acknowledgement it retains the DROP guard.
+egress rather than leaking it. Shutdown retracts readiness, waits briefly (bounded
+to fit inside mesh mode's background-task drain) for the node-agent to acknowledge
+that its BPF gates closed, and only then removes everything; without the
+acknowledgement it installs the DROP guard and retires the capture jumps/routes
+while retaining the guard. The wait must not exceed that drain budget: an aborted
+handshake leaves socketless host jumps and fwmark routes behind.
 
 **Hosted live-kernel coverage (#3705).** The required
 `ambient-host-udp-live` workflow exercises the production

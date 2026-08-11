@@ -12653,6 +12653,10 @@ async fn functional_mesh_live_host_udp_capture_proxy_backend_round_trip() {
     //     the still-enrolled interfaces FIRST, then removes the capture chain,
     //     the fwmark routing objects, and the capture listener.
     //
+    // The acknowledgement wait is capped below mesh mode's background-task drain
+    // so this unacknowledged fixture cannot be aborted mid-handshake (which would
+    // leave jumps/routes installed after the process exits).
+    //
     // No node agent runs in this fixture, so the unacknowledged branch is the
     // expected one; either way the branch actually taken must be proven by its
     // own post-condition rather than tolerated.

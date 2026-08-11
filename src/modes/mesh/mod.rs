@@ -17251,7 +17251,11 @@ impl MeshStartupOwner {
     }
 }
 
-/// Bound for joining mesh background tasks during startup rollback.
+/// Bound for joining mesh background tasks during startup rollback **and**
+/// graceful shutdown (`shutdown_and_join_mesh`). Host-network UDP capture's
+/// shutdown acknowledgement wait (`GATE_CLOSE_ACK_TIMEOUT` in
+/// `proxy::host_udp_capture`) must stay strictly below this so fail-closed
+/// capture teardown still runs before stragglers are aborted.
 const MESH_STARTUP_BACKGROUND_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Bound for joining mesh listeners during startup-failure rollback only.

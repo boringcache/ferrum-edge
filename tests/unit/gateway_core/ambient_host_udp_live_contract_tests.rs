@@ -234,6 +234,51 @@ fn ambient_host_udp_live_kernel_module_uses_production_scripts_and_skip_or_fail(
     );
 }
 
+/// Host-UDP shutdown's gate-close wait must finish (and still have time for
+/// fail-closed guard install + capture teardown) inside mesh mode's background
+/// drain. A longer wait is aborted mid-handshake: the listener dies with the
+/// process while Ferrum-owned v4/v6 jumps and fwmark routes remain installed —
+/// the exact `ProxyHostUdpBackend` live-gate failure mode on #3705.
+#[test]
+fn host_udp_shutdown_ack_wait_fits_inside_mesh_background_drain() {
+    let host_udp = read("src/proxy/host_udp_capture.rs");
+    let mesh = read("src/modes/mesh/mod.rs");
+
+    assert!(
+        host_udp.contains(
+            "const GATE_CLOSE_ACK_TIMEOUT: Duration = Duration::from_secs(1);"
+        ),
+        "host-UDP shutdown ack wait must stay at the 1s pod-netns ceiling so \
+         teardown still runs under the mesh background drain"
+    );
+    assert!(
+        host_udp.contains("gate_close_timeout.min(GATE_CLOSE_ACK_TIMEOUT)"),
+        "shutdown must cap the acknowledgement wait even when a test raises the field"
+    );
+    assert!(
+        host_udp.contains("teardown_capture_rules()")
+            && host_udp.contains("preserving a fail-closed shutdown posture"),
+        "the unacknowledged shutdown path must still retire capture jumps/routes"
+    );
+    assert!(
+        mesh.contains(
+            "const MESH_STARTUP_BACKGROUND_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);"
+        ),
+        "mesh background drain budget is the hard ceiling the host-UDP wait must fit under"
+    );
+
+    // Keep the numeric relationship explicit so a future edit that raises the
+    // ack wait without raising the drain (or vice versa) fails this contract.
+    const HOST_UDP_SHUTDOWN_ACK_SECS: u64 = 1;
+    const MESH_BACKGROUND_DRAIN_SECS: u64 = 5;
+    assert!(
+        HOST_UDP_SHUTDOWN_ACK_SECS < MESH_BACKGROUND_DRAIN_SECS,
+        "host-UDP shutdown ack wait ({HOST_UDP_SHUTDOWN_ACK_SECS}s) must leave room \
+         inside the mesh background drain ({MESH_BACKGROUND_DRAIN_SECS}s) for guard \
+         install and capture teardown"
+    );
+}
+
 /// Return the INSTRUCTIONS of a single `FROM ... AS <stage>` block, up to the
 /// next `FROM`. Comment lines are stripped: the trailing comment block of a
 /// stage documents the NEXT stage, so an absence assertion over raw text would
