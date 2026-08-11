@@ -523,7 +523,7 @@ impl XdsAdmissionController {
     where
         F: FnOnce(),
     {
-        let last = match self.inner.per_node.entry(node_key.to_string()) {
+        match self.inner.per_node.entry(node_key.to_string()) {
             Entry::Occupied(mut entry) => {
                 if *entry.get() > 1 {
                     *entry.get_mut() -= 1;
@@ -547,8 +547,7 @@ impl XdsAdmissionController {
             // A missing entry is an invariant violation, not authorization to
             // delete state that may belong to a successor generation.
             Entry::Vacant(_) => false,
-        };
-        last
+        }
     }
 
     fn unregister_node(&self, node_key: &str) -> bool {

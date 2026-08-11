@@ -5981,13 +5981,16 @@ async fn test_xds_stream_without_first_request_hits_the_initial_deadline() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_xds_response_receiver_drop_releases_while_request_sender_stays_alive() {
-    // The bug: both SotW and Delta relay loops selected only on request /
-    // update / deadline events. A client that dropped the response half while
-    // deliberately keeping the request sender alive and idle after node
-    // admission could retain the XdsStreamPermit, node-scoped state, broadcast
-    // receiver, and channel indefinitely. Dropping both halves together is not
-    // evidence for this path — prove the response-only drop first.
+async fn test_xds_client_cancellation_releases_stream_and_node_occupancy() {
+    // A real client cancellation over tonic/h2 releases BOTH transport halves.
+    // That is deliberate, not incidental: tonic's response decoder owns the h2
+    // `RecvStream` while the live request encoder owns the same stream's
+    // `SendStream`, so dropping only the response `Streaming` sends no
+    // RST_STREAM and the server observes no cancellation at all. This test
+    // therefore models cancellation the way a client actually performs it —
+    // drop the request sender and the response stream together — and asserts
+    // that every admitted stream returns aggregate, namespace, principal, and
+    // node occupancy to baseline afterwards, on both ADS methods.
     let limits = ferrum_edge::xds::XdsAdmissionLimits {
         max_total_streams: 3,
         max_streams_per_namespace: 100,
@@ -5999,39 +6002,38 @@ async fn test_xds_response_receiver_drop_releases_while_request_sender_stays_ali
     };
     let (url, admission, _handle) = start_test_xds_server_with_limits(limits).await;
 
-    let (req_tx, stream) = open_established_sotw_stream(&url, "receiver-drop", "node-sotw").await;
+    let (req_tx, stream) = open_established_sotw_stream(&url, "cancelling", "node-sotw").await;
     assert_eq!(admission.active_streams(), 1);
     assert_eq!(admission.active_nodes(), 1);
 
-    // Drop ONLY the response stream; keep the request sender alive and idle.
+    // Cancel: release both transport halves, which is what puts RST_STREAM on
+    // the wire and lets the server observe the client going away.
+    drop(req_tx);
     drop(stream);
     wait_for_active_streams(&admission, 0).await;
     assert_eq!(
         admission.active_nodes(),
         0,
-        "node occupancy must return to baseline before the request sender is dropped"
+        "node occupancy must return to baseline after a client cancellation"
     );
     assert_eq!(admission.tracked_namespaces(), 0);
     assert_eq!(admission.tracked_principals(), 0);
 
-    // Only now drop the request sender — after occupancy already returned.
-    drop(req_tx);
-
-    // Delta ADS must observe the same response-half cancellation.
+    // Delta ADS shares the same admission accounting and the same release path.
     let (delta_tx, delta_stream) =
-        open_established_delta_stream(&url, "receiver-drop", "node-delta").await;
+        open_established_delta_stream(&url, "cancelling", "node-delta").await;
     assert_eq!(admission.active_streams(), 1);
     assert_eq!(admission.active_nodes(), 1);
+    drop(delta_tx);
     drop(delta_stream);
     wait_for_active_streams(&admission, 0).await;
     assert_eq!(admission.active_nodes(), 0);
     assert_eq!(admission.tracked_namespaces(), 0);
     assert_eq!(admission.tracked_principals(), 0);
-    drop(delta_tx);
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_xds_receiver_drop_and_rapid_churn_return_to_baseline() {
+async fn test_xds_client_cancellation_rapid_churn_returns_to_baseline() {
     let limits = ferrum_edge::xds::XdsAdmissionLimits {
         max_total_streams: 3,
         max_streams_per_namespace: 100,
@@ -6043,16 +6045,18 @@ async fn test_xds_receiver_drop_and_rapid_churn_return_to_baseline() {
     };
     let (url, admission, _handle) = start_test_xds_server_with_limits(limits).await;
 
-    // Rapid connect/disconnect under unique node ids: drop the response
-    // receiver first (while the request sender is still alive), prove baseline,
-    // and only then drop the sender.
+    // Rapid connect/cancel under unique node ids. `max_active_nodes` is the
+    // scarce resource issue #3741 is about: if a cancelled stream leaked its
+    // node registration, unique-id churn would exhaust the node budget even
+    // though no stream is active.
     for index in 0..12u32 {
         let (req_tx, stream) =
             open_established_sotw_stream(&url, "churner", &format!("node-{index}")).await;
+        // A real cancellation releases both transport halves together.
+        drop(req_tx);
         drop(stream);
         wait_for_active_streams(&admission, 0).await;
         assert_eq!(admission.active_nodes(), 0);
-        drop(req_tx);
     }
 
     assert_eq!(admission.active_streams(), 0);

@@ -1735,10 +1735,11 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                             .await;
                         return;
                     }
-                    // Client dropped the response half while deliberately
-                    // keeping the request sender alive: observe that close and
-                    // exit immediately so the permit, node-scoped state,
-                    // broadcast receiver, and channel cannot linger forever.
+                    // The outbound response receiver is gone (tonic ended the
+                    // RPC, or an in-process consumer dropped the stream):
+                    // nothing can observe further work, so exit and let the
+                    // guard release the permit, node-scoped state, broadcast
+                    // receiver, and channel.
                     _ = tx.closed() => {
                         return;
                     }
@@ -2066,6 +2067,9 @@ impl AggregatedDiscoveryService for XdsAdsServer {
         let first_request_timeout = server.admission.limits().first_request_timeout;
 
         tokio::spawn(async move {
+            // Owns the permit for the whole stream lifetime; its `Drop` is the
+            // single release path for every normal, error, cancellation, abort,
+            // and shutdown exit below.
             let mut stream_guard = server.stream_guard(permit);
             let first_request_deadline = tokio::time::sleep(first_request_timeout);
             tokio::pin!(first_request_deadline);
@@ -2097,10 +2101,11 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                             .await;
                         return;
                     }
-                    // Client dropped the response half while deliberately
-                    // keeping the request sender alive: observe that close and
-                    // exit immediately so the permit, node-scoped state,
-                    // broadcast receiver, and channel cannot linger forever.
+                    // The outbound response receiver is gone (tonic ended the
+                    // RPC, or an in-process consumer dropped the stream):
+                    // nothing can observe further work, so exit and let the
+                    // guard release the permit, node-scoped state, broadcast
+                    // receiver, and channel.
                     _ = tx.closed() => {
                         return;
                     }
