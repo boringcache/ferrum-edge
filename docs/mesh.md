@@ -102,7 +102,7 @@ Ferrum's mesh subsystem is in active build-out. The paths below ship in one bina
 | Capability | Status | Notes |
 |---|---|---|
 | iptables capture (injector init container) | **Beta** | Requires `NET_ADMIN`/`NET_RAW`; rules applied at pod admission, restart needed to pick up new annotations. |
-| eBPF ambient capture | **Dev-only** | Requires a build with `--features ebpf`. The default published image has no aya loader, but enabled eBPF node-agent mode now refuses the mock backend before readiness (`capture_state="unavailable"`, degraded reason `ebpf_feature_disabled`). Helm renders the Linux-only `-ebpf` image variant (`ferrumedge/ferrum-edge:<tag>-ebpf` / `ghcr.io/ferrum-edge/ferrum-edge:<tag>-ebpf`) automatically for `nodeAgent.captureMode=ebpf`, and for the ambient/NodeWaypoint proxy when it is configured for eBPF or `FERRUM_MESH_TOPOLOGY=node_waypoint`. Real capture needs kernel **≥ 5.7** with cgroup v2 and, on kernel **≥ 5.8**, `CAP_BPF`/`CAP_NET_ADMIN`/`CAP_PERFMON`; on the **5.7.x** window use `CAP_SYS_ADMIN` + `CAP_NET_ADMIN`. `node_waypoint` mode also needs `CAP_SYS_ADMIN` on modern kernels for pod-netns `setns()`/veth discovery, so the chart adds it automatically for that topology. The NodeWaypoint ambient proxy additionally receives host PID visibility plus read-only host cgroup and bpffs mounts so it can resolve pod netns, open node-agent-pinned maps, and write per-pod ready markers only after its in-netns listener is attached. CI builds the BPF object (`build-ebpf`), compiles the userspace loader (`build-ebpf-userspace`), load/attach-tests programs on a real kernel (`ebpf-live`), and runs the Docker/kind multi-pod datapath gate (`node-waypoint-ebpf-live`) for capture/identity/chart changes. The opt-in NodeWaypoint inbound tc redirect is implemented and fail-closed; the destination tc direct-inbound guard is also implemented, while the iptables fallback remains node-global and needs a custom runtime image with `/bin/sh` + `iptables`. |
+| eBPF ambient capture | **Dev-only** | Requires a build with `--features ebpf`. The default published image has no aya loader, but enabled eBPF node-agent mode now refuses the mock backend before readiness (`capture_state="unavailable"`, degraded reason `ebpf_feature_disabled`). Helm renders the Linux-only `-ebpf` image variant (`ferrumedge/ferrum-edge:<tag>-ebpf` / `ghcr.io/ferrum-edge/ferrum-edge:<tag>-ebpf`) automatically for `nodeAgent.captureMode=ebpf`, and for the ambient/NodeWaypoint proxy when it is configured for eBPF or `FERRUM_MESH_TOPOLOGY=node_waypoint`. Real capture needs kernel **≥ 5.7** with cgroup v2 and, on kernel **≥ 5.8**, `CAP_BPF`/`CAP_NET_ADMIN`/`CAP_PERFMON`; on the **5.7.x** window use `CAP_SYS_ADMIN` + `CAP_NET_ADMIN`. `node_waypoint` mode also needs `CAP_SYS_ADMIN` on modern kernels for pod-netns `setns()`/veth discovery, so the chart adds it automatically for that topology. The NodeWaypoint ambient proxy additionally receives host PID visibility plus read-only host cgroup and bpffs mounts so it can resolve pod netns, open node-agent-pinned maps, and write per-pod ready markers only after its in-netns listener is attached. CI builds the BPF object (`build-ebpf`), compiles the userspace loader (`build-ebpf-userspace`), load/attach-tests programs on a real kernel (`ebpf-live`), and runs the Docker/kind multi-pod datapath gate (`node-waypoint-ebpf-live`) for capture/identity/chart changes. The opt-in NodeWaypoint inbound tc redirect is implemented and fail-closed; the destination tc direct-inbound guard is also implemented, while the iptables fallback remains node-global and needs a tools-capable runtime image with `/bin/sh` + `iptables` — the published `-ebpf-tools` variant, or your own equivalent. |
 | orig-dst → proxy identity bridge (node-waypoint) | **Experimental** | `src/ebpf/orig_dst_bridge.rs` mirrors socket-cookie records into the resolver (+ installs a synchronous accept-path fallback); the **accept-side cookie bridge (GAP-2M) is implemented** in the kernel `sock_ops` program (re-keys orig-dst by connection tuple, re-stamps under the accept-side cookie), and **per-pod identity enrollment is wired** (hash-join of the slice's `workload_spiffe_hash`→SPIFFE index against the eBPF-stamped `(pod_uid, hash)`), so resolution is complete end-to-end with no further proxy-side change — **IPv4 and IPv6**: both bridge paths handle `AF_INET` and `AF_INET6` (v6 ctx address words read element-by-element with verifier-safe volatile loads into `FERRUM_ORIG_DST_BY_TUPLE6`), and the in-netns manager now binds both pod-loopback families. The userspace resolver merges both families by socket cookie. The `node-waypoint-ebpf-live` workflow validates IPv4 and IPv6 end-to-end capture; tuple/byte-order/enrollment misses fail closed (never misattribute), including a cached pod whose workload a later slice removes because `resolve_record` re-validates against the current slice index on every resolve. |
 
 ### Identity / CA maturity
@@ -3626,9 +3626,25 @@ recovery-then-reap, so a switched-away node cannot keep a jump into a chain no
 socket serves. Reconciliation rebuilds the chain's contents behind a scope-exact
 DROP guard while the `PREROUTING` jump stays constant; guard install, capture install,
 socket bind, or guard release failing all leave the node dropping enrolled UDP
-egress rather than leaking it. Shutdown retracts readiness, waits (bounded) for
-the node-agent to acknowledge that its BPF gates closed, and only then removes
-everything; without the acknowledgement it retains the DROP guard.
+egress rather than leaking it. Shutdown retracts readiness, waits briefly (bounded
+to fit inside mesh mode's background-task drain) for the node-agent to acknowledge
+that its BPF gates closed, and only then removes everything; without the
+acknowledgement it installs the DROP guard and retires the capture jumps/routes
+while retaining the guard. The wait must not exceed that drain budget: an aborted
+handshake leaves socketless host jumps and fwmark routes behind.
+
+**Hosted live-kernel coverage (#3705).** The required
+`ambient-host-udp-live` workflow exercises the production
+`ProxyHostUdpBackend` / host-netns TPROXY path with
+`FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true` on a privileged runner: two
+independent workload netns/veth pairs, IPv4 and IPv6 delivery, original-destination
+recovery, ingress-ifindex attribution, identical-tuple isolation by interface,
+transparent replies, restart/reinstall, exact Ferrum-owned cleanup, and explicit
+negatives (source spoofing, missing/zero pktinfo, unenrolled/ambiguous interfaces,
+node-originated and inbound-to-pod traffic, fail-closed prerequisite/partial-install
+contracts). `FERRUM_LIVE_TESTS_REQUIRED=1` converts unsupported runners into hard
+failures. Bounded redacted diagnostics capture rules/routes, Ferrum chains, socket
+bind state, interface indexes, and post-cleanup state.
 
 **A restart is a handshake too.** Readiness is durable and shared with the
 node-agent, so a generation that dies — a crash, a restart, a rollout that
@@ -3706,11 +3722,18 @@ for this lifecycle, including when UDP capture is currently off and even when
 `nodeAgent.captureMode=iptables`. Both DaemonSets receive the shared registry and
 `FERRUM_MESH_TOPOLOGY=ambient`, so an iptables fallback reaches the node-agent's
 fail-closed startup check instead of silently bypassing cleanup. In the supported
-eBPF configuration, the node-agent/proxy pair uses the tools-capable `-ebpf`
-image, shares the pod-registry hostPath, and grants the setns/`NET_ADMIN`
-capabilities needed for stale pod-netns cleanup. This is a deliberate
-security-footprint increase that makes a later enabled-to-disabled rollout
-repairable without another chart shape change.
+eBPF configuration the node-agent keeps the distroless `-ebpf` image, while the
+ambient proxy is rendered with the tools-capable `-ebpf-tools` image, shares the
+pod-registry hostPath, and is granted the setns/`NET_ADMIN` capabilities needed
+for stale pod-netns cleanup. The image split is load-bearing, not cosmetic: the
+UDP producer and the disabled stale-rule cleanup manager both execute generated
+`sh -c` scripts calling `ip`/`iptables`/`ip6tables`, and the distroless `-ebpf`
+image ships none of them, so `preflight_capture_tools` refuses startup there by
+design. `-ebpf-tools` is a strict superset of `-ebpf` (same binaries, same BPF
+ELF) on a Debian base; it is not distroless and runs as root, so only the pod
+that needs the tools receives it. This is a deliberate security-footprint
+increase that makes a later enabled-to-disabled rollout repairable without
+another chart shape change.
 
 Every node-agent restart re-derives enrollment from the live Kubernetes pod
 list. During that relist it removes existing `.udp-ready` markers and closes the
@@ -3898,7 +3921,7 @@ the cluster network.
 
 ### Mixed-kernel clusters
 
-Mesh ambient mode requires Linux kernel >= 5.7 with cgroup v2 and bpffs for the per-pod eBPF capture path. The node agent fails fast on degraded nodes by default (`FERRUM_NODE_AGENT_FALLBACK_MODE=fail`), matching the published distroless `-ebpf` image: it includes `ip` and its runtime libraries for the supported capture path but deliberately omits a shell and the iptables fallback tools. The rest of the mesh data plane (slice apply, `mesh_authz`, `mesh_workload_metrics`, HBONE) is unaffected. Operators with a mix of supported and unsupported kernels should:
+Mesh ambient mode requires Linux kernel >= 5.7 with cgroup v2 and bpffs for the per-pod eBPF capture path. The node agent fails fast on degraded nodes by default (`FERRUM_NODE_AGENT_FALLBACK_MODE=fail`), matching the published distroless `-ebpf` image: it includes `ip` and its runtime libraries for the supported capture path but deliberately omits a shell and the iptables fallback tools. The separately published `-ebpf-tools` variant is the tools-capable superset for the paths that genuinely shell out (the Ambient UDP capture lifecycle and `FERRUM_NODE_AGENT_FALLBACK_MODE=iptables`). The rest of the mesh data plane (slice apply, `mesh_authz`, `mesh_workload_metrics`, HBONE) is unaffected. Operators with a mix of supported and unsupported kernels should:
 
 1. Alert on node-agent readiness/startup failures, `ferrum_node_agent_capture_state{state!="ready"} == 1`, and `ferrum_mesh_node_topology_degraded == 1` to track the degraded set.
 2. Label degraded nodes (e.g., `ferrum.io/capture-mode=iptables`) and configure the admission webhook (`FERRUM_MODE=injector`) to inject iptables init containers on those nodes.
