@@ -5876,11 +5876,7 @@ async fn test_xds_invalid_node_id_is_rejected_and_releases_capacity() {
     };
     let (url, admission, _handle) = start_test_xds_server_with_limits(limits).await;
 
-    for hostile in [
-        String::new(),
-        "a".repeat(17),
-        "node\ninjected".to_string(),
-    ] {
+    for hostile in [String::new(), "a".repeat(17), "node\ninjected".to_string()] {
         let mut client = ads_client(&url).await;
         let (req_tx, req_rx) = tokio::sync::mpsc::channel(4);
         req_tx.send(ads_lds_request(&hostile)).await.unwrap();

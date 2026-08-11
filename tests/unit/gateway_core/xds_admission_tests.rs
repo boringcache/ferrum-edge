@@ -610,7 +610,10 @@ fn principal_key_is_stable_non_reversible_and_full_width() {
         "distinct subjects must get distinct keys"
     );
     // A hostile, oversized subject still yields the same bounded width.
-    assert_eq!(principal_key(&"x".repeat(1_000_000)).len(), PRINCIPAL_KEY_HEX_LEN);
+    assert_eq!(
+        principal_key(&"x".repeat(1_000_000)).len(),
+        PRINCIPAL_KEY_HEX_LEN
+    );
 }
 
 #[test]
