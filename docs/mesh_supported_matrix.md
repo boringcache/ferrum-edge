@@ -145,7 +145,9 @@ CI today."
   Helm must mount the shared node-agent ↔ ambient pod registry plus host
   cgroup/bpffs views and `SYS_ADMIN`/`SYS_PTRACE` netns capabilities for
   `node_waypoint`), eBPF ambient capture (Dev-only; enabled chart topologies
-  auto-select `-ebpf` images and non-eBPF builds cannot report Ready),
+  auto-select `-ebpf` images -- or the tools-capable `-ebpf-tools` superset for
+  the Ambient UDP lifecycle, which shells out -- and non-eBPF builds cannot
+  report Ready),
   stream-family egress.
 
 ## Acceptable residual / out-of-scope (the long tail)

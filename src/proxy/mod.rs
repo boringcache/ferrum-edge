@@ -49,6 +49,12 @@ pub mod hbone_pool;
 mod hbone_proxy;
 pub mod headers;
 pub mod host_udp_capture;
+/// Privileged live-kernel gate for Ambient host-network UDP capture (#3705).
+/// Ignored by default; the hosted `ambient-host-udp-live` job runs it with
+/// `FERRUM_LIVE_TESTS_REQUIRED=1` so missing kernel primitives fail closed.
+#[cfg(all(test, target_os = "linux"))]
+#[path = "host_udp_capture_live_tests.rs"]
+mod host_udp_capture_live_tests;
 pub mod http2_pool;
 /// Unbuffered rustls server handshake used to hand a frontend-TLS TCP socket
 /// to the kernel TLS ULP (issue #3619). Linux-only: every other platform keeps
