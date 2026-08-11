@@ -7153,17 +7153,23 @@ pub async fn log_with_mirror(
     // The clone happens only when this request actually evaluated a trigger and
     // the summary does not already carry one; the untriggered default
     // configuration pays one `is_empty()` check and no allocation.
-    let stamped;
-    let summary =
-        if ctx.has_plugin_trigger_decisions() && summary.plugin_trigger_decisions.is_empty() {
-            stamped = TransactionSummary {
-                plugin_trigger_decisions: ctx.plugin_trigger_decisions(),
-                ..summary.clone()
-            };
-            &stamped
-        } else {
-            summary
-        };
+    // Keep the conditional clone out of this async future's inline state. A
+    // `TransactionSummary` is deliberately broad; storing it inline here grows
+    // every request future (including the allocation-free, untriggered case)
+    // and can exhaust a worker stack under instrumentation. The triggered path
+    // already clones owned summary data, so one box does not change the common
+    // path and bounds the future itself to a pointer-sized optional value.
+    let mut stamped = if ctx.has_plugin_trigger_decisions()
+        && summary.plugin_trigger_decisions.is_empty()
+    {
+        Some(Box::new(summary.clone()))
+    } else {
+        None
+    };
+    if let Some(stamped) = stamped.as_deref_mut() {
+        stamped.plugin_trigger_decisions = ctx.plugin_trigger_decisions();
+    }
+    let summary = stamped.as_deref().unwrap_or(summary);
     let precompute_mesh_key = plugins
         .iter()
         .any(|plugin| matches!(plugin.name(), "workload_metrics" | "prometheus_metrics"));
