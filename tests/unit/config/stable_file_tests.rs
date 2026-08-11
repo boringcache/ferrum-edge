@@ -280,8 +280,9 @@ mod unix_targets {
 
     #[test]
     fn growth_past_streaming_ceiling_is_refused() {
-        // Metadata reports a small size; a concurrent writer extends the file
-        // past the ceiling while the stable reader streams through max+1.
+        // Start below the ceiling, then require the concurrent writer to prove
+        // that growth has begun before the reader assertions start. Without
+        // this handshake the reader loop can beat the writer's first schedule.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("growing.conf");
         std::fs::write(&path, vec![b'x'; 8]).unwrap();
@@ -289,16 +290,28 @@ mod unix_targets {
         let stop = Arc::new(Mutex::new(false));
         let writer_stop = Arc::clone(&stop);
         let writer_path = path.clone();
+        let (growth_started_tx, growth_started_rx) = std::sync::mpsc::sync_channel(1);
         let writer = thread::spawn(move || {
+            let mut growth_started_tx = Some(growth_started_tx);
             while !*writer_stop.lock().unwrap() {
                 let mut file = std::fs::OpenOptions::new()
                     .append(true)
                     .open(&writer_path)
                     .unwrap();
-                let _ = file.write_all(&[b'y'; 128]);
+                if file.write_all(&[b'y'; 128]).is_ok()
+                    && let Some(started_tx) = growth_started_tx.take()
+                {
+                    let _ = started_tx.send(());
+                }
                 thread::sleep(Duration::from_millis(1));
             }
         });
+
+        if let Err(error) = growth_started_rx.recv_timeout(Duration::from_secs(2)) {
+            *stop.lock().unwrap() = true;
+            writer.join().unwrap();
+            panic!("writer did not begin the growth scenario: {error}");
+        }
 
         let mut saw_too_large_or_unstable = false;
         for _ in 0..20 {
