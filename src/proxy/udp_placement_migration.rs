@@ -486,12 +486,21 @@ pub fn prepare_placement(
                 // from absent state until a finalize proof clears the tombstone,
                 // so a restart between the quarantine and the cleanup release
                 // cannot silently adopt any placement instead.
-                if ownership_is_quarantined(registry_dir) {
-                    set_failure(UdpMigrationFailureReason::MigrationRequired);
-                    return Err(
-                        "Ambient UDP ownership is quarantined on this node and no durable record remains; run an explicit cleanup migration (the quarantine tombstone is cleared only by a finalize that proves predecessor state retired)"
-                            .to_string(),
-                    );
+                match ownership_is_quarantined(registry_dir) {
+                    Ok(true) => {
+                        set_failure(UdpMigrationFailureReason::MigrationRequired);
+                        return Err(
+                            "Ambient UDP ownership is quarantined on this node and no durable record remains; run an explicit cleanup migration (the quarantine tombstone is cleared only by a finalize that proves predecessor state retired)"
+                                .to_string(),
+                        );
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        set_failure(UdpMigrationFailureReason::DurableStateRejected);
+                        return Err(format!(
+                            "could not safely inspect the Ambient UDP ownership quarantine marker: {error}"
+                        ));
+                    }
                 }
                 let host_target = request.target == UdpPlacement::HostNetns;
                 let adopted_from_established_release =
@@ -643,8 +652,12 @@ fn state_path(registry_dir: &Path) -> PathBuf {
 
 /// Any entry at the tombstone path counts, including a symlink or a directory:
 /// this is a fail-closed presence check, never a content read.
-fn ownership_is_quarantined(registry_dir: &Path) -> bool {
-    std::fs::symlink_metadata(registry_dir.join(QUARANTINE_FILE)).is_ok()
+fn ownership_is_quarantined(registry_dir: &Path) -> Result<bool, std::io::Error> {
+    match std::fs::symlink_metadata(registry_dir.join(QUARANTINE_FILE)) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 fn clear_ownership_quarantine(registry_dir: &Path) {
