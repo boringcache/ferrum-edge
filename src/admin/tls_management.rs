@@ -1852,13 +1852,18 @@ fn managed_error_response(error: ManagedTlsError) -> Response<Full<Bytes>> {
         | ManagedTlsError::InvalidPath(_)
         | ManagedTlsError::MissingMaterial { .. }
         | ManagedTlsError::WrongKind { .. } => StatusCode::BAD_REQUEST,
-        ManagedTlsError::MaterialTooLarge | ManagedTlsError::DocumentTooLarge => {
-            StatusCode::PAYLOAD_TOO_LARGE
-        }
+        // Bounded *admitted material* is a property of the request body, so it
+        // stays a caller-facing 413. A whole-*document* refusal is not: it is
+        // raised by list/get/delete as well as by writes, it is decided against
+        // shared on-disk state the caller never sent, and no request can fix it.
+        ManagedTlsError::MaterialTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
         ManagedTlsError::RecordLimitReached => StatusCode::CONFLICT,
         ManagedTlsError::Read(_)
         | ManagedTlsError::Write(_)
         | ManagedTlsError::Parse(_)
+        // An oversized store document is unreachable shared state, reported the
+        // same way as an unreadable or unparseable one.
+        | ManagedTlsError::DocumentTooLarge
         // A misconfigured store is a server-side operator failure; reporting it
         // as a 4xx would blame the caller for something no request can fix.
         | ManagedTlsError::InvalidConfiguration(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -1878,7 +1883,10 @@ fn acme_error_response(error: AcmeError) -> Response<Full<Bytes>> {
         | AcmeError::InvalidChallengeToken(_)
         | AcmeError::BlockedDirectoryUrl(_)
         | AcmeError::MissingMaterial { .. } => StatusCode::BAD_REQUEST,
-        AcmeError::MaterialTooLarge | AcmeError::DocumentTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+        // Admitted material is bounded against the request body, so it stays a
+        // caller-facing 413. A whole-document refusal is not: list/get/delete
+        // raise it too, from shared on-disk state the caller never sent.
+        AcmeError::MaterialTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
         AcmeError::RecordLimitReached => StatusCode::CONFLICT,
         // The stored order cannot be finalized; no retry of this request can
         // change that, so it is reported to the caller rather than as an outage.
@@ -1887,6 +1895,10 @@ fn acme_error_response(error: AcmeError) -> Response<Full<Bytes>> {
         AcmeError::Read(_)
         | AcmeError::Write(_)
         | AcmeError::Parse(_)
+        // An oversized store document is unreachable shared state, reported the
+        // same way as an unreadable or unparseable one. `GET /acme/accounts`
+        // documents exactly that contract.
+        | AcmeError::DocumentTooLarge
         // A misconfigured store is a server-side operator failure; reporting it
         // as a 4xx would blame the caller for something no request can fix.
         | AcmeError::InvalidConfiguration(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -2497,6 +2509,46 @@ fn acme_certificate_usage(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #3737: a whole-document byte refusal is shared-state unavailability,
+    /// not a caller payload. Read/list/delete raise it too, and those operations
+    /// declare only `500` in `openapi.yaml` — `GET /admin/tls/acme/accounts`
+    /// documents that contract explicitly. Only bounded *admitted material*,
+    /// which is decided against the request body, keeps `413`.
+    #[test]
+    fn store_document_refusals_are_server_errors_and_material_refusals_stay_413() {
+        assert_eq!(
+            managed_error_response(ManagedTlsError::DocumentTooLarge).status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            acme_error_response(AcmeError::DocumentTooLarge).status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            managed_error_response(ManagedTlsError::MaterialTooLarge).status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        assert_eq!(
+            acme_error_response(AcmeError::MaterialTooLarge).status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+    }
+
+    /// A logical create ceiling *is* caller-facing: overwrite and delete remain
+    /// available, and every create/`PUT` route that can raise it already
+    /// declares `409` in `openapi.yaml`.
+    #[test]
+    fn logical_record_limit_refusals_are_conflicts() {
+        assert_eq!(
+            managed_error_response(ManagedTlsError::RecordLimitReached).status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            acme_error_response(AcmeError::RecordLimitReached).status(),
+            StatusCode::CONFLICT
+        );
+    }
 
     fn generated_cert_and_key() -> (String, String) {
         let key_pair =

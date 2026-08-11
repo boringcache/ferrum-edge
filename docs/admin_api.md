@@ -205,6 +205,8 @@ Responses return non-secret certificate metadata, source URI, issuer, SANs, vali
 
 Import, update, and order finalization return `413 Payload Too Large` when the certificate, private key, or combined certificate chain exceeds `FERRUM_TLS_MAX_MATERIAL_SIZE_BYTES`; the error never echoes material or source identifiers.
 
+Creating a new ACME certificate or account record returns `409 Conflict` once `FERRUM_TLS_ACME_MAX_CERTIFICATES` / `FERRUM_TLS_ACME_MAX_ACCOUNTS` is reached; overwrite and delete stay available so capacity can be reclaimed. A shared ACME store document that exceeds `FERRUM_TLS_STORE_MAX_DOCUMENT_BYTES` on read or on a candidate write returns `500 Internal Server Error` on every route that touches it, including `GET` and `DELETE` — it is unreachable shared state rather than a caller payload, and the candidate write fails before rename so the previous document stays intact. The diagnostic names the ceiling only, never record IDs, domains, paths, or material.
+
 ACME HTTP-01, TLS-ALPN-01, and DNS-01 order issue flows are available under:
 
 `GET /admin/tls/acme/accounts`, `GET/POST /admin/tls/acme/orders`, `GET/DELETE /admin/tls/acme/orders/{id}`, `POST /admin/tls/acme/orders/{id}/finalize`, `POST /admin/tls/acme/renew/{cert_id}`
@@ -293,6 +295,8 @@ Record IDs are **globally unique** across those typed collections (one shared st
 Responses return non-secret metadata only: source URI, subject, issuer, SANs, validity, public-material fingerprint, counts, and timestamps. Private keys are persisted in the managed store but never returned. Configure the store directory with `FERRUM_TLS_MANAGED_STORE_PATH`; on Unix, the JSON store files are written with owner-only permissions.
 
 Managed TLS create and update operations return `413 Payload Too Large` when an admitted material value or combined certificate chain exceeds `FERRUM_TLS_MAX_MATERIAL_SIZE_BYTES`; the error never echoes material or source identifiers.
+
+Creating a new managed record returns `409 Conflict` once `FERRUM_TLS_MANAGED_MAX_RECORDS` is reached; overwrite and delete stay available so capacity can be reclaimed. A `managed-tls.json` document that exceeds `FERRUM_TLS_STORE_MAX_DOCUMENT_BYTES` on read or on a candidate write returns `500 Internal Server Error` on every route that touches it, including `GET` and `DELETE` — it is unreachable shared state rather than a caller payload, and the candidate write fails before rename so the previous document stays intact. The diagnostic names the ceiling only, never record IDs, paths, or material.
 
 Create, update, and delete operations ask active TLS source watchers to re-pull immediately. Surfaces without a live watcher still pick up managed records when their owning config/runtime is rebuilt.
 

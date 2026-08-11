@@ -581,8 +581,10 @@ paths:
         are never returned.
 
         An empty list means the shared stores hold no accounts. A store that
-        cannot be opened, read, or parsed returns `500` instead: an unreachable
-        account store is never reported as "no persisted credentials".
+        cannot be opened, read, or parsed — including one that exceeds
+        `FERRUM_TLS_STORE_MAX_DOCUMENT_BYTES` — returns `500` instead: an
+        unreachable account store is never reported as "no persisted
+        credentials".
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/PaginationLimit"
@@ -6256,9 +6258,7 @@ components:
           schema:
             $ref: "#/components/schemas/Error"
     PayloadTooLarge:
-      description: >
-        Request body, admitted TLS material, or a managed/ACME store document
-        exceeds its configured byte limit
+      description: Request body or admitted TLS material exceeds its configured byte limit
       content:
         application/json:
           schema:
@@ -6281,7 +6281,12 @@ components:
           schema:
             $ref: "#/components/schemas/Error"
     InternalServerError:
-      description: Internal server error
+      description: >
+        Internal server error. For managed TLS and ACME routes this also covers a
+        shared store document that cannot be opened, read, or parsed, including
+        one that exceeds `FERRUM_TLS_STORE_MAX_DOCUMENT_BYTES` in either
+        direction; no request can fix that state, so it is never reported as a
+        4xx
       content:
         application/json:
           schema:
