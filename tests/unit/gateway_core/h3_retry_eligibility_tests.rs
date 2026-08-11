@@ -215,9 +215,10 @@ async fn h3_eligible_retry_bound_covers_configured_upstream_ceiling() {
 }
 
 #[test]
-fn h3_plain_and_ws_retry_share_eligible_helper_not_ad_hoc_loops() {
+fn every_h3_retry_surface_shares_eligible_helper_not_ad_hoc_loops() {
     let cross = include_str!("../../../src/http3/cross_protocol.rs");
     let ws = include_str!("../../../src/http3/websocket.rs");
+    let server = include_str!("../../../src/http3/server.rs");
     let dispatch = include_str!("../../../src/proxy/backend_dispatch.rs");
 
     assert!(
@@ -238,8 +239,17 @@ fn h3_plain_and_ws_retry_share_eligible_helper_not_ad_hoc_loops() {
         1,
         "H3 WebSocket must call the shared H3-eligible helper once"
     );
+    assert_eq!(
+        server
+            .matches("select_next_h3_eligible_retry_target(")
+            .count(),
+        1,
+        "native buffered H3 retry must call the shared H3-eligible helper once"
+    );
     assert!(
-        !cross.contains("for _ in 0..32") && !ws.contains("for _ in 0..32"),
+        !cross.contains("for _ in 0..32")
+            && !ws.contains("for _ in 0..32")
+            && !server.contains("for _ in 0..32"),
         "ad-hoc 32-iteration Unix skip loops must not remain in H3 retry paths"
     );
 

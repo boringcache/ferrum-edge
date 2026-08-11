@@ -7168,7 +7168,7 @@ async fn handle_h3_request(
                 let next_retry_target = if let (Some(_upstream_id), Some(prev_target)) =
                     (&proxy.upstream_id, &current_target)
                     && let Some(ref hash_key) = lb_hash_key
-                    && let Some(next) = crate::proxy::backend_dispatch::select_next_retry_target(
+                    && let Some(next) = crate::proxy::backend_dispatch::select_next_h3_eligible_retry_target(
                         &state,
                         &epoch,
                         &proxy,
@@ -7322,10 +7322,12 @@ async fn handle_h3_request(
                     break;
                 }
 
-                // Retry rotation must re-screen Unix-socket targets: this
-                // native-H3 loop has no Unix dialer, and the host/port is only
-                // a schema placeholder. Mesh HBONE / Sidecar mTLS targets are
-                // eligible via the shared mesh pools below (issue #3620).
+                // Defensive transport screen after the bounded H3-eligible
+                // selector above. That selector skips Unix-socket candidates,
+                // but retain this fail-closed check so a future eligibility
+                // expansion cannot make a schema-only Unix placeholder dialable
+                // here. Mesh HBONE / Sidecar mTLS targets remain eligible via
+                // the shared mesh pools below (issue #3620).
                 if let Some(reason) = crate::proxy::backend_dispatch::h3_bridge_transport_refusal(
                     current_target.as_deref(),
                 ) {
