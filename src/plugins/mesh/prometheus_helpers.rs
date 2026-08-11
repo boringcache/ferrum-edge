@@ -2353,31 +2353,6 @@ pub fn xds_streams_rejected_count() -> u64 {
     XDS_STREAMS_REJECTED.load(Ordering::Relaxed)
 }
 
-/// Current value of the per-reason ADS admission rejection counter.
-///
-/// Exposed (not `cfg(test)`) so the external unit/integration suites can assert
-/// the bounded reason breakdown without scraping and parsing the whole metrics
-/// document. Process-global, so callers should compare deltas rather than
-/// absolute values.
-pub fn xds_stream_admission_rejection_count(reason: &str) -> u64 {
-    XDS_STREAM_ADMISSION_REJECTIONS
-        .get(reason)
-        .map(|entry| entry.load(Ordering::Relaxed))
-        .unwrap_or(0)
-}
-
-/// Current value of the active-ADS-stream gauge. See
-/// [`xds_stream_admission_rejection_count`] for the process-global caveat.
-pub fn xds_active_streams_gauge() -> u64 {
-    XDS_ACTIVE_STREAMS.load(Ordering::Relaxed)
-}
-
-/// Current value of the distinct-active-node gauge. See
-/// [`xds_stream_admission_rejection_count`] for the process-global caveat.
-pub fn xds_active_node_ids_gauge() -> u64 {
-    XDS_ACTIVE_NODE_IDS.load(Ordering::Relaxed)
-}
-
 /// Current value of the warming partial-apply counter for a `namespace`.
 /// Test-only accessor.
 #[cfg(test)]
