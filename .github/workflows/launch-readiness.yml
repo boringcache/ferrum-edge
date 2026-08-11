@@ -1,8 +1,15 @@
 name: Launch Readiness
 
 # Fail-closed live launch gate for PRODUCTION_READINESS.md.
-# Evaluates paginated GitHub issue state + redacted private-advisory counts
+# Evaluates paginated GitHub issue state plus a redacted private-advisory count
 # against docs/launch-blocker-policy.json. Synthetic self-tests always run first.
+#
+# Private advisories: the Actions GITHUB_TOKEN cannot list repository security
+# advisories (that is a separate GitHub permission, NOT `security-events`), so
+# trusted runs may use an explicitly provisioned read-only advisory token and
+# every other run falls back to externally maintained repository variables that
+# carry only a redacted count and an audit timestamp. A pull request can read
+# those variables but cannot change them. See docs/launch-readiness.md.
 
 on:
   pull_request:
@@ -33,8 +40,6 @@ jobs:
       contents: read
       issues: read
       pull-requests: read
-      # Repo security advisories (private/draft) — count only; never published here.
-      security-events: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
@@ -44,64 +49,19 @@ jobs:
           # the push/schedule/tag SHA — never a synthetic merge commit alone.
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event_name == 'merge_group' && github.event.merge_group.head_sha || github.sha }}
 
-      - name: Resolve exact target SHA
-        id: sha
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          MERGE_GROUP_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
-          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          set -euo pipefail
-          case "$EVENT_NAME" in
-            merge_group)
-              if [[ ! "$MERGE_GROUP_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
-                echo "::error::merge_group head SHA missing or malformed"
-                exit 1
-              fi
-              target="$MERGE_GROUP_HEAD_SHA"
-              ;;
-            pull_request)
-              if [[ ! "$PR_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
-                echo "::error::pull_request head SHA missing or malformed"
-                exit 1
-              fi
-              target="$PR_HEAD_SHA"
-              ;;
-            *)
-              target="$(git rev-parse HEAD)"
-              ;;
-          esac
-          if [[ ! "$target" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "::error::target SHA malformed"
-            exit 1
-          fi
-          checked_out="$(git rev-parse HEAD)"
-          if [ "$checked_out" != "$target" ]; then
-            echo "::error::checkout ${checked_out} is not target ${target}"
-            exit 1
-          fi
-          echo "target=${target}" >> "$GITHUB_OUTPUT"
-          echo "Evaluating launch readiness for ${target}"
-
       - name: Synthetic policy/checker self-tests
         run: python3 -I scripts/check_launch_readiness.py --self-test
 
       - name: Verify live launch verdict
         env:
-          GH_TOKEN: ${{ github.token }}
+          # Public issue state only; this token cannot read private advisories.
           GITHUB_TOKEN: ${{ github.token }}
-          TARGET_SHA: ${{ steps.sha.outputs.target }}
-          EVENT_NAME: ${{ github.event_name }}
-        run: |
-          set -euo pipefail
-          require_pass_args=()
-          # Tag pushes and scheduled main ticks demand PASS; PR/merge_group only
-          # require claim/computed parity (honest FAIL is allowed while blockers open).
-          if [[ "$EVENT_NAME" == "push" && "$GITHUB_REF" == refs/tags/v* ]]; then
-            require_pass_args=(--require-pass)
-          fi
-          python3 -I scripts/check_launch_readiness.py \
-            --verify \
-            --launch-tier ga \
-            --target-sha "$TARGET_SHA" \
-            "${require_pass_args[@]}"
+          LAUNCH_TIER: ga
+          LAUNCH_TARGET_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event_name == 'merge_group' && github.event.merge_group.head_sha || github.sha }}
+          # Externally maintained, redacted, and read-only from a pull request.
+          LAUNCH_PRIVATE_BLOCKER_COUNT: ${{ vars.LAUNCH_PRIVATE_BLOCKER_COUNT }}
+          LAUNCH_PRIVATE_ADVISORY_AS_OF: ${{ vars.LAUNCH_PRIVATE_ADVISORY_AS_OF }}
+          # Never expose a privileged advisory token to pull-request or
+          # merge-group code; those runs use the redacted variables above.
+          LAUNCH_ADVISORY_READ_TOKEN: ${{ (github.event_name != 'pull_request' && github.event_name != 'merge_group') && secrets.LAUNCH_ADVISORY_READ_TOKEN || '' }}
+        run: python3 -I scripts/check_launch_readiness.py --verify --verify-checkout

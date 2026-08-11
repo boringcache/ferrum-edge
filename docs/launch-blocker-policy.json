@@ -1,9 +1,8 @@
 {
-  "policy_version": "1",
-  "classification_version": "launch-blocker-v1",
+  "policy_version": "2",
+  "classification_version": "launch-blocker-v2",
   "repository": "ferrum-edge/ferrum-edge",
   "default_launch_tier": "ga",
-  "freshness_max_age_seconds": 3600,
   "labels": {
     "launch_blocker": "launch-blocker",
     "launch_exempted": "launch-exempted",
@@ -81,7 +80,7 @@
   "private_advisories": {
     "enabled": true,
     "blocking_states": ["triage", "draft"],
-    "closed_states": ["closed", "published", "withdrawn"],
+    "closed_states": ["published", "closed", "withdrawn"],
     "blocking_severities_by_tier": {
       "ga": ["critical", "high", "medium"],
       "beta": ["critical", "high"],
@@ -101,11 +100,16 @@
       "cwes",
       "credits"
     ],
-    "opaque_input": {
-      "redacted_blocking_count": 0,
-      "as_of": "2026-08-11T12:00:00Z",
+    "live_api": {
+      "token_env": "LAUNCH_ADVISORY_READ_TOKEN",
+      "actions_security_events_permission_is_insufficient": true,
+      "notes": "Repository security advisories are a separate GitHub permission. The Actions GITHUB_TOKEN is refused (403) even with security-events: read, so the live listing needs an explicitly provisioned read-only advisory token supplied only to trusted (non-pull-request, non-merge-group) runs."
+    },
+    "trusted_fallback": {
+      "count_variable": "LAUNCH_PRIVATE_BLOCKER_COUNT",
+      "as_of_variable": "LAUNCH_PRIVATE_ADVISORY_AS_OF",
       "max_age_seconds": 604800,
-      "notes": "Count-only stand-in when the Actions token cannot list private repository advisories. Bump as_of when re-auditing; never store GHSA IDs or summaries here."
+      "notes": "Repository Actions variables maintained outside this tree by a maintainer with advisory access. A pull request can read them but cannot change them, which is why they may substantiate a zero count while a checked-in value may not. Missing, malformed, future-dated, or stale values are UNKNOWN. This file deliberately carries no count and no as-of value."
     }
   },
   "document": {

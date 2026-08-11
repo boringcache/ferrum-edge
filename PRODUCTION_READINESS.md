@@ -15,12 +15,19 @@ structured exemptions, and a redacted private-advisory count. Policy:
 
 A historical clean static audit (below) does **not** imply a clean live gate.
 
+The block below is a **reviewed snapshot**, never a source of truth. It is not
+evidence that any blocker is resolved: the gate recomputes the verdict from live
+data on every run and fails whenever the snapshot disagrees, whenever the verdict
+is not `PASS`, and whenever the live data cannot be established. Refresh it from
+the `Launch Readiness Gate` job output (the evaluated record carries the exact
+target SHA and as-of UTC) whenever the blocker set changes.
+
 <!-- launch-readiness:begin -->
 ```json
 {
   "verdict": "FAIL",
-  "policy_version": "1",
-  "classification_version": "launch-blocker-v1",
+  "policy_version": "2",
+  "classification_version": "launch-blocker-v2",
   "launch_tier": "ga",
   "private_blockers_redacted_count": 0,
   "counts_by_severity": {
@@ -28,15 +35,22 @@ A historical clean static audit (below) does **not** imply a clean live gate.
     "high": 7,
     "medium": 0
   },
-  "notes": "Target SHA and as-of UTC are asserted by the Launch Readiness Gate workflow for the evaluated commit; do not hand-edit those fields here."
+  "notes": "Reviewed snapshot only. Target SHA and as-of UTC come from the workflow's evaluated record; they are deliberately not asserted here."
 }
 ```
 <!-- launch-readiness:end -->
 
-Hosted enforcement: `.github/workflows/launch-readiness.yml` (PR/`main`/schedule)
-and the release/tag job in `.github/workflows/release.yml` (`--require-pass` on the
-exact tag SHA). `UNKNOWN` (missing token, API/rate-limit/pagination/schema/staleness)
-fails closed. A manually claimed `PASS` that disagrees with the computed verdict fails.
+Hosted enforcement: `.github/workflows/launch-readiness.yml` (PR/`merge_group`/
+`main`/tag/schedule) and the release/tag job in `.github/workflows/release.yml`,
+which requires a computed `PASS` for the exact released commit. Only a computed
+`PASS` whose snapshot agrees exits zero: `FAIL` and `UNKNOWN` are both non-zero,
+so this check stays red while real launch blockers are open — that is the honest
+signal, not a defect. `UNKNOWN` covers a missing token, an API/rate-limit/
+pagination/schema failure, an issue without exactly one severity label, a live
+severity label that contradicts the tracked contract, and missing/malformed/
+stale/future private-advisory input. Private advisories contribute a redacted
+count only; setup and maintenance are described in
+[`docs/launch-readiness.md`](docs/launch-readiness.md).
 
 <!-- launch-readiness:historical -->
 
