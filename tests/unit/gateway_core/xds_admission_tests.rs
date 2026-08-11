@@ -6,6 +6,9 @@
 //! deadline) is exercised in `tests/integration/cp_dp_grpc_tests.rs`.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, mpsc};
+use std::thread;
 use std::time::Duration;
 
 use ferrum_edge::xds::admission::{
@@ -433,6 +436,64 @@ fn releasing_a_node_is_idempotent_and_reports_the_last_stream() {
     drop(first);
     drop(second);
     assert_eq!(controller.active_streams(), 0);
+}
+
+#[test]
+fn last_node_cleanup_excludes_same_key_successor_registration() {
+    let controller = controller(generous());
+    let principal = principal_key("dp");
+    let mut departing = controller.reserve_stream("ferrum", &principal).unwrap();
+    departing.register_node("node-a").unwrap();
+
+    let published_state = Arc::new(AtomicUsize::new(1));
+    let (cleanup_entered_tx, cleanup_entered_rx) = mpsc::channel();
+    let (finish_cleanup_tx, finish_cleanup_rx) = mpsc::channel();
+    let cleanup_state = Arc::clone(&published_state);
+    let releaser = thread::spawn(move || {
+        ferrum_edge::_test_support::release_xds_node_with_cleanup_for_test(
+            &mut departing,
+            || {
+                cleanup_state.store(0, Ordering::Release);
+                cleanup_entered_tx.send(()).unwrap();
+                finish_cleanup_rx.recv().unwrap();
+            },
+        )
+    });
+    cleanup_entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("last-stream cleanup should start");
+
+    let successor_controller = controller.clone();
+    let successor_principal = principal.clone();
+    let successor_state = Arc::clone(&published_state);
+    let (successor_registered_tx, successor_registered_rx) = mpsc::channel();
+    let successor = thread::spawn(move || {
+        let mut permit = successor_controller
+            .reserve_stream("ferrum", &successor_principal)
+            .unwrap();
+        permit.register_node("node-a").unwrap();
+        successor_state.store(2, Ordering::Release);
+        successor_registered_tx.send(()).unwrap();
+        permit
+    });
+
+    assert!(
+        successor_registered_rx
+            .recv_timeout(Duration::from_millis(100))
+            .is_err(),
+        "same-key registration must wait until old node-scoped cleanup finishes"
+    );
+    finish_cleanup_tx.send(()).unwrap();
+    assert!(releaser.join().unwrap());
+    successor_registered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("successor should register after cleanup");
+    let successor_permit = successor.join().unwrap();
+
+    assert_eq!(published_state.load(Ordering::Acquire), 2);
+    assert_eq!(controller.node_streams("node-a"), 1);
+    drop(successor_permit);
+    assert_eq!(controller.node_streams("node-a"), 0);
 }
 
 // ── Node.id contract ───────────────────────────────────────────────────────

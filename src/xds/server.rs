@@ -185,13 +185,18 @@ impl XdsStreamGuard {
         let Some(state_key) = self.node_state_key.take() else {
             return;
         };
-        if self.permit.release_node() {
-            self.snapshot_cache.remove(&state_key);
-            self.nonce_tracker.remove_node(&state_key);
-            self.workload_identities.remove(&state_key);
-            self.waypoint_names.remove(&state_key);
-            self.node_scoping.remove(&state_key);
-        }
+        let snapshot_cache = Arc::clone(&self.snapshot_cache);
+        let nonce_tracker = Arc::clone(&self.nonce_tracker);
+        let workload_identities = Arc::clone(&self.workload_identities);
+        let waypoint_names = Arc::clone(&self.waypoint_names);
+        let node_scoping = Arc::clone(&self.node_scoping);
+        let _ = self.permit.release_node_with_cleanup(|| {
+            snapshot_cache.remove(&state_key);
+            nonce_tracker.remove_node(&state_key);
+            workload_identities.remove(&state_key);
+            waypoint_names.remove(&state_key);
+            node_scoping.remove(&state_key);
+        });
     }
 }
 

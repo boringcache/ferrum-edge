@@ -507,16 +507,28 @@ impl XdsAdmissionController {
             .is_ok()
     }
 
-    /// Release one stream from a node state key. Returns `true` when this was
-    /// the last stream for that node, i.e. the caller owns cleaning every
-    /// node-scoped map entry.
-    fn unregister_node(&self, node_key: &str) -> bool {
+    /// Release one stream from a node state key. When it is the last stream,
+    /// run `cleanup` while the node entry is still exclusively occupied, then
+    /// remove the entry and free its cardinality slot.
+    ///
+    /// Keeping cleanup inside the entry lock closes the last-stream/new-stream
+    /// ABA window: a replacement stream for the same state key cannot register
+    /// and publish fresh snapshot/identity/scoping state between removal of the
+    /// old admission entry and cleanup of the old node-scoped maps.
+    fn unregister_node_with_cleanup<F>(&self, node_key: &str, cleanup: F) -> bool
+    where
+        F: FnOnce(),
+    {
         let last = match self.inner.per_node.entry(node_key.to_string()) {
             Entry::Occupied(mut entry) => {
                 if *entry.get() > 1 {
                     *entry.get_mut() -= 1;
                     false
                 } else {
+                    // Registration takes this same entry lock before it can
+                    // publish any successor state. Clean the old state first,
+                    // then make the key vacant for a new generation.
+                    cleanup();
                     entry.remove();
                     let _ = self.inner.active_nodes.fetch_update(
                         Ordering::AcqRel,
@@ -526,10 +538,16 @@ impl XdsAdmissionController {
                     true
                 }
             }
-            Entry::Vacant(_) => true,
+            // A missing entry is an invariant violation, not authorization to
+            // delete state that may belong to a successor generation.
+            Entry::Vacant(_) => false,
         };
         self.publish_gauges();
         last
+    }
+
+    fn unregister_node(&self, node_key: &str) -> bool {
+        self.unregister_node_with_cleanup(node_key, || {})
     }
 
     fn release_stream(&self, namespace: &str, principal_key: &str) {
@@ -690,10 +708,24 @@ impl XdsStreamPermit {
     /// Idempotent: the key is taken, so a second call is a no-op returning
     /// `false`.
     pub fn release_node(&mut self) -> bool {
-        let Some(node_key) = self.node_key.take() else {
+        self.release_node_with_cleanup(|| {})
+    }
+
+    /// Release this permit's node registration and, only when it owns the last
+    /// stream for that state key, run `cleanup` before a successor generation
+    /// can register the same key.
+    pub(crate) fn release_node_with_cleanup<F>(&mut self, cleanup: F) -> bool
+    where
+        F: FnOnce(),
+    {
+        let Some(node_key) = self.node_key.as_deref() else {
             return false;
         };
-        self.controller.unregister_node(&node_key)
+        let last = self
+            .controller
+            .unregister_node_with_cleanup(node_key, cleanup);
+        self.node_key = None;
+        last
     }
 
     /// The permit's admission limits.
