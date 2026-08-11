@@ -435,6 +435,21 @@ impl PortReservations {
 /// (see `captured_output_reports_listener_addr_in_use`); every other failure
 /// stops immediately with the child's captured diagnostics. Each retry takes a
 /// fresh reservation set, per `.claude/rules/testing.md`.
+fn exact_listener_config(config_yaml: &str, proxy_http: u16) -> String {
+    let mut config: serde_yaml::Value =
+        serde_yaml::from_str(config_yaml).expect("translated config YAML");
+    for proxy in config["proxies"]
+        .as_sequence_mut()
+        .expect("translated config proxies")
+    {
+        if proxy["listen_port"].as_u64() == Some(80) {
+            proxy["listen_port"] =
+                serde_yaml::to_value(proxy_http).expect("serialize exact listener port");
+        }
+    }
+    serde_yaml::to_string(&config).expect("serialize exact-listener translated config")
+}
+
 async fn start_gateway(config_yaml: &str, extra_env: Vec<(String, String)>) -> (TestGateway, u16) {
     const MAX_ATTEMPTS: u32 = 3;
     const PROXY_HTTP: usize = 0;
@@ -445,19 +460,7 @@ async fn start_gateway(config_yaml: &str, extra_env: Vec<(String, String)>) -> (
     for attempt in 1..=MAX_ATTEMPTS {
         let ports = PortReservations::take(4).await;
         let proxy_http = ports.port(PROXY_HTTP);
-        let mut exact_listener_config: serde_yaml::Value =
-            serde_yaml::from_str(config_yaml).expect("translated config YAML");
-        for proxy in exact_listener_config["proxies"]
-            .as_sequence_mut()
-            .expect("translated config proxies")
-        {
-            if proxy["listen_port"].as_u64() == Some(80) {
-                proxy["listen_port"] =
-                    serde_yaml::to_value(proxy_http).expect("serialize exact listener port");
-            }
-        }
-        let exact_listener_config = serde_yaml::to_string(&exact_listener_config)
-            .expect("serialize exact-listener translated config");
+        let exact_listener_config = exact_listener_config(config_yaml, proxy_http);
         let mut builder = TestGateway::builder()
             // This suite exercises backend TLS, not Service-port remapping.
             // Bind its Gateway listener to the process-global test frontend so
@@ -834,8 +837,11 @@ async fn backend_tls_policy_withdrawal_reaches_the_live_data_path() {
         .config_path
         .as_ref()
         .expect("file-mode harness must populate config_path");
-    std::fs::write(config_path, translated_config_yaml(&without_policy))
-        .expect("rewrite translated config");
+    std::fs::write(
+        config_path,
+        exact_listener_config(&translated_config_yaml(&without_policy), proxy_http),
+    )
+    .expect("rewrite translated config");
     let pid = gateway.pid().expect("gateway still running");
     let signal = std::process::Command::new("kill")
         .args(["-HUP", &pid.to_string()])
