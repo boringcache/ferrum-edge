@@ -295,7 +295,7 @@ mod unix_targets {
                     .append(true)
                     .open(&writer_path)
                     .unwrap();
-                let _ = file.write_all(&vec![b'y'; 128]);
+                let _ = file.write_all(&[b'y'; 128]);
                 thread::sleep(Duration::from_millis(1));
             }
         });

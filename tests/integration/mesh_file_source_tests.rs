@@ -289,7 +289,7 @@ async fn large_reload_does_not_stall_tokio_heartbeat() {
     use ferrum_edge::config::stable_file::MAX_MESH_CONFIG_FILE_BYTES;
     use ferrum_edge::modes::mesh::config_consumer::file_source::load_mesh_slice_from_file_off_thread;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::AtomicBool;
 
     // A multi-MiB stable read (two full probes) must run on the blocking pool
     // so a Tokio heartbeat/timer on a core worker keeps advancing.
