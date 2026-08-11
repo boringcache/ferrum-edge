@@ -402,6 +402,10 @@ impl WorkloadApiAdmissionConfig {
     /// Deliberately a plain constructor with no validation: `validate` is the
     /// single place a value is judged, so `EnvConfig::validate` and mesh startup
     /// cannot disagree about what is acceptable.
+    // These arguments intentionally mirror the eight independently parsed
+    // admission settings. Keeping the mapping explicit makes it possible for
+    // EnvConfig validation and listener construction to share this one type.
+    #[allow(clippy::too_many_arguments)]
     pub fn from_settings(
         max_connections: usize,
         max_connections_per_uid: usize,
