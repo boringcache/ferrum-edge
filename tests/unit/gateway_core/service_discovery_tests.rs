@@ -4790,7 +4790,7 @@ async fn discovery_body_budget_rejects_concurrent_pollers_and_releases_on_cancel
             .await
             .expect("first body admitted")
     };
-    assert_eq!(held.len(), 64);
+    assert_eq!(held.as_slice().len(), 64);
     assert_eq!(
         ferrum_edge::_test_support::discovery_body_budget_used_for_test(),
         64
