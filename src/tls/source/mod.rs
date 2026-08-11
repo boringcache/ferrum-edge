@@ -818,6 +818,7 @@ pub fn effective_tls_max_material_size_bytes() -> Result<usize, MaterialError> {
 }
 
 /// Reject `len` when it exceeds the effective TLS material byte ceiling.
+#[allow(dead_code)] // Snapshot-wrapper seam; explicit ceilings use enforce_material_byte_limit_with.
 pub fn enforce_material_byte_limit(len: usize, kind: MaterialKind) -> Result<(), MaterialError> {
     let max_bytes = effective_tls_max_material_size_bytes()?;
     enforce_material_byte_limit_with(len, kind, max_bytes)

@@ -231,7 +231,7 @@ fn explicit_limit_validation_rejects_zero_and_caps_hostile_high_values() {
         read_bounded_material_bytes(Cursor::new(vec![b'x']), MaterialKind::Key, 0).map(|_| ()),
         load_material_blocking_with(
             &CertSource::parse(
-                "/tmp/ferrum-tls-material-cap-zero-check".into(),
+                "/tmp/ferrum-tls-material-cap-zero-check",
                 MaterialKind::Cert,
             ),
             MaterialKind::Cert,

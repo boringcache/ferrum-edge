@@ -323,6 +323,7 @@ impl ManagedTlsStore {
         })
     }
 
+    #[allow(dead_code)] // External unit tests; production uses material_with_limit.
     pub fn material(
         &self,
         identifier: &str,

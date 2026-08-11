@@ -137,6 +137,7 @@ pub const HARD_MAX_TLS_MAX_MATERIAL_SIZE_BYTES: usize = 4 * 1024 * 1024;
 /// silent fallback to unlimited or to the default). EnvConfig install accepts
 /// an identical repeated ceiling and fails closed on a mismatching repeated
 /// value so the process cannot retain a field that disagrees with loaders.
+#[allow(dead_code)] // Public env seam; race-free tests use parse_tls_max_material_size_bytes.
 pub fn tls_max_material_size_bytes_from_env() -> Result<usize, String> {
     if let Some(max_bytes) = crate::tls::source::installed_tls_max_material_size_bytes() {
         return Ok(max_bytes);
