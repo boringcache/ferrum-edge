@@ -2975,8 +2975,7 @@ async fn process_new_session_datagram(
             // Re-authorize the actual ingress interface retained with every
             // datagram before any plugin side effect.
             if let Some(source) = session.node_waypoint_source.as_ref()
-                && let Err(refusal) =
-                    source.revalidate(dgram.ingress_ifindex, client_addr.ip())
+                && let Err(refusal) = source.revalidate(dgram.ingress_ifindex, client_addr.ip())
             {
                 source.scoping.index.warn_refusal(
                     session.proxy_id.as_str(),
@@ -2984,10 +2983,7 @@ async fn process_new_session_datagram(
                     refusal,
                 );
                 session.expired.store(true, Ordering::Release);
-                signal_udp_reply_task_stop(
-                    &session.stop_reply_task,
-                    session.stop_notify.as_ref(),
-                );
+                signal_udp_reply_task_stop(&session.stop_reply_task, session.stop_notify.as_ref());
                 session.close_hook_ingress();
                 return Err(anyhow::anyhow!(
                     "NodeWaypoint UDP pending datagram attribution does not match the admitted \
@@ -3014,8 +3010,7 @@ async fn process_new_session_datagram(
             // registry/slice change during it cannot produce a late backend
             // side effect under the opening workload's identity.
             if let Some(source) = session.node_waypoint_source.as_ref()
-                && let Err(refusal) =
-                    source.revalidate(dgram.ingress_ifindex, client_addr.ip())
+                && let Err(refusal) = source.revalidate(dgram.ingress_ifindex, client_addr.ip())
             {
                 source.scoping.index.warn_refusal(
                     session.proxy_id.as_str(),
@@ -3023,10 +3018,7 @@ async fn process_new_session_datagram(
                     refusal,
                 );
                 session.expired.store(true, Ordering::Release);
-                signal_udp_reply_task_stop(
-                    &session.stop_reply_task,
-                    session.stop_notify.as_ref(),
-                );
+                signal_udp_reply_task_stop(&session.stop_reply_task, session.stop_notify.as_ref());
                 session.close_hook_ingress();
                 return Err(anyhow::anyhow!(
                     "NodeWaypoint UDP pending datagram attribution changed while policy hooks ran \
@@ -4190,8 +4182,7 @@ async fn handle_dtls_client_inner(
             // immediately before the backend side effect so a registry/slice
             // change cannot forward under stale workload identity.
             if let Some(source) = node_waypoint_source_fwd.as_ref()
-                && let Err(refusal) =
-                    source.revalidate(source.ingress_ifindex, client_addr.ip())
+                && let Err(refusal) = source.revalidate(source.ingress_ifindex, client_addr.ip())
             {
                 source
                     .scoping
@@ -4322,8 +4313,7 @@ async fn handle_dtls_client_inner(
             // the last boundary before delivery so stale-session data is never
             // encrypted and sent to a workload that inherited the peer tuple.
             if let Some(source) = node_waypoint_source_rev.as_ref()
-                && let Err(refusal) =
-                    source.revalidate(source.ingress_ifindex, client_addr.ip())
+                && let Err(refusal) = source.revalidate(source.ingress_ifindex, client_addr.ip())
             {
                 source.scoping.index.warn_refusal(
                     &proxy_id_rev,
@@ -4466,9 +4456,10 @@ async fn admit_plain_udp_stream(
             );
         }
     }
-    if let (Some(scoping), Some(binding)) =
-        (node_waypoint_udp_source, node_waypoint_source_binding.as_ref())
-        && let Err(refusal) = scoping.revalidate(binding, ingress_ifindex, client_addr.ip())
+    if let (Some(scoping), Some(binding)) = (
+        node_waypoint_udp_source,
+        node_waypoint_source_binding.as_ref(),
+    ) && let Err(refusal) = scoping.revalidate(binding, ingress_ifindex, client_addr.ip())
     {
         scoping.index.warn_refusal(
             view.proxy.id.as_str(),

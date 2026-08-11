@@ -553,7 +553,10 @@ async fn manager_task_abort_retracts_the_published_generation() {
 
     handle.abort();
     assert!(
-        handle.await.expect_err("aborted manager must not complete").is_cancelled(),
+        handle
+            .await
+            .expect_err("aborted manager must not complete")
+            .is_cancelled(),
         "the test must exercise future-drop retraction"
     );
     assert_eq!(
