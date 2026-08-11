@@ -23,6 +23,17 @@ placement (`FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true` →
 primitives into hard failure.
 Local ad-hoc runs without that flag may still print `SKIP:`.
 
+> **Run this on a disposable host.** `run.sh` installs an exit trap that
+> unconditionally removes Ferrum-owned host UDP state in the caller's network
+> namespace — the `FERRUM_MESH_UDP_HOST` / `_GUARD_A` / `_GUARD_B` mangle chains
+> and their `PREROUTING` jumps, the priority-`101` v4/v6 `ip rule`s, and the
+> `local` default routes in table `33135`. The trap runs on every exit, success
+> included, and it does not check whether this fixture created that state. On a
+> node where a real Ferrum ambient proxy is running the host-network UDP
+> placement, an ad-hoc local run therefore tears that proxy's capture path down.
+> The hosted gate is unaffected: it runs on an ephemeral runner with no Ferrum
+> workload. Pod-netns state (table `33133`, priority `100`) is never touched.
+
 ## Diagnostics
 
 Bounded, redacted snapshots of `ip rule` / table `33135`, Ferrum mangle chains,
