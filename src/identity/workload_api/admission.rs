@@ -94,8 +94,9 @@
 //! Counters and gauges are **fixed-cardinality**: an aggregate active-connection
 //! gauge, and rejection/close counters keyed only by a closed set of
 //! `&'static str` reasons. Peer UID, PID, SPIFFE ID, and token material are
-//! attacker-influenced or credential-adjacent and are never metric labels; the
-//! per-rejection detail stays in `debug!` logs, which are off by default and so
+//! attacker-influenced or credential-adjacent and are never metric labels.
+//! Rejection `debug!` logs carry only fixed reason/limit context — never raw
+//! caller identifiers or credential metadata — and are off by default so they
 //! cannot themselves be flooded into a disk-exhaustion primitive.
 //!
 //! The RPC gauge and shed counter are the closest thing here to a stream-level
@@ -822,7 +823,6 @@ impl ConnectionAdmission {
                     reject_reason::MAX_CONNECTIONS_PER_UID,
                 );
                 debug!(
-                    peer_uid = uid,
                     limit = self.limits.max_connections_per_uid,
                     "SPIFFE Workload API connection refused: peer UID is at its connection quota"
                 );
@@ -836,7 +836,6 @@ impl ConnectionAdmission {
                         reject_reason::MAX_CONNECTIONS,
                     );
                     debug!(
-                        peer_uid = uid,
                         limit = self.limits.max_connections,
                         "SPIFFE Workload API connection refused: total connection ceiling \
                          saturated"

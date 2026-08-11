@@ -953,3 +953,17 @@ fn the_accept_retry_policy_backs_off_within_a_bound_and_terminates_on_a_fatal_er
         AcceptDecision::Terminate => panic!("a transient failure is retryable"),
     }
 }
+
+/// Rejection logs must never emit a structured `peer_uid =` field: the kernel-
+/// attested UID is credential-adjacent metadata and the universal security rule
+/// forbids logging it unredacted (or hashed/encoded). Keep this as a static
+/// source guard so a future edit cannot reintroduce the field without failing CI.
+#[test]
+fn admission_rejection_logs_omit_peer_uid_structured_field() {
+    let source = include_str!("../../../src/identity/workload_api/admission.rs");
+    assert!(
+        !source.contains("peer_uid ="),
+        "Workload API admission must not log a peer_uid structured field; rejection \
+         debug logs may carry only fixed reason/limit context"
+    );
+}

@@ -946,8 +946,9 @@ pub fn decrement_workload_api_active_connections() {
 /// `identity::workload_api::admission::reject_reason` constants. Peer UID, PID,
 /// SPIFFE ID, and token material are deliberately absent: they are
 /// attacker-influenced or credential-adjacent, and a metric label built from
-/// one is both an unbounded cardinality dimension and a disclosure surface. The
-/// per-rejection detail stays in `debug!` at the reject site.
+/// one is both an unbounded cardinality dimension and a disclosure surface.
+/// Rejection `debug!` logs at the reject site carry only fixed reason/limit
+/// context — never raw caller identifiers or credential metadata.
 pub fn increment_workload_api_connection_rejected(reason: &'static str) {
     let counter = match reason {
         "peer_credentials" => &WORKLOAD_API_REJECTED_PEER_CREDENTIALS,
