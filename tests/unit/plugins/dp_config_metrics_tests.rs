@@ -103,7 +103,11 @@ fn namespace_labelled_series_carry_only_the_namespace_label() {
     let freshness =
         DpConfigFreshness::new_at(epoch, Duration::from_secs(600), StaleAction::ReadinessOnly);
     let mut output = String::new();
-    render_dp_config_freshness_prometheus(&mut output, "edge", Some(&freshness.evaluate_at(epoch)));
+    render_dp_config_freshness_prometheus(
+        &mut output,
+        ",namespace=\"edge\"",
+        Some(&freshness.evaluate_at(epoch)),
+    );
     assert!(output.contains(r#"ferrum_dp_config_stale{namespace="edge"} 0"#));
     // Closed-set reason/action labels live on `/health`, never on a series.
     assert!(!output.contains("reason="));
