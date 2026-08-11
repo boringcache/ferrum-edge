@@ -269,12 +269,13 @@ fn host_udp_shutdown_ack_wait_fits_inside_mesh_background_drain() {
     // ack wait without raising the drain (or vice versa) fails this contract.
     const HOST_UDP_SHUTDOWN_ACK_SECS: u64 = 1;
     const MESH_BACKGROUND_DRAIN_SECS: u64 = 5;
-    assert!(
-        HOST_UDP_SHUTDOWN_ACK_SECS < MESH_BACKGROUND_DRAIN_SECS,
-        "host-UDP shutdown ack wait ({HOST_UDP_SHUTDOWN_ACK_SECS}s) must leave room \
-         inside the mesh background drain ({MESH_BACKGROUND_DRAIN_SECS}s) for guard \
-         install and capture teardown"
-    );
+    const {
+        assert!(
+            HOST_UDP_SHUTDOWN_ACK_SECS < MESH_BACKGROUND_DRAIN_SECS,
+            "host-UDP shutdown ack wait must leave room inside the mesh background drain for \
+             guard install and capture teardown"
+        );
+    }
 }
 
 /// Return the INSTRUCTIONS of a single `FROM ... AS <stage>` block, up to the
