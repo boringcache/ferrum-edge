@@ -3889,16 +3889,27 @@ impl MetricsRegistry {
         // the authenticated admin status surface. Nothing here can carry
         // PEM/JWKS bytes or a secret/provider URI.
         {
+            // LABEL-FREE by construction: every series below is rendered with
+            // an empty label set, never `ns_label`. A namespace label here would
+            // be unbounded on a cluster-wide CP and would publish
+            // tenant-identifying names to any `/metrics` reader; the
+            // namespace-scoped view lives on the authenticated
+            // `GET /gateway-trust/status` surface instead. There is likewise no
+            // per-namespace revision gauge: a process-wide "published revision"
+            // would be a last-writer-wins lie on a multi-namespace CP.
+            const NO_LABELS: &str = "";
             let trust = crate::config::gateway_trust::observability_snapshot();
             output.push_str(
-                "# HELP ferrum_gateway_trust_bundle_loads_total Gateway trust-bundle generations that loaded, validated, and published.\n",
+                "# HELP ferrum_gateway_trust_bundle_published_generations_total Gateway trust-bundle generations that reached the live configuration swap.\n",
             );
-            output.push_str("# TYPE ferrum_gateway_trust_bundle_loads_total counter\n");
+            output.push_str(
+                "# TYPE ferrum_gateway_trust_bundle_published_generations_total counter\n",
+            );
             render_process_counter(
                 &mut output,
-                "ferrum_gateway_trust_bundle_loads_total",
-                trust.loads_total,
-                &ns_label,
+                "ferrum_gateway_trust_bundle_published_generations_total",
+                trust.published_generations_total,
+                NO_LABELS,
             );
 
             output.push_str(
@@ -3909,11 +3920,11 @@ impl MetricsRegistry {
                 &mut output,
                 "ferrum_gateway_trust_bundle_load_rejections_total",
                 trust.load_rejections_total,
-                &ns_label,
+                NO_LABELS,
             );
 
             output.push_str(
-                "# HELP ferrum_gateway_trust_bundle_ambiguous_authority_total Publications that found both a database record and a file-sourced trust value and withdrew trust.\n",
+                "# HELP ferrum_gateway_trust_bundle_ambiguous_authority_total Publications that found both a database record and a file-sourced trust value and kept the previously accepted trust.\n",
             );
             output
                 .push_str("# TYPE ferrum_gateway_trust_bundle_ambiguous_authority_total counter\n");
@@ -3921,29 +3932,20 @@ impl MetricsRegistry {
                 &mut output,
                 "ferrum_gateway_trust_bundle_ambiguous_authority_total",
                 trust.ambiguous_authority_total,
-                &ns_label,
+                NO_LABELS,
             );
 
             output.push_str(
-                "# HELP ferrum_gateway_trust_bundle_revision Monotonic revision of the most recently published gateway trust-bundle generation; 0 when none.\n",
+                "# HELP ferrum_gateway_trust_bundle_last_published_unix_seconds Unix time of the most recently published gateway trust-bundle generation; 0 when none.\n",
             );
-            output.push_str("# TYPE ferrum_gateway_trust_bundle_revision gauge\n");
-            render_process_counter(
-                &mut output,
-                "ferrum_gateway_trust_bundle_revision",
-                trust.published_revision,
-                &ns_label,
-            );
-
             output.push_str(
-                "# HELP ferrum_gateway_trust_bundle_last_load_unix_seconds Unix time of the most recent successful gateway trust-bundle load; 0 when none.\n",
+                "# TYPE ferrum_gateway_trust_bundle_last_published_unix_seconds gauge\n",
             );
-            output.push_str("# TYPE ferrum_gateway_trust_bundle_last_load_unix_seconds gauge\n");
             render_process_counter(
                 &mut output,
-                "ferrum_gateway_trust_bundle_last_load_unix_seconds",
-                trust.last_successful_load_unix_seconds,
-                &ns_label,
+                "ferrum_gateway_trust_bundle_last_published_unix_seconds",
+                trust.last_published_unix_seconds,
+                NO_LABELS,
             );
         }
 

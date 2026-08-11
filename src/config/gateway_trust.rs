@@ -29,9 +29,12 @@
 //! - Bounded material: authority counts, per-authority size, and total encoded
 //!   size are capped so a hostile or accidental write cannot push an unbounded
 //!   blob through the change log and into every subscriber's snapshot.
-//! - Syntactic admission: every `x509_authorities` entry must be valid base64
-//!   **and** parse as an X.509 certificate; every `jwt_authorities` entry must
-//!   carry a non-empty unique `key_id` and a bounded PEM public-key block.
+//! - Usable material, not just well-formed wrappers: every `x509_authorities`
+//!   entry must be valid base64 **and** parse as an X.509 certificate that
+//!   consumes the complete DER entry (no accepted trailing bytes); every
+//!   `jwt_authorities` entry must carry a non-empty unique `key_id` and a PEM
+//!   block the JWT-SVID authority parser can actually turn into a usable
+//!   public key.
 //! - No duplicate trust domains across `local` + `federated`.
 //!
 //! Nothing in this module logs, formats, or returns trust material. Errors name
@@ -128,20 +131,36 @@ impl GatewayTrustBundleRecord {
         }
     }
 
-    /// Idempotent admission normalization, applied on every write entrypoint
-    /// (admin, restore, import) exactly like the other config resources.
-    ///
-    /// The only normalization is derivation: `id` defaults to the namespace and
-    /// `trust_domain` is re-derived from the bundle so the identity column can
-    /// never be authored to disagree with the material. A client that sends a
-    /// *conflicting* `trust_domain` is rejected by [`Self::validate_fields`]
-    /// rather than silently corrected — see the mismatch check there.
-    pub fn normalize_fields(&mut self) {
+    /// Trim-only normalization. Deliberately derives NOTHING from
+    /// `self.namespace`: on the admin path the body's namespace is still
+    /// whatever the client sent at this point, and the server-selected
+    /// `X-Ferrum-Namespace` value is applied afterwards.
+    pub fn trim_fields(&mut self) {
         self.id = self.id.trim().to_string();
-        if self.id.is_empty() {
-            self.id = self.namespace.clone();
-        }
         self.trust_domain = self.trust_domain.trim().to_string();
+    }
+
+    /// The id a namespace's singleton record defaults to when the writer omits
+    /// one. Derived from the SERVER-selected namespace by every caller — never
+    /// from a request body — so a hostile body cannot steer either the stored
+    /// namespace or the stored id.
+    pub fn default_singleton_id(namespace: &str) -> String {
+        namespace.to_string()
+    }
+
+    /// Idempotent admission normalization for entrypoints that have already
+    /// forced the authenticated target namespace onto the record (restore,
+    /// import, loaders).
+    ///
+    /// Trims, then defaults `id` to the (already server-owned) namespace. A
+    /// client that sends a *conflicting* `trust_domain` is rejected by
+    /// [`Self::validate_fields`] rather than silently corrected — see the
+    /// mismatch check there.
+    pub fn normalize_fields(&mut self) {
+        self.trim_fields();
+        if self.id.is_empty() {
+            self.id = Self::default_singleton_id(&self.namespace);
+        }
     }
 
     /// Full syntactic + semantic admission validation.
@@ -202,7 +221,11 @@ impl GatewayTrustBundleRecord {
 
         validate_single_bundle(&self.bundle.local, "bundle.local", &mut errors);
         for (index, federated) in self.bundle.federated.iter().enumerate() {
-            validate_single_bundle(federated, &format!("bundle.federated[{index}]"), &mut errors);
+            validate_single_bundle(
+                federated,
+                &format!("bundle.federated[{index}]"),
+                &mut errors,
+            );
         }
 
         // A federated entry that repeats the local trust domain would make
@@ -295,10 +318,18 @@ fn validate_single_bundle(
                     ));
                     continue;
                 }
-                if X509Certificate::from_der(der).is_err() {
-                    errors.push(format!(
+                // The certificate must consume the COMPLETE entry. A parser
+                // that stops early would admit an authority whose stored bytes
+                // carry appended material an operator (or a differently-strict
+                // verifier) would read as part of the document.
+                match X509Certificate::from_der(der) {
+                    Ok((rest, _)) if rest.is_empty() => {}
+                    Ok(_) => errors.push(format!(
+                        "{label}.x509_authorities[{index}] carries trailing bytes after its X.509 certificate"
+                    )),
+                    Err(_) => errors.push(format!(
                         "{label}.x509_authorities[{index}] is not a parseable X.509 certificate"
-                    ));
+                    )),
                 }
             }
         }
@@ -311,7 +342,9 @@ fn validate_single_bundle(
     let mut seen_key_ids = HashSet::new();
     for (index, authority) in bundle.jwt_authorities.iter().enumerate() {
         if authority.key_id.trim().is_empty() {
-            errors.push(format!("{label}.jwt_authorities[{index}] has an empty key_id"));
+            errors.push(format!(
+                "{label}.jwt_authorities[{index}] has an empty key_id"
+            ));
         } else if authority.key_id.len() > MAX_JWT_AUTHORITY_KEY_ID_BYTES {
             errors.push(format!(
                 "{label}.jwt_authorities[{index}] key_id exceeds {MAX_JWT_AUTHORITY_KEY_ID_BYTES} bytes"
@@ -325,23 +358,30 @@ fn validate_single_bundle(
             errors.push(format!(
                 "{label}.jwt_authorities[{index}] public_key_pem exceeds {MAX_JWT_AUTHORITY_PEM_BYTES} bytes"
             ));
-        } else if !is_public_key_pem(&authority.public_key_pem) {
+        } else if !is_usable_public_key_pem(&authority.public_key_pem) {
             errors.push(format!(
-                "{label}.jwt_authorities[{index}] public_key_pem is not a PEM public key block"
+                "{label}.jwt_authorities[{index}] public_key_pem is not a usable PEM public key"
             ));
         }
     }
 }
 
-/// Cheap structural PEM check. The point is to reject an operator pasting a
-/// PRIVATE KEY (or arbitrary text) into a field that is published to every
-/// subscriber, not to re-implement key parsing.
-fn is_public_key_pem(pem: &str) -> bool {
-    let trimmed = pem.trim();
-    (trimmed.starts_with("-----BEGIN PUBLIC KEY-----")
-        && trimmed.ends_with("-----END PUBLIC KEY-----"))
-        || (trimmed.starts_with("-----BEGIN RSA PUBLIC KEY-----")
-            && trimmed.ends_with("-----END RSA PUBLIC KEY-----"))
+/// Prove the purported public key is one the JWT-SVID stack can actually use.
+///
+/// This reuses the existing JWT/JWKS authority parser
+/// ([`is_usable_public_key_material`](crate::identity::jwt_svid::jwks::is_usable_public_key_material)),
+/// which decodes the SPKI DER (or the SPIFFE-federation JWK form) completely
+/// and refuses a key type or curve point the validator could not verify with. A
+/// structural starts_with/ends_with check would admit a PRIVATE KEY paste
+/// wrapped in the right header, a truncated body, or a key type the mesh cannot
+/// use — material that persists and publishes to every subscriber but can never
+/// validate.
+///
+/// The parser's error is discarded on purpose: its text is already
+/// material-free, but this module's contract is that admission messages name
+/// only the field and index.
+fn is_usable_public_key_pem(pem: &str) -> bool {
+    crate::identity::jwt_svid::jwks::is_usable_public_key_material(pem)
 }
 
 /// Fixed-cardinality, material-free description of one namespace's trust state.
@@ -453,10 +493,59 @@ pub fn resolve_trust_authority(
     }
 }
 
+/// What one namespace-scoped publication should say about trust.
+///
+/// This is the candidate/publication boundary for trust: it is resolved from
+/// the authorities visible BEFORE any namespace partitioning clears the
+/// unpartitioned slot, so a database record plus a file/overlay value is still
+/// recognizable as two authorities rather than looking database-only.
+#[derive(Debug, Clone, PartialEq)]
+pub enum NamespaceTrustProjection {
+    /// Install this material.
+    Replace(TrustBundleSet),
+    /// Withdraw previously delivered material.
+    Clear,
+    /// Say nothing: the subscriber keeps the last trust generation it accepted.
+    ///
+    /// This is the ambiguous-authority outcome. Converting ambiguity into a
+    /// `Clear` would revoke a working generation on every replica the moment a
+    /// leftover file value appeared next to a database record — an outage
+    /// caused by a configuration smell. Issue #3727 asks for the ambiguity to
+    /// be *rejected* while last-known-good is retained, which is exactly this.
+    KeepPrevious,
+}
+
+/// Resolve the publication for one namespace from the authorities visible
+/// before partitioning.
+///
+/// `file_sourced_admissible` is false on scopes that require a namespace claim
+/// (multi-namespace control planes): an unpartitioned value must never reach a
+/// namespace-scoped stream there, so a file-only deployment withdraws rather
+/// than publishing material it cannot attribute to the subscriber.
+pub fn project_namespace_trust(
+    database_record: Option<&GatewayTrustBundleRecord>,
+    file_sourced: Option<&TrustBundleSet>,
+    file_sourced_admissible: bool,
+) -> NamespaceTrustProjection {
+    match resolve_trust_authority(database_record, file_sourced) {
+        TrustAuthorityResolution::Ambiguous => {
+            record_ambiguous_authority();
+            NamespaceTrustProjection::KeepPrevious
+        }
+        TrustAuthorityResolution::Database => match database_record {
+            Some(record) => NamespaceTrustProjection::Replace(record.bundle.clone()),
+            None => NamespaceTrustProjection::Clear,
+        },
+        TrustAuthorityResolution::File => match (file_sourced, file_sourced_admissible) {
+            (Some(bundle), true) => NamespaceTrustProjection::Replace(bundle.clone()),
+            _ => NamespaceTrustProjection::Clear,
+        },
+    }
+}
+
 /// Operator-facing message for the ambiguous-authority refusal. Names no paths,
 /// no material, and no namespace-derived secrets.
-pub const AMBIGUOUS_TRUST_AUTHORITY_MESSAGE: &str =
-    "namespace declares both a database gateway trust-bundle resource and a file-sourced \
+pub const AMBIGUOUS_TRUST_AUTHORITY_MESSAGE: &str = "namespace declares both a database gateway trust-bundle resource and a file-sourced \
      trust_bundles value; resolve to a single authority before the control plane can publish";
 
 // ─── Observability ──────────────────────────────────────────────────────────
@@ -468,11 +557,10 @@ pub const AMBIGUOUS_TRUST_AUTHORITY_MESSAGE: &str =
 // JWKS bytes, secret or provider URIs, or an unbounded identifier — only
 // counters, a revision number, and a bounded reason enum.
 
-static LOADS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static PUBLISHED_GENERATIONS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static LOAD_REJECTIONS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static AMBIGUOUS_AUTHORITY_TOTAL: AtomicU64 = AtomicU64::new(0);
-static PUBLISHED_REVISION: AtomicU64 = AtomicU64::new(0);
-static LAST_SUCCESSFUL_LOAD_UNIX_SECONDS: AtomicU64 = AtomicU64::new(0);
+static LAST_PUBLISHED_UNIX_SECONDS: AtomicU64 = AtomicU64::new(0);
 static LAST_FAILURE_REASON: AtomicU8 = AtomicU8::new(0);
 
 /// Bounded reason for the most recent trust-load failure. Deliberately an enum,
@@ -517,22 +605,73 @@ impl GatewayTrustFailureReason {
     }
 }
 
-/// Record a trust generation that loaded, validated, and published.
+/// Record a trust generation that reached the ACTUAL publication boundary —
+/// the `ArcSwap` store that makes a configuration generation live.
 ///
-/// `revision` is the record's monotonic counter (`0` when the namespace has no
-/// record, i.e. trust is legitimately absent).
-pub fn record_trust_load_success(revision: u64, now_unix_seconds: u64) {
-    LOADS_TOTAL.fetch_add(1, Ordering::Relaxed);
-    PUBLISHED_REVISION.store(revision, Ordering::Relaxed);
-    LAST_SUCCESSFUL_LOAD_UNIX_SECONDS.store(now_unix_seconds, Ordering::Relaxed);
-    LAST_FAILURE_REASON.store(
-        GatewayTrustFailureReason::None.code(),
-        Ordering::Relaxed,
-    );
+/// Deliberately not called from inside a per-namespace database load: a load
+/// still has validation, overlay composition, the atomic swap, and broadcast
+/// ahead of it, so counting there would report generations that were never
+/// published. Publications that carry no database trust record at all are not
+/// counted either — this counter answers "did a stored trust generation go
+/// live", not "did any config swap happen".
+///
+/// There is deliberately no process-wide "published revision": revisions are
+/// per namespace and a last-writer-wins process atomic would be actively
+/// misleading on a multi-namespace control plane. The per-namespace revision is
+/// on the authenticated `GET /gateway-trust/status` view instead.
+pub fn record_trust_generation_published(
+    records: &[GatewayTrustBundleRecord],
+    now_unix_seconds: u64,
+) {
+    if records.is_empty() {
+        return;
+    }
+    PUBLISHED_GENERATIONS_TOTAL.fetch_add(1, Ordering::Relaxed);
+    LAST_PUBLISHED_UNIX_SECONDS.store(now_unix_seconds, Ordering::Relaxed);
+    LAST_FAILURE_REASON.store(GatewayTrustFailureReason::None.code(), Ordering::Relaxed);
+}
+
+/// Stable fingerprint of a trust generation.
+///
+/// Covers exactly the fields that decide what a subscriber will validate with —
+/// namespace, id, trust domain, revision, and the canonical encoding of the
+/// material — so two control-plane replicas that reconstructed the same
+/// committed state produce the same string, and any rotation or revocation
+/// produces a different one. Used for configuration identity/equivalence and
+/// surfaced on the authenticated status view; it is a digest, so it carries no
+/// material.
+pub fn trust_generation_fingerprint(records: &[GatewayTrustBundleRecord]) -> String {
+    // SHA-2 goes through the FIPS-approved wrapper, never the RustCrypto crate
+    // directly (which is dev-only in this workspace).
+    use crate::fips::approved::Sha256;
+
+    let mut ordered: Vec<&GatewayTrustBundleRecord> = records.iter().collect();
+    ordered.sort_by(|a, b| a.namespace.cmp(&b.namespace).then_with(|| a.id.cmp(&b.id)));
+
+    let mut hasher = Sha256::new();
+    for record in ordered {
+        hasher.update(record.namespace.as_bytes());
+        hasher.update([0]);
+        hasher.update(record.id.as_bytes());
+        hasher.update([0]);
+        hasher.update(record.trust_domain.as_bytes());
+        hasher.update([0]);
+        hasher.update(record.revision.to_be_bytes());
+        hasher.update([0]);
+        match serde_json::to_vec(&record.bundle) {
+            Ok(encoded) => hasher.update(encoded),
+            // A bundle that cannot serialize never passed admission; fold in a
+            // distinct marker rather than silently hashing nothing.
+            Err(_) => hasher.update(b"unserializable"),
+        }
+        hasher.update([0]);
+    }
+    hex::encode(hasher.finalize())
 }
 
 /// Record a candidate that was refused before the live swap. The previous valid
-/// generation stays active, so `PUBLISHED_REVISION` is deliberately untouched.
+/// generation stays active, so the published-generation counter and timestamp
+/// are deliberately untouched.
 pub fn record_trust_load_rejection(reason: GatewayTrustFailureReason) {
     LOAD_REJECTIONS_TOTAL.fetch_add(1, Ordering::Relaxed);
     LAST_FAILURE_REASON.store(reason.code(), Ordering::Relaxed);
@@ -550,25 +689,22 @@ pub fn record_ambiguous_authority() {
 /// Process-wide, label-free snapshot for `/metrics` and admin status.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GatewayTrustObservabilitySnapshot {
-    pub loads_total: u64,
+    /// Trust generations that reached the live-configuration swap.
+    pub published_generations_total: u64,
     pub load_rejections_total: u64,
     pub ambiguous_authority_total: u64,
-    /// Revision of the most recently published generation; `0` when none.
-    pub published_revision: u64,
-    /// Unix seconds of the most recent successful load; `0` when none.
-    pub last_successful_load_unix_seconds: u64,
+    /// Unix seconds of the most recently published generation; `0` when none.
+    pub last_published_unix_seconds: u64,
     /// Bounded reason for the most recent failure.
     pub last_failure_reason: &'static str,
 }
 
 pub fn observability_snapshot() -> GatewayTrustObservabilitySnapshot {
     GatewayTrustObservabilitySnapshot {
-        loads_total: LOADS_TOTAL.load(Ordering::Relaxed),
+        published_generations_total: PUBLISHED_GENERATIONS_TOTAL.load(Ordering::Relaxed),
         load_rejections_total: LOAD_REJECTIONS_TOTAL.load(Ordering::Relaxed),
         ambiguous_authority_total: AMBIGUOUS_AUTHORITY_TOTAL.load(Ordering::Relaxed),
-        published_revision: PUBLISHED_REVISION.load(Ordering::Relaxed),
-        last_successful_load_unix_seconds: LAST_SUCCESSFUL_LOAD_UNIX_SECONDS
-            .load(Ordering::Relaxed),
+        last_published_unix_seconds: LAST_PUBLISHED_UNIX_SECONDS.load(Ordering::Relaxed),
         last_failure_reason: GatewayTrustFailureReason::from_code(
             LAST_FAILURE_REASON.load(Ordering::Relaxed),
         )
@@ -579,10 +715,9 @@ pub fn observability_snapshot() -> GatewayTrustObservabilitySnapshot {
 /// Reset every counter. Test-support only — the production paths are monotonic
 /// within a process.
 pub fn reset_observability_for_tests() {
-    LOADS_TOTAL.store(0, Ordering::Relaxed);
+    PUBLISHED_GENERATIONS_TOTAL.store(0, Ordering::Relaxed);
     LOAD_REJECTIONS_TOTAL.store(0, Ordering::Relaxed);
     AMBIGUOUS_AUTHORITY_TOTAL.store(0, Ordering::Relaxed);
-    PUBLISHED_REVISION.store(0, Ordering::Relaxed);
-    LAST_SUCCESSFUL_LOAD_UNIX_SECONDS.store(0, Ordering::Relaxed);
+    LAST_PUBLISHED_UNIX_SECONDS.store(0, Ordering::Relaxed);
     LAST_FAILURE_REASON.store(0, Ordering::Relaxed);
 }

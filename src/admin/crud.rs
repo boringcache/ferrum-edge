@@ -1777,6 +1777,20 @@ pub(crate) trait AdminResource:
     /// Default is a no-op.
     fn set_actor(&mut self, _actor: &str) {}
 
+    /// The id a create with an omitted `id` should get, derived from the
+    /// SERVER-selected namespace (`X-Ferrum-Namespace`).
+    ///
+    /// `None` — the default — keeps the historical behaviour of minting a
+    /// UUID. A singleton resource overrides this so its default identity is
+    /// derived from the authenticated namespace rather than from anything the
+    /// request body could influence: `normalize()` runs before
+    /// `set_namespace()`, so a body-derived default would key off the client's
+    /// namespace field.
+    fn default_id_for_namespace(namespace: &str) -> Option<String> {
+        let _ = namespace;
+        None
+    }
+
     fn response_body(resource: &Self) -> Value {
         json!(resource)
     }
@@ -2896,11 +2910,19 @@ impl AdminResource for GatewayTrustBundleRecord {
         // client tried to author so the stored value is always the verified
         // admin subject.
         self.updated_by = None;
-        self.normalize_fields();
+        // Trim only. The id default is derived from the SERVER-selected
+        // namespace through `default_id_for_namespace`, because `normalize()`
+        // runs before `set_namespace()` and `self.namespace` is still whatever
+        // the request body claimed at this point.
+        self.trim_fields();
     }
 
     fn set_actor(&mut self, actor: &str) {
         self.updated_by = Some(actor.to_string());
+    }
+
+    fn default_id_for_namespace(namespace: &str) -> Option<String> {
+        Some(GatewayTrustBundleRecord::default_singleton_id(namespace))
     }
 
     fn validate(&self, _ctx: &ValidationCtx<'_>) -> Result<(), ValidationError> {
@@ -4409,7 +4431,12 @@ async fn handle_write<R: AdminResource>(
     match action {
         WriteAction::Create => {
             if resource.id().is_empty() {
-                resource.set_id(Uuid::new_v4().to_string());
+                // `namespace` here is the authenticated `X-Ferrum-Namespace`
+                // value, never the body's — see `default_id_for_namespace`.
+                resource.set_id(
+                    R::default_id_for_namespace(namespace)
+                        .unwrap_or_else(|| Uuid::new_v4().to_string()),
+                );
             } else if let Err(message) = validate_resource_id(resource.id()) {
                 return Ok(super::json_response(
                     StatusCode::BAD_REQUEST,

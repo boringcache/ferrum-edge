@@ -101,9 +101,14 @@ const GATEWAY_TRUST_BUNDLE_PAGE_SQL: &str =
 const GATEWAY_TRUST_BUNDLE_INSERT_SQL: &str = "INSERT INTO gateway_trust_bundles \
      (namespace, id, trust_domain, bundle, revision, updated_by, created_at, updated_at) \
      VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
+/// Compare-and-set update. `revision` is in the WHERE clause, so the write is
+/// the compare: two admin replicas that both read revision N issue the same
+/// statement and the database serializes them — the loser matches zero rows
+/// under any isolation level, including plain READ COMMITTED, and reports a
+/// conflict instead of overwriting the winner's rotation.
 const GATEWAY_TRUST_BUNDLE_UPDATE_SQL: &str = "UPDATE gateway_trust_bundles \
      SET trust_domain = ?, bundle = ?, revision = ?, updated_by = ?, updated_at = ? \
-     WHERE namespace = ? AND id = ?";
+     WHERE namespace = ? AND id = ? AND revision = ?";
 const GATEWAY_TRUST_BUNDLE_DELETE_SQL: &str =
     "DELETE FROM gateway_trust_bundles WHERE namespace = ? AND id = ?";
 
@@ -2316,14 +2321,10 @@ impl DatabaseStore {
             }
         }
         if errors.is_empty() {
-            crate::config::gateway_trust::record_trust_load_success(
-                config
-                    .gateway_trust_bundles
-                    .first()
-                    .map(|record| record.revision)
-                    .unwrap_or(0),
-                Utc::now().timestamp().max(0) as u64,
-            );
+            // Deliberately NOT counted as a published generation here: this
+            // candidate still has overlay composition, the `ArcSwap` swap, and
+            // broadcast ahead of it. Acceptance is recorded at the real
+            // publication boundary (`record_trust_generation_published`).
             return Ok(());
         }
         crate::config::gateway_trust::record_trust_load_rejection(
@@ -4548,11 +4549,25 @@ impl DatabaseStore {
     /// Replace an existing record and its config-change row in one
     /// transaction, bumping `revision`.
     ///
-    /// `expected_revision` is the optimistic-concurrency guard. The current
-    /// revision is read INSIDE the same transaction as the write, so the
-    /// compare-and-set cannot be interleaved by a second admin replica.
-    /// Returns `Ok(false)` when no row matched `(namespace, id)` so a PUT
-    /// racing a delete surfaces as not-found rather than a phantom success.
+    /// The optimistic-concurrency guard is a REAL compare-and-set: the revision
+    /// the caller expects is a predicate of the `UPDATE` itself
+    /// (`... AND revision = ?`), not a value read first and trusted afterwards.
+    /// A read-then-write would be safe only under a row lock or serializable
+    /// isolation; under ordinary READ COMMITTED two admin replicas could both
+    /// read N and both write N+1, and the second rotation would silently
+    /// destroy the first. With the predicate in the statement the database
+    /// serializes the two writes and the loser matches zero rows.
+    ///
+    /// `expected_revision` is `Some(n)` when a client stated an expectation and
+    /// `None` for restore/import, which is already serialized behind the
+    /// namespace admission lease; `None` compares against the revision this
+    /// transaction just read, so even that path can never blind-overwrite a
+    /// writer that committed in between.
+    ///
+    /// Returns `Ok(false)` when no record exists at `(namespace, id)` so a PUT
+    /// racing a delete surfaces as not-found rather than a phantom success, and
+    /// [`GatewayTrustBundleRevisionConflict`] when the record exists but its
+    /// revision moved.
     pub async fn update_gateway_trust_bundle(
         &self,
         record: &GatewayTrustBundleRecord,
@@ -4573,8 +4588,7 @@ impl DatabaseStore {
             self.check_slow_query("update_gateway_trust_bundle", start);
             return Ok(false);
         };
-        let current_revision: i64 = existing.try_get("revision")?;
-        let current_revision = current_revision.max(0) as u64;
+        let current_revision = strict_stored_revision(&existing)?;
         if let Some(expected) = expected_revision
             && expected != current_revision
         {
@@ -4585,7 +4599,12 @@ impl DatabaseStore {
                 current: current_revision,
             }));
         }
-        let next_revision = i64::try_from(current_revision.saturating_add(1))
+        // The revision the CAS asserts. With an expectation it is the client's;
+        // without one it is what this transaction observed.
+        let asserted_revision = expected_revision.unwrap_or(current_revision);
+        let asserted_revision_sql = i64::try_from(asserted_revision)
+            .map_err(|_| anyhow::anyhow!("gateway trust bundle revision exceeds BIGINT range"))?;
+        let next_revision = i64::try_from(asserted_revision.saturating_add(1))
             .map_err(|_| anyhow::anyhow!("gateway trust bundle revision exceeds BIGINT range"))?;
 
         let update_sql = self.q(GATEWAY_TRUST_BUNDLE_UPDATE_SQL);
@@ -4597,12 +4616,31 @@ impl DatabaseStore {
             .bind(record.updated_at.to_rfc3339())
             .bind(&record.namespace)
             .bind(&record.id)
+            .bind(asserted_revision_sql)
             .execute(&mut *tx)
             .await?;
         if result.rows_affected() == 0 {
+            // Lost the compare-and-set. Re-read inside the same transaction to
+            // tell a concurrent rotation (row still there, revision moved) from
+            // a concurrent revocation (row gone).
+            let observed = sqlx::query(&select_sql)
+                .bind(&record.namespace)
+                .bind(&record.id)
+                .fetch_optional(&mut *tx)
+                .await?;
+            let conflict = match observed {
+                Some(row) => Some(strict_stored_revision(&row)?),
+                None => None,
+            };
             tx.rollback().await?;
             self.check_slow_query("update_gateway_trust_bundle", start);
-            return Ok(false);
+            return match conflict {
+                Some(current) => Err(anyhow::Error::new(GatewayTrustBundleRevisionConflict {
+                    expected: asserted_revision,
+                    current,
+                })),
+                None => Ok(false),
+            };
         }
         self.record_config_change_tx(
             &mut tx,
@@ -10955,19 +10993,75 @@ fn row_to_plugin_config_inner(
 /// fails closed and the previous valid generation stays active. The error text
 /// deliberately names the column only — never the stored material.
 fn row_to_gateway_trust_bundle(row: &AnyRow) -> Result<GatewayTrustBundleRecord, anyhow::Error> {
-    let namespace = row_namespace_or_default(row);
+    // Strict: the namespace column IS the tenant boundary and the document key.
+    // A row whose namespace is unreadable must not silently become the default
+    // namespace's trust.
+    let namespace = required_utf8_text_column(row, "namespace").map_err(|error| {
+        crate::config::gateway_trust::record_trust_load_rejection(
+            crate::config::gateway_trust::GatewayTrustFailureReason::Undecodable,
+        );
+        mark_row_decode_rejection(
+            "gateway_trust_bundle",
+            None,
+            anyhow::anyhow!("gateway trust bundle namespace column is unreadable: {error}"),
+        )
+    })?;
     row_to_gateway_trust_bundle_inner(row, &namespace).map_err(|error| {
+        crate::config::gateway_trust::record_trust_load_rejection(
+            crate::config::gateway_trust::GatewayTrustFailureReason::Undecodable,
+        );
         let id = row.try_get::<String, _>("id").ok();
         mark_row_decode_rejection("gateway_trust_bundle", id, error)
     })
+}
+
+/// Strictly decode a stored `revision`.
+///
+/// Security metadata must fail closed: a revision that is missing, not an
+/// integer, zero, or negative means the row is not the monotonic record the
+/// optimistic-concurrency contract assumes, and silently substituting `1` (or
+/// clamping a negative to `0`) would let a corrupt row win a compare-and-set or
+/// resurrect an older generation. Never echoes the stored value.
+fn strict_stored_revision(row: &AnyRow) -> Result<u64, anyhow::Error> {
+    let revision: i64 = row
+        .try_get("revision")
+        .map_err(|_| anyhow::anyhow!("gateway trust bundle revision column is unreadable"))?;
+    if revision < 1 {
+        anyhow::bail!("gateway trust bundle revision column is out of range");
+    }
+    Ok(revision as u64)
+}
+
+/// Strictly decode a stored timestamp column.
+///
+/// Unlike the shared [`parse_datetime_column`], this never falls back to
+/// `Utc::now()`: a trust record whose `created_at`/`updated_at` cannot be read
+/// is corrupt security metadata, and inventing "now" would make a corrupted row
+/// look like a fresh rotation on every load. Never echoes the stored value.
+fn strict_datetime_column(
+    row: &AnyRow,
+    column: &'static str,
+) -> Result<chrono::DateTime<Utc>, anyhow::Error> {
+    let raw: String = row
+        .try_get(column)
+        .map_err(|_| anyhow::anyhow!("gateway trust bundle {column} column is unreadable"))?;
+    if let Ok(value) = chrono::DateTime::parse_from_rfc3339(&raw) {
+        return Ok(value.with_timezone(&Utc));
+    }
+    // SQLite `CURRENT_TIMESTAMP` default format.
+    if let Ok(value) = chrono::NaiveDateTime::parse_from_str(&raw, "%Y-%m-%d %H:%M:%S") {
+        return Ok(value.and_utc());
+    }
+    anyhow::bail!("gateway trust bundle {column} column is not a valid timestamp")
 }
 
 fn row_to_gateway_trust_bundle_inner(
     row: &AnyRow,
     namespace: &str,
 ) -> Result<GatewayTrustBundleRecord, anyhow::Error> {
-    let id = required_utf8_text_column(row, "id")
-        .map_err(|error| anyhow::anyhow!("gateway trust bundle id column is unreadable: {error}"))?;
+    let id = required_utf8_text_column(row, "id").map_err(|error| {
+        anyhow::anyhow!("gateway trust bundle id column is unreadable: {error}")
+    })?;
     let trust_domain = required_utf8_text_column(row, "trust_domain").map_err(|error| {
         anyhow::anyhow!("gateway trust bundle trust_domain column is unreadable: {error}")
     })?;
@@ -10983,18 +11077,20 @@ fn row_to_gateway_trust_bundle_inner(
     // Never surface serde's message: it can quote the offending document.
     let bundle: crate::modes::mesh::config::TrustBundleSet = serde_json::from_str(&bundle_json)
         .map_err(|_| anyhow::anyhow!("gateway trust bundle stored material is not decodable"))?;
-    let revision: i64 = row.try_get("revision").unwrap_or(1);
-    let updated_by = optional_utf8_text_column(row, "updated_by").unwrap_or(None);
+    let revision = strict_stored_revision(row)?;
+    let updated_by = optional_utf8_text_column(row, "updated_by").map_err(|error| {
+        anyhow::anyhow!("gateway trust bundle updated_by column is unreadable: {error}")
+    })?;
 
     Ok(GatewayTrustBundleRecord {
         id,
         namespace: namespace.to_string(),
         trust_domain,
         bundle,
-        revision: revision.max(0) as u64,
+        revision,
         updated_by,
-        created_at: parse_datetime_column(row, "created_at"),
-        updated_at: parse_datetime_column(row, "updated_at"),
+        created_at: strict_datetime_column(row, "created_at")?,
+        updated_at: strict_datetime_column(row, "updated_at")?,
     })
 }
 

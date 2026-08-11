@@ -5355,6 +5355,11 @@ paths:
       description: |
         Creates the namespace's single gateway trust-bundle resource. Requires
         the `admin` role. A namespace that already holds a record returns `409`.
+
+        Server-owned identity: the stored `namespace` is always the
+        `X-Ferrum-Namespace` value and an omitted `id` defaults to that same
+        value. A `namespace` or `updated_by` field in the body is ignored —
+        attribution is the verified JWT subject.
       tags: [Gateway Trust]
       requestBody:
         required: true
@@ -5484,8 +5489,9 @@ paths:
         Requires the `operator` role.
 
         Redaction contract: the payload carries the trust domain, authority
-        counts, the revision, timestamps, and a bounded failure-reason enum. It
-        never carries PEM/DER/JWKS bytes, key ids, or secret/provider URIs.
+        counts, this namespace's revision, a digest `generation` identity,
+        timestamps, and a bounded failure-reason enum. It never carries
+        PEM/DER/JWKS bytes, key ids, or secret/provider URIs.
       tags: [Gateway Trust]
       responses:
         "200":
@@ -10658,6 +10664,9 @@ components:
         id:
           type: string
           maxLength: 255
+          description: >-
+            Optional. Defaults to the authenticated `X-Ferrum-Namespace` value;
+            it is never derived from a `namespace` field in the body.
         trust_domain:
           type: string
         bundle:
@@ -10676,7 +10685,11 @@ components:
         SPIFFE trust material, in the same shape the mesh configuration model
         uses. Bounded on admission: at most 16 X.509 authorities and 16 JWT
         authorities per bundle, at most 32 federated bundles, at most 16 KiB per
-        authority, and at most 256 KiB for the encoded value as a whole.
+        authority, and at most 256 KiB for the encoded value as a whole. Each
+        X.509 authority must parse as a certificate that consumes the complete
+        entry, and each JWT authority's `public_key_pem` must parse as a public
+        key the JWT-SVID validator can actually use (SPKI `PUBLIC KEY` PEM or a
+        SPIFFE-federation JWK object).
       required: [local]
       properties:
         local:
@@ -10772,13 +10785,21 @@ components:
 
     GatewayTrustStatus:
       type: object
-      required: [namespace, configured, process]
+      required: [namespace, configured, generation, process]
       properties:
         namespace:
           type: string
         configured:
           type: boolean
           description: Whether the namespace holds a trust-bundle record.
+        generation:
+          type: string
+          description: >-
+            Namespace-safe configuration identity for trust: a SHA-256 digest
+            over (namespace, id, trust domain, revision, canonical material).
+            Two control-plane replicas that reconstructed the same committed
+            state report the same value, and any rotation or revocation changes
+            it. Being a digest, it carries no trust material.
         bundle:
           allOf:
             - $ref: "#/components/schemas/GatewayTrustBundleSummary"
@@ -10786,20 +10807,27 @@ components:
         process:
           type: object
           description: >-
-            Process-wide, label-free counters. Reset on process restart.
+            Process-wide, label-free counters. Reset on process restart. There
+            is deliberately no process-wide revision: revisions are per
+            namespace and a single process value would be last-writer-wins on a
+            multi-namespace control plane. Use `bundle.revision` (this
+            namespace) or `generation`.
           required:
             [
-              loads_total,
+              published_generations_total,
               load_rejections_total,
               ambiguous_authority_total,
-              published_revision,
-              last_successful_load_unix_seconds,
+              last_published_unix_seconds,
               last_failure_reason,
             ]
           properties:
-            loads_total:
+            published_generations_total:
               type: integer
               format: int64
+              description: >-
+                Trust generations that reached the live-configuration swap, not
+                candidates that merely loaded. Publications carrying no
+                database trust record are not counted.
             load_rejections_total:
               type: integer
               format: int64
@@ -10809,10 +10837,10 @@ components:
             ambiguous_authority_total:
               type: integer
               format: int64
-            published_revision:
-              type: integer
-              format: int64
-            last_successful_load_unix_seconds:
+              description: >-
+                Publications that found two authorities and kept the previously
+                accepted trust instead of publishing either.
+            last_published_unix_seconds:
               type: integer
               format: int64
             last_failure_reason:
@@ -14404,8 +14432,13 @@ components:
               type: integer
               description: >-
                 Number of gateway trust-bundle records reconciled from the
-                payload's `gateway_trust_bundles` section. `0` when the backup
-                omits the section, which leaves existing trust untouched.
+                payload's `gateway_trust_bundles` section (`0` or `1` — the
+                resource is a namespace singleton). `0` when the backup omits
+                the section, which leaves existing trust untouched, and also
+                `0` for a present-but-empty section, which is an explicit
+                revocation. A section carrying more than one record for the
+                target namespace is rejected with `400` before any existing
+                configuration is deleted.
     # ── Shared: Transaction-Log Schema Customization ──────────────────
     # Shape of the `schema:` block (and the entries inside
     # `transaction_log_schema.schemas`). See docs/log_schema.md for the

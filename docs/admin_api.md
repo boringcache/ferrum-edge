@@ -650,9 +650,17 @@ restart, and certificate/key generations are never mixed because the resources
 and the trust side channel publish from one snapshot.
 
 **Status payload.** `GET /gateway-trust/status` returns the trust domain,
-authority counts, revision, timestamps, and a bounded failure-reason enum
-(`none`, `invalid_material`, `undecodable`, `ambiguous_authority`) plus
-process-wide counters. It never returns PEM/DER/JWKS bytes, key ids, or
+authority counts, this namespace's revision, timestamps, a bounded
+failure-reason enum (`none`, `invalid_material`, `undecodable`,
+`ambiguous_authority`), and a `generation` digest — a stable configuration
+identity for the namespace's trust state that two control-plane replicas
+reconstruct identically and that changes on every rotation or revocation. It
+also returns label-free process counters
+(`published_generations_total`, `load_rejections_total`,
+`ambiguous_authority_total`, `last_published_unix_seconds`), which count
+generations that reached the live-configuration swap rather than candidates
+that merely loaded. There is no process-wide revision: revisions are per
+namespace. The payload never returns PEM/DER/JWKS bytes, key ids, or
 secret/provider URIs.
 
 See [CP/DP mode](cp_dp_mode.md#the-gateway_trust_bundles-resource-issue-3727)
@@ -683,13 +691,19 @@ database-backed exports (possibly empty). Restore treats an **absent** array as
 "this backup says nothing about trust" and leaves the namespace's existing roots
 in place — the destructive namespace clear deliberately does not touch trust, so
 restoring an older config backup can never silently revoke roots. A **present**
-array is authoritative and reconciles exactly to what it lists, including the
-empty case, which revokes. Records are re-normalized, forced into the target
-namespace, and re-validated through the same admission path an admin `POST` uses
-*before* the clear, so a hand-edited or hostile backup cannot inject oversized or
-malformed trust material by going around the API, and an invalid section aborts
-with `400` and nothing deleted. Cached-fallback exports (`X-Data-Source: cached`)
-omit the array entirely.
+array is authoritative and reconciles exactly to what it lists against the
+authenticated target namespace, including the empty case, which revokes. The
+resource is a namespace singleton, so an array carrying more than one record is
+rejected with `400` — the reconciler never silently takes the first, which would
+make the restored trust state depend on payload order. Records are
+re-normalized, forced into the target namespace, and re-validated through the
+same admission path an admin `POST` uses *before* the clear, so a hand-edited or
+hostile backup cannot inject oversized or malformed trust material by going
+around the API, and an invalid section aborts with `400` and nothing deleted.
+Server-owned fields survive the payload: `id` and `created_at` come from the
+stored record, `revision` is assigned by the store, and `updated_by` is the
+restoring admin's verified JWT subject. Cached-fallback exports
+(`X-Data-Source: cached`) omit the array entirely.
 
 See [admin_backup_restore.md](admin_backup_restore.md) for details.
 

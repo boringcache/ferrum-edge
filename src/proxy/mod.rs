@@ -10152,6 +10152,13 @@ impl ProxyState {
             self.env_config.http3_idle_timeout,
         );
         self.config.store(Arc::clone(&published.config));
+        // Trust acceptance is counted at the swap that makes a generation live,
+        // not at load time (issue #3727). A publication carrying no
+        // database-sourced trust record is not counted at all.
+        crate::config::gateway_trust::record_trust_generation_published(
+            &published.config.gateway_trust_bundles,
+            chrono::Utc::now().timestamp().max(0) as u64,
+        );
         // Config publications can add, remove, or repoint certificate-family
         // sources without producing a TLS source-watcher event. Invalidate the
         // metrics-safe snapshot only after the validated epoch is published so

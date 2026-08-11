@@ -187,6 +187,29 @@ impl JwkPublicKey {
     }
 }
 
+/// True when `material` is a public key this stack can actually verify with,
+/// in either encoding a `jwt_authorities[].public_key_pem` field legitimately
+/// carries:
+///
+/// - an SPKI `PUBLIC KEY` PEM (what Ferrum's own authority publishes), or
+/// - a bare JWK JSON object, which is what
+///   [`federation`](crate::modes::mesh::federation) preserves verbatim from a
+///   SPIFFE JWKS document.
+///
+/// Both encodings are proved by running the real parser, so a PRIVATE KEY
+/// paste, a truncated body, trailing material, or an unsupported key type /
+/// off-curve point is refused rather than stored and published. The error is
+/// intentionally not returned: callers on the configuration-admission path
+/// report their own field/index-only message.
+pub fn is_usable_public_key_material(material: &str) -> bool {
+    if published_authority_key_id(material).is_ok() {
+        return true;
+    }
+    serde_json::from_str::<Map<String, Value>>(material)
+        .ok()
+        .is_some_and(|jwk| spki_pem_from_jwk(&jwk).is_ok())
+}
+
 /// Compute the RFC 7638 JWK thumbprint (base64url, unpadded SHA-256) of an
 /// SPKI PEM public key. Used as the `kid` for Ferrum-minted JWT-SVIDs so the
 /// key id is derived from the key itself rather than a counter that could

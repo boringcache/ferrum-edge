@@ -5405,9 +5405,44 @@ mod inner {
         mut doc: Document,
     ) -> Result<GatewayTrustBundleRecord, anyhow::Error> {
         doc.remove("_id");
+        // Fail closed on the security-relevant revision before anything else:
+        // BSON would happily deserialize a missing/negative value through
+        // serde's `#[serde(default)]`, and a record whose monotonic counter is
+        // not a positive integer is not the record the optimistic-concurrency
+        // contract assumes.
+        strict_stored_revision(&doc)?;
         // Never surface the BSON error text: it can quote the stored material.
-        mongodb::bson::from_document(doc)
-            .map_err(|_| anyhow::anyhow!("gateway trust bundle stored material is not decodable"))
+        mongodb::bson::from_document(doc).map_err(|_| {
+            crate::config::gateway_trust::record_trust_load_rejection(
+                crate::config::gateway_trust::GatewayTrustFailureReason::Undecodable,
+            );
+            anyhow::anyhow!("gateway trust bundle stored material is not decodable")
+        })
+    }
+
+    /// Strictly decode a stored gateway trust-bundle `revision`.
+    ///
+    /// Missing, non-integer, or non-positive values are corrupt security
+    /// metadata and are refused rather than defaulted; the diagnostic names the
+    /// field only and drives the bounded `undecodable` failure reason.
+    fn strict_stored_revision(doc: &Document) -> Result<u64, anyhow::Error> {
+        let value = match doc.get("revision") {
+            Some(Bson::Int64(value)) => *value,
+            Some(Bson::Int32(value)) => i64::from(*value),
+            _ => {
+                crate::config::gateway_trust::record_trust_load_rejection(
+                    crate::config::gateway_trust::GatewayTrustFailureReason::Undecodable,
+                );
+                anyhow::bail!("gateway trust bundle revision field is unreadable");
+            }
+        };
+        if value < 1 {
+            crate::config::gateway_trust::record_trust_load_rejection(
+                crate::config::gateway_trust::GatewayTrustFailureReason::Undecodable,
+            );
+            anyhow::bail!("gateway trust bundle revision field is out of range");
+        }
+        Ok(value as u64)
     }
 
     fn map_snapshot_document_error(
@@ -6165,14 +6200,9 @@ mod inner {
                 }
                 .into_anyhow());
             }
-            crate::config::gateway_trust::record_trust_load_success(
-                config
-                    .gateway_trust_bundles
-                    .first()
-                    .map(|record| record.revision)
-                    .unwrap_or(0),
-                Utc::now().timestamp().max(0) as u64,
-            );
+            // Acceptance is NOT recorded here: this candidate still has the
+            // atomic swap and broadcast ahead of it. See
+            // `record_trust_generation_published`.
             config.normalize_fields();
             config.resolve_upstream_tls();
 
@@ -9174,42 +9204,29 @@ mod inner {
                 self.compact_config_changes_best_effort(&record.namespace)
                     .await;
             } else {
-                // Standalone: insert first, then record the change. If the
-                // change record fails the inserted document is rolled back so a
-                // retry of the identical request stays idempotent and no
-                // committed bundle is left invisible to polling.
+                // Standalone MongoDB has no multi-document transaction, so the
+                // ORDER is the safety property: the poll signal is written
+                // FIRST and the trust document second.
+                //
+                // - change record fails  → nothing was mutated at all; the
+                //   caller sees the failure and no trust state moved.
+                // - document write fails → a change record exists for a
+                //   mutation that did not happen. The next poll escalates to a
+                //   full reload and reads the unchanged document, which is
+                //   correct, just one wasted reload.
+                //
+                // The reverse order (the one every other resource can afford)
+                // is exactly what must not happen here: a committed rotation or
+                // revocation with no change row is invisible to a poller that
+                // already consumed the cursor, and no later poll repairs it.
+                self.record_config_change(
+                    &record.namespace,
+                    GATEWAY_TRUST_BUNDLE_RESOURCE_TYPE,
+                    &record.id,
+                    "upsert",
+                )
+                .await?;
                 self.gateway_trust_bundles().insert_one(doc).await?;
-                if let Err(err) = self
-                    .record_config_change(
-                        &record.namespace,
-                        GATEWAY_TRUST_BUNDLE_RESOURCE_TYPE,
-                        &record.id,
-                        "upsert",
-                    )
-                    .await
-                {
-                    // The shared rollback helper deletes by `_id = resource_id`;
-                    // this collection keys documents by namespace, so roll back
-                    // against the document key we actually inserted.
-                    match self
-                        .gateway_trust_bundles()
-                        .delete_one(
-                            doc! { "_id": &record.namespace, "namespace": &record.namespace },
-                        )
-                        .await
-                    {
-                        Ok(_) => warn!(
-                            namespace = %record.namespace,
-                            "Rolled back MongoDB standalone gateway trust bundle create after the config_changes write failed"
-                        ),
-                        Err(rollback_error) => warn!(
-                            namespace = %record.namespace,
-                            error = %rollback_error,
-                            "MongoDB standalone gateway trust bundle create could not be rolled back after the config_changes write failed"
-                        ),
-                    }
-                    return Err(err);
-                }
             }
             self.check_slow_query("create_gateway_trust_bundle", start);
             Ok(())
@@ -9226,21 +9243,14 @@ mod inner {
                 "namespace": &record.namespace,
                 "id": &record.id,
             };
-            let existing = self
-                .gateway_trust_bundles()
-                .find_one(addressed)
-                .await?;
+            let existing = self.gateway_trust_bundles().find_one(addressed).await?;
             let Some(existing) = existing else {
                 // Phantom update: no document in this namespace, so no
                 // config-change record (DB-M4).
                 self.check_slow_query("update_gateway_trust_bundle", start);
                 return Ok(false);
             };
-            let current_revision = match existing.get("revision") {
-                Some(Bson::Int64(value)) if *value >= 0 => *value as u64,
-                Some(Bson::Int32(value)) if *value >= 0 => *value as u64,
-                _ => 0,
-            };
+            let current_revision = strict_stored_revision(&existing)?;
             if let Some(expected) = expected_revision
                 && expected != current_revision
             {
@@ -9252,9 +9262,10 @@ mod inner {
                     },
                 ));
             }
-            let next_revision = i64::try_from(current_revision.saturating_add(1)).map_err(|_| {
-                anyhow::anyhow!("gateway trust bundle revision exceeds BSON Int64 range")
-            })?;
+            let next_revision =
+                i64::try_from(current_revision.saturating_add(1)).map_err(|_| {
+                    anyhow::anyhow!("gateway trust bundle revision exceeds BSON Int64 range")
+                })?;
             let mut doc = gateway_trust_bundle_to_doc(record)?;
             doc.insert("revision", next_revision);
             // The replacement filter re-asserts the observed revision, so on a
@@ -9312,22 +9323,23 @@ mod inner {
                 }
                 matched
             } else {
+                // Standalone: poll signal first, mutation second (see
+                // `create_gateway_trust_bundle`). A change record for a
+                // compare-and-set that then loses its race costs one redundant
+                // full reload; the reverse order could commit a rotation no
+                // poller ever learns about.
+                self.record_config_change(
+                    &record.namespace,
+                    GATEWAY_TRUST_BUNDLE_RESOURCE_TYPE,
+                    &record.id,
+                    "upsert",
+                )
+                .await?;
                 let replaced = self
                     .gateway_trust_bundles()
                     .replace_one(filter, doc)
                     .await?;
-                if replaced.matched_count == 0 {
-                    false
-                } else {
-                    self.record_config_change(
-                        &record.namespace,
-                        GATEWAY_TRUST_BUNDLE_RESOURCE_TYPE,
-                        &record.id,
-                        "upsert",
-                    )
-                    .await?;
-                    true
-                }
+                replaced.matched_count != 0
             };
             if !matched {
                 self.check_slow_query("update_gateway_trust_bundle", start);
@@ -9389,23 +9401,23 @@ mod inner {
                 }
                 deleted
             } else {
+                // Standalone: the revocation's poll signal is written BEFORE
+                // the document is removed. A revocation that commits without a
+                // change row would be invisible to a poller that already
+                // consumed the cursor — subscribers would keep validating with
+                // roots the operator revoked, and no later poll cycle repairs
+                // that. A change row for a delete that then fails (or matched
+                // nothing) is harmless: the next poll escalates to a full
+                // reload and reads the document that is still there.
+                self.record_config_change(
+                    namespace,
+                    GATEWAY_TRUST_BUNDLE_RESOURCE_TYPE,
+                    id,
+                    "delete",
+                )
+                .await?;
                 let result = self.gateway_trust_bundles().delete_one(filter).await?;
-                if result.deleted_count == 0 {
-                    false
-                } else {
-                    // Standalone: the revocation is already durable. Recording
-                    // the change may fail, and the poll-cycle backstop (full
-                    // reload on an unreadable cursor) still converges, so
-                    // surface the error rather than resurrecting revoked roots.
-                    self.record_config_change(
-                        namespace,
-                        GATEWAY_TRUST_BUNDLE_RESOURCE_TYPE,
-                        id,
-                        "delete",
-                    )
-                    .await?;
-                    true
-                }
+                result.deleted_count != 0
             };
             self.check_slow_query("delete_gateway_trust_bundle", start);
             Ok(deleted)

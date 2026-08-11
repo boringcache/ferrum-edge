@@ -399,7 +399,10 @@ multi-tenant *unpartitioned* trust bundle side channels serialise as `null`.
 Issue #3727 then added the namespaced replacement rather than removing that
 defense: the unpartitioned clear still runs first, and only afterwards does the
 CP project the subscribing namespace's own `gateway_trust_bundles` record into
-the side channel. A namespace with no record still receives nothing, and no
+the side channel. The *classification* of which authorities exist happens
+before that clear (`resolve_namespace_trust_projection`), so a namespace
+carrying both a database record and a file-sourced value is still recognisable
+as ambiguous instead of looking database-only once the clear has run. A namespace with no record still receives nothing, and no
 namespace can observe another's material through a payload, a delta, an
 emptiness signal, an error, or a status surface — the record vector is pruned to
 the subscriber's namespace at the primary authorization boundary and is
@@ -415,4 +418,4 @@ wire.
 | Native `MeshConfigSync.MeshSubscribe` | `MeshSubscribeRequest.namespace` authorised by the resolved set | Same authorisation as ConfigSync. Full, delta, and lag recovery slices are built from a namespace-filtered config. |
 | xDS ADS | Single namespace from the resolved set | Multi-tenant streams require exactly one `ns` value because ADS has no namespace request field. Node metadata and resume resource versions cannot change tenant identity. |
 | Kubernetes controller broadcast | Reconciled config namespaces | ConfigSync broadcasts fan out via `NamespaceBroadcasts`; each namespace is serialised independently. |
-| Gateway trust bundles | `gateway_trust_bundles` record keyed by the authorised namespace | Every scope. The unpartitioned `GatewayConfig.trust_bundles` and mesh trust bundles are still withheld in `Set` and `All` scopes; the CP then projects the subscribing namespace's own database record into the `trust_bundles_json` side channel. Full snapshots state the complete current value (`Replace` or `Clear`); resource deltas state `Unchanged`. See [CP/DP mode](cp_dp_mode.md#the-gateway_trust_bundles-resource-issue-3727). |
+| Gateway trust bundles | `gateway_trust_bundles` record keyed by the authorised namespace | Every scope. The unpartitioned `GatewayConfig.trust_bundles` and mesh trust bundles are still withheld in `Set` and `All` scopes; the CP then projects the subscribing namespace's own database record into the `trust_bundles_json` side channel. Full snapshots state the complete current value (`Replace` or `Clear`); resource deltas state `Unchanged`. A namespace that presents both a database record and a file-sourced value is ambiguous: the publication is refused as `Unchanged` (subscribers keep their last accepted trust) rather than converted into a `Clear`. See [CP/DP mode](cp_dp_mode.md#the-gateway_trust_bundles-resource-issue-3727). |

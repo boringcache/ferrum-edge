@@ -1427,6 +1427,15 @@ pub(crate) fn publish_cp_full_reload(
     publication_gate.publish(move || {
         let published =
             cas_publish_db_snapshot_with_k8s_overlay(config_arc, overlay_slot, db_config);
+        // The ACTUAL publication boundary: the snapshot is now live in the
+        // `ArcSwap` and is about to be broadcast. Trust acceptance is recorded
+        // here rather than inside each namespace's database load, which still
+        // had validation, overlay composition, and this swap ahead of it
+        // (issue #3727).
+        crate::config::gateway_trust::record_trust_generation_published(
+            &published.gateway_trust_bundles,
+            chrono::Utc::now().timestamp().max(0) as u64,
+        );
         for namespace in refreshed_namespaces {
             CpGrpcServer::broadcast_namespace_update(
                 broadcasts,

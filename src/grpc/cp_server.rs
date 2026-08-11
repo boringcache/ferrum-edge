@@ -821,47 +821,101 @@ impl CpGrpcServer {
         filter_frontend_tls_sources_to_namespace(config, namespace);
     }
 
-    /// Resolve the single authoritative trust value for `namespace` and project
-    /// it into the unpartitioned `trust_bundles` slot the side channel reads
+    /// Resolve what this subscriber's snapshot should say about trust
     /// (issue #3727).
     ///
-    /// Ordering matters: this runs AFTER
-    /// [`Self::clear_unpartitioned_trust_material`], so on a multi-namespace CP
-    /// the pre-existing global value is already gone and the only thing that can
-    /// reach a subscriber is that subscriber's own database record. The existing
-    /// defense is preserved, not replaced — a namespace with no record still
-    /// receives nothing.
+    /// CRITICAL ORDERING: the authorities are classified from the UNFILTERED
+    /// configuration, before [`Self::clear_unpartitioned_trust_material`] has
+    /// removed the unpartitioned value. Classifying afterwards would make a
+    /// deployment that carries both a database record and a file/overlay value
+    /// look database-only, and the ambiguity issue #3727 asks us to reject
+    /// would be silently resolved in favour of one authority per replica.
     ///
-    /// Precedence when a deployment somehow presents both authorities: neither
-    /// wins. Silently preferring one would let two replicas disagree if only one
-    /// of them could see the file value, which is the exact divergence this
-    /// resource exists to eliminate. The projection instead withdraws trust
-    /// (deterministic on every replica) and reports a redacted diagnostic.
-    fn project_namespace_trust_material(config: &mut GatewayConfig, namespace: &str) {
-        let record_bundle = config
-            .gateway_trust_bundle_for(namespace)
-            .map(|record| record.bundle.clone());
-        let resolution = crate::config::gateway_trust::resolve_trust_authority(
+    /// The three outcomes:
+    ///
+    /// - `Replace` — the single authority's material, which for a
+    ///   claim-requiring scope can only ever be this namespace's own database
+    ///   record;
+    /// - `Clear` — this namespace has no trust to publish, an explicit
+    ///   withdrawal so a reconnecting DP reconstructs the true state;
+    /// - `KeepPrevious` — two authorities disagree. Trust is NOT revoked:
+    ///   subscribers keep the last generation they accepted while the redacted
+    ///   diagnostic and the ambiguity counter surface the misconfiguration.
+    ///   Converting the ambiguity into a clear would take a working fleet
+    ///   offline over a leftover file value.
+    fn resolve_namespace_trust_projection(
+        config: &GatewayConfig,
+        namespace: &str,
+        scope: &CpScope,
+    ) -> crate::config::gateway_trust::NamespaceTrustProjection {
+        let projection = crate::config::gateway_trust::project_namespace_trust(
             config.gateway_trust_bundle_for(namespace),
             config.trust_bundles.as_deref(),
+            !scope.requires_namespace_claim_by_default(),
         );
-        match resolution {
-            crate::config::gateway_trust::TrustAuthorityResolution::Database => {
-                config.trust_bundles = record_bundle.map(Box::new);
-            }
-            crate::config::gateway_trust::TrustAuthorityResolution::File => {
-                // No database record: the file-sourced value stands unchanged.
-            }
-            crate::config::gateway_trust::TrustAuthorityResolution::Ambiguous => {
-                error!(
-                    namespace = %namespace,
-                    "{}",
-                    crate::config::gateway_trust::AMBIGUOUS_TRUST_AUTHORITY_MESSAGE
-                );
-                crate::config::gateway_trust::record_ambiguous_authority();
-                config.trust_bundles = None;
-            }
+        if matches!(
+            projection,
+            crate::config::gateway_trust::NamespaceTrustProjection::KeepPrevious
+        ) {
+            error!(
+                namespace = %namespace,
+                "{}",
+                crate::config::gateway_trust::AMBIGUOUS_TRUST_AUTHORITY_MESSAGE
+            );
         }
+        projection
+    }
+
+    /// Apply a resolved projection to the filtered snapshot's unpartitioned
+    /// slot. `KeepPrevious` leaves nothing behind: the side channel says
+    /// nothing, so the slot must not carry material either.
+    fn apply_trust_projection(
+        filtered: &mut GatewayConfig,
+        projection: &crate::config::gateway_trust::NamespaceTrustProjection,
+    ) {
+        use crate::config::gateway_trust::NamespaceTrustProjection as Projection;
+        filtered.trust_bundles = match projection {
+            Projection::Replace(bundle) => Some(Box::new(bundle.clone())),
+            Projection::Clear | Projection::KeepPrevious => None,
+        };
+    }
+
+    /// Filter a snapshot to `namespace` AND resolve its trust side channel in
+    /// one step, so the two can never disagree.
+    ///
+    /// Returns the filtered configuration and the exact `trust_bundles_json`
+    /// value: the serialized bundle for a replace, `"null"` for an explicit
+    /// clear, and an EMPTY string when the ambiguity refusal means the
+    /// subscriber must keep what it already applied.
+    /// `pub` so external integration tests can assert the exact side-channel
+    /// encoding of every publication decision, including the ambiguity refusal.
+    pub fn filter_config_and_trust_for_scope(
+        config: &GatewayConfig,
+        namespace: &str,
+        scope: &CpScope,
+    ) -> (GatewayConfig, String) {
+        use crate::config::gateway_trust::NamespaceTrustProjection as Projection;
+
+        let (filtered, projection) = Self::filter_config_and_projection(config, namespace, scope);
+        let trust_json = match &projection {
+            Projection::KeepPrevious => String::new(),
+            Projection::Clear => "null".to_string(),
+            Projection::Replace(_) => {
+                let encoded = Self::trust_bundles_json(filtered.trust_bundles.as_deref());
+                match encoded {
+                    Ok(json) => json,
+                    Err(error) => {
+                        error!(
+                            namespace = %namespace,
+                            error = %error,
+                            "Failed to serialize gateway trust bundles; withdrawing trust for this publication"
+                        );
+                        "null".to_string()
+                    }
+                }
+            }
+        };
+        (filtered, trust_json)
     }
 
     #[cfg(test)]
@@ -890,10 +944,14 @@ impl CpGrpcServer {
                 bearer_namespaces,
             );
         }
+        // Classify the trust authorities from the UNFILTERED config, then
+        // clear, then apply — see `resolve_namespace_trust_projection`.
+        let projection =
+            Self::resolve_namespace_trust_projection(config, &request.namespace, scope);
         if scope.requires_namespace_claim_by_default() {
             Self::clear_unpartitioned_trust_material(&mut filtered);
         }
-        Self::project_namespace_trust_material(&mut filtered, &request.namespace);
+        Self::apply_trust_projection(&mut filtered, &projection);
         filtered
     }
 
@@ -1151,16 +1209,32 @@ impl CpGrpcServer {
         namespace: &str,
         scope: &CpScope,
     ) -> GatewayConfig {
+        Self::filter_config_and_projection(config, namespace, scope).0
+    }
+
+    /// The shared body of every namespace-scoped snapshot projection.
+    ///
+    /// Classifies the trust authorities BEFORE the clear, so a database record
+    /// sitting next to a file/overlay value is still visible as two authorities
+    /// (issue #3727), then partitions, then applies the single resolved
+    /// projection. Callers that need the exact side-channel encoding —
+    /// including the ambiguity refusal, which cannot be expressed as an
+    /// `Option` — use [`Self::filter_config_and_trust_for_scope`].
+    fn filter_config_and_projection(
+        config: &GatewayConfig,
+        namespace: &str,
+        scope: &CpScope,
+    ) -> (
+        GatewayConfig,
+        crate::config::gateway_trust::NamespaceTrustProjection,
+    ) {
+        let projection = Self::resolve_namespace_trust_projection(config, namespace, scope);
         let mut filtered = Self::filter_config_to_namespace(config, namespace);
         if scope.requires_namespace_claim_by_default() {
             Self::clear_unpartitioned_trust_material(&mut filtered);
         }
-        // Publish the subscriber's own namespace-keyed record (issue #3727).
-        // Runs for every scope: a single-namespace CP with a database record
-        // must distribute it too, and the multi-namespace clear above has
-        // already removed anything that was not partitioned.
-        Self::project_namespace_trust_material(&mut filtered, namespace);
-        filtered
+        Self::apply_trust_projection(&mut filtered, &projection);
+        (filtered, projection)
     }
 
     fn mesh_visible_namespaces(
@@ -1490,8 +1564,9 @@ impl CpGrpcServer {
         let Some(tx) = broadcasts.try_sender_for(namespace) else {
             return;
         };
-        let filtered = Self::filter_config_to_namespace_for_scope(config, namespace, scope);
-        Self::broadcast_update(&tx, &filtered);
+        let (filtered, trust_json) =
+            Self::filter_config_and_trust_for_scope(config, namespace, scope);
+        Self::broadcast_update_with_trust_json(&tx, &filtered, trust_json);
         registry.touch_namespace(namespace);
     }
 
@@ -1561,13 +1636,6 @@ impl CpGrpcServer {
 
     /// Broadcast a full config snapshot to all connected DPs.
     pub fn broadcast_update(tx: &broadcast::Sender<ConfigUpdate>, config: &GatewayConfig) {
-        let config_json = match Self::config_json_for_dp(config) {
-            Ok(json) => json,
-            Err(e) => {
-                error!("Refusing to publish configuration to data planes: {}", e);
-                return;
-            }
-        };
         let trust_bundles_json = match Self::trust_bundles_json(config.trust_bundles.as_deref()) {
             Ok(json) => json,
             Err(e) => {
@@ -1575,6 +1643,29 @@ impl CpGrpcServer {
                     "Failed to serialize gateway trust bundles for broadcast; skipping update: {}",
                     e
                 );
+                return;
+            }
+        };
+        Self::broadcast_update_with_trust_json(tx, config, trust_bundles_json);
+    }
+
+    /// Broadcast a full config snapshot with an already-resolved trust side
+    /// channel.
+    ///
+    /// The side channel is passed in rather than re-derived from
+    /// `config.trust_bundles`, because the `Option` in that slot cannot express
+    /// the ambiguous-authority refusal: an empty string means "say nothing, keep
+    /// the trust you already applied", which is distinct from the `"null"` an
+    /// absent slot would otherwise produce (issue #3727).
+    pub(crate) fn broadcast_update_with_trust_json(
+        tx: &broadcast::Sender<ConfigUpdate>,
+        config: &GatewayConfig,
+        trust_bundles_json: String,
+    ) {
+        let config_json = match Self::config_json_for_dp(config) {
+            Ok(json) => json,
+            Err(e) => {
+                error!("Refusing to publish configuration to data planes: {}", e);
                 return;
             }
         };
@@ -1949,20 +2040,12 @@ impl ConfigSync for CpGrpcServer {
         // Send initial full config — filtered to the DP's namespace so the
         // initial snapshot matches the per-namespace broadcast stream.
         let config = self.config.load_full();
-        let filtered =
-            Self::filter_config_to_namespace_for_scope(config.as_ref(), &dp_namespace, &self.scope);
+        let (filtered, trust_bundles_json) =
+            Self::filter_config_and_trust_for_scope(config.as_ref(), &dp_namespace, &self.scope);
         let config_json = Self::config_json_for_dp(&filtered).map_err(|e| {
             error!("Refusing to publish configuration in subscribe: {}", e);
             Status::internal("Failed to serialize configuration")
         })?;
-        let trust_bundles_json = Self::trust_bundles_json(filtered.trust_bundles.as_deref())
-            .map_err(|e| {
-                error!(
-                    "Failed to serialize gateway trust bundles in subscribe: {}",
-                    e
-                );
-                Status::internal("Failed to serialize gateway trust bundles")
-            })?;
         let initial = ConfigUpdate {
             update_type: 0, // FULL_SNAPSHOT
             config_json,
@@ -1992,25 +2075,13 @@ impl ConfigSync for CpGrpcServer {
                 // from missed deltas without re-leaking other namespaces'
                 // config.
                 let current = config_for_recovery.load_full();
-                let filtered = Self::filter_config_to_namespace_for_scope(
+                let (filtered, trust_bundles_json) = Self::filter_config_and_trust_for_scope(
                     current.as_ref(),
                     &recovery_namespace,
                     &recovery_scope,
                 );
                 match Self::config_json_for_dp(&filtered) {
                     Ok(config_json) => {
-                        let trust_bundles_json = match Self::trust_bundles_json(
-                            filtered.trust_bundles.as_deref(),
-                        ) {
-                            Ok(json) => json,
-                            Err(e) => {
-                                error!(
-                                    "Failed to serialize gateway trust bundles for recovery snapshot: {}",
-                                    e
-                                );
-                                return None;
-                            }
-                        };
                         Some(Ok(ConfigUpdate {
                             update_type: 0, // FULL_SNAPSHOT
                             config_json,
@@ -2124,11 +2195,8 @@ impl ConfigSync for CpGrpcServer {
         );
 
         let config = self.config.load_full();
-        let filtered = Self::filter_config_to_namespace_for_scope(
-            config.as_ref(),
-            &req.namespace,
-            &self.scope,
-        );
+        let (filtered, trust_bundles_json) =
+            Self::filter_config_and_trust_for_scope(config.as_ref(), &req.namespace, &self.scope);
         let config_json = Self::config_json_for_dp(&filtered).map_err(|e| {
             error!(
                 "Refusing to publish configuration in get_full_config: {}",
@@ -2136,14 +2204,6 @@ impl ConfigSync for CpGrpcServer {
             );
             Status::internal("Failed to serialize configuration")
         })?;
-        let trust_bundles_json = Self::trust_bundles_json(filtered.trust_bundles.as_deref())
-            .map_err(|e| {
-                error!(
-                    "Failed to serialize gateway trust bundles in get_full_config: {}",
-                    e
-                );
-                Status::internal("Failed to serialize gateway trust bundles")
-            })?;
 
         Ok(Response::new(FullConfigResponse {
             config_json,

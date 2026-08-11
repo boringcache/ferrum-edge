@@ -222,8 +222,7 @@ async fn a_stale_revision_loses_the_race_without_overwriting() {
         .expect("read")
         .expect("exists");
     assert_eq!(
-        stored.bundle.local.x509_authorities,
-        writer_a.bundle.local.x509_authorities,
+        stored.bundle.local.x509_authorities, writer_a.bundle.local.x509_authorities,
         "the lost race must not overwrite the winner's roots"
     );
 }
@@ -314,10 +313,12 @@ async fn every_trust_mutation_escalates_the_incremental_poll_to_a_full_reload() 
         .await
         .expect("create");
 
-    let error = store
-        .load_incremental_config("ferrum", start)
-        .await
-        .expect_err("a trust change must escalate");
+    // `IncrementalResult` is not `Debug`, so the success arm is unwrapped by
+    // hand rather than through `expect_err`.
+    let error = match store.load_incremental_config("ferrum", start).await {
+        Ok(_) => panic!("a trust change must escalate to a full reload"),
+        Err(error) => error,
+    };
     assert!(
         is_incremental_full_reload_required(&error),
         "the escalation must be the typed full-reload marker, not a generic failure"
@@ -343,10 +344,10 @@ async fn every_trust_mutation_escalates_the_incremental_poll_to_a_full_reload() 
         .delete_gateway_trust_bundle("ferrum", &created.id)
         .await
         .expect("delete");
-    let revocation_error = store
-        .load_incremental_config("ferrum", after_create)
-        .await
-        .expect_err("a revocation must escalate too");
+    let revocation_error = match store.load_incremental_config("ferrum", after_create).await {
+        Ok(_) => panic!("a revocation must escalate to a full reload too"),
+        Err(error) => error,
+    };
     assert!(is_incremental_full_reload_required(&revocation_error));
 }
 
@@ -501,9 +502,15 @@ async fn a_single_namespace_control_plane_still_publishes_its_database_record() 
     assert_eq!(projected.local.trust_domain.as_str(), "cluster.local");
 }
 
+/// Two authorities are a REFUSAL, not a revocation: subscribers keep the last
+/// generation they accepted while the misconfiguration is surfaced.
 #[tokio::test(flavor = "multi_thread")]
-async fn two_simultaneous_authorities_withdraw_trust_rather_than_ranking_them() {
-    let ferrum = record("ferrum", "cluster.local", vec![root_ca_der_base64("db-root")]);
+async fn two_simultaneous_authorities_keep_previously_accepted_trust() {
+    let ferrum = record(
+        "ferrum",
+        "cluster.local",
+        vec![root_ca_der_base64("db-root")],
+    );
     let mut config = config_with_records(vec![ferrum]);
     config.trust_bundles = Some(Box::new(TrustBundleSet {
         local: TrustBundle {
@@ -515,13 +522,297 @@ async fn two_simultaneous_authorities_withdraw_trust_rather_than_ranking_them() 
         federated: Vec::new(),
     }));
 
-    let filtered = CpGrpcServer::filter_config_to_namespace_for_scope(
+    let (filtered, side_channel) = CpGrpcServer::filter_config_and_trust_for_scope(
         &config,
         "ferrum",
         &CpScope::Single("ferrum".to_string()),
     );
     assert!(
         filtered.trust_bundles.is_none(),
-        "an ambiguous deployment must fail closed identically on every replica"
+        "an ambiguous deployment must not publish either authority's material"
+    );
+    assert_eq!(
+        side_channel, "",
+        "ambiguity must say NOTHING on the wire so the subscriber keeps its last accepted trust; \
+         encoding it as `null` would revoke a working generation over a leftover file value"
+    );
+
+    // The ambiguity must be detected from the authorities as they exist BEFORE
+    // namespace partitioning clears the unpartitioned slot. On a claim-requiring
+    // scope the clear runs first, so a projection that classified afterwards
+    // would see "database only" and publish.
+    let scope = CpScope::Set(["ferrum".to_string()].into_iter().collect());
+    let (multi_ns_filtered, multi_ns_side_channel) =
+        CpGrpcServer::filter_config_and_trust_for_scope(&config, "ferrum", &scope);
+    assert!(multi_ns_filtered.trust_bundles.is_none());
+    assert_eq!(
+        multi_ns_side_channel, "",
+        "the pre-clear classification must survive the multi-namespace clear"
+    );
+}
+
+// ── Simultaneous writers ────────────────────────────────────────────────────
+
+/// Two writers that raced from the SAME read must not both win.
+///
+/// The sequential stale-write test above only proves the store rejects a
+/// revision it can see is old. This one actually issues both updates
+/// concurrently, which is the case a read-then-write guard cannot survive under
+/// ordinary READ COMMITTED isolation: both transactions read revision N and both
+/// would write N+1, silently destroying the first rotation. The compare-and-set
+/// lives in the `UPDATE` predicate, so the database serializes them.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_simultaneous_writers_cannot_both_commit_a_rotation() {
+    let (store, _temp_dir) = sqlite_store().await;
+    let created = record("ferrum", "cluster.local", vec![root_ca_der_base64("root")]);
+    store
+        .create_gateway_trust_bundle(&created)
+        .await
+        .expect("create must succeed");
+
+    let read_by_both = store
+        .get_namespace_gateway_trust_bundle("ferrum")
+        .await
+        .expect("read")
+        .expect("exists");
+
+    let store = std::sync::Arc::new(store);
+    let mut writer_a = read_by_both.clone();
+    writer_a.bundle.local.x509_authorities = vec![root_ca_der_base64("writer-a")];
+    let mut writer_b = read_by_both.clone();
+    writer_b.bundle.local.x509_authorities = vec![root_ca_der_base64("writer-b")];
+
+    let expected = read_by_both.revision;
+    let store_a = std::sync::Arc::clone(&store);
+    let store_b = std::sync::Arc::clone(&store);
+    let (result_a, result_b) = tokio::join!(
+        async move {
+            store_a
+                .update_gateway_trust_bundle(&writer_a, Some(expected))
+                .await
+        },
+        async move {
+            store_b
+                .update_gateway_trust_bundle(&writer_b, Some(expected))
+                .await
+        }
+    );
+
+    let winners = [&result_a, &result_b]
+        .iter()
+        .filter(|result| matches!(result, Ok(true)))
+        .count();
+    assert_eq!(
+        winners, 1,
+        "exactly one simultaneous rotation may commit; got a={result_a:?} b={result_b:?}"
+    );
+
+    // The loser must fail, never silently no-op. When the store observed the
+    // winner's commit it reports the typed conflict admin surfaces render as a
+    // 409; a backend that instead refuses the interleaving outright (SQLite can
+    // return a snapshot-busy error rather than letting the second transaction
+    // upgrade) is equally safe, and both are asserted as "did not commit".
+    let loser = [result_a, result_b]
+        .into_iter()
+        .find(|result| !matches!(result, Ok(true)))
+        .expect("one writer must have lost");
+    let error = loser.expect_err("the losing writer must report an error, not Ok(false)");
+    if let Some(conflict) = gateway_trust_bundle_revision_conflict(&error) {
+        assert_eq!(conflict.expected, expected);
+        assert_eq!(
+            conflict.current,
+            expected + 1,
+            "the conflict must report the revision the winner committed"
+        );
+    }
+
+    // Exactly one bump, and the stored material belongs to the winner.
+    let stored = store
+        .get_namespace_gateway_trust_bundle("ferrum")
+        .await
+        .expect("read")
+        .expect("exists");
+    assert_eq!(
+        stored.revision,
+        expected + 1,
+        "two writers must not both advance the revision from the same read"
+    );
+    assert_ne!(
+        stored.bundle.local.x509_authorities, created.bundle.local.x509_authorities,
+        "the committed rotation must be one of the two writers', not the pre-race material"
+    );
+}
+
+/// A restore/import write states no expectation, but must still compare against
+/// the revision it read inside its own transaction rather than blind-writing.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unexpecting_writer_still_compares_and_sets() {
+    let (store, _temp_dir) = sqlite_store().await;
+    let created = record("ferrum", "cluster.local", vec![root_ca_der_base64("root")]);
+    store
+        .create_gateway_trust_bundle(&created)
+        .await
+        .expect("create must succeed");
+
+    let read_by_both = store
+        .get_namespace_gateway_trust_bundle("ferrum")
+        .await
+        .expect("read")
+        .expect("exists");
+
+    let store = std::sync::Arc::new(store);
+    let mut writer_a = read_by_both.clone();
+    writer_a.bundle.local.x509_authorities = vec![root_ca_der_base64("writer-a")];
+    let mut writer_b = read_by_both.clone();
+    writer_b.bundle.local.x509_authorities = vec![root_ca_der_base64("writer-b")];
+
+    let store_a = std::sync::Arc::clone(&store);
+    let store_b = std::sync::Arc::clone(&store);
+    let (result_a, result_b) = tokio::join!(
+        async move { store_a.update_gateway_trust_bundle(&writer_a, None).await },
+        async move { store_b.update_gateway_trust_bundle(&writer_b, None).await }
+    );
+
+    let committed = [&result_a, &result_b]
+        .iter()
+        .filter(|result| matches!(result, Ok(true)))
+        .count();
+    assert!(
+        committed >= 1,
+        "at least one unexpecting writer must commit; got a={result_a:?} b={result_b:?}"
+    );
+
+    // Whatever the interleaving, the revision advanced exactly once per
+    // committed write — never two writes onto the same revision.
+    let stored = store
+        .get_namespace_gateway_trust_bundle("ferrum")
+        .await
+        .expect("read")
+        .expect("exists");
+    assert_eq!(
+        stored.revision,
+        read_by_both.revision + committed as u64,
+        "each committed write must advance the revision exactly once"
+    );
+}
+
+// ── Fail-closed stored-row decoding ─────────────────────────────────────────
+
+/// Security metadata must fail closed. A revision that is not a positive
+/// integer means the row is not the monotonic record the concurrency contract
+/// assumes; silently substituting `1` would let a corrupt row win a
+/// compare-and-set.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_row_with_an_out_of_range_revision_is_refused_rather_than_defaulted() {
+    let (store, _temp_dir) = sqlite_store().await;
+    store
+        .create_gateway_trust_bundle(&record(
+            "ferrum",
+            "cluster.local",
+            vec![root_ca_der_base64("root")],
+        ))
+        .await
+        .expect("create");
+
+    sqlx::query("UPDATE gateway_trust_bundles SET revision = ? WHERE namespace = ?")
+        .bind(-1_i64)
+        .bind("ferrum")
+        .execute(&store.pool())
+        .await
+        .expect("out-of-band corruption applies");
+
+    store
+        .get_namespace_gateway_trust_bundle("ferrum")
+        .await
+        .expect_err("a non-positive revision must refuse the row");
+}
+
+/// An unparseable timestamp is corrupt security metadata too: inventing
+/// `Utc::now()` would make a corrupted row look like a fresh rotation on every
+/// single load.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_row_with_an_unparseable_timestamp_is_refused_rather_than_defaulted() {
+    let (store, _temp_dir) = sqlite_store().await;
+    store
+        .create_gateway_trust_bundle(&record(
+            "ferrum",
+            "cluster.local",
+            vec![root_ca_der_base64("root")],
+        ))
+        .await
+        .expect("create");
+
+    sqlx::query("UPDATE gateway_trust_bundles SET updated_at = ? WHERE namespace = ?")
+        .bind("not-a-timestamp")
+        .bind("ferrum")
+        .execute(&store.pool())
+        .await
+        .expect("out-of-band corruption applies");
+
+    let error = store
+        .get_namespace_gateway_trust_bundle("ferrum")
+        .await
+        .expect_err("an unparseable timestamp must refuse the row");
+    let rendered = format!("{error:#}");
+    assert!(
+        !rendered.contains("not-a-timestamp"),
+        "a rejection must not echo the stored value: {rendered}"
+    );
+}
+
+// ── Side-channel encoding across scopes ─────────────────────────────────────
+
+/// `Replace` for the subscriber's own record, `null` for a namespace with
+/// nothing — across every scope shape.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_scope_publishes_replace_for_a_record_and_clear_for_none() {
+    let tenant_a = record("tenant-a", "a.local", vec![root_ca_der_base64("a-root")]);
+    let config = config_with_records(vec![tenant_a]);
+
+    let scopes = [
+        CpScope::Single("tenant-a".to_string()),
+        CpScope::Set(
+            ["tenant-a".to_string(), "tenant-b".to_string()]
+                .into_iter()
+                .collect(),
+        ),
+        CpScope::All,
+    ];
+
+    for scope in &scopes {
+        let (_, side_channel) =
+            CpGrpcServer::filter_config_and_trust_for_scope(&config, "tenant-a", scope);
+        assert!(
+            side_channel.contains("a.local"),
+            "a namespace with a record must receive it on {scope:?}"
+        );
+
+        let (other, other_side_channel) =
+            CpGrpcServer::filter_config_and_trust_for_scope(&config, "tenant-b", scope);
+        assert_eq!(
+            other_side_channel, "null",
+            "a namespace with no record must be told so explicitly on {scope:?}"
+        );
+        assert!(
+            !other_side_channel.contains("a.local"),
+            "tenant-b must never observe tenant-a's material"
+        );
+        assert!(other.gateway_trust_bundles.is_empty());
+    }
+}
+
+/// An ordinary resource delta says NOTHING about trust. Before issue #3727 it
+/// encoded `null`, which the data plane reads as an explicit revocation, so
+/// every unrelated configuration change silently revoked trust.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_ordinary_resource_delta_leaves_applied_trust_untouched() {
+    use ferrum_edge::config::gateway_trust::GatewayTrustPublication;
+
+    assert_eq!(
+        GatewayTrustPublication::Unchanged
+            .to_side_channel_json()
+            .expect("unchanged encodes"),
+        "",
+        "an unrelated delta must encode as an EMPTY side channel"
     );
 }

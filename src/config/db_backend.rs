@@ -692,8 +692,7 @@ pub fn proxy_delete_atomicity_unsupported(
 
 /// Operator-facing message for a lost optimistic-concurrency race on a gateway
 /// trust-bundle write (issue #3727).
-pub const GATEWAY_TRUST_BUNDLE_REVISION_CONFLICT_MESSAGE: &str =
-    "gateway trust bundle was modified concurrently; re-read the resource and retry with the \
+pub const GATEWAY_TRUST_BUNDLE_REVISION_CONFLICT_MESSAGE: &str = "gateway trust bundle was modified concurrently; re-read the resource and retry with the \
      current revision";
 
 /// Typed optimistic-concurrency refusal for a gateway trust-bundle update.
@@ -1340,6 +1339,9 @@ impl IncrementalFullReloadRequired {
         }
     }
 
+    /// Read by external integration tests (which link the lib target); the bin
+    /// target never inspects the reason, so it is dead code there.
+    #[allow(dead_code)]
     pub fn reason(&self) -> IncrementalFullReloadReason {
         self.reason
     }

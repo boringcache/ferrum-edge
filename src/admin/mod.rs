@@ -1776,8 +1776,16 @@ fn extract_namespace(headers: &hyper::HeaderMap) -> Result<String, Response<Full
 fn is_namespace_scoped_route(segments: &[&str]) -> bool {
     match segments.first().copied() {
         Some(
-            "proxies" | "consumers" | "upstreams" | "api-specs" | "batch" | "backup" | "restore"
-            | "audit" | "gateway-trust-bundles" | "gateway-trust",
+            "proxies"
+            | "consumers"
+            | "upstreams"
+            | "api-specs"
+            | "batch"
+            | "backup"
+            | "restore"
+            | "audit"
+            | "gateway-trust-bundles"
+            | "gateway-trust",
         ) => true,
         // `GET /plugins` lists available plugin *types* (global metadata);
         // `/plugins/config[...]` is the namespace-scoped PluginConfig CRUD.
@@ -4862,7 +4870,7 @@ struct PersistCounts {
     plugin_configs: usize,
     upstreams: usize,
     api_specs: usize,
-    gateway_trust_bundles: u64,
+    gateway_trust_bundles: usize,
 }
 
 const DATABASE_OPERATION_FAILED_MESSAGE: &str = "Database unavailable — operation failed";
@@ -4903,6 +4911,10 @@ pub(crate) fn payload_persist_error_message(error: &anyhow::Error) -> String {
 async fn persist_payload_resources(
     db: &dyn DatabaseBackend,
     payload: &RestorePayload,
+    // The AUTHENTICATED target namespace. Gateway trust bundles are keyed by
+    // namespace and are a singleton, so the target cannot be inferred from the
+    // payload — it is passed explicitly (issue #3727).
+    namespace: &str,
     halt_on_error: bool,
     mode: &BatchConfigWriteMode,
 ) -> (PersistCounts, Vec<String>, bool) {
@@ -5011,76 +5023,111 @@ async fn persist_payload_resources(
     // says nothing about trust" and is a no-op; a PRESENT section is
     // authoritative and reconciles to exactly what it lists, including the
     // empty case, which revokes.
-    if should_continue(&errors) && let Some(records) = payload.gateway_trust_bundles.as_ref() {
-        if let Err(message) = reconcile_restored_gateway_trust_bundles(db, records).await {
-            errors.push(format!("gateway_trust_bundles: {message}"));
-        } else {
-            counts.gateway_trust_bundles = records.len() as u64;
+    if should_continue(&errors)
+        && let Some(records) = payload.gateway_trust_bundles.as_ref()
+    {
+        match reconcile_restored_gateway_trust_bundles(db, namespace, records).await {
+            Ok(persisted) => counts.gateway_trust_bundles = persisted,
+            Err(message) => errors.push(format!("gateway_trust_bundles: {message}")),
         }
     }
 
     (counts, errors, admission_unavailable)
 }
 
-/// Apply the restore payload's trust section to the store.
+/// Refusal when a restore payload carries more than one trust record for the
+/// target namespace. Names no ids and no material.
+pub(crate) const GATEWAY_TRUST_BUNDLE_RESTORE_NOT_SINGLETON_MESSAGE: &str =
+    "restore payload declares more than one gateway trust bundle for the target namespace; the \
+     resource is a namespace singleton";
+
+/// Apply the restore payload's trust section to `namespace`.
+///
+/// Contract (issue #3727):
+///
+/// - the section is namespace-scoped and the target namespace is the
+///   AUTHENTICATED one, passed in — never read from the payload;
+/// - the resource is a singleton, so more than one record is refused outright
+///   rather than silently reduced to whichever came first;
+/// - a PRESENT-but-empty section is an explicit revocation and deletes the
+///   namespace's record;
+/// - an ABSENT section never reaches here at all (the caller skips), so a
+///   backup that predates the resource leaves trust untouched.
 ///
 /// Every record is re-normalized and re-validated through the SAME admission
 /// path an admin `POST` uses, so a hand-edited or hostile backup cannot inject
 /// oversized or malformed trust material by going around the API. Errors are
 /// already redacted by `validate_fields`.
+///
+/// Returns the number of records persisted (0 for a revoke).
 async fn reconcile_restored_gateway_trust_bundles(
     db: &dyn DatabaseBackend,
+    namespace: &str,
     records: &[GatewayTrustBundleRecord],
-) -> Result<(), String> {
-    let mut prepared = Vec::with_capacity(records.len());
-    for record in records {
-        let mut record = record.clone();
-        record.normalize_fields();
-        record.validate_fields().map_err(|e| e.join("; "))?;
-        prepared.push(record);
+) -> Result<usize, String> {
+    if records.len() > 1 {
+        return Err(GATEWAY_TRUST_BUNDLE_RESTORE_NOT_SINGLETON_MESSAGE.to_string());
     }
 
-    let namespaces: std::collections::BTreeSet<String> = prepared
-        .iter()
-        .map(|record| record.namespace.clone())
-        .collect();
+    let desired = match records.first() {
+        Some(record) => {
+            let mut record = record.clone();
+            // The target namespace is server-selected; a payload namespace is
+            // never authoritative and never even consulted.
+            record.namespace = namespace.to_string();
+            record.normalize_fields();
+            record.validate_fields().map_err(|e| e.join("; "))?;
+            Some(record)
+        }
+        None => None,
+    };
 
-    for namespace in namespaces {
-        let existing = db
-            .get_namespace_gateway_trust_bundle(&namespace)
-            .await
-            .map_err(|error| redacted_persistence_error_message("restore", &error).to_string())?;
-        let desired = prepared.iter().find(|r| r.namespace == namespace);
-        match (existing, desired) {
-            (Some(existing), Some(desired)) => {
-                let mut desired = desired.clone();
-                desired.id = existing.id.clone();
-                desired.created_at = existing.created_at;
-                // Restore runs under the namespace admission lease, so it does
-                // not compete with a concurrent admin write and passes no
-                // revision expectation.
-                db.update_gateway_trust_bundle(&desired, None)
-                    .await
-                    .map_err(|error| {
-                        redacted_persistence_error_message("restore", &error).to_string()
-                    })?;
-            }
-            (Some(existing), None) => {
-                db.delete_gateway_trust_bundle(&namespace, &existing.id)
-                    .await
-                    .map_err(|error| {
-                        redacted_persistence_error_message("restore", &error).to_string()
-                    })?;
-            }
-            (None, Some(desired)) => {
-                db.create_gateway_trust_bundle(desired).await.map_err(|error| {
+    let existing = db
+        .get_namespace_gateway_trust_bundle(namespace)
+        .await
+        .map_err(|error| redacted_persistence_error_message("restore", &error).to_string())?;
+
+    match (existing, desired) {
+        (Some(existing), Some(mut desired)) => {
+            // Server-owned fields survive the payload: the record keeps its
+            // stored identity and creation time, and `revision` is assigned by
+            // the store rather than adopted from a file an operator could edit.
+            desired.id = existing.id.clone();
+            desired.created_at = existing.created_at;
+            desired.updated_at = Utc::now();
+            // Restore runs under the namespace admission lease, so it does not
+            // compete with a concurrent admin write and states no revision
+            // expectation; the store still compare-and-sets against the
+            // revision it reads inside the write transaction.
+            db.update_gateway_trust_bundle(&desired, None)
+                .await
+                .map_err(|error| {
                     redacted_persistence_error_message("restore", &error).to_string()
                 })?;
-            }
-            (None, None) => {}
+            Ok(1)
         }
+        (Some(existing), None) => {
+            // Present-but-empty section: an explicit revocation.
+            db.delete_gateway_trust_bundle(namespace, &existing.id)
+                .await
+                .map_err(|error| {
+                    redacted_persistence_error_message("restore", &error).to_string()
+                })?;
+            Ok(0)
+        }
+        (None, Some(mut desired)) => {
+            desired.revision = 1;
+            desired.created_at = Utc::now();
+            desired.updated_at = desired.created_at;
+            db.create_gateway_trust_bundle(&desired)
+                .await
+                .map_err(|error| {
+                    redacted_persistence_error_message("restore", &error).to_string()
+                })?;
+            Ok(1)
+        }
+        (None, None) => Ok(0),
     }
-    Ok(())
 }
 
 /// Refuse `POST /batch` on a deployment that cannot persist a whole graph
@@ -5167,7 +5214,8 @@ async fn rollback_failed_restore(
         ));
     } else {
         let payload = snapshot.restore_payload_with_api_specs();
-        let (_, persist_errors, _) = persist_payload_resources(db, &payload, false, &mode).await;
+        let (_, persist_errors, _) =
+            persist_payload_resources(db, &payload, namespace, false, &mode).await;
         errors.extend(persist_errors);
     }
     if errors.is_empty() {
@@ -5357,7 +5405,7 @@ async fn restore_snapshot_after_intervening_clear(
     let mode = BatchConfigWriteMode::RestoreRollbackReplay {
         guard_owner: guard_owner.to_string(),
     };
-    let (_, mut errors, _) = persist_payload_resources(db, &missing, false, &mode).await;
+    let (_, mut errors, _) = persist_payload_resources(db, &missing, namespace, false, &mode).await;
     // Report an incomplete recovery rather than a silent success: the operator
     // must reconcile these by hand. Counts only — no resource ids, which may be
     // attacker-influenced payload values.
@@ -6286,15 +6334,28 @@ async fn handle_gateway_trust_status(
     // Namespace-predicated at the query level: this cannot observe another
     // tenant's record even to report its absence.
     match db.get_namespace_gateway_trust_bundle(namespace).await {
-        Ok(record) => Ok(json_response(
-            StatusCode::OK,
-            &json!({
-                "namespace": namespace,
-                "configured": record.is_some(),
-                "bundle": record.as_ref().map(|record| record.summary()),
-                "process": process,
-            }),
-        )),
+        Ok(record) => {
+            // `generation` is the namespace-safe configuration identity for
+            // trust: a digest over (namespace, id, trust domain, revision,
+            // canonical material). Two control-plane replicas that
+            // reconstructed the same committed state report the same value, and
+            // any rotation or revocation changes it. It is a digest, so it
+            // carries no material. There is deliberately no process-wide
+            // "published revision" here — revisions are per namespace.
+            let generation = crate::config::gateway_trust::trust_generation_fingerprint(
+                record.as_ref().map(std::slice::from_ref).unwrap_or_default(),
+            );
+            Ok(json_response(
+                StatusCode::OK,
+                &json!({
+                    "namespace": namespace,
+                    "configured": record.is_some(),
+                    "generation": generation,
+                    "bundle": record.as_ref().map(|record| record.summary()),
+                    "process": process,
+                }),
+            ))
+        }
         Err(error) => Ok(json_response(
             StatusCode::SERVICE_UNAVAILABLE,
             &db_error_response(&error),
@@ -8006,8 +8067,18 @@ async fn handle_restore(
     // (issue #3727).
     if let Some(records) = payload.gateway_trust_bundles.as_mut() {
         let mut trust_errors = Vec::new();
+        // The resource is a namespace singleton. Forcing several records into
+        // one namespace and letting the reconciler take whichever came first
+        // would make the restored trust state depend on payload order, so more
+        // than one is refused before anything is deleted.
+        if records.len() > 1 {
+            trust_errors.push(GATEWAY_TRUST_BUNDLE_RESTORE_NOT_SINGLETON_MESSAGE.to_string());
+        }
         for record in records.iter_mut() {
             record.namespace = namespace.to_string();
+            // Attribution is server-owned: the restoring admin subject, never
+            // whatever the backup file claimed.
+            record.updated_by = Some(actor.sub.clone());
             record.normalize_fields();
             if let Err(errors) = record.validate_fields() {
                 trust_errors.extend(errors);
@@ -8452,6 +8523,7 @@ async fn handle_restore(
         .run_to_completion_while_held(import_operation.run_mutation(persist_payload_resources(
             db.as_ref(),
             &payload,
+            namespace,
             false,
             &restore_mode,
         )))

@@ -15,9 +15,10 @@
 use ferrum_edge::config::gateway_trust::{
     AMBIGUOUS_TRUST_AUTHORITY_MESSAGE, GatewayTrustBundleRecord, GatewayTrustFailureReason,
     GatewayTrustPublication, MAX_FEDERATED_BUNDLES, MAX_JWT_AUTHORITIES_PER_BUNDLE,
-    MAX_TRUST_BUNDLE_JSON_BYTES, MAX_X509_AUTHORITIES_PER_BUNDLE, TrustAuthorityResolution,
-    observability_snapshot, record_ambiguous_authority, record_trust_load_rejection,
-    record_trust_load_success, reset_observability_for_tests, resolve_trust_authority,
+    MAX_TRUST_BUNDLE_JSON_BYTES, MAX_X509_AUTHORITIES_PER_BUNDLE, NamespaceTrustProjection,
+    TrustAuthorityResolution, observability_snapshot, project_namespace_trust,
+    record_ambiguous_authority, record_trust_generation_published, record_trust_load_rejection,
+    reset_observability_for_tests, resolve_trust_authority, trust_generation_fingerprint,
 };
 use ferrum_edge::identity::TrustDomain;
 use ferrum_edge::modes::mesh::config::{JwtAuthority, TrustBundle, TrustBundleSet};
@@ -30,14 +31,23 @@ use base64::Engine;
 fn root_ca_der_base64(common_name: &str) -> String {
     let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
         .expect("test CA key generates");
-    let mut params = rcgen::CertificateParams::new(Vec::<String>::new())
-        .expect("test CA params build");
+    let mut params =
+        rcgen::CertificateParams::new(Vec::<String>::new()).expect("test CA params build");
     params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     params
         .distinguished_name
         .push(rcgen::DnType::CommonName, common_name);
     let cert = params.self_signed(&key).expect("test CA self-signs");
     base64::engine::general_purpose::STANDARD.encode(cert.der())
+}
+
+/// A real SPKI `PUBLIC KEY` PEM. Admission now proves the key is one the
+/// JWT-SVID stack can actually verify with, so a placeholder body would be
+/// rejected for the wrong reason.
+fn usable_public_key_pem() -> String {
+    rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
+        .expect("test key generates")
+        .public_key_pem()
 }
 
 fn trust_domain(value: &str) -> TrustDomain {
@@ -141,7 +151,9 @@ fn too_many_x509_authorities_are_rejected() {
         .validate_fields()
         .expect_err("an unbounded authority list must be rejected");
     assert!(
-        errors.iter().any(|error| error.contains("x509 authorities")),
+        errors
+            .iter()
+            .any(|error| error.contains("x509 authorities")),
         "expected an authority-count error, got {errors:?}"
     );
 }
@@ -201,14 +213,14 @@ fn a_private_key_pasted_into_a_jwt_authority_is_rejected() {
     assert!(
         errors
             .iter()
-            .any(|error| error.contains("not a PEM public key block")),
-        "expected a PEM shape error, got {errors:?}"
+            .any(|error| error.contains("not a usable PEM public key")),
+        "expected a public-key admission error, got {errors:?}"
     );
 }
 
 #[test]
 fn duplicate_jwt_key_ids_within_one_bundle_are_rejected() {
-    let pem = "-----BEGIN PUBLIC KEY-----\nAAAA\n-----END PUBLIC KEY-----".to_string();
+    let pem = usable_public_key_pem();
     let mut record = valid_record();
     record.bundle.local.jwt_authorities = vec![
         JwtAuthority {
@@ -234,11 +246,11 @@ fn duplicate_jwt_key_ids_within_one_bundle_are_rejected() {
 #[test]
 fn too_many_jwt_authorities_are_rejected() {
     let mut record = valid_record();
+    let pem = usable_public_key_pem();
     record.bundle.local.jwt_authorities = (0..=MAX_JWT_AUTHORITIES_PER_BUNDLE)
         .map(|index| JwtAuthority {
             key_id: format!("key-{index}"),
-            public_key_pem: "-----BEGIN PUBLIC KEY-----\nAAAA\n-----END PUBLIC KEY-----"
-                .to_string(),
+            public_key_pem: pem.clone(),
         })
         .collect();
     let errors = record
@@ -341,9 +353,7 @@ fn a_snapshot_always_states_the_complete_current_state() {
     let clear = GatewayTrustPublication::for_snapshot(None);
     assert_eq!(clear, GatewayTrustPublication::Clear);
     assert_eq!(
-        clear
-            .to_side_channel_json()
-            .expect("clear serializes"),
+        clear.to_side_channel_json().expect("clear serializes"),
         "null"
     );
 }
@@ -464,27 +474,39 @@ fn observability_counters_are_bounded_and_material_free() {
     reset_observability_for_tests();
 
     let baseline = observability_snapshot();
-    assert_eq!(baseline.loads_total, 0);
-    assert_eq!(baseline.published_revision, 0);
+    assert_eq!(baseline.published_generations_total, 0);
+    assert_eq!(baseline.last_published_unix_seconds, 0);
     assert_eq!(baseline.last_failure_reason, "none");
 
-    record_trust_load_success(7, 1_700_000_000);
-    let after_success = observability_snapshot();
-    assert_eq!(after_success.loads_total, 1);
-    assert_eq!(after_success.published_revision, 7);
-    assert_eq!(after_success.last_successful_load_unix_seconds, 1_700_000_000);
-    assert_eq!(after_success.last_failure_reason, "none");
+    // A publication that carries no database trust record is not a trust
+    // generation and must not move the counters.
+    record_trust_generation_published(&[], 1_700_000_000);
+    assert_eq!(observability_snapshot().published_generations_total, 0);
 
-    // A rejected candidate must NOT advance the published revision: the
-    // previous valid generation is still the one serving.
+    record_trust_generation_published(std::slice::from_ref(&valid_record()), 1_700_000_000);
+    let after_publish = observability_snapshot();
+    assert_eq!(after_publish.published_generations_total, 1);
+    assert_eq!(after_publish.last_published_unix_seconds, 1_700_000_000);
+    assert_eq!(after_publish.last_failure_reason, "none");
+
+    // A rejected candidate must NOT look like a publication: the previous valid
+    // generation is still the one serving.
     record_trust_load_rejection(GatewayTrustFailureReason::InvalidMaterial);
     let after_rejection = observability_snapshot();
     assert_eq!(after_rejection.load_rejections_total, 1);
     assert_eq!(
-        after_rejection.published_revision, 7,
-        "a refused candidate must not replace the live generation's revision"
+        after_rejection.published_generations_total, 1,
+        "a refused candidate must not count as a published generation"
+    );
+    assert_eq!(
+        after_rejection.last_published_unix_seconds, 1_700_000_000,
+        "a refused candidate must not advance the last-published timestamp"
     );
     assert_eq!(after_rejection.last_failure_reason, "invalid_material");
+
+    // An undecodable stored row is its own bounded reason.
+    record_trust_load_rejection(GatewayTrustFailureReason::Undecodable);
+    assert_eq!(observability_snapshot().last_failure_reason, "undecodable");
 
     record_ambiguous_authority();
     let after_ambiguous = observability_snapshot();
@@ -493,8 +515,10 @@ fn observability_counters_are_bounded_and_material_free() {
 
     // The whole snapshot is a fixed set of integers plus a bounded enum, so it
     // cannot carry a trust domain, a namespace, or an unbounded identifier.
+    // There is deliberately no process-wide revision field: revisions are per
+    // namespace and a last-writer-wins process atomic would be misleading.
     let rendered = serde_json::to_string(&after_ambiguous).expect("snapshot serializes");
-    for forbidden in ["cluster.local", "production", "BEGIN"] {
+    for forbidden in ["cluster.local", "production", "BEGIN", "revision"] {
         assert!(
             !rendered.contains(forbidden),
             "process metrics must not carry {forbidden}"
@@ -502,6 +526,52 @@ fn observability_counters_are_bounded_and_material_free() {
     }
 
     reset_observability_for_tests();
+}
+
+// ── Configuration identity ──────────────────────────────────────────────────
+
+#[test]
+fn the_generation_fingerprint_is_stable_and_changes_with_every_rotation() {
+    let record = valid_record();
+    let baseline = trust_generation_fingerprint(std::slice::from_ref(&record));
+
+    // Reconstructing the same committed state (a restarted replica) reproduces
+    // the same identity.
+    assert_eq!(
+        baseline,
+        trust_generation_fingerprint(std::slice::from_ref(&record.clone())),
+        "two replicas holding the same committed state must agree on the generation"
+    );
+
+    // A revision bump alone changes the identity, so a configuration checksum
+    // built on it cannot report "unchanged" across a rotation.
+    let mut rotated = record.clone();
+    rotated.revision += 1;
+    assert_ne!(baseline, trust_generation_fingerprint(std::slice::from_ref(&rotated)));
+
+    // So does new material.
+    let mut rematerialized = record.clone();
+    rematerialized
+        .bundle
+        .local
+        .x509_authorities
+        .push(root_ca_der_base64("rotated-root"));
+    assert_ne!(
+        baseline,
+        trust_generation_fingerprint(std::slice::from_ref(&rematerialized))
+    );
+
+    // Revocation is distinguishable from "no record at all was ever there"
+    // only by context, but both hash to the empty generation deterministically.
+    assert_eq!(
+        trust_generation_fingerprint(&[]),
+        trust_generation_fingerprint(&[])
+    );
+    assert_ne!(baseline, trust_generation_fingerprint(&[]));
+
+    // A digest carries no material.
+    assert!(!baseline.contains("BEGIN"));
+    assert!(!baseline.contains("cluster.local"));
 }
 
 // ── Serde contract ──────────────────────────────────────────────────────────
@@ -542,5 +612,146 @@ fn revision_defaults_to_zero_meaning_no_concurrency_expectation() {
     assert_eq!(
         decoded.revision, 0,
         "an omitted revision must mean 'no expectation', not revision 1"
+    );
+}
+
+// ── Usable-material admission (issue #3727 hardening) ───────────────────────
+
+#[test]
+fn a_certificate_with_trailing_bytes_is_rejected() {
+    // A parser that stops at the end of the certificate would admit an
+    // authority whose stored entry carries appended material a differently
+    // strict verifier could read as part of the document.
+    let der = base64::engine::general_purpose::STANDARD
+        .decode(root_ca_der_base64("ferrum-test-root"))
+        .expect("fixture decodes");
+    let mut with_trailer = der.clone();
+    with_trailer.extend_from_slice(&[0x00, 0x01, 0x02, 0x03]);
+
+    let mut record = valid_record();
+    record.bundle.local.x509_authorities =
+        vec![base64::engine::general_purpose::STANDARD.encode(&with_trailer)];
+    let errors = record
+        .validate_fields()
+        .expect_err("a certificate with appended bytes must be rejected");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("trailing bytes after its X.509 certificate")),
+        "expected a trailing-bytes error, got {errors:?}"
+    );
+}
+
+#[test]
+fn a_real_public_key_is_admitted_but_a_well_shaped_fake_is_not() {
+    let mut record = valid_record();
+    record.bundle.local.jwt_authorities = vec![JwtAuthority {
+        key_id: "rotation-1".to_string(),
+        public_key_pem: usable_public_key_pem(),
+    }];
+    record
+        .validate_fields()
+        .expect("a genuine SPKI public key must be admitted");
+
+    // Correct envelope, unusable body: the old structural check accepted this,
+    // and the material would have persisted and published while never being
+    // able to validate a token.
+    record.bundle.local.jwt_authorities = vec![JwtAuthority {
+        key_id: "rotation-1".to_string(),
+        public_key_pem: "-----BEGIN PUBLIC KEY-----\nAAAA\n-----END PUBLIC KEY-----".to_string(),
+    }];
+    let errors = record
+        .validate_fields()
+        .expect_err("a PEM envelope around unusable bytes must be rejected");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("not a usable PEM public key")),
+        "expected a public-key admission error, got {errors:?}"
+    );
+    for error in &errors {
+        assert!(
+            !error.contains("AAAA"),
+            "an admission error must never echo the offered material"
+        );
+    }
+}
+
+// ── Server-owned identity ───────────────────────────────────────────────────
+
+#[test]
+fn the_default_id_comes_from_the_server_selected_namespace_only() {
+    // The admin write path applies `trim_fields()` while the body's namespace
+    // is still whatever the client sent, and derives the default id from the
+    // authenticated namespace separately. A hostile body must therefore be
+    // unable to steer either value.
+    let mut record = GatewayTrustBundleRecord::new(
+        "attacker-controlled",
+        "  ",
+        bundle_with(vec![root_ca_der_base64("ferrum-test-root")]),
+    );
+    record.trim_fields();
+    assert!(
+        record.id.is_empty(),
+        "trim-only normalization must not derive an id from the body namespace"
+    );
+
+    assert_eq!(
+        GatewayTrustBundleRecord::default_singleton_id("production"),
+        "production",
+        "the default id is derived from the server-selected namespace"
+    );
+
+    // Once the server has forced the namespace, the shared normalization used
+    // by restore/import derives the same value.
+    record.namespace = "production".to_string();
+    record.normalize_fields();
+    assert_eq!(record.id, "production");
+}
+
+// ── Ambiguity is a refusal, not a revocation ────────────────────────────────
+
+#[test]
+fn two_authorities_keep_the_previously_accepted_trust_rather_than_revoking_it() {
+    reset_observability_for_tests();
+    let record = valid_record();
+    let file_value = bundle_with(vec![root_ca_der_base64("file-root")]);
+
+    let projection = project_namespace_trust(Some(&record), Some(&file_value), true);
+    assert_eq!(
+        projection,
+        NamespaceTrustProjection::KeepPrevious,
+        "an ambiguous authority must retain last-known-good, not revoke a working generation"
+    );
+    assert_eq!(
+        observability_snapshot().ambiguous_authority_total,
+        1,
+        "the refusal must be observable"
+    );
+    reset_observability_for_tests();
+}
+
+#[test]
+fn a_single_authority_publishes_and_an_absent_one_clears() {
+    let record = valid_record();
+    let file_value = bundle_with(vec![root_ca_der_base64("file-root")]);
+
+    assert_eq!(
+        project_namespace_trust(Some(&record), None, true),
+        NamespaceTrustProjection::Replace(record.bundle.clone())
+    );
+    assert_eq!(
+        project_namespace_trust(None, Some(&file_value), true),
+        NamespaceTrustProjection::Replace(file_value.clone())
+    );
+    // A claim-requiring (multi-namespace) scope must never forward an
+    // unpartitioned value: it cannot attribute it to the subscriber.
+    assert_eq!(
+        project_namespace_trust(None, Some(&file_value), false),
+        NamespaceTrustProjection::Clear
+    );
+    assert_eq!(
+        project_namespace_trust(None, None, true),
+        NamespaceTrustProjection::Clear
     );
 }

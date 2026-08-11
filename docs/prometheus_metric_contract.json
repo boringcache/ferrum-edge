@@ -1337,6 +1337,46 @@
     "emission": "always"
   },
   {
+    "name": "ferrum_gateway_trust_bundle_ambiguous_authority_total",
+    "type": "counter",
+    "help": "Publications that found both a database record and a file-sourced trust value and kept the previously accepted trust.",
+    "labels": [],
+    "subsystem": "gateway_trust",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_gateway_trust_bundle_last_published_unix_seconds",
+    "type": "gauge",
+    "help": "Unix time of the most recently published gateway trust-bundle generation; 0 when none.",
+    "labels": [],
+    "subsystem": "gateway_trust",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_gateway_trust_bundle_load_rejections_total",
+    "type": "counter",
+    "help": "Gateway trust-bundle candidates refused before the live swap; the previous valid generation stays active.",
+    "labels": [],
+    "subsystem": "gateway_trust",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_gateway_trust_bundle_published_generations_total",
+    "type": "counter",
+    "help": "Gateway trust-bundle generations that reached the live configuration swap.",
+    "labels": [],
+    "subsystem": "gateway_trust",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
     "name": "ferrum_jwks_consecutive_failures",
     "type": "gauge",
     "help": "Maximum current consecutive failures among active remote stores by fixed failure class.",

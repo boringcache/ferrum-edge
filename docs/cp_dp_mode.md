@@ -162,10 +162,22 @@ already use — there is no second representation that can drift.
 - **Bounded, validated material.** Admission caps authority counts (16 X.509 and
   16 JWT per bundle, 32 federated bundles), per-authority size (16 KiB), and the
   encoded bundle as a whole (256 KiB). Every `x509_authorities` entry must be
-  valid base64 *and* parse as an X.509 certificate; every JWT authority needs a
-  unique non-empty `key_id` and a PEM public-key block; duplicate trust domains
-  are rejected. The same validation runs on write, on every full load, and again
-  before publication.
+  valid base64 *and* parse as an X.509 certificate that consumes the complete
+  entry (a certificate with appended bytes is refused); every JWT authority
+  needs a unique non-empty `key_id` and a public key the JWT-SVID authority
+  parser can actually use — the same `is_usable_public_key_material` gate the
+  JWKS path uses, in either accepted encoding (SPKI `PUBLIC KEY` PEM or the
+  SPIFFE-federation JWK form), so a PRIVATE KEY paste, a truncated body, or an
+  unsupported key type is refused rather than stored and published. Duplicate
+  trust domains are rejected. The same validation runs on write, on every full
+  load, and again before publication.
+- **Fail-closed stored-row decoding.** Security-relevant stored fields are
+  decoded strictly: a missing/non-integer/non-positive `revision`, an
+  unreadable `namespace`/`id`/`trust_domain`/`bundle`, or an unparseable
+  timestamp refuses the row (bounded `undecodable` failure reason) instead of
+  defaulting to `1` or to `Utc::now()`. A corrupt row must not be able to win a
+  compare-and-set or look like a fresh rotation on every load. Rejections never
+  echo the stored value.
 - **Change detection.** Writes record a `gateway_trust_bundle` row in
   `config_changes`, so ordinary incremental polling sees rotations and
   revocations. A trust change escalates that poll to a full reload
@@ -183,14 +195,42 @@ already use — there is no second representation that can drift.
   Reads require `operator`, writes require `admin`. `PUT` takes the `revision`
   you read as an optimistic-concurrency expectation and returns `409` with
   `expected_revision` / `current_revision` on a lost race. `DELETE` is an
-  explicit revocation and is distinguishable on the wire from "no change".
+  explicit revocation and is distinguishable on the wire from "no change". A
+  `POST` that omits `id` derives it from the authenticated
+  `X-Ferrum-Namespace` value; neither the stored namespace nor the stored id
+  can be influenced by the request body.
+- **Atomic compare-and-set.** The revision guard is a predicate of the `UPDATE`
+  statement itself (`... AND revision = ?`) on every SQL backend, and the
+  revision is re-asserted in the MongoDB replace filter. A read-then-write would
+  be safe only under a row lock or serializable isolation; under ordinary READ
+  COMMITTED two admin replicas could both read revision N and both write N+1,
+  destroying the first rotation. Restore/import states no client expectation but
+  still compares against the revision read inside its own write transaction. The
+  bundle write and its `config_changes` entry remain one transaction (SQL, and
+  MongoDB with `FERRUM_MONGO_REPLICA_SET`).
+- **Standalone MongoDB contract.** Standalone MongoDB has no multi-document
+  transaction, so for this resource the poll signal is written **first** and the
+  document mutation second. If the change record fails, nothing was mutated at
+  all. If the document write then fails, a redundant change row costs one extra
+  full reload and nothing else. The reverse order — the trade-off other
+  resources can afford — is what must not happen here: a committed rotation or
+  revocation with no change row is invisible to a poller that already consumed
+  the cursor, and no later poll cycle repairs it. Standalone MongoDB therefore
+  guarantees "never invisible", not "never redundant"; a deployment that needs
+  full multi-document atomicity must set `FERRUM_MONGO_REPLICA_SET`.
 - **Backup/restore.** Database-backed exports always carry a
   `gateway_trust_bundles` section (possibly empty). Restore treats an **absent**
   section as "this backup says nothing about trust" and leaves existing roots
-  alone; a **present** section is authoritative and reconciles exactly, including
-  the empty case, which revokes. The namespace clear that precedes an import
-  deliberately does not touch trust, so restoring an older config backup can
-  never silently revoke a namespace's roots.
+  alone; a **present** section is authoritative and reconciles exactly against
+  the AUTHENTICATED target namespace, including the empty case, which revokes
+  that namespace's record. The resource is a singleton, so a section carrying
+  more than one record for the target namespace is refused with `400` *before*
+  the destructive clear rather than silently reduced to whichever record came
+  first. Server-owned fields survive the payload: `id` and `created_at` come
+  from the stored record, `revision` is assigned by the store, and `updated_by`
+  is the restoring admin's verified JWT subject. The namespace clear that
+  precedes an import deliberately does not touch trust, so restoring an older
+  config backup can never silently revoke a namespace's roots.
 
 ##### Publication semantics
 
@@ -213,25 +253,45 @@ subscriber's trust.
 ##### Precedence and ambiguity
 
 The database resource is the authority. If a namespace somehow presents *both* a
-database record and a file-sourced `GatewayConfig.trust_bundles`, neither wins:
-publication withdraws trust, logs the redacted
-`AMBIGUOUS_TRUST_AUTHORITY_MESSAGE`, and increments
+database record and a file-sourced `GatewayConfig.trust_bundles`, neither wins
+and the publication is **refused**: the side channel says nothing (`Unchanged`),
+so every subscriber keeps the last trust generation it accepted, while the CP
+logs the redacted `AMBIGUOUS_TRUST_AUTHORITY_MESSAGE` and increments
 `ferrum_gateway_trust_bundle_ambiguous_authority_total`. Preferring one silently
 would let two replicas diverge if only one could see the file value — exactly the
-failure this resource exists to remove. The behaviour is deterministic on every
-replica, so an ambiguous deployment fails closed rather than splitting.
+failure this resource exists to remove — and converting the ambiguity into a
+`Clear` would revoke a working fleet's roots over a leftover file value. The
+behaviour is deterministic on every replica.
+
+The two authorities are classified from the configuration as it exists *before*
+namespace partitioning clears the unpartitioned slot
+(`resolve_namespace_trust_projection`). Classifying afterwards would make a
+record-plus-file deployment look database-only on a claim-requiring scope, and
+the ambiguity would be silently resolved.
 
 ##### Observability
 
-`/metrics` exposes label-free process counters —
-`ferrum_gateway_trust_bundle_loads_total`,
-`..._load_rejections_total`, `..._ambiguous_authority_total`,
-`ferrum_gateway_trust_bundle_revision`, and
-`ferrum_gateway_trust_bundle_last_load_unix_seconds`. Cardinality is fixed by
-construction: there are no namespace, trust-domain, or resource-id labels. The
-namespace-scoped view is on the authenticated `GET /gateway-trust/status`, which
-returns the trust domain, authority counts, revision, timestamps, and a bounded
-failure-reason enum — never PEM/DER/JWKS bytes, key ids, or secret/provider URIs.
+`/metrics` exposes four process series, rendered with **no labels at all** —
+`ferrum_gateway_trust_bundle_published_generations_total`,
+`..._load_rejections_total`, `..._ambiguous_authority_total`, and
+`ferrum_gateway_trust_bundle_last_published_unix_seconds`. Cardinality is fixed
+by construction: there are no namespace, trust-domain, or resource-id labels.
+
+`published_generations_total` counts generations that reached the **actual
+publication boundary** — the `ArcSwap` store that makes a configuration
+generation live — not candidates that merely loaded. A load still has
+validation, overlay composition, the atomic swap, and broadcast ahead of it, so
+counting there would report generations that were never published. A
+publication carrying no database trust record is not counted at all.
+
+There is deliberately **no process-wide revision gauge**. Revisions are per
+namespace, so a single process atomic would be last-writer-wins and actively
+misleading on a multi-namespace CP. The namespace-scoped view is on the
+authenticated `GET /gateway-trust/status`, which returns that namespace's
+revision, its authority counts, timestamps, a bounded failure-reason enum, and
+a `generation` digest that is stable across replicas and changes on every
+rotation or revocation — never PEM/DER/JWKS bytes, key ids, or secret/provider
+URIs.
 
 ##### Namespace isolation
 
