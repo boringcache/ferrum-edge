@@ -423,7 +423,10 @@ impl XdsAdmissionController {
             self.release_total();
             return Err(XdsAdmissionRejection::PrincipalStreams);
         }
-        self.publish_gauges();
+        // Exact +1 tied to successful aggregate admission only — never a
+        // load-then-store of live counters (that races under concurrent
+        // reserve/release and can leave a stale exported gauge).
+        crate::plugins::mesh::prometheus_helpers::adjust_xds_active_streams(1);
         Ok(XdsStreamPermit {
             controller: self.clone(),
             namespace: namespace.to_string(),
@@ -483,9 +486,10 @@ impl XdsAdmissionController {
                     return Err(XdsAdmissionRejection::NodeCardinality);
                 }
                 entry.insert(1);
+                // Exact +1 for a newly admitted distinct node key only.
+                crate::plugins::mesh::prometheus_helpers::adjust_xds_active_node_ids(1);
             }
         }
-        self.publish_gauges();
         Ok(())
     }
 
@@ -535,6 +539,8 @@ impl XdsAdmissionController {
                         Ordering::Acquire,
                         |current| Some(current.saturating_sub(1)),
                     );
+                    // Exact -1 tied to last-stream removal of this node key.
+                    crate::plugins::mesh::prometheus_helpers::adjust_xds_active_node_ids(-1);
                     true
                 }
             }
@@ -542,7 +548,6 @@ impl XdsAdmissionController {
             // delete state that may belong to a successor generation.
             Entry::Vacant(_) => false,
         };
-        self.publish_gauges();
         last
     }
 
@@ -554,14 +559,8 @@ impl XdsAdmissionController {
         release_scope(&self.inner.per_principal, principal_key);
         release_scope(&self.inner.per_namespace, namespace);
         self.release_total();
-        self.publish_gauges();
-    }
-
-    fn publish_gauges(&self) {
-        crate::plugins::mesh::prometheus_helpers::set_xds_admission_gauges(
-            self.active_streams() as u64,
-            self.active_nodes() as u64,
-        );
+        // Exact -1 tied to the permit's exactly-once aggregate release.
+        crate::plugins::mesh::prometheus_helpers::adjust_xds_active_streams(-1);
     }
 }
 

@@ -65,10 +65,11 @@ static XDS_STREAMS_REJECTED: AtomicU64 = AtomicU64::new(0);
 static XDS_STREAM_ADMISSION_REJECTIONS: LazyLock<DashMap<&'static str, AtomicU64>> =
     LazyLock::new(DashMap::new);
 /// Total active ADS streams and distinct active node state keys. Both are
-/// absolute gauges published by the single process-wide
-/// `XdsAdmissionController`; label-free because every dimension that could
-/// distinguish them (node id, principal, tenant namespace) is client-influenced
-/// and would be unbounded.
+/// absolute occupancy gauges updated by atomic deltas from the single
+/// process-wide `XdsAdmissionController` on successful admission / exactly-once
+/// release (never by racing load-then-store snapshots). Label-free because every
+/// dimension that could distinguish them (node id, principal, tenant namespace)
+/// is client-influenced and would be unbounded.
 static XDS_ACTIVE_STREAMS: AtomicU64 = AtomicU64::new(0);
 static XDS_ACTIVE_NODE_IDS: AtomicU64 = AtomicU64::new(0);
 /// Set once the ADS admission controller has published a value, so the two
@@ -886,15 +887,63 @@ pub fn increment_xds_stream_admission_rejection(reason: &'static str) {
         .fetch_add(1, Ordering::Relaxed);
 }
 
-/// Publish the ADS admission controller's absolute occupancy: total active ADS
-/// streams (SotW + Delta) and distinct active node state keys (issue #3741).
+/// Apply a signed delta to the ADS active-stream gauge.
 ///
-/// Called from the single process-wide controller on every reserve/release, so
-/// the gauges return to zero when the last stream ends.
-pub fn set_xds_admission_gauges(active_streams: u64, active_node_ids: u64) {
-    XDS_ACTIVE_STREAMS.store(active_streams, Ordering::Relaxed);
-    XDS_ACTIVE_NODE_IDS.store(active_node_ids, Ordering::Relaxed);
+/// The controller publishes **exactly one** `+1` on successful aggregate
+/// admission and **exactly one** `-1` on the matching release. Independent
+/// load-then-store snapshots are deliberately avoided: concurrent
+/// reserve/release interleavings must not let an older absolute snapshot
+/// overwrite a newer value and leave a stale gauge after activity stops
+/// (issue #3741).
+pub fn adjust_xds_active_streams(delta: i64) {
+    apply_xds_admission_gauge_delta(&XDS_ACTIVE_STREAMS, delta);
+}
+
+/// Apply a signed delta to the ADS active-node-id gauge.
+///
+/// Tied exactly to successful distinct-node slot admission (`+1`) and
+/// exactly-once last-stream node removal (`-1`). Same race-safety contract as
+/// [`adjust_xds_active_streams`].
+pub fn adjust_xds_active_node_ids(delta: i64) {
+    apply_xds_admission_gauge_delta(&XDS_ACTIVE_NODE_IDS, delta);
+}
+
+fn apply_xds_admission_gauge_delta(gauge: &AtomicU64, delta: i64) {
+    if delta == 0 {
+        return;
+    }
+    if delta > 0 {
+        gauge.fetch_add(delta as u64, Ordering::Relaxed);
+    } else {
+        let amount = (-delta) as u64;
+        let _ = gauge.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            Some(current.saturating_sub(amount))
+        });
+    }
     XDS_ADMISSION_OBSERVED.store(1, Ordering::Relaxed);
+}
+
+/// Current exported ADS active-stream gauge value (absolute occupancy).
+pub fn xds_active_streams_gauge() -> u64 {
+    XDS_ACTIVE_STREAMS.load(Ordering::Relaxed)
+}
+
+/// Current exported ADS active-node-id gauge value (absolute occupancy).
+pub fn xds_active_node_ids_gauge() -> u64 {
+    XDS_ACTIVE_NODE_IDS.load(Ordering::Relaxed)
+}
+
+/// Current value of `ferrum_xds_stream_admission_rejections_total{reason}`.
+pub fn xds_stream_admission_rejection_count(reason: &'static str) -> u64 {
+    XDS_STREAM_ADMISSION_REJECTIONS
+        .get(reason)
+        .map(|entry| entry.load(Ordering::Relaxed))
+        .unwrap_or(0)
+}
+
+/// Current value of the label-free ADS stream rejection aggregate counter.
+pub fn xds_streams_rejected_total() -> u64 {
+    XDS_STREAMS_REJECTED.load(Ordering::Relaxed)
 }
 
 /// Set the coarse posture gauge for the mesh inbound listener's mTLS

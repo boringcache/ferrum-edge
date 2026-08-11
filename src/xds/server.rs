@@ -1735,6 +1735,13 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                             .await;
                         return;
                     }
+                    // Client dropped the response half while deliberately
+                    // keeping the request sender alive: observe that close and
+                    // exit immediately so the permit, node-scoped state,
+                    // broadcast receiver, and channel cannot linger forever.
+                    _ = tx.closed() => {
+                        return;
+                    }
                     maybe_request = requests.next() => {
                         let Some(request) = maybe_request else {
                             return;
@@ -1771,6 +1778,20 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                         ) {
                             Ok(node_id) => node_id,
                             Err(status) => {
+                                // First-message `Node` omission is the only
+                                // resolve failure while no node is established
+                                // yet. Route it through the same bounded
+                                // rejection accounting as an explicitly present
+                                // empty id (counted above via
+                                // `requested_node_id`) — never double-count.
+                                if node_id.is_none() {
+                                    record_xds_admission_rejection(
+                                        "xDS.StreamAggregatedResources",
+                                        &stream_namespace,
+                                        None,
+                                        XdsAdmissionRejection::NodeIdEmpty,
+                                    );
+                                }
                                 let _ = tx.send(Err(status)).await;
                                 return;
                             }
@@ -2076,6 +2097,13 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                             .await;
                         return;
                     }
+                    // Client dropped the response half while deliberately
+                    // keeping the request sender alive: observe that close and
+                    // exit immediately so the permit, node-scoped state,
+                    // broadcast receiver, and channel cannot linger forever.
+                    _ = tx.closed() => {
+                        return;
+                    }
                     maybe_request = requests.next() => {
                         let Some(request) = maybe_request else {
                             return;
@@ -2109,6 +2137,20 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                         ) {
                             Ok(node_id) => node_id,
                             Err(status) => {
+                                // First-message `Node` omission is the only
+                                // resolve failure while no node is established
+                                // yet. Route it through the same bounded
+                                // rejection accounting as an explicitly present
+                                // empty id (counted above via
+                                // `requested_node_id`) — never double-count.
+                                if node_id.is_none() {
+                                    record_xds_admission_rejection(
+                                        "xDS.DeltaAggregatedResources",
+                                        &stream_namespace,
+                                        None,
+                                        XdsAdmissionRejection::NodeIdEmpty,
+                                    );
+                                }
                                 let _ = tx.send(Err(status)).await;
                                 return;
                             }
@@ -2329,11 +2371,13 @@ impl AggregatedDiscoveryService for XdsAdsServer {
 /// Extract and validate the `Node.id` carried on one ADS request.
 ///
 /// Returns `Ok(None)` when the message carries no node (ACK/NACK follow-ups
-/// legitimately omit it). An explicitly present empty id is rejected through
-/// the same admission-reason path as every other invalid id, so it is counted
-/// without changing omission semantics. A **present** id is validated against
-/// the configured contract before it is cloned, stored, keyed, or logged, so a
-/// hostile value never reaches a map or a log line (issue #3741).
+/// legitimately omit it). An explicitly present empty id is rejected and
+/// counted here. A **first-message** omission (`Ok(None)` while no node is
+/// established yet) is rejected and counted at the resolve site in both SotW
+/// and Delta relays, using the same `node_id_empty` reason without
+/// double-counting this explicit-empty path. A **present** id is validated
+/// against the configured contract before it is cloned, stored, keyed, or
+/// logged, so a hostile value never reaches a map or a log line (issue #3741).
 fn requested_node_id(
     node: Option<&super::proto::Node>,
     max_node_id_bytes: usize,
@@ -2957,6 +3001,16 @@ mod tests {
         );
         assert!(resolve_stream_node_id(Some("node-a"), Some("node-a")).is_ok());
         assert!(resolve_stream_node_id(Some("node-a"), Some("node-b")).is_err());
+        let omitted = resolve_stream_node_id(None, None).expect_err("first-message Node omission");
+        assert_eq!(omitted.code(), tonic::Code::InvalidArgument);
+        assert_eq!(
+            omitted.message(),
+            XdsAdmissionRejection::NodeIdEmpty.status_message()
+        );
+        assert!(
+            !omitted.message().contains("node-"),
+            "omission rejection must never echo caller data"
+        );
     }
 
     #[test]
