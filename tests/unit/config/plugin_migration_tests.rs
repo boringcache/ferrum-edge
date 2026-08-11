@@ -779,8 +779,7 @@ async fn later_applied_plugin_version_cannot_hide_a_missing_prefix_entry() {
 #[tokio::test]
 async fn invalid_plugin_declarations_fail_before_creating_core_or_history_tables() {
     let out_of_range_pool = test_pool().await;
-    let out_of_range_runner =
-        MigrationRunner::new(out_of_range_pool.clone(), "sqlite".to_string());
+    let out_of_range_runner = MigrationRunner::new(out_of_range_pool.clone(), "sqlite".to_string());
     let out_of_range = vec![(
         "out_of_range_plugin",
         vec![CustomPluginMigration {

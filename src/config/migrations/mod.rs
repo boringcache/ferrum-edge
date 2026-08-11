@@ -965,9 +965,7 @@ impl MigrationRunner {
                 let history_index = histories.len();
                 history_indexes.insert(record.plugin_name.as_str(), history_index);
                 histories.push(AppliedMigrationHistory {
-                    namespace: MigrationHistoryNamespace::CustomPlugin(
-                        record.plugin_name.clone(),
-                    ),
+                    namespace: MigrationHistoryNamespace::CustomPlugin(record.plugin_name.clone()),
                     migrations: vec![AppliedMigrationHistoryEntry {
                         version: record.version,
                         checksum: record.checksum.clone(),

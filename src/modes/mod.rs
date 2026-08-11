@@ -264,8 +264,8 @@ async fn handle_startup_plugin_migrations_with_list(
     let pending = match db.pending_plugin_migrations(plugin_migrations).await {
         Ok(p) => p,
         Err(e) => {
-            if let Some(integrity_error) = e
-                .downcast_ref::<crate::config::migrations::MigrationHistoryIntegrityError>()
+            if let Some(integrity_error) =
+                e.downcast_ref::<crate::config::migrations::MigrationHistoryIntegrityError>()
             {
                 let context = format!(
                     "custom-plugin migration history integrity validation failed (mode={mode}): \
@@ -612,10 +612,9 @@ mod tests {
         .await
         .expect("drift stored checksum");
 
-        let error =
-            handle_startup_plugin_migrations_with_list(&db, false, "database", &migrations)
-                .await
-                .expect_err("warn-only mode must fail closed on typed history drift");
+        let error = handle_startup_plugin_migrations_with_list(&db, false, "database", &migrations)
+            .await
+            .expect_err("warn-only mode must fail closed on typed history drift");
         let integrity_error = error
             .downcast_ref::<crate::config::migrations::MigrationHistoryIntegrityError>()
             .expect("integrity refusal must remain typed through startup context");
