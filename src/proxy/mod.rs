@@ -35354,44 +35354,52 @@ pub(crate) async fn proxy_to_backend_retry(
     let retry_policy_port = dispatch_policy_port_for_target(proxy, upstream_target);
     let retry_pending_cap = resolve_backend_http1_max_pending_requests(proxy, retry_policy_port)
         .filter(|_| reqwest_dispatch_is_http1_only(state, proxy, upstream_target));
-    let retry_pending_scope = pending_limit_scope_for_proxy(proxy);
-    let retry_pending_slot = match state.backend_pending_limit.try_acquire(
-        retry_pending_scope.as_ref(),
-        retry_policy_port,
-        retry_pending_cap,
-    ) {
-        Ok(slot) => slot,
-        Err(limit) => {
-            warn!(
-                proxy_id = %proxy.id,
-                backend_host = %effective_host,
-                backend_port = retry_dial_port,
-                pending_policy_port = retry_policy_port,
-                pending_scope_digest = retry_pending_scope.digest(),
-                in_flight_requests = limit.current,
-                max_in_flight_requests = limit.cap,
-                "Shedding HTTP/1.1 retry: DestinationRule http1MaxPendingRequests reached for backend (upstream overflow)"
-            );
-            // Gateway-side capacity shed before the retry dial: classify
-            // `DispatchPolicyRejected` (NOT a connection_error) so the retry
-            // loop does not treat the shed as another connect failure and
-            // amplify the overflow. That class is a no-backend-signal
-            // (`client_side_no_backend_signal`), so this overflow 503 stays
-            // NEUTRAL to backend health/CB/AC, mirroring the initial-attempt
-            // shed.
-            return retry::BackendResponse {
-                status_code: 503,
-                body: ResponseBody::buffered(
-                    r#"{"error":"HTTP/1.1 in-flight request limit reached"}"#
-                        .as_bytes()
-                        .to_vec(),
-                ),
-                headers: HashMap::new(),
-                connection_error: false,
-                backend_resolved_ip: resolved_ip.clone(),
-                error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
-            };
+    let retry_pending_slot = if let Some(cap) = retry_pending_cap {
+        // Resolve/clone the scope only on the capped path. Direct-backend route
+        // overrides deliberately clear the inherited scope and cap; rebuilding
+        // a fallback scope before noticing `None` would allocate on every
+        // otherwise-uncapped retry.
+        let retry_pending_scope = pending_limit_scope_for_proxy(proxy);
+        match state.backend_pending_limit.try_acquire(
+            retry_pending_scope.as_ref(),
+            retry_policy_port,
+            Some(cap),
+        ) {
+            Ok(slot) => slot,
+            Err(limit) => {
+                warn!(
+                    proxy_id = %proxy.id,
+                    backend_host = %effective_host,
+                    backend_port = retry_dial_port,
+                    pending_policy_port = retry_policy_port,
+                    pending_scope_digest = retry_pending_scope.digest(),
+                    in_flight_requests = limit.current,
+                    max_in_flight_requests = limit.cap,
+                    "Shedding HTTP/1.1 retry: DestinationRule http1MaxPendingRequests reached for backend (upstream overflow)"
+                );
+                // Gateway-side capacity shed before the retry dial: classify
+                // `DispatchPolicyRejected` (NOT a connection_error) so the retry
+                // loop does not treat the shed as another connect failure and
+                // amplify the overflow. That class is a no-backend-signal
+                // (`client_side_no_backend_signal`), so this overflow 503 stays
+                // NEUTRAL to backend health/CB/AC, mirroring the initial-attempt
+                // shed.
+                return retry::BackendResponse {
+                    status_code: 503,
+                    body: ResponseBody::buffered(
+                        r#"{"error":"HTTP/1.1 in-flight request limit reached"}"#
+                            .as_bytes()
+                            .to_vec(),
+                    ),
+                    headers: HashMap::new(),
+                    connection_error: false,
+                    backend_resolved_ip: resolved_ip.clone(),
+                    error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+                };
+            }
         }
+    } else {
+        None
     };
 
     // Lease the `connectionPool.tcp.maxConnections` lane for this retry
@@ -38098,51 +38106,57 @@ async fn proxy_to_backend(
         // Only an HTTP/1.1-determined reqwest dispatch consults the gate; a
         // reqwest fallback that may ALPN-negotiate h2 ignores the `http1*` cap.
         .filter(|_| reqwest_dispatch_is_http1_only(state, proxy, upstream_target));
-    let pending_scope = pending_limit_scope_for_proxy(proxy);
-    let pending_slot = match state.backend_pending_limit.try_acquire(
-        pending_scope.as_ref(),
-        pending_policy_port,
-        pending_cap,
-    ) {
-        Ok(slot) => slot,
-        Err(limit) => {
-            warn!(
-                proxy_id = %proxy.id,
-                backend_host = %effective_host,
-                backend_port = pending_dial_port,
-                pending_policy_port = pending_policy_port,
-                pending_scope_digest = pending_scope.digest(),
-                in_flight_requests = limit.current,
-                max_in_flight_requests = limit.cap,
-                "Shedding HTTP/1.1 request: DestinationRule http1MaxPendingRequests reached for backend (upstream overflow)"
-            );
-            return backend_dispatch_response(
-                retry::BackendResponse {
-                    status_code: 503,
-                    body: ResponseBody::buffered(
-                        r#"{"error":"HTTP/1.1 in-flight request limit reached"}"#
-                            .as_bytes()
-                            .to_vec(),
-                    ),
-                    headers: HashMap::new(),
-                    // Gateway-side capacity shed before any backend dial: the
-                    // request never reached the backend application layer, so it
-                    // is classified `DispatchPolicyRejected` (NOT a transport
-                    // connection_error). That class is now a no-backend-signal
-                    // (`client_side_no_backend_signal`), so this overflow 503 is
-                    // NEUTRAL to backend health: it is not retried, does not trip
-                    // the backend circuit breaker / passive health, and does not
-                    // shrink the adaptive-concurrency permit for a backend that
-                    // was never dialed — mirrors the backend-TLS-SNI gateway
-                    // reject above.
-                    connection_error: false,
-                    backend_resolved_ip: resolved_ip.clone(),
-                    error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
-                },
-                None,
-                None,
-            );
+    let pending_slot = if let Some(cap) = pending_cap {
+        // Keep the no-cap path allocation-free even for an effective proxy
+        // whose direct-backend route override cleared the inherited scope.
+        let pending_scope = pending_limit_scope_for_proxy(proxy);
+        match state.backend_pending_limit.try_acquire(
+            pending_scope.as_ref(),
+            pending_policy_port,
+            Some(cap),
+        ) {
+            Ok(slot) => slot,
+            Err(limit) => {
+                warn!(
+                    proxy_id = %proxy.id,
+                    backend_host = %effective_host,
+                    backend_port = pending_dial_port,
+                    pending_policy_port = pending_policy_port,
+                    pending_scope_digest = pending_scope.digest(),
+                    in_flight_requests = limit.current,
+                    max_in_flight_requests = limit.cap,
+                    "Shedding HTTP/1.1 request: DestinationRule http1MaxPendingRequests reached for backend (upstream overflow)"
+                );
+                return backend_dispatch_response(
+                    retry::BackendResponse {
+                        status_code: 503,
+                        body: ResponseBody::buffered(
+                            r#"{"error":"HTTP/1.1 in-flight request limit reached"}"#
+                                .as_bytes()
+                                .to_vec(),
+                        ),
+                        headers: HashMap::new(),
+                        // Gateway-side capacity shed before any backend dial: the
+                        // request never reached the backend application layer, so it
+                        // is classified `DispatchPolicyRejected` (NOT a transport
+                        // connection_error). That class is now a no-backend-signal
+                        // (`client_side_no_backend_signal`), so this overflow 503 is
+                        // NEUTRAL to backend health: it is not retried, does not trip
+                        // the backend circuit breaker / passive health, and does not
+                        // shrink the adaptive-concurrency permit for a backend that
+                        // was never dialed — mirrors the backend-TLS-SNI gateway
+                        // reject above.
+                        connection_error: false,
+                        backend_resolved_ip: resolved_ip.clone(),
+                        error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+                    },
+                    None,
+                    None,
+                );
+            }
         }
+    } else {
+        None
     };
 
     // DestinationRule `connectionPool.tcp.maxConnections` on the reqwest path.
