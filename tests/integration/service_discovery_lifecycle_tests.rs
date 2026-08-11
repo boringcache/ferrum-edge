@@ -1331,7 +1331,10 @@ fn seed_published_targets(lb_cache: &LoadBalancerCache, upstream_id: &str) {
     lb_cache.update_targets(
         &default_namespace(),
         upstream_id,
-        vec![target("static.local", 9000), target("discovered.local", 8080)],
+        vec![
+            target("static.local", 9000),
+            target("discovered.local", 8080),
+        ],
         LoadBalancerAlgorithm::RoundRobin,
         None,
     );
