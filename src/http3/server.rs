@@ -7168,18 +7168,19 @@ async fn handle_h3_request(
                 let next_retry_target = if let (Some(_upstream_id), Some(prev_target)) =
                     (&proxy.upstream_id, &current_target)
                     && let Some(ref hash_key) = lb_hash_key
-                    && let Some(next) = crate::proxy::backend_dispatch::select_next_h3_eligible_retry_target(
-                        &state,
-                        &epoch,
-                        &proxy,
-                        prev_target,
-                        crate::proxy::backend_dispatch::RetryTargetRequest {
-                            base_hash_key: hash_key,
-                            client_ip: &ctx.client_ip,
-                            proxy_headers: &proxy_headers,
-                            request_authority: request_host.as_deref(),
-                        },
-                    ) {
+                    && let Some(next) =
+                        crate::proxy::backend_dispatch::select_next_h3_eligible_retry_target(
+                            &state,
+                            &epoch,
+                            &proxy,
+                            prev_target,
+                            crate::proxy::backend_dispatch::RetryTargetRequest {
+                                base_hash_key: hash_key,
+                                client_ip: &ctx.client_ip,
+                                proxy_headers: &proxy_headers,
+                                request_authority: request_host.as_deref(),
+                            },
+                        ) {
                     if !crate::proxy::retry_target_preserves_backend_path(
                         backend_path_is_policy_bound,
                         &proxy,
