@@ -3105,7 +3105,7 @@ async fn consul_shared_admission_rejection_retains_targets_and_cursor() {
         .and(path("/v1/health/service/api"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_json(&consul_health_instance("203.0.113.10", 8080))
+                .set_body_json(&consul_health_instance("8.8.8.8", 8080))
                 .insert_header("X-Consul-Index", "10"),
         )
         .up_to_n_times(1)
@@ -3141,7 +3141,7 @@ async fn consul_shared_admission_rejection_retains_targets_and_cursor() {
 
     harness.discover_and_apply(&discoverer).await.unwrap();
     assert_eq!(cursor_index(&discoverer), 10);
-    assert_eq!(harness.lb_hosts(), vec!["203.0.113.10".to_string()]);
+    assert_eq!(harness.lb_hosts(), vec!["8.8.8.8".to_string()]);
 
     harness.discover_and_apply(&discoverer).await.unwrap();
     assert_eq!(
@@ -3151,7 +3151,7 @@ async fn consul_shared_admission_rejection_retains_targets_and_cursor() {
     );
     assert_eq!(
         harness.lb_hosts(),
-        vec!["203.0.113.10".to_string()],
+        vec!["8.8.8.8".to_string()],
         "shared-admission rejection must retain installed targets"
     );
 }
@@ -3167,7 +3167,7 @@ async fn consul_rejected_same_index_then_valid_same_index_is_admitted_and_publis
         .and(path("/v1/health/service/api"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_json(&consul_health_instance("203.0.113.10", 8080))
+                .set_body_json(&consul_health_instance("8.8.8.8", 8080))
                 .insert_header("X-Consul-Index", "50"),
         )
         .up_to_n_times(1)
@@ -3218,7 +3218,7 @@ async fn consul_rejected_same_index_then_valid_same_index_is_admitted_and_publis
 
     harness.discover_and_apply(&discoverer).await.unwrap();
     assert_eq!(cursor_index(&discoverer), 50);
-    assert_eq!(harness.lb_hosts(), vec!["203.0.113.10".to_string()]);
+    assert_eq!(harness.lb_hosts(), vec!["8.8.8.8".to_string()]);
 
     harness.discover_and_apply(&discoverer).await.unwrap();
     assert_eq!(cursor_index(&discoverer), 50);
