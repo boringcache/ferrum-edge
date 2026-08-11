@@ -1046,20 +1046,20 @@ fn the_rpc_defaults_are_sized_for_legitimate_long_lived_stream_occupancy() {
     // itself: the connection ceiling would admit peers the RPC ceiling then had
     // to shed, and the shed would land on SVID renewal rather than on anything
     // abusive.
-    assert!(
-        DEFAULT_MAX_CONCURRENT_RPCS >= DEFAULT_MAX_CONNECTIONS * LONG_LIVED_RPCS_PER_CONNECTION,
-        "the service-wide RPC default ({DEFAULT_MAX_CONCURRENT_RPCS}) must cover \
-         {LONG_LIVED_RPCS_PER_CONNECTION} long-lived streams on each of the \
-         {DEFAULT_MAX_CONNECTIONS} default connections"
-    );
-    assert!(
-        DEFAULT_MAX_CONCURRENT_RPCS_PER_UID
-            >= DEFAULT_MAX_CONNECTIONS_PER_UID * LONG_LIVED_RPCS_PER_CONNECTION,
-        "the per-UID RPC default ({DEFAULT_MAX_CONCURRENT_RPCS_PER_UID}) must cover \
-         {LONG_LIVED_RPCS_PER_CONNECTION} long-lived streams on each of a UID's \
-         {DEFAULT_MAX_CONNECTIONS_PER_UID} default connections, or the quota sheds a workload \
-         that is behaving exactly as the SPIFFE Workload API describes"
-    );
+    const {
+        assert!(
+            DEFAULT_MAX_CONCURRENT_RPCS
+                >= DEFAULT_MAX_CONNECTIONS * LONG_LIVED_RPCS_PER_CONNECTION,
+            "the service-wide RPC default must cover the legitimate long-lived streams on every \
+             admitted default connection"
+        );
+        assert!(
+            DEFAULT_MAX_CONCURRENT_RPCS_PER_UID
+                >= DEFAULT_MAX_CONNECTIONS_PER_UID * LONG_LIVED_RPCS_PER_CONNECTION,
+            "the per-UID RPC default must cover the legitimate long-lived streams on every \
+             default connection admitted for one UID"
+        );
+    }
 }
 
 #[test]
