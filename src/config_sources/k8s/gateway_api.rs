@@ -2121,7 +2121,10 @@ fn listener_is_terminating_tls(listener: &Value) -> bool {
     let Some(protocol) = string_field(listener, "protocol") else {
         return false;
     };
-    if !protocol.eq_ignore_ascii_case("HTTPS") && !protocol.eq_ignore_ascii_case("TLS") {
+    if !protocol.eq_ignore_ascii_case("HTTPS")
+        && !protocol.eq_ignore_ascii_case("GRPCS")
+        && !protocol.eq_ignore_ascii_case("TLS")
+    {
         return false;
     }
     let Some(tls) = listener.get("tls") else {
@@ -9328,6 +9331,64 @@ mod tests {
                 conflict.message
             );
         }
+    }
+
+    /// GRPCS terminates frontend TLS just like HTTPS. Treating it as plaintext
+    /// would make an otherwise compatible GRPCS sibling withdraw HTTPS routes.
+    #[test]
+    fn grpcs_same_port_listener_does_not_withdraw_https_routes() {
+        let mut gateway = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [
+                    {
+                        "name": "https",
+                        "port": 443,
+                        "protocol": "HTTPS",
+                        "hostname": "web.example.com",
+                        "tls": {"mode": "Terminate", "certificateRefs": [{"name": "app-cert"}]}
+                    },
+                    {
+                        "name": "grpcs",
+                        "port": 443,
+                        "protocol": "GRPCS",
+                        "hostname": "grpc.example.com",
+                        "tls": {"mode": "Terminate", "certificateRefs": [{"name": "app-cert"}]}
+                    }
+                ]
+            }),
+        );
+        gateway.metadata.name = "edge".to_string();
+        let secret = tls_secret("app-cert", "default", true);
+        let route = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "parentRefs": [{"name": "edge", "sectionName": "https"}],
+                "hostnames": ["web.example.com"],
+                "rules": [{"backendRefs": [{"name": "web", "port": 8080}]}]
+            }),
+        );
+
+        let result = translate_k8s_objects(&[gateway, secret, route], options())
+            .expect("translation succeeds");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(result.config.proxies[0].listen_port, Some(443));
+        assert!(
+            result
+                .config
+                .http_tls_listen_ports
+                .contains(&("default".to_string(), 443))
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .all(|warning| !warning.contains("incompatible frontend shapes")),
+            "compatible HTTPS/GRPCS listeners must not conflict: {:?}",
+            result.warnings
+        );
     }
 
     /// Adversarial: two DIFFERENT Gateways share a numeric port with a
