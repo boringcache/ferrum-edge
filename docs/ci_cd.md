@@ -1406,7 +1406,8 @@ transition between them (`RELEASE_IMAGE_FAMILY_GENERATIONS`):
   `/tmp/digests-tools` working directory, and every published tag); the tools
   build/export/upload steps inside the single `docker-ebpf` job; sole ownership
   of the `docker-ebpf-tools-digest-` wildcard by that same job; the extended
-  `create-release` `needs` and release notes; and an `attest-release-images` job
+  `create-release` `needs`, the gating rationale comment that shares its `name:`
+  field block, and its release notes; and an `attest-release-images` job
   that resolves, cross-registry-compares, SBOMs, provenances, signs, attests, and
   verifies all three families in both registries.
 
@@ -1444,7 +1445,10 @@ surface comparison then reads the same bytes on both sides. The substitution
 table is derived from the two contract tables themselves, so it cannot drift from
 them; every substitution must match exactly once or the projection is abandoned
 and the unmodified revisions are compared. Nothing outside those frozen fragments
-is withheld, so a Cross command, a `CROSS_*` input, or any other executable
+is withheld — the only non-contract text the projection removes is the comments
+and blank lines inside the removed manifest job, which that job's closed
+field set and frozen `steps:` list already prevent from carrying any surface — so
+a Cross command, a `CROSS_*` input, or any other executable
 surface added anywhere in the file — including elsewhere inside a transitioned
 job — is still rejected while the adoption is in flight, and the projection never
 applies to any other workflow, to an unchanged release workflow, or to a
