@@ -8,10 +8,12 @@
 //!
 //! Failure model: any connection / IO / decode error surfaces as
 //! [`CniError::IpcFailed`] which the CNI binary reports back to kubelet
-//! as CNI error code 11. kubelet retries, and meanwhile the node-agent's
-//! kube-rs watcher fallback path keeps enrolling pods at the next
-//! reconcile, so a transient IPC outage degrades to "slower enrollment"
-//! rather than "broken pod networking".
+//! as CNI error code 11. That is the deliberate fail-closed ADD posture
+//! (issue #3609): while a chained conflist is installed, an unreachable
+//! node-agent leaves new pods in `ContainerCreating` rather than starting
+//! them outside the mesh. The kube-rs watcher still reconciles pods that
+//! already have a sandbox; it cannot create one. Do not turn IPC failure
+//! into an unauthenticated pass-through.
 
 use std::io::{Read, Write};
 use std::time::Duration;
