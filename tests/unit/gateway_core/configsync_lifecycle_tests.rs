@@ -956,9 +956,7 @@ fn rejected_resync_payload_marks_cp_authority_lost() {
         .and_then(|tail| tail.split("Ok(DpStreamEnd::TransportFailure").next())
         .expect("ResyncAfterAcceptedConfig outer-loop arm");
     assert!(
-        arm.contains(
-            "update_state_disconnected(&connection_state, cp_url, is_primary, false);"
-        ),
+        arm.contains("update_state_disconnected(&connection_state, cp_url, is_primary, false);"),
         "a refused mid-stream resync payload must mark CP authority lost"
     );
 }
