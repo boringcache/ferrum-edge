@@ -7154,17 +7154,16 @@ pub async fn log_with_mirror(
     // the summary does not already carry one; the untriggered default
     // configuration pays one `is_empty()` check and no allocation.
     let stamped;
-    let summary = if ctx.has_plugin_trigger_decisions()
-        && summary.plugin_trigger_decisions.is_empty()
-    {
-        stamped = TransactionSummary {
-            plugin_trigger_decisions: ctx.plugin_trigger_decisions(),
-            ..summary.clone()
+    let summary =
+        if ctx.has_plugin_trigger_decisions() && summary.plugin_trigger_decisions.is_empty() {
+            stamped = TransactionSummary {
+                plugin_trigger_decisions: ctx.plugin_trigger_decisions(),
+                ..summary.clone()
+            };
+            &stamped
+        } else {
+            summary
         };
-        &stamped
-    } else {
-        summary
-    };
     let precompute_mesh_key = plugins
         .iter()
         .any(|plugin| matches!(plugin.name(), "workload_metrics" | "prometheus_metrics"));

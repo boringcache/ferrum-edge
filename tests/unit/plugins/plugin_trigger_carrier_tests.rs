@@ -13,7 +13,8 @@
 use chrono::Utc;
 use ferrum_edge::_test_support::{
     admitted_datagram_plugins_for_test, attach_transaction_trigger_decisions_for_test,
-    collect_websocket_disconnect_plugins_for_test, collect_websocket_relay_plugins_decided_for_test,
+    collect_websocket_disconnect_plugins_for_test,
+    collect_websocket_relay_plugins_decided_for_test,
     collect_websocket_size_limit_plugins_for_test, plugin_trigger_carrier_counters_for_test,
 };
 use ferrum_edge::PluginCache;
@@ -268,7 +269,10 @@ async fn a_plugin_cannot_re_admit_a_skipped_instance_through_summary_metadata() 
     // the trigger layer publishes.
     summary
         .metadata
-        .insert("plugin_trigger.bill.skipped".to_string(), "false".to_string());
+        .insert(
+            "plugin_trigger.bill.skipped".to_string(),
+            "false".to_string(),
+        );
     summary
         .metadata
         .insert("mirror".to_string(), "true".to_string());
@@ -377,10 +381,7 @@ fn ws_config(proxy_id: &str, prefix: &str) -> GatewayConfig {
     config(
         vec![make_proxy(proxy_id, "/ws", vec!["rl", "size", "log"])],
         vec![
-            with_trigger(
-                builtin("rl", "ws_rate_limiting", proxy_id),
-                admit.clone(),
-            ),
+            with_trigger(builtin("rl", "ws_rate_limiting", proxy_id), admit.clone()),
             with_trigger(
                 builtin("size", "ws_message_size_limiting", proxy_id),
                 admit.clone(),
