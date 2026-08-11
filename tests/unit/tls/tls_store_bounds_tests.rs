@@ -9,7 +9,6 @@
 //! config/docs/metric inventory parity.
 
 use std::io::Cursor;
-use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -626,14 +625,12 @@ fn event_log_oversized_candidate_leaves_prior_live_and_durable_state_intact() {
     assert_eq!(reloaded[1].sources[0].cert_id, "seed-b");
 }
 
-#[test]
-fn replica_snapshot_refreshes_shared_store_record_count_gauge() {
+fn replica_snapshot_refreshes_shared_store_record_count_gauge_impl(
+    store_dir: &std::path::Path,
+) {
     use ferrum_edge::plugins::prometheus_metrics::global_registry;
 
-    let dir = tempfile::tempdir().expect("tempdir");
-    let path = dir.path().join("probe-store.json");
-    // Use the leases kind so this gauge assertion is less likely to race with
-    // concurrent managed/ACME store tests that share process-global metrics.
+    let path = store_dir.join("probe-store.json");
     let kind = TlsPersistentStoreKind::Leases;
     let writer = open_probe_kind(path.clone(), DOC_LIMIT, kind);
     let reader = open_probe_kind(path, DOC_LIMIT, kind);
@@ -673,12 +670,44 @@ fn replica_snapshot_refreshes_shared_store_record_count_gauge() {
     );
 }
 
+#[test]
+fn replica_snapshot_refreshes_shared_store_record_count_gauge() {
+    const CHILD_DIR_ENV: &str = "FERRUM_TEST_TLS_STORE_BOUNDS_GAUGE_CHILD_DIR";
+    const TEST_NAME: &str =
+        "unit::tls::tls_store_bounds_tests::replica_snapshot_refreshes_shared_store_record_count_gauge";
+
+    if let Ok(dir) = std::env::var(CHILD_DIR_ENV) {
+        replica_snapshot_refreshes_shared_store_record_count_gauge_impl(std::path::Path::new(&dir));
+        return;
+    }
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().to_path_buf();
+    let exe = std::env::current_exe().expect("current test executable");
+    let mut child = std::process::Command::new(exe)
+        .env(CHILD_DIR_ENV, &path)
+        .args(["--exact", TEST_NAME, "--nocapture"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn gauge child");
+
+    let output = child.wait_with_output().expect("wait for gauge child");
+    assert!(
+        output.status.success(),
+        "gauge child failed: {}",
+        String::from_utf8_lossy(&output.stderr[..output.stderr.len().min(4096)])
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn shared_store_and_event_log_reject_fifo_promptly_without_hanging() {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
-    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+    use std::sync::mpsc;
+
+    const OPEN_BUDGET: Duration = Duration::from_secs(2);
 
     let dir = tempfile::tempdir().expect("tempdir");
     let store_fifo = dir.path().join("store.fifo");
@@ -689,39 +718,48 @@ fn shared_store_and_event_log_reject_fifo_promptly_without_hanging() {
         assert_eq!(unsafe { libc::mkfifo(path_c.as_ptr(), 0o600) }, 0);
     }
 
-    let done = Arc::new(AtomicBool::new(false));
-    let watchdog_done = Arc::clone(&done);
-    let watchdog = thread::spawn(move || {
-        thread::sleep(Duration::from_secs(2));
-        if !watchdog_done.load(AtomicOrdering::SeqCst) {
-            panic!("FIFO open hung past the watchdog budget");
-        }
-    });
+    {
+        let store_fifo = store_fifo.clone();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let result = SharedStoreFile::<ProbeDocument>::open_with_limits(
+                store_fifo,
+                StoreIdentityMode::platform_default(),
+                TlsPersistentStoreKind::Managed,
+                DOC_LIMIT,
+            );
+            let _ = sender.send(result);
+        });
+        let store_result = receiver.recv_timeout(OPEN_BUDGET).unwrap_or_else(|error| {
+            panic!("shared store FIFO open hung past {OPEN_BUDGET:?} budget: {error}");
+        });
+        let store_error = store_result.expect_err("shared store FIFO must refuse");
+        let store_rendered = store_error.to_string();
+        assert!(
+            store_rendered.contains("not a regular file")
+                || store_rendered.contains("failed to read"),
+            "{store_rendered}"
+        );
+        assert!(!store_rendered.contains("BEGIN "));
+    }
 
-    let store_error = SharedStoreFile::<ProbeDocument>::open_with_limits(
-        store_fifo,
-        StoreIdentityMode::platform_default(),
-        TlsPersistentStoreKind::Managed,
-        DOC_LIMIT,
-    )
-    .expect_err("shared store FIFO must refuse");
-    let store_rendered = store_error.to_string();
-    assert!(
-        store_rendered.contains("not a regular file") || store_rendered.contains("failed to read"),
-        "{store_rendered}"
-    );
-    assert!(!store_rendered.contains("BEGIN "));
-
-    let event_error = TlsEventLog::open_with_document_limit(2, Some(events_fifo), DOC_LIMIT)
-        .expect_err("event log FIFO must refuse");
-    assert!(
-        event_error.contains("not a regular file") || event_error.contains("failed to read"),
-        "{event_error}"
-    );
-    assert!(!event_error.contains("BEGIN "));
-
-    done.store(true, AtomicOrdering::SeqCst);
-    watchdog.join().expect("watchdog joins");
+    {
+        let events_fifo = events_fifo.clone();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let result = TlsEventLog::open_with_document_limit(2, Some(events_fifo), DOC_LIMIT);
+            let _ = sender.send(result);
+        });
+        let event_result = receiver.recv_timeout(OPEN_BUDGET).unwrap_or_else(|error| {
+            panic!("event log FIFO open hung past {OPEN_BUDGET:?} budget: {error}");
+        });
+        let event_error = event_result.expect_err("event log FIFO must refuse");
+        assert!(
+            event_error.contains("not a regular file") || event_error.contains("failed to read"),
+            "{event_error}"
+        );
+        assert!(!event_error.contains("BEGIN "));
+    }
 }
 
 #[test]
