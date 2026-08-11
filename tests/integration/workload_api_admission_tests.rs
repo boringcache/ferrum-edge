@@ -470,7 +470,10 @@ enum ExcessStreamRefusal {
     /// `RST_STREAM` on the excess stream itself, carrying its error code.
     ResetStream(u32),
     /// A connection-level `GOAWAY`: its error code and last-stream-id.
-    GoAway { error_code: u32, last_stream_id: u32 },
+    GoAway {
+        error_code: u32,
+        last_stream_id: u32,
+    },
 }
 
 struct H2Frame {
@@ -685,7 +688,10 @@ async fn a_stream_past_the_advertised_ceiling_is_refused_at_the_protocol_level()
             "the excess stream must be reset with REFUSED_STREAM, which tells a conforming client \
              the request may be retried on a new stream"
         ),
-        ExcessStreamRefusal::GoAway { error_code, last_stream_id } => {
+        ExcessStreamRefusal::GoAway {
+            error_code,
+            last_stream_id,
+        } => {
             // Both halves are required: the code proves it was an excess-stream
             // refusal, the last-stream-id proves it was *this* stream that was
             // refused rather than one already served.

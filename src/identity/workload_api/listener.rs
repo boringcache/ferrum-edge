@@ -189,9 +189,9 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
-use super::admission::{FatalAcceptSignal, WorkloadApiAdmissionConfig};
 #[cfg(unix)]
 use super::admission::{ConnectionAdmission, FORCE_CLOSE_SETTLE, admission_stream, wait_until_set};
+use super::admission::{FatalAcceptSignal, WorkloadApiAdmissionConfig};
 use super::server::WorkloadApiService;
 
 /// Default socket path for Ferrum's own Workload API surface.
