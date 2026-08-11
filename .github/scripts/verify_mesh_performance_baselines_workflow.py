@@ -143,6 +143,7 @@ def check_scripts(failures: list[str]) -> None:
     require("SUPPORTED_SUITES" in summary, "summarizer must define SUPPORTED_SUITES", failures)
     require("suites_supported" in summary, "summarizer must gate on suites_supported", failures)
     require("expected_run_paths" in summary, "summarizer must count distinct expected run files", failures)
+    require("unexpected_run_paths" in summary, "summarizer must reject extra or misnumbered run files", failures)
     require("classify_dns_target" in summary, "summarizer must classify DNS targets fail-closed", failures)
     require("duplicate relevant blobs" in summary, "summarizer self-test must cover duplicate blobs", failures)
     require("malformed relevant blobs alongside" in summary, "summarizer self-test must cover malformed mixed runs", failures)

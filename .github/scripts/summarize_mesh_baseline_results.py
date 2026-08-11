@@ -133,6 +133,16 @@ def expected_run_paths(root: Path, required_reps: int) -> list[Path]:
     return [root / f"run_{idx}.txt" for idx in range(1, required_reps + 1)]
 
 
+def unexpected_run_paths(root: Path, required_reps: int) -> list[Path]:
+    """Return extra/misnumbered run artifacts that conflict with the ledger."""
+    expected = set(expected_run_paths(root, required_reps))
+    return sorted(
+        path
+        for path in root.glob("run_*.txt")
+        if path.is_file() and path not in expected
+    )
+
+
 def load_json(path: Path) -> Any | None:
     if not path.is_file():
         return None
@@ -451,8 +461,9 @@ def summarize_hbone(hbone_root: Path, required_reps: int) -> dict[str, Any]:
         scenario_dir = hbone_root / key
         gateway_samples: list[dict[str, Any]] = []
         direct_samples: list[dict[str, Any]] = []
-        rejected = 0
-        shape_failures = 0
+        unexpected_runs = unexpected_run_paths(scenario_dir, required_reps)
+        rejected = len(unexpected_runs)
+        shape_failures = len(unexpected_runs)
         for run_path in expected_run_paths(scenario_dir, required_reps):
             if not run_path.is_file():
                 shape_failures += 1
@@ -594,8 +605,9 @@ def summarize_dns(dns_root: Path, required_reps: int) -> dict[str, Any]:
     direct_rows: dict[tuple[str, str], list[dict[str, Any]]] = {
         key: [] for key in DNS_DIRECT_ROWS
     }
-    rejected = 0
-    shape_failures = 0
+    unexpected_runs = unexpected_run_paths(dns_root, required_reps)
+    rejected = len(unexpected_runs)
+    shape_failures = len(unexpected_runs)
     gateway_keys = set(DNS_GATEWAY_ROWS)
     direct_keys = set(DNS_DIRECT_ROWS)
 
@@ -1223,6 +1235,21 @@ def self_test() -> int:
         assert hbone_dup["1kib_c50_30s"]["repetition_evidence"]["gateway"]["actual"] == 2
         assert hbone_dup["1kib_c50_30s"]["shape_failures"] >= 1
 
+        # --- extra/misnumbered run artifacts conflict with the exact ledger ---
+        extra = root / "extra_runs" / "hbone" / "1kib_c50_30s"
+        extra.mkdir(parents=True)
+        for run in range(1, 5):
+            _write_hbone_run(
+                extra / f"run_{run}.txt",
+                gateway_rps=80.0 + run,
+                direct_rps=100.0 + run,
+            )
+        hbone_extra = summarize_hbone(extra.parent, required_repetitions(3))
+        assert hbone_extra["1kib_c50_30s"]["complete"] is False
+        assert hbone_extra["1kib_c50_30s"]["errors_ok"] is False
+        assert hbone_extra["1kib_c50_30s"]["shape_failures"] == 1
+        assert unexpected_run_paths(extra, 3) == [extra / "run_4.txt"]
+
         # --- malformed relevant blobs alongside valid samples fail closed ---
         malformed = root / "malformed_mixed" / "hbone" / "1kib_c50_30s"
         malformed.mkdir(parents=True)
@@ -1327,6 +1354,15 @@ def self_test() -> int:
         assert classify_dns_target("127.0.0.1:9999") is None
         assert classify_dns_target("127.0.0.1:15053") == "gateway"
         assert classify_dns_target("127.0.0.1:17053") == "direct"
+
+        dns_extra = root / "dns_extra_runs"
+        dns_extra.mkdir()
+        for run in range(1, 5):
+            _write_full_dns_run(dns_extra / f"run_{run}.txt")
+        dns_extra_summary = summarize_dns(dns_extra, required_repetitions(3))
+        assert dns_extra_summary["complete"] is False
+        assert dns_extra_summary["errors_ok"] is False
+        assert dns_extra_summary["shape_failures"] == 1
 
         # --- bad metrics rejected (NaN / non-positive / invalid latency) ---
         bad = root / "bad_metrics" / "hbone" / "1kib_c50_30s"
