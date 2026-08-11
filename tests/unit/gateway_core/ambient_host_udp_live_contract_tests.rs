@@ -494,17 +494,31 @@ fn ambient_udp_lifecycle_image_is_a_first_class_trusted_release_family() {
     }
 
     // 4. The digest name space is owned, and both the producing steps and the
-    //    whole assembling job are frozen by the trusted cross-build policy.
+    //    whole assembling job are frozen by the trusted cross-build policy's
+    //    admitted three-family generation (PR #3768). Ownership is expressed
+    //    through `RELEASE_TOOLS_DIGEST_PREFIX` rather than an inline literal so
+    //    the two-family base and the three-family adoption stay in sync.
     assert!(
-        policy.contains("\"docker-ebpf-tools-digest-\": (\"docker-ebpf\",),"),
+        policy.contains("RELEASE_TOOLS_DIGEST_PREFIX = \"docker-ebpf-tools-digest-\""),
+        "the tools digest wildcard prefix must be named exactly once"
+    );
+    assert!(
+        policy.contains("RELEASE_TOOLS_DIGEST_PREFIX: (\"docker-ebpf\",),"),
         "the tools digest wildcard must be owned by exactly the docker-ebpf job, \
          so no other job can inject a descriptor into the published manifest"
+    );
+    assert!(
+        policy.contains("RELEASE_THREE_FAMILY_DIGEST_ARTIFACT_OWNERS"),
+        "digest ownership for the tools family must live in the three-family \
+         adoption generation, not silently rewrite the two-family base"
     );
     for frozen in [
         "\"Build and push per-platform eBPF tools digest\": (",
         "\"Upload tools digest\": DOCKER_EBPF_TOOLS_UPLOAD_DIGEST_STEP,",
-        "\"Download tools digests\": DOCKER_EBPF_MANIFEST_TOOLS_DOWNLOAD_STEP,",
+        "\"Download tools digests\": (",
+        "DOCKER_EBPF_MANIFEST_TOOLS_DOWNLOAD_STEP",
         "\"steps\": RELEASE_DOCKER_EBPF_TOOLS_MANIFEST_STEPS,",
+        "RELEASE_IMAGE_FAMILY_GENERATIONS",
     ] {
         assert!(
             policy.contains(frozen),

@@ -727,6 +727,16 @@ pub struct MetricsRegistry {
     request_mirror_concurrency_drops: AtomicU64,
     /// `request_mirror` attempts dropped because the retained-body budget was full.
     request_mirror_budget_drops: AtomicU64,
+    /// Service-discovery snapshots rejected because every provider catalog entry
+    /// failed provider normalization (fixed reason; no upstream/index labels).
+    service_discovery_provider_normalization_rejected: AtomicU64,
+    /// Service-discovery snapshots rejected by shared host/egress admission
+    /// (fixed reason; no upstream/index labels).
+    service_discovery_shared_admission_rejected: AtomicU64,
+    /// Blocking-query cursor rollbacks after an admitted lower-index snapshot.
+    service_discovery_cursor_rollback: AtomicU64,
+    /// Blocking-query cursor advances after an admitted higher-index snapshot.
+    service_discovery_cursor_advance: AtomicU64,
     /// Current ai_federation circuits in an open/half-open recovery state.
     ai_federation_circuits_open: AtomicI64,
     /// ai_federation closed-to-open transitions.
@@ -897,6 +907,10 @@ impl MetricsRegistry {
             request_mirror_cancellations: AtomicU64::new(0),
             request_mirror_concurrency_drops: AtomicU64::new(0),
             request_mirror_budget_drops: AtomicU64::new(0),
+            service_discovery_provider_normalization_rejected: AtomicU64::new(0),
+            service_discovery_shared_admission_rejected: AtomicU64::new(0),
+            service_discovery_cursor_rollback: AtomicU64::new(0),
+            service_discovery_cursor_advance: AtomicU64::new(0),
             ai_federation_circuits_open: AtomicI64::new(0),
             ai_federation_circuits_opened: AtomicU64::new(0),
             ai_federation_circuits_closed: AtomicU64::new(0),
@@ -1370,6 +1384,58 @@ impl MetricsRegistry {
         self.request_mirror_budget_drops
             .fetch_add(1, Ordering::Relaxed);
         self.maybe_invalidate_cache();
+    }
+
+    /// Process-wide service-discovery admission / cursor counters. Labels are
+    /// never used: outcomes are fixed aggregate tallies with no upstream names,
+    /// URLs, indexes, or raw rejection strings as dimensions.
+    pub fn record_service_discovery_provider_normalization_rejected(&self) {
+        self.service_discovery_provider_normalization_rejected
+            .fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    pub fn record_service_discovery_shared_admission_rejected(&self) {
+        self.service_discovery_shared_admission_rejected
+            .fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    pub fn record_service_discovery_cursor_rollback(&self) {
+        self.service_discovery_cursor_rollback
+            .fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    pub fn record_service_discovery_cursor_advance(&self) {
+        self.service_discovery_cursor_advance
+            .fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    // Test-crate observation seams for issue #3719 counters.
+    #[allow(dead_code)]
+    pub fn service_discovery_provider_normalization_rejected_total(&self) -> u64 {
+        self.service_discovery_provider_normalization_rejected
+            .load(Ordering::Relaxed)
+    }
+
+    #[allow(dead_code)]
+    pub fn service_discovery_shared_admission_rejected_total(&self) -> u64 {
+        self.service_discovery_shared_admission_rejected
+            .load(Ordering::Relaxed)
+    }
+
+    #[allow(dead_code)]
+    pub fn service_discovery_cursor_rollback_total(&self) -> u64 {
+        self.service_discovery_cursor_rollback
+            .load(Ordering::Relaxed)
+    }
+
+    #[allow(dead_code)]
+    pub fn service_discovery_cursor_advance_total(&self) -> u64 {
+        self.service_discovery_cursor_advance
+            .load(Ordering::Relaxed)
     }
 
     pub fn record_ai_federation_circuit_opened(&self) {
@@ -2931,6 +2997,38 @@ impl MetricsRegistry {
                 "ferrum_request_mirror_budget_drops_total",
                 "request_mirror attempts dropped because max_retained_request_body_bytes was exhausted.",
                 self.request_mirror_budget_drops.load(Ordering::Relaxed),
+            ),
+        ] {
+            output.push_str(&format!("# HELP {name} {help}\n"));
+            output.push_str(&format!("# TYPE {name} counter\n"));
+            render_process_counter(&mut output, name, value, &ns_label);
+        }
+
+        // Service-discovery admission / cursor events (aggregate, label-safe).
+        for (name, help, value) in [
+            (
+                "ferrum_service_discovery_cursor_advance_total",
+                "Service-discovery blocking-query cursor advances after an admitted higher-index snapshot.",
+                self.service_discovery_cursor_advance
+                    .load(Ordering::Relaxed),
+            ),
+            (
+                "ferrum_service_discovery_cursor_rollback_total",
+                "Service-discovery blocking-query cursor rollbacks after an admitted lower-index snapshot.",
+                self.service_discovery_cursor_rollback
+                    .load(Ordering::Relaxed),
+            ),
+            (
+                "ferrum_service_discovery_provider_normalization_rejected_total",
+                "Service-discovery snapshots rejected because every provider catalog entry failed provider normalization.",
+                self.service_discovery_provider_normalization_rejected
+                    .load(Ordering::Relaxed),
+            ),
+            (
+                "ferrum_service_discovery_shared_admission_rejected_total",
+                "Service-discovery snapshots rejected by shared host/egress target admission.",
+                self.service_discovery_shared_admission_rejected
+                    .load(Ordering::Relaxed),
             ),
         ] {
             output.push_str(&format!("# HELP {name} {help}\n"));
