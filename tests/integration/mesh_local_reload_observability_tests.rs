@@ -25,7 +25,9 @@ use ferrum_edge::modes::mesh::config_consumer::file_source::{
     MeshLocalReloadApply, MeshLocalSourceRecovery, apply_mesh_file_reload_candidate,
     load_mesh_slice_from_file,
 };
-use ferrum_edge::modes::mesh::config_consumer::stock_xds_client::apply_stock_policy_reload_candidate;
+use ferrum_edge::modes::mesh::config_consumer::stock_xds_client::{
+    StockPolicySnapshot, apply_stock_policy_reload_candidate,
+};
 use ferrum_edge::modes::mesh::runtime::MeshRuntimeState;
 use ferrum_edge::modes::mesh::slice::MeshSliceRequest;
 use ferrum_edge::proxy::ProxyState;
@@ -284,7 +286,9 @@ fn stock_policy_reload_rejection_raises_and_recovery_clears_only_after_proxy() {
 
     let path = write_temp("yaml", VALID_STOCK_POLICY_YAML);
     let baseline = load_stock_policy_baseline(&path).expect("policy baseline");
-    let (tx, _rx) = tokio::sync::watch::channel(Arc::new(baseline.clone()));
+    let (tx, _rx) = tokio::sync::watch::channel(StockPolicySnapshot::initial(Arc::new(
+        baseline.clone(),
+    )));
     let recovery = MeshLocalSourceRecovery::new(Arc::new(AtomicBool::new(false)));
 
     let rejected = apply_stock_policy_reload_candidate(
@@ -294,7 +298,7 @@ fn stock_policy_reload_rejection_raises_and_recovery_clears_only_after_proxy() {
     );
     assert_eq!(rejected, MeshLocalReloadApply::Rejected);
     assert!(recovery.is_rejected());
-    assert_eq!(tx.borrow().as_ref(), &baseline);
+    assert_eq!(tx.borrow().mesh(), &baseline);
 
     let recovered = apply_stock_policy_reload_candidate(&tx, &recovery, Ok(baseline.clone()));
     assert_eq!(recovered, MeshLocalReloadApply::Unchanged);
@@ -307,7 +311,8 @@ fn stock_policy_reload_rejection_raises_and_recovery_clears_only_after_proxy() {
         version: "stock-obs-recovery".to_string(),
         ..MeshSlice::default()
     };
-    recovery.bind_installed_slice_if_policy_recovery(&bound);
+    let epoch = recovery.pending_epoch();
+    recovery.bind_installed_slice_if_policy_recovery(epoch, &bound);
     recovery.note_proxy_apply_success(&bound);
     assert!(!recovery.is_rejected());
 
@@ -317,5 +322,5 @@ fn stock_policy_reload_rejection_raises_and_recovery_clears_only_after_proxy() {
     assert_eq!(applied, MeshLocalReloadApply::Applied);
     // No prior rejection: sticky flag stays clear, but pending is still set for
     // the new recovery epoch until proxy accept (idempotent clear).
-    assert_eq!(tx.borrow().as_ref(), &changed);
+    assert_eq!(tx.borrow().mesh(), &changed);
 }

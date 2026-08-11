@@ -358,13 +358,11 @@ pub fn apply_validate_overrides(args: &ValidateArgs) {
 /// `FERRUM_CONF_PATH_FILE` source has been materialized; before that this would
 /// consult the wrong settings file.
 ///
-/// The read goes through a fresh `ConfFile::load()`, not
-/// `config::conf_file::resolve_ferrum_var`. The latter memoizes into the
-/// process-wide `CONF_FILE_CACHE`, and this helper must not be the thing that
-/// pins that cache for the rest of the process — `EnvConfig::from_env()` loads
-/// the file itself and reports a malformed one properly. A load failure here is
-/// therefore *not* treated as "a mode is configured": inference proceeds and the
-/// real error surfaces from settings validation a moment later.
+/// The read goes through `ConfFile::load()` so it shares the process-wide
+/// immutable settings snapshot with every later consumer. A load failure here
+/// is *not* treated as "a mode is configured": inference proceeds and
+/// `EnvConfig::from_env()` surfaces the same cached error before any listener
+/// starts.
 pub fn infer_file_mode() {
     use crate::config::conf_file::ConfFile;
 

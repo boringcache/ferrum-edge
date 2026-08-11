@@ -11765,7 +11765,9 @@ pub async fn run(
             format!("failed to load the stock xDS mesh policy document from '{policy_path}'")
         })?;
         let baseline = Arc::new(baseline);
-        let (policy_tx, policy_rx) = tokio::sync::watch::channel(baseline.clone());
+        let (policy_tx, policy_rx) = tokio::sync::watch::channel(
+            config_consumer::stock_xds_client::StockPolicySnapshot::initial(baseline.clone()),
+        );
 
         // The stock server is a third party: reuse only the transport TLS
         // material, never the Ferrum CP/DP JWT machinery.
@@ -13597,6 +13599,7 @@ struct MeshServingSignals {
     listener_failures: Arc<crate::startup::ServingListenerFailures>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn start_mesh_admin_listeners(
     env_config: &EnvConfig,
     shutdown_tx: &tokio::sync::watch::Sender<bool>,
@@ -16886,6 +16889,7 @@ async fn apply_mesh_slice_generation(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn start_mesh_slice_apply_task(
     mesh_state: MeshRuntimeState,
     proxy_state: ProxyState,

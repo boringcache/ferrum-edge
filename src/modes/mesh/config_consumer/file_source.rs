@@ -441,11 +441,19 @@ impl MeshLocalSourceRecovery {
     /// slice that incorporates the active policy recovery (including a later
     /// discovery update on that same recovered baseline).
     ///
+    /// `expected_epoch` is carried atomically with the policy snapshot; a
+    /// debounced slice built from an older snapshot cannot bind a newer policy
+    /// recovery that began before the old slice reached `install_slice`.
+    ///
     /// Binds only the still-current policy recovery: a canceled (`None`) or
     /// superseded (file-slice) pending state is left exactly as found, so a
     /// late install can neither resurrect a canceled recovery nor overwrite a
     /// newer candidate's identity.
-    pub fn bind_installed_slice_if_policy_recovery(&self, slice: &MeshSlice) {
+    pub fn bind_installed_slice_if_policy_recovery(
+        &self,
+        expected_epoch: u64,
+        slice: &MeshSlice,
+    ) {
         let identity = slice_content_identity(slice);
         let mut state = match self.state.lock() {
             Ok(state) => state,
@@ -457,7 +465,7 @@ impl MeshLocalSourceRecovery {
         let Some(pending) = state.pending else {
             return;
         };
-        if pending.kind != PendingRecoveryKind::Policy {
+        if pending.kind != PendingRecoveryKind::Policy || pending.epoch != expected_epoch {
             return;
         }
         match identity {
@@ -530,9 +538,11 @@ impl MeshLocalSourceRecovery {
         };
         let matches_pending = match (pending.digest, identity) {
             (Some(expected), MeshRevisionContentIdentity::Digest(digest)) => digest == expected,
-            // An unbound stock policy recovery has no content identity yet, so
-            // any apply refused while it is the current pending state cancels it.
-            (None, _) => pending.kind == PendingRecoveryKind::Policy,
+            // An unbound stock policy recovery has not installed a candidate
+            // yet. Any apply callback in that window belongs to an older slice
+            // and must not cancel the newer recovery. The stock client binds
+            // the exact epoch/digest before waking the apply task.
+            (None, _) => false,
             _ => false,
         };
         if matches_pending {
@@ -572,12 +582,15 @@ pub fn apply_mesh_file_reload_candidate(
                 .as_ref()
                 .as_ref()
                 .is_some_and(|live| live.content_eq(&slice));
-            let installed = slice.clone();
+            // Register the recovery identity BEFORE `install_slice` wakes the
+            // proxy apply task. Otherwise a fast apply can report success while
+            // no pending recovery exists yet, leaving sticky health degraded
+            // forever even though the exact candidate became live.
+            if recovery.mark_slice_recovery_pending(&slice).is_none() {
+                return MeshLocalReloadApply::Rejected;
+            }
             match state.install_slice(slice) {
                 MeshSliceInstall::Installed => {
-                    if recovery.mark_slice_recovery_pending(&installed).is_none() {
-                        return MeshLocalReloadApply::Rejected;
-                    }
                     if unchanged {
                         MeshLocalReloadApply::Unchanged
                     } else {

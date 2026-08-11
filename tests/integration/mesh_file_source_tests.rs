@@ -652,7 +652,7 @@ fn stock_policy_recovery_pending_until_bound_slice_proxy_accept() {
         MeshLocalReloadApply, MeshLocalSourceRecovery,
     };
     use ferrum_edge::modes::mesh::config_consumer::stock_xds_client::{
-        apply_stock_policy_reload_candidate, load_stock_policy_baseline,
+        StockPolicySnapshot, apply_stock_policy_reload_candidate, load_stock_policy_baseline,
     };
     use ferrum_edge::modes::mesh::slice::MeshSlice;
     use std::sync::Arc;
@@ -668,7 +668,9 @@ mesh:
 "#;
     let path = write_temp("yaml", VALID_STOCK_POLICY_YAML);
     let baseline = load_stock_policy_baseline(&path).expect("policy baseline");
-    let (tx, _rx) = tokio::sync::watch::channel(Arc::new(baseline.clone()));
+    let (tx, _rx) = tokio::sync::watch::channel(StockPolicySnapshot::initial(Arc::new(
+        baseline.clone(),
+    )));
     let recovery = MeshLocalSourceRecovery::new(Arc::new(AtomicBool::new(false)));
 
     let rejected = apply_stock_policy_reload_candidate(
@@ -697,9 +699,79 @@ mesh:
         version: "stock-recovery".to_string(),
         ..MeshSlice::default()
     };
-    recovery.bind_installed_slice_if_policy_recovery(&bound);
+    let epoch = recovery.pending_epoch();
+    recovery.bind_installed_slice_if_policy_recovery(epoch, &bound);
     recovery.note_proxy_apply_success(&bound);
     assert!(!recovery.is_rejected());
+}
+
+#[test]
+fn stock_policy_recovery_epoch_fences_stale_slice_binding() {
+    use ferrum_edge::modes::mesh::config_consumer::file_source::MeshLocalSourceRecovery;
+    use ferrum_edge::modes::mesh::slice::MeshSlice;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    let recovery = MeshLocalSourceRecovery::new(Arc::new(AtomicBool::new(false)));
+    recovery.mark_rejected();
+    let stale_epoch = recovery.begin_policy_recovery();
+    let current_epoch = recovery.begin_policy_recovery();
+    let stale = MeshSlice {
+        labels: [("policy".to_string(), "stale".to_string())].into(),
+        ..MeshSlice::default()
+    };
+    let current = MeshSlice {
+        labels: [("policy".to_string(), "current".to_string())].into(),
+        ..MeshSlice::default()
+    };
+
+    recovery.note_proxy_apply_rejection(&stale);
+    assert_eq!(
+        recovery.pending_epoch(),
+        current_epoch,
+        "an older apply rejection must not cancel an unbound newer policy recovery"
+    );
+
+    recovery.bind_installed_slice_if_policy_recovery(stale_epoch, &stale);
+    recovery.note_proxy_apply_success(&stale);
+    assert!(
+        recovery.is_rejected(),
+        "a stale policy slice must not clear the newer recovery"
+    );
+    assert_eq!(recovery.pending_epoch(), current_epoch);
+
+    recovery.bind_installed_slice_if_policy_recovery(current_epoch, &current);
+    recovery.note_proxy_apply_success(&current);
+    assert!(!recovery.is_rejected());
+}
+
+#[test]
+fn stock_policy_reload_without_consumer_fails_closed() {
+    use ferrum_edge::modes::mesh::config_consumer::file_source::{
+        MeshLocalReloadApply, MeshLocalSourceRecovery,
+    };
+    use ferrum_edge::modes::mesh::config_consumer::stock_xds_client::{
+        StockPolicySnapshot, apply_stock_policy_reload_candidate,
+    };
+    use ferrum_edge::modes::mesh::config::MeshConfig;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    let baseline = MeshConfig::default();
+    let (tx, rx) = tokio::sync::watch::channel(StockPolicySnapshot::initial(Arc::new(
+        baseline.clone(),
+    )));
+    drop(rx);
+    let recovery = MeshLocalSourceRecovery::new(Arc::new(AtomicBool::new(false)));
+
+    let outcome = apply_stock_policy_reload_candidate(&tx, &recovery, Ok(baseline));
+    assert_eq!(outcome, MeshLocalReloadApply::Rejected);
+    assert!(recovery.is_rejected());
+    assert_eq!(
+        recovery.pending_epoch(),
+        0,
+        "an undeliverable policy must not leave a recovery that can later clear"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
