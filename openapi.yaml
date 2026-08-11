@@ -14268,12 +14268,15 @@ components:
           type: array
           description: |
             Namespace-keyed gateway trust bundles (issue #3727). Present on
-            database-backed exports (possibly empty). ABSENT on cached-fallback
-            exports and on backups that predate the resource — restore treats an
-            absent section as "say nothing about trust" and leaves the
-            namespace's existing roots in place, while a present section is
-            authoritative and reconciles to exactly what it lists (an empty
-            array revokes).
+            full, unfiltered database-backed exports (possibly empty). ABSENT on
+            resource-filtered exports, cached-fallback exports, and backups that
+            predate the resource — restore treats an absent section as "say
+            nothing about trust" and leaves the namespace's existing roots in
+            place, while a present section is authoritative and reconciles to
+            exactly what it lists (an empty array revokes). Omitting this section
+            from every `?resources=` response prevents a partial artifact later
+            submitted to `POST /batch` from mutating trust outside the resource
+            classes the caller selected.
           items:
             $ref: "#/components/schemas/GatewayTrustBundle"
         api_specs:

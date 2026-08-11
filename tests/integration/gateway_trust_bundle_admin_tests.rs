@@ -501,6 +501,45 @@ async fn a_backup_round_trips_the_trust_resource_with_server_assigned_revisions(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_resource_filtered_backup_does_not_export_or_import_trust() {
+    let dir = TempDir::new().expect("temp dir");
+    let (base, _shutdown) = start_admin(admin_state(make_store(&dir).await)).await;
+    let authority = root_ca_der_base64("root");
+
+    let (status, created) = post_json(
+        &base,
+        "/gateway-trust-bundles",
+        "ferrum",
+        json!({
+            "trust_domain": "cluster.local",
+            "bundle": bundle_body("cluster.local", &authority),
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "create must succeed: {created}");
+    let revision = created["revision"].as_u64().expect("numeric revision");
+
+    // `gateway_trust_bundles` is deliberately not a resource-filter token.
+    // A proxy-only artifact is commonly replayed through POST /batch and must
+    // not carry a hidden security-state mutation outside the caller's scope.
+    let (status, partial) = get_json(&base, "/backup?resources=proxies", "ferrum").await;
+    assert_eq!(status, 200, "filtered backup must succeed: {partial}");
+    assert!(
+        partial.get("gateway_trust_bundles").is_none(),
+        "a resource-filtered backup must omit trust rather than silently widening its scope"
+    );
+    assert_eq!(partial["counts"]["gateway_trust_bundles"], 0);
+
+    let (status, imported) = post_json(&base, "/batch", "ferrum", partial).await;
+    assert_eq!(status, 201, "the partial artifact must remain batch-compatible: {imported}");
+
+    let (status, after) = get_json(&base, "/gateway-trust-bundles/ferrum", "ferrum").await;
+    assert_eq!(status, 200);
+    assert_eq!(after["revision"].as_u64(), Some(revision));
+    assert_eq!(after["bundle"]["local"]["x509_authorities"][0], authority);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_present_but_empty_section_revokes_and_an_absent_one_does_not() {
     let dir = TempDir::new().expect("temp dir");
     let (base, _shutdown) = start_admin(admin_state(make_store(&dir).await)).await;

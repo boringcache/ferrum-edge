@@ -698,8 +698,11 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
 
 The backup output is directly compatible with `POST /batch` (additive) and `POST /restore` (full replacement). Successful exports and authenticated denied/failed attempts are always audited with request context before (or instead of) releasing unredacted bytes — independent of `FERRUM_ADMIN_AUDIT_ENABLED`, which gates ordinary mutation audit events only — see [Audit Log](#audit-log) and [admin_backup_restore.md](admin_backup_restore.md). Before replacement, restore acquires a persistent namespace guard and snapshots the current namespace with a non-validating raw load from the primary, so an already-invalid-but-present config still snapshots and keeps rollback available while it is repaired. If that snapshot cannot be taken at all — a genuine database/connectivity failure — restore **aborts with `503` before deleting anything** and leaves the prior config intact (retry once the database is reachable). Database inserts are chunked into 1,000-record transactions for large-scale imports. Conditional mTLS DNS-identity uniqueness is checked under the same namespace-scoped datastore admission guard used by ordinary Consumer, plugin, proxy-association, upstream, and API-spec writes, so a concurrent admin process cannot race a batch/restore policy activation with a case-variant credential. Restore retains one persistent guard owner from before its snapshot through the clear and every import or compensating-replay batch. All non-owning namespace resource writers and replays fail closed for that full interval, so no concurrent resource can be lost merely because it was absent from the restore payload. The compensating replay intentionally does not apply newly introduced mTLS DNS admission to the old snapshot: otherwise a pre-existing ambiguity would be deleted successfully and then become impossible to restore. Normal batch/restore admission never receives this rollback-only bypass. The endpoint returns `500 Internal Server Error` with a `rollback` field (`completed` / `incomplete` / `not_needed` / `unknown_outcome`). `not_needed` means the clear definitively aborted atomically (SQL / replica-set MongoDB), so nothing was deleted and the prior config was retained without any re-import. An unknown MongoDB commit remains `unknown_outcome` with the guard retained even when immediate verification still sees the prior counts, because the clear can become visible later. API specs are included in backup and restore as a versioned `api_specs` section (`section_version: "2"`). Legacy backups that omit the section require `?confirm_api_spec_deletion=true` (in addition to `?confirm=true`) when the target namespace still holds specs. `api_specs_not_restored` / `api_specs_note` appear only when rollback is `incomplete` and the prior namespace carried specs — see [admin_backup_restore.md](admin_backup_restore.md).
 
-Gateway trust bundles ride along as a `gateway_trust_bundles` array on
-database-backed exports (possibly empty). Restore treats an **absent** array as
+Gateway trust bundles ride along as a `gateway_trust_bundles` array on full,
+unfiltered database-backed exports (possibly empty). Resource-filtered and
+cached-fallback exports omit the array, so a partial artifact never carries a
+hidden trust mutation outside the resource classes the caller selected.
+Restore treats an **absent** array as
 "this backup says nothing about trust" and leaves the namespace's existing roots
 in place — the destructive namespace clear deliberately does not touch trust, so
 restoring an older config backup can never silently revoke roots. A **present**
@@ -714,8 +717,7 @@ hostile backup cannot inject oversized or malformed trust material by going
 around the API, and an invalid section aborts with `400` and nothing deleted.
 Server-owned fields survive the payload: `id` and `created_at` come from the
 stored record, `revision` is assigned by the store, and `updated_by` is the
-restoring admin's verified JWT subject. Cached-fallback exports
-(`X-Data-Source: cached`) omit the array entirely.
+restoring admin's verified JWT subject.
 
 See [admin_backup_restore.md](admin_backup_restore.md) for details.
 

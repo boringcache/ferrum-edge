@@ -7387,11 +7387,17 @@ fn serialize_backup_payload(
         .map(|section| section.items.len())
         .unwrap_or(0);
 
-    // Gateway trust bundles (issue #3727). Exported whenever the snapshot came
-    // from the authoritative store; a cached-fallback export has no trust rows
-    // to prove and omits the section entirely so a restore of it leaves the
-    // namespace's roots untouched rather than revoking them.
-    let gateway_trust_bundles: Option<&[GatewayTrustBundleRecord]> = if source == "database" {
+    // Gateway trust bundles (issue #3727). Full authoritative exports carry the
+    // section. A cached-fallback export cannot prove trust rows, and a
+    // resource-filtered export must contain ONLY the classes the caller named;
+    // both therefore omit the section entirely. This is especially important
+    // for partial backups later sent to `POST /batch`: unexpectedly carrying
+    // trust there would let `?resources=proxies` rotate a namespace's roots.
+    // Absence is the documented no-op on restore/import, so omission preserves
+    // trust rather than revoking it.
+    let gateway_trust_bundles: Option<&[GatewayTrustBundleRecord]> = if source == "database"
+        && resource_filter.is_none()
+    {
         Some(config.gateway_trust_bundles.as_slice())
     } else {
         None
