@@ -3103,8 +3103,8 @@ pub struct MeshConnectionPoolHttp {
     /// maximum concurrent in-flight requests for a logical backend destination
     /// on the HTTP/1.1 dispatch path. Projects onto the inherited/per-port
     /// dispatch policy and is enforced per
-    /// `(namespace, stable upstream/service id, optional K8s Service UID,
-    /// policy port, selected subset)`
+    /// `(namespace, stable logical upstream/Service identity, optional K8s
+    /// Service UID, policy port, selected subset)`
     /// (issue #3778): when full a new H1 request is shed with a 503 ("upstream
     /// overflow" in Envoy terms). The selected endpoint host is not part of
     /// the key.

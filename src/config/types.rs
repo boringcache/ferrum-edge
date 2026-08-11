@@ -1771,10 +1771,10 @@ pub struct Upstream {
     /// Kubernetes Service `metadata.uid` stamped from the owning
     /// [`crate::modes::mesh::config::MeshService`] when materializing mesh
     /// egress upstreams. Participates in the H1 pending-admission scope
-    /// **alongside** the stable upstream id so a delete/recreate of the same
-    /// Service name cannot inherit a stale lane, while a reused UID cannot
-    /// collapse distinct upstreams (issue #3778). Absent for non-mesh /
-    /// native upstreams.
+    /// **alongside** the stable logical Service identity so a delete/recreate
+    /// of the same Service name cannot inherit a stale lane, while a reused
+    /// UID cannot collapse distinct Services (issue #3778). Absent for
+    /// non-mesh / native upstreams.
     ///
     /// Runtime-only carrier: `#[serde(skip)]` so the file/admin/API/
     /// OpenAPI config surface neither accepts nor emits it (no schema
@@ -3329,6 +3329,34 @@ fn non_canonical_listen_path_reason(path: &str) -> Option<&'static str> {
     }
 }
 
+/// Return the stable logical identity used by H1 pending-admission scopes.
+///
+/// Ordinary upstreams retain their resource id: display names are not unique
+/// and must never make unrelated operator resources share admission. Mesh HTTP
+/// egress is the exception. Its reserved internal upstream ids intentionally
+/// split one Service into a VIP/host upstream and one single-target upstream
+/// per directly addressed workload. Those upstreams are all cold-stamped with
+/// the same Service FQDN in `name`; using that FQDN prevents endpoint fan-out
+/// from multiplying the Service's cap. The optional Kubernetes UID remains an
+/// additive recreate fence, and the policy port is appended at acquire time.
+fn pending_limit_logical_id(upstream: &Upstream) -> &str {
+    let is_mesh_http_egress = upstream
+        .id
+        .starts_with(crate::modes::mesh::MESH_OUTBOUND_UPSTREAM_ID_PREFIX)
+        || upstream
+            .id
+            .starts_with(crate::modes::mesh::MESH_OUTBOUND_HTTP_BYWL_UPSTREAM_ID_PREFIX);
+    if is_mesh_http_egress {
+        upstream
+            .name
+            .as_deref()
+            .filter(|name| !name.is_empty())
+            .unwrap_or(upstream.id.as_str())
+    } else {
+        upstream.id.as_str()
+    }
+}
+
 impl GatewayConfig {
     /// Validate that all proxy (host, listen_path, listen_port) combinations are unique.
     ///
@@ -3995,7 +4023,7 @@ impl GatewayConfig {
     /// Intern each proxy's and upstream's logical H1 pending-admission scope
     /// (issue #3778).
     ///
-    /// Proxy scopes are built from `(namespace, stable upstream/service id,
+    /// Proxy scopes are built from `(namespace, stable upstream/Service identity,
     /// optional K8s Service UID when stamped, selected subset)`. Each
     /// Upstream also carries a derived top-level (no-subset) scope so
     /// request-time upstream route overrides can Arc-clone the destination
@@ -4006,16 +4034,18 @@ impl GatewayConfig {
     /// beside `resolve_dispatch_port_overrides`.
     pub fn resolve_pending_limit_scopes(&mut self) {
         for upstream in &mut self.upstreams {
-            upstream.pending_limit_scope = Some(std::sync::Arc::new(
-                crate::backend_pending_limit::BackendPendingScopeBase::new(
+            let scope = {
+                let logical_id = pending_limit_logical_id(upstream);
+                std::sync::Arc::new(crate::backend_pending_limit::BackendPendingScopeBase::new(
                     upstream.namespace.as_str(),
-                    upstream.id.as_str(),
+                    logical_id,
                     upstream.k8s_service_uid.as_deref(),
                     // Top-level only: route overrides clear `upstream_subset`
                     // when the effective upstream changes.
                     None,
-                ),
-            ));
+                ))
+            };
+            upstream.pending_limit_scope = Some(scope);
         }
 
         let upstream_by_key: HashMap<(&str, &str), &Upstream> = self
@@ -4027,7 +4057,10 @@ impl GatewayConfig {
         for proxy in &mut self.proxies {
             let (logical_id, uid) = if let Some(ref upstream_id) = proxy.upstream_id {
                 match upstream_by_key.get(&(proxy.namespace.as_str(), upstream_id.as_str())) {
-                    Some(upstream) => (upstream.id.as_str(), upstream.k8s_service_uid.as_deref()),
+                    Some(upstream) => (
+                        pending_limit_logical_id(upstream),
+                        upstream.k8s_service_uid.as_deref(),
+                    ),
                     None => (upstream_id.as_str(), None),
                 }
             } else {

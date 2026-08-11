@@ -31,18 +31,22 @@
 //! [`BackendPendingScopeBase`] plus the effective DestinationRule policy port:
 //!
 //! ```text
-//! (namespace/tenant, stable upstream/service id, optional Kubernetes Service UID,
-//!  policy port, selected subset)
+//! (namespace/tenant, stable logical upstream/Service identity,
+//!  optional Kubernetes Service UID, policy port, selected subset)
 //! ```
 //!
-//! The stable upstream/service identity is **always** present. When a Kubernetes
-//! Service `metadata.uid` is stamped, it is added alongside that identity so
-//! delete/recreate opens a fresh lane while an injected/reused UID cannot
-//! collapse otherwise distinct logical destinations. Ordinary Service *spec*
-//! updates (including DestinationRule cap changes) retain one shared counter —
-//! `metadata.generation` is intentionally **not** part of the lane. Native /
-//! file / database config omits the UID and uses `(namespace, upstream_id)`
-//! alone. Direct-backend proxies without an upstream use `(namespace, proxy id)`.
+//! The stable logical identity is **always** present. Ordinary upstreams use
+//! their resource id. Materialized mesh HTTP egress upstreams use their
+//! cold-stamped Service FQDN so the Service's VIP/host route and every direct
+//! workload-IP route share one lane instead of multiplying the cap by endpoint
+//! count. When a Kubernetes Service `metadata.uid` is stamped, it is added
+//! alongside that identity so delete/recreate opens a fresh lane while an
+//! injected/reused UID cannot collapse otherwise distinct logical
+//! destinations. Ordinary Service *spec* updates (including DestinationRule cap
+//! changes) retain one shared counter — `metadata.generation` is intentionally
+//! **not** part of the lane. Native / file / database config omits the UID and
+//! uses `(namespace, upstream_id)` alone. Direct-backend proxies without an
+//! upstream use `(namespace, proxy id)`.
 //!
 //! The selected endpoint host/IP is **not** part of the key: load-balanced
 //! endpoint selection, DNS refresh, pod rotation, and retries to sibling

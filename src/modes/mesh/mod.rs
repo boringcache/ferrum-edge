@@ -3943,8 +3943,11 @@ pub(crate) fn mesh_ingress_listener_groups(
 /// [`mesh_route_direction`] / [`is_mesh_outbound_route_id`] — those predicates
 /// run on proxy ids, and a shared prefix would be a latent footgun if one were
 /// ever handed an upstream id. Parallels the east-west `__mesh-ew-upstream-` id.
+pub(crate) const MESH_OUTBOUND_UPSTREAM_ID_PREFIX: &str = "__mesh-out-upstream-";
+
 pub(crate) fn mesh_outbound_upstream_id(namespace: &str, name: &str, port: u16) -> String {
-    format!("__mesh-out-upstream-{namespace}-{name}-{port}").replace(['/', '.'], "-")
+    format!("{MESH_OUTBOUND_UPSTREAM_ID_PREFIX}{namespace}-{name}-{port}")
+        .replace(['/', '.'], "-")
 }
 
 /// Upstream id for a materialized raw-TCP egress port, one per stream-family
@@ -4001,14 +4004,19 @@ pub(crate) fn mesh_outbound_tcp_bywl_upstream_id(
 /// service-host route. Kept out of the route-id prefix space (like the VIP
 /// outbound upstream ids); the paired proxy below carries the direction-scoped
 /// route prefix.
+pub(crate) const MESH_OUTBOUND_HTTP_BYWL_UPSTREAM_ID_PREFIX: &str =
+    "__mesh-out-http-bywl-upstream-";
+
 pub(crate) fn mesh_outbound_http_bywl_upstream_id(
     namespace: &str,
     name: &str,
     port: u16,
     canonical_ip: std::net::IpAddr,
 ) -> String {
-    format!("__mesh-out-http-bywl-upstream-{namespace}-{name}-{port}-{canonical_ip}")
-        .replace(['/', '.', ':'], "-")
+    format!(
+        "{MESH_OUTBOUND_HTTP_BYWL_UPSTREAM_ID_PREFIX}{namespace}-{name}-{port}-{canonical_ip}"
+    )
+    .replace(['/', '.', ':'], "-")
 }
 
 /// Reserved proxy-id prefix for hidden direct-pod-IP HTTP egress routes.

@@ -262,6 +262,114 @@ fn resolve_pending_limit_scopes_interns_upstream_and_optional_uid_not_host() {
 }
 
 #[test]
+fn mesh_service_scope_converges_vip_and_direct_workload_upstreams() {
+    fn upstream(id: &str, name: &str, uid: Option<&str>) -> Upstream {
+        let mut upstream: Upstream = serde_json::from_value(serde_json::json!({
+            "id": id,
+            "name": name,
+            "namespace": "default",
+            "targets": [{"host": "10.0.0.1", "port": 8080}],
+        }))
+        .expect("upstream");
+        upstream.k8s_service_uid = uid.map(str::to_string);
+        upstream
+    }
+
+    fn proxy(id: &str, upstream_id: &str) -> Proxy {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "namespace": "default",
+            "backend_host": "10.0.0.1",
+            "backend_port": 8080,
+            "upstream_id": upstream_id,
+        }))
+        .expect("proxy")
+    }
+
+    let reviews_vip_id = "__mesh-out-upstream-default-reviews-8080";
+    let reviews_pod_a_id = "__mesh-out-http-bywl-upstream-default-reviews-8080-10-0-0-1";
+    let reviews_pod_b_id = "__mesh-out-http-bywl-upstream-default-reviews-8080-10-0-0-2";
+    let ratings_id = "__mesh-out-upstream-default-ratings-8080";
+    let recreated_reviews_id = "__mesh-out-upstream-default-reviews-9090";
+    let file_mesh_vip_id = "__mesh-out-upstream-default-catalog-8080";
+    let file_mesh_pod_id = "__mesh-out-http-bywl-upstream-default-catalog-8080-10-0-0-3";
+
+    let mut config = GatewayConfig {
+        upstreams: vec![
+            upstream(
+                reviews_vip_id,
+                "reviews.default.svc.cluster.local",
+                Some("uid-reviews"),
+            ),
+            upstream(
+                reviews_pod_a_id,
+                "reviews.default.svc.cluster.local",
+                Some("uid-reviews"),
+            ),
+            upstream(
+                reviews_pod_b_id,
+                "reviews.default.svc.cluster.local",
+                Some("uid-reviews"),
+            ),
+            upstream(
+                ratings_id,
+                "ratings.default.svc.cluster.local",
+                Some("uid-reviews"),
+            ),
+            upstream(
+                recreated_reviews_id,
+                "reviews.default.svc.cluster.local",
+                Some("uid-reviews-new"),
+            ),
+            upstream("native-a", "shared display name", None),
+            upstream("native-b", "shared display name", None),
+            upstream(
+                file_mesh_vip_id,
+                "catalog.default.svc.cluster.local",
+                None,
+            ),
+            upstream(
+                file_mesh_pod_id,
+                "catalog.default.svc.cluster.local",
+                None,
+            ),
+        ],
+        proxies: vec![
+            proxy("reviews-vip", reviews_vip_id),
+            proxy("reviews-pod-a", reviews_pod_a_id),
+            proxy("reviews-pod-b", reviews_pod_b_id),
+        ],
+        ..GatewayConfig::default()
+    };
+    config.resolve_pending_limit_scopes();
+
+    fn upstream_scope(config: &GatewayConfig, index: usize) -> &str {
+        config.upstreams[index]
+            .pending_limit_scope
+            .as_ref()
+            .expect("upstream scope")
+            .prefix()
+    }
+    fn proxy_scope(config: &GatewayConfig, index: usize) -> &str {
+        config.proxies[index]
+            .pending_limit_scope
+            .as_ref()
+            .expect("proxy scope")
+            .prefix()
+    }
+
+    assert_eq!(upstream_scope(&config, 0), upstream_scope(&config, 1));
+    assert_eq!(upstream_scope(&config, 0), upstream_scope(&config, 2));
+    assert_eq!(proxy_scope(&config, 0), proxy_scope(&config, 1));
+    assert_eq!(proxy_scope(&config, 0), proxy_scope(&config, 2));
+    assert_eq!(proxy_scope(&config, 0), upstream_scope(&config, 0));
+    assert_ne!(upstream_scope(&config, 0), upstream_scope(&config, 3));
+    assert_ne!(upstream_scope(&config, 0), upstream_scope(&config, 4));
+    assert_ne!(upstream_scope(&config, 5), upstream_scope(&config, 6));
+    assert_eq!(upstream_scope(&config, 7), upstream_scope(&config, 8));
+}
+
+#[test]
 fn upstream_route_override_rebinds_pending_scope_away_from_source_lane() {
     // A→B upstream override must Arc-clone B's precomputed top-level scope
     // (including K8s Service UID) and must not retain A's capped lane —
