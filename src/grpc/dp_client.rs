@@ -835,10 +835,13 @@ pub async fn start_dp_client_with_stream_timings(
                     cp_count,
                     cp_url
                 );
-                // A base was already accepted on this stream, so the DP is
-                // reconnecting to the same CP for a fresh authoritative
-                // snapshot rather than having lost its authority.
-                update_state_disconnected(&connection_state, cp_url, is_primary, true);
+                // The source just supplied a payload that could not become
+                // authoritative. Treat that refusal as authority loss even
+                // though an earlier base on this stream was valid; otherwise a
+                // CP that repeatedly sends unusable resync payloads can keep an
+                // arbitrarily old last-known-good snapshot in `Reconnecting`
+                // forever and prevent the configured age bound from latching.
+                update_state_disconnected(&connection_state, cp_url, is_primary, false);
                 ConfigSyncAttemptOutcome::ResyncAfterAcceptedConfig
             }
             Ok(DpStreamEnd::TransportFailure { received_config }) => {
