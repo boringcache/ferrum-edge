@@ -261,9 +261,14 @@ exec:
 {{/*
 Render independently configurable startup/liveness/readiness probes.
 Required dict keys:
-  probes       - values.<workload>.probes
-  liveHandler  - non-empty handler used by startup + liveness (empty → skip)
-  readyHandler - non-empty handler used by readiness (empty → skip)
+  probes         - values.<workload>.probes
+  liveHandler    - non-empty handler used by liveness (empty → skip)
+  readyHandler   - non-empty handler used by readiness (empty → skip)
+Optional:
+  startupHandler - non-empty handler used by startup. When omitted/empty,
+                   startup falls back to liveHandler (backward-compatible:
+                   a liveness.override still reaches startup unless an
+                   explicit startup.override is supplied).
 */}}
 {{- define "ferrum-mesh.renderProbes" -}}
 {{- $probes := .probes | default dict -}}
@@ -272,12 +277,14 @@ Required dict keys:
 {{- $readiness := $probes.readiness | default dict -}}
 {{- $liveHandler := .liveHandler | default dict -}}
 {{- $readyHandler := .readyHandler | default dict -}}
-{{- if and ($startup.enabled | default false) $liveHandler }}
+{{- $startupHandler := .startupHandler | default dict -}}
+{{- if not $startupHandler -}}{{- $startupHandler = $liveHandler -}}{{- end -}}
+{{- if and ($startup.enabled | default false) $startupHandler }}
           startupProbe:
-            {{- /* Startup shares the process-only liveness handler. Pointing it
-                   at dependency-aware readiness would kill a pod that boots but
-                   stays legitimately unready (cert/config/CP wait). */}}
-            {{- include "ferrum-mesh.renderProbeHandler" $liveHandler | nindent 12 }}
+            {{- /* Prefer a process-only handler (--live / TCP accept). Pointing
+                   startup at dependency-aware readiness would kill a pod that
+                   boots but stays legitimately unready (cert/config/CP wait). */}}
+            {{- include "ferrum-mesh.renderProbeHandler" $startupHandler | nindent 12 }}
             failureThreshold: {{ $startup.failureThreshold }}
             periodSeconds: {{ $startup.periodSeconds }}
 {{- end }}

@@ -2725,7 +2725,7 @@ jobs:
             --set nodeAgent.probes.liveness.enabled=false \
             --set nodeAgent.probes.readiness.enabled=false \
             > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-https-mtls-disabled.yaml"
-          # HTTPS-only mTLS is allowed when computed probes are overridden.
+          # HTTPS-only mTLS is allowed when every enabled computed probe is overridden.
           helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
             --set nodeAgent.enabled=true \
             --set nodeAgent.admin.enabled=true \
@@ -2734,6 +2734,7 @@ jobs:
             --set nodeAgent.admin.tls.enabled=true \
             --set nodeAgent.admin.tls.secretName=node-agent-admin-tls \
             --set nodeAgent.admin.tls.clientCaKey=ca.crt \
+            --set nodeAgent.probes.startup.override.exec.command[0]=/bin/true \
             --set nodeAgent.probes.liveness.override.exec.command[0]=/bin/true \
             --set nodeAgent.probes.readiness.override.exec.command[0]=/bin/true \
             > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-https-mtls-override.yaml"
@@ -2749,6 +2750,40 @@ jobs:
             > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-https-mtls-unsafe.yaml" \
             2> "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-https-mtls-unsafe.err"; then
             echo "::error title=Node-agent HTTPS-only mTLS computed probes accepted::unsafe computed probes must fail closed"
+            exit 1
+          fi
+          # Asymmetric: startup stays computed while liveness/readiness are overridden → fail.
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set nodeAgent.enabled=true \
+            --set nodeAgent.admin.enabled=true \
+            --set-string nodeAgent.admin.port=0 \
+            --set-string nodeAgent.admin.httpsPort=19443 \
+            --set nodeAgent.admin.tls.enabled=true \
+            --set nodeAgent.admin.tls.secretName=node-agent-admin-tls \
+            --set nodeAgent.admin.tls.clientCaKey=ca.crt \
+            --set nodeAgent.probes.liveness.override.exec.command[0]=/bin/true \
+            --set nodeAgent.probes.readiness.override.exec.command[0]=/bin/true \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-https-mtls-asymmetric.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-https-mtls-asymmetric.err"; then
+            echo "::error title=Node-agent HTTPS-only mTLS asymmetric probe override accepted::startup must be overridden or disabled independently"
+            exit 1
+          fi
+          # HTTPS-only mTLS cannot be advertised via simple Prometheus annotations.
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set nodeAgent.enabled=true \
+            --set nodeAgent.admin.enabled=true \
+            --set-string nodeAgent.admin.port=0 \
+            --set-string nodeAgent.admin.httpsPort=19443 \
+            --set nodeAgent.admin.tls.enabled=true \
+            --set nodeAgent.admin.tls.secretName=node-agent-admin-tls \
+            --set nodeAgent.admin.tls.clientCaKey=ca.crt \
+            --set nodeAgent.probes.startup.enabled=false \
+            --set nodeAgent.probes.liveness.enabled=false \
+            --set nodeAgent.probes.readiness.enabled=false \
+            --set nodeAgent.admin.metricsScrape.enabled=true \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-https-mtls-scrape.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-https-mtls-scrape.err"; then
+            echo "::error title=Node-agent HTTPS-only mTLS scrape annotations accepted::metricsScrape with mTLS must fail closed"
             exit 1
           fi
           # Inherited ambient HTTPS default without TLS must not collide with node-agent HTTPS.

@@ -120,6 +120,120 @@ fn node_agent_admin_surface_active_requires_http_or_https() {
 }
 
 #[test]
+fn admin_https_intent_signals_fail_closed_without_server_material() {
+    ensure_crypto_provider();
+    // Inherited default port 9443 is not itself intent; each TLS-only signal
+    // below must make HTTPS security applicable and fail closed when cert/key
+    // are absent. Port 0 remains the unconditional disable sentinel.
+    let policy = load_tls_policy(&EnvConfig::default()).unwrap();
+    let crls = load_crls_from_env(&EnvConfig::default()).unwrap();
+    let addr: SocketAddr = "127.0.0.1:9443".parse().unwrap();
+
+    let cases: [(&str, EnvConfig); 3] = [
+        (
+            "client CA bundle",
+            EnvConfig {
+                node_agent_admin_enabled: true,
+                admin_http_port: 9000,
+                admin_https_port: 9443,
+                admin_https_port_configured: false,
+                admin_tls_client_ca_bundle_path: Some("/tmp/admin-client-ca.pem".into()),
+                ..EnvConfig::default()
+            },
+        ),
+        (
+            "OCSP response source",
+            EnvConfig {
+                node_agent_admin_enabled: true,
+                admin_http_port: 9000,
+                admin_https_port: 9443,
+                admin_https_port_configured: false,
+                admin_tls_ocsp_response_source: Some("/tmp/admin-ocsp.der".into()),
+                ..EnvConfig::default()
+            },
+        ),
+        (
+            "admin_tls_no_verify=true",
+            EnvConfig {
+                node_agent_admin_enabled: true,
+                admin_http_port: 9000,
+                admin_https_port: 9443,
+                admin_https_port_configured: false,
+                admin_tls_no_verify: true,
+                ..EnvConfig::default()
+            },
+        ),
+    ];
+
+    for (label, env) in cases {
+        assert!(
+            env.admin_https_explicitly_requested(),
+            "{label} must count as explicit HTTPS intent"
+        );
+        assert!(
+            node_agent_admin_https_security_applicable(&env),
+            "{label} must make node-agent HTTPS security applicable"
+        );
+        let err = expect_https_plan_error(
+            plan_admin_https_listener(
+                &env,
+                &policy,
+                &crls,
+                "Invalid node_agent admin TLS configuration",
+                addr,
+                None,
+            ),
+            &format!("{label} without server cert/key must fail closed"),
+        );
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("FERRUM_ADMIN_TLS_CERT_PATH") && msg.contains("FERRUM_ADMIN_TLS_KEY_PATH"),
+            "{label} error must name missing server material: {msg}"
+        );
+        assert!(
+            !msg.contains("/tmp/admin-"),
+            "{label} error must not echo secret/path material: {msg}"
+        );
+
+        let disabled = EnvConfig {
+            admin_https_port: 0,
+            ..env
+        };
+        assert!(
+            !node_agent_admin_https_security_applicable(&disabled),
+            "{label}: port 0 must remain the unconditional HTTPS disable sentinel"
+        );
+        let disabled_plan = plan_admin_https_listener(
+            &disabled,
+            &policy,
+            &crls,
+            "Invalid node_agent admin TLS configuration",
+            "127.0.0.1:0".parse().unwrap(),
+            None,
+        )
+        .expect("port 0 must disable HTTPS even with TLS intent fields");
+        assert!(matches!(
+            disabled_plan,
+            AdminHttpsListenerPlan::DisabledByPort
+        ));
+    }
+
+    // False no_verify is not intent on its own.
+    let no_verify_false = EnvConfig {
+        node_agent_admin_enabled: true,
+        admin_http_port: 9000,
+        admin_https_port: 9443,
+        admin_https_port_configured: false,
+        admin_tls_no_verify: false,
+        ..EnvConfig::default()
+    };
+    assert!(!no_verify_false.admin_https_explicitly_requested());
+    assert!(!node_agent_admin_https_security_applicable(
+        &no_verify_false
+    ));
+}
+
+#[test]
 fn plan_admin_https_listener_disabled_by_port_zero() {
     ensure_crypto_provider();
     let env = EnvConfig {

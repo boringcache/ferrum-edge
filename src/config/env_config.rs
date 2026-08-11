@@ -4589,14 +4589,20 @@ impl EnvConfig {
 
     /// Whether the operator explicitly requested admin HTTPS configuration.
     ///
-    /// True when `FERRUM_ADMIN_HTTPS_PORT` was present in env/`ferrum.conf`, or
-    /// either admin TLS cert/key path is set. The inherited global default port
-    /// `9443` with neither path set is **not** an explicit request — that is the
-    /// raw binary HTTP-only compatibility posture (issue #3704).
+    /// True when `FERRUM_ADMIN_HTTPS_PORT` was present in env/`ferrum.conf`,
+    /// either admin TLS cert/key path is set, a client CA / OCSP source is set,
+    /// or `FERRUM_ADMIN_TLS_NO_VERIFY=true`. The inherited global default port
+    /// `9443` with none of those signals is **not** an explicit request — that
+    /// is the raw binary HTTP-only compatibility posture (issue #3704). Port
+    /// `0` remains the unconditional HTTPS disable sentinel even when TLS
+    /// intent fields are present.
     pub fn admin_https_explicitly_requested(&self) -> bool {
         self.admin_https_port_configured
             || self.admin_tls_cert_path.is_some()
             || self.admin_tls_key_path.is_some()
+            || self.admin_tls_client_ca_bundle_path.is_some()
+            || self.admin_tls_ocsp_response_source.is_some()
+            || self.admin_tls_no_verify
     }
 
     /// Classify the network exposure of the **plaintext** admin HTTP listener

@@ -54,8 +54,12 @@ fn daemonset_renders_managed_admin_https_and_tls_env() {
         "node-agent-admin-tls",
         "prometheus.io/scheme",
         "$nodeAgentProbeUsesTls",
-        "$nodeAgentDefaultLiveProbe",
+        "$nodeAgentDefaultStartupProbe",
+        "$nodeAgentDefaultLivenessProbe",
         "$nodeAgentDefaultReadyProbe",
+        "$nodeAgentStartupHandler",
+        "not $nodeAgentAdminClientCaKey",
+        "external scrape config/sidecar",
     ] {
         assert!(
             ds.contains(needle),
@@ -67,8 +71,8 @@ fn daemonset_renders_managed_admin_https_and_tls_env() {
         "chart must fail closed on HTTPS without TLS Secret config"
     );
     assert!(
-        ds.contains("override/disable probes"),
-        "mTLS HTTPS-only rejection must mention override/disable probes"
+        ds.contains("override/disable every enabled probe"),
+        "mTLS HTTPS-only rejection must mention independent probe overrides"
     );
     assert!(
         !ds.contains("BEGIN CERTIFICATE"),
@@ -84,6 +88,29 @@ fn helpers_support_tls_admin_health_handlers() {
     assert!(
         helpers.contains("$tls := .tls | default false"),
         "adminHealthHandlers must accept an independent TLS flag"
+    );
+    assert!(
+        helpers.contains("startupHandler"),
+        "renderProbes must accept an optional independent startupHandler"
+    );
+}
+
+#[test]
+fn schema_and_values_expose_startup_override() {
+    let schema = read("values.schema.json");
+    assert!(
+        schema.contains("\"startup\"") && schema.contains("Custom startup handler"),
+        "workloadProbes.startup.override must be first-class in the schema"
+    );
+    let values = read("values.yaml");
+    assert!(
+        values.contains("startup:") && values.matches("override: {}").count() >= 6,
+        "every first-class workload probes.startup must expose override: {}"
+    );
+    assert!(
+        values.contains("simple Prometheus pod annotations")
+            || values.contains("cannot present a client certificate"),
+        "values must document mTLS scrape annotation limits"
     );
 }
 

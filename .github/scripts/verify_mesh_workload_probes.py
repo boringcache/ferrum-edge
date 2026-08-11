@@ -316,15 +316,27 @@ def validate_node_agent_dual(results_dir: Path, expectations: dict) -> None:
             "Node-agent dual missing client CA mount env",
             "optional mTLS clientCaKey must render CLIENT_CA_BUNDLE_PATH",
         )
-    if 'prometheus.io/scheme: "https"' not in resource:
+    # Dual HTTP + mTLS HTTPS: simple Prometheus annotations cannot present a
+    # client certificate, so advertise the active plaintext HTTP listener.
+    if 'prometheus.io/scheme: "https"' in resource:
         fail(
-            "Node-agent dual scrape scheme mismatch",
-            "metricsScrape with TLS must prefer https scheme/port",
+            "Node-agent dual mTLS scrape prefers unusable HTTPS",
+            "dual listeners with clientCaKey must advertise http scheme/port",
         )
-    if 'prometheus.io/port: "19443"' not in resource:
+    if 'prometheus.io/scheme: "http"' not in resource:
         fail(
-            "Node-agent dual scrape port mismatch",
-            "metricsScrape with TLS must advertise the HTTPS port",
+            "Node-agent dual mTLS scrape scheme missing",
+            "dual mTLS metricsScrape must advertise http",
+        )
+    if 'prometheus.io/port: "19090"' not in resource:
+        fail(
+            "Node-agent dual mTLS scrape port mismatch",
+            "dual mTLS metricsScrape must advertise the HTTP admin port",
+        )
+    if 'prometheus.io/port: "19443"' in resource:
+        fail(
+            "Node-agent dual mTLS scrape still advertises HTTPS port",
+            "mTLS HTTPS must not be advertised via simple prometheus.io annotations",
         )
     print("mesh probe node-agent dual ok")
 
@@ -371,10 +383,10 @@ def validate_node_agent_https_mtls_probe_policy(
     overridden = require_capture(
         results_dir, captures["node_agent_https_mtls_override"]
     ).read_text(encoding="utf-8")
-    if "/bin/true" not in overridden:
+    if overridden.count("/bin/true") < 3:
         fail(
             "Node-agent HTTPS-only mTLS override missing",
-            "explicit probe overrides must render for HTTPS-only mTLS",
+            "safe override must replace every enabled probe (startup/liveness/readiness)",
         )
     if re.search(r"ferrum-edge\"?\s*\n\s*-\s*\"health\"", overridden) and "--tls" in overridden:
         fail(
@@ -393,6 +405,32 @@ def validate_node_agent_https_mtls_probe_policy(
         fail(
             "Node-agent HTTPS-only mTLS unsafe rejection drift",
             "stderr must mention client certificate / clientCaKey guidance",
+        )
+    asymmetric = require_capture(
+        results_dir, captures["node_agent_https_mtls_asymmetric_err"]
+    ).read_text(encoding="utf-8")
+    if not asymmetric.strip():
+        fail(
+            "Node-agent HTTPS-only mTLS asymmetric override accepted",
+            "startup staying computed while liveness/readiness are overridden must fail closed",
+        )
+    if "client certificate" not in asymmetric and "clientCaKey" not in asymmetric:
+        fail(
+            "Node-agent HTTPS-only mTLS asymmetric rejection drift",
+            "stderr must mention client certificate / clientCaKey guidance",
+        )
+    scrape_err = require_capture(
+        results_dir, captures["node_agent_https_mtls_scrape_err"]
+    ).read_text(encoding="utf-8")
+    if not scrape_err.strip():
+        fail(
+            "Node-agent HTTPS-only mTLS scrape annotations accepted",
+            "metricsScrape.enabled with HTTPS-only mTLS must fail closed",
+        )
+    if "metricsScrape" not in scrape_err and "client certificate" not in scrape_err:
+        fail(
+            "Node-agent HTTPS-only mTLS scrape rejection drift",
+            "stderr must mention metricsScrape / client certificate guidance",
         )
     print("mesh probe node-agent HTTPS-only mTLS probe policy ok")
 

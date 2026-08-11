@@ -12,6 +12,8 @@
     "node_agent_https_mtls_disabled": "mesh-probes-node-agent-https-mtls-disabled.yaml",
     "node_agent_https_mtls_override": "mesh-probes-node-agent-https-mtls-override.yaml",
     "node_agent_https_mtls_unsafe_err": "mesh-probes-node-agent-https-mtls-unsafe.err",
+    "node_agent_https_mtls_asymmetric_err": "mesh-probes-node-agent-https-mtls-asymmetric.err",
+    "node_agent_https_mtls_scrape_err": "mesh-probes-node-agent-https-mtls-scrape.err",
     "node_agent_https_no_ambient_collision": "mesh-probes-node-agent-https-no-ambient-collision.yaml",
     "node_agent_https_collision_err": "mesh-probes-node-agent-https-collision.err",
     "node_waypoint": "mesh-probes-node-waypoint.yaml"

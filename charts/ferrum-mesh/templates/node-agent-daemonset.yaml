@@ -92,8 +92,10 @@
 {{- $nodeAgentProbePort = $nodeAgentAdminHttpsPort -}}
 {{- end -}}
 {{- /* HTTPS-only mTLS: computed exec probes cannot present a client cert.
-       Permit the combo when every computed probe is disabled or overridden;
-       fail only when an enabled probe would still use the built-in handler. */ -}}
+       Classify startup/liveness/readiness independently — a liveness override
+       does not cover an enabled startup probe that still uses the built-in
+       HTTPS handler. Permit the combo only when every enabled probe is
+       disabled or has an explicit override; fail otherwise. */ -}}
 {{- $nodeAgentProbes := .Values.nodeAgent.probes | default dict -}}
 {{- $nodeAgentStartupProbe := $nodeAgentProbes.startup | default dict -}}
 {{- $nodeAgentLivenessProbe := $nodeAgentProbes.liveness | default dict -}}
@@ -110,15 +112,23 @@
 {{- if hasKey $nodeAgentReadinessProbe "enabled" -}}
 {{- $nodeAgentReadinessEnabled = $nodeAgentReadinessProbe.enabled -}}
 {{- end -}}
-{{- $nodeAgentDefaultLiveProbe := and (or $nodeAgentStartupEnabled $nodeAgentLivenessEnabled) (not ($nodeAgentLivenessProbe.override | default dict)) -}}
+{{- $nodeAgentDefaultStartupProbe := and $nodeAgentStartupEnabled (not ($nodeAgentStartupProbe.override | default dict)) -}}
+{{- $nodeAgentDefaultLivenessProbe := and $nodeAgentLivenessEnabled (not ($nodeAgentLivenessProbe.override | default dict)) -}}
 {{- $nodeAgentDefaultReadyProbe := and $nodeAgentReadinessEnabled (not ($nodeAgentReadinessProbe.override | default dict)) -}}
-{{- if and $nodeAgentProbeUsesTls $nodeAgentAdminClientCaKey (or $nodeAgentDefaultLiveProbe $nodeAgentDefaultReadyProbe) -}}
-{{- fail "nodeAgent.admin.port=0 with admin mTLS (tls.clientCaKey) makes HTTPS require a client certificate, but computed exec probes cannot present one; override/disable probes or keep a plaintext loopback admin.port" -}}
+{{- if and $nodeAgentProbeUsesTls $nodeAgentAdminClientCaKey (or $nodeAgentDefaultStartupProbe $nodeAgentDefaultLivenessProbe $nodeAgentDefaultReadyProbe) -}}
+{{- fail "nodeAgent.admin.port=0 with admin mTLS (tls.clientCaKey) makes HTTPS require a client certificate, but computed exec probes cannot present one; override/disable every enabled probe (startup/liveness/readiness independently) or keep a plaintext loopback admin.port" -}}
 {{- end -}}
 {{- $nodeAgentScrape := .Values.nodeAgent.admin.metricsScrape | default dict -}}
 {{- $nodeAgentScrapeEnabled := $nodeAgentScrape.enabled | default false -}}
 {{- $nodeAgentScrapePath := $nodeAgentScrape.path | default "/metrics" -}}
-{{- $nodeAgentScrapeUsesHttps := and (ne $nodeAgentAdminHttpsPort "0") $nodeAgentAdminTlsConfigured -}}
+{{- /* Simple prometheus.io annotations cannot present a client certificate.
+       Dual HTTP + mTLS HTTPS: advertise the plaintext HTTP port/scheme.
+       HTTPS without client auth: prefer HTTPS.
+       HTTPS-only + mTLS with metricsScrape.enabled: fail closed. */ -}}
+{{- if and $nodeAgentScrapeEnabled (eq $nodeAgentAdminHttpPort "0") (ne $nodeAgentAdminHttpsPort "0") $nodeAgentAdminTlsConfigured $nodeAgentAdminClientCaKey -}}
+{{- fail "nodeAgent.admin.metricsScrape.enabled=true with HTTPS-only mTLS (tls.clientCaKey) cannot be scraped via simple Prometheus pod annotations (no client certificate); use an external scrape config/sidecar that presents a client certificate, or keep a plaintext loopback admin.port" -}}
+{{- end -}}
+{{- $nodeAgentScrapeUsesHttps := and (ne $nodeAgentAdminHttpsPort "0") $nodeAgentAdminTlsConfigured (not $nodeAgentAdminClientCaKey) -}}
 {{- $nodeAgentScrapePort := $nodeAgentAdminHttpPort -}}
 {{- $nodeAgentScrapeScheme := "http" -}}
 {{- if $nodeAgentScrapeUsesHttps -}}
@@ -504,17 +514,24 @@ spec:
                  disabled or neither HTTP nor HTTPS is available. Overrides
                  still render. HTTPS-only probes use --tls --tls-no-verify.
                  Liveness uses --live so capture degradation does not
-                 restart-loop the agent. */ -}}
+                 restart-loop the agent. Startup/liveness/readiness overrides
+                 are classified independently for HTTPS-only mTLS. */ -}}
           {{- $nodeAgentAdminAvailable := and .Values.nodeAgent.admin.enabled (or (ne $nodeAgentAdminHttpPort "0") $nodeAgentProbeUsesTls) -}}
           {{- $nodeAgentHandlers := dict "live" (dict) "ready" (dict) -}}
           {{- if $nodeAgentAdminAvailable -}}
           {{- $nodeAgentHandlers = include "ferrum-mesh.adminHealthHandlers" (dict "port" $nodeAgentProbePort "probeHost" $nodeAgentAdminProbeHost "tls" $nodeAgentProbeUsesTls) | fromYaml -}}
           {{- end -}}
-          {{- $nodeAgentLiveHandler := .Values.nodeAgent.probes.liveness.override | default dict -}}
+          {{- /* Pass startupHandler explicitly so a liveness.override cannot
+                 silently cover an enabled startup probe under HTTPS-only mTLS.
+                 Other workloads omit startupHandler and keep the liveHandler
+                 fallback in renderProbes. */ -}}
+          {{- $nodeAgentStartupHandler := $nodeAgentStartupProbe.override | default dict -}}
+          {{- if not $nodeAgentStartupHandler }}{{- $nodeAgentStartupHandler = $nodeAgentHandlers.live | default dict -}}{{- end -}}
+          {{- $nodeAgentLiveHandler := $nodeAgentLivenessProbe.override | default dict -}}
           {{- if not $nodeAgentLiveHandler }}{{- $nodeAgentLiveHandler = $nodeAgentHandlers.live | default dict -}}{{- end -}}
-          {{- $nodeAgentReadyHandler := .Values.nodeAgent.probes.readiness.override | default dict -}}
+          {{- $nodeAgentReadyHandler := $nodeAgentReadinessProbe.override | default dict -}}
           {{- if not $nodeAgentReadyHandler }}{{- $nodeAgentReadyHandler = $nodeAgentHandlers.ready | default dict -}}{{- end -}}
-          {{- include "ferrum-mesh.renderProbes" (dict "probes" .Values.nodeAgent.probes "liveHandler" $nodeAgentLiveHandler "readyHandler" $nodeAgentReadyHandler) }}
+          {{- include "ferrum-mesh.renderProbes" (dict "probes" .Values.nodeAgent.probes "startupHandler" $nodeAgentStartupHandler "liveHandler" $nodeAgentLiveHandler "readyHandler" $nodeAgentReadyHandler) }}
       volumes:
         - name: bpf-fs
           hostPath:
