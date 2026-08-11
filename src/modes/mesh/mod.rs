@@ -18175,6 +18175,7 @@ mod tests {
             generation: None,
             from: None,
             to: None,
+            established: None,
         };
         prepare_placement(registry.path(), &stable).expect("stable placement");
         let cleanup = UdpPlacementRequest {
@@ -18183,6 +18184,7 @@ mod tests {
             generation: Some("supervisor-test".to_string()),
             from: Some(UdpPlacement::PodNetns),
             to: Some(UdpPlacement::HostNetns),
+            established: None,
         };
         let context = match prepare_placement(registry.path(), &cleanup).expect("cleanup placement")
         {
