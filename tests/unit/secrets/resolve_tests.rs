@@ -520,6 +520,14 @@ fn test_resolve_all_env_secrets_reports_first_unsupported_suffix_deterministical
 /// bounded `recv_timeout`. A regression fails the test loudly instead of parking
 /// the suite.
 ///
+/// This harness no longer exercises `FERRUM_SECRET_FETCH_TIMEOUT_SECONDS`: a
+/// FIFO cannot reach the read at all now, so there is no portable way to stall a
+/// *regular*-file read here. The residual — a stalled mount on a regular file —
+/// is bounded by the detached-thread contract, covered at the reader seam by
+/// `secrets::credential_file_tests::detached_bounded_reader_timeout_does_not_pin_runtime_teardown`
+/// and pinned structurally by
+/// `secrets::file_tests::file_secret_reads_use_detached_os_thread_not_spawn_blocking`.
+///
 /// The env vars are set and left in place for the worker (which only reads
 /// them) and are cleared after the bounded wait; `ENV_LOCK` is held throughout.
 #[cfg(unix)]
@@ -598,7 +606,7 @@ fn assert_non_regular_file_source_fails_immediately_and_tears_down<F>(
 
 #[cfg(unix)]
 #[test]
-fn test_resolve_all_env_secrets_times_out_on_blocked_file_source() {
+fn test_resolve_all_env_secrets_refuses_non_regular_file_source() {
     assert_non_regular_file_source_fails_immediately_and_tears_down(
         "FERRUM_TEST_SECRET_BLOCKED_FILE",
         "FERRUM_TEST_SECRET_BLOCKED",
@@ -619,7 +627,7 @@ fn test_resolve_all_env_secrets_times_out_on_blocked_file_source() {
 /// cannot hide behind the startup-batch test.
 #[cfg(unix)]
 #[test]
-fn test_resolve_secret_times_out_on_blocked_file_source() {
+fn test_resolve_secret_refuses_non_regular_file_source() {
     assert_non_regular_file_source_fails_immediately_and_tears_down(
         "FERRUM_TEST_SECRET_BLOCKED_ONE_FILE",
         "FERRUM_TEST_SECRET_BLOCKED_ONE",
