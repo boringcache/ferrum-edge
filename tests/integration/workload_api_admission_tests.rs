@@ -995,9 +995,16 @@ async fn the_exported_admission_metrics_stay_fixed_cardinality() {
     // contract assertions below instead of depending on another concurrent test
     // having already driven the service-wide RPC ceiling.
     ferrum_edge::plugins::mesh::prometheus_helpers::increment_workload_api_rpc_rejected();
+    ferrum_edge::plugins::mesh::prometheus_helpers::increment_workload_api_connection_rejected(
+        "attacker_controlled_reason",
+    );
 
     let mut rendered = String::new();
     render_mesh_observability_metrics(&mut rendered);
+    assert!(
+        !rendered.contains("attacker_controlled_reason"),
+        "an unexpected reason must be dropped rather than creating a metric series"
+    );
 
     let allowed_reject = [
         reject_reason::PEER_CREDENTIALS,

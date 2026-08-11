@@ -71,15 +71,16 @@ static WORKLOAD_API_ADMISSION_ARMED: AtomicU64 = AtomicU64::new(0);
 static WORKLOAD_API_ACTIVE_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
 static WORKLOAD_API_ACTIVE_RPCS: AtomicU64 = AtomicU64::new(0);
 static WORKLOAD_API_RPCS_REJECTED: AtomicU64 = AtomicU64::new(0);
-/// Keyed by a closed set of `&'static str` reasons
-/// (`identity::workload_api::admission::reject_reason`), so the label dimension
-/// is fixed by construction and no peer-controlled value can enter it.
-static WORKLOAD_API_CONNECTIONS_REJECTED: LazyLock<DashMap<&'static str, AtomicU64>> =
-    LazyLock::new(DashMap::new);
-/// Same closed-set contract, over
-/// `identity::workload_api::admission::close_reason`.
-static WORKLOAD_API_CONNECTIONS_CLOSED: LazyLock<DashMap<&'static str, AtomicU64>> =
-    LazyLock::new(DashMap::new);
+// One atomic per admitted label keeps these dimensions closed by construction.
+// The increment helpers below match only these spellings; an unexpected static
+// string cannot allocate or create a new Prometheus series.
+static WORKLOAD_API_REJECTED_PEER_CREDENTIALS: AtomicU64 = AtomicU64::new(0);
+static WORKLOAD_API_REJECTED_MAX_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
+static WORKLOAD_API_REJECTED_MAX_CONNECTIONS_PER_UID: AtomicU64 = AtomicU64::new(0);
+static WORKLOAD_API_REJECTED_SHUTTING_DOWN: AtomicU64 = AtomicU64::new(0);
+static WORKLOAD_API_CLOSED_INITIAL_TIMEOUT: AtomicU64 = AtomicU64::new(0);
+static WORKLOAD_API_CLOSED_IDLE_TIMEOUT: AtomicU64 = AtomicU64::new(0);
+static WORKLOAD_API_CLOSED_SHUTDOWN_DEADLINE: AtomicU64 = AtomicU64::new(0);
 
 /// Istio/GAMMA-style RED metric key for mesh HTTP-family requests.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -948,19 +949,26 @@ pub fn decrement_workload_api_active_connections() {
 /// one is both an unbounded cardinality dimension and a disclosure surface. The
 /// per-rejection detail stays in `debug!` at the reject site.
 pub fn increment_workload_api_connection_rejected(reason: &'static str) {
-    WORKLOAD_API_CONNECTIONS_REJECTED
-        .entry(reason)
-        .or_insert_with(|| AtomicU64::new(0))
-        .fetch_add(1, Ordering::Relaxed);
+    let counter = match reason {
+        "peer_credentials" => &WORKLOAD_API_REJECTED_PEER_CREDENTIALS,
+        "max_connections" => &WORKLOAD_API_REJECTED_MAX_CONNECTIONS,
+        "max_connections_per_uid" => &WORKLOAD_API_REJECTED_MAX_CONNECTIONS_PER_UID,
+        "shutting_down" => &WORKLOAD_API_REJECTED_SHUTTING_DOWN,
+        _ => return,
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Count a Workload API connection the listener closed on a transport deadline
 /// or at the shutdown force-close. Same closed-set `reason` contract.
 pub fn increment_workload_api_connection_closed(reason: &'static str) {
-    WORKLOAD_API_CONNECTIONS_CLOSED
-        .entry(reason)
-        .or_insert_with(|| AtomicU64::new(0))
-        .fetch_add(1, Ordering::Relaxed);
+    let counter = match reason {
+        "initial_timeout" => &WORKLOAD_API_CLOSED_INITIAL_TIMEOUT,
+        "idle_timeout" => &WORKLOAD_API_CLOSED_IDLE_TIMEOUT,
+        "shutdown_deadline" => &WORKLOAD_API_CLOSED_SHUTDOWN_DEADLINE,
+        _ => return,
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Count one admitted Workload API RPC (held for a streaming RPC's whole
@@ -1339,32 +1347,63 @@ pub fn render_mesh_observability_metrics_with_gateway_namespace(
         );
     }
 
-    if !WORKLOAD_API_CONNECTIONS_REJECTED.is_empty() {
+    let workload_api_rejections = [
+        (
+            "peer_credentials",
+            WORKLOAD_API_REJECTED_PEER_CREDENTIALS.load(Ordering::Relaxed),
+        ),
+        (
+            "max_connections",
+            WORKLOAD_API_REJECTED_MAX_CONNECTIONS.load(Ordering::Relaxed),
+        ),
+        (
+            "max_connections_per_uid",
+            WORKLOAD_API_REJECTED_MAX_CONNECTIONS_PER_UID.load(Ordering::Relaxed),
+        ),
+        (
+            "shutting_down",
+            WORKLOAD_API_REJECTED_SHUTTING_DOWN.load(Ordering::Relaxed),
+        ),
+    ];
+    if workload_api_rejections.iter().any(|(_, count)| *count > 0) {
         output.push_str(
             "# HELP ferrum_mesh_workload_api_connections_rejected_total SPIFFE Workload API connections refused before any tonic allocation, by fixed admission reason.\n",
         );
         output.push_str("# TYPE ferrum_mesh_workload_api_connections_rejected_total counter\n");
-        for entry in WORKLOAD_API_CONNECTIONS_REJECTED.iter() {
+        for (reason, count) in workload_api_rejections
+            .iter()
+            .filter(|(_, count)| *count > 0)
+        {
             output.push_str(&format!(
                 "ferrum_mesh_workload_api_connections_rejected_total{{reason=\"{}\"{}}} {}\n",
-                entry.key(),
-                gateway_ns_label,
-                entry.value().load(Ordering::Relaxed)
+                reason, gateway_ns_label, count
             ));
         }
     }
 
-    if !WORKLOAD_API_CONNECTIONS_CLOSED.is_empty() {
+    let workload_api_closes = [
+        (
+            "initial_timeout",
+            WORKLOAD_API_CLOSED_INITIAL_TIMEOUT.load(Ordering::Relaxed),
+        ),
+        (
+            "idle_timeout",
+            WORKLOAD_API_CLOSED_IDLE_TIMEOUT.load(Ordering::Relaxed),
+        ),
+        (
+            "shutdown_deadline",
+            WORKLOAD_API_CLOSED_SHUTDOWN_DEADLINE.load(Ordering::Relaxed),
+        ),
+    ];
+    if workload_api_closes.iter().any(|(_, count)| *count > 0) {
         output.push_str(
             "# HELP ferrum_mesh_workload_api_connections_closed_total Established SPIFFE Workload API connections closed by a transport deadline or the bounded shutdown force-close, by fixed reason.\n",
         );
         output.push_str("# TYPE ferrum_mesh_workload_api_connections_closed_total counter\n");
-        for entry in WORKLOAD_API_CONNECTIONS_CLOSED.iter() {
+        for (reason, count) in workload_api_closes.iter().filter(|(_, count)| *count > 0) {
             output.push_str(&format!(
                 "ferrum_mesh_workload_api_connections_closed_total{{reason=\"{}\"{}}} {}\n",
-                entry.key(),
-                gateway_ns_label,
-                entry.value().load(Ordering::Relaxed)
+                reason, gateway_ns_label, count
             ));
         }
     }
