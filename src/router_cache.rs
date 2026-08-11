@@ -1713,6 +1713,7 @@ impl RouterCache {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn find_proxy_with_admission(
         &self,
         table: &HostRouteTable,
