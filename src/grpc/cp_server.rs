@@ -1204,6 +1204,7 @@ impl CpGrpcServer {
     /// `pub` so external integration tests can assert the namespace
     /// projection directly; this is the primary tenant boundary for every
     /// full-snapshot publication path.
+    #[allow(dead_code)] // Public integration-test seam is unused in the binary target.
     pub fn filter_config_to_namespace_for_scope(
         config: &GatewayConfig,
         namespace: &str,

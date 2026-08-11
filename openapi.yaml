@@ -10662,8 +10662,7 @@ components:
             value sent is the expected current revision (`0` or omitted = no
             expectation); the stored value is always assigned by the server.
         updated_by:
-          type: string
-          nullable: true
+          type: [string, "null"]
           description: >-
             Admin JWT subject that last wrote the record. Server-assigned from
             the verified token; a value in the request body is discarded.
@@ -10826,9 +10825,9 @@ components:
             state report the same value, and any rotation or revocation changes
             it. Being a digest, it carries no trust material.
         bundle:
-          allOf:
+          oneOf:
             - $ref: "#/components/schemas/GatewayTrustBundleSummary"
-          nullable: true
+            - type: "null"
         process:
           type: object
           description: >-
