@@ -5602,7 +5602,11 @@ async fn start_test_xds_server_with_limits(
             .await;
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
-    (format!("http://127.0.0.1:{}", addr.port()), admission, handle)
+    (
+        format!("http://127.0.0.1:{}", addr.port()),
+        admission,
+        handle,
+    )
 }
 
 fn ads_lds_request(node_id: &str) -> ferrum_edge::xds::proto::DiscoveryRequest {
@@ -5774,7 +5778,10 @@ async fn test_xds_sotw_and_delta_share_one_aggregate_budget() {
     // ...so a Delta stream on a fresh connection and a fresh node id is refused.
     let mut delta_client = ads_client(&url).await;
     let (req_tx, req_rx) = tokio::sync::mpsc::channel(4);
-    req_tx.send(ads_delta_lds_request("node-delta")).await.unwrap();
+    req_tx
+        .send(ads_delta_lds_request("node-delta"))
+        .await
+        .unwrap();
     let mut request = tonic::Request::new(tokio_stream::wrappers::ReceiverStream::new(req_rx));
     request
         .metadata_mut()

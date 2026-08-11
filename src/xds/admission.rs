@@ -36,18 +36,21 @@
 //! `Node.id` is descriptive metadata, never an authorization decision. Every
 //! mutable per-stream state key (snapshot cache, nonce tracker, workload
 //! identity, waypoint name, node scoping, and the per-node stream quota) is
-//! keyed by `namespace + principal digest + node id`, so two unrelated
-//! authenticated principals inside one namespace can never alias one mutable
-//! xDS state key or consume each other's quota, even when they choose the same
-//! `Node.id`.
+//! keyed by `namespace + full-width principal digest + node id`, so two
+//! unrelated authenticated principals inside one namespace can never alias one
+//! mutable xDS state key or consume each other's quota, even when they choose
+//! the same `Node.id`.
 //!
 //! ## Cardinality and redaction
 //!
 //! Nothing here labels a metric or a log field with a raw `Node.id`, JWT
-//! subject, SPIFFE URI, or token. The principal is reduced to a SHA-256 digest
-//! prefix before it is ever stored, and log sites use
-//! [`redacted_identifier`] for node ids. Rejection metrics carry only a
-//! compile-time [`XdsAdmissionRejection::metric_reason`] label.
+//! subject, SPIFFE URI, or token. The two digest domains are separate and are
+//! never interchangeable: the principal is reduced to a full-width,
+//! domain-separated SHA-256 digest ([`principal_key`]) before it is ever
+//! stored — never truncated, because that digest is a state-key and quota
+//! boundary — while log sites use the short, log-only [`redacted_identifier`]
+//! for node ids. Rejection metrics carry only a compile-time
+//! [`XdsAdmissionRejection::metric_reason`] label.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -89,9 +92,28 @@ pub const DEFAULT_XDS_MAX_NODE_ID_BYTES: usize = 253;
 /// park a task, a channel, and a permit indefinitely.
 pub const DEFAULT_XDS_FIRST_REQUEST_TIMEOUT_SECS: u64 = 30;
 
-/// Length (hex characters) of the digest prefix used for principal state keys
-/// and for redacted identifiers in logs.
-const DIGEST_PREFIX_LEN: usize = 16;
+/// Width (hex characters) of a per-principal map/state key: the FULL SHA-256
+/// digest.
+///
+/// Deliberately not truncated. A principal key is a security boundary — it
+/// keys the per-principal stream quota and, through [`xds_state_key`], the
+/// mutable snapshot / nonce / workload-identity / waypoint / scoping state —
+/// so a client that could find two subjects sharing a key could alias another
+/// principal's mutable state and drain its quota. A 64-bit truncation is a
+/// tractable collision target (~2^32 work by the birthday bound) for an
+/// attacker who freely chooses its own JWT `sub`; the full 256-bit digest is
+/// not.
+const PRINCIPAL_KEY_DIGEST_LEN: usize = 64;
+
+/// Length (hex characters) of the SHORT digest used ONLY as a redacted log
+/// identifier.
+///
+/// Log correlation is not a security boundary: the digest exists so a log line
+/// can correlate repeated occurrences of one client-supplied value without
+/// echoing attacker-controlled bytes, and a short fixed width keeps the field
+/// readable. This value is never used as a map key, a state key, or a metric
+/// label. Do not reuse it for [`principal_key`].
+const LOG_DIGEST_PREFIX_LEN: usize = 16;
 
 /// Why an ADS stream was refused. Every variant is a compile-time constant, so
 /// using [`Self::metric_reason`] as a metric label cannot grow the series at
@@ -429,11 +451,12 @@ impl XdsAdmissionController {
     fn release_total(&self) {
         // `saturating_sub` semantics: never wrap below zero even if a future
         // caller double-releases.
-        let _ = self.inner.total_streams.fetch_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            |current| Some(current.saturating_sub(1)),
-        );
+        let _ =
+            self.inner
+                .total_streams
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    Some(current.saturating_sub(1))
+                });
     }
 
     /// Register one stream against a node state key. Returns the per-node and
@@ -573,30 +596,43 @@ pub fn validate_node_id(node_id: &str, max_bytes: usize) -> Result<(), XdsAdmiss
     Ok(())
 }
 
-/// Stable, non-reversible key for an authenticated principal (JWT `sub`).
+/// Stable, non-reversible, FULL-WIDTH key for an authenticated principal
+/// (JWT `sub`).
 ///
 /// The raw subject is never stored in a map key, a state key, a log field, or a
-/// metric label — only this digest prefix is. Distinct subjects get distinct
-/// keys, so two principals cannot alias one quota or one mutable state key.
+/// metric label — only this digest is. The digest is domain-separated from
+/// [`redacted_identifier`] and is NOT truncated (see
+/// [`PRINCIPAL_KEY_DIGEST_LEN`]), so two authenticated principals cannot alias
+/// one quota or one mutable state key even when one of them chooses its own
+/// subject adversarially.
 pub fn principal_key(subject: &str) -> String {
-    digest_prefix(b"xds-principal", subject)
+    domain_digest(b"xds-principal", subject, PRINCIPAL_KEY_DIGEST_LEN)
 }
 
 /// Redacted, non-reversible stand-in for a client-supplied identifier
 /// (`Node.id`) in log fields. Correlates repeated occurrences without echoing
 /// attacker-controlled bytes into logs.
+///
+/// Log-only: this is a SHORT digest ([`LOG_DIGEST_PREFIX_LEN`]) in a different
+/// hash domain from [`principal_key`], so a log identifier can never be
+/// mistaken for — or reused as — a per-principal state key.
 pub fn redacted_identifier(value: &str) -> String {
-    digest_prefix(b"xds-identifier", value)
+    domain_digest(b"xds-identifier", value, LOG_DIGEST_PREFIX_LEN)
 }
 
-fn digest_prefix(domain: &[u8], value: &str) -> String {
+/// Domain-separated SHA-256 of `value`, hex encoded and truncated to `len`
+/// characters. The `0xff` separator cannot appear inside a UTF-8 `value`, so no
+/// value can impersonate another domain's input.
+fn domain_digest(domain: &[u8], value: &str, len: usize) -> String {
     let mut hasher = Sha256::new();
     hasher.update(domain);
     hasher.update([0xff]);
     hasher.update(value.as_bytes());
-    let digest = hex::encode(hasher.finalize());
-    // SHA-256 hex is 64 characters, so the prefix slice is always in range.
-    digest[..DIGEST_PREFIX_LEN].to_string()
+    let mut digest = hex::encode(hasher.finalize());
+    // Hex is ASCII, so truncating is char-boundary safe; a `len` at or above
+    // the full 64-character width is a no-op rather than a panic.
+    digest.truncate(len);
+    digest
 }
 
 /// Build the mutable per-stream state key.

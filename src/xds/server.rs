@@ -2342,7 +2342,10 @@ fn requested_node_id(
     Ok(Some(node.id.as_str()))
 }
 
-fn resolve_stream_node_id(current: Option<&str>, requested: Option<&str>) -> Result<String, Status> {
+fn resolve_stream_node_id(
+    current: Option<&str>,
+    requested: Option<&str>,
+) -> Result<String, Status> {
     match (current, requested) {
         (None, Some(requested)) => Ok(requested.to_string()),
         (None, None) => Err(Status::invalid_argument(
@@ -2910,7 +2913,10 @@ mod tests {
             .set_node_state_key("node-a")
             .expect_err("second concurrent stream rejected by guard");
         assert_eq!(rejection, XdsAdmissionRejection::NodeStreams);
-        assert_eq!(rejection.into_status().code(), tonic::Code::ResourceExhausted);
+        assert_eq!(
+            rejection.into_status().code(),
+            tonic::Code::ResourceExhausted
+        );
 
         // The rejected guard never registered, so dropping it must not free the
         // first stream's slot.

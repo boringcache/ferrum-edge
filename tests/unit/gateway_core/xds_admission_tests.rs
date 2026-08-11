@@ -47,7 +47,10 @@ fn default_admission_limits_are_finite_and_production_safe() {
         limits.max_streams_per_principal,
         DEFAULT_XDS_MAX_STREAMS_PER_PRINCIPAL
     );
-    assert_eq!(limits.max_streams_per_node, DEFAULT_XDS_MAX_STREAMS_PER_NODE);
+    assert_eq!(
+        limits.max_streams_per_node,
+        DEFAULT_XDS_MAX_STREAMS_PER_NODE
+    );
     assert_eq!(limits.max_active_nodes, DEFAULT_XDS_MAX_ACTIVE_NODES);
     assert_eq!(limits.max_node_id_bytes, DEFAULT_XDS_MAX_NODE_ID_BYTES);
     assert_eq!(
@@ -538,6 +541,11 @@ fn unrelated_principals_do_not_alias_one_state_key() {
         alice_key, bob_key,
         "two principals must never share one mutable xDS state key"
     );
+    assert!(
+        alice_key.contains(&alice) && !alice_key.contains("sa/alice"),
+        "the state key carries the full-width principal digest, never the raw \
+         authenticated subject"
+    );
 
     // And the per-node quota is therefore separate too.
     let controller = controller(XdsAdmissionLimits {
@@ -572,33 +580,67 @@ fn state_keys_partition_by_namespace_and_resist_delimiter_forgery() {
     );
 }
 
+/// Full SHA-256, hex encoded. A principal key is a state-key and quota
+/// boundary, so it is deliberately NOT truncated.
+const PRINCIPAL_KEY_HEX_LEN: usize = 64;
+/// A redacted log identifier only has to correlate occurrences, so it stays
+/// short — and must never be mistaken for a principal key.
+const LOG_IDENTIFIER_HEX_LEN: usize = 16;
+
 #[test]
-fn principal_key_is_stable_non_reversible_and_fixed_width() {
+fn principal_key_is_stable_non_reversible_and_full_width() {
     let subject = "spiffe://cluster.local/ns/default/sa/reviews";
     let key = principal_key(subject);
     assert_eq!(key, principal_key(subject), "stable for one subject");
-    assert_eq!(key.len(), 16, "fixed-width digest prefix bounds key memory");
+    assert_eq!(
+        key.len(),
+        PRINCIPAL_KEY_HEX_LEN,
+        "a principal key must be the FULL SHA-256 digest: it keys mutable \
+         per-principal state and quota, so a truncated digest would give an \
+         attacker choosing its own JWT subject a tractable collision target"
+    );
     assert!(key.chars().all(|c| c.is_ascii_hexdigit()));
     assert!(
         !key.contains("spiffe") && !key.contains("reviews"),
         "the raw subject must never appear in a stored key"
     );
-    // A hostile, oversized subject still yields a bounded key.
-    assert_eq!(principal_key(&"x".repeat(1_000_000)).len(), 16);
+    assert_ne!(
+        key,
+        principal_key("spiffe://cluster.local/ns/default/sa/ratings"),
+        "distinct subjects must get distinct keys"
+    );
+    // A hostile, oversized subject still yields the same bounded width.
+    assert_eq!(principal_key(&"x".repeat(1_000_000)).len(), PRINCIPAL_KEY_HEX_LEN);
 }
 
 #[test]
 fn redacted_identifier_never_echoes_the_raw_value() {
     let hostile = "node\n\rINJECTED-LOG-LINE\u{202e}";
     let redacted = redacted_identifier(hostile);
-    assert_eq!(redacted.len(), 16);
+    assert_eq!(redacted.len(), LOG_IDENTIFIER_HEX_LEN);
     assert!(redacted.chars().all(|c| c.is_ascii_hexdigit()));
     assert!(!redacted.contains("INJECTED"));
     assert_eq!(redacted, redacted_identifier(hostile), "stable per value");
     assert_ne!(redacted, redacted_identifier("node"));
-    // A node id and a principal with identical text must not collide: the two
-    // digests are domain-separated.
-    assert_ne!(redacted_identifier("same"), principal_key("same"));
+}
+
+#[test]
+fn log_identifiers_and_principal_keys_are_separate_domains() {
+    // Same input text, two purposes: the digests must not be interchangeable.
+    let value = "same";
+    let log_id = redacted_identifier(value);
+    let key = principal_key(value);
+    assert_ne!(log_id, key, "the two digests are domain-separated");
+    assert!(
+        log_id.len() < key.len(),
+        "the log identifier is the SHORT digest; the principal key is full width"
+    );
+    // The log identifier must not be a prefix of the principal key either: a
+    // shared hash domain would make a leaked log field a partial state key.
+    assert!(
+        !key.starts_with(&log_id),
+        "a log identifier must never be a truncation of the principal key"
+    );
 }
 
 // ── Rejection surface ──────────────────────────────────────────────────────
