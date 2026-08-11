@@ -1208,6 +1208,16 @@ pub struct EnvConfig {
     // Admin API
     pub admin_http_port: u16,
     pub admin_https_port: u16,
+    /// Whether `FERRUM_ADMIN_HTTPS_PORT` was present in the environment or
+    /// `ferrum.conf` (any value, including `0` or `9443`).
+    ///
+    /// The hardcoded/default value `9443` alone is **not** operator intent: raw
+    /// binary HTTP-only startups inherit that default without requesting HTTPS.
+    /// Node-agent / shared admin HTTPS planning uses
+    /// [`Self::admin_https_explicitly_requested`] so an inherited default stays
+    /// compatible while an explicitly configured nonzero HTTPS listener fails
+    /// closed on missing/partial TLS (issue #3704).
+    pub admin_https_port_configured: bool,
     pub admin_tls_cert_path: Option<String>,
     pub admin_tls_key_path: Option<String>,
     /// Bind address for Admin API listeners (HTTP, HTTPS).
@@ -2872,6 +2882,7 @@ impl Default for EnvConfig {
             proxy_bind_address: "0.0.0.0".into(),
             admin_http_port: 9000,
             admin_https_port: 9443,
+            admin_https_port_configured: false,
             admin_tls_cert_path: None,
             admin_tls_key_path: None,
             admin_bind_address: "127.0.0.1".into(),
@@ -3309,6 +3320,11 @@ impl EnvConfig {
                 => crate::admin::audit::AUDIT_MAX_DELIVERY_ATTEMPTS_DEFAULT;
             admin_require_namespace_claim: bool = "FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM" => false;
         }
+        // Durable HTTPS-intent signal: the inherited default `9443` alone is not
+        // an operator request. Capture whether the port key was actually present
+        // so node-agent / shared planners can fail closed on explicit incomplete
+        // TLS without breaking raw HTTP-only defaults (issue #3704).
+        let admin_https_port_configured = resolve_var(conf, "FERRUM_ADMIN_HTTPS_PORT").is_some();
         let audit_retention_policy = crate::admin::audit::AuditRetentionPolicy::from_parts(
             audit_retention_days,
             Some(audit_retention_max_rows),
@@ -4172,6 +4188,7 @@ impl EnvConfig {
             proxy_bind_address,
             admin_http_port,
             admin_https_port,
+            admin_https_port_configured,
             admin_tls_cert_path,
             admin_tls_key_path,
             admin_bind_address,
@@ -4568,6 +4585,18 @@ impl EnvConfig {
         self.admin_https_port != 0
             && self.admin_tls_cert_path.is_some()
             && self.admin_tls_key_path.is_some()
+    }
+
+    /// Whether the operator explicitly requested admin HTTPS configuration.
+    ///
+    /// True when `FERRUM_ADMIN_HTTPS_PORT` was present in env/`ferrum.conf`, or
+    /// either admin TLS cert/key path is set. The inherited global default port
+    /// `9443` with neither path set is **not** an explicit request — that is the
+    /// raw binary HTTP-only compatibility posture (issue #3704).
+    pub fn admin_https_explicitly_requested(&self) -> bool {
+        self.admin_https_port_configured
+            || self.admin_tls_cert_path.is_some()
+            || self.admin_tls_key_path.is_some()
     }
 
     /// Classify the network exposure of the **plaintext** admin HTTP listener

@@ -1176,6 +1176,22 @@ async fn start_node_agent_admin_listeners(
     if !env_config.node_agent_admin_enabled {
         return Ok(handles);
     }
+    // Fail closed on an explicitly requested incomplete HTTPS listener before
+    // treating the admin surface as inactive (issue #3704). Inherited default
+    // 9443 without TLS stays HTTP-only compatible.
+    if env_config.admin_https_port != 0
+        && crate::modes::startup_security::node_agent_admin_https_security_applicable(env_config)
+        && !env_config.admin_https_listener_enabled()
+    {
+        let tls_policy = crate::modes::startup_security::load_tls_policy(env_config)?;
+        let crls = crate::modes::startup_security::load_crls_from_env(env_config)?;
+        let _ = crate::modes::startup_security::load_admin_https_tls_fail_closed(
+            env_config,
+            &tls_policy,
+            &crls,
+            "Invalid node_agent admin TLS configuration",
+        )?;
+    }
     // HTTP and HTTPS are planned independently. Port 0 disables only that
     // transport; a nonzero HTTPS port with cert/key still starts HTTPS when
     // HTTP is disabled (issue #3704).
@@ -1185,7 +1201,7 @@ async fn start_node_agent_admin_listeners(
                 "{} — node_agent admin HTTPS listener disabled",
                 crate::secrets::report_env_assignment("FERRUM_ADMIN_HTTPS_PORT", "0")
             );
-        } else {
+        } else if !env_config.admin_https_explicitly_requested() {
             info!("Node agent admin TLS not configured - HTTPS listener disabled");
         }
         if env_config.admin_http_port == 0 {
@@ -1285,14 +1301,17 @@ async fn start_node_agent_admin_listeners(
     // Validate admin HTTPS TLS material BEFORE spawning any admin listener so a
     // bad cert/key cannot orphan an already-running plaintext admin task
     // (issue #2372 / #3704). Reuse the shared reloadable frontend/admin TLS
-    // planner rather than a node-agent-only TLS stack.
+    // planner rather than a node-agent-only TLS stack. Skip TLS policy/CRL loads
+    // for the inherited default HTTPS port when HTTPS was never requested.
     let admin_https_plan = if env_config.admin_https_port == 0 {
         info!(
             "{} — node_agent admin HTTPS listener disabled",
             crate::secrets::report_env_assignment("FERRUM_ADMIN_HTTPS_PORT", "0")
         );
         None
-    } else if env_config.admin_https_listener_enabled() {
+    } else if env_config.admin_https_listener_enabled()
+        || env_config.admin_https_explicitly_requested()
+    {
         let tls_policy = crate::modes::startup_security::load_tls_policy(env_config)?;
         let crls = crate::modes::startup_security::load_crls_from_env(env_config)?;
         let admin_https_addr = decide_admin_bind_address(
@@ -1327,9 +1346,11 @@ async fn start_node_agent_admin_listeners(
                 }
                 Some(planned)
             }
-            // Port/material gates already passed above; these arms are defensive.
-            crate::modes::startup_security::AdminHttpsListenerPlan::DisabledByPort
-            | crate::modes::startup_security::AdminHttpsListenerPlan::DisabledByMissingTls => None,
+            crate::modes::startup_security::AdminHttpsListenerPlan::DisabledByPort => None,
+            crate::modes::startup_security::AdminHttpsListenerPlan::DisabledByMissingTls => {
+                info!("Node agent admin TLS not configured - HTTPS listener disabled");
+                None
+            }
         }
     } else {
         info!("Node agent admin TLS not configured - HTTPS listener disabled");

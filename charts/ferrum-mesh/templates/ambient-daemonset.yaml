@@ -112,11 +112,18 @@
 {{- if and .Values.nodeAgent.enabled .Values.nodeAgent.admin.enabled (ne $ambientAdminPort "0") (eq $ambientAdminPort $nodeAgentAdminPort) -}}
 {{- fail (printf "ambient and nodeAgent both use hostNetwork and FERRUM_ADMIN_HTTP_PORT=%s; set ambient.env.FERRUM_ADMIN_HTTP_PORT or nodeAgent.admin.port to distinct ports, or set one listener port to 0" $ambientAdminPort) -}}
 {{- end -}}
+{{- /* Compare only HTTPS surfaces that will actually bind. Ambient inherits the
+       binary default HTTPS port 9443, but without admin TLS material no HTTPS
+       socket is opened — do not invent a collision against node-agent HTTPS. */ -}}
 {{- $ambientAdminHttpsPort := "9443" -}}
 {{- if hasKey $ambientEnv "FERRUM_ADMIN_HTTPS_PORT" -}}
 {{- $ambientAdminHttpsPort = toString (index $ambientEnv "FERRUM_ADMIN_HTTPS_PORT") -}}
 {{- end -}}
-{{- if and .Values.nodeAgent.enabled .Values.nodeAgent.admin.enabled (ne $ambientAdminHttpsPort "0") (ne $nodeAgentAdminHttpsPort "0") (eq $ambientAdminHttpsPort $nodeAgentAdminHttpsPort) -}}
+{{- $ambientAdminHttpsActive := and (ne $ambientAdminHttpsPort "0") (hasKey $ambientEnv "FERRUM_ADMIN_TLS_CERT_PATH") (hasKey $ambientEnv "FERRUM_ADMIN_TLS_KEY_PATH") -}}
+{{- $nodeAgentAdminTls := .Values.nodeAgent.admin.tls | default dict -}}
+{{- $nodeAgentAdminTlsConfigured := include "ferrum-mesh.nodeAgentAdminTlsConfigured" $nodeAgentAdminTls -}}
+{{- $nodeAgentAdminHttpsActive := and (ne $nodeAgentAdminHttpsPort "0") $nodeAgentAdminTlsConfigured -}}
+{{- if and .Values.nodeAgent.enabled .Values.nodeAgent.admin.enabled $ambientAdminHttpsActive $nodeAgentAdminHttpsActive (eq $ambientAdminHttpsPort $nodeAgentAdminHttpsPort) -}}
 {{- fail (printf "ambient and nodeAgent both use hostNetwork and FERRUM_ADMIN_HTTPS_PORT=%s; set ambient.env.FERRUM_ADMIN_HTTPS_PORT or nodeAgent.admin.httpsPort to distinct ports, or set one listener port to 0" $ambientAdminHttpsPort) -}}
 {{- end -}}
 {{- if $nodeWaypointRegistryEnabled -}}

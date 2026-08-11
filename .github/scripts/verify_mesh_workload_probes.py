@@ -348,6 +348,80 @@ def validate_node_agent_https_no_tls_rejected(
     print("mesh probe node-agent HTTPS without TLS rejected ok")
 
 
+def validate_node_agent_https_mtls_probe_policy(
+    results_dir: Path, expectations: dict
+) -> None:
+    captures = expectations["captures"]
+    disabled = require_capture(
+        results_dir, captures["node_agent_https_mtls_disabled"]
+    ).read_text(encoding="utf-8")
+    if "ferrum-mesh-node-agent" not in disabled:
+        fail(
+            "Node-agent HTTPS-only mTLS with disabled probes missing",
+            "disabling all computed probes must permit HTTPS-only mTLS",
+        )
+    if "readinessProbe:" in disabled or "livenessProbe:" in disabled:
+        fail(
+            "Node-agent HTTPS-only mTLS disabled probes still rendered",
+            "disabled probes must omit computed handlers",
+        )
+    overridden = require_capture(
+        results_dir, captures["node_agent_https_mtls_override"]
+    ).read_text(encoding="utf-8")
+    if "/bin/true" not in overridden:
+        fail(
+            "Node-agent HTTPS-only mTLS override missing",
+            "explicit probe overrides must render for HTTPS-only mTLS",
+        )
+    if re.search(r"ferrum-edge\"?\s*\n\s*-\s*\"health\"", overridden) and "--tls" in overridden:
+        fail(
+            "Node-agent HTTPS-only mTLS override still uses computed TLS health",
+            "overrides must replace computed exec probes",
+        )
+    err_text = require_capture(
+        results_dir, captures["node_agent_https_mtls_unsafe_err"]
+    ).read_text(encoding="utf-8")
+    if not err_text.strip():
+        fail(
+            "Node-agent HTTPS-only mTLS unsafe probes accepted",
+            "enabled computed probes under HTTPS-only mTLS must fail closed",
+        )
+    if "client certificate" not in err_text and "clientCaKey" not in err_text:
+        fail(
+            "Node-agent HTTPS-only mTLS unsafe rejection drift",
+            "stderr must mention client certificate / clientCaKey guidance",
+        )
+    print("mesh probe node-agent HTTPS-only mTLS probe policy ok")
+
+
+def validate_node_agent_https_collision_policy(
+    results_dir: Path, expectations: dict
+) -> None:
+    captures = expectations["captures"]
+    allowed = require_capture(
+        results_dir, captures["node_agent_https_no_ambient_collision"]
+    ).read_text(encoding="utf-8")
+    if "FERRUM_ADMIN_HTTPS_PORT" not in allowed or "9443" not in allowed:
+        fail(
+            "Node-agent HTTPS without ambient TLS missing",
+            "inherited ambient HTTPS default must not block node-agent HTTPS",
+        )
+    err_text = require_capture(
+        results_dir, captures["node_agent_https_collision_err"]
+    ).read_text(encoding="utf-8")
+    if not err_text.strip():
+        fail(
+            "Ambient/node-agent HTTPS collision accepted",
+            "active ambient and node-agent HTTPS on the same port must fail",
+        )
+    if "FERRUM_ADMIN_HTTPS_PORT" not in err_text:
+        fail(
+            "Ambient/node-agent HTTPS collision rejection drift",
+            "stderr must mention FERRUM_ADMIN_HTTPS_PORT",
+        )
+    print("mesh probe node-agent HTTPS collision policy ok")
+
+
 def validate_node_waypoint_ambient(results_dir: Path, expectations: dict) -> None:
     captures = expectations["captures"]
     rendered = require_capture(results_dir, captures["node_waypoint"]).read_text(
@@ -409,6 +483,8 @@ def main(argv: list[str]) -> int:
     validate_node_agent_https_only(results_dir, expectations)
     validate_node_agent_dual(results_dir, expectations)
     validate_node_agent_https_no_tls_rejected(results_dir, expectations)
+    validate_node_agent_https_mtls_probe_policy(results_dir, expectations)
+    validate_node_agent_https_collision_policy(results_dir, expectations)
     validate_node_waypoint_ambient(results_dir, expectations)
     return 0
 

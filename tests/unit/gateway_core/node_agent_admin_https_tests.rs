@@ -1,8 +1,8 @@
 //! External coverage for node-agent admin HTTP/HTTPS parity (issue #3704).
 //!
 //! Exercises the production planner/startup seam through `_test_support` so
-//! HTTP-only, HTTPS-only, dual listeners, invalid TLS, and partial-bind
-//! cleanup stay pinned without expanding the public API.
+//! HTTP-only, HTTPS-only, dual listeners, invalid TLS, reloadable TLS, optional
+//! mTLS, and partial-bind cleanup stay pinned without expanding the public API.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -13,7 +13,8 @@ use std::time::Duration;
 use ferrum_edge::_test_support::start_node_agent_admin_listeners_for_test;
 use ferrum_edge::config::EnvConfig;
 use ferrum_edge::modes::startup_security::{
-    AdminHttpsListenerPlan, load_crls_from_env, load_tls_policy, node_agent_admin_surface_active,
+    AdminHttpsListenerPlan, load_admin_https_tls_fail_closed, load_crls_from_env, load_tls_policy,
+    node_agent_admin_https_security_applicable, node_agent_admin_surface_active,
     plan_admin_https_listener,
 };
 use rcgen::{CertificateParams, KeyPair};
@@ -67,26 +68,45 @@ fn node_agent_admin_surface_active_requires_http_or_https() {
         ..EnvConfig::default()
     };
     assert!(node_agent_admin_surface_active(&http_only));
+    assert!(!node_agent_admin_https_security_applicable(&http_only));
 
     let https_only = EnvConfig {
         node_agent_admin_enabled: true,
         admin_http_port: 0,
         admin_https_port: 19443,
+        admin_https_port_configured: true,
         admin_tls_cert_path: Some("/tmp/a.crt".into()),
         admin_tls_key_path: Some("/tmp/a.key".into()),
         ..EnvConfig::default()
     };
     assert!(node_agent_admin_surface_active(&https_only));
+    assert!(node_agent_admin_https_security_applicable(&https_only));
 
     let https_port_without_tls = EnvConfig {
         node_agent_admin_enabled: true,
         admin_http_port: 0,
         admin_https_port: 19443,
+        admin_https_port_configured: true,
         admin_tls_cert_path: None,
         admin_tls_key_path: None,
         ..EnvConfig::default()
     };
     assert!(!node_agent_admin_surface_active(&https_port_without_tls));
+    assert!(node_agent_admin_https_security_applicable(
+        &https_port_without_tls
+    ));
+
+    let inherited_default = EnvConfig {
+        node_agent_admin_enabled: true,
+        admin_http_port: 9000,
+        admin_https_port: 9443,
+        admin_https_port_configured: false,
+        ..EnvConfig::default()
+    };
+    assert!(node_agent_admin_surface_active(&inherited_default));
+    assert!(!node_agent_admin_https_security_applicable(
+        &inherited_default
+    ));
 }
 
 #[test]
@@ -94,6 +114,7 @@ fn plan_admin_https_listener_disabled_by_port_zero() {
     ensure_crypto_provider();
     let env = EnvConfig {
         admin_https_port: 0,
+        admin_https_port_configured: true,
         admin_tls_cert_path: Some("/tmp/a.crt".into()),
         admin_tls_key_path: Some("/tmp/a.key".into()),
         ..EnvConfig::default()
@@ -106,10 +127,11 @@ fn plan_admin_https_listener_disabled_by_port_zero() {
 }
 
 #[test]
-fn plan_admin_https_listener_disabled_by_missing_tls() {
+fn plan_admin_https_listener_disabled_by_unrequested_inherited_default() {
     ensure_crypto_provider();
     let env = EnvConfig {
         admin_https_port: 9443,
+        admin_https_port_configured: false,
         admin_tls_cert_path: None,
         admin_tls_key_path: None,
         ..EnvConfig::default()
@@ -122,10 +144,69 @@ fn plan_admin_https_listener_disabled_by_missing_tls() {
 }
 
 #[test]
+fn plan_admin_https_listener_fails_closed_on_explicit_missing_tls() {
+    ensure_crypto_provider();
+    let env = EnvConfig {
+        admin_https_port: 19443,
+        admin_https_port_configured: true,
+        admin_tls_cert_path: None,
+        admin_tls_key_path: None,
+        ..EnvConfig::default()
+    };
+    let policy = load_tls_policy(&env).unwrap();
+    let crls = load_crls_from_env(&env).unwrap();
+    let addr: SocketAddr = "127.0.0.1:19443".parse().unwrap();
+    let err = plan_admin_https_listener(
+        &env,
+        &policy,
+        &crls,
+        "Invalid node_agent admin TLS configuration",
+        addr,
+        None,
+    )
+    .expect_err("explicit HTTPS without TLS must fail closed");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("Invalid node_agent admin TLS configuration"),
+        "unexpected error: {msg}"
+    );
+    assert!(
+        msg.contains("FERRUM_ADMIN_TLS_CERT_PATH") && msg.contains("FERRUM_ADMIN_TLS_KEY_PATH"),
+        "error must name the missing TLS paths: {msg}"
+    );
+}
+
+#[test]
+fn plan_admin_https_listener_fails_closed_on_partial_tls() {
+    ensure_crypto_provider();
+    let env = EnvConfig {
+        admin_https_port: 19443,
+        admin_https_port_configured: true,
+        admin_tls_cert_path: Some("/tmp/a.crt".into()),
+        admin_tls_key_path: None,
+        ..EnvConfig::default()
+    };
+    let policy = load_tls_policy(&env).unwrap();
+    let crls = load_crls_from_env(&env).unwrap();
+    let addr: SocketAddr = "127.0.0.1:19443".parse().unwrap();
+    let err = plan_admin_https_listener(
+        &env,
+        &policy,
+        &crls,
+        "Invalid node_agent admin TLS configuration",
+        addr,
+        None,
+    )
+    .expect_err("partial cert/key must fail closed");
+    assert!(format!("{err:#}").contains("both must be configured together"));
+}
+
+#[test]
 fn plan_admin_https_listener_fails_closed_on_missing_material() {
     ensure_crypto_provider();
     let env = EnvConfig {
         admin_https_port: 9443,
+        admin_https_port_configured: true,
         admin_tls_cert_path: Some("/nonexistent/admin.crt".into()),
         admin_tls_key_path: Some("/nonexistent/admin.key".into()),
         ..EnvConfig::default()
@@ -151,6 +232,7 @@ fn plan_admin_https_listener_enables_with_valid_material() {
     let key_path = write_pem(&dir, "admin.key", &key_pem);
     let env = EnvConfig {
         admin_https_port: 9443,
+        admin_https_port_configured: true,
         admin_tls_cert_path: Some(cert_path),
         admin_tls_key_path: Some(key_path),
         ..EnvConfig::default()
@@ -174,6 +256,105 @@ fn plan_admin_https_listener_enables_with_valid_material() {
 }
 
 #[tokio::test]
+async fn plan_admin_https_listener_instantiates_reloadable_tls_when_configured() {
+    ensure_crypto_provider();
+    let dir = TempDir::new().unwrap();
+    let (cert_pem, key_pem) = generate_self_signed_cert();
+    let cert_path = write_pem(&dir, "admin.crt", &cert_pem);
+    let key_path = write_pem(&dir, "admin.key", &key_pem);
+    let env = EnvConfig {
+        admin_https_port: 9443,
+        admin_https_port_configured: true,
+        admin_tls_cert_path: Some(cert_path),
+        admin_tls_key_path: Some(key_path),
+        frontend_tls_live_reload_enabled: true,
+        frontend_tls_watch_interval_seconds: 30,
+        ..EnvConfig::default()
+    };
+    let policy = load_tls_policy(&env).unwrap();
+    let crls = load_crls_from_env(&env).unwrap();
+    let addr: SocketAddr = "127.0.0.1:9443".parse().unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let plan = plan_admin_https_listener(
+        &env,
+        &policy,
+        &crls,
+        "Invalid test admin TLS",
+        addr,
+        Some(shutdown_rx),
+    )
+    .expect("reloadable admin TLS must plan");
+    match plan {
+        AdminHttpsListenerPlan::Enabled(mut planned) => {
+            assert!(
+                planned.reload.slot.is_some(),
+                "live reload must publish a SharedFrontendTls slot"
+            );
+            assert!(
+                planned.reload.watcher_handle.is_some(),
+                "live reload must spawn the shared admin/frontend watcher"
+            );
+            let _ = shutdown_tx.send(true);
+            if let Some(handle) = planned.reload.watcher_handle.take() {
+                let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+            }
+        }
+        AdminHttpsListenerPlan::DisabledByPort | AdminHttpsListenerPlan::DisabledByMissingTls => {
+            panic!("expected Enabled plan with reload handles")
+        }
+    }
+}
+
+#[test]
+fn optional_client_ca_mtls_loads_and_fails_closed() {
+    ensure_crypto_provider();
+    let dir = TempDir::new().unwrap();
+    let (cert_pem, key_pem) = generate_self_signed_cert();
+    let cert_path = write_pem(&dir, "admin.crt", &cert_pem);
+    let key_path = write_pem(&dir, "admin.key", &key_pem);
+    let ca_path = write_pem(&dir, "client-ca.crt", &cert_pem);
+
+    let ok_env = EnvConfig {
+        admin_https_port: 19443,
+        admin_https_port_configured: true,
+        admin_tls_cert_path: Some(cert_path.clone()),
+        admin_tls_key_path: Some(key_path.clone()),
+        admin_tls_client_ca_bundle_path: Some(ca_path),
+        ..EnvConfig::default()
+    };
+    let policy = load_tls_policy(&ok_env).unwrap();
+    let crls = load_crls_from_env(&ok_env).unwrap();
+    load_admin_https_tls_fail_closed(
+        &ok_env,
+        &policy,
+        &crls,
+        "Invalid node_agent admin TLS configuration",
+    )
+    .expect("optional client CA must load through the shared admin TLS stack")
+    .expect("HTTPS with mTLS must produce a ServerConfig");
+
+    let bad_env = EnvConfig {
+        admin_https_port: 19443,
+        admin_https_port_configured: true,
+        admin_tls_cert_path: Some(cert_path),
+        admin_tls_key_path: Some(key_path),
+        admin_tls_client_ca_bundle_path: Some("/nonexistent/client-ca.crt".into()),
+        ..EnvConfig::default()
+    };
+    let err = load_admin_https_tls_fail_closed(
+        &bad_env,
+        &policy,
+        &crls,
+        "Invalid node_agent admin TLS configuration",
+    )
+    .expect_err("missing client CA must fail closed");
+    assert!(
+        format!("{err:#}").contains("Invalid node_agent admin TLS configuration"),
+        "unexpected error: {err:#}"
+    );
+}
+
+#[tokio::test]
 async fn https_only_starts_when_http_port_is_zero() {
     ensure_crypto_provider();
     let dir = TempDir::new().unwrap();
@@ -186,6 +367,7 @@ async fn https_only_starts_when_http_port_is_zero() {
         node_agent_admin_enabled: true,
         admin_http_port: 0,
         admin_https_port: https_port,
+        admin_https_port_configured: true,
         admin_tls_cert_path: Some(cert_path),
         admin_tls_key_path: Some(key_path),
         admin_bind_address: "127.0.0.1".into(),
@@ -225,6 +407,7 @@ async fn dual_listeners_start_http_and_https() {
         node_agent_admin_enabled: true,
         admin_http_port: http_port,
         admin_https_port: https_port,
+        admin_https_port_configured: true,
         admin_tls_cert_path: Some(cert_path),
         admin_tls_key_path: Some(key_path),
         admin_bind_address: "127.0.0.1".into(),
@@ -260,6 +443,7 @@ async fn invalid_tls_fails_before_plaintext_fallback() {
         node_agent_admin_enabled: true,
         admin_http_port: http_port,
         admin_https_port: https_port,
+        admin_https_port_configured: true,
         admin_tls_cert_path: Some("/nonexistent/admin.crt".into()),
         admin_tls_key_path: Some("/nonexistent/admin.key".into()),
         admin_bind_address: "127.0.0.1".into(),
@@ -284,6 +468,73 @@ async fn invalid_tls_fails_before_plaintext_fallback() {
 }
 
 #[tokio::test]
+async fn explicit_missing_tls_fails_without_plaintext_fallback() {
+    ensure_crypto_provider();
+    let http_port = reserve_port();
+    let env_config = EnvConfig {
+        node_agent_admin_enabled: true,
+        admin_http_port: http_port,
+        admin_https_port: 19443,
+        admin_https_port_configured: true,
+        admin_tls_cert_path: None,
+        admin_tls_key_path: None,
+        admin_bind_address: "127.0.0.1".into(),
+        ..EnvConfig::default()
+    };
+    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let startup_ready = Arc::new(AtomicBool::new(false));
+
+    let err =
+        start_node_agent_admin_listeners_for_test(&env_config, &shutdown_tx, startup_ready.clone())
+            .await
+            .expect_err("explicit HTTPS without TLS must fail closed before HTTP bind");
+    assert!(
+        format!("{err:#}").contains("Invalid node_agent admin TLS configuration"),
+        "unexpected error: {err:#}"
+    );
+    assert!(
+        !startup_ready.load(Ordering::Acquire),
+        "failed TLS startup must not report ready"
+    );
+
+    let reclaim = tokio::net::TcpListener::bind(("127.0.0.1", http_port))
+        .await
+        .expect("HTTP port must remain unbound after fail-closed HTTPS");
+    drop(reclaim);
+}
+
+#[tokio::test]
+async fn inherited_https_default_keeps_http_only_compatible() {
+    ensure_crypto_provider();
+    let http_port = reserve_port();
+    let env_config = EnvConfig {
+        node_agent_admin_enabled: true,
+        admin_http_port: http_port,
+        admin_https_port: 9443,
+        admin_https_port_configured: false,
+        admin_tls_cert_path: None,
+        admin_tls_key_path: None,
+        admin_bind_address: "127.0.0.1".into(),
+        ..EnvConfig::default()
+    };
+    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let startup_ready = Arc::new(AtomicBool::new(false));
+
+    let handles =
+        start_node_agent_admin_listeners_for_test(&env_config, &shutdown_tx, startup_ready)
+            .await
+            .expect("inherited HTTPS default without TLS must stay HTTP-only");
+    assert_eq!(handles.len(), 1, "only the HTTP listener should start");
+
+    let _ = shutdown_tx.send(true);
+    for handle in handles {
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("HTTP listener must join on shutdown");
+    }
+}
+
+#[tokio::test]
 async fn https_bind_failure_rolls_back_http_listener() {
     ensure_crypto_provider();
     let dir = TempDir::new().unwrap();
@@ -301,6 +552,7 @@ async fn https_bind_failure_rolls_back_http_listener() {
         node_agent_admin_enabled: true,
         admin_http_port: http_port,
         admin_https_port: blocked_https,
+        admin_https_port_configured: true,
         admin_tls_cert_path: Some(cert_path),
         admin_tls_key_path: Some(key_path),
         admin_bind_address: "127.0.0.1".into(),

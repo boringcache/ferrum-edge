@@ -79,11 +79,12 @@ impl StartupSecurityScope {
                 dtls: false,
             },
             OperatingMode::NodeAgent => Self {
-                // TLS policy/CRLs + admin TLS material are required when the
-                // node-agent admin HTTPS listener is configured
-                // (`admin_https_listener_enabled`). `try_load_admin_tls` is a
-                // no-op when HTTPS is not enabled, so HTTP-only installs stay
-                // unaffected.
+                // TLS policy/CRLs + admin TLS material are in scope for node-agent
+                // so validate/run share one surface, but
+                // `load_startup_security_with_scope` only loads them when the
+                // admin surface is active or HTTPS was explicitly requested
+                // (issue #3704). HTTP-only / admin-disabled installs do not fail
+                // on unrelated TLS policy or CRL settings.
                 tls_policy_and_crls: true,
                 // Parsed only when the node-agent admin listener would start.
                 admin_cidrs_and_metrics: true,
@@ -162,13 +163,19 @@ pub fn load_startup_security_with_scope(
     // Node-agent only parses CIDRs/metrics when its admin surface would
     // actually start — HTTP, HTTPS, or both. HTTPS-only
     // (`FERRUM_ADMIN_HTTP_PORT=0` + configured admin TLS) must still apply the
-    // same auth/CIDR contract.
+    // same auth/CIDR contract. Explicit incomplete HTTPS still counts as an
+    // active security surface so validate fails closed before run.
     let node_agent_admin_active =
         env_config.mode != OperatingMode::NodeAgent || node_agent_admin_surface_active(env_config);
+    // Newly node-agent-owned TLS policy / CRL / admin TLS loads are gated on an
+    // active or explicitly requested admin HTTPS surface so a disabled or
+    // HTTP-only node-agent does not fail on unrelated TLS policy or CRL env.
+    let node_agent_https_security = env_config.mode != OperatingMode::NodeAgent
+        || node_agent_admin_https_security_applicable(env_config);
 
     let mut materials = StartupSecurityMaterials::empty();
 
-    if scope.tls_policy_and_crls {
+    if scope.tls_policy_and_crls && node_agent_https_security {
         materials.tls_policy = Some(load_tls_policy(env_config)?);
         materials.crls = load_crls_from_env(env_config)?;
     }
@@ -204,15 +211,31 @@ pub fn load_startup_security_with_scope(
     }
 
     if scope.admin_tls {
-        let policy = tls_policy_ref.ok_or_else(|| {
-            anyhow::anyhow!("internal error: admin TLS validation requires TLS policy scope")
-        })?;
-        let label = if env_config.mode == OperatingMode::Mesh {
-            "Invalid mesh admin TLS configuration"
+        if env_config.mode == OperatingMode::NodeAgent {
+            if node_agent_https_security {
+                let policy = tls_policy_ref.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "internal error: admin TLS validation requires TLS policy scope"
+                    )
+                })?;
+                materials.admin_tls = load_admin_https_tls_fail_closed(
+                    env_config,
+                    policy,
+                    &materials.crls,
+                    "Invalid node_agent admin TLS configuration",
+                )?;
+            }
         } else {
-            "Invalid admin TLS configuration"
-        };
-        materials.admin_tls = try_load_admin_tls(env_config, policy, &materials.crls, label)?;
+            let policy = tls_policy_ref.ok_or_else(|| {
+                anyhow::anyhow!("internal error: admin TLS validation requires TLS policy scope")
+            })?;
+            let label = if env_config.mode == OperatingMode::Mesh {
+                "Invalid mesh admin TLS configuration"
+            } else {
+                "Invalid admin TLS configuration"
+            };
+            materials.admin_tls = try_load_admin_tls(env_config, policy, &materials.crls, label)?;
+        }
     }
 
     if scope.dtls {
@@ -339,6 +362,18 @@ pub fn node_agent_admin_surface_active(env_config: &EnvConfig) -> bool {
         && (env_config.admin_http_port != 0 || env_config.admin_https_listener_enabled())
 }
 
+/// Whether node-agent should load TLS policy / CRL / admin TLS at validate/run.
+///
+/// True when admin is enabled and HTTPS is either fully configured to bind or
+/// explicitly requested with a nonzero port (including incomplete material that
+/// must fail closed). Inherited default `9443` without TLS is not applicable.
+pub fn node_agent_admin_https_security_applicable(env_config: &EnvConfig) -> bool {
+    if !env_config.node_agent_admin_enabled || env_config.admin_https_port == 0 {
+        return false;
+    }
+    env_config.admin_https_listener_enabled() || env_config.admin_https_explicitly_requested()
+}
+
 /// Fully prepared admin HTTPS listener materials shared by serving modes.
 ///
 /// TLS material is validated before any plaintext admin task is spawned so a
@@ -355,20 +390,63 @@ pub struct PlannedAdminHttps {
 pub enum AdminHttpsListenerPlan {
     /// `FERRUM_ADMIN_HTTPS_PORT=0` — disable sentinel.
     DisabledByPort,
-    /// Nonzero HTTPS port without a complete cert/key pair — no HTTPS listener.
+    /// Inherited nonzero default HTTPS port without an explicit operator
+    /// request and without TLS material — keep HTTP-only compatibility.
     DisabledByMissingTls,
     /// HTTPS listener should bind with the prepared TLS runtime.
     Enabled(PlannedAdminHttps),
 }
 
+/// Load admin HTTPS TLS when enabled, or fail closed on explicit incomplete
+/// configuration (issue #3704).
+///
+/// - Port `0` → `Ok(None)`
+/// - Inherited default port without TLS / without explicit request → `Ok(None)`
+/// - Partial cert/key → error
+/// - Explicit nonzero port without both paths → error
+/// - Both paths set → load material (fail closed on invalid/unreadable/mismatched)
+pub fn load_admin_https_tls_fail_closed(
+    env_config: &EnvConfig,
+    tls_policy: &TlsPolicy,
+    crls: &CrlList,
+    error_label: &str,
+) -> Result<Option<Arc<rustls::ServerConfig>>, anyhow::Error> {
+    if env_config.admin_https_port == 0 {
+        return Ok(None);
+    }
+    match (
+        env_config.admin_tls_cert_path.as_ref(),
+        env_config.admin_tls_key_path.as_ref(),
+    ) {
+        (None, None) => {
+            if env_config.admin_https_explicitly_requested() {
+                return Err(anyhow::anyhow!(
+                    "{error_label}: FERRUM_ADMIN_HTTPS_PORT is explicitly configured but \
+                     FERRUM_ADMIN_TLS_CERT_PATH and FERRUM_ADMIN_TLS_KEY_PATH are missing — \
+                     set both TLS paths or set FERRUM_ADMIN_HTTPS_PORT=0"
+                ));
+            }
+            Ok(None)
+        }
+        (Some(_), None) => Err(anyhow::anyhow!(
+            "{error_label}: FERRUM_ADMIN_TLS_CERT_PATH is set but FERRUM_ADMIN_TLS_KEY_PATH is \
+             missing — both must be configured together"
+        )),
+        (None, Some(_)) => Err(anyhow::anyhow!(
+            "{error_label}: FERRUM_ADMIN_TLS_KEY_PATH is set but FERRUM_ADMIN_TLS_CERT_PATH is \
+             missing — both must be configured together"
+        )),
+        (Some(_), Some(_)) => load_admin_tls_material(env_config, tls_policy, crls, error_label).map(Some),
+    }
+}
+
 /// Plan the binary-owned admin HTTPS listener from `EnvConfig`.
 ///
 /// - Port `0` → [`AdminHttpsListenerPlan::DisabledByPort`]
-/// - Nonzero port without both cert/key paths →
-///   [`AdminHttpsListenerPlan::DisabledByMissingTls`]
-/// - Nonzero port with both paths → load TLS (fail closed on invalid/missing/
-///   unreadable/mismatched material) and prepare the shared reloadable
-///   frontend/admin TLS provider
+/// - Inherited default nonzero port without explicit request and without TLS →
+///   [`AdminHttpsListenerPlan::DisabledByMissingTls`] (HTTP-only compatible)
+/// - Explicit nonzero port or partial/complete TLS material → load TLS and fail
+///   closed on missing/partial/unreadable/mismatched/malformed material
 ///
 /// Callers must invoke this **before** spawning a plaintext admin listener so
 /// startup rollback owns every handle (issue #2372 / #3704).
@@ -383,11 +461,13 @@ pub fn plan_admin_https_listener(
     if env_config.admin_https_port == 0 {
         return Ok(AdminHttpsListenerPlan::DisabledByPort);
     }
-    if !env_config.admin_https_listener_enabled() {
-        return Ok(AdminHttpsListenerPlan::DisabledByMissingTls);
-    }
 
-    let tls_config = load_admin_tls_material(env_config, tls_policy, crls, error_label)?;
+    let Some(tls_config) =
+        load_admin_https_tls_fail_closed(env_config, tls_policy, crls, error_label)?
+    else {
+        return Ok(AdminHttpsListenerPlan::DisabledByMissingTls);
+    };
+
     let reload = crate::modes::tls_reload::prepare_admin_frontend_tls(
         tls_config.clone(),
         env_config,

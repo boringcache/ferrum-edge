@@ -436,6 +436,8 @@ nodeAgent:
       # Optional mTLS client CA key within the same Secret. When set with
       # port=0 (HTTPS-only), computed exec probes cannot present a client
       # cert — override or disable them, or keep a plaintext loopback port.
+      # HTTPS-only mTLS is allowed when every computed probe is disabled or
+      # given an explicit override handler.
       clientCaKey: ""
       # Optional PEM CRL key within the same Secret (FERRUM_TLS_CRL_FILE_PATH).
       crlKey: ""

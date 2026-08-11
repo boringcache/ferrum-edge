@@ -54,6 +54,8 @@ fn daemonset_renders_managed_admin_https_and_tls_env() {
         "node-agent-admin-tls",
         "prometheus.io/scheme",
         "$nodeAgentProbeUsesTls",
+        "$nodeAgentDefaultLiveProbe",
+        "$nodeAgentDefaultReadyProbe",
     ] {
         assert!(
             ds.contains(needle),
@@ -63,6 +65,10 @@ fn daemonset_renders_managed_admin_https_and_tls_env() {
     assert!(
         ds.contains("nodeAgent.admin.httpsPort is nonzero but admin TLS is incomplete"),
         "chart must fail closed on HTTPS without TLS Secret config"
+    );
+    assert!(
+        ds.contains("override/disable probes"),
+        "mTLS HTTPS-only rejection must mention override/disable probes"
     );
     assert!(
         !ds.contains("BEGIN CERTIFICATE"),
@@ -82,10 +88,23 @@ fn helpers_support_tls_admin_health_handlers() {
 }
 
 #[test]
-fn ambient_rejects_https_port_collision_with_node_agent() {
+fn ambient_rejects_only_active_https_port_collision_with_node_agent() {
     let ambient = read("templates/ambient-daemonset.yaml");
     assert!(
         ambient.contains("FERRUM_ADMIN_HTTPS_PORT=%s"),
         "ambient chart must reject shared hostNetwork HTTPS admin ports"
+    );
+    assert!(
+        ambient.contains("$ambientAdminHttpsActive"),
+        "collision guard must require ambient HTTPS to be actually active"
+    );
+    assert!(
+        ambient.contains("$nodeAgentAdminHttpsActive"),
+        "collision guard must require node-agent HTTPS to be actually active"
+    );
+    assert!(
+        ambient.contains("FERRUM_ADMIN_TLS_CERT_PATH")
+            && ambient.contains("FERRUM_ADMIN_TLS_KEY_PATH"),
+        "ambient HTTPS activity must require complete admin TLS env"
     );
 }
