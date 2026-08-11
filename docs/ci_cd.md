@@ -1545,8 +1545,8 @@ Depends on `Validate release SHA`, then builds optimized release binaries for al
 
 ### Create Release Job
 
-**Depends On**: Release Build Job, Docker Manifest Job, and Docker eBPF Manifest
-Job
+**Depends On**: Release Build Job, Docker Manifest Job, Docker eBPF Manifest
+Job, and Docker eBPF Tools Manifest Job
 
 Creates a GitHub Release with all binaries and checksums after the versioned
 Docker manifests have been pushed. Durable release publication still fails
@@ -1884,14 +1884,16 @@ The GHCR path is `ghcr.io/${{ github.repository }}` in the workflows, so it auto
 
 ## Image Signatures, SBOMs, and Provenance
 
-Every version-tag release signs and attests the final standard and `-ebpf`
-multi-architecture image digests in both Docker Hub and GHCR. The per-platform
-push-by-digest builds deliberately retain `provenance: false`: enabling BuildKit
-provenance there turns each platform output into a manifest list and breaks the
-existing `docker buildx imagetools create` assembly contract. The dedicated
-`attest-release-images` job instead runs after both final manifests exist and:
+Every version-tag release signs and attests the final standard, `-ebpf`, and
+`-ebpf-tools` multi-architecture image digests in both Docker Hub and GHCR. The
+per-platform push-by-digest builds deliberately retain `provenance: false`:
+enabling BuildKit provenance there turns each platform output into a manifest
+list and breaks the existing `docker buildx imagetools create` assembly
+contract. The dedicated `attest-release-images` job instead runs after all three
+final manifests exist and:
 
-1. resolves each canonical `vX.Y.Z` / `vX.Y.Z-ebpf` tag to an immutable digest;
+1. resolves each canonical `vX.Y.Z` / `vX.Y.Z-ebpf` / `vX.Y.Z-ebpf-tools` tag to
+   an immutable digest;
 2. requires exactly the `linux/amd64` and `linux/arm64` descriptors and verifies
    that Docker Hub and GHCR contain the same per-platform manifests;
 3. scans each registry's immutable platform images with the digest-pinned Syft
@@ -1905,24 +1907,25 @@ existing `docker buildx imagetools create` assembly contract. The dedicated
    signature, provenance type and source commit, attestation subject digest,
    and at least two non-empty SPDX predicates.
 
-Because trusted Cross freezes `create-release.needs`, GitHub Release creation
-cannot gain a direct attestation dependency from this pull request. The
-`release-attestation-gate` job therefore joins `create-release` with
+`create-release` depends on all three manifest jobs, so the GitHub Release —
+whose notes advertise all three tag families — cannot publish unless every
+advertised manifest exists. It deliberately does **not** depend on
+`attest-release-images`: adding that edge would let a signing failure leave the
+binaries unpublished as well, and the trusted contract rejects it. The
+`release-attestation-gate` job instead joins `create-release` with
 `attest-release-images` under `if: always()`: the release workflow cannot
 succeed unless attestation verification succeeded, and a GitHub Release created
-before attestation finishes is deleted when attestation fails.
+before attestation finishes is deleted when attestation fails. That retraction
+covers the `-ebpf-tools` family exactly like the other two, because a failure in
+any family's resolve/SBOM/sign/verify step fails the whole attestation job.
 
-**Known gap — `-ebpf-tools` is published but not yet signed/attested.** The
-`attest-release-images` job is frozen byte-for-byte by the trusted cross-build
-verifier, which a pull request may not modify, so the Ambient UDP lifecycle
-variant is currently published without Cosign signatures, SBOMs, or SLSA
-provenance. Closing that gap requires a trusted-base change that adds the
-`ebpftools` family to the frozen job (and adds
-`"docker-ebpf-tools-digest-": ("docker-ebpf",)` to `DIGEST_ARTIFACT_OWNERS`, so
-the new digest wildcard is owned the way the other two are). The same freeze is
-why the GitHub Release notes still describe only the default and `-ebpf` images;
-the `-ebpf-tools` variant is documented in `docs/docker.md` and
-`docs/node_agent.md` instead.
+The `-ebpf-tools` family is a first-class release image family in the trusted
+contracts: `DIGEST_ARTIFACT_OWNERS` owns the `docker-ebpf-tools-digest-*`
+wildcard and assigns it solely to the `docker-ebpf` job that builds both eBPF
+variants from one source tree, and `PUBLISH_ARTIFACT_STEP_CONTRACTS` /
+`PUBLISH_CONTROL_CONTRACTS` freeze that job's tools build, digest export and
+upload steps together with the whole `docker-ebpf-tools-manifest` job — its
+`needs`, its download pattern, its working directory, and every published tag.
 
 The signatures and attestations are stored beside the immutable subject in each
 registry; neither registry is treated as a mutable pointer or as a fallback for
@@ -1936,9 +1939,9 @@ image to remain immutable.
 ### Consumer verification
 
 Install Cosign 3.x and Docker Buildx, then verify an immutable digest rather
-than a tag. Set `IMAGE` to either registry. For the eBPF variant, append
-`-ebpf` to `IMAGE_TAG`; the signing identity still uses the release tag because
-the workflow itself runs at `refs/tags/vX.Y.Z`.
+than a tag. Set `IMAGE` to either registry. For the eBPF variants, append
+`-ebpf` or `-ebpf-tools` to `IMAGE_TAG`; the signing identity still uses the
+release tag because the workflow itself runs at `refs/tags/vX.Y.Z`.
 
 ```bash
 RELEASE_TAG=v1.2.3
@@ -1948,6 +1951,8 @@ IMAGE=ferrumedge/ferrum-edge
 IMAGE_TAG="$RELEASE_TAG"
 # eBPF variant:
 # IMAGE_TAG="${RELEASE_TAG}-ebpf"
+# Ambient UDP lifecycle (tools-capable) variant:
+# IMAGE_TAG="${RELEASE_TAG}-ebpf-tools"
 
 DIGEST="$(
   docker buildx imagetools inspect \

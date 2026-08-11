@@ -216,6 +216,15 @@ DOCKER_EBPF_MANIFEST_DOWNLOAD_STEP = DOCKER_MANIFEST_DOWNLOAD_STEP.replace(
     "pattern: docker-digest-*",
     "pattern: docker-ebpf-digest-*",
 )
+DOCKER_EBPF_MANIFEST_TOOLS_DOWNLOAD_STEP = (
+    "      - name: Download tools digests\n"
+    "        uses: actions/download-artifact"
+    "@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8\n"
+    "        with:\n"
+    "          path: /tmp/digests-tools\n"
+    "          pattern: docker-ebpf-tools-digest-*\n"
+    "          merge-multiple: true\n"
+)
 DOCKER_EBPF_UPLOAD_DIGEST_STEP = (
     "      - name: Upload digest\n"
     "        uses: actions/upload-artifact"
@@ -223,6 +232,49 @@ DOCKER_EBPF_UPLOAD_DIGEST_STEP = (
     "        with:\n"
     "          name: docker-ebpf-digest-${{ matrix.arch_dir }}\n"
     "          path: /tmp/digests/*\n"
+    "          if-no-files-found: error\n"
+)
+# The `-ebpf-tools` variant is built inside the same `docker-ebpf` matrix job as
+# the distroless `-ebpf` variant, from one source tree and one `FEATURES` value,
+# so the two published tag families cannot drift apart. The build target, the
+# digest export, and the upload that names the second digest name space are
+# frozen exactly like their `-ebpf` counterparts: retargeting this build, or
+# pointing the tools upload at the `-ebpf` digest directory, would publish a
+# distroless image under the tag the mesh chart selects for the Ambient UDP
+# lifecycle — which cannot run the `sh -c` iptables scripts that datapath needs.
+DOCKER_EBPF_TOOLS_BUILD_STEP = (
+    "      - name: Build and push per-platform eBPF tools digest\n"
+    "        id: build_tools\n"
+    "        uses: docker/build-push-action"
+    "@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7\n"
+    "        with:\n"
+    "          context: .\n"
+    "          file: Dockerfile\n"
+    "          target: runtime-ebpf-tools\n"
+    "          platforms: ${{ matrix.platform }}\n"
+    "          build-args: |\n"
+    "            FEATURES=cloud-secrets,ebpf\n"
+    "          outputs: type=image,"
+    "\"name=ferrumedge/ferrum-edge,ghcr.io/${{ github.repository }}\","
+    "push-by-digest=true,name-canonical=true,push=true\n"
+    "          provenance: false\n"
+)
+DOCKER_EBPF_EXPORT_DIGEST_STEP = (
+    "      - name: Export digest\n"
+    "        run: |\n"
+    "          mkdir -p /tmp/digests /tmp/digests-tools\n"
+    "          digest=\"${{ steps.build.outputs.digest }}\"\n"
+    "          touch \"/tmp/digests/${digest#sha256:}\"\n"
+    "          tools_digest=\"${{ steps.build_tools.outputs.digest }}\"\n"
+    "          touch \"/tmp/digests-tools/${tools_digest#sha256:}\"\n"
+)
+DOCKER_EBPF_TOOLS_UPLOAD_DIGEST_STEP = (
+    "      - name: Upload tools digest\n"
+    "        uses: actions/upload-artifact"
+    "@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7\n"
+    "        with:\n"
+    "          name: docker-ebpf-tools-digest-${{ matrix.arch_dir }}\n"
+    "          path: /tmp/digests-tools/*\n"
     "          if-no-files-found: error\n"
 )
 # Each wildcard belongs to exactly the jobs allowed to produce a name it
@@ -234,6 +286,10 @@ DIGEST_ARTIFACT_OWNERS = {
     "release workflow": {
         "docker-digest-": ("docker",),
         "docker-ebpf-digest-": ("docker-ebpf",),
+        # The Ambient UDP lifecycle variant has its own wildcard so the two eBPF
+        # manifests cannot collect each other's descriptors, and it is owned by
+        # the same single producing job.
+        "docker-ebpf-tools-digest-": ("docker-ebpf",),
     },
 }
 # Ownership of the digest namespace does not depend on how the uploading action
@@ -304,10 +360,18 @@ PUBLISH_ARTIFACT_STEP_CONTRACTS = {
             "Download digests": DOCKER_MANIFEST_DOWNLOAD_STEP,
         },
         "docker-ebpf": {
+            "Build and push per-platform eBPF tools digest": (
+                DOCKER_EBPF_TOOLS_BUILD_STEP
+            ),
+            "Export digest": DOCKER_EBPF_EXPORT_DIGEST_STEP,
             "Upload digest": DOCKER_EBPF_UPLOAD_DIGEST_STEP,
+            "Upload tools digest": DOCKER_EBPF_TOOLS_UPLOAD_DIGEST_STEP,
         },
         "docker-ebpf-manifest": {
             "Download digests": DOCKER_EBPF_MANIFEST_DOWNLOAD_STEP,
+        },
+        "docker-ebpf-tools-manifest": {
+            "Download tools digests": DOCKER_EBPF_MANIFEST_TOOLS_DOWNLOAD_STEP,
         },
     },
 }
@@ -620,18 +684,32 @@ RELEASE_CREATE_RELEASE_STEPS = r"""    steps:
           On a node whose kernel/cgroup/bpffs probe fails, the \`-ebpf\` pod
           **exits** (default \`FERRUM_NODE_AGENT_FALLBACK_MODE=fail\`) rather than
           degrading. The published \`-ebpf\` image is **distroless** — it has no
-          \`/bin/sh\` and no \`iptables\`, and the fallback runs commands via
-          \`sh -c\`, so \`FERRUM_NODE_AGENT_FALLBACK_MODE=iptables\` on the
-          published image **crash-loops**. To use the iptables fallback, build a
-          custom runtime image that adds \`/bin/sh\` + \`iptables\`/\`ip6tables\`
-          (see [docs/node_agent.md](https://github.com/ferrum-edge/ferrum-edge/blob/main/docs/node_agent.md#kernel-fallback)),
-          then set \`FERRUM_NODE_AGENT_FALLBACK_MODE=iptables\` to fall back to
-          host iptables capture:
+          \`/bin/sh\` and no \`iptables\` — and stays that way on purpose:
 
           \`\`\`bash
           docker pull ferrumedge/ferrum-edge:$TAG_NAME-ebpf
           docker pull ghcr.io/ferrum-edge/ferrum-edge:$TAG_NAME-ebpf
           \`\`\`
+
+          The host iptables fallback and the Ambient host-network UDP capture
+          lifecycle run generated \`sh -c\` \`iptables\`/\`ip6tables\`/\`ip\`
+          commands, which the distroless \`-ebpf\` image cannot execute, so
+          \`FERRUM_NODE_AGENT_FALLBACK_MODE=iptables\` crash-loops there. Use the
+          **\`-ebpf-tools\`** variant instead: the same Linux-only eBPF build on a
+          Debian slim base carrying \`/bin/sh\`, \`iptables\`, \`ip6tables\`, and
+          \`ip\` (see [docs/node_agent.md](https://github.com/ferrum-edge/ferrum-edge/blob/main/docs/node_agent.md#kernel-fallback)).
+          The mesh Helm chart auto-selects it for the Ambient UDP lifecycle:
+
+          \`\`\`bash
+          docker pull ferrumedge/ferrum-edge:$TAG_NAME-ebpf-tools
+          docker pull ghcr.io/ferrum-edge/ferrum-edge:$TAG_NAME-ebpf-tools
+          \`\`\`
+
+          All three image families — default, \`-ebpf\`, and \`-ebpf-tools\` — are
+          Cosign-signed on their immutable multi-arch digests in both registries
+          and carry SLSA provenance plus per-platform SPDX SBOM attestations; see
+          [docs/ci_cd.md](https://github.com/ferrum-edge/ferrum-edge/blob/main/docs/ci_cd.md#image-signatures-sboms-and-provenance)
+          for the verification commands.
 
           ## Checksums
 
@@ -737,6 +815,10 @@ RELEASE_ATTEST_RELEASE_IMAGES_STEPS = r"""    steps:
           resolve_manifest standard_ghcr "ghcr.io/${GITHUB_REPOSITORY}:${TAG_NAME}"
           resolve_manifest ebpf_docker "ferrumedge/ferrum-edge:${TAG_NAME}-ebpf"
           resolve_manifest ebpf_ghcr "ghcr.io/${GITHUB_REPOSITORY}:${TAG_NAME}-ebpf"
+          resolve_manifest ebpftools_docker \
+            "ferrumedge/ferrum-edge:${TAG_NAME}-ebpf-tools"
+          resolve_manifest ebpftools_ghcr \
+            "ghcr.io/${GITHUB_REPOSITORY}:${TAG_NAME}-ebpf-tools"
 
           compare_registry_manifests() {
             local family="$1"
@@ -754,6 +836,7 @@ RELEASE_ATTEST_RELEASE_IMAGES_STEPS = r"""    steps:
 
           compare_registry_manifests standard
           compare_registry_manifests ebpf
+          compare_registry_manifests ebpftools
 
       - name: Generate SPDX SBOMs and manifest provenance
         env:
@@ -765,6 +848,8 @@ RELEASE_ATTEST_RELEASE_IMAGES_STEPS = r"""    steps:
           STANDARD_GHCR_REF: ${{ steps.images.outputs.standard_ghcr_ref }}
           EBPF_DOCKER_REF: ${{ steps.images.outputs.ebpf_docker_ref }}
           EBPF_GHCR_REF: ${{ steps.images.outputs.ebpf_ghcr_ref }}
+          EBPF_TOOLS_DOCKER_REF: ${{ steps.images.outputs.ebpftools_docker_ref }}
+          EBPF_TOOLS_GHCR_REF: ${{ steps.images.outputs.ebpftools_ghcr_ref }}
           TAG_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
@@ -814,6 +899,12 @@ RELEASE_ATTEST_RELEASE_IMAGES_STEPS = r"""    steps:
             "$DOCKERHUB_USERNAME" "$DOCKERHUB_PASSWORD"
           generate_sboms \
             ebpf ghcr "$EBPF_GHCR_REF" \
+            "$GHCR_USERNAME" "$GHCR_TOKEN"
+          generate_sboms \
+            ebpftools docker "$EBPF_TOOLS_DOCKER_REF" \
+            "$DOCKERHUB_USERNAME" "$DOCKERHUB_PASSWORD"
+          generate_sboms \
+            ebpftools ghcr "$EBPF_TOOLS_GHCR_REF" \
             "$GHCR_USERNAME" "$GHCR_TOKEN"
 
           cat > "$work/create_provenance.jq" <<'JQ'
@@ -889,6 +980,16 @@ RELEASE_ATTEST_RELEASE_IMAGES_STEPS = r"""    steps:
             "ghcr.io/${GITHUB_REPOSITORY}" \
             "$work/ebpf_ghcr.manifest.json" \
             "$work/ebpf_ghcr.provenance.json"
+          create_provenance \
+            ebpftools \
+            ferrumedge/ferrum-edge \
+            "$work/ebpftools_docker.manifest.json" \
+            "$work/ebpftools_docker.provenance.json"
+          create_provenance \
+            ebpftools \
+            "ghcr.io/${GITHUB_REPOSITORY}" \
+            "$work/ebpftools_ghcr.manifest.json" \
+            "$work/ebpftools_ghcr.provenance.json"
 
       - name: Sign and attest immutable image digests
         env:
@@ -896,6 +997,8 @@ RELEASE_ATTEST_RELEASE_IMAGES_STEPS = r"""    steps:
           STANDARD_GHCR_REF: ${{ steps.images.outputs.standard_ghcr_ref }}
           EBPF_DOCKER_REF: ${{ steps.images.outputs.ebpf_docker_ref }}
           EBPF_GHCR_REF: ${{ steps.images.outputs.ebpf_ghcr_ref }}
+          EBPF_TOOLS_DOCKER_REF: ${{ steps.images.outputs.ebpftools_docker_ref }}
+          EBPF_TOOLS_GHCR_REF: ${{ steps.images.outputs.ebpftools_ghcr_ref }}
         run: |
           set -euo pipefail
           work="$RUNNER_TEMP/image-attestations"
@@ -925,6 +1028,8 @@ RELEASE_ATTEST_RELEASE_IMAGES_STEPS = r"""    steps:
           sign_and_attest standard ghcr "$STANDARD_GHCR_REF"
           sign_and_attest ebpf docker "$EBPF_DOCKER_REF"
           sign_and_attest ebpf ghcr "$EBPF_GHCR_REF"
+          sign_and_attest ebpftools docker "$EBPF_TOOLS_DOCKER_REF"
+          sign_and_attest ebpftools ghcr "$EBPF_TOOLS_GHCR_REF"
 
       - name: Verify signatures, provenance, subjects, and SBOMs
         env:
@@ -932,6 +1037,8 @@ RELEASE_ATTEST_RELEASE_IMAGES_STEPS = r"""    steps:
           STANDARD_GHCR_REF: ${{ steps.images.outputs.standard_ghcr_ref }}
           EBPF_DOCKER_REF: ${{ steps.images.outputs.ebpf_docker_ref }}
           EBPF_GHCR_REF: ${{ steps.images.outputs.ebpf_ghcr_ref }}
+          EBPF_TOOLS_DOCKER_REF: ${{ steps.images.outputs.ebpftools_docker_ref }}
+          EBPF_TOOLS_GHCR_REF: ${{ steps.images.outputs.ebpftools_ghcr_ref }}
         run: |
           set -euo pipefail
           work="$RUNNER_TEMP/image-attestations"
@@ -1019,12 +1126,14 @@ RELEASE_ATTEST_RELEASE_IMAGES_STEPS = r"""    steps:
           verify_image standard ghcr "$STANDARD_GHCR_REF"
           verify_image ebpf docker "$EBPF_DOCKER_REF"
           verify_image ebpf ghcr "$EBPF_GHCR_REF"
+          verify_image ebpftools docker "$EBPF_TOOLS_DOCKER_REF"
+          verify_image ebpftools ghcr "$EBPF_TOOLS_GHCR_REF"
 """
 
 RELEASE_ATTEST_RELEASE_IMAGES_JOB = (
     r"""  attest-release-images:
     name: Sign and attest release images
-    needs: [docker-manifest, docker-ebpf-manifest]
+    needs: [docker-manifest, docker-ebpf-manifest, docker-ebpf-tools-manifest]
     runs-on: ubuntu-latest
     permissions:
       id-token: write
@@ -1168,6 +1277,75 @@ RELEASE_DOCKER_EBPF_MANIFEST_STEPS = r"""    steps:
             -t ghcr.io/${{ github.repository }}:${{ steps.version.outputs.TAG_NAME }}-ebpf \
             -t ghcr.io/${{ github.repository }}:${{ steps.version.outputs.VERSION }}-ebpf \
             -t ghcr.io/${{ github.repository }}:${{ steps.version.outputs.MAJOR_MINOR }}-ebpf \
+            $(printf 'ghcr.io/${{ github.repository }}@sha256:%s ' *)
+"""
+
+# The `-ebpf-tools` tag family assembles from its own digest name space in its
+# own job. It publishes by wildcard exactly like the other manifest jobs, so its
+# whole step list is frozen: the download pattern, the working directory the
+# `printf *` glob expands in, and every published tag. Pointing this job at
+# `/tmp/digests` or at the `docker-ebpf-digest-*` pattern would publish the
+# distroless image under the tag the mesh chart selects for the Ambient UDP
+# lifecycle, and adding a tag here would publish an unattested name, because the
+# attestation job resolves exactly the `-ebpf-tools` canonical tag.
+RELEASE_DOCKER_EBPF_TOOLS_MANIFEST_STEPS = r"""    steps:
+      - name: Extract version tag
+        id: version
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          if [[ ! "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then
+            echo "Invalid release tag format: $TAG_NAME" >&2
+            exit 1
+          fi
+          VERSION="${TAG_NAME#v}"
+          MAJOR_MINOR="${VERSION%.*}"
+          echo "TAG_NAME=$TAG_NAME" >> $GITHUB_OUTPUT
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+          echo "MAJOR_MINOR=$MAJOR_MINOR" >> $GITHUB_OUTPUT
+
+      # Distinct artifact name space from `docker-ebpf-digest-*`: mixing the two
+      # variants into one directory would hand `imagetools create` four
+      # descriptors and publish a manifest spanning both images.
+      - name: Download tools digests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: /tmp/digests-tools
+          pattern: docker-ebpf-tools-digest-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Create and push multi-arch eBPF tools manifest (Docker Hub)
+        working-directory: /tmp/digests-tools
+        run: |
+          docker buildx imagetools create \
+            -t ferrumedge/ferrum-edge:${{ steps.version.outputs.TAG_NAME }}-ebpf-tools \
+            -t ferrumedge/ferrum-edge:${{ steps.version.outputs.VERSION }}-ebpf-tools \
+            -t ferrumedge/ferrum-edge:${{ steps.version.outputs.MAJOR_MINOR }}-ebpf-tools \
+            $(printf 'ferrumedge/ferrum-edge@sha256:%s ' *)
+
+      - name: Create and push multi-arch eBPF tools manifest (GHCR)
+        working-directory: /tmp/digests-tools
+        run: |
+          docker buildx imagetools create \
+            -t ghcr.io/${{ github.repository }}:${{ steps.version.outputs.TAG_NAME }}-ebpf-tools \
+            -t ghcr.io/${{ github.repository }}:${{ steps.version.outputs.VERSION }}-ebpf-tools \
+            -t ghcr.io/${{ github.repository }}:${{ steps.version.outputs.MAJOR_MINOR }}-ebpf-tools \
             $(printf 'ghcr.io/${{ github.repository }}@sha256:%s ' *)
 """
 
@@ -1385,7 +1563,8 @@ PUBLISH_CONTROL_CONTRACTS = {
         "create-release": {
             "needs": (
                 "    needs: [build-release-binaries, build-release-arm64-cross, "
-                "docker-manifest, docker-ebpf-manifest]\n"
+                "docker-manifest, docker-ebpf-manifest, "
+                "docker-ebpf-tools-manifest]\n"
             ),
             "steps": RELEASE_CREATE_RELEASE_STEPS,
         },
@@ -1428,6 +1607,13 @@ PUBLISH_CONTROL_CONTRACTS = {
                 "docker-ebpf]\n"
             ),
             "steps": RELEASE_DOCKER_EBPF_MANIFEST_STEPS,
+        },
+        "docker-ebpf-tools-manifest": {
+            "needs": (
+                "    needs: [build-release-binaries, docker-manifest, "
+                "docker-ebpf, docker-ebpf-manifest]\n"
+            ),
+            "steps": RELEASE_DOCKER_EBPF_TOOLS_MANIFEST_STEPS,
         },
     },
 }
@@ -15437,11 +15623,16 @@ pre_build = []
         "docker-digest-evil",
         "docker-ebpf-digest-evil",
     )
+    tools_digest_upload_action = digest_upload_action.replace(
+        "docker-digest-evil",
+        "docker-ebpf-tools-digest-evil",
+    )
     for digest_label, proposed_action in (
         ("block-spelled", digest_upload_action),
         ("flow-spelled", flow_digest_upload_action),
         ("unpinned case-varied", unpinned_digest_upload_action),
         ("second-namespace", new_digest_upload_action),
+        ("tools-namespace", tools_digest_upload_action),
     ):
         if not compare_pr_action_collection(
             {"setup/action.yml": safe_action},
@@ -22253,6 +22444,7 @@ pre_build = []
         ("release workflow", "create-release"),
         ("release workflow", "docker-manifest"),
         ("release workflow", "docker-ebpf-manifest"),
+        ("release workflow", "docker-ebpf-tools-manifest"),
     ):
         contract = PUBLISH_CONTROL_CONTRACTS[contract_source][contract_job]
         if "steps" not in contract:
@@ -22301,6 +22493,58 @@ pre_build = []
     ):
         failures.append("an attacker-controlled attestation runner was not rejected")
 
+    # Every published image family must be a first-class subject of the frozen
+    # attestation job. A family that is published but not resolved, compared,
+    # scanned, signed, attested, and verified would ship an unsigned image under
+    # a release tag that the notes advertise.
+    for family, docker_variable, ghcr_variable in (
+        ("standard", "$STANDARD_DOCKER_REF", "$STANDARD_GHCR_REF"),
+        ("ebpf", "$EBPF_DOCKER_REF", "$EBPF_GHCR_REF"),
+        ("ebpftools", "$EBPF_TOOLS_DOCKER_REF", "$EBPF_TOOLS_GHCR_REF"),
+    ):
+        for required_invocation in (
+            f"compare_registry_manifests {family}\n",
+            f'generate_sboms \\\n            {family} docker "{docker_variable}"',
+            f'generate_sboms \\\n            {family} ghcr "{ghcr_variable}"',
+            f'sign_and_attest {family} docker "{docker_variable}"',
+            f'sign_and_attest {family} ghcr "{ghcr_variable}"',
+            f'verify_image {family} docker "{docker_variable}"',
+            f'verify_image {family} ghcr "{ghcr_variable}"',
+        ):
+            if required_invocation not in attestation_job:
+                failures.append(
+                    "the frozen attestation job does not cover image family "
+                    f"{family!r}: missing {required_invocation!r}"
+                )
+
+    # The third digest name space must be owned exactly like the other two, and
+    # only the single job that builds both eBPF variants may produce it.
+    release_digest_owners = DIGEST_ARTIFACT_OWNERS["release workflow"]
+    if release_digest_owners.get("docker-ebpf-tools-digest-") != ("docker-ebpf",):
+        failures.append(
+            "the `-ebpf-tools` digest wildcard is not owned by exactly the "
+            "docker-ebpf job"
+        )
+    tools_manifest_steps = PUBLISH_CONTROL_CONTRACTS["release workflow"][
+        "docker-ebpf-tools-manifest"
+    ]["steps"]
+    for owned_prefix in release_digest_owners:
+        if owned_prefix == "docker-ebpf-tools-digest-":
+            continue
+        if f"pattern: {owned_prefix}*" in tools_manifest_steps:
+            failures.append(
+                "the `-ebpf-tools` manifest collects another family's digest "
+                f"name space {owned_prefix!r}"
+            )
+    if (
+        DOCKER_EBPF_MANIFEST_TOOLS_DOWNLOAD_STEP not in tools_manifest_steps
+        or DOCKER_EBPF_TOOLS_UPLOAD_DIGEST_STEP == DOCKER_EBPF_UPLOAD_DIGEST_STEP
+    ):
+        failures.append(
+            "the `-ebpf-tools` digest download/upload contract is not distinct "
+            "from the `-ebpf` one"
+        )
+
     for wildcard_source, wildcard_job, wildcard_token in (
         ("CI workflow", "latest-release", "release-assets/*"),
         ("release workflow", "create-release", "files: release-assets/*"),
@@ -22308,6 +22552,11 @@ pre_build = []
         (
             "release workflow",
             "docker-ebpf-manifest",
+            "docker buildx imagetools create",
+        ),
+        (
+            "release workflow",
+            "docker-ebpf-tools-manifest",
             "docker buildx imagetools create",
         ),
     ):

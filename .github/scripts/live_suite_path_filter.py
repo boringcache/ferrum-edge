@@ -224,7 +224,9 @@ SUITE_PATTERNS: dict[str, list[str]] = {
     # ProxyHostUdpBackend TPROXY capture, attribution, replies, and cleanup.
     "ambient-host-udp": [
         r"^\.github/workflows/(ci|ambient-host-udp-live|release)\.yml$",
-        r"^\.github/scripts/(live_suite_path_filter|pr_ci_plan|verify_cross_build_policy)\.py$",
+        # The trusted release-trust surfaces decide whether the tag the chart
+        # selects is owned, gated, signed, and attested at all.
+        r"^\.github/scripts/(live_suite_path_filter|pr_ci_plan|verify_cross_build_policy|verify_release_image_attestations)\.py$",
         r"^\.github/scripts/stage_iproute2_runtime\.sh$",
         r"^\.github/actions/setup-rust-ci/",
         # The chart auto-selects a published runtime variant for the Ambient UDP
@@ -354,6 +356,11 @@ def self_test() -> int:
         ("ambient-host-udp", ["Dockerfile"], True),
         ("ambient-host-udp", [".github/workflows/release.yml"], True),
         ("ambient-host-udp", [".github/scripts/stage_iproute2_runtime.sh"], True),
+        (
+            "ambient-host-udp",
+            [".github/scripts/verify_release_image_attestations.py"],
+            True,
+        ),
         (
             "ambient-host-udp",
             ["charts/ferrum-mesh/templates/ambient-daemonset.yaml"],

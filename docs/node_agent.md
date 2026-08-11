@@ -186,9 +186,10 @@ BPF map read are gated behind `#[cfg(all(feature = "ebpf", target_os = "linux"))
 >   Its manifests are published by `docker-ebpf-tools-manifest`, which `needs:`
 >   the same core release path plus `docker-ebpf-manifest`, so the tools tags
 >   are never published for a release whose core artifacts or `-ebpf` variant
->   did not ship. It is **not** yet Cosign-signed or SBOM/provenance-attested:
->   `attest-release-images` is frozen by the trusted cross-build verifier and
->   requires a trusted-base change — see `docs/ci_cd.md`.
+>   did not ship. `create-release` and `attest-release-images` both `needs:` it,
+>   so it is Cosign-signed on its immutable multi-arch digest in both registries
+>   and carries SLSA provenance plus per-platform SPDX SBOM attestations exactly
+>   like the other two families — see `docs/ci_cd.md`.
 
 **Building the capture image.** The compiled BPF ELF and the `--features ebpf`
 binary are produced by the explicit target:

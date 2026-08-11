@@ -391,9 +391,8 @@ fn ambient_udp_lifecycle_selects_the_tools_capable_published_runtime() {
          manifests cannot be merged into one four-descriptor list"
     );
     // Gating parity with the `-ebpf` manifest job. The tools manifest lives in
-    // its own job because `docker-ebpf-manifest`'s step list is frozen
-    // byte-for-byte by the trusted cross-build policy, so the equivalence has to
-    // be asserted here instead of being structural.
+    // its own job so each tag family keeps its own frozen assembly contract and
+    // its own digest name space, which makes the equivalence explicit here.
     assert!(
         release.contains(
             "    needs: [build-release-binaries, docker-manifest, docker-ebpf, \
@@ -406,6 +405,135 @@ fn ambient_udp_lifecycle_selects_the_tools_capable_published_runtime() {
     assert!(
         release.contains("docker-ebpf-tools-manifest:\n"),
         "the tools manifest job must exist"
+    );
+}
+
+/// A published image the chart selects in production must carry the SAME release
+/// trust guarantees as the other two families. An image family that is gated and
+/// tagged but not owned, signed, and attested is a supply-chain hole exactly
+/// where the most privileged runtime (root, full Debian userland) ships.
+#[test]
+fn ambient_udp_lifecycle_image_is_a_first_class_trusted_release_family() {
+    let release = read(".github/workflows/release.yml");
+    let policy = read(".github/scripts/verify_cross_build_policy.py");
+    let attestations = read(".github/scripts/verify_release_image_attestations.py");
+
+    // 1. Release publication is gated on the tools manifest, so the notes can
+    //    never advertise a tag whose manifest assembly failed.
+    assert!(
+        release.contains(
+            "    needs: [build-release-binaries, build-release-arm64-cross, \
+             docker-manifest, docker-ebpf-manifest, docker-ebpf-tools-manifest]\n"
+        ),
+        "create-release must depend on the tools manifest"
+    );
+    for advertised in [
+        "docker pull ferrumedge/ferrum-edge:$TAG_NAME-ebpf-tools",
+        "docker pull ghcr.io/ferrum-edge/ferrum-edge:$TAG_NAME-ebpf-tools",
+    ] {
+        assert!(
+            release.contains(advertised),
+            "the release notes must advertise the family they now gate on: \
+             missing `{advertised}`"
+        );
+    }
+
+    // 2. Signing and attestation cover the third family in both registries.
+    assert!(
+        release.contains(
+            "    needs: [docker-manifest, docker-ebpf-manifest, \
+             docker-ebpf-tools-manifest]\n"
+        ),
+        "attest-release-images must depend on the tools manifest so it signs a \
+         manifest that actually exists"
+    );
+    for invocation in [
+        "resolve_manifest ebpftools_docker",
+        "resolve_manifest ebpftools_ghcr",
+        "compare_registry_manifests ebpftools",
+        "sign_and_attest ebpftools docker \"$EBPF_TOOLS_DOCKER_REF\"",
+        "sign_and_attest ebpftools ghcr \"$EBPF_TOOLS_GHCR_REF\"",
+        "verify_image ebpftools docker \"$EBPF_TOOLS_DOCKER_REF\"",
+        "verify_image ebpftools ghcr \"$EBPF_TOOLS_GHCR_REF\"",
+        "ebpftools docker \"$EBPF_TOOLS_DOCKER_REF\"",
+        "ebpftools ghcr \"$EBPF_TOOLS_GHCR_REF\"",
+        "$work/ebpftools_docker.provenance.json",
+        "$work/ebpftools_ghcr.provenance.json",
+    ] {
+        assert!(
+            release.contains(invocation),
+            "the attestation job must cover the tools family: missing \
+             `{invocation}`"
+        );
+    }
+
+    // 3. The static release-attestation contract enforces the third family
+    //    itself, so a later edit that drops it fails required CI rather than
+    //    silently shipping an unsigned image.
+    assert!(
+        attestations.contains("(\"ebpftools\", \"-ebpf-tools\", \"EBPF_TOOLS\")"),
+        "the release attestation contract must enumerate the tools family"
+    );
+    assert!(
+        attestations.contains("\"docker-ebpf-tools-manifest\","),
+        "the release attestation contract must require the tools manifest in \
+         both the create-release and attestation dependency sets"
+    );
+    for mutation in [
+        "tools-image signing",
+        "tools-image SBOM generation",
+        "tools-image attestation verification",
+        "tools-image cross-registry manifest comparison",
+        "tools-image canonical tag resolution",
+    ] {
+        assert!(
+            attestations.contains(mutation),
+            "the contract self-test must prove it rejects a dropped \
+             `{mutation}` step"
+        );
+    }
+
+    // 4. The digest name space is owned, and both the producing steps and the
+    //    whole assembling job are frozen by the trusted cross-build policy.
+    assert!(
+        policy.contains("\"docker-ebpf-tools-digest-\": (\"docker-ebpf\",),"),
+        "the tools digest wildcard must be owned by exactly the docker-ebpf job, \
+         so no other job can inject a descriptor into the published manifest"
+    );
+    for frozen in [
+        "\"Build and push per-platform eBPF tools digest\": (",
+        "\"Upload tools digest\": DOCKER_EBPF_TOOLS_UPLOAD_DIGEST_STEP,",
+        "\"Download tools digests\": DOCKER_EBPF_MANIFEST_TOOLS_DOWNLOAD_STEP,",
+        "\"steps\": RELEASE_DOCKER_EBPF_TOOLS_MANIFEST_STEPS,",
+    ] {
+        assert!(
+            policy.contains(frozen),
+            "the trusted publication contract must freeze `{frozen}`"
+        );
+    }
+    assert!(
+        policy.contains("needs: [build-release-binaries, build-release-arm64-cross, ")
+            && policy.contains("docker-ebpf-tools-manifest]\\n"),
+        "the frozen create-release dependency contract must include the tools \
+         manifest"
+    );
+
+    // 5. Editing any of those trusted surfaces must schedule this required gate.
+    let filter = read(".github/scripts/live_suite_path_filter.py");
+    assert!(
+        filter.contains("verify_release_image_attestations"),
+        "a release-trust verifier edit must schedule the Ambient host UDP gate"
+    );
+
+    // 6. The documentation must not describe the family as an unattested gap.
+    let ci_docs = read("docs/ci_cd.md");
+    assert!(
+        !ci_docs.contains("`-ebpf-tools` is published but not yet signed/attested"),
+        "the known-gap characterization must not outlive the gap"
+    );
+    assert!(
+        ci_docs.contains("standard, `-ebpf`, and\n`-ebpf-tools`"),
+        "the release-trust documentation must describe three signed families"
     );
 }
 
