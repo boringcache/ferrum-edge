@@ -482,11 +482,20 @@ fn shared_reader_source_text_is_the_single_production_seam() {
     assert!(file_src.contains("read_credential_file_detached"));
     assert!(dp_src.contains("read_credential_file"));
     assert!(dp_src.contains("mint_async"));
+    let k8s_src = include_str!("../../../src/service_discovery/kubernetes.rs");
+    assert!(k8s_src.contains("read_credential_file_detached_guarded"));
     assert!(
         !dp_src
             .lines()
             .filter(|line| !line.trim_start().starts_with("//"))
             .any(|line| line.contains("read_to_string(path)")),
         "DP token path must not call unbounded read_to_string"
+    );
+    assert!(
+        !k8s_src
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .any(|line| line.contains("read_to_string(")),
+        "Kubernetes SA token path must not call unbounded read_to_string"
     );
 }

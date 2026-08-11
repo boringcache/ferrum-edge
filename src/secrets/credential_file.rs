@@ -1,10 +1,11 @@
 //! Shared bounded reader for small file-backed credentials.
 //!
-//! Used by generic `_FILE` startup secrets, `FERRUM_DP_CP_GRPC_TOKEN_FILE`, and
-//! `FERRUM_MESH_STOCK_XDS_TOKEN_FILE` (and any future scalar credential path
-//! that must not allocate or block on a non-regular source). TLS material
-//! sources keep their own caps in `tls::source` (#3754); this module is the
-//! non-TLS credential surface.
+//! Used by generic `_FILE` startup secrets, `FERRUM_DP_CP_GRPC_TOKEN_FILE`,
+//! `FERRUM_MESH_STOCK_XDS_TOKEN_FILE`, and the Kubernetes discovery in-cluster
+//! service-account token (and any future scalar credential path that must not
+//! allocate or block on a non-regular source). TLS material sources keep their
+//! own caps in `tls::source` (#3754); this module is the non-TLS credential
+//! surface.
 //!
 //! Contract:
 //! - Open the path (Unix: `O_NONBLOCK` so FIFO/device open cannot stall).

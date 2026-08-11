@@ -118,6 +118,15 @@ pub mod _test_support {
             .expect("stock xDS token read semaphore is never closed")
     }
 
+    /// Hold the Kubernetes discovery SA-token reader slot so tests can prove a
+    /// concurrent poll waits without spawning another detached reader.
+    pub async fn acquire_k8s_sa_token_file_read_permit_for_test() -> TestSemaphorePermit {
+        crate::service_discovery::kubernetes::k8s_sa_token_file_read_limit()
+            .acquire_owned()
+            .await
+            .expect("process-wide Kubernetes SA token read semaphore is never closed")
+    }
+
     /// Exercise the crate-private stock-xDS credential boundary while keeping
     /// its metadata representation out of the public production API.
     pub async fn read_stock_xds_bearer_token_for_test(path: &str) -> Result<String, anyhow::Error> {
