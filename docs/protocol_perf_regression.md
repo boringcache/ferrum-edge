@@ -125,10 +125,13 @@ as live E2E harnesses that spin up `ferrum-edge` plus stub peers:
 | Mesh DNS proxy | `tests/performance/mesh-dns-e2e/` | Transparent mesh DNS proxy latency/QPS over UDP and TCP | Same two-stage publication residual — [#3332](https://github.com/ferrum-edge/ferrum-edge/issues/3332) |
 
 Hosted collection (stage 1) lives in
-`.github/workflows/mesh-performance-baselines.yml`. It records provenance,
-Criterion trees, HBONE/DNS JSON (≥3 repetitions), `summary.json`, and draft
-markdown under the `mesh-performance-baselines-<sha>` artifact. Stage 2 copies
-only zero-error hosted aggregates into the three `baseline.md` tables.
+`.github/workflows/mesh-performance-baselines.yml` (also callable from
+`.github/workflows/perf-benchmark.yml` with `suite=mesh_baselines` so a PR
+branch can collect before the new workflow file exists on `main`). It records
+provenance, Criterion trees, HBONE/DNS JSON (≥3 repetitions), `summary.json`,
+and draft markdown under the `mesh-performance-baselines-<sha>` artifact.
+Stage 2 copies only zero-error hosted aggregates into the three `baseline.md`
+tables.
 
 `tests/performance/mesh/README.md` is a **frozen Trusted Cross automation
 surface**: every path under `tests/performance/` is treated as protected

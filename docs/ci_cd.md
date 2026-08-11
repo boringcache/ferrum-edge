@@ -52,7 +52,7 @@ adding, removing, or materially changing a workflow.
 | `claude-review.yml` | Claude PR Review | `@claude review` issue comment on PRs | Maintainer-triggered AI review comments. |
 | `cleanup-pending-reviews.yml` | Cleanup Pending Deployment Reviews | Schedule, manual | Clears stale pending deployment review state. |
 | `prune-stale-prs.yml` | Prune Stale PRs and Branches | Schedule, manual | Repository hygiene for stale PRs/branches. |
-| `perf-benchmark.yml` | Multi Protocol Performance Benchmark | Manual | Multi-protocol benchmark suite for selected refs. |
+| `perf-benchmark.yml` | Multi Protocol Performance Benchmark | Manual | Multi-protocol benchmark suite for selected refs. Also dispatches mesh/HBONE/DNS baseline collection when `suite=mesh_baselines` (see `mesh-performance-baselines.yml` / [#3332](https://github.com/ferrum-edge/ferrum-edge/issues/3332)). |
 | `payload-size-benchmark.yml` | Payload Size Performance Benchmark | Manual | Payload-size benchmark suite for selected refs. |
 | `comparison-benchmark.yml` | Gateway Comparison Benchmark | Manual | Cross-gateway comparison benchmarks. |
 | `gateways-protocol-benchmark.yml` | Gateways Protocol Benchmark | Manual | Gateway/protocol benchmark harness. |

@@ -37,6 +37,25 @@ on:
         required: false
         default: "ubuntu-latest"
         type: string
+  # Callable from existing dispatchable workflows (e.g. perf-benchmark.yml) so
+  # collection can run on a PR branch before this file lands on main.
+  workflow_call:
+    inputs:
+      suites:
+        description: "Suites to collect (all, mesh, hbone, dns)"
+        required: false
+        default: "all"
+        type: string
+      iterations:
+        description: "Clean E2E repetitions (HBONE + DNS)"
+        required: false
+        default: "3"
+        type: string
+      runner:
+        description: "Named GitHub-hosted Linux runner class"
+        required: false
+        default: "ubuntu-latest"
+        type: string
 
 concurrency:
   group: mesh-performance-baselines-${{ github.ref }}
@@ -50,14 +69,15 @@ env:
   CARGO_NET_RETRY: "10"
   CARGO_HTTP_MULTIPLEXING: "false"
   BENCH_BUILD_PROFILE: release
-  BENCH_RUNNER_CLASS: ${{ inputs.runner }}
-  BENCH_ITERATIONS: ${{ inputs.iterations }}
+  BENCH_RUNNER_CLASS: ${{ inputs.runner || 'ubuntu-latest' }}
+  BENCH_ITERATIONS: ${{ inputs.iterations || '3' }}
   BENCH_GATEWAY_FEATURES: default (no --features)
+  BENCH_SUITES: ${{ inputs.suites || 'all' }}
 
 jobs:
   collect:
     name: Collect mesh / HBONE / DNS baselines
-    runs-on: ${{ inputs.runner }}
+    runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
     timeout-minutes: 240
 
     steps:
@@ -86,7 +106,7 @@ jobs:
 
       - name: Prepare results directories + suite command ledger
         env:
-          SUITES: ${{ inputs.suites }}
+          SUITES: ${{ env.BENCH_SUITES }}
         run: |
           set -euo pipefail
           mkdir -p mesh-baseline-results/{mesh,hbone,dns,drafts,logs}
@@ -175,11 +195,11 @@ jobs:
             --suite-commands mesh-baseline-results/suite_commands.json
 
       - name: Build gateway binary (release)
-        if: inputs.suites == 'all' || inputs.suites == 'hbone' || inputs.suites == 'dns'
+        if: env.BENCH_SUITES == 'all' || env.BENCH_SUITES == 'hbone' || env.BENCH_SUITES == 'dns'
         run: cargo build --release --bin ferrum-edge
 
       - name: Collect mesh Criterion microbenchmarks
-        if: inputs.suites == 'all' || inputs.suites == 'mesh'
+        if: env.BENCH_SUITES == 'all' || env.BENCH_SUITES == 'mesh'
         timeout-minutes: 120
         run: |
           set -euo pipefail
@@ -200,13 +220,13 @@ jobs:
           fi
 
       - name: Build HBONE harness
-        if: inputs.suites == 'all' || inputs.suites == 'hbone'
+        if: env.BENCH_SUITES == 'all' || env.BENCH_SUITES == 'hbone'
         run: |
           set -euo pipefail
           (cd tests/performance/mesh-hbone-e2e && cargo build --release)
 
       - name: Collect HBONE E2E baselines (3+ repetitions)
-        if: inputs.suites == 'all' || inputs.suites == 'hbone'
+        if: env.BENCH_SUITES == 'all' || env.BENCH_SUITES == 'hbone'
         timeout-minutes: 90
         run: |
           set -euo pipefail
@@ -234,13 +254,13 @@ jobs:
           done
 
       - name: Build DNS harness
-        if: inputs.suites == 'all' || inputs.suites == 'dns'
+        if: env.BENCH_SUITES == 'all' || env.BENCH_SUITES == 'dns'
         run: |
           set -euo pipefail
           (cd tests/performance/mesh-dns-e2e && cargo build --release)
 
       - name: Collect DNS E2E baselines (3+ repetitions)
-        if: inputs.suites == 'all' || inputs.suites == 'dns'
+        if: env.BENCH_SUITES == 'all' || env.BENCH_SUITES == 'dns'
         timeout-minutes: 90
         run: |
           set -euo pipefail

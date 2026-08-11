@@ -49,8 +49,9 @@ def require(condition: bool, message: str, failures: list[str]) -> None:
 def check_workflow(text: str, failures: list[str]) -> None:
     require("name: Mesh Performance Baselines" in text, "workflow display name missing", failures)
     require("workflow_dispatch:" in text, "workflow_dispatch trigger required", failures)
-    require("runs-on: ${{ inputs.runner }}" in text, "named runner input must drive runs-on", failures)
+    require("runs-on: ${{ inputs.runner" in text, "named runner input must drive runs-on", failures)
     require("ubuntu-latest" in text, "default runner class must be ubuntu-latest", failures)
+    require("workflow_call:" in text, "workflow_call required for PR-branch dispatch via perf-benchmark.yml", failures)
     require("BENCH_BUILD_PROFILE: release" in text, "release profile required", failures)
     require("authz_match" in text and "ip_restriction" in text, "mesh benches incomplete", failures)
     require("slice_apply" in text and "xds_translation" in text, "mesh benches incomplete", failures)
@@ -107,13 +108,18 @@ on:
     inputs:
       runner:
         default: "ubuntu-latest"
+  workflow_call:
+    inputs:
+      runner:
+        default: "ubuntu-latest"
+        type: string
 permissions:
   contents: read
 env:
   BENCH_BUILD_PROFILE: release
 jobs:
   collect:
-    runs-on: ${{ inputs.runner }}
+    runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - uses: ./.github/actions/setup-rust-ci

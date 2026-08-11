@@ -4,21 +4,36 @@
 # results to the GitHub Actions step summary.  Triggered manually via
 # workflow_dispatch so it can target any branch or PR.
 #
-# Each run executes the benchmark suite a configurable number of times
-# (1-3, default 1) to optionally identify outliers caused by noisy-neighbor
-# effects on shared GitHub runners.  A pre-benchmark health check logs CPU
-# steal, scheduler jitter, and memory to quantify runner impairment.
+# Also dispatches the mesh/HBONE/DNS baseline collection reusable workflow
+# (issue #3332) when suite=mesh_baselines — this lets a PR branch collect
+# provenance-complete artifacts before mesh-performance-baselines.yml lands
+# on main (new workflow files are not API-dispatchable until then).
+#
+# Each multi_protocol run executes the benchmark suite a configurable number
+# of times (1-3, default 1) to optionally identify outliers caused by
+# noisy-neighbor effects on shared GitHub runners.  A pre-benchmark health
+# check logs CPU steal, scheduler jitter, and memory to quantify runner
+# impairment.
 #
 # Usage:
 #   - Go to Actions → "Multi Protocol Performance Benchmark" → "Run workflow"
 #   - Pick the branch (or PR branch) to benchmark
 #   - Optionally adjust duration, concurrency, payload size, and protocols
+#   - Or set suite=mesh_baselines to collect mesh/HBONE/DNS baseline artifacts
 
 name: Multi Protocol Performance Benchmark
 
 on:
   workflow_dispatch:
     inputs:
+      suite:
+        description: "Which hosted suite to run"
+        required: false
+        default: "multi_protocol"
+        type: choice
+        options:
+          - multi_protocol
+          - mesh_baselines
       duration:
         description: "Test duration per protocol (seconds)"
         required: false
@@ -40,7 +55,7 @@ on:
         default: "all"
         type: string
       iterations:
-        description: "Number of benchmark iterations (1-3)"
+        description: "Number of benchmark iterations (1-3; mesh baselines force ≥3)"
         required: false
         default: "1"
         type: choice
@@ -58,10 +73,30 @@ on:
           - max-perf
           - ci-release
           - dev
+      mesh_suites:
+        description: "Mesh baseline subset when suite=mesh_baselines"
+        required: false
+        default: "all"
+        type: choice
+        options:
+          - all
+          - mesh
+          - hbone
+          - dns
 
 jobs:
+  mesh-baselines:
+    name: Mesh / HBONE / DNS baselines
+    if: inputs.suite == 'mesh_baselines'
+    uses: ./.github/workflows/mesh-performance-baselines.yml
+    with:
+      suites: ${{ inputs.mesh_suites }}
+      iterations: ${{ inputs.iterations == '1' && '3' || inputs.iterations }}
+      runner: ubuntu-latest
+
   benchmark:
     name: Multi-Protocol Benchmark
+    if: inputs.suite == 'multi_protocol'
     runs-on: ubuntu-latest
     timeout-minutes: 90
 
