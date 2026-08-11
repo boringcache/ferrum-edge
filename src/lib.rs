@@ -286,6 +286,31 @@ pub mod _test_support {
         )
     }
 
+    /// Test-only view of shared H3-eligible retry selection (issue #3620).
+    ///
+    /// Excludes the original failed identity plus every Unix-ineligible
+    /// candidate already encountered, bounded by `MAX_TARGETS_PER_UPSTREAM`.
+    pub fn select_next_h3_eligible_retry_target_for_test(
+        state: &crate::proxy::ProxyState,
+        epoch: &crate::request_epoch::RequestEpoch,
+        proxy: &crate::config::types::Proxy,
+        prev_target: &crate::config::types::UpstreamTarget,
+        request: RetryTargetRequestForTest<'_>,
+    ) -> Option<Arc<crate::config::types::UpstreamTarget>> {
+        crate::proxy::backend_dispatch::select_next_h3_eligible_retry_target(
+            state,
+            epoch,
+            proxy,
+            prev_target,
+            crate::proxy::backend_dispatch::RetryTargetRequest {
+                base_hash_key: request.base_hash_key,
+                client_ip: request.client_ip,
+                proxy_headers: request.proxy_headers,
+                request_authority: request.request_authority,
+            },
+        )
+    }
+
     /// Test-only view of the shared retry-rotation reissue derivation every
     /// response path uses to decide whether — and for which backend — a
     /// sticky-session cookie must be minted (#3278).

@@ -691,9 +691,14 @@ fn websocket_retry_rotation_rechecks_destination_rule_max_retries() {
             body.contains("route_retry_ceiling"),
             "{label} WebSocket retry must authorize against the original route ceiling"
         );
-        let selection = body
-            .find("select_next_retry_target(")
-            .unwrap_or_else(|| panic!("{label} WebSocket retry rotation must remain present"));
+        let selection_needle = if label == "H3" {
+            "select_next_h3_eligible_retry_target("
+        } else {
+            "select_next_retry_target("
+        };
+        let selection = body.find(selection_needle).unwrap_or_else(|| {
+            panic!("{label} WebSocket retry rotation must remain present ({selection_needle})")
+        });
         let candidate_cap = body
             .find("retry_attempt_allowed_for_target(")
             .unwrap_or_else(|| {

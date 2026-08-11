@@ -56,8 +56,8 @@ fn h3_plain_bridge_dispatches_mesh_through_shared_pools() {
         "mesh-tagged plain attempts must dial through the shared mesh helper"
     );
     assert!(
-        plain.contains("h3_dispatch_target_eligible("),
-        "mixed-upstream retry rotation must filter H3-ineligible candidates"
+        plain.contains("select_next_h3_eligible_retry_target("),
+        "mixed-upstream retry rotation must filter H3-ineligible candidates via the shared helper"
     );
     assert!(
         plain.contains("target_requires_http_mesh_egress"),

@@ -1147,18 +1147,19 @@ pub(crate) async fn handle_h3_websocket(
 
                     if let (Some(_upstream_id), Some(prev_target), Some(hash_key)) =
                         (&proxy.upstream_id, &current_target, lb_hash_key.as_deref())
-                        && let Some(next) = crate::proxy::backend_dispatch::select_next_retry_target(
-                            &state,
-                            &epoch,
-                            &proxy,
-                            prev_target,
-                            crate::proxy::backend_dispatch::RetryTargetRequest {
-                                base_hash_key: hash_key,
-                                client_ip: &ctx.client_ip,
-                                proxy_headers: &proxy_headers,
-                                request_authority: request_host.as_deref(),
-                            },
-                        )
+                        && let Some(next) =
+                            crate::proxy::backend_dispatch::select_next_h3_eligible_retry_target(
+                                &state,
+                                &epoch,
+                                &proxy,
+                                prev_target,
+                                crate::proxy::backend_dispatch::RetryTargetRequest {
+                                    base_hash_key: hash_key,
+                                    client_ip: &ctx.client_ip,
+                                    proxy_headers: &proxy_headers,
+                                    request_authority: request_host.as_deref(),
+                                },
+                            )
                     {
                         if !crate::proxy::retry_target_preserves_backend_path(
                             backend_path_is_policy_bound,
@@ -1185,81 +1186,6 @@ pub(crate) async fn handle_h3_websocket(
                                 attempt = ws_attempt,
                                 "Aborting H3 WebSocket retry because the candidate exceeds its DestinationRule maxRetries cap"
                             );
-                        } else if !crate::proxy::backend_dispatch::h3_dispatch_target_eligible(
-                            &next,
-                        ) {
-                            // Skip Unix-only (and other H3-ineligible) candidates
-                            // in mixed upstreams (issue #3620). Keep searching
-                            // by excluding this candidate.
-                            let mut exclude = next;
-                            let mut found = None;
-                            for _ in 0..32 {
-                                let Some(candidate) =
-                                    crate::proxy::backend_dispatch::select_next_retry_target(
-                                        &state,
-                                        &epoch,
-                                        &proxy,
-                                        &exclude,
-                                        crate::proxy::backend_dispatch::RetryTargetRequest {
-                                            base_hash_key: hash_key,
-                                            client_ip: &ctx.client_ip,
-                                            proxy_headers: &proxy_headers,
-                                            request_authority: request_host.as_deref(),
-                                        },
-                                    )
-                                else {
-                                    break;
-                                };
-                                if !crate::proxy::retry_target_preserves_backend_path(
-                                    backend_path_is_policy_bound,
-                                    &proxy,
-                                    &ctx.path,
-                                    strip_len,
-                                    prev_target,
-                                    &candidate,
-                                ) || !crate::proxy::retry_attempt_allowed_for_target(
-                                    route_retry_ceiling,
-                                    &proxy,
-                                    &candidate,
-                                    ws_attempt,
-                                ) {
-                                    retry_path_mismatch = true;
-                                    break;
-                                }
-                                if crate::proxy::backend_dispatch::h3_dispatch_target_eligible(
-                                    &candidate,
-                                ) {
-                                    found = Some(candidate);
-                                    break;
-                                }
-                                exclude = candidate;
-                            }
-                            if let Some(candidate) = found {
-                                retry_backend_url =
-                                    crate::proxy::build_websocket_backend_url_with_target(
-                                        &proxy,
-                                        &ctx.path,
-                                        &query_string,
-                                        &candidate.host,
-                                        candidate.port,
-                                        strip_len,
-                                        candidate.path.as_deref(),
-                                    );
-                                retry_cb_target_key = Some(crate::circuit_breaker::target_key(
-                                    &candidate.host,
-                                    candidate.port,
-                                ));
-                                retry_target = Some(candidate);
-                            } else if !retry_path_mismatch {
-                                // No eligible secured/plain candidate remains:
-                                // fail closed rather than dialing an ineligible
-                                // mesh-incompatible target.
-                                retry_path_mismatch = true;
-                                warn!(
-                                    proxy_id = %proxy.id,
-                                    "Aborting H3 WebSocket retry: no H3-eligible candidate remains"
-                                );
-                            }
                         } else {
                             retry_backend_url =
                                 crate::proxy::build_websocket_backend_url_with_target(

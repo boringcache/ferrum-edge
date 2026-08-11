@@ -101,7 +101,7 @@ fn h3_websocket_connect_loop_screens_unix_and_forks_mesh_before_dial() {
         "h3_websocket must reuse the shared websocket_mesh_egress classifier"
     );
     assert!(
-        loop_tail.contains("h3_dispatch_target_eligible("),
-        "h3_websocket retry rotation must skip H3-ineligible (Unix) candidates"
+        loop_tail.contains("select_next_h3_eligible_retry_target("),
+        "h3_websocket retry rotation must skip H3-ineligible (Unix) candidates via the shared helper"
     );
 }

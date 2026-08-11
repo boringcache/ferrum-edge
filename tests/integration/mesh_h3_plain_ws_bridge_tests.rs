@@ -84,8 +84,8 @@ fn h3_plain_bridge_source_routes_mesh_through_shared_helper() {
         "mesh-tagged plain attempts must share the H1/H2 mesh helper"
     );
     assert!(
-        plain.contains("h3_dispatch_target_eligible("),
-        "mixed-upstream retry must filter H3-ineligible candidates"
+        plain.contains("select_next_h3_eligible_retry_target("),
+        "mixed-upstream retry must filter H3-ineligible candidates via the shared helper"
     );
     assert!(
         plain.contains("run_after_proxy_hooks("),
@@ -109,8 +109,8 @@ fn h3_websocket_bridge_source_forks_shared_mesh_egress() {
         "H3 WS must reuse the shared mesh WS dialer"
     );
     assert!(
-        loop_tail.contains("h3_dispatch_target_eligible("),
-        "H3 WS retry must skip Unix-only candidates"
+        loop_tail.contains("select_next_h3_eligible_retry_target("),
+        "H3 WS retry must skip Unix-only candidates via the shared helper"
     );
 }
 

@@ -1390,6 +1390,7 @@ pub(crate) fn resolve_hash_key(
 }
 
 /// Request-derived inputs shared by every retry-target selection path.
+#[derive(Clone, Copy)]
 pub(crate) struct RetryTargetRequest<'a> {
     pub(crate) base_hash_key: &'a str,
     pub(crate) client_ip: &'a str,
@@ -1452,18 +1453,53 @@ pub(crate) fn select_next_retry_target(
     prev_target: &UpstreamTarget,
     request: RetryTargetRequest<'_>,
 ) -> Option<Arc<UpstreamTarget>> {
+    select_next_retry_target_excluding(state, epoch, proxy, prev_target, &[], request)
+}
+
+/// Like [`select_next_retry_target`], but also excludes every additional
+/// already-seen identity in `additional_excludes`.
+///
+/// Retry-only. `prev_target` still drives per-port lane / hash recomputation;
+/// `additional_excludes` only widen the sticky-identity exclusion set so an
+/// eligibility filter can skip ineligible candidates without revisiting them
+/// or the original failed endpoint. Empty `additional_excludes` is identical
+/// to [`select_next_retry_target`].
+pub(crate) fn select_next_retry_target_excluding(
+    state: &ProxyState,
+    epoch: &RequestEpoch,
+    proxy: &Proxy,
+    prev_target: &UpstreamTarget,
+    additional_excludes: &[&UpstreamTarget],
+    request: RetryTargetRequest<'_>,
+) -> Option<Arc<UpstreamTarget>> {
     let upstream_id = proxy.upstream_id.as_deref()?;
 
     // Configured selection identity for exclusion — not the dial clone.
-    let exclude_target = LoadBalancerCache::configured_sticky_identity_target_from(
+    let primary_exclude = LoadBalancerCache::configured_sticky_identity_target_from(
         &epoch.load_balancer,
         &proxy.namespace,
         upstream_id,
         prev_target,
     );
 
+    // Reconcile each additional dial / seen candidate back to its configured
+    // sticky identity before exclusion (same contract as `prev_target`).
+    let mut extra_configured: Vec<&UpstreamTarget> =
+        Vec::with_capacity(additional_excludes.len());
+    for seen in additional_excludes {
+        extra_configured.push(LoadBalancerCache::configured_sticky_identity_target_from(
+            &epoch.load_balancer,
+            &proxy.namespace,
+            upstream_id,
+            seen,
+        ));
+    }
+    let mut excludes: Vec<&UpstreamTarget> = Vec::with_capacity(1 + extra_configured.len());
+    excludes.push(primary_exclude);
+    excludes.extend_from_slice(&extra_configured);
+
     let retry_override_port =
-        crate::proxy::retry_port_override_dispatch_port(proxy, exclude_target).filter(|port| {
+        crate::proxy::retry_port_override_dispatch_port(proxy, primary_exclude).filter(|port| {
             LoadBalancerCache::has_port_override_state_from(
                 &epoch.load_balancer,
                 &proxy.namespace,
@@ -1509,50 +1545,125 @@ pub(crate) fn select_next_retry_target(
 
     let selected = if let Some(subset_name) = proxy.upstream_subset.as_deref() {
         if let Some(port) = retry_override_port {
-            LoadBalancerCache::select_next_target_for_port_subset_from(
+            LoadBalancerCache::select_next_target_for_port_subset_excluding_from(
                 &epoch.load_balancer,
                 &proxy.namespace,
                 upstream_id,
                 retry_key,
                 port,
                 subset_name,
-                exclude_target,
+                &excludes,
                 Some(&health_ctx),
             )
         } else {
-            LoadBalancerCache::select_next_target_subset_from(
+            LoadBalancerCache::select_next_target_subset_excluding_from(
                 &epoch.load_balancer,
                 &proxy.namespace,
                 upstream_id,
                 retry_key,
                 subset_name,
-                exclude_target,
+                &excludes,
                 Some(&health_ctx),
             )
         }
     } else if let Some(port) = retry_override_port {
-        LoadBalancerCache::select_next_target_for_port_from(
+        LoadBalancerCache::select_next_target_for_port_excluding_from(
             &epoch.load_balancer,
             &proxy.namespace,
             upstream_id,
             retry_key,
             port,
-            exclude_target,
+            &excludes,
             Some(&health_ctx),
         )
     } else {
-        LoadBalancerCache::select_next_target_from(
+        LoadBalancerCache::select_next_target_excluding_from(
             &epoch.load_balancer,
             &proxy.namespace,
             upstream_id,
             retry_key,
-            exclude_target,
+            &excludes,
             Some(&health_ctx),
         )
     }?;
 
     // Return a DIAL target. Never hand callers a literal wildcard host.
     concretize_retry_dial_target(selected, request.request_authority)
+}
+
+/// Select the next retry dial target that satisfies `is_eligible`.
+///
+/// Shared by the H3→HTTP plain and H3 WebSocket retry paths (issue #3620).
+/// Preserves the ordinary retry contract (LB algorithm, health/ejection,
+/// subset / per-port lanes, wildcard concretization) while:
+///
+/// - always excluding the original failed identity;
+/// - accumulating every ineligible candidate already encountered so selection
+///   cannot revisit them or oscillate among Unix-only endpoints;
+/// - terminating after at most [`crate::config::types::MAX_TARGETS_PER_UPSTREAM`]
+///   probes so an all-ineligible pool fails closed deterministically.
+///
+/// Allocation is retry-only and bounded by that same 1,000-target ceiling
+/// (one `Arc` retain per skipped ineligible candidate). The ordinary no-retry
+/// and single-exclude retry paths do not call this helper.
+pub(crate) fn select_next_eligible_retry_target(
+    state: &ProxyState,
+    epoch: &RequestEpoch,
+    proxy: &Proxy,
+    prev_target: &UpstreamTarget,
+    request: RetryTargetRequest<'_>,
+    mut is_eligible: impl FnMut(&UpstreamTarget) -> bool,
+) -> Option<Arc<UpstreamTarget>> {
+    use crate::config::types::MAX_TARGETS_PER_UPSTREAM;
+
+    let mut candidate =
+        select_next_retry_target_excluding(state, epoch, proxy, prev_target, &[], request)?;
+    if is_eligible(&candidate) {
+        return Some(candidate);
+    }
+
+    // Retain dial identities of every ineligible candidate already seen.
+    // Bound: at most MAX_TARGETS_PER_UPSTREAM-1 further probes after the first
+    // ineligible pick, covering a full configured upstream without cycling.
+    let mut seen_ineligible: Vec<Arc<UpstreamTarget>> = Vec::new();
+    for _ in 0..MAX_TARGETS_PER_UPSTREAM.saturating_sub(1) {
+        seen_ineligible.push(Arc::clone(&candidate));
+        let additional: Vec<&UpstreamTarget> =
+            seen_ineligible.iter().map(|t| t.as_ref()).collect();
+        candidate = select_next_retry_target_excluding(
+            state,
+            epoch,
+            proxy,
+            prev_target,
+            &additional,
+            request,
+        )?;
+        if is_eligible(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// H3-eligible variant of [`select_next_eligible_retry_target`].
+///
+/// Unix-socket candidates are filtered; mesh HBONE / Sidecar mTLS targets
+/// remain eligible once the plain and WebSocket bridges share those pools.
+pub(crate) fn select_next_h3_eligible_retry_target(
+    state: &ProxyState,
+    epoch: &RequestEpoch,
+    proxy: &Proxy,
+    prev_target: &UpstreamTarget,
+    request: RetryTargetRequest<'_>,
+) -> Option<Arc<UpstreamTarget>> {
+    select_next_eligible_retry_target(
+        state,
+        epoch,
+        proxy,
+        prev_target,
+        request,
+        h3_dispatch_target_eligible,
+    )
 }
 
 /// Concretize a CONFIGURED retry candidate into a DIAL target.

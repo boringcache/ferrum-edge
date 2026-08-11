@@ -538,10 +538,14 @@ fn select_next_cross_protocol_retry_target(
         return CrossProtocolRetryTarget::Unchanged;
     };
 
-    // Centralised in `backend_dispatch::select_next_retry_target` —
-    // see that helper for the per-port `hash_on` recomputation contract
-    // shared with the HTTP/H2/gRPC/WS retry sites.
-    let Some(next) = crate::proxy::backend_dispatch::select_next_retry_target(
+    // Shared H3-eligible retry selection (issue #3620): excludes the original
+    // failed identity plus every Unix-ineligible candidate already seen, up to
+    // MAX_TARGETS_PER_UPSTREAM, so mixed plain+mesh+unix upstreams land on an
+    // eligible target instead of oscillating among Unix-only endpoints or
+    // burning the attempt on a guaranteed fail-closed dial. When every
+    // remaining candidate is ineligible the caller sees Unchanged and the
+    // attempt fails closed.
+    let Some(next) = crate::proxy::backend_dispatch::select_next_h3_eligible_retry_target(
         state,
         epoch,
         proxy,
@@ -581,75 +585,6 @@ fn select_next_cross_protocol_retry_target(
             "Aborting cross-protocol retry because the candidate exceeds its DestinationRule maxRetries cap"
         );
         return CrossProtocolRetryTarget::RetryBudgetExceeded;
-    }
-
-    // Skip candidates the H3 flavor cannot safely dispatch (Unix-socket
-    // targets — no H3 Unix dialer). Keep selecting while ineligible
-    // candidates remain so mixed plain+mesh+unix upstreams degrade to an
-    // eligible target instead of burning the attempt on a guaranteed
-    // fail-closed dial (issue #3620). When every remaining candidate is
-    // ineligible the caller sees Unchanged and the attempt fails closed.
-    if !crate::proxy::backend_dispatch::h3_dispatch_target_eligible(&next) {
-        warn!(
-            proxy_id = %proxy.id,
-            target_host = %next.host,
-            target_port = next.port,
-            "Skipping H3-ineligible cross-protocol retry candidate"
-        );
-        // Re-enter selection excluding this ineligible candidate. Cap the
-        // search by the upstream size so a full set of Unix-only targets
-        // terminates as Unchanged (fail closed) rather than looping.
-        let mut exclude = next;
-        for _ in 0..32 {
-            let Some(candidate) = crate::proxy::backend_dispatch::select_next_retry_target(
-                state,
-                epoch,
-                proxy,
-                &exclude,
-                crate::proxy::backend_dispatch::RetryTargetRequest {
-                    base_hash_key: hash_key,
-                    client_ip,
-                    proxy_headers,
-                    request_authority,
-                },
-            ) else {
-                return CrossProtocolRetryTarget::Unchanged;
-            };
-            if !crate::proxy::retry_target_preserves_backend_path(
-                backend_path_is_policy_bound,
-                proxy,
-                path,
-                strip_len,
-                prev_target,
-                &candidate,
-            ) {
-                return CrossProtocolRetryTarget::BackendPathMismatch;
-            }
-            if !crate::proxy::retry_attempt_allowed_for_target(
-                route_max_retries,
-                proxy,
-                &candidate,
-                attempt,
-            ) {
-                return CrossProtocolRetryTarget::RetryBudgetExceeded;
-            }
-            if crate::proxy::backend_dispatch::h3_dispatch_target_eligible(&candidate) {
-                let next_url = crate::proxy::build_backend_url_with_target(
-                    proxy,
-                    path,
-                    query_string,
-                    &candidate.host,
-                    candidate.port,
-                    strip_len,
-                    candidate.path.as_deref(),
-                );
-                let next_cb_target_key =
-                    crate::circuit_breaker::target_key(&candidate.host, candidate.port);
-                return CrossProtocolRetryTarget::Selected(candidate, next_cb_target_key, next_url);
-            }
-            exclude = candidate;
-        }
-        return CrossProtocolRetryTarget::Unchanged;
     }
 
     let next_url = crate::proxy::build_backend_url_with_target(
