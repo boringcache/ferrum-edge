@@ -4096,6 +4096,18 @@ unchanged, and valid sibling listeners reconcile independently.
 
 Gateway API status writing requires `get/list/watch` on `gatewayclasses`, `gateways`, `listenersets`, `httproutes`, `grpcroutes`, `tcproutes`, `tlsroutes`, `udproutes`, `referencegrants`, and `backendtlspolicies`, plus `get/list/watch` on MCS `serviceimports`, plus `get/list/watch` on core `secrets`/`configmaps`/`services`/`endpointslices` for certificate, BackendTLSPolicy CA, and optional EndpointSlice backend resolution, plus `patch` on Gateway/ListenerSet/route/`backendtlspolicies` `status` subresources. `GatewayClass` is cluster-scoped; route, Gateway, ListenerSet, and ServiceImport watches are namespaced when `FERRUM_K8S_WATCH_NAMESPACES` is set. The Helm chart grants these verbs through `controlPlane.rbac.*`; disable unused watches there when installing a narrower controller.
 
+### Synthetic Gateway / ListenerSet MeshService names
+
+Each materializable Gateway or ListenerSet listener is also published as a synthetic `MeshService` so mesh inventory and status correlation share one object identity. The generated name is:
+
+```text
+{kind}-{parent_byte_len}-{parent_name}-{listener_name}
+```
+
+where `kind` is `gateway` or `listenerset`, and `parent_byte_len` is the UTF-8 byte length of the parent resource name in decimal (no leading zeros except for an empty name). Examples: Gateway `edge` listener `https` → `gateway-4-edge-https`; ListenerSet `extra` listener `extra-http` → `listenerset-5-extra-extra-http`.
+
+Mesh consumers key services by `(namespace, name)`. A plain hyphen join of parent and listener is ambiguous (`a-b`+`c` vs `a`+`b-c`), so one entry could overwrite the other while exact listener provenance still reported both Programmed. Length-prefixing the parent makes `(parent, listener)` injective within each kind. Kind prefixes keep Gateway- and ListenerSet-derived names disjoint even when resource names collide across kinds. Ferrum does **not** truncate these names to a DNS-label ceiling: `MeshService.name` validation only requires a non-empty string, and truncating would reintroduce collisions. Programmed status still follows typed listener provenance (`GatewayApiListenerKey` / ListenerSet `programmed_listeners`), never a reconstruct-from-name guess.
+
 ## Istio CRD Status
 
 When `FERRUM_K8S_CONTROLLER_ENABLED=true` and Istio CRD watching is enabled (`FERRUM_K8S_WATCH_ISTIO_CRDS=true`, the in-pod default), the controller writes a `status.conditions[]` block to every Istio CRD it translates so `kubectl describe <kind> <name>` shows how Ferrum interpreted the resource. All ten translated kinds are covered: `AuthorizationPolicy`, `PeerAuthentication`, `RequestAuthentication`, `DestinationRule`, `VirtualService`, `ServiceEntry`, `WorkloadEntry`, `Sidecar`, `Telemetry`, and `ProxyConfig`. Istio status planning shares the same primary-translation reuse path as Gateway API status (one materialization plus skip errors; no per-object filtered retranslate) and remains unlimited — the rotating 256-candidate budget is Gateway API only.

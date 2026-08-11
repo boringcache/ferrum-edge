@@ -4768,7 +4768,13 @@ fn mesh_services_from_gateway(
             let port = port_from_u64(object, raw_port, "listeners[].port")?;
             let name = listener_name;
             services.push(MeshService {
-                name: format!("{}-{name}", object.metadata.name),
+                // Kind-scoped, length-prefixed identity — see
+                // `gateway_api_listener_mesh_service_name`.
+                name: super::gateway_api_listener_mesh_service_name(
+                    GatewayApiListenerParentKind::Gateway,
+                    &object.metadata.name,
+                    name,
+                ),
                 namespace: object.metadata.namespace.clone(),
                 ports: vec![ServicePort {
                     port,
@@ -4782,6 +4788,8 @@ fn mesh_services_from_gateway(
                 // egress VIP mapping does not apply to them.
                 cluster_ips: Vec::new(),
             });
+            acc.gateway_api_materialized_gateway_listeners
+                .insert(listener_key);
             Ok::<(), K8sTranslateError>(())
         })?;
     Ok(services)
@@ -8374,12 +8382,12 @@ mod tests {
         assert!(
             mesh.services
                 .iter()
-                .any(|service| service.name == "sample-https-valid")
+                .any(|service| service.name == "gateway-6-sample-https-valid")
         );
         assert!(
             mesh.services
                 .iter()
-                .all(|service| service.name != "sample-https-invalid")
+                .all(|service| service.name != "gateway-6-sample-https-invalid")
         );
     }
 
@@ -8464,12 +8472,12 @@ mod tests {
         assert!(result.config.mesh.as_ref().is_some_and(|mesh| {
             mesh.services
                 .iter()
-                .any(|service| service.name == "edge-a-https-a")
+                .any(|service| service.name == "gateway-6-edge-a-https-a")
         }));
         assert!(result.config.mesh.as_ref().is_some_and(|mesh| {
             mesh.services
                 .iter()
-                .any(|service| service.name == "edge-b-https-b")
+                .any(|service| service.name == "gateway-6-edge-b-https-b")
         }));
         assert!(
             !result.config.proxies.is_empty(),
