@@ -117,10 +117,7 @@ fn ca_status(operation: &'static str, error: &CaError) -> Status {
             Status::permission_denied("trust domain not authorized")
         }
         CaError::Upstream(_) => {
-            error!(
-                operation,
-                error_class, "certificate authority unavailable"
-            );
+            error!(operation, error_class, "certificate authority unavailable");
             Status::unavailable("certificate authority unavailable")
         }
         CaError::Config(_) | CaError::Internal(_) | CaError::Io(_) => {

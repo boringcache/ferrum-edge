@@ -2527,10 +2527,7 @@ impl CertificateAuthority for InjectedCa {
     }
 }
 
-fn injected_service(
-    ca: InjectedCa,
-    federated: Option<TrustDomain>,
-) -> WorkloadApiService {
+fn injected_service(ca: InjectedCa, federated: Option<TrustDomain>) -> WorkloadApiService {
     let trust_domain = ca.trust_domain.clone();
     let id = SpiffeId::from_parts(&trust_domain, "ns/test/sa/foo").unwrap();
     let attestor: Arc<dyn Attestor> = Arc::new(StubAttestor { id });
