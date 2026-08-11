@@ -23,10 +23,11 @@
 //! | `response.code` | int | HTTP/gRPC response status |
 //! | `destination.port` | int | internal metric CEL stamp (same resolution as mesh authz) |
 //!
-//! `has(<attribute>)` tests presence in the evaluation context. Empty string
-//! attributes and mesh-key fields cleared by earlier `REMOVE` overrides in an
-//! ordered tag plan are treated as absent (fail-closed), including
-//! `response.code`.
+//! `has(<string attribute>)` tests presence in the evaluation context. Empty
+//! string attributes and mesh-key fields cleared by earlier `REMOVE` overrides
+//! in an ordered tag plan are treated as absent (fail-closed). Integer
+//! attributes remain available only through `string(...)`; a removed integer
+//! attribute evaluates to the empty string.
 //! Unremoved mesh-key attributes that resolve to the sentinel `unknown` remain
 //! present — `has(source.workload)` does not test attribution resolution.
 //! `request.method` and `request.host` may also be absent when unset.

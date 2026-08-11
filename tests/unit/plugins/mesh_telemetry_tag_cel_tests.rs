@@ -189,7 +189,7 @@ async fn cel_cannot_read_a_label_removed_earlier_in_the_override_plan() {
                 "name": "destination_service",
                 "operation": {
                     "type": "set_expr",
-                    "cel": "has(response.code) ? \"visible\" : \"redacted\""
+                    "cel": "string(response.code)"
                 }
             }]
         }
@@ -228,8 +228,12 @@ async fn cel_cannot_read_a_label_removed_earlier_in_the_override_plan() {
         "removed response_code must stay absent: {counter}"
     );
     assert!(
-        counter.contains(r#"destination_service="redacted""#),
-        "CEL must treat removed response.code as absent: {counter}"
+        counter.contains(r#"destination_service="""#),
+        "CEL must render a removed response.code as absent: {counter}"
+    );
+    assert!(
+        !counter.contains(r#"destination_service="200""#),
+        "removed response.code must not leak into another label: {counter}"
     );
     assert!(
         !counter.contains("spiffe://cluster.local/ns/default/sa/frontend"),
