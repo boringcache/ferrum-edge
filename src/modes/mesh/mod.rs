@@ -21009,11 +21009,6 @@ mod tests {
         let mesh_slice: MeshSlice =
             serde_json::from_value(mesh_authz.config["mesh_slice"].clone()).unwrap();
         assert_eq!(mesh_slice.mesh_policies.len(), 1);
-        let synthesized_udp_upstreams = prepared.upstreams.iter().any(|upstream| {
-            upstream
-                .id
-                .starts_with(MESH_OUTBOUND_UDP_UPSTREAM_ID_PREFIX)
-        });
         if udp_source_identity_available() {
             assert_eq!(
                 service_udp_stream_ports(dns).len(),
@@ -21021,21 +21016,20 @@ mod tests {
                 "with per-datagram source attribution the UDP service port must stay routable; \
                  scoped policy is enforced per source pod at the session boundary instead"
             );
-            assert!(
-                synthesized_udp_upstreams,
-                "the synthesized UDP upstream must survive so attributable clients keep working"
-            );
         } else {
             assert!(
                 service_udp_stream_ports(dns).is_empty(),
                 "without per-datagram source attribution the UDP service port must be stripped \
                  from NodeWaypoint mesh metadata"
             );
-            assert!(
-                !synthesized_udp_upstreams,
-                "synthesized UDP upstreams must not survive fail-closed suppression"
-            );
         }
+        assert!(
+            !prepared.upstreams.iter().any(|upstream| upstream
+                .id
+                .starts_with(MESH_OUTBOUND_UDP_UPSTREAM_ID_PREFIX)),
+            "NodeWaypoint attribution protects inbound service traffic; this topology still has \
+             no source-side UDP egress relay and must not synthesize an outbound UDP upstream"
+        );
     }
 
     #[test]
