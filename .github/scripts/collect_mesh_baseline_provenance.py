@@ -120,7 +120,7 @@ def main() -> int:
             "server_url": os.environ.get("GITHUB_SERVER_URL", "https://github.com"),
         },
         "runner": {
-            "class": os.environ.get("BENCH_RUNNER_CLASS", "ubuntu-latest"),
+            "class": os.environ.get("BENCH_RUNNER_CLASS", "ubuntu-24.04"),
             "name": os.environ.get("RUNNER_NAME"),
             "os": os.environ.get("RUNNER_OS") or platform.system(),
             "arch": os.environ.get("RUNNER_ARCH") or platform.machine(),
@@ -176,8 +176,9 @@ def main() -> int:
             ),
             "e2e_repetitions": int(os.environ.get("BENCH_ITERATIONS", "3")),
             "e2e_policy": (
-                "At least three clean repetitions; discard/fail the collection if "
-                "any retained row has non-zero unexplained errors"
+                "At least three clean repetitions (configured count, never below "
+                "three); discard/fail publication if any retained row has non-zero "
+                "unexplained errors or if CPU steal exceeds 5.0%"
             ),
         },
         "suite_commands": suite_commands,

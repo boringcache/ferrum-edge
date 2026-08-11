@@ -16,7 +16,7 @@ shape, not a laptop SLA.
 | Field | Value |
 |---|---|
 | Ferrum commit SHA | _TBD_ (from `provenance.json`) |
-| Runner class | `ubuntu-latest` (GitHub-hosted Linux) |
+| Runner class | `ubuntu-24.04` (GitHub-hosted Linux; pinned) |
 | CPU model / topology | _TBD_ |
 | RAM | _TBD_ |
 | OS / kernel / arch | _TBD_ |
@@ -112,7 +112,9 @@ are reported beside the overhead column and are not folded into it.
 1. Push the candidate SHA (or use the PR branch).
 2. Run Actions → **Mesh Performance Baselines** → `suites=mesh` or `all`.
 3. Download artifact `mesh-performance-baselines-<sha>`.
-4. Confirm `summary.json` → `acceptance_gate.mesh_complete == true`.
+4. Confirm `summary.json` → `acceptance_gate.mesh_complete == true` and
+   `runner_health_ok == true` (CPU steal ≤ 5.0% across pre-collection and any
+   recorded E2E probes; see `runner_health.json`).
 5. Copy Criterion means (and σ / CI from `estimates.json`) into the tables above.
 6. Link the artifact (or commit a companion `summary.json` excerpt) from the
    reference-environment table.

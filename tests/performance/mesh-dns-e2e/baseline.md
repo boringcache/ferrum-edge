@@ -13,7 +13,7 @@ self-relative trends; do not promote opportunistic laptop numbers into CI floors
 | Field | Value |
 |---|---|
 | Ferrum commit SHA | _TBD_ |
-| Runner class | `ubuntu-latest` (GitHub-hosted Linux) |
+| Runner class | `ubuntu-24.04` (GitHub-hosted Linux; pinned) |
 | CPU / RAM / OS / kernel / arch | _TBD_ (see `provenance.json`) |
 | Rust / harness versions | from artifact provenance |
 | Build profile / features | `--release`, default features |
@@ -77,11 +77,15 @@ Only the upstream-forward class is meaningful here (mesh-internal / mesh-wildcar
 
 1. Trigger **Mesh Performance Baselines** (`suites=dns` or `all`, `iterations≥3`).
 2. Download `mesh-performance-baselines-<sha>`.
-3. Require `summary.json` → `dns_complete` and `dns_errors_ok`.
-4. Discard any repetition with unexplained non-zero `total_errors`.
-5. Publish mean qps/latency into the tables and record upstream-forward overhead
+3. Require `summary.json` → `dns_complete` and `dns_errors_ok` with every
+   documented gateway row (mesh-internal, mesh-wildcard, upstream-forward ×
+   UDP/TCP) and both direct upstream-forward UDP/TCP rows at ≥3 repetitions.
+4. Require `runner_health_ok` (CPU steal ≤ 5.0% across pre-collection and
+   per-run probes in `runner_health.json` / `runner_health_probes.jsonl`).
+5. Discard any repetition with unexplained non-zero `total_errors`.
+6. Publish mean qps/latency into the tables and record upstream-forward overhead
    with the formula above.
-6. Link the artifact paths for raw JSON blobs.
+7. Link the artifact paths for raw JSON blobs.
 
 ## Bottleneck review
 
@@ -97,7 +101,8 @@ Only the upstream-forward class is meaningful here (mesh-internal / mesh-wildcar
   publish per runner OS/class.
 - CP stub publishes one slice; slice-churn cost belongs to `mesh/slice_apply`,
   not these rows.
-- Shared-runner CPU steal can inflate p99; re-run when health checks warn.
+- Shared-runner CPU steal can inflate p99; publication fails closed above **5.0%**
+  steal — re-run rather than publishing impaired baselines.
 
 ## Refresh cadence
 

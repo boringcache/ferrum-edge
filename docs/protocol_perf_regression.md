@@ -127,11 +127,14 @@ as live E2E harnesses that spin up `ferrum-edge` plus stub peers:
 Hosted collection (stage 1) lives in
 `.github/workflows/mesh-performance-baselines.yml` (also callable from
 `.github/workflows/perf-benchmark.yml` with `suite=mesh_baselines` so a PR
-branch can collect before the new workflow file exists on `main`). It records
-provenance, Criterion trees, HBONE/DNS JSON (≥3 repetitions), `summary.json`,
-and draft markdown under the `mesh-performance-baselines-<sha>` artifact.
-Stage 2 copies only zero-error hosted aggregates into the three `baseline.md`
-tables.
+branch can collect before the new workflow file exists on `main`). Collection
+is pinned to GitHub-hosted `ubuntu-24.04` (no arbitrary/self-hosted runner
+input). It records provenance, Criterion trees, HBONE/DNS JSON (≥3 repetitions),
+`runner_health.json` + per-E2E steal probes, `summary.json`, and draft markdown
+under the `mesh-performance-baselines-<sha>` artifact. Selected-suite acceptance
+fails the job when required gates are false (undersampling, missing DNS rows,
+nonzero errors, or CPU steal > 5.0%); artifacts still upload. Stage 2 copies
+only zero-error hosted aggregates into the three `baseline.md` tables.
 
 `tests/performance/mesh/README.md` is a **frozen Trusted Cross automation
 surface**: every path under `tests/performance/` is treated as protected

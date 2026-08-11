@@ -2,7 +2,8 @@
 """Static contract checks for the mesh performance baselines workflow (#3332).
 
 Does not execute benchmarks. Validates workflow wiring, pinned actions, suite
-coverage, provenance/summary scripts, and docs inventory pointers.
+coverage, provenance/summary scripts, ubuntu-24.04 pin, acceptance step, and
+docs inventory pointers.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "mesh-performance-baselines.yml"
+PERF_BENCHMARK_PATH = REPO_ROOT / ".github" / "workflows" / "perf-benchmark.yml"
 PROVENANCE_SCRIPT = REPO_ROOT / ".github" / "scripts" / "collect_mesh_baseline_provenance.py"
 SUMMARY_SCRIPT = REPO_ROOT / ".github" / "scripts" / "summarize_mesh_baseline_results.py"
 PROTOCOL_DOC = REPO_ROOT / "docs" / "protocol_perf_regression.md"
@@ -49,10 +51,23 @@ def require(condition: bool, message: str, failures: list[str]) -> None:
 def check_workflow(text: str, failures: list[str]) -> None:
     require("name: Mesh Performance Baselines" in text, "workflow display name missing", failures)
     require("workflow_dispatch:" in text, "workflow_dispatch trigger required", failures)
-    require("runs-on: ${{ inputs.runner" in text, "named runner input must drive runs-on", failures)
-    require("ubuntu-latest" in text, "default runner class must be ubuntu-latest", failures)
+    require("runs-on: ubuntu-24.04" in text, "collection must pin runs-on ubuntu-24.04", failures)
+    require("BENCH_RUNNER_CLASS: ubuntu-24.04" in text, "BENCH_RUNNER_CLASS must be ubuntu-24.04", failures)
+    require("ubuntu-24.04" in text, "default runner class must be ubuntu-24.04", failures)
+    require("inputs:\n      runner:" not in text and "runner:" not in _workflow_inputs_block(text), "arbitrary runner input must be removed", failures)
+    require(
+        "runs-on: self-hosted" not in text.lower()
+        and "runs-on: [self-hosted" not in text.lower()
+        and "- self-hosted" not in text.lower(),
+        "must not dispatch to self-hosted runners",
+        failures,
+    )
     require("workflow_call:" in text, "workflow_call required for PR-branch dispatch via perf-benchmark.yml", failures)
     require("BENCH_BUILD_PROFILE: release" in text, "release profile required", failures)
+    require("BENCH_MAX_CPU_STEAL_PERCENT: \"5.0\"" in text or "BENCH_MAX_CPU_STEAL_PERCENT: '5.0'" in text, "documented CPU steal threshold required", failures)
+    require("runner_health.json" in text, "machine-readable runner_health.json required", failures)
+    require("runner_health_probes.jsonl" in text, "per-E2E runner health probes required", failures)
+    require("--check-acceptance" in text, "selected-suite acceptance step required", failures)
     require("authz_match" in text and "ip_restriction" in text, "mesh benches incomplete", failures)
     require("slice_apply" in text and "xds_translation" in text, "mesh benches incomplete", failures)
     require("1kib_c50_30s" in text and "16kib_c50_30s" in text, "HBONE scenarios incomplete", failures)
@@ -63,6 +78,16 @@ def check_workflow(text: str, failures: list[str]) -> None:
     require("actions/upload-artifact@" in text, "artifact upload required", failures)
     require("mesh-performance-baselines-${{ github.sha }}" in text, "artifact name must include SHA", failures)
     require("permissions:\n  contents: read" in text, "contents: read permission required", failures)
+    # Upload must remain available after acceptance failure.
+    upload_idx = text.find("Upload mesh baseline artifacts")
+    accept_idx = text.find("Enforce selected-suite acceptance gates")
+    require(upload_idx != -1 and accept_idx != -1, "acceptance + upload steps required", failures)
+    require(accept_idx < upload_idx, "acceptance step must precede artifact upload", failures)
+    require(
+        "if: always()" in text[upload_idx : upload_idx + 200],
+        "artifact upload must use if: always()",
+        failures,
+    )
 
     for match in EXTERNAL_ACTION.finditer(text):
         action = match.group("action")
@@ -79,14 +104,49 @@ def check_workflow(text: str, failures: list[str]) -> None:
     require("./.github/actions/setup-rust-ci" in text, "must use setup-rust-ci", failures)
 
 
-def check_docs_and_baselines(failures: list[str]) -> None:
+def _workflow_inputs_block(text: str) -> str:
+    """Return concatenated workflow_dispatch + workflow_call inputs sections."""
+    blocks: list[str] = []
+    for trigger in ("workflow_dispatch:", "workflow_call:"):
+        start = text.find(trigger)
+        if start == -1:
+            continue
+        # Capture until permissions/concurrency/env/jobs at top level-ish.
+        chunk = text[start : start + 1200]
+        blocks.append(chunk)
+    return "\n".join(blocks)
+
+
+def check_caller_and_scripts(failures: list[str]) -> None:
     require(PROVENANCE_SCRIPT.is_file(), "provenance script missing", failures)
     require(SUMMARY_SCRIPT.is_file(), "summary script missing", failures)
     require(WORKFLOW_PATH.is_file(), "workflow missing", failures)
 
+    provenance = PROVENANCE_SCRIPT.read_text(encoding="utf-8")
+    require("ubuntu-24.04" in provenance, "provenance default runner class must be ubuntu-24.04", failures)
+
+    summary = SUMMARY_SCRIPT.read_text(encoding="utf-8")
+    require("repetition_evidence" in summary, "summarizer must expose repetition_evidence", failures)
+    require("MAX_CPU_STEAL_PERCENT" in summary, "summarizer must document steal threshold", failures)
+    require("DNS_GATEWAY_ROWS" in summary, "summarizer must enumerate required DNS gateway rows", failures)
+    require("--check-acceptance" in summary, "summarizer must support acceptance check", failures)
+    require("undersampling" in summary or "one gateway" in summary, "summarizer self-test must cover undersampling", failures)
+
+    if PERF_BENCHMARK_PATH.is_file():
+        caller = PERF_BENCHMARK_PATH.read_text(encoding="utf-8")
+        if "mesh-performance-baselines.yml" in caller:
+            require(
+                "runner:" not in caller.split("mesh-performance-baselines.yml", 1)[1].split("benchmark:", 1)[0],
+                "perf-benchmark mesh_baselines caller must not pass runner input",
+                failures,
+            )
+
+
+def check_docs_and_baselines(failures: list[str]) -> None:
     protocol = PROTOCOL_DOC.read_text(encoding="utf-8")
     require("mesh-performance-baselines.yml" in protocol, "protocol_perf_regression.md missing workflow pointer", failures)
     require("#3332" in protocol, "protocol_perf_regression.md must keep #3332 pointer", failures)
+    require("ubuntu-24.04" in protocol, "protocol_perf_regression.md must document ubuntu-24.04 pin", failures)
 
     ci_cd = CI_CD_DOC.read_text(encoding="utf-8")
     require("mesh-performance-baselines.yml" in ci_cd, "ci_cd.md inventory missing workflow row", failures)
@@ -98,6 +158,9 @@ def check_docs_and_baselines(failures: list[str]) -> None:
         require("refresh" in text.lower() or "cadence" in text.lower(), f"{path} missing refresh cadence", failures)
         require("directional" in text.lower(), f"{path} missing directional hardware caveat", failures)
         require("bottleneck" in text.lower(), f"{path} missing bottleneck review note", failures)
+        require("ubuntu-24.04" in text, f"{path} must pin runner class ubuntu-24.04", failures)
+        require("_TBD_" in text, f"{path} must keep stage-1 TBD cells (no fabricated numbers)", failures)
+        require("5.0%" in text or "5%" in text, f"{path} must document CPU steal publication threshold", failures)
 
 
 def self_test() -> int:
@@ -106,20 +169,27 @@ name: Mesh Performance Baselines
 on:
   workflow_dispatch:
     inputs:
-      runner:
-        default: "ubuntu-latest"
+      suites:
+        default: "all"
+      iterations:
+        default: "3"
   workflow_call:
     inputs:
-      runner:
-        default: "ubuntu-latest"
+      suites:
+        default: "all"
+        type: string
+      iterations:
+        default: "3"
         type: string
 permissions:
   contents: read
 env:
   BENCH_BUILD_PROFILE: release
+  BENCH_RUNNER_CLASS: ubuntu-24.04
+  BENCH_MAX_CPU_STEAL_PERCENT: "5.0"
 jobs:
   collect:
-    runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - uses: ./.github/actions/setup-rust-ci
@@ -128,7 +198,13 @@ jobs:
       - run: ./run.sh --duration 60 --concurrency 100
       - run: collect_mesh_baseline_provenance.py
       - run: summarize_mesh_baseline_results.py
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - run: runner_health.json runner_health_probes.jsonl
+      - name: Enforce selected-suite acceptance gates
+        if: always()
+        run: --check-acceptance
+      - name: Upload mesh baseline artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: mesh-performance-baselines-${{ github.sha }}
 """
@@ -150,6 +226,7 @@ def main() -> int:
     failures: list[str] = []
     text = WORKFLOW_PATH.read_text(encoding="utf-8")
     check_workflow(text, failures)
+    check_caller_and_scripts(failures)
     check_docs_and_baselines(failures)
     if failures:
         for failure in failures:

@@ -19,7 +19,7 @@ RPS when interpreting regressions.
 | OS / kernel | _TBD_ |
 | Architecture | _TBD_ |
 | Ferrum Edge revision | _TBD_ |
-| Runner class | `ubuntu-latest` (GitHub-hosted Linux) |
+| Runner class | `ubuntu-24.04` (GitHub-hosted Linux; pinned) |
 | Rust / harness versions | from artifact `provenance.json` |
 | Build profile | `--release` |
 | Feature flags | default (no `--features`) |
@@ -77,10 +77,14 @@ cd tests/performance/mesh-hbone-e2e
 1. Trigger **Mesh Performance Baselines** on the candidate SHA (`suites=hbone` or `all`).
 2. Download `mesh-performance-baselines-<sha>`.
 3. Require `summary.json` → `acceptance_gate.hbone_complete` and `hbone_errors_ok`.
-4. Reject any repetition with non-zero `total_errors`; do not average failures away.
-5. Publish mean RPS / latency across remaining clean runs and the overhead percent
+4. Require `repetition_evidence` showing ≥3 clean gateway and direct samples per
+   scenario (configured iterations, never below three).
+5. Require `runner_health_ok` (CPU steal ≤ 5.0% in `runner_health.json` and
+   per-run probes); reject the collection for publication when exceeded.
+6. Reject any repetition with non-zero `total_errors`; do not average failures away.
+7. Publish mean RPS / latency across remaining clean runs and the overhead percent
    from the formula above.
-6. Attach or link the raw `hbone/**/run_*.txt` JSON blobs from the artifact.
+8. Attach or link the raw `hbone/**/run_*.txt` JSON blobs from the artifact.
 
 ## Bottleneck review
 
@@ -90,7 +94,8 @@ Before treating Gateway+HBONE RPS as “gateway capacity”:
 - mTLS + H2 CONNECT setup is amortized; numbers are steady-state, not handshake cost.
 - Direct baseline bypasses gateway **and** sidecar; overhead includes tunnel relay,
   not only `ferrum-edge` proxy overhead.
-- Shared GitHub runners can show CPU steal; re-run when steal warnings appear.
+- Shared GitHub runners can show CPU steal; publication fails closed when steal
+  exceeds **5.0%** (re-run rather than publishing impaired numbers).
 - Userspace HBONE relay (no `splice` fast path through TLS) dominates large payloads.
 
 ## Refresh cadence
