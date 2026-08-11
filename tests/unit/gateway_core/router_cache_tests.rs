@@ -1880,12 +1880,13 @@ fn refused_listener_ports_fail_closed_without_poisoning_siblings() {
     let mut sibling = test_proxy("sibling", "/api");
     sibling.hosts = vec!["other.example.com".into()];
     sibling.listen_port = Some(8080);
-    sibling.listen_port_tls = true;
 
-    let cache = RouterCache::new(
-        &test_config(vec![refused, refused_exact, refused_regex, sibling]),
-        100,
-    );
+    let sibling_namespace = sibling.namespace.clone();
+    let mut config = test_config(vec![refused, refused_exact, refused_regex, sibling]);
+    config
+        .http_tls_listen_ports
+        .insert((sibling_namespace, 8080));
+    let cache = RouterCache::new(&config, 100);
 
     // Warm positive cache entries before the refusal is published.
     let before = cache
