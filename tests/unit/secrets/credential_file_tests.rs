@@ -129,7 +129,9 @@ fn concurrent_growth_is_capped_by_streaming_budget() {
             if self.served > LIMIT {
                 return Ok(0);
             }
-            let n = buf.len().min(LIMIT.saturating_add(1).saturating_sub(self.served));
+            let n = buf
+                .len()
+                .min(LIMIT.saturating_add(1).saturating_sub(self.served));
             for slot in &mut buf[..n] {
                 *slot = b'x';
             }
