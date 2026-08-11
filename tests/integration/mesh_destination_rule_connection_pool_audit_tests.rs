@@ -696,7 +696,9 @@ async fn subset_http1_pending_guard_releases_on_cancellation() {
 /// or long-lived gRPC response occupying backend capacity while uncounted.
 #[tokio::test]
 async fn destination_active_request_permit_releases_on_task_cancellation() {
-    use ferrum_edge::backend_active_request_limit::{BackendActiveRequestLimiter, DestinationScope};
+    use ferrum_edge::backend_active_request_limit::{
+        BackendActiveRequestLimiter, DestinationScope,
+    };
 
     let scope = || DestinationScope {
         namespace: "default",
@@ -780,12 +782,16 @@ fn destination_active_request_breaker_is_wired_into_backend_admission() {
 fn destination_active_request_permit_is_held_for_the_response_lifetime() {
     let limiter_source = include_str!("../../../src/backend_active_request_limit.rs");
     assert!(
-        limiter_source.contains("impl crate::plugins::BackendAdmissionPermit for DestinationActiveRequestPermit"),
+        limiter_source.contains(
+            "impl crate::plugins::BackendAdmissionPermit for DestinationActiveRequestPermit"
+        ),
         "the guard must be carried by the backend-admission permit set"
     );
     let body_source = include_str!("../../../src/proxy/body.rs");
     assert!(
-        body_source.contains("_backend_admission_permits: Option<crate::plugins::BackendAdmissionPermitSet>"),
+        body_source.contains(
+            "_backend_admission_permits: Option<crate::plugins::BackendAdmissionPermitSet>"
+        ),
         "ProxyBody must own the permit set so it drops at body completion"
     );
 }
