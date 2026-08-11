@@ -553,9 +553,13 @@ impl DpConfigFreshness {
     /// bound, or `None` when nothing is pending.
     ///
     /// `None` means "there is no deadline to schedule": the bound is disabled,
-    /// the DP already latched stale, or the DP still has (or may still have) an
-    /// authoritative source. The monitor waits on [`Self::wait_for_change`]
-    /// alone in that case, so it never busy-polls.
+    /// the DP already latched stale, the DP still has (or may still have) an
+    /// authoritative source, or the computed deadline is not representable as an
+    /// [`Instant`] because an astronomical configured bound overflows the
+    /// platform monotonic clock range. An unrepresentable deadline cannot occur
+    /// within that range, so returning `None` is correct rather than panicking
+    /// on unchecked `Instant + Duration`. The monitor waits on
+    /// [`Self::wait_for_change`] alone in that case, so it never busy-polls.
     pub fn next_stale_deadline_at(&self, now: Instant) -> Option<Instant> {
         if !self.enabled() {
             return None;
@@ -569,9 +573,12 @@ impl DpConfigFreshness {
         let applied = self.last_applied_ms.load(Ordering::Acquire);
         let base = match applied {
             0 => self.epoch,
-            stamp => self.epoch + Duration::from_millis(stamp.saturating_sub(1)),
+            stamp => self
+                .epoch
+                .checked_add(Duration::from_millis(stamp.saturating_sub(1)))?,
         };
-        Some((base + self.max_stale).max(now))
+        let deadline = base.checked_add(self.max_stale)?;
+        Some(deadline.max(now))
     }
 
     /// The current state word (`generation << 1 | stale`).

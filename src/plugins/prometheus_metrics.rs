@@ -4293,9 +4293,10 @@ fn render_ai_counter_family(
 /// publish a process-wide admission flag inside a shared test binary.
 ///
 /// Present only in DP mode (`freshness` is `None` everywhere else). Every
-/// series is fixed-cardinality: no CP endpoint, credential, namespace, node id,
-/// or reason string is used as a label — the closed-set reason is exposed on
-/// authenticated `/health` instead.
+/// series is fixed-cardinality: `namespace` is the only standard metric label.
+/// CP endpoint, credential, node id, and configuration content are not exposed
+/// as labels — the closed-set reason is exposed on authenticated `/health`
+/// instead.
 pub fn render_dp_config_freshness_prometheus(
     output: &mut String,
     ns_label: &str,

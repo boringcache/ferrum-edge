@@ -169,11 +169,11 @@ pub async fn run(
         shutdown_tx.subscribe(),
     );
 
-    // Config-staleness evaluator (issue #3726). The threshold is a time-based
-    // edge with no event to hang it on, so a 1s tick advances it; every CP
-    // event (connect, disconnect, applied snapshot) also evaluates inline, and
-    // `/health` evaluates on demand, so the tick only bounds how long the
-    // admission gate lags the boundary.
+    // Config-staleness evaluator (issue #3726). CP events (connect, disconnect,
+    // applied snapshot) evaluate inline and `/health` evaluates on demand; the
+    // monitor itself is event/deadline-driven and sleeps until the exact bound
+    // implied by the current applied snapshot (`next_stale_deadline_at`),
+    // re-arming whenever that state changes — no coarse tick.
     let staleness_handle =
         start_config_staleness_monitor(config_freshness.clone(), shutdown_tx.subscribe());
 

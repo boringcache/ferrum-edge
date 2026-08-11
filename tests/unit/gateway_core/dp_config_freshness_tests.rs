@@ -336,6 +336,35 @@ fn a_disabled_bound_never_goes_stale() {
     );
 }
 
+/// An extreme but syntactically valid `FERRUM_DP_CONFIG_MAX_STALE_SECONDS`
+/// (`u64::MAX`) must not panic the deadline arithmetic: an Instant that far
+/// ahead is unrepresentable, so there is no scheduled deadline, and an ordinary
+/// current instant must not latch stale against that astronomical bound.
+#[test]
+fn astronomical_max_stale_bound_does_not_panic_or_schedule_unrepresentable_deadline() {
+    let epoch = epoch();
+    let freshness = DpConfigFreshness::new_at(
+        epoch,
+        Duration::from_secs(u64::MAX),
+        StaleAction::FailClosed,
+    );
+    freshness.record_cp_connected_at(epoch);
+    freshness.record_snapshot_applied_at(epoch);
+    freshness.record_cp_authority_lost_at(epoch);
+
+    let now = at(epoch, 1);
+    let snapshot = freshness.evaluate_at(now);
+    assert!(
+        !snapshot.stale,
+        "an ordinary current instant must not latch against an astronomical bound"
+    );
+    assert!(!snapshot.new_traffic_blocked);
+    assert!(
+        freshness.next_stale_deadline_at(now).is_none(),
+        "Instant::checked_add overflow yields no representable scheduled deadline"
+    );
+}
+
 /// The monitor is deadline-driven, not tick-driven: the deadline it arms is the
 /// exact instant the applied snapshot crosses the configured bound, and it is
 /// armed only while the DP has actually lost authority.
