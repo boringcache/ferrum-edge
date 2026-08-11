@@ -1675,10 +1675,7 @@ fn k8s_endpointslice_fixture() -> serde_json::Value {
     })
 }
 
-fn k8s_discoverer_for_token_path(
-    api_url: String,
-    token_path: &str,
-) -> KubernetesDiscoverer {
+fn k8s_discoverer_for_token_path(api_url: String, token_path: &str) -> KubernetesDiscoverer {
     KubernetesDiscoverer::new(
         reqwest::Client::new(),
         "default".to_string(),
@@ -1728,10 +1725,8 @@ async fn kubernetes_invalid_sa_token_fails_closed_before_api_request() {
 
     let temp = tempfile::tempdir().unwrap();
     let oversized = temp.path().join("oversized-sa-token-sentinel");
-    let payload = vec![
-        b'T';
-        ferrum_edge::secrets::credential_file::DEFAULT_CREDENTIAL_FILE_MAX_BYTES + 1,
-    ];
+    let payload =
+        vec![b'T'; ferrum_edge::secrets::credential_file::DEFAULT_CREDENTIAL_FILE_MAX_BYTES + 1];
     std::fs::write(&oversized, &payload).unwrap();
 
     let mock_server = MockServer::start().await;
@@ -1744,8 +1739,7 @@ async fn kubernetes_invalid_sa_token_fails_closed_before_api_request() {
     let env = EnvGuard::new(&["KUBE_TOKEN"]);
     env.set("KUBE_TOKEN", "must-not-be-used-when-sa-exists");
 
-    let discoverer =
-        k8s_discoverer_for_token_path(mock_server.uri(), oversized.to_str().unwrap());
+    let discoverer = k8s_discoverer_for_token_path(mock_server.uri(), oversized.to_str().unwrap());
     let error = discoverer
         .discover()
         .await
@@ -1757,7 +1751,10 @@ async fn kubernetes_invalid_sa_token_fails_closed_before_api_request() {
         "{rendered}"
     );
     assert!(rendered.contains("exceeds the maximum"), "{rendered}");
-    assert!(!rendered.contains("oversized-sa-token-sentinel"), "{rendered}");
+    assert!(
+        !rendered.contains("oversized-sa-token-sentinel"),
+        "{rendered}"
+    );
     assert!(!rendered.contains(&"T".repeat(32)), "{rendered}");
     assert!(
         !rendered.contains("must-not-be-used-when-sa-exists"),
@@ -1798,7 +1795,10 @@ async fn kubernetes_empty_sa_token_fails_closed_without_kube_token_fallback() {
     );
     assert!(rendered.contains("empty"), "{rendered}");
     assert!(!rendered.contains("empty-sa-token-sentinel"), "{rendered}");
-    assert!(!rendered.contains("must-not-be-used-for-empty-sa"), "{rendered}");
+    assert!(
+        !rendered.contains("must-not-be-used-for-empty-sa"),
+        "{rendered}"
+    );
 }
 
 #[cfg(unix)]
@@ -1880,7 +1880,10 @@ async fn kubernetes_invalid_utf8_sa_token_fails_closed_before_api_request() {
         "{rendered}"
     );
     assert!(rendered.contains("not valid UTF-8"), "{rendered}");
-    assert!(!rendered.contains("invalid-utf8-sa-token-sentinel"), "{rendered}");
+    assert!(
+        !rendered.contains("invalid-utf8-sa-token-sentinel"),
+        "{rendered}"
+    );
     assert!(!rendered.contains("valid-prefix-"), "{rendered}");
     assert!(
         !rendered.contains("must-not-be-used-for-invalid-utf8"),
@@ -1896,15 +1899,13 @@ async fn kubernetes_exact_limit_sa_token_is_accepted() {
 
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("exact-limit-sa-token");
-    let token = "A".repeat(ferrum_edge::secrets::credential_file::DEFAULT_CREDENTIAL_FILE_MAX_BYTES);
+    let token =
+        "A".repeat(ferrum_edge::secrets::credential_file::DEFAULT_CREDENTIAL_FILE_MAX_BYTES);
     std::fs::write(&path, token.as_bytes()).unwrap();
 
     let mock_server = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(header(
-            "authorization",
-            format!("Bearer {token}"),
-        ))
+        .and(header("authorization", format!("Bearer {token}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(&k8s_endpointslice_fixture()))
         .expect(1)
         .mount(&mock_server)
@@ -1936,13 +1937,10 @@ async fn kubernetes_non_regular_sa_token_fails_closed_before_api_request() {
         .await;
 
     let discoverer = k8s_discoverer_for_token_path(mock_server.uri(), fifo.to_str().unwrap());
-    let error = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        discoverer.discover(),
-    )
-    .await
-    .expect("FIFO rejection must not stall discovery")
-    .expect_err("FIFO SA token must fail closed");
+    let error = tokio::time::timeout(std::time::Duration::from_secs(2), discoverer.discover())
+        .await
+        .expect("FIFO rejection must not stall discovery")
+        .expect_err("FIFO SA token must fail closed");
     let rendered = error.to_string();
     assert!(
         rendered.contains("failed to read Kubernetes service-account token"),
@@ -2057,27 +2055,20 @@ async fn kubernetes_discovery_bounds_detached_sa_token_reader_occupancy() {
     };
 
     let discoverer = k8s_discoverer_for_token_path(mock_server.uri(), path.to_str().unwrap());
-    let permit =
-        ferrum_edge::_test_support::acquire_k8s_sa_token_file_read_permit_for_test().await;
+    let permit = ferrum_edge::_test_support::acquire_k8s_sa_token_file_read_permit_for_test().await;
 
     assert!(
-        tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            discoverer.discover(),
-        )
-        .await
-        .is_err(),
+        tokio::time::timeout(std::time::Duration::from_millis(100), discoverer.discover(),)
+            .await
+            .is_err(),
         "a concurrent discovery poll must wait instead of spawning another detached reader"
     );
 
     drop(permit);
-    let targets = tokio::time::timeout(
-        std::time::Duration::from_secs(1),
-        discoverer.discover(),
-    )
-    .await
-    .expect("discovery should resume after the reader slot releases")
-    .expect("bounded SA token read");
+    let targets = tokio::time::timeout(std::time::Duration::from_secs(1), discoverer.discover())
+        .await
+        .expect("discovery should resume after the reader slot releases")
+        .expect("bounded SA token read");
     assert_eq!(targets.len(), 1);
 }
 
