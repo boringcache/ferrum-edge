@@ -323,16 +323,8 @@ fn mesh_service_scope_converges_vip_and_direct_workload_upstreams() {
             ),
             upstream("native-a", "shared display name", None),
             upstream("native-b", "shared display name", None),
-            upstream(
-                file_mesh_vip_id,
-                "catalog.default.svc.cluster.local",
-                None,
-            ),
-            upstream(
-                file_mesh_pod_id,
-                "catalog.default.svc.cluster.local",
-                None,
-            ),
+            upstream(file_mesh_vip_id, "catalog.default.svc.cluster.local", None),
+            upstream(file_mesh_pod_id, "catalog.default.svc.cluster.local", None),
         ],
         proxies: vec![
             proxy("reviews-vip", reviews_vip_id),

@@ -3946,8 +3946,7 @@ pub(crate) fn mesh_ingress_listener_groups(
 pub(crate) const MESH_OUTBOUND_UPSTREAM_ID_PREFIX: &str = "__mesh-out-upstream-";
 
 pub(crate) fn mesh_outbound_upstream_id(namespace: &str, name: &str, port: u16) -> String {
-    format!("{MESH_OUTBOUND_UPSTREAM_ID_PREFIX}{namespace}-{name}-{port}")
-        .replace(['/', '.'], "-")
+    format!("{MESH_OUTBOUND_UPSTREAM_ID_PREFIX}{namespace}-{name}-{port}").replace(['/', '.'], "-")
 }
 
 /// Upstream id for a materialized raw-TCP egress port, one per stream-family
@@ -4013,10 +4012,8 @@ pub(crate) fn mesh_outbound_http_bywl_upstream_id(
     port: u16,
     canonical_ip: std::net::IpAddr,
 ) -> String {
-    format!(
-        "{MESH_OUTBOUND_HTTP_BYWL_UPSTREAM_ID_PREFIX}{namespace}-{name}-{port}-{canonical_ip}"
-    )
-    .replace(['/', '.', ':'], "-")
+    format!("{MESH_OUTBOUND_HTTP_BYWL_UPSTREAM_ID_PREFIX}{namespace}-{name}-{port}-{canonical_ip}")
+        .replace(['/', '.', ':'], "-")
 }
 
 /// Reserved proxy-id prefix for hidden direct-pod-IP HTTP egress routes.
