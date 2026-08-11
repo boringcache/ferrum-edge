@@ -234,7 +234,7 @@ fn config_parsers_cover_absent_clamp_and_fail_closed() {
             "ferrum.conf must template {key}"
         );
     }
-    assert!(MIN_TLS_STORE_MAX_DOCUMENT_BYTES >= 1024);
+    const { assert!(MIN_TLS_STORE_MAX_DOCUMENT_BYTES >= 1024) };
 
     for family in [
         "ferrum_tls_store_document_bytes",
