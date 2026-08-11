@@ -991,6 +991,10 @@ async fn the_exported_admission_metrics_stay_fixed_cardinality() {
     .await;
     let _held = connect_admitted(&harness.path).await;
     connect_expecting_shed(&harness.path).await;
+    // This family is conditional, so make its HELP/sample deterministic for the
+    // contract assertions below instead of depending on another concurrent test
+    // having already driven the service-wide RPC ceiling.
+    ferrum_edge::plugins::mesh::prometheus_helpers::increment_workload_api_rpc_rejected();
 
     let mut rendered = String::new();
     render_mesh_observability_metrics(&mut rendered);
@@ -1064,12 +1068,14 @@ async fn the_exported_admission_metrics_stay_fixed_cardinality() {
             "not a protocol-level stream refusal",
         ),
     ] {
-        if let Some(line) = rendered.lines().find(|line| line.starts_with(family)) {
-            assert!(
-                line.contains(expected),
-                "{family} must state the one-way relationship to HTTP/2 streams: {line}"
-            );
-        }
+        let line = rendered
+            .lines()
+            .find(|line| line.starts_with(family))
+            .unwrap_or_else(|| panic!("{family} must be rendered for its contract assertion"));
+        assert!(
+            line.contains(expected),
+            "{family} must state the one-way relationship to HTTP/2 streams: {line}"
+        );
     }
     // And the converse claim must not creep back in.
     for line in rendered
