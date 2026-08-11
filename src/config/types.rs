@@ -3017,7 +3017,8 @@ impl FrontendTlsCertificateSource {
     }
 }
 
-/// Upper bound on Gateway-delivered frontend TLS certificates in one snapshot.
+/// Upper bound on Gateway-delivered frontend TLS certificates per serving
+/// namespace in one snapshot.
 ///
 /// The data plane materializes every entry into a resident rustls
 /// `CertifiedKey` and an SNI index, so the set has to be bounded by config
@@ -9539,11 +9540,18 @@ impl GatewayConfig {
     ) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
-        if self.frontend_tls_certificate_sources.len() > MAX_FRONTEND_TLS_CERTIFICATE_SOURCES {
-            errors.push(format!(
-                "Gateway frontend TLS certificate source set exceeds the {} source admission limit; refusing the snapshot rather than serving a partial listener set",
-                MAX_FRONTEND_TLS_CERTIFICATE_SOURCES
-            ));
+        let mut frontend_tls_sources_by_namespace = std::collections::HashMap::new();
+        for source in &self.frontend_tls_certificate_sources {
+            let count = frontend_tls_sources_by_namespace
+                .entry(source.namespace.as_str())
+                .or_insert(0usize);
+            *count += 1;
+            if *count == MAX_FRONTEND_TLS_CERTIFICATE_SOURCES + 1 {
+                errors.push(format!(
+                    "Gateway frontend TLS certificate source set for namespace '{}' exceeds the {} source admission limit; refusing the snapshot rather than serving a partial listener set",
+                    source.namespace, MAX_FRONTEND_TLS_CERTIFICATE_SOURCES
+                ));
+            }
         }
 
         // Shared cache: when multiple proxies reference the same TLS file path,
