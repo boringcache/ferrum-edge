@@ -11,8 +11,7 @@
 //! through the shared bounded stable-file reader (regular-file open target,
 //! Unix `O_NONBLOCK`, 1 MiB ceiling with `limit + 1`, stable identity/content
 //! probes). The accepted result — or a precise load error — is cached for the
-//! process lifetime. A failed load is never converted into an empty config via
-//! `unwrap_or_default()`.
+//! process lifetime. A failed load is never converted into an empty fallback.
 //!
 //! When `FERRUM_CONF_PATH` is unset and `./ferrum.conf` is genuinely absent,
 //! an empty defaults map is accepted for backward compatibility. An explicitly

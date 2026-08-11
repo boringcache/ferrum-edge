@@ -375,6 +375,22 @@ pub fn infer_file_mode() {
     let conf_mode = ConfFile::load()
         .ok()
         .and_then(|conf| conf.get("FERRUM_MODE").map(str::to_string));
+    infer_file_mode_from_conf_mode(conf_mode.as_deref());
+}
+
+/// Apply the file-mode smart default after the immutable settings snapshot has
+/// already been resolved.
+///
+/// Kept as a small public seam because process-level callers may already hold
+/// the accepted `ferrum.conf` value, and tests must not attempt to replace the
+/// process-wide `OnceLock` snapshot with several different files.
+#[doc(hidden)]
+pub fn infer_file_mode_from_conf_mode(conf_mode: Option<&str>) {
+    // Preserve CLI/direct-env precedence even for callers that already loaded
+    // the settings snapshot.
+    if direct_env_var_is_set("FERRUM_MODE") {
+        return;
+    }
     if conf_mode.is_some_and(|mode| !mode.trim().is_empty()) {
         return;
     }

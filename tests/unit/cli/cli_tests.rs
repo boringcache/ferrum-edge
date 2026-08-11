@@ -699,15 +699,9 @@ fn test_infer_file_mode_yields_to_conf_file_mode() {
     without_env_vars(
         &["FERRUM_MODE", "FERRUM_CONF_PATH", "FERRUM_FILE_CONFIG_PATH"],
         || {
-            let temp_dir = TempDir::new().unwrap();
-            let conf_path = temp_dir.path().join("ferrum.conf");
-            std::fs::write(&conf_path, "FERRUM_MODE = database\n").unwrap();
-            unsafe {
-                std::env::set_var("FERRUM_CONF_PATH", &conf_path);
-                std::env::set_var("FERRUM_FILE_CONFIG_PATH", "/tmp/spec.yaml");
-            }
+            unsafe { std::env::set_var("FERRUM_FILE_CONFIG_PATH", "/tmp/spec.yaml") };
 
-            ferrum_edge::cli::infer_file_mode();
+            ferrum_edge::cli::infer_file_mode_from_conf_mode(Some("database"));
 
             assert!(
                 std::env::var("FERRUM_MODE").is_err(),
@@ -732,7 +726,7 @@ fn test_infer_file_mode_treats_blank_conf_mode_as_unset() {
                 std::env::set_var("FERRUM_FILE_CONFIG_PATH", "/tmp/spec.yaml");
             }
 
-            ferrum_edge::cli::infer_file_mode();
+            ferrum_edge::cli::infer_file_mode_from_conf_mode(Some(""));
 
             assert_eq!(std::env::var("FERRUM_MODE").unwrap(), "file");
         },
@@ -771,7 +765,7 @@ fn test_run_explicit_spec_does_not_override_conf_file_mode() {
                 "overrides must not synthesize a mode before inference"
             );
 
-            ferrum_edge::cli::infer_file_mode();
+            ferrum_edge::cli::infer_file_mode_from_conf_mode(Some("database"));
 
             assert!(
                 std::env::var("FERRUM_MODE").is_err(),
@@ -801,7 +795,7 @@ fn test_validate_explicit_spec_does_not_override_conf_file_mode() {
                 fips_mode: None,
             };
             ferrum_edge::cli::apply_validate_overrides(&args);
-            ferrum_edge::cli::infer_file_mode();
+            ferrum_edge::cli::infer_file_mode_from_conf_mode(Some("cp"));
 
             assert!(
                 std::env::var("FERRUM_MODE").is_err(),
