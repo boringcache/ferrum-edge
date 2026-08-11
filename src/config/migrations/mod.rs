@@ -965,6 +965,7 @@ impl MigrationRunner {
         Ok(())
     }
 
+    #[allow(dead_code)] // core-only helper for run_pending; production uses validate_known_history_locked
     async fn validate_core_history_locked(
         &self,
         connection: &mut AnyConnection,
@@ -1018,6 +1019,7 @@ impl MigrationRunner {
     ///
     /// This helper is intentionally core-only. Production startup uses
     /// [`Self::run_pending_with_plugin_history`] for combined validation.
+    #[allow(dead_code)] // exercised via external migration tests; production uses run_pending_with_plugin_history
     pub async fn run_pending(&self) -> Result<Vec<MigrationRecord>, anyhow::Error> {
         let mut migration_lock =
             MigrationConnectionLock::acquire(&self.pool, &self.db_type).await?;
