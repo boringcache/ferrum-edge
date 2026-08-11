@@ -1280,52 +1280,6 @@ fn tcp_and_udp_gateway_listeners_may_share_a_numeric_port() {
 }
 
 #[test]
-fn https_and_udp_gateway_listeners_conflict_on_http3_socket() {
-    let mut gateway = http_gateway("edge", Some("Same"));
-    gateway.spec["listeners"] = json!([
-        {
-            "name": "https",
-            "port": 8443,
-            "protocol": "HTTPS",
-            "tls": {
-                "mode": "Terminate",
-                "certificateRefs": [{ "name": "edge-cert" }]
-            },
-            "allowedRoutes": { "namespaces": { "from": "Same" } }
-        },
-        {
-            "name": "udp",
-            "port": 8443,
-            "protocol": "UDP",
-            "allowedRoutes": {
-                "kinds": [{ "kind": "UDPRoute" }],
-                "namespaces": { "from": "Same" }
-            }
-        }
-    ]);
-    let objects = vec![gateway_class(), gateway, tls_secret("edge-cert", "default")];
-    let translation = translate_k8s_objects(&objects, options()).expect("translate");
-
-    for listener in ["https", "udp"] {
-        let key = GatewayApiListenerKey {
-            namespace: "default".to_string(),
-            parent_kind: GatewayApiListenerParentKind::Gateway,
-            gateway: "edge".to_string(),
-            listener: listener.to_string(),
-        };
-        assert_eq!(
-            translation
-                .listener_conflicts
-                .get(&key)
-                .map(|conflict| conflict.reason),
-            Some("ProtocolConflict"),
-            "{listener} must conflict with the shared HTTP/3 UDP socket: {:?}",
-            translation.listener_conflicts
-        );
-    }
-}
-
-#[test]
 fn tcp_and_tls_passthrough_listeners_may_share_a_numeric_port() {
     let mut gateway = http_gateway("edge", Some("Same"));
     gateway.spec["listeners"] = json!([

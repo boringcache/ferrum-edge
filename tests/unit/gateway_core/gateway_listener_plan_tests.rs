@@ -102,7 +102,7 @@ fn plan_for(proxies: Vec<Proxy>) -> GatewayListenerPlan {
     GatewayListenerPlan::from_config(&config, &HashSet::new(), &BTreeMap::new(), false)
 }
 
-fn http3_plan_for(proxies: Vec<Proxy>) -> GatewayListenerPlan {
+fn tls_plan_for(proxies: Vec<Proxy>, http3_enabled: bool) -> GatewayListenerPlan {
     let mut config = GatewayConfig {
         proxies,
         ..GatewayConfig::default()
@@ -111,7 +111,12 @@ fn http3_plan_for(proxies: Vec<Proxy>) -> GatewayListenerPlan {
     config
         .http_tls_listen_ports
         .insert((ferrum_edge::config::types::default_namespace(), PORT));
-    GatewayListenerPlan::from_config(&config, &HashSet::new(), &BTreeMap::new(), true)
+    GatewayListenerPlan::from_config(
+        &config,
+        &HashSet::new(),
+        &BTreeMap::new(),
+        http3_enabled,
+    )
 }
 
 #[test]
@@ -152,10 +157,13 @@ fn http_and_dtls_stream_may_share_numeric_port() {
 
 #[test]
 fn http3_and_udp_stream_on_same_port_is_refused() {
-    let plan = http3_plan_for(vec![
-        http_proxy("https-gw", PORT),
-        stream_proxy("udp-stream", BackendScheme::Udp, PORT),
-    ]);
+    let plan = tls_plan_for(
+        vec![
+            http_proxy("https-gw", PORT),
+            stream_proxy("udp-stream", BackendScheme::Udp, PORT),
+        ],
+        true,
+    );
 
     assert!(!plan.ports.contains_key(&PORT));
     let reason = plan.refused.get(&PORT).expect("refusal reason");
@@ -167,16 +175,37 @@ fn http3_and_udp_stream_on_same_port_is_refused() {
 
 #[test]
 fn http3_and_dtls_stream_on_same_port_is_refused() {
-    let plan = http3_plan_for(vec![
-        http_proxy("https-gw", PORT),
-        stream_proxy("dtls-stream", BackendScheme::Dtls, PORT),
-    ]);
+    let plan = tls_plan_for(
+        vec![
+            http_proxy("https-gw", PORT),
+            stream_proxy("dtls-stream", BackendScheme::Dtls, PORT),
+        ],
+        true,
+    );
 
     assert!(!plan.ports.contains_key(&PORT));
     let reason = plan.refused.get(&PORT).expect("refusal reason");
     assert!(
         reason.contains("UDP/DTLS stream proxy"),
         "unexpected refusal: {reason}"
+    );
+}
+
+#[test]
+fn https_and_udp_stream_may_share_numeric_port_when_http3_is_disabled() {
+    let plan = tls_plan_for(
+        vec![
+            http_proxy("https-gw", PORT),
+            stream_proxy("udp-stream", BackendScheme::Udp, PORT),
+        ],
+        false,
+    );
+
+    assert_eq!(plan.ports.get(&PORT), Some(&GatewayListenerClass::Tls));
+    assert!(
+        !plan.refused.contains_key(&PORT),
+        "disabled HTTP/3 owns no UDP socket: {:?}",
+        plan.refused
     );
 }
 
