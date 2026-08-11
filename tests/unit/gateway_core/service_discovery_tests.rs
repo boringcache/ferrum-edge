@@ -4640,3 +4640,953 @@ async fn consul_shared_admission_rejection_increments_bounded_metric() {
         "shared-admission rejection must increment bounded counter (before={before}, after={after})"
     );
 }
+
+// ── Discovery body ceilings + Kubernetes envelope integrity (#3718/#3720) ──
+
+fn discovery_body_test_lock() -> &'static tokio::sync::Mutex<()> {
+    use std::sync::OnceLock;
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+/// Serializes discovery-body tests that compare process counters or publish the
+/// production install seam. Custom limits and their budget counters are scoped
+/// to the calling test thread, so unrelated parallel discovery tests keep the
+/// installed/default production limits.
+struct DiscoveryBodyLimitsGuard {
+    _lock: tokio::sync::MutexGuard<'static, ()>,
+    clear_override: bool,
+}
+
+impl DiscoveryBodyLimitsGuard {
+    /// Exclusive ownership for collector / budget observation without changing
+    /// effective ceilings.
+    async fn serialize() -> Self {
+        Self {
+            _lock: discovery_body_test_lock().lock().await,
+            clear_override: false,
+        }
+    }
+
+    async fn install(max_response: usize, max_error: usize, budget: usize) -> Self {
+        let lock = discovery_body_test_lock().lock().await;
+        ferrum_edge::_test_support::override_discovery_body_limits_for_test(
+            ferrum_edge::config::env_config::DiscoveryBodyLimits {
+                max_response_bytes: max_response,
+                max_error_bytes: max_error,
+                body_budget_bytes: budget,
+            },
+        )
+        .expect("test discovery body limits");
+        Self {
+            _lock: lock,
+            clear_override: true,
+        }
+    }
+}
+
+impl Drop for DiscoveryBodyLimitsGuard {
+    fn drop(&mut self) {
+        if self.clear_override {
+            ferrum_edge::_test_support::clear_discovery_body_limits_override_for_test();
+        }
+    }
+}
+
+async fn serve_raw_http_once(status_line: &str, headers: &[(&str, &str)], body: &[u8]) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind raw discovery fixture");
+    let addr = listener.local_addr().expect("local addr");
+    let status = status_line.to_string();
+    let header_lines: Vec<(String, String)> = headers
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+        .collect();
+    let body = body.to_vec();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept");
+        let mut buf = [0u8; 4096];
+        let _ = socket.read(&mut buf).await;
+        let mut response = format!("{status}\r\n");
+        for (k, v) in &header_lines {
+            response.push_str(&format!("{k}: {v}\r\n"));
+        }
+        response.push_str("Connection: close\r\n\r\n");
+        let _ = socket.write_all(response.as_bytes()).await;
+        let _ = socket.write_all(&body).await;
+        let _ = socket.shutdown().await;
+    });
+    format!("http://{addr}")
+}
+
+fn chunked_body(payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    // Emit one chunk for the whole payload so the collector still streams
+    // through reqwest's chunk API without a Content-Length.
+    out.extend_from_slice(format!("{:x}\r\n", payload.len()).as_bytes());
+    out.extend_from_slice(payload);
+    out.extend_from_slice(b"\r\n0\r\n\r\n");
+    out
+}
+
+#[test]
+fn discovery_body_limits_parse_rejects_zero_and_inconsistent_relationships() {
+    use ferrum_edge::config::env_config::{
+        DEFAULT_SERVICE_DISCOVERY_BODY_BUDGET_BYTES,
+        DEFAULT_SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES,
+        DEFAULT_SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES,
+        HARD_MAX_SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES, parse_discovery_body_limits,
+    };
+
+    let defaults = parse_discovery_body_limits(None, None, None).unwrap();
+    assert_eq!(
+        defaults.max_response_bytes,
+        DEFAULT_SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES
+    );
+    assert_eq!(
+        defaults.max_error_bytes,
+        DEFAULT_SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES
+    );
+    assert_eq!(
+        defaults.body_budget_bytes,
+        DEFAULT_SERVICE_DISCOVERY_BODY_BUDGET_BYTES
+    );
+
+    assert!(
+        parse_discovery_body_limits(Some("0"), None, None)
+            .unwrap_err()
+            .contains("0 is not unlimited")
+    );
+    assert!(
+        parse_discovery_body_limits(None, Some("0"), None)
+            .unwrap_err()
+            .contains("0 is not unlimited")
+    );
+    assert!(
+        parse_discovery_body_limits(None, None, Some("0"))
+            .unwrap_err()
+            .contains("0 is not unlimited")
+    );
+    assert!(
+        parse_discovery_body_limits(Some("1024"), Some("2048"), Some("4096"))
+            .unwrap_err()
+            .contains("must be <=")
+    );
+    assert!(
+        parse_discovery_body_limits(Some("8192"), Some("1024"), Some("4096"))
+            .unwrap_err()
+            .contains("must be >=")
+    );
+    let clamped =
+        parse_discovery_body_limits(Some("999999999"), Some("1024"), Some("999999999")).unwrap();
+    assert_eq!(
+        clamped.max_response_bytes,
+        HARD_MAX_SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES
+    );
+}
+
+#[test]
+fn discovery_body_limits_parsing_is_pure_across_repeated_snapshots() {
+    use ferrum_edge::config::env_config::parse_discovery_body_limits;
+
+    let first = parse_discovery_body_limits(Some("1024"), Some("512"), Some("2048")).unwrap();
+    let second = parse_discovery_body_limits(Some("4096"), Some("1024"), Some("8192")).unwrap();
+    let first_again = parse_discovery_body_limits(Some("1024"), Some("512"), Some("2048")).unwrap();
+    assert_eq!(first, first_again);
+    assert_ne!(first.max_response_bytes, second.max_response_bytes);
+    assert_eq!(second.max_response_bytes, 4096);
+}
+
+#[test]
+fn discovery_body_limits_envconfig_parse_does_not_pin_process_install() {
+    use crate::unit::env_lock::EnvGuard;
+    use ferrum_edge::config::env_config::{
+        DEFAULT_SERVICE_DISCOVERY_BODY_BUDGET_BYTES,
+        DEFAULT_SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES,
+        DEFAULT_SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES, SERVICE_DISCOVERY_BODY_BUDGET_BYTES_KEY,
+        SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES_KEY, SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES_KEY,
+    };
+
+    let env = EnvGuard::new(&[
+        "FERRUM_MODE",
+        "FERRUM_FILE_CONFIG_PATH",
+        SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES_KEY,
+        SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES_KEY,
+        SERVICE_DISCOVERY_BODY_BUDGET_BYTES_KEY,
+    ]);
+    env.set("FERRUM_MODE", "file");
+    env.set(
+        "FERRUM_FILE_CONFIG_PATH",
+        "/tmp/ferrum-discovery-body-cap.yaml",
+    );
+    env.set(SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES_KEY, "2048");
+    env.set(SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES_KEY, "512");
+    env.set(SERVICE_DISCOVERY_BODY_BUDGET_BYTES_KEY, "4096");
+    let first = ferrum_edge::config::EnvConfig::from_env().expect("first snapshot");
+    assert_eq!(first.service_discovery_max_response_body_bytes, 2048);
+    assert_eq!(first.service_discovery_max_error_body_bytes, 512);
+    assert_eq!(first.service_discovery_body_budget_bytes, 4096);
+
+    // A later, different but valid snapshot must still parse: from_env must not
+    // have installed the process OnceLock on the first call.
+    env.set(SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES_KEY, "8192");
+    env.set(SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES_KEY, "1024");
+    env.set(SERVICE_DISCOVERY_BODY_BUDGET_BYTES_KEY, "16384");
+    let second = ferrum_edge::config::EnvConfig::from_env().expect("second snapshot");
+    assert_eq!(second.service_discovery_max_response_body_bytes, 8192);
+    assert_eq!(second.service_discovery_max_error_body_bytes, 1024);
+    assert_eq!(second.service_discovery_body_budget_bytes, 16384);
+
+    // Clearing the keys restores documented defaults without OnceLock poisoning.
+    env.unset(SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES_KEY);
+    env.unset(SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES_KEY);
+    env.unset(SERVICE_DISCOVERY_BODY_BUDGET_BYTES_KEY);
+    let defaults = ferrum_edge::config::EnvConfig::from_env().expect("default snapshot");
+    assert_eq!(
+        defaults.service_discovery_max_response_body_bytes,
+        DEFAULT_SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES
+    );
+    assert_eq!(
+        defaults.service_discovery_max_error_body_bytes,
+        DEFAULT_SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES
+    );
+    assert_eq!(
+        defaults.service_discovery_body_budget_bytes,
+        DEFAULT_SERVICE_DISCOVERY_BODY_BUDGET_BYTES
+    );
+}
+
+#[tokio::test]
+async fn discovery_body_limits_install_accepts_identical_and_rejects_mismatch() {
+    use ferrum_edge::config::env_config::{
+        DEFAULT_SERVICE_DISCOVERY_BODY_BUDGET_BYTES,
+        DEFAULT_SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES,
+        DEFAULT_SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES, DiscoveryBodyLimits,
+    };
+    use ferrum_edge::service_discovery::http_body::install_discovery_body_limits;
+
+    // Installing limits updates the same process-wide budget ceiling used by
+    // collector tests. Hold their lifetime lock so this deterministic install
+    // cannot race a test-owned override or a live budget permit.
+    let _guard = DiscoveryBodyLimitsGuard::serialize().await;
+
+    let defaults = DiscoveryBodyLimits {
+        max_response_bytes: DEFAULT_SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES,
+        max_error_bytes: DEFAULT_SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES,
+        body_budget_bytes: DEFAULT_SERVICE_DISCOVERY_BODY_BUDGET_BYTES,
+    };
+    // Prefer documented defaults so this stays coherent if another suite already
+    // published the production install seam in-process.
+    install_discovery_body_limits(defaults).expect("default install");
+    install_discovery_body_limits(defaults).expect("identical reinstall");
+
+    let mismatch = install_discovery_body_limits(DiscoveryBodyLimits {
+        max_response_bytes: 1024,
+        max_error_bytes: 512,
+        body_budget_bytes: 2048,
+    })
+    .expect_err("mismatching install must fail closed");
+    assert!(
+        mismatch.contains("already installed with a different value"),
+        "{mismatch}"
+    );
+    assert!(
+        !mismatch.contains("1024") && !mismatch.contains("4194304"),
+        "mismatch diagnostic must not echo numeric ceilings: {mismatch}"
+    );
+
+    let zero = install_discovery_body_limits(DiscoveryBodyLimits {
+        max_response_bytes: 0,
+        max_error_bytes: 0,
+        body_budget_bytes: 0,
+    })
+    .expect_err("install must not accept 0");
+    assert!(
+        zero.contains("0 is not unlimited") || zero.contains("must be >= 1"),
+        "{zero}"
+    );
+}
+
+#[tokio::test]
+async fn discovery_body_test_override_does_not_leak_to_parallel_threads() {
+    use ferrum_edge::config::env_config::{
+        DEFAULT_SERVICE_DISCOVERY_BODY_BUDGET_BYTES,
+        DEFAULT_SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES,
+        DEFAULT_SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES,
+    };
+
+    let _guard = DiscoveryBodyLimitsGuard::install(64, 32, 256).await;
+    assert_eq!(
+        ferrum_edge::service_discovery::http_body::effective_discovery_body_limits()
+            .max_response_bytes,
+        64
+    );
+    assert_eq!(
+        ferrum_edge::_test_support::discovery_body_budget_max_for_test(),
+        256
+    );
+
+    let (parallel_limits, parallel_budget) = std::thread::spawn(|| {
+        (
+            ferrum_edge::service_discovery::http_body::effective_discovery_body_limits(),
+            ferrum_edge::_test_support::discovery_body_budget_max_for_test(),
+        )
+    })
+    .join()
+    .expect("parallel discovery test thread");
+    assert_eq!(
+        parallel_limits.max_response_bytes,
+        DEFAULT_SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES
+    );
+    assert_eq!(
+        parallel_limits.max_error_bytes,
+        DEFAULT_SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES
+    );
+    assert_eq!(parallel_budget, DEFAULT_SERVICE_DISCOVERY_BODY_BUDGET_BYTES);
+}
+
+#[test]
+fn discovery_body_limits_production_publish_seam_lives_in_main() {
+    let main_src = include_str!("../../../src/main.rs");
+    let env_src = include_str!("../../../src/config/env_config.rs");
+    assert!(
+        main_src.contains("install_discovery_body_limits"),
+        "production startup must publish discovery body ceilings after EnvConfig is accepted"
+    );
+    assert!(
+        !env_src.contains("install_discovery_body_limits("),
+        "EnvConfig parsing must remain pure and must not install the process OnceLock"
+    );
+}
+
+#[tokio::test]
+async fn discovery_collector_rejects_oversized_content_length_before_body() {
+    let _guard = DiscoveryBodyLimitsGuard::install(64, 32, 256).await;
+    let registry = ferrum_edge::plugins::prometheus_metrics::global_registry();
+    let before = registry.service_discovery_response_oversized_total();
+
+    let base = serve_raw_http_once(
+        "HTTP/1.1 200 OK",
+        &[
+            ("Content-Type", "application/json"),
+            ("Content-Length", "1000000"),
+        ],
+        b"{}",
+    )
+    .await;
+    let response = reqwest::Client::new()
+        .get(format!("{base}/v1"))
+        .send()
+        .await
+        .expect("send");
+    let err = ferrum_edge::_test_support::collect_discovery_response_body_for_test(response, true)
+        .await
+        .expect_err("oversized CL must fail");
+    assert_eq!(err, "response_oversized");
+    assert!(registry.service_discovery_response_oversized_total() > before);
+    assert_eq!(
+        ferrum_edge::_test_support::discovery_body_budget_used_for_test(),
+        0,
+        "oversized CL must not charge the shared budget"
+    );
+}
+
+#[tokio::test]
+async fn discovery_collector_rejects_disagreeing_repeated_content_length() {
+    let _guard = DiscoveryBodyLimitsGuard::install(64, 32, 256).await;
+    let registry = ferrum_edge::plugins::prometheus_metrics::global_registry();
+    let before = registry.service_discovery_response_oversized_total();
+
+    // Two field lines that disagree: the HTTP client may reject before the
+    // collector, or the collector must fail closed on ambiguity. Either
+    // boundary preserves the early oversized-declaration contract.
+    let base = serve_raw_http_once(
+        "HTTP/1.1 200 OK",
+        &[
+            ("Content-Type", "application/json"),
+            ("Content-Length", "32"),
+            ("Content-Length", "48"),
+        ],
+        &[b'x'; 32],
+    )
+    .await;
+    let client_result = reqwest::Client::new()
+        .get(format!("{base}/dup"))
+        .send()
+        .await;
+    match client_result {
+        Err(_) => {
+            // Client rejected conflicting Content-Length before collection.
+        }
+        Ok(response) => {
+            let err = ferrum_edge::_test_support::collect_discovery_response_body_for_test(
+                response, true,
+            )
+            .await
+            .expect_err("disagreeing CL must fail closed");
+            assert_eq!(err, "ambiguous_content_length");
+            assert!(registry.service_discovery_response_oversized_total() > before);
+        }
+    }
+    assert_eq!(
+        ferrum_edge::_test_support::discovery_body_budget_used_for_test(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn discovery_collector_accepts_agreeing_repeated_content_length() {
+    let _guard = DiscoveryBodyLimitsGuard::install(64, 32, 256).await;
+    let body = vec![b'y'; 16];
+    let base = serve_raw_http_once(
+        "HTTP/1.1 200 OK",
+        &[
+            ("Content-Type", "application/json"),
+            ("Content-Length", "16"),
+            ("Content-Length", "16"),
+        ],
+        &body,
+    )
+    .await;
+    let client_result = reqwest::Client::new()
+        .get(format!("{base}/ok"))
+        .send()
+        .await;
+    match client_result {
+        Err(_) => {
+            // Some HTTP stacks reject even agreeing repeats; that still keeps
+            // the collector boundary fail-closed for malformed framing.
+        }
+        Ok(response) => {
+            let accepted = ferrum_edge::_test_support::collect_discovery_response_body_for_test(
+                response, true,
+            )
+            .await
+            .expect("agreeing repeated CL must be accepted when the client delivers it");
+            assert_eq!(accepted, 16);
+        }
+    }
+}
+
+#[tokio::test]
+async fn discovery_collector_does_not_preallocate_uncharged_content_length() {
+    let collector_src = include_str!("../../../src/service_discovery/http_body.rs");
+    assert!(
+        !collector_src.contains("Vec::with_capacity") && !collector_src.contains("buf.reserve"),
+        "the collector must not preallocate from untrusted Content-Length"
+    );
+
+    // A large-but-under-ceiling Content-Length must not allocate that capacity
+    // outside the shared budget. Stall after headers so only the declaration is
+    // visible; budget usage must stay zero until retained bytes are charged.
+    let _guard = DiscoveryBodyLimitsGuard::install(1024, 32, 2048).await;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind stalled fixture");
+    let addr = listener.local_addr().expect("addr");
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept");
+        let mut buf = [0u8; 4096];
+        let _ = socket.read(&mut buf).await;
+        let headers = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 512\r\nConnection: close\r\n\r\n";
+        let _ = socket.write_all(headers.as_bytes()).await;
+        let _ = release_rx.await;
+        let _ = socket.write_all(&[b'z'; 512]).await;
+        let _ = socket.shutdown().await;
+    });
+
+    let response = reqwest::Client::new()
+        .get(format!("http://{addr}/stall"))
+        .send()
+        .await
+        .expect("headers");
+    assert_eq!(
+        ferrum_edge::_test_support::discovery_body_budget_used_for_test(),
+        0,
+        "headers alone must not charge or pre-reserve against the shared budget"
+    );
+
+    let collect = tokio::spawn(async move {
+        ferrum_edge::_test_support::collect_discovery_response_body_for_test(response, true).await
+    });
+    // Give the collector a chance to observe Content-Length and (incorrectly)
+    // reserve before any body bytes arrive.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        ferrum_edge::_test_support::discovery_body_budget_used_for_test(),
+        0,
+        "stalled body must not charge budget before retained bytes exist"
+    );
+    let _ = release_tx.send(());
+    let accepted = collect.await.expect("join").expect("collect");
+    assert_eq!(accepted, 512);
+    assert_eq!(
+        ferrum_edge::_test_support::discovery_body_budget_used_for_test(),
+        0,
+        "permit must release after the collected body drops"
+    );
+}
+
+#[tokio::test]
+async fn discovery_collector_accepts_exact_limit_and_rejects_limit_plus_one_chunked() {
+    let _guard = DiscoveryBodyLimitsGuard::install(64, 32, 256).await;
+    let exact = vec![b'a'; 64];
+    let over = vec![b'b'; 65];
+
+    let base_ok = serve_raw_http_once(
+        "HTTP/1.1 200 OK",
+        &[
+            ("Content-Type", "application/json"),
+            ("Transfer-Encoding", "chunked"),
+        ],
+        &chunked_body(&exact),
+    )
+    .await;
+    let ok = reqwest::Client::new()
+        .get(format!("{base_ok}/ok"))
+        .send()
+        .await
+        .expect("send exact");
+    let accepted = ferrum_edge::_test_support::collect_discovery_response_body_for_test(ok, true)
+        .await
+        .expect("exact limit must be accepted");
+    assert_eq!(accepted, 64);
+    assert_eq!(
+        ferrum_edge::_test_support::discovery_body_budget_used_for_test(),
+        0,
+        "permit must release after collector result drops"
+    );
+
+    let base_over = serve_raw_http_once(
+        "HTTP/1.1 200 OK",
+        &[
+            ("Content-Type", "application/json"),
+            ("Transfer-Encoding", "chunked"),
+        ],
+        &chunked_body(&over),
+    )
+    .await;
+    let bad = reqwest::Client::new()
+        .get(format!("{base_over}/over"))
+        .send()
+        .await
+        .expect("send over");
+    let err = ferrum_edge::_test_support::collect_discovery_response_body_for_test(bad, true)
+        .await
+        .expect_err("limit+1 must fail");
+    assert_eq!(err, "response_oversized");
+    assert_eq!(
+        ferrum_edge::_test_support::discovery_body_budget_used_for_test(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn discovery_collector_bounds_error_bodies_independently() {
+    let _guard = DiscoveryBodyLimitsGuard::install(256, 16, 1024).await;
+    let body = vec![b'x'; 64];
+    let base = serve_raw_http_once(
+        "HTTP/1.1 500 Internal Server Error",
+        &[
+            ("Content-Type", "text/plain"),
+            ("Transfer-Encoding", "chunked"),
+        ],
+        &chunked_body(&body),
+    )
+    .await;
+    let response = reqwest::Client::new()
+        .get(format!("{base}/err"))
+        .send()
+        .await
+        .expect("send");
+    let err = ferrum_edge::_test_support::collect_discovery_response_body_for_test(response, false)
+        .await
+        .expect_err("error body must use tighter ceiling");
+    assert_eq!(err, "response_oversized");
+}
+
+#[tokio::test]
+async fn discovery_body_budget_rejects_concurrent_pollers_and_releases_on_cancel() {
+    let _guard = DiscoveryBodyLimitsGuard::install(64, 16, 96).await;
+    let payload = vec![b'z'; 64];
+
+    async fn one_collect(base: String) -> Result<usize, &'static str> {
+        let response = reqwest::Client::new()
+            .get(format!("{base}/body"))
+            .send()
+            .await
+            .map_err(|_| "body_read_failed")?;
+        ferrum_edge::_test_support::collect_discovery_response_body_for_test(response, true).await
+    }
+
+    // Hold one successful body (and its permit) while other pollers compete.
+    let hold_base = serve_raw_http_once(
+        "HTTP/1.1 200 OK",
+        &[
+            ("Content-Type", "application/json"),
+            ("Transfer-Encoding", "chunked"),
+        ],
+        &chunked_body(&payload),
+    )
+    .await;
+    let held_response = reqwest::Client::new()
+        .get(format!("{hold_base}/hold"))
+        .send()
+        .await
+        .expect("hold send");
+    let held = {
+        use ferrum_edge::service_discovery::http_body::{
+            DiscoveryBodyRole, collect_discovery_response_body,
+        };
+        collect_discovery_response_body(held_response, DiscoveryBodyRole::Success)
+            .await
+            .expect("first body admitted")
+    };
+    assert_eq!(held.as_slice().len(), 64);
+    assert_eq!(
+        ferrum_edge::_test_support::discovery_body_budget_used_for_test(),
+        64
+    );
+
+    let mut rejected = 0usize;
+    for _ in 0..4 {
+        let base = serve_raw_http_once(
+            "HTTP/1.1 200 OK",
+            &[
+                ("Content-Type", "application/json"),
+                ("Transfer-Encoding", "chunked"),
+            ],
+            &chunked_body(&payload),
+        )
+        .await;
+        match one_collect(base).await {
+            Ok(_) => {}
+            Err("body_budget_rejected") => rejected += 1,
+            Err(other) => panic!("unexpected collector failure: {other}"),
+        }
+    }
+    assert!(
+        rejected >= 1,
+        "shared budget must reject at least one concurrent poller"
+    );
+
+    // Cancellation: drop an in-flight charged body and confirm budget releases.
+    drop(held);
+    assert_eq!(
+        ferrum_edge::_test_support::discovery_body_budget_used_for_test(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn kubernetes_malformed_envelopes_fail_closed_valid_empty_withdraws() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let _guard = DiscoveryBodyLimitsGuard::serialize().await;
+    let registry = ferrum_edge::plugins::prometheus_metrics::global_registry();
+    let before = registry.service_discovery_malformed_envelope_total();
+
+    for malformed in [
+        serde_json::json!({}),
+        serde_json::json!({"items": null}),
+        serde_json::json!({"items": {}}),
+        serde_json::json!({"items": "nope"}),
+        serde_json::json!([1, 2, 3]),
+    ] {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&malformed))
+            .mount(&mock_server)
+            .await;
+        let discoverer = KubernetesDiscoverer::new(
+            reqwest::Client::new(),
+            "default".to_string(),
+            "svc".to_string(),
+            None,
+            None,
+            1,
+        )
+        .with_api_url(mock_server.uri());
+        let err = discoverer.discover().await.expect_err("malformed envelope");
+        assert!(
+            err.to_string().contains("malformed EndpointSliceList"),
+            "unexpected error: {err}"
+        );
+    }
+    assert!(registry.service_discovery_malformed_envelope_total() > before);
+
+    // Invalid JSON
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{not-json"))
+        .mount(&mock_server)
+        .await;
+    let discoverer = KubernetesDiscoverer::new(
+        reqwest::Client::new(),
+        "default".to_string(),
+        "svc".to_string(),
+        None,
+        None,
+        1,
+    )
+    .with_api_url(mock_server.uri());
+    assert!(discoverer.discover().await.is_err());
+
+    // Authoritative empty withdrawal
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"items": []})))
+        .mount(&mock_server)
+        .await;
+    let discoverer = KubernetesDiscoverer::new(
+        reqwest::Client::new(),
+        "default".to_string(),
+        "svc".to_string(),
+        None,
+        None,
+        1,
+    )
+    .with_api_url(mock_server.uri());
+    let empty = discoverer.discover().await.expect("valid empty");
+    assert!(empty.targets().is_empty());
+}
+
+#[tokio::test]
+async fn kubernetes_normal_endpointslicelist_still_parses() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let _guard = DiscoveryBodyLimitsGuard::serialize().await;
+    let mock_server = MockServer::start().await;
+    let response = serde_json::json!({
+        "apiVersion": "discovery.k8s.io/v1",
+        "kind": "EndpointSliceList",
+        "items": [{
+            "ports": [{"name": "http", "port": 8080}],
+            "endpoints": [{
+                "addresses": ["10.244.0.9"],
+                "conditions": {"ready": true, "serving": true}
+            }]
+        }]
+    });
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&response))
+        .mount(&mock_server)
+        .await;
+    let discoverer = KubernetesDiscoverer::new(
+        reqwest::Client::new(),
+        "default".to_string(),
+        "svc".to_string(),
+        None,
+        None,
+        1,
+    )
+    .with_api_url(mock_server.uri());
+    let targets = discoverer.discover().await.unwrap();
+    assert_eq!(targets.len(), 1);
+    assert_eq!(targets[0].host, "10.244.0.9");
+    assert_eq!(targets[0].port, 8080);
+}
+
+#[tokio::test]
+async fn kubernetes_error_response_does_not_surface_body_bytes() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let _guard = DiscoveryBodyLimitsGuard::serialize().await;
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(
+            ResponseTemplate::new(403).set_body_string("secret-token=abc&registry-credential=xyz"),
+        )
+        .mount(&mock_server)
+        .await;
+    let discoverer = KubernetesDiscoverer::new(
+        reqwest::Client::new(),
+        "default".to_string(),
+        "svc".to_string(),
+        None,
+        None,
+        1,
+    )
+    .with_api_url(mock_server.uri());
+    let err = discoverer.discover().await.unwrap_err().to_string();
+    assert!(err.contains("403"));
+    assert!(!err.contains("secret-token"));
+    assert!(!err.contains("registry-credential"));
+}
+
+#[tokio::test]
+async fn production_discovery_loop_retains_targets_and_cursor_on_oversized_or_malformed() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // Keep the success ceiling well above valid Consul/Kubernetes fixtures
+    // (~100-150B compact JSON) while the oversized probe stays clearly over it.
+    let _guard = DiscoveryBodyLimitsGuard::install(1024, 64, 4096).await;
+
+    // Seed Consul with a healthy snapshot + cursor, then serve oversized and
+    // confirm prior LB targets + cursor remain.
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("X-Consul-Index", "77")
+                .set_body_json(consul_health_instance("10.0.0.40", 8080)),
+        )
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let discoverer = ConsulDiscoverer::new(
+        reqwest::Client::new(),
+        mock_server.uri(),
+        "api".to_string(),
+        None,
+        None,
+        false,
+        None,
+        1,
+    );
+    let mut harness = ConsulPipelineHarness::new("up-body-cap", Vec::new());
+    harness.discover_and_apply(&discoverer).await.unwrap();
+    assert_eq!(cursor_index(&discoverer), 77);
+    let installed = harness
+        .lb_cache
+        .get_upstream("ferrum", "up-body-cap")
+        .expect("upstream installed");
+    assert!(
+        installed
+            .targets
+            .iter()
+            .any(|t| t.host == "10.0.0.40" && t.port == 8080)
+    );
+
+    // Oversized success body must retain targets + cursor (streamed limit).
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("X-Consul-Index", "99")
+                .set_body_string("x".repeat(4096)),
+        )
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+    let err = discoverer.discover().await.expect_err("oversized");
+    assert!(err.to_string().contains("byte limit"));
+    assert_eq!(cursor_index(&discoverer), 77);
+    let still = harness
+        .lb_cache
+        .get_upstream("ferrum", "up-body-cap")
+        .expect("upstream retained");
+    assert!(still.targets.iter().any(|t| t.host == "10.0.0.40"));
+
+    // Kubernetes malformed envelope through the production apply pipeline.
+    let k8s_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "items": [{
+                "ports": [{"port": 8080}],
+                "endpoints": [{
+                    "addresses": ["10.244.1.1"],
+                    "conditions": {"ready": true}
+                }]
+            }]
+        })))
+        .up_to_n_times(1)
+        .mount(&k8s_server)
+        .await;
+    let k8s = KubernetesDiscoverer::new(
+        reqwest::Client::new(),
+        "default".to_string(),
+        "svc".to_string(),
+        None,
+        None,
+        1,
+    )
+    .with_api_url(k8s_server.uri());
+    let mut k8s_harness = ConsulPipelineHarness::new("up-k8s-envelope", Vec::new());
+    let good = k8s.discover().await.unwrap();
+    let _ = ferrum_edge::_test_support::apply_service_discovery_snapshot_for_test(
+        "ferrum",
+        "up-k8s-envelope",
+        "kubernetes",
+        good,
+        &mut k8s_harness.state,
+        &k8s_harness.lb_cache,
+        &k8s_harness.request_epoch,
+        &k8s_harness.static_targets,
+        LoadBalancerAlgorithm::RoundRobin,
+        &None,
+        &k8s_harness.cancel_rx,
+        &None,
+        &k8s_harness.dns_cache,
+        &k8s_harness.health_checker,
+    )
+    .await;
+    assert!(
+        k8s_harness
+            .lb_cache
+            .get_upstream("ferrum", "up-k8s-envelope")
+            .unwrap()
+            .targets
+            .iter()
+            .any(|t| t.host == "10.244.1.1")
+    );
+
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .mount(&k8s_server)
+        .await;
+    assert!(k8s.discover().await.is_err());
+    assert!(
+        k8s_harness
+            .lb_cache
+            .get_upstream("ferrum", "up-k8s-envelope")
+            .unwrap()
+            .targets
+            .iter()
+            .any(|t| t.host == "10.244.1.1"),
+        "malformed envelope must retain last admitted Kubernetes targets"
+    );
+}
+
+#[tokio::test]
+async fn consul_normal_parsing_still_works_under_bounded_collector() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("X-Consul-Index", "5")
+                .set_body_json(consul_health_instance("10.0.0.50", 9090)),
+        )
+        .mount(&mock_server)
+        .await;
+    let discoverer = ConsulDiscoverer::new(
+        reqwest::Client::new(),
+        mock_server.uri(),
+        "api".to_string(),
+        None,
+        None,
+        false,
+        None,
+        1,
+    );
+    let snapshot = discoverer.discover().await.unwrap();
+    assert_eq!(snapshot.targets().len(), 1);
+    assert_eq!(snapshot.pending_cursor_index(), Some(5));
+}

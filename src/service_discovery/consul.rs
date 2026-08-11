@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::debug;
 
+use super::http_body::{DiscoveryBodyRole, collect_discovery_response_body};
 use super::{DiscoveryCursorCommit, DiscoverySnapshot};
 
 /// Characters that must be percent-encoded in a URL path segment (RFC 3986 §3.3).
@@ -188,10 +189,11 @@ impl super::ServiceDiscoverer for ConsulDiscoverer {
         let candidate_index = parse_consul_index_header(response.headers());
 
         if !response.status().is_success() {
-            // Fail closed without reading or logging response bodies (may
-            // contain secrets). Fixed ACL remediation for 401/403 only.
+            // Fail closed without surfacing response bodies (may contain
+            // secrets). Drain under the tighter error-body ceiling, then emit
+            // fixed ACL remediation for 401/403 only.
             let status = response.status().as_u16();
-            drop(response);
+            let _ = collect_discovery_response_body(response, DiscoveryBodyRole::Error).await;
             if matches!(status, 401 | 403) {
                 anyhow::bail!(
                     "Consul API returned status {status}; check Consul ACL token policy (service:read on the discovered service)"
@@ -202,14 +204,13 @@ impl super::ServiceDiscoverer for ConsulDiscoverer {
 
         // Distinguish transport/read failures from malformed JSON without
         // logging body bytes, URLs, tokens, or unredacted error strings.
-        // Body byte caps for Consul / Kubernetes discovery are owned by
-        // issue #3720 — do not absorb that work here.
-        let body_bytes = response
-            .bytes()
+        let body_bytes = collect_discovery_response_body(response, DiscoveryBodyRole::Success)
             .await
-            .map_err(|_| anyhow::anyhow!("Consul API response body read failed"))?;
-        let body: Vec<serde_json::Value> = serde_json::from_slice(&body_bytes)
+            .map_err(|e| e.as_anyhow("Consul"))?;
+        let body: Vec<serde_json::Value> = serde_json::from_slice(body_bytes.as_slice())
             .map_err(|_| anyhow::anyhow!("Consul API returned malformed JSON"))?;
+        // Release the shared body-budget permit before target construction.
+        drop(body_bytes);
         let provider_item_count = body.len();
         let mut targets = Vec::new();
         let mut missing_service = 0usize;

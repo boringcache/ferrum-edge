@@ -16,11 +16,25 @@ use crate::util::endpointslice::{
     EndpointSliceEndpointEligibility, endpoint_slice_endpoint_eligibility,
 };
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::Semaphore;
 use tracing::{debug, warn};
+
+use super::http_body::{DiscoveryBodyRole, collect_discovery_response_body};
+
+/// Typed EndpointSliceList envelope.
+///
+/// `items` is required and must be a JSON array. A missing field, `null`, or
+/// non-array value fails deserialization and is treated as a malformed
+/// envelope — never as an authoritative empty snapshot. A valid empty list
+/// (`{"items":[]}`) remains admissible and may withdraw targets.
+#[derive(Debug, Deserialize)]
+struct EndpointSliceListEnvelope {
+    items: Vec<serde_json::Value>,
+}
 
 /// Standard in-cluster projected service-account token path.
 pub const DEFAULT_SERVICE_ACCOUNT_TOKEN_PATH: &str =
@@ -288,19 +302,32 @@ impl super::ServiceDiscoverer for KubernetesDiscoverer {
 
         let response = request.send().await?;
         if !response.status().is_success() {
-            let status = response.status();
-            let body = match response.text().await {
-                Ok(t) => t,
-                Err(e) => format!("<failed to read response body: {}>", e),
-            };
-            anyhow::bail!(
-                "Kubernetes API returned {}: {}",
-                status,
-                body.chars().take(200).collect::<String>()
-            );
+            let status = response.status().as_u16();
+            // Bound and discard the error body. Never log or surface body
+            // bytes, credentials, or URLs — fixed status diagnostics only.
+            let _ = collect_discovery_response_body(response, DiscoveryBodyRole::Error).await;
+            anyhow::bail!("Kubernetes API returned status {status}");
         }
 
-        let body: serde_json::Value = response.json().await?;
+        let body_bytes = collect_discovery_response_body(response, DiscoveryBodyRole::Success)
+            .await
+            .map_err(|e| e.as_anyhow("Kubernetes"))?;
+        let envelope: EndpointSliceListEnvelope =
+            match serde_json::from_slice(body_bytes.as_slice()) {
+                Ok(envelope) => envelope,
+                Err(_) => {
+                    crate::plugins::prometheus_metrics::global_registry()
+                        .record_service_discovery_malformed_envelope();
+                    warn!(
+                        reason = "malformed_envelope",
+                        "Kubernetes discovery: EndpointSliceList envelope rejected"
+                    );
+                    anyhow::bail!("Kubernetes API returned malformed EndpointSliceList envelope");
+                }
+            };
+        // Release the shared body-budget permit before target construction.
+        drop(body_bytes);
+
         let mut targets = Vec::new();
         let mut slices = 0usize;
         let mut missing_port = 0usize;
@@ -311,67 +338,63 @@ impl super::ServiceDiscoverer for KubernetesDiscoverer {
         let mut missing_addresses = 0usize;
         let mut non_string_addresses = 0usize;
 
-        if let Some(items) = body.get("items").and_then(|v| v.as_array()) {
-            for item in items {
-                slices += 1;
-                // Extract ports
-                let port = self.extract_port(item);
-                if port.is_none() {
-                    missing_port += 1;
-                }
+        for item in &envelope.items {
+            slices += 1;
+            // Extract ports
+            let port = self.extract_port(item);
+            if port.is_none() {
+                missing_port += 1;
+            }
 
-                // Extract endpoints
-                if let Some(endpoints) = item.get("endpoints").and_then(|v| v.as_array()) {
-                    for endpoint in endpoints {
-                        // Eligibility is decided once per snapshot ingest so the
-                        // published LB target set never consults conditions on
-                        // the request path.
-                        match endpoint_slice_endpoint_eligibility(endpoint) {
-                            EndpointSliceEndpointEligibility::Eligible => {}
-                            EndpointSliceEndpointEligibility::Terminating => {
-                                terminating += 1;
-                                continue;
-                            }
-                            EndpointSliceEndpointEligibility::NotReady => {
-                                not_ready += 1;
-                                continue;
-                            }
-                            EndpointSliceEndpointEligibility::NotServing => {
-                                non_serving += 1;
-                                continue;
-                            }
+            // Extract endpoints
+            if let Some(endpoints) = item.get("endpoints").and_then(|v| v.as_array()) {
+                for endpoint in endpoints {
+                    // Eligibility is decided once per snapshot ingest so the
+                    // published LB target set never consults conditions on
+                    // the request path.
+                    match endpoint_slice_endpoint_eligibility(endpoint) {
+                        EndpointSliceEndpointEligibility::Eligible => {}
+                        EndpointSliceEndpointEligibility::Terminating => {
+                            terminating += 1;
+                            continue;
                         }
-
-                        if let Some(addresses) =
-                            endpoint.get("addresses").and_then(|v| v.as_array())
-                        {
-                            if addresses.is_empty() {
-                                missing_addresses += 1;
-                            }
-                            for addr in addresses {
-                                match (addr.as_str(), port) {
-                                    (Some(address), Some(port)) => {
-                                        targets.push(UpstreamTarget {
-                                            host: address.to_string(),
-                                            port,
-                                            service_port_policy_key: None,
-                                            weight: self.default_weight,
-                                            tags: HashMap::new(),
-                                            locality: None,
-                                            path: None,
-                                        });
-                                    }
-                                    (None, _) => non_string_addresses += 1,
-                                    (Some(_), None) => {}
-                                }
-                            }
-                        } else {
-                            missing_addresses += 1;
+                        EndpointSliceEndpointEligibility::NotReady => {
+                            not_ready += 1;
+                            continue;
+                        }
+                        EndpointSliceEndpointEligibility::NotServing => {
+                            non_serving += 1;
+                            continue;
                         }
                     }
-                } else {
-                    missing_endpoints += 1;
+
+                    if let Some(addresses) = endpoint.get("addresses").and_then(|v| v.as_array()) {
+                        if addresses.is_empty() {
+                            missing_addresses += 1;
+                        }
+                        for addr in addresses {
+                            match (addr.as_str(), port) {
+                                (Some(address), Some(port)) => {
+                                    targets.push(UpstreamTarget {
+                                        host: address.to_string(),
+                                        port,
+                                        service_port_policy_key: None,
+                                        weight: self.default_weight,
+                                        tags: HashMap::new(),
+                                        locality: None,
+                                        path: None,
+                                    });
+                                }
+                                (None, _) => non_string_addresses += 1,
+                                (Some(_), None) => {}
+                            }
+                        }
+                    } else {
+                        missing_addresses += 1;
+                    }
                 }
+            } else {
+                missing_endpoints += 1;
             }
         }
 

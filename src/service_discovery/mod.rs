@@ -11,6 +11,7 @@
 
 pub mod consul;
 pub mod dns_sd;
+pub mod http_body;
 pub mod kubernetes;
 pub mod mesh;
 
