@@ -104,14 +104,6 @@ impl ChargedDiscoveryBody {
         &self.bytes
     }
 
-    pub fn len(&self) -> usize {
-        self.bytes.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.bytes.is_empty()
-    }
-
     /// Move the bytes out while keeping the permit alive until the returned
     /// [`Bytes`] (and any clones) drop.
     #[allow(dead_code)] // available to callers / tests that need Bytes ownership

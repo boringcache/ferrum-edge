@@ -4552,7 +4552,7 @@ async fn discovery_collector_rejects_disagreeing_repeated_content_length() {
             ("Content-Length", "32"),
             ("Content-Length", "48"),
         ],
-        &vec![b'x'; 32],
+        &[b'x'; 32],
     )
     .await;
     let client_result = reqwest::Client::new()
@@ -4970,7 +4970,9 @@ async fn production_discovery_loop_retains_targets_and_cursor_on_oversized_or_ma
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    let _guard = DiscoveryBodyLimitsGuard::install(96, 32, 512).await;
+    // Keep the success ceiling well above valid Consul/Kubernetes fixtures
+    // (~100-150B compact JSON) while the oversized probe stays clearly over it.
+    let _guard = DiscoveryBodyLimitsGuard::install(1024, 64, 4096).await;
 
     // Seed Consul with a healthy snapshot + cursor, then serve oversized and
     // confirm prior LB targets + cursor remain.
@@ -5017,7 +5019,7 @@ async fn production_discovery_loop_retains_targets_and_cursor_on_oversized_or_ma
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("X-Consul-Index", "99")
-                .set_body_string("x".repeat(200)),
+                .set_body_string("x".repeat(4096)),
         )
         .up_to_n_times(1)
         .mount(&mock_server)
