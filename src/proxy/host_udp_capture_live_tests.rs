@@ -249,11 +249,7 @@ struct VethPairConfig<'a> {
     pod_v6: Ipv6Addr,
 }
 
-fn attach_veth_pair(
-    host_pid: u32,
-    pod_pid: u32,
-    cfg: &VethPairConfig<'_>,
-) -> Result<(), String> {
+fn attach_veth_pair(host_pid: u32, pod_pid: u32, cfg: &VethPairConfig<'_>) -> Result<(), String> {
     let host_if = cfg.host_if;
     let pod_if = cfg.pod_if;
     let host_v4 = cfg.host_v4;
