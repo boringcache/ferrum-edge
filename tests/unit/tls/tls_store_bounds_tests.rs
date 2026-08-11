@@ -274,7 +274,7 @@ fn bounded_document_reader_accepts_exact_limit_and_rejects_limit_plus_one() {
         SharedStoreError::Oversized {
             max_bytes,
             direction,
-            path,
+            ref path,
         } => {
             assert_eq!(max_bytes, DOC_LIMIT);
             assert_eq!(direction, TlsStoreIoDirection::Read);
@@ -471,22 +471,22 @@ fn acme_terminal_history_stays_bounded_across_thousands_of_cycles_without_droppi
             )
         })
         .count();
-    let recoverable = orders
-        .iter()
-        .filter(|order| order.status == AcmeOrderStatus::Valid && order.finalization.is_some())
-        .count();
     let terminal = orders
         .iter()
         .filter(|order| {
             matches!(
                 order.status,
                 AcmeOrderStatus::Failed | AcmeOrderStatus::Cancelled
-            ) || (order.status == AcmeOrderStatus::Valid && order.finalization.is_none())
+            ) || (order.status == AcmeOrderStatus::Valid && order.id != "valid-recoverable")
         })
         .count();
     assert_eq!(active, 3, "active/recoverable orders must be retained");
-    assert_eq!(
-        recoverable, 1,
+    assert!(
+        store
+            .get_order("valid-recoverable")
+            .expect("recoverable valid order")
+            .finalization
+            .is_some(),
         "valid orders with finalization material must be retained"
     );
     assert_eq!(
@@ -579,8 +579,10 @@ fn event_log_bounds_load_and_compacts_atomically() {
 
     // Oversized on-disk input must fail without adopting unbounded content.
     std::fs::write(&path, vec![b'{'; DOC_LIMIT + 8]).expect("write oversized");
-    let error = TlsEventLog::open_with_document_limit(2, Some(path), DOC_LIMIT)
-        .expect_err("oversized event log");
+    let error = match TlsEventLog::open_with_document_limit(2, Some(path), DOC_LIMIT) {
+        Err(error) => error,
+        Ok(_) => panic!("oversized event log must fail closed"),
+    };
     assert!(error.contains("exceeds the configured byte ceiling"));
     assert!(!error.contains(&"x".repeat(32)));
 }
@@ -749,7 +751,10 @@ fn shared_store_and_event_log_reject_fifo_promptly_without_hanging() {
         let event_result = receiver.recv_timeout(OPEN_BUDGET).unwrap_or_else(|error| {
             panic!("event log FIFO open hung past {OPEN_BUDGET:?} budget: {error}");
         });
-        let event_error = event_result.expect_err("event log FIFO must refuse");
+        let event_error = match event_result {
+            Err(error) => error,
+            Ok(_) => panic!("event log FIFO must refuse"),
+        };
         assert!(
             event_error.contains("not a regular file") || event_error.contains("failed to read"),
             "{event_error}"
@@ -783,7 +788,7 @@ fn multi_process_mutation_is_atomic_and_visible() {
         ManagedTlsStore::open_with_limits(&path, 64 * 1024, 64, None).expect("parent open");
 
     let exe = std::env::current_exe().expect("current test executable");
-    let mut child = std::process::Command::new(exe)
+    let child = std::process::Command::new(exe)
         .env(CHILD_DIR_ENV, &path)
         .args(["--exact", TEST_NAME, "--nocapture"])
         .stdout(std::process::Stdio::null())
@@ -791,17 +796,14 @@ fn multi_process_mutation_is_atomic_and_visible() {
         .spawn()
         .expect("spawn OS-process writer child");
 
-    let mut saw_partial_json = false;
     for _ in 0..200 {
         match store_b.get("rec-5") {
             Ok(record) => {
                 assert_eq!(record.id, "rec-5");
-                assert!(!saw_partial_json);
                 break;
             }
             Err(ManagedTlsError::NotFound(_)) => {}
             Err(ManagedTlsError::Parse(_)) => {
-                saw_partial_json = true;
                 panic!("reader observed a partial/corrupt document");
             }
             Err(error) => panic!("unexpected reader error: {error}"),
