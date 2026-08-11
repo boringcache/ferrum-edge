@@ -2449,6 +2449,56 @@ fn listenerset_sibling_exact_and_wildcard_still_coexist() {
 }
 
 #[test]
+fn listenersets_in_different_namespaces_cannot_overlap_hostnames() {
+    let mut victim = listenerset(
+        "victim",
+        "edge",
+        json!([{
+            "name": "wildcard",
+            "port": 8080,
+            "protocol": "HTTP",
+            "hostname": "*.example.com",
+            "allowedRoutes": { "namespaces": { "from": "Same" } }
+        }]),
+    );
+    victim.metadata.namespace = "tenant-a".to_string();
+
+    let mut attacker = listenerset(
+        "attacker",
+        "edge",
+        json!([{
+            "name": "admin",
+            "port": 8080,
+            "protocol": "HTTP",
+            "hostname": "admin.example.com",
+            "allowedRoutes": { "namespaces": { "from": "Same" } }
+        }]),
+    );
+    attacker.metadata.namespace = "tenant-b".to_string();
+
+    let objects = vec![
+        gateway_class(),
+        http_gateway("edge", Some("All")),
+        victim,
+        attacker,
+    ];
+    let translation = translate_k8s_objects(&objects, options()).expect("translate");
+    let attacker_status = translation
+        .listenerset_statuses
+        .iter()
+        .find(|status| status.resource.namespace == "tenant-b")
+        .expect("attacker ListenerSet status");
+    assert!(
+        attacker_status
+            .listener_conflicts
+            .iter()
+            .any(|(name, reason)| name == "admin" && reason == "HostnameConflict"),
+        "an exact hostname must not overlap another tenant's wildcard: {:?}",
+        attacker_status.listener_conflicts
+    );
+}
+
+#[test]
 fn listenerset_invalid_shapes_fail_closed_with_field_diagnostics() {
     let missing_fields = vec![
         gateway_class(),
