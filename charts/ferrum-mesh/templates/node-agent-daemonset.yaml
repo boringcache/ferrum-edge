@@ -57,8 +57,11 @@
 {{- $nodeAgentImage := printf "%s:%s" $nodeAgentImageRepository $nodeAgentImageTag -}}
 {{- $nodeAgentAdminBindAddress := toString .Values.nodeAgent.admin.bindAddress -}}
 {{- $nodeAgentAdminProbeHost := include "ferrum-mesh.adminProbeHost" $nodeAgentAdminBindAddress -}}
-{{- $nodeAgentAdminHttpPort := toString (.Values.nodeAgent.admin.port | default "19090") -}}
-{{- $nodeAgentAdminHttpsPort := toString (.Values.nodeAgent.admin.httpsPort | default "0") -}}
+{{- /* Do not pipe ports through Sprig `default`: integer 0 is empty there and
+       would silently re-enable plaintext admin.port=19090 (or httpsPort defaults).
+       values.yaml already supplies the chart defaults. */ -}}
+{{- $nodeAgentAdminHttpPort := toString .Values.nodeAgent.admin.port -}}
+{{- $nodeAgentAdminHttpsPort := toString .Values.nodeAgent.admin.httpsPort -}}
 {{- $nodeAgentAdminTls := .Values.nodeAgent.admin.tls | default dict -}}
 {{- $nodeAgentAdminTlsConfigured := include "ferrum-mesh.nodeAgentAdminTlsConfigured" $nodeAgentAdminTls -}}
 {{- $nodeAgentAdminMountPath := trimSuffix "/" ($nodeAgentAdminTls.mountPath | default "/etc/ferrum/tls/admin") -}}
@@ -83,6 +86,10 @@
 {{- end -}}
 {{- if and $nodeAgentAdminCrlKey (not $nodeAgentAdminTlsConfigured) -}}
 {{- fail "nodeAgent.admin.tls.crlKey requires a complete admin TLS Secret mount (enabled + secretName + certKey + keyKey)" -}}
+{{- end -}}
+{{- /* Same-process HTTP/HTTPS collision when both listeners would bind. */ -}}
+{{- if and (ne $nodeAgentAdminHttpPort "0") (ne $nodeAgentAdminHttpsPort "0") $nodeAgentAdminTlsConfigured (eq $nodeAgentAdminHttpPort $nodeAgentAdminHttpsPort) -}}
+{{- fail (printf "nodeAgent.admin.port and nodeAgent.admin.httpsPort both use %s; set distinct ports or disable one listener (port/httpsPort=0)" $nodeAgentAdminHttpPort) -}}
 {{- end -}}
 {{- /* Prefer plaintext probes when HTTP is enabled so kubelet does not need
        --tls; HTTPS-only (HTTP port 0) dials the HTTPS port with --tls. */ -}}

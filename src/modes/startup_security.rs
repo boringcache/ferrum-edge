@@ -160,11 +160,12 @@ pub fn load_startup_security_with_scope(
         return Ok(StartupSecurityMaterials::empty());
     }
 
-    // Node-agent only parses CIDRs/metrics when its admin surface would
-    // actually start — HTTP, HTTPS, or both. HTTPS-only
-    // (`FERRUM_ADMIN_HTTP_PORT=0` + configured admin TLS) must still apply the
-    // same auth/CIDR contract. Explicit incomplete HTTPS still counts as an
-    // active security surface so validate fails closed before run.
+    // Node-agent only parses CIDRs/metrics when `node_agent_admin_surface_active`
+    // is true — plaintext HTTP and/or complete HTTPS that would bind. HTTP=0
+    // plus explicit incomplete HTTPS is *not* an active admin surface here, so
+    // CIDR/metrics are skipped in that shape; fail-closed validation for that
+    // incomplete HTTPS intent comes from the HTTPS-security / admin-TLS branch
+    // below (`node_agent_admin_https_security_applicable`).
     let node_agent_admin_active =
         env_config.mode != OperatingMode::NodeAgent || node_agent_admin_surface_active(env_config);
     // Newly node-agent-owned TLS policy / CRL / admin TLS loads are gated on an

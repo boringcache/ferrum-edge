@@ -67,6 +67,17 @@ fn daemonset_renders_managed_admin_https_and_tls_env() {
         );
     }
     assert!(
+        ds.contains("toString .Values.nodeAgent.admin.port")
+            && ds.contains("toString .Values.nodeAgent.admin.httpsPort")
+            && !ds.contains("| default \"19090\"")
+            && !ds.contains("httpsPort | default \"0\""),
+        "admin port reads must preserve integer zero (no Sprig default on port/httpsPort)"
+    );
+    assert!(
+        ds.contains("nodeAgent.admin.port and nodeAgent.admin.httpsPort both use"),
+        "chart must reject node-agent HTTP/HTTPS same-port when both would bind"
+    );
+    assert!(
         ds.contains("nodeAgent.admin.httpsPort is nonzero but admin TLS is incomplete"),
         "chart must fail closed on HTTPS without TLS Secret config"
     );
@@ -133,5 +144,17 @@ fn ambient_rejects_only_active_https_port_collision_with_node_agent() {
         ambient.contains("FERRUM_ADMIN_TLS_CERT_PATH")
             && ambient.contains("FERRUM_ADMIN_TLS_KEY_PATH"),
         "ambient HTTPS activity must require complete admin TLS env"
+    );
+    assert!(
+        ambient.contains("toString .Values.nodeAgent.admin.httpsPort")
+            && !ambient.contains("httpsPort | default \"0\""),
+        "ambient collision reads must preserve integer node-agent httpsPort=0"
+    );
+    assert!(
+        ambient.contains("ambient FERRUM_ADMIN_HTTP_PORT and nodeAgent.admin.httpsPort both use hostNetwork port")
+            && ambient.contains(
+                "ambient FERRUM_ADMIN_HTTPS_PORT and nodeAgent.admin.port both use hostNetwork port"
+            ),
+        "ambient chart must reject cross-protocol hostNetwork admin port collisions"
     );
 }

@@ -1176,10 +1176,13 @@ async fn start_node_agent_admin_listeners(
     if !env_config.node_agent_admin_enabled {
         return Ok(handles);
     }
-    // Fail closed on an explicitly requested incomplete HTTPS listener before
-    // treating the admin surface as inactive (issue #3704). Inherited default
-    // 9443 without TLS stays HTTP-only compatible.
-    if env_config.admin_https_port != 0
+    // Fail closed on HTTPS-only incomplete intent before treating the admin
+    // surface as inactive (issue #3704). When plaintext HTTP is also active the
+    // shared planner below owns the same TLS/CRL/admin-TLS loads — skip the
+    // duplicate I/O here. Inherited default 9443 without TLS stays HTTP-only
+    // compatible.
+    if env_config.admin_http_port == 0
+        && env_config.admin_https_port != 0
         && crate::modes::startup_security::node_agent_admin_https_security_applicable(env_config)
         && !env_config.admin_https_listener_enabled()
     {
@@ -1212,7 +1215,10 @@ async fn start_node_agent_admin_listeners(
             warn!(
                 "No node_agent admin API listeners are active — {} and admin HTTPS not configured or {}. The admin API is unreachable.",
                 crate::secrets::report_env_assignment("FERRUM_ADMIN_HTTP_PORT", "0"),
-                crate::secrets::report_env_assignment("FERRUM_ADMIN_HTTPS_PORT", "0")
+                crate::secrets::report_env_assignment(
+                    "FERRUM_ADMIN_HTTPS_PORT",
+                    &env_config.admin_https_port.to_string()
+                )
             );
         }
         return Ok(handles);

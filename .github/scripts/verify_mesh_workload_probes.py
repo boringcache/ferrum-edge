@@ -288,6 +288,54 @@ def validate_node_agent_https_only(results_dir: Path, expectations: dict) -> Non
     print("mesh probe node-agent HTTPS-only ok")
 
 
+def validate_node_agent_integer_port0_preserves_https_only(
+    results_dir: Path, expectations: dict
+) -> None:
+    """Integer `--set nodeAgent.admin.port=0` must not re-enable plaintext 19090."""
+
+    captures = expectations["captures"]
+    rendered = require_capture(
+        results_dir, captures["node_agent_https_only_int_port0"]
+    ).read_text(encoding="utf-8")
+    resource = resource_document(rendered, "ferrum-mesh-node-agent", "DaemonSet")
+    if not re.search(
+        r'(?m)^\s+- name: FERRUM_ADMIN_HTTP_PORT\s*\n\s+value: "0"\s*$',
+        resource,
+    ):
+        fail(
+            "Integer admin.port=0 re-enabled plaintext",
+            "Helm --set nodeAgent.admin.port=0 must render FERRUM_ADMIN_HTTP_PORT=0",
+        )
+    if re.search(
+        r'(?m)^\s+- name: FERRUM_ADMIN_HTTP_PORT\s*\n\s+value: "19090"\s*$',
+        resource,
+    ):
+        fail(
+            "Integer admin.port=0 fell back to 19090",
+            "Sprig default must not treat integer 0 as empty for admin.port",
+        )
+    readiness = require_probe(resource, "ferrum-mesh-node-agent", "readinessProbe")
+    if "--tls" not in readiness or not re.search(r'(?m)^\s+-\s+"19443"\s*$', readiness):
+        fail(
+            "Integer port=0 HTTPS-only probe regress",
+            "integer port=0 HTTPS-only must keep TLS probes on httpsPort",
+        )
+    err_text = require_capture(
+        results_dir, captures["node_agent_https_mtls_int_port0_err"]
+    ).read_text(encoding="utf-8")
+    if not err_text.strip():
+        fail(
+            "Integer port=0 bypassed HTTPS-only mTLS guard",
+            "--set nodeAgent.admin.port=0 must keep HTTPS-only mTLS fail-closed",
+        )
+    if "client certificate" not in err_text and "clientCaKey" not in err_text:
+        fail(
+            "Integer port=0 mTLS rejection drift",
+            "stderr must mention client certificate / clientCaKey guidance",
+        )
+    print("mesh probe node-agent integer port=0 HTTPS-only/mTLS ok")
+
+
 def validate_node_agent_dual(results_dir: Path, expectations: dict) -> None:
     captures = expectations["captures"]
     rendered = require_capture(results_dir, captures["node_agent_dual"]).read_text(
@@ -460,6 +508,53 @@ def validate_node_agent_https_collision_policy(
             "Ambient/node-agent HTTPS collision rejection drift",
             "stderr must mention FERRUM_ADMIN_HTTPS_PORT",
         )
+    http_https = require_capture(
+        results_dir, captures["node_agent_http_https_collision_err"]
+    ).read_text(encoding="utf-8")
+    if not http_https.strip():
+        fail(
+            "Node-agent HTTP/HTTPS collision accepted",
+            "same-port node-agent HTTP+HTTPS must fail closed",
+        )
+    if "httpsPort" not in http_https and "admin.port" not in http_https:
+        fail(
+            "Node-agent HTTP/HTTPS collision rejection drift",
+            "stderr must mention admin.port / httpsPort",
+        )
+    ambient_http = require_capture(
+        results_dir, captures["ambient_http_node_https_collision_err"]
+    ).read_text(encoding="utf-8")
+    if not ambient_http.strip():
+        fail(
+            "Ambient HTTP / node-agent HTTPS collision accepted",
+            "cross-protocol hostNetwork collision must fail closed",
+        )
+    if "hostNetwork" not in ambient_http and "httpsPort" not in ambient_http:
+        fail(
+            "Ambient HTTP / node-agent HTTPS collision rejection drift",
+            "stderr must mention the cross-protocol collision",
+        )
+    ambient_https = require_capture(
+        results_dir, captures["ambient_https_node_http_collision_err"]
+    ).read_text(encoding="utf-8")
+    if not ambient_https.strip():
+        fail(
+            "Ambient HTTPS / node-agent HTTP collision accepted",
+            "cross-protocol hostNetwork collision must fail closed",
+        )
+    if "hostNetwork" not in ambient_https and "admin.port" not in ambient_https:
+        fail(
+            "Ambient HTTPS / node-agent HTTP collision rejection drift",
+            "stderr must mention the cross-protocol collision",
+        )
+    noncollision = require_capture(
+        results_dir, captures["admin_port_noncollision"]
+    ).read_text(encoding="utf-8")
+    if "ferrum-mesh-node-agent" not in noncollision or "ferrum-mesh-ambient" not in noncollision:
+        fail(
+            "Admin port noncollision control missing workloads",
+            "distinct active admin ports must still render ambient and node-agent",
+        )
     print("mesh probe node-agent HTTPS collision policy ok")
 
 
@@ -522,6 +617,7 @@ def main(argv: list[str]) -> int:
     validate_coupled_rejected(results_dir, expectations)
     validate_node_agent_port0(results_dir, expectations)
     validate_node_agent_https_only(results_dir, expectations)
+    validate_node_agent_integer_port0_preserves_https_only(results_dir, expectations)
     validate_node_agent_dual(results_dir, expectations)
     validate_node_agent_https_no_tls_rejected(results_dir, expectations)
     validate_node_agent_https_mtls_probe_policy(results_dir, expectations)
