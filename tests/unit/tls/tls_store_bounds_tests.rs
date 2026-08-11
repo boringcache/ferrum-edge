@@ -684,7 +684,7 @@ fn replica_snapshot_refreshes_shared_store_record_count_gauge() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().to_path_buf();
     let exe = std::env::current_exe().expect("current test executable");
-    let mut child = std::process::Command::new(exe)
+    let child = std::process::Command::new(exe)
         .env(CHILD_DIR_ENV, &path)
         .args(["--exact", TEST_NAME, "--nocapture"])
         .stdout(std::process::Stdio::null())
@@ -720,7 +720,7 @@ fn shared_store_and_event_log_reject_fifo_promptly_without_hanging() {
 
     {
         let store_fifo = store_fifo.clone();
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = mpsc::sync_channel(1);
         thread::spawn(move || {
             let result = SharedStoreFile::<ProbeDocument>::open_with_limits(
                 store_fifo,
@@ -745,7 +745,7 @@ fn shared_store_and_event_log_reject_fifo_promptly_without_hanging() {
 
     {
         let events_fifo = events_fifo.clone();
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = mpsc::sync_channel(1);
         thread::spawn(move || {
             let result = TlsEventLog::open_with_document_limit(2, Some(events_fifo), DOC_LIMIT);
             let _ = sender.send(result);
