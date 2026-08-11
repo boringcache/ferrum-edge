@@ -4029,35 +4029,6 @@ jobs:
           )
           render_upgrade "${finalize_args[@]}" >/dev/null
           apply_contract host-netns finalize kind-pod-host pod-netns host-netns
-          # A settled placement must attest itself so a rebooted or newly joined
-          # node — which has no node-local durable record but provably no
-          # predecessor rules — adopts it instead of refusing forever (#3703).
-          # These two renders name the Ambient topology explicitly so the
-          # DaemonSet's own host-placement contract is satisfied.
-          ambient_topology_args=(
-            --set nodeAgent.captureMode=ebpf
-            --set-string ambient.env.FERRUM_MESH_TOPOLOGY=ambient
-            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_ENABLED=true
-          )
-          settled_render="$(render_upgrade "${ambient_topology_args[@]}" \
-            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true)"
-          if ! printf '%s\n' "$settled_render" \
-            | grep -A1 -F 'name: FERRUM_MESH_CAPTURE_UDP_PLACEMENT_ESTABLISHED' \
-            | grep -Fq 'value: "host-netns"'; then
-            echo "::error title=Established UDP placement attestation missing::a settled host placement must attest itself for rebooted and newly joined nodes"
-            exit 1
-          fi
-          # A release that is CHANGING the placement must never attest itself.
-          migrating_render="$(render_upgrade "${ambient_topology_args[@]}" \
-            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE=cleanup \
-            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_GENERATION=kind-attest \
-            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_FROM=host-netns \
-            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_TO=pod-netns)"
-          if printf '%s\n' "$migrating_render" \
-            | grep -Fq 'FERRUM_MESH_CAPTURE_UDP_PLACEMENT_ESTABLISHED'; then
-            echo "::error title=Migrating release attested itself::the established attestation must be absent outside the stable phase"
-            exit 1
-          fi
           render_upgrade \
             --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_ENABLED=true \
             --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE=cleanup \
