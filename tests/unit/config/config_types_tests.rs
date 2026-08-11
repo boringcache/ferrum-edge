@@ -133,6 +133,7 @@ fn make_upstream(id: &str) -> Upstream {
         created_at: Utc::now(),
         updated_at: Utc::now(),
         k8s_service_uid: None,
+        pending_limit_scope: None,
     }
 }
 

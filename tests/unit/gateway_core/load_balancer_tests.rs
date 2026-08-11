@@ -250,6 +250,7 @@ fn test_load_balancer_cache() {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             k8s_service_uid: None,
+            pending_limit_scope: None,
         }],
         ..Default::default()
     };
@@ -634,6 +635,7 @@ fn test_least_latency_cache_record_and_select() {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             k8s_service_uid: None,
+            pending_limit_scope: None,
         }],
         ..Default::default()
     };
@@ -1263,6 +1265,7 @@ fn test_load_balancer_cache_get_hash_on_strategy() {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             k8s_service_uid: None,
+            pending_limit_scope: None,
         }],
         ..Default::default()
     };
@@ -1380,6 +1383,7 @@ fn make_upstream(id: &str, targets: Vec<UpstreamTarget>) -> Upstream {
         created_at: Utc::now(),
         updated_at: Utc::now(),
         k8s_service_uid: None,
+        pending_limit_scope: None,
     }
 }
 
@@ -3006,6 +3010,7 @@ fn least_latency_passive_recovery_does_not_restore_warmup_bias() {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             k8s_service_uid: None,
+            pending_limit_scope: None,
         }],
         ..Default::default()
     };

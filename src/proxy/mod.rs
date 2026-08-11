@@ -34795,9 +34795,12 @@ pub(crate) fn dispatch_policy_port_for_target(
 
 /// Resolve the precomputed logical H1 pending-admission scope for a proxy
 /// (issue #3778). Config publication interns it onto
-/// `Proxy.pending_limit_scope`. Incomplete test fixtures that skipped
-/// `resolve_pending_limit_scopes` get an on-demand build (still keyed by
-/// namespace / upstream_id / subset — never by selected host).
+/// `Proxy.pending_limit_scope`; upstream-id route overrides Arc-clone the
+/// destination `Upstream.pending_limit_scope` (and direct-backend overrides
+/// clear it) via `apply_route_overrides_with_upstreams`. Incomplete test
+/// fixtures that skipped `resolve_pending_limit_scopes` get an on-demand
+/// build (still keyed by namespace / upstream_id / subset — never by
+/// selected host).
 pub(crate) fn pending_limit_scope_for_proxy(
     proxy: &Proxy,
 ) -> std::sync::Arc<crate::backend_pending_limit::BackendPendingScopeBase> {
@@ -56764,6 +56767,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             k8s_service_uid: None,
+            pending_limit_scope: None,
         };
         upstream.port_overrides.insert(
             8080,
@@ -56823,6 +56827,7 @@ mod tests {
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
                 k8s_service_uid: None,
+                pending_limit_scope: None,
             }],
             ..GatewayConfig::default()
         };
@@ -57442,6 +57447,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             k8s_service_uid: None,
+            pending_limit_scope: None,
         };
         // The fallback projects even when the per-port map is empty (the SD case).
         assert!(upstream.port_overrides.is_empty());
@@ -57520,6 +57526,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             k8s_service_uid: None,
+            pending_limit_scope: None,
         };
         upstream.normalize_fields();
 

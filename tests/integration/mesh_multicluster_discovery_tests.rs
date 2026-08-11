@@ -360,6 +360,7 @@ async fn mesh_multicluster_load_balancer_fails_over_local_to_remote() {
         created_at: now,
         updated_at: now,
         k8s_service_uid: None,
+        pending_limit_scope: None,
     };
 
     let config = GatewayConfig {

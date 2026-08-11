@@ -13749,6 +13749,7 @@ mod inner {
                 created_at: now,
                 updated_at: now,
                 k8s_service_uid: None,
+                pending_limit_scope: None,
             };
 
             let doc = upstream_to_doc(&upstream).expect("upstream_to_doc should succeed");
@@ -14057,6 +14058,7 @@ mod inner {
                 created_at: now,
                 updated_at: now,
                 k8s_service_uid: None,
+                pending_limit_scope: None,
             };
             let doc = upstream_to_doc(&upstream).unwrap();
             assert!(

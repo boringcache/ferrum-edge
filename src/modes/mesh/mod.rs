@@ -3119,6 +3119,7 @@ fn build_east_west_service_proxies_and_upstreams(
                 created_at: now,
                 updated_at: now,
                 k8s_service_uid: None,
+                pending_limit_scope: None,
             };
             upstreams.push(upstream);
 
@@ -5125,6 +5126,7 @@ fn mesh_ingress_unix_upstream(
         created_at: now,
         updated_at: now,
         k8s_service_uid: None,
+        pending_limit_scope: None,
     }
 }
 
@@ -8057,6 +8059,7 @@ fn mesh_outbound_route_upstream(
         dispatch_port_override_fallback: None,
         api_spec_id: None,
         k8s_service_uid,
+        pending_limit_scope: None,
         created_at: now,
         updated_at: now,
     }
@@ -10498,6 +10501,7 @@ fn build_egress_upstream(
         created_at: now,
         updated_at: now,
         k8s_service_uid: None,
+        pending_limit_scope: None,
     }
 }
 
@@ -23668,6 +23672,7 @@ mod tests {
             created_at: now,
             updated_at: now,
             k8s_service_uid: None,
+            pending_limit_scope: None,
         }
     }
 
@@ -28423,6 +28428,7 @@ mod tests {
             created_at: loaded_at,
             updated_at: loaded_at,
             k8s_service_uid: None,
+            pending_limit_scope: None,
         });
         let mesh_slice = MeshSlice {
             namespace: "default".to_string(),
@@ -28650,6 +28656,7 @@ mod tests {
             created_at: now,
             updated_at: now,
             k8s_service_uid: None,
+            pending_limit_scope: None,
         }
     }
 
@@ -29130,6 +29137,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             k8s_service_uid: None,
+            pending_limit_scope: None,
         });
         let mut config_b = config_a.clone();
 

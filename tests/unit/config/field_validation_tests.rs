@@ -135,6 +135,7 @@ fn make_upstream(id: &str) -> Upstream {
         created_at: Utc::now(),
         updated_at: Utc::now(),
         k8s_service_uid: None,
+        pending_limit_scope: None,
     }
 }
 
@@ -2889,6 +2890,7 @@ fn test_validate_backend_ip_policy_upstream_target_denied() {
         created_at: Utc::now(),
         updated_at: Utc::now(),
         k8s_service_uid: None,
+        pending_limit_scope: None,
     };
     let config = GatewayConfig {
         upstreams: vec![upstream],

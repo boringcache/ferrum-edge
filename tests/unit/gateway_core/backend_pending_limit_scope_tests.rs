@@ -4,15 +4,19 @@
 //! Inline `backend_pending_limit` tests already exercise concurrent acquire /
 //! drop / zero-count eviction. This module focuses on cross-Service isolation,
 //! endpoint-fan-out non-multiplication, namespace isolation, UID recreate
-//! fencing, additive UID+upstream identity, and deterministic cap-update
-//! semantics that the acceptance contract requires to be visible outside the
-//! production module.
+//! fencing, additive UID+upstream identity, deterministic cap-update
+//! semantics, and request-time upstream route-override rebind of the
+//! precomputed scope that the acceptance contract requires to be visible
+//! outside the production module.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
 use ferrum_edge::backend_pending_limit::{BackendPendingLimiter, BackendPendingScopeBase};
+use ferrum_edge::config::types::{GatewayConfig, Proxy, Upstream};
+use ferrum_edge::plugins::RequestContext;
 
 fn scope(ns: &str, id: &str, uid: Option<&str>, sub: Option<&str>) -> BackendPendingScopeBase {
     BackendPendingScopeBase::new(ns, id, uid, sub)
@@ -251,5 +255,191 @@ fn resolve_pending_limit_scopes_interns_upstream_and_optional_uid_not_host() {
         svc.prefix(),
         host_keyed_collision.prefix(),
         "UID-backed Service identity must not collapse to a host-shaped upstream id"
+    );
+}
+
+#[test]
+fn upstream_route_override_rebinds_pending_scope_away_from_source_lane() {
+    // A→B upstream override must Arc-clone B's precomputed top-level scope
+    // (including K8s Service UID) and must not retain A's capped lane —
+    // including A's selected subset, which runtime clears on upstream change.
+    let mut upstream_a: Upstream = serde_json::from_value(serde_json::json!({
+        "id": "upstream-a",
+        "namespace": "shop",
+        "targets": [{"host": "10.0.0.1", "port": 8080}],
+    }))
+    .expect("upstream A");
+    upstream_a.k8s_service_uid = Some("uid-a".to_string());
+
+    let mut upstream_b: Upstream = serde_json::from_value(serde_json::json!({
+        "id": "upstream-b",
+        "namespace": "shop",
+        "targets": [{"host": "10.0.0.1", "port": 8080}],
+    }))
+    .expect("upstream B");
+    upstream_b.k8s_service_uid = Some("uid-b".to_string());
+
+    let proxy: Proxy = serde_json::from_value(serde_json::json!({
+        "id": "route-a",
+        "namespace": "shop",
+        "backend_host": "10.0.0.1",
+        "backend_port": 8080,
+        "upstream_id": "upstream-a",
+        "upstream_subset": "v1",
+    }))
+    .expect("proxy");
+
+    let mut config = GatewayConfig {
+        proxies: vec![proxy],
+        upstreams: vec![upstream_a, upstream_b],
+        ..GatewayConfig::default()
+    };
+    config.resolve_pending_limit_scopes();
+
+    let proxy = Arc::new(config.proxies[0].clone());
+    let source_scope = proxy
+        .pending_limit_scope
+        .as_ref()
+        .expect("proxy A scope interned");
+    assert!(
+        source_scope.prefix().contains("upstream-a"),
+        "source lane must bind upstream A"
+    );
+    assert!(
+        source_scope.prefix().contains("uid-a"),
+        "source lane must bind Service UID A"
+    );
+    assert!(
+        source_scope.prefix().contains("v1"),
+        "source lane must bind selected subset v1"
+    );
+
+    let upstream_b = Arc::new(config.upstreams[1].clone());
+    let dest_scope = upstream_b
+        .pending_limit_scope
+        .as_ref()
+        .expect("upstream B top-level scope interned");
+    assert!(
+        dest_scope.prefix().contains("upstream-b") && dest_scope.prefix().contains("uid-b"),
+        "destination carrier must include B id + UID"
+    );
+    assert!(
+        !dest_scope.prefix().contains("v1"),
+        "upstream carrier is top-level only (subset cleared on override)"
+    );
+
+    let mut upstreams = HashMap::new();
+    upstreams.insert("upstream-b".to_string(), Arc::clone(&upstream_b));
+
+    let mut ctx = RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
+    ctx.route_override_upstream_id = Some("upstream-b".to_string());
+    let effective = ctx.apply_route_overrides_with_upstreams(Arc::clone(&proxy), &upstreams);
+
+    assert_eq!(effective.upstream_id.as_deref(), Some("upstream-b"));
+    assert!(
+        effective.upstream_subset.is_none(),
+        "upstream change clears selected subset"
+    );
+    let effective_scope = effective
+        .pending_limit_scope
+        .as_ref()
+        .expect("override must rebind pending scope");
+    assert!(
+        Arc::ptr_eq(effective_scope, dest_scope),
+        "override must Arc-clone B's precomputed scope (no per-request rebuild)"
+    );
+    assert_ne!(
+        effective_scope.prefix(),
+        source_scope.prefix(),
+        "effective proxy must not retain A's logical lane"
+    );
+    assert!(
+        !effective_scope.prefix().contains("upstream-a")
+            && !effective_scope.prefix().contains("uid-a"),
+        "A's id/UID must not remain on the rebound scope"
+    );
+    assert!(
+        effective_scope.prefix().contains("upstream-b")
+            && effective_scope.prefix().contains("uid-b"),
+        "rebound scope must carry B's id + UID"
+    );
+}
+
+#[test]
+fn direct_backend_override_clears_stale_upstream_pending_scope() {
+    let mut upstream: Upstream = serde_json::from_value(serde_json::json!({
+        "id": "upstream-a",
+        "namespace": "shop",
+        "targets": [{"host": "10.0.0.1", "port": 8080}],
+    }))
+    .expect("upstream");
+    upstream.k8s_service_uid = Some("uid-a".to_string());
+
+    let proxy: Proxy = serde_json::from_value(serde_json::json!({
+        "id": "route-a",
+        "namespace": "shop",
+        "backend_host": "10.0.0.1",
+        "backend_port": 8080,
+        "upstream_id": "upstream-a",
+    }))
+    .expect("proxy");
+
+    let mut config = GatewayConfig {
+        proxies: vec![proxy],
+        upstreams: vec![upstream],
+        ..GatewayConfig::default()
+    };
+    config.resolve_pending_limit_scopes();
+
+    let proxy = Arc::new(config.proxies[0].clone());
+    assert!(proxy.pending_limit_scope.is_some());
+
+    let mut ctx = RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
+    ctx.route_override_backend_host = Some("direct.svc".to_string());
+    let effective = ctx.apply_route_overrides_with_upstreams(proxy, &HashMap::new());
+
+    assert!(effective.upstream_id.is_none());
+    assert!(
+        effective.pending_limit_scope.is_none(),
+        "direct-backend override must clear the stale capped upstream lane"
+    );
+}
+
+#[test]
+fn no_route_override_preserves_proxy_pending_scope_arc() {
+    let mut upstream: Upstream = serde_json::from_value(serde_json::json!({
+        "id": "upstream-a",
+        "namespace": "shop",
+        "targets": [{"host": "10.0.0.1", "port": 8080}],
+    }))
+    .expect("upstream");
+    upstream.k8s_service_uid = Some("uid-a".to_string());
+
+    let proxy: Proxy = serde_json::from_value(serde_json::json!({
+        "id": "route-a",
+        "namespace": "shop",
+        "backend_host": "10.0.0.1",
+        "backend_port": 8080,
+        "upstream_id": "upstream-a",
+    }))
+    .expect("proxy");
+
+    let mut config = GatewayConfig {
+        proxies: vec![proxy],
+        upstreams: vec![upstream],
+        ..GatewayConfig::default()
+    };
+    config.resolve_pending_limit_scopes();
+
+    let proxy = Arc::new(config.proxies[0].clone());
+    let upstreams = HashMap::from([(
+        "upstream-a".to_string(),
+        Arc::new(config.upstreams[0].clone()),
+    )]);
+    let ctx = RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
+    let effective = ctx.apply_route_overrides_with_upstreams(Arc::clone(&proxy), &upstreams);
+    assert!(
+        Arc::ptr_eq(&effective, &proxy),
+        "ordinary no-override path must remain a no-op (same Proxy Arc)"
     );
 }

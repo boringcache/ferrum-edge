@@ -155,10 +155,11 @@ thread_local! {
 
 /// Precomputed logical admission-scope identity for H1 pending limiting.
 ///
-/// Built once per proxy during config publication and shared via `Arc` so the
-/// request path never reconstructs namespace / upstream / subset strings.
-/// The effective DestinationRule policy port is appended at acquire time
-/// (multi-port upstreams select it per target).
+/// Built once per proxy (and once per upstream for top-level override rebind)
+/// during config publication and shared via `Arc` so the request path never
+/// reconstructs namespace / upstream / subset strings. The effective
+/// DestinationRule policy port is appended at acquire time (multi-port
+/// upstreams select it per target).
 #[derive(Debug, Clone)]
 pub struct BackendPendingScopeBase {
     /// Length-prefixed identity prefix ending with `|` so a port can be

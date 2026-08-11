@@ -1782,6 +1782,18 @@ pub struct Upstream {
     /// apply; never an operator input field.
     #[serde(skip)]
     pub k8s_service_uid: Option<String>,
+    /// Precomputed top-level (no-subset) H1 pending-admission scope for this
+    /// upstream (issue #3778). Interned at config publication by
+    /// [`GatewayConfig::resolve_pending_limit_scopes`] so
+    /// [`crate::plugins::RequestContext::apply_route_overrides_with_upstreams`]
+    /// can Arc-clone it when an upstream-id route override rebinds the
+    /// effective proxy — without reconstructing namespace / upstream / UID /
+    /// subset strings on the request path. Subset is always `None` here
+    /// because an upstream change clears `Proxy.upstream_subset`.
+    /// `#[serde(skip)]` — derived only; never an operator input field.
+    #[serde(skip)]
+    pub pending_limit_scope:
+        Option<std::sync::Arc<crate::backend_pending_limit::BackendPendingScopeBase>>,
     #[serde(default = "Utc::now")]
     pub created_at: DateTime<Utc>,
     #[serde(default = "Utc::now")]
@@ -2524,8 +2536,10 @@ pub struct Proxy {
     /// Interned at config publication by
     /// [`GatewayConfig::resolve_pending_limit_scopes`] so the reqwest/H1 (and
     /// H3→plain bridge) hot path never reconstructs namespace / upstream /
-    /// subset strings. The DestinationRule policy port is appended at acquire
-    /// time. `#[serde(skip)]` — derived only.
+    /// subset strings. Upstream-id route overrides Arc-clone the destination
+    /// [`Upstream::pending_limit_scope`]; direct-backend overrides clear it.
+    /// The DestinationRule policy port is appended at acquire time.
+    /// `#[serde(skip)]` — derived only.
     #[serde(skip)]
     pub pending_limit_scope:
         Option<std::sync::Arc<crate::backend_pending_limit::BackendPendingScopeBase>>,
@@ -3978,15 +3992,32 @@ impl GatewayConfig {
         }
     }
 
-    /// Intern each proxy's logical H1 pending-admission scope (issue #3778).
+    /// Intern each proxy's and upstream's logical H1 pending-admission scope
+    /// (issue #3778).
     ///
-    /// Built from `(namespace, stable upstream/service id, optional K8s
-    /// Service UID when stamped, selected subset)`. The DestinationRule
+    /// Proxy scopes are built from `(namespace, stable upstream/service id,
+    /// optional K8s Service UID when stamped, selected subset)`. Each
+    /// Upstream also carries a derived top-level (no-subset) scope so
+    /// request-time upstream route overrides can Arc-clone the destination
+    /// lane without reconstructing identity strings. The DestinationRule
     /// policy port is appended at acquire time. Must run after
     /// upstreams/proxies are settled (including mesh materialization that
     /// stamps `Upstream.k8s_service_uid`). Invoked from `normalize_fields`
     /// beside `resolve_dispatch_port_overrides`.
     pub fn resolve_pending_limit_scopes(&mut self) {
+        for upstream in &mut self.upstreams {
+            upstream.pending_limit_scope = Some(std::sync::Arc::new(
+                crate::backend_pending_limit::BackendPendingScopeBase::new(
+                    upstream.namespace.as_str(),
+                    upstream.id.as_str(),
+                    upstream.k8s_service_uid.as_deref(),
+                    // Top-level only: route overrides clear `upstream_subset`
+                    // when the effective upstream changes.
+                    None,
+                ),
+            ));
+        }
+
         let upstream_by_key: HashMap<(&str, &str), &Upstream> = self
             .upstreams
             .iter()
