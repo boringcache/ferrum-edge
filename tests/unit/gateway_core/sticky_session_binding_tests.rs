@@ -2412,12 +2412,16 @@ fn all_six_retry_callers_pass_request_authority_to_shared_helper() {
     );
     assert_eq!(h3_server.matches("select_next_retry_target(").count(), 1);
     assert_eq!(
-        h3_cross.matches("select_next_h3_eligible_retry_target(").count(),
+        h3_cross
+            .matches("select_next_h3_eligible_retry_target(")
+            .count(),
         1,
         "cross-protocol must funnel through one shared H3-eligible helper call"
     );
     assert_eq!(
-        h3_ws.matches("select_next_h3_eligible_retry_target(").count(),
+        h3_ws
+            .matches("select_next_h3_eligible_retry_target(")
+            .count(),
         1,
         "H3 WebSocket must funnel through one shared H3-eligible helper call"
     );
@@ -2434,7 +2438,12 @@ fn all_six_retry_callers_pass_request_authority_to_shared_helper() {
 
     // Every production call passes the validated inbound host near the helper.
     for (label, source, needle, expected_calls) in [
-        ("proxy/mod.rs", proxy_src, "select_next_retry_target(", 3usize),
+        (
+            "proxy/mod.rs",
+            proxy_src,
+            "select_next_retry_target(",
+            3usize,
+        ),
         ("http3/server.rs", h3_server, "select_next_retry_target(", 1),
         (
             "http3/websocket.rs",

@@ -1484,8 +1484,7 @@ pub(crate) fn select_next_retry_target_excluding(
 
     // Reconcile each additional dial / seen candidate back to its configured
     // sticky identity before exclusion (same contract as `prev_target`).
-    let mut extra_configured: Vec<&UpstreamTarget> =
-        Vec::with_capacity(additional_excludes.len());
+    let mut extra_configured: Vec<&UpstreamTarget> = Vec::with_capacity(additional_excludes.len());
     for seen in additional_excludes {
         extra_configured.push(LoadBalancerCache::configured_sticky_identity_target_from(
             &epoch.load_balancer,
@@ -1628,8 +1627,7 @@ pub(crate) fn select_next_eligible_retry_target(
     let mut seen_ineligible: Vec<Arc<UpstreamTarget>> = Vec::new();
     for _ in 0..MAX_TARGETS_PER_UPSTREAM.saturating_sub(1) {
         seen_ineligible.push(Arc::clone(&candidate));
-        let additional: Vec<&UpstreamTarget> =
-            seen_ineligible.iter().map(|t| t.as_ref()).collect();
+        let additional: Vec<&UpstreamTarget> = seen_ineligible.iter().map(|t| t.as_ref()).collect();
         candidate = select_next_retry_target_excluding(
             state,
             epoch,

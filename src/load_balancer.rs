@@ -1818,12 +1818,7 @@ impl LoadBalancerCache {
         health: Option<&HealthContext<'_>>,
     ) -> Option<Arc<UpstreamTarget>> {
         let balancer = snapshot.balancer(namespace, upstream_id)?;
-        balancer.select_excluding_from_subset_endpoint_lane(
-            ctx_key,
-            subset_name,
-            exclude,
-            health,
-        )
+        balancer.select_excluding_from_subset_endpoint_lane(ctx_key, subset_name, exclude, health)
     }
 
     #[allow(clippy::too_many_arguments)]

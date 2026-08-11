@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use ferrum_edge::config::types::{
-    GatewayConfig, LoadBalancerAlgorithm, Proxy, Upstream, UpstreamTarget, MAX_TARGETS_PER_UPSTREAM,
+    GatewayConfig, LoadBalancerAlgorithm, MAX_TARGETS_PER_UPSTREAM, Proxy, Upstream, UpstreamTarget,
 };
 use ferrum_edge::proxy::unix_backend::MESH_UNIX_SOCKET_TAG;
 
@@ -227,7 +227,9 @@ fn h3_plain_and_ws_retry_share_eligible_helper_not_ad_hoc_loops() {
         "shared eligibility helper must live in backend_dispatch and honour MAX_TARGETS_PER_UPSTREAM"
     );
     assert_eq!(
-        cross.matches("select_next_h3_eligible_retry_target(").count(),
+        cross
+            .matches("select_next_h3_eligible_retry_target(")
+            .count(),
         1,
         "cross-protocol must call the shared H3-eligible helper once"
     );
@@ -253,9 +255,8 @@ fn h3_plain_and_ws_retry_share_eligible_helper_not_ad_hoc_loops() {
     assert!(
         ws_retry.contains("None =>")
             && ws_retry.contains("retry_path_mismatch = true")
-            && ws_retry.contains(
-                "\"Aborting H3 WebSocket retry: no H3-eligible candidate remains\""
-            ),
+            && ws_retry
+                .contains("\"Aborting H3 WebSocket retry: no H3-eligible candidate remains\""),
         "H3 WebSocket must abort when select_next_h3_eligible_retry_target returns None"
     );
 
