@@ -345,6 +345,104 @@ fn with_current<R>(key: &str, generation: u64, f: impl FnOnce(&mut TaskHealth) -
     Some(f(entry.value_mut()))
 }
 
+/// Outcome of a generation-fenced publication attempt.
+pub(crate) enum FencedPublish<T> {
+    /// The generation still owned the key, so the publication closure ran.
+    Published(T),
+    /// The generation was superseded (or its entry already removed). The
+    /// publication closure never ran.
+    Superseded,
+}
+
+impl<T> FencedPublish<T> {
+    /// `None` when the generation was superseded.
+    #[allow(dead_code)] // reached from the external test crate; dead in the bin target
+    pub(crate) fn published(self) -> Option<T> {
+        match self {
+            Self::Published(value) => Some(value),
+            Self::Superseded => None,
+        }
+    }
+}
+
+/// Run `publish` only while `generation` still owns `key`, holding this key's
+/// registry shard guard across the whole check-and-publish window.
+///
+/// This is the publication fence. [`register_task`] installs a replacement
+/// generation through `DashMap::insert`, which must take the **same** shard
+/// write lock, so a reconcile either completes before the ownership check here
+/// (and `publish` never runs) or blocks until after the publication finished.
+/// A bare [`generation_is_current`] call followed by a publication would leave
+/// exactly that window open, letting a superseded task overwrite the
+/// replacement's load-balancer / request-epoch state.
+///
+/// Contract for `publish`:
+///
+/// * synchronous — never `.await` while the shard guard is held;
+/// * must not call back into this module (a re-entrant registry access on the
+///   same shard would deadlock, and an aggregate recompute walks every shard);
+/// * bounded — other keys hashing to this shard block for its duration.
+///
+/// Lock order is registry shard → publication locks (request-epoch write lock,
+/// load-balancer/health-check maps). Nothing in those paths reads this
+/// registry, so the order cannot invert.
+pub(crate) fn publish_if_current<T>(
+    key: &str,
+    generation: u64,
+    publish: impl FnOnce() -> T,
+) -> FencedPublish<T> {
+    let Some(entry) = registry().get_mut(key) else {
+        return FencedPublish::Superseded;
+    };
+    if entry.generation != generation {
+        return FencedPublish::Superseded;
+    }
+    let result = publish();
+    // Explicit: the shard guard must outlive `publish()`, which is the whole
+    // point of the fence.
+    drop(entry);
+    FencedPublish::Published(result)
+}
+
+/// Publish a staleness withdrawal and claim its expiry episode under one fence.
+///
+/// Returns the publication result plus whether this call claimed the episode,
+/// so the caller keeps emitting exactly one operator warning and one metric per
+/// episode. Claiming inside the fence keeps a superseded generation from
+/// consuming the replacement's episode, and gives the static-only
+/// republication the same anti-race guarantee as [`publish_if_current`].
+pub(crate) fn publish_withdrawal_if_current<E>(
+    key: &str,
+    generation: u64,
+    publish: impl FnOnce() -> Result<(), E>,
+) -> FencedPublish<(Result<(), E>, bool)> {
+    let result;
+    let claimed;
+    {
+        let Some(mut entry) = registry().get_mut(key) else {
+            return FencedPublish::Superseded;
+        };
+        if entry.generation != generation {
+            return FencedPublish::Superseded;
+        }
+        result = publish();
+        claimed = if result.is_ok() && !entry.expiry_applied {
+            entry.expiry_applied = true;
+            entry.withdrawn = true;
+            entry.expiry_retry_at = None;
+            entry.expiry_retry_attempts = 0;
+            true
+        } else {
+            false
+        };
+    }
+    if claimed {
+        // Never inside the fence: the recompute walks every shard.
+        refresh_coarse_aggregate();
+    }
+    FencedPublish::Published((result, claimed))
+}
+
 /// Register (or replace) the health entry for a newly started task generation.
 pub(crate) fn register_task(
     key: &str,
@@ -436,19 +534,21 @@ pub(crate) fn record_failure(key: &str, generation: u64, reason: DiscoveryFailur
     });
 }
 
-/// Claim the expiry action for the current stale episode.
+/// Claim a non-withdrawing expiry episode (the `retain` policy).
 ///
 /// Idempotent: returns `true` only for the transition into the expired state,
-/// so the discovery loop applies exactly one expiry action per episode — under
-/// every policy, including `retain`, which performs no withdrawal — and cannot
-/// hot-loop on an already-expired staleness deadline.
-pub(crate) fn claim_expiry(key: &str, generation: u64, withdrew: bool) -> bool {
+/// so the discovery loop applies exactly one expiry action per episode and
+/// cannot hot-loop on an already-expired staleness deadline. Withdrawing
+/// policies claim their episode inside the publication fence instead
+/// ([`publish_withdrawal_if_current`]), so the claim cannot be separated from
+/// the republication it describes.
+pub(crate) fn claim_expiry(key: &str, generation: u64) -> bool {
     let claimed = with_current(key, generation, |entry| {
         if entry.expiry_applied {
             return false;
         }
         entry.expiry_applied = true;
-        entry.withdrawn = withdrew;
+        entry.withdrawn = false;
         entry.expiry_retry_at = None;
         entry.expiry_retry_attempts = 0;
         true
@@ -692,6 +792,41 @@ pub fn generation_for_test(key: &str) -> Option<u64> {
 #[allow(dead_code)] // reached from the external test crate; dead in the bin target
 pub fn expiry_retry_attempts_for_test(key: &str) -> Option<u64> {
     registry().get(key).map(|entry| entry.expiry_retry_attempts)
+}
+
+/// Run `body` inside the production publication fence for `key`/`generation`.
+///
+/// Test-only seam for proving the interleaving contract: while `body` runs, a
+/// concurrent [`register_task_for_test`] for the same key cannot complete.
+/// `None` means the generation was already superseded and `body` never ran.
+/// `body` must not touch this registry (see [`publish_if_current`]).
+#[allow(dead_code)] // reached from the external test crate; dead in the bin target
+pub fn publish_under_fence_for_test<T>(
+    key: &str,
+    generation: u64,
+    body: impl FnOnce() -> T,
+) -> Option<T> {
+    publish_if_current(key, generation, body).published()
+}
+
+/// Drive the staleness-withdrawal fence exactly as the discovery loop's expiry
+/// path does. `None` means the generation was superseded and `publish` never
+/// ran; otherwise the publication result and whether this call claimed the
+/// expiry episode.
+#[allow(dead_code)] // reached from the external test crate; dead in the bin target
+pub fn publish_withdrawal_under_fence_for_test(
+    key: &str,
+    generation: u64,
+    publish: impl FnOnce() -> Result<(), String>,
+) -> Option<(Result<(), String>, bool)> {
+    publish_withdrawal_if_current(key, generation, publish).published()
+}
+
+/// Whether `key`'s current entry has its expiry episode applied. Test-only
+/// observation seam for the fenced withdrawal claim.
+#[allow(dead_code)] // reached from the external test crate; dead in the bin target
+pub fn expiry_applied_for_test(key: &str) -> Option<bool> {
+    registry().get(key).map(|entry| entry.expiry_applied)
 }
 
 /// Force `key`'s staleness anchor to `age` seconds ago without waiting.

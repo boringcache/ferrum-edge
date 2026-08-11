@@ -138,6 +138,20 @@ fn task_key(id: &str) -> String {
     format!("{}|{}", default_namespace(), id)
 }
 
+/// Hosts currently installed in the load balancer for `id`.
+fn lb_hosts(lb_cache: &LoadBalancerCache, id: &str) -> Vec<String> {
+    lb_cache
+        .get_upstream(&default_namespace(), id)
+        .map(|upstream| {
+            upstream
+                .targets
+                .iter()
+                .map(|target| target.host.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Discoverer under full test control: it can return targets, fail, or panic.
 struct ScriptedDiscoverer {
     calls: Arc<AtomicU64>,
@@ -481,6 +495,341 @@ async fn a_superseded_generation_neither_restarts_nor_publishes() {
         Some(99),
         "the superseded supervisor must not have overwritten the newer generation"
     );
+}
+
+// ── #3721: the publication fence ──────────────────────────────────────
+//
+// The invariant is stronger than "check ownership before publishing": a bare
+// check followed by a publication leaves a window in which a reconcile can
+// register the replacement generation, after which the superseded task still
+// overwrites the replacement's load-balancer / request-epoch state. These tests
+// pin the atomicity of the check and the publication.
+
+fn scripted_staleness() -> health::DiscoveryStaleness {
+    health::resolve_staleness(60, SdStalePolicy::Withdraw, 1)
+}
+
+/// Spin until `predicate` holds. Used only to hand off between the fence
+/// holder and the thread standing in for a reconcile.
+fn spin_until(predicate: impl Fn() -> bool) {
+    while !predicate() {
+        std::thread::yield_now();
+    }
+}
+
+#[tokio::test]
+async fn a_replacement_generation_cannot_register_between_the_fence_check_and_the_publish() {
+    let _guard = isolated().await;
+
+    let key = task_key("fenced-publish");
+    health::register_task_for_test(&key, 1, "scripted", scripted_staleness());
+
+    let entered = Arc::new(AtomicBool::new(false));
+    let replacement_started = Arc::new(AtomicBool::new(false));
+    let published = Arc::new(AtomicBool::new(false));
+
+    let holder = {
+        let key = key.clone();
+        let entered = Arc::clone(&entered);
+        let replacement_started = Arc::clone(&replacement_started);
+        let published = Arc::clone(&published);
+        std::thread::spawn(move || {
+            health::publish_under_fence_for_test(&key, 1, || {
+                entered.store(true, Ordering::SeqCst);
+                // Hold the fence across the whole window in which a reconcile
+                // tries to install the replacement generation.
+                spin_until(|| replacement_started.load(Ordering::SeqCst));
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                published.store(true, Ordering::SeqCst);
+            })
+            .is_some()
+        })
+    };
+
+    spin_until(|| entered.load(Ordering::SeqCst));
+    replacement_started.store(true, Ordering::SeqCst);
+    // Stands in for the reconcile that registers the replacement. It must not
+    // be able to complete while the superseded generation is mid-publication.
+    health::register_task_for_test(&key, 2, "scripted", scripted_staleness());
+
+    assert!(
+        published.load(Ordering::SeqCst),
+        "a replacement generation registered while the fenced publication was still running; \
+         the ownership check and the publication are not atomic"
+    );
+    assert!(
+        holder.join().expect("fence thread"),
+        "the fence must admit the generation that still owned the key"
+    );
+    assert_eq!(health::generation_for_test(&key), Some(2));
+
+    // Past the replacement, the superseded generation is refused outright.
+    let ran = Arc::new(AtomicBool::new(false));
+    let refused = health::publish_under_fence_for_test(&key, 1, || {
+        ran.store(true, Ordering::SeqCst);
+    });
+    assert!(refused.is_none(), "a superseded generation must be refused");
+    assert!(
+        !ran.load(Ordering::SeqCst),
+        "a superseded generation must not run its publication at all"
+    );
+}
+
+/// Drive the production apply pipeline bound to a supervised generation.
+#[allow(clippy::too_many_arguments)]
+async fn apply_under_generation(
+    upstream_id: &str,
+    lifecycle_key: &str,
+    generation: u64,
+    discovered: Vec<UpstreamTarget>,
+    state: &mut ferrum_edge::_test_support::DiscoveryLoopStateForTest,
+    lb_cache: &LoadBalancerCache,
+    dns_cache: &DnsCache,
+    health_checker: &HealthChecker,
+    cancel_rx: &tokio::sync::watch::Receiver<bool>,
+) -> ferrum_edge::_test_support::DiscoveryApplyControlForTest {
+    ferrum_edge::_test_support::apply_service_discovery_snapshot_for_generation_for_test(
+        &default_namespace(),
+        upstream_id,
+        "scripted",
+        DiscoverySnapshot::from_targets(discovered),
+        state,
+        lb_cache,
+        &None,
+        &[],
+        LoadBalancerAlgorithm::RoundRobin,
+        &None,
+        cancel_rx,
+        &None,
+        dns_cache,
+        health_checker,
+        lifecycle_key,
+        generation,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_superseded_generation_publishes_no_discovered_snapshot() {
+    let _guard = isolated().await;
+
+    let config = config_with(vec![upstream_with_sd("fenced-snapshot", Vec::new(), None)]);
+    let lb_cache = LoadBalancerCache::new(&config);
+    let dns_cache = DnsCache::new(Default::default());
+    let health_checker = HealthChecker::new();
+    let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    let key = task_key("fenced-snapshot");
+
+    health::register_task_for_test(&key, 1, "scripted", scripted_staleness());
+    let mut state = ferrum_edge::_test_support::DiscoveryLoopStateForTest::new();
+
+    // Current generation: the fence admits the publication.
+    let control = apply_under_generation(
+        "fenced-snapshot",
+        &key,
+        1,
+        vec![target("first.local", 8080)],
+        &mut state,
+        &lb_cache,
+        &dns_cache,
+        &health_checker,
+        &cancel_rx,
+    )
+    .await;
+    assert_eq!(
+        control,
+        ferrum_edge::_test_support::DiscoveryApplyControlForTest::Continue
+    );
+    assert_eq!(lb_hosts(&lb_cache, "fenced-snapshot"), vec!["first.local"]);
+
+    // A reconcile installs the replacement generation.
+    health::register_task_for_test(&key, 2, "scripted", scripted_staleness());
+
+    let control = apply_under_generation(
+        "fenced-snapshot",
+        &key,
+        1,
+        vec![target("superseded.local", 8080)],
+        &mut state,
+        &lb_cache,
+        &dns_cache,
+        &health_checker,
+        &cancel_rx,
+    )
+    .await;
+
+    assert_eq!(
+        control,
+        ferrum_edge::_test_support::DiscoveryApplyControlForTest::Stop,
+        "a superseded generation must stop instead of publishing"
+    );
+    assert_eq!(
+        lb_hosts(&lb_cache, "fenced-snapshot"),
+        vec!["first.local"],
+        "a superseded generation must not overwrite the replacement's load-balancer state"
+    );
+}
+
+#[tokio::test]
+async fn a_superseded_generation_publishes_no_staleness_withdrawal() {
+    let _guard = isolated().await;
+
+    let key = task_key("fenced-withdrawal");
+    health::register_task_for_test(&key, 1, "scripted", scripted_staleness());
+
+    // While current, the fenced withdrawal publishes and claims the episode.
+    let published = health::publish_withdrawal_under_fence_for_test(&key, 1, || Ok(()))
+        .expect("the current generation may withdraw");
+    assert!(published.0.is_ok());
+    assert!(published.1, "the current generation claims its episode");
+    assert_eq!(health::expiry_applied_for_test(&key), Some(true));
+
+    // A second withdrawal in the same episode publishes but does not re-claim,
+    // so the operator warning and metric stay one-per-episode.
+    let repeat = health::publish_withdrawal_under_fence_for_test(&key, 1, || Ok(()))
+        .expect("still the current generation");
+    assert!(!repeat.1, "an episode must be claimed exactly once");
+
+    // A reconcile installs the replacement generation.
+    health::register_task_for_test(&key, 2, "scripted", scripted_staleness());
+
+    let ran = Arc::new(AtomicBool::new(false));
+    let refused = health::publish_withdrawal_under_fence_for_test(&key, 1, || {
+        ran.store(true, Ordering::SeqCst);
+        Ok(())
+    });
+    assert!(
+        refused.is_none(),
+        "a superseded generation must not publish a static-only withdrawal"
+    );
+    assert!(
+        !ran.load(Ordering::SeqCst),
+        "the withdrawal publication must not run at all for a superseded generation"
+    );
+    assert_eq!(
+        health::expiry_applied_for_test(&key),
+        Some(false),
+        "a superseded generation must not consume the replacement's expiry episode"
+    );
+}
+
+#[tokio::test]
+async fn a_replacement_generation_cannot_register_during_a_fenced_withdrawal() {
+    let _guard = isolated().await;
+
+    let key = task_key("fenced-withdrawal-race");
+    health::register_task_for_test(&key, 1, "scripted", scripted_staleness());
+
+    let entered = Arc::new(AtomicBool::new(false));
+    let replacement_started = Arc::new(AtomicBool::new(false));
+    let published = Arc::new(AtomicBool::new(false));
+
+    let holder = {
+        let key = key.clone();
+        let entered = Arc::clone(&entered);
+        let replacement_started = Arc::clone(&replacement_started);
+        let published = Arc::clone(&published);
+        std::thread::spawn(move || {
+            health::publish_withdrawal_under_fence_for_test(&key, 1, || {
+                entered.store(true, Ordering::SeqCst);
+                spin_until(|| replacement_started.load(Ordering::SeqCst));
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                published.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+            .is_some()
+        })
+    };
+
+    spin_until(|| entered.load(Ordering::SeqCst));
+    replacement_started.store(true, Ordering::SeqCst);
+    health::register_task_for_test(&key, 2, "scripted", scripted_staleness());
+
+    assert!(
+        published.load(Ordering::SeqCst),
+        "a replacement generation registered while a staleness withdrawal was mid-publication"
+    );
+    assert!(holder.join().expect("fence thread"));
+    assert_eq!(health::generation_for_test(&key), Some(2));
+    assert_eq!(
+        health::expiry_applied_for_test(&key),
+        Some(false),
+        "the replacement's fresh entry must not inherit the superseded episode claim"
+    );
+}
+
+#[tokio::test]
+async fn a_superseded_supervisor_does_not_withdraw_when_its_staleness_bound_elapses() {
+    let _guard = isolated().await;
+
+    let statics = vec![target("static.local", 9000)];
+    let config = config_with(vec![upstream_with_sd(
+        "superseded-stale",
+        statics.clone(),
+        None,
+    )]);
+    let lb_cache = Arc::new(LoadBalancerCache::new(&config));
+    let discoverer = Arc::new(ScriptedDiscoverer::new(vec![target("discovered.local", 8080)]));
+    let hang = Arc::clone(&discoverer.hang);
+    let calls = Arc::clone(&discoverer.calls);
+    let metrics = ferrum_edge::plugins::prometheus_metrics::global_registry();
+    let withdrawals_before = metrics.service_discovery_stale_withdrawals_total();
+
+    let task = spawn_supervised_discovery_task_for_test(
+        &default_namespace(),
+        "superseded-stale",
+        "scripted",
+        discoverer,
+        Arc::clone(&lb_cache),
+        None,
+        Arc::new(HealthChecker::new()),
+        DnsCache::new(Default::default()),
+        statics,
+        LoadBalancerAlgorithm::RoundRobin,
+        1,
+        3,
+        SdStalePolicy::Withdraw,
+        1,
+    );
+
+    assert!(
+        wait_for(|| {
+            lb_hosts(&lb_cache, "superseded-stale").contains(&"discovered.local".to_string())
+        })
+        .await,
+        "initial discovered snapshot must publish"
+    );
+    // Park the poller inside discover() so the registry stops answering, then
+    // supersede it exactly as a reconcile would — before its 3s staleness bound
+    // elapses. A deadline armed before the replacement registered still reaches
+    // the expiry path, where the fence must refuse it.
+    hang.store(true, Ordering::SeqCst);
+    health::register_task_for_test(&task.key, 99, "scripted", scripted_staleness());
+    assert!(
+        calls.load(Ordering::SeqCst) >= 1,
+        "the poller must have run before it was superseded"
+    );
+
+    // Well past the effective staleness bound: nothing may be withdrawn.
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+    assert!(
+        lb_hosts(&lb_cache, "superseded-stale").contains(&"discovered.local".to_string()),
+        "a superseded generation must not withdraw discovered targets"
+    );
+    assert_eq!(
+        health::expiry_applied_for_test(&task.key),
+        Some(false),
+        "a superseded generation must not claim the replacement's expiry episode"
+    );
+    assert_eq!(
+        metrics.service_discovery_stale_withdrawals_total(),
+        withdrawals_before,
+        "no withdrawal may be recorded for a superseded generation"
+    );
+
+    let _ = task.cancel_tx.send(true);
+    let _ = task.handle.await;
 }
 
 // ── #3717: bounded staleness ──────────────────────────────────────────

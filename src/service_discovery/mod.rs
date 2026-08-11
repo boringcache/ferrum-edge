@@ -26,7 +26,7 @@ use crate::load_balancer::{LoadBalancerCache, target_host_port_key};
 use crate::plugins::PluginHttpClient;
 use crate::request_epoch::RequestEpochStore;
 use dashmap::DashMap;
-use health::{DiscoveryFailureReason, DiscoveryStaleness};
+use health::{DiscoveryFailureReason, DiscoveryStaleness, FencedPublish};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1211,6 +1211,17 @@ pub(crate) enum DiscoveryApplyControl {
     Stop,
 }
 
+/// Outcome of one fenced installation of a merged target set.
+#[derive(Debug)]
+enum FencedInstall {
+    /// Targets were installed into the load balancer / request epoch.
+    Published,
+    /// Installation was attempted and failed; last-known targets are retained.
+    Failed(String),
+    /// Cancel or shutdown was observed inside the fence; nothing was published.
+    Aborted,
+}
+
 /// Exact production admission → publication → cursor-commit pipeline for one
 /// successful `discover()` result. Used by [`run_discovery_loop`] and exposed
 /// to external tests through `_test_support` so coverage cannot bypass the
@@ -1313,9 +1324,12 @@ pub(crate) async fn apply_discovered_snapshot(
         }
     };
 
-    // Fence a superseded generation before it can publish: a reconcile may have
-    // replaced this task while `discover()` was in flight, and the replacement
-    // owns the load-balancer state for this upstream (issue #3721).
+    // Early exit for a task that was already superseded while `discover()` was
+    // in flight: the replacement owns the load-balancer state for this upstream
+    // (issue #3721). This check only avoids wasted merge/DNS-warmup work — the
+    // authoritative fence is around the publication itself, below, because any
+    // check performed *before* an unfenced publish can be overtaken by the
+    // reconcile that registers the replacement.
     if let Some(lifecycle) = lifecycle
         && !lifecycle.is_current()
     {
@@ -1386,43 +1400,72 @@ pub(crate) async fn apply_discovered_snapshot(
             dns_cache.warmup(hostnames).await;
         }
 
-        // Cancellation could have fired during the DNS warmup await.
-        if *cancel_rx.borrow() {
-            debug!(
-                "Service discovery: task for upstream {} canceled during DNS warmup, discarding results",
-                upstream_id,
-            );
-            return DiscoveryApplyControl::Stop;
-        }
-        if let Some(rx) = shutdown_rx
-            && *rx.borrow()
-        {
-            debug!(
-                "Service discovery: shutting down task for upstream {} during DNS warmup, discarding results",
-                upstream_id,
-            );
-            return DiscoveryApplyControl::Stop;
-        }
-
-        if let Err(error) = install_merged_targets(
-            upstream_namespace,
-            upstream_id,
-            &merged,
-            lb_cache,
-            request_epoch,
-            algorithm,
-            hash_on,
-            health_checker,
-        ) {
-            warn!(
-                "Service discovery [{}]: upstream {} target publication failed: {}. Keeping last-known targets and blocking-query cursor.",
-                provider_name, upstream_id, error,
-            );
-            if let Some(lifecycle) = lifecycle {
-                lifecycle.record_failure(DiscoveryFailureReason::PublishFailed);
+        // Everything that decides whether this task may still write routing
+        // state runs inside the fence: cancellation (which a reconcile signals
+        // *before* it registers the replacement) and the load-balancer /
+        // request-epoch installation. While the fence is held, a reconcile
+        // cannot register the replacement generation, so the check and the
+        // publication cannot be interleaved.
+        let install = || {
+            if *cancel_rx.borrow() {
+                return FencedInstall::Aborted;
             }
-            // Drop pending cursor without committing.
-            return DiscoveryApplyControl::Continue;
+            if let Some(rx) = shutdown_rx
+                && *rx.borrow()
+            {
+                return FencedInstall::Aborted;
+            }
+            match install_merged_targets(
+                upstream_namespace,
+                upstream_id,
+                &merged,
+                lb_cache,
+                request_epoch,
+                algorithm,
+                hash_on,
+                health_checker,
+            ) {
+                Ok(()) => FencedInstall::Published,
+                Err(error) => FencedInstall::Failed(error),
+            }
+        };
+
+        let installed = match lifecycle {
+            Some(lifecycle) => match lifecycle.publish_fenced(install) {
+                FencedPublish::Published(installed) => installed,
+                FencedPublish::Superseded => {
+                    info!(
+                        upstream = %upstream_id,
+                        "Service discovery: superseded task discarding discovery results without publishing"
+                    );
+                    return DiscoveryApplyControl::Stop;
+                }
+            },
+            // No supervised generation behind this call (external test seam):
+            // there is no ownership entry to fence against.
+            None => install(),
+        };
+
+        match installed {
+            FencedInstall::Published => {}
+            FencedInstall::Aborted => {
+                debug!(
+                    "Service discovery: task for upstream {} canceled or shutting down before publication, discarding results",
+                    upstream_id,
+                );
+                return DiscoveryApplyControl::Stop;
+            }
+            FencedInstall::Failed(error) => {
+                warn!(
+                    "Service discovery [{}]: upstream {} target publication failed: {}. Keeping last-known targets and blocking-query cursor.",
+                    provider_name, upstream_id, error,
+                );
+                if let Some(lifecycle) = lifecycle {
+                    lifecycle.record_failure(DiscoveryFailureReason::PublishFailed);
+                }
+                // Drop pending cursor without committing.
+                return DiscoveryApplyControl::Continue;
+            }
         }
 
         state.last_discovered = discovered;
@@ -1512,12 +1555,20 @@ pub(crate) struct DiscoveryLifecycle {
 }
 
 impl DiscoveryLifecycle {
-    fn new(key: String, generation: u64) -> Self {
+    pub(crate) fn new(key: String, generation: u64) -> Self {
         Self { key, generation }
     }
 
     fn is_current(&self) -> bool {
         health::generation_is_current(&self.key, self.generation)
+    }
+
+    /// Run `publish` under this generation's ownership fence.
+    ///
+    /// The ownership check and the publication are atomic with respect to
+    /// generation replacement: see [`health::publish_if_current`].
+    fn publish_fenced<T>(&self, publish: impl FnOnce() -> T) -> FencedPublish<T> {
+        health::publish_if_current(&self.key, self.generation, publish)
     }
 
     fn record_success(&self) {
@@ -1675,12 +1726,16 @@ async fn run_discovery_loop(
 /// withdrawal, not a republish per timer wakeup. Recovery clears it: the next
 /// admitted snapshot republishes through the ordinary path because the loop's
 /// `last_discovered` was reset here.
+///
+/// Withdrawal publishes through the same ownership fence as an ordinary
+/// snapshot, so a superseded generation cannot install static-only targets over
+/// the replacement's routing state.
 fn apply_staleness_expiry(ctx: &DiscoveryTaskContext, state: &mut DiscoveryLoopState) {
     let policy = ctx.staleness.policy;
     let registry = crate::plugins::prometheus_metrics::global_registry();
 
     if !policy.withdraws() {
-        if health::claim_expiry(&ctx.key, ctx.generation, false) {
+        if health::claim_expiry(&ctx.key, ctx.generation) {
             registry.record_service_discovery_stale_expiry();
             warn!(
                 upstream = %ctx.upstream_id,
@@ -1695,16 +1750,33 @@ fn apply_staleness_expiry(ctx: &DiscoveryTaskContext, state: &mut DiscoveryLoopS
 
     let withdrawn_count = state.last_discovered.len();
     let merged = merge_targets(&ctx.static_targets, &[]);
-    let published = install_merged_targets(
-        &ctx.upstream_namespace,
-        &ctx.upstream_id,
-        &merged,
-        &ctx.lb_cache,
-        &ctx.request_epoch,
-        ctx.algorithm,
-        &ctx.hash_on,
-        &ctx.health_checker,
-    );
+    // The static-only republication and the expiry claim run under the same
+    // ownership fence as ordinary publication: a generation replaced while this
+    // withdrawal was being computed can neither overwrite the replacement's
+    // load-balancer state nor consume its expiry episode.
+    let fenced = health::publish_withdrawal_if_current(&ctx.key, ctx.generation, || {
+        install_merged_targets(
+            &ctx.upstream_namespace,
+            &ctx.upstream_id,
+            &merged,
+            &ctx.lb_cache,
+            &ctx.request_epoch,
+            ctx.algorithm,
+            &ctx.hash_on,
+            &ctx.health_checker,
+        )
+    });
+    let (published, claimed) = match fenced {
+        FencedPublish::Published(outcome) => outcome,
+        FencedPublish::Superseded => {
+            debug!(
+                upstream = %ctx.upstream_id,
+                generation = ctx.generation,
+                "Service discovery: superseded task did not publish a staleness withdrawal"
+            );
+            return;
+        }
+    };
 
     match published {
         Ok(()) => {
@@ -1712,7 +1784,7 @@ fn apply_staleness_expiry(ctx: &DiscoveryTaskContext, state: &mut DiscoveryLoopS
             // snapshot even when it is byte-identical to the withdrawn set.
             state.last_discovered.clear();
             state.snapshot_installed = true;
-            if health::claim_expiry(&ctx.key, ctx.generation, true) {
+            if claimed {
                 registry.record_service_discovery_stale_expiry();
                 registry.record_service_discovery_stale_withdrawal();
                 warn!(
