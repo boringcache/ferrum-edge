@@ -1395,8 +1395,33 @@ pub mod _test_support {
                 jwks_uri,
                 &http_client,
                 refresh_interval,
+                Duration::from_secs(
+                    crate::plugins::utils::jwks_store::DEFAULT_JWKS_MAX_STALE_SECONDS,
+                ),
             ),
         )
+    }
+
+    /// Arm a one-shot rejection after JWKS background startup during the next
+    /// staged PluginCache build. Used to prove unpublished max-stale policy is
+    /// rolled back to the still-published generation.
+    pub fn request_plugin_cache_reject_after_jwks_startup_for_test() {
+        crate::plugin_cache::request_reject_after_jwks_startup_for_test();
+    }
+
+    pub fn clear_jwks_cache_for_test() {
+        crate::plugins::utils::jwks_cache::clear_jwks_cache();
+    }
+
+    pub fn cached_jwks_requirement_for_test(
+        jwks_uri: &str,
+    ) -> Option<crate::plugins::utils::jwks_cache::JwksRefreshRequirement> {
+        crate::plugins::utils::jwks_cache::cached_requirement(jwks_uri)
+    }
+
+    pub fn cached_jwks_refresh_generation_for_test(jwks_uri: &str) -> Option<u64> {
+        crate::plugins::utils::jwks_cache::cached_refresh_state(jwks_uri)
+            .map(|(_, generation)| generation)
     }
 
     pub fn oidc_sealed_refresh_session_cookie_for_test(
