@@ -2676,10 +2676,19 @@ async fn process_new_session_datagram(
     // ultimately reject them.
     let stream_ctx = admit_plain_udp_stream(&epoch, &view, client_addr, listen_port).await?;
 
+    // Bind the flow's datagram hooks to the decisions the admission chain just
+    // memoized. Evaluated once here; every datagram of this session — starting
+    // with this one — consumes the resulting list without re-evaluating a
+    // predicate (issue #3734).
+    let admitted_datagram_plugins = crate::plugins::admitted_datagram_plugins(
+        &view.datagram_plugins,
+        &stream_ctx.plugin_trigger_decisions(),
+    );
+
     let first_datagram_metadata =
         std::sync::Mutex::new(std::collections::HashMap::<String, String>::new());
     if !udp_datagram_allowed(
-        &view.datagram_plugins,
+        &admitted_datagram_plugins,
         udp_session_client_ip(client_addr),
         Arc::from(view.proxy.id.as_str()),
         view.proxy.name.as_deref().map(Arc::from),
@@ -3261,6 +3270,14 @@ async fn start_dtls_frontend_listener(
                     // Opaque connect-time execution-trigger outcomes, carried to
                     // the disconnect summary so a skipped instance stays skipped.
                     let handler_trigger_decisions = stream_ctx.plugin_trigger_decisions();
+                    // Bind this DTLS flow's datagram hooks to the same
+                    // decisions, once, before any datagram hook runs. Every
+                    // later datagram traverses the filtered list with no
+                    // predicate re-evaluation (issue #3734).
+                    let datagram_plugins = crate::plugins::admitted_datagram_plugins(
+                        &datagram_plugins,
+                        &handler_trigger_decisions,
+                    );
                     let (handler_metadata, handler_correlation_ids) = if handler_has_plugins {
                         stream_ctx.take_metadata_with_correlation_ids()
                     } else {
@@ -4055,6 +4072,14 @@ async fn create_session(
         consumer_index: _,
         sni_hostname: _,
     } = view;
+    // Same binding the caller applied to the first datagram: a per-instance
+    // trigger that evaluated `false` during `on_stream_connect` performs zero
+    // datagram-hook work for the whole flow, including the hook-ingress channel
+    // this session would otherwise allocate for it.
+    let datagram_plugins = crate::plugins::admitted_datagram_plugins(
+        &datagram_plugins,
+        &stream_ctx.plugin_trigger_decisions(),
+    );
     let proxy_id = proxy.id.as_str();
     let proxy_name = proxy.name.clone();
     let proxy_namespace = proxy.namespace.clone();

@@ -1742,7 +1742,8 @@ paths:
         right now?": process CPU and memory, file descriptors, ephemeral-port
         pressure, HTTP status rates, error classes, DNS cache outcomes, pool
         churn, TCP resets, log-event counters, bounded stdout/stderr sink
-        health/loss/last-failure diagnostics, and the inline overload state.
+        health/loss/last-failure diagnostics, unlabeled plugin execution-trigger
+        carrier counters, and the inline overload state.
 
         The response is cached briefly (default 1000 ms, configurable with
         `FERRUM_METRICS_RUNTIME_CACHE_MS`) because system metrics are sampled in
@@ -12579,7 +12580,7 @@ components:
     # ── Runtime metrics ─────────────────────────────────────────────
     RuntimeMetricsSnapshot:
       type: object
-      required: [timestamp, uptime_seconds, mode, ferrum_version, system, http, errors, dns, connections, logs, overload]
+      required: [timestamp, uptime_seconds, mode, ferrum_version, system, http, errors, dns, connections, logs, plugin_triggers, overload]
       properties:
         timestamp:
           type: string
@@ -12604,8 +12605,42 @@ components:
           $ref: "#/components/schemas/RuntimeConnectionsSnapshot"
         logs:
           $ref: "#/components/schemas/RuntimeLogsSnapshot"
+        plugin_triggers:
+          $ref: "#/components/schemas/RuntimePluginTriggerSnapshot"
         overload:
           $ref: "#/components/schemas/OverloadSnapshot"
+
+    RuntimePluginTriggerSnapshot:
+      type: object
+      description: |
+        Fixed-cardinality counters for per-instance plugin execution-trigger
+        decision carriers. These counters carry no labels: no trigger input,
+        route, identity, header value, plugin-controlled string, or secret is
+        ever recorded. Monotonic for the process lifetime.
+      required: [skipped_terminal_log_hooks, skipped_session_hooks, missing_decision_carriers]
+      properties:
+        skipped_terminal_log_hooks:
+          type: integer
+          format: uint64
+          description: |
+            Terminal `log` / `log_with_mesh_key` invocations suppressed because
+            the transaction summary carried an explicit false decision for that
+            instance.
+        skipped_session_hooks:
+          type: integer
+          format: uint64
+          description: |
+            WebSocket-session and UDP/DTLS-flow hook sets suppressed because the
+            session carried an explicit false decision for that instance.
+        missing_decision_carriers:
+          type: integer
+          format: uint64
+          description: |
+            Contextless hooks that RAN because no decision was carried for the
+            instance. Backward compatible by design (missing state never
+            suppresses a security or audit hook); a sustained nonzero rate on a
+            triggered deployment means a summary or session path is not stamping
+            the carrier.
 
     RuntimeSystemSnapshot:
       type: object

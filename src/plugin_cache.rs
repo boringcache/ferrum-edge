@@ -102,14 +102,19 @@ use async_trait::async_trait;
 /// `DeferredCorsPlugin` and its trigger still governs both hooks that wrapper
 /// forwards.
 ///
-/// # Phase boundary
+/// # Contextless phases
 ///
-/// `WS frame`, `UDP datagram`, WS-disconnect, the initial response-header
-/// policy, and the `log` phase have no request context at the point they run, so
-/// they cannot be gated coherently. Plugin-cache admission REFUSES a trigger on
-/// an instance that declares the first four rather than silently half-applying
-/// one; the `log` phase is the documented ungated boundary and is forwarded
-/// unconditionally. See `trigger_composition_error`.
+/// The `log` phase, WS frame/reassembly/delivery/disconnect, and UDP datagram
+/// hooks have no request context at the point they run. They are still gated,
+/// by consuming ONE decision taken where authoritative facts existed and carried
+/// to the hook: `TransactionSummary` / `StreamTransactionSummary` for the
+/// terminal hooks, the upgrade's memoized decision for WebSocket (consumed while
+/// the relay builds the session's plugin lists, before any capability set), and
+/// the session's `StreamTriggerDecisions` for UDP/DTLS. Explicit `false` skips,
+/// explicit `true` runs, and a MISSING carrier runs — missing state never
+/// suppresses a security or audit hook. The initial response-header policy and
+/// the other generation-folded capabilities remain REFUSED at publication rather
+/// than half-applied. See `trigger_composition_error`.
 struct PluginInstanceWrapper {
     inner: Arc<dyn Plugin>,
     priority: u16,
@@ -141,6 +146,16 @@ impl PluginInstanceWrapper {
     fn runs_stream(&self, ctx: &mut StreamConnectionContext) -> bool {
         match &self.trigger {
             Some(gate) => gate.admits_stream(ctx),
+            None => true,
+        }
+    }
+
+    /// Read the decision carried on a terminal transaction summary. Explicit
+    /// `false` skips, explicit `true` runs, missing runs (and is counted).
+    #[inline]
+    fn runs_terminal_log(&self, summary: &TransactionSummary) -> bool {
+        match &self.trigger {
+            Some(gate) => gate.transaction_log_decision_or_run(summary),
             None => true,
         }
     }
@@ -765,13 +780,15 @@ pub(crate) fn validate_plugin_security_composition(
 ///
 /// The refused surfaces are:
 ///
-/// * **WebSocket frame, WS-disconnect, and UDP datagram hooks.** They run with
-///   no `RequestContext` / `StreamConnectionContext` in hand (`on_ws_frame`
-///   takes only a proxy id, connection id, direction, and message), so there is
-///   nothing authoritative left to evaluate. Gating the upgrade but not the
-///   frames would let a "skipped" WAF stop inspecting the handshake while still
-///   inspecting — or stop inspecting — the messages. Tracked for a typed
-///   frame-phase predicate surface in a follow-up.
+/// WebSocket frame / framing / disconnect and UDP datagram hooks used to be
+/// refused here. They are now ADMITTED, because every capability those surfaces
+/// publish is bound to one decision taken where authoritative facts still exist —
+/// the upgrade's `RequestContext` for WebSocket, the first-datagram
+/// `on_stream_connect` chain for UDP/DTLS — and carried on the session, so no
+/// hook of that surface is left half-gated (issue #3734). What remains refused:
+///
+/// * **Stream-only instances with an HTTP-only predicate.** See
+///   `stream_only_trigger_field_error`.
 /// * **The initial response-header policy.** `apply_initial_response_header_policy`
 ///   is a synchronous, contextless re-assertion of a plugin-owned header set
 ///   (`security_headers`), invoked from paths that hold no `RequestContext` at
@@ -810,25 +827,14 @@ fn trigger_composition_error(
     plugin: &dyn Plugin,
     gate: &PluginTriggerGate,
 ) -> Option<&'static str> {
-    if plugin.requires_ws_frame_hooks() || plugin.observes_ws_frame_decisions() {
-        return Some(
-            "the plugin runs WebSocket frame hooks, which execute without a request context and therefore cannot be gated by a trigger",
-        );
-    }
-    if plugin.requires_websocket_framing() {
-        return Some(
-            "the plugin requires WebSocket framing, whose per-frame phase cannot be gated by a trigger",
-        );
-    }
-    if plugin.requires_ws_disconnect_hooks() {
-        return Some(
-            "the plugin runs WebSocket disconnect hooks, which execute without a request context and therefore cannot be gated by a trigger",
-        );
-    }
-    if plugin.requires_udp_datagram_hooks() {
-        return Some(
-            "the plugin runs UDP datagram hooks, which execute without a connection context and therefore cannot be gated by a trigger",
-        );
+    // WebSocket frame / framing / disconnect and UDP datagram hooks are no
+    // longer refused: every capability those surfaces publish is now bound to
+    // ONE decision taken at upgrade / first-datagram admission and carried on
+    // the session (issue #3734). A UDP/DTLS-only instance still cannot carry a
+    // predicate whose fact that transport never establishes — see
+    // `stream_only_trigger_field_error`.
+    if let Some(reason) = stream_only_trigger_field_error(plugin, gate) {
+        return Some(reason);
     }
     if plugin.is_initial_response_header_policy() {
         return Some(
@@ -866,6 +872,51 @@ fn trigger_composition_error(
         );
     }
     None
+}
+
+/// Refuse a predicate field that a stream-only (TCP / UDP / DTLS) instance can
+/// never establish authoritatively.
+///
+/// A UDP/DTLS flow has a proxy/namespace, a direct and policy client IP, a
+/// listener port, a transport protocol identity, and — for DTLS termination and
+/// DTLS/TLS passthrough — an SNI from the ClientHello. It has no request line,
+/// header block, query string, or cookie jar, and never will.
+///
+/// On a plugin that ALSO serves HTTP, an HTTP-only predicate is meaningful: it
+/// evaluates to `false` for the stream leg and normally for the plugin's HTTP
+/// requests, which is the documented per-protocol limitation. On a STREAM-ONLY
+/// plugin the same predicate is a constant — silently "never runs", or, beneath
+/// `not`, silently "always runs" — so it is refused at publication with the
+/// offending field named, rather than reinterpreting an absent HTTP concept as
+/// an empty string or a broad match.
+fn stream_only_trigger_field_error(
+    plugin: &dyn Plugin,
+    gate: &PluginTriggerGate,
+) -> Option<&'static str> {
+    if !is_stream_only_plugin(plugin) {
+        return None;
+    }
+    match gate.http_only_field()? {
+        "method" => Some(
+            "a stream-only (TCP/UDP/DTLS) plugin cannot be gated on `method`: a datagram or byte stream has no request line, so the predicate would be a constant rather than a condition",
+        ),
+        "path" => Some(
+            "a stream-only (TCP/UDP/DTLS) plugin cannot be gated on `path`: a datagram or byte stream has no request target, so the predicate would be a constant rather than a condition",
+        ),
+        "host" => Some(
+            "a stream-only (TCP/UDP/DTLS) plugin cannot be gated on `host`: a datagram or byte stream has no request authority; use `sni` for DTLS/TLS ClientHello routing facts",
+        ),
+        "header" => Some(
+            "a stream-only (TCP/UDP/DTLS) plugin cannot be gated on `header`: a datagram or byte stream has no header block, so the predicate would be a constant rather than a condition",
+        ),
+        "query" => Some(
+            "a stream-only (TCP/UDP/DTLS) plugin cannot be gated on `query`: a datagram or byte stream has no request target, so the predicate would be a constant rather than a condition",
+        ),
+        "cookie" => Some(
+            "a stream-only (TCP/UDP/DTLS) plugin cannot be gated on `cookie`: a datagram or byte stream has no header block, so the predicate would be a constant rather than a condition",
+        ),
+        _ => None,
+    }
 }
 
 /// Protocols whose plugin lifecycle is the stream connect/disconnect pair rather
@@ -1853,18 +1904,30 @@ impl Plugin for PluginInstanceWrapper {
             .on_response_stream_terminated(ctx, response_status, outcome)
             .await;
     }
+    /// Terminal transaction logging agrees with the instance's request/response
+    /// hooks (issue #3733). The decision travels on the summary in an opaque
+    /// crate-constructed carrier, never through the summary's plugin-writable
+    /// `metadata` map, so a skipped instance cannot be re-admitted here by
+    /// another plugin's metadata write and a mirror entry inherits the decision
+    /// that applied to its originating request. A MISSING carrier RUNS.
     async fn log(&self, summary: &TransactionSummary) {
+        if !self.runs_terminal_log(summary) {
+            return;
+        }
         self.inner.log(summary).await;
     }
     /// Must forward: the trait default degrades to `log()`, so a wrapped mesh
     /// observability sink would silently lose its precomputed RED key purely
-    /// because the instance carries a `priority_override` or a trigger. The
-    /// `log` phase is the documented ungated boundary, so no gate here.
+    /// because the instance carries a `priority_override` or a trigger. Gated by
+    /// the same carried decision as [`Self::log`].
     async fn log_with_mesh_key(
         &self,
         summary: &TransactionSummary,
         mesh_key: Option<&crate::plugins::mesh::prometheus_helpers::MeshRequestKey>,
     ) {
+        if !self.runs_terminal_log(summary) {
+            return;
+        }
         self.inner.log_with_mesh_key(summary, mesh_key).await;
     }
     fn is_auth_plugin(&self) -> bool {
@@ -1921,9 +1984,34 @@ impl Plugin for PluginInstanceWrapper {
     fn requires_websocket_framing(&self) -> bool {
         self.inner.requires_websocket_framing()
     }
+    /// Evaluate (and memoize) this instance's execution trigger while the
+    /// upgrade still holds authoritative request facts (issue #3734).
+    ///
+    /// The relay drops a `false` instance from every WebSocket list before it
+    /// computes the session's capability set, so the skip costs nothing per
+    /// frame and cannot force framing on a session that would otherwise be a raw
+    /// tunnel.
+    fn admits_ws_session(&self, ctx: &mut RequestContext) -> bool {
+        match &self.trigger {
+            Some(gate) => gate.admits_ws_session(ctx),
+            None => true,
+        }
+    }
+    /// Consume the decision this instance took at UDP/DTLS session admission.
+    /// Missing state runs, matching the historical behavior, and is counted.
+    fn admits_stream_session_hooks(
+        &self,
+        decisions: &crate::plugins::StreamTriggerDecisions,
+    ) -> bool {
+        match &self.trigger {
+            Some(gate) => gate.stream_session_decision_or_run(decisions),
+            None => true,
+        }
+    }
     /// Priority override affects chain ORDER, which the relay has already
     /// applied by the time sessions bind, so the inner plugin's session-bound
-    /// substitute is returned directly.
+    /// substitute is returned directly. Admission is decided separately by
+    /// [`Plugin::admits_ws_session`], which the relay calls first.
     fn bind_ws_session(self: Arc<Self>, ctx: &RequestContext) -> Option<Arc<dyn Plugin>> {
         Arc::clone(&self.inner).bind_ws_session(ctx)
     }
