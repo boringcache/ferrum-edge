@@ -91,12 +91,16 @@ fn unbounded_scope_names_lists_every_zeroed_budget() {
 
 #[test]
 fn node_id_and_first_request_zeroes_are_unbounded_scopes_by_themselves() {
-    let mut limits = XdsAdmissionLimits::default();
-    limits.max_node_id_bytes = 0;
+    let limits = XdsAdmissionLimits {
+        max_node_id_bytes: 0,
+        ..XdsAdmissionLimits::default()
+    };
     assert!(limits.has_unbounded_scope());
 
-    limits.max_node_id_bytes = DEFAULT_XDS_MAX_NODE_ID_BYTES;
-    limits.first_request_timeout = Duration::ZERO;
+    let limits = XdsAdmissionLimits {
+        first_request_timeout: Duration::ZERO,
+        ..XdsAdmissionLimits::default()
+    };
     assert!(limits.has_unbounded_scope());
 }
 

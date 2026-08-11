@@ -258,9 +258,7 @@ fn test_xds_unbounded_budget_rejected_under_production_mode() {
         ],
         || {
             remove_var("FERRUM_XDS_ALLOW_UNBOUNDED_STREAM_LIMITS");
-            let config = EnvConfig::from_env().unwrap();
-            let error = config
-                .validate_xds_admission_limits()
+            let error = EnvConfig::from_env()
                 .expect_err("production posture must refuse unbounded ADS budgets");
             assert!(error.contains("FERRUM_XDS_MAX_TOTAL_STREAMS"), "{error}");
             assert!(error.contains("FERRUM_XDS_MAX_ACTIVE_NODES"), "{error}");
