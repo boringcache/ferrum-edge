@@ -426,7 +426,7 @@ fn dr_subset_connection_pool_http_idle_timeout_and_h2_max_requests_supported() {
         category = CATEGORY,
         feature = "subsets[].trafficPolicy.connectionPool.http.{idleTimeout,http2MaxRequests}",
         status = Status::Supported,
-        notes = "Projected into ResolvedSubsetTrafficPolicy and overlaid onto the selected proxy's inherited dispatch fallback with field-level precedence portLevelSettings > selected subset > top-level. idleTimeout → pool_idle_timeout_seconds (reqwest rcfg). http2MaxRequests → pool_http2_max_concurrent_streams on direct-H2/native-gRPC builders; reqwest H2 has no equivalent knob. Pool keys carry upstream_subset so same-endpoint sibling subsets stay isolated.",
+        notes = "Projected into ResolvedSubsetTrafficPolicy and overlaid onto the selected proxy's inherited dispatch fallback with field-level precedence portLevelSettings > selected subset > top-level. idleTimeout → pool_idle_timeout_seconds (reqwest rcfg). http2MaxRequests → pool_http2_max_concurrent_streams on direct-H2/native-gRPC builders and those pools' keys (`none` when unset); reqwest H2 has no equivalent knob. Pool keys also carry upstream_subset so same-endpoint sibling subsets stay isolated.",
     );
     let result = translate_k8s_objects(
         &[destination_rule(json!({

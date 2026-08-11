@@ -209,7 +209,8 @@ The current run records these `deferred` entries:
   `maxRetries`, and `http1MaxPendingRequests` (issue #3735): projected into
   `ResolvedSubsetTrafficPolicy`, overlaid onto the selected proxy's inherited
   fallback with field-level precedence `portLevelSettings` > selected subset >
-  top-level. Reqwest's H2 path still lacks an `http2MaxRequests` builder knob
+  top-level. Direct-H2 / native-gRPC pool keys include the effective stream cap;
+  Reqwest's H2 path still lacks an `http2MaxRequests` builder knob
   (documented transport caveat).
 
 Previously deferred and now flipped to `supported`:
