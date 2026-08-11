@@ -29,3 +29,4 @@
 /docs/launch-readiness.md                   @jeremyjpj0916
 /scripts/check_launch_readiness.py          @jeremyjpj0916
 /.github/workflows/launch-readiness.yml     @jeremyjpj0916
+/.github/workflows/release.yml              @jeremyjpj0916

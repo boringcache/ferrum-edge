@@ -1696,7 +1696,12 @@ def run_self_test() -> int:  # noqa: C901 — a flat fixture table stays readabl
     expired = validate_exemptions(
         {
             "exemptions_version": "1",
-            "exemptions": [exemption(expires_at="2026-02-01T00:00:00Z")],
+            "exemptions": [
+                exemption(
+                    approved_at="2026-01-01T00:00:00Z",
+                    expires_at="2026-02-01T00:00:00Z",
+                )
+            ],
         },
         FIXED_NOW,
     )
