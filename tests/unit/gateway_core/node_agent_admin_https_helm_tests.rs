@@ -105,7 +105,7 @@ fn schema_and_values_expose_startup_override() {
     let values = read("values.yaml");
     assert!(
         values.contains("startup:") && values.matches("override: {}").count() >= 6,
-        "every first-class workload probes.startup must expose override: {}"
+        "every first-class workload probes.startup must expose override: {{}}"
     );
     assert!(
         values.contains("simple Prometheus pod annotations")
