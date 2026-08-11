@@ -397,7 +397,7 @@ without a restart. These bounds are deliberate and tested:
   process-global proxy frontend on the exact requested port already satisfies
   the Gateway listener: the router sees that accepted port, so the dynamic
   manager binds no duplicate socket and reports no failure. A wrong-class
-  global proxy frontend, an admin / control-plane listener, or a TCP/UDP stream
+  global proxy frontend, an admin / control-plane listener, or a TCP/TLS stream
   proxy on the port is refused; a port the process lacks permission to bind
   (`:80` / `:443` without `CAP_NET_BIND_SERVICE`) fails and is retried. Either
   way the failure is logged and surfaced on
