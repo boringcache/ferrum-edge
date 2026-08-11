@@ -240,18 +240,26 @@ fn nsenter_sh(pid: u32, script: &str) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-fn attach_veth_pair(
-    host_pid: u32,
-    pod_pid: u32,
-    host_if: &str,
-    pod_if: &str,
+struct VethPairConfig<'a> {
+    host_if: &'a str,
+    pod_if: &'a str,
     host_v4: Ipv4Addr,
     pod_v4: Ipv4Addr,
     host_v6: Ipv6Addr,
     pod_v6: Ipv6Addr,
-    remote_v4: Ipv4Addr,
-    remote_v6: Ipv6Addr,
+}
+
+fn attach_veth_pair(
+    host_pid: u32,
+    pod_pid: u32,
+    cfg: &VethPairConfig<'_>,
 ) -> Result<(), String> {
+    let host_if = cfg.host_if;
+    let pod_if = cfg.pod_if;
+    let host_v4 = cfg.host_v4;
+    let pod_v4 = cfg.pod_v4;
+    let host_v6 = cfg.host_v6;
+    let pod_v6 = cfg.pod_v6;
     let _ = Command::new("ip").args(["link", "del", host_if]).status();
     run_checked(Command::new("ip").args([
         "link", "add", host_if, "type", "veth", "peer", "name", pod_if,
@@ -284,10 +292,10 @@ fn attach_veth_pair(
              ip -6 route add {host_v6}/128 dev {pod_if}; \
              ip route add default via {host_v4} dev {pod_if}; \
              ip -6 route add default via {host_v6} dev {pod_if}; \
-             ip neigh add {remote_v4} lladdr 02:00:00:00:00:aa dev {pod_if} nud permanent || true; \
-             ip -6 neigh add {remote_v6} lladdr 02:00:00:00:00:aa dev {pod_if} nud permanent || true; \
-             ip route add {remote_v4}/32 via {host_v4} dev {pod_if}; \
-             ip -6 route add {remote_v6}/128 via {host_v6} dev {pod_if}"
+             ip neigh add {REMOTE_V4} lladdr 02:00:00:00:00:aa dev {pod_if} nud permanent || true; \
+             ip -6 neigh add {REMOTE_V6} lladdr 02:00:00:00:00:aa dev {pod_if} nud permanent || true; \
+             ip route add {REMOTE_V4}/32 via {host_v4} dev {pod_if}; \
+             ip -6 route add {REMOTE_V6}/128 via {host_v6} dev {pod_if}"
         ),
     )?;
     Ok(())
@@ -392,10 +400,14 @@ fn recv_one(
         match batch.recv(capture_fd, 8) {
             Ok(n) if n > 0 => {
                 let (payload, source) = batch.datagram(0);
+                let source = crate::util::client_identity::canonical_socket_addr(source);
+                let orig = batch
+                    .orig_dst(0)
+                    .map(crate::util::client_identity::canonical_socket_addr);
                 let local = batch
                     .local_addr(0)
                     .ok_or_else(|| "captured datagram carried no IP_PKTINFO".to_string())?;
-                return Ok((payload.to_vec(), source, batch.orig_dst(0), local.ifindex));
+                return Ok((payload.to_vec(), source, orig, local.ifindex));
             }
             _ if Instant::now() >= deadline => {
                 return Err("capture socket received no datagram within the deadline".to_string());
@@ -643,8 +655,16 @@ impl LiveTopology {
         let pod_if_c = format!("pc{suffix}");
 
         attach_veth_pair(
-            host_pid, pod_a_pid, &if_a, &pod_if_a, HOST_A_V4, POD_A_V4, HOST_A_V6, POD_A_V6,
-            REMOTE_V4, REMOTE_V6,
+            host_pid,
+            pod_a_pid,
+            &VethPairConfig {
+                host_if: &if_a,
+                pod_if: &pod_if_a,
+                host_v4: HOST_A_V4,
+                pod_v4: POD_A_V4,
+                host_v6: HOST_A_V6,
+                pod_v6: POD_A_V6,
+            },
         )?;
 
         // Give node-originated traffic a real output route. Pod egress reaches
@@ -658,12 +678,28 @@ impl LiveTopology {
             ),
         )?;
         attach_veth_pair(
-            host_pid, pod_b_pid, &if_b, &pod_if_b, HOST_B_V4, POD_B_V4, HOST_B_V6, POD_B_V6,
-            REMOTE_V4, REMOTE_V6,
+            host_pid,
+            pod_b_pid,
+            &VethPairConfig {
+                host_if: &if_b,
+                pod_if: &pod_if_b,
+                host_v4: HOST_B_V4,
+                pod_v4: POD_B_V4,
+                host_v6: HOST_B_V6,
+                pod_v6: POD_B_V6,
+            },
         )?;
         attach_veth_pair(
-            host_pid, pod_c_pid, &if_c, &pod_if_c, HOST_C_V4, POD_C_V4, HOST_C_V6, POD_C_V6,
-            REMOTE_V4, REMOTE_V6,
+            host_pid,
+            pod_c_pid,
+            &VethPairConfig {
+                host_if: &if_c,
+                pod_if: &pod_if_c,
+                host_v4: HOST_C_V4,
+                pod_v4: POD_C_V4,
+                host_v6: HOST_C_V6,
+                pod_v6: POD_C_V6,
+            },
         )?;
 
         let host_sysfs = PathBuf::from(format!("/proc/{host_pid}/root/sys/class/net"));
