@@ -1408,7 +1408,10 @@ fn spawn_stock_policy_reload(
 #[cfg(unix)]
 fn stop_accepting_stock_policy_candidates(
     publish_allowed: &AtomicBool,
-    in_flight: &mut Option<(u64, tokio::task::JoinHandle<Result<MeshConfig, anyhow::Error>>)>,
+    in_flight: &mut Option<(
+        u64,
+        tokio::task::JoinHandle<Result<MeshConfig, anyhow::Error>>,
+    )>,
 ) {
     publish_allowed.store(false, Ordering::Release);
     if let Some((_, handle)) = in_flight.take() {

@@ -39,7 +39,6 @@ use ferrum_edge::modes::mesh::config_consumer::stock_xds_client::{
 };
 use ferrum_edge::modes::mesh::runtime::MeshRuntimeState;
 use ferrum_edge::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
-use std::sync::atomic::AtomicBool;
 use ferrum_edge::xds::proto::aggregated_discovery_service_server::{
     AggregatedDiscoveryService, AggregatedDiscoveryServiceServer,
 };
@@ -49,6 +48,7 @@ use ferrum_edge::xds::proto::{
 use ferrum_edge::xds::stock::StockXdsLimits;
 use ferrum_edge::xds::stock_proto as sp;
 use ferrum_edge::xds::{CDS_TYPE_URL, EDS_TYPE_URL, SDS_TYPE_URL};
+use std::sync::atomic::AtomicBool;
 
 const REVIEWS_CLUSTER: &str = "outbound|9080||reviews.default.svc.cluster.local";
 const RATINGS_CLUSTER: &str = "outbound|9080||ratings.default.svc.cluster.local";

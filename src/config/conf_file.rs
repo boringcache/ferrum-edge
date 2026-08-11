@@ -79,9 +79,7 @@ impl ConfFile {
     /// precise configuration error. The process-wide cache retains that result
     /// for the lifetime of the process.
     pub fn load() -> Result<Self, String> {
-        CONF_FILE_CACHE
-            .get_or_init(Self::load_uncached)
-            .clone()
+        CONF_FILE_CACHE.get_or_init(Self::load_uncached).clone()
     }
 
     /// Load without consulting the process cache. Intended for tests that need

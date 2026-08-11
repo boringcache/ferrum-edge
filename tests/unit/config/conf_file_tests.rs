@@ -306,10 +306,7 @@ fn conf_file_missing_equals_error_omits_secret_bearing_line() {
         err.contains("missing '='"),
         "expected missing-'=' reason, got: {err}"
     );
-    assert!(
-        err.contains("line 1"),
-        "expected line number, got: {err}"
-    );
+    assert!(err.contains("line 1"), "expected line number, got: {err}");
     assert!(
         !err.contains(secret_line),
         "malformed-line diagnostic must not echo the secret-bearing line: {err}"

@@ -11923,6 +11923,11 @@ pub async fn run(
         mesh_slice_version = %initial_applied_mesh_slice.version,
         "Mesh global plugin chain prepared from initial mesh slice"
     );
+    let local_source_recovery = matches!(
+        runtime.config_protocol,
+        MeshConfigProtocol::File | MeshConfigProtocol::StockXds
+    )
+    .then_some(local_source_recovery);
 
     serve_mesh_runtime(
         env_config,
@@ -11934,6 +11939,7 @@ pub async fn run(
         MeshRuntimeBackgroundOwnership {
             handles: background_handles,
             finalize_global_plugins_on_shutdown: true,
+            local_source_recovery,
         },
     )
     .await
@@ -11956,6 +11962,10 @@ struct MeshRuntimeBackgroundOwnership {
     // must not stop process-global delivery generations. Production always
     // passes true.
     finalize_global_plugins_on_shutdown: bool,
+    // Shared only by the localized file / stock-policy recovery path. Keeping
+    // it with the already-running source tasks preserves one handshake through
+    // startup ownership transfer; test probes that do not run a source omit it.
+    local_source_recovery: Option<Arc<config_consumer::file_source::MeshLocalSourceRecovery>>,
 }
 
 async fn serve_mesh_runtime(
@@ -11970,6 +11980,7 @@ async fn serve_mesh_runtime(
     let MeshRuntimeBackgroundOwnership {
         handles: mesh_background_handles,
         finalize_global_plugins_on_shutdown,
+        local_source_recovery,
     } = background_ownership;
     // Prep before MeshStartupOwner exists. Incoming `mesh_background_handles`
     // already hold config-consumer / gRPC TLS watcher tasks from `run()`, so
@@ -12020,6 +12031,7 @@ async fn serve_mesh_runtime(
         tls_policy,
         crls,
         bpf_metrics_state,
+        local_source_recovery,
     )
     .await
     {
@@ -12376,6 +12388,7 @@ async fn arm_mesh_runtime_startup(
     tls_policy: TlsPolicy,
     crls: tls::CrlList,
     bpf_metrics_state: Option<Arc<crate::ebpf::bpf_metrics::BpfMetricsState>>,
+    local_source_recovery: Option<Arc<config_consumer::file_source::MeshLocalSourceRecovery>>,
 ) -> Result<(), anyhow::Error> {
     let shutdown_tx = owner.shutdown_tx.clone();
     let proxy_state = owner.proxy_state.clone();
@@ -12842,6 +12855,10 @@ async fn arm_mesh_runtime_startup(
     let startup_ready = Arc::new(AtomicBool::new(false));
     let serving_degraded = Arc::new(AtomicBool::new(false));
     let serving_listener_failures = Arc::new(crate::startup::ServingListenerFailures::default());
+    let config_rejected = local_source_recovery
+        .as_ref()
+        .map(|recovery| recovery.config_rejected_flag())
+        .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
     let MeshAdminListeners {
         handles: admin_handles,
         startup_signals: admin_startup_signals,
@@ -13407,7 +13424,7 @@ async fn arm_mesh_runtime_startup(
         },
         shutdown_tx.subscribe(),
         dns_proxy_handle,
-        Some(local_source_recovery),
+        local_source_recovery,
     ));
 
     info!(
@@ -16877,9 +16894,7 @@ fn start_mesh_slice_apply_task(
     mut inbound_tls_reload: MeshInboundTlsReloadState,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     dns_proxy: Option<Arc<MeshDnsProxy>>,
-    local_source_recovery: Option<
-        Arc<config_consumer::file_source::MeshLocalSourceRecovery>,
-    >,
+    local_source_recovery: Option<Arc<config_consumer::file_source::MeshLocalSourceRecovery>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         // Topology is process-fixed, so whether this data plane has an inbound
@@ -17016,9 +17031,7 @@ fn start_mesh_slice_apply_task(
                         // Overlay re-apply of last-accepted must NOT clear a
                         // sticky local-source failure unless that base is the
                         // exact pending recovery identity.
-                        if overlay_accepted
-                            && let Some(recovery) = local_source_recovery.as_ref()
-                        {
+                        if overlay_accepted && let Some(recovery) = local_source_recovery.as_ref() {
                             recovery.note_proxy_apply_success(base.as_ref());
                         }
                     }
@@ -17612,6 +17625,7 @@ pub mod startup_rollback_test_seams {
             MeshRuntimeBackgroundOwnership {
                 handles: vec![sentinel],
                 finalize_global_plugins_on_shutdown: false,
+                local_source_recovery: None,
             },
         )
         .await;
@@ -19035,6 +19049,7 @@ mod tests {
                 MeshRuntimeBackgroundOwnership {
                     handles: Vec::new(),
                     finalize_global_plugins_on_shutdown: true,
+                    local_source_recovery: None,
                 },
             )
             .await

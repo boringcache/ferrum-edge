@@ -236,10 +236,7 @@ fn read_opened_file(
     Ok(bytes)
 }
 
-fn read_snapshot(
-    path: &Path,
-    max_bytes: u64,
-) -> Result<(FileIdentity, Vec<u8>), StableFileError> {
+fn read_snapshot(path: &Path, max_bytes: u64) -> Result<(FileIdentity, Vec<u8>), StableFileError> {
     let path_metadata_before = std::fs::metadata(path).map_err(map_io)?;
     require_regular_file(&path_metadata_before)?;
     let path_identity_before = FileIdentity::from_metadata(&path_metadata_before);

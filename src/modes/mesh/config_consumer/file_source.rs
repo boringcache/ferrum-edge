@@ -828,7 +828,10 @@ fn spawn_mesh_reload(
 #[cfg(unix)]
 fn stop_accepting_reload_candidates(
     publish_allowed: &AtomicBool,
-    in_flight: &mut Option<(u64, tokio::task::JoinHandle<Result<MeshSlice, anyhow::Error>>)>,
+    in_flight: &mut Option<(
+        u64,
+        tokio::task::JoinHandle<Result<MeshSlice, anyhow::Error>>,
+    )>,
 ) {
     publish_allowed.store(false, Ordering::Release);
     if let Some((_, handle)) = in_flight.take() {
