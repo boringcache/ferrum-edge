@@ -962,6 +962,7 @@ mod xds_admission_gauge_delta_tests {
 }
 
 /// Current value of `ferrum_xds_stream_admission_rejections_total{reason}`.
+#[allow(dead_code)] // External integration tests consume the library copy; the binary target does not.
 pub fn xds_stream_admission_rejection_count(reason: &'static str) -> u64 {
     XDS_STREAM_ADMISSION_REJECTIONS
         .get(reason)
@@ -970,6 +971,7 @@ pub fn xds_stream_admission_rejection_count(reason: &'static str) -> u64 {
 }
 
 /// Current value of the label-free ADS stream rejection aggregate counter.
+#[allow(dead_code)] // External integration tests consume the library copy; the binary target does not.
 pub fn xds_streams_rejected_total() -> u64 {
     XDS_STREAMS_REJECTED.load(Ordering::Relaxed)
 }
