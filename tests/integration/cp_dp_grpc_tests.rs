@@ -5703,10 +5703,7 @@ async fn open_established_delta_stream(
 ) {
     let mut client = ads_client(url).await;
     let (req_tx, req_rx) = tokio::sync::mpsc::channel(4);
-    req_tx
-        .send(ads_delta_lds_request(node_id))
-        .await
-        .unwrap();
+    req_tx.send(ads_delta_lds_request(node_id)).await.unwrap();
     let mut request = tonic::Request::new(tokio_stream::wrappers::ReceiverStream::new(req_rx));
     request
         .metadata_mut()
@@ -6002,8 +5999,7 @@ async fn test_xds_response_receiver_drop_releases_while_request_sender_stays_ali
     };
     let (url, admission, _handle) = start_test_xds_server_with_limits(limits).await;
 
-    let (req_tx, stream) =
-        open_established_sotw_stream(&url, "receiver-drop", "node-sotw").await;
+    let (req_tx, stream) = open_established_sotw_stream(&url, "receiver-drop", "node-sotw").await;
     assert_eq!(admission.active_streams(), 1);
     assert_eq!(admission.active_nodes(), 1);
 
@@ -6109,8 +6105,7 @@ async fn test_xds_omitted_node_on_first_message_counts_node_id_empty_rejection()
             })
             .await
             .unwrap();
-        let mut request =
-            tonic::Request::new(tokio_stream::wrappers::ReceiverStream::new(req_rx));
+        let mut request = tonic::Request::new(tokio_stream::wrappers::ReceiverStream::new(req_rx));
         request
             .metadata_mut()
             .insert("authorization", bearer_for("omit-sotw"));
@@ -6148,8 +6143,7 @@ async fn test_xds_omitted_node_on_first_message_counts_node_id_empty_rejection()
             })
             .await
             .unwrap();
-        let mut request =
-            tonic::Request::new(tokio_stream::wrappers::ReceiverStream::new(req_rx));
+        let mut request = tonic::Request::new(tokio_stream::wrappers::ReceiverStream::new(req_rx));
         request
             .metadata_mut()
             .insert("authorization", bearer_for("omit-delta"));
@@ -6190,8 +6184,7 @@ async fn test_xds_omitted_node_on_first_message_counts_node_id_empty_rejection()
         let mut client = ads_client(&url).await;
         let (req_tx, req_rx) = tokio::sync::mpsc::channel(4);
         req_tx.send(ads_lds_request("")).await.unwrap();
-        let mut request =
-            tonic::Request::new(tokio_stream::wrappers::ReceiverStream::new(req_rx));
+        let mut request = tonic::Request::new(tokio_stream::wrappers::ReceiverStream::new(req_rx));
         request
             .metadata_mut()
             .insert("authorization", bearer_for("empty-id"));

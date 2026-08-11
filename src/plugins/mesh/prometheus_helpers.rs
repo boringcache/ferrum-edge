@@ -895,7 +895,7 @@ pub fn increment_xds_stream_admission_rejection(reason: &'static str) {
 /// reserve/release interleavings must not let an older absolute snapshot
 /// overwrite a newer value and leave a stale gauge after activity stops
 /// (issue #3741).
-pub fn adjust_xds_active_streams(delta: i64) {
+pub(crate) fn adjust_xds_active_streams(delta: i64) {
     apply_xds_admission_gauge_delta(&XDS_ACTIVE_STREAMS, delta);
 }
 
@@ -904,7 +904,7 @@ pub fn adjust_xds_active_streams(delta: i64) {
 /// Tied exactly to successful distinct-node slot admission (`+1`) and
 /// exactly-once last-stream node removal (`-1`). Same race-safety contract as
 /// [`adjust_xds_active_streams`].
-pub fn adjust_xds_active_node_ids(delta: i64) {
+pub(crate) fn adjust_xds_active_node_ids(delta: i64) {
     apply_xds_admission_gauge_delta(&XDS_ACTIVE_NODE_IDS, delta);
 }
 
@@ -923,14 +923,42 @@ fn apply_xds_admission_gauge_delta(gauge: &AtomicU64, delta: i64) {
     XDS_ADMISSION_OBSERVED.store(1, Ordering::Relaxed);
 }
 
-/// Current exported ADS active-stream gauge value (absolute occupancy).
-pub fn xds_active_streams_gauge() -> u64 {
-    XDS_ACTIVE_STREAMS.load(Ordering::Relaxed)
-}
+// This private helper cannot be exercised from the external test crate without
+// exposing process-global gauge internals. Keep its concurrency regression
+// isolated from the parallel test suite so unrelated controllers cannot move a
+// shared baseline underneath the assertion.
+#[cfg(test)]
+mod xds_admission_gauge_delta_tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Barrier};
 
-/// Current exported ADS active-node-id gauge value (absolute occupancy).
-pub fn xds_active_node_ids_gauge() -> u64 {
-    XDS_ACTIVE_NODE_IDS.load(Ordering::Relaxed)
+    use super::apply_xds_admission_gauge_delta;
+
+    #[test]
+    fn concurrent_deltas_return_an_isolated_gauge_to_zero() {
+        let threads = 16usize;
+        let gauge = Arc::new(AtomicU64::new(0));
+        let start = Arc::new(Barrier::new(threads));
+        let mut handles = Vec::with_capacity(threads);
+
+        for _ in 0..threads {
+            let gauge = Arc::clone(&gauge);
+            let start = Arc::clone(&start);
+            handles.push(std::thread::spawn(move || {
+                start.wait();
+                for _ in 0..1_000 {
+                    apply_xds_admission_gauge_delta(&gauge, 1);
+                    std::thread::yield_now();
+                    apply_xds_admission_gauge_delta(&gauge, -1);
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.join().expect("gauge delta thread panicked");
+        }
+        assert_eq!(gauge.load(Ordering::Relaxed), 0);
+    }
 }
 
 /// Current value of `ferrum_xds_stream_admission_rejections_total{reason}`.

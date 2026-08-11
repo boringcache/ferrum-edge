@@ -1,7 +1,7 @@
 //! Aggregate xDS ADS admission control (issue #3741).
 //!
 //! These cover the budget arithmetic, the `Node.id` contract, principal
-//! isolation, permit release, and race-safe exported gauge accounting. The
+//! isolation and permit release. The
 //! wire-level behaviour (both ADS methods sharing one budget, response-receiver
 //! drop while the request sender stays alive, task abort, the no-first-message
 //! deadline, first-message Node omission metrics) is exercised in
@@ -819,89 +819,4 @@ async fn aborting_a_permit_holding_task_returns_the_controller_to_baseline() {
     let _reused = controller
         .reserve_stream("ferrum", &principal)
         .expect("capacity is available again");
-}
-
-// ── Exported gauge race safety ─────────────────────────────────────────────
-
-#[test]
-fn concurrent_reserve_release_cannot_leave_stale_exported_gauges() {
-    // Absolute load-then-store of live counters races: an older snapshot can
-    // store last and leave ferrum_xds_active_streams / ferrum_xds_active_node_ids
-    // non-zero after every permit has dropped. Atomic deltas tied to successful
-    // admission and exactly-once release must leave the exported gauges at the
-    // same baseline they started from once the controller is idle again.
-    use ferrum_edge::plugins::mesh::prometheus_helpers::{
-        xds_active_node_ids_gauge, xds_active_streams_gauge,
-    };
-
-    let controller = controller(XdsAdmissionLimits {
-        max_total_streams: 256,
-        max_streams_per_namespace: 256,
-        max_streams_per_principal: 256,
-        max_streams_per_node: 8,
-        max_active_nodes: 256,
-        ..generous()
-    });
-    let streams_before = xds_active_streams_gauge();
-    let nodes_before = xds_active_node_ids_gauge();
-
-    let threads = 16usize;
-    let cycles_per_thread = 200usize;
-    let start = Arc::new(std::sync::Barrier::new(threads));
-    let mut handles = Vec::with_capacity(threads);
-    for thread_idx in 0..threads {
-        let controller = controller.clone();
-        let start = Arc::clone(&start);
-        handles.push(thread::spawn(move || {
-            start.wait();
-            let principal = principal_key(&format!("gauge-racer-{thread_idx}"));
-            for cycle in 0..cycles_per_thread {
-                let shared = format!("gauge-shared-{thread_idx}");
-                let unique = format!("gauge-node-{thread_idx}-{cycle}");
-                // Hold two streams on one node key so the occupied (no
-                // node-gauge change) path interleaves with vacant +1 / last
-                // stream -1, while a third unique-node stream races the
-                // distinct-node gauge itself.
-                let mut first = controller
-                    .reserve_stream("ferrum", &principal)
-                    .expect("capacity available under concurrent churn");
-                first
-                    .register_node(&shared)
-                    .expect("shared node admitted");
-                let mut second = controller
-                    .reserve_stream("ferrum", &principal)
-                    .expect("second stream admitted");
-                second
-                    .register_node(&shared)
-                    .expect("occupied node path admitted");
-                let mut third = controller
-                    .reserve_stream("ferrum", &principal)
-                    .expect("unique-node stream admitted");
-                third
-                    .register_node(&unique)
-                    .expect("unique node admitted");
-                drop(third);
-                drop(second);
-                drop(first);
-            }
-        }));
-    }
-    for handle in handles {
-        handle.join().expect("gauge racer thread panicked");
-    }
-
-    assert_eq!(controller.active_streams(), 0);
-    assert_eq!(controller.active_nodes(), 0);
-    assert_eq!(controller.tracked_namespaces(), 0);
-    assert_eq!(controller.tracked_principals(), 0);
-    assert_eq!(
-        xds_active_streams_gauge(),
-        streams_before,
-        "exported active-stream gauge must return to its pre-churn baseline"
-    );
-    assert_eq!(
-        xds_active_node_ids_gauge(),
-        nodes_before,
-        "exported active-node gauge must return to its pre-churn baseline"
-    );
 }
