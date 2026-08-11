@@ -1417,14 +1417,14 @@ fn acme_material_max_bytes() -> Result<usize, AcmeError> {
 }
 
 fn validate_acme_material_limit(max_bytes: usize) -> Result<usize, AcmeError> {
-    crate::tls::source::validate_explicit_tls_max_material_size_bytes(max_bytes).map_err(
-        |error| match error {
+    crate::tls::source::validate_explicit_tls_max_material_size_bytes(max_bytes).map_err(|error| {
+        match error {
             crate::tls::source::MaterialError::InvalidSource { details, .. } => {
                 AcmeError::InvalidConfiguration(details)
             }
             other => AcmeError::InvalidConfiguration(other.to_string()),
-        },
-    )
+        }
+    })
 }
 
 fn ensure_acme_bytes_within_limit(len: usize, max_bytes: usize) -> Result<(), AcmeError> {

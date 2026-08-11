@@ -230,7 +230,10 @@ fn explicit_limit_validation_rejects_zero_and_caps_hostile_high_values() {
         enforce_material_byte_limit_with(1, MaterialKind::Cert, 0),
         read_bounded_material_bytes(Cursor::new(vec![b'x']), MaterialKind::Key, 0).map(|_| ()),
         load_material_blocking_with(
-            &CertSource::parse("/tmp/ferrum-tls-material-cap-zero-check".into(), MaterialKind::Cert),
+            &CertSource::parse(
+                "/tmp/ferrum-tls-material-cap-zero-check".into(),
+                MaterialKind::Cert,
+            ),
             MaterialKind::Cert,
             0,
         )
@@ -252,12 +255,13 @@ fn explicit_limit_validation_rejects_zero_and_caps_hostile_high_values() {
         other => panic!("expected Oversized under capped hard max, got {other}"),
     }
 
-    let managed_zero = ManagedTlsStore::open_with_material_limit(
-        tempfile::tempdir().expect("tempdir").path(),
-        0,
-    )
-    .expect_err("managed open must reject 0");
-    assert!(matches!(managed_zero, ManagedTlsError::InvalidConfiguration(_)));
+    let managed_zero =
+        ManagedTlsStore::open_with_material_limit(tempfile::tempdir().expect("tempdir").path(), 0)
+            .expect_err("managed open must reject 0");
+    assert!(matches!(
+        managed_zero,
+        ManagedTlsError::InvalidConfiguration(_)
+    ));
 
     let managed_high = ManagedTlsStore::open_with_material_limit(
         tempfile::tempdir().expect("tempdir").path(),
@@ -302,9 +306,8 @@ fn provider_and_kubernetes_admission_helpers_enforce_before_into_bytes_or_clone(
     ] {
         admit_provider_secret_string_before_into_bytes(LIMIT, kind, LIMIT)
             .expect("provider exact limit");
-        let provider_over =
-            admit_provider_secret_string_before_into_bytes(LIMIT + 1, kind, LIMIT)
-                .expect_err("provider limit+1");
+        let provider_over = admit_provider_secret_string_before_into_bytes(LIMIT + 1, kind, LIMIT)
+            .expect_err("provider limit+1");
         assert_oversized(provider_over, kind);
 
         admit_k8s_secret_bytes_before_clone(LIMIT, kind, LIMIT).expect("k8s exact limit");

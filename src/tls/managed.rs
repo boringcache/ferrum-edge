@@ -640,74 +640,75 @@ impl ManagedSourceReference {
             });
         }
 
-        let bytes = match self.part {
-            ManagedMaterialPart::Cert => {
-                let cert = record.cert_pem.as_deref().ok_or_else(|| {
-                    ManagedTlsError::MissingMaterial {
-                        id: record.id.clone(),
-                        kind: self.part.source_suffix(),
-                    }
-                })?;
-                combine_cert_and_chain_checked(cert, record.chain_pem.as_deref(), max_bytes)?
-            }
-            ManagedMaterialPart::Key => {
-                let pem = record.key_pem.as_ref().ok_or_else(|| {
-                    ManagedTlsError::MissingMaterial {
-                        id: record.id.clone(),
-                        kind: self.part.source_suffix(),
-                    }
-                })?;
-                ensure_managed_bytes_within_limit(pem.len(), max_bytes)?;
-                pem.as_bytes().to_vec()
-            }
-            ManagedMaterialPart::CaBundle => {
-                let pem = record.ca_bundle_pem.as_ref().ok_or_else(|| {
-                    ManagedTlsError::MissingMaterial {
-                        id: record.id.clone(),
-                        kind: self.part.source_suffix(),
-                    }
-                })?;
-                ensure_managed_bytes_within_limit(pem.len(), max_bytes)?;
-                pem.as_bytes().to_vec()
-            }
-            ManagedMaterialPart::Crl => {
-                let pem = record.crl_pem.as_ref().ok_or_else(|| {
-                    ManagedTlsError::MissingMaterial {
-                        id: record.id.clone(),
-                        kind: self.part.source_suffix(),
-                    }
-                })?;
-                ensure_managed_bytes_within_limit(pem.len(), max_bytes)?;
-                pem.as_bytes().to_vec()
-            }
-            ManagedMaterialPart::Ocsp => {
-                let encoded = record.ocsp_der_base64.as_deref().ok_or_else(|| {
-                    ManagedTlsError::MissingMaterial {
-                        id: record.id.clone(),
-                        kind: self.part.source_suffix(),
-                    }
-                })?;
-                // Encoded length is an upper bound; also check decoded size.
-                ensure_managed_bytes_within_limit(encoded.len(), max_bytes)?;
-                let bytes =
-                    decode_base64(encoded).map_err(|_| ManagedTlsError::MissingMaterial {
-                        id: record.id.clone(),
-                        kind: self.part.source_suffix(),
+        let bytes =
+            match self.part {
+                ManagedMaterialPart::Cert => {
+                    let cert = record.cert_pem.as_deref().ok_or_else(|| {
+                        ManagedTlsError::MissingMaterial {
+                            id: record.id.clone(),
+                            kind: self.part.source_suffix(),
+                        }
                     })?;
-                ensure_managed_bytes_within_limit(bytes.len(), max_bytes)?;
-                bytes
-            }
-            ManagedMaterialPart::Jwks => {
-                let json = record.jwks_json.as_ref().ok_or_else(|| {
-                    ManagedTlsError::MissingMaterial {
-                        id: record.id.clone(),
-                        kind: self.part.source_suffix(),
-                    }
-                })?;
-                ensure_managed_bytes_within_limit(json.len(), max_bytes)?;
-                json.as_bytes().to_vec()
-            }
-        };
+                    combine_cert_and_chain_checked(cert, record.chain_pem.as_deref(), max_bytes)?
+                }
+                ManagedMaterialPart::Key => {
+                    let pem = record.key_pem.as_ref().ok_or_else(|| {
+                        ManagedTlsError::MissingMaterial {
+                            id: record.id.clone(),
+                            kind: self.part.source_suffix(),
+                        }
+                    })?;
+                    ensure_managed_bytes_within_limit(pem.len(), max_bytes)?;
+                    pem.as_bytes().to_vec()
+                }
+                ManagedMaterialPart::CaBundle => {
+                    let pem = record.ca_bundle_pem.as_ref().ok_or_else(|| {
+                        ManagedTlsError::MissingMaterial {
+                            id: record.id.clone(),
+                            kind: self.part.source_suffix(),
+                        }
+                    })?;
+                    ensure_managed_bytes_within_limit(pem.len(), max_bytes)?;
+                    pem.as_bytes().to_vec()
+                }
+                ManagedMaterialPart::Crl => {
+                    let pem = record.crl_pem.as_ref().ok_or_else(|| {
+                        ManagedTlsError::MissingMaterial {
+                            id: record.id.clone(),
+                            kind: self.part.source_suffix(),
+                        }
+                    })?;
+                    ensure_managed_bytes_within_limit(pem.len(), max_bytes)?;
+                    pem.as_bytes().to_vec()
+                }
+                ManagedMaterialPart::Ocsp => {
+                    let encoded = record.ocsp_der_base64.as_deref().ok_or_else(|| {
+                        ManagedTlsError::MissingMaterial {
+                            id: record.id.clone(),
+                            kind: self.part.source_suffix(),
+                        }
+                    })?;
+                    // Encoded length is an upper bound; also check decoded size.
+                    ensure_managed_bytes_within_limit(encoded.len(), max_bytes)?;
+                    let bytes =
+                        decode_base64(encoded).map_err(|_| ManagedTlsError::MissingMaterial {
+                            id: record.id.clone(),
+                            kind: self.part.source_suffix(),
+                        })?;
+                    ensure_managed_bytes_within_limit(bytes.len(), max_bytes)?;
+                    bytes
+                }
+                ManagedMaterialPart::Jwks => {
+                    let json = record.jwks_json.as_ref().ok_or_else(|| {
+                        ManagedTlsError::MissingMaterial {
+                            id: record.id.clone(),
+                            kind: self.part.source_suffix(),
+                        }
+                    })?;
+                    ensure_managed_bytes_within_limit(json.len(), max_bytes)?;
+                    json.as_bytes().to_vec()
+                }
+            };
 
         Ok(ManagedMaterial {
             bytes,
@@ -842,14 +843,14 @@ fn managed_material_max_bytes() -> Result<usize, ManagedTlsError> {
 }
 
 fn validate_managed_material_limit(max_bytes: usize) -> Result<usize, ManagedTlsError> {
-    crate::tls::source::validate_explicit_tls_max_material_size_bytes(max_bytes).map_err(
-        |error| match error {
+    crate::tls::source::validate_explicit_tls_max_material_size_bytes(max_bytes).map_err(|error| {
+        match error {
             crate::tls::source::MaterialError::InvalidSource { details, .. } => {
                 ManagedTlsError::InvalidConfiguration(details)
             }
             other => ManagedTlsError::InvalidConfiguration(other.to_string()),
-        },
-    )
+        }
+    })
 }
 
 fn ensure_managed_bytes_within_limit(len: usize, max_bytes: usize) -> Result<(), ManagedTlsError> {
