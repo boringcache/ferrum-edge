@@ -810,8 +810,9 @@ async fn a_connection_that_never_speaks_is_closed_on_its_deadline_and_returns_it
                     "server sent {total_read} bytes without closing; a silent connection must be closed on its initial deadline (cap {MAX_SERVER_BYTES})"
                 );
             }
+            let remaining = MAX_SERVER_BYTES - total_read;
             let read = silent
-                .read(&mut buf)
+                .read(&mut buf[..remaining])
                 .await
                 .expect("the close is a clean transport teardown");
             if read == 0 {
