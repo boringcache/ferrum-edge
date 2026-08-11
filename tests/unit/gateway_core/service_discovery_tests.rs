@@ -4207,11 +4207,7 @@ impl Drop for DiscoveryBodyLimitsGuard {
     }
 }
 
-async fn serve_raw_http_once(
-    status_line: &str,
-    headers: &[(&str, &str)],
-    body: &[u8],
-) -> String {
+async fn serve_raw_http_once(status_line: &str, headers: &[(&str, &str)], body: &[u8]) -> String {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -4255,8 +4251,8 @@ fn discovery_body_limits_parse_rejects_zero_and_inconsistent_relationships() {
     use ferrum_edge::config::env_config::{
         DEFAULT_SERVICE_DISCOVERY_BODY_BUDGET_BYTES,
         DEFAULT_SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES,
-        DEFAULT_SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES, HARD_MAX_SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES,
-        parse_discovery_body_limits,
+        DEFAULT_SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES,
+        HARD_MAX_SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES, parse_discovery_body_limits,
     };
 
     let defaults = parse_discovery_body_limits(None, None, None).unwrap();
@@ -4298,8 +4294,8 @@ fn discovery_body_limits_parse_rejects_zero_and_inconsistent_relationships() {
             .unwrap_err()
             .contains("must be >=")
     );
-    let clamped = parse_discovery_body_limits(Some("999999999"), Some("1024"), Some("999999999"))
-        .unwrap();
+    let clamped =
+        parse_discovery_body_limits(Some("999999999"), Some("1024"), Some("999999999")).unwrap();
     assert_eq!(
         clamped.max_response_bytes,
         HARD_MAX_SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES
@@ -4358,10 +4354,9 @@ async fn discovery_collector_accepts_exact_limit_and_rejects_limit_plus_one_chun
         .send()
         .await
         .expect("send exact");
-    let accepted =
-        ferrum_edge::_test_support::collect_discovery_response_body_for_test(ok, true)
-            .await
-            .expect("exact limit must be accepted");
+    let accepted = ferrum_edge::_test_support::collect_discovery_response_body_for_test(ok, true)
+        .await
+        .expect("exact limit must be accepted");
     assert_eq!(accepted, 64);
     assert_eq!(
         ferrum_edge::_test_support::discovery_body_budget_used_for_test(),
@@ -4607,8 +4602,7 @@ async fn kubernetes_error_response_does_not_surface_body_bytes() {
     let mock_server = MockServer::start().await;
     Mock::given(method("GET"))
         .respond_with(
-            ResponseTemplate::new(403)
-                .set_body_string("secret-token=abc&registry-credential=xyz"),
+            ResponseTemplate::new(403).set_body_string("secret-token=abc&registry-credential=xyz"),
         )
         .mount(&mock_server)
         .await;
@@ -4696,17 +4690,15 @@ async fn production_discovery_loop_retains_targets_and_cursor_on_oversized_or_ma
     // Kubernetes malformed envelope through the production apply pipeline.
     let k8s_server = MockServer::start().await;
     Mock::given(method("GET"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "items": [{
-                    "ports": [{"port": 8080}],
-                    "endpoints": [{
-                        "addresses": ["10.244.1.1"],
-                        "conditions": {"ready": true}
-                    }]
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "items": [{
+                "ports": [{"port": 8080}],
+                "endpoints": [{
+                    "addresses": ["10.244.1.1"],
+                    "conditions": {"ready": true}
                 }]
-            })),
-        )
+            }]
+        })))
         .up_to_n_times(1)
         .mount(&k8s_server)
         .await;

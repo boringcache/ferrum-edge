@@ -150,11 +150,14 @@ pub fn parse_tls_max_material_size_bytes(raw: Option<&str>) -> Result<usize, Str
 }
 
 /// Settings key for the per-response discovery success-body ceiling.
-pub const SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES_KEY: &str = "FERRUM_SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES";
+pub const SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES_KEY: &str =
+    "FERRUM_SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES";
 /// Settings key for the discovery error-body ceiling.
-pub const SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES_KEY: &str = "FERRUM_SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES";
+pub const SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES_KEY: &str =
+    "FERRUM_SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES";
 /// Settings key for the process-wide concurrent discovery-body budget.
-pub const SERVICE_DISCOVERY_BODY_BUDGET_BYTES_KEY: &str = "FERRUM_SERVICE_DISCOVERY_BODY_BUDGET_BYTES";
+pub const SERVICE_DISCOVERY_BODY_BUDGET_BYTES_KEY: &str =
+    "FERRUM_SERVICE_DISCOVERY_BODY_BUDGET_BYTES";
 
 /// Default per-response Kubernetes/Consul discovery success-body ceiling (4 MiB).
 pub const DEFAULT_SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES: usize = 4 * 1024 * 1024;
@@ -248,9 +251,7 @@ fn validate_discovery_body_limits(limits: DiscoveryBodyLimits) -> Result<(), Str
         || limits.max_error_bytes == 0
         || limits.body_budget_bytes == 0
     {
-        return Err(
-            "service discovery body ceilings must be >= 1; 0 is not unlimited".to_string(),
-        );
+        return Err("service discovery body ceilings must be >= 1; 0 is not unlimited".to_string());
     }
     if limits.max_response_bytes > HARD_MAX_SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES {
         return Err(format!(

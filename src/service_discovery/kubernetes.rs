@@ -215,19 +215,19 @@ impl super::ServiceDiscoverer for KubernetesDiscoverer {
         let body_bytes = collect_discovery_response_body(response, DiscoveryBodyRole::Success)
             .await
             .map_err(|e| e.as_anyhow("Kubernetes"))?;
-        let envelope: EndpointSliceListEnvelope = match serde_json::from_slice(body_bytes.as_slice())
-        {
-            Ok(envelope) => envelope,
-            Err(_) => {
-                crate::plugins::prometheus_metrics::global_registry()
-                    .record_service_discovery_malformed_envelope();
-                warn!(
-                    reason = "malformed_envelope",
-                    "Kubernetes discovery: EndpointSliceList envelope rejected"
-                );
-                anyhow::bail!("Kubernetes API returned malformed EndpointSliceList envelope");
-            }
-        };
+        let envelope: EndpointSliceListEnvelope =
+            match serde_json::from_slice(body_bytes.as_slice()) {
+                Ok(envelope) => envelope,
+                Err(_) => {
+                    crate::plugins::prometheus_metrics::global_registry()
+                        .record_service_discovery_malformed_envelope();
+                    warn!(
+                        reason = "malformed_envelope",
+                        "Kubernetes discovery: EndpointSliceList envelope rejected"
+                    );
+                    anyhow::bail!("Kubernetes API returned malformed EndpointSliceList envelope");
+                }
+            };
         // Release the shared body-budget permit before target construction.
         drop(body_bytes);
 

@@ -23,9 +23,7 @@ use bytes::Bytes;
 use http::header::CONTENT_LENGTH;
 use tracing::warn;
 
-use crate::config::env_config::{
-    DEFAULT_SERVICE_DISCOVERY_BODY_BUDGET_BYTES, DiscoveryBodyLimits,
-};
+use crate::config::env_config::{DEFAULT_SERVICE_DISCOVERY_BODY_BUDGET_BYTES, DiscoveryBodyLimits};
 use crate::util::body_limit::{ContentLength, parse_content_length};
 
 /// Role of the response body being collected.
@@ -73,18 +71,18 @@ impl DiscoveryBodyError {
 
     pub fn as_anyhow(self, provider: &'static str) -> anyhow::Error {
         match self {
-            Self::Oversized => anyhow::anyhow!(
-                "{provider} discovery response body exceeds configured byte limit"
-            ),
+            Self::Oversized => {
+                anyhow::anyhow!("{provider} discovery response body exceeds configured byte limit")
+            }
             Self::BudgetExhausted => anyhow::anyhow!(
                 "{provider} discovery response rejected: concurrent body budget exhausted"
             ),
             Self::ReadFailed => {
                 anyhow::anyhow!("{provider} discovery response body read failed")
             }
-            Self::AmbiguousContentLength => anyhow::anyhow!(
-                "{provider} discovery response rejected: ambiguous Content-Length"
-            ),
+            Self::AmbiguousContentLength => {
+                anyhow::anyhow!("{provider} discovery response rejected: ambiguous Content-Length")
+            }
         }
     }
 }

@@ -22,8 +22,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::debug;
 
-use super::{DiscoveryCursorCommit, DiscoverySnapshot};
 use super::http_body::{DiscoveryBodyRole, collect_discovery_response_body};
+use super::{DiscoveryCursorCommit, DiscoverySnapshot};
 
 /// Characters that must be percent-encoded in a URL path segment (RFC 3986 §3.3).
 /// Encodes everything except unreserved chars and sub-delims that are safe in path segments.
