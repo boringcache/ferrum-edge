@@ -148,8 +148,8 @@ async fn start_admin(state: AdminState) -> (String, tokio::sync::watch::Sender<b
 }
 
 fn root_ca_der_base64(common_name: &str) -> String {
-    let key =
-        rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("test CA key generates");
+    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
+        .expect("test CA key generates");
     let mut params =
         rcgen::CertificateParams::new(Vec::<String>::new()).expect("test CA params build");
     params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
@@ -579,7 +579,10 @@ async fn more_than_one_record_is_refused_before_anything_is_deleted() {
     hostile["gateway_trust_bundles"] = json!([backup["gateway_trust_bundles"][0], second]);
 
     let (status, body) = post_json(&base, "/restore?confirm=true", "ferrum", hostile).await;
-    assert_eq!(status, 400, "a non-singleton section must be refused: {body}");
+    assert_eq!(
+        status, 400,
+        "a non-singleton section must be refused: {body}"
+    );
     assert!(
         body["error"]
             .as_str()
@@ -591,5 +594,8 @@ async fn more_than_one_record_is_refused_before_anything_is_deleted() {
     // Nothing was mutated: the original generation is intact.
     let (status, after) = get_json(&base, "/gateway-trust-bundles/ferrum", "ferrum").await;
     assert_eq!(status, 200, "the refused restore must not revoke trust");
-    assert_eq!(after["revision"], 1, "and must not bump the revision either");
+    assert_eq!(
+        after["revision"], 1,
+        "and must not bump the revision either"
+    );
 }

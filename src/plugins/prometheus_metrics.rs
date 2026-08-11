@@ -3938,9 +3938,8 @@ impl MetricsRegistry {
             output.push_str(
                 "# HELP ferrum_gateway_trust_bundle_last_published_unix_seconds Unix time of the most recently published gateway trust-bundle generation; 0 when none.\n",
             );
-            output.push_str(
-                "# TYPE ferrum_gateway_trust_bundle_last_published_unix_seconds gauge\n",
-            );
+            output
+                .push_str("# TYPE ferrum_gateway_trust_bundle_last_published_unix_seconds gauge\n");
             render_process_counter(
                 &mut output,
                 "ferrum_gateway_trust_bundle_last_published_unix_seconds",

@@ -604,7 +604,10 @@ fn the_generation_fingerprint_is_stable_and_changes_with_every_rotation() {
     // built on it cannot report "unchanged" across a rotation.
     let mut rotated = record.clone();
     rotated.revision += 1;
-    assert_ne!(baseline, trust_generation_fingerprint(std::slice::from_ref(&rotated)));
+    assert_ne!(
+        baseline,
+        trust_generation_fingerprint(std::slice::from_ref(&rotated))
+    );
 
     // So does new material.
     let mut rematerialized = record.clone();

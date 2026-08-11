@@ -1083,13 +1083,9 @@ async fn persist_undecodable_update_repair<R: AdminResource>(
     if !result? {
         return Ok(None);
     }
-    let settled = settle_written_resource_while_held::<R>(
-        guard.as_ref(),
-        db.as_ref(),
-        &namespace,
-        written,
-    )
-    .await?;
+    let settled =
+        settle_written_resource_while_held::<R>(guard.as_ref(), db.as_ref(), &namespace, written)
+            .await?;
     finish_write_success(
         db,
         &state,

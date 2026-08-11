@@ -9246,7 +9246,12 @@ mod inner {
                 session
                     .start_transaction()
                     .and_run(
-                        (self, record.clone(), record.namespace.clone(), record.id.clone()),
+                        (
+                            self,
+                            record.clone(),
+                            record.namespace.clone(),
+                            record.id.clone(),
+                        ),
                         |s, (this, record, namespace, id)| {
                             Box::pin(async move {
                                 // The change row is written first so its
@@ -9264,10 +9269,9 @@ mod inner {
                                         "upsert",
                                     )
                                     .await?;
-                                let doc = gateway_trust_bundle_to_doc(record, revision)
-                                    .map_err(|error| {
-                                        mongodb::error::Error::custom(error.to_string())
-                                    })?;
+                                let doc = gateway_trust_bundle_to_doc(record, revision).map_err(
+                                    |error| mongodb::error::Error::custom(error.to_string()),
+                                )?;
                                 this.gateway_trust_bundles()
                                     .insert_one(doc)
                                     .session(&mut *s)
@@ -9352,7 +9356,9 @@ mod inner {
             // unrepresentable revision into a predicate that matches the wrong
             // document (or no document) instead of surfacing an error.
             let Ok(current_revision_sql) = i64::try_from(current_revision) else {
-                return Err(anyhow::anyhow!("gateway trust bundle revision exceeds Int64 range"));
+                return Err(anyhow::anyhow!(
+                    "gateway trust bundle revision exceeds Int64 range"
+                ));
             };
             // The replacement filter re-asserts the observed revision, so on a
             // replica set the compare-and-set is atomic and on standalone the

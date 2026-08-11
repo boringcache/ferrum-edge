@@ -5037,8 +5037,7 @@ async fn persist_payload_resources(
 
 /// Refusal when a restore payload carries more than one trust record for the
 /// target namespace. Names no ids and no material.
-pub(crate) const GATEWAY_TRUST_BUNDLE_RESTORE_NOT_SINGLETON_MESSAGE: &str =
-    "restore payload declares more than one gateway trust bundle for the target namespace; the \
+pub(crate) const GATEWAY_TRUST_BUNDLE_RESTORE_NOT_SINGLETON_MESSAGE: &str = "restore payload declares more than one gateway trust bundle for the target namespace; the \
      resource is a namespace singleton";
 
 /// Apply the restore payload's trust section to `namespace`.
@@ -6352,7 +6351,10 @@ async fn handle_gateway_trust_status(
             // carries no material. There is deliberately no process-wide
             // "published revision" here — revisions are per namespace.
             let generation = crate::config::gateway_trust::trust_generation_fingerprint(
-                record.as_ref().map(std::slice::from_ref).unwrap_or_default(),
+                record
+                    .as_ref()
+                    .map(std::slice::from_ref)
+                    .unwrap_or_default(),
             );
             Ok(json_response(
                 StatusCode::OK,
