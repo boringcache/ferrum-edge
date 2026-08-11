@@ -191,10 +191,12 @@ async fn h3_eligible_retry_all_unix_pool_terminates_without_cycle() {
 async fn h3_eligible_retry_bound_covers_configured_upstream_ceiling() {
     // Guard the bound itself: the helper must be willing to walk past the
     // old 32-iteration cap up to the configured MAX_TARGETS_PER_UPSTREAM.
-    assert!(
-        MAX_TARGETS_PER_UPSTREAM > 32,
-        "regression depends on the configured upstream ceiling exceeding the old hard-coded 32"
-    );
+    const {
+        assert!(
+            MAX_TARGETS_PER_UPSTREAM > 32,
+            "regression depends on the configured upstream ceiling exceeding the old hard-coded 32"
+        );
+    }
 
     // Keep the fixture smaller than the absolute ceiling for unit-test speed,
     // but still well above 32, with the eligible target last.

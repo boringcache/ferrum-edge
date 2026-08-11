@@ -2403,14 +2403,21 @@ fn all_six_retry_callers_pass_request_authority_to_shared_helper() {
     let h3_ws = include_str!("../../../src/http3/websocket.rs");
 
     // Three call sites in proxy/mod.rs (HTTP/H2, direct gRPC, WebSocket) and
-    // one each in the three H3 retry paths (H3 plain/WS use the eligibility
-    // wrapper; native H3 still calls select_next_retry_target directly).
+    // one each in the three H3 retry paths. All H3 paths use the eligibility
+    // wrapper so Unix-only targets cannot consume a retry or be dialed through
+    // a schema placeholder.
     assert_eq!(
         proxy_src.matches("select_next_retry_target(").count(),
         3,
         "proxy/mod.rs must keep exactly the three retry call sites"
     );
-    assert_eq!(h3_server.matches("select_next_retry_target(").count(), 1);
+    assert_eq!(
+        h3_server
+            .matches("select_next_h3_eligible_retry_target(")
+            .count(),
+        1,
+        "native H3 must funnel through one shared H3-eligible helper call"
+    );
     assert_eq!(
         h3_cross
             .matches("select_next_h3_eligible_retry_target(")
@@ -2435,6 +2442,11 @@ fn all_six_retry_callers_pass_request_authority_to_shared_helper() {
         0,
         "H3 WebSocket must not open-code select_next_retry_target beside the eligibility wrapper"
     );
+    assert_eq!(
+        h3_server.matches("select_next_retry_target(").count(),
+        0,
+        "native H3 must not open-code select_next_retry_target beside the eligibility wrapper"
+    );
 
     // Every production call passes the validated inbound host near the helper.
     for (label, source, needle, expected_calls) in [
@@ -2444,7 +2456,12 @@ fn all_six_retry_callers_pass_request_authority_to_shared_helper() {
             "select_next_retry_target(",
             3usize,
         ),
-        ("http3/server.rs", h3_server, "select_next_retry_target(", 1),
+        (
+            "http3/server.rs",
+            h3_server,
+            "select_next_h3_eligible_retry_target(",
+            1,
+        ),
         (
             "http3/websocket.rs",
             h3_ws,

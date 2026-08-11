@@ -48,8 +48,13 @@ fn h3_plain_bridge_dispatches_mesh_through_shared_pools() {
         .next()
         .expect("H3→HTTP plain dispatcher must remain bounded");
     assert!(
-        plain.contains("h3_bridge_transport_refusal("),
-        "the plain bridge must refuse Unix targets, not all mesh tags"
+        plain.contains("run_plain_attempt_local_policy_or_reject("),
+        "every plain attempt must pass through the local transport-policy gate"
+    );
+    assert!(
+        source.contains("async fn run_plain_attempt_local_policy_or_reject")
+            && source.contains("h3_bridge_transport_refusal(current_target)"),
+        "the shared per-attempt policy gate must refuse Unix targets, not all mesh tags"
     );
     assert!(
         plain.contains("proxy_h3_plain_http_mesh_buffered("),
