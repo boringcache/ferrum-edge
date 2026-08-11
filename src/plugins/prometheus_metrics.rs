@@ -3345,7 +3345,8 @@ impl MetricsRegistry {
             (
                 "ferrum_service_discovery_stale_expiries_total",
                 "Service-discovery tasks whose last admitted snapshot crossed the configured staleness bound.",
-                self.service_discovery_stale_expiries.load(Ordering::Relaxed),
+                self.service_discovery_stale_expiries
+                    .load(Ordering::Relaxed),
             ),
             (
                 "ferrum_service_discovery_stale_recoveries_total",
@@ -3377,7 +3378,8 @@ impl MetricsRegistry {
             (
                 "ferrum_service_discovery_tasks_replaced_total",
                 "Service-discovery tasks replaced across a config reconcile because their effective specification changed.",
-                self.service_discovery_tasks_replaced.load(Ordering::Relaxed),
+                self.service_discovery_tasks_replaced
+                    .load(Ordering::Relaxed),
             ),
             (
                 "ferrum_service_discovery_tasks_started_total",

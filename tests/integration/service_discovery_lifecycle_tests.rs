@@ -302,7 +302,10 @@ async fn reconcile_replaces_a_task_whose_static_targets_changed() {
     )]);
     manager.reconcile(&changed, None);
 
-    assert_ne!(health::generation_for_test(&task_key("mixed")), Some(before));
+    assert_ne!(
+        health::generation_for_test(&task_key("mixed")),
+        Some(before)
+    );
 
     manager.stop();
 }
@@ -432,7 +435,9 @@ async fn a_clean_cancel_is_not_counted_as_a_crash() {
     );
 
     let _ = task.cancel_tx.send(true);
-    task.handle.await.expect("supervisor exits cleanly on cancel");
+    task.handle
+        .await
+        .expect("supervisor exits cleanly on cancel");
 
     assert_eq!(
         metrics.service_discovery_task_panics_total(),
@@ -769,7 +774,10 @@ async fn a_superseded_supervisor_does_not_withdraw_when_its_staleness_bound_elap
         None,
     )]);
     let lb_cache = Arc::new(LoadBalancerCache::new(&config));
-    let discoverer = Arc::new(ScriptedDiscoverer::new(vec![target("discovered.local", 8080)]));
+    let discoverer = Arc::new(ScriptedDiscoverer::new(vec![target(
+        "discovered.local",
+        8080,
+    )]));
     let hang = Arc::clone(&discoverer.hang);
     let calls = Arc::clone(&discoverer.calls);
     let metrics = ferrum_edge::plugins::prometheus_metrics::global_registry();
@@ -841,7 +849,10 @@ async fn expiry_withdraws_discovered_targets_and_retains_static_targets() {
     let statics = vec![target("static.local", 9000)];
     let config = config_with(vec![upstream_with_sd("stale-mixed", statics.clone(), None)]);
     let lb_cache = Arc::new(LoadBalancerCache::new(&config));
-    let discoverer = Arc::new(ScriptedDiscoverer::new(vec![target("discovered.local", 8080)]));
+    let discoverer = Arc::new(ScriptedDiscoverer::new(vec![target(
+        "discovered.local",
+        8080,
+    )]));
     let fail = Arc::clone(&discoverer.fail);
     let metrics = ferrum_edge::plugins::prometheus_metrics::global_registry();
     let withdrawals_before = metrics.service_discovery_stale_withdrawals_total();
@@ -913,7 +924,10 @@ async fn expiry_recovers_and_republishes_without_a_config_reload() {
 
     let config = config_with(vec![upstream_with_sd("recovering", Vec::new(), None)]);
     let lb_cache = Arc::new(LoadBalancerCache::new(&config));
-    let discoverer = Arc::new(ScriptedDiscoverer::new(vec![target("discovered.local", 8080)]));
+    let discoverer = Arc::new(ScriptedDiscoverer::new(vec![target(
+        "discovered.local",
+        8080,
+    )]));
     let fail = Arc::clone(&discoverer.fail);
     let metrics = ferrum_edge::plugins::prometheus_metrics::global_registry();
     let recoveries_before = metrics.service_discovery_stale_recoveries_total();
@@ -1008,13 +1022,9 @@ async fn expiry_withdrawal_is_not_blocked_by_a_hung_discovery_call() {
 
     assert!(
         wait_for(|| {
-            health::snapshot()
-                .upstreams
-                .iter()
-                .any(|upstream| {
-                    upstream.upstream == task.key
-                        && upstream.last_success_age_seconds.is_some()
-                })
+            health::snapshot().upstreams.iter().any(|upstream| {
+                upstream.upstream == task.key && upstream.last_success_age_seconds.is_some()
+            })
         })
         .await,
         "initial discovered snapshot must publish"
@@ -1077,13 +1087,9 @@ async fn failed_expiry_publication_retries_and_fails_readiness_closed() {
 
     assert!(
         wait_for(|| {
-            health::snapshot()
-                .upstreams
-                .iter()
-                .any(|upstream| {
-                    upstream.upstream == task.key
-                        && upstream.last_success_age_seconds.is_some()
-                })
+            health::snapshot().upstreams.iter().any(|upstream| {
+                upstream.upstream == task.key && upstream.last_success_age_seconds.is_some()
+            })
         })
         .await,
         "initial discovered snapshot must publish before LB generation exhaustion"
@@ -1119,7 +1125,10 @@ async fn fail_readiness_policy_degrades_readiness_until_recovery() {
 
     let config = config_with(vec![upstream_with_sd("critical", Vec::new(), None)]);
     let lb_cache = Arc::new(LoadBalancerCache::new(&config));
-    let discoverer = Arc::new(ScriptedDiscoverer::new(vec![target("discovered.local", 8080)]));
+    let discoverer = Arc::new(ScriptedDiscoverer::new(vec![target(
+        "discovered.local",
+        8080,
+    )]));
     let fail = Arc::clone(&discoverer.fail);
 
     let task = spawn_supervised_discovery_task_for_test(
@@ -1174,7 +1183,10 @@ async fn retain_policy_keeps_targets_but_still_reports_staleness() {
 
     let config = config_with(vec![upstream_with_sd("legacy", Vec::new(), None)]);
     let lb_cache = Arc::new(LoadBalancerCache::new(&config));
-    let discoverer = Arc::new(ScriptedDiscoverer::new(vec![target("discovered.local", 8080)]));
+    let discoverer = Arc::new(ScriptedDiscoverer::new(vec![target(
+        "discovered.local",
+        8080,
+    )]));
     let fail = Arc::clone(&discoverer.fail);
 
     let task = spawn_supervised_discovery_task_for_test(

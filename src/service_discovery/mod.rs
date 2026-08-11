@@ -546,10 +546,7 @@ impl ServiceDiscoveryManager {
         if started > 0 || replaced > 0 || stopped > 0 {
             info!(
                 kept,
-                started,
-                replaced,
-                stopped,
-                "Service discovery: reconciled discovery tasks"
+                started, replaced, stopped, "Service discovery: reconciled discovery tasks"
             );
         } else {
             debug!(

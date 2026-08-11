@@ -2051,11 +2051,8 @@ async fn handle_admin_request_inner(
         let dp_config_stale = dp_config_freshness
             .as_ref()
             .is_some_and(|freshness| freshness.stale);
-        let ready = startup_ready
-            && !serving_degraded
-            && jwks_ready
-            && discovery_ready
-            && !dp_config_stale;
+        let ready =
+            startup_ready && !serving_degraded && jwks_ready && discovery_ready && !dp_config_stale;
         health_status["ready"] = json!(ready);
         if detailed && let Some(freshness) = dp_config_freshness.as_ref() {
             // Fixed-cardinality only: booleans, seconds, counters, and
@@ -2276,11 +2273,13 @@ async fn handle_admin_request_inner(
             // A discovery task with fail-readiness policy, or a failed
             // fail-closed withdrawal publication, is likewise unavailable.
             health_status["status"] =
-                json!(if serving_degraded || !jwks_ready || !discovery_ready || dp_config_stale {
-                    "unavailable"
-                } else {
-                    "starting"
-                });
+                json!(
+                    if serving_degraded || !jwks_ready || !discovery_ready || dp_config_stale {
+                        "unavailable"
+                    } else {
+                        "starting"
+                    }
+                );
             StatusCode::SERVICE_UNAVAILABLE
         } else {
             StatusCode::OK

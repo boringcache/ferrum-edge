@@ -53,10 +53,13 @@ fn unbounded_staleness_is_admitted_with_the_explicit_opt_in() {
 #[test]
 fn staleness_window_clamps_to_the_documented_bounds() {
     let low = parse_discovery_staleness_policy(Some("1"), None, None).expect("low value parses");
-    assert_eq!(low.max_stale_seconds, MIN_SERVICE_DISCOVERY_MAX_STALE_SECONDS);
+    assert_eq!(
+        low.max_stale_seconds,
+        MIN_SERVICE_DISCOVERY_MAX_STALE_SECONDS
+    );
 
-    let high = parse_discovery_staleness_policy(Some("9999999"), None, None)
-        .expect("high value parses");
+    let high =
+        parse_discovery_staleness_policy(Some("9999999"), None, None).expect("high value parses");
     assert_eq!(
         high.max_stale_seconds,
         HARD_MAX_SERVICE_DISCOVERY_MAX_STALE_SECONDS
@@ -74,7 +77,10 @@ fn staleness_policy_tokens_round_trip_and_reject_unknown_values() {
         let policy =
             parse_discovery_staleness_policy(None, Some(token), None).expect("token parses");
         assert_eq!(policy.policy, expected, "token {token}");
-        assert_eq!(SdStalePolicy::parse_token(expected.as_str()), Some(expected));
+        assert_eq!(
+            SdStalePolicy::parse_token(expected.as_str()),
+            Some(expected)
+        );
     }
 
     assert!(parse_discovery_staleness_policy(None, Some("drop_everything"), None).is_err());
@@ -108,7 +114,9 @@ fn effective_window_is_floored_at_three_poll_intervals() {
 
     assert_eq!(
         staleness.max_stale,
-        Some(Duration::from_secs(600 * DISCOVERY_MIN_STALE_POLL_INTERVALS)),
+        Some(Duration::from_secs(
+            600 * DISCOVERY_MIN_STALE_POLL_INTERVALS
+        )),
     );
 }
 
