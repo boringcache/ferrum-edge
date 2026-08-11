@@ -44,7 +44,8 @@ fn ambient_attests_only_settled_upgrade_matching_installed_contract() {
     );
     assert!(
         ambient.contains("ferrum-mesh-udp-placement-%s")
-            && ambient.contains("lookup \"v1\" \"ConfigMap\" .Release.Namespace $ambientUdpContractName"),
+            && ambient
+                .contains("lookup \"v1\" \"ConfigMap\" .Release.Namespace $ambientUdpContractName"),
         "attestation must read the installed placement ConfigMap, never invent cluster state"
     );
     assert!(
@@ -69,8 +70,7 @@ fn ambient_never_attests_while_current_release_is_migrating() {
     // Attestation derivation is gated on the CURRENT release phase being
     // stable. A cleanup/finalize rollout that is CHANGING placement therefore
     // cannot emit FERRUM_MESH_CAPTURE_UDP_PLACEMENT_ESTABLISHED for itself.
-    let established_gate =
-        "eq $ambientTopology \"ambient\") (eq $ambientUdpMigrationPhase \"stable\") .Release.IsUpgrade";
+    let established_gate = "eq $ambientTopology \"ambient\") (eq $ambientUdpMigrationPhase \"stable\") .Release.IsUpgrade";
     assert!(
         ambient.contains(established_gate),
         "migrating releases (cleanup/finalize) must be excluded from established attestation"
@@ -100,9 +100,8 @@ fn ambient_never_attests_while_current_release_is_migrating() {
 fn ambient_env_override_still_wins_over_chart_managed_attestation() {
     let ambient = read("templates/ambient-daemonset.yaml");
     assert!(
-        ambient.contains(
-            "not (hasKey $ambientEnv \"FERRUM_MESH_CAPTURE_UDP_PLACEMENT_ESTABLISHED\")"
-        ),
+        ambient
+            .contains("not (hasKey $ambientEnv \"FERRUM_MESH_CAPTURE_UDP_PLACEMENT_ESTABLISHED\")"),
         "explicit ambient.env attestation must win so GitOps/client-render pipelines can supply their own gate"
     );
 }
