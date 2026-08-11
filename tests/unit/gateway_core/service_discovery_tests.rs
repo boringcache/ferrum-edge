@@ -1700,7 +1700,7 @@ async fn kubernetes_missing_sa_token_falls_back_to_kube_token() {
 
     Mock::given(method("GET"))
         .and(header("authorization", "Bearer env-kube-token-value"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(&k8s_endpointslice_fixture()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(k8s_endpointslice_fixture()))
         .expect(1)
         .mount(&mock_server)
         .await;
@@ -1731,7 +1731,7 @@ async fn kubernetes_invalid_sa_token_fails_closed_before_api_request() {
 
     let mock_server = MockServer::start().await;
     Mock::given(method("GET"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(&k8s_endpointslice_fixture()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(k8s_endpointslice_fixture()))
         .expect(0)
         .mount(&mock_server)
         .await;
@@ -1774,7 +1774,7 @@ async fn kubernetes_empty_sa_token_fails_closed_without_kube_token_fallback() {
 
     let mock_server = MockServer::start().await;
     Mock::given(method("GET"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(&k8s_endpointslice_fixture()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(k8s_endpointslice_fixture()))
         .expect(0)
         .mount(&mock_server)
         .await;
@@ -1815,7 +1815,7 @@ async fn kubernetes_broken_projected_sa_token_symlink_fails_closed_without_kube_
 
     let mock_server = MockServer::start().await;
     Mock::given(method("GET"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(&k8s_endpointslice_fixture()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(k8s_endpointslice_fixture()))
         .expect(0)
         .mount(&mock_server)
         .await;
@@ -1860,7 +1860,7 @@ async fn kubernetes_invalid_utf8_sa_token_fails_closed_before_api_request() {
 
     let mock_server = MockServer::start().await;
     Mock::given(method("GET"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(&k8s_endpointslice_fixture()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(k8s_endpointslice_fixture()))
         .expect(0)
         .mount(&mock_server)
         .await;
@@ -1906,7 +1906,7 @@ async fn kubernetes_exact_limit_sa_token_is_accepted() {
     let mock_server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(header("authorization", format!("Bearer {token}")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(&k8s_endpointslice_fixture()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(k8s_endpointslice_fixture()))
         .expect(1)
         .mount(&mock_server)
         .await;
@@ -1931,7 +1931,7 @@ async fn kubernetes_non_regular_sa_token_fails_closed_before_api_request() {
 
     let mock_server = MockServer::start().await;
     Mock::given(method("GET"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(&k8s_endpointslice_fixture()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(k8s_endpointslice_fixture()))
         .expect(0)
         .mount(&mock_server)
         .await;
@@ -1972,14 +1972,14 @@ async fn kubernetes_projected_sa_token_symlink_rotation_between_polls() {
     let mock_server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(header("authorization", "Bearer projected-sa-v1"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(&k8s_endpointslice_fixture()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(k8s_endpointslice_fixture()))
         .up_to_n_times(1)
         .expect(1)
         .mount(&mock_server)
         .await;
     Mock::given(method("GET"))
         .and(header("authorization", "Bearer projected-sa-v2"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(&k8s_endpointslice_fixture()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(k8s_endpointslice_fixture()))
         .expect(1)
         .mount(&mock_server)
         .await;
@@ -2010,7 +2010,7 @@ async fn kubernetes_sa_token_read_keeps_tokio_heartbeat_alive() {
     let mock_server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(header("authorization", "Bearer heartbeat-sa-token"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(&k8s_endpointslice_fixture()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(k8s_endpointslice_fixture()))
         .mount(&mock_server)
         .await;
 
@@ -2048,7 +2048,7 @@ async fn kubernetes_discovery_bounds_detached_sa_token_reader_occupancy() {
         let mock_server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(header("authorization", "Bearer serialized-sa-token"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&k8s_endpointslice_fixture()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(k8s_endpointslice_fixture()))
             .mount(&mock_server)
             .await;
         mock_server
