@@ -25393,14 +25393,16 @@ async fn handle_proxy_request_inner(
             if crate::modes::mesh::mesh_route_direction(&rm.proxy.id)
                 .is_some_and(|route_dir| Some(route_dir) != ctx.mesh_direction) =>
         {
-            state.router_cache.resolve_route_excluding_wrong_direction_in_epoch(
-                &epoch,
-                request_host.as_deref(),
-                &path,
-                ctx.mesh_direction,
-                ctx.frontend_listen_port,
-                is_tls,
-            )
+            state
+                .router_cache
+                .resolve_route_excluding_wrong_direction_in_epoch(
+                    &epoch,
+                    request_host.as_deref(),
+                    &path,
+                    ctx.mesh_direction,
+                    ctx.frontend_listen_port,
+                    is_tls,
+                )
         }
         other => other,
     };

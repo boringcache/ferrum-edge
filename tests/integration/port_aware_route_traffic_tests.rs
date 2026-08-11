@@ -521,16 +521,12 @@ async fn refused_gateway_listener_does_not_poison_sibling_and_recovers() {
         matches!(outcome, ferrum_edge::proxy::ConfigApplyOutcome::Applied),
         "recovery publication must apply: {outcome:?}"
     );
-    wait_for_listener_ports(&handles, &[sibling_port, recovered_port]).await;
-    assert!(
-        handles
-            .gateway_listeners
-            .bind_failures()
-            .iter()
-            .all(|failure| failure.port != recovered_port && failure.port != admin_port),
-        "recovery must withdraw the prior refusal: {:?}",
-        handles.gateway_listeners.bind_failures()
-    );
+    wait_for_listener_ports_and_withdrawn_failures(
+        &handles,
+        &[sibling_port, recovered_port],
+        &[admin_port],
+    )
+    .await;
     assert_eq!(
         http_get(recovered_port, "/api/x").await,
         (200, "listener-refused".to_string()),
@@ -844,20 +840,34 @@ async fn wait_for_listener_ports(
     handles: &ferrum_edge::modes::file::ServeHandles,
     expected: &[u16],
 ) {
-    let mut want = expected.to_vec();
+    wait_for_listener_ports_and_withdrawn_failures(handles, expected, &[]).await;
+}
+
+/// Like [`wait_for_listener_ports`], but also waits until the lock-free
+/// `bind_failures` snapshot no longer lists any of `withdrawn_failure_ports`.
+/// Reconcile can insert a socket before it publishes the updated failure set.
+async fn wait_for_listener_ports_and_withdrawn_failures(
+    handles: &ferrum_edge::modes::file::ServeHandles,
+    expected_active: &[u16],
+    withdrawn_failure_ports: &[u16],
+) {
+    let mut want = expected_active.to_vec();
     want.sort_unstable();
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         let mut active = handles.gateway_listeners.active_ports().await;
         active.sort_unstable();
-        if active == want {
+        let failures = handles.gateway_listeners.bind_failures();
+        let withdrawals_ok = withdrawn_failure_ports
+            .iter()
+            .all(|port| !failures.iter().any(|failure| failure.port == *port));
+        if active == want && withdrawals_ok {
             return;
         }
         if std::time::Instant::now() >= deadline {
             panic!(
-                "Gateway listener ports never converged: want {want:?}, active {active:?}, \
-                 failures {:?}",
-                handles.gateway_listeners.bind_failures()
+                "Gateway listener state never converged: want active {want:?}, actual {active:?}, \
+                 want withdrawn failures {withdrawn_failure_ports:?}, failures {failures:?}"
             );
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
