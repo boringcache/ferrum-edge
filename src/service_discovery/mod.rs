@@ -747,10 +747,12 @@ impl DiscoveryLoopState {
         Self::default()
     }
 
+    #[allow(dead_code)] // reached via `_test_support` from the external test crate
     pub(crate) fn snapshot_installed(&self) -> bool {
         self.snapshot_installed
     }
 
+    #[allow(dead_code)] // reached via `_test_support` from the external test crate
     pub(crate) fn last_discovered(&self) -> &[UpstreamTarget] {
         &self.last_discovered
     }
