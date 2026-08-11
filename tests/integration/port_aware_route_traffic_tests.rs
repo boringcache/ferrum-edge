@@ -173,12 +173,115 @@ async fn start_body_backend(body: &'static [u8]) -> (u16, tokio::task::JoinHandl
 }
 
 /// Reserve an ephemeral port number and release the socket so the gateway can
-/// bind it itself. Retried by the callers' outer loop on a bind race.
+/// bind it itself. Whole-startup callers retry on a bind race.
 async fn reserve_free_port() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     drop(listener);
     port
+}
+
+const GATEWAY_LISTENER_STARTUP_ATTEMPTS: u32 = 3;
+
+/// Successful startup for two same-protocol Gateway listener ports via
+/// `file::serve`. Production still owns every Gateway listener bind.
+struct TwoSameProtocolListenersStartup {
+    handles: ferrum_edge::modes::file::ServeHandles,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    listener_a_port: u16,
+    listener_b_port: u16,
+    global_proxy_port: u16,
+}
+
+/// Start `file::serve` with two distinct Gateway listener ports, retrying the
+/// whole startup when an ephemeral port reservation races before the manager
+/// binds it.
+async fn start_two_same_protocol_gateway_listeners(
+    backend_a: u16,
+    backend_b: u16,
+) -> TwoSameProtocolListenersStartup {
+    use std::sync::Arc;
+
+    use ferrum_edge::proxy::gateway_listener::GatewayListenerBindFailure;
+
+    let mut last_bind_failures: Arc<Vec<GatewayListenerBindFailure>> =
+        Arc::new(Vec::new());
+
+    for attempt in 1..=GATEWAY_LISTENER_STARTUP_ATTEMPTS {
+        let listener_a_port = reserve_free_port().await;
+        let listener_b_port = reserve_free_port().await;
+        assert_ne!(listener_a_port, listener_b_port);
+
+        let config = config_with(vec![
+            port_scoped_proxy("gw-a", backend_a, Some(listener_a_port)),
+            port_scoped_proxy("gw-b", backend_b, Some(listener_b_port)),
+        ]);
+        config
+            .validate_unique_listen_paths()
+            .expect("distinct listener ports are independent route-table slots");
+
+        let proxy_http = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let admin_http = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let global_proxy_port = proxy_http.local_addr().unwrap().port();
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+
+        let handles = match serve(
+            test_env_config(0, 0),
+            config,
+            serve_options(proxy_http, admin_http),
+            shutdown_tx.clone(),
+        )
+        .await
+        {
+            Ok(handles) => handles,
+            Err(error) => {
+                eprintln!(
+                    "two-listener startup attempt {attempt}/{GATEWAY_LISTENER_STARTUP_ATTEMPTS} \
+                     failed before serve returned: {error}"
+                );
+                if attempt == GATEWAY_LISTENER_STARTUP_ATTEMPTS {
+                    panic!(
+                        "file::serve failed after {GATEWAY_LISTENER_STARTUP_ATTEMPTS} attempts: \
+                         {error}"
+                    );
+                }
+                continue;
+            }
+        };
+
+        let mut active = handles.gateway_listeners.active_ports().await;
+        active.sort_unstable();
+        let mut expected = vec![listener_a_port, listener_b_port];
+        expected.sort_unstable();
+
+        if active == expected {
+            return TwoSameProtocolListenersStartup {
+                handles,
+                shutdown_tx,
+                listener_a_port,
+                listener_b_port,
+                global_proxy_port,
+            };
+        }
+
+        last_bind_failures = handles.gateway_listeners.bind_failures();
+        eprintln!(
+            "two-listener startup attempt {attempt}/{GATEWAY_LISTENER_STARTUP_ATTEMPTS} \
+             lost an ephemeral-port race: want active {expected:?}, actual {active:?}, \
+             refusals: {last_bind_failures:?}"
+        );
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handles.join()).await;
+        if attempt == GATEWAY_LISTENER_STARTUP_ATTEMPTS {
+            panic!(
+                "both Gateway listener ports must be bound by the gateway after \
+                 {GATEWAY_LISTENER_STARTUP_ATTEMPTS} attempts; want {expected:?}, \
+                 actual {active:?}, refusals: {last_bind_failures:?}"
+            );
+        }
+    }
+
+    unreachable!("startup loop always returns or panics")
 }
 
 /// `Ok((status, body))`, or `Err` when the port is not accepting at all.
@@ -232,43 +335,15 @@ async fn two_same_protocol_gateway_listeners_bind_and_route_independently() {
     let (backend_80, _b80) = start_body_backend(b"listener-a").await;
     let (backend_8080, _b8080) = start_body_backend(b"listener-b").await;
 
-    let listener_a_port = reserve_free_port().await;
-    let listener_b_port = reserve_free_port().await;
-    assert_ne!(listener_a_port, listener_b_port);
-
-    let config = config_with(vec![
-        port_scoped_proxy("gw-a", backend_80, Some(listener_a_port)),
-        port_scoped_proxy("gw-b", backend_8080, Some(listener_b_port)),
-    ]);
-    // Two same-protocol listener ports must not collide at validation.
-    config
-        .validate_unique_listen_paths()
-        .expect("distinct listener ports are independent route-table slots");
-
-    let proxy_http = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let admin_http = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let global_proxy_port = proxy_http.local_addr().unwrap().port();
-    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
-    let handles = serve(
-        test_env_config(0, 0),
-        config,
-        serve_options(proxy_http, admin_http),
-        shutdown_tx.clone(),
-    )
-    .await
-    .expect("file::serve starts");
-
-    // The gateway — not the test — owns these sockets.
-    let mut active = handles.gateway_listeners.active_ports().await;
-    active.sort_unstable();
-    let mut expected = vec![listener_a_port, listener_b_port];
-    expected.sort_unstable();
-    assert_eq!(
-        active,
-        expected,
-        "both Gateway listener ports must be bound by the gateway; refusals: {:?}",
-        handles.gateway_listeners.bind_failures()
-    );
+    let startup =
+        start_two_same_protocol_gateway_listeners(backend_80, backend_8080).await;
+    let TwoSameProtocolListenersStartup {
+        handles,
+        shutdown_tx,
+        listener_a_port,
+        listener_b_port,
+        global_proxy_port,
+    } = startup;
 
     let (status_a, body_a) = http_get(listener_a_port, "/api/x").await;
     assert_eq!(status_a, 200, "listener A must serve: {body_a}");
