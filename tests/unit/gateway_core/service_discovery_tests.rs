@@ -1042,12 +1042,14 @@ fn test_merge_targets_preserves_discovered_tags() {
 // ── Consul response parsing edge cases ────────────────────────────────
 
 #[tokio::test]
-async fn test_consul_discover_weight_zero_uses_default() {
+async fn test_consul_discover_weight_zero_skipped() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     let mock_server = MockServer::start().await;
 
+    // Explicit Passing=0 is invalid under the nonzero target-weight contract.
+    // Missing Weights falls back to default_weight; present-but-invalid skips.
     let consul_response = serde_json::json!([{
         "Node": {"Address": "10.0.0.1"},
         "Service": {
@@ -1076,13 +1078,14 @@ async fn test_consul_discover_weight_zero_uses_default() {
         None,
         false,
         None,
-        42, // default_weight
+        42, // default_weight — must not be applied when Passing is explicitly 0
     );
 
     let targets = discoverer.discover().await.unwrap();
-    assert_eq!(targets.len(), 1);
-    // Passing weight is 0 so it should use 0 (the code uses the Passing value as-is)
-    assert_eq!(targets[0].weight, 0);
+    assert!(
+        targets.is_empty(),
+        "explicit Passing=0 must skip the entry, not coerce to default or publish weight 0"
+    );
 }
 
 #[tokio::test]
@@ -1305,6 +1308,355 @@ async fn test_consul_discover_consul_tags_extracted() {
     assert_eq!(targets[0].tags.get("consul_tag_1").unwrap(), "v2");
     assert_eq!(targets[0].tags.get("consul_tag_2").unwrap(), "canary");
     assert_eq!(targets[0].tags.len(), 3);
+}
+
+// ── Registry numeric bounds (issue #3723) ──────────────────────────────
+
+#[tokio::test]
+async fn test_consul_discover_port_boundary_table() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // Ports 1 and 65535 admit; 0 / 65536 / 65537 / u64::MAX reject without wrapping.
+    let cases: &[(serde_json::Value, bool, Option<u16>)] = &[
+        (serde_json::json!(0), false, None),
+        (serde_json::json!(1), true, Some(1)),
+        (serde_json::json!(65535), true, Some(65535)),
+        (serde_json::json!(65536), false, None),
+        (serde_json::json!(65537), false, None),
+        (serde_json::json!(u64::MAX), false, None),
+    ];
+
+    for (idx, (port_value, expect_admit, expected_port)) in cases.iter().enumerate() {
+        let mock_server = MockServer::start().await;
+        let consul_response = serde_json::json!([{
+            "Node": {"Address": "10.0.0.1"},
+            "Service": {
+                "Address": "10.0.0.1",
+                "Port": port_value,
+                "Tags": []
+            }
+        }]);
+
+        Mock::given(method("GET"))
+            .and(path("/v1/health/service/port-bounds"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&consul_response))
+            .mount(&mock_server)
+            .await;
+
+        let discoverer = ConsulDiscoverer::new(
+            reqwest::Client::new(),
+            mock_server.uri(),
+            "port-bounds".to_string(),
+            None,
+            None,
+            false,
+            None,
+            1,
+        );
+
+        let targets = discoverer.discover().await.unwrap();
+        if *expect_admit {
+            assert_eq!(
+                targets.len(),
+                1,
+                "case {idx}: port {port_value} must admit exactly one target"
+            );
+            assert_eq!(targets[0].port, expected_port.unwrap());
+            // Guard against the pre-fix wrap of 65537 → 1.
+            assert_ne!(
+                targets[0].port, 0,
+                "case {idx}: admitted port must be nonzero"
+            );
+        } else {
+            assert!(
+                targets.is_empty(),
+                "case {idx}: port {port_value} must be rejected without publishing a wrapped target"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_consul_discover_weight_boundary_table() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let max = MAX_TARGET_WEIGHT;
+    let cases: &[(serde_json::Value, bool, Option<u32>)] = &[
+        (serde_json::json!(0), false, None),
+        (serde_json::json!(1), true, Some(1)),
+        (serde_json::json!(max), true, Some(max)),
+        (serde_json::json!(u64::from(max) + 1), false, None),
+        (serde_json::json!(u64::from(u32::MAX) + 1), false, None),
+        (serde_json::json!(u64::MAX), false, None),
+    ];
+
+    for (idx, (weight_value, expect_admit, expected_weight)) in cases.iter().enumerate() {
+        let mock_server = MockServer::start().await;
+        let consul_response = serde_json::json!([{
+            "Node": {"Address": "10.0.0.1"},
+            "Service": {
+                "Address": "10.0.0.1",
+                "Port": 8080,
+                "Tags": [],
+                "Weights": {"Passing": weight_value, "Warning": 1}
+            }
+        }]);
+
+        Mock::given(method("GET"))
+            .and(path("/v1/health/service/weight-bounds"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&consul_response))
+            .mount(&mock_server)
+            .await;
+
+        let discoverer = ConsulDiscoverer::new(
+            reqwest::Client::new(),
+            mock_server.uri(),
+            "weight-bounds".to_string(),
+            None,
+            None,
+            false,
+            None,
+            9, // default_weight — must not rescue an explicitly invalid Passing
+        );
+
+        let targets = discoverer.discover().await.unwrap();
+        if *expect_admit {
+            assert_eq!(targets.len(), 1, "case {idx}: weight {weight_value} must admit");
+            assert_eq!(targets[0].weight, expected_weight.unwrap());
+        } else {
+            assert!(
+                targets.is_empty(),
+                "case {idx}: weight {weight_value} must skip without wrap/coercion"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_consul_discover_mixed_valid_invalid_ports_and_weights() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    // Mixed snapshot: valid peers remain; malformed ports/weights never wrap
+    // into routable targets.
+    let consul_response = serde_json::json!([
+        {
+            "Node": {"Address": "10.0.0.1"},
+            "Service": {
+                "Address": "10.0.0.1",
+                "Port": 8080,
+                "Tags": [],
+                "Weights": {"Passing": 5}
+            }
+        },
+        {
+            "Node": {"Address": "10.0.0.2"},
+            "Service": {
+                "Address": "10.0.0.2",
+                "Port": 65537,
+                "Tags": []
+            }
+        },
+        {
+            "Node": {"Address": "10.0.0.3"},
+            "Service": {
+                "Address": "10.0.0.3",
+                "Port": 9090,
+                "Tags": [],
+                "Weights": {"Passing": u64::MAX}
+            }
+        },
+        {
+            "Node": {"Address": "10.0.0.4"},
+            "Service": {
+                "Address": "10.0.0.4",
+                "Port": 65535,
+                "Tags": [],
+                "Weights": {"Passing": MAX_TARGET_WEIGHT}
+            }
+        },
+        {
+            "Node": {"Address": "10.0.0.5"},
+            "Service": {
+                "Address": "10.0.0.5",
+                "Port": 1,
+                "Tags": []
+            }
+        }
+    ]);
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/mixed"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(&consul_response)
+                .insert_header("X-Consul-Index", "7"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let discoverer = ConsulDiscoverer::new(
+        reqwest::Client::new(),
+        mock_server.uri(),
+        "mixed".to_string(),
+        None,
+        None,
+        false,
+        None,
+        3,
+    );
+
+    let snapshot = discoverer.discover().await.unwrap();
+    let targets = snapshot.targets();
+
+    assert_eq!(
+        targets.len(),
+        3,
+        "only valid entries must publish; invalid peers must be skipped"
+    );
+    assert_eq!(targets[0].host, "10.0.0.1");
+    assert_eq!(targets[0].port, 8080);
+    assert_eq!(targets[0].weight, 5);
+    assert_eq!(targets[1].host, "10.0.0.4");
+    assert_eq!(targets[1].port, 65535);
+    assert_eq!(targets[1].weight, MAX_TARGET_WEIGHT);
+    assert_eq!(targets[2].host, "10.0.0.5");
+    assert_eq!(targets[2].port, 1);
+    assert_eq!(targets[2].weight, 3); // missing Weights → default_weight
+
+    // No wrapped port-1 from 65537, and no wrapped weight from u64::MAX.
+    assert!(
+        !targets
+            .iter()
+            .any(|t| t.host == "10.0.0.2" || t.host == "10.0.0.3")
+    );
+    assert!(!targets.iter().any(|t| t.port == 1 && t.host == "10.0.0.2"));
+}
+
+#[tokio::test]
+async fn test_kubernetes_discover_port_boundary_table() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let cases: &[(u64, bool, Option<u16>)] = &[
+        (0, false, None),
+        (1, true, Some(1)),
+        (65535, true, Some(65535)),
+        (65536, false, None),
+        (65537, false, None),
+        (u64::MAX, false, None),
+    ];
+
+    for (idx, &(raw_port, expect_admit, expected_port)) in cases.iter().enumerate() {
+        let mock_server = MockServer::start().await;
+        let response = serde_json::json!({
+            "items": [{
+                "ports": [{"name": "http", "port": raw_port, "protocol": "TCP"}],
+                "endpoints": [{
+                    "addresses": ["10.244.0.5"],
+                    "conditions": {"ready": true}
+                }]
+            }]
+        });
+
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response))
+            .mount(&mock_server)
+            .await;
+
+        let discoverer = KubernetesDiscoverer::new(
+            reqwest::Client::new(),
+            "default".to_string(),
+            "my-service".to_string(),
+            Some("http".to_string()),
+            None,
+            1,
+        )
+        .with_api_url(mock_server.uri());
+
+        let targets = discoverer.discover().await.unwrap();
+        if expect_admit {
+            assert_eq!(targets.len(), 1, "case {idx}: port {raw_port} must admit");
+            assert_eq!(targets[0].port, expected_port.unwrap());
+        } else {
+            assert!(
+                targets.is_empty(),
+                "case {idx}: port {raw_port} must reject without wrapping (65537 must not become 1)"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_kubernetes_discover_mixed_valid_invalid_ports_in_snapshot() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    // One slice with an out-of-range port and one with a valid port: only the
+    // valid slice's ready endpoints publish. Fail-closed for the bad slice
+    // must not taint the valid peer.
+    let response = serde_json::json!({
+        "items": [
+            {
+                "ports": [{"name": "http", "port": 65537, "protocol": "TCP"}],
+                "endpoints": [{
+                    "addresses": ["10.244.0.1"],
+                    "conditions": {"ready": true}
+                }]
+            },
+            {
+                "ports": [{"name": "http", "port": 8080, "protocol": "TCP"}],
+                "endpoints": [{
+                    "addresses": ["10.244.0.2"],
+                    "conditions": {"ready": true}
+                }]
+            },
+            {
+                "ports": [{"name": "http", "port": 0, "protocol": "TCP"}],
+                "endpoints": [{
+                    "addresses": ["10.244.0.3"],
+                    "conditions": {"ready": true}
+                }]
+            },
+            {
+                "ports": [{"name": "http", "port": 65535, "protocol": "TCP"}],
+                "endpoints": [{
+                    "addresses": ["10.244.0.4"],
+                    "conditions": {"ready": true}
+                }]
+            }
+        ]
+    });
+
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&response))
+        .mount(&mock_server)
+        .await;
+
+    let discoverer = KubernetesDiscoverer::new(
+        reqwest::Client::new(),
+        "default".to_string(),
+        "my-service".to_string(),
+        Some("http".to_string()),
+        None,
+        1,
+    )
+    .with_api_url(mock_server.uri());
+
+    let targets = discoverer.discover().await.unwrap();
+    assert_eq!(targets.len(), 2);
+    assert_eq!(targets[0].host, "10.244.0.2");
+    assert_eq!(targets[0].port, 8080);
+    assert_eq!(targets[1].host, "10.244.0.4");
+    assert_eq!(targets[1].port, 65535);
+    assert!(!targets.iter().any(|t| t.host == "10.244.0.1" && t.port == 1));
+    assert!(!targets.iter().any(|t| t.host == "10.244.0.1" || t.host == "10.244.0.3"));
 }
 
 // ── Kubernetes response parsing edge cases ────────────────────────────
