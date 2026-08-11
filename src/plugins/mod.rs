@@ -7159,13 +7159,12 @@ pub async fn log_with_mirror(
     // and can exhaust a worker stack under instrumentation. The triggered path
     // already clones owned summary data, so one box does not change the common
     // path and bounds the future itself to a pointer-sized optional value.
-    let mut stamped = if ctx.has_plugin_trigger_decisions()
-        && summary.plugin_trigger_decisions.is_empty()
-    {
-        Some(Box::new(summary.clone()))
-    } else {
-        None
-    };
+    let mut stamped =
+        if ctx.has_plugin_trigger_decisions() && summary.plugin_trigger_decisions.is_empty() {
+            Some(Box::new(summary.clone()))
+        } else {
+            None
+        };
     if let Some(stamped) = stamped.as_deref_mut() {
         stamped.plugin_trigger_decisions = ctx.plugin_trigger_decisions();
     }
