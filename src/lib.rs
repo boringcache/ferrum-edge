@@ -2602,6 +2602,37 @@ pub mod _test_support {
         summary.plugin_trigger_decisions = ctx.plugin_trigger_decisions();
     }
 
+    /// Project a request's memoized execution-trigger decisions onto a terminal
+    /// transaction summary, exactly as `plugins::log_with_mirror` does for every
+    /// production HTTP-family terminal path.
+    ///
+    /// Same rationale as the stream variant: the carrier is not constructible
+    /// with real content outside this crate, so external tests reach the
+    /// production projection through here.
+    pub fn attach_transaction_trigger_decisions_for_test(
+        summary: &mut crate::plugins::TransactionSummary,
+        ctx: &crate::plugins::RequestContext,
+    ) {
+        summary.plugin_trigger_decisions = ctx.plugin_trigger_decisions();
+    }
+
+    /// Bind a UDP/DTLS flow's datagram-hook list to the decisions an
+    /// `on_stream_connect` chain memoized, exactly as first-datagram admission
+    /// does on both the plain-UDP and DTLS paths.
+    pub fn admitted_datagram_plugins_for_test(
+        datagram_plugins: &Arc<[Arc<dyn crate::plugins::Plugin>]>,
+        ctx: &crate::plugins::StreamConnectionContext,
+    ) -> Arc<[Arc<dyn crate::plugins::Plugin>]> {
+        let decisions = ctx.plugin_trigger_decisions();
+        crate::plugins::admitted_datagram_plugins(datagram_plugins, &decisions)
+    }
+
+    /// Snapshot the unlabeled trigger-carrier counters.
+    pub fn plugin_trigger_carrier_counters_for_test()
+    -> crate::plugins::trigger::PluginTriggerCarrierCounters {
+        crate::plugins::trigger::carrier_counters()
+    }
+
     // ── proxy/tcp_proxy ──────────────────────────────────────────────────────
     pub fn classify_stream_error(error: &anyhow::Error) -> crate::retry::ErrorClass {
         crate::proxy::tcp_proxy::classify_stream_error(error)
@@ -2956,10 +2987,28 @@ pub mod _test_support {
         Vec<Arc<dyn crate::plugins::Plugin>>,
     );
 
+    /// Compatibility seam for callers that hold an immutable upgrade context.
+    /// The production step memoizes per-instance trigger decisions on the
+    /// context, so this variant decides against a throwaway clone; use
+    /// `collect_websocket_relay_plugins_decided_for_test` when the memoized
+    /// decisions must be observable afterwards.
     pub fn collect_websocket_relay_plugins_for_test(
         plugins: &[Arc<dyn crate::plugins::Plugin>],
         requires_websocket_framing: bool,
         upgrade_ctx: &crate::plugins::RequestContext,
+    ) -> WebSocketRelayPluginListsForTest {
+        let mut upgrade_ctx = upgrade_ctx.clone();
+        crate::proxy::collect_websocket_relay_plugins(
+            plugins,
+            requires_websocket_framing,
+            &mut upgrade_ctx,
+        )
+    }
+
+    pub fn collect_websocket_relay_plugins_decided_for_test(
+        plugins: &[Arc<dyn crate::plugins::Plugin>],
+        requires_websocket_framing: bool,
+        upgrade_ctx: &mut crate::plugins::RequestContext,
     ) -> WebSocketRelayPluginListsForTest {
         crate::proxy::collect_websocket_relay_plugins(
             plugins,
@@ -2968,16 +3017,36 @@ pub mod _test_support {
         )
     }
 
+    /// Run the production per-session parser-ceiling collection step, which is
+    /// where WebSocket admission is first decided (before the backend
+    /// handshake, which is the earliest point a ceiling is consumed).
+    pub fn collect_websocket_size_limit_plugins_for_test(
+        plugins: &[Arc<dyn crate::plugins::Plugin>],
+        upgrade_ctx: &mut crate::plugins::RequestContext,
+    ) -> Vec<Arc<dyn crate::plugins::Plugin>> {
+        crate::proxy::collect_websocket_size_limit_plugins(plugins, upgrade_ctx)
+    }
+
+    /// Run the production per-session disconnect-hook collection step, under the
+    /// same per-instance execution-trigger admission as the frame path.
+    pub fn collect_websocket_disconnect_plugins_for_test(
+        plugins: &[Arc<dyn crate::plugins::Plugin>],
+        upgrade_ctx: &mut crate::plugins::RequestContext,
+    ) -> Vec<Arc<dyn crate::plugins::Plugin>> {
+        crate::proxy::collect_websocket_disconnect_plugins(plugins, upgrade_ctx)
+    }
+
     /// Report the production parser-policy and post-reassembly hook lists.
     pub fn websocket_relay_plugin_names_for_test(
         plugins: &[Arc<dyn crate::plugins::Plugin>],
         requires_websocket_framing: bool,
         upgrade_ctx: &crate::plugins::RequestContext,
     ) -> (Vec<String>, Vec<String>) {
+        let mut upgrade_ctx = upgrade_ctx.clone();
         let (framing_plugins, frame_plugins) = crate::proxy::collect_websocket_relay_plugins(
             plugins,
             requires_websocket_framing,
-            upgrade_ctx,
+            &mut upgrade_ctx,
         );
         (
             framing_plugins

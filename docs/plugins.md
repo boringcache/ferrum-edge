@@ -172,15 +172,34 @@ The trigger is a generic layer and never replaces route selection, mesh routing,
 or a plugin's own policy matchers. It is compiled and bounded at config load,
 admin write, and plugin-cache publication — the request path only walks
 precompiled matchers. A false trigger suppresses every hook of that instance —
-request, response, and stream connect/disconnect alike — including its
-per-request buffering, body-release, and enforcement claims, so a skipped
-instance makes no external call, takes no lease, and retains no state.
+request, response, terminal transaction logging, stream connect/disconnect,
+WebSocket frame/reassembly/delivery/disconnect, and UDP/DTLS datagram hooks
+alike — including its per-request buffering, body-release, and enforcement
+claims, so a skipped instance makes no external call, takes no lease, and
+retains no state.
 
-Some surfaces cannot be gated coherently and are refused at publication rather
-than half-applied: WebSocket frame/disconnect hooks, UDP datagram hooks, the
-contextless initial response-header policy (`security_headers`), an identity
-predicate on an authentication plugin, an identity predicate on a stream-only
-plugin, fixed core request/response body ceilings, and contextless
+The contextless surfaces are gated by carrying ONE decision from the
+authoritative admission point rather than re-evaluating a predicate later.
+Terminal `log` / `log_with_mesh_key` read the decision from an opaque,
+non-serialized carrier on the transaction summary; WebSocket frame, reassembly,
+delivery, size-limit, and disconnect hooks read it from the upgrade's decision,
+which is taken before the session's capability set exists (a skipped instance
+therefore cannot force framing or pull a session off the raw tunnel path); UDP
+and DTLS datagram hooks read it from the session, decided once by the
+`on_stream_connect` chain, so no predicate is evaluated per packet. Missing
+carrier state RUNS the hook — historical behavior is preserved and the
+occurrence is counted in the unlabeled `plugin_triggers` counters on
+`GET /metrics/runtime` — so an absent carrier can never silently disable a
+security plugin.
+
+Some surfaces still cannot be gated coherently and are refused at publication
+rather than half-applied: the contextless initial response-header policy
+(`security_headers`), an identity predicate on an authentication plugin, an
+identity predicate on a stream-only plugin, an HTTP-only predicate (`method`,
+`path`, `host`, `header`, `query`, `cookie`) on a stream-only plugin — a
+datagram or byte stream has no request line, header block, query string, or
+cookie jar, so the field is named in the error instead of being reinterpreted as
+empty — fixed core request/response body ceilings, and contextless
 response-trailer ownership. An identity predicate (`consumer` / `auth_method` /
 `spiffe_id`) also never gates a stream connection at all — the one gated stream
 phase is where stream authentication itself runs — so on a plugin that serves
