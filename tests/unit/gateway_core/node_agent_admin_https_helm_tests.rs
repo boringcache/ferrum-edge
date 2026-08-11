@@ -151,10 +151,11 @@ fn ambient_rejects_only_active_https_port_collision_with_node_agent() {
         "ambient collision reads must preserve integer node-agent httpsPort=0"
     );
     assert!(
-        ambient.contains("ambient FERRUM_ADMIN_HTTP_PORT and nodeAgent.admin.httpsPort both use hostNetwork port")
-            && ambient.contains(
-                "ambient FERRUM_ADMIN_HTTPS_PORT and nodeAgent.admin.port both use hostNetwork port"
-            ),
+        ambient.contains(
+            "ambient FERRUM_ADMIN_HTTP_PORT and nodeAgent.admin.httpsPort both use hostNetwork port"
+        ) && ambient.contains(
+            "ambient FERRUM_ADMIN_HTTPS_PORT and nodeAgent.admin.port both use hostNetwork port"
+        ),
         "ambient chart must reject cross-protocol hostNetwork admin port collisions"
     );
 }
