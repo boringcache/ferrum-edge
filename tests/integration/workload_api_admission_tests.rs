@@ -811,8 +811,9 @@ async fn a_connection_that_never_speaks_is_closed_on_its_deadline_and_returns_it
                 );
             }
             let remaining = MAX_SERVER_BYTES - total_read;
+            let read_len = remaining.min(READ_CHUNK);
             let read = silent
-                .read(&mut buf[..remaining])
+                .read(&mut buf[..read_len])
                 .await
                 .expect("the close is a clean transport teardown");
             if read == 0 {
