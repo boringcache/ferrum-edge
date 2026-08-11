@@ -24,7 +24,8 @@ use std::time::{Duration, Instant};
 
 use crate::capture::{
     CaptureConfig, Ip6TablesMode, IptablesPlan, TPROXY_HOST_ROUTE_RULE_PRIORITY,
-    TPROXY_HOST_ROUTE_TABLE, UDP_HOST_CAPTURE_CHAIN, UDP_HOST_GUARD_CHAIN_A, UDP_HOST_GUARD_CHAIN_B,
+    TPROXY_HOST_ROUTE_TABLE, UDP_HOST_CAPTURE_CHAIN, UDP_HOST_GUARD_CHAIN_A,
+    UDP_HOST_GUARD_CHAIN_B,
 };
 use crate::identity::spiffe::SpiffeId;
 use crate::modes::mesh::hbone::UdpSourceIdentity;
@@ -47,6 +48,13 @@ const POD_A_V6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0, 0, 1, 0, 0, 0, 2);
 const POD_B_V6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0, 0, 2, 0, 0, 0, 2);
 const HOST_A_V6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0, 0, 1, 0, 0, 0, 1);
 const HOST_B_V6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0, 0, 2, 0, 0, 0, 1);
+// Pod C is deliberately UNENROLLED: it gets a netns and a veth pair like the
+// others, but its host-side interface is passed to neither the capture ruleset
+// nor the identity index.
+const POD_C_V4: Ipv4Addr = Ipv4Addr::new(10, 200, 3, 2);
+const HOST_C_V4: Ipv4Addr = Ipv4Addr::new(10, 200, 3, 1);
+const POD_C_V6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0, 0, 3, 0, 0, 0, 2);
+const HOST_C_V6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0, 0, 3, 0, 0, 0, 1);
 const POD_A_UID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const POD_B_UID: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 const DIAG_CAP: usize = 4096;
@@ -202,7 +210,7 @@ fn spawn_pod_child() -> Option<Child> {
         .ok()
 }
 
-fn run_checked(mut cmd: Command) -> Result<(), String> {
+fn run_checked(cmd: &mut Command) -> Result<(), String> {
     let output = cmd
         .output()
         .map_err(|error| format!("spawn failed: {error}"))?;
@@ -248,20 +256,8 @@ fn attach_veth_pair(
     run_checked(Command::new("ip").args([
         "link", "add", host_if, "type", "veth", "peer", "name", pod_if,
     ]))?;
-    run_checked(Command::new("ip").args([
-        "link",
-        "set",
-        host_if,
-        "netns",
-        &host_pid.to_string(),
-    ]))?;
-    run_checked(Command::new("ip").args([
-        "link",
-        "set",
-        pod_if,
-        "netns",
-        &pod_pid.to_string(),
-    ]))?;
+    run_checked(Command::new("ip").args(["link", "set", host_if, "netns", &host_pid.to_string()]))?;
+    run_checked(Command::new("ip").args(["link", "set", pod_if, "netns", &pod_pid.to_string()]))?;
 
     nsenter_sh(
         host_pid,
@@ -397,16 +393,42 @@ fn recv_one(
                 let local = batch
                     .local_addr(0)
                     .ok_or_else(|| "captured datagram carried no IP_PKTINFO".to_string())?;
-                return Ok((
-                    payload.to_vec(),
-                    source,
-                    batch.orig_dst(0),
-                    local.ifindex,
-                ));
+                return Ok((payload.to_vec(), source, batch.orig_dst(0), local.ifindex));
             }
             _ if Instant::now() >= deadline => {
                 return Err("capture socket received no datagram within the deadline".to_string());
             }
+            _ => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
+}
+
+/// Drain the capture socket for a bounded window and fail if `needle` appears.
+///
+/// Absence is the assertion here, so the window must be DRAINED rather than
+/// sampled once: a single non-blocking `recv` races the kernel queueing the
+/// datagram and would report a false negative for a datagram that really was
+/// redirected.
+fn assert_not_captured(capture_fd: i32, needle: &[u8], window: Duration) -> Result<(), String> {
+    let mut batch = RecvMmsgBatch::new(8, true);
+    let deadline = Instant::now() + window;
+    loop {
+        match batch.recv(capture_fd, 8) {
+            Ok(n) if n > 0 => {
+                for index in 0..n {
+                    let (payload, source) = batch.datagram(index);
+                    if payload == needle {
+                        return Err(format!(
+                            "capture socket received a datagram it must never see (from {source})"
+                        ));
+                    }
+                }
+                // Stay bounded even under a steady stream of other datagrams.
+                if Instant::now() >= deadline {
+                    return Ok(());
+                }
+            }
+            _ if Instant::now() >= deadline => return Ok(()),
             _ => std::thread::sleep(Duration::from_millis(20)),
         }
     }
@@ -424,6 +446,59 @@ fn send_from_pod(
         socket
             .send_to(payload, dst)
             .map_err(|error| format!("send_to {dst}: {error}"))?;
+        Ok(())
+    })
+}
+
+/// Bind a receiver inside `pod_pid`'s netns and wait (bounded) for one datagram.
+fn spawn_reply_waiter(
+    pod_pid: u32,
+    bind: SocketAddr,
+) -> std::thread::JoinHandle<Result<(Vec<u8>, SocketAddr), String>> {
+    std::thread::spawn(move || {
+        run_in_netns(pod_pid, move || {
+            let socket = std::net::UdpSocket::bind(bind)
+                .map_err(|error| format!("bind reply waiter {bind}: {error}"))?;
+            socket
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .map_err(|error| format!("timeout: {error}"))?;
+            let mut buf = [0u8; 64];
+            let (n, from) = socket
+                .recv_from(&mut buf)
+                .map_err(|error| format!("recv reply: {error}"))?;
+            Ok((buf[..n].to_vec(), from))
+        })
+    })
+}
+
+/// Reply from the host netns SOURCED FROM the captured original destination,
+/// exactly as the production return path does: a non-locally bound
+/// `IP_TRANSPARENT` socket, so the client sees the address it dialed.
+fn transparent_reply(
+    host_pid: u32,
+    captured_destination: SocketAddr,
+    client: SocketAddr,
+    payload: &'static [u8],
+) -> Result<(), String> {
+    run_in_netns(host_pid, move || {
+        let socket = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )
+        .map_err(|error| format!("reply socket: {error}"))?;
+        socket
+            .set_reuse_address(true)
+            .map_err(|error| format!("SO_REUSEADDR: {error}"))?;
+        crate::socket_opts::set_ip_transparent(socket.as_raw_fd())
+            .map_err(|error| format!("IP_TRANSPARENT: {error}"))?;
+        socket
+            .bind(&captured_destination.into())
+            .map_err(|error| format!("non-local bind {captured_destination}: {error}"))?;
+        let std_socket: std::net::UdpSocket = socket.into();
+        std_socket
+            .send_to(payload, client)
+            .map_err(|error| format!("reply send: {error}"))?;
         Ok(())
     })
 }
@@ -463,56 +538,62 @@ struct LiveTopology {
     _host: ChildGuard,
     _pod_a: ChildGuard,
     _pod_b: ChildGuard,
+    _pod_c: ChildGuard,
     host_pid: u32,
     pod_a_pid: u32,
     pod_b_pid: u32,
+    /// Unenrolled workload: never passed to the capture ruleset or the index.
+    pod_c_pid: u32,
     host_sysfs: PathBuf,
     if_a: String,
     if_b: String,
     pod_if_a: String,
     ifindex_a: u32,
     ifindex_b: u32,
+    ifindex_c: u32,
+}
+
+/// Spawn one netns child and wrap it in a guard as soon as it is ready, so every
+/// later failure unwinds through `Drop` instead of a hand-written kill cascade.
+fn spawn_ready_pod(label: &str) -> Result<(ChildGuard, u32), String> {
+    let mut child = spawn_pod_child().ok_or_else(|| format!("{label} unshare unavailable"))?;
+    if let Err(error) = wait_for_sleep_ready(&mut child) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+    let pid = child.id();
+    Ok((ChildGuard(child), pid))
 }
 
 impl LiveTopology {
     fn create() -> Result<Self, String> {
-        let mut host = spawn_host_shaped_child().ok_or_else(|| "`unshare` unavailable".to_string())?;
-        wait_for_sleep_ready(&mut host).map_err(|error| {
+        let mut host =
+            spawn_host_shaped_child().ok_or_else(|| "`unshare` unavailable".to_string())?;
+        if let Err(error) = wait_for_sleep_ready(&mut host) {
             let _ = host.kill();
             let _ = host.wait();
-            error
-        })?;
+            return Err(error);
+        }
         let host_pid = host.id();
+        let host = ChildGuard(host);
 
-        let mut pod_a = spawn_pod_child().ok_or_else(|| "pod A unshare unavailable".to_string())?;
-        wait_for_sleep_ready(&mut pod_a).map_err(|error| {
-            let _ = pod_a.kill();
-            let _ = pod_a.wait();
-            let _ = host.kill();
-            let _ = host.wait();
-            error
-        })?;
-        let mut pod_b = spawn_pod_child().ok_or_else(|| "pod B unshare unavailable".to_string())?;
-        wait_for_sleep_ready(&mut pod_b).map_err(|error| {
-            let _ = pod_b.kill();
-            let _ = pod_b.wait();
-            let _ = pod_a.kill();
-            let _ = pod_a.wait();
-            let _ = host.kill();
-            let _ = host.wait();
-            error
-        })?;
+        let (pod_a, pod_a_pid) = spawn_ready_pod("pod A")?;
+        let (pod_b, pod_b_pid) = spawn_ready_pod("pod B")?;
+        let (pod_c, pod_c_pid) = spawn_ready_pod("pod C")?;
 
         let suffix = format!("{:x}", std::process::id());
         let suffix = &suffix[suffix.len().saturating_sub(6)..];
         let if_a = format!("ha{suffix}");
         let if_b = format!("hb{suffix}");
+        let if_c = format!("hc{suffix}");
         let pod_if_a = format!("pa{suffix}");
         let pod_if_b = format!("pb{suffix}");
+        let pod_if_c = format!("pc{suffix}");
 
-        if let Err(error) = attach_veth_pair(
+        attach_veth_pair(
             host_pid,
-            pod_a.id(),
+            pod_a_pid,
             &if_a,
             &pod_if_a,
             HOST_A_V4,
@@ -521,18 +602,10 @@ impl LiveTopology {
             POD_A_V6,
             REMOTE_V4,
             REMOTE_V6,
-        ) {
-            let _ = pod_b.kill();
-            let _ = pod_b.wait();
-            let _ = pod_a.kill();
-            let _ = pod_a.wait();
-            let _ = host.kill();
-            let _ = host.wait();
-            return Err(error);
-        }
-        if let Err(error) = attach_veth_pair(
+        )?;
+        attach_veth_pair(
             host_pid,
-            pod_b.id(),
+            pod_b_pid,
             &if_b,
             &pod_if_b,
             HOST_B_V4,
@@ -541,38 +614,44 @@ impl LiveTopology {
             POD_B_V6,
             REMOTE_V4,
             REMOTE_V6,
-        ) {
-            let _ = Command::new("ip").args(["link", "del", &if_a]).status();
-            let _ = pod_b.kill();
-            let _ = pod_b.wait();
-            let _ = pod_a.kill();
-            let _ = pod_a.wait();
-            let _ = host.kill();
-            let _ = host.wait();
-            return Err(error);
-        }
+        )?;
+        attach_veth_pair(
+            host_pid,
+            pod_c_pid,
+            &if_c,
+            &pod_if_c,
+            HOST_C_V4,
+            POD_C_V4,
+            HOST_C_V6,
+            POD_C_V6,
+            REMOTE_V4,
+            REMOTE_V6,
+        )?;
 
         let host_sysfs = PathBuf::from(format!("/proc/{host_pid}/root/sys/class/net"));
         let ifindex_a = dedicated_host_ifindex(&host_sysfs, &if_a)
             .map_err(|error| format!("validate {if_a}: {error}"))?;
         let ifindex_b = dedicated_host_ifindex(&host_sysfs, &if_b)
             .map_err(|error| format!("validate {if_b}: {error}"))?;
-        let pod_a_pid = pod_a.id();
-        let pod_b_pid = pod_b.id();
+        let ifindex_c = dedicated_host_ifindex(&host_sysfs, &if_c)
+            .map_err(|error| format!("validate {if_c}: {error}"))?;
 
         Ok(Self {
-            _host: ChildGuard(host),
-            _pod_a: ChildGuard(pod_a),
-            _pod_b: ChildGuard(pod_b),
+            _host: host,
+            _pod_a: pod_a,
+            _pod_b: pod_b,
+            _pod_c: pod_c,
             host_pid,
             pod_a_pid,
             pod_b_pid,
+            pod_c_pid,
             host_sysfs,
             if_a,
             if_b,
             pod_if_a,
             ifindex_a,
             ifindex_b,
+            ifindex_c,
         })
     }
 }
@@ -607,7 +686,14 @@ fn host_udp_live_kernel_multi_pod_dual_stack_attribution_and_replies() {
         skip_or_fail("not root; cannot create host/pod netns or install TPROXY");
         return;
     }
-    for binary in ["unshare", "nsenter", "ip", "iptables", "ip6tables", "iptables-save"] {
+    for binary in [
+        "unshare",
+        "nsenter",
+        "ip",
+        "iptables",
+        "ip6tables",
+        "iptables-save",
+    ] {
         let present = Command::new("sh")
             .args(["-c", &format!("command -v {binary} >/dev/null 2>&1")])
             .status()
@@ -629,10 +715,9 @@ fn host_udp_live_kernel_multi_pod_dual_stack_attribution_and_replies() {
         }
     };
 
-    if let Err(error) = install_production_host_capture(
-        topo.host_pid,
-        &[topo.if_a.clone(), topo.if_b.clone()],
-    ) {
+    if let Err(error) =
+        install_production_host_capture(topo.host_pid, &[topo.if_a.clone(), topo.if_b.clone()])
+    {
         panic!(
             "production host UDP capture install failed: {error}\n{}",
             bounded_host_diag(topo.host_pid)
@@ -749,47 +834,11 @@ fn host_udp_live_kernel_multi_pod_dual_stack_attribution_and_replies() {
     assert_ne!(if_a_seen, if_b_seen);
 
     // Transparent reply sourced from the captured destination reaches pod A.
-    let waiter = std::thread::spawn({
-        let pod_a_pid = topo.pod_a_pid;
-        move || {
-            run_in_netns(pod_a_pid, || {
-                let socket = std::net::UdpSocket::bind(SocketAddr::new(IpAddr::V4(POD_A_V4), 43001))
-                    .map_err(|error| format!("bind reply waiter: {error}"))?;
-                socket
-                    .set_read_timeout(Some(Duration::from_secs(3)))
-                    .map_err(|error| format!("timeout: {error}"))?;
-                let mut buf = [0u8; 64];
-                let (n, from) = socket
-                    .recv_from(&mut buf)
-                    .map_err(|error| format!("recv reply: {error}"))?;
-                Ok((buf[..n].to_vec(), from))
-            })
-        }
-    });
+    let captured_dst = SocketAddr::new(IpAddr::V4(REMOTE_V4), DIAL_PORT);
+    let pod_a_reply = SocketAddr::new(IpAddr::V4(POD_A_V4), 43001);
+    let waiter = spawn_reply_waiter(topo.pod_a_pid, pod_a_reply);
     std::thread::sleep(Duration::from_millis(100));
-    run_in_netns(host_pid, move || {
-        let socket = socket2::Socket::new(
-            socket2::Domain::IPV4,
-            socket2::Type::DGRAM,
-            Some(socket2::Protocol::UDP),
-        )
-        .map_err(|error| format!("reply socket: {error}"))?;
-        socket
-            .set_reuse_address(true)
-            .map_err(|error| format!("SO_REUSEADDR: {error}"))?;
-        let fd = socket.as_raw_fd();
-        crate::socket_opts::set_ip_transparent(fd)
-            .map_err(|error| format!("IP_TRANSPARENT: {error}"))?;
-        let bind = SocketAddr::new(IpAddr::V4(REMOTE_V4), DIAL_PORT);
-        socket
-            .bind(&bind.into())
-            .map_err(|error| format!("non-local bind {bind}: {error}"))?;
-        let std_socket: std::net::UdpSocket = socket.into();
-        std_socket
-            .send_to(b"reply-a", SocketAddr::new(IpAddr::V4(POD_A_V4), 43001))
-            .map_err(|error| format!("reply send: {error}"))?;
-        Ok(())
-    })
+    transparent_reply(host_pid, captured_dst, pod_a_reply, b"reply-a")
     .unwrap_or_else(|error| {
         panic!(
             "transparent reply failed: {error}\n{}",
@@ -895,16 +944,12 @@ fn host_udp_live_kernel_multi_pod_dual_stack_attribution_and_replies() {
         );
         Ok(())
     });
-    std::thread::sleep(Duration::from_millis(200));
-    let mut batch = RecvMmsgBatch::new(8, true);
-    if let Ok(n) = batch.recv(capture_fd, 8) {
-        for i in 0..n {
-            let (payload, _) = batch.datagram(i);
-            assert_ne!(
-                payload, b"node-origin",
-                "node-originated traffic must not be captured"
-            );
-        }
+    let absence_window = Duration::from_millis(500);
+    if let Err(error) = assert_not_captured(capture_fd, b"node-origin", absence_window) {
+        panic!(
+            "node-originated traffic must not be captured: {error}\n{}",
+            bounded_host_diag(host_pid)
+        );
     }
 
     // Inbound-to-pod: deliver toward the pod address from the host-shaped
@@ -917,28 +962,102 @@ fn host_udp_live_kernel_multi_pod_dual_stack_attribution_and_replies() {
         let _ = socket.send_to(b"inbound-to-pod", SocketAddr::new(IpAddr::V4(POD_A_V4), 9));
         Ok(())
     });
-    std::thread::sleep(Duration::from_millis(200));
-    if let Ok(n) = batch.recv(capture_fd, 8) {
-        for i in 0..n {
-            let (payload, _) = batch.datagram(i);
-            assert_ne!(
-                payload, b"inbound-to-pod",
-                "inbound-to-pod traffic must not be captured on the host UDP path"
-            );
-        }
+    if let Err(error) = assert_not_captured(capture_fd, b"inbound-to-pod", absence_window) {
+        panic!(
+            "inbound-to-pod traffic must not be captured on the host UDP path: {error}\n{}",
+            bounded_host_diag(host_pid)
+        );
     }
 
-    // Unenrolled pod: third veth sends; no rule should divert it onto the socket.
-    // Covered structurally by interface scoping — traffic on an unlisted iface
-    // never matches `-i <enrolled>`.
+    // Unenrolled workload: pod C has a real netns, a real veth pair, and a route
+    // to the same remote destination, but its host-side interface is in neither
+    // the capture ruleset nor the identity index. Prove BOTH halves executably —
+    // the kernel never redirects its egress onto the proxy's capture socket, and
+    // the identity boundary refuses to attribute it — rather than asserting the
+    // interface-scoping argument in a comment.
+    send_from_pod(
+        topo.pod_c_pid,
+        SocketAddr::new(IpAddr::V4(POD_C_V4), 44001),
+        SocketAddr::new(IpAddr::V4(REMOTE_V4), DIAL_PORT),
+        b"unenrolled-c",
+    )
+    .expect("unenrolled pod C send");
+    let unenrolled_window = Duration::from_millis(750);
+    if let Err(error) = assert_not_captured(capture_fd, b"unenrolled-c", unenrolled_window) {
+        panic!(
+            "an unenrolled workload must not be redirected or captured: {error}\n{}",
+            bounded_host_diag(host_pid)
+        );
+    }
+    assert_eq!(
+        index.authorize(Some(topo.ifindex_c), IpAddr::V4(POD_C_V4)),
+        Err(HostUdpDatagramRefusal::UnenrolledInterface),
+        "an unenrolled workload must not be attributable"
+    );
+    assert!(
+        index
+            .identity_for(Some(topo.ifindex_c), IpAddr::V4(POD_C_V4))
+            .is_none(),
+        "an unenrolled workload must carry no identity"
+    );
 
-    // Restart/reconciliation: tear down and reinstall; capture must recover.
+    // Restart/reconciliation: tear down, prove nothing Ferrum-owned survives,
+    // reinstall, and then prove the DATA PLANE recovered — a fresh captured
+    // datagram with exact attribution plus a transparent reply. Lifecycle-only
+    // coverage would pass even if reinstall produced rules that divert nothing.
     teardown_production_host_capture(host_pid)
         .unwrap_or_else(|error| panic!("restart teardown: {error}"));
     assert_no_ferrum_host_state(host_pid)
         .unwrap_or_else(|error| panic!("post-restart-teardown: {error}"));
     install_production_host_capture(host_pid, &[topo.if_a.clone(), topo.if_b.clone()])
         .unwrap_or_else(|error| panic!("restart install: {error}"));
+
+    send_from_pod(
+        topo.pod_a_pid,
+        SocketAddr::new(IpAddr::V4(POD_A_V4), 45001),
+        SocketAddr::new(IpAddr::V4(REMOTE_V4), DIAL_PORT),
+        b"post-restart-a4",
+    )
+    .expect("post-restart pod A send");
+    let (payload, source, orig, ifindex) =
+        recv_one(capture_fd, Instant::now() + Duration::from_secs(3)).unwrap_or_else(|error| {
+            panic!(
+                "capture did not recover after reinstall: {error}\n{}",
+                bounded_host_diag(host_pid)
+            );
+        });
+    assert_eq!(payload, b"post-restart-a4");
+    assert_eq!(source.ip(), IpAddr::V4(POD_A_V4));
+    assert_eq!(
+        orig,
+        Some(SocketAddr::new(IpAddr::V4(REMOTE_V4), DIAL_PORT))
+    );
+    assert_eq!(ifindex, ifindex_a);
+    index
+        .authorize(Some(ifindex), source.ip())
+        .expect("post-restart pod A must still attribute");
+
+    let pod_a_restart_reply = SocketAddr::new(IpAddr::V4(POD_A_V4), 45001);
+    let waiter = spawn_reply_waiter(topo.pod_a_pid, pod_a_restart_reply);
+    std::thread::sleep(Duration::from_millis(100));
+    transparent_reply(
+        host_pid,
+        captured_dst,
+        pod_a_restart_reply,
+        b"post-restart-reply",
+    )
+    .unwrap_or_else(|error| {
+        panic!(
+            "post-restart transparent reply failed: {error}\n{}",
+            bounded_host_diag(host_pid)
+        );
+    });
+    let recovered = waiter
+        .join()
+        .expect("post-restart reply waiter thread")
+        .expect("pod A must receive the post-restart transparent reply");
+    assert_eq!(recovered.0, b"post-restart-reply");
+    assert_eq!(recovered.1.ip(), IpAddr::V4(REMOTE_V4));
 
     // Final exact Ferrum-owned cleanup.
     teardown_production_host_capture(host_pid)
@@ -977,8 +1096,8 @@ fn host_udp_live_kernel_fail_closed_prerequisites_and_partial_install() {
 
     // Guard-without-capture is the documented partial-install posture: retain
     // DROP rather than a half-live datapath.
-    let guard = IptablesPlan::host_udp_guard_script(&config, &["vethx".to_string()])
-        .expect("guard script");
+    let guard =
+        IptablesPlan::host_udp_guard_script(&config, &["vethx".to_string()]).expect("guard script");
     assert!(
         guard.contains("-j DROP") || guard.contains("DROP"),
         "guard must drop enrolled scope during rebuild/partial install"

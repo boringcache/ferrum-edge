@@ -11209,6 +11209,34 @@ impl LiveGatewayChild {
         }
     }
 
+    /// SIGTERM and wait up to `grace` for the child to exit on its own.
+    ///
+    /// Returns whether it did. A `false` result means the child was force-killed
+    /// mid-shutdown, so nothing downstream may treat its graceful-shutdown work
+    /// (listener stop, gate-close handshake, iptables cleanup) as having run.
+    /// `stop()`'s fixed 5s grace is shorter than the host-UDP gate-close
+    /// acknowledgement budget, so a test that asserts a shutdown post-condition
+    /// must use this instead.
+    fn stop_gracefully(&mut self, grace: Duration) -> bool {
+        let Some(mut child) = self.0.take() else {
+            return false;
+        };
+        let pid = child.id();
+        let _ = Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status();
+        let deadline = Instant::now() + grace;
+        while Instant::now() < deadline {
+            if child.try_wait().is_ok_and(|status| status.is_some()) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        false
+    }
+
     fn poll_status(&mut self) -> String {
         match self.0.as_mut().map(Child::try_wait) {
             Some(Ok(Some(status))) => format!("exited with {status}"),
@@ -12170,7 +12198,9 @@ impl LiveHostUdpVethPod {
                 .map_err(|error| format!("configure host-udp host veth: {error}"))?;
             if !status.success() {
                 let _ = Command::new("ip").args(["link", "del", &host_if]).status();
-                return Err(format!("host-udp host veth command {args:?} failed with {status}"));
+                return Err(format!(
+                    "host-udp host veth command {args:?} failed with {status}"
+                ));
             }
         }
         if let Err(error) = netns_command(
@@ -12288,7 +12318,11 @@ fn host_udp_capture_snapshot(capture_port: u16) -> Result<(usize, usize, usize),
 }
 
 #[cfg(target_os = "linux")]
-fn wait_for_host_udp_capture(capture_port: u16, active: bool, timeout: Duration) -> Result<(), String> {
+fn wait_for_host_udp_capture(
+    capture_port: u16,
+    active: bool,
+    timeout: Duration,
+) -> Result<(), String> {
     let deadline = Instant::now() + timeout;
     loop {
         match host_udp_capture_snapshot(capture_port) {
@@ -12520,22 +12554,83 @@ async fn functional_mesh_live_host_udp_capture_proxy_backend_round_trip() {
     assert_eq!(reply_b, b"host-udp-b");
     assert_eq!(source_b, destination);
 
-    gateway_a.stop();
-    if let Err(error) = wait_for_host_udp_capture(capture_port, false, Duration::from_secs(20)) {
-        // Shutdown without node-agent ack retains the DROP guard by design; prove
-        // Ferrum-owned objects remain exact and do not name foreign tables.
-        let rules = Command::new("iptables-save")
-            .args(["-t", "mangle"])
-            .output()
-            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
-            .unwrap_or_default();
-        for foreign in ["33133", "33134", "table 133"] {
-            assert!(
-                !rules.contains(foreign),
-                "host-UDP teardown must not name foreign object {foreign}: {error}"
-            );
-        }
-        eprintln!("host-UDP shutdown retained fail-closed posture: {error}");
+    // Shutdown is asserted against an EXACT outcome, never "whatever survived a
+    // timeout". `ProxyHostUdpBackend::shutdown` has exactly two documented
+    // branches, and both retire the capture path completely:
+    //
+    //   * acknowledged  - the node agent published `.udp-not-ready` for every
+    //     pod, so `teardown_all()` removes every Ferrum-owned host object;
+    //   * unacknowledged - the fail-closed branch installs the DROP guard over
+    //     the still-enrolled interfaces FIRST, then removes the capture chain,
+    //     the fwmark routing objects, and the capture listener.
+    //
+    // No node agent runs in this fixture, so the unacknowledged branch is the
+    // expected one; either way the branch actually taken must be proven by its
+    // own post-condition rather than tolerated.
+    assert!(
+        gateway_a.stop_gracefully(Duration::from_secs(60)),
+        "gateway A must complete its own shutdown; a force-killed child proves \
+         nothing about ProxyHostUdpBackend cleanup\n{}",
+        captured_output(&temp_a)
+    );
+    let retire_budget = Duration::from_secs(20);
+    if let Err(error) = wait_for_host_udp_capture(capture_port, false, retire_budget) {
+        panic!(
+            "ProxyHostUdpBackend shutdown did not retire the host capture path: {error}\n{}",
+            captured_output(&temp_a)
+        );
+    }
+
+    let mangle = Command::new("iptables-save")
+        .args(["-t", "mangle"])
+        .output()
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+        .expect("read the mangle table after host-UDP shutdown");
+    for foreign in ["33133", "33134", "table 133"] {
+        assert!(
+            !mangle.contains(foreign),
+            "host-UDP shutdown must not name foreign object {foreign}\n{mangle}"
+        );
+    }
+    assert!(
+        !mangle.lines().any(|line| {
+            line.starts_with("-A PREROUTING ")
+                && line.contains("FERRUM_MESH_UDP_HOST")
+                && !line.contains("GUARD")
+        }),
+        "the capture chain jump must be gone after shutdown\n{mangle}"
+    );
+
+    let logs = captured_output(&temp_a);
+    let unacknowledged = logs.contains("node-agent did not acknowledge closing its UDP gates");
+    if unacknowledged {
+        // Narrowly justified retained-guard outcome: the guard is the ONLY thing
+        // keeping a pod whose BPF gate is still open from escaping in plaintext,
+        // so it must actually be installed and it must DROP.
+        assert!(
+            mangle.contains("FERRUM_MESH_UDP_HOST_GUARD_A")
+                || mangle.contains("FERRUM_MESH_UDP_HOST_GUARD_B"),
+            "an unacknowledged shutdown must retain an installed fail-closed \
+             DROP guard\n{mangle}"
+        );
+        assert!(
+            mangle.lines().any(|line| {
+                line.contains("FERRUM_MESH_UDP_HOST_GUARD") && line.contains("-j DROP")
+            }),
+            "the retained shutdown guard must DROP the enrolled scope\n{mangle}"
+        );
+        assert!(
+            !logs.contains("could not install the shutdown fail-closed guard"),
+            "the shutdown guard install must succeed\n{logs}"
+        );
+    } else {
+        // Acknowledged outcome (`teardown_all`): nothing Ferrum-owned may
+        // survive at all, guard chains included.
+        assert!(
+            !mangle.contains("FERRUM_MESH_UDP_HOST"),
+            "an acknowledged shutdown must remove every Ferrum-owned host UDP \
+             object, guard chains included\n{mangle}"
+        );
     }
 
     gateway_b.stop();

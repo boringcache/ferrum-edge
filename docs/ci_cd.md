@@ -41,7 +41,7 @@ adding, removing, or materially changing a workflow.
 | `gateway-api-conformance.yml` | Gateway API Conformance | PRs, `merge_group`, push to `main`, weekly schedule, manual | Upstream Gateway API conformance lab; `Gateway API Conformance` is directly required on PRs and merge-queue groups. |
 | `mesh-e2e-sidecar-live.yml` | Mesh E2E Sidecar Live Datapath | PRs, `merge_group`, push to `main`, manual | Release-blocking sidecar datapath validation; `Mesh E2E Sidecar Live` is directly required on PRs and merge-queue groups. |
 | `cross-build-policy.yml` | Cross Build Policy | `pull_request_target` for PRs to `main`, `merge_group` | Read-only trusted-base validation of every PR-controlled ARM64 Cross configuration and invocation surface on PRs; merge-group mode verifies the synthesized combined SHA with `contents: read` only. `Trusted Cross Build Policy` is directly required. |
-| `ambient-host-udp-live.yml` | Ambient Host UDP Live Kernel | Path-filtered PRs, manual | Privileged live-kernel gate for Ambient host-network UDP capture (`ProxyHostUdpBackend`). |
+| `ambient-host-udp-live.yml` | Ambient Host UDP Live Kernel | Every PR, `merge_group`, manual | Privileged live-kernel gate for Ambient host-network UDP capture (`ProxyHostUdpBackend`); relevance is decided by a trusted-base classifier and `Ambient Host UDP Live` reports on every run. |
 | `node-waypoint-ebpf-live.yml` | NodeWaypoint eBPF Live Datapath | Path-filtered PRs, manual | Live eBPF datapath validation in kind. |
 | `multicluster-federation-live.yml` | Multicluster Federation Live Datapath | PRs, `merge_group`, push to `main`, manual | Release-blocking multicluster federation datapath validation; `Multicluster Federation Live` is directly required on PRs and merge-queue groups. |
 | `multicluster-poller-partition-live.yml` | Multicluster Poller Partition Live | PRs, `merge_group`, push to `main`, manual | Release-blocking two-CP/two-DP trust/discovery partition and bounded last-good-retention validation; `Multicluster Poller Partition Live` is directly required. |
@@ -82,7 +82,8 @@ Pull Request / Merge Queue group
             ├─► Gateway API Conformance
             ├─► Mesh E2E Sidecar Live
             ├─► Multicluster Federation Live
-            └─► Multicluster Poller Partition Live
+            ├─► Multicluster Poller Partition Live
+            └─► Ambient Host UDP Live
 
 Push to main
     ├─► Full required validation gate
@@ -108,6 +109,7 @@ app id `15368`):
 | `Trusted Cross Build Policy` | `.github/workflows/cross-build-policy.yml` | `verify` |
 | `Multicluster Federation Live` | `.github/workflows/multicluster-federation-live.yml` | `gate` |
 | `Multicluster Poller Partition Live` | `.github/workflows/multicluster-poller-partition-live.yml` | `gate` |
+| `Ambient Host UDP Live` | `.github/workflows/ambient-host-udp-live.yml` | `gate` |
 
 Each owner declares a `merge_group` (`types: [checks_requested]`) trigger in
 addition to its existing `pull_request` / `pull_request_target` / `push` /
@@ -326,13 +328,14 @@ and accepts the planned heavy jobs as skipped. Pushes to `main` publish the
 `latest` prerelease and Docker images only after the full aggregate and build
 matrix pass.
 
-Branch protection must require seven independent PR **and** merge-queue checks:
+Branch protection must require eight independent PR **and** merge-queue checks:
 the unchanged `Tests` aggregate from `ci.yml`, `Merge Coverage` from
 `coverage.yml`, `Gateway API Conformance` from `gateway-api-conformance.yml`,
 `Mesh E2E Sidecar Live` from `mesh-e2e-sidecar-live.yml`,
 `Multicluster Federation Live` from `multicluster-federation-live.yml`,
 `Multicluster Poller Partition Live` from
-`multicluster-poller-partition-live.yml`, and
+`multicluster-poller-partition-live.yml`,
+`Ambient Host UDP Live` from `ambient-host-udp-live.yml`, and
 `Trusted Cross Build Policy` from `cross-build-policy.yml`. Each dedicated
 workflow triggers on every pull request and on `merge_group`, and fails closed
 on planning or validation failures. They are required directly rather than
@@ -539,9 +542,35 @@ diagnostics, mesh drift snapshots, pod-registry dumps, live assertions, and
 
 **Runs**: `ubuntu-24.04`
 
-`ambient-host-udp-live` runs on PRs that touch host-UDP capture, mesh UDP
-serving, capture plan generators, Ambient mesh serving, Helm mesh charts, the
-live fixture, or related docs. It builds the lib and functional test binaries
+`ambient-host-udp-live` triggers on **every** pull request and merge-group run —
+it carries no top-level `paths:` filter, because a required check that can
+disappear cannot be relied on. A `changes` job instead decides relevance from
+the **base branch's** copy of `.github/scripts/live_suite_path_filter.py`, read
+by pinned object id at one immutable trusted commit and executed under an
+isolated interpreter, so a pull request can never widen its own suite patterns
+to declare itself irrelevant. The live job runs only when that verdict is
+`true`, and the `if: always()` final gate `Ambient Host UDP Live` reports on
+every run: green when the suite passed or was legitimately irrelevant, red when
+a relevant live job failed or was unexpectedly absent. Every checkout, parsing,
+or classifier error fails closed.
+
+One narrow bootstrap exception exists for the pull request that introduces the
+suite: `origin/main` does not yet list `ambient-host-udp` among the classifier's
+`--suite` choices, so the trusted classifier rejects it with argparse's exact
+`invalid choice: 'ambient-host-udp'`. Only that exact rejection forces
+`relevant=true`, so the introducing pull request still runs the live suite
+rather than deferring it to a future merge; every other classifier failure still
+exits non-zero. Once `main` carries the suite the branch is unreachable and
+ordinary trusted-base classification applies.
+`.github/scripts/verify_cross_build_policy.py` freezes both the bootstrap
+relevance job and the final gate byte-for-byte
+(`LIVE_SUITE_UNKNOWN_SUITE_BOOTSTRAP_RELEVANCE_JOB_TEMPLATE`,
+`AMBIENT_HOST_UDP_LIVE_GATE_JOB`), so a later untrusted workflow edit cannot
+silently skip or rename the check.
+
+The relevant surfaces are host-UDP capture, mesh UDP serving, capture plan
+generators, Ambient mesh serving, Helm mesh charts, the live fixture, and
+related docs. When relevant, the job builds the lib and functional test binaries
 (without running them as the invoking user), preflights `unshare` /
 `iptables` / `ip6tables` / TPROXY primitives, then runs
 `tests/k8s/ambient_host_udp_live/run.sh` as root with

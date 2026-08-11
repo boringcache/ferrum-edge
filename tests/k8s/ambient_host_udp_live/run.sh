@@ -97,8 +97,13 @@ for bin in unshare nsenter ip iptables ip6tables iptables-save timeout; do
 done
 
 # Prove TPROXY / policy routing are usable in a throwaway netns before the suite.
-if ! unshare --net sh -c 'ip link set lo up; iptables -t mangle -L >/dev/null'; ip6tables -t mangle -L >/dev/null'; echo ready' \
-  >"$RESULTS/preflight.txt" 2>&1; then
+# Keep the entire netns body as one correctly quoted -c argument so iptables,
+# ip6tables, and the readiness echo cannot detach onto the host shell, and chain
+# the probes with `&&` so a failing probe fails the whole unit: with `;` the exit
+# status would be `echo ready`'s, and an unusable mangle table would read as
+# preflight success.
+preflight_netns='set -e; ip link set lo up && iptables -t mangle -L >/dev/null && ip6tables -t mangle -L >/dev/null && echo ready'
+if ! unshare --net sh -c "$preflight_netns" >"$RESULTS/preflight.txt" 2>&1; then
   if [[ "$LIVE_REQUIRED" == "1" || "$LIVE_REQUIRED" == "true" ]]; then
     fail_required "host-UDP live preflight failed under required mode"
   fi

@@ -1641,6 +1641,262 @@ LIVE_SUITE_RELEVANCE_JOB_TEMPLATE = r"""  changes:
           printf '%s\n' "$plan" | sed -n '/^## /,$p' >> "$GITHUB_STEP_SUMMARY"
 """
 
+# Introducing-suite bootstrap variant of the trusted-base relevance job.
+# Identical to LIVE_SUITE_RELEVANCE_JOB_TEMPLATE through trusted-filter
+# acquisition and --self-test, then adds a narrow fail-closed exception: when
+# the trusted classifier specifically rejects @@SUITE@@ as an unknown argparse
+# choice (the introducing-PR case against immutable origin/main), force
+# relevant=true so the live suite still runs. Every other classifier failure
+# remains fail-closed. Once main admits the suite, argparse accepts it and the
+# ordinary true|false path applies.
+LIVE_SUITE_UNKNOWN_SUITE_BOOTSTRAP_RELEVANCE_JOB_TEMPLATE = r"""  changes:
+    name: @@DISPLAY@@
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      relevant: ${{ steps.filter.outputs.relevant }}
+    steps:
+      - name: Checkout Ferrum Edge
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          fetch-depth: 0
+
+      # Relevance decides whether a REQUIRED live gate runs at all, so it must
+      # never be computed by code the pull request supplies: a PR that widens
+      # its own suite patterns could declare itself irrelevant, skip the live
+      # job, and still turn the required check green.
+      #
+      # Everything below reads ONE immutable trusted commit. The base-branch
+      # tip is fetched from the base repository, pinned once to a full object
+      # id, checked to hold the filter as a regular blob, and then read BY
+      # OBJECT ID rather than by path. A fork head, a rewritten head, or a push
+      # to the base branch mid-run therefore cannot swap the script between
+      # validation and execution, and every failure exits non-zero so the gate
+      # fails closed instead of quietly declaring itself irrelevant.
+      #
+      # Bootstrap exception (frozen by verify_cross_build_policy.py): when the
+      # trusted-base classifier specifically rejects suite @@SUITE@@ as
+      # an unknown choice — which is the introducing-PR case against immutable
+      # origin/main — force relevant=true so this PR still runs the live suite.
+      # Every other checkout, parsing, or classifier error fails closed. Once
+      # main contains the suite, ordinary trusted-base classification applies.
+      #
+      # This block is frozen by .github/scripts/verify_cross_build_policy.py
+      # (see live_suite_relevance_errors); it is the ambient-host-udp unknown-
+      # suite bootstrap variant of the trusted-base relevance contract.
+      - name: Check for @@SLUG@@ changes
+        id: filter
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          MERGE_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+        run: |
+          set -euo pipefail
+
+          filter_path=.github/scripts/live_suite_path_filter.py
+          changed_files="$RUNNER_TEMP/@@SLUG@@-changed-files.txt"
+          trusted_filter="$RUNNER_TEMP/@@SLUG@@-trusted-filter.py"
+          rm -f -- "$changed_files" "$trusted_filter"
+          : > "$changed_files"
+
+          filter_args=(--suite @@SUITE@@ --changed-files "$changed_files")
+
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            # `github.base_ref` names a branch in the BASE repository, so a fork
+            # cannot control its contents -- but it is still untrusted text.
+            # Reject anything outside a conservative branch charset before it
+            # reaches a refspec so no option, pathspec, or revision-syntax
+            # metacharacter can be smuggled into a git invocation.
+            if ! printf '%s' "$BASE_REF" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._/-]{0,200}$'; then
+              echo "::error::refusing to resolve an unsafe base ref" >&2
+              exit 1
+            fi
+            case "$BASE_REF" in
+              *..*|*//*|*/|*.lock|*/.*)
+                echo "::error::refusing to resolve an unsafe base ref" >&2
+                exit 1
+                ;;
+            esac
+            fetched=false
+            for attempt in 1 2 3; do
+              if git fetch --no-tags --no-recurse-submodules origin \
+                "+refs/heads/${BASE_REF}:refs/ferrum/trusted-base"; then
+                fetched=true
+                break
+              fi
+              echo "git fetch of ${BASE_REF} failed (attempt ${attempt}/3); retrying" >&2
+              sleep $(( attempt * 10 ))
+            done
+            if [ "$fetched" != true ]; then
+              echo "::error::git fetch of ${BASE_REF} failed after 3 attempts" >&2
+              exit 1
+            fi
+            # Pin the moving tip exactly once; nothing below re-resolves a ref.
+            trusted_sha="$(git rev-parse --verify --quiet refs/ferrum/trusted-base^{commit} || true)"
+          elif [ "$EVENT_NAME" = "merge_group" ]; then
+            # Merge queues synthesize a combined SHA. Use the event's base_sha
+            # as the trusted filter source and the change-set base so a missing
+            # pull_request payload cannot force-skip or check only main.
+            if ! printf '%s' "$MERGE_BASE_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+              echo "::error::merge_group base_sha missing or malformed" >&2
+              exit 1
+            fi
+            if ! git cat-file -e "${MERGE_BASE_SHA}^{commit}" 2>/dev/null; then
+              fetched=false
+              for attempt in 1 2 3; do
+                if git fetch --no-tags --no-recurse-submodules origin \
+                  "${MERGE_BASE_SHA}"; then
+                  fetched=true
+                  break
+                fi
+                echo "git fetch of merge_group base failed (attempt ${attempt}/3); retrying" >&2
+                sleep $(( attempt * 10 ))
+              done
+              if [ "$fetched" != true ]; then
+                echo "::error::git fetch of merge_group base_sha failed after 3 attempts" >&2
+                exit 1
+              fi
+            fi
+            trusted_sha="$MERGE_BASE_SHA"
+          else
+            # A push to the default branch and a manual dispatch already run
+            # trusted code, so the checked-out commit IS the trusted base.
+            trusted_sha="$(git rev-parse --verify --quiet 'HEAD^{commit}' || true)"
+            filter_args+=(--force-run)
+          fi
+
+          if ! printf '%s' "$trusted_sha" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::trusted base did not resolve to a full commit id" >&2
+            exit 1
+          fi
+
+          # Reject anything that is not a regular blob at that exact commit: a
+          # symlink (mode 120000) would make a content read emit its target
+          # path, a gitlink (160000) or tree (040000) carries no script at all,
+          # and a missing entry must fail closed rather than fall back to the
+          # pull request's own copy.
+          entry="$(git ls-tree --full-tree "$trusted_sha" -- "$filter_path")"
+          if [ "$(printf '%s\n' "$entry" | grep -c . || true)" != "1" ]; then
+            echo "::error::${filter_path} is not a single tree entry at ${trusted_sha}" >&2
+            exit 1
+          fi
+          entry_mode="$(printf '%s\n' "$entry" | awk '{print $1}')"
+          entry_type="$(printf '%s\n' "$entry" | awk '{print $2}')"
+          entry_object="$(printf '%s\n' "$entry" | awk '{print $3}')"
+          entry_path="$(printf '%s\n' "$entry" | awk -F'\t' '{print $2}')"
+          if [ "$entry_type" != "blob" ] || [ "$entry_path" != "$filter_path" ]; then
+            echo "::error::${filter_path} is not a blob at ${trusted_sha}" >&2
+            exit 1
+          fi
+          case "$entry_mode" in
+            100644|100755) ;;
+            *)
+              echo "::error::${filter_path} has non-regular mode ${entry_mode}" >&2
+              exit 1
+              ;;
+          esac
+          if ! printf '%s' "$entry_object" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::${filter_path} did not resolve to an object id" >&2
+            exit 1
+          fi
+          if [ "$(git cat-file -s "$entry_object")" -gt 262144 ]; then
+            echo "::error::${filter_path} exceeds the 256 KiB trusted-filter ceiling" >&2
+            exit 1
+          fi
+          git cat-file blob "$entry_object" > "$trusted_filter"
+
+          if [ "$EVENT_NAME" = "pull_request" ] || [ "$EVENT_NAME" = "merge_group" ]; then
+            git diff --name-only --no-renames "${trusted_sha}...HEAD" \
+              | sort > "$changed_files"
+          fi
+
+          # Isolated interpreter: no user site directory, no PYTHON* overrides,
+          # and no implicit path entry, so nothing the pull request committed
+          # can be imported by the trusted filter.
+          python3 -I "$trusted_filter" --self-test
+          filter_err="$RUNNER_TEMP/@@SLUG@@-filter.err"
+          rm -f -- "$filter_err"
+          set +e
+          plan="$(python3 -I "$trusted_filter" "${filter_args[@]}" 2>"$filter_err")"
+          filter_status=$?
+          set -e
+          if [ "$filter_status" -ne 0 ]; then
+            # Narrow fail-closed bootstrap for the introducing PR of suite
+            # @@SUITE@@: immutable origin/main does not yet list this suite in
+            # live_suite_path_filter.py choices. Only that exact unknown-suite
+            # rejection forces relevant=true; every other classifier failure
+            # exits non-zero. Once main admits the suite, argparse accepts it
+            # and ordinary trusted-base classification applies.
+            if grep -Fq "invalid choice: '@@SUITE@@'" "$filter_err"; then
+              echo "relevant=true" >> "$GITHUB_OUTPUT"
+              {
+                echo "Bootstrap: trusted base ${trusted_sha} does not recognize suite @@SUITE@@; forcing relevant=true for the introducing PR."
+                echo ""
+                echo "Classifier stderr:"
+                cat "$filter_err"
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            cat "$filter_err" >&2 || true
+            echo "::error::trusted relevance filter failed" >&2
+            exit 1
+          fi
+          relevant="$(printf '%s\n' "$plan" | sed -n 's/^relevant=//p')"
+          case "$relevant" in
+            true|false) ;;
+            *)
+              echo "::error::trusted relevance filter produced no usable verdict" >&2
+              exit 1
+              ;;
+          esac
+          echo "relevant=$relevant" >> "$GITHUB_OUTPUT"
+          echo "Relevance decided by trusted base ${trusted_sha}." >> "$GITHUB_STEP_SUMMARY"
+          printf '%s\n' "$plan" | sed -n '/^## /,$p' >> "$GITHUB_STEP_SUMMARY"
+"""
+
+# Unconditional final gate for ambient host-UDP live. Exists on every
+# pull_request / merge_group run and fails when the relevant live job fails or
+# is unexpectedly absent. Frozen so a later untrusted workflow edit cannot
+# silently drop or rename the check.
+AMBIENT_HOST_UDP_LIVE_GATE_JOB = r"""  gate:
+    name: Ambient Host UDP Live
+    needs:
+      - changes
+      - ambient-host-udp-live
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Summarize ambient host-UDP live result
+        run: |
+          {
+            echo "## Ambient Host UDP Live"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${{ needs.changes.result }}" != "success" ]; then
+            echo "Failed before change detection completed." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          if [ "${{ needs.changes.outputs.relevant }}" = "false" ]; then
+            echo "Skipped live-kernel validation: no ambient host-UDP capture, mesh UDP, fixture, documentation, or CI workflow surfaces changed." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if [ "${{ needs.changes.outputs.relevant }}" != "true" ]; then
+            echo "Change detection returned an invalid relevance result: ${{ needs.changes.outputs.relevant }}." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          if [ "${{ needs.ambient-host-udp-live.result }}" != "success" ]; then
+            echo "Live-kernel validation failed or did not complete: ${{ needs.ambient-host-udp-live.result }}." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          echo "Live-kernel validation passed." >> "$GITHUB_STEP_SUMMARY"
+"""
+
 # workflow file -> (relevance job, live job, display name, temp slug, suite).
 LIVE_SUITE_RELEVANCE_CONTRACTS = {
     "mesh-e2e-sidecar-live.yml": (
@@ -1664,6 +1920,29 @@ LIVE_SUITE_RELEVANCE_CONTRACTS = {
         "multicluster-poller-partition",
         "mesh-federation",
     ),
+    "ambient-host-udp-live.yml": (
+        "changes",
+        "ambient-host-udp-live",
+        "Ambient host-UDP trigger",
+        "ambient-host-udp",
+        "ambient-host-udp",
+    ),
+}
+
+# Suites introduced by a PR against an immutable base that does not yet list
+# them must use the unknown-suite bootstrap relevance job, not the ordinary
+# template. Once main admits the suite, the bootstrap path becomes unreachable
+# (argparse accepts the choice) and ordinary classification applies.
+LIVE_SUITE_UNKNOWN_SUITE_BOOTSTRAP_WORKFLOWS = frozenset(
+    {
+        "ambient-host-udp-live.yml",
+    }
+)
+
+# Final-gate contracts keyed by workflow file. Absence or mutation of the gate
+# would let a relevant live failure disappear from the required check surface.
+LIVE_SUITE_GATE_CONTRACTS = {
+    "ambient-host-udp-live.yml": AMBIENT_HOST_UDP_LIVE_GATE_JOB,
 }
 
 # Freezing the relevance job alone is not sufficient. A pull request that left
@@ -9041,6 +9320,30 @@ def live_suite_relevance_job(display: str, slug: str, suite: str) -> str:
     )
 
 
+def live_suite_unknown_suite_bootstrap_relevance_job(
+    display: str, slug: str, suite: str
+) -> str:
+    """Render the introducing-suite bootstrap relevance job."""
+
+    return (
+        LIVE_SUITE_UNKNOWN_SUITE_BOOTSTRAP_RELEVANCE_JOB_TEMPLATE.replace(
+            "@@DISPLAY@@", display
+        )
+        .replace("@@SLUG@@", slug)
+        .replace("@@SUITE@@", suite)
+    )
+
+
+def expected_live_suite_relevance_job(
+    workflow_name: str, display: str, slug: str, suite: str
+) -> str:
+    """Select ordinary vs unknown-suite-bootstrap relevance text."""
+
+    if workflow_name in LIVE_SUITE_UNKNOWN_SUITE_BOOTSTRAP_WORKFLOWS:
+        return live_suite_unknown_suite_bootstrap_relevance_job(display, slug, suite)
+    return live_suite_relevance_job(display, slug, suite)
+
+
 def live_suite_relevance_errors(
     workflows: dict[str, str],
     source: str,
@@ -9080,7 +9383,8 @@ def live_suite_relevance_errors(
         errors.extend(failures)
         if not failures:
             assert block is not None
-            if block != live_suite_relevance_job(display, slug, suite):
+            expected = expected_live_suite_relevance_job(name, display, slug, suite)
+            if block != expected:
                 errors.append(
                     f"{located} job {relevance_job!r} must be exactly the trusted-base "
                     "relevance contract; a required live gate may not decide its own "
@@ -9103,6 +9407,23 @@ def live_suite_relevance_errors(
                     "trusted relevance output; rewriting it skips the live job just "
                     "as effectively as tampering with the relevance decision"
                 )
+        gate_expected = LIVE_SUITE_GATE_CONTRACTS.get(name)
+        if gate_expected is not None:
+            gate_block, gate_failures = extract_job_block(
+                contents,
+                located,
+                "gate",
+                required=True,
+            )
+            errors.extend(gate_failures)
+            if not gate_failures:
+                assert gate_block is not None
+                if gate_block != gate_expected:
+                    errors.append(
+                        f"{located} job 'gate' must be exactly the frozen "
+                        "unconditional final-gate contract; renaming or weakening "
+                        "it lets a live failure disappear"
+                    )
     return errors
 
 
@@ -22403,8 +22724,10 @@ pre_build = []
             "the trusted-base relevance contract executes the pull request's own filter"
         )
 
-    def relevance_workflow(display: str, live_job: str, body: str) -> str:
-        return (
+    def relevance_workflow(
+        contract_name: str, display: str, live_job: str, body: str
+    ) -> str:
+        text = (
             "name: Self-test live suite\n"
             "on:\n"
             "  pull_request:\n"
@@ -22421,17 +22744,62 @@ pre_build = []
             + "    steps:\n"
             + "      - run: echo live\n"
         )
+        gate = LIVE_SUITE_GATE_CONTRACTS.get(contract_name)
+        if gate is not None:
+            text += "\n" + gate
+        return text
 
     relevance_workflows = {
         contract_name: relevance_workflow(
+            contract_name,
             contract[2],
             contract[1],
-            live_suite_relevance_job(contract[2], contract[3], contract[4]),
+            expected_live_suite_relevance_job(
+                contract_name, contract[2], contract[3], contract[4]
+            ),
         )
         for contract_name, contract in LIVE_SUITE_RELEVANCE_CONTRACTS.items()
     }
     if live_suite_relevance_errors(relevance_workflows, "self-test workflows"):
         failures.append("the trusted-base relevance contract was rejected")
+
+    # Introducing-suite bootstrap must stay distinct from the ordinary contract
+    # and must force relevant=true only on the exact unknown-suite argparse
+    # rejection. Once main admits the suite, that branch is unreachable.
+    rendered_bootstrap = live_suite_unknown_suite_bootstrap_relevance_job(
+        "Display", "slug", "suite"
+    )
+    for sentinel in ("@@DISPLAY@@", "@@SLUG@@", "@@SUITE@@"):
+        if sentinel in rendered_bootstrap:
+            failures.append(
+                f"{sentinel} survived unknown-suite bootstrap relevance rendering"
+            )
+    if "invalid choice: 'suite'" not in rendered_bootstrap:
+        failures.append(
+            "the unknown-suite bootstrap no longer matches the argparse rejection"
+        )
+    if "forcing relevant=true for the introducing PR" not in rendered_bootstrap:
+        failures.append(
+            "the unknown-suite bootstrap no longer forces relevant=true"
+        )
+    if rendered_bootstrap == live_suite_relevance_job("Display", "slug", "suite"):
+        failures.append(
+            "the unknown-suite bootstrap collapsed into the ordinary relevance job"
+        )
+    if "ambient-host-udp-live.yml" not in LIVE_SUITE_UNKNOWN_SUITE_BOOTSTRAP_WORKFLOWS:
+        failures.append(
+            "ambient-host-udp-live.yml must use the unknown-suite bootstrap relevance job"
+        )
+    if LIVE_SUITE_GATE_CONTRACTS.get("ambient-host-udp-live.yml") is None:
+        failures.append(
+            "ambient-host-udp-live.yml must freeze the Ambient Host UDP Live final gate"
+        )
+    elif "name: Ambient Host UDP Live\n" not in (
+        LIVE_SUITE_GATE_CONTRACTS["ambient-host-udp-live.yml"]
+    ):
+        failures.append(
+            "the ambient host-UDP final gate must be named exactly Ambient Host UDP Live"
+        )
 
     relevance_mutations: dict[str, tuple[str, str]] = {
         "pull-request-supplied filter": (
