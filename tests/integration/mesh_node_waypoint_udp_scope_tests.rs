@@ -434,8 +434,7 @@ fn deleting_a_pod_from_the_registry_retracts_its_attribution() {
         fixture
             .index
             .revalidate(&pinned, Some(IFINDEX_B), ip(IP_B))
-            .err()
-            .expect("its live session must stop too"),
+            .expect_err("its live session must stop too"),
         NodeWaypointUdpSourceRefusal::UnenrolledInterface
     );
     assert!(
@@ -464,8 +463,7 @@ fn a_pod_moving_to_a_new_interface_is_attributed_on_the_new_one_only() {
         fixture
             .index
             .authorize(Some(IFINDEX_A), ip(IP_A))
-            .err()
-            .expect("the stale interface must attribute nothing"),
+            .expect_err("the stale interface must attribute nothing"),
         NodeWaypointUdpSourceRefusal::UnenrolledInterface
     );
 }
@@ -527,8 +525,7 @@ async fn manager_shutdown_retracts_the_published_generation() {
     assert_eq!(
         index
             .authorize(Some(IFINDEX_A), ip(IP_A))
-            .err()
-            .expect("a retracted index attributes nothing"),
+            .expect_err("a retracted index attributes nothing"),
         NodeWaypointUdpSourceRefusal::IndexUnavailable
     );
 }

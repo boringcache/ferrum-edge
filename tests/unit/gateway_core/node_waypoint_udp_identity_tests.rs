@@ -22,7 +22,7 @@ const UID_A: &str = "11111111-1111-1111-1111-111111111111";
 const UID_B: &str = "22222222-2222-2222-2222-222222222222";
 
 fn spiffe(sa: &str) -> SpiffeId {
-    SpiffeId::new(&format!("spiffe://cluster.local/ns/payments/sa/{sa}")).expect("valid SPIFFE ID")
+    SpiffeId::new(format!("spiffe://cluster.local/ns/payments/sa/{sa}")).expect("valid SPIFFE ID")
 }
 
 fn binding(
