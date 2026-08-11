@@ -1674,9 +1674,11 @@ pub struct EnvConfig {
     /// (refused under production posture). Default: 256.
     pub xds_max_streams_per_principal: usize,
     /// Maximum distinct node state keys with at least one active ADS stream.
-    /// Bounds the node-scoped snapshot/nonce/identity/waypoint/scoping maps
-    /// independently of the stream count. `0` disables the cap (refused under
-    /// production posture). Default: 2048.
+    /// Bounds the node-scoped snapshot/nonce/identity/waypoint/scoping maps.
+    /// A state key exists only while a stream holds it, so this only binds
+    /// below `xds_max_total_streams` (or when that budget is unbounded); at the
+    /// defaults the total-stream budget saturates first. `0` disables the cap
+    /// (refused under production posture). Default: 2048.
     pub xds_max_active_nodes: usize,
     /// Maximum accepted `Node.id` length in UTF-8 bytes. Longer ids are refused
     /// with `INVALID_ARGUMENT` before the value is cloned, stored, or logged.

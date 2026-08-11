@@ -64,9 +64,12 @@ use crate::fips::approved::Sha256;
 
 /// Default ceiling on total concurrent ADS streams for one CP process.
 ///
-/// Matches the default CP gRPC connection ceiling
-/// (`FERRUM_CP_GRPC_MAX_CONNECTIONS`), so ADS cannot outlive the transport
-/// budget that already bounds the listener.
+/// Numerically matches the default CP gRPC connection ceiling
+/// (`FERRUM_CP_GRPC_MAX_CONNECTIONS`), but that ceiling bounds *connections*,
+/// not streams: one HTTP/2 connection multiplexes up to
+/// `FERRUM_SERVER_HTTP2_MAX_CONCURRENT_STREAMS` (default 1000) concurrent ADS
+/// streams, so the transport budget does not bound ADS occupancy. This is the
+/// only aggregate ADS stream bound.
 pub const DEFAULT_XDS_MAX_TOTAL_STREAMS: usize = 1024;
 /// Default ceiling on concurrent ADS streams for one namespace/tenant.
 pub const DEFAULT_XDS_MAX_STREAMS_PER_NAMESPACE: usize = 512;
@@ -79,9 +82,18 @@ pub const DEFAULT_XDS_MAX_STREAMS_PER_PRINCIPAL: usize = 256;
 /// ADS stream; the small headroom tolerates brief overlap during a client
 /// reconnect (old stream draining while the new one establishes).
 pub const DEFAULT_XDS_MAX_STREAMS_PER_NODE: usize = 4;
-/// Default ceiling on distinct active node state keys. Bounds node-scoped maps
-/// (snapshot cache, nonce tracker, workload identity, waypoint, scoping)
-/// independently of the stream count.
+/// Default ceiling on distinct active node state keys. Bounds the node-scoped
+/// maps (snapshot cache, nonce tracker, workload identity, waypoint, scoping).
+///
+/// A node state key exists only while at least one admitted stream holds it
+/// (registered on that stream's first request, removed when its last stream
+/// releases), so distinct active nodes can never exceed active streams. This
+/// budget therefore only *binds* when it is set below
+/// [`DEFAULT_XDS_MAX_TOTAL_STREAMS`] / `FERRUM_XDS_MAX_TOTAL_STREAMS`, or when
+/// the total-stream budget is unbounded (`0`). At the shipped defaults
+/// (`2048` > `1024`) it is a defense-in-depth ceiling that the total-stream
+/// budget reaches first — deliberately, so tightening the node map bound is an
+/// explicit operator choice rather than a surprise refusal on a large fleet.
 pub const DEFAULT_XDS_MAX_ACTIVE_NODES: usize = 2048;
 /// Default maximum `Node.id` length in UTF-8 bytes. 253 is the DNS name
 /// ceiling, which covers every hostname / pod-identity shape Ferrum's own DP

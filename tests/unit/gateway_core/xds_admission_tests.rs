@@ -194,6 +194,92 @@ fn distinct_node_cardinality_is_bounded_independently_of_stream_count() {
     assert_eq!(controller.active_streams(), 0);
 }
 
+#[test]
+fn a_node_budget_above_the_total_stream_budget_can_never_bind() {
+    // A node state key exists only while an admitted stream holds it, so
+    // distinct active nodes can never exceed active streams. Pinned because the
+    // shipped defaults put the node ceiling ABOVE the total-stream ceiling
+    // (2048 > 1024), which makes the distinct-node budget defense-in-depth
+    // rather than an active limit — `docs/configuration.md`,
+    // `docs/mesh.md` -> "xDS ADS admission budgets", and `ferrum.conf` all say
+    // so, and this test is what keeps that claim true.
+    let defaults = XdsAdmissionLimits::default();
+    assert!(
+        defaults.max_active_nodes >= defaults.max_total_streams,
+        "if the node ceiling ever drops below the total-stream ceiling the \
+         documented default relationship must be updated with it: nodes={} \
+         streams={}",
+        defaults.max_active_nodes,
+        defaults.max_total_streams
+    );
+
+    let total = 16usize;
+    let controller = controller(XdsAdmissionLimits {
+        max_total_streams: total,
+        max_active_nodes: total * 4,
+        max_streams_per_node: 1,
+        ..generous()
+    });
+    let principal = principal_key("dp");
+
+    // Every admitted stream takes a brand-new node key — the most node slots a
+    // client can possibly consume.
+    let mut held = Vec::new();
+    for index in 0..total {
+        let mut permit = controller
+            .reserve_stream("ferrum", &principal)
+            .expect("within the total-stream budget");
+        permit
+            .register_node(&format!("node-{index}"))
+            .expect("a node ceiling above the total budget never refuses");
+        held.push(permit);
+    }
+    assert_eq!(controller.active_streams(), total);
+    assert_eq!(
+        controller.active_nodes(),
+        total,
+        "distinct nodes track streams exactly when every stream is a new node"
+    );
+
+    // The total budget — not the node ceiling — is what refuses the next one.
+    assert_eq!(
+        controller.reserve_stream("ferrum", &principal).unwrap_err(),
+        XdsAdmissionRejection::TotalStreams
+    );
+
+    // And the node ceiling DOES bind once it is set below the total budget.
+    // (`XdsAdmissionController::new` directly, because the `controller` helper
+    // is shadowed by the binding above.)
+    let tight = XdsAdmissionController::new(XdsAdmissionLimits {
+        max_total_streams: total,
+        max_active_nodes: 2,
+        max_streams_per_node: 1,
+        ..generous()
+    });
+    let mut tight_held = Vec::new();
+    for index in 0..2u32 {
+        let mut permit = tight.reserve_stream("ferrum", &principal).unwrap();
+        permit.register_node(&format!("node-{index}")).unwrap();
+        tight_held.push(permit);
+    }
+    let mut third = tight
+        .reserve_stream("ferrum", &principal)
+        .expect("stream budget still has room");
+    assert_eq!(
+        third.register_node("node-2"),
+        Err(XdsAdmissionRejection::NodeCardinality),
+        "below the total budget the node ceiling is the binding scope"
+    );
+
+    drop(third);
+    tight_held.clear();
+    held.clear();
+    assert_eq!(controller.active_streams(), 0);
+    assert_eq!(controller.active_nodes(), 0);
+    assert_eq!(tight.active_streams(), 0);
+    assert_eq!(tight.active_nodes(), 0);
+}
+
 // ── Precedence: total → namespace → principal → node → cardinality ─────────
 
 #[test]
