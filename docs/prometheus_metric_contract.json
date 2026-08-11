@@ -1323,6 +1323,114 @@
     "emission": "conditional"
   },
   {
+    "name": "ferrum_dp_config_cp_connected",
+    "type": "gauge",
+    "help": "Whether the DP currently has a ConfigSync stream to some control plane (1) or none (0).",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "dp_config",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_dp_config_max_stale_seconds",
+    "type": "gauge",
+    "help": "Configured maximum applied-snapshot age before the DP degrades readiness (0 = bound disabled).",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "dp_config",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_dp_config_new_traffic_blocked",
+    "type": "gauge",
+    "help": "Whether the DP is refusing new HTTP/TCP/UDP-session/DTLS-session admissions because its configuration is stale (1) or not (0).",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "dp_config",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_dp_config_snapshot_age_seconds",
+    "type": "gauge",
+    "help": "Age of the DP's last validated and successfully applied CP configuration snapshot, on a monotonic clock.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "dp_config",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_dp_config_snapshot_apply_failures_total",
+    "type": "counter",
+    "help": "CP snapshots that were admitted and then failed to apply since process start.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "dp_config",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_dp_config_snapshots_applied_total",
+    "type": "counter",
+    "help": "CP snapshots/deltas validated and successfully applied since process start.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "dp_config",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_dp_config_snapshots_rejected_total",
+    "type": "counter",
+    "help": "CP payloads refused before apply since process start.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "dp_config",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_dp_config_stale",
+    "type": "gauge",
+    "help": "Whether the DP's applied configuration is past its bound with no authoritative CP (1) or not (0).",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "dp_config",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_dp_config_stale_transitions_total",
+    "type": "counter",
+    "help": "Transitions into the stale state since process start.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "dp_config",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
     "name": "ferrum_edge_overhead_ms",
     "type": "histogram",
     "help": "Gateway overhead (excluding backend and plugins) in milliseconds.",
@@ -3316,6 +3424,72 @@
     "export_surface": "/metrics",
     "bundled": "documented_only",
     "emission": "conditional"
+  },
+  {
+    "name": "ferrum_tls_store_admission_rejected_total",
+    "type": "counter",
+    "help": "Logical persistent TLS store admission refusals by store and reason.",
+    "labels": [
+      "store",
+      "reason",
+      "namespace"
+    ],
+    "subsystem": "tls",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_tls_store_document_bytes",
+    "type": "gauge",
+    "help": "Current serialized byte length of a persistent TLS store document.",
+    "labels": [
+      "store",
+      "namespace"
+    ],
+    "subsystem": "tls",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_tls_store_oversized_total",
+    "type": "counter",
+    "help": "Oversized persistent TLS store document refusals by store and direction.",
+    "labels": [
+      "store",
+      "direction",
+      "namespace"
+    ],
+    "subsystem": "tls",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_tls_store_pruned_total",
+    "type": "counter",
+    "help": "Terminal ACME order history entries pruned under the exclusive mutation lock.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "tls",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_tls_store_record_count",
+    "type": "gauge",
+    "help": "Current logical record count in a persistent TLS store.",
+    "labels": [
+      "store",
+      "namespace"
+    ],
+    "subsystem": "tls",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
   },
   {
     "name": "ferrum_websocket_bytes_total",

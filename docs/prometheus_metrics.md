@@ -214,6 +214,15 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_database_delta_recoveries_total` | counter | `namespace` | `database_polling` | `documented_only` | `conditional` | Rejected database delta recovery events after an accepted incremental apply or full reload. |
 | `ferrum_database_delta_rejections_total` | counter | `resource_category`, `namespace` | `database_polling` | `documented_only` | `conditional` | Database incremental deltas rejected by validation, bucketed by bounded resource category. |
 | `ferrum_database_poll_last_completed_timestamp_seconds` | gauge | `namespace` | `database_polling` | `documented_only` | `conditional` | Unix timestamp of the most recently completed database/CP config poll attempt (including empty success). |
+| `ferrum_dp_config_cp_connected` | gauge | `namespace` | `dp_config` | `documented_only` | `conditional` | Whether the DP currently has a ConfigSync stream to some control plane (1) or none (0). |
+| `ferrum_dp_config_max_stale_seconds` | gauge | `namespace` | `dp_config` | `documented_only` | `conditional` | Configured maximum applied-snapshot age before the DP degrades readiness (0 = bound disabled). |
+| `ferrum_dp_config_new_traffic_blocked` | gauge | `namespace` | `dp_config` | `documented_only` | `conditional` | Whether the DP is refusing new HTTP/TCP/UDP-session/DTLS-session admissions because its configuration is stale (1) or not (0). |
+| `ferrum_dp_config_snapshot_age_seconds` | gauge | `namespace` | `dp_config` | `documented_only` | `conditional` | Age of the DP's last validated and successfully applied CP configuration snapshot, on a monotonic clock. |
+| `ferrum_dp_config_snapshot_apply_failures_total` | counter | `namespace` | `dp_config` | `documented_only` | `conditional` | CP snapshots that were admitted and then failed to apply since process start. |
+| `ferrum_dp_config_snapshots_applied_total` | counter | `namespace` | `dp_config` | `documented_only` | `conditional` | CP snapshots/deltas validated and successfully applied since process start. |
+| `ferrum_dp_config_snapshots_rejected_total` | counter | `namespace` | `dp_config` | `documented_only` | `conditional` | CP payloads refused before apply since process start. |
+| `ferrum_dp_config_stale` | gauge | `namespace` | `dp_config` | `documented_only` | `conditional` | Whether the DP's applied configuration is past its bound with no authoritative CP (1) or not (0). |
+| `ferrum_dp_config_stale_transitions_total` | counter | `namespace` | `dp_config` | `documented_only` | `conditional` | Transitions into the stale state since process start. |
 | `ferrum_edge_overhead_ms` | histogram | `proxy_id`, `le`, `namespace` | `prometheus_metrics` | `dashboard` | `always` | Gateway overhead (excluding backend and plugins) in milliseconds. |
 | `ferrum_jwks_consecutive_failures` | gauge | `class` | `jwks` | `documented_only` | `always` | Maximum current consecutive failures among active remote stores by fixed failure class. |
 | `ferrum_jwks_refresh_failures_total` | counter | `class` | `jwks` | `documented_only` | `always` | Remote JWKS refresh failures by fixed failure class. |
@@ -362,6 +371,11 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_tls_source_fetch_duration_seconds` | histogram | `scheme`, `kind`, `le`, `namespace` | `tls` | `documented_only` | `conditional` | TLS material source fetch duration in seconds. |
 | `ferrum_tls_source_fetch_failures_total` | counter | `scheme`, `kind`, `reason`, `namespace` | `tls` | `documented_only` | `conditional` | TLS material source fetch failures by scheme, kind, and bounded reason. |
 | `ferrum_tls_source_refresh_total` | counter | `scheme`, `kind`, `surface`, `outcome`, `namespace` | `tls` | `documented_only` | `conditional` | TLS material source refresh attempts by scheme, kind, surface, and outcome. |
+| `ferrum_tls_store_admission_rejected_total` | counter | `store`, `reason`, `namespace` | `tls` | `documented_only` | `always` | Logical persistent TLS store admission refusals by store and reason. |
+| `ferrum_tls_store_document_bytes` | gauge | `store`, `namespace` | `tls` | `documented_only` | `always` | Current serialized byte length of a persistent TLS store document. |
+| `ferrum_tls_store_oversized_total` | counter | `store`, `direction`, `namespace` | `tls` | `documented_only` | `always` | Oversized persistent TLS store document refusals by store and direction. |
+| `ferrum_tls_store_pruned_total` | counter | `namespace` | `tls` | `documented_only` | `always` | Terminal ACME order history entries pruned under the exclusive mutation lock. |
+| `ferrum_tls_store_record_count` | gauge | `store`, `namespace` | `tls` | `documented_only` | `always` | Current logical record count in a persistent TLS store. |
 | `ferrum_websocket_bytes_total` | counter | `proxy_id`, `direction`, `namespace` | `websocket` | `documented_only` | `conditional` | WebSocket payload bytes relayed by direction. |
 | `ferrum_websocket_frames_total` | counter | `proxy_id`, `direction`, `namespace` | `websocket` | `documented_only` | `conditional` | WebSocket frames relayed by direction. |
 | `ferrum_websocket_session_duration_ms` | histogram | `proxy_id`, `result`, `direction`, `io_side`, `error_class`, `termination_reason`, `le`, `namespace` | `websocket` | `documented_only` | `conditional` | WebSocket session duration in milliseconds. |

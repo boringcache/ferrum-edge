@@ -827,6 +827,21 @@ pub struct MetricsRegistry {
     pub tls_source_fetch_failure_counter: DashMap<TlsSourceFetchFailureKey, TimestampedCounter>,
     /// TLS certificate rotation outcomes from source watchers.
     pub tls_cert_rotation_counter: DashMap<TlsCertRotationKey, TimestampedCounter>,
+    /// Current serialized byte length of each persistent TLS store document.
+    /// Fixed cardinality: one gauge per [`crate::tls::shared_store::TlsPersistentStoreKind`].
+    tls_store_document_bytes:
+        [AtomicU64; crate::tls::shared_store::TlsPersistentStoreKind::ALL.len()],
+    /// Current logical record count for each persistent TLS store.
+    tls_store_record_count:
+        [AtomicU64; crate::tls::shared_store::TlsPersistentStoreKind::ALL.len()],
+    /// Oversized read/write refusals by store kind and I/O direction.
+    tls_store_oversized_total:
+        [[AtomicU64; 2]; crate::tls::shared_store::TlsPersistentStoreKind::ALL.len()],
+    /// Logical admission refusals by store kind and fixed reason.
+    tls_store_admission_rejected_total:
+        [[AtomicU64; 2]; crate::tls::shared_store::TlsPersistentStoreKind::ALL.len()],
+    /// Terminal ACME order history entries pruned under the exclusive mutation lock.
+    tls_store_pruned_total: AtomicU64,
     /// Node-agent metrics registered by `FERRUM_MODE=node_agent`.
     node_agent_metrics: ArcSwap<Option<Arc<NodeAgentMetrics>>>,
     /// Admin/management-plane connection limiter, registered when an admin
@@ -946,6 +961,15 @@ impl MetricsRegistry {
             tls_source_fetch_duration_buckets: DashMap::new(),
             tls_source_fetch_failure_counter: DashMap::new(),
             tls_cert_rotation_counter: DashMap::new(),
+            tls_store_document_bytes: std::array::from_fn(|_| AtomicU64::new(0)),
+            tls_store_record_count: std::array::from_fn(|_| AtomicU64::new(0)),
+            tls_store_oversized_total: std::array::from_fn(|_| {
+                std::array::from_fn(|_| AtomicU64::new(0))
+            }),
+            tls_store_admission_rejected_total: std::array::from_fn(|_| {
+                std::array::from_fn(|_| AtomicU64::new(0))
+            }),
+            tls_store_pruned_total: AtomicU64::new(0),
             node_agent_metrics: ArcSwap::from_pointee(None),
             admin_conn_metrics: ArcSwap::from_pointee(None),
             cp_grpc_conn_metrics: ArcSwap::from_pointee(None),
@@ -1750,6 +1774,60 @@ impl MetricsRegistry {
         self.maybe_invalidate_cache();
     }
 
+    pub fn set_tls_store_document_bytes(
+        &self,
+        kind: crate::tls::shared_store::TlsPersistentStoreKind,
+        bytes: u64,
+    ) {
+        self.tls_store_document_bytes[kind.index()].store(bytes, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    pub fn set_tls_store_record_count(
+        &self,
+        kind: crate::tls::shared_store::TlsPersistentStoreKind,
+        count: u64,
+    ) {
+        self.tls_store_record_count[kind.index()].store(count, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    /// Fixed-cardinality test/operator seam for the current logical record
+    /// count gauge of one persistent TLS store.
+    #[allow(dead_code)] // External unit tests call this through the library target.
+    pub fn current_tls_store_record_count(
+        &self,
+        kind: crate::tls::shared_store::TlsPersistentStoreKind,
+    ) -> u64 {
+        self.tls_store_record_count[kind.index()].load(Ordering::Relaxed)
+    }
+
+    pub fn record_tls_store_oversized(
+        &self,
+        kind: crate::tls::shared_store::TlsPersistentStoreKind,
+        direction: crate::tls::shared_store::TlsStoreIoDirection,
+    ) {
+        self.tls_store_oversized_total[kind.index()][direction as usize]
+            .fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    pub fn record_tls_store_admission_rejected(
+        &self,
+        kind: crate::tls::shared_store::TlsPersistentStoreKind,
+        reason: crate::tls::shared_store::TlsStoreAdmissionReason,
+    ) {
+        self.tls_store_admission_rejected_total[kind.index()][reason as usize]
+            .fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    pub fn record_tls_store_pruned(&self, count: u64) {
+        self.tls_store_pruned_total
+            .fetch_add(count, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
     pub fn record_mesh_outbound_registry_decision(
         &self,
         mesh_namespace: &str,
@@ -2487,7 +2565,29 @@ impl MetricsRegistry {
         self.append_mesh_observability_prometheus(&mut output);
         self.append_node_waypoint_observability_prometheus(&mut output);
         self.append_udp_placement_migration_prometheus(&mut output);
+        self.append_dp_config_freshness_prometheus(&mut output);
         output
+    }
+
+    /// Append the bounded DP configuration-freshness families from live state.
+    ///
+    /// Kept off the render cache (issue #3726): every one of these series comes
+    /// from process-static atomics and from the passage of time — snapshot age,
+    /// the stale/blocked bits, and counters that no registry producer can
+    /// invalidate the cache for. A memoized body would report an age and an
+    /// admission state that are wrong by however long the cache has been held,
+    /// which is exactly the window an operator is watching during an outage.
+    fn append_dp_config_freshness_prometheus(&self, output: &mut String) {
+        let ns_label = self
+            .namespace_label
+            .read()
+            .map(|label| label.clone())
+            .unwrap_or_default();
+        render_dp_config_freshness_prometheus(
+            output,
+            &ns_label,
+            crate::dp_config_freshness::snapshot().as_ref(),
+        );
     }
 
     /// Append the process-static mesh observability families from live state.
@@ -2552,6 +2652,7 @@ impl MetricsRegistry {
         self.append_mesh_observability_prometheus(&mut output);
         self.append_node_waypoint_observability_prometheus(&mut output);
         self.append_udp_placement_migration_prometheus(&mut output);
+        self.append_dp_config_freshness_prometheus(&mut output);
         output
     }
 
@@ -3738,6 +3839,83 @@ impl MetricsRegistry {
             }
         }
 
+        output.push_str(
+            "# HELP ferrum_tls_store_document_bytes Current serialized byte length of a persistent TLS store document.\n",
+        );
+        output.push_str("# TYPE ferrum_tls_store_document_bytes gauge\n");
+        for kind in crate::tls::shared_store::TlsPersistentStoreKind::ALL {
+            let bytes = self.tls_store_document_bytes[kind.index()].load(Ordering::Relaxed);
+            output.push_str(&format!(
+                "ferrum_tls_store_document_bytes{{store=\"{}\"{}}} {}\n",
+                kind.as_str(),
+                ns_label,
+                bytes
+            ));
+        }
+        output.push_str(
+            "# HELP ferrum_tls_store_record_count Current logical record count in a persistent TLS store.\n",
+        );
+        output.push_str("# TYPE ferrum_tls_store_record_count gauge\n");
+        for kind in crate::tls::shared_store::TlsPersistentStoreKind::ALL {
+            let records = self.tls_store_record_count[kind.index()].load(Ordering::Relaxed);
+            output.push_str(&format!(
+                "ferrum_tls_store_record_count{{store=\"{}\"{}}} {}\n",
+                kind.as_str(),
+                ns_label,
+                records
+            ));
+        }
+        output.push_str(
+            "# HELP ferrum_tls_store_oversized_total Oversized persistent TLS store document refusals by store and direction.\n",
+        );
+        output.push_str("# TYPE ferrum_tls_store_oversized_total counter\n");
+        for kind in crate::tls::shared_store::TlsPersistentStoreKind::ALL {
+            for direction in [
+                crate::tls::shared_store::TlsStoreIoDirection::Read,
+                crate::tls::shared_store::TlsStoreIoDirection::Write,
+            ] {
+                let count = self.tls_store_oversized_total[kind.index()][direction as usize]
+                    .load(Ordering::Relaxed);
+                output.push_str(&format!(
+                    "ferrum_tls_store_oversized_total{{store=\"{}\",direction=\"{}\"{}}} {}\n",
+                    kind.as_str(),
+                    direction.as_str(),
+                    ns_label,
+                    count
+                ));
+            }
+        }
+        output.push_str(
+            "# HELP ferrum_tls_store_admission_rejected_total Logical persistent TLS store admission refusals by store and reason.\n",
+        );
+        output.push_str("# TYPE ferrum_tls_store_admission_rejected_total counter\n");
+        for kind in crate::tls::shared_store::TlsPersistentStoreKind::ALL {
+            for reason in [
+                crate::tls::shared_store::TlsStoreAdmissionReason::RecordLimit,
+                crate::tls::shared_store::TlsStoreAdmissionReason::DocumentBytes,
+            ] {
+                let count = self.tls_store_admission_rejected_total[kind.index()][reason as usize]
+                    .load(Ordering::Relaxed);
+                output.push_str(&format!(
+                    "ferrum_tls_store_admission_rejected_total{{store=\"{}\",reason=\"{}\"{}}} {}\n",
+                    kind.as_str(),
+                    reason.as_str(),
+                    ns_label,
+                    count
+                ));
+            }
+        }
+        output.push_str(
+            "# HELP ferrum_tls_store_pruned_total Terminal ACME order history entries pruned under the exclusive mutation lock.\n",
+        );
+        output.push_str("# TYPE ferrum_tls_store_pruned_total counter\n");
+        render_process_counter(
+            &mut output,
+            "ferrum_tls_store_pruned_total",
+            self.tls_store_pruned_total.load(Ordering::Relaxed),
+            &ns_label,
+        );
+
         // Mesh observability and NodeWaypoint ADR families are appended outside
         // this cached body — do not fold either of them back in here.
 
@@ -4326,6 +4504,125 @@ fn render_ai_counter_family(
             proxy_id, key.provider, ns_label, value
         ));
     }
+}
+
+/// Render the bounded DP last-known-good configuration families (issue #3726).
+///
+/// A free function taking the projection explicitly so the exact rendered text
+/// is testable without installing the process-global DP tracker, which would
+/// publish a process-wide admission flag inside a shared test binary.
+///
+/// Present only in DP mode (`freshness` is `None` everywhere else). Every
+/// series is fixed-cardinality: `namespace` is the only standard metric label.
+/// CP endpoint, credential, node id, and configuration content are not exposed
+/// as labels — the closed-set reason is exposed on authenticated `/health`
+/// instead.
+pub fn render_dp_config_freshness_prometheus(
+    output: &mut String,
+    ns_label: &str,
+    freshness: Option<&crate::dp_config_freshness::DpConfigFreshnessSnapshot>,
+) {
+    let Some(freshness) = freshness else {
+        return;
+    };
+    output.push_str(
+        "# HELP ferrum_dp_config_snapshot_age_seconds Age of the DP's last validated and successfully applied CP configuration snapshot, on a monotonic clock.\n",
+    );
+    output.push_str("# TYPE ferrum_dp_config_snapshot_age_seconds gauge\n");
+    render_process_counter(
+        output,
+        "ferrum_dp_config_snapshot_age_seconds",
+        freshness.snapshot_age_seconds,
+        ns_label,
+    );
+
+    output.push_str(
+        "# HELP ferrum_dp_config_max_stale_seconds Configured maximum applied-snapshot age before the DP degrades readiness (0 = bound disabled).\n",
+    );
+    output.push_str("# TYPE ferrum_dp_config_max_stale_seconds gauge\n");
+    render_process_counter(
+        output,
+        "ferrum_dp_config_max_stale_seconds",
+        freshness.max_stale_seconds,
+        ns_label,
+    );
+
+    output.push_str(
+        "# HELP ferrum_dp_config_stale Whether the DP's applied configuration is past its bound with no authoritative CP (1) or not (0).\n",
+    );
+    output.push_str("# TYPE ferrum_dp_config_stale gauge\n");
+    render_process_counter(
+        output,
+        "ferrum_dp_config_stale",
+        u64::from(freshness.stale),
+        ns_label,
+    );
+
+    output.push_str(
+        "# HELP ferrum_dp_config_new_traffic_blocked Whether the DP is refusing new HTTP/TCP/UDP-session/DTLS-session admissions because its configuration is stale (1) or not (0).\n",
+    );
+    output.push_str("# TYPE ferrum_dp_config_new_traffic_blocked gauge\n");
+    render_process_counter(
+        output,
+        "ferrum_dp_config_new_traffic_blocked",
+        u64::from(freshness.new_traffic_blocked),
+        ns_label,
+    );
+
+    output.push_str(
+        "# HELP ferrum_dp_config_cp_connected Whether the DP currently has a ConfigSync stream to some control plane (1) or none (0).\n",
+    );
+    output.push_str("# TYPE ferrum_dp_config_cp_connected gauge\n");
+    render_process_counter(
+        output,
+        "ferrum_dp_config_cp_connected",
+        u64::from(freshness.cp_connected),
+        ns_label,
+    );
+
+    output.push_str(
+        "# HELP ferrum_dp_config_stale_transitions_total Transitions into the stale state since process start.\n",
+    );
+    output.push_str("# TYPE ferrum_dp_config_stale_transitions_total counter\n");
+    render_process_counter(
+        output,
+        "ferrum_dp_config_stale_transitions_total",
+        freshness.stale_transitions_total,
+        ns_label,
+    );
+
+    output.push_str(
+        "# HELP ferrum_dp_config_snapshots_applied_total CP snapshots/deltas validated and successfully applied since process start.\n",
+    );
+    output.push_str("# TYPE ferrum_dp_config_snapshots_applied_total counter\n");
+    render_process_counter(
+        output,
+        "ferrum_dp_config_snapshots_applied_total",
+        freshness.applied_total,
+        ns_label,
+    );
+
+    output.push_str(
+        "# HELP ferrum_dp_config_snapshots_rejected_total CP payloads refused before apply since process start.\n",
+    );
+    output.push_str("# TYPE ferrum_dp_config_snapshots_rejected_total counter\n");
+    render_process_counter(
+        output,
+        "ferrum_dp_config_snapshots_rejected_total",
+        freshness.rejected_total,
+        ns_label,
+    );
+
+    output.push_str(
+        "# HELP ferrum_dp_config_snapshot_apply_failures_total CP snapshots that were admitted and then failed to apply since process start.\n",
+    );
+    output.push_str("# TYPE ferrum_dp_config_snapshot_apply_failures_total counter\n");
+    render_process_counter(
+        output,
+        "ferrum_dp_config_snapshot_apply_failures_total",
+        freshness.apply_failed_total,
+        ns_label,
+    );
 }
 
 fn render_process_counter(output: &mut String, metric_name: &str, value: u64, ns_label: &str) {
