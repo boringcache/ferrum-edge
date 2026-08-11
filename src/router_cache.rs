@@ -121,8 +121,8 @@ struct HttpPortMatchContext<'a> {
     single_tls_listen_port: Option<u16>,
     /// Listener admission published with the exact request/config generation.
     /// A pending generation rejects every listener-scoped route. Once the
-    /// matching reconcile acknowledges it, only admission-refused ports remain
-    /// ineligible; ordinary OS bind failures stay eligible for Service remap.
+    /// matching reconcile acknowledges it, every admission-refused or
+    /// bind-failed port remains ineligible for Service remap.
     listener_admission: &'a GatewayListenerAdmission,
 }
 
@@ -414,8 +414,9 @@ pub(crate) struct HostRouteTable {
 /// New config generations start pending so a newly published port-scoped route
 /// cannot use an older generation's successful decision. The listener manager
 /// replaces pending with a decided refusal set only after reconciling that same
-/// config generation. Ordinary OS bind failures are deliberately absent from
-/// the decided set so Service-fronted remapping remains available.
+/// config generation. The decided set includes both pre-bind admission
+/// refusals and OS bind failures so neither can expose a listener-scoped route
+/// through Service-fronted remapping.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GatewayListenerAdmission {
     pending: bool,
