@@ -1107,7 +1107,15 @@ fn a_per_uid_rpc_quota_at_or_above_the_service_ceiling_is_refused() {
 
 #[test]
 fn rpc_clamping_never_produces_a_quota_that_can_take_every_permit() {
-    for max_concurrent_rpcs in [0usize, 1, 2, 3, 512, MAX_CONCURRENT_RPCS_CEILING, usize::MAX] {
+    for max_concurrent_rpcs in [
+        0usize,
+        1,
+        2,
+        3,
+        512,
+        MAX_CONCURRENT_RPCS_CEILING,
+        usize::MAX,
+    ] {
         for max_concurrent_rpcs_per_uid in [
             0usize,
             1,

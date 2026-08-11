@@ -564,9 +564,10 @@ impl WorkloadApiAdmissionConfig {
                 .max_concurrent_streams
                 .clamp(1, MAX_CONCURRENT_STREAMS_CEILING),
             max_concurrent_rpcs,
-            max_concurrent_rpcs_per_uid: self
-                .max_concurrent_rpcs_per_uid
-                .clamp(1, MAX_CONCURRENT_RPCS_PER_UID_CEILING.min(max_concurrent_rpcs - 1)),
+            max_concurrent_rpcs_per_uid: self.max_concurrent_rpcs_per_uid.clamp(
+                1,
+                MAX_CONCURRENT_RPCS_PER_UID_CEILING.min(max_concurrent_rpcs - 1),
+            ),
             initial_connection_timeout: clamp_duration(
                 self.initial_connection_timeout,
                 INITIAL_CONNECTION_TIMEOUT_CEILING,
