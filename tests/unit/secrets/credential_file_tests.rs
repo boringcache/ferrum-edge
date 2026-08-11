@@ -126,10 +126,10 @@ fn concurrent_growth_is_capped_by_streaming_budget() {
     }
     impl std::io::Read for GrowingThenOversize {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            if self.served >= LIMIT + 1 {
+            if self.served > LIMIT {
                 return Ok(0);
             }
-            let n = buf.len().min(LIMIT + 1 - self.served);
+            let n = buf.len().min(LIMIT.saturating_add(1).saturating_sub(self.served));
             for slot in &mut buf[..n] {
                 *slot = b'x';
             }
@@ -404,6 +404,68 @@ fn fifo_rejection_does_not_leave_a_blocked_detached_reader() {
         .expect_err("FIFO")
     });
     assert!(matches!(error, CredentialFileError::NotRegularFile));
+}
+
+#[test]
+fn detached_bounded_reader_timeout_does_not_pin_runtime_teardown() {
+    use std::io::Read;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    const WATCHDOG: Duration = Duration::from_secs(30);
+    const FETCH_TIMEOUT: Duration = Duration::from_millis(50);
+    const EXPECTED_CEILING: Duration = Duration::from_secs(2);
+
+    struct StallRead {
+        gate: Arc<AtomicBool>,
+    }
+
+    impl Read for StallRead {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            while !self.gate.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Ok(0)
+        }
+    }
+
+    let gate = Arc::new(AtomicBool::new(false));
+    let gate_worker = gate.clone();
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let started = Instant::now();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = rt.block_on(async {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let join_handle = std::thread::spawn(move || {
+                let _ = tx.send(read_bounded_credential_bytes(
+                    StallRead { gate: gate_worker },
+                    LIMIT,
+                ));
+            });
+            drop(join_handle);
+            tokio::time::timeout(FETCH_TIMEOUT, rx).await
+        });
+        let _ = sender.send((result, started.elapsed()));
+    });
+
+    let (result, elapsed) = receiver
+        .recv_timeout(WATCHDOG)
+        .expect("detached bounded-reader timeout and runtime teardown must complete");
+    assert!(
+        result.is_err(),
+        "stalling reader must exceed the fetch timeout, got: {result:?}"
+    );
+    assert!(
+        elapsed < EXPECTED_CEILING,
+        "timeout path must finish promptly, took {elapsed:?}"
+    );
+    gate.store(true, Ordering::Release);
 }
 
 #[test]

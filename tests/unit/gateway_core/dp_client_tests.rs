@@ -304,6 +304,11 @@ fn grpc_jwt_projected_symlink_rotation_is_visible_on_next_mint() {
     assert_eq!(secret.mint("n", None, None).unwrap(), "projected-v2");
 }
 
+fn source_calls_mint_async_with_namespace_and_awaits(source: &str) -> bool {
+    let collapsed: String = source.split_whitespace().collect();
+    collapsed.contains("mint_async(node_id,Some(namespace),None).await")
+}
+
 #[test]
 fn grpc_jwt_consumers_use_mint_async_for_reconnect_paths() {
     // Native mesh, DP ConfigSync, and Ferrum xDS ADS are the production
@@ -319,7 +324,7 @@ fn grpc_jwt_consumers_use_mint_async_for_reconnect_paths() {
         "native MeshSubscribe reconnect must mint_async"
     );
     assert!(
-        dp.contains("mint_async(node_id, Some(namespace), None).await"),
+        source_calls_mint_async_with_namespace_and_awaits(dp),
         "DP ConfigSync reconnect must mint_async"
     );
     assert!(

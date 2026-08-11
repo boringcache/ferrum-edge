@@ -150,6 +150,21 @@ fn open_credential_file(path: &Path) -> Result<File, CredentialFileError> {
     }
 }
 
+/// Fast-reject known non-regular path kinds before `open(2)` so sockets, FIFOs,
+/// devices, and directories fail as [`CredentialFileError::NotRegularFile`]
+/// without a blocking open. Symlinked credential pathnames are left to open so
+/// the opened target remains authoritative against races.
+fn reject_non_regular_path_before_open(path: &Path) -> Result<(), CredentialFileError> {
+    let metadata = std::fs::symlink_metadata(path).map_err(CredentialFileError::Io)?;
+    if metadata.file_type().is_symlink() {
+        return Ok(());
+    }
+    if !metadata.is_file() {
+        return Err(CredentialFileError::NotRegularFile);
+    }
+    Ok(())
+}
+
 fn require_regular_file(file: &File) -> Result<std::fs::Metadata, CredentialFileError> {
     let metadata = file.metadata().map_err(CredentialFileError::Io)?;
     if !metadata.is_file() {
@@ -169,6 +184,7 @@ pub fn read_credential_file(
 ) -> Result<String, CredentialFileError> {
     let max_bytes = validate_credential_file_max_bytes(max_bytes)?;
     let path = Path::new(path);
+    reject_non_regular_path_before_open(path)?;
     let file = open_credential_file(path)?;
     let metadata = require_regular_file(&file)?;
     // Fast-reject known-oversized regular files (including sparse files whose

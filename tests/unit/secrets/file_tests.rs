@@ -6,6 +6,7 @@ use crate::unit::env_lock::ENV_LOCK;
 #[test]
 fn file_secret_reads_use_detached_os_thread_not_spawn_blocking() {
     let file_src = include_str!("../../../src/secrets/file.rs");
+    let credential_src = include_str!("../../../src/secrets/credential_file.rs");
     let registry_src = include_str!("../../../src/secrets/registry.rs");
 
     assert!(
@@ -17,7 +18,11 @@ fn file_secret_reads_use_detached_os_thread_not_spawn_blocking() {
         "detached reader threads must keep the ferrum-secret-file name"
     );
     assert!(
-        file_src.contains("drop(join_handle)"),
+        file_src.contains("read_credential_file_detached"),
+        "_FILE async reads must delegate to the shared detached credential reader"
+    );
+    assert!(
+        credential_src.contains("drop(join_handle)"),
         "JoinHandle must be dropped explicitly so the OS thread detaches"
     );
     let mut file_code_lines = file_src.lines().filter(|line| {
