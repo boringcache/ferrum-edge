@@ -2556,12 +2556,13 @@ pub fn classify_grpc_mesh_dispatch(
 ///   `grpc-status` trailers; it is unrelated to
 ///   [`GrpcDispatchTransport`]'s nested-HTTP/2 HBONE transport, which native
 ///   gRPC surfaces use directly instead of falling through (issue #3284).
-///   Native gRPC must therefore still be refused inside the branch, and so must
-///   gRPC-Web the `grpc_web` plugin TRANSLATED (codex r2-1): by dispatch time
-///   the outbound request is wire-native gRPC (`content-type:
-///   application/grpc`), so letting it ride the HBONE HTTP/1.1 inner tunnel
-///   or the cross-cluster paths would hit the exact no-trailer corruption the
-///   refusal exists to prevent. The original request content-type
+///   Native gRPC must therefore stay inside the native branch, where it uses
+///   [`GrpcDispatchTransport`]'s nested-HTTP/2 HBONE transport (issues #3284,
+///   #3728), and so must gRPC-Web the `grpc_web` plugin TRANSLATED (codex r2-1):
+///   by dispatch time the outbound request is wire-native gRPC (`content-type:
+///   application/grpc`), so letting either shape ride the generic HBONE
+///   HTTP/1.1 inner tunnel would hit the exact no-trailer corruption this gate
+///   prevents. The original request content-type
 ///   (`request_uses_grpc_content_type`) alone cannot see the translation —
 ///   pair it with the plugin's spoof-proof context marker
 ///   (`grpc_web::request_is_grpc_web_translated`).
@@ -2589,11 +2590,12 @@ pub fn grpc_mesh_dispatch_falls_through(
         GrpcMeshDispatch::RefuseCrossClusterNoTransport
         | GrpcMeshDispatch::RefuseCrossClusterMalformed => false,
         // Pass-through gRPC-Web only. For HBONE that is because the generic
-        // HTTP-family path runs an HTTP/1.1 client inside the byte tunnel; for
-        // an HTTP/1.1 Unix socket it is because the socket itself speaks
-        // HTTP/1.1. Either way a non-gRPC-content-type request is ordinary HTTP
-        // and rides the generic path, while a genuine gRPC request must NOT and
-        // is refused by the caller instead.
+        // HTTP-family path runs an HTTP/1.1 client inside the byte tunnel;
+        // native / translated gRPC stays in-branch and uses the nested-HTTP/2
+        // transport. For an HTTP/1.1 Unix socket, native / translated gRPC also
+        // stays in-branch but is refused because this dispatch surface has no
+        // trailer-preserving Unix transport. A non-gRPC-content-type request is
+        // ordinary HTTP in either case and rides the generic path.
         GrpcMeshDispatch::HboneCrossCluster
         | GrpcMeshDispatch::Hbone
         | GrpcMeshDispatch::RefuseUnixSocketHttp1 => {
