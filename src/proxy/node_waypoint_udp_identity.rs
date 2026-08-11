@@ -463,7 +463,9 @@ impl NodeWaypointUdpSourceScoping {
             .resolver
             .policy_scope_for_pod_identity(&binding.pod_uid, &binding.principal)
         else {
-            return Err(self.index.record(NodeWaypointUdpSourceRefusal::PodNotInSlice));
+            return Err(self
+                .index
+                .record(NodeWaypointUdpSourceRefusal::PodNotInSlice));
         };
         Ok(ResolvedUdpSource { binding, scope })
     }
@@ -476,8 +478,7 @@ impl NodeWaypointUdpSourceScoping {
         ingress_ifindex: Option<u32>,
         source: IpAddr,
     ) -> Result<(), NodeWaypointUdpSourceRefusal> {
-        self.index
-            .revalidate(pinned, ingress_ifindex, source)?;
+        self.index.revalidate(pinned, ingress_ifindex, source)?;
         if self
             .resolver
             .policy_scope_for_pod_identity(&pinned.pod_uid, &pinned.principal)

@@ -311,7 +311,11 @@ fn an_interface_two_enrolled_pods_claim_refuses_both_rather_than_guessing() {
         "a shared bridge interface makes attribution impossible; capturing under a guessed \
          identity is exactly the cross-tenant confusion this channel exists to prevent"
     );
-    assert_eq!(state.refused.len(), 2, "both claimants are refused, not one");
+    assert_eq!(
+        state.refused.len(),
+        2,
+        "both claimants are refused, not one"
+    );
 }
 
 #[test]
@@ -486,7 +490,10 @@ fn live_kernel_reports_an_ingress_interface_that_drives_attribution() {
     );
     assert_eq!(
         index
-            .authorize(Some(ingress_ifindex.wrapping_add(1_000)), IpAddr::V4(sender_v4))
+            .authorize(
+                Some(ingress_ifindex.wrapping_add(1_000)),
+                IpAddr::V4(sender_v4)
+            )
             .expect_err("an interface no enrolled pod owns must be refused"),
         NodeWaypointUdpSourceRefusal::UnenrolledInterface
     );

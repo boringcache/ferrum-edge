@@ -32,8 +32,8 @@ use ferrum_edge::modes::mesh::node_waypoint::NodeWaypointIdentityResolver;
 use ferrum_edge::proxy::host_udp_capture::ResolvedInterface;
 use ferrum_edge::proxy::netns_capture::{PodCaptureSource, PodCaptureSourceIps, PodCaptureTarget};
 use ferrum_edge::proxy::node_waypoint_udp_identity::{
-    NodeWaypointUdpInterfaceResolver, NodeWaypointUdpSourceIndex, NodeWaypointUdpSourceIndexManager,
-    NodeWaypointUdpSourceRefusal, NodeWaypointUdpSourceScoping,
+    NodeWaypointUdpInterfaceResolver, NodeWaypointUdpSourceIndex,
+    NodeWaypointUdpSourceIndexManager, NodeWaypointUdpSourceRefusal, NodeWaypointUdpSourceScoping,
 };
 
 const POD_A: &str = "11111111-1111-1111-1111-111111111111";

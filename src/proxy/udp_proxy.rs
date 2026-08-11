@@ -599,8 +599,7 @@ fn spawn_session_hook_ingress_worker(
             // the meantime cannot produce a late backend side effect under the
             // old workload identity.
             if let Some(source) = session.node_waypoint_source.as_ref()
-                && let Err(refusal) =
-                    source.revalidate(source.ingress_ifindex, client_addr.ip())
+                && let Err(refusal) = source.revalidate(source.ingress_ifindex, client_addr.ip())
             {
                 source.scoping.index.warn_refusal(
                     session.proxy_id.as_str(),
@@ -608,10 +607,7 @@ fn spawn_session_hook_ingress_worker(
                     refusal,
                 );
                 session.expired.store(true, Ordering::Release);
-                signal_udp_reply_task_stop(
-                    &session.stop_reply_task,
-                    session.stop_notify.as_ref(),
-                );
+                signal_udp_reply_task_stop(&session.stop_reply_task, session.stop_notify.as_ref());
                 session.close_hook_ingress();
                 break;
             }
@@ -2539,10 +2535,8 @@ async fn process_datagram(
     // removal all fail here and terminate the session rather than letting it
     // keep relaying under evidence that is no longer vouched for.
     if let Some(source) = session.node_waypoint_source.as_ref()
-        && let Err(refusal) = source.revalidate(
-            local_addr.map(|local| local.ifindex),
-            client_addr.ip(),
-        )
+        && let Err(refusal) =
+            source.revalidate(local_addr.map(|local| local.ifindex), client_addr.ip())
     {
         source
             .scoping
@@ -2555,10 +2549,7 @@ async fn process_datagram(
         // identity-aware map removal, active-session decrement, overload-guard
         // release, and disconnect emission. Removing here would make its later
         // `remove_if` miss and leak all three lifecycle accounts.
-        signal_udp_reply_task_stop(
-            &session.stop_reply_task,
-            session.stop_notify.as_ref(),
-        );
+        signal_udp_reply_task_stop(&session.stop_reply_task, session.stop_notify.as_ref());
         session.close_hook_ingress();
         *last_client = None;
         return Err(anyhow::anyhow!(
@@ -4013,14 +4004,12 @@ async fn handle_dtls_client_inner(
                 Err(_) => break,
             };
             if let Some(source) = node_waypoint_source_fwd.as_ref()
-                && let Err(refusal) =
-                    source.revalidate(source.ingress_ifindex, client_addr.ip())
+                && let Err(refusal) = source.revalidate(source.ingress_ifindex, client_addr.ip())
             {
-                source.scoping.index.warn_refusal(
-                    &proxy_id_fwd,
-                    dgram_client_ip.as_ref(),
-                    refusal,
-                );
+                source
+                    .scoping
+                    .index
+                    .warn_refusal(&proxy_id_fwd, dgram_client_ip.as_ref(), refusal);
                 return Err(anyhow::anyhow!(
                     "NodeWaypoint DTLS source attribution no longer valid ({})",
                     refusal.as_str()
@@ -4121,8 +4110,7 @@ async fn handle_dtls_client_inner(
                 break;
             };
             if let Some(source) = node_waypoint_source_rev.as_ref()
-                && let Err(refusal) =
-                    source.revalidate(source.ingress_ifindex, client_addr.ip())
+                && let Err(refusal) = source.revalidate(source.ingress_ifindex, client_addr.ip())
             {
                 source.scoping.index.warn_refusal(
                     &proxy_id_rev,
@@ -4490,8 +4478,7 @@ async fn create_session(
     // publishing the session so a registry/slice change during those awaits
     // cannot forward the retained first datagram under stale evidence.
     if let Some(source) = node_waypoint_source.as_ref()
-        && let Err(refusal) =
-            source.revalidate(source.ingress_ifindex, client_addr.ip())
+        && let Err(refusal) = source.revalidate(source.ingress_ifindex, client_addr.ip())
     {
         source
             .scoping
@@ -4751,8 +4738,7 @@ async fn create_session(
             // rotation, or interface/address reuse cannot deliver stale-session
             // data to a new workload that inherited the peer tuple.
             if let Some(source) = reply_session.node_waypoint_source.as_ref()
-                && let Err(refusal) =
-                    source.revalidate(source.ingress_ifindex, client_addr.ip())
+                && let Err(refusal) = source.revalidate(source.ingress_ifindex, client_addr.ip())
             {
                 source.scoping.index.warn_refusal(
                     &reply_proxy_id,

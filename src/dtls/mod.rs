@@ -388,6 +388,7 @@ pub(crate) fn dtls_stale_session_removal_preserves_newer_generation_for_test() -
             incoming_tx: gen2_tx,
             shutdown_tx: gen2_shutdown_tx,
             generation: 2,
+            ingress_ifindex: None,
         },
     );
     active_sessions.fetch_add(1, Ordering::Relaxed);
@@ -1221,11 +1222,9 @@ impl DtlsServer {
                         return Ok(());
                     };
                     loop {
-                        let received = self
-                            .socket
-                            .try_io(tokio::io::Interest::READABLE, || {
-                                batch.recv(fd, DTLS_INGRESS_CAPTURE_BATCH)
-                            });
+                        let received = self.socket.try_io(tokio::io::Interest::READABLE, || {
+                            batch.recv(fd, DTLS_INGRESS_CAPTURE_BATCH)
+                        });
                         match received {
                             Ok(n) if n > 0 => {
                                 for i in 0..n {
@@ -1250,17 +1249,11 @@ impl DtlsServer {
                                         | std::io::ErrorKind::Interrupted
                                 ) =>
                             {
-                                trace!(
-                                    "DTLS server transient recvmmsg error (ignored): {}",
-                                    e
-                                );
+                                trace!("DTLS server transient recvmmsg error (ignored): {}", e);
                                 break;
                             }
                             Err(e) => {
-                                return Err(anyhow::anyhow!(
-                                    "DTLS server recvmmsg error: {}",
-                                    e
-                                ));
+                                return Err(anyhow::anyhow!("DTLS server recvmmsg error: {}", e));
                             }
                         }
                     }
@@ -2358,11 +2351,19 @@ mod tests {
         })
         .await;
 
-        server.spawn_session("127.0.0.1:12347".parse().unwrap(), client_hello_packet(), None);
+        server.spawn_session(
+            "127.0.0.1:12347".parse().unwrap(),
+            client_hello_packet(),
+            None,
+        );
         assert_eq!(server.active_session_count(), 1);
         assert_eq!(mirror.load(Ordering::Relaxed), 1);
 
-        server.spawn_session("127.0.0.1:12348".parse().unwrap(), client_hello_packet(), None);
+        server.spawn_session(
+            "127.0.0.1:12348".parse().unwrap(),
+            client_hello_packet(),
+            None,
+        );
         assert_eq!(server.active_session_count(), 1);
         assert_eq!(mirror.load(Ordering::Relaxed), 1);
 
@@ -2469,7 +2470,11 @@ mod tests {
         // single session to validate the snapshot path: `spawn_session`
         // captures the swapped `certificate` value rather than the
         // original.
-        server.spawn_session("127.0.0.1:43210".parse().unwrap(), client_hello_packet(), None);
+        server.spawn_session(
+            "127.0.0.1:43210".parse().unwrap(),
+            client_hello_packet(),
+            None,
+        );
         assert!(
             server.active_session_count() <= 1,
             "spawn_session honored admission limits after a live-reload swap"
