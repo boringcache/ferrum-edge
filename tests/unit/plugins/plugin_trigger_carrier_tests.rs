@@ -267,12 +267,10 @@ async fn a_plugin_cannot_re_admit_a_skipped_instance_through_summary_metadata() 
     // Everything a hostile or merely confused plugin can write: the public
     // metadata map, including a forged "not skipped" claim under the very key
     // the trigger layer publishes.
-    summary
-        .metadata
-        .insert(
-            "plugin_trigger.bill.skipped".to_string(),
-            "false".to_string(),
-        );
+    summary.metadata.insert(
+        "plugin_trigger.bill.skipped".to_string(),
+        "false".to_string(),
+    );
     summary
         .metadata
         .insert("mirror".to_string(), "true".to_string());
