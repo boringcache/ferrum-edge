@@ -783,10 +783,8 @@ fn certificate_cap_is_isolated_per_serving_namespace() {
             tls_secret("victim-cert", "zzz-victim"),
             route("zzz-victim", "victim-route", "edge", "https", "/"),
         ],
-        options().with_source_namespaces(vec![
-            "aaa-attacker".to_string(),
-            "zzz-victim".to_string(),
-        ]),
+        options()
+            .with_source_namespaces(vec!["aaa-attacker".to_string(), "zzz-victim".to_string()]),
     )
     .expect("translation succeeds");
 
