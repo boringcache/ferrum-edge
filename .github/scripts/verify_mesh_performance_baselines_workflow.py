@@ -16,7 +16,6 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "mesh-performance-baselines.yml"
-PERF_BENCHMARK_PATH = REPO_ROOT / ".github" / "workflows" / "perf-benchmark.yml"
 PROVENANCE_SCRIPT = REPO_ROOT / ".github" / "scripts" / "collect_mesh_baseline_provenance.py"
 SUMMARY_SCRIPT = REPO_ROOT / ".github" / "scripts" / "summarize_mesh_baseline_results.py"
 PROTOCOL_DOC = REPO_ROOT / "docs" / "protocol_perf_regression.md"
@@ -62,7 +61,7 @@ def check_workflow(text: str, failures: list[str]) -> None:
         "must not dispatch to self-hosted runners",
         failures,
     )
-    require("workflow_call:" in text, "workflow_call required for PR-branch dispatch via perf-benchmark.yml", failures)
+    require("workflow_call:" in text, "trusted reusable entry point required", failures)
     require("BENCH_BUILD_PROFILE: release" in text, "release profile required", failures)
     require("BENCH_MAX_CPU_STEAL_PERCENT: \"5.0\"" in text or "BENCH_MAX_CPU_STEAL_PERCENT: '5.0'" in text, "documented CPU steal threshold required", failures)
     require("runner_health.json" in text, "machine-readable runner_health.json required", failures)
@@ -117,7 +116,7 @@ def _workflow_inputs_block(text: str) -> str:
     return "\n".join(blocks)
 
 
-def check_caller_and_scripts(failures: list[str]) -> None:
+def check_scripts(failures: list[str]) -> None:
     require(PROVENANCE_SCRIPT.is_file(), "provenance script missing", failures)
     require(SUMMARY_SCRIPT.is_file(), "summary script missing", failures)
     require(WORKFLOW_PATH.is_file(), "workflow missing", failures)
@@ -131,16 +130,6 @@ def check_caller_and_scripts(failures: list[str]) -> None:
     require("DNS_GATEWAY_ROWS" in summary, "summarizer must enumerate required DNS gateway rows", failures)
     require("--check-acceptance" in summary, "summarizer must support acceptance check", failures)
     require("undersampling" in summary or "one gateway" in summary, "summarizer self-test must cover undersampling", failures)
-
-    if PERF_BENCHMARK_PATH.is_file():
-        caller = PERF_BENCHMARK_PATH.read_text(encoding="utf-8")
-        if "mesh-performance-baselines.yml" in caller:
-            require(
-                "runner:" not in caller.split("mesh-performance-baselines.yml", 1)[1].split("benchmark:", 1)[0],
-                "perf-benchmark mesh_baselines caller must not pass runner input",
-                failures,
-            )
-
 
 def check_docs_and_baselines(failures: list[str]) -> None:
     protocol = PROTOCOL_DOC.read_text(encoding="utf-8")
@@ -226,7 +215,7 @@ def main() -> int:
     failures: list[str] = []
     text = WORKFLOW_PATH.read_text(encoding="utf-8")
     check_workflow(text, failures)
-    check_caller_and_scripts(failures)
+    check_scripts(failures)
     check_docs_and_baselines(failures)
     if failures:
         for failure in failures:

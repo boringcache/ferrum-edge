@@ -11,27 +11,17 @@ import argparse
 import json
 import os
 import platform
-import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 
-def run_capture(command: list[str]) -> str:
+def read_fact(facts_dir: Path, name: str) -> str:
+    path = facts_dir / name
     try:
-        completed = subprocess.run(
-            command,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-    except (OSError, subprocess.TimeoutExpired) as error:
+        return path.read_text(encoding="utf-8").strip()
+    except OSError as error:
         return f"<unavailable: {error}>"
-    if completed.returncode != 0:
-        stderr = (completed.stderr or "").strip()
-        return f"<failed rc={completed.returncode}: {stderr[:200]}>"
-    return (completed.stdout or "").strip()
 
 
 def first_matching_line(text: str, needle: str) -> str | None:
@@ -82,19 +72,25 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
+        "--host-facts-dir",
+        type=Path,
+        required=True,
+        help="Directory of literal-command host/toolchain captures",
+    )
+    parser.add_argument(
         "--suite-commands",
         type=Path,
         help="Optional JSON file listing exact suite commands that will run",
     )
     args = parser.parse_args()
 
-    lscpu = run_capture(["lscpu"])
-    uname_a = run_capture(["uname", "-a"])
-    free_h = run_capture(["free", "-h"])
-    meminfo = run_capture(["cat", "/proc/meminfo"])
-    rustc_v = run_capture(["rustc", "--version", "--verbose"])
-    cargo_v = run_capture(["cargo", "--version", "--verbose"])
-    nproc = run_capture(["nproc"])
+    lscpu = read_fact(args.host_facts_dir, "lscpu.txt")
+    uname_a = read_fact(args.host_facts_dir, "uname.txt")
+    free_h = read_fact(args.host_facts_dir, "free.txt")
+    meminfo = read_fact(args.host_facts_dir, "meminfo.txt")
+    rustc_v = read_fact(args.host_facts_dir, "rustc-version.txt")
+    cargo_v = read_fact(args.host_facts_dir, "cargo-version.txt")
+    nproc = read_fact(args.host_facts_dir, "nproc.txt")
 
     mem_total_kib = parse_meminfo_kib(meminfo, "MemTotal")
     suite_commands = []
@@ -109,7 +105,7 @@ def main() -> int:
     provenance = {
         "schema_version": 1,
         "collected_at_utc": datetime.now(timezone.utc).isoformat(),
-        "commit_sha": os.environ.get("GITHUB_SHA") or run_capture(["git", "rev-parse", "HEAD"]),
+        "commit_sha": os.environ.get("GITHUB_SHA"),
         "github": {
             "run_id": os.environ.get("GITHUB_RUN_ID"),
             "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),

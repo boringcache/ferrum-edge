@@ -37,8 +37,7 @@ on:
           - "3"
           - "4"
           - "5"
-  # Callable from existing dispatchable workflows (e.g. perf-benchmark.yml) so
-  # collection can run on a PR branch before this file lands on main.
+  # Retain a reusable entry point for trusted callers after this workflow lands.
   workflow_call:
     inputs:
       suites:
@@ -204,8 +203,18 @@ jobs:
           PY
           } 2>&1 | tee mesh-baseline-results/logs/runner_health.log
 
+          mkdir -p mesh-baseline-results/host-facts
+          lscpu > mesh-baseline-results/host-facts/lscpu.txt
+          uname -a > mesh-baseline-results/host-facts/uname.txt
+          free -h > mesh-baseline-results/host-facts/free.txt
+          cp /proc/meminfo mesh-baseline-results/host-facts/meminfo.txt
+          rustc --version --verbose > mesh-baseline-results/host-facts/rustc-version.txt
+          cargo --version --verbose > mesh-baseline-results/host-facts/cargo-version.txt
+          nproc > mesh-baseline-results/host-facts/nproc.txt
+
           python3 .github/scripts/collect_mesh_baseline_provenance.py \
             --output mesh-baseline-results/provenance.json \
+            --host-facts-dir mesh-baseline-results/host-facts \
             --suite-commands mesh-baseline-results/suite_commands.json
 
       - name: Build gateway binary (release)
