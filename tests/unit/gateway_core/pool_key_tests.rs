@@ -699,7 +699,7 @@ fn h2_pool_key_basic_format() {
     let key = Http2ConnectionPool::pool_key_for_warmup(&proxy);
     // Format: host|port|dns|subset|h2mcs|ca|mtls_cert|mtls_key|sni|sans|verify|svidg=N
     assert_eq!(
-        key, "backend.example.com|8080|||none|||||1|svidg=static",
+        key, "backend.example.com|8080|||none||||||1|svidg=static",
         "basic H2 key format mismatch"
     );
 }
