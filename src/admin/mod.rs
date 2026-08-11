@@ -6350,9 +6350,8 @@ async fn handle_gateway_trust_status(
             // any rotation or revocation changes it. It is a digest, so it
             // carries no material. There is deliberately no process-wide
             // "published revision" here — revisions are per namespace.
-            let generation = crate::config::gateway_trust::trust_generation_fingerprint(
-                record.as_slice(),
-            );
+            let generation =
+                crate::config::gateway_trust::trust_generation_fingerprint(record.as_slice());
             Ok(json_response(
                 StatusCode::OK,
                 &json!({
