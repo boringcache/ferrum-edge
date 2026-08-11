@@ -1022,6 +1022,28 @@ fn a_plaintext_and_tls_listener_sharing_a_port_both_report_conflicted() {
     let update = gateway_update(&objects, "edge");
     assert_listener_refused(&update, "plain", "ProtocolConflict");
     assert_listener_refused(&update, "secure", "ProtocolConflict");
+    let expected_message = "Port 8443 is claimed by both plaintext and an effective TLS-serving \
+         frontend shape, so every conflicting claim on this port is refused \
+         (Conflicted).";
+    for name in ["plain", "secure"] {
+        let conflicted = listener_condition(listener_status(&update, name), "Conflicted");
+        assert_eq!(
+            conflicted["message"].as_str(),
+            Some(expected_message),
+            "listener {name} status must use fixed port/category wording: {conflicted:?}"
+        );
+        let message = conflicted["message"].as_str().unwrap_or_default();
+        assert!(
+            !message.contains("Gateway/default/edge")
+                && !message.contains("#plain")
+                && !message.contains("#secure")
+                && !message.contains("a.example.com")
+                && !message.contains("b.example.com")
+                && !message.contains("app-cert")
+                && !message.contains("Gateway API listeners ["),
+            "Gateway status Conflicted message must not disclose resource identities: {message}"
+        );
+    }
 
     let translation = translate_k8s_objects(&objects, options()).expect("translation");
     assert_eq!(
@@ -1035,7 +1057,125 @@ fn a_plaintext_and_tls_listener_sharing_a_port_both_report_conflicted() {
             conflict.reason, "ProtocolConflict",
             "listener {key} must report ProtocolConflict"
         );
+        assert_eq!(conflict.message, expected_message);
+        assert!(
+            !conflict.message.contains(&key.to_string())
+                && !conflict.message.contains("a.example.com")
+                && !conflict.message.contains("b.example.com")
+                && !conflict.message.contains("app-cert")
+                && !conflict.message.contains("Gateway API listeners ["),
+            "physical conflict message must not disclose resource identities: {} => {}",
+            key,
+            conflict.message
+        );
     }
+}
+
+/// HTTP-family vs raw TCP on one TCP port is a physical family conflict.
+/// Both Gateway listeners must report Conflicted / PortUnavailable and the
+/// translation conflict map must agree — not merely withdraw config.
+#[test]
+fn http_and_raw_tcp_listeners_sharing_a_port_both_report_conflicted() {
+    let gateway = object(
+        "gateway.networking.k8s.io/v1",
+        "Gateway",
+        "edge",
+        "default",
+        json!({
+            "gatewayClassName": "ferrum",
+            "listeners": [
+                {
+                    "name": "http",
+                    "port": 8080,
+                    "protocol": "HTTP",
+                    "allowedRoutes": {"namespaces": {"from": "All"}}
+                },
+                {
+                    "name": "tcp",
+                    "port": 8080,
+                    "protocol": "TCP",
+                    "allowedRoutes": {
+                        "kinds": [{"kind": "TCPRoute"}],
+                        "namespaces": {"from": "All"}
+                    }
+                }
+            ]
+        }),
+    );
+    let class = object(
+        "gateway.networking.k8s.io/v1",
+        "GatewayClass",
+        "ferrum",
+        "default",
+        json!({"controllerName": FERRUM_GATEWAY_CONTROLLER_NAME}),
+    );
+    let objects = vec![class, gateway];
+
+    let update = gateway_update(&objects, "edge");
+    assert_listener_refused(&update, "http", "ProtocolConflict");
+    assert_listener_refused(&update, "tcp", "ProtocolConflict");
+
+    // Reversed listener order must not change status.
+    let mut reversed = objects.clone();
+    if let Some(listeners) = reversed[1]
+        .spec
+        .get_mut("listeners")
+        .and_then(Value::as_array_mut)
+    {
+        listeners.reverse();
+    }
+    let reversed_update = gateway_update(&reversed, "edge");
+    assert_listener_refused(&reversed_update, "http", "ProtocolConflict");
+    assert_listener_refused(&reversed_update, "tcp", "ProtocolConflict");
+
+    let translation = translate_k8s_objects(&objects, options()).expect("translation");
+    assert_eq!(
+        translation.listener_conflicts.len(),
+        2,
+        "translation must refuse both HTTP and TCP claims: {:?}",
+        translation.listener_conflicts
+    );
+    for listener in ["http", "tcp"] {
+        let key = GatewayApiListenerKey {
+            namespace: "default".to_string(),
+            parent_kind: GatewayApiListenerParentKind::Gateway,
+            gateway: "edge".to_string(),
+            listener: listener.to_string(),
+        };
+        let conflict = translation
+            .listener_conflicts
+            .get(&key)
+            .unwrap_or_else(|| panic!("missing conflict for {listener}"));
+        assert_eq!(conflict.reason, "ProtocolConflict");
+        assert_eq!(
+            conflict.message,
+            "Port 8080 is claimed by incompatible protocol families on the same TCP \
+             transport (HTTP-family vs raw stream), so every conflicting claim on this \
+             port is refused (Conflicted)."
+        );
+    }
+    assert!(
+        translation.warnings.iter().any(|warning| {
+            warning.contains("Gateway default/edge listener http rejected: ProtocolConflict")
+        }) && translation.warnings.iter().any(|warning| {
+            warning.contains("Gateway default/edge listener tcp rejected: ProtocolConflict")
+        }),
+        "warnings must agree with status withdrawal: {:?}",
+        translation.warnings
+    );
+    // One family-arbitration decision — not a second plaintext-vs-TLS refuse message.
+    assert_eq!(
+        translation
+            .warnings
+            .iter()
+            .filter(|warning| {
+                warning.contains("both plaintext and an effective TLS-serving frontend shape")
+            })
+            .count(),
+        0,
+        "HTTP+TCP must not also emit plaintext-vs-TLS refuse warnings: {:?}",
+        translation.warnings
+    );
 }
 
 #[test]
@@ -1986,6 +2126,32 @@ fn different_certificate_sets_across_namespaces_refuse_every_effective_claim() {
     let edge_b = gateway_update_with_options(&objects, options.clone(), "edge-b");
     assert_listener_refused(&edge_b, "https", "HostnameConflict");
 
+    let expected_message = "Port 8443 has incompatible effective TLS credential sets across \
+         namespaces, so every conflicting claim on this port is refused \
+         (Conflicted).";
+    for (update, gateway) in [
+        (&edge_a, "edge-a"),
+        (&edge_b, "edge-b"),
+        (&other, "other-edge"),
+    ] {
+        let conflicted = listener_condition(listener_status(update, "https"), "Conflicted");
+        assert_eq!(
+            conflicted["message"].as_str(),
+            Some(expected_message),
+            "Gateway {gateway} status must use fixed port/category wording: {conflicted:?}"
+        );
+        let message = conflicted["message"].as_str().unwrap_or_default();
+        assert!(
+            !message.contains("Gateway/")
+                && !message.contains(gateway)
+                && !message.contains("#https")
+                && !message.contains("cert-a")
+                && !message.contains("cert-b")
+                && !message.contains("Gateway API listeners ["),
+            "Gateway {gateway} Conflicted message must not disclose resource identities: {message}"
+        );
+    }
+
     let translation = translate_k8s_objects(&objects, options).expect("translation");
     assert!(
         translation
@@ -2023,6 +2189,27 @@ fn different_certificate_sets_across_namespaces_refuse_every_effective_claim() {
         "translation must refuse every listener in the incompatible default namespace plan: {:?}",
         translation.listener_conflicts
     );
+    for (key, conflict) in &translation.listener_conflicts {
+        assert_eq!(conflict.reason, "HostnameConflict");
+        assert_eq!(
+            conflict.message, expected_message,
+            "cross-namespace credential conflict must use fixed port/category wording"
+        );
+        assert!(
+            !conflict.message.contains(&key.to_string())
+                && !conflict
+                    .message
+                    .contains(&format!("{}.example.com", key.gateway))
+                && !conflict.message.contains("cert-a")
+                && !conflict.message.contains("cert-b")
+                && !conflict.message.contains("k8s://")
+                && !conflict.message.contains("#tls.")
+                && !conflict.message.contains("Gateway API listeners ["),
+            "physical conflict message must not disclose resource or credential identities: {} => {}",
+            key,
+            conflict.message
+        );
+    }
     assert!(
         translation.config.proxies.is_empty(),
         "a physically refused listener must materialize no routes: {:?}",

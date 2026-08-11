@@ -1722,8 +1722,12 @@ fn listener_is_effective_tls_serving_claim(
 /// published physical and hostname conflict maps instead of independently
 /// recomputing ownership from raw objects.
 ///
-/// Listeners that are already non-materializable contribute no claim and are
-/// ignored, so a broken sibling cannot take down a healthy listener.
+/// Unresolved / unsupported listeners contribute no claim, so a broken sibling
+/// cannot take down a healthy listener. Listeners already recorded in
+/// `gateway_api_listener_conflicts` by ListenerSet/Gateway family arbitration
+/// (HTTP-family vs raw TCP/TLS stream on one TCP port) are skipped here so
+/// status and warnings stay one decision per physical shape — never a second
+/// plaintext-vs-TLS message for claims already withdrawn as family conflicts.
 pub(super) fn refuse_incompatible_same_port_listeners(acc: &mut K8sAccumulator) {
     #[derive(Default)]
     struct PortClaims {
@@ -1746,7 +1750,15 @@ pub(super) fn refuse_incompatible_same_port_listeners(acc: &mut K8sAccumulator) 
     loop {
         let plan = plan_gateway_frontend_tls_namespace_slots(acc);
         let mut claims_by_port: BTreeMap<u16, PortClaims> = BTreeMap::new();
+        // Family arbitration (HTTP-family vs raw TCP/TLS stream) already
+        // withdrew these and recorded Gateway status conflicts; do not
+        // re-claim them into plaintext-vs-TLS arbitration.
+        let already_conflicted: BTreeSet<GatewayApiListenerKey> =
+            acc.gateway_api_listener_conflicts.keys().cloned().collect();
         for (key, policy) in &acc.gateway_api_listener_policies {
+            if already_conflicted.contains(key) {
+                continue;
+            }
             // Only the HTTP family shares the HTTP-route socket set — the same
             // protocols `listener_route_kinds_for_protocol` admits HTTPRoute /
             // GRPCRoute on. A TLS-passthrough or L4 listener on the same number
@@ -1794,7 +1806,11 @@ pub(super) fn refuse_incompatible_same_port_listeners(acc: &mut K8sAccumulator) 
             if !protocol_conflict && !credential_conflict {
                 continue;
             }
-            let (reason, refused_keys, detail) = if protocol_conflict {
+            // Deterministic bounded wording: numeric port + fixed conflict
+            // category only. Never join listener keys or echo namespace /
+            // Gateway / ListenerSet / listener / hostname / credential strings
+            // (cross-tenant disclosure on Gateway.status.listeners[]).
+            let (reason, refused_keys, message) = if protocol_conflict {
                 (
                     "ProtocolConflict",
                     claims
@@ -1803,25 +1819,23 @@ pub(super) fn refuse_incompatible_same_port_listeners(acc: &mut K8sAccumulator) 
                         .chain(claims.effective_tls.iter())
                         .cloned()
                         .collect::<Vec<_>>(),
-                    "both plaintext and an effective TLS-serving claim (one socket is one or the other)",
+                    format!(
+                        "Port {port} is claimed by both plaintext and an effective TLS-serving \
+                         frontend shape, so every conflicting claim on this port is refused \
+                         (Conflicted)."
+                    ),
                 )
             } else {
                 (
                     "HostnameConflict",
                     claims.effective_tls,
-                    "effective TLS serving sets from different Gateway namespaces resolve to \
-                     different credentials on one physical socket",
+                    format!(
+                        "Port {port} has incompatible effective TLS credential sets across \
+                         namespaces, so every conflicting claim on this port is refused \
+                         (Conflicted)."
+                    ),
                 )
             };
-            let listeners = refused_keys
-                .iter()
-                .map(|key| key.to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let message = format!(
-                "Gateway API listeners [{listeners}] claim port {port} with incompatible frontend \
-                 shapes: {detail}, so every conflicting claim on this port is refused (Conflicted)."
-            );
             warnings.push(message.clone());
             refused.extend(refused_keys.into_iter().map(|key| {
                 (
@@ -9287,11 +9301,33 @@ mod tests {
         );
         assert!(
             result.warnings.iter().any(|warning| {
-                warning.contains("incompatible frontend shapes") && warning.contains("8443")
+                warning.contains(
+                    "Port 8443 is claimed by both plaintext and an effective TLS-serving \
+                     frontend shape",
+                )
             }),
             "the refusal must be reported: {:?}",
             result.warnings
         );
+        for (key, conflict) in &result.listener_conflicts {
+            assert_eq!(conflict.reason, "ProtocolConflict");
+            assert_eq!(
+                conflict.message,
+                "Port 8443 is claimed by both plaintext and an effective TLS-serving \
+                 frontend shape, so every conflicting claim on this port is refused \
+                 (Conflicted)."
+            );
+            assert!(
+                !conflict.message.contains(&key.to_string())
+                    && !conflict.message.contains("a.example.com")
+                    && !conflict.message.contains("b.example.com")
+                    && !conflict.message.contains("app-cert")
+                    && !conflict.message.contains("Gateway API listeners ["),
+                "physical conflict message must not disclose listener identities: {} => {}",
+                key,
+                conflict.message
+            );
+        }
     }
 
     /// Adversarial: two DIFFERENT Gateways share a numeric port with a
