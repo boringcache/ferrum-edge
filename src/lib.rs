@@ -888,6 +888,120 @@ pub mod _test_support {
         crate::service_discovery::service_discovery_task_key(namespace, upstream_id)
     }
 
+    /// Committed Consul blocking-query index (`0` = non-blocking).
+    ///
+    /// Observation seam for issue #3719 tests; production callers use the
+    /// discoverer's URL builder which reads the same atomic slot.
+    pub fn consul_blocking_query_index_for_test(
+        discoverer: &crate::service_discovery::consul::ConsulDiscoverer,
+    ) -> u64 {
+        discoverer.blocking_query_index()
+    }
+
+    /// Bounded `X-Consul-Index` parser used by Consul discovery (issue #3719).
+    ///
+    /// External unit tests cover the private parser through this seam so the
+    /// production module does not need an inline test module for these cases.
+    pub fn parse_consul_index_header_for_test(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+        crate::service_discovery::consul::parse_consul_index_header(headers)
+    }
+
+    /// Mutable discovery-loop state used by the production apply pipeline.
+    #[derive(Debug, Default)]
+    pub struct DiscoveryLoopStateForTest {
+        inner: crate::service_discovery::DiscoveryLoopState,
+    }
+
+    impl DiscoveryLoopStateForTest {
+        pub fn new() -> Self {
+            Self {
+                inner: crate::service_discovery::DiscoveryLoopState::new(),
+            }
+        }
+
+        pub fn snapshot_installed(&self) -> bool {
+            self.inner.snapshot_installed()
+        }
+
+        pub fn last_discovered(&self) -> &[crate::config::types::UpstreamTarget] {
+            self.inner.last_discovered()
+        }
+    }
+
+    /// Whether the production apply pipeline should keep polling (`true`) or
+    /// stop the task (`false`) after handling one snapshot.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum DiscoveryApplyControlForTest {
+        Continue,
+        Stop,
+    }
+
+    /// Drive the exact production admission → publication → cursor-commit
+    /// pipeline for one discovered snapshot (issue #3719).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn apply_service_discovery_snapshot_for_test(
+        upstream_namespace: &str,
+        upstream_id: &str,
+        provider_name: &str,
+        snapshot: crate::service_discovery::DiscoverySnapshot,
+        state: &mut DiscoveryLoopStateForTest,
+        lb_cache: &crate::load_balancer::LoadBalancerCache,
+        request_epoch: &Option<std::sync::Arc<crate::request_epoch::RequestEpochStore>>,
+        static_targets: &[crate::config::types::UpstreamTarget],
+        algorithm: crate::config::types::LoadBalancerAlgorithm,
+        hash_on: &Option<String>,
+        cancel_rx: &tokio::sync::watch::Receiver<bool>,
+        shutdown_rx: &Option<tokio::sync::watch::Receiver<bool>>,
+        dns_cache: &crate::dns::DnsCache,
+        health_checker: &crate::health_check::HealthChecker,
+    ) -> DiscoveryApplyControlForTest {
+        match crate::service_discovery::apply_discovered_snapshot(
+            upstream_namespace,
+            upstream_id,
+            provider_name,
+            snapshot,
+            &mut state.inner,
+            lb_cache,
+            request_epoch,
+            static_targets,
+            algorithm,
+            hash_on,
+            cancel_rx,
+            shutdown_rx,
+            dns_cache,
+            health_checker,
+        )
+        .await
+        {
+            crate::service_discovery::DiscoveryApplyControl::Continue => {
+                DiscoveryApplyControlForTest::Continue
+            }
+            crate::service_discovery::DiscoveryApplyControl::Stop => {
+                DiscoveryApplyControlForTest::Stop
+            }
+        }
+    }
+
+    /// Rebuild a request-epoch store at a specific LB generation so publication
+    /// overflow (and therefore publication failure) can be exercised.
+    pub fn request_epoch_store_with_lb_generation_for_test(
+        store: &crate::request_epoch::RequestEpochStore,
+        lb_generation: u64,
+    ) -> crate::request_epoch::RequestEpochStore {
+        let current = store.load();
+        crate::request_epoch::RequestEpochStore::new(crate::request_epoch::RequestEpoch {
+            config: std::sync::Arc::clone(&current.config),
+            proxy_index_by_key: std::sync::Arc::clone(&current.proxy_index_by_key),
+            route_table: std::sync::Arc::clone(&current.route_table),
+            plugin_cache: std::sync::Arc::clone(&current.plugin_cache),
+            consumer_index: std::sync::Arc::clone(&current.consumer_index),
+            load_balancer: std::sync::Arc::clone(&current.load_balancer),
+            config_generation: current.config_generation,
+            route_generation: current.route_generation,
+            lb_generation,
+        })
+    }
+
     // ── plugins/grpc_deadline + proxy rejection finalization ────────────────
     pub fn grpc_deadline_duration_millis_ceil_saturating_for_test(
         duration: std::time::Duration,

@@ -3027,6 +3027,54 @@
     "emission": "always"
   },
   {
+    "name": "ferrum_service_discovery_cursor_advance_total",
+    "type": "counter",
+    "help": "Service-discovery blocking-query cursor advances after an admitted higher-index snapshot.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "service_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_service_discovery_cursor_rollback_total",
+    "type": "counter",
+    "help": "Service-discovery blocking-query cursor rollbacks after an admitted lower-index snapshot.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "service_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_service_discovery_provider_normalization_rejected_total",
+    "type": "counter",
+    "help": "Service-discovery snapshots rejected because every provider catalog entry failed provider normalization.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "service_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_service_discovery_shared_admission_rejected_total",
+    "type": "counter",
+    "help": "Service-discovery snapshots rejected by shared host/egress target admission.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "service_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
     "name": "ferrum_stream_connections_total",
     "type": "counter",
     "help": "Total stream connections (TCP/UDP).",
