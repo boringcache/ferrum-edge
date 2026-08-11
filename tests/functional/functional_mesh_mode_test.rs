@@ -5561,7 +5561,7 @@ async fn functional_mesh_ambient_egress_grpc_routes_a_to_b_over_hbone_with_trail
         "custom (non-hop-by-hop) trailers must survive the HBONE relay: {resp:?}\n{logs}"
     );
     assert!(
-        resp.headers.get("grpc-status").is_none(),
+                !resp.headers.contains_key("grpc-status"),
         "a completed RPC must NOT carry a header-borne grpc-status — that shape is the \
          gateway's Trailers-Only refusal, not the backend's answer: {resp:?}\n{logs}"
     );
