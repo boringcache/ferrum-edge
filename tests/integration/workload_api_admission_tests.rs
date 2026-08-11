@@ -632,7 +632,9 @@ async fn normal_identity_service_is_unchanged_under_tight_limits() {
     );
 
     // Rotation still republishes on the already-open stream.
-    harness.rotation_signal.send_modify(|revision| *revision += 1);
+    harness
+        .rotation_signal
+        .send_modify(|revision| *revision += 1);
     let rotated = tokio::time::timeout(Duration::from_secs(10), svids.next())
         .await
         .expect("rotation republishes on the open stream")

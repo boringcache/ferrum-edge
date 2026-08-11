@@ -414,7 +414,11 @@ fn check_duration(
     value: Duration,
     ceiling: Duration,
 ) -> Result<(), WorkloadApiListenerError> {
-    check_range(setting, value.as_secs() as usize, ceiling.as_secs() as usize)
+    check_range(
+        setting,
+        value.as_secs() as usize,
+        ceiling.as_secs() as usize,
+    )
 }
 
 /// Shared per-connection state the watchdog and the I/O wrapper both hold.

@@ -179,9 +179,7 @@ use tracing::{info, warn};
 
 use super::admission::WorkloadApiAdmissionConfig;
 #[cfg(unix)]
-use super::admission::{
-    ConnectionAdmission, FORCE_CLOSE_SETTLE, admission_stream, wait_until_set,
-};
+use super::admission::{ConnectionAdmission, FORCE_CLOSE_SETTLE, admission_stream, wait_until_set};
 use super::server::WorkloadApiService;
 
 /// Default socket path for Ferrum's own Workload API surface.

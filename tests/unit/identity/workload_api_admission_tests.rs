@@ -60,7 +60,9 @@ fn default_admission_limits_are_finite_and_within_every_ceiling() {
             && defaults.initial_connection_timeout <= INITIAL_CONNECTION_TIMEOUT_CEILING
     );
     assert!(!defaults.idle_timeout.is_zero() && defaults.idle_timeout <= IDLE_TIMEOUT_CEILING);
-    assert!(!defaults.shutdown_grace.is_zero() && defaults.shutdown_grace <= SHUTDOWN_GRACE_CEILING);
+    assert!(
+        !defaults.shutdown_grace.is_zero() && defaults.shutdown_grace <= SHUTDOWN_GRACE_CEILING
+    );
 
     // The per-UID quota must actually bind, or one peer can take the pool.
     assert!(
@@ -207,7 +209,10 @@ fn clamping_enforces_the_ceilings_even_when_validation_is_bypassed() {
         clamped.max_connections_per_uid,
         MAX_CONNECTIONS_PER_UID_CEILING
     );
-    assert_eq!(clamped.max_concurrent_streams, MAX_CONCURRENT_STREAMS_CEILING);
+    assert_eq!(
+        clamped.max_concurrent_streams,
+        MAX_CONCURRENT_STREAMS_CEILING
+    );
     assert_eq!(clamped.max_concurrent_rpcs, MAX_CONCURRENT_RPCS_CEILING);
     assert_eq!(
         clamped.initial_connection_timeout,

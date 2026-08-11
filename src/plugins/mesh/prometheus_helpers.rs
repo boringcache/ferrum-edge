@@ -971,11 +971,10 @@ pub fn increment_workload_api_active_rpcs() {
 
 /// Release one admitted Workload API RPC.
 pub fn decrement_workload_api_active_rpcs() {
-    let _ = WORKLOAD_API_ACTIVE_RPCS.fetch_update(
-        Ordering::Relaxed,
-        Ordering::Relaxed,
-        |current| Some(current.saturating_sub(1)),
-    );
+    let _ =
+        WORKLOAD_API_ACTIVE_RPCS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            Some(current.saturating_sub(1))
+        });
 }
 
 /// Count a Workload API RPC shed by the service-wide concurrency ceiling.
