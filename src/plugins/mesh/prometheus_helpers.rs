@@ -1676,7 +1676,11 @@ fn apply_metric_override_plan(
                         // Stream/TCP paths leave it None: TCP families reject
                         // HTTP-only `response.code` at admission, so there is
                         // no stream-side response-code evaluation path.
-                        response_code: extras.response_code,
+                        response_code: extras.response_code.filter(|_| {
+                            key.removed_labels
+                                & (1u16 << MeshMetricLabel::ResponseCode.index())
+                                == 0
+                        }),
                         destination_port: extras.destination_port,
                     };
                     let Some(value) = evaluate_compact_metric_tag_cel(body, live_ctx) else {

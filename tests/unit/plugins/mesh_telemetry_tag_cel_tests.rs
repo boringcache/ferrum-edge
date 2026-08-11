@@ -180,6 +180,17 @@ async fn cel_cannot_read_a_label_removed_earlier_in_the_override_plan() {
                     "type": "set_expr",
                     "cel": "has(source.principal) ? source.principal : \"redacted\""
                 }
+            }, {
+                "metric": "REQUEST_COUNT",
+                "name": "response_code",
+                "operation": {"type": "remove"}
+            }, {
+                "metric": "REQUEST_COUNT",
+                "name": "destination_service",
+                "operation": {
+                    "type": "set_expr",
+                    "cel": "has(response.code) ? \"visible\" : \"redacted\""
+                }
             }]
         }
     }))
@@ -211,6 +222,14 @@ async fn cel_cannot_read_a_label_removed_earlier_in_the_override_plan() {
     assert!(
         counter.contains(r#"source_app="redacted""#),
         "CEL must treat removed source.principal as absent: {counter}"
+    );
+    assert!(
+        !counter.contains("response_code="),
+        "removed response_code must stay absent: {counter}"
+    );
+    assert!(
+        counter.contains(r#"destination_service="redacted""#),
+        "CEL must treat removed response.code as absent: {counter}"
     );
     assert!(
         !counter.contains("spiffe://cluster.local/ns/default/sa/frontend"),
