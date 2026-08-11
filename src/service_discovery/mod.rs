@@ -924,7 +924,9 @@ pub(crate) async fn apply_discovered_snapshot(
             // stale shared LB state after task restart/reconcile).
             info!(
                 "Service discovery [{}]: upstream {} installing initial discovered snapshot ({} discovered targets)",
-                provider_name, upstream_id, discovered.len(),
+                provider_name,
+                upstream_id,
+                discovered.len(),
             );
         } else {
             info!(

@@ -902,9 +902,7 @@ pub mod _test_support {
     ///
     /// External unit tests cover the private parser through this seam so the
     /// production module does not need an inline test module for these cases.
-    pub fn parse_consul_index_header_for_test(
-        headers: &reqwest::header::HeaderMap,
-    ) -> Option<u64> {
+    pub fn parse_consul_index_header_for_test(headers: &reqwest::header::HeaderMap) -> Option<u64> {
         crate::service_discovery::consul::parse_consul_index_header(headers)
     }
 

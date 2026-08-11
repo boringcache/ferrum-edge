@@ -3009,12 +3009,14 @@ impl MetricsRegistry {
             (
                 "ferrum_service_discovery_cursor_advance_total",
                 "Service-discovery blocking-query cursor advances after an admitted higher-index snapshot.",
-                self.service_discovery_cursor_advance.load(Ordering::Relaxed),
+                self.service_discovery_cursor_advance
+                    .load(Ordering::Relaxed),
             ),
             (
                 "ferrum_service_discovery_cursor_rollback_total",
                 "Service-discovery blocking-query cursor rollbacks after an admitted lower-index snapshot.",
-                self.service_discovery_cursor_rollback.load(Ordering::Relaxed),
+                self.service_discovery_cursor_rollback
+                    .load(Ordering::Relaxed),
             ),
             (
                 "ferrum_service_discovery_provider_normalization_rejected_total",
