@@ -111,12 +111,7 @@ fn tls_plan_for(proxies: Vec<Proxy>, http3_enabled: bool) -> GatewayListenerPlan
     config
         .http_tls_listen_ports
         .insert((ferrum_edge::config::types::default_namespace(), PORT));
-    GatewayListenerPlan::from_config(
-        &config,
-        &HashSet::new(),
-        &BTreeMap::new(),
-        http3_enabled,
-    )
+    GatewayListenerPlan::from_config(&config, &HashSet::new(), &BTreeMap::new(), http3_enabled)
 }
 
 #[test]
