@@ -1038,7 +1038,7 @@ impl Drop for ServiceDiscoveryManager {
 }
 
 impl SdProvider {
-    pub fn as_str(&self) -> &str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             SdProvider::DnsSd => "dns_sd",
             SdProvider::Kubernetes => "kubernetes",
