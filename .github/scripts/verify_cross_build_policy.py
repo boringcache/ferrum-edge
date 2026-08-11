@@ -1543,6 +1543,131 @@ RELEASE_TOOLS_FAMILY_TOKENS = (
     RELEASE_TOOLS_MANIFEST_JOB_NAME,
 )
 
+# The eBPF producer owns package-write credentials and the source tree handed to
+# both image builds. Freezing only its named build/export/upload fragments is not
+# sufficient: an extra step could rewrite the Docker context before either
+# frozen build, and an extra job-level key could move the job to an untrusted
+# runner or make failure advisory. The complete `steps:` value is therefore a
+# direct job-field contract in both admitted generations, and the closed-field
+# set below rejects every additional job-level execution control.
+RELEASE_DOCKER_EBPF_STEPS = r"""    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push per-platform eBPF digest
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: Dockerfile
+          target: runtime-ebpf
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            FEATURES=cloud-secrets,ebpf
+          outputs: type=image,"name=ferrumedge/ferrum-edge,ghcr.io/${{ github.repository }}",push-by-digest=true,name-canonical=true,push=true
+          provenance: false
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: docker-ebpf-digest-${{ matrix.arch_dir }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+"""
+
+RELEASE_DOCKER_EBPF_BUILD_STEP = r"""      - name: Build and push per-platform eBPF digest
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: Dockerfile
+          target: runtime-ebpf
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            FEATURES=cloud-secrets,ebpf
+          outputs: type=image,"name=ferrumedge/ferrum-edge,ghcr.io/${{ github.repository }}",push-by-digest=true,name-canonical=true,push=true
+          provenance: false
+"""
+RELEASE_DOCKER_EBPF_EXPORT_DIGEST_STEP = r"""      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+"""
+RELEASE_DOCKER_EBPF_TOOLS_COMMENT = r"""      # `-ebpf-tools`: the Ambient UDP lifecycle runtime the mesh chart selects
+      # for `ambient.captureMode`-independent UDP capture (#3705). It is built in
+      # THIS job, from the same source and the same `FEATURES`, so the tools tag
+      # can never lag or drift from the `-ebpf` tag the chart's other tiers use;
+      # its manifest is gated by exactly the same release path below.
+"""
+RELEASE_THREE_FAMILY_DOCKER_EBPF_STEPS = adopted_release_contract(
+    RELEASE_DOCKER_EBPF_STEPS,
+    (
+        (
+            RELEASE_DOCKER_EBPF_BUILD_STEP,
+            RELEASE_DOCKER_EBPF_BUILD_STEP
+            + "\n"
+            + RELEASE_DOCKER_EBPF_TOOLS_COMMENT
+            + DOCKER_EBPF_TOOLS_BUILD_STEP,
+            1,
+        ),
+        (
+            RELEASE_DOCKER_EBPF_EXPORT_DIGEST_STEP,
+            DOCKER_EBPF_TOOLS_EXPORT_DIGEST_STEP,
+            1,
+        ),
+        (
+            DOCKER_EBPF_UPLOAD_DIGEST_STEP,
+            DOCKER_EBPF_UPLOAD_DIGEST_STEP
+            + "\n"
+            + DOCKER_EBPF_TOOLS_UPLOAD_DIGEST_STEP,
+            1,
+        ),
+    ),
+    "docker-ebpf steps",
+)
+
+# Direct fields of these jobs form a closed set. This is the semantic equivalent
+# of an exact whole-job contract while allowing comments to remain review notes:
+# `continue-on-error`, `if`, `env`, `environment`, `container`, `services`,
+# `timeout-minutes`, or any other new job control is rejected.
+RELEASE_DOCKER_EBPF_CLOSED_FIELDS = (
+    "name",
+    "needs",
+    "runs-on",
+    "permissions",
+    "strategy",
+    "steps",
+)
+RELEASE_TOOLS_MANIFEST_CLOSED_FIELDS = (
+    "name",
+    "needs",
+    "runs-on",
+    "permissions",
+    "steps",
+)
+
 # The main-branch publication gate is itself a release-integrity boundary. Its
 # complete job is frozen rather than selected fields so an ordinary pull
 # request cannot add `continue-on-error`, widen permissions, weaken a retry or
@@ -1780,7 +1905,14 @@ PUBLISH_CONTROL_CONTRACTS = {
             "steps": RELEASE_DOCKER_MANIFEST_STEPS,
         },
         "docker-ebpf": {
+            "name": "    name: Docker eBPF variant (${{ matrix.platform }})\n",
             "needs": "    needs: validate-release-sha\n",
+            "runs-on": "    runs-on: ${{ matrix.os }}\n",
+            "permissions": (
+                "    permissions:\n"
+                "      contents: read\n"
+                "      packages: write\n"
+            ),
             "strategy": (
                 "    strategy:\n"
                 "      fail-fast: false\n"
@@ -1793,6 +1925,7 @@ PUBLISH_CONTROL_CONTRACTS = {
                 "            platform: linux/arm64\n"
                 "            arch_dir: arm64\n"
             ),
+            "steps": RELEASE_DOCKER_EBPF_STEPS,
         },
         "docker-ebpf-manifest": {
             "needs": (
@@ -1817,6 +1950,9 @@ RELEASE_IMAGE_FAMILY_GENERATIONS = {
         "control": dict(PUBLISH_CONTROL_CONTRACTS["release workflow"]),
         "steps": dict(PUBLISH_ARTIFACT_STEP_CONTRACTS["release workflow"]),
         "digest_owners": dict(DIGEST_ARTIFACT_OWNERS["release workflow"]),
+        "closed_job_fields": {
+            "docker-ebpf": RELEASE_DOCKER_EBPF_CLOSED_FIELDS,
+        },
     },
     RELEASE_THREE_FAMILY_GENERATION: {
         "exact_jobs": {
@@ -1831,8 +1967,19 @@ RELEASE_IMAGE_FAMILY_GENERATIONS = {
                 "needs": RELEASE_THREE_FAMILY_CREATE_RELEASE_NEEDS,
                 "steps": RELEASE_THREE_FAMILY_CREATE_RELEASE_STEPS,
             },
+            "docker-ebpf": {
+                **PUBLISH_CONTROL_CONTRACTS["release workflow"]["docker-ebpf"],
+                "steps": RELEASE_THREE_FAMILY_DOCKER_EBPF_STEPS,
+            },
             RELEASE_TOOLS_MANIFEST_JOB_NAME: {
+                "name": "    name: Docker eBPF Tools Manifest\n",
                 "needs": RELEASE_THREE_FAMILY_TOOLS_MANIFEST_NEEDS,
+                "runs-on": "    runs-on: ubuntu-latest\n",
+                "permissions": (
+                    "    permissions:\n"
+                    "      contents: read\n"
+                    "      packages: write\n"
+                ),
                 "steps": RELEASE_DOCKER_EBPF_TOOLS_MANIFEST_STEPS,
             },
         },
@@ -1855,6 +2002,12 @@ RELEASE_IMAGE_FAMILY_GENERATIONS = {
             },
         },
         "digest_owners": dict(RELEASE_THREE_FAMILY_DIGEST_ARTIFACT_OWNERS),
+        "closed_job_fields": {
+            "docker-ebpf": RELEASE_DOCKER_EBPF_CLOSED_FIELDS,
+            RELEASE_TOOLS_MANIFEST_JOB_NAME: (
+                RELEASE_TOOLS_MANIFEST_CLOSED_FIELDS
+            ),
+        },
     },
 }
 
@@ -4327,19 +4480,6 @@ def build_release_family_fixture(generation: str) -> str:
 
     tables = RELEASE_IMAGE_FAMILY_GENERATIONS[generation]
     control = tables["control"]
-    if generation == RELEASE_THREE_FAMILY_GENERATION:
-        ebpf_steps = (
-            "    steps:\n"
-            + DOCKER_EBPF_TOOLS_BUILD_STEP
-            + "\n"
-            + DOCKER_EBPF_TOOLS_EXPORT_DIGEST_STEP
-            + "\n"
-            + DOCKER_EBPF_UPLOAD_DIGEST_STEP
-            + "\n"
-            + DOCKER_EBPF_TOOLS_UPLOAD_DIGEST_STEP
-        )
-    else:
-        ebpf_steps = "    steps:\n" + DOCKER_EBPF_UPLOAD_DIGEST_STEP
     fixture = (
         "name: Release fixture\n"
         # The canonical block mapping, not `on: [push]`: the pull-request
@@ -4369,10 +4509,12 @@ def build_release_family_fixture(generation: str) -> str:
         + control["docker-manifest"]["steps"]
         + "\n"
         + "  docker-ebpf:\n"
+        + control["docker-ebpf"]["name"]
         + control["docker-ebpf"]["needs"]
-        + "    runs-on: ${{ matrix.os }}\n"
+        + control["docker-ebpf"]["runs-on"]
+        + control["docker-ebpf"]["permissions"]
         + control["docker-ebpf"]["strategy"]
-        + ebpf_steps
+        + control["docker-ebpf"]["steps"]
         + "\n"
         + "  docker-ebpf-manifest:\n"
         + control["docker-ebpf-manifest"]["needs"]
@@ -4383,8 +4525,10 @@ def build_release_family_fixture(generation: str) -> str:
         fixture += (
             "\n"
             + f"  {RELEASE_TOOLS_MANIFEST_JOB_NAME}:\n"
+            + control[RELEASE_TOOLS_MANIFEST_JOB_NAME]["name"]
             + control[RELEASE_TOOLS_MANIFEST_JOB_NAME]["needs"]
-            + "    runs-on: ubuntu-latest\n"
+            + control[RELEASE_TOOLS_MANIFEST_JOB_NAME]["runs-on"]
+            + control[RELEASE_TOOLS_MANIFEST_JOB_NAME]["permissions"]
             + control[RELEASE_TOOLS_MANIFEST_JOB_NAME]["steps"]
         )
     return fixture
@@ -4500,11 +4644,61 @@ def digest_artifact_ownership_errors(
     return errors
 
 
+def closed_job_field_errors(
+    contents: str,
+    source: str,
+    job_name: str,
+    expected_fields: tuple[str, ...],
+) -> list[str]:
+    """Reject every extra, missing, duplicate, reordered, or opaque job field.
+
+    The protected producer and manifest jobs carry credentials and publish
+    release tags. Checking their known field values is insufficient if a pull
+    request can add another direct field such as `continue-on-error`, `if`,
+    `environment`, `container`, or `services`. The field list is therefore a
+    closed ordered contract; each field's complete value is checked separately
+    by `validate_publish_control_contract`.
+    """
+
+    block, failures = extract_job_block(
+        contents,
+        source,
+        job_name,
+        required=True,
+    )
+    if failures or block is None:
+        return failures
+    actual_fields: list[str] = []
+    errors: list[str] = []
+    for index, line in enumerate(block.splitlines(), start=1):
+        if index == 1 or not line.strip() or line.lstrip().startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        if indent != 4:
+            continue
+        decoded = decode_simple_yaml_key(line)
+        if decoded is None or decoded[0] != 4:
+            errors.append(
+                f"{source} job {job_name!r} has an opaque direct field at "
+                f"job line {index}; protected release jobs require canonical "
+                "block-mapping fields"
+            )
+            continue
+        actual_fields.append(decoded[1])
+    if tuple(actual_fields) != expected_fields:
+        errors.append(
+            f"{source} job {job_name!r} direct fields must be exactly "
+            f"{expected_fields!r} in order, found {tuple(actual_fields)!r}"
+        )
+    return errors
+
+
 def validate_publish_control_contract(contents: str, source: str) -> list[str]:
     contracts = PUBLISH_CONTROL_CONTRACTS.get(source, {})
     exact_jobs = PUBLISH_EXACT_JOB_CONTRACTS.get(source, {})
     step_contracts = PUBLISH_ARTIFACT_STEP_CONTRACTS.get(source, {})
     owners = DIGEST_ARTIFACT_OWNERS.get(source, {})
+    closed_job_fields: dict[str, tuple[str, ...]] = {}
     errors: list[str] = []
     if source == "release workflow":
         # Which release image families this revision publishes decides which
@@ -4521,6 +4715,7 @@ def validate_publish_control_contract(contents: str, source: str) -> list[str]:
         exact_jobs = tables["exact_jobs"]
         step_contracts = tables["steps"]
         owners = tables["digest_owners"]
+        closed_job_fields = tables["closed_job_fields"]
     for key_name in PUBLISH_FORBIDDEN_TOP_LEVEL_KEYS.get(source, ()):
         block, failures = extract_top_level_block(
             contents,
@@ -4577,6 +4772,15 @@ def validate_publish_control_contract(contents: str, source: str) -> list[str]:
                     f"{source} job {job_name!r} step {step_name!r} differs from "
                     "the trusted ARM64 publication artifact-selection contract"
                 )
+    for job_name, expected_fields in closed_job_fields.items():
+        errors.extend(
+            closed_job_field_errors(
+                contents,
+                source,
+                job_name,
+                expected_fields,
+            )
+        )
     errors.extend(digest_artifact_ownership_errors(contents, source, owners))
     # A step may declare its inputs as `with: {name: docker-digest-evil}`, which
     # names no key at the start of any line. The same ownership scan run over the
@@ -23141,6 +23345,46 @@ pre_build = []
                 f"an unchanged {generation} release workflow was rejected"
             )
 
+        producer_steps = RELEASE_IMAGE_FAMILY_GENERATIONS[generation]["control"][
+            "docker-ebpf"
+        ]["steps"]
+        extra_step = fixture.replace(
+            producer_steps,
+            producer_steps.replace(
+                "    steps:\n",
+                "    steps:\n"
+                "      - name: Rewrite the trusted Docker context\n"
+                "        run: cp attacker.Dockerfile Dockerfile\n\n",
+                1,
+            ),
+            1,
+        )
+        extra_field = fixture.replace(
+            RELEASE_IMAGE_FAMILY_GENERATIONS[generation]["control"]["docker-ebpf"][
+                "runs-on"
+            ],
+            RELEASE_IMAGE_FAMILY_GENERATIONS[generation]["control"]["docker-ebpf"][
+                "runs-on"
+            ]
+            + "    continue-on-error: true\n",
+            1,
+        )
+        for tamper_label, tampered in (
+            ("extra producer step", extra_step),
+            ("extra producer field", extra_field),
+        ):
+            if tampered == fixture:
+                failures.append(
+                    f"the {generation} {tamper_label} fixture did not change"
+                )
+            elif not validate_publish_control_contract(
+                tampered,
+                "release workflow",
+            ):
+                failures.append(
+                    f"the {generation} release contract accepted an {tamper_label}"
+                )
+
     # The admitted transition: exactly this, in exactly this direction.
     if compare_pr_publish_control_contract(
         two_family_release,
@@ -23161,6 +23405,47 @@ pre_build = []
     # Anything that is not the complete shape is neither of the two admitted
     # states, whichever side of the adoption it is proposed from.
     partial_adoptions = {
+        "extra producer step rewrites the Docker context": (
+            three_family_release.replace(
+                RELEASE_THREE_FAMILY_DOCKER_EBPF_STEPS,
+                RELEASE_THREE_FAMILY_DOCKER_EBPF_STEPS.replace(
+                    "    steps:\n",
+                    "    steps:\n"
+                    "      - name: Rewrite the trusted Docker context\n"
+                    "        run: cp attacker.Dockerfile Dockerfile\n\n",
+                    1,
+                ),
+                1,
+            )
+        ),
+        "producer moved to an attacker-controlled runner": (
+            three_family_release.replace(
+                three_family["control"]["docker-ebpf"]["runs-on"],
+                "    runs-on: self-hosted\n",
+                1,
+            )
+        ),
+        "producer failure made advisory": (
+            three_family_release.replace(
+                three_family["control"]["docker-ebpf"]["runs-on"],
+                three_family["control"]["docker-ebpf"]["runs-on"]
+                + "    continue-on-error: true\n",
+                1,
+            )
+        ),
+        "tools manifest moved to an attacker-controlled runner": (
+            three_family_release.replace(
+                "  docker-ebpf-tools-manifest:\n"
+                "    name: Docker eBPF Tools Manifest\n"
+                + RELEASE_THREE_FAMILY_TOOLS_MANIFEST_NEEDS
+                + "    runs-on: ubuntu-latest\n",
+                "  docker-ebpf-tools-manifest:\n"
+                "    name: Docker eBPF Tools Manifest\n"
+                + RELEASE_THREE_FAMILY_TOOLS_MANIFEST_NEEDS
+                + "    runs-on: self-hosted\n",
+                1,
+            )
+        ),
         "tools manifest job removed but its uploads kept": (
             three_family_release.replace(
                 "\n"

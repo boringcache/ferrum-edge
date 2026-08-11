@@ -1410,6 +1410,13 @@ transition between them (`RELEASE_IMAGE_FAMILY_GENERATIONS`):
   that resolves, cross-registry-compares, SBOMs, provenances, signs, attests, and
   verifies all three families in both registries.
 
+The credentialed `docker-ebpf` producer is closed over its complete ordered
+job-field set and its entire `steps:` list in both shapes; the tools manifest is
+closed the same way after adoption. An extra context-rewrite step, an alternate
+runner, `continue-on-error`, `if`, `environment`, `container`, `services`, or
+any other added job control is therefore a contract violation even when every
+named build/upload fragment remains unchanged.
+
 A revision is classified from itself, and is then held to the complete contract of
 the shape it claims — so a partial adoption, an extra publisher or tag, an
 alternate action/runner/permission/`needs`/step, a missing attestation operation,
