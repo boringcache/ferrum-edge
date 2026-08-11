@@ -213,7 +213,8 @@ fn create_test_proxy(id: &str, listen_path: &str, backend_port: u16) -> Proxy {
         created_at: Utc::now(),
         updated_at: Utc::now(),
         pending_limit_scope: None,
-    },
+    }
+}
 
 // DP now generates its own JWT from the shared secret via dp_client::generate_dp_jwt()
 

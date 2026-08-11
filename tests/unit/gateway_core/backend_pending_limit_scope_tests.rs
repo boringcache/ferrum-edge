@@ -14,13 +14,8 @@ use std::thread;
 
 use ferrum_edge::backend_pending_limit::{BackendPendingLimiter, BackendPendingScopeBase};
 
-fn scope(
-    ns: &str,
-    id: &str,
-    uid: Option<&str>,
-    subset: Option<&str>,
-) -> BackendPendingScopeBase {
-    BackendPendingScopeBase::new(ns, id, uid, subset)
+fn scope(ns: &str, id: &str, uid: Option<&str>, sub: Option<&str>) -> BackendPendingScopeBase {
+    BackendPendingScopeBase::new(ns, id, uid, sub)
 }
 
 #[test]
@@ -202,14 +197,7 @@ fn cap_update_preserves_count_and_releases_exactly_once() {
 fn concurrent_mixed_scope_churn_evicts_idle_keys() {
     let limiter = Arc::new(BackendPendingLimiter::new());
     let scopes: Vec<Arc<BackendPendingScopeBase>> = (0..4)
-        .map(|i| {
-            Arc::new(scope(
-                "default",
-                &format!("svc-{i}"),
-                None,
-                Some("v1"),
-            ))
-        })
+        .map(|i| Arc::new(scope("default", &format!("svc-{i}"), None, Some("v1"))))
         .collect();
     let granted = Arc::new(AtomicUsize::new(0));
     let mut handles = Vec::new();
@@ -245,32 +233,22 @@ fn resolve_pending_limit_scopes_interns_upstream_and_optional_uid_not_host() {
     // Mirror GatewayConfig::resolve_pending_limit_scopes identity selection:
     // stable upstream id is always present; optional UID is additive; host
     // never enters the key.
-    let scope = BackendPendingScopeBase::new(
-        "default",
-        "reviews",
-        Some("uid-reviews"),
-        Some("v1"),
-    );
+    let svc = scope("default", "reviews", Some("uid-reviews"), Some("v1"));
     assert!(
-        scope.prefix().contains("id"),
+        svc.prefix().contains("id"),
         "stable upstream id must always participate in the interned identity"
     );
     assert!(
-        scope.prefix().contains("uid"),
+        svc.prefix().contains("uid"),
         "K8s Service UID must participate alongside the upstream id"
     );
     assert!(
-        !scope.prefix().contains("10.0.0.5"),
+        !svc.prefix().contains("10.0.0.5"),
         "selected/backend host must not enter the pending scope key"
     );
-    let host_keyed_collision = BackendPendingScopeBase::new(
-        "default",
-        "10.0.0.5",
-        None,
-        Some("v1"),
-    );
+    let host_keyed_collision = scope("default", "10.0.0.5", None, Some("v1"));
     assert_ne!(
-        scope.prefix(),
+        svc.prefix(),
         host_keyed_collision.prefix(),
         "UID-backed Service identity must not collapse to a host-shaped upstream id"
     );

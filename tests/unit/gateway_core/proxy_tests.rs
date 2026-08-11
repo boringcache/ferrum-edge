@@ -870,13 +870,13 @@ fn test_longest_prefix_match() {
                 listen_path: Some("/api".to_string()),
                 id: "short".into(),
                 namespace: ferrum_edge::config::types::default_namespace(),
-                ..test_proxy(),
+                ..test_proxy()
             },
             Proxy {
                 listen_path: Some("/api/v1".to_string()),
                 id: "long".into(),
                 namespace: ferrum_edge::config::types::default_namespace(),
-                ..test_proxy(),
+                ..test_proxy()
             },
         ],
         consumers: vec![],
@@ -898,7 +898,7 @@ fn test_no_match() {
         version: "1".to_string(),
         proxies: vec![Proxy {
             listen_path: Some("/api".to_string()),
-            ..test_proxy(),
+            ..test_proxy()
         }],
         consumers: vec![],
         plugin_configs: vec![],

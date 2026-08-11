@@ -2527,7 +2527,8 @@ pub struct Proxy {
     /// subset strings. The DestinationRule policy port is appended at acquire
     /// time. `#[serde(skip)]` — derived only.
     #[serde(skip)]
-    pub pending_limit_scope: Option<std::sync::Arc<crate::backend_pending_limit::BackendPendingScopeBase>>,
+    pub pending_limit_scope:
+        Option<std::sync::Arc<crate::backend_pending_limit::BackendPendingScopeBase>>,
     /// Optional upstream ID for load-balanced backends.
     /// When set, overrides backend_host/backend_port with upstream target selection.
     #[serde(default)]
@@ -3995,10 +3996,7 @@ impl GatewayConfig {
         for proxy in &mut self.proxies {
             let (logical_id, uid) = if let Some(ref upstream_id) = proxy.upstream_id {
                 match upstream_by_key.get(&(proxy.namespace.as_str(), upstream_id.as_str())) {
-                    Some(upstream) => (
-                        upstream.id.as_str(),
-                        upstream.k8s_service_uid.as_deref(),
-                    ),
+                    Some(upstream) => (upstream.id.as_str(), upstream.k8s_service_uid.as_deref()),
                     None => (upstream_id.as_str(), None),
                 }
             } else {

@@ -1136,9 +1136,7 @@ fn cross_gateway_http_and_tcp_on_same_port_protocol_conflict() {
                 services
                     .iter()
                     .all(|service| service.name != format!("{gateway}-{listener}")),
-                "order {:?} must not materialize conflicted MeshService {gateway,
-uid: None,
-}-{listener}: {:?}",
+                "order {:?} must not materialize conflicted MeshService {gateway}-{listener}: {:?}",
                 gateway_order,
                 services
                     .iter()

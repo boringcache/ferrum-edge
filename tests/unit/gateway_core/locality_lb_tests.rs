@@ -92,8 +92,7 @@ fn upstream(source_locality: &str, targets: Vec<UpstreamTarget>) -> Upstream {
         LoadBalancerAlgorithm::RoundRobin,
         Some(source_locality),
         targets,
-    ),
-    k8s_service_uid: None,
+    )
 }
 
 fn config(upstream: Upstream) -> GatewayConfig {

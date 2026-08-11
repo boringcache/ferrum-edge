@@ -900,7 +900,7 @@ async fn test_http3_streaming_decision_logic() {
             retryable_methods: vec!["GET".to_string()],
             backoff: ferrum_edge::config::types::BackoffStrategy::Fixed { delay_ms: 100 },
         }),
-        ..proxy_stream.clone(),
+        ..proxy_stream.clone()
     };
 
     // --- Case 3: Proxy with ai_token_metrics plugin → should buffer responses ---
@@ -913,7 +913,7 @@ async fn test_http3_streaming_decision_logic() {
         plugins: vec![PluginAssociation {
             plugin_config_id: "ai-token-metrics-cfg".to_string(),
         }],
-        ..proxy_stream.clone(),
+        ..proxy_stream.clone()
     };
 
     let gc = GatewayConfig {

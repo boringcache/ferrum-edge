@@ -34804,18 +34804,13 @@ pub(crate) fn pending_limit_scope_for_proxy(
     if let Some(scope) = proxy.pending_limit_scope.clone() {
         return scope;
     }
-    let logical_id = proxy
-        .upstream_id
-        .as_deref()
-        .unwrap_or(proxy.id.as_str());
-    std::sync::Arc::new(
-        crate::backend_pending_limit::BackendPendingScopeBase::new(
-            proxy.namespace.as_str(),
-            logical_id,
-            None,
-            proxy.upstream_subset.as_deref(),
-        ),
-    )
+    let logical_id = proxy.upstream_id.as_deref().unwrap_or(proxy.id.as_str());
+    std::sync::Arc::new(crate::backend_pending_limit::BackendPendingScopeBase::new(
+        proxy.namespace.as_str(),
+        logical_id,
+        None,
+        proxy.upstream_subset.as_deref(),
+    ))
 }
 
 /// Resolve the DestinationRule `connectionPool.http.http1MaxPendingRequests`

@@ -311,8 +311,7 @@ fn service_with_protocol_overrides(overrides: Vec<(u16, AppProtocol)>) -> MeshSe
     ports.sort_by_key(|port| port.port);
     service.ports = ports;
     service.protocol_overrides = overrides.into_iter().collect();
-    service,
-    uid: None,
+    service
 }
 
 #[test]

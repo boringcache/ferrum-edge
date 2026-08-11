@@ -704,7 +704,10 @@ mod tests {
         assert_eq!(limiter.current(&a, 80), 1);
         assert_eq!(limiter.current(&b, 80), 1);
         assert_ne!(a.prefix(), b.prefix());
-        assert!(a.prefix().contains("id"), "stable upstream id always present");
+        assert!(
+            a.prefix().contains("id"),
+            "stable upstream id always present"
+        );
         assert!(a.prefix().contains("uid"), "optional UID is additive");
     }
 

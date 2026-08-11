@@ -1678,8 +1678,7 @@ fn test_apply_delta_mixed_add_remove_modify() {
     let u3 = make_upstream("u3", make_targets(3));
     let modified_u2 = Upstream {
         algorithm: LoadBalancerAlgorithm::Random,
-        ..make_upstream("u2", make_targets(1)),
-        k8s_service_uid: None,
+        ..make_upstream("u2", make_targets(1))
     };
     let new_config = GatewayConfig {
         upstreams: vec![modified_u2.clone(), u3.clone()],
