@@ -189,27 +189,45 @@ A DP that has accepted one snapshot keeps serving it while every control plane i
 | Applied FULL_SNAPSHOT or accepted DELTA | **Yes** — the only reset |
 | ConfigSync heartbeat frame | No |
 | Reconnect / CP failover / transport success | No |
+| A pre-snapshot DELTA, or a DELTA refused for version/clock/authority freshness (empty body included) | No — counted once as `snapshot_rejected` |
+| A DELTA that was admitted and then failed to apply (empty body included) | No — counted once as `snapshot_apply_failed` |
 | Fenced FULL_SNAPSHOT (stale, unorderable, clock-skewed) | No — counted as `snapshot_rejected` |
 | Rejected non-empty DELTA | No — counted as `snapshot_rejected` |
 | Snapshot admitted but rejected during apply | No — counted as `snapshot_apply_failed` |
 
-**When the DP degrades.** Staleness requires the applied snapshot to have reached the bound **and** every control plane to be unreachable for at least a short reconnect grace (30 seconds, clamped to the bound itself). Both conditions matter:
+**When the DP degrades.** The configured maximum **is** the boundary — nothing is added to it. Staleness requires the applied snapshot to have reached the bound **and** the DP to have actually lost its authoritative source. That second condition is a state the reconnect loop owns (`cp_authority`), not a time window:
 
-- *Partial CP loss.* Losing one CP while another remains authoritative never marks the DP stale — it fails over and is connected again, and a connected DP is still receiving revocations. A configuration that is simply quiet for longer than the bound is not stale.
-- *Total CP loss.* With no CP reachable, the DP degrades exactly when the applied snapshot reaches the bound (or immediately on the grace expiring, if it was already older when the outage began).
-- The reconnect grace exists so a routine CP restart or rolling upgrade does not blip traffic on a fleet whose configuration has legitimately been unchanged for longer than the bound.
+| `cp_authority` | Meaning | Can latch the bound? |
+|---|---|---|
+| `connected` | A ConfigSync stream to some CP is established | No |
+| `reconnecting` | An intentional primary-retry or TLS-rotation reconnect, or a healthy session that had delivered config, is being re-established | No |
+| `lost` | A connect/subscribe attempt failed, or a stream ended without delivering usable authoritative config | Yes |
+
+- *Partial CP loss.* Losing one CP while another remains authoritative never marks the DP stale — the failed stream leaves the DP `reconnecting`, the handoff completes, and a connected DP is still receiving revocations. A configuration that is simply quiet for longer than the bound is not stale, and a successful failover does not blip traffic even when the applied snapshot is already older than the bound.
+- *Intentional reconnects.* A primary-retry reconnect (`FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS`) and a CP/DP TLS rotation are deliberate disconnects, never authority loss.
+- *Total CP loss.* With no CP reachable, the first failed attempt moves the DP to `lost`, and it degrades exactly when the applied snapshot reaches the bound — immediately, if it was already older. The only detection latency is the transport/failover attempt itself, which is unavoidable; it is not a configurable or hidden grace, and repeated failed CP cycles cannot postpone the boundary, because the boundary is the applied-snapshot age and not an outage duration.
 
 **What degrading does.** `stale` is sticky once raised:
 
 1. `/health` (and `/status`) report `ready: false` with `status: "unavailable"` and return `503`, so orchestrators stop steering new traffic at the pod. `/live` is unaffected — the process is alive, its configuration is not current.
-2. Under `fail_closed`, new HTTP/1.1, HTTP/2, HTTP/3, and TCP stream admissions are refused (`503` / gRPC `UNAVAILABLE` / TCP RST). Already-accepted connections and in-flight requests are untouched and drain under the normal timeouts; graceful shutdown draining is unchanged. UDP is connectionless and has no admission boundary of its own — a UDP-only DP is bounded by readiness alone.
+2. Under `fail_closed`, new admissions are refused on every protocol family the DP serves:
+
+   | Family | Refusal at the boundary |
+   |---|---|
+   | HTTP/1.1, HTTP/2 (including gRPC and gRPC-Web) | `503` / gRPC `UNAVAILABLE`, checked **before** the ACME HTTP-01 early return — a CP-controlled challenge or route may not be the one request shape that walks past the fence — and independently of the overload carve-out that deliberately still lets ACME outrun load shedding |
+   | HTTP/3 | `503` / gRPC `UNAVAILABLE` on the request stream |
+   | TCP / TCP+TLS stream listeners | New connection dropped at accept (RST) |
+   | UDP stream listeners | Datagrams from sources with **no established session** are dropped; UDP has no handshake but it does have a real new-session boundary, and it is enforced on every receive path (`recvmmsg` batch, PKTINFO batch, and the non-Linux `try_recv_from` drain) |
+   | DTLS stream listeners | New associations refused at both the pre-allocation gate (`allow_new_session`) and the post-accept gate, so no race path admits one |
+
+   Already-accepted connections, established UDP/DTLS sessions, and in-flight requests are untouched and drain under the normal timeouts; graceful shutdown draining is unchanged.
 3. Under `readiness_only`, only step 1 applies. This is the named compatibility mode for deployments that would rather keep serving stale policy than shed traffic.
 
 **Recovery.** The stale state clears only when a snapshot passes every normal validation, freshness-authority, and monotonic-version check *and* applies successfully. Reconnecting, negotiating heartbeats, or receiving a snapshot that is then fenced or fails to apply does not restore readiness or admission.
 
 **Startup and restarts.** The DP holds no persisted or on-disk configuration cache — it starts with an empty `GatewayConfig` and fetches everything from a CP — so a restart always begins with no applied snapshot. In that state readiness is already `false` (`startup_ready` waits for the first applied snapshot and backend-capability classification), and the same bound applies with the age measured from process start: a DP that never reaches a CP is stale after `FERRUM_DP_CONFIG_MAX_STALE_SECONDS`, reported as `awaiting_first_snapshot` until then. Restart behavior is therefore identical with or without a prior outage.
 
-**Diagnostics.** Authenticated `/health` includes a fixed-cardinality `dp_config` object (`stale`, `reason`, `stale_action`, `new_traffic_blocked`, `cp_connected`, `cp_disconnected_seconds`, `max_stale_seconds`, `applied_snapshot`, `snapshot_age_seconds`, and the `applied`/`rejected`/`apply_failed`/`stale_transitions` counters). `reason` is a closed set that distinguishes `cp_disconnected`, `snapshot_stale`, `snapshot_rejected`, and `snapshot_apply_failed` (plus `ok` and `awaiting_first_snapshot`). The same state is exported as fixed-cardinality Prometheus series: `ferrum_dp_config_snapshot_age_seconds`, `ferrum_dp_config_max_stale_seconds`, `ferrum_dp_config_stale`, `ferrum_dp_config_new_traffic_blocked`, `ferrum_dp_config_cp_connected`, `ferrum_dp_config_stale_transitions_total`, `ferrum_dp_config_snapshots_applied_total`, `ferrum_dp_config_snapshots_rejected_total`, and `ferrum_dp_config_snapshot_apply_failures_total`. No CP endpoint, credential, namespace, node id, or configuration content appears in any of them.
+**Diagnostics.** Authenticated `/health` includes a fixed-cardinality `dp_config` object (`stale`, `reason`, `stale_action`, `new_traffic_blocked`, `cp_connected`, `cp_authority`, `cp_disconnected_seconds`, `max_stale_seconds`, `applied_snapshot`, `snapshot_age_seconds`, and the `applied`/`rejected`/`apply_failed`/`stale_transitions` counters). `reason` is a closed set that distinguishes `cp_disconnected`, `snapshot_stale`, `snapshot_rejected`, and `snapshot_apply_failed` (plus `ok` and `awaiting_first_snapshot`). The same state is exported as fixed-cardinality Prometheus series: `ferrum_dp_config_snapshot_age_seconds`, `ferrum_dp_config_max_stale_seconds`, `ferrum_dp_config_stale`, `ferrum_dp_config_new_traffic_blocked`, `ferrum_dp_config_cp_connected`, `ferrum_dp_config_stale_transitions_total`, `ferrum_dp_config_snapshots_applied_total`, `ferrum_dp_config_snapshots_rejected_total`, and `ferrum_dp_config_snapshot_apply_failures_total`. No CP endpoint, credential, namespace, node id, or configuration content appears in any of them.
 
 
 ## DP Multi-CP Failover

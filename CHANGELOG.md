@@ -17,12 +17,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   window. Heartbeats, reconnect attempts, CP transport success, fenced or
   rejected snapshots, rejected deltas, and snapshots that fail to apply do not
   reset the age; only an applied snapshot does, and only an applied snapshot
-  restores service — a reconnect alone does not. At the bound (and after a short
-  reconnect grace, so a routine CP restart or failover does not blip traffic)
-  `/health` reports `ready: false` with `status: "unavailable"`, and under the
-  default `FERRUM_DP_CONFIG_STALE_ACTION=fail_closed` new HTTP/1.1, HTTP/2,
-  HTTP/3, and TCP stream admissions are refused while already-accepted
-  connections and in-flight requests drain normally. `readiness_only` is the
+  restores service — a reconnect alone does not. The configured maximum is the
+  boundary itself — nothing is added to it. Staleness additionally requires the
+  DP to have actually lost its authoritative source: an intentional
+  primary-retry or TLS-rotation reconnect, and a successful failover to an
+  alternate CP, leave the DP `reconnecting` and never latch, while a failed
+  attempt latches the moment the applied snapshot reaches the bound. At the
+  bound `/health` reports `ready: false` with `status: "unavailable"`, and under
+  the default `FERRUM_DP_CONFIG_STALE_ACTION=fail_closed` new HTTP/1.1, HTTP/2,
+  HTTP/3, TCP, UDP-session, and DTLS-session admissions are refused while
+  already-accepted connections, established sessions, and in-flight requests
+  drain normally. `readiness_only` is the
   named compatibility mode that degrades readiness only, and
   `FERRUM_DP_CONFIG_MAX_STALE_SECONDS=0` restores the previous unbounded
   behavior as an explicit, deliberately unsafe opt-in that logs a startup

@@ -995,18 +995,26 @@ pub(crate) async fn await_dp_listener_handles(
     crate::modes::file::await_listener_handles(listener_handles, shutdown_on_panic).await
 }
 
-/// Advance the DP config-staleness boundary on a fixed 1s tick (issue #3726).
+/// Close the DP config-staleness boundary at its exact deadline (issue #3726).
 ///
-/// Every state change the DP can observe (CP connect/disconnect, applied
-/// snapshot) evaluates inline, and `/health` evaluates on demand. What neither
-/// covers is the passage of time itself: a DP that is disconnected and idle has
-/// no event at the moment its snapshot crosses the bound. This tick supplies
-/// it, so the admission gate closes within a second of the boundary rather than
-/// at the next request or probe.
+/// Every state change the DP can observe (CP connect, an intentional or failed
+/// reconnect, an applied snapshot) evaluates inline, and `/health` evaluates on
+/// demand. What neither covers is the passage of time itself: a DP that has
+/// lost every control plane and is idle has no event at the moment its snapshot
+/// crosses the bound.
 ///
-/// Evaluation is a handful of relaxed atomic loads with no allocation, so the
-/// tick is free even when the bound is disabled — but skip the task entirely in
-/// that case, since there is no boundary to cross.
+/// A coarse tick would supply that event only to within its period, which widens
+/// the operator's configured maximum by up to a full period — the bound is a
+/// safety boundary, so it may not be rounded up. Instead this task sleeps until
+/// the *exact* deadline the current applied snapshot implies
+/// (`next_stale_deadline_at`) and re-arms whenever the state that deadline is
+/// derived from changes. There is no polling: with no deadline pending (bound
+/// disabled, already stale, or a CP still authoritative) it waits only on the
+/// change notification, which carries a stored permit so a change that lands
+/// between two waits cannot be missed.
+///
+/// Evaluation itself is a handful of atomic operations with no allocation and no
+/// lock, so nothing here touches the proxy hot path.
 fn start_config_staleness_monitor(
     freshness: Arc<crate::dp_config_freshness::DpConfigFreshness>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
@@ -1015,30 +1023,41 @@ fn start_config_staleness_monitor(
         if !freshness.enabled() {
             return;
         }
-        let mut ticker = tokio::time::interval(Duration::from_secs(1));
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut logged_transitions = 0u64;
         loop {
-            tokio::select! {
-                _ = ticker.tick() => {
-                    let snapshot = freshness.evaluate();
-                    if snapshot.stale && snapshot.stale_transitions_total > logged_transitions {
-                        logged_transitions = snapshot.stale_transitions_total;
-                        // Once per transition into stale, not once per tick. No
-                        // CP URL, token, or config content — closed-set labels
-                        // and counters only.
-                        tracing::warn!(
-                            reason = snapshot.reason,
-                            stale_action = snapshot.stale_action,
-                            new_traffic_blocked = snapshot.new_traffic_blocked,
-                            snapshot_age_seconds = snapshot.snapshot_age_seconds,
-                            max_stale_seconds = snapshot.max_stale_seconds,
-                            "DP configuration is stale beyond the configured bound with no \
-                             control plane connected; readiness is degraded"
-                        );
+            let snapshot = freshness.evaluate();
+            if snapshot.stale && snapshot.stale_transitions_total > logged_transitions {
+                logged_transitions = snapshot.stale_transitions_total;
+                // Once per transition into stale, not once per wakeup. No CP
+                // URL, token, or config content — closed-set labels and
+                // counters only.
+                tracing::warn!(
+                    reason = snapshot.reason,
+                    stale_action = snapshot.stale_action,
+                    new_traffic_blocked = snapshot.new_traffic_blocked,
+                    snapshot_age_seconds = snapshot.snapshot_age_seconds,
+                    max_stale_seconds = snapshot.max_stale_seconds,
+                    "DP configuration is stale beyond the configured bound with no \
+                     authoritative control plane; readiness is degraded"
+                );
+            }
+
+            let deadline = freshness.next_stale_deadline_at(std::time::Instant::now());
+            let changed = freshness.wait_for_change();
+            match deadline {
+                Some(deadline) => {
+                    tokio::select! {
+                        _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {}
+                        _ = changed => {}
+                        _ = shutdown_rx.changed() => break,
                     }
                 }
-                _ = shutdown_rx.changed() => break,
+                None => {
+                    tokio::select! {
+                        _ = changed => {}
+                        _ = shutdown_rx.changed() => break,
+                    }
+                }
             }
         }
     })

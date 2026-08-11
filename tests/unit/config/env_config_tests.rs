@@ -409,6 +409,30 @@ fn test_env_config_dp_config_max_stale_zero_is_the_unbounded_opt_in() {
     );
 }
 
+/// The documented accepted values are exactly `fail_closed` and
+/// `readiness_only`; a case or dash variant is not an alias.
+#[test]
+fn test_env_config_dp_config_stale_action_rejects_case_and_dash_variants() {
+    for rejected in ["FAIL_CLOSED", "fail-closed", "Readiness-Only"] {
+        with_env_vars(
+            &[
+                ("FERRUM_MODE", "dp"),
+                ("FERRUM_DP_CP_GRPC_URLS", "http://127.0.0.1:50051"),
+                (
+                    "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                    "secret-padding-for-32-char-min!!",
+                ),
+                ("FERRUM_DP_CONFIG_STALE_ACTION", rejected),
+            ],
+            || {
+                let err = EnvConfig::from_env()
+                    .expect_err("only the exact documented spellings are accepted");
+                assert!(err.contains("FERRUM_DP_CONFIG_STALE_ACTION"));
+            },
+        );
+    }
+}
+
 #[test]
 fn test_env_config_dp_config_stale_action_rejects_unknown_values() {
     with_env_vars(

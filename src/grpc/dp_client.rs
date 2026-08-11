@@ -737,7 +737,9 @@ pub async fn start_dp_client_with_stream_timings(
                     backoff.current_cp_index + 1,
                     cp_count,
                 );
-                update_state_disconnected(&connection_state, cp_url, is_primary);
+                // Intentional: the DP is deliberately dropping a healthy
+                // fallback stream to retry the primary. Not authority loss.
+                update_state_disconnected(&connection_state, cp_url, is_primary, true);
                 backoff.current_cp_index = 0;
                 ConfigSyncAttemptOutcome::IntentionalDisconnect
             }
@@ -749,7 +751,8 @@ pub async fn start_dp_client_with_stream_timings(
                         .map(|reload| reload.label)
                         .unwrap_or("DP")
                 );
-                update_state_disconnected(&connection_state, cp_url, is_primary);
+                // Intentional: rotated TLS material, immediate reconnect.
+                update_state_disconnected(&connection_state, cp_url, is_primary, true);
                 ConfigSyncAttemptOutcome::IntentionalDisconnect
             }
             Ok(DpStreamEnd::Clean { received_config }) => {
@@ -759,7 +762,9 @@ pub async fn start_dp_client_with_stream_timings(
                     cp_count,
                     cp_url
                 );
-                update_state_disconnected(&connection_state, cp_url, is_primary);
+                // A stream that delivered config was authoritative until it
+                // closed; a stream that never did is authority loss.
+                update_state_disconnected(&connection_state, cp_url, is_primary, received_config);
                 if received_config {
                     if is_fallback {
                         info!("Stream ended on fallback CP; will retry primary CP first");
@@ -783,7 +788,7 @@ pub async fn start_dp_client_with_stream_timings(
                     cp_count,
                     cp_url
                 );
-                update_state_disconnected(&connection_state, cp_url, is_primary);
+                update_state_disconnected(&connection_state, cp_url, is_primary, false);
                 ConfigSyncAttemptOutcome::StaleSnapshotFenced
             }
             Ok(DpStreamEnd::InvalidDeltaFreshness) => {
@@ -801,7 +806,7 @@ pub async fn start_dp_client_with_stream_timings(
                     cp_count,
                     cp_url
                 );
-                update_state_disconnected(&connection_state, cp_url, is_primary);
+                update_state_disconnected(&connection_state, cp_url, is_primary, false);
                 ConfigSyncAttemptOutcome::InvalidDeltaFreshness
             }
             Ok(DpStreamEnd::InvalidSubscriptionBase) => {
@@ -815,7 +820,7 @@ pub async fn start_dp_client_with_stream_timings(
                     cp_count,
                     cp_url
                 );
-                update_state_disconnected(&connection_state, cp_url, is_primary);
+                update_state_disconnected(&connection_state, cp_url, is_primary, false);
                 ConfigSyncAttemptOutcome::InvalidSubscriptionBase
             }
             Ok(DpStreamEnd::ResyncAfterAcceptedConfig) => {
@@ -830,11 +835,14 @@ pub async fn start_dp_client_with_stream_timings(
                     cp_count,
                     cp_url
                 );
-                update_state_disconnected(&connection_state, cp_url, is_primary);
+                // A base was already accepted on this stream, so the DP is
+                // reconnecting to the same CP for a fresh authoritative
+                // snapshot rather than having lost its authority.
+                update_state_disconnected(&connection_state, cp_url, is_primary, true);
                 ConfigSyncAttemptOutcome::ResyncAfterAcceptedConfig
             }
             Ok(DpStreamEnd::TransportFailure { received_config }) => {
-                update_state_disconnected(&connection_state, cp_url, is_primary);
+                update_state_disconnected(&connection_state, cp_url, is_primary, received_config);
                 if received_config && is_fallback {
                     info!(
                         "Transport failure on fallback CP after accepted config; will retry primary CP first"
@@ -851,7 +859,9 @@ pub async fn start_dp_client_with_stream_timings(
                     cp_url,
                     e
                 );
-                update_state_disconnected(&connection_state, cp_url, is_primary);
+                // A failed connect/subscribe attempt is the authority-loss
+                // signal the bound latches on.
+                update_state_disconnected(&connection_state, cp_url, is_primary, false);
                 // Pre-stream connect/subscribe failures never delivered config.
                 ConfigSyncAttemptOutcome::ConnectionError
             }
@@ -1017,16 +1027,29 @@ async fn wait_optional_tls_reload(mut revision_rx: Option<watch::Receiver<u64>>)
 }
 
 /// Helper: mark connection state as disconnected with the last attempted CP target.
+///
+/// `authority_retained` classifies the stream end for the bounded-config-age
+/// safety boundary (issue #3726). It is `true` only when this disconnect is not
+/// itself evidence that the DP lost its authoritative configuration source: an
+/// intentional primary-retry or TLS-rotation reconnect, or a session that had
+/// already delivered config and is being re-established. Such a disconnect
+/// leaves the DP `Reconnecting`, so a successful handoff to a fallback or
+/// alternate CP never blips traffic. Everything else — a failed attempt, a
+/// stream that never delivered usable authoritative config, a fenced snapshot,
+/// a refused delta — is a real loss of authority, and the bound may latch on it
+/// the moment the applied snapshot reaches its configured maximum age. There is
+/// deliberately no grace period on top of that maximum.
 fn update_state_disconnected(
     connection_state: &Option<Arc<ArcSwap<DpCpConnectionState>>>,
     cp_url: &str,
     is_primary: bool,
+    authority_retained: bool,
 ) {
-    // Start (or continue) the CP-outage window that bounds how long the last
-    // applied snapshot may keep serving (issue #3726). Called once per failed
-    // attempt across multi-CP failover; the tracker keeps the first stamp, and
-    // a successful connect to any CP clears it.
-    crate::dp_config_freshness::record_cp_disconnected();
+    if authority_retained {
+        crate::dp_config_freshness::record_cp_reconnecting();
+    } else {
+        crate::dp_config_freshness::record_cp_authority_lost();
+    }
     if let Some(cs) = connection_state {
         let prev = cs.load();
         cs.store(Arc::new(DpCpConnectionState {
@@ -1069,10 +1092,12 @@ fn update_state_config_diverged(
     connection_state: Option<&Arc<ArcSwap<DpCpConnectionState>>>,
     metrics: &ConfigSyncDivergenceMetrics,
 ) {
+    // Divergence accounting is independent of the #3726 freshness outcome
+    // counters: this helper is reached from both refused-before-apply and
+    // admitted-then-failed-apply paths, and only the call site knows which. Each
+    // of those sites records its own freshness outcome exactly once, so nothing
+    // is recorded here.
     metrics.record_rejection();
-    // A rejected delta is received-but-not-applied: it must not reset the
-    // stale bound, only classify the reason (issue #3726).
-    crate::dp_config_freshness::record_snapshot_rejected();
     crate::plugins::prometheus_metrics::global_registry()
         .invalidate_configsync_divergence_metrics_cache();
     if let Some(cs) = connection_state {
@@ -2150,6 +2175,9 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                         "Refusing DELTA before a valid FULL_SNAPSHOT base on this \
                          subscription; terminating stream without applying"
                     );
+                    // Refused before apply (issue #3726): count it once as a
+                    // rejected payload; the applied-snapshot age is untouched.
+                    crate::dp_config_freshness::record_snapshot_rejected();
                     return Ok(DpStreamEnd::InvalidSubscriptionBase);
                 }
                 match serde_json::from_str::<IncrementalResult>(&update.config_json) {
@@ -2166,6 +2194,7 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                                     let _ = delta_rejection_stream_disposition(
                                         DeltaRejectionKind::InvalidTrustSideChannel,
                                     );
+                                    crate::dp_config_freshness::record_snapshot_rejected();
                                     update_state_config_diverged(
                                         connection_state,
                                         divergence_metrics,
@@ -2224,6 +2253,13 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                                         poll_timestamp = %poll_timestamp,
                                         "Refusing DELTA with inconsistent or unorderable freshness"
                                     );
+                                    // Freshness accounting is independent of
+                                    // divergence: an empty delta is refused
+                                    // before apply just like a non-empty one and
+                                    // must be counted exactly once (#3726),
+                                    // while divergence stays deliberately
+                                    // non-empty-only.
+                                    crate::dp_config_freshness::record_snapshot_rejected();
                                     if !was_empty {
                                         update_state_config_diverged(
                                             connection_state,
@@ -2244,6 +2280,7 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                                 "Refusing DELTA with an implausibly-future committed timestamp \
                                  before it can poison the freshness watermark"
                             );
+                            crate::dp_config_freshness::record_snapshot_rejected();
                             if !was_empty {
                                 update_state_config_diverged(connection_state, divergence_metrics);
                             }
@@ -2259,6 +2296,7 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                                 poll_timestamp = %poll_timestamp,
                                 "Refusing DELTA older than the applied authority watermark"
                             );
+                            crate::dp_config_freshness::record_snapshot_rejected();
                             if !was_empty {
                                 update_state_config_diverged(connection_state, divergence_metrics);
                             }
@@ -2367,6 +2405,10 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                                 // freshness authority or last_config_received_at.
                                 // Do not apply trust from a rejected resource batch.
                                 let _ = gateway_trust_bundle_update;
+                                // Admitted then failed to apply, empty body or
+                                // not: this is `snapshot_apply_failed`, never a
+                                // refused-before-apply rejection (#3726).
+                                crate::dp_config_freshness::record_snapshot_apply_failed();
                                 if was_empty {
                                     tracing::debug!(
                                         "Ignoring rejected empty delta from CP (no resource changes)"
@@ -2408,6 +2450,7 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                         error!("Failed to parse delta update: {}", e);
                         let _ =
                             delta_rejection_stream_disposition(DeltaRejectionKind::ParseFailure);
+                        crate::dp_config_freshness::record_snapshot_rejected();
                         update_state_config_diverged(connection_state, divergence_metrics);
                         return Ok(DpStreamEnd::ResyncAfterAcceptedConfig);
                     }

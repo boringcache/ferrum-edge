@@ -1349,7 +1349,7 @@
   {
     "name": "ferrum_dp_config_new_traffic_blocked",
     "type": "gauge",
-    "help": "Whether the DP is refusing new request/connection admissions because its configuration is stale (1) or not (0).",
+    "help": "Whether the DP is refusing new HTTP/TCP/UDP-session/DTLS-session admissions because its configuration is stale (1) or not (0).",
     "labels": [
       "namespace"
     ],
@@ -1409,7 +1409,7 @@
   {
     "name": "ferrum_dp_config_stale",
     "type": "gauge",
-    "help": "Whether the DP's applied configuration is past its bound with no CP connected (1) or not (0).",
+    "help": "Whether the DP's applied configuration is past its bound with no authoritative CP (1) or not (0).",
     "labels": [
       "namespace"
     ],
