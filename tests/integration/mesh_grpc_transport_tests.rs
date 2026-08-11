@@ -393,9 +393,18 @@ async fn serve_grpc_stream(
 
     let mut trailers = HeaderMap::new();
     if behavior == GrpcPeerBehavior::RespondWithNonZeroStatus {
-        trailers.insert("grpc-status", PEER_FAILED_PRECONDITION.parse().expect("status"));
-        trailers.insert("grpc-message", PEER_FAILURE_MESSAGE.parse().expect("message"));
-        trailers.insert("x-mesh-peer-trailer", PEER_CUSTOM_TRAILER.parse().expect("trailer"));
+        trailers.insert(
+            "grpc-status",
+            PEER_FAILED_PRECONDITION.parse().expect("status"),
+        );
+        trailers.insert(
+            "grpc-message",
+            PEER_FAILURE_MESSAGE.parse().expect("message"),
+        );
+        trailers.insert(
+            "x-mesh-peer-trailer",
+            PEER_CUSTOM_TRAILER.parse().expect("trailer"),
+        );
     } else {
         trailers.insert("grpc-status", "0".parse().expect("status value"));
         trailers.insert("grpc-message", "ok".parse().expect("message value"));
