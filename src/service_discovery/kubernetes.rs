@@ -177,7 +177,7 @@ impl KubernetesDiscoverer {
 
 #[async_trait::async_trait]
 impl super::ServiceDiscoverer for KubernetesDiscoverer {
-    async fn discover(&self) -> Result<Vec<UpstreamTarget>, anyhow::Error> {
+    async fn discover(&self) -> Result<super::DiscoverySnapshot, anyhow::Error> {
         let url = self.api_url();
 
         let mut request = self.client.get(&url);
@@ -300,7 +300,7 @@ impl super::ServiceDiscoverer for KubernetesDiscoverer {
             );
         }
 
-        Ok(targets)
+        Ok(super::DiscoverySnapshot::from_targets(targets))
     }
 
     fn provider_name(&self) -> &str {

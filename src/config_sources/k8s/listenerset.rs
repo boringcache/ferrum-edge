@@ -394,11 +394,11 @@ pub(crate) fn finalize_listenerset_conflicts(acc: &mut K8sAccumulator, objects: 
     // HostnameConflict keeps Gateway→ListenerSet precedence (only the later
     // claim loses) among otherwise compatible same-protocol claims that
     // survived family arbitration, scoped to the parent Gateway exactly as
-    // before. Distinct Gateway hostnames (including catch-all plus named
-    // siblings) do not conflict because `hostnames_conflict` only matches equal
-    // values. Plaintext-vs-TLS HTTP-family refusal stays in
-    // `refuse_incompatible_same_port_listeners` so messages stay one decision
-    // per physical shape.
+    // before. Equal values conflict at every trust level; a later ListenerSet
+    // also loses when its coverage overlaps a Gateway owner. Distinct sibling
+    // Gateway or ListenerSet values still coexist. Plaintext-vs-TLS HTTP-family
+    // refusal stays in `refuse_incompatible_same_port_listeners` so messages
+    // stay one decision per physical shape.
     for candidates in by_gateway.values_mut() {
         candidates.sort_by(|left, right| {
             (
@@ -420,14 +420,13 @@ pub(crate) fn finalize_listenerset_conflicts(acc: &mut K8sAccumulator, objects: 
             if !candidate.eligible || conflicted.contains_key(&candidate.key) {
                 continue;
             }
-            // Exact-duplicate same-protocol claims (equal hostname values on the
-            // same port) lose here for both Gateway and ListenerSet parents —
-            // later claim only, preserving Gateway→ListenerSet precedence.
-            // Catch-all (`None`) versus a named hostname does not conflict
-            // (`hostnames_conflict` requires equal values), so HTTPS catch-all
-            // + hostname siblings stay materializable. Process-wide HTTP-family
-            // vs raw TCP/TLS ProtocolConflict was already decided above; this
-            // walk only applies same-protocol HostnameConflict.
+            // Exact-duplicate same-protocol claims lose here at every trust
+            // level. Cross-trust Gateway→ListenerSet overlap is stricter so a
+            // tenant cannot materialize inside Gateway-owned coverage, while
+            // compatible siblings at the same trust level remain materializable.
+            // Process-wide HTTP-family vs raw TCP/TLS ProtocolConflict was
+            // already decided above; this walk applies only same-protocol
+            // HostnameConflict.
             if let Some(reason) = conflict_against_accepted(candidate, &accepted) {
                 conflicted.insert(candidate.key.clone(), reason);
                 continue;
@@ -544,11 +543,15 @@ pub(crate) fn materialize_listenerset_mesh_services(
         };
         let port = super::port_from_u64(object, raw_port, "listeners[].port")?;
         acc.mesh.services.push(MeshService {
-            // Gateway and ListenerSet are distinct Kubernetes resources and
-            // may legally share namespace/name/listener. Keep the synthetic
-            // service identity kind-scoped so one resource can never masquerade
-            // as the other's materialization in downstream consumers.
-            name: format!("listenerset-{}-{listener_name}", object.metadata.name),
+            // Kind-scoped, length-prefixed identity — see
+            // `gateway_api_listener_mesh_service_name`. Shared with Gateway
+            // materialization so both kinds stay injective under
+            // `(namespace, name)` keying.
+            name: super::gateway_api_listener_mesh_service_name(
+                GatewayApiListenerParentKind::ListenerSet,
+                &object.metadata.name,
+                listener_name,
+            ),
             namespace: object.metadata.namespace.clone(),
             ports: vec![ServicePort {
                 port,
@@ -693,7 +696,7 @@ fn conflict_against_accepted(
         // HTTP vs HTTPS on one port is plaintext-vs-TLS physical refusal owned
         // by `refuse_incompatible_same_port_listeners`, not a family conflict.
         if prior.protocol.eq_ignore_ascii_case(&candidate.protocol)
-            && hostnames_conflict(prior.hostname.as_deref(), candidate.hostname.as_deref())
+            && hostnames_conflict(prior, candidate)
         {
             return Some("HostnameConflict");
         }
@@ -724,15 +727,54 @@ fn listener_port_family(protocol: &str) -> Option<ListenerPortFamily> {
     }
 }
 
-fn hostnames_conflict(left: Option<&str>, right: Option<&str>) -> bool {
-    // Pinned Gateway listener distinctness: exact, wildcard, and fallback
-    // (empty/unset hostname) are distinct values. Only equal hostname values
-    // conflict on the same protocol+port; runtime precedence handles overlap.
+/// Hostname conflict arbitration for ListenerSet merge.
+///
+/// Gateway API v1.5.1 treats exact, wildcard, and unset/catch-all hostnames as
+/// distinct listener values: compatible siblings coexist and runtime precedence
+/// picks the most specific match. Identical hostname values still conflict.
+///
+/// Cross-trust claims are stricter. When a higher-precedence **Gateway**
+/// listener already owns a port/protocol slot, a tenant **ListenerSet** must
+/// not materialize a hostname that overlaps that Gateway coverage — including
+/// exact-vs-wildcard, nested wildcards, and unset/catch-all — or it can hijack
+/// traffic the Gateway already claims.
+fn hostnames_conflict(prior: &ConflictCandidate, candidate: &ConflictCandidate) -> bool {
+    let left = prior.hostname.as_deref();
+    let right = candidate.hostname.as_deref();
+    let cross_trust = prior.key.parent_kind == GatewayApiListenerParentKind::Gateway
+        && candidate.key.parent_kind == GatewayApiListenerParentKind::ListenerSet;
+
     match (left, right) {
         (None, None) => true,
-        (Some(left), Some(right)) => left == right,
-        (None, Some(_)) | (Some(_), None) => false,
+        (Some(left), Some(right)) if left == right => true,
+        (Some(left), Some(right)) => cross_trust && hostname_coverages_overlap(left, right),
+        (None, Some(_)) | (Some(_), None) => cross_trust,
     }
+}
+
+fn hostname_coverages_overlap(left: &str, right: &str) -> bool {
+    let left_suffix = left.strip_prefix("*.");
+    let right_suffix = right.strip_prefix("*.");
+    match (left_suffix, right_suffix) {
+        (None, None) => false,
+        (Some(suffix), None) => hostname_matches_suffix(right, suffix),
+        (None, Some(suffix)) => hostname_matches_suffix(left, suffix),
+        (Some(left), Some(right)) => suffix_is_within(left, right) || suffix_is_within(right, left),
+    }
+}
+
+fn hostname_matches_suffix(hostname: &str, suffix: &str) -> bool {
+    // Gateway API wildcard coverage is a DNS-suffix match below the suffix,
+    // but never includes the bare suffix apex (`*.example.com` ⊄ `example.com`).
+    hostname != suffix && suffix_is_within(hostname, suffix)
+}
+
+fn suffix_is_within(hostname: &str, suffix: &str) -> bool {
+    // Require a DNS label boundary so `notexample.com` never matches
+    // `*.example.com` via a raw string suffix.
+    hostname
+        .strip_suffix(suffix)
+        .is_some_and(|prefix| prefix.ends_with('.'))
 }
 
 fn listenerset_listener_names_are_duplicated(listeners: &[Value]) -> bool {
