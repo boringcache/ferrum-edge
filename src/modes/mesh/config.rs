@@ -3025,7 +3025,8 @@ pub struct MeshTrafficPolicy {
     /// Optional `DestinationRule.trafficPolicy.connectionPool.http` block.
     /// When present, the K8s translator has parsed at least one supported HTTP
     /// connection-pool knob (`idleTimeout`, `http2MaxRequests`,
-    /// `h2UpgradePolicy`, `maxRetries`, `http1MaxPendingRequests`); the mesh
+    /// `maxConcurrentStreams`, `h2UpgradePolicy`, `maxRetries`,
+    /// `http1MaxPendingRequests`); the mesh
     /// apply layer accumulates top-level values on the upstream's inherited
     /// fallback and stores explicit `portLevelSettings` values separately in
     /// `port_overrides[port]`; dispatch merges them field-by-field with the

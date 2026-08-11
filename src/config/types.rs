@@ -3948,7 +3948,7 @@ impl GatewayConfig {
             .filter(|(_, m)| !m.is_empty())
             .collect();
 
-        // Inherited top-level `connectionPool.http` fallback. All five applied
+        // Inherited top-level `connectionPool.http` fallback. All six applied
         // HTTP fields supported at subset scope are overlaid per proxy via the
         // shared selected-subset helper so admission and runtime stay aligned.
         // The per-port map stays separate and is consulted first at dispatch,

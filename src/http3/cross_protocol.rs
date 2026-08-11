@@ -1726,8 +1726,9 @@ where
     // Honor DestinationRule per-port `connectionPool.http` effective-proxy
     // overrides for the LB-selected target, mirroring the H1/H2 plain dispatch
     // path (`proxy_to_backend` / `proxy_to_backend_retry`). The effective proxy
-    // (per-port `idleTimeout` / `http2MaxRequests` / TLS / `h2UpgradePolicy` /
-    // `connectTimeout`, plus the service-discovery top-level fallback) is
+    // (per-port `idleTimeout` / `http2MaxRequests` / `maxConcurrentStreams` /
+    // TLS / `h2UpgradePolicy` / `connectTimeout`, plus the service-discovery
+    // top-level fallback) is
     // RE-RESOLVED per attempt INSIDE the retry loop below (against the failed
     // attempt's `current_target`), so a retry that rotates to a different port
     // gets THAT port's policy — the shared reqwest client (`get_client`), the

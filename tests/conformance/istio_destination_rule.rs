@@ -411,16 +411,16 @@ fn dr_connection_pool_http_http1_max_pending_requests_supported() {
     assert_eq!(http.http1_max_pending_requests, Some(50));
 }
 
-/// All five subset-scoped HTTP pool fields are carried together on the mesh
+/// All six subset-scoped HTTP pool fields are carried together on the mesh
 /// slice. Apply-time precedence and no-leakage are covered by the integration
 /// DestinationRule port-policy suite.
 #[test]
 fn dr_subset_connection_pool_http_combined() {
     register_feature!(
         category = CATEGORY,
-        feature = "subsets[].trafficPolicy.connectionPool.http.{h2UpgradePolicy,maxRetries,http1MaxPendingRequests,idleTimeout,http2MaxRequests}",
+        feature = "subsets[].trafficPolicy.connectionPool.http.{h2UpgradePolicy,maxRetries,http1MaxPendingRequests,idleTimeout,http2MaxRequests,maxConcurrentStreams}",
         status = Status::Supported,
-        notes = "Preserved per subset; runtime precedence is explicit port-level > selected subset > top-level. H1 admission is keyed by subset; retry caps never synthesize retry policy; idleTimeout projects onto pool_idle_timeout_seconds (reqwest rcfg identity); http2MaxRequests is the destination-wide active-request breaker whose lane key carries the selected subset (issue #3775). Shared-client keys already carry upstream_subset so sibling subsets cannot first-materialize each other.",
+        notes = "Preserved per subset; runtime precedence is explicit port-level > selected subset > top-level. H1 admission is keyed by subset; retry caps never synthesize retry policy; idleTimeout projects onto pool_idle_timeout_seconds (reqwest rcfg identity); http2MaxRequests is the destination-wide active-request breaker whose lane key carries the selected subset (issue #3775); maxConcurrentStreams remains the separate per-connection HTTP/2 transport cap. Shared-client keys already carry upstream_subset so sibling subsets cannot first-materialize each other.",
     );
     let dr = translated(json!({
         "host": "echo.default.svc.cluster.local",
@@ -432,7 +432,8 @@ fn dr_subset_connection_pool_http_combined() {
                 "maxRetries": 2,
                 "http1MaxPendingRequests": 7,
                 "idleTimeout": "45s",
-                "http2MaxRequests": 10
+                "http2MaxRequests": 10,
+                "maxConcurrentStreams": 6
             }}}
         }]
     }));
@@ -449,6 +450,7 @@ fn dr_subset_connection_pool_http_combined() {
     assert_eq!(http.http1_max_pending_requests, Some(7));
     assert_eq!(http.idle_timeout_ms, Some(45_000));
     assert_eq!(http.http2_max_requests, Some(10));
+    assert_eq!(http.max_concurrent_streams, Some(6));
 }
 
 /// `subsets[].trafficPolicy.connectionPool.http.{idleTimeout,http2MaxRequests}`
