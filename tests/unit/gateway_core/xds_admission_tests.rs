@@ -450,14 +450,11 @@ fn last_node_cleanup_excludes_same_key_successor_registration() {
     let (finish_cleanup_tx, finish_cleanup_rx) = mpsc::channel();
     let cleanup_state = Arc::clone(&published_state);
     let releaser = thread::spawn(move || {
-        ferrum_edge::_test_support::release_xds_node_with_cleanup_for_test(
-            &mut departing,
-            || {
-                cleanup_state.store(0, Ordering::Release);
-                cleanup_entered_tx.send(()).unwrap();
-                finish_cleanup_rx.recv().unwrap();
-            },
-        )
+        ferrum_edge::_test_support::release_xds_node_with_cleanup_for_test(&mut departing, || {
+            cleanup_state.store(0, Ordering::Release);
+            cleanup_entered_tx.send(()).unwrap();
+            finish_cleanup_rx.recv().unwrap();
+        })
     });
     cleanup_entered_rx
         .recv_timeout(Duration::from_secs(5))
