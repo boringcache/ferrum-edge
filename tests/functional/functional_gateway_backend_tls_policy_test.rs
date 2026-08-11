@@ -445,8 +445,25 @@ async fn start_gateway(config_yaml: &str, extra_env: Vec<(String, String)>) -> (
     for attempt in 1..=MAX_ATTEMPTS {
         let ports = PortReservations::take(4).await;
         let proxy_http = ports.port(PROXY_HTTP);
+        let mut exact_listener_config: serde_yaml::Value =
+            serde_yaml::from_str(config_yaml).expect("translated config YAML");
+        for proxy in exact_listener_config["proxies"]
+            .as_sequence_mut()
+            .expect("translated config proxies")
+        {
+            if proxy["listen_port"].as_u64() == Some(80) {
+                proxy["listen_port"] =
+                    serde_yaml::to_value(proxy_http).expect("serialize exact listener port");
+            }
+        }
+        let exact_listener_config = serde_yaml::to_string(&exact_listener_config)
+            .expect("serialize exact-listener translated config");
         let mut builder = TestGateway::builder()
-            .mode_file(config_yaml.to_string())
+            // This suite exercises backend TLS, not Service-port remapping.
+            // Bind its Gateway listener to the process-global test frontend so
+            // parallel fixtures that also declare :80 cannot turn a real
+            // EADDRINUSE refusal into an unrelated 404.
+            .mode_file(exact_listener_config)
             // The translator stamps every resource with the Kubernetes
             // namespace (`default`), and file mode filters the loaded document
             // down to `FERRUM_NAMESPACE` — whose default is `ferrum`. Without
