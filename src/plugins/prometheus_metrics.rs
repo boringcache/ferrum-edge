@@ -3744,34 +3744,33 @@ impl MetricsRegistry {
             "# HELP ferrum_tls_store_document_bytes Current serialized byte length of a persistent TLS store document.\n",
         );
         output.push_str("# TYPE ferrum_tls_store_document_bytes gauge\n");
+        for kind in crate::tls::shared_store::TlsPersistentStoreKind::ALL {
+            let bytes = self.tls_store_document_bytes[kind.index()].load(Ordering::Relaxed);
+            output.push_str(&format!(
+                "ferrum_tls_store_document_bytes{{store=\"{}\"{}}} {}\n",
+                kind.as_str(),
+                ns_label,
+                bytes
+            ));
+        }
         output.push_str(
             "# HELP ferrum_tls_store_record_count Current logical record count in a persistent TLS store.\n",
         );
         output.push_str("# TYPE ferrum_tls_store_record_count gauge\n");
+        for kind in crate::tls::shared_store::TlsPersistentStoreKind::ALL {
+            let records = self.tls_store_record_count[kind.index()].load(Ordering::Relaxed);
+            output.push_str(&format!(
+                "ferrum_tls_store_record_count{{store=\"{}\"{}}} {}\n",
+                kind.as_str(),
+                ns_label,
+                records
+            ));
+        }
         output.push_str(
             "# HELP ferrum_tls_store_oversized_total Oversized persistent TLS store document refusals by store and direction.\n",
         );
         output.push_str("# TYPE ferrum_tls_store_oversized_total counter\n");
-        output.push_str(
-            "# HELP ferrum_tls_store_admission_rejected_total Logical persistent TLS store admission refusals by store and reason.\n",
-        );
-        output.push_str("# TYPE ferrum_tls_store_admission_rejected_total counter\n");
-        output.push_str(
-            "# HELP ferrum_tls_store_pruned_total Terminal ACME order history entries pruned under the exclusive mutation lock.\n",
-        );
-        output.push_str("# TYPE ferrum_tls_store_pruned_total counter\n");
         for kind in crate::tls::shared_store::TlsPersistentStoreKind::ALL {
-            let store = kind.as_str();
-            let bytes = self.tls_store_document_bytes[kind.index()].load(Ordering::Relaxed);
-            let records = self.tls_store_record_count[kind.index()].load(Ordering::Relaxed);
-            output.push_str(&format!(
-                "ferrum_tls_store_document_bytes{{store=\"{}\"{}}} {}\n",
-                store, ns_label, bytes
-            ));
-            output.push_str(&format!(
-                "ferrum_tls_store_record_count{{store=\"{}\"{}}} {}\n",
-                store, ns_label, records
-            ));
             for direction in [
                 crate::tls::shared_store::TlsStoreIoDirection::Read,
                 crate::tls::shared_store::TlsStoreIoDirection::Write,
@@ -3780,12 +3779,18 @@ impl MetricsRegistry {
                     .load(Ordering::Relaxed);
                 output.push_str(&format!(
                     "ferrum_tls_store_oversized_total{{store=\"{}\",direction=\"{}\"{}}} {}\n",
-                    store,
+                    kind.as_str(),
                     direction.as_str(),
                     ns_label,
                     count
                 ));
             }
+        }
+        output.push_str(
+            "# HELP ferrum_tls_store_admission_rejected_total Logical persistent TLS store admission refusals by store and reason.\n",
+        );
+        output.push_str("# TYPE ferrum_tls_store_admission_rejected_total counter\n");
+        for kind in crate::tls::shared_store::TlsPersistentStoreKind::ALL {
             for reason in [
                 crate::tls::shared_store::TlsStoreAdmissionReason::RecordLimit,
                 crate::tls::shared_store::TlsStoreAdmissionReason::DocumentBytes,
@@ -3794,13 +3799,17 @@ impl MetricsRegistry {
                     .load(Ordering::Relaxed);
                 output.push_str(&format!(
                     "ferrum_tls_store_admission_rejected_total{{store=\"{}\",reason=\"{}\"{}}} {}\n",
-                    store,
+                    kind.as_str(),
                     reason.as_str(),
                     ns_label,
                     count
                 ));
             }
         }
+        output.push_str(
+            "# HELP ferrum_tls_store_pruned_total Terminal ACME order history entries pruned under the exclusive mutation lock.\n",
+        );
+        output.push_str("# TYPE ferrum_tls_store_pruned_total counter\n");
         render_process_counter(
             &mut output,
             "ferrum_tls_store_pruned_total",

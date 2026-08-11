@@ -258,6 +258,7 @@ impl TlsLeaseStore {
         let Some(fence) = fence else {
             return Ok(None);
         };
+        self.publish_lease_record_count();
         Ok(Some(TlsLeaseGuard {
             store: Arc::clone(self),
             name: name.to_string(),
@@ -294,7 +295,7 @@ impl TlsLeaseStore {
     ) -> Result<bool, TlsLeaseError> {
         let holder = self.holder.clone();
         let name = name.to_string();
-        self.file.mutate_if::<_, TlsLeaseError>(move |document| {
+        let renewed = self.file.mutate_if::<_, TlsLeaseError>(move |document| {
             let now = Utc::now();
             let Some(existing) = document.leases.get_mut(&name) else {
                 return Ok((false, false));
@@ -304,7 +305,11 @@ impl TlsLeaseStore {
             }
             existing.expires_at = now + lease_delta(ttl);
             Ok((true, true))
-        })
+        })?;
+        if renewed {
+            self.publish_lease_record_count();
+        }
+        Ok(renewed)
     }
 
     /// Run `commit` under the lease store's exclusive lock, and only while this
@@ -360,7 +365,7 @@ impl TlsLeaseStore {
     fn release_claim(&self, name: &str, fence: u64) -> Result<bool, TlsLeaseError> {
         let holder = self.holder.clone();
         let name = name.to_string();
-        self.file.mutate_if::<_, TlsLeaseError>(move |document| {
+        let released = self.file.mutate_if::<_, TlsLeaseError>(move |document| {
             let Some(existing) = document.leases.get_mut(&name) else {
                 return Ok((false, false));
             };
@@ -373,7 +378,20 @@ impl TlsLeaseStore {
             // so the fence keeps advancing monotonically for this name.
             existing.expires_at = Utc::now();
             Ok((true, true))
-        })
+        })?;
+        if released {
+            self.publish_lease_record_count();
+        }
+        Ok(released)
+    }
+
+    fn publish_lease_record_count(&self) {
+        if let Ok(document) = self.file.snapshot() {
+            record_store_record_count(
+                TlsPersistentStoreKind::Leases,
+                document.leases.len() as u64,
+            );
+        }
     }
 }
 
@@ -1062,10 +1080,6 @@ fn prune_expired(document: &mut TlsLeaseStoreFile, now: DateTime<Utc>) {
         .unwrap_or_else(chrono::TimeDelta::zero);
     let cutoff = now - retention;
     document.leases.retain(|_, lease| lease.expires_at > cutoff);
-    record_store_record_count(
-        TlsPersistentStoreKind::Leases,
-        document.leases.len() as u64,
-    );
 }
 
 /// Clamp a lease TTL into `chrono` space. Callers pass operator-clamped values;

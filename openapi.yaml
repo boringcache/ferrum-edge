@@ -6256,7 +6256,9 @@ components:
           schema:
             $ref: "#/components/schemas/Error"
     PayloadTooLarge:
-      description: Request body or admitted TLS material exceeds its configured byte limit
+      description: >
+        Request body, admitted TLS material, or a managed/ACME store document
+        exceeds its configured byte limit
       content:
         application/json:
           schema:
@@ -6265,8 +6267,9 @@ components:
       description: >
         Resource already exists, conflicts with an existing resource, a managed TLS
         ID collides across material kinds, the mutation would invalidate an active
-        managed TLS reference on delete, or the mutation would make mTLS DNS
-        identities ambiguous
+        managed TLS reference on delete, the mutation would make mTLS DNS
+        identities ambiguous, or a managed/ACME create would exceed the configured
+        logical record limit (overwrite and delete remain available)
       content:
         application/json:
           schema:

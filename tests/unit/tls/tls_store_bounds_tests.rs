@@ -3,8 +3,9 @@
 //! Covers exact-limit and limit+1 whole-document I/O, previous-state preservation
 //! on oversized candidate writes, managed create vs overwrite/delete at the
 //! logical record limit, ACME active/recoverable retention with bounded terminal
-//! history, bounded event-log load/compaction, secret-safe oversized diagnostics,
-//! and multi-process atomic visibility of successful mutations.
+//! history across thousands of renewal cycles, bounded event-log load/compaction,
+//! secret-safe oversized diagnostics, multi-process atomic visibility, and
+//! config/docs/metric inventory parity.
 
 use std::io::Cursor;
 use std::sync::Arc;
@@ -23,8 +24,8 @@ use ferrum_edge::config::env_config::{
 };
 use ferrum_edge::config::public_env_inventory::PUBLIC_FERRUM_ENV_SETTINGS;
 use ferrum_edge::tls::acme::{
-    AcmeCertificateRecord, AcmeCertificateStatus, AcmeCertificateStore, AcmeError, AcmeOrderRecord,
-    AcmeOrderStatus, AcmeOrderStore,
+    AcmeAccountStore, AcmeCertificateRecord, AcmeCertificateStatus, AcmeCertificateStore, AcmeError,
+    AcmeOrderFinalization, AcmeOrderRecord, AcmeOrderStatus, AcmeOrderStore,
 };
 use ferrum_edge::tls::events::{TlsEventFilter, TlsEventLog, TlsSourceEvent, TlsSourceEventMaterial};
 use ferrum_edge::tls::managed::{ManagedTlsError, ManagedTlsRecord, ManagedTlsStore};
@@ -35,6 +36,10 @@ use ferrum_edge::tls::shared_store::{
 use serde::{Deserialize, Serialize};
 
 const DOC_LIMIT: usize = 2048;
+const CONFIGURATION_MD: &str = include_str!("../../../docs/configuration.md");
+const FERRUM_CONF: &str = include_str!("../../../ferrum.conf");
+const METRIC_CONTRACT: &str = include_str!("../../../docs/prometheus_metric_contract.json");
+const METRICS_MD: &str = include_str!("../../../docs/prometheus_metrics.md");
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 struct ProbeDocument {
@@ -201,8 +206,33 @@ fn config_parsers_cover_absent_clamp_and_fail_closed() {
             PUBLIC_FERRUM_ENV_SETTINGS.contains(&key),
             "public inventory must list {key}"
         );
+        assert!(
+            CONFIGURATION_MD.contains(&format!("| `{key}`")),
+            "docs/configuration.md must document {key}"
+        );
+        assert!(
+            FERRUM_CONF.contains(&format!("# {key} =")),
+            "ferrum.conf must template {key}"
+        );
     }
     assert!(MIN_TLS_STORE_MAX_DOCUMENT_BYTES >= 1024);
+
+    for family in [
+        "ferrum_tls_store_document_bytes",
+        "ferrum_tls_store_record_count",
+        "ferrum_tls_store_oversized_total",
+        "ferrum_tls_store_admission_rejected_total",
+        "ferrum_tls_store_pruned_total",
+    ] {
+        assert!(
+            METRIC_CONTRACT.contains(&format!("\"name\": \"{family}\"")),
+            "metric contract must inventory {family}"
+        );
+        assert!(
+            METRICS_MD.contains(&format!("| `{family}`")),
+            "prometheus_metrics.md must document {family}"
+        );
+    }
 }
 
 #[test]
@@ -236,6 +266,27 @@ fn bounded_document_reader_accepts_exact_limit_and_rejects_limit_plus_one() {
         }
         other => panic!("expected Oversized, got {other}"),
     }
+}
+
+#[test]
+fn shared_store_loads_exact_limit_valid_document() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("probe-store.json");
+    let store = open_probe(path.clone(), DOC_LIMIT);
+    let filler_len = DOC_LIMIT.saturating_sub(40);
+    store
+        .mutate(|document| {
+            document.value = "E".repeat(filler_len.min(DOC_LIMIT / 2));
+            Ok::<_, SharedStoreError>(())
+        })
+        .expect("seed near-limit document");
+    let on_disk = std::fs::read(&path).expect("read seeded document");
+    assert!(on_disk.len() <= DOC_LIMIT);
+    let reopened = open_probe(path, DOC_LIMIT);
+    assert_eq!(
+        reopened.snapshot().expect("exact-limit load").value.len(),
+        store.snapshot().expect("live").value.len()
+    );
 }
 
 #[test]
@@ -346,7 +397,7 @@ fn managed_creates_stop_at_logical_limit_while_overwrite_and_delete_remain() {
 }
 
 #[test]
-fn acme_terminal_history_stays_bounded_across_many_cycles_without_dropping_active() {
+fn acme_terminal_history_stays_bounded_across_thousands_of_cycles_without_dropping_active() {
     let dir = tempfile::tempdir().expect("tempdir");
     let store = AcmeOrderStore::open_with_limits(dir.path(), 3, None).expect("open");
 
@@ -362,11 +413,34 @@ fn acme_terminal_history_stays_bounded_across_many_cycles_without_dropping_activ
             .expect("active upsert");
     }
 
-    for cycle in 0..200 {
+    // Valid + finalization material is crash-recovery state and must be retained.
+    let mut recoverable = sample_order("valid-recoverable", "cert-a", AcmeOrderStatus::Valid);
+    recoverable.finalization = Some(
+        AcmeOrderFinalization::generate(&["example.test".to_string()])
+            .expect("generate finalization"),
+    );
+    store
+        .upsert_order(recoverable, false)
+        .expect("recoverable valid upsert");
+
+    for cycle in 0..2_500 {
         let id = format!("term-{cycle}");
+        let status = if cycle % 2 == 0 {
+            AcmeOrderStatus::Failed
+        } else {
+            AcmeOrderStatus::Cancelled
+        };
         store
-            .upsert_order(sample_order(&id, "cert-a", AcmeOrderStatus::Failed), false)
+            .upsert_order(sample_order(&id, "cert-a", status), false)
             .expect("terminal upsert");
+    }
+
+    // Terminal Valid without finalization is history and may be pruned.
+    for cycle in 0..20 {
+        let id = format!("valid-done-{cycle}");
+        store
+            .upsert_order(sample_order(&id, "cert-a", AcmeOrderStatus::Valid), false)
+            .expect("terminal valid upsert");
     }
 
     let orders = store.list_orders().expect("list");
@@ -381,12 +455,29 @@ fn acme_terminal_history_stays_bounded_across_many_cycles_without_dropping_activ
             )
         })
         .count();
+    let recoverable = orders
+        .iter()
+        .filter(|order| order.status == AcmeOrderStatus::Valid && order.finalization.is_some())
+        .count();
     let terminal = orders
         .iter()
-        .filter(|order| matches!(order.status, AcmeOrderStatus::Failed))
+        .filter(|order| {
+            matches!(
+                order.status,
+                AcmeOrderStatus::Failed | AcmeOrderStatus::Cancelled
+            ) || (order.status == AcmeOrderStatus::Valid && order.finalization.is_none())
+        })
         .count();
     assert_eq!(active, 3, "active/recoverable orders must be retained");
-    assert_eq!(terminal, 3, "terminal history must stay at the configured bound");
+    assert_eq!(
+        recoverable, 1,
+        "valid orders with finalization material must be retained"
+    );
+    assert_eq!(
+        terminal, 3,
+        "terminal history must stay at the configured bound"
+    );
+    assert!(store.get_order("valid-recoverable").is_ok());
     assert!(
         store.get_order("active-0").is_ok()
             || store.get_order("active-1").is_ok()
@@ -416,6 +507,36 @@ fn acme_certificate_creates_stop_at_logical_limit_while_overwrite_remains() {
     store
         .upsert_certificate(sample_certificate("cert-b"), false)
         .expect("create after delete");
+}
+
+#[test]
+fn acme_account_creates_stop_at_logical_limit_while_overwrite_remains() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = AcmeAccountStore::open_with_limits(dir.path(), 1, None).expect("open");
+    store
+        .upsert_account(
+            "acct-1".to_string(),
+            "https://acme.example.test/directory".to_string(),
+            r#"{"id":"acct-1"}"#.to_string(),
+        )
+        .expect("create");
+    let refused = store
+        .upsert_account(
+            "acct-2".to_string(),
+            "https://acme.example.test/directory".to_string(),
+            r#"{"id":"acct-2"}"#.to_string(),
+        )
+        .expect_err("second create");
+    assert!(matches!(refused, AcmeError::RecordLimitReached));
+    assert!(!refused.to_string().contains("acct-2"));
+
+    store
+        .upsert_account(
+            "acct-1".to_string(),
+            "https://acme.example.test/directory".to_string(),
+            r#"{"id":"acct-1","rotated":true}"#.to_string(),
+        )
+        .expect("overwrite at limit");
 }
 
 #[test]

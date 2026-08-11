@@ -346,7 +346,7 @@ impl ManagedTlsStore {
         // so a record another instance committed is neither invisible nor
         // silently overwritten. Creates are admitted against the logical record
         // ceiling; overwrite and delete remain available at the limit.
-        self.file.mutate(move |document| {
+        let outcome = self.file.mutate(move |document| {
             let mut record = record;
             let now = Utc::now();
             if let Some(existing) = document.records.get(&record.id) {
@@ -374,25 +374,26 @@ impl ManagedTlsStore {
                 record.updated_at = now;
             }
             document.records.insert(record.id.clone(), record.clone());
-            record_store_record_count(
-                TlsPersistentStoreKind::Managed,
-                document.records.len() as u64,
-            );
-            Ok(record)
-        })
+            // Publish the gauge only after durable publication succeeds so a
+            // refused oversized candidate cannot leave counts ahead of state.
+            Ok((record, document.records.len() as u64))
+        })?;
+        record_store_record_count(TlsPersistentStoreKind::Managed, outcome.1);
+        Ok(outcome.0)
     }
 
     pub fn delete(&self, id: &str) -> Result<ManagedTlsRecord, ManagedTlsError> {
         validate_managed_id(id)?;
         let id = id.to_string();
-        self.file.mutate(move |document| {
+        let outcome = self.file.mutate(move |document| {
             let removed = document.records.remove(&id);
-            record_store_record_count(
-                TlsPersistentStoreKind::Managed,
-                document.records.len() as u64,
-            );
-            removed.ok_or(ManagedTlsError::NotFound(id))
-        })
+            match removed {
+                Some(record) => Ok((record, document.records.len() as u64)),
+                None => Err(ManagedTlsError::NotFound(id)),
+            }
+        })?;
+        record_store_record_count(TlsPersistentStoreKind::Managed, outcome.1);
+        Ok(outcome.0)
     }
 
     #[allow(dead_code)] // External unit tests; production uses material_with_limit.

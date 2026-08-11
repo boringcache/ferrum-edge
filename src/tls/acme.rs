@@ -755,7 +755,7 @@ impl AcmeCertificateStore {
         validate_acme_domains(&record.domains)?;
         validate_acme_certificate_material_size(&record, self.max_material_bytes)?;
         let max_certificates = self.max_certificates;
-        self.file.mutate(move |document| {
+        let outcome = self.file.mutate(move |document| {
             let mut record = record;
             let now = Utc::now();
             if let Some(existing) = document.certificates.get(&record.id) {
@@ -778,25 +778,24 @@ impl AcmeCertificateStore {
             document
                 .certificates
                 .insert(record.id.clone(), record.clone());
-            record_store_record_count(
-                TlsPersistentStoreKind::AcmeCertificates,
-                document.certificates.len() as u64,
-            );
-            Ok(record)
-        })
+            Ok((record, document.certificates.len() as u64))
+        })?;
+        record_store_record_count(TlsPersistentStoreKind::AcmeCertificates, outcome.1);
+        Ok(outcome.0)
     }
 
     pub fn delete_certificate(&self, id: &str) -> Result<AcmeCertificateRecord, AcmeError> {
         validate_acme_id(id)?;
         let id = id.to_string();
-        self.file.mutate(move |document| {
+        let outcome = self.file.mutate(move |document| {
             let removed = document.certificates.remove(&id);
-            record_store_record_count(
-                TlsPersistentStoreKind::AcmeCertificates,
-                document.certificates.len() as u64,
-            );
-            removed.ok_or(AcmeError::NotFound(id))
-        })
+            match removed {
+                Some(record) => Ok((record, document.certificates.len() as u64)),
+                None => Err(AcmeError::NotFound(id)),
+            }
+        })?;
+        record_store_record_count(TlsPersistentStoreKind::AcmeCertificates, outcome.1);
+        Ok(outcome.0)
     }
 
     pub fn material(
@@ -948,7 +947,7 @@ impl AcmeOrderStore {
             finalization.validate(&record.domains)?;
         }
         let terminal_history = self.terminal_history;
-        self.file.mutate(move |document| {
+        let outcome = self.file.mutate(move |document| {
             let mut record = record;
             let now = Utc::now();
             if let Some(existing) = document.orders.get(&record.id) {
@@ -963,26 +962,25 @@ impl AcmeOrderStore {
             }
             document.orders.insert(record.id.clone(), record.clone());
             let pruned = prune_terminal_order_history(document, terminal_history);
-            record_store_pruned(pruned as u64);
-            record_store_record_count(
-                TlsPersistentStoreKind::AcmeOrders,
-                document.orders.len() as u64,
-            );
-            Ok(record)
-        })
+            Ok((record, pruned, document.orders.len() as u64))
+        })?;
+        record_store_pruned(outcome.1 as u64);
+        record_store_record_count(TlsPersistentStoreKind::AcmeOrders, outcome.2);
+        Ok(outcome.0)
     }
 
     pub fn delete_order(&self, id: &str) -> Result<AcmeOrderRecord, AcmeError> {
         validate_acme_id(id)?;
         let id = id.to_string();
-        self.file.mutate(move |document| {
+        let outcome = self.file.mutate(move |document| {
             let removed = document.orders.remove(&id);
-            record_store_record_count(
-                TlsPersistentStoreKind::AcmeOrders,
-                document.orders.len() as u64,
-            );
-            removed.ok_or(AcmeError::OrderNotFound(id))
-        })
+            match removed {
+                Some(record) => Ok((record, document.orders.len() as u64)),
+                None => Err(AcmeError::OrderNotFound(id)),
+            }
+        })?;
+        record_store_record_count(TlsPersistentStoreKind::AcmeOrders, outcome.1);
+        Ok(outcome.0)
     }
 
     /// Key authorization for a pending HTTP-01 token.
@@ -1138,7 +1136,7 @@ impl AcmeAccountStore {
         validate_acme_account_credentials_json(&credentials_json)?;
         let key = acme_account_store_key(&directory_url, &account_id);
         let max_accounts = self.max_accounts;
-        self.file.mutate(move |document| {
+        let outcome = self.file.mutate(move |document| {
             let now = Utc::now();
             let created_at = match document.accounts.get(&key) {
                 Some(existing) => existing.created_at,
@@ -1162,12 +1160,10 @@ impl AcmeAccountStore {
                 last_used_at: Some(now),
             };
             document.accounts.insert(key, record.clone());
-            record_store_record_count(
-                TlsPersistentStoreKind::AcmeAccounts,
-                document.accounts.len() as u64,
-            );
-            Ok(record)
-        })
+            Ok((record, document.accounts.len() as u64))
+        })?;
+        record_store_record_count(TlsPersistentStoreKind::AcmeAccounts, outcome.1);
+        Ok(outcome.0)
     }
 }
 

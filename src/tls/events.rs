@@ -128,14 +128,12 @@ pub struct TlsEventLog {
 
 impl TlsEventLog {
     pub fn new(capacity: usize) -> Self {
-        let max_document_bytes = crate::config::env_config::tls_store_max_document_bytes_from_env()
-            .unwrap_or(crate::config::env_config::DEFAULT_TLS_STORE_MAX_DOCUMENT_BYTES);
         Self {
             capacity: capacity.max(1),
             next_id: AtomicU64::new(1),
             events: Mutex::new(VecDeque::new()),
             path: None,
-            max_document_bytes,
+            max_document_bytes: crate::config::env_config::DEFAULT_TLS_STORE_MAX_DOCUMENT_BYTES,
         }
     }
 
