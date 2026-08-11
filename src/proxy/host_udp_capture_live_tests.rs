@@ -182,7 +182,7 @@ fn spawn_host_shaped_child() -> Option<Child> {
          command -v ip >/dev/null 2>&1 || exit 97; \
          command -v mount >/dev/null 2>&1 || exit 97; \
          mount -t sysfs sysfs /sys || exit 98; \
-         ip link set lo up 2>/dev/null || true; \
+         ip link set lo up || exit 98; \
          printf '1\\n' > /proc/sys/net/ipv4/ip_forward || exit 98; \
          printf '0\\n' > /proc/sys/net/ipv4/conf/all/rp_filter || exit 98; \
          printf '0\\n' > /proc/sys/net/ipv6/conf/all/disable_ipv6 || true; \
@@ -930,12 +930,12 @@ fn host_udp_live_kernel_multi_pod_dual_stack_attribution_and_replies() {
     let waiter = spawn_reply_waiter(topo.pod_a_pid, pod_a_reply);
     std::thread::sleep(Duration::from_millis(100));
     transparent_reply(host_pid, captured_dst, pod_a_reply, b"reply-a")
-    .unwrap_or_else(|error| {
-        panic!(
-            "transparent reply failed: {error}\n{}",
-            bounded_host_diag(host_pid)
-        );
-    });
+        .unwrap_or_else(|error| {
+            panic!(
+                "transparent reply failed: {error}\n{}",
+                bounded_host_diag(host_pid)
+            );
+        });
     let got = waiter
         .join()
         .expect("reply waiter thread")

@@ -11554,14 +11554,15 @@ fn wait_for_udp_capture_snapshot(
 }
 
 #[cfg(target_os = "linux")]
-fn udp_round_trip_from_netns(
+fn udp_round_trip_from_netns_with_source(
     pid: u32,
+    source_ip: std::net::IpAddr,
     destination: SocketAddr,
     payload: &'static [u8],
     timeout: Duration,
 ) -> Result<(Vec<u8>, SocketAddr), String> {
     run_in_live_netns(pid, move || {
-        let socket = std::net::UdpSocket::bind("127.0.0.1:0")
+        let socket = std::net::UdpSocket::bind(SocketAddr::new(source_ip, 0))
             .map_err(|error| format!("bind pod UDP client: {error}"))?;
         socket
             .set_read_timeout(Some(timeout))
@@ -11575,6 +11576,22 @@ fn udp_round_trip_from_netns(
             .map_err(|error| format!("receive UDP reply: {error}"))?;
         Ok((buf[..n].to_vec(), source))
     })
+}
+
+#[cfg(target_os = "linux")]
+fn udp_round_trip_from_netns(
+    pid: u32,
+    destination: SocketAddr,
+    payload: &'static [u8],
+    timeout: Duration,
+) -> Result<(Vec<u8>, SocketAddr), String> {
+    udp_round_trip_from_netns_with_source(
+        pid,
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        destination,
+        payload,
+        timeout,
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -12403,7 +12420,8 @@ async fn functional_mesh_live_host_udp_capture_proxy_backend_round_trip() {
     }
     ensure_gateway_built().expect("build gateway for host-UDP live test");
 
-    const VIP: &str = "192.0.2.90";
+    const VIP_V4: &str = "192.0.2.90";
+    const VIP_V6: &str = "2001:db8::90";
     const POD_A: &str = "host-udp-live-pod-a";
     const POD_B: &str = "host-udp-live-pod-b";
     let capture_port = ferrum_edge::capture::DEFAULT_UDP_OUTBOUND_PORT;
@@ -12441,24 +12459,26 @@ async fn functional_mesh_live_host_udp_capture_proxy_backend_round_trip() {
     let (echo_port, _echo_received, echo_task) = start_counting_udp_echo().await;
     let node_a = "functional-live-host-udp-a";
     let node_b = "functional-live-host-udp-b";
-    let cp_a = start_static_mesh_cp(live_source_capture_slice(
+    let mut slice_a = live_source_capture_slice(
         node_a,
         echo_spiffe,
         "127.0.0.1",
-        VIP,
+        VIP_V4,
         echo_port,
         AppProtocol::Udp,
-    ))
-    .await;
-    let cp_b = start_static_mesh_cp(live_source_capture_slice(
+    );
+    slice_a.services[0].cluster_ips.push(VIP_V6.to_string());
+    let mut slice_b = live_source_capture_slice(
         node_b,
         echo_spiffe,
         "127.0.0.1",
-        VIP,
+        VIP_V4,
         echo_port,
         AppProtocol::Udp,
-    ))
-    .await;
+    );
+    slice_b.services[0].cluster_ips.push(VIP_V6.to_string());
+    let cp_a = start_static_mesh_cp(slice_a).await;
+    let cp_b = start_static_mesh_cp(slice_b).await;
 
     let ports_b = reserve_mesh_ports().await;
     let b_hbone_port = ports_b.hbone;
@@ -12549,12 +12569,15 @@ async fn functional_mesh_live_host_udp_capture_proxy_backend_round_trip() {
         captured_output(&temp_a)
     );
 
-    let destination: SocketAddr = format!("{VIP}:{echo_port}").parse().expect("UDP VIP");
+    let destination_v4: SocketAddr = format!("{VIP_V4}:{echo_port}")
+        .parse()
+        .expect("IPv4 UDP VIP");
     let deadline = Instant::now() + Duration::from_secs(20);
     let (reply_a, source_a) = loop {
-        match udp_round_trip_from_netns(
+        match udp_round_trip_from_netns_with_source(
             pod_a.pod.pid(),
-            destination,
+            std::net::IpAddr::V4(pod_a.pod_v4),
+            destination_v4,
             b"host-udp-a",
             Duration::from_secs(3),
         ) {
@@ -12569,11 +12592,12 @@ async fn functional_mesh_live_host_udp_capture_proxy_backend_round_trip() {
         }
     };
     assert_eq!(reply_a, b"host-udp-a");
-    assert_eq!(source_a, destination);
+    assert_eq!(source_a, destination_v4);
 
-    let (reply_b, source_b) = udp_round_trip_from_netns(
+    let (reply_b, source_b) = udp_round_trip_from_netns_with_source(
         pod_b.pod.pid(),
-        destination,
+        std::net::IpAddr::V4(pod_b.pod_v4),
+        destination_v4,
         b"host-udp-b",
         Duration::from_secs(5),
     )
@@ -12584,7 +12608,31 @@ async fn functional_mesh_live_host_udp_capture_proxy_backend_round_trip() {
         )
     });
     assert_eq!(reply_b, b"host-udp-b");
-    assert_eq!(source_b, destination);
+    assert_eq!(source_b, destination_v4);
+
+    let destination_v6: SocketAddr = format!("[{VIP_V6}]:{echo_port}")
+        .parse()
+        .expect("IPv6 UDP VIP");
+    for (pod, payload) in [
+        (&pod_a, b"host-udp-a6" as &'static [u8]),
+        (&pod_b, b"host-udp-b6" as &'static [u8]),
+    ] {
+        let (reply, source) = udp_round_trip_from_netns_with_source(
+            pod.pod.pid(),
+            std::net::IpAddr::V6(pod.pod_v6),
+            destination_v6,
+            payload,
+            Duration::from_secs(5),
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "host-UDP IPv6 round trip failed: {error}\n{}",
+                captured_output(&temp_a)
+            )
+        });
+        assert_eq!(reply, payload);
+        assert_eq!(source, destination_v6);
+    }
 
     // Shutdown is asserted against an EXACT outcome, never "whatever survived a
     // timeout". `ProxyHostUdpBackend::shutdown` has exactly two documented

@@ -222,6 +222,18 @@ fn ambient_host_udp_live_kernel_module_uses_production_scripts_and_skip_or_fail(
         live.contains("DIAG_CAP"),
         "live diagnostics must be bounded"
     );
+
+    let functional = read("tests/functional/functional_mesh_mode_test.rs");
+    assert!(
+        functional.contains("FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED"),
+        "the process-level gate must select the production host-netns backend"
+    );
+    assert!(
+        functional.contains("std::net::IpAddr::V4(pod_a.pod_v4)")
+            && functional.contains("std::net::IpAddr::V6(pod.pod_v6)")
+            && functional.contains("VIP_V6"),
+        "the production backend gate must send dual-stack traffic from enrolled pod addresses"
+    );
 }
 
 #[test]
