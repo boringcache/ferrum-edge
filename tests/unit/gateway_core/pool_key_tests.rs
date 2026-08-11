@@ -1905,11 +1905,11 @@ async fn same_endpoint_subset_idle_and_h2_caps_partition_pool_keys() {
     assert_ne!(reqwest_v1, reqwest_v2);
     assert_ne!(reqwest_v1, reqwest_none);
     assert!(
-        reqwest_v1.contains("|rcfg=") && reqwest_v1.contains(";i45"),
+        reqwest_v1.contains("|rcfg=i45;"),
         "v1 idleTimeout must participate in reqwest rcfg: {reqwest_v1}"
     );
     assert!(
-        reqwest_v2.contains(";i12"),
+        reqwest_v2.contains("|rcfg=i12;"),
         "v2 idleTimeout must participate in reqwest rcfg: {reqwest_v2}"
     );
 

@@ -10706,6 +10706,20 @@ components:
             Subset concurrent in-flight HTTP/1.1 admission cap projected from
             a mesh DestinationRule. Admission is isolated by selected subset;
             direct admin/file configuration is rejected.
+        http_idle_timeout_ms:
+          type: [integer, "null"]
+          format: uint64
+          readOnly: true
+          description: >-
+            Subset backend HTTP idle timeout in milliseconds projected from a
+            mesh DestinationRule. Direct admin/file configuration is rejected.
+        h2_max_concurrent_streams:
+          type: [integer, "null"]
+          format: uint32
+          readOnly: true
+          description: >-
+            Subset HTTP/2 concurrent-stream cap projected from a mesh
+            DestinationRule. Direct admin/file configuration is rejected.
         passive_health_check:
           oneOf:
             - $ref: "#/components/schemas/PassiveHealthCheck"
