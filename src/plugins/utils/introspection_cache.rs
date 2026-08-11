@@ -57,11 +57,16 @@ pub struct CachedAuthorizationError {
 /// identity selection, or configured header fan-out are deliberately absent.
 /// This prevents a valid but arbitrary JSON response from becoming long-lived
 /// cache state.
+///
+/// `expires_at_unix` is the absolute credential validity derived once at the
+/// provider-response boundary so cache hits and single-flight followers cannot
+/// extend a relative `expires_in` bound.
 pub struct CachedAuthorization {
     pub authorization_error: Option<CachedAuthorizationError>,
     pub identity: Option<Box<str>>,
     pub identity_header: Option<Box<str>>,
     pub claim_headers: Box<[CachedClaimHeader]>,
+    pub expires_at_unix: Option<i64>,
 }
 
 impl CachedAuthorization {
@@ -395,7 +400,6 @@ impl IntrospectionCache {
         token: &str,
         authorization: Arc<CachedAuthorization>,
         now: Instant,
-        exp: Option<i64>,
     ) -> bool {
         if self.positive_ttl.is_zero() {
             return false;
@@ -409,7 +413,7 @@ impl IntrospectionCache {
             self.record_admission_skip(EntryClass::Active, "expiry");
             return false;
         };
-        if let Some(exp) = exp {
+        if let Some(exp) = authorization.expires_at_unix {
             let unix_now = chrono::Utc::now().timestamp();
             let Ok(seconds) = u64::try_from(exp.saturating_sub(unix_now)) else {
                 self.record_admission_skip(EntryClass::Active, "expiry");
@@ -654,6 +658,7 @@ mod tests {
             identity: Some("x".repeat(payload_bytes).into_boxed_str()),
             identity_header: None,
             claim_headers: Box::default(),
+            expires_at_unix: None,
         })
     }
 
@@ -682,7 +687,7 @@ mod tests {
     fn positive_cache_expires_and_releases_bytes() {
         let cache = cache(100, 4096, 1024 * 1024);
         let now = Instant::now();
-        assert!(cache.insert_active("token", authorization(32), now, None));
+        assert!(cache.insert_active("token", authorization(32), now));
         assert!(cache.retained_bytes() > 0);
         assert!(matches!(cache.get("token", now), CacheLookup::Active(_)));
         assert!(matches!(
@@ -695,7 +700,7 @@ mod tests {
     #[test]
     fn oversized_active_result_is_not_retained() {
         let cache = cache(100, 256, 1024 * 1024);
-        assert!(!cache.insert_active("token", authorization(512), Instant::now(), None));
+        assert!(!cache.insert_active("token", authorization(512), Instant::now()));
         assert_eq!(cache.len(), 0);
         assert_eq!(cache.retained_bytes(), 0);
     }
@@ -705,11 +710,11 @@ mod tests {
         let candidate = authorization(64);
         let exact = candidate.retained_bytes();
         let exact_cache = cache(100, exact, 1024 * 1024);
-        assert!(exact_cache.insert_active("exact", candidate, Instant::now(), None));
+        assert!(exact_cache.insert_active("exact", candidate, Instant::now()));
 
         let oversized = authorization(64);
         let smaller_cache = cache(100, exact - 1, 1024 * 1024);
-        assert!(!smaller_cache.insert_active("one-byte-over", oversized, Instant::now(), None,));
+        assert!(!smaller_cache.insert_active("one-byte-over", oversized, Instant::now()));
     }
 
     #[test]
@@ -722,7 +727,7 @@ mod tests {
                     for token in 0_u64..100 {
                         let name = format!("worker-{worker}-token-{token}");
                         if token.is_multiple_of(2) {
-                            cache.insert_active(&name, authorization(64), Instant::now(), None);
+                            cache.insert_active(&name, authorization(64), Instant::now());
                         } else {
                             cache.insert_negative(&name, Instant::now());
                         }
@@ -742,7 +747,7 @@ mod tests {
             for _ in 0..8 {
                 let cache = Arc::clone(&cache);
                 scope.spawn(move || {
-                    cache.insert_active("same", authorization(64), Instant::now(), None);
+                    cache.insert_active("same", authorization(64), Instant::now());
                 });
             }
         });
@@ -758,7 +763,7 @@ mod tests {
         let cache = Arc::new(cache(100, 4096, 1024 * 1024));
         let budget = Arc::downgrade(&cache.budget);
         let now = Instant::now();
-        assert!(cache.insert_active("in-flight", authorization(64), now, None));
+        assert!(cache.insert_active("in-flight", authorization(64), now));
         let result = match cache.get("in-flight", now) {
             CacheLookup::Active(result) => result,
             _ => panic!("active result must be present"),
@@ -774,7 +779,7 @@ mod tests {
     fn negative_churn_cannot_evict_active_entries() {
         let cache = cache(100, 4096, 1024 * 1024);
         let now = Instant::now();
-        assert!(cache.insert_active("hot", authorization(64), now, None));
+        assert!(cache.insert_active("hot", authorization(64), now));
         for token in 0..1000 {
             cache.insert_negative(&format!("inactive-{token}"), now);
         }
@@ -787,7 +792,7 @@ mod tests {
         let now = Instant::now();
         assert!(cache.insert_negative("inactive-hot", now));
         for token in 0..1000 {
-            cache.insert_active(&format!("active-{token}"), authorization(64), now, None);
+            cache.insert_active(&format!("active-{token}"), authorization(64), now);
         }
         assert!(matches!(
             cache.get("inactive-hot", now),
