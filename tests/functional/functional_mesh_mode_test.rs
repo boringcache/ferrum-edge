@@ -12422,8 +12422,13 @@ async fn functional_mesh_live_host_udp_capture_proxy_backend_round_trip() {
 
     const VIP_V4: &str = "192.0.2.90";
     const VIP_V6: &str = "2001:db8::90";
-    const POD_A: &str = "host-udp-live-pod-a";
-    const POD_B: &str = "host-udp-live-pod-b";
+    // Registry filenames ARE the pod UIDs. `UdpSourceIdentity::new` (and therefore
+    // production host-UDP enrollment) fail-closed unless the UID parses as a
+    // Kubernetes UUID — the same shape `host_udp_capture_live_tests` and the
+    // node-agent registry publish. Non-UUID labels leave `source_identity=None`
+    // and surface as `reason=missing_identity` with capture never installed.
+    const POD_A: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const POD_B: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
     let capture_port = ferrum_edge::capture::DEFAULT_UDP_OUTBOUND_PORT;
 
     let pod_a = match LiveHostUdpVethPod::spawn(21) {
