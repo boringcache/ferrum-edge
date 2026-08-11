@@ -1747,6 +1747,7 @@ impl MetricsRegistry {
 
     /// Fixed-cardinality test/operator seam for the current logical record
     /// count gauge of one persistent TLS store.
+    #[allow(dead_code)] // External unit tests call this through the library target.
     pub fn current_tls_store_record_count(
         &self,
         kind: crate::tls::shared_store::TlsPersistentStoreKind,

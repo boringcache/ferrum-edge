@@ -254,6 +254,7 @@ impl ManagedTlsStore {
     /// caps values above the hard maxima before any store I/O.
     ///
     /// `max_document_bytes` of `None` uses `FERRUM_TLS_STORE_MAX_DOCUMENT_BYTES`.
+    #[allow(dead_code)] // External unit tests; production uses open.
     pub fn open_with_material_limit(
         dir: impl Into<PathBuf>,
         max_material_bytes: usize,
@@ -298,6 +299,7 @@ impl ManagedTlsStore {
     }
 
     /// Configured logical record admission ceiling.
+    #[allow(dead_code)] // External unit tests call this through the library target.
     pub fn max_records(&self) -> usize {
         self.max_records
     }
