@@ -436,7 +436,9 @@ pub fn load_admin_https_tls_fail_closed(
             "{error_label}: FERRUM_ADMIN_TLS_KEY_PATH is set but FERRUM_ADMIN_TLS_CERT_PATH is \
              missing — both must be configured together"
         )),
-        (Some(_), Some(_)) => load_admin_tls_material(env_config, tls_policy, crls, error_label).map(Some),
+        (Some(_), Some(_)) => {
+            load_admin_tls_material(env_config, tls_policy, crls, error_label).map(Some)
+        }
     }
 }
 
