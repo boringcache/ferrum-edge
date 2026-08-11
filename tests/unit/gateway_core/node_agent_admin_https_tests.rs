@@ -49,6 +49,16 @@ fn reserve_port() -> u16 {
         .port()
 }
 
+fn expect_https_plan_error(
+    result: Result<AdminHttpsListenerPlan, anyhow::Error>,
+    message: &str,
+) -> anyhow::Error {
+    match result {
+        Err(err) => err,
+        Ok(_) => panic!("{message}"),
+    }
+}
+
 #[test]
 fn node_agent_admin_surface_active_requires_http_or_https() {
     let disabled = EnvConfig {
@@ -156,15 +166,17 @@ fn plan_admin_https_listener_fails_closed_on_explicit_missing_tls() {
     let policy = load_tls_policy(&env).unwrap();
     let crls = load_crls_from_env(&env).unwrap();
     let addr: SocketAddr = "127.0.0.1:19443".parse().unwrap();
-    let err = plan_admin_https_listener(
-        &env,
-        &policy,
-        &crls,
-        "Invalid node_agent admin TLS configuration",
-        addr,
-        None,
-    )
-    .expect_err("explicit HTTPS without TLS must fail closed");
+    let err = expect_https_plan_error(
+        plan_admin_https_listener(
+            &env,
+            &policy,
+            &crls,
+            "Invalid node_agent admin TLS configuration",
+            addr,
+            None,
+        ),
+        "explicit HTTPS without TLS must fail closed",
+    );
     let msg = format!("{err:#}");
     assert!(
         msg.contains("Invalid node_agent admin TLS configuration"),
@@ -189,15 +201,17 @@ fn plan_admin_https_listener_fails_closed_on_partial_tls() {
     let policy = load_tls_policy(&env).unwrap();
     let crls = load_crls_from_env(&env).unwrap();
     let addr: SocketAddr = "127.0.0.1:19443".parse().unwrap();
-    let err = plan_admin_https_listener(
-        &env,
-        &policy,
-        &crls,
-        "Invalid node_agent admin TLS configuration",
-        addr,
-        None,
-    )
-    .expect_err("partial cert/key must fail closed");
+    let err = expect_https_plan_error(
+        plan_admin_https_listener(
+            &env,
+            &policy,
+            &crls,
+            "Invalid node_agent admin TLS configuration",
+            addr,
+            None,
+        ),
+        "partial cert/key must fail closed",
+    );
     assert!(format!("{err:#}").contains("both must be configured together"));
 }
 
@@ -214,8 +228,17 @@ fn plan_admin_https_listener_fails_closed_on_missing_material() {
     let policy = load_tls_policy(&env).unwrap();
     let crls = load_crls_from_env(&env).unwrap();
     let addr: SocketAddr = "127.0.0.1:9443".parse().unwrap();
-    let err = plan_admin_https_listener(&env, &policy, &crls, "Invalid test admin TLS", addr, None)
-        .expect_err("missing TLS material must fail closed");
+    let err = expect_https_plan_error(
+        plan_admin_https_listener(
+            &env,
+            &policy,
+            &crls,
+            "Invalid test admin TLS",
+            addr,
+            None,
+        ),
+        "missing TLS material must fail closed",
+    );
     let msg = format!("{err:#}");
     assert!(
         msg.contains("Invalid test admin TLS"),
