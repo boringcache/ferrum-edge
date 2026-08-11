@@ -1208,7 +1208,7 @@ upstreams:
         poll_interval_seconds: 15
 ```
 
-The Kubernetes provider lists `EndpointSlice` objects for the configured service and publishes only lifecycle-eligible endpoints. Semantics match the controller path: `terminating=true` is never routable (even when `ready=true`), explicit `serving=false` is skipped, and omitted `ready`/`serving` follow Kubernetes tri-state defaults. Each poll rebuilds the upstream's load-balancer targets from the latest snapshot, so a draining endpoint is removed from the live set while healthy peers remain. A successful HTTP response must decode as a typed EndpointSliceList with a required JSON array `items`. `{}`, `{"items":null}`, `{"items":{}}`, invalid JSON, and incompatible top-level shapes are discovery failures that retain the last admitted targets; only a structurally valid `{"items":[]}` is an authoritative empty snapshot that may withdraw targets.
+The Kubernetes provider lists `EndpointSlice` objects for the configured service and publishes only lifecycle-eligible endpoints. Semantics match the controller path: `terminating=true` is never routable (even when `ready=true`), explicit `serving=false` is skipped, and omitted `ready`/`serving` follow Kubernetes tri-state defaults. Each poll rebuilds the upstream's load-balancer targets from the latest snapshot, so a draining endpoint is removed from the live set while healthy peers remain. Provider-reported `port` values must be integers in `1..=65535`; malformed or out-of-range entries are skipped without wrapping while valid peers in the same snapshot remain published. A successful HTTP response must decode as a typed EndpointSliceList with a required JSON array `items`. `{}`, `{"items":null}`, `{"items":{}}`, invalid JSON, and incompatible top-level shapes are discovery failures that retain the last admitted targets; only a structurally valid `{"items":[]}` is an authoritative empty snapshot that may withdraw targets.
 **Consul**:
 ```yaml
 upstreams:
@@ -1227,6 +1227,8 @@ upstreams:
         poll_interval_seconds: 10
         token: "consul-acl-token"
 ```
+
+Consul provider-reported `Port` values must be integers in `1..=65535`; malformed or out-of-range entries are skipped without wrapping while valid peers in the same snapshot remain published. An explicit `Weights.Passing` must be an integer in `1..=65535`; missing `Weights`/`Passing` uses `default_weight`, but explicit zero, malformed, or out-of-range values skip that entry.
 
 **Ferrum Mesh**:
 ```yaml

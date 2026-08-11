@@ -166,27 +166,59 @@ impl KubernetesDiscoverer {
     }
 
     /// Extract the matching port from an EndpointSlice item.
+    ///
+    /// Returns `None` when the named/first port is absent or outside
+    /// `1..=u16::MAX` (checked admission; never wraps).
+    #[cfg(test)]
     fn extract_port(&self, item: &serde_json::Value) -> Option<u16> {
-        let ports = item.get("ports").and_then(|v| v.as_array())?;
-
-        if let Some(ref port_name) = self.port_name {
-            // Find port by name
-            for port in ports {
-                let name = port.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                if name == port_name {
-                    return port.get("port").and_then(|p| p.as_u64()).map(|p| p as u16);
-                }
-            }
-            None
-        } else {
-            // Use first port
-            ports
-                .first()?
-                .get("port")
-                .and_then(|p| p.as_u64())
-                .map(|p| p as u16)
+        match self.classify_port(item) {
+            EndpointSlicePortAdmission::Admitted(port) => Some(port),
+            EndpointSlicePortAdmission::Missing | EndpointSlicePortAdmission::Invalid => None,
         }
     }
+
+    /// Classify the selected EndpointSlice port for structured skip tallies.
+    ///
+    /// Distinguishes a missing/unmatched port from an explicitly present value
+    /// outside `1..=u16::MAX` so out-of-range integers are not conflated with
+    /// absent fields. Never wraps. Aligns with the Kubernetes controller
+    /// EndpointSlice port filter (`nonzero && <= u16::MAX`).
+    fn classify_port(&self, item: &serde_json::Value) -> EndpointSlicePortAdmission {
+        let Some(ports) = item.get("ports").and_then(|v| v.as_array()) else {
+            return EndpointSlicePortAdmission::Missing;
+        };
+
+        let selected = if let Some(ref port_name) = self.port_name {
+            ports
+                .iter()
+                .find(|port| port.get("name").and_then(|n| n.as_str()).unwrap_or("") == port_name)
+        } else {
+            ports.first()
+        };
+
+        let Some(port_obj) = selected else {
+            return EndpointSlicePortAdmission::Missing;
+        };
+
+        match port_obj.get("port") {
+            None => EndpointSlicePortAdmission::Missing,
+            Some(value) => match value.as_u64() {
+                None => EndpointSlicePortAdmission::Invalid,
+                Some(raw) => match super::admit_registry_port(raw) {
+                    Some(port) => EndpointSlicePortAdmission::Admitted(port),
+                    None => EndpointSlicePortAdmission::Invalid,
+                },
+            },
+        }
+    }
+}
+
+/// Result of selecting and admitting one EndpointSlice port field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EndpointSlicePortAdmission {
+    Admitted(u16),
+    Missing,
+    Invalid,
 }
 
 #[async_trait::async_trait]
@@ -234,6 +266,7 @@ impl super::ServiceDiscoverer for KubernetesDiscoverer {
         let mut targets = Vec::new();
         let mut slices = 0usize;
         let mut missing_port = 0usize;
+        let mut invalid_port = 0usize;
         let mut missing_endpoints = 0usize;
         let mut not_ready = 0usize;
         let mut terminating = 0usize;
@@ -243,11 +276,18 @@ impl super::ServiceDiscoverer for KubernetesDiscoverer {
 
         for item in &envelope.items {
             slices += 1;
-            // Extract ports
-            let port = self.extract_port(item);
-            if port.is_none() {
-                missing_port += 1;
-            }
+            // Extract ports with checked admission (no wrap on out-of-range).
+            let port = match self.classify_port(item) {
+                EndpointSlicePortAdmission::Admitted(port) => Some(port),
+                EndpointSlicePortAdmission::Missing => {
+                    missing_port += 1;
+                    None
+                }
+                EndpointSlicePortAdmission::Invalid => {
+                    invalid_port += 1;
+                    None
+                }
+            };
 
             // Extract endpoints
             if let Some(endpoints) = item.get("endpoints").and_then(|v| v.as_array()) {
@@ -313,6 +353,7 @@ impl super::ServiceDiscoverer for KubernetesDiscoverer {
                 service = %self.service_name,
                 slices,
                 missing_port,
+                invalid_port,
                 missing_endpoints,
                 not_ready,
                 terminating,
