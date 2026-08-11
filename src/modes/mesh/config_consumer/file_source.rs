@@ -242,6 +242,39 @@ pub fn mesh_reload_completion_may_publish(
     publish_allowed && matches!(select_winner, MeshReloadSelectReady::Completion)
 }
 
+/// What a pending local-source recovery is waiting for.
+///
+/// At most ONE recovery is pending at a time, so the pending slot's epoch is
+/// the linearization tag for "still current".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingRecoveryKind {
+    /// File-source candidate: bound to its content digest at creation.
+    Slice,
+    /// Stock-policy baseline: unbound until the stock client installs a slice
+    /// that incorporates it (`bind_installed_slice_if_policy_recovery`).
+    Policy,
+}
+
+/// The single recovery candidate awaiting proxy acceptance.
+#[derive(Debug, Clone, Copy)]
+struct PendingRecovery {
+    /// Epoch that created this pending state.
+    epoch: u64,
+    kind: PendingRecoveryKind,
+    /// Content digest the proxy must accept before health may clear. `None`
+    /// while a stock-policy recovery is still unbound.
+    digest: Option<[u8; 32]>,
+}
+
+/// Serialized recovery-transition state (see [`MeshLocalSourceRecovery`]).
+#[derive(Debug, Default)]
+struct MeshLocalRecoveryState {
+    /// Last issued epoch; advanced on reject and on every new pending recovery.
+    last_epoch: u64,
+    /// The single pending recovery; `None` when none is outstanding.
+    pending: Option<PendingRecovery>,
+}
+
 /// Sticky local-source health + race-safe recovery handshake (issue #3776).
 ///
 /// `config_rejected` is the authenticated `/health` surface held by
@@ -249,20 +282,28 @@ pub fn mesh_reload_completion_may_publish(
 /// current recovery candidate being accepted by the proxy apply lifecycle —
 /// provisional `install_slice` / policy channel send must not clear it, and an
 /// older success must not clear after a newer failure.
+///
+/// **Linearization contract.** Every transition — cancel, new pending
+/// candidate, policy-identity bind, proxy accept, proxy reject — runs as ONE
+/// critical section of `state`, and the `config_rejected` write that belongs to
+/// that transition happens inside the SAME critical section. A callback
+/// therefore decides against the state that is current at the instant it holds
+/// the lock; there is no capture-then-act window in which a newer rejection or
+/// a newer candidate can land between a stale callback's test and its write. In
+/// particular an older success can never clear after a newer failure, and an
+/// older rejection can never cancel a newer pending recovery whose identity
+/// differs. The `AtomicBool` stays the lock-free AdminState READ surface
+/// (`/health`), but it is only ever WRITTEN under this lock.
+///
+/// The lock is non-reentrant and is the only lock this type takes, so it can
+/// neither deadlock against itself nor participate in a lock cycle: public
+/// methods take it once and delegate to `*_locked` helpers instead of calling
+/// each other.
 #[derive(Debug)]
 pub struct MeshLocalSourceRecovery {
     config_rejected: Arc<AtomicBool>,
-    /// Monotonic epoch advanced on reject and on every new pending recovery.
-    epoch: AtomicU64,
-    /// Epoch currently allowed to clear `config_rejected` after proxy apply.
-    /// `0` means no pending recovery.
-    pending_epoch: AtomicU64,
-    /// Active stock-policy recovery epoch (`0` when none). While set, stock
-    /// installs rebind the pending slice identity so a discovery update that
-    /// incorporates the recovered policy can still clear.
-    policy_recovery_epoch: AtomicU64,
-    /// Content digest of the pending recovery slice. `None` until bound.
-    pending_digest: Mutex<Option<[u8; 32]>>,
+    /// The transition authority. See the type-level linearization contract.
+    state: Mutex<MeshLocalRecoveryState>,
 }
 
 impl MeshLocalSourceRecovery {
@@ -272,10 +313,7 @@ impl MeshLocalSourceRecovery {
     pub fn new(config_rejected: Arc<AtomicBool>) -> Arc<Self> {
         Arc::new(Self {
             config_rejected,
-            epoch: AtomicU64::new(0),
-            pending_epoch: AtomicU64::new(0),
-            policy_recovery_epoch: AtomicU64::new(0),
-            pending_digest: Mutex::new(None),
+            state: Mutex::new(MeshLocalRecoveryState::default()),
         })
     }
 
@@ -291,19 +329,60 @@ impl MeshLocalSourceRecovery {
 
     /// Epoch currently pending proxy acceptance (`0` = none).
     pub fn pending_epoch(&self) -> u64 {
-        self.pending_epoch.load(Ordering::Acquire)
+        match self.state.lock() {
+            Ok(state) => state.pending.map_or(0, |pending| pending.epoch),
+            Err(_) => {
+                self.fail_closed_on_poisoned_state();
+                0
+            }
+        }
     }
 
-    /// Raise `config_rejected` and cancel any older pending recovery so it can
-    /// no longer clear health.
-    pub fn mark_rejected(&self) {
+    /// A poisoned transition lock means an earlier transition panicked partway
+    /// through, so the pending slot can no longer be trusted. Fail closed: hold
+    /// (or raise) the sticky degraded signal, never clear it, and refuse the
+    /// transition — without an `unwrap`/`expect` panic on a production path.
+    fn fail_closed_on_poisoned_state(&self) {
         self.config_rejected.store(true, Ordering::Relaxed);
-        let _ = self.epoch.fetch_add(1, Ordering::AcqRel);
-        self.pending_epoch.store(0, Ordering::Release);
-        self.policy_recovery_epoch.store(0, Ordering::Release);
-        if let Ok(mut guard) = self.pending_digest.lock() {
-            *guard = None;
+        warn!(
+            "Mesh local-source recovery transition state is poisoned; refusing the recovery \
+             transition and holding config_rejected"
+        );
+    }
+
+    /// Raise `config_rejected` and cancel any pending recovery so it can no
+    /// longer clear health.
+    pub fn mark_rejected(&self) {
+        match self.state.lock() {
+            Ok(mut state) => self.mark_rejected_locked(&mut state),
+            Err(_) => self.fail_closed_on_poisoned_state(),
         }
+    }
+
+    /// Transition body for [`Self::mark_rejected`]. The caller already holds the
+    /// transition lock — never call the public method from inside a critical
+    /// section, the mutex is not reentrant.
+    fn mark_rejected_locked(&self, state: &mut MeshLocalRecoveryState) {
+        state.last_epoch = state.last_epoch.wrapping_add(1);
+        state.pending = None;
+        self.config_rejected.store(true, Ordering::Relaxed);
+    }
+
+    /// Install a fresh pending recovery under the caller-held transition lock.
+    fn begin_pending_locked(
+        &self,
+        state: &mut MeshLocalRecoveryState,
+        kind: PendingRecoveryKind,
+        digest: Option<[u8; 32]>,
+    ) -> u64 {
+        state.last_epoch = state.last_epoch.wrapping_add(1);
+        let epoch = state.last_epoch;
+        state.pending = Some(PendingRecovery {
+            epoch,
+            kind,
+            digest,
+        });
+        epoch
     }
 
     /// Mark a provisionally installed file-source recovery candidate.
@@ -311,22 +390,30 @@ impl MeshLocalSourceRecovery {
     /// Does **not** clear `config_rejected`. An uncomputable content identity
     /// fails closed (stays/sets degraded) because recovery cannot be proven.
     pub fn mark_slice_recovery_pending(&self, slice: &MeshSlice) -> Option<u64> {
-        match slice_content_identity(slice) {
+        // The digest is a pure function of the candidate, so it is computed
+        // outside the transition: the lock covers the state change only.
+        let identity = slice_content_identity(slice);
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(_) => {
+                self.fail_closed_on_poisoned_state();
+                return None;
+            }
+        };
+        match identity {
             MeshRevisionContentIdentity::Digest(digest) => {
-                let epoch = self.epoch.fetch_add(1, Ordering::AcqRel) + 1;
-                if let Ok(mut guard) = self.pending_digest.lock() {
-                    *guard = Some(digest);
-                }
-                self.pending_epoch.store(epoch, Ordering::Release);
-                self.policy_recovery_epoch.store(0, Ordering::Release);
-                Some(epoch)
+                let kind = PendingRecoveryKind::Slice;
+                Some(self.begin_pending_locked(&mut state, kind, Some(digest)))
             }
             MeshRevisionContentIdentity::Unavailable => {
+                // Same critical section: an unprovable candidate supersedes any
+                // pending recovery and fails closed as one transition.
+                self.mark_rejected_locked(&mut state);
+                drop(state);
                 warn!(
                     "Mesh local reload candidate has uncomputable content identity; raising \
                      config_rejected because recovery cannot be proven"
                 );
-                self.mark_rejected();
                 None
             }
         }
@@ -335,96 +422,121 @@ impl MeshLocalSourceRecovery {
     /// Begin a stock-policy recovery after a valid baseline is published to the
     /// watch channel. Does **not** clear `config_rejected`; the pending slice
     /// identity is bound later when the stock client installs a rebuilt slice.
+    ///
+    /// Returns the new pending epoch, or `0` when the transition was refused
+    /// because the state is poisoned (health is then held degraded).
     pub fn begin_policy_recovery(&self) -> u64 {
-        let epoch = self.epoch.fetch_add(1, Ordering::AcqRel) + 1;
-        if let Ok(mut guard) = self.pending_digest.lock() {
-            *guard = None;
+        match self.state.lock() {
+            Ok(mut state) => {
+                self.begin_pending_locked(&mut state, PendingRecoveryKind::Policy, None)
+            }
+            Err(_) => {
+                self.fail_closed_on_poisoned_state();
+                0
+            }
         }
-        self.pending_epoch.store(epoch, Ordering::Release);
-        self.policy_recovery_epoch.store(epoch, Ordering::Release);
-        epoch
     }
 
     /// Rebind the pending recovery identity when the stock client installs a
     /// slice that incorporates the active policy recovery (including a later
     /// discovery update on that same recovered baseline).
+    ///
+    /// Binds only the still-current policy recovery: a canceled (`None`) or
+    /// superseded (file-slice) pending state is left exactly as found, so a
+    /// late install can neither resurrect a canceled recovery nor overwrite a
+    /// newer candidate's identity.
     pub fn bind_installed_slice_if_policy_recovery(&self, slice: &MeshSlice) {
-        let epoch = self.policy_recovery_epoch.load(Ordering::Acquire);
-        if epoch == 0 || self.pending_epoch.load(Ordering::Acquire) != epoch {
+        let identity = slice_content_identity(slice);
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(_) => {
+                self.fail_closed_on_poisoned_state();
+                return;
+            }
+        };
+        let Some(pending) = state.pending else {
+            return;
+        };
+        if pending.kind != PendingRecoveryKind::Policy {
             return;
         }
-        match slice_content_identity(slice) {
+        match identity {
             MeshRevisionContentIdentity::Digest(digest) => {
-                if let Ok(mut guard) = self.pending_digest.lock() {
-                    *guard = Some(digest);
-                }
+                state.pending = Some(PendingRecovery {
+                    digest: Some(digest),
+                    ..pending
+                });
             }
             MeshRevisionContentIdentity::Unavailable => {
+                self.mark_rejected_locked(&mut state);
+                drop(state);
                 warn!(
                     "Stock policy recovery slice has uncomputable content identity; raising \
                      config_rejected because recovery cannot be proven"
                 );
-                self.mark_rejected();
             }
         }
     }
 
     /// Clear sticky rejection only when the proxy accepted the exact current
     /// pending recovery identity (Applied or content-identical no-op).
+    ///
+    /// The identity test and the clear share one critical section, so a newer
+    /// rejection or a newer candidate that linearizes first is already visible
+    /// and this (now stale) success declines.
     pub fn note_proxy_apply_success(&self, slice: &MeshSlice) {
-        let pending = self.pending_epoch.load(Ordering::Acquire);
-        if pending == 0 {
-            return;
-        }
-        let expected = match self.pending_digest.lock() {
-            Ok(guard) => *guard,
-            Err(_) => return,
-        };
-        let Some(expected) = expected else {
+        let MeshRevisionContentIdentity::Digest(digest) = slice_content_identity(slice) else {
+            // An unprovable identity can never prove a recovery; it is also not
+            // evidence of failure, so health is left untouched.
             return;
         };
-        match slice_content_identity(slice) {
-            MeshRevisionContentIdentity::Digest(digest) if digest == expected => {
-                if self.pending_epoch.load(Ordering::Acquire) != pending {
-                    return;
-                }
-                crate::modes::clear_config_rejected_after_accepted_full_reload(
-                    &self.config_rejected,
-                    "mesh local-source recovery",
-                );
-                self.pending_epoch.store(0, Ordering::Release);
-                self.policy_recovery_epoch.store(0, Ordering::Release);
-                if let Ok(mut guard) = self.pending_digest.lock() {
-                    *guard = None;
-                }
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(_) => {
+                self.fail_closed_on_poisoned_state();
+                return;
             }
-            _ => {}
+        };
+        let Some(pending) = state.pending else {
+            return;
+        };
+        if pending.digest != Some(digest) {
+            return;
         }
+        state.pending = None;
+        crate::modes::clear_config_rejected_after_accepted_full_reload(
+            &self.config_rejected,
+            "mesh local-source recovery",
+        );
     }
 
     /// Proxy rejection / quarantine of a pending recovery leaves degraded and
     /// cancels that pending clear.
+    ///
+    /// Only the still-current pending identity is cancelable: an older callback
+    /// whose candidate no longer matches the pending slot leaves a newer
+    /// recovery outstanding.
     pub fn note_proxy_apply_rejection(&self, slice: &MeshSlice) {
-        let pending = self.pending_epoch.load(Ordering::Acquire);
-        if pending == 0 {
-            return;
-        }
-        let expected = match self.pending_digest.lock() {
-            Ok(guard) => *guard,
+        let identity = slice_content_identity(slice);
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
             Err(_) => {
-                self.mark_rejected();
+                self.fail_closed_on_poisoned_state();
                 return;
             }
         };
-        let matches_pending = match (expected, slice_content_identity(slice)) {
+        let Some(pending) = state.pending else {
+            return;
+        };
+        let matches_pending = match (pending.digest, identity) {
             (Some(expected), MeshRevisionContentIdentity::Digest(digest)) => digest == expected,
-            // Unbound stock policy recovery (install not yet bound) still
-            // cancels when any apply under that epoch fails closed.
-            (None, _) => self.policy_recovery_epoch.load(Ordering::Acquire) == pending,
+            // An unbound stock policy recovery has no content identity yet, so
+            // any apply refused while it is the current pending state cancels it.
+            (None, _) => pending.kind == PendingRecoveryKind::Policy,
             _ => false,
         };
         if matches_pending {
-            self.mark_rejected();
+            self.mark_rejected_locked(&mut state);
         }
     }
 }

@@ -501,6 +501,151 @@ fn mesh_local_source_recovery_requires_proxy_accept_and_fences_generations() {
     assert_eq!(recovery.pending_epoch(), 0);
 }
 
+/// Rounds per concurrency regression. Each round forces one barrier-aligned
+/// interleaving of a stale callback against a newer transition; the asserted
+/// invariant holds in EVERY linearization, so a correct handshake can never
+/// fail a round while a torn (multi-atomic, check-then-act) handshake loses the
+/// invariant as soon as one round lands in its window.
+const RECOVERY_RACE_ROUNDS: usize = 512;
+
+#[test]
+fn concurrent_newer_rejection_and_stale_success_keep_local_source_health_degraded() {
+    use ferrum_edge::modes::mesh::config_consumer::file_source::MeshLocalSourceRecovery;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Barrier};
+
+    let path = write_temp("yaml", VALID_MESH_YAML);
+    let slice = load_mesh_slice_from_file(&path, request_for_namespace("ferrum")).unwrap();
+
+    // Race A: an older `note_proxy_apply_success` for the pending candidate runs
+    // concurrently with a NEWER `mark_rejected`. Both linearizations end
+    // degraded:
+    //   * rejection first — the now-stale success must not clear;
+    //   * success first  — it clears, then the newer rejection raises again.
+    // So `config_rejected` is true after every round, and no pending recovery
+    // survives. Without one transition authority the success's clear can land
+    // after the rejection and health silently reports healthy.
+    for round in 0..RECOVERY_RACE_ROUNDS {
+        let recovery = MeshLocalSourceRecovery::new(Arc::new(AtomicBool::new(false)));
+        recovery.mark_rejected();
+        assert!(
+            recovery.mark_slice_recovery_pending(&slice).is_some(),
+            "round {round}: candidate must become pending"
+        );
+
+        let barrier = Arc::new(Barrier::new(2));
+        let success = {
+            let recovery = Arc::clone(&recovery);
+            let barrier = Arc::clone(&barrier);
+            let slice = slice.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                recovery.note_proxy_apply_success(&slice);
+            })
+        };
+        let rejection = {
+            let recovery = Arc::clone(&recovery);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                recovery.mark_rejected();
+            })
+        };
+        success.join().expect("success callback thread");
+        rejection.join().expect("rejection thread");
+
+        assert!(
+            recovery.is_rejected(),
+            "round {round}: a stale success must never clear health after a newer failure"
+        );
+        assert_eq!(
+            recovery.pending_epoch(),
+            0,
+            "round {round}: a newer failure must leave no pending recovery"
+        );
+    }
+}
+
+#[test]
+fn concurrent_stale_rejection_and_newer_candidate_keep_the_newer_recovery() {
+    use ferrum_edge::modes::mesh::config_consumer::file_source::MeshLocalSourceRecovery;
+    use ferrum_edge::modes::mesh::slice::MeshSlice;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Barrier};
+
+    let path = write_temp("yaml", VALID_MESH_YAML);
+    let older = load_mesh_slice_from_file(&path, request_for_namespace("ferrum")).unwrap();
+    // Distinct CONTENT (not just `version`, which the content digest clears).
+    let newer = MeshSlice {
+        labels: [("recovery-race".to_string(), "newer".to_string())].into(),
+        ..older.clone()
+    };
+
+    // Race B: an older `note_proxy_apply_rejection` carrying the OLD pending
+    // identity runs concurrently with a NEWER candidate becoming pending. Both
+    // linearizations leave the newer recovery outstanding and clearable:
+    //   * candidate first — the stale rejection's identity no longer matches
+    //     the pending slot, so it cancels nothing;
+    //   * rejection first — it cancels the old pending, then the newer
+    //     candidate installs its own.
+    // A torn handshake tests the old identity and then cancels unconditionally,
+    // wiping the newer recovery so it can never clear health again.
+    for round in 0..RECOVERY_RACE_ROUNDS {
+        let recovery = MeshLocalSourceRecovery::new(Arc::new(AtomicBool::new(false)));
+        recovery.mark_rejected();
+        assert!(
+            recovery.mark_slice_recovery_pending(&older).is_some(),
+            "round {round}: older candidate must become pending"
+        );
+
+        let barrier = Arc::new(Barrier::new(2));
+        let rejection = {
+            let recovery = Arc::clone(&recovery);
+            let barrier = Arc::clone(&barrier);
+            let older = older.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                recovery.note_proxy_apply_rejection(&older);
+            })
+        };
+        let candidate = {
+            let recovery = Arc::clone(&recovery);
+            let barrier = Arc::clone(&barrier);
+            let newer = newer.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                recovery.mark_slice_recovery_pending(&newer)
+            })
+        };
+        rejection.join().expect("rejection callback thread");
+        assert!(
+            candidate
+                .join()
+                .expect("candidate thread")
+                .is_some_and(|epoch| epoch != 0),
+            "round {round}: the newer candidate must always become pending"
+        );
+
+        assert_ne!(
+            recovery.pending_epoch(),
+            0,
+            "round {round}: a stale rejection must not cancel a newer pending recovery"
+        );
+        // The surviving pending recovery is the NEWER one: accepting exactly it
+        // clears sticky health in both linearizations.
+        recovery.note_proxy_apply_success(&newer);
+        assert!(
+            !recovery.is_rejected(),
+            "round {round}: proxy acceptance of the newer recovery must clear health"
+        );
+        assert_eq!(
+            recovery.pending_epoch(),
+            0,
+            "round {round}: the clear consumes the pending recovery"
+        );
+    }
+}
+
 #[test]
 fn stock_policy_recovery_pending_until_bound_slice_proxy_accept() {
     use ferrum_edge::modes::mesh::config_consumer::file_source::{
