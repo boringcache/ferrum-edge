@@ -306,7 +306,13 @@ fn grpc_jwt_debug_never_renders_token_file_path_or_secret() {
     let secret = GrpcJwtSecret::new("super-secret-value-never-in-debug".to_string())
         .with_token_file(Some("/run/secrets/cp-token-sentinel".to_string()));
     let rendered = format!("{secret:?}");
-    assert!(!rendered.contains("super-secret-value-never-in-debug"), "{rendered}");
+    assert!(
+        !rendered.contains("super-secret-value-never-in-debug"),
+        "{rendered}"
+    );
     assert!(!rendered.contains("cp-token-sentinel"), "{rendered}");
-    assert!(rendered.contains("token_file_configured: true"), "{rendered}");
+    assert!(
+        rendered.contains("token_file_configured: true"),
+        "{rendered}"
+    );
 }

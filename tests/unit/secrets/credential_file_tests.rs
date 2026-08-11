@@ -79,21 +79,30 @@ fn exact_limit_loads_and_limit_plus_one_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let exact = dir.path().join("exact");
     std::fs::write(&exact, vec![b'a'; LIMIT]).unwrap();
-    let got =
-        read_credential_file(exact.to_str().unwrap(), LIMIT, CredentialTrim::TrailingWhitespace)
-            .expect("exact");
+    let got = read_credential_file(
+        exact.to_str().unwrap(),
+        LIMIT,
+        CredentialTrim::TrailingWhitespace,
+    )
+    .expect("exact");
     assert_eq!(got.len(), LIMIT);
 
     let over = dir.path().join("over");
     std::fs::write(&over, vec![b'b'; LIMIT + 1]).unwrap();
-    let error =
-        read_credential_file(over.to_str().unwrap(), LIMIT, CredentialTrim::TrailingWhitespace)
-            .expect_err("limit+1");
+    let error = read_credential_file(
+        over.to_str().unwrap(),
+        LIMIT,
+        CredentialTrim::TrailingWhitespace,
+    )
+    .expect_err("limit+1");
     match error {
         CredentialFileError::Oversized { max_bytes } => assert_eq!(max_bytes, LIMIT),
         other => panic!("expected Oversized, got {other}"),
     }
-    assert_no_leak(&error.to_string(), &[over.to_str().unwrap(), &"b".repeat(LIMIT + 1)]);
+    assert_no_leak(
+        &error.to_string(),
+        &[over.to_str().unwrap(), &"b".repeat(LIMIT + 1)],
+    );
 }
 
 #[test]
@@ -155,8 +164,8 @@ fn sparse_large_file_is_rejected_without_full_allocation() {
         }
     };
     assert!(before > LIMIT as u64);
-    let error =
-        read_credential_file(path.to_str().unwrap(), LIMIT, CredentialTrim::Ends).expect_err("sparse");
+    let error = read_credential_file(path.to_str().unwrap(), LIMIT, CredentialTrim::Ends)
+        .expect_err("sparse");
     assert!(matches!(
         error,
         CredentialFileError::Oversized { max_bytes: LIMIT }
@@ -264,7 +273,10 @@ fn projected_secret_symlink_and_atomic_target_rotation() {
 fn missing_path_errors_are_source_redacted() {
     let missing = "/nonexistent/ferrum-credential-source-sentinel";
     let error = read_credential_file(missing, LIMIT, CredentialTrim::Ends).expect_err("missing");
-    assert_no_leak(&error.to_string(), &["ferrum-credential-source-sentinel", missing]);
+    assert_no_leak(
+        &error.to_string(),
+        &["ferrum-credential-source-sentinel", missing],
+    );
 }
 
 #[test]
@@ -309,7 +321,10 @@ fn detached_file_secret_rejects_non_regular_without_stall() {
         .unwrap();
     let dir = tempfile::tempdir().unwrap();
     let error = rt
-        .block_on(read_secret_detached(dir.path().to_str().unwrap(), "DIR_KEY"))
+        .block_on(read_secret_detached(
+            dir.path().to_str().unwrap(),
+            "DIR_KEY",
+        ))
         .expect_err("directory");
     assert!(error.contains("DIR_KEY_FILE"));
     assert_no_leak(&error, &[dir.path().to_str().unwrap()]);

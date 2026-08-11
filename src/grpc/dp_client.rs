@@ -327,8 +327,12 @@ fn read_external_cp_token_file(path: &str) -> Result<String, anyhow::Error> {
         CredentialTrim, DEFAULT_CREDENTIAL_FILE_MAX_BYTES, read_credential_file,
     };
     // Neither the token nor its source path is logged or echoed into an error.
-    read_credential_file(path, DEFAULT_CREDENTIAL_FILE_MAX_BYTES, CredentialTrim::Ends)
-        .map_err(map_external_cp_token_error)
+    read_credential_file(
+        path,
+        DEFAULT_CREDENTIAL_FILE_MAX_BYTES,
+        CredentialTrim::Ends,
+    )
+    .map_err(map_external_cp_token_error)
 }
 
 async fn read_external_cp_token_file_detached(path: &str) -> Result<String, anyhow::Error> {
@@ -1665,7 +1669,9 @@ async fn connect_and_subscribe_with_startup_ready_inner(
     // claim — it never restricts the back-compat path.
     // External token files are read off-worker via mint_async (detached thread
     // + shared bounded regular-file reader). Never call sync mint() here.
-    let auth_token = jwt_secret.mint_async(node_id, Some(namespace), None).await?;
+    let auth_token = jwt_secret
+        .mint_async(node_id, Some(namespace), None)
+        .await?;
     if jwt_secret.uses_external_token() {
         info!(
             "Presenting externally issued CP/DP token from FERRUM_DP_CP_GRPC_TOKEN_FILE \

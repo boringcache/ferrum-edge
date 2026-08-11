@@ -48,17 +48,13 @@ pub enum CredentialFileError {
     /// Opened descriptor is not a regular file (FIFO, socket, device, dir, …).
     NotRegularFile,
     /// Content exceeded `max_bytes` (metadata precheck or limit+1 read).
-    Oversized {
-        max_bytes: usize,
-    },
+    Oversized { max_bytes: usize },
     /// Bytes were not valid UTF-8.
     InvalidUtf8,
     /// Empty after applying the trim policy.
     Empty,
     /// Caller requested a zero or above-hard-max ceiling.
-    InvalidLimit {
-        max_bytes: usize,
-    },
+    InvalidLimit { max_bytes: usize },
 }
 
 impl std::fmt::Display for CredentialFileError {
@@ -215,12 +211,12 @@ pub async fn read_credential_file_detached(
     // open/read must not pin runtime teardown after the caller's timeout.
     drop(join_handle);
 
-    receiver
-        .await
-        .map_err(|_| CredentialFileError::Io(std::io::Error::new(
+    receiver.await.map_err(|_| {
+        CredentialFileError::Io(std::io::Error::new(
             std::io::ErrorKind::BrokenPipe,
             "credential file read ended without producing a result",
-        )))?
+        ))
+    })?
 }
 
 /// Test-only helper: write `bytes` then extend the file to `logical_len` so the
