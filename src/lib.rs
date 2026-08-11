@@ -983,6 +983,50 @@ pub mod _test_support {
         }
     }
 
+    /// Override discovery body ceilings for issue #3718/#3720 external tests.
+    pub fn override_discovery_body_limits_for_test(
+        limits: crate::config::env_config::DiscoveryBodyLimits,
+    ) -> Result<(), String> {
+        crate::service_discovery::http_body::override_discovery_body_limits_for_test(limits)
+    }
+
+    /// Clear a discovery body ceiling test override.
+    pub fn clear_discovery_body_limits_override_for_test() {
+        crate::service_discovery::http_body::clear_discovery_body_limits_override_for_test()
+    }
+
+    /// Bytes currently charged against the discovery body shared budget.
+    pub fn discovery_body_budget_used_for_test() -> usize {
+        crate::service_discovery::http_body::discovery_body_budget_used_for_test()
+    }
+
+    /// Configured discovery body shared budget ceiling.
+    pub fn discovery_body_budget_max_for_test() -> usize {
+        crate::service_discovery::http_body::discovery_body_budget_max_for_test()
+    }
+
+    /// Collect a discovery HTTP response through the production bounded collector.
+    pub async fn collect_discovery_response_body_for_test(
+        response: reqwest::Response,
+        success: bool,
+    ) -> Result<usize, &'static str> {
+        use crate::service_discovery::http_body::{
+            DiscoveryBodyError, DiscoveryBodyRole, collect_discovery_response_body,
+        };
+        let role = if success {
+            DiscoveryBodyRole::Success
+        } else {
+            DiscoveryBodyRole::Error
+        };
+        match collect_discovery_response_body(response, role).await {
+            Ok(body) => Ok(body.as_slice().len()),
+            Err(DiscoveryBodyError::Oversized) => Err("response_oversized"),
+            Err(DiscoveryBodyError::BudgetExhausted) => Err("body_budget_rejected"),
+            Err(DiscoveryBodyError::ReadFailed) => Err("body_read_failed"),
+            Err(DiscoveryBodyError::AmbiguousContentLength) => Err("ambiguous_content_length"),
+        }
+    }
+
     /// Rebuild a request-epoch store at a specific LB generation so publication
     /// overflow (and therefore publication failure) can be exercised.
     pub fn request_epoch_store_with_lb_generation_for_test(
@@ -997,6 +1041,7 @@ pub mod _test_support {
             plugin_cache: std::sync::Arc::clone(&current.plugin_cache),
             consumer_index: std::sync::Arc::clone(&current.consumer_index),
             load_balancer: std::sync::Arc::clone(&current.load_balancer),
+            gateway_listener_admission: std::sync::Arc::clone(&current.gateway_listener_admission),
             config_generation: current.config_generation,
             route_generation: current.route_generation,
             lb_generation,
@@ -8695,6 +8740,21 @@ pub mod _test_support {
 
     // ── node-agent eBPF startup-rollback seams (issue #2371) ─────────────────
     pub type NodeAgentStartupCleanupProbe = node_agent_cleanup_seams::NodeAgentStartupCleanupProbe;
+
+    /// Drive the production node-agent admin HTTP/HTTPS listener planner
+    /// (issue #3704) from external unit/integration tests.
+    pub async fn start_node_agent_admin_listeners_for_test(
+        env_config: &crate::config::EnvConfig,
+        shutdown_tx: &tokio::sync::watch::Sender<bool>,
+        startup_ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<Vec<tokio::task::JoinHandle<()>>, anyhow::Error> {
+        crate::modes::node_agent::start_node_agent_admin_listeners_for_test(
+            env_config,
+            shutdown_tx,
+            startup_ready,
+        )
+        .await
+    }
 
     /// Post-`load_programs` initialization failure must roll back BPF state.
     pub fn node_agent_post_load_init_failure_cleanup_probe_for_test() -> NodeAgentStartupCleanupProbe

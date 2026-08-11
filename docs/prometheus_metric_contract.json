@@ -3183,6 +3183,18 @@
     "emission": "always"
   },
   {
+    "name": "ferrum_service_discovery_body_budget_rejected_total",
+    "type": "counter",
+    "help": "Service-discovery HTTP responses rejected because the concurrent body budget was exhausted.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "service_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
     "name": "ferrum_service_discovery_cursor_advance_total",
     "type": "counter",
     "help": "Service-discovery blocking-query cursor advances after an admitted higher-index snapshot.",
@@ -3207,9 +3219,33 @@
     "emission": "always"
   },
   {
+    "name": "ferrum_service_discovery_malformed_envelope_total",
+    "type": "counter",
+    "help": "Service-discovery Kubernetes EndpointSliceList envelopes rejected as malformed.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "service_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
     "name": "ferrum_service_discovery_provider_normalization_rejected_total",
     "type": "counter",
     "help": "Service-discovery snapshots rejected because every provider catalog entry failed provider normalization.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "service_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_service_discovery_response_oversized_total",
+    "type": "counter",
+    "help": "Service-discovery HTTP responses rejected for oversized or ambiguous body bounds.",
     "labels": [
       "namespace"
     ],
