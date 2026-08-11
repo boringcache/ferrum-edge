@@ -2403,6 +2403,68 @@
     "emission": "conditional"
   },
   {
+    "name": "ferrum_mesh_workload_api_active_connections",
+    "type": "gauge",
+    "help": "SPIFFE Workload API connections currently admitted by the transport admission boundary.",
+    "labels": [
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_workload_api_active_rpcs",
+    "type": "gauge",
+    "help": "SPIFFE Workload API RPCs currently admitted by the service-wide concurrency ceiling.",
+    "labels": [
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_workload_api_connections_closed_total",
+    "type": "counter",
+    "help": "Established SPIFFE Workload API connections closed by a transport deadline or the bounded shutdown force-close, by fixed reason.",
+    "labels": [
+      "reason",
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_workload_api_connections_rejected_total",
+    "type": "counter",
+    "help": "SPIFFE Workload API connections refused before any tonic allocation, by fixed admission reason.",
+    "labels": [
+      "reason",
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_workload_api_rpcs_rejected_total",
+    "type": "counter",
+    "help": "SPIFFE Workload API RPCs shed by the service-wide concurrency ceiling before any producer work was spawned.",
+    "labels": [
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
     "name": "ferrum_node_agent_attach_errors_total",
     "type": "counter",
     "help": "Node-agent BPF attachment or map update errors.",

@@ -58,11 +58,12 @@ use async_trait::async_trait;
 use std::collections::{BTreeMap, HashMap};
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, watch};
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
 use tracing::{debug, error, warn};
 
+use super::admission::{PermitStream, RpcPermit};
 use super::latest_wins::{self, LatestWinsSender};
 use super::proto::spiffe_workload_api_server::{SpiffeWorkloadApi, SpiffeWorkloadApiServer};
 use super::proto::{
@@ -176,6 +177,10 @@ pub struct WorkloadApiService {
     /// tonic's graceful server shutdown is not held open forever by the
     /// deliberately long-lived Workload API streams.
     service_shutdown: Option<watch::Receiver<bool>>,
+    /// Service-wide concurrent-RPC ceiling (issue #3758). `None` for a service
+    /// constructed directly — the listener always attaches one, so the served
+    /// surface is never unbounded.
+    rpc_limit: Option<Arc<Semaphore>>,
 }
 
 impl WorkloadApiService {
@@ -195,6 +200,7 @@ impl WorkloadApiService {
             federated_trust_domains: Vec::new(),
             jwt_svid_ttl_secs: DEFAULT_JWT_SVID_TTL_SECS,
             service_shutdown: None,
+            rpc_limit: None,
         }
     }
 
@@ -214,6 +220,7 @@ impl WorkloadApiService {
             federated_trust_domains: Vec::new(),
             jwt_svid_ttl_secs: DEFAULT_JWT_SVID_TTL_SECS,
             service_shutdown: None,
+            rpc_limit: None,
         }
     }
 
@@ -280,6 +287,51 @@ impl WorkloadApiService {
     pub fn with_service_shutdown(mut self, shutdown: watch::Receiver<bool>) -> Self {
         self.service_shutdown = Some(shutdown);
         self
+    }
+
+    /// Apply the service-wide concurrent-RPC ceiling (issue #3758).
+    ///
+    /// The transport bounds connections and per-connection streams; this bounds
+    /// the product. Without it, `max_connections * max_concurrent_streams`
+    /// simultaneous RPCs — each with its own attestation, CA issuance, rotation
+    /// subscription, and producer task — is the reachable worst case, and the
+    /// per-RPC protections in this module all begin *after* admission.
+    ///
+    /// Attached by [`super::listener::serve_workload_api_with_admission`], so
+    /// the served surface always carries one; a service constructed directly by
+    /// a test or another caller is left unlimited rather than silently
+    /// acquiring a bound it did not ask for.
+    pub fn with_max_concurrent_rpcs(mut self, max_concurrent_rpcs: usize) -> Self {
+        self.rpc_limit = Some(Arc::new(Semaphore::new(max_concurrent_rpcs.max(1))));
+        self
+    }
+
+    /// Take a service-wide RPC permit, or shed the call.
+    ///
+    /// **Never waits.** A permit that is unavailable is answered
+    /// `RESOURCE_EXHAUSTED` right away, so an over-limit caller cannot grow an
+    /// unbounded queue of pending RPCs behind the ceiling — the queue is itself
+    /// the resource exhaustion the ceiling exists to prevent, and a queued
+    /// identity request that is eventually served far too late is worse than a
+    /// refusal the client can retry.
+    ///
+    /// Called at the very top of every RPC, before metadata validation,
+    /// attestation, CA work, or any spawned producer, so a shed call costs the
+    /// dispatch and nothing else.
+    fn admit_rpc(&self) -> Result<Option<RpcPermit>, Status> {
+        let Some(limit) = self.rpc_limit.as_ref() else {
+            return Ok(None);
+        };
+        match Arc::clone(limit).try_acquire_owned() {
+            Ok(permit) => Ok(Some(RpcPermit::new(permit))),
+            Err(_) => {
+                crate::plugins::mesh::prometheus_helpers::increment_workload_api_rpc_rejected();
+                debug!("SPIFFE Workload API RPC shed: service-wide concurrency ceiling saturated");
+                Err(Status::resource_exhausted(
+                    "the Workload API is at its concurrent-request ceiling; retry shortly",
+                ))
+            }
+        }
     }
 
     pub fn rotation_signal(&self) -> &Arc<watch::Sender<u64>> {
@@ -724,6 +776,9 @@ impl SpiffeWorkloadApi for WorkloadApiService {
         &self,
         request: Request<X509svidRequest>,
     ) -> Result<Response<Self::FetchX509SVIDStream>, Status> {
+        // Service-wide admission first: a shed call must not run attestation,
+        // mint an SVID, or spawn a rotation producer.
+        let rpc_permit = self.admit_rpc()?;
         Self::validate_workload_metadata(&request)?;
         // Retain PeerInfo for the lifetime of the stream so each rotation
         // re-runs the authoritative attestor/entitlement checks rather than
@@ -789,7 +844,14 @@ impl SpiffeWorkloadApi for WorkloadApiService {
             }
         });
 
-        Ok(Response::new(Box::pin(out_rx.into_stream())))
+        // The permit rides the response stream, so it is held for exactly as
+        // long as the producer task, rotation subscription, and pending
+        // private-key slot exist — and is released by a client disconnect or a
+        // cancelled task just as by a clean end.
+        Ok(Response::new(Box::pin(PermitStream::new(
+            out_rx.into_stream(),
+            rpc_permit,
+        ))))
     }
 
     type FetchX509BundlesStream =
@@ -799,6 +861,7 @@ impl SpiffeWorkloadApi for WorkloadApiService {
         &self,
         request: Request<X509BundlesRequest>,
     ) -> Result<Response<Self::FetchX509BundlesStream>, Status> {
+        let rpc_permit = self.admit_rpc()?;
         // Bundle-only entitlement policy (explicit): this RPC returns public
         // CA trust material only — never private keys — so it does not run
         // the attestor chain. Callers still must present the mandatory
@@ -848,13 +911,18 @@ impl SpiffeWorkloadApi for WorkloadApiService {
             }
         });
 
-        Ok(Response::new(Box::pin(out_rx.into_stream())))
+        Ok(Response::new(Box::pin(PermitStream::new(
+            out_rx.into_stream(),
+            rpc_permit,
+        ))))
     }
 
     async fn fetch_jwtsvid(
         &self,
         request: Request<JwtsvidRequest>,
     ) -> Result<Response<JwtsvidResponse>, Status> {
+        // Held for the whole handler: a unary mint is bounded by its own body.
+        let _rpc_permit = self.admit_rpc()?;
         Self::validate_workload_metadata(&request)?;
         // The subject is the *attested* identity, never a caller claim. Run
         // the attestor chain before looking at the payload so an unattested
@@ -913,6 +981,7 @@ impl SpiffeWorkloadApi for WorkloadApiService {
         &self,
         request: Request<JwtBundlesRequest>,
     ) -> Result<Response<Self::FetchJWTBundlesStream>, Status> {
+        let rpc_permit = self.admit_rpc()?;
         // Same entitlement policy as `FetchX509Bundles`: public trust material
         // only, so the mandatory metadata header is required but the attestor
         // chain is not run. Private key material stays exclusive to
@@ -981,13 +1050,17 @@ impl SpiffeWorkloadApi for WorkloadApiService {
             }
         });
 
-        Ok(Response::new(Box::pin(out_rx.into_stream())))
+        Ok(Response::new(Box::pin(PermitStream::new(
+            out_rx.into_stream(),
+            rpc_permit,
+        ))))
     }
 
     async fn validate_jwtsvid(
         &self,
         request: Request<ValidateJwtsvidRequest>,
     ) -> Result<Response<ValidateJwtsvidResponse>, Status> {
+        let _rpc_permit = self.admit_rpc()?;
         // Validation consumes only public trust material and mints nothing,
         // so — like the bundle RPCs — it requires the mandatory metadata
         // header but not the attestor chain.
