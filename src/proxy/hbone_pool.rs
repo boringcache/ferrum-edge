@@ -3612,7 +3612,10 @@ mod tests {
 
         let connect = HbonePoolError::Connect {
             addr: "10.0.0.1:15008".to_string(),
-            source: std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "connection refused"),
+            source: std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "connection refused",
+            ),
         };
         assert!(
             connect.is_capability_failure(),
