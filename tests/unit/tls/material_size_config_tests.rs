@@ -90,5 +90,5 @@ fn hard_maximum_is_finite_and_equals_the_default() {
         DEFAULT_TLS_MAX_MATERIAL_SIZE_BYTES, HARD_MAX_TLS_MAX_MATERIAL_SIZE_BYTES,
         "default and hard maximum stay aligned so operators cannot raise past PEM parse admission"
     );
-    assert!(HARD_MAX_TLS_MAX_MATERIAL_SIZE_BYTES < usize::MAX / 2);
+    const { assert!(HARD_MAX_TLS_MAX_MATERIAL_SIZE_BYTES < usize::MAX / 2) };
 }

@@ -123,7 +123,7 @@ fn non_regular_fifo_is_terminated_by_the_streaming_byte_budget() {
             .expect("open fifo writer");
         // limit+1 stays within ordinary pipe capacity; tolerate BrokenPipe if
         // the bounded reader closes after limit+1 before the write completes.
-        match file.write_all(&vec![b'f'; LIMIT + 1]) {
+        match file.write_all(&[b'f'; LIMIT + 1]) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {}
             Err(error) => panic!("unexpected fifo writer error: {error}"),
@@ -527,7 +527,7 @@ fn default_ceiling_is_finite_production_posture() {
         DEFAULT_TLS_MAX_MATERIAL_SIZE_BYTES,
         HARD_MAX_TLS_MAX_MATERIAL_SIZE_BYTES
     );
-    assert!(DEFAULT_TLS_MAX_MATERIAL_SIZE_BYTES > 0);
+    const { assert!(DEFAULT_TLS_MAX_MATERIAL_SIZE_BYTES > 0) };
     let rejected = ferrum_edge::config::env_config::parse_tls_max_material_size_bytes(Some("0"))
         .expect_err("0 must fail closed");
     assert!(rejected.contains("not unlimited"));
