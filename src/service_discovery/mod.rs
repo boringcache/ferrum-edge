@@ -157,6 +157,7 @@ impl DiscoverySnapshot {
     }
 
     /// Provider-normalized targets (before shared host/egress admission).
+    #[allow(dead_code)] // exercised by external tests; dead in the binary target
     pub fn targets(&self) -> &[UpstreamTarget] {
         &self.targets
     }
