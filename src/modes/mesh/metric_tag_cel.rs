@@ -365,6 +365,7 @@ impl<'a> MetricTagCelContext<'a> {
             MetricTagCelAttr::RequestHost => self.request_host.filter(|v| !v.is_empty()),
             MetricTagCelAttr::ResponseCode | MetricTagCelAttr::DestinationPort => None,
         }
+        .filter(|value| !value.is_empty())
     }
 
     pub fn int_attr(&self, attr: MetricTagCelAttr) -> Option<u16> {

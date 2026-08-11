@@ -166,6 +166,50 @@ async fn cel_reads_original_attribution_not_prior_label_mutations() {
 }
 
 #[tokio::test]
+async fn cel_cannot_read_a_label_removed_earlier_in_the_override_plan() {
+    let workload_metrics = WorkloadMetrics::new(&json!({
+        "metrics": {
+            "tag_overrides": [{
+                "metric": "REQUEST_COUNT",
+                "name": "source_principal",
+                "operation": {"type": "remove"}
+            }, {
+                "metric": "REQUEST_COUNT",
+                "name": "source_app",
+                "operation": {
+                    "type": "set_expr",
+                    "cel": "has(source.principal) ? source.principal : \"redacted\""
+                }
+            }]
+        }
+    }))
+    .expect("ordered remove and CEL override");
+
+    let mut ctx = RequestContext::new("10.0.0.2".into(), "GET".into(), "/".into());
+    let mut headers = HashMap::new();
+    workload_metrics.before_proxy(&mut ctx, &mut headers).await;
+
+    let registry = MetricsRegistry::new();
+    let summary = TransactionSummary {
+        http_method: "GET".into(),
+        response_status_code: 200,
+        metadata: mesh_identity_metadata(ctx.metadata),
+        ..TransactionSummary::default()
+    };
+    registry.record(&summary);
+    let counter = registry
+        .render_uncached()
+        .lines()
+        .find(|line| line.starts_with("ferrum_mesh_requests_total{"))
+        .expect("mesh request counter")
+        .to_string();
+
+    assert!(!counter.contains("source_principal="), "{counter}");
+    assert!(counter.contains(r#"source_app="redacted""#), "{counter}");
+    assert!(!counter.contains("spiffe://"), "{counter}");
+}
+
+#[tokio::test]
 async fn missing_cel_attribute_emits_empty_label_not_invented_data() {
     let workload_metrics = WorkloadMetrics::new(&json!({
         "metrics": {
