@@ -124,33 +124,12 @@ pub const MIN_TLS_MAX_MATERIAL_SIZE_BYTES: usize = 1;
 /// admission bound.
 pub const HARD_MAX_TLS_MAX_MATERIAL_SIZE_BYTES: usize = 4 * 1024 * 1024;
 
-/// Effective TLS material source byte ceiling
-/// (`FERRUM_TLS_MAX_MATERIAL_SIZE_BYTES`).
+/// Pure parse/validation for `FERRUM_TLS_MAX_MATERIAL_SIZE_BYTES`.
 ///
-/// Prefer the immutable runtime snapshot installed by [`EnvConfig`] when
-/// present. Otherwise parse through the same pure helper EnvConfig uses so
-/// free/helper parsing cannot disagree with the configured field.
-///
-/// Absent selects the documented default. Values above the hard maximum clamp
-/// down. `0` and other values below the minimum are rejected with a stable,
-/// setting-named, secret-free error. A malformed value is an error (never a
-/// silent fallback to unlimited or to the default). EnvConfig install accepts
-/// an identical repeated ceiling and fails closed on a mismatching repeated
-/// value so the process cannot retain a field that disagrees with loaders.
-#[allow(dead_code)] // Public env seam; race-free tests use parse_tls_max_material_size_bytes.
-pub fn tls_max_material_size_bytes_from_env() -> Result<usize, String> {
-    if let Some(max_bytes) = crate::tls::source::installed_tls_max_material_size_bytes() {
-        return Ok(max_bytes);
-    }
-    parse_tls_max_material_size_bytes(
-        crate::config::conf_file::resolve_ferrum_var(TLS_MAX_MATERIAL_SIZE_BYTES_KEY).as_deref(),
-    )
-}
-
-/// Pure parse/validation half of [`tls_max_material_size_bytes_from_env`].
-///
-/// `None` means the key is configured nowhere. External unit tests drive this
-/// helper so they do not race other suites on the process environment.
+/// Used by [`EnvConfig`] and [`crate::tls::source::effective_tls_max_material_size_bytes`]
+/// when no runtime snapshot is installed. `None` means the key is configured
+/// nowhere. External unit tests call this helper directly so they do not race
+/// other suites on the process environment.
 pub fn parse_tls_max_material_size_bytes(raw: Option<&str>) -> Result<usize, String> {
     let value = match raw {
         None => return Ok(DEFAULT_TLS_MAX_MATERIAL_SIZE_BYTES),

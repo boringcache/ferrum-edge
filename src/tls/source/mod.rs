@@ -803,8 +803,8 @@ pub fn effective_tls_max_material_size_bytes() -> Result<usize, MaterialError> {
     if let Some(max_bytes) = installed_tls_max_material_size_bytes() {
         return Ok(max_bytes);
     }
-    // Parse without consulting the snapshot helper to avoid recursion through
-    // `tls_max_material_size_bytes_from_env` (which prefers the snapshot).
+    // Shared EnvConfig/free-loader parse path; tests call
+    // `parse_tls_max_material_size_bytes` directly for race-free env isolation.
     crate::config::env_config::parse_tls_max_material_size_bytes(
         crate::config::conf_file::resolve_ferrum_var(
             crate::config::env_config::TLS_MAX_MATERIAL_SIZE_BYTES_KEY,
@@ -815,13 +815,6 @@ pub fn effective_tls_max_material_size_bytes() -> Result<usize, MaterialError> {
         source_id: "tls-material-size".to_string(),
         details,
     })
-}
-
-/// Reject `len` when it exceeds the effective TLS material byte ceiling.
-#[allow(dead_code)] // Snapshot-wrapper seam; explicit ceilings use enforce_material_byte_limit_with.
-pub fn enforce_material_byte_limit(len: usize, kind: MaterialKind) -> Result<(), MaterialError> {
-    let max_bytes = effective_tls_max_material_size_bytes()?;
-    enforce_material_byte_limit_with(len, kind, max_bytes)
 }
 
 /// Reject `len` when it exceeds an explicit TLS material byte ceiling.
