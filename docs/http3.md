@@ -234,11 +234,13 @@ mesh-tagged target re-dials over that target's own dial plan (never the previous
 target's session), and rotating onto an undispatchable one fails closed. The
 half-open circuit-breaker probe slot a refusal consumes is released.
 
-The H3→HTTP plain bridge, plain requests selected for the native H3 backend
-pool, and the H3 WebSocket bridge are unchanged and still refuse **any**
-mesh-tagged target before dialing: plain HTTP gets a 502 with
-`gateway-error-reason`, and the WebSocket bridge refuses the upgrade with the
-same 502 shape.
+The H3→HTTP plain bridge and the H3 WebSocket bridge share the same HBONE /
+Sidecar mesh-mTLS egress pools the H1/H2 paths use (issue #3620). Mesh-tagged
+targets are forced off the native QUIC pool onto those bridges; Unix-socket
+targets remain refused because H3 has no Unix dialer. Mixed-upstream retry
+rotation skips H3-ineligible candidates (Unix) and fails closed when no
+eligible secured or plain transport remains — there is never a plaintext
+fallback for a mesh-tagged target.
 
 ## Buffering policy
 

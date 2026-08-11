@@ -13487,7 +13487,7 @@ fn backend_url_authority_host_is(url: &str, host: &str) -> bool {
 /// not depend on its callers for the property it exists to provide. Bracketed
 /// IPv6 is unaffected: the closing `]` is part of the rendered host, so the
 /// remainder is `` or `:{port}` exactly as for a DNS name.
-fn rewrite_backend_url_authority_host(url: &str, from_host: &str, to_host: &str) -> String {
+pub(crate) fn rewrite_backend_url_authority_host(url: &str, from_host: &str, to_host: &str) -> String {
     let Some(scheme_end) = url.find("://") else {
         return url.to_string();
     };
@@ -13862,7 +13862,7 @@ pub(crate) enum WsBackendHandshake {
 }
 
 impl WsBackendHandshake {
-    fn negotiated_subprotocol(&self) -> Option<&hyper::header::HeaderValue> {
+    pub(crate) fn negotiated_subprotocol(&self) -> Option<&hyper::header::HeaderValue> {
         match self {
             Self::Direct(handshake) => handshake.negotiated_subprotocol.as_ref(),
             Self::Mesh(handshake) => handshake.negotiated_subprotocol.as_ref(),
@@ -14074,7 +14074,7 @@ pub(crate) async fn connect_websocket_backend(
 /// The mesh egress transport a WebSocket upgrade should ride, derived from the
 /// LB-selected upstream target's tags. `None` means the target is not mesh-egress
 /// tagged, so the ordinary direct TCP/TLS WebSocket path is used.
-enum MeshWsEgress {
+pub(crate) enum MeshWsEgress {
     /// Sidecar SVID-mTLS (`mesh.mtls`): dial the peer sidecar's inbound mTLS
     /// listener over a fresh mesh-mTLS H2 connection and RFC 8441 Extended
     /// CONNECT (Sidecar materializes inbound WS routes).
@@ -14098,7 +14098,9 @@ enum MeshWsEgress {
 /// WebSocket analogue of the `supports_mesh_mtls_backend` / `can_attempt_hbone_backend`
 /// fail-closed contract, but the SVID/capability check is deferred to the dial
 /// because returning `None` here would route to the plaintext path.
-fn websocket_mesh_egress(target: &UpstreamTarget) -> Option<MeshWsEgress> {
+///
+/// Shared by the H1/H2 WebSocket path and the H3 WebSocket bridge (issue #3620).
+pub(crate) fn websocket_mesh_egress(target: &UpstreamTarget) -> Option<MeshWsEgress> {
     // HBONE is checked FIRST so a corrupted target carrying BOTH transport tags
     // (`mesh.hbone` + `mesh.mtls`) resolves to the Ambient branch, mirroring the
     // gRPC classifier's HBONE-wins precedence (`classify_grpc_mesh_dispatch`).
@@ -14161,8 +14163,10 @@ fn websocket_mesh_egress(target: &UpstreamTarget) -> Option<MeshWsEgress> {
 /// absent/invalid pinned identity, a peer that never negotiated Extended CONNECT
 /// (Sidecar), or a relay/handshake failure (Ambient) errors instead of falling
 /// back to a plaintext dial.
+///
+/// Shared by the H1/H2 WebSocket path and the H3 WebSocket bridge (issue #3620).
 #[allow(clippy::too_many_arguments)]
-async fn connect_mesh_websocket_backend(
+pub(crate) async fn connect_mesh_websocket_backend(
     state: &ProxyState,
     proxy: &Proxy,
     target: &UpstreamTarget,
@@ -35805,6 +35809,105 @@ async fn proxy_to_backend_mesh_retry(
         request_body_exceeded,
         proxy.backend_read_timeout_ms,
     )
+}
+
+/// Whether a plain-HTTP / WebSocket H3 attempt must ride a mesh egress
+/// transport for `target` (issue #3620).
+///
+/// True for Sidecar `mesh.mtls` and Ambient `mesh.hbone` (including
+/// cross-cluster). Unix-socket targets are NOT mesh egress here — they are
+/// refused by [`backend_dispatch::h3_bridge_transport_refusal`].
+pub(crate) fn target_requires_http_mesh_egress(target: &UpstreamTarget) -> bool {
+    hbone_pool::target_hbone_enabled(target)
+        || mesh_mtls_pool::target_mesh_mtls_enabled(target)
+}
+
+/// Dispatch a buffered plain-HTTP attempt over the mesh transport required by
+/// `upstream_target` (HBONE or Sidecar mesh-mTLS).
+///
+/// Shared by the H3→HTTP plain bridge and the native-H3 buffered retry
+/// rotation when they land on a mesh-tagged target (issue #3620). Reuses the
+/// same `proxy_to_backend_hbone` / `proxy_to_backend_mesh_mtls` security
+/// plumbing as H1/H2 — identity pinning, pool keys, east-west SNI/trust-
+/// domain scope, and fail-closed refusal when the secured transport cannot
+/// materialize. Never falls back to a plaintext direct dial.
+///
+/// Request bodies are always replayable (`MeshClientRequestBody::Replayable`)
+/// because the H3 frontend does not expose a hyper `Incoming` body. Responses
+/// are collected buffered so the H3 writer can reuse the existing plain
+/// response pipeline.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn proxy_h3_plain_http_mesh_buffered(
+    state: &ProxyState,
+    proxy: &Proxy,
+    backend_url: &str,
+    method: &str,
+    headers: &HashMap<String, String>,
+    body: Bytes,
+    upstream_target: &UpstreamTarget,
+    plugins: &[Arc<dyn Plugin>],
+    request_ctx: &RequestContext,
+    client_ip: &str,
+    xff_append_ip: &str,
+    request_is_secure: bool,
+) -> retry::BackendResponse {
+    let dispatch_hbone = hbone_pool::target_hbone_enabled(upstream_target);
+    let dispatch_mesh_mtls = mesh_mtls_pool::target_mesh_mtls_enabled(upstream_target);
+    // Corrupted BOTH-tags target: prefer HBONE classification so the dial
+    // re-screens mixed tags and fails closed rather than silently picking
+    // Sidecar mTLS (mirrors `classify_grpc_mesh_dispatch` / WS egress).
+    if !dispatch_hbone && !dispatch_mesh_mtls {
+        return retry::BackendResponse {
+            status_code: 502,
+            body: ResponseBody::buffered(
+                br#"{"error":"Bad Gateway","message":"Mesh transport dispatch required for this backend target"}"#
+                    .to_vec(),
+            ),
+            headers: HashMap::from([(
+                "gateway-error-reason".to_string(),
+                "mesh transport dispatch required for this backend target".to_string(),
+            )]),
+            connection_error: false,
+            backend_resolved_ip: None,
+            error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+        };
+    }
+
+    // Build an exact HeaderMap replay representation from the H3 bridge's
+    // folded string map. Duplicate field lines are already collapsed on the
+    // H3 intake path; mesh merge still applies hop-by-hop stripping and
+    // forwarding-header regeneration at the outbound boundary.
+    let mut replay_headers = hyper::HeaderMap::with_capacity(headers.len());
+    for (name, value) in headers {
+        let Ok(header_name) = hyper::header::HeaderName::from_bytes(name.as_bytes()) else {
+            continue;
+        };
+        let Ok(header_value) = hyper::header::HeaderValue::from_str(value) else {
+            continue;
+        };
+        replay_headers.append(header_name, header_value);
+    }
+
+    let (response, _, _) = proxy_to_backend_mesh_retry(
+        state,
+        proxy,
+        backend_url,
+        method,
+        headers,
+        Some(upstream_target),
+        Some(&body),
+        Some(&replay_headers),
+        dispatch_hbone,
+        plugins,
+        request_ctx,
+        false, // buffered response for the H3 plain writer
+        client_ip,
+        xff_append_ip,
+        request_is_secure,
+        &request_ctx.bytes_sent_observed,
+    )
+    .await;
+    response
 }
 
 /// Proxy the request to the backend.

@@ -42,7 +42,7 @@ Retry logic applies to the following proxy protocols:
 
 HTTP-family protocols (HTTP/1.1, HTTP/2, HTTP/3) share the same retry loop in the proxy core and support both connection failure and HTTP status code retries.
 
-For H1/H2 frontend requests, that loop is transport-neutral across mixed plain, HBONE, and Sidecar mesh-mTLS target sets. Selection/rotation runs first; the exact target's effective port policy, timeout, connection limits, TLS identity/SNI/trust domain, pool partition, and plain/mesh transport are then re-resolved for every attempt. The HTTP/3 frontend still fails closed for mesh-tagged targets because it has no mesh egress bridge.
+For H1/H2 frontend requests, that loop is transport-neutral across mixed plain, HBONE, and Sidecar mesh-mTLS target sets. Selection/rotation runs first; the exact target's effective port policy, timeout, connection limits, TLS identity/SNI/trust domain, pool partition, and plain/mesh transport are then re-resolved for every attempt. The HTTP/3 frontend shares the same HBONE and Sidecar mesh-mTLS egress pools for plain HTTP and WebSocket (and already for gRPC): mesh-tagged targets ride those secured transports, Unix-socket candidates are filtered from H3 retry rotation because H3 has no Unix dialer, and the attempt fails closed when no eligible secured or plain transport remains.
 
 gRPC retries handle connection-level failures (connect refused, timeout, DNS, TLS, and pooled-sender dispatch cancellations where hyper proves the request never left the client) by buffering the request body and replaying it against alternative upstream targets. Read timeouts and gRPC application-level errors (e.g., UNAVAILABLE status in trailers) are not retried because the request was already sent to the backend.
 

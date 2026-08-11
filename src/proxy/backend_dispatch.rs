@@ -217,20 +217,48 @@ pub(crate) fn direct_http_mesh_transport_refusal(
 
 /// Whether a network-only HTTP dispatch surface must refuse this target.
 ///
-/// HTTP/3's native, cross-protocol, and WebSocket backend paths can dial only
-/// network transports. In addition to the secured mesh transports screened by
-/// [`direct_http_mesh_transport_refusal`], they must therefore refuse a
-/// `mesh.unix_socket` target rather than dialing its schema-only loopback
-/// placeholder. Keep this helper scoped to those network-only surfaces: the
-/// H1/H2 proxy has a real Unix-stream dispatch path and must not reject it.
+/// Surfaces that dial only direct network transports (no HBONE / mesh-mTLS /
+/// Unix fork) must refuse mesh-tagged targets AND `mesh.unix_socket` targets
+/// rather than dialing a secured destination in the clear or hitting a
+/// schema-only loopback placeholder. Keep this helper scoped to those
+/// network-only surfaces: the H1/H2 proxy has real mesh and Unix dispatch
+/// paths and must not reject them.
+///
+/// After issue #3620 the H3→HTTP plain and H3 WebSocket bridges are no longer
+/// network-only — they share the H1/H2 mesh egress transports — and should
+/// call [`h3_bridge_transport_refusal`] instead (Unix-only). The native H3
+/// backend pool remains network-only (QUIC has no mesh tunnel) and still uses
+/// this helper, or forces mesh-tagged targets onto the bridge before dialing.
 pub(crate) fn direct_network_http_transport_refusal(
     target: Option<&UpstreamTarget>,
 ) -> Option<&'static str> {
-    direct_http_mesh_transport_refusal(target).or_else(|| {
-        target
-            .is_some_and(crate::proxy::unix_backend::target_is_unix_backend)
-            .then_some("Unix socket dispatch required for this backend target")
-    })
+    direct_http_mesh_transport_refusal(target).or_else(|| h3_bridge_transport_refusal(target))
+}
+
+/// Whether an H3 frontend can safely dispatch this target over a network
+/// transport it owns (plain, HBONE, or Sidecar mesh-mTLS).
+///
+/// Unix-socket targets remain ineligible because H3 has no Unix dialer
+/// (issue #3620). Mesh-tagged HBONE / Sidecar mTLS targets ARE eligible once
+/// the plain and WebSocket bridges share the H1/H2 mesh egress pools.
+pub(crate) fn h3_dispatch_target_eligible(target: &UpstreamTarget) -> bool {
+    !crate::proxy::unix_backend::target_is_unix_backend(target)
+}
+
+/// Refusal for targets the H3 plain / WebSocket bridges still cannot dispatch
+/// after mesh egress support (issue #3620).
+///
+/// Mesh HBONE and Sidecar mTLS are dispatchable through the shared pools;
+/// only a `mesh.unix_socket` target remains refused (its host/port is a
+/// schema-only loopback placeholder). Use this on the H3 bridges; keep
+/// [`direct_network_http_transport_refusal`] for truly network-only surfaces
+/// such as the native H3 QUIC pool.
+pub(crate) fn h3_bridge_transport_refusal(
+    target: Option<&UpstreamTarget>,
+) -> Option<&'static str> {
+    target
+        .is_some_and(crate::proxy::unix_backend::target_is_unix_backend)
+        .then_some("Unix socket dispatch required for this backend target")
 }
 
 /// Select an upstream target for the given proxy using load balancing with
@@ -1639,6 +1667,28 @@ mod tests {
         assert_eq!(
             direct_network_http_transport_refusal(Some(&unix)),
             Some("Unix socket dispatch required for this backend target")
+        );
+        assert_eq!(
+            h3_bridge_transport_refusal(Some(&unix)),
+            Some("Unix socket dispatch required for this backend target")
+        );
+        assert!(!h3_dispatch_target_eligible(&unix));
+    }
+
+    #[test]
+    fn h3_bridge_transport_refusal_allows_mesh_tagged_targets() {
+        let hbone = target_with_tags(&[(crate::proxy::hbone_pool::HBONE_TARGET_TAG, "true")]);
+        let mtls = target_with_tags(&[(
+            crate::proxy::mesh_mtls_pool::MESH_MTLS_TARGET_TAG,
+            "true",
+        )]);
+        assert_eq!(h3_bridge_transport_refusal(Some(&hbone)), None);
+        assert_eq!(h3_bridge_transport_refusal(Some(&mtls)), None);
+        assert!(h3_dispatch_target_eligible(&hbone));
+        assert!(h3_dispatch_target_eligible(&mtls));
+        assert!(
+            direct_network_http_transport_refusal(Some(&hbone)).is_some(),
+            "native-only surfaces still refuse mesh tags"
         );
     }
 

@@ -583,6 +583,79 @@ fn select_next_cross_protocol_retry_target(
         return CrossProtocolRetryTarget::RetryBudgetExceeded;
     }
 
+    // Skip candidates the H3 flavor cannot safely dispatch (Unix-socket
+    // targets — no H3 Unix dialer). Keep selecting while ineligible
+    // candidates remain so mixed plain+mesh+unix upstreams degrade to an
+    // eligible target instead of burning the attempt on a guaranteed
+    // fail-closed dial (issue #3620). When every remaining candidate is
+    // ineligible the caller sees Unchanged and the attempt fails closed.
+    if !crate::proxy::backend_dispatch::h3_dispatch_target_eligible(&next) {
+        warn!(
+            proxy_id = %proxy.id,
+            target_host = %next.host,
+            target_port = next.port,
+            "Skipping H3-ineligible cross-protocol retry candidate"
+        );
+        // Re-enter selection excluding this ineligible candidate. Cap the
+        // search by the upstream size so a full set of Unix-only targets
+        // terminates as Unchanged (fail closed) rather than looping.
+        let mut exclude = next;
+        for _ in 0..32 {
+            let Some(candidate) = crate::proxy::backend_dispatch::select_next_retry_target(
+                state,
+                epoch,
+                proxy,
+                &exclude,
+                crate::proxy::backend_dispatch::RetryTargetRequest {
+                    base_hash_key: hash_key,
+                    client_ip,
+                    proxy_headers,
+                    request_authority,
+                },
+            ) else {
+                return CrossProtocolRetryTarget::Unchanged;
+            };
+            if !crate::proxy::retry_target_preserves_backend_path(
+                backend_path_is_policy_bound,
+                proxy,
+                path,
+                strip_len,
+                prev_target,
+                &candidate,
+            ) {
+                return CrossProtocolRetryTarget::BackendPathMismatch;
+            }
+            if !crate::proxy::retry_attempt_allowed_for_target(
+                route_max_retries,
+                proxy,
+                &candidate,
+                attempt,
+            ) {
+                return CrossProtocolRetryTarget::RetryBudgetExceeded;
+            }
+            if crate::proxy::backend_dispatch::h3_dispatch_target_eligible(&candidate) {
+                let next_url = crate::proxy::build_backend_url_with_target(
+                    proxy,
+                    path,
+                    query_string,
+                    &candidate.host,
+                    candidate.port,
+                    strip_len,
+                    candidate.path.as_deref(),
+                );
+                let next_cb_target_key =
+                    crate::circuit_breaker::target_key(&candidate.host, candidate.port);
+                return CrossProtocolRetryTarget::Selected(
+                    candidate,
+                    next_cb_target_key,
+                    next_url,
+                );
+            }
+            exclude = candidate;
+        }
+        return CrossProtocolRetryTarget::Unchanged;
+    }
+
     let next_url = crate::proxy::build_backend_url_with_target(
         proxy,
         path,
@@ -1240,12 +1313,12 @@ async fn run_plain_attempt_local_policy_or_reject<'a, S>(
 where
     S: RecvStream + SendStream<Bytes>,
 {
-    // The H3 plain bridge has no HBONE / mesh-mTLS / east-west / Unix dispatch
-    // path. A direct network dial would either bypass the secured mesh
-    // transport or hit a Unix target's schema-only loopback placeholder, so
-    // fail closed before backend admission or body relay.
+    // The H3 plain bridge shares HBONE / Sidecar mesh-mTLS egress with H1/H2
+    // (issue #3620). A Unix-socket target still has no dialer here — its
+    // host/port is a schema-only loopback placeholder — so fail closed before
+    // backend admission or body relay rather than dialing the placeholder.
     if let Some(reason) =
-        crate::proxy::backend_dispatch::direct_network_http_transport_refusal(current_target)
+        crate::proxy::backend_dispatch::h3_bridge_transport_refusal(current_target)
     {
         warn!(
             proxy_id = %dispatch_proxy.id,
@@ -1798,6 +1871,66 @@ where
             requires_response_body_buffering,
         );
 
+    // Mesh egress needs an exact replayable body for the shared H1/H2 HBONE /
+    // Sidecar mesh-mTLS pools. Force-buffer a streaming upload when the
+    // selected target is mesh-tagged (issue #3620).
+    let (prebuffered_body, raw_prebuffered_body_bytes) = if prebuffered_body.is_none()
+        && upstream_target.is_some_and(crate::proxy::target_requires_http_mesh_egress)
+    {
+        match super::server::collect_h3_request_body_with_deadline(
+            drain_h3_body(stream, effective_max_request_body_size_bytes),
+            grpc_web_deadline_at,
+            proxy.backend_read_timeout_ms,
+        )
+        .await
+        {
+            Ok(Some(body)) => {
+                let len = body.len() as u64;
+                (Some(body), len)
+            }
+            Ok(None) => {
+                return write_plain_gateway_error(
+                    stream,
+                    ctx,
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    r#"{"error":"Request body too large"}"#,
+                    None,
+                    backend_start,
+                    0,
+                )
+                .await;
+            }
+            Err(super::server::H3RequestBodyReadError::DeadlineExceeded) => {
+                return write_plain_grpc_web_client_deadline(
+                    stream,
+                    plugins,
+                    ctx,
+                    response_committed_plugins,
+                    initial_response_header_policy_plugins,
+                    backend_start,
+                    0,
+                    backend_url,
+                )
+                .await;
+            }
+            Err(super::server::H3RequestBodyReadError::TimedOut)
+            | Err(super::server::H3RequestBodyReadError::Read(_)) => {
+                return write_plain_gateway_error(
+                    stream,
+                    ctx,
+                    StatusCode::REQUEST_TIMEOUT,
+                    r#"{"error":"Request timeout"}"#,
+                    None,
+                    backend_start,
+                    0,
+                )
+                .await;
+            }
+        }
+    } else {
+        (prebuffered_body, raw_prebuffered_body_bytes)
+    };
+
     let (response, bytes_sent, mut backend_admission_permits, backend_admission_elapsed) =
         match prebuffered_body {
             Some(buffered_body) => {
@@ -1910,6 +2043,270 @@ where
                         Some((sni_proxy, sni_url)) => (sni_proxy.as_ref(), sni_url.as_str()),
                         None => (dispatch_proxy, current_url.as_str()),
                     };
+
+                    // Mesh-tagged targets ride the shared H1/H2 HBONE /
+                    // Sidecar mesh-mTLS pools rather than a plaintext
+                    // reqwest dial (issue #3620). Identity pinning, pool
+                    // keys, and fail-closed refusal when the secured
+                    // transport cannot materialize are owned by those
+                    // pools — never fall back to a direct dial here.
+                    if let Some(target) = current_target.as_deref().filter(|target| {
+                        crate::proxy::target_requires_http_mesh_egress(target)
+                    }) {
+                        drop(pending_slot);
+                        let attempt_result = crate::proxy::proxy_h3_plain_http_mesh_buffered(
+                            state,
+                            dispatch_proxy,
+                            &current_url,
+                            method,
+                            proxy_headers,
+                            Bytes::from(buffered_body.clone()),
+                            target,
+                            plugins,
+                            ctx,
+                            client_ip,
+                            xff_append_ip,
+                            ctx.request_is_secure,
+                        )
+                        .await;
+                        if let Some(retry_config) = retry_config
+                            && crate::retry::should_retry(
+                                retry_config,
+                                method,
+                                &attempt_result,
+                                attempt,
+                            )
+                            && crate::proxy::current_retry_attempt_allowed(
+                                route_retry_ceiling,
+                                proxy,
+                                current_target.as_deref(),
+                                attempt,
+                            )
+                        {
+                            let retry_target = select_next_cross_protocol_retry_target(
+                                state,
+                                epoch,
+                                proxy,
+                                lb_hash_key,
+                                current_target.as_ref(),
+                                strip_len,
+                                backend_path_is_policy_bound,
+                                path,
+                                query_string,
+                                client_ip,
+                                proxy_headers,
+                                request_authority,
+                                route_retry_ceiling,
+                                attempt,
+                            );
+                            if !matches!(
+                                &retry_target,
+                                CrossProtocolRetryTarget::BackendPathMismatch
+                                    | CrossProtocolRetryTarget::RetryBudgetExceeded
+                            ) {
+                                record_cross_protocol_backend_admission_outcome(
+                                    &mut backend_admission_permits,
+                                    attempt_result.status_code,
+                                    attempt_result.connection_error,
+                                    attempt_result.error_class,
+                                    backend_admission_start.elapsed(),
+                                );
+                                record_cross_protocol_retry_failure(
+                                    state,
+                                    proxy,
+                                    upstream_balancer,
+                                    current_target.as_deref(),
+                                    current_cb_target_key.as_deref(),
+                                    attempt_result.status_code,
+                                    attempt_result.connection_error,
+                                    cb_retry_probe_slot_available,
+                                );
+                                cb_retry_probe_slot_available = false;
+                                let delay = crate::retry::retry_delay(retry_config, attempt);
+                                if let Err(()) = crate::plugins::await_grpc_deadline(
+                                    grpc_web_deadline_at,
+                                    tokio::time::sleep(delay),
+                                )
+                                .await
+                                {
+                                    record_plain_grpc_web_client_deadline(
+                                        state,
+                                        epoch,
+                                        proxy,
+                                        upstream_balancer,
+                                        current_target.as_deref(),
+                                        current_cb_target_key.as_deref(),
+                                        cb_retry_probe_slot_available,
+                                        backend_start,
+                                        &mut backend_admission_permits,
+                                        backend_admission_start.elapsed(),
+                                    );
+                                    return write_plain_grpc_web_client_deadline(
+                                        stream,
+                                        plugins,
+                                        ctx,
+                                        response_committed_plugins,
+                                        initial_response_header_policy_plugins,
+                                        backend_start,
+                                        bytes_sent,
+                                        &current_url,
+                                    )
+                                    .await;
+                                }
+                                attempt += 1;
+                                if let CrossProtocolRetryTarget::Selected(
+                                    next_target,
+                                    next_cb_target_key,
+                                    next_url,
+                                ) = retry_target
+                                {
+                                    current_target = Some(next_target);
+                                    current_cb_target_key = Some(next_cb_target_key);
+                                    current_url = next_url;
+                                }
+                                warn!(
+                                    proxy_id = %proxy.id,
+                                    attempt = attempt,
+                                    max_retries = retry_config.max_retries,
+                                    connection_error = attempt_result.connection_error,
+                                    "Retrying cross-protocol H3→HTTP mesh backend request"
+                                );
+                                continue;
+                            }
+                        }
+
+                        // Terminal mesh attempt: record outcomes and write the
+                        // buffered response through the same after_proxy /
+                        // sticky / reject-write pipeline as the reqwest
+                        // buffered success path (issue #3620).
+                        let mesh_status = attempt_result.status_code;
+                        let mut response_headers = attempt_result.headers.clone();
+                        let mesh_body = match attempt_result.body {
+                            crate::retry::ResponseBody::Buffered(bytes) => bytes,
+                            crate::retry::ResponseBody::Streaming { .. }
+                            | crate::retry::ResponseBody::StreamingH2(_)
+                            | crate::retry::ResponseBody::StreamingH3(_) => {
+                                Bytes::from_static(br#"{"error":"Backend unavailable"}"#)
+                            }
+                        };
+                        let mesh_error_class = attempt_result.error_class;
+                        let mesh_connection_error = attempt_result.connection_error;
+                        let mesh_resolved_ip = attempt_result.backend_resolved_ip.clone();
+                        record_backend_outcome(
+                            state,
+                            proxy,
+                            &epoch.load_balancer,
+                            upstream_balancer,
+                            current_target.as_deref(),
+                            current_cb_target_key.as_deref(),
+                            mesh_status,
+                            mesh_connection_error,
+                            mesh_error_class,
+                            cb_retry_probe_slot_available,
+                            false,
+                            backend_start.elapsed(),
+                        );
+                        record_cross_protocol_backend_admission_outcome(
+                            &mut backend_admission_permits,
+                            mesh_status,
+                            mesh_connection_error,
+                            mesh_error_class,
+                            backend_admission_start.elapsed(),
+                        );
+                        let status =
+                            StatusCode::from_u16(mesh_status).unwrap_or(StatusCode::BAD_GATEWAY);
+                        crate::http3::server::stamp_h3_original_response_metadata(
+                            ctx,
+                            mesh_status,
+                            &response_headers,
+                        );
+                        if !plugins.is_empty()
+                            && let Some(reject) = crate::proxy::run_after_proxy_hooks(
+                                plugins,
+                                ctx,
+                                mesh_status,
+                                &mut response_headers,
+                            )
+                            .await
+                        {
+                            let reject_status = StatusCode::from_u16(reject.status_code)
+                                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                            let (mut normalized, mut translated) = normalize_reject_for_client(
+                                ctx,
+                                reject_status,
+                                reject.body,
+                                &reject.headers,
+                                false,
+                            );
+                            run_cross_protocol_reject_committed_hooks(
+                                response_committed_plugins,
+                                ctx,
+                                false,
+                                &mut normalized,
+                                &mut translated,
+                            )
+                            .await;
+                            let mut outcome = if let Some(translated) = translated {
+                                write_reject_with_headers(
+                                    stream,
+                                    StatusCode::OK,
+                                    Bytes::from(translated.body),
+                                    &translated.headers,
+                                    backend_start,
+                                    bytes_sent,
+                                    RejectBodyDisposition::WireBody,
+                                )
+                                .await?
+                            } else {
+                                write_reject_with_headers(
+                                    stream,
+                                    normalized.http_status,
+                                    normalized.body,
+                                    &normalized.headers,
+                                    backend_start,
+                                    bytes_sent,
+                                    normalized.body_disposition,
+                                )
+                                .await?
+                            };
+                            outcome.backend_target =
+                                Some(strip_query_from_backend_url(&current_url));
+                            outcome.connection_error = mesh_connection_error;
+                            outcome.error_class = mesh_error_class;
+                            outcome.backend_resolved_ip = mesh_resolved_ip;
+                            return Ok(outcome);
+                        }
+                        let sticky_reissue_target =
+                            crate::proxy::backend_dispatch::sticky_cookie_reissue_target(
+                                sticky_cookie_needed,
+                                upstream_target,
+                                current_target.as_deref(),
+                            );
+                        crate::http3::server::inject_sticky_cookie_with_deadline_provenance(
+                            ctx,
+                            epoch,
+                            proxy,
+                            sticky_reissue_target,
+                            sticky_reissue_target.is_some(),
+                            &mut response_headers,
+                        );
+                        let mut outcome = write_reject_with_headers(
+                            stream,
+                            status,
+                            mesh_body,
+                            &response_headers,
+                            backend_start,
+                            bytes_sent,
+                            RejectBodyDisposition::WireBody,
+                        )
+                        .await?;
+                        outcome.backend_target =
+                            Some(strip_query_from_backend_url(&current_url));
+                        outcome.connection_error = mesh_connection_error;
+                        outcome.error_class = mesh_error_class;
+                        outcome.backend_resolved_ip = mesh_resolved_ip;
+                        return Ok(outcome);
+                    }
 
                     let client_result = match crate::plugins::await_grpc_deadline(
                         grpc_web_deadline_at,

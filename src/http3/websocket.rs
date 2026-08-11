@@ -834,13 +834,13 @@ pub(crate) async fn handle_h3_websocket(
     // connection closes. Captured out of the loop alongside the handshake.
     let backend_conn_guard;
     let backend_handshake = loop {
-        // The H3 WebSocket bridge has no `websocket_mesh_egress` or Unix fork —
-        // `connect_websocket_backend` is a plain TCP/TLS dial. A direct dial
-        // would bypass the secured mesh transport or hit a Unix target's
-        // schema-only placeholder, so fail closed BEFORE dialing (issues #2007
-        // and #3261). Sits at the loop top so the initial target AND every
-        // retry-rotated target re-entering the loop are screened.
-        if let Some(reason) = crate::proxy::backend_dispatch::direct_network_http_transport_refusal(
+        // Unix-socket targets remain network-only refusals: this bridge has no
+        // Unix dialer and the target's host/port is a schema-only placeholder.
+        // Mesh HBONE / Sidecar mTLS targets now ride the shared H1/H2 mesh
+        // WebSocket egress (issue #3620) instead of failing closed here.
+        // Sits at the loop top so the initial target AND every retry-rotated
+        // target re-entering the loop are screened.
+        if let Some(reason) = crate::proxy::backend_dispatch::h3_bridge_transport_refusal(
             current_target.as_deref(),
         ) {
             warn!(
@@ -1002,21 +1002,76 @@ pub(crate) async fn handle_h3_websocket(
             current_target.as_deref(),
         );
         let ws_dial_proxy = ws_connection_proxy.as_ref();
-        match crate::proxy::connect_websocket_backend(
-            &current_backend_url,
-            ws_dial_proxy,
-            &state.env_config,
-            &client_headers,
-            state.tls_policy.as_deref(),
-            &state.crls,
-            ws_size_limits.max_frame_bytes,
-            ws_size_limits.max_message_bytes,
-            state.websocket_write_buffer_size,
-            ws_idle_tracker.clone(),
-            Some(&state.dns_cache),
-        )
-        .await
-        {
+        // Mesh egress (Sidecar `mesh.mtls` / Ambient `mesh.hbone`): ride the
+        // shared H1/H2 mesh WebSocket transports rather than a plaintext dial
+        // (issue #3620). Recomputed per attempt because retry may rotate
+        // `current_target`.
+        let ws_mesh_egress = current_target
+            .as_deref()
+            .and_then(crate::proxy::websocket_mesh_egress);
+        let ws_backend_url_for_parse: std::borrow::Cow<'_, str> = match current_target.as_deref() {
+            Some(target)
+                if matches!(
+                    &ws_mesh_egress,
+                    Some(crate::proxy::MeshWsEgress::AmbientHbone)
+                ) && crate::proxy::hbone_pool::target_hbone_cross_cluster(target) =>
+            {
+                match crate::proxy::hbone_pool::target_hbone_authority_host(target) {
+                    Ok(app_host) => std::borrow::Cow::Owned(
+                        crate::proxy::rewrite_backend_url_authority_host(
+                            &current_backend_url,
+                            &target.host,
+                            app_host,
+                        ),
+                    ),
+                    Err(_) => std::borrow::Cow::Borrowed(current_backend_url.as_str()),
+                }
+            }
+            _ => std::borrow::Cow::Borrowed(current_backend_url.as_str()),
+        };
+        let ws_path_and_query: std::borrow::Cow<'_, str> = ws_backend_url_for_parse
+            .parse::<hyper::Uri>()
+            .ok()
+            .and_then(|uri| uri.path_and_query().map(|pq| pq.as_str().to_string()))
+            .map(std::borrow::Cow::Owned)
+            .unwrap_or(std::borrow::Cow::Borrowed("/"));
+        let ws_dial_result: Result<
+            crate::proxy::WsBackendHandshake,
+            Box<dyn std::error::Error + Send + Sync>,
+        > = match (&ws_mesh_egress, current_target.as_deref()) {
+            (Some(egress), Some(target)) => crate::proxy::connect_mesh_websocket_backend(
+                &state,
+                ws_dial_proxy,
+                target,
+                egress,
+                request_host.as_deref(),
+                ws_path_and_query.as_ref(),
+                &client_headers,
+                ws_size_limits.max_frame_bytes,
+                ws_size_limits.max_message_bytes,
+                state.websocket_write_buffer_size,
+                ws_idle_tracker.clone(),
+                ctx.peer_spiffe_id.as_ref(),
+            )
+            .await
+            .map(|handshake| crate::proxy::WsBackendHandshake::Mesh(Box::new(handshake))),
+            _ => crate::proxy::connect_websocket_backend(
+                &current_backend_url,
+                ws_dial_proxy,
+                &state.env_config,
+                &client_headers,
+                state.tls_policy.as_deref(),
+                &state.crls,
+                ws_size_limits.max_frame_bytes,
+                ws_size_limits.max_message_bytes,
+                state.websocket_write_buffer_size,
+                ws_idle_tracker.clone(),
+                Some(&state.dns_cache),
+            )
+            .await
+            .map(|handshake| crate::proxy::WsBackendHandshake::Direct(Box::new(handshake))),
+        };
+        match ws_dial_result {
             Ok(handshake) => {
                 backend_conn_guard = conn_slot;
                 break handshake;
@@ -1026,8 +1081,8 @@ pub(crate) async fn handle_h3_websocket(
                 // a retry so a rotated target acquires its own slot and a
                 // failed attempt never leaks a count.
                 drop(conn_slot);
-                // `connect_websocket_backend` covers more than TCP+TLS setup:
-                // it ALSO sends the WebSocket upgrade request and reads the
+                // Direct and mesh WS dials cover more than TCP+TLS setup: they
+                // ALSO send the WebSocket upgrade request and read the
                 // backend's response. Use the same unified
                 // `request_reached_wire` boundary as the H1/H2 path so a
                 // backend-side upgrade rejection (post-wire) does NOT retry
@@ -1130,6 +1185,81 @@ pub(crate) async fn handle_h3_websocket(
                                 attempt = ws_attempt,
                                 "Aborting H3 WebSocket retry because the candidate exceeds its DestinationRule maxRetries cap"
                             );
+                        } else if !crate::proxy::backend_dispatch::h3_dispatch_target_eligible(
+                            &next,
+                        ) {
+                            // Skip Unix-only (and other H3-ineligible) candidates
+                            // in mixed upstreams (issue #3620). Keep searching
+                            // by excluding this candidate.
+                            let mut exclude = next;
+                            let mut found = None;
+                            for _ in 0..32 {
+                                let Some(candidate) =
+                                    crate::proxy::backend_dispatch::select_next_retry_target(
+                                        &state,
+                                        &epoch,
+                                        &proxy,
+                                        &exclude,
+                                        crate::proxy::backend_dispatch::RetryTargetRequest {
+                                            base_hash_key: hash_key,
+                                            client_ip: &ctx.client_ip,
+                                            proxy_headers: &proxy_headers,
+                                            request_authority: request_host.as_deref(),
+                                        },
+                                    )
+                                else {
+                                    break;
+                                };
+                                if !crate::proxy::retry_target_preserves_backend_path(
+                                    backend_path_is_policy_bound,
+                                    &proxy,
+                                    &ctx.path,
+                                    strip_len,
+                                    prev_target,
+                                    &candidate,
+                                ) || !crate::proxy::retry_attempt_allowed_for_target(
+                                    route_retry_ceiling,
+                                    &proxy,
+                                    &candidate,
+                                    ws_attempt,
+                                ) {
+                                    retry_path_mismatch = true;
+                                    break;
+                                }
+                                if crate::proxy::backend_dispatch::h3_dispatch_target_eligible(
+                                    &candidate,
+                                ) {
+                                    found = Some(candidate);
+                                    break;
+                                }
+                                exclude = candidate;
+                            }
+                            if let Some(candidate) = found {
+                                retry_backend_url =
+                                    crate::proxy::build_websocket_backend_url_with_target(
+                                        &proxy,
+                                        &ctx.path,
+                                        &query_string,
+                                        &candidate.host,
+                                        candidate.port,
+                                        strip_len,
+                                        candidate.path.as_deref(),
+                                    );
+                                retry_cb_target_key = Some(crate::circuit_breaker::target_key(
+                                    &candidate.host,
+                                    candidate.port,
+                                ));
+                                retry_target = Some(candidate);
+                            } else if !retry_path_mismatch {
+                                // No eligible secured/plain candidate remains:
+                                // fail closed rather than dialing an ineligible
+                                // mesh-incompatible target.
+                                retry_path_mismatch = true;
+                                warn!(
+                                    proxy_id = %proxy.id,
+                                    "Aborting H3 WebSocket retry: no H3-eligible candidate remains"
+                                );
+                            }
                         } else {
                             retry_backend_url =
                                 crate::proxy::build_websocket_backend_url_with_target(
@@ -1373,7 +1503,7 @@ pub(crate) async fn handle_h3_websocket(
     // applicable to RFC 9220 Extended CONNECT via RFC 8441 §5.2). Add this
     // transport-owned field after policy enforcement so policy cannot invent
     // or remove the backend-negotiated value.
-    if let Some(proto) = backend_handshake.negotiated_subprotocol.clone() {
+    if let Some(proto) = backend_handshake.negotiated_subprotocol().cloned() {
         response_builder = response_builder.header("sec-websocket-protocol", proto);
     }
     let response = match response_builder.body(()) {
@@ -1401,8 +1531,6 @@ pub(crate) async fn handle_h3_websocket(
     // long-lived H3 WebSocket block normal H1/H2/H3 requests from the
     // same IP for the entire session duration.
     drop(per_ip_guard);
-
-    let backend_ws_stream = backend_handshake.stream;
 
     // Emit the successful-upgrade TransactionSummary now — same shape
     // the H1/H2 path emits at upgrade time.
@@ -1578,33 +1706,64 @@ pub(crate) async fn handle_h3_websocket(
     //
     // tunnel mode is forced off — QUIC ≠ TCP, there is no raw socket to
     // splice. The same shared `run_websocket_proxy` handles per-frame
-    // plugins, cancellation, and on_ws_disconnect bookkeeping.
-    let relay_result = crate::proxy::run_websocket_proxy(
-        client_io,
-        backend_ws_stream,
-        &proxy_id_for_relay,
-        ws_conn_id,
-        ws_framing_plugins,
-        ws_frame_plugins,
-        ws_disconnect_plugins,
-        session_meta,
-        ws_connection_permit,
-        max_ws_frame,
-        ws_write_buf,
-        false, // H3 always frame-parses; tunnel mode is H1-only
-        crate::proxy::WS_DRAIN_GRACE,
-        // RFC 9220 §5: WebSocket frames over HTTP/3 are NOT masked. The H3
-        // receive pump rejects masked client frames with close code 1002 before
-        // tungstenite's permissive accept-unmasked mode can normalize them.
-        true,
-        ws_idle_tracker,
-        ws_session_deadline,
-        state.health_check_shutdown_rx.clone(),
-        Arc::clone(&state.overload),
-        crate::proxy::WsFragmentPolicy::from_env(&state.env_config),
-        &adaptive_buf,
-    )
-    .await;
+    // plugins, cancellation, and on_ws_disconnect bookkeeping. Dispatch
+    // on Direct vs Mesh so both backend transports share one relay
+    // (issue #3620).
+    let relay_result = match backend_handshake {
+        crate::proxy::WsBackendHandshake::Direct(handshake) => {
+            let handshake = *handshake;
+            crate::proxy::run_websocket_proxy(
+                client_io,
+                handshake.stream,
+                &proxy_id_for_relay,
+                ws_conn_id,
+                ws_framing_plugins,
+                ws_frame_plugins,
+                ws_disconnect_plugins,
+                session_meta,
+                ws_connection_permit,
+                max_ws_frame,
+                ws_write_buf,
+                false, // H3 always frame-parses; tunnel mode is H1-only
+                crate::proxy::WS_DRAIN_GRACE,
+                // RFC 9220 §5: WebSocket frames over HTTP/3 are NOT masked.
+                true,
+                ws_idle_tracker,
+                ws_session_deadline,
+                state.health_check_shutdown_rx.clone(),
+                Arc::clone(&state.overload),
+                crate::proxy::WsFragmentPolicy::from_env(&state.env_config),
+                &adaptive_buf,
+            )
+            .await
+        }
+        crate::proxy::WsBackendHandshake::Mesh(handshake) => {
+            let handshake = *handshake;
+            crate::proxy::run_websocket_proxy(
+                client_io,
+                handshake.stream,
+                &proxy_id_for_relay,
+                ws_conn_id,
+                ws_framing_plugins,
+                ws_frame_plugins,
+                ws_disconnect_plugins,
+                session_meta,
+                ws_connection_permit,
+                max_ws_frame,
+                ws_write_buf,
+                false,
+                crate::proxy::WS_DRAIN_GRACE,
+                true,
+                ws_idle_tracker,
+                ws_session_deadline,
+                state.health_check_shutdown_rx.clone(),
+                Arc::clone(&state.overload),
+                crate::proxy::WsFragmentPolicy::from_env(&state.env_config),
+                &adaptive_buf,
+            )
+            .await
+        }
+    };
 
     if let Err(e) = relay_result {
         error!(

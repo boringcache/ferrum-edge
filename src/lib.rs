@@ -7352,6 +7352,33 @@ pub mod _test_support {
         crate::proxy::backend_dispatch::direct_http_mesh_transport_refusal(Some(target))
     }
 
+    /// Unix-only refusal the H3 plain / WebSocket bridges apply after mesh
+    /// egress support (issue #3620). Mesh HBONE / Sidecar mTLS targets return
+    /// `None` here — they are dispatchable through the shared pools.
+    pub fn h3_bridge_transport_refusal_for_test(
+        target: &crate::config::types::UpstreamTarget,
+    ) -> Option<&'static str> {
+        crate::proxy::backend_dispatch::h3_bridge_transport_refusal(Some(target))
+    }
+
+    /// Whether an H3 frontend can safely dispatch `target` (issue #3620).
+    /// Unix-socket targets remain ineligible; mesh-tagged HBONE / Sidecar mTLS
+    /// targets are eligible once the plain and WebSocket bridges share the
+    /// H1/H2 mesh egress pools.
+    pub fn h3_dispatch_target_eligible_for_test(
+        target: &crate::config::types::UpstreamTarget,
+    ) -> bool {
+        crate::proxy::backend_dispatch::h3_dispatch_target_eligible(target)
+    }
+
+    /// Whether a plain-HTTP / WebSocket H3 attempt must ride mesh egress for
+    /// `target` (issue #3620).
+    pub fn target_requires_http_mesh_egress_for_test(
+        target: &crate::config::types::UpstreamTarget,
+    ) -> bool {
+        crate::proxy::target_requires_http_mesh_egress(target)
+    }
+
     /// Whether the inbound request declared a request body on the wire, as the
     /// retry loop's replay gate evaluates it.
     pub fn inbound_request_declares_body_for_test(ctx: &crate::plugins::RequestContext) -> bool {
