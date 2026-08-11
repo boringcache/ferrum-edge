@@ -4314,6 +4314,87 @@ def release_generation_tables(generation: str | None) -> dict[str, dict]:
     ]
 
 
+def build_release_family_fixture(generation: str) -> str:
+    """Assemble a complete release workflow for one admitted family shape.
+
+    Self-tests that exercise release-workflow policy must feed it a file the
+    policy can actually classify and validate: the proposal is held to the
+    COMPLETE contract of the shape it claims, so a generic stub labelled
+    "release workflow" is rejected before the behaviour under test is reached.
+    The fixtures are assembled from the frozen contracts themselves rather than
+    transcribed, so they cannot drift from the policy they are used to test.
+    """
+
+    tables = RELEASE_IMAGE_FAMILY_GENERATIONS[generation]
+    control = tables["control"]
+    if generation == RELEASE_THREE_FAMILY_GENERATION:
+        ebpf_steps = (
+            "    steps:\n"
+            + DOCKER_EBPF_TOOLS_BUILD_STEP
+            + "\n"
+            + DOCKER_EBPF_TOOLS_EXPORT_DIGEST_STEP
+            + "\n"
+            + DOCKER_EBPF_UPLOAD_DIGEST_STEP
+            + "\n"
+            + DOCKER_EBPF_TOOLS_UPLOAD_DIGEST_STEP
+        )
+    else:
+        ebpf_steps = "    steps:\n" + DOCKER_EBPF_UPLOAD_DIGEST_STEP
+    fixture = (
+        "name: Release fixture\n"
+        # The canonical block mapping, not `on: [push]`: the pull-request
+        # comparison extracts the trigger as a whole top-level block and rejects
+        # any other spelling, on both sides, before it can compare anything else.
+        "on:\n"
+        "  push:\n"
+        "    tags:\n"
+        "      - 'v*'\n"
+        "jobs:\n"
+        + tables["exact_jobs"]["attest-release-images"]
+        + "\n"
+        + "  create-release:\n"
+        + control["create-release"]["needs"]
+        + "    runs-on: ubuntu-latest\n"
+        + control["create-release"]["steps"]
+        + "\n"
+        + "  docker:\n"
+        + control["docker"]["needs"]
+        + "    runs-on: ubuntu-latest\n"
+        + control["docker"]["strategy"]
+        + control["docker"]["steps"]
+        + "\n"
+        + "  docker-manifest:\n"
+        + control["docker-manifest"]["needs"]
+        + "    runs-on: ubuntu-latest\n"
+        + control["docker-manifest"]["steps"]
+        + "\n"
+        + "  docker-ebpf:\n"
+        + control["docker-ebpf"]["needs"]
+        + "    runs-on: ${{ matrix.os }}\n"
+        + control["docker-ebpf"]["strategy"]
+        + ebpf_steps
+        + "\n"
+        + "  docker-ebpf-manifest:\n"
+        + control["docker-ebpf-manifest"]["needs"]
+        + "    runs-on: ubuntu-latest\n"
+        + control["docker-ebpf-manifest"]["steps"]
+    )
+    if generation == RELEASE_THREE_FAMILY_GENERATION:
+        fixture += (
+            "\n"
+            + f"  {RELEASE_TOOLS_MANIFEST_JOB_NAME}:\n"
+            + control[RELEASE_TOOLS_MANIFEST_JOB_NAME]["needs"]
+            + "    runs-on: ubuntu-latest\n"
+            + control[RELEASE_TOOLS_MANIFEST_JOB_NAME]["steps"]
+        )
+    return fixture
+
+
+# Where a self-test splices an extra job into a release fixture. It is a job
+# boundary the assembled fixture always contains, in both admitted shapes.
+RELEASE_FIXTURE_JOB_ANCHOR = "\n  docker-manifest:\n"
+
+
 def release_image_family_transition_errors(
     merge_base_contents: str,
     proposed_contents: str,
@@ -15475,21 +15556,47 @@ pre_build = []
             "merge-base comparison allowed a flow-spelled unprotected Cross "
             "configuration input"
         )
+    # The release-workflow comparison holds the proposal to the COMPLETE frozen
+    # contract of the image-family shape it claims, so its cases need a file the
+    # policy can classify and validate rather than the generic fixture above.
+    # Both admitted shapes are assembled from the frozen contracts themselves, so
+    # they cannot drift from the policy; the three-family fixture is exercised
+    # further down, where the adoption transition is tested.
+    release_family_fixtures: dict[str, str] = {
+        generation: build_release_family_fixture(generation)
+        for generation in RELEASE_IMAGE_FAMILY_GENERATIONS
+    }
+    two_family_release = release_family_fixtures[RELEASE_TWO_FAMILY_GENERATION]
+    three_family_release = release_family_fixtures[RELEASE_THREE_FAMILY_GENERATION]
+
+    def release_fixture_with_job(job_block: str, label: str) -> str:
+        """Splice one extra job into the assembled two-family release fixture."""
+
+        spliced = two_family_release.replace(
+            RELEASE_FIXTURE_JOB_ANCHOR,
+            "\n" + job_block + RELEASE_FIXTURE_JOB_ANCHOR,
+            1,
+        )
+        if spliced == two_family_release:
+            failures.append(
+                f"the release fixture job anchor did not match for {label}"
+            )
+        return spliced
+
     # A flow-spelled digest upload names no key at the start of any line, so the
     # ownership scan the comparison already ran on the proposed tree could not
     # see it. It reaches the wildcard manifest download exactly as the block
     # spelling does.
-    flow_digest_workflow = benign_workflow.replace(
-        "\n  unrelated:\n",
-        "\n  flow-upload:\n"
+    flow_digest_workflow = release_fixture_with_job(
+        "  flow-upload:\n"
         "    runs-on: ubuntu-latest\n"
         "    steps:\n"
-        "      - {uses: actions/upload-artifact@v7, with: {name: docker-digest-evil}}\n"
-        "\n  unrelated:\n",
-        1,
+        "      - {uses: actions/upload-artifact@v7, "
+        "with: {name: docker-digest-evil}}\n",
+        "the flow-spelled digest upload",
     )
     if not compare_pr_workflow_job(
-        workflow,
+        two_family_release,
         flow_digest_workflow,
         "release workflow",
         "protected-arm",
@@ -15499,19 +15606,17 @@ pre_build = []
         )
     # The block spelling of the same upload was already rejected; keeping it here
     # proves the flow pass added coverage rather than replacing it.
-    block_digest_workflow = benign_workflow.replace(
-        "\n  unrelated:\n",
-        "\n  block-upload:\n"
+    block_digest_workflow = release_fixture_with_job(
+        "  block-upload:\n"
         "    runs-on: ubuntu-latest\n"
         "    steps:\n"
         "      - uses: actions/upload-artifact@v7\n"
         "        with:\n"
-        "          name: docker-digest-evil\n"
-        "\n  unrelated:\n",
-        1,
+        "          name: docker-digest-evil\n",
+        "the block-spelled digest upload",
     )
     if not compare_pr_workflow_job(
-        workflow,
+        two_family_release,
         block_digest_workflow,
         "release workflow",
         "protected-arm",
@@ -15522,34 +15627,30 @@ pre_build = []
     # Ordinary workflow edits outside the protected job, the frozen publication
     # contracts, and the digest namespace must stay available: the contract
     # freezes the ARM64 boundary, not routine CI maintenance.
-    benign_added_job = benign_workflow.replace(
-        "\n  unrelated:\n",
-        "\n  extra-tests:\n"
+    benign_added_job = release_fixture_with_job(
+        "  extra-tests:\n"
         "    runs-on: ubuntu-latest\n"
         "    steps:\n"
         "      - uses: actions/upload-artifact@" + ("c" * 40) + "\n"
         "        with:\n"
-        "          name: coverage-report\n"
-        "\n  unrelated:\n",
-        1,
+        "          name: coverage-report\n",
+        "the unrelated added job",
     )
     if compare_pr_workflow_job(
-        workflow,
+        two_family_release,
         benign_added_job,
         "release workflow",
         "protected-arm",
     ):
         failures.append("merge-base comparison rejected an unrelated added job")
-    benign_flow_job = benign_workflow.replace(
-        "\n  unrelated:\n",
-        "\n  flow-tests:\n"
+    benign_flow_job = release_fixture_with_job(
+        "  flow-tests:\n"
         "    runs-on: ubuntu-latest\n"
-        "    steps: [{run: echo flow-safe}]\n"
-        "\n  unrelated:\n",
-        1,
+        "    steps: [{run: echo flow-safe}]\n",
+        "the benign flow-spelled step",
     )
     if compare_pr_workflow_job(
-        workflow,
+        two_family_release,
         benign_flow_job,
         "release workflow",
         "protected-arm",
@@ -22895,10 +22996,10 @@ pre_build = []
     # complete job contract is frozen. Freezing only the visible steps would
     # still permit a pull request to select an attacker-controlled runner or
     # introduce another job-level execution surface.
-    attestation_job = PUBLISH_EXACT_JOB_CONTRACTS["release workflow"][
-        "attest-release-images"
-    ]
-    attestation_workflow = "name: Release fixture\njobs:\n" + attestation_job
+    # The complete two-family fixture leads with the attestation job, so the
+    # single-substitution tampers below land in it, and the comparison reaches
+    # the exact-job contract instead of stopping at an incomplete release file.
+    attestation_workflow = two_family_release
     appended_privileged_step = attestation_workflow.replace(
         "    steps:\n",
         "    steps:\n"
@@ -22906,6 +23007,8 @@ pre_build = []
         "        run: echo tampered\n",
         1,
     )
+    if appended_privileged_step == attestation_workflow:
+        failures.append("the attestation step tamper did not change the fixture")
     if not compare_pr_publish_control_contract(
         attestation_workflow,
         appended_privileged_step,
@@ -22917,6 +23020,8 @@ pre_build = []
         "    runs-on: self-hosted\n",
         1,
     )
+    if attacker_runner == attestation_workflow:
+        failures.append("the attestation runner tamper did not change the fixture")
     if not compare_pr_publish_control_contract(
         attestation_workflow,
         attacker_runner,
@@ -23012,74 +23117,8 @@ pre_build = []
             "contract no longer covers its wildcard publish command"
         )
 
-    # Two complete release workflows, one per admitted shape, assembled from the
-    # frozen contracts themselves so the fixtures cannot drift from the policy.
-    release_family_fixtures: dict[str, str] = {}
-    for generation, ebpf_steps in (
-        (
-            RELEASE_TWO_FAMILY_GENERATION,
-            "    steps:\n" + DOCKER_EBPF_UPLOAD_DIGEST_STEP,
-        ),
-        (
-            RELEASE_THREE_FAMILY_GENERATION,
-            "    steps:\n"
-            + DOCKER_EBPF_TOOLS_BUILD_STEP
-            + "\n"
-            + DOCKER_EBPF_TOOLS_EXPORT_DIGEST_STEP
-            + "\n"
-            + DOCKER_EBPF_UPLOAD_DIGEST_STEP
-            + "\n"
-            + DOCKER_EBPF_TOOLS_UPLOAD_DIGEST_STEP,
-        ),
-    ):
-        tables = RELEASE_IMAGE_FAMILY_GENERATIONS[generation]
-        control = tables["control"]
-        fixture = (
-            "name: Release fixture\n"
-            "on: [push]\n"
-            "jobs:\n"
-            + tables["exact_jobs"]["attest-release-images"]
-            + "\n"
-            + "  create-release:\n"
-            + control["create-release"]["needs"]
-            + "    runs-on: ubuntu-latest\n"
-            + control["create-release"]["steps"]
-            + "\n"
-            + "  docker:\n"
-            + control["docker"]["needs"]
-            + "    runs-on: ubuntu-latest\n"
-            + control["docker"]["strategy"]
-            + control["docker"]["steps"]
-            + "\n"
-            + "  docker-manifest:\n"
-            + control["docker-manifest"]["needs"]
-            + "    runs-on: ubuntu-latest\n"
-            + control["docker-manifest"]["steps"]
-            + "\n"
-            + "  docker-ebpf:\n"
-            + control["docker-ebpf"]["needs"]
-            + "    runs-on: ${{ matrix.os }}\n"
-            + control["docker-ebpf"]["strategy"]
-            + ebpf_steps
-            + "\n"
-            + "  docker-ebpf-manifest:\n"
-            + control["docker-ebpf-manifest"]["needs"]
-            + "    runs-on: ubuntu-latest\n"
-            + control["docker-ebpf-manifest"]["steps"]
-        )
-        if generation == RELEASE_THREE_FAMILY_GENERATION:
-            fixture += (
-                "\n"
-                + f"  {RELEASE_TOOLS_MANIFEST_JOB_NAME}:\n"
-                + control[RELEASE_TOOLS_MANIFEST_JOB_NAME]["needs"]
-                + "    runs-on: ubuntu-latest\n"
-                + control[RELEASE_TOOLS_MANIFEST_JOB_NAME]["steps"]
-            )
-        release_family_fixtures[generation] = fixture
-
-    two_family_release = release_family_fixtures[RELEASE_TWO_FAMILY_GENERATION]
-    three_family_release = release_family_fixtures[RELEASE_THREE_FAMILY_GENERATION]
-
+    # The two complete release workflows, one per admitted shape, were assembled
+    # from the frozen contracts themselves earlier in this self-test.
     for generation, fixture in release_family_fixtures.items():
         classified, classification_failures = release_image_family_generation(
             fixture,
