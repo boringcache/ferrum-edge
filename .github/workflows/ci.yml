@@ -2686,6 +2686,33 @@ jobs:
             --set-string nodeAgent.admin.port=0 \
             > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-port0.yaml"
           helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set nodeAgent.enabled=true \
+            --set nodeAgent.admin.enabled=true \
+            --set-string nodeAgent.admin.port=0 \
+            --set-string nodeAgent.admin.httpsPort=19443 \
+            --set nodeAgent.admin.tls.enabled=true \
+            --set nodeAgent.admin.tls.secretName=node-agent-admin-tls \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-https-only.yaml"
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set nodeAgent.enabled=true \
+            --set nodeAgent.admin.enabled=true \
+            --set-string nodeAgent.admin.port=19090 \
+            --set-string nodeAgent.admin.httpsPort=19443 \
+            --set nodeAgent.admin.tls.enabled=true \
+            --set nodeAgent.admin.tls.secretName=node-agent-admin-tls \
+            --set nodeAgent.admin.tls.clientCaKey=ca.crt \
+            --set nodeAgent.admin.metricsScrape.enabled=true \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-dual.yaml"
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set nodeAgent.enabled=true \
+            --set nodeAgent.admin.enabled=true \
+            --set-string nodeAgent.admin.httpsPort=19443 \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-https-no-tls.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-https-no-tls.err"; then
+            echo "::error title=Node-agent HTTPS without TLS accepted::httpsPort without admin.tls must fail closed"
+            exit 1
+          fi
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
             --set ambient.enabled=true \
             --set ambient.captureMode=ebpf \
             --set ambient.env.FERRUM_MESH_TOPOLOGY=node_waypoint \

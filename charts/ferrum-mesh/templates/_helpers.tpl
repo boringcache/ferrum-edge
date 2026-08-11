@@ -206,6 +206,11 @@ Build the process-only (/live) and dependency-aware (/health) exec handlers for
 workloads that expose the admin listener. Liveness/startup MUST use --live so an
 alive-but-degraded process is not restart-looped.
 
+Dict keys:
+  port      - listen port
+  probeHost - dial host for in-pod exec
+  tls       - optional; when truthy, append --tls --tls-no-verify (HTTPS-only)
+
 Command argv is kept as a Helm list here; `ferrum-mesh.renderProbeHandler` emits
 each item with `| quote` so hosts like `::1` / `127.0.0.1` and ports stay
 double-quoted in the rendered manifest (go-yaml's plain `toYaml` leaves those
@@ -214,9 +219,25 @@ bare, which breaks frozen NodeWaypoint chart assertions).
 {{- define "ferrum-mesh.adminHealthHandlers" -}}
 {{- $port := toString .port -}}
 {{- $host := toString .probeHost -}}
+{{- $tls := .tls | default false -}}
 {{- $liveCmd := list "/app/ferrum-edge" "health" "--live" "-p" $port "--host" $host -}}
 {{- $readyCmd := list "/app/ferrum-edge" "health" "-p" $port "--host" $host -}}
+{{- if $tls -}}
+{{- $liveCmd = list "/app/ferrum-edge" "health" "--live" "--tls" "--tls-no-verify" "-p" $port "--host" $host -}}
+{{- $readyCmd = list "/app/ferrum-edge" "health" "--tls" "--tls-no-verify" "-p" $port "--host" $host -}}
+{{- end -}}
 {{- dict "live" (dict "exec" (dict "command" $liveCmd)) "ready" (dict "exec" (dict "command" $readyCmd)) | toYaml -}}
+{{- end -}}
+
+{{/*
+Resolve whether node-agent admin TLS Secret mounts are fully configured.
+Returns the string "true" or empty.
+*/}}
+{{- define "ferrum-mesh.nodeAgentAdminTlsConfigured" -}}
+{{- $tls := . | default dict -}}
+{{- if and $tls.enabled $tls.secretName $tls.certKey $tls.keyKey -}}
+true
+{{- end -}}
 {{- end -}}
 
 {{/*

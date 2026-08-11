@@ -8601,6 +8601,21 @@ pub mod _test_support {
     // ── node-agent eBPF startup-rollback seams (issue #2371) ─────────────────
     pub type NodeAgentStartupCleanupProbe = node_agent_cleanup_seams::NodeAgentStartupCleanupProbe;
 
+    /// Drive the production node-agent admin HTTP/HTTPS listener planner
+    /// (issue #3704) from external unit/integration tests.
+    pub async fn start_node_agent_admin_listeners_for_test(
+        env_config: &crate::config::EnvConfig,
+        shutdown_tx: &tokio::sync::watch::Sender<bool>,
+        startup_ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<Vec<tokio::task::JoinHandle<()>>, anyhow::Error> {
+        crate::modes::node_agent::start_node_agent_admin_listeners_for_test(
+            env_config,
+            shutdown_tx,
+            startup_ready,
+        )
+        .await
+    }
+
     /// Post-`load_programs` initialization failure must roll back BPF state.
     pub fn node_agent_post_load_init_failure_cleanup_probe_for_test() -> NodeAgentStartupCleanupProbe
     {

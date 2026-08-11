@@ -576,14 +576,29 @@ fn node_agent_admin_gate_matches_serving_listener_boundary() {
     let port_disabled = EnvConfig {
         node_agent_admin_enabled: true,
         admin_http_port: 0,
+        admin_https_port: 0,
         ..disabled.clone()
     };
     load_startup_security(&port_disabled)
         .expect("port-zero node-agent admin must not parse admin security policy");
 
+    let https_only_malformed = EnvConfig {
+        node_agent_admin_enabled: true,
+        admin_http_port: 0,
+        admin_https_port: 19443,
+        admin_tls_cert_path: Some("/tmp/tls.crt".to_string()),
+        admin_tls_key_path: Some("/tmp/tls.key".to_string()),
+        ..disabled.clone()
+    };
+    let err = load_startup_security(&https_only_malformed)
+        .err()
+        .expect("HTTPS-only node-agent admin must still parse CIDRs");
+    assert!(format!("{err:#}").contains("FERRUM_ADMIN_ALLOWED_CIDRS"));
+
     let active = EnvConfig {
         node_agent_admin_enabled: true,
         admin_http_port: 9000,
+        admin_https_port: 0,
         ..disabled
     };
     let err = load_startup_security(&active)

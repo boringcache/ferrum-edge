@@ -6,6 +6,9 @@
     "override": "mesh-probes-override.yaml",
     "coupled_err": "mesh-probes-coupled.err",
     "node_agent_port0": "mesh-probes-node-agent-port0.yaml",
+    "node_agent_https_only": "mesh-probes-node-agent-https-only.yaml",
+    "node_agent_dual": "mesh-probes-node-agent-dual.yaml",
+    "node_agent_https_no_tls_err": "mesh-probes-node-agent-https-no-tls.err",
     "node_waypoint": "mesh-probes-node-waypoint.yaml"
   },
   "workloads": [

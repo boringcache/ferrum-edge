@@ -79,11 +79,16 @@ impl StartupSecurityScope {
                 dtls: false,
             },
             OperatingMode::NodeAgent => Self {
-                tls_policy_and_crls: false,
+                // TLS policy/CRLs + admin TLS material are required when the
+                // node-agent admin HTTPS listener is configured
+                // (`admin_https_listener_enabled`). `try_load_admin_tls` is a
+                // no-op when HTTPS is not enabled, so HTTP-only installs stay
+                // unaffected.
+                tls_policy_and_crls: true,
                 // Parsed only when the node-agent admin listener would start.
                 admin_cidrs_and_metrics: true,
                 frontend_tls: false,
-                admin_tls: false,
+                admin_tls: true,
                 dtls: false,
             },
             OperatingMode::Injector | OperatingMode::Migrate => Self {
@@ -154,10 +159,12 @@ pub fn load_startup_security_with_scope(
         return Ok(StartupSecurityMaterials::empty());
     }
 
-    // Node-agent only parses CIDRs/metrics/JWT when its admin listener would
-    // actually start — preserve that mode-specific gate.
-    let node_agent_admin_active = env_config.mode != OperatingMode::NodeAgent
-        || (env_config.node_agent_admin_enabled && env_config.admin_http_port != 0);
+    // Node-agent only parses CIDRs/metrics when its admin surface would
+    // actually start — HTTP, HTTPS, or both. HTTPS-only
+    // (`FERRUM_ADMIN_HTTP_PORT=0` + configured admin TLS) must still apply the
+    // same auth/CIDR contract.
+    let node_agent_admin_active =
+        env_config.mode != OperatingMode::NodeAgent || node_agent_admin_surface_active(env_config);
 
     let mut materials = StartupSecurityMaterials::empty();
 
@@ -319,6 +326,80 @@ pub fn load_admin_tls_material(
         crls,
     )
     .map_err(|e| anyhow::anyhow!("{}: {}", error_label, e))
+}
+
+/// Whether node-agent mode should start any admin listener surface.
+///
+/// True when admin is opted in and at least one of plaintext HTTP or
+/// configured HTTPS would bind. HTTPS follows the shared
+/// [`EnvConfig::admin_https_listener_enabled`] contract (nonzero port + both
+/// cert/key paths).
+pub fn node_agent_admin_surface_active(env_config: &EnvConfig) -> bool {
+    env_config.node_agent_admin_enabled
+        && (env_config.admin_http_port != 0 || env_config.admin_https_listener_enabled())
+}
+
+/// Fully prepared admin HTTPS listener materials shared by serving modes.
+///
+/// TLS material is validated before any plaintext admin task is spawned so a
+/// bad cert/key cannot orphan an already-running HTTP listener.
+pub struct PlannedAdminHttps {
+    pub addr: std::net::SocketAddr,
+    pub tls_config: Arc<rustls::ServerConfig>,
+    pub reload: crate::modes::tls_reload::AdminFrontendTlsReloadHandles,
+}
+
+/// Independent admin HTTPS listener plan used by node-agent and other serving
+/// modes. HTTP and HTTPS ports are decided separately; HTTPS is never gated on
+/// a nonzero HTTP port.
+pub enum AdminHttpsListenerPlan {
+    /// `FERRUM_ADMIN_HTTPS_PORT=0` — disable sentinel.
+    DisabledByPort,
+    /// Nonzero HTTPS port without a complete cert/key pair — no HTTPS listener.
+    DisabledByMissingTls,
+    /// HTTPS listener should bind with the prepared TLS runtime.
+    Enabled(PlannedAdminHttps),
+}
+
+/// Plan the binary-owned admin HTTPS listener from `EnvConfig`.
+///
+/// - Port `0` → [`AdminHttpsListenerPlan::DisabledByPort`]
+/// - Nonzero port without both cert/key paths →
+///   [`AdminHttpsListenerPlan::DisabledByMissingTls`]
+/// - Nonzero port with both paths → load TLS (fail closed on invalid/missing/
+///   unreadable/mismatched material) and prepare the shared reloadable
+///   frontend/admin TLS provider
+///
+/// Callers must invoke this **before** spawning a plaintext admin listener so
+/// startup rollback owns every handle (issue #2372 / #3704).
+pub fn plan_admin_https_listener(
+    env_config: &EnvConfig,
+    tls_policy: &TlsPolicy,
+    crls: &CrlList,
+    error_label: &str,
+    addr: std::net::SocketAddr,
+    shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+) -> Result<AdminHttpsListenerPlan, anyhow::Error> {
+    if env_config.admin_https_port == 0 {
+        return Ok(AdminHttpsListenerPlan::DisabledByPort);
+    }
+    if !env_config.admin_https_listener_enabled() {
+        return Ok(AdminHttpsListenerPlan::DisabledByMissingTls);
+    }
+
+    let tls_config = load_admin_tls_material(env_config, tls_policy, crls, error_label)?;
+    let reload = crate::modes::tls_reload::prepare_admin_frontend_tls(
+        tls_config.clone(),
+        env_config,
+        tls_policy,
+        crls,
+        shutdown_rx,
+    );
+    Ok(AdminHttpsListenerPlan::Enabled(PlannedAdminHttps {
+        addr,
+        tls_config,
+        reload,
+    }))
 }
 
 /// Validate DTLS frontend cert (+ optional client CA) expiry when both DTLS

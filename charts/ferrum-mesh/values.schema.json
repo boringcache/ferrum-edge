@@ -606,6 +606,59 @@
                   "pattern": "^[0-9]{1,5}$"
                 }
               ]
+            },
+            "httpsPort": {
+              "description": "Admin HTTPS listen port. Default 0 disables HTTPS until admin.tls is configured. Accepts integer or numeric string.",
+              "oneOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 65535
+                },
+                {
+                  "type": "string",
+                  "pattern": "^[0-9]{1,5}$"
+                }
+              ]
+            },
+            "tls": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": {
+                  "type": "boolean"
+                },
+                "secretName": {
+                  "type": "string"
+                },
+                "mountPath": {
+                  "type": "string"
+                },
+                "certKey": {
+                  "type": "string"
+                },
+                "keyKey": {
+                  "type": "string"
+                },
+                "clientCaKey": {
+                  "type": "string"
+                },
+                "crlKey": {
+                  "type": "string"
+                }
+              }
+            },
+            "metricsScrape": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": {
+                  "type": "boolean"
+                },
+                "path": {
+                  "type": "string"
+                }
+              }
             }
           }
         },

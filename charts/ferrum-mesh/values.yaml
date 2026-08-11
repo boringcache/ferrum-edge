@@ -417,10 +417,38 @@ nodeAgent:
     # Non-conflicting with the ambient mesh admin listener's binary default
     # (9000) when both DaemonSets run on the host network.
     port: 19090
-  # Admin-backed probes. When admin is disabled or port=0, computed probes are
-  # omitted (preserve the historical no-readiness behavior) unless an override
+    # Admin HTTPS port. Default 0 keeps existing HTTP-only installs unchanged
+    # (the binary default is 9443, so the chart must pin 0 until TLS is opted
+    # in). Set a nonzero port together with admin.tls below for HTTPS-only
+    # (port=0) or dual-listener operation.
+    httpsPort: 0
+    # Optional admin TLS Secret mount. Uses the shared FERRUM_ADMIN_TLS_*
+    # contract — no node-agent-only TLS variables. When enabled with a
+    # secretName, the chart mounts cert/key (and optional client CA / CRL)
+    # read-only and sets the matching PATH env vars. Incomplete or invalid
+    # combinations fail at helm render; do not store PEM material in values.
+    tls:
+      enabled: false
+      secretName: ""
+      mountPath: /etc/ferrum/tls/admin
+      certKey: tls.crt
+      keyKey: tls.key
+      # Optional mTLS client CA key within the same Secret. When set with
+      # port=0 (HTTPS-only), computed exec probes cannot present a client
+      # cert — override or disable them, or keep a plaintext loopback port.
+      clientCaKey: ""
+      # Optional PEM CRL key within the same Secret (FERRUM_TLS_CRL_FILE_PATH).
+      crlKey: ""
+    # Optional Prometheus scrape annotations. When enabled, scheme/port follow
+    # the active admin listener (HTTPS preferred when TLS is configured).
+    metricsScrape:
+      enabled: false
+      path: /metrics
+  # Admin-backed probes. When admin is disabled or both HTTP and HTTPS ports
+  # are 0 (or HTTPS is selected without TLS), computed probes are omitted
+  # (preserve the historical no-readiness behavior) unless an override
   # handler is supplied. Liveness uses --live so capture degradation does not
-  # restart-loop the agent.
+  # restart-loop the agent. HTTPS-only probes dial with --tls --tls-no-verify.
   probes:
     startup:
       enabled: true
