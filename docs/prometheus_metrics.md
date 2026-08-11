@@ -380,8 +380,11 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_websocket_frames_total` | counter | `proxy_id`, `direction`, `namespace` | `websocket` | `documented_only` | `conditional` | WebSocket frames relayed by direction. |
 | `ferrum_websocket_session_duration_ms` | histogram | `proxy_id`, `result`, `direction`, `io_side`, `error_class`, `termination_reason`, `le`, `namespace` | `websocket` | `documented_only` | `conditional` | WebSocket session duration in milliseconds. |
 | `ferrum_websocket_sessions_total` | counter | `proxy_id`, `result`, `direction`, `io_side`, `error_class`, `termination_reason`, `namespace` | `websocket` | `documented_only` | `conditional` | Completed WebSocket sessions by bounded terminal classification. |
+| `ferrum_xds_active_node_ids` | gauge | `gateway_namespace` | `mesh` | `documented_only` | `conditional` | Distinct node state keys with at least one active ADS stream. |
+| `ferrum_xds_active_streams` | gauge | `gateway_namespace` | `mesh` | `documented_only` | `conditional` | Currently active ADS streams (SotW plus Delta) admitted by the control plane. |
 | `ferrum_xds_first_slice_nacks_total` | counter | `namespace`, `type_url`, `gateway_namespace` | `mesh` | `documented_only` | `conditional` | NACKs of a required mesh-slice type while the data plane is still waiting for its first slice. |
-| `ferrum_xds_streams_rejected_total` | counter | `gateway_namespace` | `mesh` | `documented_only` | `conditional` | ADS streams rejected for exceeding the per-node concurrent-stream ceiling. |
+| `ferrum_xds_stream_admission_rejections_total` | counter | `reason`, `gateway_namespace` | `mesh` | `documented_only` | `conditional` | ADS streams rejected at admission, by bounded reason. |
+| `ferrum_xds_streams_rejected_total` | counter | `gateway_namespace` | `mesh` | `documented_only` | `conditional` | ADS streams rejected at admission by any scope (total, namespace, principal, node, node cardinality, invalid Node.id, or initial-request deadline). |
 | `ferrum_xds_warming_partial_applies_total` | counter | `namespace`, `gateway_namespace` | `mesh` | `documented_only` | `conditional` | Mesh slices applied while marked as xDS required-version skewed. Normal coherent xDS apply should not increment this. |
 
 ## Bundled observability surfaces

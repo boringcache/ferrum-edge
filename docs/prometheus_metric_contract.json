@@ -3557,6 +3557,30 @@
     "emission": "conditional"
   },
   {
+    "name": "ferrum_xds_active_node_ids",
+    "type": "gauge",
+    "help": "Distinct node state keys with at least one active ADS stream.",
+    "labels": [
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_xds_active_streams",
+    "type": "gauge",
+    "help": "Currently active ADS streams (SotW plus Delta) admitted by the control plane.",
+    "labels": [
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
     "name": "ferrum_xds_first_slice_nacks_total",
     "type": "counter",
     "help": "NACKs of a required mesh-slice type while the data plane is still waiting for its first slice.",
@@ -3571,9 +3595,22 @@
     "emission": "conditional"
   },
   {
+    "name": "ferrum_xds_stream_admission_rejections_total",
+    "type": "counter",
+    "help": "ADS streams rejected at admission, by bounded reason.",
+    "labels": [
+      "reason",
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
     "name": "ferrum_xds_streams_rejected_total",
     "type": "counter",
-    "help": "ADS streams rejected for exceeding the per-node concurrent-stream ceiling.",
+    "help": "ADS streams rejected at admission by any scope (total, namespace, principal, node, node cardinality, invalid Node.id, or initial-request deadline).",
     "labels": [
       "gateway_namespace"
     ],
