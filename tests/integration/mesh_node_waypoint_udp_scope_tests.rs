@@ -529,3 +529,37 @@ async fn manager_shutdown_retracts_the_published_generation() {
         NodeWaypointUdpSourceRefusal::IndexUnavailable
     );
 }
+
+/// The manager is security-critical background state, not merely a cache
+/// warmer. If its task is aborted (the same future-drop path a panic takes),
+/// the last published identity generation must become unavailable immediately
+/// instead of remaining trusted forever.
+#[tokio::test]
+async fn manager_task_abort_retracts_the_published_generation() {
+    let fixture = Fixture::new();
+    fixture.manager.reconcile_once();
+    let before_run = fixture.index.generation();
+    let index = fixture.index.clone();
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let handle = tokio::spawn(async move { fixture.manager.run(shutdown_rx).await });
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while index.generation() == before_run {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("manager should enter its reconcile loop");
+
+    handle.abort();
+    assert!(
+        handle.await.expect_err("aborted manager must not complete").is_cancelled(),
+        "the test must exercise future-drop retraction"
+    );
+    assert_eq!(
+        index
+            .authorize(Some(IFINDEX_A), ip(IP_A))
+            .expect_err("an aborted manager must leave no trusted attribution"),
+        NodeWaypointUdpSourceRefusal::IndexUnavailable
+    );
+}

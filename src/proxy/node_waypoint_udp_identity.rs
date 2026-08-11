@@ -234,6 +234,11 @@ impl NodeWaypointUdpSourceRefusal {
 #[derive(Debug, Default)]
 struct SourceGeneration {
     generation: u64,
+    /// Part of the same `ArcSwap` snapshot as the bindings. This makes shutdown
+    /// retraction atomic with map replacement: readers see either the prior
+    /// published generation or the new retracted generation, never a stale
+    /// binding paired with a separately loaded publication flag.
+    published: bool,
     by_ifindex: HashMap<u32, Arc<NodeWaypointUdpSourceBinding>>,
 }
 
@@ -243,10 +248,6 @@ struct SourceGeneration {
 pub struct NodeWaypointUdpSourceIndex {
     current: ArcSwap<SourceGeneration>,
     next_generation: AtomicU64,
-    /// Whether a generation has ever been published. An index that has never
-    /// published refuses everything (`IndexUnavailable`) rather than looking
-    /// like "no pods enrolled".
-    published: std::sync::atomic::AtomicBool,
     refusals: [AtomicU64; NodeWaypointUdpSourceRefusal::COUNT],
     warn_last_ms: [AtomicU64; NodeWaypointUdpSourceRefusal::COUNT],
     warn_suppressed: [AtomicU64; NodeWaypointUdpSourceRefusal::COUNT],
@@ -257,7 +258,6 @@ impl Default for NodeWaypointUdpSourceIndex {
         Self {
             current: ArcSwap::from_pointee(SourceGeneration::default()),
             next_generation: AtomicU64::new(1),
-            published: std::sync::atomic::AtomicBool::new(false),
             refusals: std::array::from_fn(|_| AtomicU64::new(0)),
             warn_last_ms: std::array::from_fn(|_| AtomicU64::new(REFUSAL_WARN_UNSET_MS)),
             warn_suppressed: std::array::from_fn(|_| AtomicU64::new(0)),
@@ -298,9 +298,9 @@ impl NodeWaypointUdpSourceIndex {
         }
         self.current.store(Arc::new(SourceGeneration {
             generation,
+            published: true,
             by_ifindex,
         }));
-        self.published.store(true, Ordering::Release);
         generation
     }
 
@@ -308,9 +308,9 @@ impl NodeWaypointUdpSourceIndex {
     /// draining cannot attribute a late datagram to a pod that is no longer
     /// covered.
     pub fn clear(&self) {
-        self.published.store(false, Ordering::Release);
         self.current.store(Arc::new(SourceGeneration {
             generation: self.next_generation.fetch_add(1, Ordering::Relaxed),
+            published: false,
             by_ifindex: HashMap::new(),
         }));
     }
@@ -337,13 +337,13 @@ impl NodeWaypointUdpSourceIndex {
         ingress_ifindex: Option<u32>,
         source: IpAddr,
     ) -> Result<Arc<NodeWaypointUdpSourceBinding>, NodeWaypointUdpSourceRefusal> {
-        if !self.published.load(Ordering::Acquire) {
+        let snapshot = self.current.load();
+        if !snapshot.published {
             return Err(self.record(NodeWaypointUdpSourceRefusal::IndexUnavailable));
         }
         let Some(ifindex) = ingress_ifindex.filter(|index| *index != 0) else {
             return Err(self.record(NodeWaypointUdpSourceRefusal::NoIngressInterface));
         };
-        let snapshot = self.current.load();
         let Some(binding) = snapshot.by_ifindex.get(&ifindex) else {
             return Err(self.record(NodeWaypointUdpSourceRefusal::UnenrolledInterface));
         };
@@ -564,6 +564,20 @@ pub struct NodeWaypointUdpSourceIndexManager<R: NodeWaypointUdpInterfaceResolver
     poll_interval: Duration,
 }
 
+/// Retract attribution evidence whenever the manager future leaves scope — not
+/// only on an orderly shutdown signal. Tokio task abort and panic both drop the
+/// future, so a dead manager cannot leave an indefinitely trusted last-good
+/// index behind while listeners continue draining or serving.
+struct SourceIndexRetractionGuard {
+    index: Arc<NodeWaypointUdpSourceIndex>,
+}
+
+impl Drop for SourceIndexRetractionGuard {
+    fn drop(&mut self) {
+        self.index.clear();
+    }
+}
+
 impl<R: NodeWaypointUdpInterfaceResolver> NodeWaypointUdpSourceIndexManager<R> {
     pub fn new(
         source: Arc<dyn PodCaptureSource>,
@@ -621,6 +635,9 @@ impl<R: NodeWaypointUdpInterfaceResolver> NodeWaypointUdpSourceIndexManager<R> {
     }
 
     pub async fn run(self, mut shutdown: watch::Receiver<bool>) {
+        let retraction = SourceIndexRetractionGuard {
+            index: self.index.clone(),
+        };
         info!(
             poll_interval_ms = self.poll_interval.as_millis() as u64,
             "NodeWaypoint UDP/DTLS source-identity index started; scoped AuthorizationPolicy is \
@@ -640,9 +657,9 @@ impl<R: NodeWaypointUdpInterfaceResolver> NodeWaypointUdpSourceIndexManager<R> {
                 }
             }
         }
-        // Retract on shutdown: a listener still draining must not attribute a
-        // late datagram under a generation nobody is maintaining.
-        self.index.clear();
+        // Drop the guard explicitly so retraction precedes the diagnostic. The
+        // same Drop path also runs if this task is aborted or unwinds.
+        drop(retraction);
         debug!("NodeWaypoint UDP/DTLS source-identity index retracted at shutdown");
     }
 }

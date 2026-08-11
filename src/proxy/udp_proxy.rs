@@ -566,6 +566,23 @@ fn spawn_session_hook_ingress_worker(
                 break;
             }
 
+            // The datagram may have waited in this bounded worker queue after
+            // the listener's first check. Revalidate before invoking plugins
+            // so their own side effects cannot run under stale workload scope.
+            if let Some(source) = session.node_waypoint_source.as_ref()
+                && let Err(refusal) = source.revalidate(source.ingress_ifindex, client_addr.ip())
+            {
+                source.scoping.index.warn_refusal(
+                    session.proxy_id.as_str(),
+                    session.datagram_client_ip.as_ref(),
+                    refusal,
+                );
+                session.expired.store(true, Ordering::Release);
+                signal_udp_reply_task_stop(&session.stop_reply_task, session.stop_notify.as_ref());
+                session.close_hook_ingress();
+                break;
+            }
+
             let allowed = tokio::select! {
                 allowed = udp_datagram_allowed(
                 &session.datagram_plugins,
@@ -642,22 +659,35 @@ fn spawn_session_hook_ingress_worker(
 /// this queue preserves that behavior without blocking the recv loop.
 #[derive(Default)]
 struct PendingDatagramQueue {
-    datagrams: Vec<Vec<u8>>,
+    datagrams: Vec<PendingDatagram>,
     queued_bytes: usize,
+}
+
+/// One datagram retained while its source tuple's session is being admitted.
+/// The ingress interface is authorization evidence, not optional routing
+/// metadata: dropping it would let a same-tuple datagram arriving on another
+/// interface inherit the opening datagram's NodeWaypoint workload identity.
+#[derive(Debug, PartialEq, Eq)]
+struct PendingDatagram {
+    data: Vec<u8>,
+    ingress_ifindex: Option<u32>,
 }
 
 impl PendingDatagramQueue {
     /// Append a follow-up datagram, tail-dropping once either cap is hit.
     /// Returns `false` when the datagram was dropped. Zero-length datagrams
     /// are valid UDP and are queued like any other.
-    fn push_bounded(&mut self, data: &[u8]) -> bool {
+    fn push_bounded(&mut self, data: &[u8], ingress_ifindex: Option<u32>) -> bool {
         if self.datagrams.len() >= PENDING_SESSION_MAX_QUEUED_DATAGRAMS
             || self.queued_bytes.saturating_add(data.len()) > PENDING_SESSION_MAX_QUEUED_BYTES
         {
             return false;
         }
         self.queued_bytes += data.len();
-        self.datagrams.push(data.to_vec());
+        self.datagrams.push(PendingDatagram {
+            data: data.to_vec(),
+            ingress_ifindex,
+        });
         true
     }
 }
@@ -911,7 +941,7 @@ fn udp_active_session_cap_reached(metrics: &UdpProxyMetrics, max_sessions: usize
 fn take_pending_datagrams(
     pending_sessions: &PendingSessionMap,
     client_addr: SocketAddr,
-) -> Option<Vec<Vec<u8>>> {
+) -> Option<Vec<PendingDatagram>> {
     match pending_sessions.entry(client_addr) {
         dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
             if occupied.get().datagrams.is_empty() {
@@ -2450,7 +2480,7 @@ async fn process_datagram(
         // instead of being dropped; the setup task drains the queue in
         // arrival order before releasing the gate. Beyond the caps we
         // tail-drop, preserving the pending gate's flood-resistance bound.
-        let _ = pending.push_bounded(data);
+        let _ = pending.push_bounded(data, local_addr.map(|local| local.ifindex));
         return Ok(());
     }
 
@@ -2492,7 +2522,7 @@ async fn process_datagram(
             // function (not expected — the recv loop is a single task). Treat
             // this datagram as a follow-up for the in-flight setup.
             if let Some(mut pending) = pending_sessions.get_mut(&client_addr) {
-                let _ = pending.push_bounded(data);
+                let _ = pending.push_bounded(data, local_addr.map(|local| local.ifindex));
             }
             return Ok(());
         }
@@ -2841,6 +2871,24 @@ async fn process_new_session_datagram(
         return Ok(());
     }
 
+    // The first-datagram hook above may await. Revalidate before reserving a
+    // slot or beginning DNS/backend setup so stale source evidence cannot
+    // authorize those side effects.
+    if let Some(source) = node_waypoint_session_source.as_ref()
+        && let Err(refusal) = source.revalidate(source.ingress_ifindex, client_addr.ip())
+    {
+        source.scoping.index.warn_refusal(
+            view.proxy.id.as_str(),
+            &udp_session_client_ip(client_addr),
+            refusal,
+        );
+        return Err(anyhow::anyhow!(
+            "NodeWaypoint UDP source attribution changed while first-datagram policy hooks ran \
+             ({})",
+            refusal.as_str()
+        ));
+    }
+
     let mut reservation = reserve_udp_session_slot(metrics, max_sessions)?;
 
     let session = create_session(
@@ -2889,6 +2937,28 @@ async fn process_new_session_datagram(
         let _ = session.local_addr.set(la);
     }
 
+    // Session construction performs the same check before publication, but do
+    // it again at the last await boundary before the retained first datagram is
+    // sent. Shutdown/reconcile may retract the attribution while metadata is
+    // transferred from the first-datagram hook.
+    if let Some(source) = session.node_waypoint_source.as_ref()
+        && let Err(refusal) =
+            source.revalidate(local_addr.map(|local| local.ifindex), client_addr.ip())
+    {
+        source.scoping.index.warn_refusal(
+            session.proxy_id.as_str(),
+            session.datagram_client_ip.as_ref(),
+            refusal,
+        );
+        session.expired.store(true, Ordering::Release);
+        signal_udp_reply_task_stop(&session.stop_reply_task, session.stop_notify.as_ref());
+        session.close_hook_ingress();
+        return Err(anyhow::anyhow!(
+            "NodeWaypoint UDP source attribution changed before the initial forward ({})",
+            refusal.as_str()
+        ));
+    }
+
     forward_client_datagram_to_backend(&session, &data).await?;
     metrics.datagrams_out.fetch_add(1, Ordering::Relaxed);
     metrics
@@ -2901,13 +2971,37 @@ async fn process_new_session_datagram(
     // packet-error handling as the established-session path.
     while let Some(batch) = take_pending_datagrams(pending_sessions, client_addr) {
         for dgram in batch {
+            // Pending entries are keyed only by the spoofable source tuple.
+            // Re-authorize the actual ingress interface retained with every
+            // datagram before any plugin side effect.
+            if let Some(source) = session.node_waypoint_source.as_ref()
+                && let Err(refusal) =
+                    source.revalidate(dgram.ingress_ifindex, client_addr.ip())
+            {
+                source.scoping.index.warn_refusal(
+                    session.proxy_id.as_str(),
+                    session.datagram_client_ip.as_ref(),
+                    refusal,
+                );
+                session.expired.store(true, Ordering::Release);
+                signal_udp_reply_task_stop(
+                    &session.stop_reply_task,
+                    session.stop_notify.as_ref(),
+                );
+                session.close_hook_ingress();
+                return Err(anyhow::anyhow!(
+                    "NodeWaypoint UDP pending datagram attribution does not match the admitted \
+                     session ({}); closing the session",
+                    refusal.as_str()
+                ));
+            }
             if !udp_datagram_allowed(
                 &session.datagram_plugins,
                 Arc::clone(&session.datagram_client_ip),
                 Arc::clone(&session.datagram_proxy_id),
                 session.datagram_proxy_name.clone(),
                 session.listen_port,
-                &dgram,
+                &dgram.data,
                 session.datagram_payload_kind,
                 UdpDatagramDirection::ClientToBackend,
                 Some(UdpMetadataSink::new(&session.metadata)),
@@ -2916,7 +3010,31 @@ async fn process_new_session_datagram(
             {
                 continue;
             }
-            if let Err(e) = forward_client_datagram_to_backend(&session, &dgram).await {
+            // The hook above may await arbitrary I/O. Revalidate again so a
+            // registry/slice change during it cannot produce a late backend
+            // side effect under the opening workload's identity.
+            if let Some(source) = session.node_waypoint_source.as_ref()
+                && let Err(refusal) =
+                    source.revalidate(dgram.ingress_ifindex, client_addr.ip())
+            {
+                source.scoping.index.warn_refusal(
+                    session.proxy_id.as_str(),
+                    session.datagram_client_ip.as_ref(),
+                    refusal,
+                );
+                session.expired.store(true, Ordering::Release);
+                signal_udp_reply_task_stop(
+                    &session.stop_reply_task,
+                    session.stop_notify.as_ref(),
+                );
+                session.close_hook_ingress();
+                return Err(anyhow::anyhow!(
+                    "NodeWaypoint UDP pending datagram attribution changed while policy hooks ran \
+                     ({}); closing the session",
+                    refusal.as_str()
+                ));
+            }
+            if let Err(e) = forward_client_datagram_to_backend(&session, &dgram.data).await {
                 debug!(
                     proxy_id = %session.datagram_proxy_id,
                     client = %udp_client_log_addr(client_addr),
@@ -2929,7 +3047,7 @@ async fn process_new_session_datagram(
             metrics.datagrams_out.fetch_add(1, Ordering::Relaxed);
             metrics
                 .bytes_out
-                .fetch_add(dgram.len() as u64, Ordering::Relaxed);
+                .fetch_add(dgram.data.len() as u64, Ordering::Relaxed);
         }
     }
     // `take_pending_datagrams` removed the gate entry under the shard lock;
@@ -3823,6 +3941,24 @@ async fn handle_dtls_client_inner(
         .clone();
     let idle_timeout = Duration::from_secs(proxy.udp_idle_timeout_seconds.max(1));
 
+    // Source admission ran before the potentially asynchronous stream plugin
+    // chain. Revalidate at the handler boundary so a pod deletion, identity
+    // rotation, or interface reuse during that chain cannot even begin backend
+    // selection/setup under stale workload evidence.
+    if let Some(source) = node_waypoint_source.as_ref()
+        && let Err(refusal) = source.revalidate(source.ingress_ifindex, client_addr.ip())
+    {
+        source.scoping.index.warn_refusal(
+            proxy_id,
+            udp_session_client_ip(client_addr).as_ref(),
+            refusal,
+        );
+        return Err(anyhow::anyhow!(
+            "NodeWaypoint DTLS source attribution changed after stream admission ({})",
+            refusal.as_str()
+        ));
+    }
+
     // Resolve backend target
     let lb_hash_key = udp_lb_hash_key_for_client_ip(client_addr.ip());
     let (backend_host, backend_port) =
@@ -4050,6 +4186,24 @@ async fn handle_dtls_client_inner(
                 }
             }
 
+            // A datagram hook may await arbitrary I/O. Revalidate after it and
+            // immediately before the backend side effect so a registry/slice
+            // change cannot forward under stale workload identity.
+            if let Some(source) = node_waypoint_source_fwd.as_ref()
+                && let Err(refusal) =
+                    source.revalidate(source.ingress_ifindex, client_addr.ip())
+            {
+                source
+                    .scoping
+                    .index
+                    .warn_refusal(&proxy_id_fwd, dgram_client_ip.as_ref(), refusal);
+                return Err(anyhow::anyhow!(
+                    "NodeWaypoint DTLS source attribution changed while client policy hooks ran \
+                     ({})",
+                    refusal.as_str()
+                ));
+            }
+
             // Publish before sending so a fast backend reply cannot observe a
             // zero or stale amplification budget.
             last_request_size_fwd.store(len as u64, Ordering::Release);
@@ -4162,6 +4316,25 @@ async fn handle_dtls_client_inner(
                 if drop {
                     continue;
                 }
+            }
+
+            // The response hook above may await arbitrary I/O. Revalidate at
+            // the last boundary before delivery so stale-session data is never
+            // encrypted and sent to a workload that inherited the peer tuple.
+            if let Some(source) = node_waypoint_source_rev.as_ref()
+                && let Err(refusal) =
+                    source.revalidate(source.ingress_ifindex, client_addr.ip())
+            {
+                source.scoping.index.warn_refusal(
+                    &proxy_id_rev,
+                    dgram_client_ip_rev.as_ref(),
+                    refusal,
+                );
+                return Err(anyhow::anyhow!(
+                    "NodeWaypoint DTLS source attribution changed while response policy hooks ran \
+                     ({})",
+                    refusal.as_str()
+                ));
             }
 
             if client_sender.send(&data).await.is_err() {
@@ -4292,6 +4465,20 @@ async fn admit_plain_udp_stream(
                 StreamSetupError::new(StreamSetupKind::RejectedByPlugin, "(UDP session)").into(),
             );
         }
+    }
+    if let (Some(scoping), Some(binding)) =
+        (node_waypoint_udp_source, node_waypoint_source_binding.as_ref())
+        && let Err(refusal) = scoping.revalidate(binding, ingress_ifindex, client_addr.ip())
+    {
+        scoping.index.warn_refusal(
+            view.proxy.id.as_str(),
+            &udp_session_client_ip(client_addr),
+            refusal,
+        );
+        return Err(anyhow::anyhow!(
+            "NodeWaypoint UDP source attribution changed while stream admission hooks ran ({})",
+            refusal.as_str()
+        ));
     }
     Ok((stream_ctx, node_waypoint_source_binding))
 }
@@ -4801,6 +4988,31 @@ async fn create_session(
                 }
             }
 
+            // Response hooks may await arbitrary I/O. Revalidate at the last
+            // boundary before the client send so churn cannot deliver a stale
+            // reply to a workload that inherited the peer tuple.
+            if let Some(source) = reply_session.node_waypoint_source.as_ref()
+                && let Err(refusal) = source.revalidate(source.ingress_ifindex, client_addr.ip())
+            {
+                source.scoping.index.warn_refusal(
+                    &reply_proxy_id,
+                    &udp_session_client_ip(client_addr),
+                    refusal,
+                );
+                reply_session.expired.store(true, Ordering::Release);
+                disconnect_error = Some((
+                    format!(
+                        "NodeWaypoint UDP source attribution changed while response policy hooks \
+                         ran ({})",
+                        refusal.as_str()
+                    ),
+                    crate::retry::ErrorClass::DispatchPolicyRejected,
+                    crate::plugins::DisconnectCause::RecvError,
+                    crate::plugins::Direction::BackendToClient,
+                ));
+                break;
+            }
+
             // Batch-local counters for this recv burst.
             let mut batch_dgrams: u64 = 1;
             let mut batch_bytes: u64 = len as u64;
@@ -4944,6 +5156,28 @@ async fn create_session(
                                 if drop {
                                     continue;
                                 }
+                            }
+                            if let Some(source) = reply_session.node_waypoint_source.as_ref()
+                                && let Err(refusal) =
+                                    source.revalidate(source.ingress_ifindex, client_addr.ip())
+                            {
+                                source.scoping.index.warn_refusal(
+                                    &reply_proxy_id,
+                                    &udp_session_client_ip(client_addr),
+                                    refusal,
+                                );
+                                reply_session.expired.store(true, Ordering::Release);
+                                disconnect_error = Some((
+                                    format!(
+                                        "NodeWaypoint UDP source attribution changed while \
+                                         response policy hooks ran ({})",
+                                        refusal.as_str()
+                                    ),
+                                    crate::retry::ErrorClass::DispatchPolicyRejected,
+                                    crate::plugins::DisconnectCause::RecvError,
+                                    crate::plugins::Direction::BackendToClient,
+                                ));
+                                break 'reply;
                             }
 
                             batch_dgrams += 1;
@@ -6240,30 +6474,43 @@ backend_tls_verify_server_cert: false
         let mut queue = super::PendingDatagramQueue::default();
 
         // Zero-length datagrams are valid UDP and must be queued.
-        assert!(queue.push_bounded(&[]));
-        assert!(queue.push_bounded(&[1]));
-        assert!(queue.push_bounded(&[2, 2]));
+        assert!(queue.push_bounded(&[], Some(7)));
+        assert!(queue.push_bounded(&[1], Some(8)));
+        assert!(queue.push_bounded(&[2, 2], None));
         assert_eq!(
             queue.datagrams,
-            vec![Vec::<u8>::new(), vec![1], vec![2, 2]],
-            "queue must preserve arrival order"
+            vec![
+                super::PendingDatagram {
+                    data: Vec::new(),
+                    ingress_ifindex: Some(7),
+                },
+                super::PendingDatagram {
+                    data: vec![1],
+                    ingress_ifindex: Some(8),
+                },
+                super::PendingDatagram {
+                    data: vec![2, 2],
+                    ingress_ifindex: None,
+                },
+            ],
+            "queue must preserve arrival order and authorization evidence"
         );
         assert_eq!(queue.queued_bytes, 3);
 
         // Byte cap: a datagram that would exceed the total byte budget is
         // tail-dropped without touching the queue.
         let oversize = vec![0u8; super::PENDING_SESSION_MAX_QUEUED_BYTES];
-        assert!(!queue.push_bounded(&oversize));
+        assert!(!queue.push_bounded(&oversize, Some(9)));
         assert_eq!(queue.datagrams.len(), 3);
         assert_eq!(queue.queued_bytes, 3);
 
         // Datagram-count cap: beyond the max entry count everything is
         // tail-dropped, even zero-length datagrams.
         for _ in queue.datagrams.len()..super::PENDING_SESSION_MAX_QUEUED_DATAGRAMS {
-            assert!(queue.push_bounded(&[7]));
+            assert!(queue.push_bounded(&[7], Some(7)));
         }
-        assert!(!queue.push_bounded(&[8]));
-        assert!(!queue.push_bounded(&[]));
+        assert!(!queue.push_bounded(&[8], Some(8)));
+        assert!(!queue.push_bounded(&[], None));
         assert_eq!(
             queue.datagrams.len(),
             super::PENDING_SESSION_MAX_QUEUED_DATAGRAMS
@@ -6571,14 +6818,26 @@ backend_tls_verify_server_cert: false
         pending.insert(addr, super::PendingDatagramQueue::default());
         {
             let mut entry = pending.get_mut(&addr).expect("gate present");
-            assert!(entry.push_bounded(&[1]));
-            assert!(entry.push_bounded(&[2]));
+            assert!(entry.push_bounded(&[1], Some(7)));
+            assert!(entry.push_bounded(&[2], Some(8)));
         }
 
         // First take hands off the queued batch in arrival order and leaves
         // the gate in place so concurrent arrivals keep queueing.
         let batch = super::take_pending_datagrams(&pending, addr).expect("queued batch");
-        assert_eq!(batch, vec![vec![1], vec![2]]);
+        assert_eq!(
+            batch,
+            vec![
+                super::PendingDatagram {
+                    data: vec![1],
+                    ingress_ifindex: Some(7),
+                },
+                super::PendingDatagram {
+                    data: vec![2],
+                    ingress_ifindex: Some(8),
+                },
+            ]
+        );
         assert!(
             pending.contains_key(&addr),
             "gate must survive a non-empty take"
@@ -6589,10 +6848,16 @@ backend_tls_verify_server_cert: false
         {
             let mut entry = pending.get_mut(&addr).expect("gate present");
             assert_eq!(entry.queued_bytes, 0, "take must reset byte accounting");
-            assert!(entry.push_bounded(&[3]));
+            assert!(entry.push_bounded(&[3], None));
         }
         let batch = super::take_pending_datagrams(&pending, addr).expect("late batch");
-        assert_eq!(batch, vec![vec![3]]);
+        assert_eq!(
+            batch,
+            vec![super::PendingDatagram {
+                data: vec![3],
+                ingress_ifindex: None,
+            }]
+        );
 
         // Empty queue: the gate is removed atomically and the drain ends.
         assert!(super::take_pending_datagrams(&pending, addr).is_none());

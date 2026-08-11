@@ -1249,14 +1249,11 @@ impl StreamListenerManager {
     /// proxies continue to pass `node_waypoint_policy_scope: None` and behave
     /// exactly as before.
     ///
-    /// Deliberately TCP-only. Node-waypoint capture keys identity by the
-    /// per-connection TCP socket cookie (`connect4`/`connect6` cgroup hooks
-    /// stamp the source pod into `FERRUM_ORIG_DST4/6`, looked up at accept time
-    /// via `getsockopt(SO_COOKIE)`). A UDP stream proxy has a single shared
-    /// frontend socket with one cookie for every client, and there are no UDP
-    /// capture hooks, so there is no per-source-pod cookie to resolve. UDP/DTLS
-    /// node-waypoint streams therefore remain mesh-wide-only (the existing
-    /// fail-closed default) — see `src/proxy/udp_proxy.rs` and `docs/mesh.md`.
+    /// TCP consumes this resolver through the per-connection socket-cookie
+    /// bridge. UDP/DTLS has no useful per-client cookie on its shared frontend
+    /// socket, so it consumes the same resolver only after the separate
+    /// ingress-interface/source-address index attributes a datagram to a pod;
+    /// see [`Self::set_node_waypoint_udp_source_index`].
     pub fn set_node_waypoint_identity_resolver(&self, resolver: Arc<NodeWaypointIdentityResolver>) {
         self.node_waypoint_identity_resolver
             .store(Arc::new(Some(resolver)));
