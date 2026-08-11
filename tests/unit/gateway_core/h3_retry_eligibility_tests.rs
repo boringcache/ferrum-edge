@@ -240,4 +240,29 @@ fn h3_plain_and_ws_retry_share_eligible_helper_not_ad_hoc_loops() {
         !cross.contains("for _ in 0..32") && !ws.contains("for _ in 0..32"),
         "ad-hoc 32-iteration Unix skip loops must not remain in H3 retry paths"
     );
+
+    // WebSocket caller must map helper None to the abort flag (fail closed),
+    // not silently skip an `if let Some(...)` and retry the original target.
+    let ws_retry = ws
+        .split("let mut retry_backend_url = current_backend_url.clone();")
+        .nth(1)
+        .expect("H3 WebSocket retry staging")
+        .split("\"Retrying H3 WebSocket backend connection\"")
+        .next()
+        .expect("bounded H3 WebSocket retry block");
+    assert!(
+        ws_retry.contains("None =>")
+            && ws_retry.contains("retry_path_mismatch = true")
+            && ws_retry.contains(
+                "\"Aborting H3 WebSocket retry: no H3-eligible candidate remains\""
+            ),
+        "H3 WebSocket must abort when select_next_h3_eligible_retry_target returns None"
+    );
+
+    // Cross-protocol keeps established Unchanged-on-None caller semantics:
+    // selection returns Unchanged; abort variants remain path/budget only.
+    assert!(
+        cross.contains(") else {\n        return CrossProtocolRetryTarget::Unchanged;\n    };"),
+        "cross-protocol must keep mapping helper None to Unchanged"
+    );
 }

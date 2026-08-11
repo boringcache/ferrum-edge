@@ -1147,59 +1147,74 @@ pub(crate) async fn handle_h3_websocket(
 
                     if let (Some(_upstream_id), Some(prev_target), Some(hash_key)) =
                         (&proxy.upstream_id, &current_target, lb_hash_key.as_deref())
-                        && let Some(next) =
-                            crate::proxy::backend_dispatch::select_next_h3_eligible_retry_target(
-                                &state,
-                                &epoch,
-                                &proxy,
-                                prev_target,
-                                crate::proxy::backend_dispatch::RetryTargetRequest {
-                                    base_hash_key: hash_key,
-                                    client_ip: &ctx.client_ip,
-                                    proxy_headers: &proxy_headers,
-                                    request_authority: request_host.as_deref(),
-                                },
-                            )
                     {
-                        if !crate::proxy::retry_target_preserves_backend_path(
-                            backend_path_is_policy_bound,
+                        // Shared H3-eligible selection (issue #3620). `Some(next)`
+                        // still runs path + DestinationRule retry-budget gates;
+                        // `None` must fail closed (set the abort flag) rather than
+                        // silently falling through and retrying the original
+                        // failed / H3-ineligible target.
+                        match crate::proxy::backend_dispatch::select_next_h3_eligible_retry_target(
+                            &state,
+                            &epoch,
                             &proxy,
-                            &ctx.path,
-                            strip_len,
                             prev_target,
-                            &next,
+                            crate::proxy::backend_dispatch::RetryTargetRequest {
+                                base_hash_key: hash_key,
+                                client_ip: &ctx.client_ip,
+                                proxy_headers: &proxy_headers,
+                                request_authority: request_host.as_deref(),
+                            },
                         ) {
-                            retry_path_mismatch = true;
-                            warn!(
-                                proxy_id = %proxy.id,
-                                "Aborting H3 WebSocket retry because the candidate would change the authorized backend method path"
-                            );
-                        } else if !crate::proxy::retry_attempt_allowed_for_target(
-                            route_retry_ceiling,
-                            &proxy,
-                            &next,
-                            ws_attempt,
-                        ) {
-                            retry_path_mismatch = true;
-                            warn!(
-                                proxy_id = %proxy.id,
-                                attempt = ws_attempt,
-                                "Aborting H3 WebSocket retry because the candidate exceeds its DestinationRule maxRetries cap"
-                            );
-                        } else {
-                            retry_backend_url =
-                                crate::proxy::build_websocket_backend_url_with_target(
+                            Some(next) => {
+                                if !crate::proxy::retry_target_preserves_backend_path(
+                                    backend_path_is_policy_bound,
                                     &proxy,
                                     &ctx.path,
-                                    &query_string,
-                                    &next.host,
-                                    next.port,
                                     strip_len,
-                                    next.path.as_deref(),
+                                    prev_target,
+                                    &next,
+                                ) {
+                                    retry_path_mismatch = true;
+                                    warn!(
+                                        proxy_id = %proxy.id,
+                                        "Aborting H3 WebSocket retry because the candidate would change the authorized backend method path"
+                                    );
+                                } else if !crate::proxy::retry_attempt_allowed_for_target(
+                                    route_retry_ceiling,
+                                    &proxy,
+                                    &next,
+                                    ws_attempt,
+                                ) {
+                                    retry_path_mismatch = true;
+                                    warn!(
+                                        proxy_id = %proxy.id,
+                                        attempt = ws_attempt,
+                                        "Aborting H3 WebSocket retry because the candidate exceeds its DestinationRule maxRetries cap"
+                                    );
+                                } else {
+                                    retry_backend_url =
+                                        crate::proxy::build_websocket_backend_url_with_target(
+                                            &proxy,
+                                            &ctx.path,
+                                            &query_string,
+                                            &next.host,
+                                            next.port,
+                                            strip_len,
+                                            next.path.as_deref(),
+                                        );
+                                    retry_cb_target_key = Some(
+                                        crate::circuit_breaker::target_key(&next.host, next.port),
+                                    );
+                                    retry_target = Some(next);
+                                }
+                            }
+                            None => {
+                                retry_path_mismatch = true;
+                                warn!(
+                                    proxy_id = %proxy.id,
+                                    "Aborting H3 WebSocket retry: no H3-eligible candidate remains"
                                 );
-                            retry_cb_target_key =
-                                Some(crate::circuit_breaker::target_key(&next.host, next.port));
-                            retry_target = Some(next);
+                            }
                         }
                     }
 
