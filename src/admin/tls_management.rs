@@ -1852,7 +1852,10 @@ fn managed_error_response(error: ManagedTlsError) -> Response<Full<Bytes>> {
         | ManagedTlsError::InvalidPath(_)
         | ManagedTlsError::MissingMaterial { .. }
         | ManagedTlsError::WrongKind { .. } => StatusCode::BAD_REQUEST,
-        ManagedTlsError::MaterialTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+        ManagedTlsError::MaterialTooLarge | ManagedTlsError::DocumentTooLarge => {
+            StatusCode::PAYLOAD_TOO_LARGE
+        }
+        ManagedTlsError::RecordLimitReached => StatusCode::CONFLICT,
         ManagedTlsError::Read(_)
         | ManagedTlsError::Write(_)
         | ManagedTlsError::Parse(_)
@@ -1875,7 +1878,8 @@ fn acme_error_response(error: AcmeError) -> Response<Full<Bytes>> {
         | AcmeError::InvalidChallengeToken(_)
         | AcmeError::BlockedDirectoryUrl(_)
         | AcmeError::MissingMaterial { .. } => StatusCode::BAD_REQUEST,
-        AcmeError::MaterialTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+        AcmeError::MaterialTooLarge | AcmeError::DocumentTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+        AcmeError::RecordLimitReached => StatusCode::CONFLICT,
         // The stored order cannot be finalized; no retry of this request can
         // change that, so it is reported to the caller rather than as an outage.
         // The rendering names the order and nothing about the material itself.

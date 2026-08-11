@@ -72,7 +72,10 @@ use thiserror::Error;
 use tokio::sync::watch;
 use uuid::Uuid;
 
-use crate::tls::shared_store::{SharedStoreError, SharedStoreFile, VersionedStoreFile};
+use crate::tls::shared_store::{
+    SharedStoreError, SharedStoreFile, TlsPersistentStoreKind, VersionedStoreFile,
+    record_store_record_count,
+};
 
 const LEASE_STORE_FILE_NAME: &str = "tls-leases.json";
 const DEFAULT_STORE_DIR: &str = "./ferrum-managed-tls";
@@ -188,7 +191,10 @@ impl TlsLeaseStore {
                 dir.display()
             ))
         })?;
-        let file = SharedStoreFile::open(dir.join(LEASE_STORE_FILE_NAME))?;
+        let file = SharedStoreFile::open(dir.join(LEASE_STORE_FILE_NAME), TlsPersistentStoreKind::Leases)?;
+        if let Ok(document) = file.snapshot() {
+            record_store_record_count(TlsPersistentStoreKind::Leases, document.leases.len() as u64);
+        }
         Ok(Self { holder, file })
     }
 
@@ -1056,6 +1062,10 @@ fn prune_expired(document: &mut TlsLeaseStoreFile, now: DateTime<Utc>) {
         .unwrap_or_else(chrono::TimeDelta::zero);
     let cutoff = now - retention;
     document.leases.retain(|_, lease| lease.expires_at > cutoff);
+    record_store_record_count(
+        TlsPersistentStoreKind::Leases,
+        document.leases.len() as u64,
+    );
 }
 
 /// Clamp a lease TTL into `chrono` space. Callers pass operator-clamped values;

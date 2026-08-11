@@ -25,7 +25,10 @@ use x509_parser::extensions::{GeneralName, ParsedExtension};
 use x509_parser::prelude::*;
 
 use crate::config::types::validate_resource_id;
-use crate::tls::shared_store::{SharedStoreError, SharedStoreFile, VersionedStoreFile};
+use crate::tls::shared_store::{
+    SharedStoreError, SharedStoreFile, TlsPersistentStoreKind, TlsStoreAdmissionReason,
+    VersionedStoreFile, record_store_admission_rejected, record_store_record_count,
+};
 use crate::tls::source::MaterialKind;
 
 const STORE_FILE_NAME: &str = "managed-tls.json";
@@ -163,6 +166,16 @@ pub enum ManagedTlsError {
     /// or record payloads.
     #[error("managed TLS material exceeds the configured byte ceiling")]
     MaterialTooLarge,
+    /// Whole-document serialized size exceeded `FERRUM_TLS_STORE_MAX_DOCUMENT_BYTES`.
+    ///
+    /// Deliberately content-free: diagnostics must not echo store payloads.
+    #[error("managed TLS store document exceeds the configured byte ceiling")]
+    DocumentTooLarge,
+    /// Creating a new record would exceed `FERRUM_TLS_MANAGED_MAX_RECORDS`.
+    ///
+    /// Overwrite and delete remain available. Never echoes record payloads.
+    #[error("managed TLS store has reached the configured record limit")]
+    RecordLimitReached,
     #[error("failed to read managed TLS store: {0}")]
     Read(String),
     #[error("failed to write managed TLS store: {0}")]
@@ -190,6 +203,7 @@ impl From<SharedStoreError> for ManagedTlsError {
             // configuration failure, not a missing record: fail closed with the
             // rule that was broken so the operator can see it.
             SharedStoreError::InvalidConfig { .. } => Self::InvalidConfiguration(error.to_string()),
+            SharedStoreError::Oversized { .. } => Self::DocumentTooLarge,
         }
     }
 }
@@ -217,25 +231,43 @@ impl VersionedStoreFile for ManagedTlsStoreFile {
 pub struct ManagedTlsStore {
     file: SharedStoreFile<ManagedTlsStoreFile>,
     max_material_bytes: usize,
+    max_records: usize,
 }
 
 impl ManagedTlsStore {
     pub fn open(dir: impl Into<PathBuf>) -> Result<Self, ManagedTlsError> {
         let max_material_bytes = managed_material_max_bytes()?;
-        Self::open_with_material_limit(dir, max_material_bytes)
+        let max_records = crate::config::env_config::tls_managed_max_records_from_env()
+            .map_err(ManagedTlsError::InvalidConfiguration)?;
+        Self::open_with_limits(dir, max_material_bytes, max_records, None)
     }
 
-    /// Open a managed store with an explicit material byte ceiling.
+    /// Open a managed store with explicit material and record ceilings.
     ///
     /// Production callers should prefer [`Self::open`], which snapshots the
-    /// validated runtime policy. Tests inject a small finite limit here instead
-    /// of mutating process-global policy state. Rejects `0` and caps values
-    /// above the hard maximum before any store I/O.
+    /// validated runtime policy. Tests inject small finite limits here instead
+    /// of mutating process-global policy state. Rejects `0` material bytes and
+    /// caps values above the hard maxima before any store I/O.
+    ///
+    /// `max_document_bytes` of `None` uses `FERRUM_TLS_STORE_MAX_DOCUMENT_BYTES`.
     pub fn open_with_material_limit(
         dir: impl Into<PathBuf>,
         max_material_bytes: usize,
     ) -> Result<Self, ManagedTlsError> {
+        let max_records = crate::config::env_config::tls_managed_max_records_from_env()
+            .map_err(ManagedTlsError::InvalidConfiguration)?;
+        Self::open_with_limits(dir, max_material_bytes, max_records, None)
+    }
+
+    /// Open with explicit material, record, and optional document ceilings.
+    pub fn open_with_limits(
+        dir: impl Into<PathBuf>,
+        max_material_bytes: usize,
+        max_records: usize,
+        max_document_bytes: Option<usize>,
+    ) -> Result<Self, ManagedTlsError> {
         let max_material_bytes = validate_managed_material_limit(max_material_bytes)?;
+        let max_records = validate_managed_record_limit(max_records)?;
         let dir = dir.into();
         if dir.as_os_str().is_empty() {
             return Err(ManagedTlsError::InvalidPath(
@@ -243,10 +275,33 @@ impl ManagedTlsStore {
             ));
         }
         std::fs::create_dir_all(&dir).map_err(|error| ManagedTlsError::Write(error.to_string()))?;
-        Ok(Self {
-            file: SharedStoreFile::open(dir.join(STORE_FILE_NAME))?,
+        let path = dir.join(STORE_FILE_NAME);
+        let file = match max_document_bytes {
+            Some(max_document_bytes) => SharedStoreFile::open_with_limits(
+                path,
+                crate::tls::shared_store::StoreIdentityMode::platform_default(),
+                TlsPersistentStoreKind::Managed,
+                max_document_bytes,
+            )?,
+            None => SharedStoreFile::open(path, TlsPersistentStoreKind::Managed)?,
+        };
+        let store = Self {
+            file,
             max_material_bytes,
-        })
+            max_records,
+        };
+        if let Ok(document) = store.file.snapshot() {
+            record_store_record_count(
+                TlsPersistentStoreKind::Managed,
+                document.records.len() as u64,
+            );
+        }
+        Ok(store)
+    }
+
+    /// Configured logical record admission ceiling.
+    pub fn max_records(&self) -> usize {
+        self.max_records
     }
 
     /// Version of the authoritative document behind the last read.
@@ -285,10 +340,12 @@ impl ManagedTlsStore {
     ) -> Result<ManagedTlsRecord, ManagedTlsError> {
         validate_managed_id(&record.id)?;
         validate_managed_record_material_size(&record, self.max_material_bytes)?;
+        let max_records = self.max_records;
         // Existence, kind conflicts, and `created_at` preservation are all
         // decided under the exclusive lock against the authoritative document,
         // so a record another instance committed is neither invisible nor
-        // silently overwritten.
+        // silently overwritten. Creates are admitted against the logical record
+        // ceiling; overwrite and delete remain available at the limit.
         self.file.mutate(move |document| {
             let mut record = record;
             let now = Utc::now();
@@ -306,10 +363,21 @@ impl ManagedTlsStore {
                 record.created_at = existing.created_at;
                 record.updated_at = now;
             } else {
+                if document.records.len() >= max_records {
+                    record_store_admission_rejected(
+                        TlsPersistentStoreKind::Managed,
+                        TlsStoreAdmissionReason::RecordLimit,
+                    );
+                    return Err(ManagedTlsError::RecordLimitReached);
+                }
                 record.created_at = now;
                 record.updated_at = now;
             }
             document.records.insert(record.id.clone(), record.clone());
+            record_store_record_count(
+                TlsPersistentStoreKind::Managed,
+                document.records.len() as u64,
+            );
             Ok(record)
         })
     }
@@ -319,6 +387,10 @@ impl ManagedTlsStore {
         let id = id.to_string();
         self.file.mutate(move |document| {
             let removed = document.records.remove(&id);
+            record_store_record_count(
+                TlsPersistentStoreKind::Managed,
+                document.records.len() as u64,
+            );
             removed.ok_or(ManagedTlsError::NotFound(id))
         })
     }
@@ -852,6 +924,17 @@ fn validate_managed_material_limit(max_bytes: usize) -> Result<usize, ManagedTls
             other => ManagedTlsError::InvalidConfiguration(other.to_string()),
         }
     })
+}
+
+fn validate_managed_record_limit(max_records: usize) -> Result<usize, ManagedTlsError> {
+    if max_records < crate::config::env_config::MIN_TLS_MANAGED_MAX_RECORDS {
+        return Err(ManagedTlsError::InvalidConfiguration(format!(
+            "{} must be at least {}; 0 is not unlimited",
+            crate::config::env_config::TLS_MANAGED_MAX_RECORDS_KEY,
+            crate::config::env_config::MIN_TLS_MANAGED_MAX_RECORDS
+        )));
+    }
+    Ok(max_records.min(crate::config::env_config::HARD_MAX_TLS_MANAGED_MAX_RECORDS))
 }
 
 fn ensure_managed_bytes_within_limit(len: usize, max_bytes: usize) -> Result<(), ManagedTlsError> {
