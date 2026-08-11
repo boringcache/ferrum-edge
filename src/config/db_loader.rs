@@ -7763,10 +7763,13 @@ impl DatabaseStore {
         pool: &AnyPool,
     ) -> Result<Vec<String>, anyhow::Error> {
         let start = Instant::now();
+        // Include gateway_trust_bundles so a trust-only namespace still appears
+        // in CP/admin enumeration (issue #3727 / PR #3782).
         let sql = "SELECT DISTINCT namespace FROM proxies \
                    UNION SELECT DISTINCT namespace FROM consumers \
                    UNION SELECT DISTINCT namespace FROM plugin_configs \
                    UNION SELECT DISTINCT namespace FROM upstreams \
+                   UNION SELECT DISTINCT namespace FROM gateway_trust_bundles \
                    ORDER BY 1";
         let rows: Vec<AnyRow> = sqlx::query(sql).fetch_all(pool).await?;
         let mut namespaces = Vec::with_capacity(rows.len());
@@ -7819,12 +7822,14 @@ impl DatabaseStore {
         let start = Instant::now();
         // The union subquery keeps one deterministic ordering for both the
         // count and the page so `total` and the returned slice cannot drift
-        // apart across the four resource tables.
+        // apart across the five resource tables (including trust-only
+        // namespaces that exist solely in gateway_trust_bundles).
         let count_sql = "SELECT COUNT(*) AS cnt FROM (\
                          SELECT DISTINCT namespace FROM proxies \
                          UNION SELECT DISTINCT namespace FROM consumers \
                          UNION SELECT DISTINCT namespace FROM plugin_configs \
-                         UNION SELECT DISTINCT namespace FROM upstreams\
+                         UNION SELECT DISTINCT namespace FROM upstreams \
+                         UNION SELECT DISTINCT namespace FROM gateway_trust_bundles\
                          ) AS ferrum_namespaces";
         let count_row = sqlx::query(count_sql).fetch_one(pool).await?;
         let total: i64 = count_row.try_get("cnt")?;
@@ -7833,6 +7838,7 @@ impl DatabaseStore {
                         UNION SELECT DISTINCT namespace FROM consumers \
                         UNION SELECT DISTINCT namespace FROM plugin_configs \
                         UNION SELECT DISTINCT namespace FROM upstreams \
+                        UNION SELECT DISTINCT namespace FROM gateway_trust_bundles \
                         ORDER BY 1 LIMIT ? OFFSET ?";
         let rows: Vec<AnyRow> = sqlx::query(&self.q(page_sql))
             .bind(limit)

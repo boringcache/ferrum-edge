@@ -11139,7 +11139,9 @@ mod inner {
         async fn list_namespaces(&self) -> Result<Vec<String>, anyhow::Error> {
             let mut all_namespaces = HashSet::new();
 
-            // Collect distinct namespaces from all 4 collections
+            // Collect distinct namespaces from every namespaced config
+            // collection, including gateway_trust_bundles so a trust-only
+            // namespace still appears in CP/admin enumeration.
             for ns in self.distinct_namespaces("proxies").await? {
                 all_namespaces.insert(ns);
             }
@@ -11150,6 +11152,9 @@ mod inner {
                 all_namespaces.insert(ns);
             }
             for ns in self.distinct_namespaces("upstreams").await? {
+                all_namespaces.insert(ns);
+            }
+            for ns in self.distinct_namespaces("gateway_trust_bundles").await? {
                 all_namespaces.insert(ns);
             }
 

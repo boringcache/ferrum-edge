@@ -2250,6 +2250,22 @@ async fn seed_namespace_upstream(store: &DatabaseStore, namespace: &str, id: &st
         .unwrap();
 }
 
+/// Seed a namespace that exists *only* as a gateway trust bundle row.
+/// Listing must discover it even when proxies/consumers/plugins/upstreams are empty.
+async fn seed_namespace_trust_bundle_only(store: &DatabaseStore, namespace: &str) {
+    sqlx::query(
+        "INSERT INTO gateway_trust_bundles \
+         (namespace, id, trust_domain, bundle, revision, created_at, updated_at) \
+         VALUES (?, ?, ?, '{}', 1, '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')",
+    )
+    .bind(namespace)
+    .bind(namespace)
+    .bind(format!("{namespace}.local"))
+    .execute(&store.pool())
+    .await
+    .unwrap();
+}
+
 #[tokio::test]
 async fn list_namespaces_paginated_empty_store_returns_zero_total() {
     let temp_dir = tempfile::TempDir::new().unwrap();
@@ -2381,6 +2397,76 @@ async fn list_namespaces_paginated_insert_after_cursor_keeps_pages_stable() {
             .iter()
             .any(|returned| second.items.contains(returned)),
         "no row from the first page may reappear after the cursor"
+    );
+}
+
+#[tokio::test]
+async fn list_namespaces_includes_trust_bundle_only_namespace() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let store = connect_namespaces_test_store(&temp_dir, "ns-trust-list").await;
+
+    seed_namespace_upstream(&store, "alpha", "up-alpha").await;
+    seed_namespace_trust_bundle_only(&store, "trust-only").await;
+
+    let namespaces = store.list_namespaces().await.unwrap();
+    assert_eq!(
+        namespaces,
+        vec!["alpha".to_string(), "trust-only".to_string()],
+        "a namespace that only owns a gateway trust bundle must still enumerate"
+    );
+}
+
+#[tokio::test]
+async fn list_namespaces_paginated_includes_trust_bundle_only_namespace() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let store = connect_namespaces_test_store(&temp_dir, "ns-trust-page").await;
+
+    seed_namespace_upstream(&store, "zeta", "up-zeta").await;
+    seed_namespace_trust_bundle_only(&store, "middle-trust").await;
+    seed_namespace_upstream(&store, "alpha", "up-alpha").await;
+
+    let page = store.list_namespaces_paginated(100, 0).await.unwrap();
+    assert_eq!(page.total, 3);
+    assert_eq!(page.items, vec!["alpha", "middle-trust", "zeta"]);
+
+    // Paginate so the trust-only name is not on the first page, proving the
+    // count and ordered union both include gateway_trust_bundles.
+    let first = store.list_namespaces_paginated(1, 0).await.unwrap();
+    assert_eq!(first.items, vec!["alpha"]);
+    assert_eq!(first.total, 3);
+
+    let second = store.list_namespaces_paginated(1, 1).await.unwrap();
+    assert_eq!(second.items, vec!["middle-trust"]);
+    assert_eq!(second.total, 3);
+}
+
+/// Source-level drift guard: issue #3727 trust bundles are a namespaced
+/// resource and must participate in both list and paginated list unions.
+#[test]
+fn list_namespaces_sql_unions_gateway_trust_bundles() {
+    let source = include_str!("../../../src/config/db_loader.rs");
+
+    let list_body = source
+        .split("async fn list_namespaces_from_pool(")
+        .nth(1)
+        .and_then(|rest| rest.split("pub async fn list_namespaces_paginated(").next())
+        .expect("list_namespaces_from_pool body");
+    assert!(
+        list_body.contains("UNION SELECT DISTINCT namespace FROM gateway_trust_bundles"),
+        "list_namespaces_from_pool must union gateway_trust_bundles"
+    );
+
+    let page_body = source
+        .split("async fn list_namespaces_paginated_from_pool(")
+        .nth(1)
+        .and_then(|rest| rest.split("ApiSpec operations").next())
+        .expect("list_namespaces_paginated_from_pool body");
+    let trust_unions = page_body
+        .matches("UNION SELECT DISTINCT namespace FROM gateway_trust_bundles")
+        .count();
+    assert!(
+        trust_unions >= 2,
+        "paginated count and page queries must both union gateway_trust_bundles (found {trust_unions})"
     );
 }
 
