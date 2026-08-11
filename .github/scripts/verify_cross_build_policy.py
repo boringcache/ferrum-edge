@@ -216,6 +216,15 @@ DOCKER_EBPF_MANIFEST_DOWNLOAD_STEP = DOCKER_MANIFEST_DOWNLOAD_STEP.replace(
     "pattern: docker-digest-*",
     "pattern: docker-ebpf-digest-*",
 )
+DOCKER_EBPF_MANIFEST_TOOLS_DOWNLOAD_STEP = (
+    "      - name: Download tools digests\n"
+    "        uses: actions/download-artifact"
+    "@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8\n"
+    "        with:\n"
+    "          path: /tmp/digests-tools\n"
+    "          pattern: docker-ebpf-tools-digest-*\n"
+    "          merge-multiple: true\n"
+)
 DOCKER_EBPF_UPLOAD_DIGEST_STEP = (
     "      - name: Upload digest\n"
     "        uses: actions/upload-artifact"
@@ -223,6 +232,51 @@ DOCKER_EBPF_UPLOAD_DIGEST_STEP = (
     "        with:\n"
     "          name: docker-ebpf-digest-${{ matrix.arch_dir }}\n"
     "          path: /tmp/digests/*\n"
+    "          if-no-files-found: error\n"
+)
+# The `-ebpf-tools` variant is built inside the same `docker-ebpf` matrix job as
+# the distroless `-ebpf` variant, from one source tree and one `FEATURES` value,
+# so the two published tag families cannot drift apart. The build target, the
+# digest export, and the upload that names the second digest name space are
+# frozen exactly like their `-ebpf` counterparts: retargeting this build, or
+# pointing the tools upload at the `-ebpf` digest directory, would publish a
+# distroless image under the tag the mesh chart selects for the Ambient UDP
+# lifecycle — which cannot run the `sh -c` iptables scripts that datapath needs.
+# These three steps only become contract once the trusted base has adopted the
+# three-family release shape; see `RELEASE_IMAGE_FAMILY_GENERATIONS`.
+DOCKER_EBPF_TOOLS_BUILD_STEP = (
+    "      - name: Build and push per-platform eBPF tools digest\n"
+    "        id: build_tools\n"
+    "        uses: docker/build-push-action"
+    "@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7\n"
+    "        with:\n"
+    "          context: .\n"
+    "          file: Dockerfile\n"
+    "          target: runtime-ebpf-tools\n"
+    "          platforms: ${{ matrix.platform }}\n"
+    "          build-args: |\n"
+    "            FEATURES=cloud-secrets,ebpf\n"
+    "          outputs: type=image,"
+    "\"name=ferrumedge/ferrum-edge,ghcr.io/${{ github.repository }}\","
+    "push-by-digest=true,name-canonical=true,push=true\n"
+    "          provenance: false\n"
+)
+DOCKER_EBPF_TOOLS_EXPORT_DIGEST_STEP = (
+    "      - name: Export digest\n"
+    "        run: |\n"
+    "          mkdir -p /tmp/digests /tmp/digests-tools\n"
+    "          digest=\"${{ steps.build.outputs.digest }}\"\n"
+    "          touch \"/tmp/digests/${digest#sha256:}\"\n"
+    "          tools_digest=\"${{ steps.build_tools.outputs.digest }}\"\n"
+    "          touch \"/tmp/digests-tools/${tools_digest#sha256:}\"\n"
+)
+DOCKER_EBPF_TOOLS_UPLOAD_DIGEST_STEP = (
+    "      - name: Upload tools digest\n"
+    "        uses: actions/upload-artifact"
+    "@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7\n"
+    "        with:\n"
+    "          name: docker-ebpf-tools-digest-${{ matrix.arch_dir }}\n"
+    "          path: /tmp/digests-tools/*\n"
     "          if-no-files-found: error\n"
 )
 # Each wildcard belongs to exactly the jobs allowed to produce a name it
@@ -235,6 +289,17 @@ DIGEST_ARTIFACT_OWNERS = {
         "docker-digest-": ("docker",),
         "docker-ebpf-digest-": ("docker-ebpf",),
     },
+}
+# The `-ebpf-tools` name space is owned by the single job that builds both eBPF
+# variants, so the two eBPF manifests can never collect each other's
+# descriptors. It is a separate table because it is only in force once the
+# trusted base has adopted the three-family release shape. The prefix below is
+# nevertheless refused to repo-local composite actions in every generation,
+# since a local action is never a digest owner at all.
+RELEASE_TOOLS_DIGEST_PREFIX = "docker-ebpf-tools-digest-"
+RELEASE_THREE_FAMILY_DIGEST_ARTIFACT_OWNERS = {
+    **DIGEST_ARTIFACT_OWNERS["release workflow"],
+    RELEASE_TOOLS_DIGEST_PREFIX: ("docker-ebpf",),
 }
 # Ownership of the digest namespace does not depend on how the uploading action
 # is pinned. `actions/upload-artifact@v7` uploads exactly what the SHA-pinned
@@ -1171,6 +1236,313 @@ RELEASE_DOCKER_EBPF_MANIFEST_STEPS = r"""    steps:
             $(printf 'ghcr.io/${{ github.repository }}@sha256:%s ' *)
 """
 
+# ---------------------------------------------------------------------------
+# Third release image family (`-ebpf-tools`): a one-time, base-aware adoption.
+#
+# The release workflow publishes two image families today. A third one cannot be
+# introduced by an ordinary pull request, because every publishing job here is
+# frozen byte for byte, and the frozen text cannot be widened without a policy
+# change that this same policy refuses to let a pull request make. The transition
+# is therefore modelled exactly like the admitted fuzz lane: the trusted base is
+# read, and a pull request may either leave the release workflow at the shape the
+# base already carries or move it, in one step, to the complete three-family
+# shape written below. Nothing in between is accepted, and once the base carries
+# the three-family shape the two-family shape is no longer reachable.
+#
+# The three-family contracts are derived from the two-family originals by
+# anchored substitution rather than being restated, so the parts that must not
+# change cannot drift while the parts that must change are the visible diff.
+# Every anchor is required to occur an exact number of times; a miss is a policy
+# failure reported by `self_test`, never a silently skipped substitution.
+RELEASE_THREE_FAMILY_SUBSTITUTION_ERRORS: list[str] = []
+
+
+def adopted_release_contract(
+    text: str,
+    replacements: tuple[tuple[str, str, int], ...],
+    label: str,
+) -> str:
+    """Derive one three-family contract from its frozen two-family original."""
+
+    derived = text
+    for anchor, replacement, expected in replacements:
+        found = derived.count(anchor)
+        if found != expected:
+            RELEASE_THREE_FAMILY_SUBSTITUTION_ERRORS.append(
+                f"the {label} three-family adoption anchor {anchor[:120]!r} "
+                f"occurs {found} times, expected {expected}"
+            )
+            continue
+        derived = derived.replace(anchor, replacement, expected)
+    if derived == text:
+        RELEASE_THREE_FAMILY_SUBSTITUTION_ERRORS.append(
+            f"the {label} three-family contract is identical to the two-family "
+            "one, so the adoption would admit no change at all"
+        )
+    return derived
+
+
+# The release notes are the published description of what a release contains, and
+# they are inside the frozen `create-release` step list. Advertising a tag the
+# workflow does not sign, or omitting the one it does, is the failure this text
+# freeze exists to prevent.
+RELEASE_THREE_FAMILY_CREATE_RELEASE_STEPS = adopted_release_contract(
+    RELEASE_CREATE_RELEASE_STEPS,
+    (
+        (
+            r"""          \`/bin/sh\` and no \`iptables\`, and the fallback runs commands via
+          \`sh -c\`, so \`FERRUM_NODE_AGENT_FALLBACK_MODE=iptables\` on the
+          published image **crash-loops**. To use the iptables fallback, build a
+          custom runtime image that adds \`/bin/sh\` + \`iptables\`/\`ip6tables\`
+          (see [docs/node_agent.md](https://github.com/ferrum-edge/ferrum-edge/blob/main/docs/node_agent.md#kernel-fallback)),
+          then set \`FERRUM_NODE_AGENT_FALLBACK_MODE=iptables\` to fall back to
+          host iptables capture:
+
+          \`\`\`bash
+          docker pull ferrumedge/ferrum-edge:$TAG_NAME-ebpf
+          docker pull ghcr.io/ferrum-edge/ferrum-edge:$TAG_NAME-ebpf
+          \`\`\`
+""",
+            r"""          \`/bin/sh\` and no \`iptables\` — and stays that way on purpose:
+
+          \`\`\`bash
+          docker pull ferrumedge/ferrum-edge:$TAG_NAME-ebpf
+          docker pull ghcr.io/ferrum-edge/ferrum-edge:$TAG_NAME-ebpf
+          \`\`\`
+
+          The host iptables fallback and the Ambient host-network UDP capture
+          lifecycle run generated \`sh -c\` \`iptables\`/\`ip6tables\`/\`ip\`
+          commands, which the distroless \`-ebpf\` image cannot execute, so
+          \`FERRUM_NODE_AGENT_FALLBACK_MODE=iptables\` crash-loops there. Use the
+          **\`-ebpf-tools\`** variant instead: the same Linux-only eBPF build on a
+          Debian slim base carrying \`/bin/sh\`, \`iptables\`, \`ip6tables\`, and
+          \`ip\` (see [docs/node_agent.md](https://github.com/ferrum-edge/ferrum-edge/blob/main/docs/node_agent.md#kernel-fallback)).
+          The mesh Helm chart auto-selects it for the Ambient UDP lifecycle:
+
+          \`\`\`bash
+          docker pull ferrumedge/ferrum-edge:$TAG_NAME-ebpf-tools
+          docker pull ghcr.io/ferrum-edge/ferrum-edge:$TAG_NAME-ebpf-tools
+          \`\`\`
+
+          All three image families — default, \`-ebpf\`, and \`-ebpf-tools\` — are
+          Cosign-signed on their immutable multi-arch digests in both registries
+          and carry SLSA provenance plus per-platform SPDX SBOM attestations; see
+          [docs/ci_cd.md](https://github.com/ferrum-edge/ferrum-edge/blob/main/docs/ci_cd.md#image-signatures-sboms-and-provenance)
+          for the verification commands.
+""",
+            1,
+        ),
+    ),
+    "create-release",
+)
+
+# Every published family must be a first-class subject of this job: resolved,
+# compared across registries, SBOM'd, provenance'd, signed, attested, and
+# verified. A family that is published but skipped here ships an unsigned image
+# under a release tag the notes advertise.
+RELEASE_THREE_FAMILY_ATTEST_RELEASE_IMAGES_STEPS = adopted_release_contract(
+    RELEASE_ATTEST_RELEASE_IMAGES_STEPS,
+    (
+        (
+            '          resolve_manifest ebpf_ghcr '
+            '"ghcr.io/${GITHUB_REPOSITORY}:${TAG_NAME}-ebpf"\n',
+            '          resolve_manifest ebpf_ghcr '
+            '"ghcr.io/${GITHUB_REPOSITORY}:${TAG_NAME}-ebpf"\n'
+            "          resolve_manifest ebpftools_docker \\\n"
+            '            "ferrumedge/ferrum-edge:${TAG_NAME}-ebpf-tools"\n'
+            "          resolve_manifest ebpftools_ghcr \\\n"
+            '            "ghcr.io/${GITHUB_REPOSITORY}:${TAG_NAME}-ebpf-tools"\n',
+            1,
+        ),
+        (
+            "          compare_registry_manifests ebpf\n",
+            "          compare_registry_manifests ebpf\n"
+            "          compare_registry_manifests ebpftools\n",
+            1,
+        ),
+        # The same two refs are exported to each of the three shell steps that
+        # consume them, so this anchor is deliberately replaced three times.
+        (
+            "          EBPF_GHCR_REF: ${{ steps.images.outputs.ebpf_ghcr_ref }}\n",
+            "          EBPF_GHCR_REF: ${{ steps.images.outputs.ebpf_ghcr_ref }}\n"
+            "          EBPF_TOOLS_DOCKER_REF: "
+            "${{ steps.images.outputs.ebpftools_docker_ref }}\n"
+            "          EBPF_TOOLS_GHCR_REF: "
+            "${{ steps.images.outputs.ebpftools_ghcr_ref }}\n",
+            3,
+        ),
+        (
+            "          generate_sboms \\\n"
+            '            ebpf ghcr "$EBPF_GHCR_REF" \\\n'
+            '            "$GHCR_USERNAME" "$GHCR_TOKEN"\n',
+            "          generate_sboms \\\n"
+            '            ebpf ghcr "$EBPF_GHCR_REF" \\\n'
+            '            "$GHCR_USERNAME" "$GHCR_TOKEN"\n'
+            "          generate_sboms \\\n"
+            '            ebpftools docker "$EBPF_TOOLS_DOCKER_REF" \\\n'
+            '            "$DOCKERHUB_USERNAME" "$DOCKERHUB_PASSWORD"\n'
+            "          generate_sboms \\\n"
+            '            ebpftools ghcr "$EBPF_TOOLS_GHCR_REF" \\\n'
+            '            "$GHCR_USERNAME" "$GHCR_TOKEN"\n',
+            1,
+        ),
+        (
+            "          create_provenance \\\n"
+            "            ebpf \\\n"
+            '            "ghcr.io/${GITHUB_REPOSITORY}" \\\n'
+            '            "$work/ebpf_ghcr.manifest.json" \\\n'
+            '            "$work/ebpf_ghcr.provenance.json"\n',
+            "          create_provenance \\\n"
+            "            ebpf \\\n"
+            '            "ghcr.io/${GITHUB_REPOSITORY}" \\\n'
+            '            "$work/ebpf_ghcr.manifest.json" \\\n'
+            '            "$work/ebpf_ghcr.provenance.json"\n'
+            "          create_provenance \\\n"
+            "            ebpftools \\\n"
+            "            ferrumedge/ferrum-edge \\\n"
+            '            "$work/ebpftools_docker.manifest.json" \\\n'
+            '            "$work/ebpftools_docker.provenance.json"\n'
+            "          create_provenance \\\n"
+            "            ebpftools \\\n"
+            '            "ghcr.io/${GITHUB_REPOSITORY}" \\\n'
+            '            "$work/ebpftools_ghcr.manifest.json" \\\n'
+            '            "$work/ebpftools_ghcr.provenance.json"\n',
+            1,
+        ),
+        (
+            '          sign_and_attest ebpf ghcr "$EBPF_GHCR_REF"\n',
+            '          sign_and_attest ebpf ghcr "$EBPF_GHCR_REF"\n'
+            '          sign_and_attest ebpftools docker "$EBPF_TOOLS_DOCKER_REF"\n'
+            '          sign_and_attest ebpftools ghcr "$EBPF_TOOLS_GHCR_REF"\n',
+            1,
+        ),
+        (
+            '          verify_image ebpf ghcr "$EBPF_GHCR_REF"\n',
+            '          verify_image ebpf ghcr "$EBPF_GHCR_REF"\n'
+            '          verify_image ebpftools docker "$EBPF_TOOLS_DOCKER_REF"\n'
+            '          verify_image ebpftools ghcr "$EBPF_TOOLS_GHCR_REF"\n',
+            1,
+        ),
+    ),
+    "attest-release-images steps",
+)
+
+RELEASE_THREE_FAMILY_ATTEST_RELEASE_IMAGES_JOB = (
+    adopted_release_contract(
+        RELEASE_ATTEST_RELEASE_IMAGES_JOB.replace(
+            RELEASE_ATTEST_RELEASE_IMAGES_STEPS,
+            RELEASE_THREE_FAMILY_ATTEST_RELEASE_IMAGES_STEPS,
+            1,
+        ),
+        (
+            (
+                "    needs: [docker-manifest, docker-ebpf-manifest]\n",
+                "    needs: [docker-manifest, docker-ebpf-manifest, "
+                "docker-ebpf-tools-manifest]\n",
+                1,
+            ),
+        ),
+        "attest-release-images job",
+    )
+)
+
+# `create-release` publishes the GitHub Release page. Gating it on the third
+# manifest keeps the page from advertising a family whose tags were never
+# pushed.
+RELEASE_THREE_FAMILY_CREATE_RELEASE_NEEDS = (
+    "    needs: [build-release-binaries, build-release-arm64-cross, "
+    "docker-manifest, docker-ebpf-manifest, "
+    "docker-ebpf-tools-manifest]\n"
+)
+
+# The `-ebpf-tools` tag family assembles from its own digest name space in its
+# own job. It publishes by wildcard exactly like the other manifest jobs, so its
+# whole step list is frozen: the download pattern, the working directory the
+# `printf *` glob expands in, and every published tag. Pointing this job at
+# `/tmp/digests` or at the `docker-ebpf-digest-*` pattern would publish the
+# distroless image under the tag the mesh chart selects for the Ambient UDP
+# lifecycle, and adding a tag here would publish an unattested name, because the
+# attestation job resolves exactly the `-ebpf-tools` canonical tag.
+RELEASE_DOCKER_EBPF_TOOLS_MANIFEST_STEPS = r"""    steps:
+      - name: Extract version tag
+        id: version
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          if [[ ! "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then
+            echo "Invalid release tag format: $TAG_NAME" >&2
+            exit 1
+          fi
+          VERSION="${TAG_NAME#v}"
+          MAJOR_MINOR="${VERSION%.*}"
+          echo "TAG_NAME=$TAG_NAME" >> $GITHUB_OUTPUT
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+          echo "MAJOR_MINOR=$MAJOR_MINOR" >> $GITHUB_OUTPUT
+
+      # Distinct artifact name space from `docker-ebpf-digest-*`: mixing the two
+      # variants into one directory would hand `imagetools create` four
+      # descriptors and publish a manifest spanning both images.
+      - name: Download tools digests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: /tmp/digests-tools
+          pattern: docker-ebpf-tools-digest-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Create and push multi-arch eBPF tools manifest (Docker Hub)
+        working-directory: /tmp/digests-tools
+        run: |
+          docker buildx imagetools create \
+            -t ferrumedge/ferrum-edge:${{ steps.version.outputs.TAG_NAME }}-ebpf-tools \
+            -t ferrumedge/ferrum-edge:${{ steps.version.outputs.VERSION }}-ebpf-tools \
+            -t ferrumedge/ferrum-edge:${{ steps.version.outputs.MAJOR_MINOR }}-ebpf-tools \
+            $(printf 'ferrumedge/ferrum-edge@sha256:%s ' *)
+
+      - name: Create and push multi-arch eBPF tools manifest (GHCR)
+        working-directory: /tmp/digests-tools
+        run: |
+          docker buildx imagetools create \
+            -t ghcr.io/${{ github.repository }}:${{ steps.version.outputs.TAG_NAME }}-ebpf-tools \
+            -t ghcr.io/${{ github.repository }}:${{ steps.version.outputs.VERSION }}-ebpf-tools \
+            -t ghcr.io/${{ github.repository }}:${{ steps.version.outputs.MAJOR_MINOR }}-ebpf-tools \
+            $(printf 'ghcr.io/${{ github.repository }}@sha256:%s ' *)
+"""
+
+RELEASE_TOOLS_MANIFEST_JOB_NAME = "docker-ebpf-tools-manifest"
+RELEASE_THREE_FAMILY_TOOLS_MANIFEST_NEEDS = (
+    "    needs: [build-release-binaries, docker-manifest, "
+    "docker-ebpf, docker-ebpf-manifest]\n"
+)
+# Any of these tokens in a release workflow means the `-ebpf-tools` family is
+# being touched. Before adoption none of them may appear anywhere in the file:
+# that is what makes "leave it byte-identical or adopt the whole shape" the only
+# two reachable states, and what rejects a partial adoption that plants a tools
+# tag, a tools digest directory, or a tools upload without the frozen jobs.
+RELEASE_TOOLS_FAMILY_TOKENS = (
+    "-ebpf-tools",
+    "ebpftools",
+    "digests-tools",
+    "runtime-ebpf-tools",
+    RELEASE_TOOLS_DIGEST_PREFIX,
+    RELEASE_TOOLS_MANIFEST_JOB_NAME,
+)
+
 # The main-branch publication gate is itself a release-integrity boundary. Its
 # complete job is frozen rather than selected fields so an ordinary pull
 # request cannot add `continue-on-error`, widen permissions, weaken a retry or
@@ -1429,6 +1801,60 @@ PUBLISH_CONTROL_CONTRACTS = {
             ),
             "steps": RELEASE_DOCKER_EBPF_MANIFEST_STEPS,
         },
+    },
+}
+
+# The two admitted shapes of the release workflow, keyed by how many production
+# image families it publishes. Exactly one of them is in force for any given
+# revision, chosen from that revision itself; which transitions between them are
+# legal is decided by comparing the trusted base with the proposal, never by the
+# proposal alone (`release_image_family_transition_errors`).
+RELEASE_TWO_FAMILY_GENERATION = "two-family"
+RELEASE_THREE_FAMILY_GENERATION = "three-family"
+RELEASE_IMAGE_FAMILY_GENERATIONS = {
+    RELEASE_TWO_FAMILY_GENERATION: {
+        "exact_jobs": dict(PUBLISH_EXACT_JOB_CONTRACTS["release workflow"]),
+        "control": dict(PUBLISH_CONTROL_CONTRACTS["release workflow"]),
+        "steps": dict(PUBLISH_ARTIFACT_STEP_CONTRACTS["release workflow"]),
+        "digest_owners": dict(DIGEST_ARTIFACT_OWNERS["release workflow"]),
+    },
+    RELEASE_THREE_FAMILY_GENERATION: {
+        "exact_jobs": {
+            **PUBLISH_EXACT_JOB_CONTRACTS["release workflow"],
+            "attest-release-images": (
+                RELEASE_THREE_FAMILY_ATTEST_RELEASE_IMAGES_JOB
+            ),
+        },
+        "control": {
+            **PUBLISH_CONTROL_CONTRACTS["release workflow"],
+            "create-release": {
+                "needs": RELEASE_THREE_FAMILY_CREATE_RELEASE_NEEDS,
+                "steps": RELEASE_THREE_FAMILY_CREATE_RELEASE_STEPS,
+            },
+            RELEASE_TOOLS_MANIFEST_JOB_NAME: {
+                "needs": RELEASE_THREE_FAMILY_TOOLS_MANIFEST_NEEDS,
+                "steps": RELEASE_DOCKER_EBPF_TOOLS_MANIFEST_STEPS,
+            },
+        },
+        "steps": {
+            **PUBLISH_ARTIFACT_STEP_CONTRACTS["release workflow"],
+            # One job builds both eBPF variants, so all four steps that decide
+            # what each digest name space receives are frozen together.
+            "docker-ebpf": {
+                "Build and push per-platform eBPF tools digest": (
+                    DOCKER_EBPF_TOOLS_BUILD_STEP
+                ),
+                "Export digest": DOCKER_EBPF_TOOLS_EXPORT_DIGEST_STEP,
+                "Upload digest": DOCKER_EBPF_UPLOAD_DIGEST_STEP,
+                "Upload tools digest": DOCKER_EBPF_TOOLS_UPLOAD_DIGEST_STEP,
+            },
+            RELEASE_TOOLS_MANIFEST_JOB_NAME: {
+                "Download tools digests": (
+                    DOCKER_EBPF_MANIFEST_TOOLS_DOWNLOAD_STEP
+                ),
+            },
+        },
+        "digest_owners": dict(RELEASE_THREE_FAMILY_DIGEST_ARTIFACT_OWNERS),
     },
 }
 
@@ -3799,6 +4225,12 @@ def digest_artifact_prefixes() -> tuple[str, ...]:
                 for owners in DIGEST_ARTIFACT_OWNERS.values()
                 for prefix in owners
             }
+            # The `-ebpf-tools` name space is refused to repo-local composite
+            # actions in every generation, adopted or not. A local action is
+            # never a digest owner, so pre-reserving the prefix costs nothing
+            # and closes the window where the adoption commit would otherwise
+            # inherit an already-planted local-action upload.
+            | set(RELEASE_THREE_FAMILY_DIGEST_ARTIFACT_OWNERS)
         )
     )
 
@@ -3829,7 +4261,127 @@ def local_action_digest_upload_errors(contents: str, source: str) -> list[str]:
     return errors
 
 
-def digest_artifact_ownership_errors(contents: str, source: str) -> list[str]:
+def release_image_family_generation(
+    contents: str,
+    source: str,
+) -> tuple[str | None, list[str]]:
+    """Classify a release workflow as one of the two admitted family shapes.
+
+    The classifier reads one structural fact — whether the frozen
+    `docker-ebpf-tools-manifest` job exists — and then requires the rest of the
+    file to agree with it. Before adoption the `-ebpf-tools` family may not be
+    named anywhere at all, which is what makes "byte-identical or the complete
+    new shape" the only two reachable states: a half-landed adoption that plants
+    a tools tag, a tools digest directory, or a tools upload without the frozen
+    jobs classifies as neither and is rejected here rather than being validated
+    against contracts that do not describe it.
+
+    Classification decides which contract table applies to THIS revision only.
+    Whether moving from one table to the other is permitted is a separate,
+    comparative question answered by `release_image_family_transition_errors`.
+    """
+
+    lines = contents.splitlines()
+    job_names = {name for name, _, _ in workflow_job_ranges(lines)}
+    present_tokens = [
+        token for token in RELEASE_TOOLS_FAMILY_TOKENS if token in contents
+    ]
+    if RELEASE_TOOLS_MANIFEST_JOB_NAME in job_names:
+        return RELEASE_THREE_FAMILY_GENERATION, []
+    if present_tokens:
+        return None, [
+            f"{source} names the `-ebpf-tools` release image family "
+            f"({', '.join(repr(token) for token in present_tokens)}) without "
+            f"the frozen {RELEASE_TOOLS_MANIFEST_JOB_NAME!r} job; the third "
+            "image family is admitted only as the complete frozen shape, never "
+            "as a partial adoption"
+        ]
+    return RELEASE_TWO_FAMILY_GENERATION, []
+
+
+def release_generation_tables(generation: str | None) -> dict[str, dict]:
+    """Return the contract tables in force for one classified revision.
+
+    An unclassifiable revision falls back to the two-family tables so the rest
+    of the publication contract is still enforced against it; the classification
+    error itself is already reported by the caller.
+    """
+
+    return RELEASE_IMAGE_FAMILY_GENERATIONS[
+        generation
+        if generation in RELEASE_IMAGE_FAMILY_GENERATIONS
+        else RELEASE_TWO_FAMILY_GENERATION
+    ]
+
+
+def release_image_family_transition_errors(
+    merge_base_contents: str,
+    proposed_contents: str,
+    source: str,
+) -> list[str]:
+    """Admit the `-ebpf-tools` adoption once, in one direction, and completely.
+
+    Three properties, in the order they are checked:
+
+    * The proposal is held to the COMPLETE contract of whichever shape it
+      claims. This is an absolute validation of the proposed file rather than a
+      comparison, because during the adoption the frozen text changes by design
+      and a comparison would have to be suspended precisely where the new
+      publisher, the new digest name space, and the new attestation subjects
+      arrive. Being absolute, it also rejects every partial adoption, extra
+      publisher or tag, alternate action/runner/permission/needs/step, missing
+      attestation operation, and mixed digest name space.
+    * A trusted base that has already adopted the three-family shape can never
+      be taken back to the two-family one. Without this the admission would be
+      a permanent either/or hole: a later pull request could delete the third
+      family's manifest job, its digest ownership, and its attestation coverage
+      and still classify as a valid two-family workflow.
+    * Any transition other than two-family to three-family fails closed.
+
+    The trusted base is read only as the baseline; it is never the thing being
+    validated here, and the proposal never decides its own admissibility.
+    """
+
+    base_generation, errors = release_image_family_generation(
+        merge_base_contents,
+        f"merge-base {source}",
+    )
+    proposed_generation, proposed_errors = release_image_family_generation(
+        proposed_contents,
+        f"proposed {source}",
+    )
+    errors = [*errors, *proposed_errors]
+    errors.extend(validate_publish_control_contract(proposed_contents, source))
+    if base_generation is None or proposed_generation is None:
+        return errors
+    if base_generation == proposed_generation:
+        return errors
+    if (
+        base_generation == RELEASE_THREE_FAMILY_GENERATION
+        and proposed_generation == RELEASE_TWO_FAMILY_GENERATION
+    ):
+        errors.append(
+            f"{source} cannot remove the `-ebpf-tools` release image family "
+            "after the trusted base adopts it; the third family's manifest "
+            "job, digest ownership, and attestation coverage are one-way"
+        )
+        return errors
+    if not (
+        base_generation == RELEASE_TWO_FAMILY_GENERATION
+        and proposed_generation == RELEASE_THREE_FAMILY_GENERATION
+    ):
+        errors.append(
+            f"{source} proposes an unadmitted release image-family transition "
+            f"({base_generation} to {proposed_generation})"
+        )
+    return errors
+
+
+def digest_artifact_ownership_errors(
+    contents: str,
+    source: str,
+    owners: dict[str, tuple[str, ...]] | None = None,
+) -> list[str]:
     """Reject any job outside the frozen producers that can feed a manifest.
 
     The manifest jobs collect their inputs by wildcard, and artifacts are scoped
@@ -3837,9 +4389,14 @@ def digest_artifact_ownership_errors(contents: str, source: str) -> list[str]:
     anywhere in the run reaches `docker buildx imagetools create` whether or not
     the job graph connects it. Ownership of the name space is what makes the
     frozen download pattern meaningful.
+
+    `owners` overrides the per-source table when the caller has already resolved
+    which release image-family generation is in force; the third eBPF name space
+    exists only in the adopted one.
     """
 
-    owners = DIGEST_ARTIFACT_OWNERS.get(source, {})
+    if owners is None:
+        owners = DIGEST_ARTIFACT_OWNERS.get(source, {})
     if not owners:
         return []
     errors: list[str] = []
@@ -3864,7 +4421,25 @@ def digest_artifact_ownership_errors(contents: str, source: str) -> list[str]:
 
 def validate_publish_control_contract(contents: str, source: str) -> list[str]:
     contracts = PUBLISH_CONTROL_CONTRACTS.get(source, {})
+    exact_jobs = PUBLISH_EXACT_JOB_CONTRACTS.get(source, {})
+    step_contracts = PUBLISH_ARTIFACT_STEP_CONTRACTS.get(source, {})
+    owners = DIGEST_ARTIFACT_OWNERS.get(source, {})
     errors: list[str] = []
+    if source == "release workflow":
+        # Which release image families this revision publishes decides which
+        # frozen contracts describe it. The choice is made from the file itself
+        # and constrains it completely; it is the caller's comparison against
+        # the trusted base that decides whether reaching this shape was allowed.
+        generation, generation_errors = release_image_family_generation(
+            contents,
+            source,
+        )
+        errors.extend(generation_errors)
+        tables = release_generation_tables(generation)
+        contracts = tables["control"]
+        exact_jobs = tables["exact_jobs"]
+        step_contracts = tables["steps"]
+        owners = tables["digest_owners"]
     for key_name in PUBLISH_FORBIDDEN_TOP_LEVEL_KEYS.get(source, ()):
         block, failures = extract_top_level_block(
             contents,
@@ -3878,7 +4453,7 @@ def validate_publish_control_contract(contents: str, source: str) -> list[str]:
                 f"{source} must not define top-level {key_name!r}; protected "
                 "publication jobs may not inherit workflow run defaults"
             )
-    for job_name, expected in PUBLISH_EXACT_JOB_CONTRACTS.get(source, {}).items():
+    for job_name, expected in exact_jobs.items():
         actual, failures = extract_job_block(
             contents,
             source,
@@ -3906,7 +4481,7 @@ def validate_publish_control_contract(contents: str, source: str) -> list[str]:
                     f"{source} job {job_name!r} field {field_name!r} differs "
                     "from the trusted ARM64 publication dependency contract"
                 )
-    for job_name, steps in PUBLISH_ARTIFACT_STEP_CONTRACTS.get(source, {}).items():
+    for job_name, steps in step_contracts.items():
         for step_name, expected in steps.items():
             actual, failures = extract_job_step_block(
                 contents,
@@ -3921,7 +4496,7 @@ def validate_publish_control_contract(contents: str, source: str) -> list[str]:
                     f"{source} job {job_name!r} step {step_name!r} differs from "
                     "the trusted ARM64 publication artifact-selection contract"
                 )
-    errors.extend(digest_artifact_ownership_errors(contents, source))
+    errors.extend(digest_artifact_ownership_errors(contents, source, owners))
     # A step may declare its inputs as `with: {name: docker-digest-evil}`, which
     # names no key at the start of any line. The same ownership scan run over the
     # block rendering sees it.
@@ -3929,7 +4504,11 @@ def validate_publish_control_contract(contents: str, source: str) -> list[str]:
         flow_normalized_findings(
             contents,
             source,
-            digest_artifact_ownership_errors,
+            lambda rendered, rendered_source: digest_artifact_ownership_errors(
+                rendered,
+                rendered_source,
+                owners,
+            ),
         )
     )
     return list(dict.fromkeys(errors))
@@ -3941,7 +4520,39 @@ def compare_pr_publish_control_contract(
     source: str,
 ) -> list[str]:
     contracts = PUBLISH_CONTROL_CONTRACTS.get(source, {})
+    exact_jobs = PUBLISH_EXACT_JOB_CONTRACTS.get(source, {})
+    step_contracts = PUBLISH_ARTIFACT_STEP_CONTRACTS.get(source, {})
     errors: list[str] = []
+    # A frozen contract is normally held in place by comparing the proposal with
+    # the trusted base. The one admitted release image-family adoption changes
+    # that frozen text on purpose, so for the release workflow the proposal is
+    # additionally — and during an adoption, instead — held to the complete
+    # contract of the shape it claims, and the base is consulted only to decide
+    # whether that shape was reachable from it.
+    compare_frozen_text = True
+    if source == "release workflow":
+        errors.extend(
+            release_image_family_transition_errors(
+                merge_base_contents,
+                proposed_contents,
+                source,
+            )
+        )
+        base_generation, _ = release_image_family_generation(
+            merge_base_contents,
+            f"merge-base {source}",
+        )
+        proposed_generation, _ = release_image_family_generation(
+            proposed_contents,
+            f"proposed {source}",
+        )
+        if base_generation is not None and base_generation == proposed_generation:
+            tables = release_generation_tables(base_generation)
+            contracts = tables["control"]
+            exact_jobs = tables["exact_jobs"]
+            step_contracts = tables["steps"]
+        else:
+            compare_frozen_text = False
     for key_name in PUBLISH_FORBIDDEN_TOP_LEVEL_KEYS.get(source, ()):
         baseline, baseline_failures = extract_top_level_block(
             merge_base_contents,
@@ -3963,7 +4574,11 @@ def compare_pr_publish_control_contract(
                     f"{source} top-level {key_name!r} cannot be changed by a "
                     "pull request because protected publication jobs inherit it"
                 )
-    for job_name in PUBLISH_EXACT_JOB_CONTRACTS.get(source, {}):
+    if not compare_frozen_text:
+        exact_jobs = {}
+        contracts = {}
+        step_contracts = {}
+    for job_name in exact_jobs:
         baseline, baseline_failures = extract_job_block(
             merge_base_contents,
             f"merge-base {source}",
@@ -4008,7 +4623,7 @@ def compare_pr_publish_control_contract(
                         f"{source} job {job_name!r} ARM64 publication field "
                         f"{field_name!r} cannot be changed by a pull request"
                     )
-    for job_name, steps in PUBLISH_ARTIFACT_STEP_CONTRACTS.get(source, {}).items():
+    for job_name, steps in step_contracts.items():
         for step_name in steps:
             baseline, baseline_failures = extract_job_step_block(
                 merge_base_contents,
@@ -15437,11 +16052,19 @@ pre_build = []
         "docker-digest-evil",
         "docker-ebpf-digest-evil",
     )
+    # The third eBPF name space is refused to a local action before the release
+    # workflow adopts it, so the adoption commit cannot inherit an upload that
+    # was already planted here.
+    tools_digest_upload_action = digest_upload_action.replace(
+        "docker-digest-evil",
+        "docker-ebpf-tools-digest-evil",
+    )
     for digest_label, proposed_action in (
         ("block-spelled", digest_upload_action),
         ("flow-spelled", flow_digest_upload_action),
         ("unpinned case-varied", unpinned_digest_upload_action),
         ("second-namespace", new_digest_upload_action),
+        ("tools-namespace", tools_digest_upload_action),
     ):
         if not compare_pr_action_collection(
             {"setup/action.yml": safe_action},
@@ -22300,6 +22923,344 @@ pre_build = []
         "release workflow",
     ):
         failures.append("an attacker-controlled attestation runner was not rejected")
+
+    # ----------------------------------------------------------------------
+    # The one admitted release image-family adoption (`-ebpf-tools`).
+    # ----------------------------------------------------------------------
+    failures.extend(RELEASE_THREE_FAMILY_SUBSTITUTION_ERRORS)
+
+    three_family = RELEASE_IMAGE_FAMILY_GENERATIONS[RELEASE_THREE_FAMILY_GENERATION]
+    two_family = RELEASE_IMAGE_FAMILY_GENERATIONS[RELEASE_TWO_FAMILY_GENERATION]
+
+    # Every published image family must be a first-class subject of the frozen
+    # attestation job. A family that is published but not resolved, compared,
+    # scanned, signed, attested, and verified would ship an unsigned image under
+    # a release tag that the notes advertise.
+    adopted_attestation_job = three_family["exact_jobs"]["attest-release-images"]
+    for family, docker_variable, ghcr_variable in (
+        ("standard", "$STANDARD_DOCKER_REF", "$STANDARD_GHCR_REF"),
+        ("ebpf", "$EBPF_DOCKER_REF", "$EBPF_GHCR_REF"),
+        ("ebpftools", "$EBPF_TOOLS_DOCKER_REF", "$EBPF_TOOLS_GHCR_REF"),
+    ):
+        for required_invocation in (
+            f"compare_registry_manifests {family}\n",
+            f'generate_sboms \\\n            {family} docker "{docker_variable}"',
+            f'generate_sboms \\\n            {family} ghcr "{ghcr_variable}"',
+            f'sign_and_attest {family} docker "{docker_variable}"',
+            f'sign_and_attest {family} ghcr "{ghcr_variable}"',
+            f'verify_image {family} docker "{docker_variable}"',
+            f'verify_image {family} ghcr "{ghcr_variable}"',
+        ):
+            if required_invocation not in adopted_attestation_job:
+                failures.append(
+                    "the adopted attestation job does not cover image family "
+                    f"{family!r}: missing {required_invocation!r}"
+                )
+    if "docker-ebpf-tools-manifest" not in adopted_attestation_job:
+        failures.append(
+            "the adopted attestation job does not wait for the `-ebpf-tools` "
+            "manifest job"
+        )
+
+    # The third digest name space must be owned exactly like the other two, and
+    # only the single job that builds both eBPF variants may produce it.
+    adopted_digest_owners = three_family["digest_owners"]
+    if adopted_digest_owners.get(RELEASE_TOOLS_DIGEST_PREFIX) != ("docker-ebpf",):
+        failures.append(
+            "the `-ebpf-tools` digest wildcard is not owned by exactly the "
+            "docker-ebpf job"
+        )
+    if RELEASE_TOOLS_DIGEST_PREFIX in two_family["digest_owners"]:
+        failures.append(
+            "the `-ebpf-tools` digest wildcard is owned before the release "
+            "workflow adopts the family"
+        )
+    if RELEASE_TOOLS_DIGEST_PREFIX not in digest_artifact_prefixes():
+        failures.append(
+            "the `-ebpf-tools` digest wildcard is not refused to repo-local "
+            "composite actions in every generation"
+        )
+    adopted_tools_manifest_steps = three_family["control"][
+        RELEASE_TOOLS_MANIFEST_JOB_NAME
+    ]["steps"]
+    for owned_prefix in adopted_digest_owners:
+        if owned_prefix == RELEASE_TOOLS_DIGEST_PREFIX:
+            continue
+        if f"pattern: {owned_prefix}*" in adopted_tools_manifest_steps:
+            failures.append(
+                "the `-ebpf-tools` manifest collects another family's digest "
+                f"name space {owned_prefix!r}"
+            )
+    if (
+        DOCKER_EBPF_MANIFEST_TOOLS_DOWNLOAD_STEP not in adopted_tools_manifest_steps
+        or DOCKER_EBPF_TOOLS_UPLOAD_DIGEST_STEP == DOCKER_EBPF_UPLOAD_DIGEST_STEP
+    ):
+        failures.append(
+            "the `-ebpf-tools` digest download/upload contract is not distinct "
+            "from the `-ebpf` one"
+        )
+    if not adopted_tools_manifest_steps.startswith(
+        "    steps:\n"
+    ) or not adopted_tools_manifest_steps.endswith("\n"):
+        failures.append(
+            f"release workflow job {RELEASE_TOOLS_MANIFEST_JOB_NAME!r} step "
+            "contract is not a whole extracted steps block"
+        )
+    if "docker buildx imagetools create" not in adopted_tools_manifest_steps:
+        failures.append(
+            f"release workflow job {RELEASE_TOOLS_MANIFEST_JOB_NAME!r} step "
+            "contract no longer covers its wildcard publish command"
+        )
+
+    # Two complete release workflows, one per admitted shape, assembled from the
+    # frozen contracts themselves so the fixtures cannot drift from the policy.
+    release_family_fixtures: dict[str, str] = {}
+    for generation, ebpf_steps in (
+        (
+            RELEASE_TWO_FAMILY_GENERATION,
+            "    steps:\n" + DOCKER_EBPF_UPLOAD_DIGEST_STEP,
+        ),
+        (
+            RELEASE_THREE_FAMILY_GENERATION,
+            "    steps:\n"
+            + DOCKER_EBPF_TOOLS_BUILD_STEP
+            + "\n"
+            + DOCKER_EBPF_TOOLS_EXPORT_DIGEST_STEP
+            + "\n"
+            + DOCKER_EBPF_UPLOAD_DIGEST_STEP
+            + "\n"
+            + DOCKER_EBPF_TOOLS_UPLOAD_DIGEST_STEP,
+        ),
+    ):
+        tables = RELEASE_IMAGE_FAMILY_GENERATIONS[generation]
+        control = tables["control"]
+        fixture = (
+            "name: Release fixture\n"
+            "on: [push]\n"
+            "jobs:\n"
+            + tables["exact_jobs"]["attest-release-images"]
+            + "\n"
+            + "  create-release:\n"
+            + control["create-release"]["needs"]
+            + "    runs-on: ubuntu-latest\n"
+            + control["create-release"]["steps"]
+            + "\n"
+            + "  docker:\n"
+            + control["docker"]["needs"]
+            + "    runs-on: ubuntu-latest\n"
+            + control["docker"]["strategy"]
+            + control["docker"]["steps"]
+            + "\n"
+            + "  docker-manifest:\n"
+            + control["docker-manifest"]["needs"]
+            + "    runs-on: ubuntu-latest\n"
+            + control["docker-manifest"]["steps"]
+            + "\n"
+            + "  docker-ebpf:\n"
+            + control["docker-ebpf"]["needs"]
+            + "    runs-on: ${{ matrix.os }}\n"
+            + control["docker-ebpf"]["strategy"]
+            + ebpf_steps
+            + "\n"
+            + "  docker-ebpf-manifest:\n"
+            + control["docker-ebpf-manifest"]["needs"]
+            + "    runs-on: ubuntu-latest\n"
+            + control["docker-ebpf-manifest"]["steps"]
+        )
+        if generation == RELEASE_THREE_FAMILY_GENERATION:
+            fixture += (
+                "\n"
+                + f"  {RELEASE_TOOLS_MANIFEST_JOB_NAME}:\n"
+                + control[RELEASE_TOOLS_MANIFEST_JOB_NAME]["needs"]
+                + "    runs-on: ubuntu-latest\n"
+                + control[RELEASE_TOOLS_MANIFEST_JOB_NAME]["steps"]
+            )
+        release_family_fixtures[generation] = fixture
+
+    two_family_release = release_family_fixtures[RELEASE_TWO_FAMILY_GENERATION]
+    three_family_release = release_family_fixtures[RELEASE_THREE_FAMILY_GENERATION]
+
+    for generation, fixture in release_family_fixtures.items():
+        classified, classification_failures = release_image_family_generation(
+            fixture,
+            "self-test release workflow",
+        )
+        if classification_failures or classified != generation:
+            failures.append(
+                f"the {generation} release fixture did not classify as itself"
+            )
+        if validate_publish_control_contract(fixture, "release workflow"):
+            failures.append(
+                f"a valid {generation} release publication contract was rejected"
+            )
+        if compare_pr_publish_control_contract(
+            fixture,
+            fixture,
+            "release workflow",
+        ):
+            failures.append(
+                f"an unchanged {generation} release workflow was rejected"
+            )
+
+    # The admitted transition: exactly this, in exactly this direction.
+    if compare_pr_publish_control_contract(
+        two_family_release,
+        three_family_release,
+        "release workflow",
+    ):
+        failures.append("the exact `-ebpf-tools` adoption transition was rejected")
+    if not compare_pr_publish_control_contract(
+        three_family_release,
+        two_family_release,
+        "release workflow",
+    ):
+        failures.append(
+            "a downgrade away from the adopted `-ebpf-tools` release shape was "
+            "not rejected"
+        )
+
+    # Anything that is not the complete shape is neither of the two admitted
+    # states, whichever side of the adoption it is proposed from.
+    partial_adoptions = {
+        "tools manifest job removed but its uploads kept": (
+            three_family_release.replace(
+                "\n"
+                + f"  {RELEASE_TOOLS_MANIFEST_JOB_NAME}:\n"
+                + three_family["control"][RELEASE_TOOLS_MANIFEST_JOB_NAME]["needs"]
+                + "    runs-on: ubuntu-latest\n"
+                + adopted_tools_manifest_steps,
+                "",
+                1,
+            )
+        ),
+        "tools upload retargeted at the `-ebpf` digest directory": (
+            three_family_release.replace(
+                "          path: /tmp/digests-tools/*\n",
+                "          path: /tmp/digests/*\n",
+                1,
+            )
+        ),
+        "tools manifest collects the `-ebpf` digest name space": (
+            three_family_release.replace(
+                "          pattern: docker-ebpf-tools-digest-*\n",
+                "          pattern: docker-ebpf-digest-*\n",
+                1,
+            )
+        ),
+        "tools manifest publishes an extra unattested tag": (
+            three_family_release.replace(
+                "            $(printf 'ferrumedge/ferrum-edge@sha256:%s ' *)\n"
+                "\n"
+                "      - name: Create and push multi-arch eBPF tools manifest (GHCR)",
+                "            -t ferrumedge/ferrum-edge:latest-ebpf-tools \\\n"
+                "            $(printf 'ferrumedge/ferrum-edge@sha256:%s ' *)\n"
+                "\n"
+                "      - name: Create and push multi-arch eBPF tools manifest (GHCR)",
+                1,
+            )
+        ),
+        "tools build retargeted at the distroless stage": (
+            three_family_release.replace(
+                "          target: runtime-ebpf-tools\n",
+                "          target: runtime-ebpf\n",
+                1,
+            )
+        ),
+        "tools manifest `needs` weakened": (
+            three_family_release.replace(
+                three_family["control"][RELEASE_TOOLS_MANIFEST_JOB_NAME]["needs"],
+                "    needs: docker-ebpf\n",
+                1,
+            )
+        ),
+        "attestation coverage of the tools family dropped": (
+            three_family_release.replace(
+                "          compare_registry_manifests ebpftools\n",
+                "",
+                1,
+            )
+        ),
+        "create-release no longer waits for the tools manifest": (
+            three_family_release.replace(
+                RELEASE_THREE_FAMILY_CREATE_RELEASE_NEEDS,
+                two_family["control"]["create-release"]["needs"],
+                1,
+            )
+        ),
+    }
+    for label, tampered in partial_adoptions.items():
+        if tampered == three_family_release:
+            failures.append(f"{label!r} fixture did not change the release workflow")
+            continue
+        if not validate_publish_control_contract(tampered, "release workflow"):
+            failures.append(f"a partial `-ebpf-tools` adoption ({label}) was accepted")
+        if not compare_pr_publish_control_contract(
+            two_family_release,
+            tampered,
+            "release workflow",
+        ):
+            failures.append(
+                f"a partial `-ebpf-tools` adoption ({label}) was allowed by the "
+                "merge-base comparison"
+            )
+        if not compare_pr_publish_control_contract(
+            three_family_release,
+            tampered,
+            "release workflow",
+        ):
+            failures.append(
+                f"a post-adoption mutation ({label}) was allowed by the "
+                "merge-base comparison"
+            )
+
+    # Injecting the third digest name space into a workflow that has not adopted
+    # the family, and into one that has, are separate failures: before adoption
+    # the family may not be named at all, and after it the name space belongs to
+    # exactly one job.
+    injected_tools_upload = (
+        "\n"
+        "  unrelated:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - uses: actions/upload-artifact@v7\n"
+        "        with:\n"
+        f"          name: {RELEASE_TOOLS_DIGEST_PREFIX}evil\n"
+    )
+    for label, base_fixture in (
+        ("before adoption", two_family_release),
+        ("after adoption", three_family_release),
+    ):
+        injected = base_fixture + injected_tools_upload
+        if not validate_publish_control_contract(injected, "release workflow"):
+            failures.append(
+                f"a `-ebpf-tools` digest name-space injection {label} was accepted"
+            )
+        if not compare_pr_publish_control_contract(
+            base_fixture,
+            injected,
+            "release workflow",
+        ):
+            failures.append(
+                f"a `-ebpf-tools` digest name-space injection {label} was allowed "
+                "by the merge-base comparison"
+            )
+
+    # Naming the family without the frozen jobs is a partial adoption too, even
+    # when nothing is uploaded.
+    tools_tag_only = two_family_release.replace(
+        "            $(printf 'ferrumedge/ferrum-edge@sha256:%s ' *)\n",
+        "            -t ferrumedge/ferrum-edge:latest-ebpf-tools \\\n"
+        "            $(printf 'ferrumedge/ferrum-edge@sha256:%s ' *)\n",
+        1,
+    )
+    if tools_tag_only == two_family_release:
+        failures.append("the `-ebpf-tools` tag-only fixture did not change anything")
+    elif not compare_pr_publish_control_contract(
+        two_family_release,
+        tools_tag_only,
+        "release workflow",
+    ):
+        failures.append("an unbacked `-ebpf-tools` publish tag was not rejected")
 
     for wildcard_source, wildcard_job, wildcard_token in (
         ("CI workflow", "latest-release", "release-assets/*"),
