@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use ferrum_edge::config::stable_file::{
     MAX_FERRUM_CONF_BYTES, MAX_GATEWAY_CONFIG_FILE_BYTES, MAX_MESH_CONFIG_FILE_BYTES,
-    StableFileError, StableFileReadOptions, detect_json_or_yaml_extension, format_stable_file_error,
-    read_stable_file,
+    StableFileError, StableFileReadOptions, detect_json_or_yaml_extension,
+    format_stable_file_error, read_stable_file,
 };
 
 const TEST_LIMIT: u64 = 64;
@@ -72,8 +72,11 @@ fn sparse_oversized_metadata_is_fast_rejected() {
 
 #[test]
 fn missing_path_is_not_found() {
-    let err = read_stable_file(Path::new("/nonexistent/ferrum-stable-file.conf"), opts(TEST_LIMIT))
-        .expect_err("missing");
+    let err = read_stable_file(
+        Path::new("/nonexistent/ferrum-stable-file.conf"),
+        opts(TEST_LIMIT),
+    )
+    .expect_err("missing");
     assert!(matches!(err, StableFileError::NotFound));
 }
 
@@ -101,7 +104,10 @@ fn detect_format_sniffs_unknown_extensions_once() {
         Path::new("mesh.unknown"),
         "{\"mesh\":{}}"
     ));
-    assert!(detect_json_or_yaml_extension(Path::new("a.yaml"), "{not-json"));
+    assert!(detect_json_or_yaml_extension(
+        Path::new("a.yaml"),
+        "{not-json"
+    ));
     assert!(!detect_json_or_yaml_extension(Path::new("a.json"), "mesh:"));
 }
 
@@ -131,8 +137,7 @@ mod unix_targets {
             "FIFO rejection must not wait for a producer"
         );
         assert!(
-            matches!(err, StableFileError::NotRegularFile)
-                || matches!(err, StableFileError::Io(_)),
+            matches!(err, StableFileError::NotRegularFile) || matches!(err, StableFileError::Io(_)),
             "expected non-regular rejection, got {err}"
         );
     }
@@ -299,10 +304,7 @@ mod unix_targets {
         for _ in 0..20 {
             match read_stable_file(&path, opts(32)) {
                 Ok(content) => {
-                    assert!(
-                        content.len() <= 32,
-                        "must never retain past the ceiling"
-                    );
+                    assert!(content.len() <= 32, "must never retain past the ceiling");
                 }
                 Err(StableFileError::TooLarge { .. }) | Err(StableFileError::Unstable(_)) => {
                     saw_too_large_or_unstable = true;

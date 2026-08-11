@@ -206,8 +206,8 @@ fn mesh_file_oversized_sparse_document_is_refused() {
     let file = std::fs::File::create(&over).unwrap();
     file.set_len(MAX_MESH_CONFIG_FILE_BYTES + 1).unwrap();
     drop(file);
-    let err = load_mesh_slice_from_file(&over, request_for_namespace("ferrum"))
-        .expect_err("limit+1");
+    let err =
+        load_mesh_slice_from_file(&over, request_for_namespace("ferrum")).expect_err("limit+1");
     let msg = err.to_string();
     assert!(
         msg.contains("maximum supported size is 67108864 bytes"),
@@ -257,8 +257,8 @@ fn unknown_extension_json_object_parses_once_as_json() {
 #[test]
 fn malformed_yaml_fails_without_echoing_document_body() {
     let path = write_temp("yaml", "mesh: [\n  this is not valid\n");
-    let err = load_mesh_slice_from_file(&path, request_for_namespace("ferrum"))
-        .expect_err("malformed");
+    let err =
+        load_mesh_slice_from_file(&path, request_for_namespace("ferrum")).expect_err("malformed");
     let msg = err.to_string();
     assert!(
         msg.contains("invalid mesh configuration document"),
@@ -277,14 +277,10 @@ fn fifo_mesh_path_is_rejected_promptly() {
         .expect("mkfifo");
     assert!(status.success());
     let started = std::time::Instant::now();
-    let err = load_mesh_slice_from_file(&fifo, request_for_namespace("ferrum"))
-        .expect_err("fifo");
+    let err = load_mesh_slice_from_file(&fifo, request_for_namespace("ferrum")).expect_err("fifo");
     assert!(started.elapsed() < std::time::Duration::from_secs(2));
     let msg = err.to_string();
-    assert!(
-        msg.contains("not a regular file"),
-        "got: {msg}"
-    );
+    assert!(msg.contains("not a regular file"), "got: {msg}");
 }
 
 #[cfg(unix)]
@@ -292,8 +288,8 @@ fn fifo_mesh_path_is_rejected_promptly() {
 async fn large_reload_does_not_stall_tokio_heartbeat() {
     use ferrum_edge::config::stable_file::MAX_MESH_CONFIG_FILE_BYTES;
     use ferrum_edge::modes::mesh::config_consumer::file_source::load_mesh_slice_from_file_off_thread;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     // A multi-MiB stable read (two full probes) must run on the blocking pool
     // so a Tokio heartbeat/timer on a core worker keeps advancing.
@@ -338,23 +334,113 @@ async fn large_reload_does_not_stall_tokio_heartbeat() {
 }
 
 #[test]
-fn mesh_file_source_uses_spawn_blocking_and_stable_reader() {
-    let src = include_str!("../../src/modes/mesh/config_consumer/file_source.rs");
+fn mesh_reload_generation_advances_on_signal_and_stales_inflight_candidate() {
+    use ferrum_edge::modes::mesh::config_consumer::file_source::{
+        mesh_reload_generation_is_current, record_mesh_reload_request,
+    };
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let latest = AtomicU64::new(0);
+    let gen1 = record_mesh_reload_request(&latest);
+    assert_eq!(gen1, 1);
+    assert!(mesh_reload_generation_is_current(
+        gen1,
+        latest.load(Ordering::Acquire)
+    ));
+
+    // A signal observed during an in-flight load must advance the requested
+    // generation immediately so the older candidate cannot install.
+    let gen2 = record_mesh_reload_request(&latest);
+    assert_eq!(gen2, 2);
     assert!(
-        src.contains("spawn_blocking"),
-        "SIGHUP reload must isolate filesystem/parse work on spawn_blocking"
+        !mesh_reload_generation_is_current(gen1, latest.load(Ordering::Acquire)),
+        "in-flight gen1 must be stale once a later signal is observed"
+    );
+    assert!(mesh_reload_generation_is_current(
+        gen2,
+        latest.load(Ordering::Acquire)
+    ));
+
+    // Coalesced follow-up signals collapse to one newer requested generation.
+    let gen3 = record_mesh_reload_request(&latest);
+    assert_eq!(gen3, 3);
+    assert!(!mesh_reload_generation_is_current(gen2, 3));
+    assert!(mesh_reload_generation_is_current(gen3, 3));
+}
+
+#[test]
+fn mesh_file_reload_rejects_raise_and_accepted_clears_config_rejected() {
+    use ferrum_edge::modes::mesh::config_consumer::file_source::{
+        MeshLocalReloadApply, apply_mesh_file_reload_candidate,
+    };
+    use ferrum_edge::modes::mesh::runtime::MeshRuntimeState;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let path = write_temp("yaml", VALID_MESH_YAML);
+    let slice = load_mesh_slice_from_file(&path, request_for_namespace("ferrum")).unwrap();
+    let state = MeshRuntimeState::new();
+    state.install_slice(slice.clone());
+    let flag = AtomicBool::new(false);
+
+    let rejected = apply_mesh_file_reload_candidate(
+        &state,
+        &flag,
+        load_mesh_slice_from_file(
+            std::path::Path::new("/nonexistent/ferrum-mesh-reload.yaml"),
+            request_for_namespace("ferrum"),
+        ),
+    );
+    assert_eq!(rejected, MeshLocalReloadApply::Rejected);
+    assert!(flag.load(Ordering::Relaxed));
+    let retained = state.snapshot().as_ref().as_ref().cloned().unwrap();
+    assert!(retained.content_eq(&slice));
+
+    let recovered = apply_mesh_file_reload_candidate(&state, &flag, Ok(slice.clone()));
+    assert!(matches!(
+        recovered,
+        MeshLocalReloadApply::Applied | MeshLocalReloadApply::Unchanged
+    ));
+    assert!(
+        !flag.load(Ordering::Relaxed),
+        "accepted reload must clear config_rejected"
+    );
+
+    let unchanged = apply_mesh_file_reload_candidate(&state, &flag, Ok(slice));
+    assert_eq!(unchanged, MeshLocalReloadApply::Unchanged);
+    assert!(!flag.load(Ordering::Relaxed));
+}
+
+#[test]
+fn production_mesh_startup_wires_off_thread_loads_for_file_and_stock() {
+    // Behavioral seam for production wiring: the mesh runtime must await the
+    // off-thread wrappers rather than calling the synchronous loaders on a
+    // Tokio worker during startup / policy-watcher setup.
+    let mesh_mod = include_str!("../../src/modes/mesh/mod.rs");
+    assert!(
+        mesh_mod.contains("load_mesh_slice_from_file_off_thread"),
+        "file protocol startup must use the off-thread loader"
     );
     assert!(
-        src.contains("read_stable_file"),
-        "mesh file source must use the shared stable-file primitive"
+        mesh_mod.contains("load_stock_policy_baseline_off_thread"),
+        "stock_xds startup must use the off-thread policy loader"
     );
     assert!(
-        src.contains("pending_follow_up"),
-        "rapid SIGHUP delivery must coalesce into at most one follow-up load"
+        mesh_mod.contains("config_rejected.clone()"),
+        "mesh admin health must receive the shared config_rejected signal"
+    );
+
+    let stock = include_str!("../../src/modes/mesh/config_consumer/stock_xds_client.rs");
+    assert!(
+        stock.contains("spawn_blocking"),
+        "stock policy watcher must isolate filesystem/parse work"
     );
     assert!(
-        !src.contains("std::fs::read_to_string"),
-        "mesh file source must not use unbounded read_to_string"
+        stock.contains("record_mesh_reload_request"),
+        "stock policy watcher must share generation fencing with file mode"
+    );
+    assert!(
+        stock.contains("stop_accepting_stock_policy_candidates"),
+        "stock watcher shutdown must stop accepting without awaiting blocking work"
     );
 }
 
@@ -382,7 +468,10 @@ fn failed_reload_retains_last_good_slice() {
     std::fs::write(&path, "mesh: {").unwrap();
     let err = load_mesh_slice_from_file(&path, request_for_namespace("ferrum"))
         .expect_err("invalid reload candidate");
-    assert!(err.to_string().contains("invalid mesh configuration document"));
+    assert!(
+        err.to_string()
+            .contains("invalid mesh configuration document")
+    );
     let after = state
         .snapshot()
         .as_ref()

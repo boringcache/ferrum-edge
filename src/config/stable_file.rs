@@ -347,7 +347,7 @@ pub fn format_stable_file_error(
 
 /// Convert a stable-file failure into an `anyhow::Error` with source-specific
 /// wording. Exhausted instability retries include the atomic-replace guidance.
-pub fn stable_file_error_ anyhow(
+pub fn stable_file_error_anyhow(
     path: &Path,
     options: StableFileReadOptions<'_>,
     error: StableFileError,

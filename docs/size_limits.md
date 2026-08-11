@@ -154,7 +154,7 @@ Proxy request/response size limits do **not** cover on-disk configuration docume
 |----------|---------|-------|
 | File-mode gateway config (`FERRUM_FILE_CONFIG_PATH`) | 64 MiB | YAML/JSON `GatewayConfig`; SIGHUP reload keeps last known-good on failure |
 | `ferrum.conf` (`FERRUM_CONF_PATH`) | 1 MiB | Process-startup snapshot only; sticky load result (no empty fallback on failure) |
-| Localized mesh policy (`FERRUM_MESH_FILE_CONFIG_PATH`) | 64 MiB | `file` / `stock_xds` protocols; SIGHUP reload is off-thread and coalesced |
+| Localized mesh policy (`FERRUM_MESH_FILE_CONFIG_PATH`) | 64 MiB | `file` / `stock_xds` protocols; SIGHUP reload is off-thread, coalesced, and surfaces `config_rejected` on failure |
 
 Enforcement rules:
 

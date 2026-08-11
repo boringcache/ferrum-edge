@@ -11682,23 +11682,28 @@ pub async fn run(
         foreign_authority_adopt_secs: env_config.mesh_config_revision_adopt_secs,
     });
     let federation_activation = FederationActivation::from_env_config(&env_config);
+    // Localized mesh file / stock-xDS policy reload rejection signal (issue
+    // #3776). Shared with AdminState so authenticated `/health` reports
+    // degraded + `config_rejected` while the last-good slice/policy serves.
+    let config_rejected = Arc::new(AtomicBool::new(false));
 
     let mut background_handles = Vec::new();
     if runtime.config_protocol == MeshConfigProtocol::File {
         // Localized file source: no control plane, so no CP/DP JWT secret and
-        // no DP gRPC TLS machinery. The initial load is synchronous and
-        // fail-closed — an unreadable or invalid mesh document refuses
+        // no DP gRPC TLS machinery. The initial load is fail-closed on a
+        // blocking worker — an unreadable or invalid mesh document refuses
         // startup, matching file-mode validation semantics. Subsequent SIGHUP
-        // reloads keep the last good slice on error.
+        // reloads keep the last good slice on error and raise config_rejected.
         let file_path = runtime.file_config_path.clone().ok_or_else(|| {
             anyhow::anyhow!(
                 "FERRUM_MESH_FILE_CONFIG_PATH is required when FERRUM_MESH_CONFIG_PROTOCOL=file"
             )
         })?;
-        let initial_slice = config_consumer::file_source::load_mesh_slice_from_file(
-            std::path::Path::new(&file_path),
+        let initial_slice = config_consumer::file_source::load_mesh_slice_from_file_off_thread(
+            std::path::PathBuf::from(&file_path),
             runtime.mesh_slice_request(),
         )
+        .await
         .with_context(|| format!("failed to load localized mesh config from '{file_path}'"))?;
         // Fail-closed beyond mesh-field validity: run the full slice→config
         // preparation (plugin injection, materialization, DestinationRule
@@ -11725,6 +11730,7 @@ pub async fn run(
                 file_path.clone(),
                 runtime.mesh_slice_request(),
                 mesh_state.clone(),
+                config_rejected.clone(),
                 shutdown_tx.subscribe(),
             ),
         );
@@ -11748,9 +11754,10 @@ pub async fn run(
                  FERRUM_MESH_CONFIG_PROTOCOL=stock_xds"
             )
         })?;
-        let baseline = config_consumer::stock_xds_client::load_stock_policy_baseline(
-            std::path::Path::new(&policy_path),
+        let baseline = config_consumer::stock_xds_client::load_stock_policy_baseline_off_thread(
+            std::path::PathBuf::from(&policy_path),
         )
+        .await
         .with_context(|| {
             format!("failed to load the stock xDS mesh policy document from '{policy_path}'")
         })?;
@@ -11781,6 +11788,7 @@ pub async fn run(
             config_consumer::stock_xds_client::start_stock_policy_watcher_with_shutdown(
                 policy_path.clone(),
                 policy_tx,
+                config_rejected.clone(),
                 shutdown_tx.subscribe(),
             ),
         ));
@@ -12838,6 +12846,7 @@ async fn arm_mesh_runtime_startup(
         &shutdown_tx,
         proxy_state.clone(),
         mesh_state.clone(),
+        config_rejected.clone(),
         MeshServingSignals {
             startup_ready: startup_ready.clone(),
             serving_degraded: serving_degraded.clone(),
@@ -13571,6 +13580,7 @@ fn start_mesh_admin_listeners(
     shutdown_tx: &tokio::sync::watch::Sender<bool>,
     proxy_state: ProxyState,
     mesh_state: MeshRuntimeState,
+    config_rejected: Arc<AtomicBool>,
     serving_signals: MeshServingSignals,
     tls_policy: &TlsPolicy,
     crls: &tls::CrlList,
@@ -13613,7 +13623,7 @@ fn start_mesh_admin_listeners(
         serving_degraded: Some(serving_degraded.clone()),
         serving_listener_failures: Some(serving_listener_failures.clone()),
         db_available: None,
-        config_rejected: None,
+        config_rejected: Some(config_rejected.clone()),
         admin_restore_max_body_size_mib: env_config.admin_restore_max_body_size_mib,
         admin_spec_max_body_size_mib: env_config.admin_spec_max_body_size_mib,
         reserved_ports: env_config.reserved_gateway_ports(),
