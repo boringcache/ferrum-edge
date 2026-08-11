@@ -1037,6 +1037,7 @@ async fn run_two_replica_convergence(
         .as_str()
         .expect("status carries a generation digest")
         .to_string();
+    let published_before_race_a = published_generations(&status_a);
 
     // The convergence assertion. B never restarted and never saw the admin
     // request; its counter can only advance because its own poll cycle detected
@@ -1056,6 +1057,7 @@ async fn run_two_replica_convergence(
         Some(generation.as_str()),
         "[{label}] both replicas must reconstruct the same generation: {status_b}"
     );
+    let published_before_race_b = published_generations(&status_b);
 
     // Concurrent writers from the same read: exactly one compare-and-set commits
     // and every loser is a typed conflict, not a silent overwrite.
@@ -1115,7 +1117,40 @@ async fn run_two_replica_convergence(
         "[{label}] the winning write must advance the revision"
     );
 
-    // Both replicas converge on the winner's material.
+    // Both replicas must publish the winner without a restart. Reading the
+    // shared database alone would not prove that either process validated and
+    // swapped the winning generation into its live ArcSwap snapshot.
+    let converged_a = wait_for_published_revision(
+        client,
+        &replica_a,
+        PRIMARY_NAMESPACE,
+        committed_revision,
+        published_before_race_a + 1,
+        Duration::from_secs(60),
+        &format!("[{label}] replica A winning-revision publication"),
+    )
+    .await;
+    let converged_b = wait_for_published_revision(
+        client,
+        &replica_b,
+        PRIMARY_NAMESPACE,
+        committed_revision,
+        published_before_race_b + 1,
+        Duration::from_secs(60),
+        &format!("[{label}] replica B winning-revision publication"),
+    )
+    .await;
+    let converged_generation = converged_a["generation"]
+        .as_str()
+        .expect("status carries a generation digest")
+        .to_string();
+    assert_eq!(
+        converged_b["generation"].as_str(),
+        Some(converged_generation.as_str()),
+        "[{label}] both replicas must publish the winning generation: {converged_b}"
+    );
+
+    // Their admin reads must agree with the just-published winner too.
     let (_, from_a) = trust_get(client, &replica_a, PRIMARY_NAMESPACE, PRIMARY_NAMESPACE).await;
     let (_, from_b) = trust_get(client, &replica_b, PRIMARY_NAMESPACE, PRIMARY_NAMESPACE).await;
     assert_eq!(
@@ -1128,11 +1163,6 @@ async fn run_two_replica_convergence(
         stored_authorities(&from_a),
         "[{label}] both replicas must read the same committed material"
     );
-    let (_, converged_a) = trust_status(client, &replica_a, PRIMARY_NAMESPACE).await;
-    let converged_generation = converged_a["generation"]
-        .as_str()
-        .expect("status carries a generation digest")
-        .to_string();
 
     // Restart reconstruction: a brand-new process, database only.
     replica_b.shutdown();
