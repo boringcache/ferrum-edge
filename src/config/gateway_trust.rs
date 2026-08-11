@@ -345,7 +345,7 @@ fn validate_single_bundle(
                 // carry appended material an operator (or a differently-strict
                 // verifier) would read as part of the document.
                 match X509Certificate::from_der(der) {
-                    Ok((rest, _)) if rest.is_empty() => {}
+                    Ok(([], _)) => {}
                     Ok(_) => errors.push(format!(
                         "{label}.x509_authorities[{index}] carries trailing bytes after its X.509 certificate"
                     )),

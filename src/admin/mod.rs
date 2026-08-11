@@ -6351,10 +6351,7 @@ async fn handle_gateway_trust_status(
             // carries no material. There is deliberately no process-wide
             // "published revision" here — revisions are per namespace.
             let generation = crate::config::gateway_trust::trust_generation_fingerprint(
-                record
-                    .as_ref()
-                    .map(std::slice::from_ref)
-                    .unwrap_or_default(),
+                record.as_slice(),
             );
             Ok(json_response(
                 StatusCode::OK,
