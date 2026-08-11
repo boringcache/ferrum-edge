@@ -11,7 +11,8 @@
 //! * charges retained bytes against a process-wide concurrent budget whose
 //!   permits release on every error and drop path (including cancellation)
 //! * grows the shared charge incrementally so a small body does not reserve
-//!   the full per-response maximum
+//!   the full per-response maximum and never pre-allocates from an untrusted
+//!   `Content-Length` outside that budget
 //!
 //! Diagnostics stay fixed-cardinality: oversized / budget / read failures never
 //! carry provider URLs, tokens, headers, or body bytes.
@@ -20,6 +21,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::Bytes;
+use http::HeaderMap;
 use http::header::CONTENT_LENGTH;
 use tracing::warn;
 
@@ -197,6 +199,11 @@ pub fn install_discovery_body_limits(limits: DiscoveryBodyLimits) -> Result<(), 
 
 /// Test-only override that replaces effective ceilings without touching the
 /// production OnceLock. Restored by [`clear_discovery_body_limits_override_for_test`].
+///
+/// Callers must hold the external discovery-body test lifetime lock for the
+/// entire override + collection window. This function never zeroes
+/// [`BUDGET_USED`]: resetting usage while another test-owned permit is live
+/// would undercount. Stale charges are released by permit `Drop`.
 #[allow(dead_code)] // reached via `_test_support` from the external test crate
 pub fn override_discovery_body_limits_for_test(limits: DiscoveryBodyLimits) -> Result<(), String> {
     crate::config::env_config::parse_discovery_body_limits(
@@ -209,13 +216,15 @@ pub fn override_discovery_body_limits_for_test(limits: DiscoveryBodyLimits) -> R
         .map_err(|_| "service discovery body limit test override lock poisoned".to_string())?;
     *guard = Some(limits);
     BUDGET_MAX.store(limits.body_budget_bytes, Ordering::Release);
-    // Drop any stale charge so a prior cancelled test cannot poison the budget.
-    BUDGET_USED.store(0, Ordering::Release);
     Ok(())
 }
 
 /// Clear a test override and restore the budget max from the installed (or
 /// default) ceilings.
+///
+/// Does not reset [`BUDGET_USED`]. Call only after every test-owned permit in
+/// the serialized window has dropped (or will drop via RAII before the next
+/// test acquires the lifetime lock).
 #[allow(dead_code)] // reached via `_test_support` from the external test crate
 pub fn clear_discovery_body_limits_override_for_test() {
     if let Ok(mut guard) = TEST_OVERRIDE_LIMITS.lock() {
@@ -223,7 +232,6 @@ pub fn clear_discovery_body_limits_override_for_test() {
     }
     let limits = installed_or_default_limits();
     BUDGET_MAX.store(limits.body_budget_bytes, Ordering::Release);
-    BUDGET_USED.store(0, Ordering::Release);
 }
 
 /// Effective ceilings: test override → installed EnvConfig snapshot → defaults.
@@ -274,11 +282,44 @@ pub fn discovery_body_budget_max_for_test() -> usize {
     BUDGET_MAX.load(Ordering::Acquire)
 }
 
+/// Reduce every `Content-Length` header value (including repeated field lines
+/// and comma-folded members) to one agreed length, or fail closed.
+///
+/// [`HeaderMap::get`] only examines one `HeaderValue`. The security contract
+/// requires every present value to parse and agree before the oversized
+/// declaration fast path can accept or reject the response.
+fn discovery_declared_content_length(headers: &HeaderMap) -> Option<ContentLength> {
+    let mut values = headers.get_all(CONTENT_LENGTH).iter();
+    let first = values.next()?;
+    let mut agreed: Option<u64> = None;
+    for value in std::iter::once(first).chain(values) {
+        let Ok(raw) = value.to_str() else {
+            return Some(ContentLength::Ambiguous);
+        };
+        match parse_content_length(raw) {
+            ContentLength::Exact(parsed) => match agreed {
+                None => agreed = Some(parsed),
+                Some(previous) if previous != parsed => return Some(ContentLength::Ambiguous),
+                Some(_) => {}
+            },
+            ContentLength::Ambiguous => return Some(ContentLength::Ambiguous),
+        }
+    }
+    Some(match agreed {
+        Some(value) => ContentLength::Exact(value),
+        None => ContentLength::Ambiguous,
+    })
+}
+
 /// Collect a discovery HTTP response body under the configured ceilings and
 /// shared concurrent budget.
 ///
 /// On success the returned [`ChargedDiscoveryBody`] holds the budget permit
 /// until dropped. On every error path the permit is released before returning.
+///
+/// Allocator capacity is never reserved from an untrusted `Content-Length`
+/// before a shared-budget charge. Retained byte ranges are charged immediately
+/// before append; cancellation, error, and drop release the charge.
 pub async fn collect_discovery_response_body(
     response: reqwest::Response,
     role: DiscoveryBodyRole,
@@ -286,9 +327,8 @@ pub async fn collect_discovery_response_body(
     let limits = effective_discovery_body_limits();
     let max_bytes = limits.ceiling_for(role);
 
-    if let Some(value) = response.headers().get(CONTENT_LENGTH) {
-        let raw = value.to_str().unwrap_or("");
-        match parse_content_length(raw) {
+    if let Some(declared) = discovery_declared_content_length(response.headers()) {
+        match declared {
             ContentLength::Exact(declared) => {
                 if declared as usize > max_bytes {
                     record_body_failure(DiscoveryBodyError::Oversized, role);
@@ -303,15 +343,10 @@ pub async fn collect_discovery_response_body(
     }
 
     let mut permit = DiscoveryBodyBudgetPermit::empty();
+    // Grow only with retained, budget-charged chunks. Do not `reserve` from
+    // attacker-controlled Content-Length: that would allocate outside
+    // FERRUM_SERVICE_DISCOVERY_BODY_BUDGET_BYTES before any permit exists.
     let mut buf = Vec::new();
-    // Prefer a precise capacity when Content-Length is known and within the
-    // ceiling; never pre-allocate the full configured maximum for a small body.
-    if let Some(hint) = response.content_length() {
-        let hint = hint as usize;
-        if hint <= max_bytes {
-            buf.reserve(hint);
-        }
-    }
 
     let mut response = response;
     loop {

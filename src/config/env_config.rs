@@ -3835,7 +3835,10 @@ impl EnvConfig {
             resolve_var(conf, SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES_KEY).as_deref(),
             resolve_var(conf, SERVICE_DISCOVERY_BODY_BUDGET_BYTES_KEY).as_deref(),
         )?;
-        crate::service_discovery::http_body::install_discovery_body_limits(discovery_body_limits)?;
+        // Parsing stays pure: do not publish the process OnceLock here.
+        // `main` installs the accepted EnvConfig snapshot once before any
+        // discovery poller can run (identical reinstall accepted; mismatch
+        // fails closed at that seam).
         let service_discovery_max_response_body_bytes = discovery_body_limits.max_response_bytes;
         let service_discovery_max_error_body_bytes = discovery_body_limits.max_error_bytes;
         let service_discovery_body_budget_bytes = discovery_body_limits.body_budget_bytes;

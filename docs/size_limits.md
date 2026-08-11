@@ -136,11 +136,12 @@ Kubernetes EndpointSlice and Consul health discovery responses are control-plane
 
 Enforcement rules:
 
-- **Content-Length fast path.** An exact declared length above the role ceiling is refused before any chunk is retained. Ambiguous `Content-Length` framing fails closed (never treated as unknown length).
+- **Content-Length fast path.** Every present `Content-Length` field line (and every comma-folded member) must parse and agree. An exact agreed length above the role ceiling is refused before any chunk is retained. Ambiguous or disagreeing framing fails closed (never treated as unknown length).
 - **Streaming.** Chunked / missing-length bodies are counted chunk-by-chunk and abort before retaining `limit + 1` bytes. Collectors never call unbounded `Response::{text,json,bytes}` first.
-- **Shared budget.** Each collected byte range charges a cancellation-safe permit that releases on every error and drop path. Small bodies charge only their actual size.
+- **Shared budget.** Each retained byte range charges a cancellation-safe permit **before** append; permits release on every error and drop path. Small bodies charge only their actual size. The collector does **not** pre-allocate from an untrusted `Content-Length` outside this budget.
 - **Error bodies.** Non-success responses are drained under the tighter error ceiling and discarded. Fixed provider/status diagnostics are emitted; body bytes, URLs, tokens, and headers are never logged.
 - **Finite only.** `0` is rejected (not unlimited). Values above each hard maximum clamp down. A malformed value fails closed.
+- **Parse vs publish.** `EnvConfig` parsing validates these ceilings without installing process-global state. Production startup publishes the accepted snapshot once before any discovery poller runs (identical reinstall accepted; mismatch fails closed).
 - **Fail closed.** Oversized, budget-exhausted, and malformed Kubernetes envelopes retain the last admitted `LoadBalancerCache` targets and any pending Consul `X-Consul-Index` cursor.
 
 See also [configuration.md](configuration.md#service-discovery).
