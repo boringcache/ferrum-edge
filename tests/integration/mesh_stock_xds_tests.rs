@@ -919,17 +919,14 @@ async fn stock_shared_endpoint_survives_when_the_foreign_namespace_sorts_first()
             .collect::<Vec<_>>()
     );
     assert!(
-        slice
-            .workloads
-            .iter()
-            .any(|workload| {
-                workload.service_name == "reviews"
-                    && workload.attached_service_namespace() == "default"
-                    && workload
-                        .addresses
-                        .iter()
-                        .any(|address| address == "10.1.2.3")
-            }),
+        slice.workloads.iter().any(|workload| {
+            workload.service_name == "reviews"
+                && workload.attached_service_namespace() == "default"
+                && workload
+                    .addresses
+                    .iter()
+                    .any(|address| address == "10.1.2.3")
+        }),
         "the visible service must keep the shared endpoint after the earlier foreign owner narrows"
     );
     assert!(

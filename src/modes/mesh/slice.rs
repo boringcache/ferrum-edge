@@ -4440,11 +4440,7 @@ mod tests {
         let services = vec![
             make_service("other", "alpha"),
             make_service_with_workload_refs("other", "bravo", vec![decoy_spiffe]),
-            make_service_with_workload_refs(
-                "other",
-                "payments",
-                vec![workload.spiffe_id.clone()],
-            ),
+            make_service_with_workload_refs("other", "payments", vec![workload.spiffe_id.clone()]),
             make_service("other", "zulu"),
             make_service("default", "checkout"),
         ];

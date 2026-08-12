@@ -401,8 +401,7 @@ fn stock_shared_endpoint_keeps_per_service_workload_independent_of_btree_order()
         .workloads
         .iter()
         .find(|workload| {
-            workload.service_name == "reviews"
-                && workload.attached_service_namespace() == "default"
+            workload.service_name == "reviews" && workload.attached_service_namespace() == "default"
         })
         .expect("visible service keeps its own workload stamp");
     assert_eq!(foreign_workload.spiffe_id.as_str(), REVIEWS_SAN);

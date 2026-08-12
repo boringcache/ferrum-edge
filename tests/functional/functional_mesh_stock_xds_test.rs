@@ -1347,16 +1347,12 @@ async fn functional_mesh_stock_xds_live_datapath_matrix() {
     assert!(
         observed.unpinned_peer_before.reached_backend(),
         "the unpinned-peer host must first be routable under a representable pin — {}\n{logs}",
-        observed
-            .unpinned_peer_before
-            .describe("unpinned pre-state")
+        observed.unpinned_peer_before.describe("unpinned pre-state")
     );
     assert!(
         observed.subset_cluster_before.reached_backend(),
         "the subset host must first be routable as a non-subset cluster — {}\n{logs}",
-        observed
-            .subset_cluster_before
-            .describe("subset pre-state")
+        observed.subset_cluster_before.describe("subset pre-state")
     );
     assert!(
         observed.good_service_after_refusals.reached_backend(),
