@@ -243,6 +243,128 @@ pub const DEFAULT_SERVICE_DISCOVERY_BODY_BUDGET_BYTES: usize = 32 * 1024 * 1024;
 /// Hard maximum concurrent discovery-body budget (256 MiB).
 pub const HARD_MAX_SERVICE_DISCOVERY_BODY_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 
+/// Settings key for the provider-neutral discovery staleness bound.
+pub const SERVICE_DISCOVERY_MAX_STALE_SECONDS_KEY: &str =
+    "FERRUM_SERVICE_DISCOVERY_MAX_STALE_SECONDS";
+/// Settings key for the discovery staleness expiry policy.
+pub const SERVICE_DISCOVERY_STALE_POLICY_KEY: &str = "FERRUM_SERVICE_DISCOVERY_STALE_POLICY";
+/// Settings key for the unsafe unbounded-retention opt-in.
+pub const SERVICE_DISCOVERY_ALLOW_UNBOUNDED_STALE_KEY: &str =
+    "FERRUM_SERVICE_DISCOVERY_ALLOW_UNBOUNDED_STALE";
+
+/// Default maximum age of the last successfully admitted and published
+/// discovery snapshot before the expiry policy applies (5 minutes).
+pub const DEFAULT_SERVICE_DISCOVERY_MAX_STALE_SECONDS: u64 = 300;
+/// Hard maximum discovery staleness bound (24 hours). Larger values clamp down;
+/// unbounded retention is `0` plus the explicit unsafe opt-in.
+pub const HARD_MAX_SERVICE_DISCOVERY_MAX_STALE_SECONDS: u64 =
+    crate::config::types::MAX_SD_MAX_STALE_SECONDS;
+/// Minimum discovery staleness bound. A window shorter than one poll interval
+/// would expire between healthy polls, so short values clamp up here and are
+/// additionally floored at three poll intervals per task at runtime.
+pub const MIN_SERVICE_DISCOVERY_MAX_STALE_SECONDS: u64 =
+    crate::config::types::MIN_SD_MAX_STALE_SECONDS;
+
+/// Validated provider-neutral discovery staleness policy (issue #3717).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiscoveryStalenessPolicy {
+    /// Process default maximum staleness in seconds. `0` means unbounded and is
+    /// only reachable with `allow_unbounded`.
+    pub max_stale_seconds: u64,
+    /// Action taken when a task's last admitted snapshot expires.
+    pub policy: crate::config::types::SdStalePolicy,
+    /// Whether unbounded (`0`) retention is admitted — process default and
+    /// per-upstream overrides alike.
+    pub allow_unbounded: bool,
+}
+
+impl DiscoveryStalenessPolicy {
+    pub const fn defaults() -> Self {
+        Self {
+            max_stale_seconds: DEFAULT_SERVICE_DISCOVERY_MAX_STALE_SECONDS,
+            policy: crate::config::types::SdStalePolicy::Withdraw,
+            allow_unbounded: false,
+        }
+    }
+}
+
+impl Default for DiscoveryStalenessPolicy {
+    fn default() -> Self {
+        Self::defaults()
+    }
+}
+
+/// Pure parse/validation for the three discovery staleness env keys.
+///
+/// - `None` selects each key's documented default.
+/// - A malformed number, an unknown policy token, or a malformed boolean fails
+///   closed rather than silently reverting to unbounded retention.
+/// - `0` (unbounded last-known retention) is admitted only when the unsafe
+///   opt-in is explicitly `true`.
+/// - Values above the hard maximum clamp down; values below the floor clamp up.
+pub fn parse_discovery_staleness_policy(
+    max_stale: Option<&str>,
+    policy: Option<&str>,
+    allow_unbounded: Option<&str>,
+) -> Result<DiscoveryStalenessPolicy, String> {
+    let allow_unbounded = match allow_unbounded.map(str::trim) {
+        None | Some("") => false,
+        Some(raw) => match raw.to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" => true,
+            "false" | "0" | "no" => false,
+            _ => {
+                return Err(format!(
+                    "{SERVICE_DISCOVERY_ALLOW_UNBOUNDED_STALE_KEY} must be true or false"
+                ));
+            }
+        },
+    };
+
+    let max_stale_seconds = match max_stale.map(str::trim) {
+        None | Some("") => DEFAULT_SERVICE_DISCOVERY_MAX_STALE_SECONDS,
+        Some(raw) => {
+            let value = raw.parse::<u64>().map_err(|_| {
+                format!(
+                    "{SERVICE_DISCOVERY_MAX_STALE_SECONDS_KEY} must be a whole number of seconds; \
+                     the configured value is not"
+                )
+            })?;
+            if value == 0 {
+                if !allow_unbounded {
+                    return Err(format!(
+                        "{SERVICE_DISCOVERY_MAX_STALE_SECONDS_KEY}=0 keeps discovered targets \
+                         routable forever after the registry stops answering. Set a bounded \
+                         window, or opt in explicitly with \
+                         {SERVICE_DISCOVERY_ALLOW_UNBOUNDED_STALE_KEY}=true"
+                    ));
+                }
+                0
+            } else {
+                value.clamp(
+                    MIN_SERVICE_DISCOVERY_MAX_STALE_SECONDS,
+                    HARD_MAX_SERVICE_DISCOVERY_MAX_STALE_SECONDS,
+                )
+            }
+        }
+    };
+
+    let policy = match policy.map(str::trim) {
+        None | Some("") => crate::config::types::SdStalePolicy::default(),
+        Some(raw) => crate::config::types::SdStalePolicy::parse_token(raw).ok_or_else(|| {
+            format!(
+                "{SERVICE_DISCOVERY_STALE_POLICY_KEY} must be one of retain, withdraw, \
+                 fail_readiness"
+            )
+        })?,
+    };
+
+    Ok(DiscoveryStalenessPolicy {
+        max_stale_seconds,
+        policy,
+        allow_unbounded,
+    })
+}
+
 /// Validated discovery body ceilings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DiscoveryBodyLimits {
@@ -1808,6 +1930,11 @@ pub struct EnvConfig {
     /// a larger per-IP cap can never fire and is refused at startup rather than
     /// silently ignored.
     pub cp_grpc_max_connections_per_ip: usize,
+    /// Independent finite lifetime for every bearer-authenticated ConfigSync,
+    /// MeshSubscribe, and ADS stream admitted by a control plane. This never
+    /// extends token expiry; the earlier deadline wins. Default 3600 seconds;
+    /// validated to 60..=86400 and cannot be disabled.
+    pub cp_grpc_max_stream_lifetime_seconds: u64,
     /// Capacity of the tokio broadcast channel used to fan out config deltas
     /// to subscribed Data Planes. When a DP lags behind by more than this many
     /// updates, it receives a full config snapshot instead of the missed deltas.
@@ -2013,6 +2140,22 @@ pub struct EnvConfig {
     /// still refused for a non-root Ferrum. Set this when the co-located
     /// application runs as a different uid than the sidecar.
     pub mesh_unix_socket_allowed_uids: Vec<u32>,
+    /// Maximum concurrently-open PHYSICAL connections the sidecar-ingress Unix
+    /// backend pool may hold per admitted target identity (issue #3731).
+    ///
+    /// The bound is INBOUND transport capacity toward the co-located
+    /// application, not an Istio `DestinationRule` (which is outbound,
+    /// client-side policy and deliberately does not govern this path). It is
+    /// keyed by the pool's full structured identity — namespace, proxy id,
+    /// effective upstream id, canonical socket path, the admitted
+    /// `(dev, ino, owner_uid)`, and the wire protocol — so sibling ingress
+    /// listeners and replaced socket objects can never share or steal a lane.
+    ///
+    /// Only a NEW physical connection is admitted against it: a pooled HTTP/1.1
+    /// hit and every additional stream on a shared h2c carrier are free, so a
+    /// target pinned at `1` still serves unbounded sequential requests and
+    /// unbounded concurrent RPCs. `0` disables the bound.
+    pub mesh_unix_ingress_max_connections: u32,
     /// Comma-separated W3C `baggage` key prefixes stripped from outbound
     /// requests at dispatch. Default empty: forward unchanged. Operators set
     /// this to keep mesh-internal identity claims (e.g. `source.`) from
@@ -2795,6 +2938,17 @@ pub struct EnvConfig {
     /// Kubernetes/Consul pollers. Default 32 MiB, hard maximum 256 MiB; must be
     /// at least the per-response success ceiling; `0` is rejected.
     pub service_discovery_body_budget_bytes: usize,
+    /// Provider-neutral maximum age of the last successfully admitted and
+    /// published discovery snapshot before the expiry policy applies, in
+    /// seconds. `0` is unbounded last-known retention and requires
+    /// `service_discovery_allow_unbounded_stale`. (default: 300)
+    pub service_discovery_max_stale_seconds: u64,
+    /// Action applied when a discovery task's snapshot exceeds the staleness
+    /// bound. (default: `withdraw`)
+    pub service_discovery_stale_policy: crate::config::types::SdStalePolicy,
+    /// Unsafe opt-in that admits unbounded (`0`) discovery staleness, both as
+    /// the process default and as a per-upstream override. (default: false)
+    pub service_discovery_allow_unbounded_stale: bool,
     /// Number of days before certificate expiration to emit a warning log.
     /// Expired certificates are rejected at startup/config-load time.
     /// Set to 0 to disable near-expiry warnings. (default: 30)
@@ -3360,6 +3514,8 @@ impl Default for EnvConfig {
             cp_grpc_tls_client_ca_path: None,
             cp_grpc_max_connections: 1024,
             cp_grpc_max_connections_per_ip: 64,
+            cp_grpc_max_stream_lifetime_seconds:
+                crate::grpc::auth::DEFAULT_GRPC_MAX_STREAM_LIFETIME_SECONDS,
             cp_broadcast_channel_capacity: 128,
             cp_namespaces: Vec::new(),
             cp_require_namespace_claim: false,
@@ -3406,6 +3562,8 @@ impl Default for EnvConfig {
             mesh_trusted_hbone_assertors: Vec::new(),
             mesh_unix_socket_allowed_roots: Vec::new(),
             mesh_unix_socket_allowed_uids: Vec::new(),
+            mesh_unix_ingress_max_connections:
+                crate::proxy::unix_backend_pool::DEFAULT_UNIX_INGRESS_MAX_CONNECTIONS,
             mesh_egress_strip_baggage_keys: Vec::new(),
             mesh_outbound_traffic_policy: "allow_any".to_string(),
             mesh_outbound_registry_reject_status: 502,
@@ -3578,6 +3736,9 @@ impl Default for EnvConfig {
                 DEFAULT_SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES,
             service_discovery_max_error_body_bytes: DEFAULT_SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES,
             service_discovery_body_budget_bytes: DEFAULT_SERVICE_DISCOVERY_BODY_BUDGET_BYTES,
+            service_discovery_max_stale_seconds: DEFAULT_SERVICE_DISCOVERY_MAX_STALE_SECONDS,
+            service_discovery_stale_policy: crate::config::types::SdStalePolicy::Withdraw,
+            service_discovery_allow_unbounded_stale: false,
             tls_cert_expiry_warning_days: 30,
             tls_inventory_snapshot_ttl_seconds: DEFAULT_SNAPSHOT_TTL_SECONDS,
             tls_early_data_methods: HashSet::new(),
@@ -3925,6 +4086,7 @@ impl EnvConfig {
             cp_grpc_tls_client_ca_path: Option<String> = "FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH";
             cp_grpc_max_connections: usize = "FERRUM_CP_GRPC_MAX_CONNECTIONS" => 1024usize;
             cp_grpc_max_connections_per_ip: usize = "FERRUM_CP_GRPC_MAX_CONNECTIONS_PER_IP" => 64usize;
+            cp_grpc_max_stream_lifetime_seconds: u64 = "FERRUM_CP_GRPC_MAX_STREAM_LIFETIME_SECONDS" => crate::grpc::auth::DEFAULT_GRPC_MAX_STREAM_LIFETIME_SECONDS;
             cp_broadcast_channel_capacity: usize = "FERRUM_CP_BROADCAST_CHANNEL_CAPACITY" => 128usize;
             cp_namespaces: Vec<String> = "FERRUM_CP_NAMESPACES" => Vec::new();
             cp_require_namespace_claim: bool = "FERRUM_CP_REQUIRE_NAMESPACE_CLAIM" => false;
@@ -3962,6 +4124,7 @@ impl EnvConfig {
             mesh_trusted_hbone_assertors: Vec<String> = "FERRUM_MESH_TRUSTED_HBONE_ASSERTORS" => Vec::new();
             mesh_unix_socket_allowed_roots: Vec<String> = "FERRUM_MESH_UNIX_SOCKET_ALLOWED_ROOTS" => Vec::new();
             mesh_unix_socket_allowed_uids: Vec<u32> = "FERRUM_MESH_UNIX_SOCKET_ALLOWED_UIDS" => Vec::new();
+            mesh_unix_ingress_max_connections: u32 = "FERRUM_MESH_UNIX_INGRESS_MAX_CONNECTIONS" => crate::proxy::unix_backend_pool::DEFAULT_UNIX_INGRESS_MAX_CONNECTIONS;
             mesh_egress_strip_baggage_keys: Vec<String> = "FERRUM_MESH_EGRESS_STRIP_BAGGAGE_KEYS" => Vec::new();
             mesh_outbound_traffic_policy: String = "FERRUM_MESH_OUTBOUND_TRAFFIC_POLICY" => "allow_any".to_string();
             mesh_outbound_registry_reject_status: u16 = "FERRUM_MESH_OUTBOUND_REGISTRY_REJECT_STATUS" => 502u16;
@@ -4173,6 +4336,18 @@ impl EnvConfig {
         let service_discovery_max_response_body_bytes = discovery_body_limits.max_response_bytes;
         let service_discovery_max_error_body_bytes = discovery_body_limits.max_error_bytes;
         let service_discovery_body_budget_bytes = discovery_body_limits.body_budget_bytes;
+
+        // Provider-neutral bounded staleness policy (issue #3717). Parsing is
+        // pure here as well; the runtime snapshot is installed once from `main`
+        // before any poller can start.
+        let discovery_staleness = parse_discovery_staleness_policy(
+            resolve_var(conf, SERVICE_DISCOVERY_MAX_STALE_SECONDS_KEY).as_deref(),
+            resolve_var(conf, SERVICE_DISCOVERY_STALE_POLICY_KEY).as_deref(),
+            resolve_var(conf, SERVICE_DISCOVERY_ALLOW_UNBOUNDED_STALE_KEY).as_deref(),
+        )?;
+        let service_discovery_max_stale_seconds = discovery_staleness.max_stale_seconds;
+        let service_discovery_stale_policy = discovery_staleness.policy;
+        let service_discovery_allow_unbounded_stale = discovery_staleness.allow_unbounded;
 
         // This binding is trusted process configuration, never connection or
         // header data. An explicit empty value deliberately clears it. When it
@@ -4727,6 +4902,7 @@ impl EnvConfig {
             cp_grpc_tls_client_ca_path,
             cp_grpc_max_connections,
             cp_grpc_max_connections_per_ip,
+            cp_grpc_max_stream_lifetime_seconds,
             cp_broadcast_channel_capacity,
             cp_namespaces,
             cp_require_namespace_claim,
@@ -4764,6 +4940,7 @@ impl EnvConfig {
             mesh_trusted_hbone_assertors,
             mesh_unix_socket_allowed_roots,
             mesh_unix_socket_allowed_uids,
+            mesh_unix_ingress_max_connections,
             mesh_egress_strip_baggage_keys,
             mesh_outbound_traffic_policy,
             mesh_outbound_registry_reject_status,
@@ -4924,6 +5101,9 @@ impl EnvConfig {
             service_discovery_max_response_body_bytes,
             service_discovery_max_error_body_bytes,
             service_discovery_body_budget_bytes,
+            service_discovery_max_stale_seconds,
+            service_discovery_stale_policy,
+            service_discovery_allow_unbounded_stale,
             tls_cert_expiry_warning_days,
             tls_inventory_snapshot_ttl_seconds,
             tls_early_data_methods,
@@ -5879,6 +6059,19 @@ impl EnvConfig {
             crate::proxy::stream_match::validate_canonical_gateway_ref(gateway_ref)
                 .map_err(|e| format!("FERRUM_STREAM_GATEWAY_REF: {e}"))?;
         }
+        // Sidecar-ingress Unix transport capacity (issue #3731). `0` is the
+        // explicit "no bound" opt-out; anything above the ceiling could not be
+        // reached before the process file-descriptor limit anyway, so accepting
+        // it would advertise a bound that is not one. Rejected at the config
+        // boundary rather than clamped, so an operator typo is visible.
+        if self.mesh_unix_ingress_max_connections
+            > crate::proxy::unix_backend_pool::MAX_UNIX_INGRESS_MAX_CONNECTIONS
+        {
+            return Err(format!(
+                "FERRUM_MESH_UNIX_INGRESS_MAX_CONNECTIONS must be 0 (no bound) or at most {}",
+                crate::proxy::unix_backend_pool::MAX_UNIX_INGRESS_MAX_CONNECTIONS
+            ));
+        }
 
         // Mesh config ordering domains (issues #2473 / #3611). Both are
         // validated here, at the single configuration boundary, and neither
@@ -5954,6 +6147,17 @@ impl EnvConfig {
                     ));
                 }
             }
+        }
+
+        if !(crate::grpc::auth::MIN_GRPC_MAX_STREAM_LIFETIME_SECONDS
+            ..=crate::grpc::auth::MAX_GRPC_MAX_STREAM_LIFETIME_SECONDS)
+            .contains(&self.cp_grpc_max_stream_lifetime_seconds)
+        {
+            return Err(format!(
+                "FERRUM_CP_GRPC_MAX_STREAM_LIFETIME_SECONDS must be between {} and {} seconds; 0/unbounded is not permitted",
+                crate::grpc::auth::MIN_GRPC_MAX_STREAM_LIFETIME_SECONDS,
+                crate::grpc::auth::MAX_GRPC_MAX_STREAM_LIFETIME_SECONDS,
+            ));
         }
 
         // CP/DP gRPC credential presence (advisory GHSA-3f2j-wwqw-grmg).
