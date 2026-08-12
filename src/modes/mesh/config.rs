@@ -3081,7 +3081,7 @@ pub struct MeshConnectionPoolHttp {
     /// DESTINATION-WIDE active-request breaker by
     /// [`crate::backend_active_request_limit::BackendActiveRequestLimiter`] —
     /// one shared budget per `(namespace, logical destination, policy port,
-    /// selected subset, config generation)` spanning HTTP/1.1, reqwest-
+    /// selected subset)` spanning HTTP/1.1, reqwest-
     /// negotiated H2, direct H2, native gRPC, HBONE/mesh-mTLS, and the HTTP/3
     /// bridges. It is deliberately NOT an HTTP/2 transport setting; the
     /// per-connection knob is `max_concurrent_streams` below.

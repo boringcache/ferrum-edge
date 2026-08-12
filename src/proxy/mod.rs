@@ -34671,7 +34671,8 @@ pub(crate) fn resolve_effective_proxy_for_target<'a>(
     // are FIELD-MERGED, not wholesale-replaced: a per-port `connectionPool.http`
     // field wins when set, otherwise the selected-subset/top-level value is inherited —
     // so an unrelated per-port field (`connectTimeout`/`tls`) no longer wipes the
-    // inherited top-level `idleTimeout`/`maxConcurrentStreams`/`maxRetries`. This
+    // inherited top-level `idleTimeout`/`http2MaxRequests`/
+    // `maxConcurrentStreams`/`maxRetries`. This
     // matches the cold-path tiering exactly (inherited fallback, then a partial
     // per-port overlay; see `apply_connection_pool_http_to_port_override` in
     // `src/modes/mesh/mod.rs`). Resolve each field through borrowed references:
@@ -57253,7 +57254,8 @@ mod tests {
         // codex r1 #1806: a partial per-port `portLevelSettings` entry that sets
         // ONLY an unrelated field (here `connectTimeout`) must NOT wipe the
         // inherited top-level `connectionPool.http` overlay
-        // (`idleTimeout`/`maxConcurrentStreams`/`maxRetries`/`http1MaxPendingRequests`).
+        // (`idleTimeout`/`http2MaxRequests`/`maxConcurrentStreams`/`maxRetries`/
+        // `http1MaxPendingRequests`).
         // The per-port field wins where set; otherwise the fallback is inherited —
         // exactly the non-SD apply-time layering
         // (`apply_connection_pool_http_to_port_override`).

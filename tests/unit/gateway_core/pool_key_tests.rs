@@ -1967,7 +1967,7 @@ fn same_subset_divergent_h2_caps_partition_direct_h2_and_grpc_keys() {
 }
 
 /// Configured-versus-removed/default H2 caps must differ so DestinationRule
-/// update/delete of http2MaxRequests retires the prior builder connection.
+/// update/delete of maxConcurrentStreams retires the prior builder connection.
 #[test]
 fn h2_and_grpc_pool_keys_partition_configured_versus_default_h2_cap() {
     let mut configured = minimal_proxy();
