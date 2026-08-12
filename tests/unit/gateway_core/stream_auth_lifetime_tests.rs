@@ -10,22 +10,25 @@ use std::time::Duration;
 
 use ferrum_edge::_test_support::{
     BufferedUploadWaitOutcomeForTest, DtlsAuthorizationExpiryForTest, EarlyUploadBoundKind,
-    ProbePumpOutcome, ProbeTransportPoll, ResponseCollectBoundForTest, UploadPumpProbe,
-    attribute_dispatch_phase_bound_for_test, authorization_bounded_header_deadline_for_test,
+    H3UploadWaitOutcomeForTest, ProbePumpOutcome, ProbeTransportPoll, ResponseCollectBoundForTest,
+    UploadPumpProbe, attribute_dispatch_phase_bound_for_test,
+    authorization_bounded_header_deadline_for_test,
     authorization_expired_dispatch_placeholder_for_test,
     authorization_expired_pre_commitment_response_for_test,
     collect_buffered_upload_under_authorization_for_test,
-    collect_buffered_upload_under_composed_bound_for_test, compose_buffered_upload_bound_for_test,
-    compose_dispatch_phase_bound_for_test, direct_h2_upload_join_bound_for_test,
-    dispatch_phase_authorization_expiry_for_test, dtls_authorization_expired_before_relay_for_test,
-    dtls_setup_stage_under_authorization_for_test, request_received_at_for_test,
-    request_upload_auth_deadline_for_test, set_request_credential_deadline_for_test,
+    collect_buffered_upload_under_composed_bound_for_test,
+    collect_h3_upload_under_authorization_for_test, compose_buffered_upload_bound_for_test,
+    compose_dispatch_phase_bound_for_test, compose_h3_upload_bound_for_test,
+    direct_h2_upload_join_bound_for_test, dispatch_phase_authorization_expiry_for_test,
+    dtls_authorization_expired_before_relay_for_test, dtls_setup_stage_under_authorization_for_test,
+    request_received_at_for_test, request_upload_auth_deadline_for_test,
+    set_grpc_deadline_budget_for_test, set_request_credential_deadline_for_test,
     settle_dtls_relay_authorization_expiry_for_test, within_stream_auth_deadline_for_test,
 };
 use ferrum_edge::config::types::Consumer;
 use ferrum_edge::plugins::{Direction, DisconnectCause, RequestContext};
 use ferrum_edge::proxy::auth_lifetime::{
-    StreamAuthDeadline, StreamAuthProtocolFamily, StreamAuthTermination, compose_absolute_bound,
+    ComposedAuthBound, StreamAuthDeadline, StreamAuthProtocolFamily, StreamAuthTermination,
     counters, effective_request_auth_deadline, effective_stream_auth_deadline,
     expired_authorization, record_termination, request_is_authenticated,
 };
@@ -551,7 +554,10 @@ async fn a_retry_backoff_shorter_than_the_authorization_deadline_completes_norma
     )
     .await
     .expect("a backoff inside the authorization lifetime is an ordinary wait");
-    assert_eq!(tokio::time::Instant::now() - started, Duration::from_secs(2));
+    assert_eq!(
+        tokio::time::Instant::now() - started,
+        Duration::from_secs(2)
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -571,7 +577,10 @@ async fn a_retry_backoff_is_cancelled_at_the_authorization_deadline() {
     .await
     .expect_err("the backoff must be cancelled at the absolute deadline");
     assert_eq!(termination, StreamAuthTermination::CredentialExpired);
-    assert_eq!(tokio::time::Instant::now() - started, Duration::from_secs(3));
+    assert_eq!(
+        tokio::time::Instant::now() - started,
+        Duration::from_secs(3)
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -632,18 +641,20 @@ async fn the_composed_bound_is_the_earliest_of_the_two_absolute_plans() {
 
     // Authorization earlier than the client's RPC deadline.
     assert_eq!(
-        compose_absolute_bound(
+        ComposedAuthBound::compose(
             Some(later),
             Some(plan_at(earlier, StreamAuthTermination::CredentialExpired))
-        ),
+        )
+        .deadline(),
         Some(earlier)
     );
     // Client's RPC deadline earlier than authorization.
     assert_eq!(
-        compose_absolute_bound(
+        ComposedAuthBound::compose(
             Some(earlier),
             Some(plan_at(later, StreamAuthTermination::CredentialExpired))
-        ),
+        )
+        .deadline(),
         Some(earlier)
     );
 }
@@ -657,19 +668,23 @@ async fn a_missing_bound_never_widens_the_other() {
     // HTTP relays were unbounded before: with no protocol deadline the
     // authorization plan must still be the bound.
     assert_eq!(
-        compose_absolute_bound(
+        ComposedAuthBound::compose(
             None,
             Some(plan_at(
                 at,
                 StreamAuthTermination::AuthenticatedStreamMaxLifetime
             ))
-        ),
+        )
+        .deadline(),
         Some(at)
     );
     // An unauthenticated request carries no authorization lifetime, so the
     // protocol's own bound is unchanged.
-    assert_eq!(compose_absolute_bound(Some(at), None), Some(at));
-    assert_eq!(compose_absolute_bound(None, None), None);
+    assert_eq!(
+        ComposedAuthBound::compose(Some(at), None).deadline(),
+        Some(at)
+    );
+    assert_eq!(ComposedAuthBound::compose(None, None).deadline(), None);
 }
 
 #[tokio::test(start_paused = true)]
@@ -2251,7 +2266,8 @@ fn dtls_plan(after: Duration, termination: StreamAuthTermination) -> StreamAuthD
 /// bounded class into the metadata the disconnect summary carries.
 fn assert_dtls_expiry_is_policy_neutral(expiry: &DtlsAuthorizationExpiryForTest) {
     assert_eq!(
-        expiry.error_class, ErrorClass::RequestError,
+        expiry.error_class,
+        ErrorClass::RequestError,
         "an authorization expiry must never read as a transport or backend fault"
     );
     assert_eq!(expiry.disconnect_cause, DisconnectCause::RecvError);
@@ -2266,7 +2282,8 @@ fn assert_dtls_expiry_is_policy_neutral(expiry: &DtlsAuthorizationExpiryForTest)
     );
     let reason = expiry.metadata.get(TERMINATION_REASON_KEY).cloned();
     assert_eq!(
-        reason.as_deref(), Some("credential_expired"),
+        reason.as_deref(),
+        Some("credential_expired"),
         "the bounded class must reach the stream transaction summary"
     );
     assert_eq!(expiry.metadata.len(), 1, "one class, nothing else");
@@ -2297,7 +2314,10 @@ async fn an_already_elapsed_dtls_plan_never_starts_a_setup_stage() {
         !started.load(std::sync::atomic::Ordering::SeqCst),
         "an expired credential must resolve no name and dial no backend"
     );
-    assert_eq!(expiry.setup_kind, Some(StreamSetupKind::AuthorizationExpired));
+    assert_eq!(
+        expiry.setup_kind,
+        Some(StreamSetupKind::AuthorizationExpired)
+    );
     assert!(
         expiry.setup_kind.expect("typed kind").is_client_side(),
         "a gateway policy decision about the client's credential is client-side"
@@ -2344,7 +2364,10 @@ async fn a_dtls_setup_stage_outliving_the_plan_is_cancelled_and_health_neutral()
         !finished.load(std::sync::atomic::Ordering::SeqCst),
         "the in-flight setup future must be dropped, not finished"
     );
-    assert_eq!(expiry.setup_kind, Some(StreamSetupKind::AuthorizationExpired));
+    assert_eq!(
+        expiry.setup_kind,
+        Some(StreamSetupKind::AuthorizationExpired)
+    );
     assert_eq!(expiry.error, DTLS_SETUP_EXPIRED_ERROR);
     assert_eq!(
         expiry.probe_releases, 1,
@@ -2454,7 +2477,11 @@ fn a_relay_phase_dtls_expiry_publishes_the_bounded_class_exactly_once() {
     let merged_reason = merged.get(TERMINATION_REASON_KEY).cloned();
     let survived = merged.get("waf.signature").cloned();
     assert_eq!(merged_reason.as_deref(), Some("credential_expired"));
-    assert_eq!(survived.as_deref(), Some("none"), "connect metadata survives");
+    assert_eq!(
+        survived.as_deref(),
+        Some("none"),
+        "connect metadata survives"
+    );
 }
 
 #[test]
@@ -2465,7 +2492,10 @@ fn the_dtls_and_upload_pump_authorization_paths_carry_no_production_panic() {
         ("src/proxy/udp_proxy.rs", UDP_PROXY_SOURCE),
         ("src/proxy/upload_pump.rs", UPLOAD_PUMP_SOURCE),
     ] {
-        let production = source.split("#[cfg(test)]").next().expect("production source");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source");
         for macro_name in ["unreachable!", "panic!(", "todo!", "unimplemented!"] {
             assert!(
                 !production.contains(macro_name),
@@ -2613,7 +2643,13 @@ fn native_h3_grpc_dispatch_phases_compose_the_authorization_lifetime() {
     let dispatch = H3_SERVER_SOURCE
         .split("async fn dispatch_grpc_native_h3(")
         .nth(1)
-        .expect("native-H3 gRPC dispatch");
+        .expect("native-H3 gRPC dispatch")
+        // Bounded at the next item: the counted assertions below are about THIS
+        // dispatch, and an unbounded tail would fold in every later relay's own
+        // hoisted plan.
+        .split("async fn log_h3_grpc_transaction(")
+        .next()
+        .expect("bounded native-H3 gRPC dispatch");
     // The plan is hoisted AHEAD of the backend open, and the dispatch bound is
     // the composition rather than the raw protocol bound.
     let precommit = dispatch
@@ -2633,7 +2669,9 @@ fn native_h3_grpc_dispatch_phases_compose_the_authorization_lifetime() {
     // Both phases check authorization FIRST, so a policy expiry is never
     // reported as a backend timeout and never downgrades the H3 capability.
     assert_eq!(
-        dispatch.matches("Some(termination) => Err(termination),").count(),
+        dispatch
+            .matches("Some(termination) => Err(termination),")
+            .count(),
         2,
         "a native-H3 gRPC dispatch phase lost its authorization attribution"
     );
@@ -2744,7 +2782,9 @@ fn every_precommit_h3_grpc_terminal_is_preceded_by_the_authorization_gate() {
     let write_at = terminal
         .find("await_h3_grpc_terminal_write_with_grace(")
         .expect("terminal write");
-    let retire_at = terminal.find("pump_guard.retire().await;").expect("pump retire");
+    let retire_at = terminal
+        .find("pump_guard.retire().await;")
+        .expect("pump retire");
     let permits_at = terminal
         .find("record_h3_backend_admission_outcome(")
         .expect("admission permit release");
@@ -2754,7 +2794,9 @@ fn every_precommit_h3_grpc_terminal_is_preceded_by_the_authorization_gate() {
          admission permits are released"
     );
     assert_eq!(
-        terminal.matches("record_h3_backend_admission_outcome(").count(),
+        terminal
+            .matches("record_h3_backend_admission_outcome(")
+            .count(),
         1,
         "the admission permit set must be released exactly once"
     );
@@ -3021,6 +3063,309 @@ async fn an_h3_seam_with_no_client_deadline_is_owned_by_authorization_alone() {
     assert_eq!(unbounded.expired_authorization(), None);
 }
 
+// --- The native-H3 buffered request-upload seam (issue #3815) ---------------
+//
+// The seven native-H3 sites that BUFFER a client upload before dispatch were the
+// last family that composed the client's optional RPC deadline with the admitted
+// credential's authorization deadline and then chose the owner by re-reading the
+// clock once the bound had fired. A buffered drain of a continuously active
+// upload is exactly the shape that is observed late: the collect makes progress
+// on every poll, so the task can be scheduled again only well after BOTH
+// instants have passed. Re-reading there reports the gateway's security decision
+// — a different client-visible terminal, a different recorded class, and a
+// fixed-cardinality authorization count — for a drain the client's own strictly
+// earlier `grpc-timeout` actually bounded.
+//
+// These drive the real collector, so they fail against any seam that re-derives
+// the owner instead of consuming the captured composition.
+
+/// Move the paused clock forward so "already elapsed" instants stay
+/// representable without depending on the process's uptime.
+async fn paused_clock_with_history() -> tokio::time::Instant {
+    tokio::time::advance(Duration::from_secs(600)).await;
+    tokio::time::Instant::now()
+}
+
+fn elapsed_by(now: tokio::time::Instant, ago: Duration) -> tokio::time::Instant {
+    now.checked_sub(ago).expect("representable")
+}
+
+fn plan_elapsed(
+    now: tokio::time::Instant,
+    ago: Duration,
+    termination: StreamAuthTermination,
+) -> Option<StreamAuthDeadline> {
+    Some(plan_at(elapsed_by(now, ago), termination))
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_late_woken_h3_upload_keeps_a_strictly_earlier_client_deadline_as_the_clients_own() {
+    let now = paused_clock_with_history().await;
+    // The client's `grpc-timeout` fired first, and the credential's own deadline
+    // has ALSO passed by the time the drain is observed. This is exactly the
+    // state a late-woken buffered drain returns in.
+    let bound = ComposedBound::compose(
+        Some(elapsed_by(now, Duration::from_secs(60))),
+        plan_elapsed(
+            now,
+            Duration::from_secs(30),
+            StreamAuthTermination::CredentialExpired,
+        ),
+    );
+    let upload = std::future::pending::<Result<(), ()>>();
+
+    assert_eq!(
+        collect_h3_upload_under_authorization_for_test(upload, bound, 0).await,
+        H3UploadWaitOutcomeForTest::DeadlineExceeded,
+        "a strictly earlier client RPC deadline must keep the deadline terminal; reporting \
+         an authorization expiry here would change the client-visible response, latch a \
+         termination class, and charge the fixed-cardinality counter"
+    );
+    // ...and the credential's own instant stays reachable for detached work that
+    // must be bounded by it.
+    assert!(bound.authorization_deadline_at().is_some());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_late_woken_h3_upload_carries_a_strictly_earlier_authorization_bound() {
+    let now = paused_clock_with_history().await;
+    let bound = ComposedBound::compose(
+        Some(elapsed_by(now, Duration::from_secs(30))),
+        plan_elapsed(
+            now,
+            Duration::from_secs(60),
+            StreamAuthTermination::AuthenticatedStreamMaxLifetime,
+        ),
+    );
+    let upload = std::future::pending::<Result<(), ()>>();
+
+    assert_eq!(
+        collect_h3_upload_under_authorization_for_test(upload, bound, 0).await,
+        H3UploadWaitOutcomeForTest::AuthorizationExpired(
+            StreamAuthTermination::AuthenticatedStreamMaxLifetime
+        ),
+        "the earlier authorization bound owns the drain and carries its bounded class"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_exact_h3_upload_tie_goes_to_authorization() {
+    let now = paused_clock_with_history().await;
+    let bound = ComposedBound::compose(
+        Some(elapsed_by(now, Duration::from_secs(30))),
+        plan_elapsed(
+            now,
+            Duration::from_secs(30),
+            StreamAuthTermination::CredentialExpired,
+        ),
+    );
+    let upload = std::future::pending::<Result<(), ()>>();
+
+    assert_eq!(
+        collect_h3_upload_under_authorization_for_test(upload, bound, 0).await,
+        H3UploadWaitOutcomeForTest::AuthorizationExpired(StreamAuthTermination::CredentialExpired),
+        "a genuine tie resolves to the security decision, matching every biased select arm"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_operator_upload_timeout_earlier_than_the_composed_bound_stays_timed_out() {
+    let now = paused_clock_with_history().await;
+    // Authorization WINS composition here, so a seam that derived its terminal
+    // from the bound alone would report a security expiry for a drain the
+    // operator's own whole-upload stall guard ended.
+    let bound = ComposedBound::compose(
+        Some(now + Duration::from_secs(600)),
+        Some(plan_at(
+            now + Duration::from_secs(60),
+            StreamAuthTermination::CredentialExpired,
+        )),
+    );
+    assert_eq!(bound.deadline(), Some(now + Duration::from_secs(60)));
+
+    let upload = std::future::pending::<Result<(), ()>>();
+    let task = tokio::spawn(async move {
+        collect_h3_upload_under_authorization_for_test(upload, bound, 10).await
+    });
+    // Register the `timeout_at` waiter before advancing the paused clock.
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_millis(10)).await;
+    tokio::task::yield_now().await;
+
+    assert_eq!(
+        task.await.expect("join"),
+        H3UploadWaitOutcomeForTest::TimedOut,
+        "the operator whole-upload stall guard keeps its own precedence and terminal"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unauthenticated_h3_upload_never_reports_an_authorization_expiry() {
+    let now = paused_clock_with_history().await;
+    let bound = ComposedBound::compose(Some(elapsed_by(now, Duration::from_secs(30))), None);
+    assert_eq!(bound.authorization_deadline_at(), None);
+    let upload = std::future::pending::<Result<(), ()>>();
+
+    assert_eq!(
+        collect_h3_upload_under_authorization_for_test(upload, bound, 0).await,
+        H3UploadWaitOutcomeForTest::DeadlineExceeded
+    );
+
+    // With neither bound configured the drain stays unbounded, exactly as it was
+    // before this contract existed.
+    let unbounded = ComposedBound::compose(None, None);
+    let completed = std::future::ready::<Result<(), ()>>(Ok(()));
+    assert_eq!(
+        collect_h3_upload_under_authorization_for_test(completed, unbounded, 0).await,
+        H3UploadWaitOutcomeForTest::Collected
+    );
+    // A client read failure is still a read failure, never a policy terminal.
+    let failed = std::future::ready::<Result<(), ()>>(Err(()));
+    assert_eq!(
+        collect_h3_upload_under_authorization_for_test(failed, unbounded, 0).await,
+        H3UploadWaitOutcomeForTest::ClientError
+    );
+}
+
+/// The composer the seven sites share derives BOTH the awaited instant and the
+/// reported owner from one read of the arbiter.
+#[tokio::test(start_paused = true)]
+async fn the_native_h3_upload_composer_keeps_the_owner_from_the_request_context() {
+    // The credential outlives the client's own RPC budget.
+    let mut ctx = authenticated_ctx();
+    let received_at = request_received_at_for_test(&ctx);
+    set_request_credential_deadline_for_test(&mut ctx, Some(received_at + Duration::from_secs(30)));
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(5_000));
+
+    let bound = compose_h3_upload_bound_for_test(&ctx, DEFAULT_MAX);
+    assert_eq!(bound.deadline(), Some(received_at + Duration::from_secs(5)));
+    assert_eq!(
+        bound.authorization_deadline_at(),
+        Some(received_at + Duration::from_secs(30))
+    );
+    tokio::time::advance(Duration::from_secs(600)).await;
+    assert_eq!(
+        bound.expired_authorization(),
+        None,
+        "both instants are in the past now, and the client's is still the owner"
+    );
+
+    // The credential expires first.
+    let mut ctx = authenticated_ctx();
+    let received_at = request_received_at_for_test(&ctx);
+    set_request_credential_deadline_for_test(&mut ctx, Some(received_at + Duration::from_secs(5)));
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(30_000));
+    let bound = compose_h3_upload_bound_for_test(&ctx, DEFAULT_MAX);
+    assert_eq!(bound.deadline(), Some(received_at + Duration::from_secs(5)));
+    tokio::time::advance(Duration::from_secs(600)).await;
+    assert_eq!(
+        bound.expired_authorization(),
+        Some(StreamAuthTermination::CredentialExpired)
+    );
+
+    // An exact tie between the two goes to authorization.
+    let mut ctx = authenticated_ctx();
+    let received_at = request_received_at_for_test(&ctx);
+    set_request_credential_deadline_for_test(&mut ctx, Some(received_at + Duration::from_secs(5)));
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(5_000));
+    let bound = compose_h3_upload_bound_for_test(&ctx, DEFAULT_MAX);
+    assert_eq!(bound.deadline(), Some(received_at + Duration::from_secs(5)));
+    tokio::time::advance(Duration::from_secs(600)).await;
+    assert_eq!(
+        bound.expired_authorization(),
+        Some(StreamAuthTermination::CredentialExpired),
+        "a tie at the arbiter is still the security decision"
+    );
+
+    // An unauthenticated request keeps only the client's own bound.
+    let mut anonymous = anonymous_ctx();
+    let received_at = request_received_at_for_test(&anonymous);
+    set_grpc_deadline_budget_for_test(&mut anonymous, Some(5_000));
+    let bound = compose_h3_upload_bound_for_test(&anonymous, DEFAULT_MAX);
+    assert_eq!(bound.deadline(), Some(received_at + Duration::from_secs(5)));
+    assert_eq!(bound.authorization_deadline_at(), None);
+    tokio::time::advance(Duration::from_secs(600)).await;
+    assert_eq!(bound.expired_authorization(), None);
+}
+
+/// Every native-H3 buffered upload site consumes the captured winner, and the
+/// projection that discarded it no longer exists.
+#[test]
+fn every_native_h3_upload_site_attributes_from_the_captured_composition() {
+    let collector = H3_SERVER_SOURCE
+        .split("pub(crate) async fn collect_h3_request_body_under_authorization<F, T, E>(")
+        .nth(1)
+        .expect("the typed native-H3 upload collector")
+        .split("\n/// ")
+        .next()
+        .expect("bounded collector");
+    assert!(
+        collector.contains("compose_early_upload_bound(bound.deadline()"),
+        "the awaited instant must be a projection of the captured composition"
+    );
+    assert!(
+        collector.contains("DeadlineExceeded(bound.expired_authorization())"),
+        "the deadline terminal must carry the owner captured at composition time"
+    );
+    assert!(
+        collector.contains("EarlyUploadBoundKind::OperatorTimeout)) => {")
+            && collector.contains("H3RequestBodyReadError::TimedOut)?"),
+        "the operator whole-upload stall guard keeps its own precedence and terminal"
+    );
+    assert!(
+        !collector.contains("record_termination(") && !collector.contains("record_once("),
+        "the collector only REPORTS an owner; the request's shared latch is what counts it"
+    );
+
+    // The no-plan wrapper the cross-protocol bridge uses composes against
+    // `None`, so its deadline is structurally the client's own.
+    let wrapper = H3_SERVER_SOURCE
+        .split("pub(crate) async fn collect_h3_request_body_with_deadline<F, T, E>(")
+        .nth(1)
+        .expect("the no-plan native-H3 upload wrapper")
+        .split("\n/// ")
+        .next()
+        .expect("bounded wrapper");
+    assert!(wrapper.contains("ComposedAuthBound::compose(deadline, None)"));
+
+    // All seven sites bind the captured winner rather than recomputing one.
+    assert_eq!(
+        H3_SERVER_SOURCE
+            .matches("Err(H3RequestBodyReadError::DeadlineExceeded(authorization_expiry)) => {")
+            .count(),
+        7,
+        "a native-H3 upload site stopped consuming the winner captured at composition"
+    );
+    let compact = H3_SERVER_SOURCE
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        !compact.contains("expired_authorization( crate::proxy::auth_lifetime::"),
+        "no H3 upload site may re-derive its owner from the clock against a freshly \
+         recomputed authorization plan"
+    );
+
+    // The projection that returned only the instant is gone, so a seam cannot
+    // compose a bound and then be left with no way to name its owner.
+    for (name, source) in [
+        ("http3/server.rs", H3_SERVER_SOURCE),
+        (
+            "http3/cross_protocol.rs",
+            include_str!("../../../src/http3/cross_protocol.rs"),
+        ),
+        (
+            "proxy/auth_lifetime.rs",
+            include_str!("../../../src/proxy/auth_lifetime.rs"),
+        ),
+    ] {
+        assert!(
+            !source.contains("compose_absolute_bound"),
+            "{name} still reaches for the owner-discarding projection"
+        );
+    }
+}
+
 // --- Captured attribution for the pre-commitment phase bound ----------------
 //
 // Two very different owners can drive the same instant: the client's own
@@ -3030,10 +3375,7 @@ async fn an_h3_seam_with_no_client_deadline_is_owned_by_authorization_alone() {
 // until after the LATER of the two sees both as elapsed. Attribution must come
 // from the composition, where both instants were known.
 
-fn plan_after(
-    after: Duration,
-    termination: StreamAuthTermination,
-) -> Option<StreamAuthDeadline> {
+fn plan_after(after: Duration, termination: StreamAuthTermination) -> Option<StreamAuthDeadline> {
     Some(StreamAuthDeadline {
         at: tokio::time::Instant::now() + after,
         termination,

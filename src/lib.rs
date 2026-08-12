@@ -9414,11 +9414,74 @@ pub mod _test_support {
             Err(crate::http3::server::H3RequestBodyReadError::TimedOut) => {
                 Err(EarlyUploadWaitError::TimedOut)
             }
-            Err(crate::http3::server::H3RequestBodyReadError::DeadlineExceeded) => {
+            Err(crate::http3::server::H3RequestBodyReadError::DeadlineExceeded(_)) => {
                 Err(EarlyUploadWaitError::DeadlineExceeded)
             }
             Err(crate::http3::server::H3RequestBodyReadError::Read(_)) => {
                 Err(EarlyUploadWaitError::Read)
+            }
+        }
+    }
+
+    /// Which bound ended a NATIVE-H3 buffered request-upload drain, and — when
+    /// the composed absolute bound is what fired — which of its two owners was
+    /// captured at composition time (issue #3815).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum H3UploadWaitOutcomeForTest {
+        Collected,
+        ClientError,
+        /// The operator whole-upload stall guard fired. It composes on top of
+        /// the absolute bound and never carries an authorization attribution.
+        TimedOut,
+        /// The composed absolute bound fired and the CLIENT's own RPC deadline
+        /// is the captured winner.
+        DeadlineExceeded,
+        /// The composed absolute bound fired and the admitted credential's
+        /// authorization lifetime is the captured winner.
+        AuthorizationExpired(crate::proxy::auth_lifetime::StreamAuthTermination),
+    }
+
+    /// Compose the native-H3 buffered-upload bound exactly as all seven
+    /// native-H3 upload sites do: the client's optional RPC deadline against
+    /// the admitted request's authorization plan, keeping the winning owner.
+    pub fn compose_h3_upload_bound_for_test(
+        ctx: &crate::plugins::RequestContext,
+        max_lifetime_seconds: u64,
+    ) -> crate::proxy::auth_lifetime::ComposedAuthBound {
+        crate::http3::server::h3_upload_authorization_bound(ctx, max_lifetime_seconds)
+    }
+
+    /// Run one native-H3 buffered request-upload drain against an
+    /// ALREADY-COMPOSED authorization bound (issue #3815).
+    ///
+    /// This is the seam every native-H3 upload site uses, so a test can
+    /// compose, let arbitrary scheduling delay pass, and still observe that the
+    /// reported owner comes from the composition rather than from the clock.
+    pub async fn collect_h3_upload_under_authorization_for_test<F>(
+        collect: F,
+        bound: crate::proxy::auth_lifetime::ComposedAuthBound,
+        request_body_read_timeout_ms: u64,
+    ) -> H3UploadWaitOutcomeForTest
+    where
+        F: std::future::Future<Output = Result<(), ()>>,
+    {
+        use crate::http3::server::H3RequestBodyReadError as H3UploadError;
+
+        match crate::http3::server::collect_h3_request_body_under_authorization(
+            collect,
+            bound,
+            request_body_read_timeout_ms,
+        )
+        .await
+        {
+            Ok(()) => H3UploadWaitOutcomeForTest::Collected,
+            Err(H3UploadError::Read(())) => H3UploadWaitOutcomeForTest::ClientError,
+            Err(H3UploadError::TimedOut) => H3UploadWaitOutcomeForTest::TimedOut,
+            Err(H3UploadError::DeadlineExceeded(None)) => {
+                H3UploadWaitOutcomeForTest::DeadlineExceeded
+            }
+            Err(H3UploadError::DeadlineExceeded(Some(termination))) => {
+                H3UploadWaitOutcomeForTest::AuthorizationExpired(termination)
             }
         }
     }

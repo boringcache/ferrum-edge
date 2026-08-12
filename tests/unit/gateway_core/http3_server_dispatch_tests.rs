@@ -220,7 +220,7 @@ fn h3_terminal_body_read_failures_commit_dedup_cleanup_once() {
         .split("let backend_admission_plugins = plugin_cache_view.backend_admission_plugins();")
         .next()
         .expect("H3 terminal provider dispatch must remain bounded");
-    assert!(terminal_dispatch.contains("collect_h3_request_body_with_deadline("));
+    assert!(terminal_dispatch.contains("collect_h3_request_body_under_authorization("));
     assert!(terminal_dispatch.contains("drain_h3_request_body("));
     // Ok(None): idle recv after a completed oversize drain — the flavor-aware
     // writer already halts after HEADERS; do not duplicate STOP_SENDING.
@@ -1309,7 +1309,7 @@ fn h3_native_and_cross_protocol_cancel_writers_use_post_deadline_grace() {
         .split("Err(super::server::H3RequestBodyReadError::TimedOut) => {")
         .nth(1)
         .expect("cross-protocol timed-out bridge arm")
-        .split("Err(super::server::H3RequestBodyReadError::DeadlineExceeded) => {")
+        .split("Err(super::server::H3RequestBodyReadError::DeadlineExceeded(_)) => {")
         .next()
         .expect("bounded timed-out bridge arm");
     assert!(timed_out.contains("await_post_deadline_terminal_response_write("));

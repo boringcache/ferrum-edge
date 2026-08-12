@@ -486,6 +486,11 @@ fn earliest(
 /// A tie still goes to authorization, matching the biased select-arm ordering
 /// every relay and write seam uses: when both bounds are genuinely eligible,
 /// the security decision is the one reported.
+///
+/// This type is deliberately the ONLY composer: there is no projection helper
+/// that returns the bare instant, so a seam cannot compose a bound and then be
+/// left with no way to name its owner. A caller that needs only the instant
+/// takes [`ComposedAuthBound::deadline`] from the value it already holds.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ComposedAuthBound {
     at: Option<tokio::time::Instant>,
@@ -560,27 +565,6 @@ impl ComposedAuthBound {
         }
         expired_authorization(self.authorization)
     }
-}
-
-/// Compose an admitted request's authorization deadline with whatever absolute
-/// bound the protocol already established (a client `grpc-timeout`, an RPC
-/// deadline), returning the earliest.
-///
-/// Used by every H3 write and upload seam whose only prior bound was the
-/// client's OPTIONAL RPC deadline (plus, on the upload side, a per-read
-/// operator timeout) — neither of which stops a **continuously active** upload
-/// or a **parked** downstream write from outliving the credential that
-/// admitted the stream.
-///
-/// This projection keeps only the instant. A seam that also ATTRIBUTES an
-/// expiry must carry [`ComposedAuthBound`] itself rather than re-deriving the
-/// owner from the clock.
-#[inline]
-pub fn compose_absolute_bound(
-    protocol_deadline_at: Option<tokio::time::Instant>,
-    auth_deadline: Option<StreamAuthDeadline>,
-) -> Option<tokio::time::Instant> {
-    ComposedAuthBound::compose(protocol_deadline_at, auth_deadline).deadline()
 }
 
 /// Attribute an already-fired composed bound: `Some` when the authorization

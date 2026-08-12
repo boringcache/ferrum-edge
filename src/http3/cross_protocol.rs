@@ -5062,7 +5062,10 @@ where
                 crate::http3::stream_util::halt_request_body(stream);
                 return result;
             }
-            Err(super::server::H3RequestBodyReadError::DeadlineExceeded) => {
+            // This bridge drain supplies NO authorization plan, so the winner
+            // captured at composition is structurally the client's own RPC
+            // deadline: it can never carry an authorization termination.
+            Err(super::server::H3RequestBodyReadError::DeadlineExceeded(_)) => {
                 ctx.mark_gateway_deadline_response_selected();
                 release_cross_protocol_circuit_breaker_probe_on_admission_reject(
                     state,

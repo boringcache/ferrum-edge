@@ -16,8 +16,7 @@ use bytes::Bytes;
 use ferrum_edge::_test_support::{
     GRPC_FRAME_TRAILER, parse_grpc_frames, proxy_body_into_grpc_web_streaming_for_test,
     proxy_body_streaming_for_test, proxy_body_with_authorization_deadline_and_closer_for_test,
-    proxy_body_with_authorization_deadline_for_test,
-    proxy_body_with_client_grpc_deadline_for_test,
+    proxy_body_with_authorization_deadline_for_test, proxy_body_with_client_grpc_deadline_for_test,
 };
 use ferrum_edge::proxy::auth_lifetime::{
     AuthorizationConnectionCloser, StreamAuthDeadline, StreamAuthProtocolFamily,
@@ -798,24 +797,27 @@ async fn an_upstream_error_immediately_before_the_deadline_stays_an_error() {
     let fired = Arc::new(AtomicBool::new(false));
     let closer = AuthorizationConnectionCloser::new();
     let grace = ferrum_edge::_test_support::authorization_transport_close_grace();
-    let mut body = pump_body(
-        proxy_body_streaming_for_test(Box::pin(StreamBody::new(stream::iter(vec![Err::<
-            Frame<Bytes>,
-            ProxyBodyError,
-        >(
-            Box::new(std::io::Error::other("backend failed")) as ProxyBodyError,
-        )])))),
-        future_deadline(
-            Duration::from_secs(5),
-            StreamAuthTermination::CredentialExpired,
-        ),
-        &latch,
-        &fired,
-        Some(closer.clone()),
-    );
+    let mut body =
+        pump_body(
+            proxy_body_streaming_for_test(Box::pin(StreamBody::new(stream::iter(vec![Err::<
+                Frame<Bytes>,
+                ProxyBodyError,
+            >(
+                Box::new(std::io::Error::other("backend failed")) as ProxyBodyError,
+            )])))),
+            future_deadline(
+                Duration::from_secs(5),
+                StreamAuthTermination::CredentialExpired,
+            ),
+            &latch,
+            &fired,
+            Some(closer.clone()),
+        );
 
     let terminal = body.frame().await.expect("a terminal frame");
-    let error = terminal.err().expect("an upstream error must stay an error");
+    let error = terminal
+        .err()
+        .expect("an upstream error must stay an error");
     assert!(
         error.to_string().contains("backend failed"),
         "the upstream error must be delivered verbatim, never collapsed into a clean EOF or \
@@ -989,9 +991,7 @@ fn wrapped_body(
     )
 }
 
-fn stream_of(
-    frames: Vec<Result<Frame<Bytes>, ProxyBodyError>>,
-) -> ferrum_edge::proxy::ProxyBody {
+fn stream_of(frames: Vec<Result<Frame<Bytes>, ProxyBodyError>>) -> ferrum_edge::proxy::ProxyBody {
     proxy_body_streaming_for_test(Box::pin(StreamBody::new(stream::iter(frames))))
 }
 

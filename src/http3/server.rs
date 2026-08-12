@@ -69,11 +69,26 @@ use crate::tls::{CrlList, TlsPolicy};
 pub(crate) const MESH_DISPATCH_REQUIRED_REJECT_BODY: &[u8] =
     br#"{"error":"Bad Gateway","message":"Mesh transport dispatch required for this backend target"}"#;
 
+/// Terminal outcome of a bounded H3 request-upload drain.
+///
+/// `DeadlineExceeded` carries the OWNER of the composed absolute bound, decided
+/// where both instants were known (issue #3815). Once that bound has fired,
+/// "was the authorization deadline in the past?" is not a sound way to ask
+/// which of the two ended the drain: a task that is not polled again until
+/// after the LATER of the two sees BOTH as elapsed, and would report the
+/// gateway's security decision for a drain a strictly earlier client RPC
+/// deadline actually bounded.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum H3RequestBodyReadError<E> {
     Read(E),
+    /// The operator whole-upload stall guard (`backend_read_timeout_ms`) fired.
+    /// It is composed on top of the absolute bound and keeps its own
+    /// precedence, so it never carries an authorization attribution.
     TimedOut,
-    DeadlineExceeded,
+    /// The composed ABSOLUTE bound fired. `Some` only when the admitted
+    /// credential's authorization lifetime is the captured winner AND its
+    /// instant has actually elapsed; `None` is the client's own RPC deadline.
+    DeadlineExceeded(Option<crate::proxy::auth_lifetime::StreamAuthTermination>),
 }
 
 pub(crate) async fn collect_h3_request_body_with_timeout<F, T, E>(
@@ -93,19 +108,33 @@ where
         .map_err(H3RequestBodyReadError::Read)
 }
 
-pub(crate) async fn collect_h3_request_body_with_deadline<F, T, E>(
+/// Drain an H3 request upload under an ALREADY-COMPOSED authorization bound.
+///
+/// `bound` is the earliest of the client's optional RPC deadline and the
+/// admitted credential's absolute authorization deadline, and it already knows
+/// which of the two owns that instant (issue #3815).
+///
+/// The operator whole-upload stall guard (`backend_read_timeout_ms`) is
+/// composed on top of it here and keeps its existing precedence: when the fresh
+/// operator window is strictly earlier it wins, the drain is `TimedOut`, and no
+/// authorization attribution is taken at all. Only when the composed ABSOLUTE
+/// bound is what fires is the captured winner consulted — read from the
+/// composition rather than re-derived from the clock, so an arbitrarily late
+/// wake cannot reattribute a strictly earlier client deadline to the gateway's
+/// security decision.
+pub(crate) async fn collect_h3_request_body_under_authorization<F, T, E>(
     collect: F,
-    deadline: Option<tokio::time::Instant>,
+    bound: crate::proxy::auth_lifetime::ComposedAuthBound,
     request_body_read_timeout_ms: u64,
 ) -> Result<T, H3RequestBodyReadError<E>>
 where
     F: std::future::Future<Output = Result<T, E>>,
 {
     // Preserve both timeout regimes via the shared earliest-of composer: the
-    // absolute RPC deadline bounds the whole call, and the operator read
-    // timeout still caps a stalled client upload even when grpc-timeout is
-    // very large. Operator timeout `0` disables only that fresh bound.
-    match crate::proxy::compose_early_upload_bound(deadline, request_body_read_timeout_ms) {
+    // composed absolute bound caps the whole call, and the operator read
+    // timeout still caps a stalled client upload even when that absolute bound
+    // is very large. Operator timeout `0` disables only that fresh bound.
+    match crate::proxy::compose_early_upload_bound(bound.deadline(), request_body_read_timeout_ms) {
         Some((effective_deadline, crate::proxy::EarlyUploadBoundKind::OperatorTimeout)) => {
             tokio::time::timeout_at(effective_deadline, collect)
                 .await
@@ -115,11 +144,66 @@ where
         Some((effective_deadline, crate::proxy::EarlyUploadBoundKind::RpcDeadline)) => {
             tokio::time::timeout_at(effective_deadline, collect)
                 .await
-                .map_err(|_| H3RequestBodyReadError::DeadlineExceeded)?
+                // Evaluated only once the bound has actually fired, and only to
+                // read the winner captured at composition time. The clock is
+                // still consulted inside `expired_authorization` so a bound
+                // that fired for some other reason can never fabricate an
+                // expiry; it is never consulted to CHOOSE between the owners.
+                .map_err(|_| {
+                    H3RequestBodyReadError::DeadlineExceeded(bound.expired_authorization())
+                })?
                 .map_err(H3RequestBodyReadError::Read)
         }
         None => collect_h3_request_body_with_timeout(collect, request_body_read_timeout_ms).await,
     }
+}
+
+/// [`collect_h3_request_body_under_authorization`] for a drain that supplies NO
+/// authorization plan — the cross-protocol H3→gRPC bridge and the test helper.
+///
+/// Composing against `None` is what makes their `DeadlineExceeded` structurally
+/// the client's own RPC deadline: an absent plan can never win composition, so
+/// such a drain cannot report an authorization termination or charge the
+/// fixed-cardinality counter.
+pub(crate) async fn collect_h3_request_body_with_deadline<F, T, E>(
+    collect: F,
+    deadline: Option<tokio::time::Instant>,
+    request_body_read_timeout_ms: u64,
+) -> Result<T, H3RequestBodyReadError<E>>
+where
+    F: std::future::Future<Output = Result<T, E>>,
+{
+    collect_h3_request_body_under_authorization(
+        collect,
+        crate::proxy::auth_lifetime::ComposedAuthBound::compose(deadline, None),
+        request_body_read_timeout_ms,
+    )
+    .await
+}
+
+/// The composed absolute bound every native-H3 buffered upload drain runs
+/// under: the client's optional RPC deadline against the admitted request's
+/// authorization deadline, KEEPING the winning owner (issue #3815).
+///
+/// A continuously active upload makes progress on every poll, so it is bounded
+/// by neither that optional deadline nor the per-read operator timeout and
+/// could otherwise outlive the credential that admitted it.
+///
+/// ONE composer for all seven native-H3 upload sites: the instant that is
+/// awaited and the owner that is reported are projections of the same
+/// composition, so they can never come from two different reads of the arbiter.
+#[inline]
+pub(crate) fn h3_upload_authorization_bound(
+    ctx: &RequestContext,
+    authenticated_stream_max_lifetime_seconds: u64,
+) -> crate::proxy::auth_lifetime::ComposedAuthBound {
+    crate::proxy::auth_lifetime::ComposedAuthBound::compose(
+        ctx.grpc_deadline_at(),
+        crate::proxy::auth_lifetime::effective_request_auth_deadline(
+            ctx,
+            authenticated_stream_max_lifetime_seconds,
+        ),
+    )
 }
 
 /// Drain an H3 request-body recv half into an owned buffer.
@@ -166,7 +250,7 @@ fn h3_request_body_timeout_contract<E>(
     error: &H3RequestBodyReadError<E>,
 ) -> (&'static str, &'static str) {
     match error {
-        H3RequestBodyReadError::DeadlineExceeded => (
+        H3RequestBodyReadError::DeadlineExceeded(_) => (
             r#"{"error":"Request deadline exceeded"}"#,
             GATEWAY_DEADLINE_EXCEEDED_MESSAGE,
         ),
@@ -2437,19 +2521,11 @@ async fn handle_h3_request(
             protocol_max_body,
             authenticate_body_requirements.plugin_limit,
         );
-        let body_data = match collect_h3_request_body_with_deadline(
+        let body_data = match collect_h3_request_body_under_authorization(
             drain_h3_request_body(&mut stream, max_body),
-            // Compose the admitted request's ABSOLUTE authorization bound
-            // (issue #3815) with the client's optional RPC deadline. A
-            // continuously active upload is otherwise bounded by neither
-            // that optional deadline nor the per-read operator timeout, so
-            // it could outlive the credential that admitted it.
-            crate::proxy::auth_lifetime::compose_absolute_bound(
-                ctx.grpc_deadline_at(),
-                crate::proxy::auth_lifetime::effective_request_auth_deadline(
-                    &ctx,
-                    state.env_config.authenticated_stream_max_lifetime_seconds,
-                ),
+            h3_upload_authorization_bound(
+                &ctx,
+                state.env_config.authenticated_stream_max_lifetime_seconds,
             ),
             proxy.backend_read_timeout_ms,
         )
@@ -2475,17 +2551,10 @@ async fn handle_h3_request(
                 halt_cancelled_h3_upload(&mut stream);
                 return Err(error.into());
             }
-            Err(H3RequestBodyReadError::DeadlineExceeded) => {
-                // Attribute the composed bound: `Some` only when the AUTHORIZATION
-                // deadline is the one that elapsed. Recomputed from the same
-                // request-receipt anchor, so it cannot drift from the bound above.
-                let upload_authorization_expiry =
-                    crate::proxy::auth_lifetime::expired_authorization(
-                        crate::proxy::auth_lifetime::effective_request_auth_deadline(
-                            &ctx,
-                            state.env_config.authenticated_stream_max_lifetime_seconds,
-                        ),
-                    );
+            // The winner was captured where BOTH instants were known, so a late
+            // wake cannot reattribute a strictly earlier client RPC deadline to
+            // the gateway's security decision.
+            Err(H3RequestBodyReadError::DeadlineExceeded(authorization_expiry)) => {
                 finalize_h3_upload_deadline_rejection(
                     &mut stream,
                     &state,
@@ -2496,7 +2565,7 @@ async fn handle_h3_request(
                     start_time,
                     "grpc_deadline_upload_before_authenticate",
                     plugin_execution_ns,
-                    upload_authorization_expiry,
+                    authorization_expiry,
                 )
                 .await?;
                 return Ok(());
@@ -2646,19 +2715,11 @@ async fn handle_h3_request(
             authorize_body_requirements.plugin_limit,
         );
         if crate::proxy::early_upload_phase_needs_fresh_drain(&prebuffered_body_data) {
-            let body_data = match collect_h3_request_body_with_deadline(
+            let body_data = match collect_h3_request_body_under_authorization(
                 drain_h3_request_body(&mut stream, body_limit),
-                // Compose the admitted request's ABSOLUTE authorization bound
-                // (issue #3815) with the client's optional RPC deadline. A
-                // continuously active upload is otherwise bounded by neither
-                // that optional deadline nor the per-read operator timeout, so
-                // it could outlive the credential that admitted it.
-                crate::proxy::auth_lifetime::compose_absolute_bound(
-                    ctx.grpc_deadline_at(),
-                    crate::proxy::auth_lifetime::effective_request_auth_deadline(
-                        &ctx,
-                        state.env_config.authenticated_stream_max_lifetime_seconds,
-                    ),
+                h3_upload_authorization_bound(
+                    &ctx,
+                    state.env_config.authenticated_stream_max_lifetime_seconds,
                 ),
                 proxy.backend_read_timeout_ms,
             )
@@ -2684,17 +2745,10 @@ async fn handle_h3_request(
                     halt_cancelled_h3_upload(&mut stream);
                     return Err(error.into());
                 }
-                Err(H3RequestBodyReadError::DeadlineExceeded) => {
-                    // Attribute the composed bound: `Some` only when the AUTHORIZATION
-                    // deadline is the one that elapsed. Recomputed from the same
-                    // request-receipt anchor, so it cannot drift from the bound above.
-                    let upload_authorization_expiry =
-                        crate::proxy::auth_lifetime::expired_authorization(
-                            crate::proxy::auth_lifetime::effective_request_auth_deadline(
-                                &ctx,
-                                state.env_config.authenticated_stream_max_lifetime_seconds,
-                            ),
-                        );
+                // The winner was captured where BOTH instants were known, so a
+                // late wake cannot reattribute a strictly earlier client RPC
+                // deadline to the gateway's security decision.
+                Err(H3RequestBodyReadError::DeadlineExceeded(authorization_expiry)) => {
                     finalize_h3_upload_deadline_rejection(
                         &mut stream,
                         &state,
@@ -2705,7 +2759,7 @@ async fn handle_h3_request(
                         start_time,
                         "grpc_deadline_upload_before_authorize",
                         plugin_execution_ns,
-                        upload_authorization_expiry,
+                        authorization_expiry,
                     )
                     .await?;
                     return Ok(());
@@ -2932,19 +2986,11 @@ async fn handle_h3_request(
     if before_proxy_body_requirements.required
         && crate::proxy::early_upload_phase_needs_fresh_drain(&prebuffered_body_data)
     {
-        let body_data = match collect_h3_request_body_with_deadline(
+        let body_data = match collect_h3_request_body_under_authorization(
             drain_h3_request_body(&mut stream, before_proxy_body_limit),
-            // Compose the admitted request's ABSOLUTE authorization bound
-            // (issue #3815) with the client's optional RPC deadline. A
-            // continuously active upload is otherwise bounded by neither
-            // that optional deadline nor the per-read operator timeout, so
-            // it could outlive the credential that admitted it.
-            crate::proxy::auth_lifetime::compose_absolute_bound(
-                ctx.grpc_deadline_at(),
-                crate::proxy::auth_lifetime::effective_request_auth_deadline(
-                    &ctx,
-                    state.env_config.authenticated_stream_max_lifetime_seconds,
-                ),
+            h3_upload_authorization_bound(
+                &ctx,
+                state.env_config.authenticated_stream_max_lifetime_seconds,
             ),
             proxy.backend_read_timeout_ms,
         )
@@ -2970,17 +3016,10 @@ async fn handle_h3_request(
                 halt_cancelled_h3_upload(&mut stream);
                 return Err(error.into());
             }
-            Err(H3RequestBodyReadError::DeadlineExceeded) => {
-                // Attribute the composed bound: `Some` only when the AUTHORIZATION
-                // deadline is the one that elapsed. Recomputed from the same
-                // request-receipt anchor, so it cannot drift from the bound above.
-                let upload_authorization_expiry =
-                    crate::proxy::auth_lifetime::expired_authorization(
-                        crate::proxy::auth_lifetime::effective_request_auth_deadline(
-                            &ctx,
-                            state.env_config.authenticated_stream_max_lifetime_seconds,
-                        ),
-                    );
+            // The winner was captured where BOTH instants were known, so a late
+            // wake cannot reattribute a strictly earlier client RPC deadline to
+            // the gateway's security decision.
+            Err(H3RequestBodyReadError::DeadlineExceeded(authorization_expiry)) => {
                 finalize_h3_upload_deadline_rejection(
                     &mut stream,
                     &state,
@@ -2991,7 +3030,7 @@ async fn handle_h3_request(
                     start_time,
                     "grpc_deadline_upload_before_before_proxy",
                     plugin_execution_ns,
-                    upload_authorization_expiry,
+                    authorization_expiry,
                 )
                 .await?;
                 return Ok(());
@@ -4010,19 +4049,11 @@ async fn handle_h3_request(
         let body_was_prebuffered = prebuffered_body_data.is_some();
         let mut body_data = prebuffered_body_data.take().unwrap_or_default();
         if !body_was_prebuffered {
-            body_data = match collect_h3_request_body_with_deadline(
+            body_data = match collect_h3_request_body_under_authorization(
                 drain_h3_request_body(&mut stream, content_length_limit),
-                // Compose the admitted request's ABSOLUTE authorization bound
-                // (issue #3815) with the client's optional RPC deadline. A
-                // continuously active upload is otherwise bounded by neither
-                // that optional deadline nor the per-read operator timeout, so
-                // it could outlive the credential that admitted it.
-                crate::proxy::auth_lifetime::compose_absolute_bound(
-                    ctx.grpc_deadline_at(),
-                    crate::proxy::auth_lifetime::effective_request_auth_deadline(
-                        &ctx,
-                        state.env_config.authenticated_stream_max_lifetime_seconds,
-                    ),
+                h3_upload_authorization_bound(
+                    &ctx,
+                    state.env_config.authenticated_stream_max_lifetime_seconds,
                 ),
                 proxy.backend_read_timeout_ms,
             )
@@ -4102,21 +4133,14 @@ async fn handle_h3_request(
                     .await?;
                     return Ok(());
                 }
-                Err(H3RequestBodyReadError::DeadlineExceeded) => {
+                // The winner was captured where BOTH instants were known, so a
+                // late wake cannot reattribute a strictly earlier client RPC
+                // deadline to the gateway's security decision.
+                Err(H3RequestBodyReadError::DeadlineExceeded(authorization_expiry)) => {
                     ctx.metadata.insert(
                         RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY.to_string(),
                         "true".to_string(),
                     );
-                    // Attribute the composed bound: `Some` only when the AUTHORIZATION
-                    // deadline is the one that elapsed. Recomputed from the same
-                    // request-receipt anchor, so it cannot drift from the bound above.
-                    let upload_authorization_expiry =
-                        crate::proxy::auth_lifetime::expired_authorization(
-                            crate::proxy::auth_lifetime::effective_request_auth_deadline(
-                                &ctx,
-                                state.env_config.authenticated_stream_max_lifetime_seconds,
-                            ),
-                        );
                     finalize_h3_upload_deadline_rejection(
                         &mut stream,
                         &state,
@@ -4127,7 +4151,7 @@ async fn handle_h3_request(
                         start_time,
                         "grpc_deadline_terminal_h3_upload",
                         plugin_execution_ns,
-                        upload_authorization_expiry,
+                        authorization_expiry,
                     )
                     .await?;
                     return Ok(());
@@ -4542,19 +4566,11 @@ async fn handle_h3_request(
         let body_was_prebuffered = prebuffered_body_data.is_some();
         let mut body_data = prebuffered_body_data.take().unwrap_or_default();
         if !body_was_prebuffered {
-            body_data = match collect_h3_request_body_with_deadline(
+            body_data = match collect_h3_request_body_under_authorization(
                 drain_h3_request_body(&mut stream, content_length_limit),
-                // Compose the admitted request's ABSOLUTE authorization bound
-                // (issue #3815) with the client's optional RPC deadline. A
-                // continuously active upload is otherwise bounded by neither
-                // that optional deadline nor the per-read operator timeout, so
-                // it could outlive the credential that admitted it.
-                crate::proxy::auth_lifetime::compose_absolute_bound(
-                    ctx.grpc_deadline_at(),
-                    crate::proxy::auth_lifetime::effective_request_auth_deadline(
-                        &ctx,
-                        state.env_config.authenticated_stream_max_lifetime_seconds,
-                    ),
+                h3_upload_authorization_bound(
+                    &ctx,
+                    state.env_config.authenticated_stream_max_lifetime_seconds,
                 ),
                 proxy.backend_read_timeout_ms,
             )
@@ -4600,7 +4616,10 @@ async fn handle_h3_request(
                     );
                     return Err(error.into());
                 }
-                Err(H3RequestBodyReadError::DeadlineExceeded) => {
+                // The winner was captured where BOTH instants were known, so a
+                // late wake cannot reattribute a strictly earlier client RPC
+                // deadline to the gateway's security decision.
+                Err(H3RequestBodyReadError::DeadlineExceeded(authorization_expiry)) => {
                     release_h3_circuit_breaker_probe_on_admission_reject(
                         &state,
                         &proxy,
@@ -4608,16 +4627,6 @@ async fn handle_h3_request(
                         cb_is_half_open_probe,
                     );
                     drop(preacquired_backend_admission.take_if_acquired());
-                    // Attribute the composed bound: `Some` only when the AUTHORIZATION
-                    // deadline is the one that elapsed. Recomputed from the same
-                    // request-receipt anchor, so it cannot drift from the bound above.
-                    let upload_authorization_expiry =
-                        crate::proxy::auth_lifetime::expired_authorization(
-                            crate::proxy::auth_lifetime::effective_request_auth_deadline(
-                                &ctx,
-                                state.env_config.authenticated_stream_max_lifetime_seconds,
-                            ),
-                        );
                     finalize_h3_upload_deadline_rejection(
                         &mut stream,
                         &state,
@@ -4628,7 +4637,7 @@ async fn handle_h3_request(
                         start_time,
                         "grpc_deadline_upload_before_dispatch",
                         plugin_execution_ns,
-                        upload_authorization_expiry,
+                        authorization_expiry,
                     )
                     .await?;
                     return Ok(());
@@ -5238,19 +5247,11 @@ async fn handle_h3_request(
                 let body_was_prebuffered = prebuffered_body_data.is_some();
                 let mut body_data = prebuffered_body_data.take().unwrap_or_default();
                 if !body_was_prebuffered {
-                    body_data = match collect_h3_request_body_with_deadline(
+                    body_data = match collect_h3_request_body_under_authorization(
                         drain_h3_request_body(&mut stream, content_length_limit),
-                        // Compose the admitted request's ABSOLUTE authorization bound
-                        // (issue #3815) with the client's optional RPC deadline. A
-                        // continuously active upload is otherwise bounded by neither
-                        // that optional deadline nor the per-read operator timeout, so
-                        // it could outlive the credential that admitted it.
-                        crate::proxy::auth_lifetime::compose_absolute_bound(
-                            ctx.grpc_deadline_at(),
-                            crate::proxy::auth_lifetime::effective_request_auth_deadline(
-                                &ctx,
-                                state.env_config.authenticated_stream_max_lifetime_seconds,
-                            ),
+                        h3_upload_authorization_bound(
+                            &ctx,
+                            state.env_config.authenticated_stream_max_lifetime_seconds,
                         ),
                         proxy.backend_read_timeout_ms,
                     )
@@ -5313,7 +5314,10 @@ async fn handle_h3_request(
                             );
                             return Err(error.into());
                         }
-                        Err(H3RequestBodyReadError::DeadlineExceeded) => {
+                        // The winner was captured where BOTH instants were
+                        // known, so a late wake cannot reattribute a strictly
+                        // earlier client RPC deadline to the security decision.
+                        Err(H3RequestBodyReadError::DeadlineExceeded(authorization_expiry)) => {
                             crate::proxy::backend_dispatch::record_backend_outcome_no_conn_end(
                                 &state,
                                 &proxy,
@@ -5328,16 +5332,6 @@ async fn handle_h3_request(
                                 false,
                                 backend_start.elapsed(),
                             );
-                            // Attribute the composed bound: `Some` only when the AUTHORIZATION
-                            // deadline is the one that elapsed. Recomputed from the same
-                            // request-receipt anchor, so it cannot drift from the bound above.
-                            let upload_authorization_expiry =
-                                crate::proxy::auth_lifetime::expired_authorization(
-                                    crate::proxy::auth_lifetime::effective_request_auth_deadline(
-                                        &ctx,
-                                        state.env_config.authenticated_stream_max_lifetime_seconds,
-                                    ),
-                                );
                             finalize_h3_upload_deadline_rejection(
                                 &mut stream,
                                 &state,
@@ -5348,7 +5342,7 @@ async fn handle_h3_request(
                                 start_time,
                                 "grpc_deadline_upload_before_cross_protocol_dispatch",
                                 plugin_execution_ns,
-                                upload_authorization_expiry,
+                                authorization_expiry,
                             )
                             .await?;
                             return Ok(());
@@ -6731,19 +6725,11 @@ async fn handle_h3_request(
     let body_was_prebuffered = prebuffered_body_data.is_some();
     let mut body_data = prebuffered_body_data.take().unwrap_or_default();
     if !body_was_prebuffered {
-        body_data = match collect_h3_request_body_with_deadline(
+        body_data = match collect_h3_request_body_under_authorization(
             drain_h3_request_body(&mut stream, effective_max_request_body_size_bytes),
-            // Compose the admitted request's ABSOLUTE authorization bound
-            // (issue #3815) with the client's optional RPC deadline. A
-            // continuously active upload is otherwise bounded by neither
-            // that optional deadline nor the per-read operator timeout, so
-            // it could outlive the credential that admitted it.
-            crate::proxy::auth_lifetime::compose_absolute_bound(
-                ctx.grpc_deadline_at(),
-                crate::proxy::auth_lifetime::effective_request_auth_deadline(
-                    &ctx,
-                    state.env_config.authenticated_stream_max_lifetime_seconds,
-                ),
+            h3_upload_authorization_bound(
+                &ctx,
+                state.env_config.authenticated_stream_max_lifetime_seconds,
             ),
             proxy.backend_read_timeout_ms,
         )
@@ -6788,23 +6774,16 @@ async fn handle_h3_request(
                 );
                 return Err(error.into());
             }
-            Err(H3RequestBodyReadError::DeadlineExceeded) => {
+            // The winner was captured where BOTH instants were known, so a late
+            // wake cannot reattribute a strictly earlier client RPC deadline to
+            // the gateway's security decision.
+            Err(H3RequestBodyReadError::DeadlineExceeded(authorization_expiry)) => {
                 release_h3_circuit_breaker_probe_on_admission_reject(
                     &state,
                     &proxy,
                     cb_target_key.as_deref(),
                     cb_is_half_open_probe,
                 );
-                // Attribute the composed bound: `Some` only when the AUTHORIZATION
-                // deadline is the one that elapsed. Recomputed from the same
-                // request-receipt anchor, so it cannot drift from the bound above.
-                let upload_authorization_expiry =
-                    crate::proxy::auth_lifetime::expired_authorization(
-                        crate::proxy::auth_lifetime::effective_request_auth_deadline(
-                            &ctx,
-                            state.env_config.authenticated_stream_max_lifetime_seconds,
-                        ),
-                    );
                 finalize_h3_upload_deadline_rejection(
                     &mut stream,
                     &state,
@@ -6815,7 +6794,7 @@ async fn handle_h3_request(
                     start_time,
                     "grpc_deadline_buffered_h3_upload",
                     plugin_execution_ns,
-                    upload_authorization_expiry,
+                    authorization_expiry,
                 )
                 .await?;
                 return Ok(());
@@ -15852,7 +15831,12 @@ mod h3_request_body_timeout_tests {
             .expect("one second before now is representable");
         let upload = std::future::pending::<Result<(), ()>>();
         let result = super::collect_h3_request_body_with_deadline(upload, Some(deadline), 0).await;
-        assert_eq!(result, Err(super::H3RequestBodyReadError::DeadlineExceeded));
+        // No authorization plan was supplied, so the captured winner is the
+        // client's own RPC deadline and never a security decision.
+        assert_eq!(
+            result,
+            Err(super::H3RequestBodyReadError::DeadlineExceeded(None))
+        );
     }
 
     #[tokio::test]

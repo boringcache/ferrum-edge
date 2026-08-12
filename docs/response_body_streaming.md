@@ -675,11 +675,19 @@ Deliberate scope notes:
   error regardless of the pipe's state, and `cancel_and_join()` gives the
   handler an actual join before it returns.
 - An H3 request body that is **buffered before dispatch** composes the
-  authorization deadline into the existing early-upload ceiling
-  (`backend_read_timeout_ms` and the optional client RPC deadline) through
-  `auth_lifetime::compose_absolute_bound`, so a continuously active trickle
-  upload cannot outlive the credential either. When the authorization bound is
-  the one that elapsed, the terminal is the fixed redacted `401` (gRPC keeps
+  authorization deadline with the optional client RPC deadline into one
+  `auth_lifetime::ComposedAuthBound` (`http3::server::h3_upload_authorization_bound`)
+  and drains under it through
+  `http3::server::collect_h3_request_body_under_authorization`, so a
+  continuously active trickle upload cannot outlive the credential either. The
+  operator whole-upload guard (`backend_read_timeout_ms`) composes on top and
+  keeps its own precedence: when it is strictly earlier the drain is a plain
+  read timeout with no authorization attribution at all. Only when the composed
+  ABSOLUTE bound fires is the owner consulted, and it is the one captured at
+  composition rather than a fresh read of the clock — so a drain observed after
+  BOTH instants passed still reports the client's own strictly earlier
+  `grpc-timeout` as the client's. When the authorization bound is the captured
+  winner, the terminal is the fixed redacted `401` (gRPC keeps
   `grpc-status: 16`) rather than the deadline contract.
 
 ### The gateway-owned upload pump
@@ -781,16 +789,29 @@ fixed-cardinality counter for a parked write. It is used by:
   relays).
 
 The remaining writers reach the same plan through
-`auth_lifetime::compose_absolute_bound`, which folds the authorization deadline
-into whatever absolute bound the protocol already had: the native-H3 gRPC relay
-(`dispatch_grpc_native_h3`), the buffered native-H3 writer, and the
-cross-protocol plain bridge's header, buffered-body, and post-relay
-trailer/FIN writes. Attribution is uniform — when both bounds have elapsed the
-authorization one is reported, matching the biased `select!` ordering — and the
-terminal follows commitment state: a fixed redacted `401` (gRPC `grpc-status:
-16`) before response headers commit, a deterministic reset afterwards. A gateway
-policy expiry is health-neutral everywhere: it never moves the circuit breaker,
-passive health, or the H3 capability registry.
+`auth_lifetime::ComposedAuthBound`, which folds the authorization deadline into
+whatever absolute bound the protocol already had: the native-H3 gRPC relay
+(`dispatch_grpc_native_h3`), the buffered native-H3 writer, the seven native-H3
+buffered request-upload drains, and the cross-protocol plain bridge's header,
+buffered-body, and post-relay trailer/FIN writes.
+
+Attribution is uniform, and it is taken at COMPOSITION, where both instants are
+still known — never by re-reading the clock once the bound has fired. A parked
+write, a backend that withholds its response head, and a continuously active
+buffered upload are all routinely observed only after BOTH instants have passed;
+asking "is the authorization deadline in the past?" there would report the
+gateway's security decision for a phase the client's own strictly earlier
+deadline actually bounded, changing the client-visible terminal, the recorded
+class, and the fixed-cardinality counter. A genuine tie still resolves to
+authorization, matching the biased `select!` ordering. There is deliberately no
+projection helper that composes the two and returns only the instant: a seam
+that composes always keeps the value that can name its owner
+(`ComposedAuthBound::deadline` is taken from it, not instead of it).
+
+The terminal follows commitment state: a fixed redacted `401` (gRPC
+`grpc-status: 16`) before response headers commit, a deterministic reset
+afterwards. A gateway policy expiry is health-neutral everywhere: it never moves
+the circuit breaker, passive health, or the H3 capability registry.
 
 ### Live acceptance coverage
 
