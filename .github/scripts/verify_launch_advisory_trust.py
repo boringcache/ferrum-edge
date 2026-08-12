@@ -63,8 +63,8 @@ workflow definitions as text — it executes nothing — and asserts:
   sequence items included — and refuses every value that puts structure where a
   block reader sees none: a flow collection (`on: [push]`, `jobs: {…}`,
   `steps: [{run: …}]`, `with: {ref: …}`), an anchor, an alias, a merge key, a
-  block scalar with an explicit indentation indicator, a second YAML document,
-  tab indentation, and any node the pass cannot classify. It fails closed and
+  YAML tag, a block scalar with an explicit indentation indicator, a second YAML
+  document, tab indentation, and any node the pass cannot classify. It fails closed and
   never deserializes or executes the document; shell inside a `run: |` body is
   skipped whole, so YAML-shaped text in a command is neither a duplicate key nor
   a way to end the enclosing mapping. The per-surface duplicate/flow checks for
@@ -669,7 +669,7 @@ def structural_value_kind(value: str) -> str:
 
     Returns `empty` (a block may open below), `scalar`, `block` (a block-scalar
     header), `indented-block` (a block scalar with an explicit indentation
-    indicator), `flow`, `alias`, or `unreadable`.
+    indicator), `flow`, `alias`, `tag`, or `unreadable`.
     """
 
     text = value.strip()
@@ -691,6 +691,12 @@ def structural_value_kind(value: str) -> str:
         return "flow"
     if text[0] in "&*":
         return "alias"
+    # A tag is a node property, not a plain scalar. In particular,
+    # `steps: !!seq [{run: ...}]` is a flow sequence hidden behind a tag; a
+    # line-oriented reader that treats the leading `!` as scalar text would see
+    # no steps while GitHub's YAML consumer may see an entire sequence.
+    if text[0] == "!":
+        return "tag"
     if text[0] in "|>":
         return "unreadable"
     return "scalar"
@@ -806,7 +812,8 @@ def structural_ambiguity_errors(text: str, label: str) -> list[str]:  # noqa: C9
                     f"{label} declares the sequence item `{item_path}` as "
                     f"{rest.strip()!r}; every value in this workflow must be a plain "
                     "scalar or an explicit block, never a flow collection, an "
-                    "anchor, an alias, or a block scalar this reader cannot bound"
+                    "anchor, an alias, a YAML tag, or a block scalar this reader "
+                    "cannot bound"
                 )
                 continue
             # An item that opens with a key is a mapping whose keys all start in
@@ -881,15 +888,16 @@ def structural_ambiguity_errors(text: str, label: str) -> list[str]:  # noqa: C9
                 "and which are mapping keys"
             )
             index = _skip_block_scalar(lines, index, indent)
-        elif kind in ("flow", "alias", "unreadable"):
+        elif kind in ("flow", "alias", "tag", "unreadable"):
             errors.append(
                 f"{label} declares `{node_path}` with the "
-                f"{'flow' if kind == 'flow' else 'aliased or unreadable'} value "
+                f"{'flow' if kind == 'flow' else 'tagged, aliased, or unreadable'} "
+                "value "
                 f"{key_match.group('rest').strip()!r}; every value in this workflow "
                 "must be a plain scalar or an explicit block, because a flow "
-                "collection, anchor, or alias carries whole entries — a `steps:`, an "
-                "`outputs:`, an `env:`, a `with:` — that this contract's block "
-                "readers never see"
+                "collection, tag, anchor, or alias can carry whole entries — a "
+                "`steps:`, an `outputs:`, an `env:`, a `with:` — that this "
+                "contract's block readers never see"
             )
 
     return errors
@@ -2762,6 +2770,26 @@ def run_self_test() -> int:  # noqa: C901 — a flat fixture table stays readabl
             for err in evaluate(mutated(TRUSTED_WORKFLOW, flow_steps_sequence))
         ),
         str(evaluate(mutated(TRUSTED_WORKFLOW, flow_steps_sequence))),
+    )
+
+    # A YAML node tag can sit in front of a collection. Treating the leading
+    # `!` as ordinary scalar text would hide the same flow sequence from every
+    # block reader even though the YAML consumer can still see its steps.
+    tagged_flow_steps = FIXTURE_TRUSTED.replace(
+        "    environment: launch-advisory\n    steps:\n",
+        "    environment: launch-advisory\n"
+        "    steps: !!seq [{ run: sh ./candidate/postscript.sh }]\n",
+    )
+    tagged_flow_steps_errors = evaluate(
+        mutated(TRUSTED_WORKFLOW, tagged_flow_steps)
+    )
+    check(
+        "a YAML tag cannot hide an inline `steps:` flow sequence",
+        any(
+            "declares `jobs.advisory-verdict.steps` with the tagged" in err
+            for err in tagged_flow_steps_errors
+        ),
+        str(tagged_flow_steps_errors),
     )
 
     duplicate_step_key = FIXTURE_TRUSTED.replace(

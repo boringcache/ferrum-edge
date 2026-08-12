@@ -441,7 +441,8 @@ indentation-aware structural pass** over `launch-advisory-trust.yml` that:
   occurrence first and an untrusted one last is rejected, and so is the reverse;
 - refuses every value that puts structure where a block reader sees none: a
   **flow collection** (`on: [push]`, `jobs: {…}`, `steps: [{run: …}]`,
-  `with: {ref: …}`, `env: {PATH: …}`), a **YAML anchor, alias, or merge key**, a
+  `with: {ref: …}`, `env: {PATH: …}`), a **YAML tag, anchor, alias, or merge
+  key**, a
   **block scalar with an explicit indentation indicator** (whose indicator, not
   this reader, would decide where the shell ends), a **second YAML document**,
   **tab indentation**, and any node it cannot classify — including a key at an
@@ -516,7 +517,8 @@ top-level step key, a duplicate checkout `with:` input, an `on:`, `steps:`,
 on `establish-trust` that exports a candidate-controlled `trusted_sha`, a
 duplicate `outputs:` redirecting the trusted anchor in both orderings, a
 duplicate `run:` on a trust-job step behind the exact admitted command, a
-duplicate flow `steps:` and a duplicate flow `env:` on the publisher, a duplicate
+duplicate flow `steps:` and a duplicate flow `env:` on the publisher, a tagged
+flow sequence that would hide an inline `steps:` value, a duplicate
 key in a mapping no value-level check reads at all, a document node the pass
 cannot classify, and YAML-shaped shell inside a `run: |` body that must *not* be
 read as structure — and then applies the same contract to the real
