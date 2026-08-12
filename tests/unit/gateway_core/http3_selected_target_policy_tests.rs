@@ -19,15 +19,55 @@ fn squeeze(source: &str) -> String {
     collapsed.replace(",)", ")")
 }
 
+/// Head of an H3 upstream-selection site. RFC 9298 CONNECT-UDP destinations are
+/// client-named and merely ADMITTED against the route's configured set, never
+/// load balanced, so the binding is a two-armed `if`: the tunnel arm yields
+/// `UpstreamSelection::unselected()` and every other request runs the ordinary
+/// balanced lookup. Both the initial binding and the gated deferred-override
+/// rebind share that shape, so ordering contracts anchor on it rather than on a
+/// bare `select_upstream_target` call that no longer starts either statement.
+const H3_SELECTION_HEAD: &str = "selection = if is_connect_udp_request {";
+const H3_INITIAL_SELECTION_HEAD: &str = "let mut selection = if is_connect_udp_request {";
+
+/// Assert an H3 selection site still resolves BOTH arms — an unselected tunnel
+/// and a real balanced `select_upstream_target` lookup — before the selection's
+/// fields are moved out into the dispatch inputs. This keeps the anchor honest:
+/// it cannot pass against a site that dropped the balanced lookup, dropped the
+/// CONNECT-UDP carve-out, or consumed a selection it never assigned.
+fn assert_h3_selection_arms(site: &str, what: &str) {
+    let unselected = site
+        .find("crate::proxy::backend_dispatch::UpstreamSelection::unselected()")
+        .unwrap_or_else(|| {
+            panic!("{what}: the CONNECT-UDP arm must select nothing (admitted, never balanced)")
+        });
+    let balanced = site
+        .find("crate::proxy::backend_dispatch::select_upstream_target(")
+        .unwrap_or_else(|| panic!("{what}: the non-tunnel arm must run the balanced lookup"));
+    let consumed = site
+        .find("lb_hash_key = selection.lb_hash_key.take();")
+        .unwrap_or_else(|| panic!("{what}: the selection fields must be taken from this site"));
+    assert!(
+        unselected < balanced && balanced < consumed,
+        "{what}: both selection arms must resolve before the selection fields are consumed"
+    );
+}
+
+/// Offset of the initial (pre-deferred) H3 selection site, arms verified.
+fn initial_h3_selection(source: &str) -> usize {
+    let selection = source
+        .find(H3_INITIAL_SELECTION_HEAD)
+        .expect("H3 selected-target lookup must remain present");
+    assert_h3_selection_arms(&source[selection..], "initial H3 selection");
+    selection
+}
+
 #[test]
 fn h3_terminal_final_body_dispatch_follows_path_policy_and_precedes_breaker() {
     let source = include_str!("../../../src/http3/server.rs");
-    // Match without the `let` binder: the initial selection is now `let mut
-    // selection` so the deferred-override rebind can replace it wholesale. The
-    // first occurrence is still the pre-deferred lookup this ordering pins.
-    let selection = source
-        .find("selection = crate::proxy::backend_dispatch::select_upstream_target(")
-        .expect("H3 backend selection must remain present");
+    // Anchor on the initial selection BINDING, not on a bare call: CONNECT-UDP
+    // splits the statement into two arms. The first occurrence is still the
+    // pre-deferred selection this ordering pins.
+    let selection = initial_h3_selection(source);
     let path_policy = source[selection..]
         .find("if backend_path_is_policy_bound {")
         .map(|offset| selection + offset)
@@ -121,10 +161,20 @@ fn h3_deferred_destination_override_is_rebound_before_dispatch() {
         .expect("deferred re-selection must be gated on the destination having moved");
     assert!(gate > rebase);
 
-    // Whole selection replace, not target-only: balancer + sticky ride `selection`.
+    // Whole selection replace, not target-only: balancer + sticky ride
+    // `selection`. The rebind is the same two-armed shape as the initial
+    // selection, and `assert_h3_selection_arms` proves the gated block still
+    // re-runs a real balanced lookup for non-tunnel requests while keeping a
+    // CONNECT-UDP tunnel unselected — a deferred hook may move the ROUTE, but it
+    // must not smuggle a load-balanced member into an admitted-only tunnel.
     let whole = after_deferred
-        .find("selection = crate::proxy::backend_dispatch::select_upstream_target(")
+        .find(H3_SELECTION_HEAD)
         .expect("the gated rebind must re-run upstream selection wholesale");
+    assert!(
+        whole > gate,
+        "the wholesale re-selection must sit inside the destination-moved gate, never before it"
+    );
+    assert_h3_selection_arms(&after_deferred[whole..], "deferred H3 re-selection");
     let sticky = after_deferred
         .find("let sticky_cookie_needed = selection.sticky_cookie_needed;")
         .expect("sticky accounting must still read the live selection");
@@ -153,11 +203,23 @@ fn h3_deferred_destination_override_is_rebound_before_dispatch() {
 fn h3_frontend_caps_retry_before_retry_dependent_decisions() {
     let source = squeeze(include_str!("../../../src/http3/server.rs"));
     // `selection` is mutable so a deferred destination claim can replace it;
-    // the first occurrence is still the pre-deferred lookup pinned here.
+    // the first occurrence is still the pre-deferred lookup pinned here. The
+    // binding is two-armed because an RFC 9298 CONNECT-UDP tunnel is admitted
+    // rather than balanced, so pin the exact arms: a tunnel selects nothing and
+    // every other request runs the ordinary balanced lookup.
     let selection = source
-        .find("letmutselection=crate::proxy::backend_dispatch::select_upstream_target(")
+        .find("letmutselection=ifis_connect_udp_request{")
         .expect("H3 selected-target lookup must remain present");
     let after_selection = &source[selection..];
+    let two_armed_selection = concat!(
+        "letmutselection=ifis_connect_udp_request{",
+        "crate::proxy::backend_dispatch::UpstreamSelection::unselected()",
+        "}else{crate::proxy::backend_dispatch::select_upstream_target("
+    );
+    assert!(
+        after_selection.starts_with(two_armed_selection),
+        "H3 must select nothing for CONNECT-UDP and run the balanced lookup otherwise"
+    );
 
     let cap = after_selection
         .find("letmutselected_base_proxy=crate::proxy::cap_proxy_retry_for_target(")
@@ -386,9 +448,7 @@ fn h3_backend_path_policy_runs_after_target_selection_and_before_dispatch() {
     let backend_path_plugins = source
         .find("let backend_path_plugins = plugin_cache_view.backend_path_plugins();")
         .expect("H3 must load the prefiltered backend-path policy list");
-    let selection = source
-        .find("selection = crate::proxy::backend_dispatch::select_upstream_target(")
-        .expect("H3 selected-target lookup must remain present");
+    let selection = initial_h3_selection(source);
     assert!(
         backend_path_plugins < selection,
         "H3 must load the cached backend-path plugin view before target selection"

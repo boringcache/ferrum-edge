@@ -822,7 +822,7 @@ async fn functional_h3_connect_udp_refuses_capsule_protocol_forbidden_fields() {
     }
 
     // And the successful response must not carry them either.
-    let mut tunnel = open_tunnel(&client, &url).await;
+    let tunnel = open_tunnel(&client, &url).await;
     assert_eq!(tunnel.status.as_u16(), 200);
     for forbidden in ["content-length", "content-type", "transfer-encoding"] {
         assert!(
