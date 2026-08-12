@@ -534,9 +534,20 @@ pub(crate) fn generation_is_current(key: &str, generation: u64) -> bool {
 
 /// Record a successfully admitted and published (or confirmed) snapshot.
 pub(crate) fn record_success(key: &str, generation: u64) {
+    let now = Instant::now();
     let affects_coarse = with_current(key, generation, |entry| {
+        // `stale`, `readiness_failing`, and therefore `ready()` / `degraded()`
+        // are derived from the staleness anchor at compute time rather than
+        // stored, so a success that clears a stale window whose expiry episode
+        // has not been claimed yet must invalidate the cache as well. A task is
+        // stale-but-unclaimed while its poller is mid-publication (the deadline
+        // is not armed across DNS warmup and installation); a coarse recompute
+        // driven by any other task's transition inside that window would
+        // otherwise latch `ready: false` on `/health` and `/status` long after
+        // discovery recovered, with no further transition to clear it.
         let affects_coarse = entry.expiry_applied
             || entry.expiry_retry_at.is_some()
+            || entry.is_stale(now)
             || matches!(
                 entry.state,
                 DiscoveryTaskState::Restarting
@@ -544,7 +555,7 @@ pub(crate) fn record_success(key: &str, generation: u64) {
                     | DiscoveryTaskState::Stopped
             );
         entry.state = DiscoveryTaskState::Running;
-        entry.last_success_at = Some(Instant::now());
+        entry.last_success_at = Some(now);
         entry.consecutive_failures = 0;
         entry.consecutive_crashes = 0;
         entry.last_error = None;

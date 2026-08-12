@@ -764,6 +764,92 @@ async fn a_superseded_generation_publishes_no_discovered_snapshot() {
     );
 }
 
+/// Recovery must invalidate the cached coarse aggregate even when the stale
+/// window it clears was never claimed by an expiry episode.
+///
+/// `stale` and `readiness_failing` are derived from the staleness anchor at
+/// compute time, not stored, and a task is stale-but-unclaimed for as long as
+/// its poller sits mid-publication (the staleness deadline is not armed across
+/// DNS warmup and installation). A coarse recompute driven by any *other*
+/// task's lifecycle transition inside that window caches `ready: false`, so the
+/// success that ends the window has to refresh it — otherwise `/health` and
+/// `/status` keep answering 503 after discovery has fully recovered, with no
+/// further transition left to clear it.
+#[tokio::test]
+async fn recovery_from_an_unclaimed_stale_window_clears_cached_readiness() {
+    let _guard = isolated().await;
+
+    let config = config_with(vec![upstream_with_sd("cached-ready", Vec::new(), None)]);
+    let lb_cache = LoadBalancerCache::new(&config);
+    let dns_cache = DnsCache::new(Default::default());
+    let health_checker = HealthChecker::new();
+    let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    let key = task_key("cached-ready");
+
+    health::register_task_for_test(&key, 1, "scripted", scripted_staleness());
+    let mut state = ferrum_edge::_test_support::DiscoveryLoopStateForTest::new();
+
+    let control = apply_under_generation(
+        "cached-ready",
+        &key,
+        1,
+        vec![target("first.local", 8080)],
+        &mut state,
+        &lb_cache,
+        &dns_cache,
+        &health_checker,
+        &cancel_rx,
+    )
+    .await;
+    assert_eq!(
+        control,
+        ferrum_edge::_test_support::DiscoveryApplyControlForTest::Continue
+    );
+
+    // Age past the 60s bound with no supervisor attached, so nothing claims or
+    // withdraws the episode. `age_anchor_for_test` recomputes the coarse
+    // aggregate exactly as a concurrent task's transition would, which is what
+    // caches the fail-closed verdict.
+    assert!(health::age_anchor_for_test(&key, 600));
+    assert_eq!(health::coarse_aggregate().stale, 1);
+    assert!(
+        !health::coarse_aggregate().ready(),
+        "an unclaimed stale window under the withdraw policy fails readiness closed"
+    );
+
+    // Recovery through the production publication path.
+    let control = apply_under_generation(
+        "cached-ready",
+        &key,
+        1,
+        vec![target("recovered.local", 8080)],
+        &mut state,
+        &lb_cache,
+        &dns_cache,
+        &health_checker,
+        &cancel_rx,
+    )
+    .await;
+    assert_eq!(
+        control,
+        ferrum_edge::_test_support::DiscoveryApplyControlForTest::Continue
+    );
+
+    assert_eq!(
+        health::aggregate().stale,
+        0,
+        "the admitted snapshot advanced the staleness anchor"
+    );
+    assert!(
+        health::coarse_aggregate().ready(),
+        "a success that clears an unclaimed stale window must invalidate the cache"
+    );
+    assert!(
+        !health::coarse_aggregate().degraded(),
+        "a recovered task must not keep reporting degraded coarse health"
+    );
+}
+
 #[tokio::test]
 async fn a_superseded_generation_publishes_no_staleness_withdrawal() {
     let _guard = isolated().await;
