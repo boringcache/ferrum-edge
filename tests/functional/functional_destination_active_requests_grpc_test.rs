@@ -49,29 +49,26 @@ async fn functional_destination_active_requests_grpc_unary_holds_until_trailers(
     let backend_port = reservation.port;
     let backend = ScriptedGrpcBackend::builder_plain(reservation.into_listener())
         .connection_scripts([
-            // Connection 0: answer headers + one message, then park BEFORE the
-            // status trailer. The RPC is still active; the budget must still be
-            // consumed.
-            vec![
-                GrpcStep::AcceptRpc(MatchRpc::any()),
-                GrpcStep::SendInitialHeaders,
-                GrpcStep::RespondMessage(Bytes::from_static(b"held")),
-                GrpcStep::AwaitTestSignal,
-                GrpcStep::RespondStatus {
-                    code: 0,
-                    message: "",
-                },
-            ],
-            // Every later connection: a plain successful unary RPC.
-            vec![
-                GrpcStep::AcceptRpc(MatchRpc::any()),
-                GrpcStep::SendInitialHeaders,
-                GrpcStep::RespondMessage(Bytes::from_static(b"ok")),
-                GrpcStep::RespondStatus {
-                    code: 0,
-                    message: "",
-                },
-            ],
+            // Connection 0 stays open after trailers so a pooled follow-up can
+            // reuse it. A one-shot script would close ~100ms after status and
+            // the gateway's gRPC pool would surface that as `Backend unavailable`
+            // — which is not a still-held destination permit.
+            {
+                let mut steps = vec![
+                    GrpcStep::AcceptRpc(MatchRpc::any()),
+                    GrpcStep::SendInitialHeaders,
+                    GrpcStep::RespondMessage(Bytes::from_static(b"held")),
+                    GrpcStep::AwaitTestSignal,
+                    GrpcStep::RespondStatus {
+                        code: 0,
+                        message: "",
+                    },
+                ];
+                steps.extend(grpc_ok_unary_steps());
+                steps
+            },
+            // Fresh dials (if the pool opens another connection) succeed too.
+            grpc_ok_unary_steps(),
         ])
         .spawn()
         .expect("spawn scripted gRPC backend");
@@ -125,8 +122,15 @@ async fn functional_destination_active_requests_grpc_unary_holds_until_trailers(
         Some(0),
         "the held unary RPC must complete OK"
     );
+    wait_until(
+        HOLD_WAIT,
+        "the held connection to arm the post-trailer acceptor",
+        || backend.acceptors_waiting() >= 1,
+    )
+    .await;
 
-    // Trailers ended the exchange; the permit must be back.
+    // Trailers ended the exchange; the permit must be back. The follow-up
+    // must actually reach the backend (not merely stop returning 503).
     let after = grpc_unary(port, PROBE_PATH).await;
     assert_eq!(
         after.effective_grpc_status(),
@@ -154,27 +158,23 @@ async fn functional_destination_active_requests_grpc_streaming_release_on_cancel
     let backend_port = reservation.port;
     let backend = ScriptedGrpcBackend::builder_plain(reservation.into_listener())
         .connection_scripts([
-            // Connection 0: a long-lived stream whose request direction stays
-            // open and whose response has begun but not terminated.
-            vec![
-                GrpcStep::AcceptStreamingRpc(MatchRpc::any()),
-                GrpcStep::SendInitialHeaders,
-                GrpcStep::RespondMessage(Bytes::from_static(b"chunk")),
-                GrpcStep::AwaitTestSignal,
-                GrpcStep::RespondStatus {
-                    code: 0,
-                    message: "",
-                },
-            ],
-            vec![
-                GrpcStep::AcceptRpc(MatchRpc::any()),
-                GrpcStep::SendInitialHeaders,
-                GrpcStep::RespondMessage(Bytes::from_static(b"ok")),
-                GrpcStep::RespondStatus {
-                    code: 0,
-                    message: "",
-                },
-            ],
+            // Connection 0: park after the response has begun, then wait for
+            // the gateway to RST this stream when the client cancels, and keep
+            // the connection reusable for the post-cancel RPC. Parking on
+            // AwaitTestSignal until teardown left the pooled connection unable
+            // to accept a follow-up stream.
+            {
+                let mut steps = vec![
+                    GrpcStep::AcceptStreamingRpc(MatchRpc::any()),
+                    GrpcStep::SendInitialHeaders,
+                    GrpcStep::RespondMessage(Bytes::from_static(b"chunk")),
+                    GrpcStep::AwaitTestSignal,
+                    GrpcStep::ExpectReset(Duration::from_secs(20)),
+                ];
+                steps.extend(grpc_ok_unary_steps());
+                steps
+            },
+            grpc_ok_unary_steps(),
         ])
         .spawn()
         .expect("spawn scripted gRPC backend");
@@ -201,14 +201,26 @@ async fn functional_destination_active_requests_grpc_streaming_release_on_cancel
         "the shed RPC must not have opened a backend stream"
     );
 
-    // Client cancels the live stream: the whole client task (and its HTTP/2
-    // connection) is dropped, so the gateway observes a reset rather than a
-    // clean end. The permit rides the response body, so it must still drop.
+    // Client cancels the live stream: aborting the task now also aborts the
+    // h2 connection driver, so the gateway observes a reset. Release the
+    // park so the script can witness that RST and arm the next acceptor;
+    // the follow-up must then reach the backend, not merely stop shedding.
     hold.abort();
+    backend.release_test_signal();
+    wait_until(
+        HOLD_WAIT,
+        "the gateway to RST the cancelled backend stream",
+        || backend.stream_reset_count() >= 1,
+    )
+    .await;
+    wait_until(
+        HOLD_WAIT,
+        "the held connection to arm the post-cancel acceptor",
+        || backend.acceptors_waiting() >= 1,
+    )
+    .await;
 
-    let after = timeout(Duration::from_secs(20), retry_grpc_unary(port, PROBE_PATH))
-        .await
-        .expect("post-cancel RPC timed out");
+    let after = grpc_unary(port, PROBE_PATH).await;
     assert_eq!(
         after.effective_grpc_status(),
         0,
@@ -219,8 +231,6 @@ async fn functional_destination_active_requests_grpc_streaming_release_on_cancel
         "the post-cancel RPC must have reached the backend"
     );
 
-    // Let the parked script unwind before the fixture is torn down.
-    backend.release_test_signal();
     gateway.shutdown().await;
     drop(backend);
 }
@@ -240,19 +250,16 @@ async fn grpc_unary(gateway_port: u16, path: &str) -> GrpcResponse {
     .unwrap_or_else(|err| panic!("gRPC {path} failed: {err}"))
 }
 
-/// The scripted fixture closes a finished connection shortly after its last
-/// step, so a pooled sender can lose a race with that close exactly once. Retry
-/// a successful-path probe rather than encoding that race as a permit failure.
-async fn retry_grpc_unary(gateway_port: u16, path: &str) -> GrpcResponse {
-    let mut last = grpc_unary(gateway_port, path).await;
-    for _ in 0..4 {
-        if last.effective_grpc_status() == 0 {
-            return last;
-        }
-        sleep(Duration::from_millis(200)).await;
-        last = grpc_unary(gateway_port, path).await;
-    }
-    last
+fn grpc_ok_unary_steps() -> Vec<GrpcStep> {
+    vec![
+        GrpcStep::AcceptRpc(MatchRpc::any()),
+        GrpcStep::SendInitialHeaders,
+        GrpcStep::RespondMessage(Bytes::from_static(b"ok")),
+        GrpcStep::RespondStatus {
+            code: 0,
+            message: "",
+        },
+    ]
 }
 
 fn assert_shed_as_unavailable(response: &GrpcResponse, what: &str) {

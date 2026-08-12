@@ -19,7 +19,7 @@ use super::destination_active_requests_helpers::{
     HoldBehavior, HoldingHttp1Backend, NS, OVERFLOW_BODY, UPSTREAM_ID,
     assert_projected_active_request_cap, prepare_for_assertions, start_gateway,
 };
-use crate::scaffolding::clients::{Http3Client, Http3Response};
+use crate::scaffolding::clients::{GetOptions, Http3Client, Http3Response, Http3ResponseStream};
 
 use ferrum_edge::config::types::GatewayConfig;
 use http::StatusCode;
@@ -97,7 +97,11 @@ async fn functional_destination_active_requests_h3_release_on_client_cancellatio
 
     let hold_client = Http3Client::insecure().expect("hold h3 client");
     let hold_url = format!("https://localhost:{https_port}/h3/hold");
-    let hold = tokio::spawn(async move { retry_h3_get(&hold_client, &hold_url).await });
+    // Own the H3 stream (and its QUIC driver) so cancellation is a real
+    // STOP_SENDING + driver abort. Aborting a `get()` task leaks the inner
+    // driver, the gateway never sees the client go away, and the permit stays
+    // held — which is a fixture bug, not a still-held production permit.
+    let mut hold_stream = open_h3_hold_stream(&hold_client, &hold_url).await;
     backend.wait_for_hits(1, Duration::from_secs(20)).await;
 
     let probe_client = Http3Client::insecure().expect("probe h3 client");
@@ -113,10 +117,8 @@ async fn functional_destination_active_requests_h3_release_on_client_cancellatio
     );
     backend.assert_hits_eq(1, SETTLE).await;
 
-    // Cancel the in-flight H3 request by dropping its task and its QUIC
-    // endpoint. The backend never answered, so only the relay-owned permit can
-    // free the budget.
-    hold.abort();
+    hold_stream.cancel_response_download();
+    drop(hold_stream);
 
     let after_client = Http3Client::insecure().expect("post-cancel h3 client");
     let after = tokio::spawn({
@@ -156,6 +158,26 @@ async fn retry_h3_get(client: &Http3Client, url: &str) -> Http3Response {
             }
             Err(err) => panic!(
                 "H3 request to {url} did not complete; last startup error={last_err:?}; final error={err}"
+            ),
+        }
+    }
+}
+
+async fn open_h3_hold_stream(client: &Http3Client, url: &str) -> Http3ResponseStream {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut last_err = None;
+    loop {
+        match client
+            .open_response_stream(url, GetOptions::default())
+            .await
+        {
+            Ok(stream) => return stream,
+            Err(err) if Instant::now() < deadline => {
+                last_err = Some(err.to_string());
+                sleep(Duration::from_millis(100)).await;
+            }
+            Err(err) => panic!(
+                "H3 hold stream to {url} did not open; last startup error={last_err:?}; final error={err}"
             ),
         }
     }

@@ -844,6 +844,14 @@ pub struct Http3ResponseStream {
 }
 
 impl Http3ResponseStream {
+    /// Cancel the response-download direction so the gateway observes a real
+    /// client abort (`H3_REQUEST_CANCELLED`) rather than a leaked QUIC driver
+    /// keeping the request alive after the caller task is cancelled.
+    pub fn cancel_response_download(&mut self) {
+        self.stream
+            .stop_sending(h3::error::Code::H3_REQUEST_CANCELLED);
+    }
+
     /// Await response headers.
     pub async fn recv_response(
         &mut self,
