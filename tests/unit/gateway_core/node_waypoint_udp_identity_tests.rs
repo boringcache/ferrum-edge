@@ -620,7 +620,12 @@ async fn losing_dtls_relays_are_joined_before_the_handler_returns() {
     let mut winner = tokio::spawn(async {});
     let _ = (&mut winner).await;
 
-    abort_and_join_dtls_relays(&mut winner, &mut loser, DtlsRelayCompletion::ClientToBackend).await;
+    abort_and_join_dtls_relays(
+        &mut winner,
+        &mut loser,
+        DtlsRelayCompletion::ClientToBackend,
+    )
+    .await;
 
     assert!(
         !still_running.load(std::sync::atomic::Ordering::SeqCst),

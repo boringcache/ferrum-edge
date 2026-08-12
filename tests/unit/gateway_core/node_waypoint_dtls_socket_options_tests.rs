@@ -243,7 +243,10 @@ fn success_on_one_family_does_not_satisfy_a_dual_stack_socket() {
     )
     .expect_err("a dual-stack socket missing IPV6_RECVPKTINFO must fail closed");
     assert_eq!(refused.required, IngressPktinfoFamilies::Both);
-    assert!(refused.v4.is_none(), "IPv4 succeeded and must not be blamed");
+    assert!(
+        refused.v4.is_none(),
+        "IPv4 succeeded and must not be blamed"
+    );
     assert!(refused.v6.is_some(), "the IPv6 failure must be reported");
     let text = refused.to_string();
     assert!(

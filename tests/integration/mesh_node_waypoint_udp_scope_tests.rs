@@ -838,7 +838,11 @@ fn a_udp_service_port_materializes_a_node_waypoint_datagram_listener() {
         .iter()
         .find(|upstream| upstream.id == upstream_id)
         .expect("the listener's upstream must be materialized");
-    assert!(upstream.id.starts_with(MESH_NODE_WAYPOINT_UDP_UPSTREAM_ID_PREFIX));
+    assert!(
+        upstream
+            .id
+            .starts_with(MESH_NODE_WAYPOINT_UDP_UPSTREAM_ID_PREFIX)
+    );
     assert_eq!(
         upstream
             .targets
@@ -947,8 +951,18 @@ fn only_the_node_waypoint_topology_materializes_udp_listeners() {
 fn two_services_claiming_one_udp_port_materialize_no_listener() {
     let _env = UdpListenerEnvGuard::set(Some("true"));
     let runtime = node_waypoint_runtime();
-    let a = workload_for("dns-a", DEFAULT_NAMESPACE, [("app", "udp")], ["10.244.3.11"]);
-    let b = workload_for("dns-b", DEFAULT_NAMESPACE, [("app", "udp")], ["10.244.3.12"]);
+    let a = workload_for(
+        "dns-a",
+        DEFAULT_NAMESPACE,
+        [("app", "udp")],
+        ["10.244.3.11"],
+    );
+    let b = workload_for(
+        "dns-b",
+        DEFAULT_NAMESPACE,
+        [("app", "udp")],
+        ["10.244.3.12"],
+    );
     let config = prepare(
         &runtime,
         vec![
@@ -1015,13 +1029,19 @@ fn a_reload_updates_endpoints_and_withdraws_a_removed_service() {
     let first_backend = workload_for("dns", DEFAULT_NAMESPACE, [("app", "udp")], ["10.244.3.11"]);
     let first = prepare(
         &runtime,
-        vec![udp_service("dns", 5353, AppProtocol::Udp, &[&first_backend])],
+        vec![udp_service(
+            "dns",
+            5353,
+            AppProtocol::Udp,
+            &[&first_backend],
+        )],
         vec![first_backend],
     );
     assert_eq!(udp_listeners(&first).len(), 1);
 
     // Source pod recreation / endpoint change: same service, new pod address.
-    let replaced_backend = workload_for("dns", DEFAULT_NAMESPACE, [("app", "udp")], ["10.244.3.99"]);
+    let replaced_backend =
+        workload_for("dns", DEFAULT_NAMESPACE, [("app", "udp")], ["10.244.3.99"]);
     let updated = prepare(
         &runtime,
         vec![udp_service(
