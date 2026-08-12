@@ -1577,6 +1577,69 @@ fn record_plain_grpc_web_client_deadline(
     );
 }
 
+/// Record a client deadline after the backend has already produced a terminal
+/// response.
+///
+/// The ordinary reqwest arm has no backend transport classification at this
+/// point, so it keeps the existing health-neutral client-deadline accounting.
+/// A mesh dispatch can instead return a buffered gateway error together with a
+/// real backend transport classification. Do not let a later client deadline
+/// erase that already-established backend signal.
+#[allow(clippy::too_many_arguments)]
+fn record_plain_grpc_web_client_deadline_after_backend_response(
+    state: &ProxyState,
+    epoch: &RequestEpoch,
+    proxy: &Proxy,
+    upstream_balancer: Option<&Arc<LoadBalancer>>,
+    current_target: Option<&UpstreamTarget>,
+    current_cb_target_key: Option<&str>,
+    cb_is_half_open_probe: bool,
+    backend_start: Instant,
+    backend_admission_permits: &mut Option<BackendAdmissionPermitSet>,
+    backend_admission_elapsed: Duration,
+    backend_status: u16,
+    backend_connection_error: bool,
+    backend_error_class: Option<ErrorClass>,
+) {
+    if !backend_connection_error && backend_error_class.is_none() {
+        record_plain_grpc_web_client_deadline(
+            state,
+            epoch,
+            proxy,
+            upstream_balancer,
+            current_target,
+            current_cb_target_key,
+            cb_is_half_open_probe,
+            backend_start,
+            backend_admission_permits,
+            backend_admission_elapsed,
+        );
+        return;
+    }
+
+    record_backend_outcome(
+        state,
+        proxy,
+        &epoch.load_balancer,
+        upstream_balancer,
+        current_target,
+        current_cb_target_key,
+        backend_status,
+        backend_connection_error,
+        backend_error_class,
+        cb_is_half_open_probe,
+        false,
+        backend_start.elapsed(),
+    );
+    record_cross_protocol_backend_admission_outcome(
+        backend_admission_permits,
+        backend_status,
+        backend_connection_error,
+        backend_error_class,
+        backend_admission_elapsed,
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn write_plain_grpc_web_client_deadline<S>(
     stream: &mut RequestStream<S, Bytes>,
@@ -3203,6 +3266,8 @@ where
         &response_headers,
         effective_max_response_body_size_bytes,
     ) {
+        let terminal_backend_failure =
+            terminal_connection_error || terminal_error_class.is_some();
         warn!(
             proxy_id = %proxy.id,
             response_body_bytes = len,
@@ -3216,18 +3281,26 @@ where
             upstream_balancer,
             current_target.as_deref(),
             current_cb_target_key.as_deref(),
-            502,
-            false,
-            None,
+            if terminal_backend_failure { status } else { 502 },
+            terminal_connection_error,
+            if terminal_backend_failure {
+                terminal_error_class
+            } else {
+                None
+            },
             cb_retry_probe_slot_available,
             false,
             backend_start.elapsed(),
         );
         record_cross_protocol_backend_admission_outcome(
             &mut backend_admission_permits,
-            502,
-            false,
-            Some(ErrorClass::ResponseBodyTooLarge),
+            if terminal_backend_failure { status } else { 502 },
+            terminal_connection_error,
+            if terminal_backend_failure {
+                terminal_error_class
+            } else {
+                Some(ErrorClass::ResponseBodyTooLarge)
+            },
             backend_admission_elapsed,
         );
         let mut outcome = write_plain_gateway_error(
@@ -3242,6 +3315,8 @@ where
         .await?;
         outcome.backend_target = Some(strip_query_from_backend_url(&current_url));
         outcome.backend_resolved_ip = final_backend_resolved_ip.clone();
+        outcome.connection_error = terminal_connection_error;
+        outcome.error_class = terminal_error_class;
         outcome.body_error_class = Some(ErrorClass::ResponseBodyTooLarge);
         return Ok(outcome);
     }
@@ -3612,7 +3687,7 @@ where
             .await
             .is_err()
         {
-            record_plain_grpc_web_client_deadline(
+            record_plain_grpc_web_client_deadline_after_backend_response(
                 state,
                 epoch,
                 proxy,
@@ -3623,8 +3698,11 @@ where
                 backend_start,
                 &mut backend_admission_permits,
                 backend_admission_elapsed,
+                status,
+                terminal_connection_error,
+                terminal_error_class,
             );
-            return write_plain_grpc_web_client_deadline(
+            let mut outcome = write_plain_grpc_web_client_deadline(
                 stream,
                 plugins,
                 ctx,
@@ -3634,7 +3712,11 @@ where
                 bytes_sent,
                 &current_url,
             )
-            .await;
+            .await?;
+            outcome.backend_resolved_ip = final_backend_resolved_ip.clone();
+            outcome.connection_error = terminal_connection_error;
+            outcome.error_class = terminal_error_class;
+            return Ok(outcome);
         }
 
         // Buffered bridge response: `response_body` below IS the wire body, so
@@ -3667,7 +3749,7 @@ where
                 error,
                 crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded
             ) {
-                record_plain_grpc_web_client_deadline(
+                record_plain_grpc_web_client_deadline_after_backend_response(
                     state,
                     epoch,
                     proxy,
@@ -3678,42 +3760,76 @@ where
                     backend_start,
                     &mut backend_admission_permits,
                     backend_admission_elapsed,
+                    status,
+                    terminal_connection_error,
+                    terminal_error_class,
                 );
-                return write_plain_grpc_web_client_deadline_without_hooks(
+                let mut outcome = write_plain_grpc_web_client_deadline_without_hooks(
                     stream,
                     ctx,
                     backend_start,
                     bytes_sent,
                     &current_url,
                 )
-                .await;
+                .await?;
+                outcome.backend_resolved_ip = final_backend_resolved_ip.clone();
+                outcome.connection_error = terminal_connection_error;
+                outcome.error_class = terminal_error_class;
+                return Ok(outcome);
             }
             debug!(
                 ?error,
                 "cross-protocol H3 buffered response header write failed"
             );
-            record_cross_protocol_header_write_disconnect(
-                state,
-                proxy,
-                epoch,
-                upstream_balancer,
-                current_target.as_ref(),
-                current_cb_target_key.as_deref(),
-                response_status,
-                status,
-                cb_retry_probe_slot_available,
-                backend_start,
-                &mut backend_admission_permits,
-                backend_admission_elapsed,
-            );
-            return Ok(cross_protocol_header_write_disconnect_outcome(
+            if terminal_connection_error || terminal_error_class.is_some() {
+                record_backend_outcome(
+                    state,
+                    proxy,
+                    &epoch.load_balancer,
+                    upstream_balancer,
+                    current_target.as_deref(),
+                    current_cb_target_key.as_deref(),
+                    status,
+                    terminal_connection_error,
+                    terminal_error_class,
+                    cb_retry_probe_slot_available,
+                    false,
+                    backend_start.elapsed(),
+                );
+                record_cross_protocol_backend_admission_outcome(
+                    &mut backend_admission_permits,
+                    status,
+                    terminal_connection_error,
+                    terminal_error_class,
+                    backend_admission_elapsed,
+                );
+            } else {
+                record_cross_protocol_header_write_disconnect(
+                    state,
+                    proxy,
+                    epoch,
+                    upstream_balancer,
+                    current_target.as_ref(),
+                    current_cb_target_key.as_deref(),
+                    response_status,
+                    status,
+                    cb_retry_probe_slot_available,
+                    backend_start,
+                    &mut backend_admission_permits,
+                    backend_admission_elapsed,
+                );
+            }
+            let mut outcome = cross_protocol_header_write_disconnect_outcome(
                 response_status,
                 false,
                 bytes_sent,
                 backend_start,
                 Some(strip_query_from_backend_url(&current_url)),
                 final_backend_resolved_ip.clone(),
-            ));
+            );
+            outcome.connection_error = terminal_connection_error;
+            outcome.error_class = terminal_error_class;
+            return Ok(outcome);
         }
         let bytes_streamed = response_body.len() as u64;
         let buffered_write = async {
@@ -3735,7 +3851,7 @@ where
                     (false, true)
                 }
                 Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
-                    record_plain_grpc_web_client_deadline(
+                    record_plain_grpc_web_client_deadline_after_backend_response(
                         state,
                         epoch,
                         proxy,
@@ -3746,6 +3862,9 @@ where
                         backend_start,
                         &mut backend_admission_permits,
                         backend_admission_elapsed,
+                        status,
+                        terminal_connection_error,
+                        terminal_error_class,
                     );
                     let (deadline_bytes, deadline_written) =
                         append_plain_grpc_web_client_deadline(stream, ctx).await;
@@ -3758,8 +3877,8 @@ where
                         backend_resolved_ip: final_backend_resolved_ip.clone(),
                         body_completed: deadline_written,
                         client_disconnected: false,
-                        connection_error: false,
-                        error_class: None,
+                        connection_error: terminal_connection_error,
+                        error_class: terminal_error_class,
                         body_error_class: Some(ErrorClass::ClientDisconnect),
                         backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
                         backend_ttfb_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
@@ -3789,15 +3908,14 @@ where
         // adaptive limiter shrink/grow on a signal that does not reflect backend
         // health. Matches the streaming path below and the H1/H2 path, which
         // capture the backend status before response-body hooks run.
+        let admission_error_class = terminal_error_class.or_else(|| {
+            (!body_completed).then_some(ErrorClass::ClientDisconnect)
+        });
         record_cross_protocol_backend_admission_outcome(
             &mut backend_admission_permits,
             status,
             terminal_connection_error,
-            if body_completed {
-                terminal_error_class
-            } else {
-                Some(ErrorClass::ClientDisconnect)
-            },
+            admission_error_class,
             backend_admission_elapsed,
         );
 

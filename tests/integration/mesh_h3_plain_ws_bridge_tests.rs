@@ -194,6 +194,37 @@ fn h3_plain_bridge_mesh_streaming_variants_fail_closed() {
     );
 }
 
+/// A mesh response can carry a real transport classification (for example a
+/// connection failure represented as a buffered 502). Once established, a
+/// later client deadline or disconnect must not overwrite that backend signal
+/// with the health-neutral client-side terminal.
+#[test]
+fn h3_plain_bridge_preserves_mesh_outcomes_across_client_terminals() {
+    let plain = h3_plain_dispatcher_source();
+
+    assert_eq!(
+        plain
+            .matches("record_plain_grpc_web_client_deadline_after_backend_response(")
+            .count(),
+        3,
+        "plugin, header-write, and body-write deadlines after a terminal \
+         backend response must preserve its classification"
+    );
+    assert!(
+        plain.contains("if terminal_connection_error || terminal_error_class.is_some() {")
+            && plain.contains("outcome.connection_error = terminal_connection_error;")
+            && plain.contains("outcome.error_class = terminal_error_class;"),
+        "client write failures must keep backend transport classification on \
+         accounting and the cross-protocol outcome"
+    );
+    assert!(
+        plain.contains("terminal_error_class.or_else(|| {")
+            && plain.contains("then_some(ErrorClass::ClientDisconnect)"),
+        "a downstream body failure may supply the admission fallback only when \
+         no backend classification already exists"
+    );
+}
+
 #[test]
 fn h3_websocket_bridge_source_forks_shared_mesh_egress() {
     let src = include_str!("../../src/http3/websocket.rs");
