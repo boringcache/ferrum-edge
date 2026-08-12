@@ -9,17 +9,29 @@
 //! keep mutating network state — or hold the inherited stderr pipe open — after
 //! the caller has reported timeout.
 //!
+//! The deadline path never issues a potentially blocking stderr read. Nonblocking
+//! mode is established before any diagnostic `read`, and inability to do that is
+//! an explicit error after the owned child is terminated as far as the platform
+//! can prove. Platforms without a process-group/nonblocking collector fail closed
+//! rather than pretending the deadline is enforced.
+//!
 //! The unbounded path (`deadline == None`) keeps a blocking `.output()` wait: the
 //! ordinary migration cleanup phase intentionally retries forever.
 
-use std::io::{self, Read};
-use std::process::{Child, Command, Stdio};
+use std::io;
+#[cfg(unix)]
+use std::io::Read;
+use std::process::Command;
+#[cfg(unix)]
+use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
 const WAIT_POLL: Duration = Duration::from_millis(10);
 /// Bounded diagnostic capture for the deadline path. Ordinary nonzero exits
 /// still surface this prefix; a grandchild that never closes stderr cannot
 /// grow it without bound.
+#[cfg(unix)]
 const MAX_DEADLINE_STDERR: usize = 64 * 1024;
 
 /// Outcome of an owned `sh -c` invocation.
@@ -40,6 +52,11 @@ pub enum OwnedShellError {
     /// variant exists so that failure is reported rather than claimed as a
     /// successful termination.
     DeadlineCleanupFailed { error: String },
+    /// A deadline was supplied, but a safe bounded/nonblocking diagnostic
+    /// collector (and process-group kill) could not be established. The owned
+    /// child was terminated as far as the platform can prove, or never spawned
+    /// on platforms that cannot implement the contract.
+    DeadlineUnsupported { error: String },
 }
 
 impl OwnedShellError {
@@ -58,11 +75,26 @@ impl OwnedShellError {
         }
     }
 
+    #[cfg(unix)]
     fn from_deadline_cleanup(cleanup: Result<(), io::Error>) -> Self {
         match cleanup {
             Ok(()) => Self::DeadlineElapsed,
             Err(error) => Self::DeadlineCleanupFailed {
                 error: error.to_string(),
+            },
+        }
+    }
+
+    #[cfg(unix)]
+    fn from_collector_setup(setup: io::Error, cleanup: Result<(), io::Error>) -> Self {
+        match cleanup {
+            Ok(()) => Self::DeadlineUnsupported {
+                error: setup.to_string(),
+            },
+            Err(cleanup_error) => Self::DeadlineCleanupFailed {
+                error: format!(
+                    "failed to establish a nonblocking stderr collector ({setup}); owned descendants could not be proven terminated: {cleanup_error}"
+                ),
             },
         }
     }
@@ -84,14 +116,17 @@ impl std::fmt::Display for OwnedShellError {
                     "script exceeded its deadline; owned descendants could not be proven terminated: {error}"
                 )
             }
+            Self::DeadlineUnsupported { error } => {
+                write!(f, "script deadline cannot be enforced: {error}")
+            }
         }
     }
 }
 
 impl std::error::Error for OwnedShellError {}
 
-impl From<std::io::Error> for OwnedShellError {
-    fn from(error: std::io::Error) -> Self {
+impl From<io::Error> for OwnedShellError {
+    fn from(error: io::Error) -> Self {
         Self::Io(error)
     }
 }
@@ -138,6 +173,22 @@ fn run_unbounded(script: &str) -> Result<(), OwnedShellError> {
 }
 
 fn run_until(script: &str, deadline: Instant) -> Result<(), OwnedShellError> {
+    #[cfg(unix)]
+    {
+        run_until_unix(script, deadline)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (script, deadline);
+        Err(OwnedShellError::DeadlineUnsupported {
+            error: "hard wall-clock deadlines require a Unix process group and a nonblocking stderr collector"
+                .to_string(),
+        })
+    }
+}
+
+#[cfg(unix)]
+fn run_until_unix(script: &str, deadline: Instant) -> Result<(), OwnedShellError> {
     let mut command = Command::new("sh");
     command
         .arg("-c")
@@ -150,7 +201,6 @@ fn run_until(script: &str, deadline: Instant) -> Result<(), OwnedShellError> {
     // Own the whole tree so `iptables`/`ip` grandchildren die with the shell.
     // Safety: `setpgid(0, 0)` only rearranges this child's process-group
     // membership before `exec`, and the child has not yet started user code.
-    #[cfg(unix)]
     unsafe {
         use std::os::unix::process::CommandExt;
         command.pre_exec(|| {
@@ -161,7 +211,14 @@ fn run_until(script: &str, deadline: Instant) -> Result<(), OwnedShellError> {
         });
     }
     let mut child = command.spawn()?;
-    set_stderr_nonblocking(&mut child);
+    if let Err(setup) = set_stderr_nonblocking(&child) {
+        let cleanup = terminate_owned_tree(&mut child, deadline);
+        // Never drain stderr here: the pipe may still be blocking.
+        return Err(return_without_blocking_wait(
+            child,
+            OwnedShellError::from_collector_setup(setup, cleanup),
+        ));
+    }
     let mut stderr = Vec::new();
     loop {
         drain_stderr_nonblocking(&mut child, &mut stderr);
@@ -169,24 +226,33 @@ fn run_until(script: &str, deadline: Instant) -> Result<(), OwnedShellError> {
             Ok(Some(status)) => {
                 // The direct child is gone. Remaining process-group members are
                 // still owned by this invocation: they can hold the inherited
-                // stderr fd open (defeating an unbounded `read_to_end`) and can
-                // keep mutating network state. Reap them before collecting
+                // stderr fd open and can keep mutating network state. Signal
+                // the group (never the reaped PID) before collecting
                 // diagnostics or returning success.
-                let cleanup = terminate_owned_tree(&mut child);
+                let cleanup = terminate_owned_tree(&mut child, deadline);
                 drain_stderr_until(&mut child, &mut stderr, deadline);
                 if Instant::now() >= deadline {
-                    return Err(OwnedShellError::from_deadline_cleanup(cleanup));
+                    return Err(return_without_blocking_wait(
+                        child,
+                        OwnedShellError::from_deadline_cleanup(cleanup),
+                    ));
                 }
                 if let Err(error) = cleanup {
-                    return Err(OwnedShellError::Io(error));
+                    return Err(return_without_blocking_wait(
+                        child,
+                        OwnedShellError::Io(error),
+                    ));
                 }
                 return finish_status(status, stderr);
             }
             Ok(None) => {
                 if Instant::now() >= deadline {
-                    let cleanup = terminate_owned_tree(&mut child);
+                    let cleanup = terminate_owned_tree(&mut child, deadline);
                     drain_stderr_until(&mut child, &mut stderr, deadline);
-                    return Err(OwnedShellError::from_deadline_cleanup(cleanup));
+                    return Err(return_without_blocking_wait(
+                        child,
+                        OwnedShellError::from_deadline_cleanup(cleanup),
+                    ));
                 }
                 let slice = deadline
                     .saturating_duration_since(Instant::now())
@@ -196,12 +262,18 @@ fn run_until(script: &str, deadline: Instant) -> Result<(), OwnedShellError> {
                 }
             }
             Err(error) => {
-                let cleanup = terminate_owned_tree(&mut child);
+                let cleanup = terminate_owned_tree(&mut child, deadline);
                 drain_stderr_until(&mut child, &mut stderr, deadline);
                 if Instant::now() >= deadline {
-                    return Err(OwnedShellError::from_deadline_cleanup(cleanup));
+                    return Err(return_without_blocking_wait(
+                        child,
+                        OwnedShellError::from_deadline_cleanup(cleanup),
+                    ));
                 }
-                return Err(OwnedShellError::Io(error));
+                return Err(return_without_blocking_wait(
+                    child,
+                    OwnedShellError::Io(error),
+                ));
             }
         }
     }
@@ -221,22 +293,55 @@ fn finish_status(
     }
 }
 
-fn set_stderr_nonblocking(child: &mut Child) {
-    #[cfg(unix)]
-    if let Some(pipe) = child.stderr.as_ref() {
-        use std::os::unix::io::AsRawFd;
-        let fd = pipe.as_raw_fd();
-        // Safety: `fd` is the live stderr pipe of the child we spawned. GETFL
-        // / SETFL only change the O_NONBLOCK flag on that descriptor.
-        unsafe {
-            let flags = libc::fcntl(fd, libc::F_GETFL, 0);
-            if flags >= 0 {
-                let _ = libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-            }
+/// Close the diagnostic pipe without reading it and leak `child` when it is
+/// still unreaped, so `Child::drop` cannot issue a blocking `wait` after the
+/// caller has already failed closed.
+#[cfg(unix)]
+fn return_without_blocking_wait(mut child: Child, error: OwnedShellError) -> OwnedShellError {
+    match child.try_wait() {
+        Ok(Some(_)) => error,
+        Err(error) if error.kind() == io::ErrorKind::InvalidInput => error,
+        _ => {
+            let _ = child.stderr.take();
+            std::mem::forget(child);
+            error
         }
     }
 }
 
+#[cfg(unix)]
+fn set_stderr_nonblocking(child: &Child) -> io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let Some(pipe) = child.stderr.as_ref() else {
+        return Err(io::Error::other("owned shell stderr pipe was not captured"));
+    };
+    let fd = pipe.as_raw_fd();
+    // Safety: `fd` is the live stderr pipe of the child we spawned. GETFL /
+    // SETFL only change the O_NONBLOCK flag on that descriptor.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL, 0);
+        if flags < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let confirmed = libc::fcntl(fd, libc::F_GETFL, 0);
+        if confirmed < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if (confirmed & libc::O_NONBLOCK) == 0 {
+            return Err(io::Error::other(
+                "O_NONBLOCK was not established on the owned shell stderr pipe",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Caller must have proven the stderr pipe is `O_NONBLOCK`. A blocking `read`
+/// here would violate the wall-clock deadline.
+#[cfg(unix)]
 fn drain_stderr_nonblocking(child: &mut Child, stderr: &mut Vec<u8>) {
     let Some(pipe) = child.stderr.as_mut() else {
         return;
@@ -269,6 +374,7 @@ fn drain_stderr_nonblocking(child: &mut Child, stderr: &mut Vec<u8>) {
     }
 }
 
+#[cfg(unix)]
 fn drain_stderr_until(child: &mut Child, stderr: &mut Vec<u8>, deadline: Instant) {
     loop {
         drain_stderr_nonblocking(child, stderr);
@@ -285,57 +391,60 @@ fn drain_stderr_until(child: &mut Child, stderr: &mut Vec<u8>, deadline: Instant
     }
 }
 
-/// SIGKILL the owned process group and reap the direct child. Remaining
-/// grandchildren that were reparented to init cannot be `waitpid`'d here; the
-/// group signal is the platform's ownership boundary.
-fn terminate_owned_tree(child: &mut Child) -> Result<(), io::Error> {
-    let pid = child.id();
-    let mut kill_error = None;
-    #[cfg(unix)]
-    {
-        let pid = pid as i32;
-        // Safety: `pid` is the child we spawned into its own process group.
-        // SIGKILL to `-pid` terminates that group even after the leader has
-        // exited; SIGKILL to `pid` covers a child that failed to join the
-        // group. Neither call dereferences memory.
-        if unsafe { libc::kill(-pid, libc::SIGKILL) } != 0 {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::ESRCH) {
-                kill_error = Some(error);
-            }
-        }
-        if unsafe { libc::kill(pid, libc::SIGKILL) } != 0 {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::ESRCH) {
-                kill_error = Some(error);
-            }
-        }
-        loop {
-            let mut status = 0;
-            // Safety: `waitpid(-pgid, WNOHANG)` reaps any remaining children
-            // in this process group that we still parent. It does not
-            // dereference userspace memory.
-            let reaped = unsafe { libc::waitpid(-pid, &mut status, libc::WNOHANG) };
-            if reaped <= 0 {
-                break;
-            }
+/// SIGKILL the owned process group and reap the direct child under `deadline`.
+///
+/// The group signal is the platform's ownership boundary: grandchildren that
+/// were reparented to init cannot be `waitpid`'d here. The direct child is
+/// reaped only through `Child` so this process never steals std's wait status.
+/// After a successful `setpgid(0, 0)`, the child is the group leader; a
+/// positive `kill(pid)` is therefore unnecessary, and after the leader has
+/// been reaped it would be a PID-reuse hazard.
+#[cfg(unix)]
+fn terminate_owned_tree(child: &mut Child, deadline: Instant) -> Result<(), io::Error> {
+    signal_owned_group(child)?;
+    reap_direct_child_until(child, deadline)
+}
+
+#[cfg(unix)]
+fn signal_owned_group(child: &Child) -> Result<(), io::Error> {
+    let pid = child.id() as i32;
+    // Safety: `pid` is the child we spawned into its own process group.
+    // SIGKILL to `-pid` terminates that group even after the leader has
+    // exited. This does not dereference memory.
+    if unsafe { libc::kill(-pid, libc::SIGKILL) } != 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(error);
         }
     }
-    #[cfg(not(unix))]
-    {
-        if let Err(error) = child.kill()
-            && error.kind() != io::ErrorKind::InvalidInput
-        {
-            kill_error = Some(error);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn reap_direct_child_until(child: &mut Child, deadline: Instant) -> Result<(), io::Error> {
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "owned child was not reaped before the deadline",
+                    ));
+                }
+                let slice = deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(WAIT_POLL);
+                if slice.is_zero() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "owned child was not reaped before the deadline",
+                    ));
+                }
+                std::thread::sleep(slice);
+            }
+            Err(error) if error.kind() == io::ErrorKind::InvalidInput => return Ok(()),
+            Err(error) => return Err(error),
         }
-    }
-    match child.wait() {
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::InvalidInput => {}
-        Err(error) => return Err(error),
-    }
-    match kill_error {
-        Some(error) => Err(error),
-        None => Ok(()),
     }
 }

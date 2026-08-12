@@ -1599,6 +1599,9 @@ pub fn preflight_capture_tools_until(
         ) => Err(format!(
             "the Ambient UDP node preflight could not prove predecessor retirement within its timeout; no proof was published ({error})"
         )),
+        Err(OwnedShellError::DeadlineUnsupported { error }) => Err(format!(
+            "the Ambient UDP node preflight could not establish a bounded command collector ({error}); no proof was published"
+        )),
         Err(OwnedShellError::Io(e)) => Err(format!(
             "Ambient UDP capture is enabled but `sh` is not available in the runtime image \
              (the producer runs in-netns `sh -c` scripts that call `ip`/`iptables`): {e}. Use a \
@@ -2383,6 +2386,9 @@ fn run_shell_script_until(
             std::io::ErrorKind::TimedOut,
             format!("in-netns script exceeded its deadline ({error})"),
         )),
+        Err(OwnedShellError::DeadlineUnsupported { error }) => Err(std::io::Error::other(format!(
+            "in-netns script cannot be run under a hard deadline: {error}"
+        ))),
         Err(OwnedShellError::Io(error)) => Err(error),
         Err(OwnedShellError::Failed { status, stderr }) => Err(std::io::Error::other(format!(
             "in-netns script failed (exit {:?}): {}",

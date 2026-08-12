@@ -582,6 +582,9 @@ pub fn execute_ambient_udp_preflight(args: &AmbientUdpPreflightArgs) -> Result<(
                     crate::proxy::udp_placement_cleanup::UdpCleanupOutcome::DeadlineElapsed,
                 );
             }
+            Err(error) if error.contains("bounded command collector") => {
+                return Err(error);
+            }
             Err(error) => {
                 return Err(format!(
                     "the Ambient UDP node preflight image cannot run the required tooling: {error}"

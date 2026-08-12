@@ -1013,9 +1013,10 @@ fn ambient_udp_production_entry_points_are_scheduled_by_the_trusted_classifier()
     assert!(
         cli.contains("preflight_capture_tools_until")
             && cli.contains("owned_shell::deadline_elapsed")
+            && cli.contains("bounded command collector")
             && !cli.contains("short-circuits"),
-        "the preflight must bound tool/cleanup work by the wall-clock deadline and must not \
-         short-circuit on leftover proof"
+        "the preflight must bound tool/cleanup work by the wall-clock deadline, fail closed when \
+         a bounded collector cannot be established, and must not short-circuit on leftover proof"
     );
 
     let mesh = read("src/modes/mesh/mod.rs");
@@ -1035,8 +1036,13 @@ fn ambient_udp_production_entry_points_are_scheduled_by_the_trusted_classifier()
     assert!(
         owned_shell.contains("drain_stderr_until")
             && owned_shell.contains("terminate_owned_tree")
-            && owned_shell.contains("DeadlineCleanupFailed"),
-        "deadline-owned shells must bound stderr collection and report process-group cleanup failure"
+            && owned_shell.contains("DeadlineCleanupFailed")
+            && owned_shell.contains("DeadlineUnsupported")
+            && owned_shell.contains("O_NONBLOCK")
+            && owned_shell.contains("set_stderr_nonblocking")
+            && !owned_shell.contains("let _ = libc::fcntl"),
+        "deadline-owned shells must fail closed unless a nonblocking stderr collector is proven, \
+         bound stderr collection, and report process-group cleanup failure"
     );
 
     let migration = read("src/proxy/udp_placement_migration.rs");

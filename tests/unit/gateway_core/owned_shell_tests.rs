@@ -146,3 +146,53 @@ fn a_shell_that_exits_while_a_descendant_holds_stderr_still_returns_by_the_deadl
     }
     panic!("owned descendant pid {pid} must not survive the invocation");
 }
+
+#[test]
+fn an_unenforceable_deadline_is_not_reported_as_elapsed() {
+    let error = OwnedShellError::DeadlineUnsupported {
+        error: "test collector".to_string(),
+    };
+    assert!(!error.is_deadline_elapsed(), "{error}");
+    assert!(error.deadline_cleanup_error().is_none(), "{error}");
+    let displayed = error.to_string();
+    assert!(displayed.contains("cannot be enforced"), "{displayed}");
+}
+
+#[cfg(not(unix))]
+#[test]
+fn deadline_path_fails_closed_when_process_groups_are_unavailable() {
+    let start = Instant::now();
+    let error = owned_shell::run_sh_c("sleep 30", Some(start + Duration::from_secs(30)))
+        .expect_err("deadline path must not spawn an unbounded child");
+    assert!(!error.is_deadline_elapsed(), "{error}");
+    match error {
+        OwnedShellError::DeadlineUnsupported { error } => {
+            assert!(
+                error.contains("Unix process group") && error.contains("nonblocking"),
+                "{error}"
+            );
+        }
+        other => panic!("expected DeadlineUnsupported, got {other}"),
+    }
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "unsupported deadline path must not block, took {elapsed:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_silent_stalled_child_still_returns_by_the_deadline_without_stderr() {
+    // A child that never writes stderr used to hang forever when O_NONBLOCK
+    // was not established, because drain issued a blocking read before wait.
+    let start = Instant::now();
+    let error = owned_shell::run_sh_c("sleep 30", Some(start + Duration::from_millis(250)))
+        .expect_err("sleep must be cut off by the deadline");
+    assert!(error.is_deadline_elapsed(), "{error}");
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "a silent child must not pin the deadline path on a blocking stderr read, took {elapsed:?}"
+    );
+}
