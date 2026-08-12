@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use ferrum_edge::config::stable_file::{
     MAX_FERRUM_CONF_BYTES, MAX_GATEWAY_CONFIG_FILE_BYTES, MAX_MESH_CONFIG_FILE_BYTES,
-    StableFileError, StableFileReadOptions, detect_json_or_yaml_extension,
-    format_stable_file_error, read_stable_file,
+    StableFileError, StableFileReadOptions, classify_error_after_first_probe,
+    detect_json_or_yaml_extension, format_stable_file_error, read_stable_file,
 };
 
 const TEST_LIMIT: u64 = 64;
@@ -44,12 +44,46 @@ fn exact_limit_loads_and_limit_plus_one_is_refused() {
     std::fs::write(&over, vec![b'b'; (TEST_LIMIT + 1) as usize]).unwrap();
     let err = read_stable_file(&over, opts(TEST_LIMIT)).expect_err("limit+1 must refuse");
     match err {
-        StableFileError::TooLarge { len, max_bytes } => {
+        StableFileError::TooLarge {
+            len,
+            max_bytes,
+            len_is_lower_bound,
+        } => {
             assert_eq!(max_bytes, TEST_LIMIT);
             assert!(len > TEST_LIMIT);
+            // Metadata already knew the real size here, so it is exact.
+            assert!(!len_is_lower_bound, "metadata refusal reports an exact size");
         }
         other => panic!("expected TooLarge, got {other}"),
     }
+}
+
+#[test]
+fn streamed_too_large_reports_a_lower_bound_not_an_exact_size() {
+    // Metadata under the ceiling, real content past it: the read stops at
+    // `max_bytes + 1`, so the diagnostic must say "at least" rather than
+    // presenting the truncation point as the measured file size.
+    let streamed = StableFileError::TooLarge {
+        len: TEST_LIMIT + 1,
+        max_bytes: TEST_LIMIT,
+        len_is_lower_bound: true,
+    };
+    let rendered = streamed.to_string();
+    assert!(
+        rendered.starts_with("file is at least "),
+        "streamed refusal must not report a lower bound as exact: {rendered}"
+    );
+
+    let exact = StableFileError::TooLarge {
+        len: TEST_LIMIT + 1,
+        max_bytes: TEST_LIMIT,
+        len_is_lower_bound: false,
+    };
+    let rendered = exact.to_string();
+    assert!(
+        rendered.starts_with("file is 65 bytes"),
+        "a metadata-known size stays exact: {rendered}"
+    );
 }
 
 #[test]
@@ -62,7 +96,7 @@ fn sparse_oversized_metadata_is_fast_rejected() {
 
     let err = read_stable_file(&path, opts(TEST_LIMIT)).expect_err("sparse oversized");
     match err {
-        StableFileError::TooLarge { len, max_bytes } => {
+        StableFileError::TooLarge { len, max_bytes, .. } => {
             assert_eq!(len, TEST_LIMIT + 1);
             assert_eq!(max_bytes, TEST_LIMIT);
         }
@@ -95,24 +129,74 @@ fn invalid_utf8_is_rejected_without_byte_leakage() {
 }
 
 #[test]
-fn detect_format_preserves_yaml_superset_for_unknown_extensions() {
-    assert!(detect_json_or_yaml_extension(
-        Path::new("mesh.unknown"),
-        "mesh:\n  services: []\n"
+fn format_selection_is_extension_only_and_defaults_unknown_paths_to_yaml() {
+    // Only `.json` selects the JSON parser. Everything else — including
+    // unknown and extensionless paths — selects YAML.
+    assert!(detect_json_or_yaml_extension(Path::new("mesh.yaml")));
+    assert!(detect_json_or_yaml_extension(Path::new("mesh.yml")));
+    assert!(detect_json_or_yaml_extension(Path::new("mesh.YAML")));
+    assert!(detect_json_or_yaml_extension(Path::new("mesh.unknown")));
+    assert!(detect_json_or_yaml_extension(Path::new("mesh")));
+    assert!(!detect_json_or_yaml_extension(Path::new("mesh.json")));
+    assert!(!detect_json_or_yaml_extension(Path::new("mesh.JSON")));
+}
+
+#[test]
+fn unknown_extension_selects_yaml_with_no_json_fallback() {
+    // YAML is a superset of JSON, so an unknown-extension path holding an
+    // ordinary JSON document parses. That is the ONLY reason JSON keeps
+    // working there — it is not a fallback.
+    let ordinary_json = r#"{"mesh": {"services": []}}"#;
+    assert!(detect_json_or_yaml_extension(Path::new("mesh.unknown")));
+    serde_yaml::from_str::<serde_yaml::Value>(ordinary_json)
+        .expect("ordinary JSON is inside the YAML superset");
+
+    // A JSON-only shape that YAML rejects proves the removed content-sniffing
+    // fallback really is gone: libyaml invalidates a simple key once it runs
+    // past 1024 bytes, so this document is valid JSON and invalid YAML.
+    let long_key = "k".repeat(2048);
+    let json_only = format!("{{\"{long_key}\": 1}}");
+    serde_json::from_str::<serde_json::Value>(&json_only)
+        .expect("a 2 KiB object key is perfectly valid JSON");
+    assert!(
+        serde_yaml::from_str::<serde_yaml::Value>(&json_only).is_err(),
+        "a mapping key past libyaml's 1024-byte simple-key limit must fail YAML parsing"
+    );
+
+    // Selection therefore decides the outcome: the same bytes load under a
+    // `.json` extension and fail closed under an unknown one.
+    assert!(!detect_json_or_yaml_extension(Path::new("doc.json")));
+    assert!(detect_json_or_yaml_extension(Path::new("doc.unknown")));
+}
+
+#[test]
+fn a_disappearance_after_the_first_probe_is_instability_not_terminal_absence() {
+    // `absent_ok` callers key on a FIRST-probe NotFound. Once a probe has seen
+    // the path, a later NotFound means the target was replaced or removed
+    // mid-read, which must take the bounded retry instead of failing closed as
+    // a permanently absent file.
+    assert!(matches!(
+        classify_error_after_first_probe(StableFileError::NotFound),
+        StableFileError::Unstable(_)
     ));
-    assert!(detect_json_or_yaml_extension(
-        Path::new("mesh.unknown"),
-        "{\"mesh\":{}}"
+
+    // Every other classification is passed through untouched.
+    assert!(matches!(
+        classify_error_after_first_probe(StableFileError::NotRegularFile),
+        StableFileError::NotRegularFile
     ));
-    assert!(detect_json_or_yaml_extension(
-        Path::new("mesh.unknown"),
-        "{mesh: {services: []}}"
+    assert!(matches!(
+        classify_error_after_first_probe(StableFileError::TooLarge {
+            len: 2,
+            max_bytes: 1,
+            len_is_lower_bound: false,
+        }),
+        StableFileError::TooLarge { .. }
     ));
-    assert!(detect_json_or_yaml_extension(
-        Path::new("a.yaml"),
-        "{not-json"
+    assert!(matches!(
+        classify_error_after_first_probe(StableFileError::Unstable("kept")),
+        StableFileError::Unstable("kept")
     ));
-    assert!(!detect_json_or_yaml_extension(Path::new("a.json"), "mesh:"));
 }
 
 #[cfg(unix)]
@@ -279,6 +363,56 @@ mod unix_targets {
         assert!(
             saw_ok || saw_reject,
             "replacement churn must yield stable generations and/or fail-closed rejects"
+        );
+    }
+
+    #[test]
+    fn delete_recreate_churn_still_reaches_a_stable_generation() {
+        // Behavioral companion to the classifier test: a publisher that removes
+        // and recreates the path (non-atomic `cp`/editor style) must still be
+        // able to yield a stable generation. Before the disappearance was
+        // classified as instability, a window between probes surfaced a
+        // terminal NotFound that the bounded retry never revisited.
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("churn.conf");
+        std::fs::write(&live, "AAAA").unwrap();
+
+        let stop = Arc::new(Mutex::new(false));
+        let writer_stop = Arc::clone(&stop);
+        let writer_path = live.clone();
+        let writer = thread::spawn(move || {
+            while !*writer_stop.lock().unwrap() {
+                let _ = std::fs::remove_file(&writer_path);
+                thread::sleep(Duration::from_micros(200));
+                let _ = std::fs::write(&writer_path, "AAAA");
+                thread::sleep(Duration::from_millis(1));
+            }
+        });
+
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let mut saw_ok = false;
+        while Instant::now() < deadline {
+            match read_stable_file(&live, opts(TEST_LIMIT)) {
+                Ok(content) => {
+                    saw_ok = true;
+                    assert_eq!(content, "AAAA", "must never publish partial content");
+                }
+                // A first-probe absence during the writer's delete window is a
+                // legitimate NotFound; instability and transient IO are the
+                // fail-closed retry outcomes.
+                Err(StableFileError::NotFound)
+                | Err(StableFileError::Unstable(_))
+                | Err(StableFileError::Io(_)) => {}
+                Err(other) => panic!("unexpected error: {other}"),
+            }
+        }
+
+        *stop.lock().unwrap() = true;
+        writer.join().unwrap();
+        // The file exists between churn cycles, so a correct reader converges.
+        assert!(
+            saw_ok,
+            "delete/recreate churn must still reach a stable generation"
         );
     }
 

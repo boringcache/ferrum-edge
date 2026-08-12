@@ -13,10 +13,11 @@
 //! probes). The accepted result — or a precise load error — is cached for the
 //! process lifetime. A failed load is never converted into an empty fallback.
 //!
-//! When `FERRUM_CONF_PATH` is unset and `./ferrum.conf` is genuinely absent,
+//! When `FERRUM_CONF_PATH` is unset — or set to an empty / whitespace-only
+//! value, which configures nothing — and `./ferrum.conf` is genuinely absent,
 //! an empty defaults map is accepted for backward compatibility. An explicitly
-//! configured path that is missing, non-regular, oversized, unstable, invalid
-//! UTF-8, or malformed fails closed.
+//! configured non-empty path that is missing, non-regular, oversized, unstable,
+//! invalid UTF-8, or malformed fails closed.
 
 use crate::config::stable_file::{
     MAX_FERRUM_CONF_BYTES, StableFileError, StableFileReadOptions, format_stable_file_error,
@@ -50,7 +51,18 @@ pub fn resolve_ferrum_var(key: &str) -> Option<String> {
     if let Ok(val) = std::env::var(key) {
         return Some(val);
     }
-    match CONF_FILE_CACHE.get_or_init(ConfFile::load_uncached) {
+    conf_value_from_cached(CONF_FILE_CACHE.get_or_init(ConfFile::load_uncached), key)
+}
+
+/// Conf-file half of [`resolve_ferrum_var`], split out so the fail-closed
+/// behavior is testable without pinning the process-wide `OnceLock` snapshot.
+///
+/// A sticky load failure resolves to `None`. It must never be converted into an
+/// empty defaults map, which would silently turn a malformed or unreadable
+/// `ferrum.conf` into "no values configured" for the process lifetime.
+#[doc(hidden)]
+pub fn conf_value_from_cached(cached: &Result<ConfFile, String>, key: &str) -> Option<String> {
+    match cached {
         Ok(conf) => conf.get(key).map(|v| v.to_string()),
         Err(_) => None,
     }
@@ -166,8 +178,24 @@ impl ConfFile {
 }
 
 fn resolve_conf_path() -> (PathBuf, bool) {
-    match std::env::var(CONF_PATH_ENV_VAR) {
-        Ok(path) => (PathBuf::from(path), false),
-        Err(_) => (PathBuf::from(DEFAULT_CONF_PATH), true),
+    conf_path_selection(std::env::var(CONF_PATH_ENV_VAR).ok().as_deref())
+}
+
+/// Choose the conf-file path and whether absence is acceptable.
+///
+/// Takes the configured value directly rather than reading the environment, so
+/// the selection rule is testable without touching (or echoing) process
+/// environment state.
+///
+/// An empty or whitespace-only `FERRUM_CONF_PATH` is treated as **unset**: an
+/// operator who exports the variable without a value has configured nothing, so
+/// falling back to the default path with `absent_ok = true` preserves the
+/// historical "no conf file" behavior instead of failing startup on a blank
+/// path. An explicit non-empty path stays fail-closed.
+#[doc(hidden)]
+pub fn conf_path_selection(configured: Option<&str>) -> (PathBuf, bool) {
+    match configured {
+        Some(path) if !path.trim().is_empty() => (PathBuf::from(path), false),
+        _ => (PathBuf::from(DEFAULT_CONF_PATH), true),
     }
 }

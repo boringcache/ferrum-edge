@@ -380,35 +380,6 @@ fn mesh_reload_generation_advances_on_signal_and_stales_inflight_candidate() {
 }
 
 #[test]
-fn simultaneous_shutdown_and_completion_chooses_shutdown_and_does_not_publish() {
-    use ferrum_edge::modes::mesh::config_consumer::file_source::{
-        MeshReloadSelectReady, mesh_reload_completion_may_publish, mesh_reload_select_priority,
-    };
-
-    assert_eq!(
-        mesh_reload_select_priority(false, true, true),
-        Some(MeshReloadSelectReady::Shutdown),
-        "tied shutdown+completion must choose shutdown"
-    );
-    assert!(!mesh_reload_completion_may_publish(
-        true,
-        MeshReloadSelectReady::Shutdown
-    ));
-    assert!(mesh_reload_completion_may_publish(
-        true,
-        MeshReloadSelectReady::Completion
-    ));
-    assert!(!mesh_reload_completion_may_publish(
-        false,
-        MeshReloadSelectReady::Completion
-    ));
-    assert_eq!(
-        mesh_reload_select_priority(true, true, false),
-        Some(MeshReloadSelectReady::Hangup)
-    );
-}
-
-#[test]
 fn mesh_local_source_recovery_requires_proxy_accept_and_fences_generations() {
     use ferrum_edge::modes::mesh::config_consumer::file_source::{
         MeshLocalReloadApply, MeshLocalSourceRecovery, apply_mesh_file_reload_candidate,
@@ -879,4 +850,865 @@ fn failed_reload_retains_last_good_slice() {
         state.snapshot().as_ref().as_ref().unwrap().services.len(),
         1
     );
+}
+
+// ── Real reload-loop coverage (issue #3776) ─────────────────────────────────
+//
+// `run_mesh_local_reload_loop` IS the production state machine: both
+// `start_mesh_file_source_with_shutdown` and
+// `start_stock_policy_watcher_with_shutdown` delegate to it, differing only in
+// their notifier (SIGHUP), loader, and apply step. These tests drive that exact
+// loop through its injected-notifier seam so coalescing, generation fencing,
+// shutdown, and fail-closed retention are proven on the code that runs in
+// production rather than on a stand-in helper.
+
+mod reload_loop {
+    use super::{VALID_MESH_YAML, request_for_namespace};
+
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::Duration;
+
+    use ferrum_edge::modes::mesh::config::MeshConfig;
+    use ferrum_edge::modes::mesh::config_consumer::file_source::{
+        MESH_FILE_RELOAD_MESSAGES, MeshLocalReloadResult, MeshLocalSourceRecovery,
+        apply_mesh_file_reload_candidate, load_mesh_slice_from_file, run_mesh_local_reload_loop,
+        spawn_mesh_reload,
+    };
+    use ferrum_edge::modes::mesh::config_consumer::stock_xds_client::{
+        STOCK_POLICY_RELOAD_MESSAGES, StockPolicySnapshot, apply_stock_policy_reload_candidate,
+        load_stock_policy_baseline, spawn_stock_policy_reload,
+    };
+    use ferrum_edge::modes::mesh::runtime::MeshRuntimeState;
+
+    const SECOND_MESH_YAML: &str = r#"
+version: "1"
+mesh:
+  services:
+    - name: renamed-after-reload
+      namespace: ferrum
+      ports:
+        - port: 80
+          protocol: http
+"#;
+
+    const POLICY_YAML: &str = r#"
+version: "1"
+mesh:
+  peer_authentications:
+    - name: strict-default
+      namespace: ferrum
+      mtls_mode: strict
+"#;
+
+    const SECOND_POLICY_YAML: &str = r#"
+version: "1"
+mesh:
+  peer_authentications:
+    - name: renamed-after-reload
+      namespace: ferrum
+      mtls_mode: strict
+"#;
+
+    /// Name of the single `PeerAuthentication` the published baseline carries.
+    fn published_policy_name(snapshot: &StockPolicySnapshot) -> String {
+        snapshot
+            .mesh()
+            .peer_authentications
+            .first()
+            .map(|policy| policy.name.clone())
+            .unwrap_or_default()
+    }
+
+    /// A one-shot latch the first in-flight blocking load parks on, so the test
+    /// can hold exactly one generation in flight while notifications pile up.
+    #[derive(Default)]
+    struct Gate {
+        released: Mutex<bool>,
+        signal: Condvar,
+    }
+
+    impl Gate {
+        fn wait(&self) {
+            let mut released = self.released.lock().unwrap();
+            while !*released {
+                released = self.signal.wait(released).unwrap();
+            }
+        }
+
+        fn release(&self) {
+            *self.released.lock().unwrap() = true;
+            self.signal.notify_all();
+        }
+
+        /// Block the CALLER (deliberately, including a current-thread runtime
+        /// worker) until released or the deadline passes.
+        fn wait_timeout(&self, timeout: Duration) -> bool {
+            let released = self.released.lock().unwrap();
+            let (released, result) = self
+                .signal
+                .wait_timeout_while(released, timeout, |released| !*released)
+                .unwrap();
+            *released && !result.timed_out()
+        }
+    }
+
+    fn write(path: &std::path::Path, body: &str) {
+        std::fs::write(path, body).expect("write mesh document");
+    }
+
+    /// Poll `condition` until it holds or the deadline expires. Used instead of
+    /// fixed sleeps so the tests observe real loop progress.
+    async fn wait_until(label: &str, mut condition: impl FnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !condition() {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for: {label}"));
+    }
+
+    // ── localized `file` mesh source ────────────────────────────────────────
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn file_loop_coalesces_rapid_notifications_and_the_final_document_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mesh.yaml");
+        write(&path, VALID_MESH_YAML);
+        let path_str = path.to_string_lossy().to_string();
+
+        let state = MeshRuntimeState::new();
+        state.install_slice(
+            load_mesh_slice_from_file(&path, request_for_namespace("ferrum")).unwrap(),
+        );
+        let flag = Arc::new(AtomicBool::new(false));
+        let recovery = MeshLocalSourceRecovery::new(flag.clone());
+
+        let (notify_tx, notify_rx) = tokio::sync::mpsc::channel::<()>(16);
+        let (_shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(Gate::default());
+
+        let loop_task = {
+            let (path_str, state, recovery) = (path_str.clone(), state.clone(), recovery.clone());
+            let (spawns, gate) = (spawns.clone(), gate.clone());
+            tokio::spawn(async move {
+                let spawn_path = path_str.clone();
+                run_mesh_local_reload_loop(
+                    notify_rx,
+                    &mut shutdown_rx,
+                    &path_str,
+                    &recovery,
+                    &MESH_FILE_RELOAD_MESSAGES,
+                    || {
+                        // Hold ONLY the first generation in flight; every later
+                        // generation goes through the production spawn helper.
+                        if spawns.fetch_add(1, Ordering::SeqCst) == 0 {
+                            let gate = gate.clone();
+                            let load_path = spawn_path.clone();
+                            tokio::task::spawn_blocking(move || {
+                                gate.wait();
+                                load_mesh_slice_from_file(
+                                    std::path::Path::new(&load_path),
+                                    request_for_namespace("ferrum"),
+                                )
+                            })
+                        } else {
+                            spawn_mesh_reload(&spawn_path, request_for_namespace("ferrum"))
+                        }
+                    },
+                    |slice| MeshLocalReloadResult {
+                        version: Some(slice.version.clone()),
+                        apply: apply_mesh_file_reload_candidate(&state, &recovery, Ok(slice)),
+                    },
+                )
+                .await;
+            })
+        };
+
+        // Generation 1 is now parked in the blocking pool.
+        notify_tx.send(()).await.unwrap();
+        wait_until("first generation in flight", || {
+            spawns.load(Ordering::SeqCst) == 1
+        })
+        .await;
+
+        // Rewrite the document, then deliver a burst while generation 1 is
+        // still in flight. Waiting for the channel to drain proves the loop
+        // OBSERVED every notification before the completion arm can run, so the
+        // coalescing assertion below is not timing-dependent.
+        write(&path, SECOND_MESH_YAML);
+        for _ in 0..3 {
+            notify_tx.send(()).await.unwrap();
+        }
+        wait_until("burst observed by the loop", || notify_tx.capacity() == 16).await;
+
+        gate.release();
+
+        // The stale generation-1 candidate is discarded and exactly one
+        // follow-up generation runs, loading the FINAL document.
+        wait_until("final document installed", || {
+            state
+                .snapshot()
+                .as_ref()
+                .as_ref()
+                .is_some_and(|slice| {
+                    slice
+                        .services
+                        .first()
+                        .is_some_and(|svc| svc.name == "renamed-after-reload")
+                })
+        })
+        .await;
+        assert_eq!(
+            spawns.load(Ordering::SeqCst),
+            2,
+            "a burst during one in-flight load must coalesce to exactly one follow-up"
+        );
+
+        loop_task.abort();
+        let _ = loop_task.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn file_loop_shutdown_during_an_in_flight_load_returns_without_publishing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mesh.yaml");
+        write(&path, VALID_MESH_YAML);
+        let path_str = path.to_string_lossy().to_string();
+
+        let state = MeshRuntimeState::new();
+        let baseline = load_mesh_slice_from_file(&path, request_for_namespace("ferrum")).unwrap();
+        state.install_slice(baseline.clone());
+        let flag = Arc::new(AtomicBool::new(false));
+        let recovery = MeshLocalSourceRecovery::new(flag.clone());
+
+        let (notify_tx, notify_rx) = tokio::sync::mpsc::channel::<()>(4);
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(Gate::default());
+
+        let loop_task = {
+            let (path_str, state, recovery) = (path_str.clone(), state.clone(), recovery.clone());
+            let (spawns, gate) = (spawns.clone(), gate.clone());
+            tokio::spawn(async move {
+                let spawn_path = path_str.clone();
+                run_mesh_local_reload_loop(
+                    notify_rx,
+                    &mut shutdown_rx,
+                    &path_str,
+                    &recovery,
+                    &MESH_FILE_RELOAD_MESSAGES,
+                    || {
+                        spawns.fetch_add(1, Ordering::SeqCst);
+                        let gate = gate.clone();
+                        let load_path = spawn_path.clone();
+                        tokio::task::spawn_blocking(move || {
+                            gate.wait();
+                            load_mesh_slice_from_file(
+                                std::path::Path::new(&load_path),
+                                request_for_namespace("ferrum"),
+                            )
+                        })
+                    },
+                    |slice| MeshLocalReloadResult {
+                        version: Some(slice.version.clone()),
+                        apply: apply_mesh_file_reload_candidate(&state, &recovery, Ok(slice)),
+                    },
+                )
+                .await;
+            })
+        };
+
+        notify_tx.send(()).await.unwrap();
+        wait_until("load in flight", || spawns.load(Ordering::SeqCst) == 1).await;
+
+        // A different, perfectly VALID document: if the loop awaited the
+        // started blocking job (or let a late completion publish), this content
+        // would become live.
+        write(&path, SECOND_MESH_YAML);
+        shutdown_tx.send(true).unwrap();
+
+        // Shutdown must NOT wait for the non-cancellable blocking job.
+        tokio::time::timeout(Duration::from_secs(5), loop_task)
+            .await
+            .expect("shutdown must not await a started blocking load")
+            .expect("reload loop task");
+
+        gate.release();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert!(
+            state
+                .snapshot()
+                .as_ref()
+                .as_ref()
+                .expect("baseline retained")
+                .content_eq(&baseline),
+            "a load completing after shutdown must never publish"
+        );
+        assert!(!flag.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn file_loop_invalid_candidate_retains_last_good_and_raises_config_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mesh.yaml");
+        write(&path, VALID_MESH_YAML);
+        let path_str = path.to_string_lossy().to_string();
+
+        let state = MeshRuntimeState::new();
+        let baseline = load_mesh_slice_from_file(&path, request_for_namespace("ferrum")).unwrap();
+        state.install_slice(baseline.clone());
+        let flag = Arc::new(AtomicBool::new(false));
+        let recovery = MeshLocalSourceRecovery::new(flag.clone());
+
+        let (notify_tx, notify_rx) = tokio::sync::mpsc::channel::<()>(4);
+        let (_shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let loop_task = {
+            let (path_str, state, recovery) = (path_str.clone(), state.clone(), recovery.clone());
+            tokio::spawn(async move {
+                let spawn_path = path_str.clone();
+                run_mesh_local_reload_loop(
+                    notify_rx,
+                    &mut shutdown_rx,
+                    &path_str,
+                    &recovery,
+                    &MESH_FILE_RELOAD_MESSAGES,
+                    || spawn_mesh_reload(&spawn_path, request_for_namespace("ferrum")),
+                    |slice| MeshLocalReloadResult {
+                        version: Some(slice.version.clone()),
+                        apply: apply_mesh_file_reload_candidate(&state, &recovery, Ok(slice)),
+                    },
+                )
+                .await;
+            })
+        };
+
+        write(&path, "mesh: {");
+        notify_tx.send(()).await.unwrap();
+        wait_until("rejection observed", || flag.load(Ordering::SeqCst)).await;
+        assert!(
+            state
+                .snapshot()
+                .as_ref()
+                .as_ref()
+                .expect("last-good retained")
+                .content_eq(&baseline),
+            "an invalid candidate must retain the last-good slice"
+        );
+
+        // Recovery still requires proxy acceptance of the exact candidate.
+        write(&path, VALID_MESH_YAML);
+        notify_tx.send(()).await.unwrap();
+        wait_until("recovery candidate pending", || {
+            recovery.pending_epoch() != 0
+        })
+        .await;
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "a provisional install must not clear sticky health"
+        );
+        let live = state
+            .snapshot()
+            .as_ref()
+            .as_ref()
+            .cloned()
+            .expect("candidate installed");
+        recovery.note_proxy_apply_success(&live);
+        assert!(!flag.load(Ordering::SeqCst));
+
+        loop_task.abort();
+        let _ = loop_task.await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn file_loop_shutdown_wins_a_simultaneously_ready_completion() {
+        // On a current-thread runtime the loop task is only polled when this
+        // test awaits. Arming shutdown and finishing the load while the task is
+        // unpolled makes both select arms ready at the SAME poll, which is the
+        // exact tie the `biased;` shutdown-first ordering exists to resolve.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mesh.yaml");
+        write(&path, VALID_MESH_YAML);
+        let path_str = path.to_string_lossy().to_string();
+
+        let state = MeshRuntimeState::new();
+        let baseline = load_mesh_slice_from_file(&path, request_for_namespace("ferrum")).unwrap();
+        state.install_slice(baseline.clone());
+        let flag = Arc::new(AtomicBool::new(false));
+        let recovery = MeshLocalSourceRecovery::new(flag.clone());
+
+        let (notify_tx, notify_rx) = tokio::sync::mpsc::channel::<()>(4);
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(Gate::default());
+        let finished = Arc::new(Gate::default());
+
+        let loop_task = {
+            let (path_str, state, recovery) = (path_str.clone(), state.clone(), recovery.clone());
+            let (spawns, gate) = (spawns.clone(), gate.clone());
+            let finished = finished.clone();
+            tokio::spawn(async move {
+                let spawn_path = path_str.clone();
+                run_mesh_local_reload_loop(
+                    notify_rx,
+                    &mut shutdown_rx,
+                    &path_str,
+                    &recovery,
+                    &MESH_FILE_RELOAD_MESSAGES,
+                    || {
+                        spawns.fetch_add(1, Ordering::SeqCst);
+                        let gate = gate.clone();
+                        let load_path = spawn_path.clone();
+                        let finished = finished.clone();
+                        tokio::task::spawn_blocking(move || {
+                            gate.wait();
+                            let loaded = load_mesh_slice_from_file(
+                                std::path::Path::new(&load_path),
+                                request_for_namespace("ferrum"),
+                            );
+                            finished.release();
+                            loaded
+                        })
+                    },
+                    |slice| MeshLocalReloadResult {
+                        version: Some(slice.version.clone()),
+                        apply: apply_mesh_file_reload_candidate(&state, &recovery, Ok(slice)),
+                    },
+                )
+                .await;
+            })
+        };
+
+        notify_tx.send(()).await.unwrap();
+        wait_until("load in flight", || spawns.load(Ordering::SeqCst) == 1).await;
+
+        // A valid but DIFFERENT document, so publishing would be observable.
+        write(&path, SECOND_MESH_YAML);
+
+        // From here on the test performs no `.await`, so the loop task cannot
+        // be polled until both arms are armed.
+        shutdown_tx.send(true).unwrap();
+        gate.release();
+        assert!(
+            finished.wait_timeout(Duration::from_secs(10)),
+            "blocking load must complete while the loop is unpolled"
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), loop_task)
+            .await
+            .expect("loop returns on the tied poll")
+            .expect("reload loop task");
+
+        assert!(
+            state
+                .snapshot()
+                .as_ref()
+                .as_ref()
+                .expect("baseline retained")
+                .content_eq(&baseline),
+            "a completion tied with shutdown must not publish"
+        );
+        assert!(!flag.load(Ordering::SeqCst));
+    }
+
+    // ── `stock_xds` policy watcher ──────────────────────────────────────────
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stock_policy_loop_coalesces_rapid_notifications_and_the_final_document_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("policy.yaml");
+        write(&path, POLICY_YAML);
+        let path_str = path.to_string_lossy().to_string();
+
+        let baseline = load_stock_policy_baseline(&path).expect("policy baseline");
+        let (policy_tx, _policy_rx) =
+            tokio::sync::watch::channel(StockPolicySnapshot::initial(Arc::new(baseline)));
+        let flag = Arc::new(AtomicBool::new(false));
+        let recovery = MeshLocalSourceRecovery::new(flag.clone());
+
+        let (notify_tx, notify_rx) = tokio::sync::mpsc::channel::<()>(16);
+        let (_shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(Gate::default());
+        let observed = policy_tx.subscribe();
+
+        let loop_task = {
+            let (path_str, recovery) = (path_str.clone(), recovery.clone());
+            let (spawns, gate) = (spawns.clone(), gate.clone());
+            tokio::spawn(async move {
+                let spawn_path = path_str.clone();
+                run_mesh_local_reload_loop(
+                    notify_rx,
+                    &mut shutdown_rx,
+                    &path_str,
+                    &recovery,
+                    &STOCK_POLICY_RELOAD_MESSAGES,
+                    || {
+                        if spawns.fetch_add(1, Ordering::SeqCst) == 0 {
+                            let gate = gate.clone();
+                            let load_path = spawn_path.clone();
+                            tokio::task::spawn_blocking(move || {
+                                gate.wait();
+                                load_stock_policy_baseline(std::path::Path::new(&load_path))
+                            })
+                        } else {
+                            spawn_stock_policy_reload(&spawn_path)
+                        }
+                    },
+                    |mesh: MeshConfig| MeshLocalReloadResult {
+                        version: None,
+                        apply: apply_stock_policy_reload_candidate(&policy_tx, &recovery, Ok(mesh)),
+                    },
+                )
+                .await;
+            })
+        };
+
+        notify_tx.send(()).await.unwrap();
+        wait_until("first generation in flight", || {
+            spawns.load(Ordering::SeqCst) == 1
+        })
+        .await;
+
+        write(&path, SECOND_POLICY_YAML);
+        for _ in 0..3 {
+            notify_tx.send(()).await.unwrap();
+        }
+        wait_until("burst observed by the loop", || notify_tx.capacity() == 16).await;
+
+        gate.release();
+
+        wait_until("final policy published", || {
+            published_policy_name(&observed.borrow()) == "renamed-after-reload"
+        })
+        .await;
+        assert_eq!(
+            spawns.load(Ordering::SeqCst),
+            2,
+            "a burst during one in-flight load must coalesce to exactly one follow-up"
+        );
+
+        loop_task.abort();
+        let _ = loop_task.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stock_policy_loop_shutdown_during_an_in_flight_load_returns_without_publishing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("policy.yaml");
+        write(&path, POLICY_YAML);
+        let path_str = path.to_string_lossy().to_string();
+
+        let baseline = load_stock_policy_baseline(&path).expect("policy baseline");
+        let (policy_tx, _policy_rx) =
+            tokio::sync::watch::channel(StockPolicySnapshot::initial(Arc::new(baseline)));
+        let flag = Arc::new(AtomicBool::new(false));
+        let recovery = MeshLocalSourceRecovery::new(flag.clone());
+        let observed = policy_tx.subscribe();
+
+        let (notify_tx, notify_rx) = tokio::sync::mpsc::channel::<()>(4);
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(Gate::default());
+
+        let loop_task = {
+            let (path_str, recovery) = (path_str.clone(), recovery.clone());
+            let (spawns, gate) = (spawns.clone(), gate.clone());
+            tokio::spawn(async move {
+                let spawn_path = path_str.clone();
+                run_mesh_local_reload_loop(
+                    notify_rx,
+                    &mut shutdown_rx,
+                    &path_str,
+                    &recovery,
+                    &STOCK_POLICY_RELOAD_MESSAGES,
+                    || {
+                        spawns.fetch_add(1, Ordering::SeqCst);
+                        let gate = gate.clone();
+                        let load_path = spawn_path.clone();
+                        tokio::task::spawn_blocking(move || {
+                            gate.wait();
+                            load_stock_policy_baseline(std::path::Path::new(&load_path))
+                        })
+                    },
+                    |mesh: MeshConfig| MeshLocalReloadResult {
+                        version: None,
+                        apply: apply_stock_policy_reload_candidate(&policy_tx, &recovery, Ok(mesh)),
+                    },
+                )
+                .await;
+            })
+        };
+
+        notify_tx.send(()).await.unwrap();
+        wait_until("load in flight", || spawns.load(Ordering::SeqCst) == 1).await;
+
+        write(&path, SECOND_POLICY_YAML);
+        shutdown_tx.send(true).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), loop_task)
+            .await
+            .expect("shutdown must not await a started blocking load")
+            .expect("reload loop task");
+
+        gate.release();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert_eq!(
+            published_policy_name(&observed.borrow()),
+            "strict-default",
+            "a load completing after shutdown must never publish a new baseline"
+        );
+        assert!(!flag.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stock_policy_loop_invalid_candidate_retains_last_good_and_raises_config_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("policy.yaml");
+        write(&path, POLICY_YAML);
+        let path_str = path.to_string_lossy().to_string();
+
+        let baseline = load_stock_policy_baseline(&path).expect("policy baseline");
+        let (policy_tx, _policy_rx) =
+            tokio::sync::watch::channel(StockPolicySnapshot::initial(Arc::new(baseline)));
+        let flag = Arc::new(AtomicBool::new(false));
+        let recovery = MeshLocalSourceRecovery::new(flag.clone());
+        let observed = policy_tx.subscribe();
+
+        let (notify_tx, notify_rx) = tokio::sync::mpsc::channel::<()>(4);
+        let (_shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let loop_task = {
+            let (path_str, recovery) = (path_str.clone(), recovery.clone());
+            tokio::spawn(async move {
+                let spawn_path = path_str.clone();
+                run_mesh_local_reload_loop(
+                    notify_rx,
+                    &mut shutdown_rx,
+                    &path_str,
+                    &recovery,
+                    &STOCK_POLICY_RELOAD_MESSAGES,
+                    || spawn_stock_policy_reload(&spawn_path),
+                    |mesh: MeshConfig| MeshLocalReloadResult {
+                        version: None,
+                        apply: apply_stock_policy_reload_candidate(&policy_tx, &recovery, Ok(mesh)),
+                    },
+                )
+                .await;
+            })
+        };
+
+        write(&path, "mesh: {");
+        notify_tx.send(()).await.unwrap();
+        wait_until("rejection observed", || flag.load(Ordering::SeqCst)).await;
+        assert_eq!(
+            published_policy_name(&observed.borrow()),
+            "strict-default",
+            "an invalid candidate must retain the last-good policy baseline"
+        );
+        assert_eq!(
+            recovery.pending_epoch(),
+            0,
+            "a rejected candidate must leave no recovery that could later clear"
+        );
+
+        // A valid candidate publishes and marks recovery pending, but only the
+        // proxy apply lifecycle may clear sticky health.
+        write(&path, SECOND_POLICY_YAML);
+        notify_tx.send(()).await.unwrap();
+        wait_until("recovery candidate pending", || {
+            recovery.pending_epoch() != 0
+        })
+        .await;
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "a channel send must not clear sticky health"
+        );
+
+        loop_task.abort();
+        let _ = loop_task.await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stock_policy_loop_shutdown_wins_a_simultaneously_ready_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("policy.yaml");
+        write(&path, POLICY_YAML);
+        let path_str = path.to_string_lossy().to_string();
+
+        let baseline = load_stock_policy_baseline(&path).expect("policy baseline");
+        let (policy_tx, _policy_rx) =
+            tokio::sync::watch::channel(StockPolicySnapshot::initial(Arc::new(baseline)));
+        let flag = Arc::new(AtomicBool::new(false));
+        let recovery = MeshLocalSourceRecovery::new(flag.clone());
+        let observed = policy_tx.subscribe();
+
+        let (notify_tx, notify_rx) = tokio::sync::mpsc::channel::<()>(4);
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(Gate::default());
+        let finished = Arc::new(Gate::default());
+
+        let loop_task = {
+            let (path_str, recovery) = (path_str.clone(), recovery.clone());
+            let (spawns, gate) = (spawns.clone(), gate.clone());
+            let finished = finished.clone();
+            tokio::spawn(async move {
+                let spawn_path = path_str.clone();
+                run_mesh_local_reload_loop(
+                    notify_rx,
+                    &mut shutdown_rx,
+                    &path_str,
+                    &recovery,
+                    &STOCK_POLICY_RELOAD_MESSAGES,
+                    || {
+                        spawns.fetch_add(1, Ordering::SeqCst);
+                        let gate = gate.clone();
+                        let load_path = spawn_path.clone();
+                        let finished = finished.clone();
+                        tokio::task::spawn_blocking(move || {
+                            gate.wait();
+                            let loaded =
+                                load_stock_policy_baseline(std::path::Path::new(&load_path));
+                            finished.release();
+                            loaded
+                        })
+                    },
+                    |mesh: MeshConfig| MeshLocalReloadResult {
+                        version: None,
+                        apply: apply_stock_policy_reload_candidate(&policy_tx, &recovery, Ok(mesh)),
+                    },
+                )
+                .await;
+            })
+        };
+
+        notify_tx.send(()).await.unwrap();
+        wait_until("load in flight", || spawns.load(Ordering::SeqCst) == 1).await;
+
+        write(&path, SECOND_POLICY_YAML);
+
+        shutdown_tx.send(true).unwrap();
+        gate.release();
+        assert!(
+            finished.wait_timeout(Duration::from_secs(10)),
+            "blocking load must complete while the loop is unpolled"
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), loop_task)
+            .await
+            .expect("loop returns on the tied poll")
+            .expect("reload loop task");
+
+        assert_eq!(
+            published_policy_name(&observed.borrow()),
+            "strict-default",
+            "a completion tied with shutdown must not publish"
+        );
+        assert!(!flag.load(Ordering::SeqCst));
+    }
+}
+
+// ── Recovery-transition atomicity and no-pending short circuits (#3776) ─────
+
+#[test]
+fn mark_rejected_if_pending_is_one_transition_and_ignores_a_cleared_slot() {
+    use ferrum_edge::modes::mesh::config_consumer::file_source::MeshLocalSourceRecovery;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    let path = write_temp("yaml", VALID_MESH_YAML);
+    let slice = load_mesh_slice_from_file(&path, request_for_namespace("ferrum")).unwrap();
+
+    // No pending recovery: the helper must NOT raise sticky health. The old
+    // `pending_epoch() != 0` + `mark_rejected()` pair could observe a pending
+    // slot, lose it to a concurrent accept, and then raise anyway.
+    let recovery = MeshLocalSourceRecovery::new(Arc::new(AtomicBool::new(false)));
+    assert!(!recovery.mark_rejected_if_pending());
+    assert!(
+        !recovery.is_rejected(),
+        "an already-cleared pending slot must not raise config_rejected"
+    );
+
+    // A pending recovery that is accepted before the callback runs is likewise
+    // no longer rejectable.
+    recovery.mark_rejected();
+    assert!(recovery.mark_slice_recovery_pending(&slice).is_some());
+    recovery.note_proxy_apply_success(&slice);
+    assert!(!recovery.is_rejected());
+    assert_eq!(recovery.pending_epoch(), 0);
+    assert!(!recovery.mark_rejected_if_pending());
+    assert!(!recovery.is_rejected());
+
+    // Still pending: the helper raises and consumes the pending slot.
+    assert!(recovery.mark_slice_recovery_pending(&slice).is_some());
+    assert!(recovery.mark_rejected_if_pending());
+    assert!(recovery.is_rejected());
+    assert_eq!(
+        recovery.pending_epoch(),
+        0,
+        "raising rejection cancels the pending clear in the same transition"
+    );
+}
+
+#[test]
+fn apply_callbacks_with_no_relevant_pending_recovery_are_no_ops() {
+    // The early-return contract behind the hot-path recovery work: with no
+    // pending recovery (or an unbound policy recovery), a proxy accept/reject
+    // or a policy bind must leave health and the pending slot exactly as found.
+    use ferrum_edge::modes::mesh::config_consumer::file_source::MeshLocalSourceRecovery;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    let path = write_temp("yaml", VALID_MESH_YAML);
+    let slice = load_mesh_slice_from_file(&path, request_for_namespace("ferrum")).unwrap();
+
+    // Healthy, nothing pending.
+    let recovery = MeshLocalSourceRecovery::new(Arc::new(AtomicBool::new(false)));
+    recovery.note_proxy_apply_success(&slice);
+    recovery.note_proxy_apply_rejection(&slice);
+    recovery.bind_installed_slice_if_policy_recovery(1, &slice);
+    assert!(!recovery.is_rejected());
+    assert_eq!(recovery.pending_epoch(), 0);
+
+    // Degraded, nothing pending: an unrelated accepted slice must not clear.
+    recovery.mark_rejected();
+    recovery.note_proxy_apply_success(&slice);
+    assert!(recovery.is_rejected());
+    assert_eq!(recovery.pending_epoch(), 0);
+
+    // Unbound policy recovery: no digest is bound yet, so neither an apply
+    // rejection nor a bind for a DIFFERENT epoch may touch it.
+    let epoch = recovery.begin_policy_recovery();
+    assert_ne!(epoch, 0);
+    recovery.note_proxy_apply_rejection(&slice);
+    assert_eq!(
+        recovery.pending_epoch(),
+        epoch,
+        "an unbound policy recovery is not cancelable by an older apply callback"
+    );
+    recovery.bind_installed_slice_if_policy_recovery(epoch.wrapping_add(1), &slice);
+    assert_eq!(
+        recovery.pending_epoch(),
+        epoch,
+        "a bind for another epoch must leave the pending slot untouched"
+    );
+
+    // The matching bind does take effect, and only then can the exact slice
+    // clear sticky health.
+    recovery.bind_installed_slice_if_policy_recovery(epoch, &slice);
+    recovery.note_proxy_apply_success(&slice);
+    assert!(!recovery.is_rejected());
+    assert_eq!(recovery.pending_epoch(), 0);
 }

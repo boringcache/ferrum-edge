@@ -191,7 +191,9 @@ Enforcement rules:
 - **Non-blocking open (Unix).** `O_NONBLOCK` prevents a raced special file from wedging the caller after the pre-open metadata check.
 - **Metadata + streaming.** Known oversized metadata is fast-rejected; reads still stream through `limit + 1` so growth or inaccurate metadata cannot bypass the ceiling.
 - **Stability.** Two independent open/read cycles must observe matching file identity and byte-identical content. Instability retries a bounded number of times, then fails closed.
-- **Diagnostics.** Errors name the logical source and never include file contents.
+- **Absence.** Only the first probe's absence is an authoritative "not found" (the signal an optional document such as a default `ferrum.conf` keys on). A path that disappears after a probe already observed it — a delete/recreate or atomic-replace window — is classified as instability and takes the bounded retry instead of failing closed as permanently absent.
+- **Format selection.** JSON vs YAML is chosen from the file extension alone; there is no content sniffing and no JSON fallback, so a document is never parsed twice merely to classify it.
+- **Diagnostics.** Errors name the logical source and never include file contents. A refusal that stopped streaming at `limit + 1` reports the size as "at least N bytes" rather than presenting the truncation point as an exact measurement.
 
 See also [configuration.md](configuration.md) and [mesh.md](mesh.md#localized-file-source-no-control-plane).
 

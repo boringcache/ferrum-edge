@@ -45,7 +45,6 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -61,11 +60,12 @@ use super::common::{
     next_backoff_secs, refresh_dp_grpc_tls_config_if_changed, should_race_primary_retry,
     tonic_tls_config, wait_for_shutdown, wait_optional_tls_reload,
 };
+#[cfg(unix)]
+use super::file_source::SignalReloadNotifier;
 use super::file_source::{
-    MeshLocalReloadApply, MeshLocalSourceRecovery, MeshReloadSelectReady,
-    mark_mesh_local_reload_rejected, mesh_reload_completion_may_publish,
-    mesh_reload_generation_is_current, normalized_mesh_gateway_config, read_mesh_config_document,
-    record_mesh_reload_request,
+    MeshLocalReloadApply, MeshLocalReloadResult, MeshLocalSourceRecovery, MeshReloadLoopMessages,
+    mark_mesh_local_reload_rejected, normalized_mesh_gateway_config, read_mesh_config_document,
+    run_mesh_local_reload_loop,
 };
 use crate::grpc::dp_client::{DpGrpcTlsConfig, DpGrpcTlsReload};
 use crate::modes::mesh::config::MeshConfig;
@@ -1166,20 +1166,25 @@ fn apply_pending(
     last_logged_refusals: &mut Option<Vec<StockRefusal>>,
     recovery: &MeshLocalSourceRecovery,
 ) -> Result<(), anyhow::Error> {
-    let version = pending.slice.version.clone();
-    let services = pending.slice.services.len();
-    let workloads = pending.slice.workloads.len();
-    let type_url = pending.type_url.clone();
-    let refusals = pending.refusals;
-    let policy_recovery_epoch = pending.policy_recovery_epoch;
-    let installed = pending.slice.clone();
+    let PendingStockSlice {
+        slice,
+        type_url,
+        refusals,
+        policy_recovery_epoch,
+    } = *pending;
+    let version = slice.version.clone();
+    let services = slice.services.len();
+    let workloads = slice.workloads.len();
     // Bind the exact policy generation before `install_slice` wakes the proxy
     // apply task. A stale debounced slice carries its older epoch and therefore
-    // cannot bind or clear a newer concurrent policy recovery.
+    // cannot bind or clear a newer concurrent policy recovery. Binding BORROWS
+    // the candidate — it is moved into `install_slice` immediately after, so
+    // the recovery handshake must not force a full `MeshSlice` clone on this
+    // path.
     if let Some(epoch) = policy_recovery_epoch {
-        recovery.bind_installed_slice_if_policy_recovery(epoch, &installed);
+        recovery.bind_installed_slice_if_policy_recovery(epoch, &slice);
     }
-    match state.install_slice(pending.slice) {
+    match state.install_slice(slice) {
         MeshSliceInstall::Installed => {}
         MeshSliceInstall::Quarantined(rejection) => {
             warn!(
@@ -1188,10 +1193,10 @@ fn apply_pending(
                  the last-good slice and closing the stream for failover"
             );
             // Local policy recovery (or any install under a pending recovery)
-            // that hits the revision gate must stay/set degraded.
-            if recovery.pending_epoch() != 0 {
-                recovery.mark_rejected();
-            }
+            // that hits the revision gate must stay/set degraded. One critical
+            // section: a separate `pending_epoch()` test would let the slot be
+            // cleared or replaced before the raise landed.
+            recovery.mark_rejected_if_pending();
             return Err(anyhow::anyhow!(
                 "stock xDS mesh slice quarantined: {}",
                 rejection.reason().as_metric_label()
@@ -1314,10 +1319,7 @@ pub async fn start_stock_policy_watcher_with_shutdown(
 ) {
     #[cfg(unix)]
     {
-        use futures_util::FutureExt as _;
-
-        let mut hangup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
-        {
+        let hangup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
             Ok(stream) => stream,
             Err(e) => {
                 warn!(
@@ -1330,134 +1332,19 @@ pub async fn start_stock_policy_watcher_with_shutdown(
             }
         };
 
-        let latest_requested = AtomicU64::new(0);
-        let publish_allowed = AtomicBool::new(true);
-        let mut accepted_generation = 0u64;
-        let mut pending_follow_up = false;
-        let mut in_flight: Option<(
-            u64,
-            tokio::task::JoinHandle<Result<MeshConfig, anyhow::Error>>,
-        )> = None;
-
-        loop {
-            // `biased;` + shutdown first: when shutdown and completion are both
-            // ready, shutdown wins and completion cannot publish.
-            tokio::select! {
-                biased;
-                _ = wait_for_shutdown(&mut shutdown_rx) => {
-                    info!("Stock xDS mesh policy watcher shutting down");
-                    stop_accepting_stock_policy_candidates(&publish_allowed, &mut in_flight);
-                    return;
-                }
-                received = hangup.recv() => {
-                    if received.is_none() {
-                        warn!(
-                            "SIGHUP stream closed; the stock xDS mesh policy document will not \
-                             reload until restart"
-                        );
-                        stop_accepting_stock_policy_candidates(&publish_allowed, &mut in_flight);
-                        wait_for_shutdown(&mut shutdown_rx).await;
-                        return;
-                    }
-                    while hangup.recv().now_or_never().flatten().is_some() {}
-
-                    let generation = record_mesh_reload_request(&latest_requested);
-                    if in_flight.is_some() {
-                        pending_follow_up = true;
-                        continue;
-                    }
-                    in_flight = Some(spawn_stock_policy_reload(generation, &path));
-                }
-                join_result = async {
-                    match in_flight.as_mut() {
-                        Some((_, handle)) => Some(handle.await),
-                        None => {
-                            std::future::pending::<()>().await;
-                            None
-                        }
-                    }
-                } => {
-                    let Some((generation, _)) = in_flight.take() else {
-                        continue;
-                    };
-                    let Some(join_result) = join_result else {
-                        continue;
-                    };
-                    if !mesh_reload_completion_may_publish(
-                        publish_allowed.load(Ordering::Acquire),
-                        MeshReloadSelectReady::Completion,
-                    ) {
-                        continue;
-                    }
-
-                    match join_result {
-                        Ok(Ok(mesh)) => {
-                            let latest = latest_requested.load(Ordering::Acquire);
-                            if !mesh_reload_generation_is_current(generation, latest) {
-                                info!(
-                                    file_path = %path,
-                                    generation,
-                                    latest,
-                                    "Discarding stale stock xDS mesh policy reload generation"
-                                );
-                            } else if generation >= accepted_generation {
-                                let outcome = apply_stock_policy_reload_candidate(
-                                    &policy_tx,
-                                    &recovery,
-                                    Ok(mesh),
-                                );
-                                if matches!(
-                                    outcome,
-                                    MeshLocalReloadApply::Applied
-                                        | MeshLocalReloadApply::Unchanged
-                                ) {
-                                    info!(
-                                        file_path = %path,
-                                        generation,
-                                        ?outcome,
-                                        "Reloaded the stock xDS mesh policy document on SIGHUP"
-                                    );
-                                    accepted_generation = generation;
-                                }
-                            }
-                        }
-                        Ok(Err(e)) => {
-                            warn!(
-                                file_path = %path,
-                                generation,
-                                error = %e,
-                                "Failed to reload the stock xDS mesh policy document on SIGHUP; \
-                                 keeping the last good policy baseline"
-                            );
-                            mark_mesh_local_reload_rejected(&recovery);
-                        }
-                        Err(join_error) if join_error.is_cancelled() => {
-                            info!(
-                                file_path = %path,
-                                generation,
-                                "Stock xDS mesh policy reload join cancelled before publish"
-                            );
-                        }
-                        Err(join_error) => {
-                            warn!(
-                                file_path = %path,
-                                generation,
-                                error = %join_error,
-                                "Stock xDS mesh policy reload worker panicked; keeping the last \
-                                 good policy baseline"
-                            );
-                            mark_mesh_local_reload_rejected(&recovery);
-                        }
-                    }
-
-                    if pending_follow_up && publish_allowed.load(Ordering::Acquire) {
-                        pending_follow_up = false;
-                        let generation = latest_requested.load(Ordering::Acquire);
-                        in_flight = Some(spawn_stock_policy_reload(generation, &path));
-                    }
-                }
-            }
-        }
+        run_mesh_local_reload_loop(
+            SignalReloadNotifier(hangup),
+            &mut shutdown_rx,
+            &path,
+            &recovery,
+            &STOCK_POLICY_RELOAD_MESSAGES,
+            || spawn_stock_policy_reload(&path),
+            |mesh| MeshLocalReloadResult {
+                version: None,
+                apply: apply_stock_policy_reload_candidate(&policy_tx, &recovery, Ok(mesh)),
+            },
+        )
+        .await;
     }
 
     #[cfg(not(unix))]
@@ -1472,32 +1359,27 @@ pub async fn start_stock_policy_watcher_with_shutdown(
     }
 }
 
-#[cfg(unix)]
-fn spawn_stock_policy_reload(
-    generation: u64,
-    path: &str,
-) -> (
-    u64,
-    tokio::task::JoinHandle<Result<MeshConfig, anyhow::Error>>,
-) {
-    let load_path = PathBuf::from(path);
-    let handle = tokio::task::spawn_blocking(move || load_stock_policy_baseline(&load_path));
-    (generation, handle)
-}
+/// Log lines for the `stock_xds` policy watcher's reload loop.
+pub const STOCK_POLICY_RELOAD_MESSAGES: MeshReloadLoopMessages = MeshReloadLoopMessages {
+    shutdown: "Stock xDS mesh policy watcher shutting down",
+    notifier_closed: "SIGHUP stream closed; the stock xDS mesh policy document will not reload \
+                      until restart",
+    stale_generation: "Discarding stale stock xDS mesh policy reload generation",
+    reloaded: "Reloaded the stock xDS mesh policy document on SIGHUP",
+    load_failed: "Failed to reload the stock xDS mesh policy document on SIGHUP; keeping the last \
+                  good policy baseline",
+    join_cancelled: "Stock xDS mesh policy reload join cancelled before publish",
+    worker_panicked: "Stock xDS mesh policy reload worker panicked; keeping the last good policy \
+                      baseline",
+};
 
-/// Stop accepting stock policy reload candidates without awaiting a started
-/// `spawn_blocking` job (which Tokio cannot cancel once running).
-#[cfg(unix)]
-fn stop_accepting_stock_policy_candidates(
-    publish_allowed: &AtomicBool,
-    in_flight: &mut Option<(
-        u64,
-        tokio::task::JoinHandle<Result<MeshConfig, anyhow::Error>>,
-    )>,
-) {
-    publish_allowed.store(false, Ordering::Release);
-    if let Some((_, handle)) = in_flight.take() {
-        handle.abort();
-        drop(handle);
-    }
+/// Spawn one stock-policy baseline load onto the blocking pool.
+///
+/// Public so tests can drive [`run_mesh_local_reload_loop`] with the exact
+/// production loader instead of a stand-in.
+pub fn spawn_stock_policy_reload(
+    path: &str,
+) -> tokio::task::JoinHandle<Result<MeshConfig, anyhow::Error>> {
+    let load_path = PathBuf::from(path);
+    tokio::task::spawn_blocking(move || load_stock_policy_baseline(&load_path))
 }

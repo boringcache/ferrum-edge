@@ -123,9 +123,9 @@ pub fn read_mesh_config_document(
     let content = read_stable_file(path, options)
         .map_err(|error| stable_file_error_anyhow(path, options, error))?;
 
-    // Extension first; unknown/extensionless paths use YAML, which also admits
-    // JSON without a separate full-document detection parse.
-    let is_yaml = detect_json_or_yaml_extension(path, &content);
+    // Extension only; unknown/extensionless paths use YAML, which also admits
+    // ordinary JSON without a separate full-document detection parse.
+    let is_yaml = detect_json_or_yaml_extension(path);
 
     let document: MeshFileDocument = if is_yaml {
         serde_yaml::from_str(&content).map_err(|e| anyhow::anyhow!(mesh_doc_parse_error(e)))?
@@ -197,49 +197,223 @@ pub fn mesh_reload_generation_is_current(generation: u64, latest_requested: u64)
     generation == latest_requested
 }
 
-/// Which reload-loop arm wins when one or more are simultaneously ready.
+/// Reload notification source driving [`run_mesh_local_reload_loop`].
 ///
-/// Shutdown is ordered first so a tied completion cannot publish after the
-/// gate should already be closed. Production loops use a `biased;`
-/// `tokio::select!` with the shutdown arm listed first; this helper is the
-/// behavioral contract those loops implement.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MeshReloadSelectReady {
-    Hangup,
-    Completion,
-    Shutdown,
+/// Production wraps the SIGHUP stream ([`SignalReloadNotifier`]); tests inject
+/// an mpsc receiver so the EXACT production loop body can be driven
+/// deterministically instead of through a process-global signal.
+pub trait MeshReloadNotifier: Send {
+    /// Wait for the next reload notification. `None` means the source closed
+    /// and no further reloads are possible.
+    fn recv(&mut self) -> impl std::future::Future<Output = Option<()>> + Send;
+
+    /// Drop notifications that are already queued, without waiting. Repeated
+    /// signals collapse into the single follow-up the loop schedules.
+    fn drain_ready(&mut self);
 }
 
-/// Deterministic winner for the localized file / stock-policy reload loop.
-///
-/// When shutdown and completion are both ready, shutdown wins. Hangup is only
-/// selected when shutdown is not ready.
-pub fn mesh_reload_select_priority(
-    hangup_ready: bool,
-    completion_ready: bool,
-    shutdown_ready: bool,
-) -> Option<MeshReloadSelectReady> {
-    if shutdown_ready {
-        return Some(MeshReloadSelectReady::Shutdown);
+/// SIGHUP-backed notifier used by both production reload loops.
+#[cfg(unix)]
+pub struct SignalReloadNotifier(pub tokio::signal::unix::Signal);
+
+#[cfg(unix)]
+impl MeshReloadNotifier for SignalReloadNotifier {
+    async fn recv(&mut self) -> Option<()> {
+        self.0.recv().await
     }
-    if hangup_ready {
-        return Some(MeshReloadSelectReady::Hangup);
+
+    fn drain_ready(&mut self) {
+        use futures_util::FutureExt as _;
+        while self.0.recv().now_or_never().flatten().is_some() {}
     }
-    if completion_ready {
-        return Some(MeshReloadSelectReady::Completion);
-    }
-    None
 }
 
-/// Whether a completed load may publish after the select winner is known.
+/// Injected notifier seam: the deterministic stand-in for SIGHUP delivery.
 ///
-/// Shutdown winners never publish, even if `publish_allowed` has not flipped
-/// yet — callers must stop accepting before returning from the shutdown arm.
-pub fn mesh_reload_completion_may_publish(
-    publish_allowed: bool,
-    select_winner: MeshReloadSelectReady,
-) -> bool {
-    publish_allowed && matches!(select_winner, MeshReloadSelectReady::Completion)
+/// This is a plain generic impl, not a test-only runtime branch — the loop it
+/// drives is byte-for-byte the loop production runs.
+impl MeshReloadNotifier for tokio::sync::mpsc::Receiver<()> {
+    async fn recv(&mut self) -> Option<()> {
+        tokio::sync::mpsc::Receiver::recv(self).await
+    }
+
+    fn drain_ready(&mut self) {
+        while self.try_recv().is_ok() {}
+    }
+}
+
+/// Operator-facing log lines for one localized reload loop instance. Keeping
+/// them as `&'static str` fields lets both sources share one state machine
+/// while retaining their own wording.
+#[derive(Debug, Clone, Copy)]
+pub struct MeshReloadLoopMessages {
+    pub shutdown: &'static str,
+    pub notifier_closed: &'static str,
+    pub stale_generation: &'static str,
+    pub reloaded: &'static str,
+    pub load_failed: &'static str,
+    pub join_cancelled: &'static str,
+    pub worker_panicked: &'static str,
+}
+
+/// Outcome of applying one completed reload candidate.
+#[derive(Debug, Clone)]
+pub struct MeshLocalReloadResult {
+    pub apply: MeshLocalReloadApply,
+    /// Optional observability stamp (the mesh slice version, when the source
+    /// produces one).
+    pub version: Option<String>,
+}
+
+/// The localized reload state machine shared by the `file` mesh source and the
+/// `stock_xds` policy watcher.
+///
+/// One loop, two instantiations, so the coalescing / generation-fencing /
+/// shutdown contract cannot diverge between them:
+///
+/// * repeated notifications coalesce to ONE in-flight load plus at most ONE
+///   follow-up, and the requested generation advances when the notification is
+///   OBSERVED, so an older completed load can never install over a newer
+///   request;
+/// * shutdown is `biased;`-first, so a completion that becomes ready in the
+///   same poll cannot publish; shutdown also stops accepting candidates without
+///   awaiting a started (non-cancellable) `spawn_blocking` job;
+/// * every failure path (load error, worker panic, apply rejection) retains the
+///   last-good generation and raises the sticky `config_rejected` signal.
+pub async fn run_mesh_local_reload_loop<N, T, S, A>(
+    mut notifier: N,
+    shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
+    path: &str,
+    recovery: &MeshLocalSourceRecovery,
+    messages: &MeshReloadLoopMessages,
+    spawn: S,
+    mut apply: A,
+) where
+    N: MeshReloadNotifier,
+    T: Send + 'static,
+    S: Fn() -> tokio::task::JoinHandle<Result<T, anyhow::Error>>,
+    A: FnMut(T) -> MeshLocalReloadResult,
+{
+    let latest_requested = AtomicU64::new(0);
+    let publish_allowed = AtomicBool::new(true);
+    let mut accepted_generation = 0u64;
+    let mut pending_follow_up = false;
+    let mut in_flight: Option<(u64, tokio::task::JoinHandle<Result<T, anyhow::Error>>)> = None;
+
+    loop {
+        // `biased;` + shutdown first: when shutdown and completion are both
+        // ready, shutdown wins and the completion cannot publish.
+        tokio::select! {
+            biased;
+            _ = super::common::wait_for_shutdown(shutdown_rx) => {
+                info!("{}", messages.shutdown);
+                stop_accepting_reload_candidates(&publish_allowed, &mut in_flight);
+                return;
+            }
+            received = notifier.recv() => {
+                if received.is_none() {
+                    warn!("{}", messages.notifier_closed);
+                    stop_accepting_reload_candidates(&publish_allowed, &mut in_flight);
+                    super::common::wait_for_shutdown(shutdown_rx).await;
+                    return;
+                }
+                // Coalesce any already-queued notifications into one follow-up.
+                notifier.drain_ready();
+
+                // Advance the requested generation at observation so an
+                // in-flight older candidate becomes stale immediately.
+                let generation = record_mesh_reload_request(&latest_requested);
+                if in_flight.is_some() {
+                    pending_follow_up = true;
+                    continue;
+                }
+                in_flight = Some((generation, spawn()));
+            }
+            join_result = async {
+                match in_flight.as_mut() {
+                    Some((_, handle)) => Some(handle.await),
+                    None => {
+                        std::future::pending::<()>().await;
+                        None
+                    }
+                }
+            } => {
+                let Some((generation, _)) = in_flight.take() else {
+                    continue;
+                };
+                let Some(join_result) = join_result else {
+                    continue;
+                };
+
+                if !publish_allowed.load(Ordering::Acquire) {
+                    // Shutdown already stopped accepting candidates.
+                    continue;
+                }
+
+                match join_result {
+                    Ok(Ok(loaded)) => {
+                        let latest = latest_requested.load(Ordering::Acquire);
+                        if !mesh_reload_generation_is_current(generation, latest) {
+                            info!(
+                                file_path = %path,
+                                generation,
+                                latest,
+                                "{}", messages.stale_generation
+                            );
+                        } else if generation >= accepted_generation {
+                            let result = apply(loaded);
+                            if matches!(
+                                result.apply,
+                                MeshLocalReloadApply::Applied | MeshLocalReloadApply::Unchanged
+                            ) {
+                                info!(
+                                    file_path = %path,
+                                    mesh_slice_version = result.version.as_deref().unwrap_or(""),
+                                    generation,
+                                    outcome = ?result.apply,
+                                    "{}", messages.reloaded
+                                );
+                                accepted_generation = generation;
+                            }
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        warn!(
+                            file_path = %path,
+                            generation,
+                            error = %e,
+                            "{}", messages.load_failed
+                        );
+                        mark_mesh_local_reload_rejected(recovery);
+                    }
+                    Err(join_error) if join_error.is_cancelled() => {
+                        info!(
+                            file_path = %path,
+                            generation,
+                            "{}", messages.join_cancelled
+                        );
+                    }
+                    Err(join_error) => {
+                        warn!(
+                            file_path = %path,
+                            generation,
+                            error = %join_error,
+                            "{}", messages.worker_panicked
+                        );
+                        mark_mesh_local_reload_rejected(recovery);
+                    }
+                }
+
+                if pending_follow_up && publish_allowed.load(Ordering::Acquire) {
+                    pending_follow_up = false;
+                    // Reuse the latest requested generation recorded when the
+                    // coalesced notification(s) arrived.
+                    let generation = latest_requested.load(Ordering::Acquire);
+                    in_flight = Some((generation, spawn()));
+                }
+            }
+        }
+    }
 }
 
 /// What a pending local-source recovery is waiting for.
@@ -359,6 +533,53 @@ impl MeshLocalSourceRecovery {
         }
     }
 
+    /// Raise `config_rejected` only if a recovery is still pending, as ONE
+    /// critical section.
+    ///
+    /// `pending_epoch() != 0` followed by a separate `mark_rejected()` is a
+    /// TOCTOU: the pending slot can be cleared (a concurrent proxy accept) or
+    /// replaced (a newer candidate) between the two calls, so the second call
+    /// would either raise health for a recovery that already succeeded or
+    /// cancel a newer recovery it never tested. Testing and raising under one
+    /// lock acquisition removes that window.
+    ///
+    /// Returns whether the sticky signal was raised. A poisoned lock fails
+    /// closed (raises and reports `true`).
+    pub fn mark_rejected_if_pending(&self) -> bool {
+        match self.state.lock() {
+            Ok(mut state) => {
+                if state.pending.is_none() {
+                    return false;
+                }
+                self.mark_rejected_locked(&mut state);
+                true
+            }
+            Err(_) => {
+                self.fail_closed_on_poisoned_state();
+                true
+            }
+        }
+    }
+
+    /// Whether a pending recovery exists that a slice identity could match.
+    ///
+    /// Cheap pre-check so the callbacks below can skip canonical slice
+    /// digesting entirely when there is nothing to bind, clear, or cancel. It
+    /// is only an optimization: every caller re-acquires the lock and
+    /// re-validates the pending slot before acting, so a state change in the
+    /// gap cannot be acted on stale.
+    fn has_digest_bearing_pending(&self) -> bool {
+        match self.state.lock() {
+            Ok(state) => state
+                .pending
+                .is_some_and(|pending| pending.digest.is_some()),
+            Err(_) => {
+                self.fail_closed_on_poisoned_state();
+                false
+            }
+        }
+    }
+
     /// Transition body for [`Self::mark_rejected`]. The caller already holds the
     /// transition lock — never call the public method from inside a critical
     /// section, the mutex is not reentrant.
@@ -450,7 +671,27 @@ impl MeshLocalSourceRecovery {
     /// late install can neither resurrect a canceled recovery nor overwrite a
     /// newer candidate's identity.
     pub fn bind_installed_slice_if_policy_recovery(&self, expected_epoch: u64, slice: &MeshSlice) {
+        // Cheap pre-check: with no still-current policy recovery for this
+        // epoch there is nothing to bind, so skip the canonical digest work
+        // entirely. The authoritative test is re-done under the lock below.
+        match self.state.lock() {
+            Ok(state) => {
+                let relevant = state.pending.is_some_and(|pending| {
+                    pending.kind == PendingRecoveryKind::Policy && pending.epoch == expected_epoch
+                });
+                if !relevant {
+                    return;
+                }
+            }
+            Err(_) => {
+                self.fail_closed_on_poisoned_state();
+                return;
+            }
+        }
+
         let identity = slice_content_identity(slice);
+        // Re-acquire and revalidate epoch/kind exactly as before: the pending
+        // slot may have been canceled or superseded while the digest ran.
         let mut state = match self.state.lock() {
             Ok(state) => state,
             Err(_) => {
@@ -489,6 +730,12 @@ impl MeshLocalSourceRecovery {
     /// rejection or a newer candidate that linearizes first is already visible
     /// and this (now stale) success declines.
     pub fn note_proxy_apply_success(&self, slice: &MeshSlice) {
+        // No digest-bearing pending recovery ⇒ nothing this success could
+        // prove, so do not pay for the canonical slice identity. The pending
+        // slot is re-read and re-compared under the lock below.
+        if !self.has_digest_bearing_pending() {
+            return;
+        }
         let MeshRevisionContentIdentity::Digest(digest) = slice_content_identity(slice) else {
             // An unprovable identity can never prove a recovery; it is also not
             // evidence of failure, so health is left untouched.
@@ -521,6 +768,12 @@ impl MeshLocalSourceRecovery {
     /// whose candidate no longer matches the pending slot leaves a newer
     /// recovery outstanding.
     pub fn note_proxy_apply_rejection(&self, slice: &MeshSlice) {
+        // Only a digest-bearing pending recovery is cancelable (an unbound
+        // policy recovery deliberately matches nothing), so skip the canonical
+        // digest when there is none. Re-validated under the lock below.
+        if !self.has_digest_bearing_pending() {
+            return;
+        }
         let identity = slice_content_identity(slice);
         let mut state = match self.state.lock() {
             Ok(state) => state,
@@ -644,10 +897,7 @@ pub async fn start_mesh_file_source_with_shutdown(
 ) {
     #[cfg(unix)]
     {
-        use futures_util::FutureExt as _;
-
-        let mut hangup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
-        {
+        let hangup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
             Ok(stream) => stream,
             Err(e) => {
                 warn!(
@@ -660,142 +910,19 @@ pub async fn start_mesh_file_source_with_shutdown(
             }
         };
 
-        let latest_requested = AtomicU64::new(0);
-        let publish_allowed = AtomicBool::new(true);
-        let mut accepted_generation = 0u64;
-        let mut pending_follow_up = false;
-        let mut in_flight: Option<(
-            u64,
-            tokio::task::JoinHandle<Result<MeshSlice, anyhow::Error>>,
-        )> = None;
-
-        loop {
-            // `biased;` + shutdown first: when shutdown and completion are both
-            // ready, shutdown wins and completion cannot publish.
-            tokio::select! {
-                biased;
-                _ = super::common::wait_for_shutdown(&mut shutdown_rx) => {
-                    info!("Mesh file source shutting down");
-                    stop_accepting_reload_candidates(&publish_allowed, &mut in_flight);
-                    return;
-                }
-                received = hangup.recv() => {
-                    if received.is_none() {
-                        warn!(
-                            "SIGHUP stream closed; mesh file source will not reload until restart"
-                        );
-                        stop_accepting_reload_candidates(&publish_allowed, &mut in_flight);
-                        super::common::wait_for_shutdown(&mut shutdown_rx).await;
-                        return;
-                    }
-                    // Coalesce any already-queued hangups into one follow-up.
-                    while hangup.recv().now_or_never().flatten().is_some() {}
-
-                    // Advance the requested generation at signal observation so
-                    // an in-flight older candidate becomes stale immediately.
-                    let generation = record_mesh_reload_request(&latest_requested);
-                    if in_flight.is_some() {
-                        pending_follow_up = true;
-                        continue;
-                    }
-
-                    in_flight = Some(spawn_mesh_reload(generation, &path, request.clone()));
-                }
-                join_result = async {
-                    match in_flight.as_mut() {
-                        Some((_, handle)) => Some(handle.await),
-                        None => {
-                            std::future::pending::<()>().await;
-                            None
-                        }
-                    }
-                } => {
-                    let Some((generation, _)) = in_flight.take() else {
-                        continue;
-                    };
-                    let Some(join_result) = join_result else {
-                        continue;
-                    };
-
-                    if !mesh_reload_completion_may_publish(
-                        publish_allowed.load(Ordering::Acquire),
-                        MeshReloadSelectReady::Completion,
-                    ) {
-                        // Shutdown already stopped accepting candidates.
-                        continue;
-                    }
-
-                    match join_result {
-                        Ok(Ok(slice)) => {
-                            let latest = latest_requested.load(Ordering::Acquire);
-                            if !mesh_reload_generation_is_current(generation, latest) {
-                                info!(
-                                    file_path = %path,
-                                    generation,
-                                    latest,
-                                    "Discarding stale mesh file reload generation"
-                                );
-                            } else if generation >= accepted_generation {
-                                let version = slice.version.clone();
-                                let outcome = apply_mesh_file_reload_candidate(
-                                    &state,
-                                    &recovery,
-                                    Ok(slice),
-                                );
-                                if matches!(
-                                    outcome,
-                                    MeshLocalReloadApply::Applied
-                                        | MeshLocalReloadApply::Unchanged
-                                ) {
-                                    info!(
-                                        file_path = %path,
-                                        mesh_slice_version = %version,
-                                        generation,
-                                        ?outcome,
-                                        "Reloaded mesh config file on SIGHUP"
-                                    );
-                                    accepted_generation = generation;
-                                }
-                            }
-                        }
-                        Ok(Err(e)) => {
-                            warn!(
-                                file_path = %path,
-                                generation,
-                                error = %e,
-                                "Failed to reload mesh config file on SIGHUP; keeping the last \
-                                 good mesh slice"
-                            );
-                            mark_mesh_local_reload_rejected(&recovery);
-                        }
-                        Err(join_error) if join_error.is_cancelled() => {
-                            info!(
-                                file_path = %path,
-                                generation,
-                                "Mesh file reload join cancelled before publish"
-                            );
-                        }
-                        Err(join_error) => {
-                            warn!(
-                                file_path = %path,
-                                generation,
-                                error = %join_error,
-                                "Mesh file reload worker panicked; keeping the last good mesh slice"
-                            );
-                            mark_mesh_local_reload_rejected(&recovery);
-                        }
-                    }
-
-                    if pending_follow_up && publish_allowed.load(Ordering::Acquire) {
-                        pending_follow_up = false;
-                        // Reuse the latest requested generation recorded when
-                        // the coalesced signal(s) arrived.
-                        let generation = latest_requested.load(Ordering::Acquire);
-                        in_flight = Some(spawn_mesh_reload(generation, &path, request.clone()));
-                    }
-                }
-            }
-        }
+        run_mesh_local_reload_loop(
+            SignalReloadNotifier(hangup),
+            &mut shutdown_rx,
+            &path,
+            &recovery,
+            &MESH_FILE_RELOAD_MESSAGES,
+            || spawn_mesh_reload(&path, request.clone()),
+            |slice| MeshLocalReloadResult {
+                version: Some(slice.version.clone()),
+                apply: apply_mesh_file_reload_candidate(&state, &recovery, Ok(slice)),
+            },
+        )
+        .await;
     }
 
     #[cfg(not(unix))]
@@ -812,19 +939,27 @@ pub async fn start_mesh_file_source_with_shutdown(
     }
 }
 
-#[cfg(unix)]
-fn spawn_mesh_reload(
-    generation: u64,
+/// Log lines for the localized `file` mesh source's reload loop.
+pub const MESH_FILE_RELOAD_MESSAGES: MeshReloadLoopMessages = MeshReloadLoopMessages {
+    shutdown: "Mesh file source shutting down",
+    notifier_closed: "SIGHUP stream closed; mesh file source will not reload until restart",
+    stale_generation: "Discarding stale mesh file reload generation",
+    reloaded: "Reloaded mesh config file on SIGHUP",
+    load_failed: "Failed to reload mesh config file on SIGHUP; keeping the last good mesh slice",
+    join_cancelled: "Mesh file reload join cancelled before publish",
+    worker_panicked: "Mesh file reload worker panicked; keeping the last good mesh slice",
+};
+
+/// Spawn one localized mesh-document load onto the blocking pool.
+///
+/// Public so tests can drive [`run_mesh_local_reload_loop`] with the exact
+/// production loader instead of a stand-in.
+pub fn spawn_mesh_reload(
     path: &str,
     request: MeshSliceRequest,
-) -> (
-    u64,
-    tokio::task::JoinHandle<Result<MeshSlice, anyhow::Error>>,
-) {
+) -> tokio::task::JoinHandle<Result<MeshSlice, anyhow::Error>> {
     let load_path = PathBuf::from(path);
-    let handle =
-        tokio::task::spawn_blocking(move || load_mesh_slice_from_file(&load_path, request));
-    (generation, handle)
+    tokio::task::spawn_blocking(move || load_mesh_slice_from_file(&load_path, request))
 }
 
 /// Stop accepting reload candidates and detach any in-flight blocking work.
@@ -832,15 +967,11 @@ fn spawn_mesh_reload(
 /// Tokio cannot cancel a `spawn_blocking` task once it has started. Aborting
 /// the join handle only prevents scheduling if the job has not begun; awaiting
 /// a started job would stall watcher shutdown. Dropping the handle detaches
-/// the result, and [`publish_allowed`] prevents a late completion from
+/// the result, and the `publish_allowed` gate prevents a late completion from
 /// installing if the join arm still races.
-#[cfg(unix)]
-fn stop_accepting_reload_candidates(
+fn stop_accepting_reload_candidates<T>(
     publish_allowed: &AtomicBool,
-    in_flight: &mut Option<(
-        u64,
-        tokio::task::JoinHandle<Result<MeshSlice, anyhow::Error>>,
-    )>,
+    in_flight: &mut Option<(u64, tokio::task::JoinHandle<Result<T, anyhow::Error>>)>,
 ) {
     publish_allowed.store(false, Ordering::Release);
     if let Some((_, handle)) = in_flight.take() {

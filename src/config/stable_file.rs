@@ -15,7 +15,11 @@
 //! 4. Two independent open/read cycles must observe matching file identity and
 //!    **byte-identical** content. Size/metadata agreement alone is not success.
 //! 5. Instability retries a bounded number of times, then fails closed.
-//! 6. Errors name the logical source and never include file contents.
+//! 6. Only the FIRST probe's absence is an authoritative [`StableFileError::NotFound`]
+//!    (the `absent_ok` signal). A path that disappears after a probe already
+//!    proved it existed is transient instability, so it takes the bounded retry
+//!    instead of failing closed as a terminal absence.
+//! 7. Errors name the logical source and never include file contents.
 
 use std::io::Read;
 use std::path::Path;
@@ -105,10 +109,14 @@ pub enum StableFileError {
     NotRegularFile,
     /// Document exceeds the caller ceiling (metadata and/or streamed bytes).
     TooLarge {
-        /// Observed or lower-bound size in bytes.
+        /// Observed size in bytes, or a lower bound when `len_is_lower_bound`.
         len: u64,
         /// Configured ceiling.
         max_bytes: u64,
+        /// `true` when the read stopped at `max_bytes + 1` and the real size is
+        /// only known to be at least `len`. Streamed refusals must not report a
+        /// lower bound as if it were the exact file size.
+        len_is_lower_bound: bool,
     },
     /// Consecutive probes disagreed on identity or content.
     Unstable(&'static str),
@@ -122,10 +130,23 @@ impl std::fmt::Display for StableFileError {
             Self::NotFound => write!(f, "path not found"),
             Self::Io(error) => write!(f, "{error}"),
             Self::NotRegularFile => write!(f, "path exists but is not a regular file"),
-            Self::TooLarge { len, max_bytes } => write!(
-                f,
-                "file is {len} bytes; maximum supported size is {max_bytes} bytes"
-            ),
+            Self::TooLarge {
+                len,
+                max_bytes,
+                len_is_lower_bound,
+            } => {
+                if *len_is_lower_bound {
+                    write!(
+                        f,
+                        "file is at least {len} bytes; maximum supported size is {max_bytes} bytes"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "file is {len} bytes; maximum supported size is {max_bytes} bytes"
+                    )
+                }
+            }
             Self::Unstable(reason) => write!(f, "{reason}"),
             Self::NotUtf8(error) => write!(f, "file is not valid UTF-8: {error}"),
         }
@@ -192,6 +213,7 @@ fn read_opened_file(
         return Err(StableFileError::TooLarge {
             len: identity.len,
             max_bytes,
+            len_is_lower_bound: false,
         });
     }
 
@@ -204,9 +226,12 @@ fn read_opened_file(
         bounded.read_to_end(&mut bytes).map_err(map_io)?;
     }
     if bytes.len() as u64 > max_bytes {
+        // The read deliberately stopped at `max_bytes + 1`, so this is a lower
+        // bound on the real size, not a measurement of it.
         return Err(StableFileError::TooLarge {
             len: max_bytes.saturating_add(1),
             max_bytes,
+            len_is_lower_bound: true,
         });
     }
     if bytes.len() as u64 != identity.len {
@@ -236,23 +261,47 @@ fn read_opened_file(
     Ok(bytes)
 }
 
+/// Reclassify a failure observed **after** a probe already proved the path
+/// existed.
+///
+/// Only the first metadata probe is authoritative for absence — that is the
+/// signal `absent_ok` callers key on. Once the path has been seen, a `NotFound`
+/// from a later open/metadata probe means the target was replaced or removed
+/// mid-read (an atomic-publish or delete/recreate window), which is transient
+/// instability and belongs to the bounded retry. Returning terminal `NotFound`
+/// there would make a momentary republish look like a permanently absent file.
+pub fn classify_error_after_first_probe(error: StableFileError) -> StableFileError {
+    match error {
+        StableFileError::NotFound => StableFileError::Unstable(
+            "configured path disappeared after a probe already observed it",
+        ),
+        other => other,
+    }
+}
+
 fn read_snapshot(path: &Path, max_bytes: u64) -> Result<(FileIdentity, Vec<u8>), StableFileError> {
+    // The FIRST metadata probe is the only authoritative absence signal.
     let path_metadata_before = std::fs::metadata(path).map_err(map_io)?;
     require_regular_file(&path_metadata_before)?;
     let path_identity_before = FileIdentity::from_metadata(&path_metadata_before);
 
-    let mut file = open_path(path).map_err(map_io)?;
-    let opened_metadata = file.metadata().map_err(map_io)?;
-    require_regular_file(&opened_metadata)?;
-    let opened_identity = FileIdentity::from_metadata(&opened_metadata);
-    if opened_identity != path_identity_before {
-        return Err(StableFileError::Unstable(
-            "path target changed before the file handle was opened",
-        ));
-    }
+    // Everything below has already seen the path exist, so a disappearance is
+    // instability rather than terminal absence.
+    (|| {
+        let mut file = open_path(path).map_err(map_io)?;
+        let opened_metadata = file.metadata().map_err(map_io)?;
+        require_regular_file(&opened_metadata)?;
+        let opened_identity = FileIdentity::from_metadata(&opened_metadata);
+        if opened_identity != path_identity_before {
+            return Err(StableFileError::Unstable(
+                "path target changed before the file handle was opened",
+            ));
+        }
 
-    let bytes = read_opened_file(path, &mut file, &opened_identity, max_bytes)?;
-    Ok((opened_identity, bytes))
+        let bytes = read_opened_file(path, &mut file, &opened_identity, max_bytes)?;
+        Ok((opened_identity, bytes))
+    })()
+    .map_err(classify_error_after_first_probe)
 }
 
 /// Read `path` under the shared bounded stability/atomicity contract.
@@ -270,7 +319,10 @@ pub fn read_stable_file(
     for attempt in 1..=options.max_attempts {
         match (|| -> Result<String, StableFileError> {
             let (first_identity, first_bytes) = read_snapshot(path, options.max_bytes)?;
-            let (second_identity, second_bytes) = read_snapshot(path, options.max_bytes)?;
+            // The first probe already proved the path exists, so a second-probe
+            // absence is a replacement window, not a terminal `NotFound`.
+            let (second_identity, second_bytes) = read_snapshot(path, options.max_bytes)
+                .map_err(classify_error_after_first_probe)?;
             if second_identity != first_identity {
                 return Err(StableFileError::Unstable(
                     "file identity changed between consecutive stable-read probes",
@@ -344,40 +396,27 @@ pub fn format_stable_file_error(
 
 /// Convert a stable-file failure into an `anyhow::Error` with source-specific
 /// wording. Exhausted instability retries include the atomic-replace guidance.
+///
+/// Delegates to [`format_stable_file_error`] so the two operator-facing
+/// renderings cannot drift apart.
 pub fn stable_file_error_anyhow(
     path: &Path,
     options: StableFileReadOptions<'_>,
     error: StableFileError,
 ) -> anyhow::Error {
-    // `read_stable_file` only returns `Unstable` after exhausting retries (or
-    // when max_attempts is zero). Single-probe instability is retried inside
-    // the reader. Format exhausted retries with the longer guidance string.
-    match error {
-        StableFileError::Unstable(reason) => anyhow::anyhow!(
-            "{} {} remained unstable after {} read attempts ({}). Publish updates \
-             with an atomic replace (write a temp file, fsync, rename over the \
-             path) or equivalent; reload keeps the last known-good live \
-             generation when this guard fails closed.",
-            options.source_name,
-            path.display(),
-            options.max_attempts,
-            reason
-        ),
-        other => anyhow::anyhow!(
-            "Failed to read {} {}: {other}",
-            options.source_name,
-            path.display()
-        ),
-    }
+    anyhow::anyhow!("{}", format_stable_file_error(path, options, &error))
 }
 
 /// Select JSON vs YAML from a file extension.
 ///
-/// Unknown or extensionless paths use YAML. JSON is a YAML subset, so this
-/// preserves the historical acceptance of both JSON documents and YAML flow
-/// mappings without parsing a large document once for detection and again for
-/// deserialization.
-pub fn detect_json_or_yaml_extension(path: &Path, _content: &str) -> bool {
+/// `.yaml`/`.yml` and unknown or extensionless paths select YAML; only `.json`
+/// selects the JSON parser. YAML is a superset of JSON, so an unknown-extension
+/// path holding an ordinary JSON document still parses — but the parser really
+/// is YAML, and a JSON-only shape YAML rejects (for example a mapping key past
+/// libyaml's 1024-byte simple-key limit) fails closed. There is deliberately no
+/// content sniffing and no JSON fallback: detection must not parse a large
+/// document once to classify it and again to deserialize it.
+pub fn detect_json_or_yaml_extension(path: &Path) -> bool {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())

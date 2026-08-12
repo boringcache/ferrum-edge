@@ -394,18 +394,77 @@ fn conf_file_malformed_syntax_fails_without_inventing_empty_cache_via_load_from_
 }
 
 #[test]
-fn resolve_ferrum_var_source_does_not_unwrap_or_default_on_load_failure() {
-    // Source-contract pin: the lazy resolver must not convert a load failure
-    // into an empty ConfFile for the process lifetime.
-    let src = include_str!("../../../src/config/conf_file.rs");
-    assert!(
-        !src.contains("unwrap_or_default()"),
-        "resolve_ferrum_var must not failure-open via unwrap_or_default"
+fn conf_lookup_fails_closed_on_a_sticky_load_failure() {
+    // Behavioral replacement for the old source-string pin: the conf-file half
+    // of `resolve_ferrum_var` must resolve to `None` on a cached load failure,
+    // never to an invented empty defaults map. `resolve_ferrum_var` itself
+    // memoizes into a process-wide `OnceLock`, so the shared decision function
+    // is exercised directly against both cached outcomes.
+    let failed: Result<ConfFile, String> =
+        Err("Failed to read ferrum.conf /etc/ferrum.conf: path not found".to_string());
+    assert_eq!(
+        ferrum_edge::config::conf_file::conf_value_from_cached(&failed, "FERRUM_MODE"),
+        None,
+        "a sticky load failure must not resolve conf-backed values"
     );
-    assert!(
-        src.contains("OnceLock<Result<ConfFile, String>>"),
-        "cache must retain Result so failures stay sticky and explicit"
+    assert_eq!(
+        ferrum_edge::config::conf_file::conf_value_from_cached(&failed, "FERRUM_LOG_LEVEL"),
+        None
     );
+
+    let loaded: Result<ConfFile, String> = ConfFile::parse("FERRUM_LOG_LEVEL = debug\n");
+    assert_eq!(
+        ferrum_edge::config::conf_file::conf_value_from_cached(&loaded, "FERRUM_LOG_LEVEL")
+            .as_deref(),
+        Some("debug"),
+        "an accepted snapshot still resolves its values"
+    );
+    assert_eq!(
+        ferrum_edge::config::conf_file::conf_value_from_cached(&loaded, "FERRUM_MODE"),
+        None,
+        "an absent key is None, which is what the failure case must be indistinguishable from"
+    );
+}
+
+#[test]
+fn empty_or_whitespace_conf_path_is_treated_as_unset() {
+    use ferrum_edge::config::conf_file::conf_path_selection;
+    use std::path::PathBuf;
+
+    let default_path = PathBuf::from("./ferrum.conf");
+
+    // Unset: default path, absence tolerated (historical behavior).
+    assert_eq!(conf_path_selection(None), (default_path.clone(), true));
+
+    // Exported-but-blank configures nothing, so it must behave as unset rather
+    // than failing startup on a blank path.
+    assert_eq!(conf_path_selection(Some("")), (default_path.clone(), true));
+    assert_eq!(
+        conf_path_selection(Some("   \t ")),
+        (default_path.clone(), true)
+    );
+
+    // An explicit non-empty path stays fail-closed.
+    assert_eq!(
+        conf_path_selection(Some("/etc/ferrum/ferrum.conf")),
+        (PathBuf::from("/etc/ferrum/ferrum.conf"), false)
+    );
+}
+
+#[test]
+fn a_blank_conf_path_falls_back_to_absent_ok_default_loading() {
+    // End-to-end through the load path the selection feeds: the default path is
+    // tolerated when absent, so a blank FERRUM_CONF_PATH cannot turn into a
+    // blank-path startup failure.
+    use ferrum_edge::config::conf_file::conf_path_selection;
+
+    let (path, absent_ok) = conf_path_selection(Some(" "));
+    assert!(absent_ok);
+    if !path.exists() {
+        let conf = ConfFile::load_from_path(&path, absent_ok)
+            .expect("a blank configured path must fall back to tolerated defaults");
+        assert!(conf.is_empty());
+    }
 }
 
 #[cfg(unix)]
