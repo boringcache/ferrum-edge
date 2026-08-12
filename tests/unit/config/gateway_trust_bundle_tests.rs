@@ -265,16 +265,31 @@ fn too_many_jwt_authorities_are_rejected() {
 
 #[test]
 fn an_oversized_bundle_is_rejected_and_the_error_carries_no_material() {
-    // One valid root repeated is under the per-authority cap but blows the
-    // whole-bundle cap once the federated set is large enough.
+    // Every individual authority and list stays within its own cap. Max-length
+    // (but valid and unique) JWT key ids make the complete federated document
+    // deterministically exceed the whole-bundle cap even when the generated
+    // P-256 certificate encoding changes size across rcgen versions.
     let der = root_ca_der_base64("ferrum-test-root");
+    let public_key_pem = usable_public_key_pem();
+    let jwt_authorities = |bundle_index: usize| -> Vec<JwtAuthority> {
+        (0..MAX_JWT_AUTHORITIES_PER_BUNDLE)
+            .map(|authority_index| JwtAuthority {
+                key_id: format!(
+                    "key-{bundle_index}-{authority_index}-{}",
+                    "x".repeat(230)
+                ),
+                public_key_pem: public_key_pem.clone(),
+            })
+            .collect()
+    };
     let mut record = valid_record();
     record.bundle.local.x509_authorities = vec![der.clone(); MAX_X509_AUTHORITIES_PER_BUNDLE];
+    record.bundle.local.jwt_authorities = jwt_authorities(MAX_FEDERATED_BUNDLES);
     record.bundle.federated = (0..MAX_FEDERATED_BUNDLES)
         .map(|index| TrustBundle {
             trust_domain: trust_domain(&format!("federated-{index}.local")),
             x509_authorities: vec![der.clone(); MAX_X509_AUTHORITIES_PER_BUNDLE],
-            jwt_authorities: Vec::new(),
+            jwt_authorities: jwt_authorities(index),
             refresh_hint_seconds: None,
         })
         .collect();

@@ -1031,6 +1031,8 @@ fn config_empty_ignoring_gateway_managed_plugins(config: &GatewayConfig, namespa
     config.proxies.is_empty()
         && config.consumers.is_empty()
         && config.upstreams.is_empty()
+        && config.gateway_trust_bundles.is_empty()
+        && config.trust_bundles.is_none()
         && config.plugin_configs.iter().all(|plugin| {
             plugin.namespace == namespace
                 && plugin.id == GATEWAY_WORKLOAD_METRICS_PLUGIN_ID
@@ -10496,6 +10498,16 @@ impl ProxyState {
                             ),
                         )?;
                     let mesh_changed = current.config.mesh != new_config.mesh;
+                    // Namespace-scoped database trust and the unpartitioned
+                    // file/overlay authority are both intentionally absent
+                    // from ConfigDelta: neither belongs on the ordinary
+                    // resource-delta wire contract. They still decide live
+                    // gateway verification, so a trust-only rotation,
+                    // revocation, or authority-precedence change must publish
+                    // a fresh request epoch rather than taking the no-op path.
+                    let gateway_trust_changed = current.config.gateway_trust_bundles
+                        != new_config.gateway_trust_bundles
+                        || current.config.trust_bundles != new_config.trust_bundles;
                     // DestinationRule-derived projections
                     // (`dispatch_port_overrides`, `dispatch_port_override_fallback`,
                     // `resolved_tls`, stream-relay dispatch maps) and the
@@ -10513,6 +10525,7 @@ impl ProxyState {
                         Self::projected_dr_dispatch_changed_upstreams(&current.config, &new_config);
                     let projected_lb_changed = !projected_lb_modified.is_empty();
                     if !mesh_changed
+                        && !gateway_trust_changed
                         && !projected_routes_changed
                         && !projected_lb_changed
                         && country_mmdb_plugin_cache.is_none()
@@ -10631,7 +10644,7 @@ impl ProxyState {
         // carries the new mesh config and/or geo plugin snapshot, and
         // `mirror_request_epoch_wrappers` published its wrapper views above.
         let Some(delta) = applied_delta else {
-            debug!("Config update: out-of-band mesh/MMDB generation republished");
+            debug!("Config update: out-of-band mesh/trust/MMDB generation republished");
             return ConfigApplyOutcome::Applied;
         };
         let proxy_plugin_rebuild_count = proxy_plugin_rebuild_count.get();

@@ -564,6 +564,12 @@ fn namespaces_referenced_by_config(config: &GatewayConfig) -> Vec<String> {
     namespaces.extend(config.consumers.iter().map(|c| c.namespace.clone()));
     namespaces.extend(config.plugin_configs.iter().map(|pc| pc.namespace.clone()));
     namespaces.extend(config.upstreams.iter().map(|u| u.namespace.clone()));
+    namespaces.extend(
+        config
+            .gateway_trust_bundles
+            .iter()
+            .map(|record| record.namespace.clone()),
+    );
     normalize_namespace_list(&namespaces)
 }
 
@@ -2027,6 +2033,18 @@ pub async fn run(
     );
 
     let config_arc = Arc::new(ArcSwap::new(Arc::new(config)));
+    // The startup full load is already validated and becomes the CP's live
+    // snapshot at this ArcSwap construction. Poll-time full reloads record at
+    // `publish_cp_full_reload`, but a restarted replica with no subsequent DB
+    // change would otherwise advertise an empty trust publication forever.
+    {
+        let published = config_arc.load_full();
+        crate::config::gateway_trust::record_trust_generation_published(
+            &published.gateway_trust_bundles,
+            published.trust_bundles.as_deref(),
+            chrono::Utc::now().timestamp().max(0) as u64,
+        );
+    }
     // Independently owned K8s overlay slot shared by the reconciler (writer)
     // and the DB poll loop (reader/composer). Empty until the first accepted
     // reconcile; full DB reloads re-merge through this slot (#2982).
@@ -4350,14 +4368,29 @@ mod tests {
     fn retained_polled_namespaces_includes_resources_and_known_namespaces() {
         let mut proxy = make_proxy("p1");
         proxy.namespace = "tenant-a".to_string();
+        let trust_domain = crate::identity::TrustDomain::new("tenant-c.local").unwrap();
+        let trust_record = crate::config::gateway_trust::GatewayTrustBundleRecord::new(
+            "tenant-c",
+            "tenant-c",
+            crate::modes::mesh::config::TrustBundleSet {
+                local: crate::modes::mesh::config::TrustBundle {
+                    trust_domain,
+                    x509_authorities: Vec::new(),
+                    jwt_authorities: Vec::new(),
+                    refresh_hint_seconds: None,
+                },
+                federated: Vec::new(),
+            },
+        );
         let config = GatewayConfig {
             proxies: vec![proxy],
             known_namespaces: vec!["tenant-b".to_string()],
+            gateway_trust_bundles: vec![trust_record],
             ..Default::default()
         };
 
         let retained = retained_polled_namespaces(&config);
-        assert_eq!(retained, vec!["tenant-a", "tenant-b"]);
+        assert_eq!(retained, vec!["tenant-a", "tenant-b", "tenant-c"]);
     }
 
     #[test]

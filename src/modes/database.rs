@@ -1324,6 +1324,19 @@ pub async fn run(
         Some(tls_policy.clone()),
         Some(shutdown_tx.subscribe()),
     )?;
+    // ProxyState construction is the initial live-config publication boundary.
+    // Hot reloads record trust inside the request-epoch swap, but a process
+    // restarted with an already-persisted bundle has no later delta to trigger
+    // that path. Register the validated startup snapshot now so authenticated
+    // status reports what this process is actually serving.
+    {
+        let published = proxy_state.config.load_full();
+        crate::config::gateway_trust::record_trust_generation_published(
+            &published.gateway_trust_bundles,
+            published.trust_bundles.as_deref(),
+            chrono::Utc::now().timestamp().max(0) as u64,
+        );
+    }
     crate::runtime_metrics::global().configure(
         env_config.status_counts_max_entries,
         env_config.runtime_metrics_pool_tracking_enabled,
