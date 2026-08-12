@@ -220,8 +220,8 @@ impl BackendActiveRequestLimiter {
     /// second per-destination map or retaining churned destination identities.
     #[inline]
     pub(crate) fn record_rejection_warning(&self) -> Option<u64> {
-        let now_ms = u64::try_from(self.rejection_warn_epoch.elapsed().as_millis())
-            .unwrap_or(u64::MAX);
+        let now_ms =
+            u64::try_from(self.rejection_warn_epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
         self.rejection_warn.on_event(now_ms)
     }
 
