@@ -15,6 +15,18 @@ placement (`FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true` →
 - Explicit negatives: source spoofing, missing/zero pktinfo, unenrolled /
   ambiguous interfaces, node-originated and inbound-to-pod traffic, fail-closed
   prerequisite / partial-install script contracts
+- The missed-rollout/rejoin scenario of
+  [#3809](https://github.com/ferrum-edge/ferrum-edge/issues/3809): a
+  pre-contract node that stays booted with live workload pods and their network
+  namespaces, carries the real predecessor pod-netns placement (dual-stack) with
+  no listener behind it, and rejoins the settled host-netns release. The gate
+  demonstrates the resulting blackhole, proves the runtime guard refuses the
+  rejoin and records nothing, runs the **production** node-preflight retirement
+  supervisor over a real node-agent pod registry, and then proves the same
+  never-restarted workloads reach the host producer with correct attribution and
+  a working transparent return path. Predecessor pod-netns state (table `33133`)
+  is created ONLY inside this fixture's disposable workload namespaces, which
+  die with the fixture; the caller's namespace is never given pod-netns rules.
 
 ## Skip-or-fail
 
