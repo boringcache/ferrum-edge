@@ -133,7 +133,7 @@ use crate::config::types::{DispatchKind, GatewayConfig};
 use crate::proxy::ProxyState;
 use crate::proxy::gateway_listener_status::{
     GatewayListenerFailureCategory, GatewayListenerFailureObservation, GatewayListenerProtocolHalf,
-    GatewayListenerStatus,
+    GatewayListenerStatus, GatewayListenerTransientEvent,
 };
 
 /// Whether a Gateway listener port terminates TLS on the frontend.
@@ -476,6 +476,11 @@ impl GatewayListenerBindFailure {
 /// as one coherent view of the same generation.
 struct ReconcileOutcome {
     failures: Vec<GatewayListenerBindFailure>,
+    /// Active failures for the bounded status snapshot. Listener-task deaths
+    /// that rebind in the same pass are omitted here and published as transient
+    /// events instead.
+    status_observations: Vec<GatewayListenerFailureObservation>,
+    transient_events: Vec<GatewayListenerTransientEvent>,
     refused_route_ports: BTreeSet<u16>,
     h3_ports: Vec<u16>,
     /// Gateway listener ports this process must bind for this generation.
@@ -753,6 +758,8 @@ impl GatewayListenerManager {
             let expected = self.state.request_epoch.load();
             let ReconcileOutcome {
                 failures,
+                status_observations,
+                transient_events,
                 refused_route_ports,
                 h3_ports,
                 desired_listeners,
@@ -780,11 +787,12 @@ impl GatewayListenerManager {
             // pass that lost the admission race can never overwrite a newer
             // generation's status even if it reached this point.
             if let Some(status) = self.status.as_ref() {
-                status.publish(
+                status.publish_transients(
                     expected.config_generation,
                     desired_listeners,
                     active_listeners,
-                    failures.iter().map(GatewayListenerBindFailure::observation),
+                    status_observations,
+                    transient_events,
                     crate::proxy::gateway_listener_status::now_unix_ms(),
                 );
             }
@@ -831,6 +839,8 @@ impl GatewayListenerManager {
         self.reap_finished_drains().await;
 
         let mut live = self.listeners.lock().await;
+        let mut listener_task_ended_tcp: BTreeSet<u16> = BTreeSet::new();
+        let mut listener_task_ended_quic: BTreeSet<u16> = BTreeSet::new();
 
         // Reap listeners whose TCP accept loop ended after startup. A finished
         // accept loop means the port is no longer served; leaving the entry in
@@ -865,6 +875,7 @@ impl GatewayListenerManager {
                     );
                 }
                 error!(port, "Gateway API listener ended unexpectedly: {error}");
+                listener_task_ended_tcp.insert(port);
                 failures.push(GatewayListenerBindFailure::tcp(
                     port,
                     GatewayListenerFailureCategory::ListenerTaskEnded,
@@ -883,12 +894,12 @@ impl GatewayListenerManager {
                 port,
                 "Gateway API HTTP/3 listener ended unexpectedly: {error}"
             );
-            // Reported for this pass even when `ensure_quic` rebinds QUIC
-            // further down the same pass, exactly as a dead TCP accept loop is:
-            // a healthy-to-dead transition that recovered immediately must
-            // still be counted and visible once, and the next pass clears it as
-            // a recovery. Suppressing it on same-pass success would make the
-            // death invisible to metrics and health entirely.
+            // Recorded in the raw reconcile result for logs and `bind_failures()`.
+            // The bounded status snapshot publishes the death as a transient
+            // same-pass event when this half rebinds below; only a failed
+            // rebind leaves a durable active failure (the bind/retirement
+            // error), not `listener_task_ended`.
+            listener_task_ended_quic.insert(port);
             failures.push(GatewayListenerBindFailure::quic(
                 port,
                 GatewayListenerFailureCategory::ListenerTaskEnded,
@@ -1128,10 +1139,36 @@ impl GatewayListenerManager {
         // `plan.ports` and its TCP half is expected to bind and serve.
         let desired_listeners = plan.ports.len() + plan.refused.len();
         let active_listeners = live.len();
+
+        let status_observations: Vec<GatewayListenerFailureObservation> = failures
+            .iter()
+            .filter(|failure| {
+                failure.category != GatewayListenerFailureCategory::ListenerTaskEnded
+            })
+            .map(GatewayListenerBindFailure::observation)
+            .collect();
+        let mut transient_events: Vec<GatewayListenerTransientEvent> = listener_task_ended_tcp
+            .iter()
+            .map(|port| GatewayListenerTransientEvent {
+                port: *port,
+                protocol: GatewayListenerProtocolHalf::Tcp,
+                category: GatewayListenerFailureCategory::ListenerTaskEnded,
+            })
+            .chain(listener_task_ended_quic.iter().map(|port| {
+                GatewayListenerTransientEvent {
+                    port: *port,
+                    protocol: GatewayListenerProtocolHalf::Quic,
+                    category: GatewayListenerFailureCategory::ListenerTaskEnded,
+                }
+            }))
+            .collect();
+
         drop(live);
 
         ReconcileOutcome {
             failures,
+            status_observations,
+            transient_events,
             refused_route_ports,
             h3_ports,
             desired_listeners,
@@ -1664,23 +1701,52 @@ mod tests {
                 .tcp_ended(),
             "the rebound listener must be live"
         );
-        // The pass that reaped the dead task publishes it as a runtime
-        // listener-task death on the TCP half, not as a bind refusal.
+        // The pass that reaped the dead task rebinded in the same reconcile, so
+        // the death is transient: no active failure while the cumulative
+        // counters record one onset and one recovery.
         let snapshot = status.snapshot();
-        assert_eq!(snapshot.active_failures, 1, "{snapshot:?}");
-        let entry = &snapshot.failures[0];
-        assert_eq!(entry.port, port);
-        assert_eq!(entry.protocol, GatewayListenerProtocolHalf::Tcp);
+        assert_eq!(snapshot.active_failures, 0, "{snapshot:?}");
+        assert!(!snapshot.degraded());
         assert_eq!(
-            entry.category,
-            GatewayListenerFailureCategory::ListenerTaskEnded
+            status
+                .cumulative()
+                .failures_total
+                .iter()
+                .find(|series| {
+                    series.protocol == GatewayListenerProtocolHalf::Tcp
+                        && series.category == GatewayListenerFailureCategory::ListenerTaskEnded
+                })
+                .map(|series| series.value),
+            Some(1)
+        );
+        assert_eq!(
+            status
+                .cumulative()
+                .recoveries_total
+                .iter()
+                .find(|series| {
+                    series.protocol == GatewayListenerProtocolHalf::Tcp
+                        && series.category == GatewayListenerFailureCategory::ListenerTaskEnded
+                })
+                .map(|series| series.value),
+            Some(1)
         );
 
-        // The rebind succeeded, so the next pass clears it and counts a
-        // recovery — this signal is recoverable, unlike the sticky
-        // `serving_listener_failures` surface.
+        // A later healthy pass must not double-count the transient death.
         manager.reconcile().await;
         assert!(!status.snapshot().degraded());
+        assert_eq!(
+            status
+                .cumulative()
+                .failures_total
+                .iter()
+                .find(|series| {
+                    series.protocol == GatewayListenerProtocolHalf::Tcp
+                        && series.category == GatewayListenerFailureCategory::ListenerTaskEnded
+                })
+                .map(|series| series.value),
+            Some(1)
+        );
         assert_eq!(
             status
                 .cumulative()
@@ -1932,30 +1998,46 @@ mod tests {
         );
         drop(live);
 
-        // The rebind does not hide the death: it is published for the pass that
-        // observed it, on the QUIC half only.
+        // The rebind does not leave an active failure: the death is transient on
+        // the QUIC half only, while the healthy TCP half stays out of the
+        // snapshot entirely.
         let snapshot = status.snapshot();
+        assert_eq!(snapshot.active_failures, 0, "{snapshot:?}");
+        assert!(!snapshot.degraded());
         assert!(
-            snapshot.failures.iter().any(|entry| {
-                entry.port == port
-                    && entry.protocol == GatewayListenerProtocolHalf::Quic
-                    && entry.category == GatewayListenerFailureCategory::ListenerTaskEnded
-            }),
-            "{snapshot:?}"
-        );
-        assert!(
-            snapshot
-                .failures
-                .iter()
-                .all(|entry| entry.protocol == GatewayListenerProtocolHalf::Quic),
+            snapshot.failures.is_empty(),
             "the healthy TCP half must not appear in the published status: {snapshot:?}"
+        );
+        assert_eq!(
+            status
+                .cumulative()
+                .failures_total
+                .iter()
+                .find(|series| {
+                    series.protocol == GatewayListenerProtocolHalf::Quic
+                        && series.category == GatewayListenerFailureCategory::ListenerTaskEnded
+                })
+                .map(|series| series.value),
+            Some(1)
+        );
+        assert_eq!(
+            status
+                .cumulative()
+                .recoveries_total
+                .iter()
+                .find(|series| {
+                    series.protocol == GatewayListenerProtocolHalf::Quic
+                        && series.category == GatewayListenerFailureCategory::ListenerTaskEnded
+                })
+                .map(|series| series.value),
+            Some(1)
         );
 
         // Clearing the handle lets the existing `ensure_quic` path retry the
         // port. That retry can lose a race with the aborted endpoint's socket
         // close, so recovery is asserted across retry passes rather than
         // pinned to the first one — what matters is that HTTP/3 comes back
-        // without a restart and the status clears itself.
+        // without a restart and the status stays healthy.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             manager.reconcile().await;
@@ -1974,6 +2056,18 @@ mod tests {
         // The death is counted exactly once however many retries the rebind
         // took: a still-failing retry ages its entry instead of re-counting an
         // onset, so its recovery is counted once too.
+        assert_eq!(
+            status
+                .cumulative()
+                .failures_total
+                .iter()
+                .find(|series| {
+                    series.protocol == GatewayListenerProtocolHalf::Quic
+                        && series.category == GatewayListenerFailureCategory::ListenerTaskEnded
+                })
+                .map(|series| series.value),
+            Some(1)
+        );
         assert_eq!(
             status
                 .cumulative()

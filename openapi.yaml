@@ -12600,9 +12600,11 @@ components:
         for every active identity even when its detail was dropped: a retry does
         not re-count an onset it already counted, and an identity that recovers
         is counted once whether or not it was ever shown here. If a single pass
-        somehow exceeds the 4096-identity bound, `overflowed` is `true` and those
-        totals account only for the tracked identities — the snapshot reports
-        the gap instead of publishing figures it cannot stand behind.
+        somehow exceeds the 4096-identity bound, `overflowed` is `true` and
+        previously tracked identities that still appear anywhere in the stream
+        keep their ledger slots while only brand-new identities are evicted in
+        deterministic key order — the snapshot reports the gap instead of
+        publishing figures it cannot stand behind.
 
         Ports, `detail`, and `config_generation` appear here only — they are
         never Prometheus labels and never appear in the unauthenticated

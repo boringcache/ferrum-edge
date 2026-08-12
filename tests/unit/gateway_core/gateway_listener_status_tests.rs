@@ -21,7 +21,8 @@ use std::sync::Arc;
 use ferrum_edge::proxy::gateway_listener_status::{
     GatewayListenerFailureCategory, GatewayListenerFailureObservation,
     GatewayListenerFailureOrigin, GatewayListenerProtocolHalf, GatewayListenerStatus,
-    MAX_ACTIVE_TRACKED_FAILURES, MAX_DETAIL_CHARS, MAX_TRACKED_FAILURES,
+    GatewayListenerTransientEvent, MAX_ACTIVE_TRACKED_FAILURES, MAX_DETAIL_CHARS,
+    MAX_TRACKED_FAILURES,
 };
 
 const NS_LABEL: &str = ",namespace=\"ferrum\"";
@@ -820,6 +821,158 @@ fn exceeding_the_identity_ledger_bound_is_reported_not_silently_corrupted() {
             ),
         MAX_ACTIVE_TRACKED_FAILURES as u64
     );
+}
+
+/// When the ledger is full, previously tracked identities that appear only after
+/// a burst of brand-new keys in the observation stream must not be dropped and
+/// counted as recoveries.
+#[test]
+fn overflow_prioritizes_ledger_keys_over_new_admissions_in_encounter_order() {
+    let status = GatewayListenerStatus::new();
+    let tracked_ports: Vec<u16> = (1..=MAX_ACTIVE_TRACKED_FAILURES as u16).collect();
+    assert!(status.publish(
+        1,
+        tracked_ports.len(),
+        0,
+        oversubscribed_failures(tracked_ports.clone()),
+        1_000,
+    ));
+    assert_eq!(tcp_bind_failures_total(&status), MAX_ACTIVE_TRACKED_FAILURES as u64);
+    assert_eq!(status.snapshot().active_failures, MAX_ACTIVE_TRACKED_FAILURES);
+
+    // Adversarial encounter order: brand-new keys first, every tracked key last.
+    let mut observations = oversubscribed_failures((60_000..60_500).collect::<Vec<_>>());
+    observations.extend(oversubscribed_failures(tracked_ports.clone()));
+    assert!(status.publish(1, observations.len(), 0, observations, 2_000));
+
+    let snapshot = status.snapshot();
+    assert!(snapshot.overflowed);
+    assert_eq!(snapshot.active_failures, MAX_ACTIVE_TRACKED_FAILURES);
+    assert_eq!(
+        tcp_bind_failures_total(&status),
+        MAX_ACTIVE_TRACKED_FAILURES as u64,
+        "tracked identities must not be false-recovered and re-counted as onsets"
+    );
+    assert_eq!(tcp_bind_recoveries_total(&status), 0);
+    let entry = snapshot
+        .failures
+        .iter()
+        .find(|entry| entry.port == tracked_ports[0])
+        .expect("a tracked identity must remain active");
+    assert_eq!(entry.observations, 2);
+    assert_eq!(entry.first_observed_unix_ms, 1_000);
+}
+
+/// A partial recovery during overflow must recover only identities genuinely
+/// absent from the full stream, without resetting history for survivors.
+#[test]
+fn overflow_partial_recovery_counts_only_absent_identities() {
+    let status = GatewayListenerStatus::new();
+    let tracked_ports: Vec<u16> = (1..=MAX_ACTIVE_TRACKED_FAILURES as u16).collect();
+    assert!(status.publish(
+        1,
+        tracked_ports.len(),
+        0,
+        oversubscribed_failures(tracked_ports.clone()),
+        1_000,
+    ));
+
+    let mut overflow_pass = oversubscribed_failures((70_000..70_500).collect::<Vec<_>>());
+    overflow_pass.extend(oversubscribed_failures(tracked_ports.clone()));
+    assert!(status.publish(1, overflow_pass.len(), 0, overflow_pass, 2_000));
+
+    let survivors: Vec<u16> = tracked_ports[MAX_ACTIVE_TRACKED_FAILURES / 2..].to_vec();
+    let mut partial = oversubscribed_failures((80_000..80_500).collect::<Vec<_>>());
+    partial.extend(oversubscribed_failures(survivors.clone()));
+    assert!(status.publish(1, partial.len(), 0, partial, 3_000));
+
+    assert_eq!(
+        tcp_bind_recoveries_total(&status),
+        (MAX_ACTIVE_TRACKED_FAILURES / 2) as u64
+    );
+    assert_eq!(
+        tcp_bind_failures_total(&status),
+        MAX_ACTIVE_TRACKED_FAILURES as u64
+    );
+    let snapshot = status.snapshot();
+    assert_eq!(snapshot.active_failures, MAX_ACTIVE_TRACKED_FAILURES / 2);
+    let survivor = snapshot
+        .failures
+        .iter()
+        .find(|entry| entry.port == survivors[0])
+        .expect("a surviving tracked identity");
+    assert_eq!(survivor.observations, 3);
+    assert_eq!(survivor.first_observed_unix_ms, 1_000);
+}
+
+/// A same-pass listener-task death that rebinds before publication is transient:
+/// cumulative counters move once, but nothing stays active.
+#[test]
+fn a_transient_listener_task_death_does_not_enter_the_active_ledger() {
+    let status = GatewayListenerStatus::new();
+    assert!(status.publish_transients(
+        4,
+        2,
+        2,
+        Vec::new(),
+        [GatewayListenerTransientEvent {
+            port: 8443,
+            protocol: GatewayListenerProtocolHalf::Tcp,
+            category: GatewayListenerFailureCategory::ListenerTaskEnded,
+        }],
+        1_000,
+    ));
+
+    let snapshot = status.snapshot();
+    assert!(!snapshot.degraded());
+    assert_eq!(snapshot.active_failures, 0);
+    assert!(snapshot.failures.is_empty());
+    assert_eq!(
+        cumulative_failures(
+            &status,
+            GatewayListenerProtocolHalf::Tcp,
+            GatewayListenerFailureCategory::ListenerTaskEnded,
+        ),
+        1
+    );
+    assert_eq!(
+        cumulative_recoveries(
+            &status,
+            GatewayListenerProtocolHalf::Tcp,
+            GatewayListenerFailureCategory::ListenerTaskEnded,
+        ),
+        1
+    );
+
+    assert!(status.publish_transients(4, 2, 2, Vec::new(), Vec::new(), 2_000));
+    assert_eq!(
+        cumulative_failures(
+            &status,
+            GatewayListenerProtocolHalf::Tcp,
+            GatewayListenerFailureCategory::ListenerTaskEnded,
+        ),
+        1,
+        "a later healthy pass must not double-count the transient death"
+    );
+}
+
+/// Generation `0` and `u64::MAX` are exact published values with no sentinel
+/// encoding.
+#[test]
+fn generation_boundaries_publish_and_read_back_exactly() {
+    let status = GatewayListenerStatus::new();
+    assert_eq!(status.published_generation(), None);
+
+    assert!(status.publish(0, 1, 1, Vec::new(), 1_000));
+    assert_eq!(status.published_generation(), Some(0));
+    assert_eq!(status.snapshot().config_generation, 0);
+
+    let max = u64::MAX;
+    assert!(status.publish(max, 1, 1, Vec::new(), 2_000));
+    assert_eq!(status.published_generation(), Some(max));
+    assert_eq!(status.snapshot().config_generation, max);
+    assert!(!status.publish(max - 1, 1, 0, vec![tcp_bind_failure(8443)], 3_000));
+    assert_eq!(status.published_generation(), Some(max));
 }
 
 // ---------------------------------------------------------------------------

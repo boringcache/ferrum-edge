@@ -139,10 +139,11 @@ port already owned by another process; `port_reserved`,
 port map; `dedicated_bind_conflict` and `dedicated_bind_tls_unsupported` identify
 Sidecar ingress bind declarations that cannot be realized without widening or
 misclassifying the listener; `listener_task_ended` means an accept loop died
-after a successful bind and is being rebound — on the `quic` half only the
-HTTP/3 listener is reaped and retried, so HTTP/1.1 and HTTP/2 keep serving that
-port and its routes stay admitted; `class_flip_deferred` means a
-frontend TLS-class change is waiting for the previous accept sockets to close;
+after a successful bind and is being rebound — a same-pass rebind increments
+the cumulative failure and recovery counters once while the active gauge stays
+`0` once the half is live again. On the `quic` half only the HTTP/3 listener is
+reaped and retried, so HTTP/1.1 and HTTP/2 keep serving that port and its routes
+stay admitted; `class_flip_deferred` means a frontend TLS-class change is waiting for the previous accept sockets to close;
 `retirement_pending` is the same fail-closed wait for another bind-identity
 change. No action clears these manually — the supervisor retries on its own,
 and the metrics clear when it succeeds.
