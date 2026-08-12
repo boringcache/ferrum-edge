@@ -4527,7 +4527,7 @@ jobs:
           cache-directories: ${{ github.workspace }}/.cache/sccache
 
       - name: Install bpf-linker
-        run: cargo install bpf-linker --locked
+        uses: ./.github/actions/setup-bpf-linker
 
       - name: Build BPF programs
         run: cd ebpf && cargo +nightly build --target bpfel-unknown-none -Z build-std=core --release -p ferrum-ebpf
@@ -4586,7 +4586,7 @@ jobs:
           shared-key: "ci-ebpf-live"
 
       - name: Install bpf-linker
-        run: cargo install bpf-linker --locked
+        uses: ./.github/actions/setup-bpf-linker
 
       - name: Build BPF programs (kernel object)
         run: cd ebpf && cargo +nightly build --target bpfel-unknown-none -Z build-std=core --release -p ferrum-ebpf
