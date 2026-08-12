@@ -247,10 +247,13 @@ impl HbonePoolError {
     }
 
     /// Whether this error is affirmative evidence that the selected peer
-    /// cannot establish HBONE with the configured identity/protocol contract.
+    /// cannot establish HBONE with the configured identity/TLS contract.
     ///
-    /// DNS and TCP reachability errors fail the current request closed, but
-    /// they are not capability evidence. Marking them `Unsupported` would make
+    /// DNS, TCP reachability, and post-TLS HTTP/2 preface/handshake errors
+    /// fail the current request closed, but they are not capability evidence.
+    /// `H2Handshake` is reached only after TLS (including ALPN) already
+    /// succeeded; peer restart, EOF, or reset during the H2 handshake is
+    /// transient transport loss. Marking any of these `Unsupported` would make
     /// a rolling peer restart permanent: the dispatch gate suppresses every
     /// later tunnel attempt, so live traffic can never prove recovery.
     pub fn is_capability_failure(&self) -> bool {
@@ -261,7 +264,6 @@ impl HbonePoolError {
                 | Self::InvalidServerName { .. }
                 | Self::TlsConfig(_)
                 | Self::TlsHandshake { .. }
-                | Self::H2Handshake { .. }
         )
     }
 }
@@ -3614,11 +3616,11 @@ mod tests {
 
         let h2_failure = HbonePoolError::H2Handshake {
             host: "orders.default.svc.cluster.local".to_string(),
-            message: "ALPN mismatch".to_string(),
+            message: "peer reset connection during HTTP/2 preface".to_string(),
         };
         assert!(
-            h2_failure.is_capability_failure(),
-            "pre-CONNECT HTTP/2 establishment failure is a capability signal"
+            !h2_failure.is_capability_failure(),
+            "post-TLS H2 handshake loss during peer restart must preserve prior capability"
         );
     }
 

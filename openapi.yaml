@@ -27739,10 +27739,11 @@ components:
             Gateway-to-mesh HBONE support for upstream targets tagged
             `mesh.hbone=true`. `supported` means the gateway can open
             HTTP/2 CONNECT over SPIFFE mTLS to the sidecar port;
-            `unsupported` follows definitive identity/TLS/protocol evidence;
-            `unknown` is used for untagged targets, gateways without SVIDs,
-            not-yet-probed entries, or cold probes that hit only transient
-            DNS/connect/timeout failures. Transient failures preserve an
+            `unsupported` follows definitive identity/TLS configuration
+            evidence; `unknown` is used for untagged targets, gateways
+            without SVIDs, not-yet-probed entries, or cold probes that hit
+            only transient DNS/connect/timeout or post-TLS HTTP/2
+            preface/handshake failures. Transient failures preserve an
             existing verdict so rolling peer restarts can recover.
         last_probe_at_unix_secs:
           type: integer
