@@ -79,6 +79,19 @@
 //! are published in the exact request epoch so an unavailable listener cannot
 //! become reachable through the process-global proxy or the single-listener
 //! Service remap.
+//!
+//! # Observability
+//!
+//! Every pass also publishes a bounded, structured realization snapshot to the
+//! shared [`crate::proxy::gateway_listener_status::GatewayListenerStatus`]
+//! installed by the mode (issue #3810). That snapshot — not the raw
+//! [`GatewayListenerManager::bind_failures`] seam — is what authenticated
+//! `/health` detail and the fixed-cardinality `ferrum_gateway_listener_*`
+//! Prometheus families read, and it clears automatically when a retry binds the
+//! port. It is published only after the matching admission decision was
+//! accepted for the same generation, and the status object fences stale
+//! generations of its own accord, so a pass that lost the epoch race can never
+//! overwrite the current generation's status.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
@@ -89,6 +102,10 @@ use tracing::{error, info, warn};
 
 use crate::config::types::{DispatchKind, GatewayConfig};
 use crate::proxy::ProxyState;
+use crate::proxy::gateway_listener_status::{
+    GatewayListenerFailureCategory, GatewayListenerFailureObservation, GatewayListenerProtocolHalf,
+    GatewayListenerStatus,
+};
 
 /// Whether a Gateway listener port terminates TLS on the frontend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -116,6 +133,15 @@ pub struct GatewayListenerPlan {
     /// Ports the config asked for that this process refuses to bind, with the
     /// reason. Surfaced rather than silently dropped.
     pub refused: BTreeMap<u16, String>,
+    /// Bounded category for each entry in `refused`, keyed identically.
+    ///
+    /// Deliberately a sibling map rather than a field on a refusal struct: the
+    /// operator-facing message and the metric-safe category have different
+    /// lifetimes (the message is authenticated detail, the category is a
+    /// Prometheus label), and keeping `refused` a `BTreeMap<u16, String>` keeps
+    /// this observability work independent of the protocol-scoped refusal
+    /// rework in PR #3818 (issue #3811), which reshapes the same map.
+    pub refused_categories: BTreeMap<u16, GatewayListenerFailureCategory>,
 }
 
 impl GatewayListenerPlan {
@@ -158,6 +184,7 @@ impl GatewayListenerPlan {
         let mut ports: BTreeMap<u16, GatewayListenerClass> = BTreeMap::new();
         let mut already_served: BTreeMap<u16, GatewayListenerClass> = BTreeMap::new();
         let mut refused: BTreeMap<u16, String> = BTreeMap::new();
+        let mut refused_categories: BTreeMap<u16, GatewayListenerFailureCategory> = BTreeMap::new();
         for proxy in &config.proxies {
             if proxy.dispatch_kind.is_stream() {
                 continue;
@@ -181,6 +208,9 @@ impl GatewayListenerPlan {
                 if *existing == class {
                     already_served.insert(port, class);
                 } else {
+                    refused_categories
+                        .entry(port)
+                        .or_insert(GatewayListenerFailureCategory::ProcessGlobalClassMismatch);
                     refused.entry(port).or_insert_with(|| {
                         format!(
                             "port {port} is already owned by a process-global {} proxy \
@@ -198,6 +228,9 @@ impl GatewayListenerPlan {
             // proxy ports this gateway did not adopt as a same-class frontend
             // above — name the set rather than guessing which member it was.
             if reserved.contains(&port) {
+                refused_categories
+                    .entry(port)
+                    .or_insert(GatewayListenerFailureCategory::PortReserved);
                 refused.entry(port).or_insert_with(|| {
                     format!(
                         "port {port} is reserved by another Ferrum listener \
@@ -207,6 +240,9 @@ impl GatewayListenerPlan {
                 continue;
             }
             if tcp_stream_ports.contains(&port) {
+                refused_categories
+                    .entry(port)
+                    .or_insert(GatewayListenerFailureCategory::StreamPortCollision);
                 refused.entry(port).or_insert_with(|| {
                     format!(
                         "port {port} is claimed by a TCP/TLS stream proxy in the same config; \
@@ -219,6 +255,9 @@ impl GatewayListenerPlan {
                 && class == GatewayListenerClass::Tls
                 && udp_stream_ports.contains(&port)
             {
+                refused_categories
+                    .entry(port)
+                    .or_insert(GatewayListenerFailureCategory::UdpStreamCollision);
                 refused.entry(port).or_insert_with(|| {
                     format!(
                         "port {port} is claimed by a UDP/DTLS stream proxy in the same config; \
@@ -235,6 +274,9 @@ impl GatewayListenerPlan {
                 // hand-authored config: refuse the port outright rather than
                 // letting whichever proxy happened to sort first decide the
                 // socket's protocol for the other.
+                refused_categories
+                    .entry(port)
+                    .or_insert(GatewayListenerFailureCategory::ClassConflict);
                 refused.entry(port).or_insert_with(|| {
                     format!(
                         "port {port} is claimed as both plaintext and TLS by HTTP-family proxies \
@@ -250,7 +292,20 @@ impl GatewayListenerPlan {
             ports,
             already_served,
             refused,
+            refused_categories,
         }
+    }
+
+    /// Bounded category recorded beside a refusal.
+    ///
+    /// A refusal is always recorded with its category, so the fallback is
+    /// unreachable in practice; it keeps a future refusal site from silently
+    /// publishing an uncategorized failure.
+    fn refusal_category(&self, port: u16) -> GatewayListenerFailureCategory {
+        self.refused_categories
+            .get(&port)
+            .copied()
+            .unwrap_or(GatewayListenerFailureCategory::ClassConflict)
     }
 }
 
@@ -258,7 +313,58 @@ impl GatewayListenerPlan {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct GatewayListenerBindFailure {
     pub port: u16,
+    /// Which protocol half is not serving. Every admission refusal currently
+    /// withdraws the whole listener, so it is reported against the TCP half;
+    /// an HTTP/3 socket that fails beside a healthy TCP listener is reported
+    /// against the QUIC half alone.
+    pub protocol: GatewayListenerProtocolHalf,
+    /// Bounded reason, safe as a fixed-cardinality metric label.
+    pub category: GatewayListenerFailureCategory,
     pub error: String,
+}
+
+impl GatewayListenerBindFailure {
+    fn tcp(port: u16, category: GatewayListenerFailureCategory, error: String) -> Self {
+        Self {
+            port,
+            protocol: GatewayListenerProtocolHalf::Tcp,
+            category,
+            error,
+        }
+    }
+
+    fn quic(port: u16, category: GatewayListenerFailureCategory, error: String) -> Self {
+        Self {
+            port,
+            protocol: GatewayListenerProtocolHalf::Quic,
+            category,
+            error,
+        }
+    }
+
+    fn observation(&self) -> GatewayListenerFailureObservation {
+        GatewayListenerFailureObservation::new(
+            self.port,
+            self.protocol,
+            self.category,
+            self.error.clone(),
+        )
+    }
+}
+
+/// Everything one reconcile pass decided for a single config generation.
+///
+/// Grouped rather than returned as a tuple because the caller must publish the
+/// route-admission decision, the `Alt-Svc` set, and the operator-facing status
+/// as one coherent view of the same generation.
+struct ReconcileOutcome {
+    failures: Vec<GatewayListenerBindFailure>,
+    refused_route_ports: BTreeSet<u16>,
+    h3_ports: Vec<u16>,
+    /// Gateway listener ports this process must bind for this generation.
+    desired_listeners: usize,
+    /// Gateway listener ports with a live accept loop at the end of the pass.
+    active_listeners: usize,
 }
 
 type ListenerTask = tokio::task::JoinHandle<Result<(), anyhow::Error>>;
@@ -377,6 +483,10 @@ pub struct GatewayListenerManager {
     /// same-port Gateway route without a second bind.
     existing_frontends: BTreeMap<u16, GatewayListenerClass>,
     bind_failures: arc_swap::ArcSwap<Vec<GatewayListenerBindFailure>>,
+    /// Shared realization status read by authenticated `/health` and by the
+    /// Prometheus renderer (issue #3810). `None` only in tests that do not
+    /// assert on observability.
+    status: Option<Arc<GatewayListenerStatus>>,
 }
 
 impl GatewayListenerManager {
@@ -403,7 +513,20 @@ impl GatewayListenerManager {
             revisions: Mutex::new(Some(revisions)),
             existing_frontends,
             bind_failures: arc_swap::ArcSwap::from_pointee(Vec::new()),
+            status: None,
         }
+    }
+
+    /// Publish bounded realization status to a shared observability surface.
+    ///
+    /// The mode installs the same handle on `AdminState`, so authenticated
+    /// `/health` detail and `/metrics` observe exactly what this manager last
+    /// decided — without either of them reaching into the manager's live
+    /// listener map.
+    #[must_use]
+    pub fn with_status(mut self, status: Arc<GatewayListenerStatus>) -> Self {
+        self.status = Some(status);
+        self
     }
 
     /// Override the process-global frontend ports with the sockets actually
@@ -455,8 +578,9 @@ impl GatewayListenerManager {
     }
 
     /// Most recent refusals / bind failures. Lock-free read.
-    // Same bin-target caveat as `active_ports`: the observability seam is
-    // consumed by `tests/` and external library callers, not by the binary.
+    // Same bin-target caveat as `active_ports`: this raw seam is consumed by
+    // `tests/` and external library callers. Production observability consumes
+    // the shared `GatewayListenerStatus` instead (issue #3810).
     #[allow(dead_code)]
     pub fn bind_failures(&self) -> Arc<Vec<GatewayListenerBindFailure>> {
         self.bind_failures.load_full()
@@ -471,8 +595,14 @@ impl GatewayListenerManager {
         let _reconcile_guard = self.reconcile_lock.lock().await;
         loop {
             let expected = self.state.request_epoch.load();
-            let (failures, refused_route_ports, h3_ports) =
-                self.reconcile_generation(&expected).await;
+            let outcome = self.reconcile_generation(&expected).await;
+            let ReconcileOutcome {
+                failures,
+                refused_route_ports,
+                h3_ports,
+                desired_listeners,
+                active_listeners,
+            } = outcome;
             if !self
                 .state
                 .publish_gateway_listener_admission(&expected, refused_route_ports)
@@ -489,6 +619,23 @@ impl GatewayListenerManager {
             }
             self.state.publish_gateway_h3_alt_svc(&h3_ports);
             self.bind_failures.store(Arc::new(failures.clone()));
+            // Publish the bounded operator-facing status last, and only after
+            // the admission decision was accepted for this exact generation.
+            // The status object fences stale generations independently, so a
+            // pass that lost the admission race can never overwrite a newer
+            // generation's status even if it reached this point.
+            if let Some(status) = self.status.as_ref() {
+                status.publish(
+                    expected.config_generation,
+                    desired_listeners,
+                    active_listeners,
+                    failures
+                        .iter()
+                        .map(GatewayListenerBindFailure::observation)
+                        .collect(),
+                    crate::proxy::gateway_listener_status::now_unix_ms(),
+                );
+            }
             return failures;
         }
     }
@@ -496,7 +643,7 @@ impl GatewayListenerManager {
     async fn reconcile_generation(
         &self,
         expected: &crate::request_epoch::RequestEpoch,
-    ) -> (Vec<GatewayListenerBindFailure>, BTreeSet<u16>, Vec<u16>) {
+    ) -> ReconcileOutcome {
         let config = expected.config();
         let plan = GatewayListenerPlan::from_config(
             config,
@@ -507,15 +654,16 @@ impl GatewayListenerManager {
         let mut failures: Vec<GatewayListenerBindFailure> = plan
             .refused
             .iter()
-            .map(|(port, error)| GatewayListenerBindFailure {
-                port: *port,
-                error: error.clone(),
+            .map(|(port, error)| {
+                GatewayListenerBindFailure::tcp(*port, plan.refusal_category(*port), error.clone())
             })
             .collect();
         for failure in &failures {
             warn!(
                 port = failure.port,
-                "Gateway API listener refused: {}", failure.error
+                reason = failure.category.as_str(),
+                "Gateway API listener refused: {}",
+                failure.error
             );
         }
 
@@ -542,7 +690,11 @@ impl GatewayListenerManager {
                     );
                 }
                 error!(port, "Gateway API listener ended unexpectedly: {error}");
-                failures.push(GatewayListenerBindFailure { port, error });
+                failures.push(GatewayListenerBindFailure::tcp(
+                    port,
+                    GatewayListenerFailureCategory::ListenerTaskEnded,
+                    error,
+                ));
             }
         }
 
@@ -603,7 +755,11 @@ impl GatewayListenerManager {
                         CLASS_FLIP_RETIRE_TIMEOUT.as_secs()
                     );
                     warn!(port, "Gateway API listener class flip deferred: {error}");
-                    failures.push(GatewayListenerBindFailure { port, error });
+                    failures.push(GatewayListenerBindFailure::tcp(
+                        port,
+                        GatewayListenerFailureCategory::RetirementPending,
+                        error,
+                    ));
                     defer_rebind.insert(port);
                     self.draining.lock().await.extend(
                         pending
@@ -658,14 +814,18 @@ impl GatewayListenerManager {
                         port = *port,
                         "Gateway API listener rebind deferred: {error}"
                     );
-                    failures.push(GatewayListenerBindFailure { port: *port, error });
+                    failures.push(GatewayListenerBindFailure::tcp(
+                        *port,
+                        GatewayListenerFailureCategory::RetirementPending,
+                        error,
+                    ));
                 }
                 continue;
             }
             if let Some(listener) = live.get_mut(port) {
                 // Retry a QUIC socket that did not come up with its TCP peer.
-                if let Some(error) = self.ensure_quic(*port, listener).await {
-                    failures.push(GatewayListenerBindFailure { port: *port, error });
+                if let Some((category, error)) = self.ensure_quic(*port, listener).await {
+                    failures.push(GatewayListenerBindFailure::quic(*port, category, error));
                 }
                 continue;
             }
@@ -675,20 +835,28 @@ impl GatewayListenerManager {
                      configured on this gateway; the listener is not bound"
                 );
                 warn!(port = *port, "Gateway API listener refused: {error}");
-                failures.push(GatewayListenerBindFailure { port: *port, error });
+                failures.push(GatewayListenerBindFailure::tcp(
+                    *port,
+                    GatewayListenerFailureCategory::FrontendTlsMissing,
+                    error,
+                ));
                 refused_route_ports.insert(*port);
                 continue;
             }
             match self.spawn_listener(*port, *class).await {
                 Ok(mut listener) => {
-                    if let Some(error) = self.ensure_quic(*port, &mut listener).await {
-                        failures.push(GatewayListenerBindFailure { port: *port, error });
+                    if let Some((category, error)) = self.ensure_quic(*port, &mut listener).await {
+                        failures.push(GatewayListenerBindFailure::quic(*port, category, error));
                     }
                     live.insert(*port, listener);
                 }
                 Err(error) => {
                     error!(port = *port, "Gateway API listener bind failed: {error}");
-                    failures.push(GatewayListenerBindFailure { port: *port, error });
+                    failures.push(GatewayListenerBindFailure::tcp(
+                        *port,
+                        GatewayListenerFailureCategory::BindFailed,
+                        error,
+                    ));
                     refused_route_ports.insert(*port);
                 }
             }
@@ -698,9 +866,20 @@ impl GatewayListenerManager {
             .iter()
             .filter_map(|(port, listener)| listener.quic.is_some().then_some(*port))
             .collect();
+        // Every declared Gateway listener port this process must bind itself.
+        // `already_served` ports are excluded: a process-global frontend of the
+        // same class already serves them, so no dynamic socket is desired.
+        let desired_listeners = plan.ports.len() + plan.refused.len();
+        let active_listeners = live.len();
         drop(live);
 
-        (failures, refused_route_ports, h3_ports)
+        ReconcileOutcome {
+            failures,
+            refused_route_ports,
+            h3_ports,
+            desired_listeners,
+            active_listeners,
+        }
     }
 
     /// Drop finished drains so completed handles cannot accumulate for the life
@@ -777,20 +956,30 @@ impl GatewayListenerManager {
 
     /// Bind the QUIC socket for a TLS-class listener when HTTP/3 is enabled.
     ///
-    /// Returns the failure reason when the QUIC listener could not be started.
+    /// Returns the bounded category and failure reason when the QUIC listener
+    /// could not be started.
     /// The TCP listener keeps serving H1/H2 in that case and the QUIC bind is
     /// retried on the next reconcile / retry tick; `Alt-Svc` does not advertise
     /// HTTP/3 for the port until the socket exists, so no client is steered at
-    /// a socket that is not there.
-    async fn ensure_quic(&self, port: u16, listener: &mut LiveListener) -> Option<String> {
+    /// a socket that is not there. The failure is therefore reported against
+    /// the QUIC half alone — reporting it as a listener-wide outage would
+    /// falsely claim H1/H2 are unavailable on a serving port.
+    async fn ensure_quic(
+        &self,
+        port: u16,
+        listener: &mut LiveListener,
+    ) -> Option<(GatewayListenerFailureCategory, String)> {
         let http3 = self.http3.as_ref()?;
         if listener.class != GatewayListenerClass::Tls || listener.quic.is_some() {
             return None;
         }
         let Some(tls_config) = self.tls.quic_initial_config() else {
-            return Some(format!(
-                "port {port} has no frontend TLS material for an HTTP/3 listener; HTTP/3 is not \
-                 served on this Gateway listener port"
+            return Some((
+                GatewayListenerFailureCategory::FrontendTlsMissing,
+                format!(
+                    "port {port} has no frontend TLS material for an HTTP/3 listener; HTTP/3 is \
+                     not served on this Gateway listener port"
+                ),
             ));
         };
         let addr = SocketAddr::new(self.bind_addr, port);
@@ -830,7 +1019,7 @@ impl GatewayListenerManager {
                     Err(err) => format!("HTTP/3 listener task panicked: {err}"),
                 };
                 error!(port, "Gateway API HTTP/3 listener bind failed: {error}");
-                Some(error)
+                Some((GatewayListenerFailureCategory::BindFailed, error))
             }
         }
     }
@@ -1068,13 +1257,24 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_dead_listener_task_is_reaped_surfaced_and_rebound() {
         let port = free_port().await;
+        // A locally-owned status handle, never the process-global one: killing
+        // a live accept-loop task is private-state behavior (see the module
+        // note above), and the published category is the only way to prove the
+        // observability surface distinguishes a dead accept loop from a bind
+        // refusal.
+        let status = Arc::new(crate::proxy::gateway_listener_status::GatewayListenerStatus::new());
         let manager = GatewayListenerManager::new(
             test_state(port_scoped_config(port)),
             std::net::IpAddr::from([127, 0, 0, 1]),
             GatewayListenerTls::default(),
-        );
+        )
+        .with_status(status.clone());
         assert!(manager.reconcile().await.is_empty());
         assert_eq!(manager.active_ports().await, vec![port]);
+        assert!(
+            !status.snapshot().degraded(),
+            "a healthy listener must publish no active failure"
+        );
 
         // Kill the accept loop behind the manager's back, exactly as a panic
         // or an unexpected loop exit would.
@@ -1113,6 +1313,35 @@ mod tests {
                 .expect("listener")
                 .is_finished(),
             "the rebound listener must be live"
+        );
+        // The pass that reaped the dead task publishes it as a runtime
+        // listener-task death on the TCP half, not as a bind refusal.
+        let snapshot = status.snapshot();
+        assert_eq!(snapshot.active_failures, 1, "{snapshot:?}");
+        let entry = &snapshot.failures[0];
+        assert_eq!(entry.port, port);
+        assert_eq!(entry.protocol, GatewayListenerProtocolHalf::Tcp);
+        assert_eq!(
+            entry.category,
+            GatewayListenerFailureCategory::ListenerTaskEnded
+        );
+
+        // The rebind succeeded, so the next pass clears it and counts a
+        // recovery — this signal is recoverable, unlike the sticky
+        // `serving_listener_failures` surface.
+        manager.reconcile().await;
+        assert!(!status.snapshot().degraded());
+        assert_eq!(
+            status
+                .cumulative()
+                .recoveries_total
+                .iter()
+                .find(|series| {
+                    series.protocol == GatewayListenerProtocolHalf::Tcp
+                        && series.category == GatewayListenerFailureCategory::ListenerTaskEnded
+                })
+                .map(|series| series.value),
+            Some(1)
         );
         manager.shutdown_all().await;
     }

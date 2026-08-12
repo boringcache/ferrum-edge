@@ -13641,6 +13641,8 @@ fn start_mesh_admin_listeners(
         startup_ready: Some(startup_ready.clone()),
         serving_degraded: Some(serving_degraded.clone()),
         serving_listener_failures: Some(serving_listener_failures.clone()),
+        gateway_listener_status: None,
+        gateway_listener_failure_fails_readiness: false,
         db_available: None,
         config_rejected: None,
         admin_restore_max_body_size_mib: env_config.admin_restore_max_body_size_mib,
