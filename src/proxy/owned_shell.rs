@@ -297,7 +297,7 @@ fn finish_status(status: std::process::ExitStatus, stderr: Vec<u8>) -> Result<()
 fn return_without_blocking_wait(mut child: Child, error: OwnedShellError) -> OwnedShellError {
     match child.try_wait() {
         Ok(Some(_)) => error,
-        Err(error) if error.kind() == io::ErrorKind::InvalidInput => error,
+        Err(io_error) if io_error.kind() == io::ErrorKind::InvalidInput => error,
         _ => {
             let _ = child.stderr.take();
             std::mem::forget(child);
