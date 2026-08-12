@@ -384,10 +384,10 @@ impl HoldingHttp1Backend {
                         });
                     }
                     Some(joined) = children.join_next() => {
-                        if let Err(join_err) = joined {
-                            if join_err.is_panic() {
-                                return Err(format!("holding connection panicked: {join_err}"));
-                            }
+                        if let Err(join_err) = joined
+                            && join_err.is_panic()
+                        {
+                            return Err(format!("holding connection panicked: {join_err}"));
                         }
                     }
                 }
