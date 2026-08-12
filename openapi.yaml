@@ -12028,18 +12028,21 @@ components:
         CP/DP verification trust-bundle reload worker and the bounded window in
         which an unrevalidatable verifier may keep authorizing (issue #3813).
 
-        Every field is fixed-cardinality — booleans, seconds, counters, a closed
-        reason label, and a redacted generation identifier. Nothing here carries
-        a bundle path, key material, a JWT, a `kid`, a namespace inventory, or
-        any credential identifier. `active_generation` is a domain-separated
-        re-hash of the internal configuration fingerprint truncated to 16 hex
-        characters: two replicas holding the same configuration publish the same
-        value, so fleet convergence after a rotation is checkable without
-        revealing anything about the credentials themselves.
+        Every field is fixed-cardinality — booleans, seconds, counters, and a
+        closed reason label. Nothing here carries a bundle path, key material, a
+        JWT, a `kid`, a namespace inventory, or any credential identifier, and
+        nothing here is *derived* from credential material either: no generation
+        identifier, fingerprint, or digest is published. A deterministic,
+        replica-comparable identifier computed from key material would let an
+        attacker who guesses a candidate symmetric secret confirm the guess
+        offline, and re-hashing, domain separation, or truncation does not
+        remove that property. Convergence across replicas is therefore **not**
+        checkable from this payload; the internal configuration fingerprint
+        stays private to the reload worker as a change detector only.
 
         Ages are measured on a monotonic clock, so a wall-clock/NTP step can
         neither extend nor shorten the window. Only an accepted reload resets
-        `active_generation_age_seconds`; attempts, refusals, and the passage of
+        `last_acceptance_age_seconds`; attempts, refusals, and the passage of
         time do not. Once that age reaches `max_stale_seconds`, `stale` latches,
         `admission_blocked` turns true for every configuration stream family,
         and `/health` reports `ready: false` with `status: "unavailable"`. The
@@ -12054,7 +12057,6 @@ components:
           admission_blocked,
           readiness_blocked,
           reason,
-          active_generation_age_seconds,
           max_stale_seconds,
           unbounded_stale_allowed,
           consecutive_failures,
@@ -12122,17 +12124,6 @@ components:
               worker_exited,
             ]
           description: Closed-set reason currently blocking rotation.
-        active_generation:
-          type: string
-          nullable: true
-          description: >
-            Redacted, replica-comparable identifier of the active trust
-            generation. 16 lowercase hex characters; never the internal
-            fingerprint, a `kid`, or any key material.
-        active_generation_age_seconds:
-          type: integer
-          format: uint64
-          description: Seconds since the last accepted generation, monotonic.
         last_attempt_age_seconds:
           type: integer
           format: uint64

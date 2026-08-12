@@ -3180,7 +3180,6 @@ fn stale_trust_store() -> Arc<CpDpVerifierStore> {
         Duration::from_millis(1),
         false,
         Duration::from_secs(30),
-        "0000000000000000".to_string(),
         tokio::time::Instant::now(),
     );
     let status = Arc::new(status);
@@ -3352,7 +3351,6 @@ async fn stale_trust_terminates_established_streams_on_every_surface() {
             bound,
             false,
             Duration::from_secs(30),
-            "0000000000000000".to_string(),
             tokio::time::Instant::now(),
         ));
         let verifier =
@@ -3409,7 +3407,6 @@ async fn stale_trust_ends_the_shared_authorization_lease() {
         bound,
         false,
         Duration::from_secs(30),
-        "0000000000000000".to_string(),
         tokio::time::Instant::now(),
     ));
     let verifier =

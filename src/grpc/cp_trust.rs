@@ -1242,8 +1242,7 @@ impl CpDpTrustBundle {
         // Phase one: resolve every referenced source from the pinned
         // generation. Nothing semantic is constructed until the whole immutable
         // candidate exists, so an incoherent bundle is refused before a single
-        // `TrustedKey` — or the fingerprint that would publish it — comes into
-        // being.
+        // `TrustedKey` comes into being.
         let mut materials = Vec::with_capacity(document.keys.len());
         let mut material_bytes = 0_u64;
         for entry in &document.keys {
@@ -1381,6 +1380,14 @@ impl std::fmt::Debug for CpDpVerifier {
 }
 
 impl CpDpVerifier {
+    /// Digest over every credential identity and namespace ceiling.
+    ///
+    /// This is **private on purpose**. It hashes key material (including an
+    /// HS\* secret-derived identity), so anyone who can guess a candidate
+    /// secret can recompute it offline; publishing it — or any deterministic
+    /// unkeyed function of it, however domain-separated or truncated — would be
+    /// a credential-verification oracle. It exists solely so the reload worker
+    /// can tell a semantic change from a confirmation.
     fn configuration_fingerprint(&self) -> [u8; 32] {
         match self {
             Self::SharedSecret(secret) => {
@@ -1388,21 +1395,6 @@ impl CpDpVerifier {
             }
             Self::TrustBundle(bundle) => bundle.configuration_fingerprint(),
         }
-    }
-
-    /// Redacted, replica-comparable identifier of this verifier's generation.
-    ///
-    /// The raw fingerprint digests each credential's key material and namespace
-    /// ceiling, so it is never published directly; the redaction re-hashes it
-    /// under a display-only domain and truncates it (see
-    /// [`crate::grpc::cp_trust_health::redact_generation_fingerprint`]). Two CP
-    /// replicas holding the same configuration produce the same value, which is
-    /// what makes fleet convergence checkable without revealing anything about
-    /// the credentials themselves.
-    pub fn redacted_generation(&self) -> String {
-        crate::grpc::cp_trust_health::redact_generation_fingerprint(
-            &self.configuration_fingerprint(),
-        )
     }
 
     /// True when this verifier provides server-derived namespace binding.
@@ -1778,9 +1770,11 @@ async fn trust_bundle_reload_worker(
             status.record_rejected(TrustReloadFailure::ScopeValidationFailed);
             continue;
         }
+        // The fingerprint never leaves this loop: it is a change detector, not
+        // an observable value (publishing it, or any unkeyed derivative, would
+        // let a guessed secret be confirmed offline).
         let fingerprint = candidate.configuration_fingerprint();
         let changed = accepted_fingerprint != fingerprint;
-        let redacted = candidate.redacted_generation();
         if changed {
             verifier.replace(candidate);
             accepted_fingerprint = fingerprint;
@@ -1794,7 +1788,7 @@ async fn trust_bundle_reload_worker(
         // bound asks about. Recording it is what lets an outage that ends
         // without any configuration change clear degraded state and count one
         // recovery.
-        status.record_accepted(redacted, changed);
+        status.record_accepted(changed);
     }
 }
 

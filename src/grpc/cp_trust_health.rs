@@ -34,12 +34,18 @@
 //! # Disclosure discipline
 //!
 //! Nothing here renders a path, bundle bytes, a JWT, a namespace, a `kid`, a
-//! credential identifier, or any key material. The published generation
-//! identifier is a domain-separated re-hash of the internal configuration
-//! fingerprint, truncated to 16 hex characters: stable and comparable across
-//! replicas that share one configuration, and not a digest an operator (or an
-//! attacker with a candidate secret) can verify material against. Failure
-//! reasons come from one closed, compile-time set.
+//! credential identifier, or any key material — and nothing here renders any
+//! value *derived* from key material either. In particular no generation
+//! identifier, fingerprint, or digest is published. A deterministic identifier
+//! computed from credential material is an offline verification oracle no
+//! matter how it is re-hashed, domain-separated, or truncated: an attacker who
+//! can guess a candidate symmetric secret can recompute the same value from
+//! public algorithms and compare. The internal configuration fingerprint
+//! therefore stays private to the reload worker, where it serves only as a
+//! semantic change detector, and never reaches health, metrics, or logs.
+//!
+//! What is published is booleans, counters, monotonic ages in seconds, and one
+//! closed, compile-time set of failure reasons.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -49,11 +55,9 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::task::{Context, Poll};
 
-use arc_swap::ArcSwapOption;
 use serde::Serialize;
 use tokio::time::{Duration, Instant, Sleep};
 
-use crate::fips::approved::Sha256;
 use crate::grpc::cp_trust::TrustBundleRejectReason;
 
 /// Low bit of the state word: sticky stale. The remaining bits are the accepted
@@ -225,9 +229,10 @@ impl WorkerState {
 /// Fixed-cardinality projection for authenticated `/health` and `/status`, the
 /// Prometheus render pass, and tests.
 ///
-/// Every field is a boolean, a count, a number of seconds, a closed-set label,
-/// or the redacted generation identifier. Nothing here is derived from bundle
-/// bytes, a path, a namespace, a `kid`, or a token.
+/// Every field is a boolean, a count, a number of seconds, or a closed-set
+/// label. Nothing here is derived from bundle bytes, key material, a path, a
+/// namespace, a `kid`, or a token — including indirectly through a digest,
+/// fingerprint, or generation identifier.
 #[derive(Clone, Debug, Serialize)]
 pub struct CpDpTrustReloadSnapshot {
     /// Whether a file-backed trust bundle is configured and watched at all.
@@ -248,11 +253,6 @@ pub struct CpDpTrustReloadSnapshot {
     pub readiness_blocked: bool,
     /// Closed-set reason: `ok` or a [`TrustReloadFailure`] label.
     pub reason: &'static str,
-    /// Redacted, replica-comparable identifier of the active trust generation.
-    /// `None` before the first acceptance.
-    pub active_generation: Option<String>,
-    /// Age of the active generation, in seconds, on a monotonic clock.
-    pub active_generation_age_seconds: u64,
     /// Seconds since the last reload attempt completed. `None` if none has.
     pub last_attempt_age_seconds: Option<u64>,
     /// Seconds since the last accepted generation. `None` if none has been
@@ -313,28 +313,6 @@ pub fn disabled_status() -> Arc<CpDpTrustReloadStatus> {
         .clone()
 }
 
-/// Redact a raw configuration fingerprint into a stable, replica-comparable
-/// identifier.
-///
-/// The internal fingerprint is a digest over each credential's key material and
-/// namespace ceiling, so publishing it verbatim would hand out an offline
-/// verification oracle for a symmetric secret. Re-hashing under a distinct
-/// domain and truncating to 64 bits keeps the value comparable across replicas
-/// that share one configuration while removing that property.
-pub fn redact_generation_fingerprint(fingerprint: &[u8; 32]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(b"ferrum-cp-dp-trust-generation-display-v1\0");
-    hasher.update(fingerprint);
-    let digest = hasher.finalize();
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(16);
-    for byte in &digest[..8] {
-        out.push(HEX[usize::from(byte >> 4)] as char);
-        out.push(HEX[usize::from(byte & 0x0f)] as char);
-    }
-    out
-}
-
 /// Lock-free reload accounting for the CP/DP trust bundle.
 ///
 /// Publication is atomics only: no lock, no allocation on the read path, and no
@@ -348,7 +326,6 @@ pub struct CpDpTrustReloadStatus {
     stall_after: Duration,
     /// Monotonic base. Every stamp is a millisecond offset from here.
     epoch: Instant,
-    generation: ArcSwapOption<String>,
     /// `accepted_generation << 1 | stale`. The counter increments on every
     /// acceptance; the stale bit is sticky within a generation and is cleared
     /// only by the generation bump itself.
@@ -390,19 +367,8 @@ impl CpDpTrustReloadStatus {
     /// the configuration layer admits only behind an explicit unsafe opt-in),
     /// and `interval` is the watcher's poll period, which sets the
     /// stalled-worker window.
-    pub fn watching(
-        max_stale: Duration,
-        unbounded_allowed: bool,
-        interval: Duration,
-        fingerprint: String,
-    ) -> Self {
-        Self::watching_at(
-            max_stale,
-            unbounded_allowed,
-            interval,
-            fingerprint,
-            Instant::now(),
-        )
+    pub fn watching(max_stale: Duration, unbounded_allowed: bool, interval: Duration) -> Self {
+        Self::watching_at(max_stale, unbounded_allowed, interval, Instant::now())
     }
 
     /// [`Self::watching`] with an explicit monotonic base, so tests can drive
@@ -411,7 +377,6 @@ impl CpDpTrustReloadStatus {
         max_stale: Duration,
         unbounded_allowed: bool,
         interval: Duration,
-        fingerprint: String,
         now: Instant,
     ) -> Self {
         // Three missed polls, floored at a minute, is long enough that ordinary
@@ -419,7 +384,6 @@ impl CpDpTrustReloadStatus {
         // wedged in the kernel is visible well before the stale bound.
         let stall_after = interval.saturating_mul(3).max(Duration::from_secs(60));
         let status = Self::build(true, max_stale, unbounded_allowed, stall_after, now);
-        status.generation.store(Some(Arc::new(fingerprint)));
         status
             .last_acceptance_ms
             .store(status.stamp(now), Ordering::Release);
@@ -440,7 +404,6 @@ impl CpDpTrustReloadStatus {
             unbounded_allowed,
             stall_after,
             epoch,
-            generation: ArcSwapOption::empty(),
             state: AtomicU64::new(0),
             last_attempt_ms: AtomicU64::new(0),
             last_acceptance_ms: AtomicU64::new(0),
@@ -495,21 +458,22 @@ impl CpDpTrustReloadStatus {
 
     /// A reload attempt produced a usable generation.
     ///
-    /// `fingerprint` is already redacted. `changed` distinguishes a replacement
-    /// from a semantically identical confirmation; both are acceptances,
-    /// because both prove the trust source is readable and coherent again.
+    /// `changed` distinguishes a replacement from a semantically identical
+    /// confirmation; both are acceptances, because both prove the trust source
+    /// is readable and coherent again. The candidate's configuration
+    /// fingerprint stays inside the worker — it is a change detector, never an
+    /// observable value.
     ///
     /// The write order is load-bearing: the acceptance stamp lands first, then
-    /// the generation bump publishes it, so a staleness evaluation that
-    /// observed the older generation fails its compare-and-swap instead of
+    /// the internal generation bump publishes it, so a staleness evaluation
+    /// that observed the older generation fails its compare-and-swap instead of
     /// latching on top of the recovery.
-    pub fn record_accepted_at(&self, now: Instant, fingerprint: String, changed: bool) {
+    pub fn record_accepted_at(&self, now: Instant, changed: bool) {
         self.last_acceptance_ms
             .store(self.stamp(now), Ordering::Release);
         self.last_attempt_ms
             .store(self.stamp(now), Ordering::Release);
         self.acceptances_total.fetch_add(1, Ordering::Relaxed);
-        self.generation.store(Some(Arc::new(fingerprint)));
         self.last_failure.store(0, Ordering::Relaxed);
         let failures = self.consecutive_failures.swap(0, Ordering::AcqRel);
         // Bump the generation and clear the sticky stale bit in one step. The
@@ -532,8 +496,8 @@ impl CpDpTrustReloadStatus {
     }
 
     /// [`Self::record_accepted_at`] at the current instant.
-    pub fn record_accepted(&self, fingerprint: String, changed: bool) {
-        self.record_accepted_at(Instant::now(), fingerprint, changed);
+    pub fn record_accepted(&self, changed: bool) {
+        self.record_accepted_at(Instant::now(), changed);
     }
 
     /// A reload attempt was refused. The previous verifier is retained in full;
@@ -722,11 +686,6 @@ impl CpDpTrustReloadStatus {
             admission_blocked: stale,
             readiness_blocked: stale || worker_state == WorkerState::Failed,
             reason: self.last_failure_reason().map_or("ok", |f| f.as_str()),
-            active_generation: self
-                .generation
-                .load_full()
-                .map(|generation| generation.as_ref().clone()),
-            active_generation_age_seconds: self.age_from(last_acceptance, now).as_secs(),
             last_attempt_age_seconds: (last_attempt != 0)
                 .then(|| self.since_stamp(last_attempt, now).as_secs()),
             last_acceptance_age_seconds: (last_acceptance != 0)

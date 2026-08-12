@@ -2096,7 +2096,6 @@ pub async fn run(
                     max_stale,
                     env_config.cp_dp_trust_allow_unbounded_stale,
                     trust_reload_interval,
-                    cp_dp_verifier.redacted_generation(),
                 ),
             );
             crate::grpc::cp_trust_health::install(status)

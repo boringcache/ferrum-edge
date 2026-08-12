@@ -4676,7 +4676,8 @@ pub fn render_dp_config_freshness_prometheus(
 /// `None` everywhere else). Every series is fixed-cardinality: `namespace` and
 /// the closed [`crate::grpc::cp_trust_health::TrustReloadFailure`] set are the
 /// only labels. No bundle path, `kid`, namespace inventory, credential
-/// identifier, or generation fingerprint is ever a label value.
+/// identifier, generation identifier, fingerprint, or any other value derived
+/// from key material is ever a label value or a sample value.
 pub fn render_cp_dp_trust_reload_prometheus(
     output: &mut String,
     ns_label: &str,
@@ -4748,13 +4749,13 @@ pub fn render_cp_dp_trust_reload_prometheus(
     );
 
     output.push_str(
-        "# HELP ferrum_cp_dp_trust_active_generation_age_seconds Seconds since the CP last accepted (replaced or confirmed) its trust generation, on a monotonic clock.\n",
+        "# HELP ferrum_cp_dp_trust_last_acceptance_age_seconds Seconds since the CP last accepted (replaced or confirmed) its trust source, on a monotonic clock.\n",
     );
-    output.push_str("# TYPE ferrum_cp_dp_trust_active_generation_age_seconds gauge\n");
+    output.push_str("# TYPE ferrum_cp_dp_trust_last_acceptance_age_seconds gauge\n");
     render_process_counter(
         output,
-        "ferrum_cp_dp_trust_active_generation_age_seconds",
-        status.active_generation_age_seconds,
+        "ferrum_cp_dp_trust_last_acceptance_age_seconds",
+        status.last_acceptance_age_seconds.unwrap_or(0),
         ns_label,
     );
 

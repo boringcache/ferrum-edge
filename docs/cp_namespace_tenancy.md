@@ -355,14 +355,19 @@ has a finite default.
 `cp_dp_trust` object, and `/metrics` carries the `ferrum_cp_dp_trust_*`
 families. Both are fixed-cardinality: booleans, counters, seconds, the closed
 reason set above (plus `reader_unavailable`, `reload_reader_failed`,
-`reload_read_timed_out`, `scope_validation_failed`, and `worker_exited`), and a
-**redacted generation identifier**. That identifier is a domain-separated
-re-hash of the internal configuration fingerprint truncated to 16 hex
-characters, so two replicas holding the same configuration publish the same
-value — fleet convergence after a rotation is checkable — while it is not a
-digest anyone can verify candidate key material against. No path, `kid`,
-namespace, token, or key byte appears in any of it. Unauthenticated probes
-still receive only the documented coarse `status` / `ready` pair.
+`reload_read_timed_out`, `scope_validation_failed`, and `worker_exited`).
+Nothing more. No path, `kid`, namespace, token, or key byte appears in any of
+it — and **no generation identifier, fingerprint, or digest** either, not even
+a re-hashed or truncated one. Any deterministic identifier computed from
+credential material is an offline verification oracle: an attacker holding a
+candidate symmetric secret can recompute it with public algorithms and compare
+it against the published value, and domain separation or truncation only
+shortens the comparison, it does not remove it. The internal configuration
+fingerprint therefore stays private to the reload worker, where it is used only
+to tell a semantic change from a confirmation. The consequence is deliberate:
+**you cannot check fleet generation convergence from this surface.** Compare
+what you deployed at the source of truth instead. Unauthenticated probes still
+receive only the documented coarse `status` / `ready` pair.
 
 **What the states mean.**
 
@@ -390,8 +395,10 @@ default.
 Suggested alerts: `ferrum_cp_dp_trust_degraded == 1` for longer than one poll
 interval (a rotation is not landing), `ferrum_cp_dp_trust_stale == 1` (this
 replica is refusing its data planes), `ferrum_cp_dp_trust_reload_worker_running
-== 0` (supervision failure), and a `count(count by (active_generation) (...))`
-style comparison of the redacted generation across replicas after a rotation.
+== 0` (supervision failure), and
+`max(ferrum_cp_dp_trust_last_acceptance_age_seconds) > 3 *
+FERRUM_SECRET_REFRESH_INTERVAL_SECONDS` (some replica has stopped revalidating
+even if it has not yet reached its bound).
 
 ### mTLS / SPIFFE intersection
 

@@ -1127,9 +1127,9 @@
     "emission": "conditional"
   },
   {
-    "name": "ferrum_cp_dp_trust_active_generation_age_seconds",
+    "name": "ferrum_cp_dp_trust_degraded",
     "type": "gauge",
-    "help": "Seconds since the CP last accepted (replaced or confirmed) its trust generation, on a monotonic clock.",
+    "help": "Whether the CP is authorizing with a trust generation it could not revalidate (1) or not (0).",
     "labels": [
       "namespace"
     ],
@@ -1139,9 +1139,9 @@
     "emission": "conditional"
   },
   {
-    "name": "ferrum_cp_dp_trust_degraded",
+    "name": "ferrum_cp_dp_trust_last_acceptance_age_seconds",
     "type": "gauge",
-    "help": "Whether the CP is authorizing with a trust generation it could not revalidate (1) or not (0).",
+    "help": "Seconds since the CP last accepted (replaced or confirmed) its trust source, on a monotonic clock.",
     "labels": [
       "namespace"
     ],

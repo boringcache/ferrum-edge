@@ -14,7 +14,10 @@
 //! * an unexpectedly dead worker fails readiness immediately, while a clean
 //!   shutdown is never reported as a failure;
 //! * nothing published anywhere — health JSON, metrics text, or logs — carries
-//!   a path, a `kid`, a namespace, or key material.
+//!   a path, a `kid`, a namespace, key material, or any value *derived* from
+//!   key material: no generation identifier, fingerprint, or digest, however
+//!   re-hashed or truncated, because such a value is an offline oracle against
+//!   a guessed symmetric secret.
 //!
 //! The five gRPC stream families' behaviour at the boundary is covered in
 //! `cp_tenant_trust_binding_tests.rs`, which already owns the multi-surface
@@ -28,7 +31,7 @@ use tokio::time::{Duration, Instant, advance};
 
 use ferrum_edge::grpc::cp_trust::{CpDpTrustBundle, CpDpVerifier};
 use ferrum_edge::grpc::cp_trust_health::{
-    CpDpTrustReloadStatus, TRUST_RELOAD_FAILURES, TrustReloadFailure, redact_generation_fingerprint,
+    CpDpTrustReloadStatus, TRUST_RELOAD_FAILURES, TrustReloadFailure,
 };
 use ferrum_edge::plugins::prometheus_metrics::render_cp_dp_trust_reload_prometheus;
 
@@ -62,18 +65,8 @@ fn verifier(kid: &str, namespace: &str, secret: &str) -> CpDpVerifier {
     )
 }
 
-fn generation(kid: &str, namespace: &str, secret: &str) -> String {
-    verifier(kid, namespace, secret).redacted_generation()
-}
-
 fn status_at(now: Instant, max_stale: Duration) -> CpDpTrustReloadStatus {
-    CpDpTrustReloadStatus::watching_at(
-        max_stale,
-        max_stale.is_zero(),
-        POLL_INTERVAL,
-        generation(KID, NAMESPACE, SECRET),
-        now,
-    )
+    CpDpTrustReloadStatus::watching_at(max_stale, max_stale.is_zero(), POLL_INTERVAL, now)
 }
 
 // ── Degraded state and the closed reason set ─────────────────────────────
@@ -104,7 +97,10 @@ async fn first_rejected_candidate_marks_degraded_immediately() {
         !snapshot.stale && !snapshot.admission_blocked && !snapshot.readiness_blocked,
         "a transient failure inside the bound keeps serving: {snapshot:?}"
     );
-    assert_eq!(snapshot.active_generation, healthy.active_generation);
+    assert_eq!(
+        snapshot.acceptances_total, healthy.acceptances_total,
+        "a refusal is not an acceptance"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -170,7 +166,7 @@ async fn every_closed_reason_has_a_distinct_fixed_label() {
 #[tokio::test(start_paused = true)]
 async fn unchanged_candidate_after_an_outage_clears_degraded_and_counts_one_recovery() {
     let status = status_at(Instant::now(), BOUND);
-    let expected_generation = status.snapshot().active_generation.clone();
+    let accepted_before = status.snapshot().acceptances_total;
     for _ in 0..3 {
         status.record_attempt();
         status.record_rejected(TrustReloadFailure::ReadTimedOut);
@@ -182,38 +178,39 @@ async fn unchanged_candidate_after_an_outage_clears_degraded_and_counts_one_reco
     // trust source was read coherently and revalidated, which is exactly the
     // question the bound asks.
     status.record_attempt();
-    status.record_accepted(generation(KID, NAMESPACE, SECRET), false);
+    status.record_accepted(false);
 
     let snapshot = status.snapshot();
     assert!(!snapshot.degraded, "recovery clears degraded: {snapshot:?}");
     assert_eq!(snapshot.reason, "ok");
     assert_eq!(snapshot.consecutive_failures, 0);
     assert_eq!(snapshot.recoveries_total, 1);
-    assert_eq!(snapshot.active_generation, expected_generation);
+    assert_eq!(snapshot.acceptances_total, accepted_before + 1);
     assert_eq!(snapshot.last_acceptance_age_seconds, Some(0));
 
     // A second healthy poll is not a second recovery.
     status.record_attempt();
-    status.record_accepted(generation(KID, NAMESPACE, SECRET), false);
+    status.record_accepted(false);
     assert_eq!(status.snapshot().recoveries_total, 1);
 }
 
 #[tokio::test(start_paused = true)]
-async fn changed_candidate_publishes_a_new_generation_and_counts_one_recovery() {
+async fn changed_candidate_recovers_and_counts_one_recovery() {
     let status = status_at(Instant::now(), BOUND);
-    let before = status.snapshot().active_generation.clone();
+    let accepted_before = status.snapshot().acceptances_total;
     status.record_attempt();
     status.record_rejected(TrustReloadFailure::DocumentInvalid);
 
     status.record_attempt();
-    status.record_accepted(generation("tenant-a-v2", NAMESPACE, SECRET), true);
+    status.record_accepted(true);
 
     let snapshot = status.snapshot();
     assert!(!snapshot.degraded);
     assert_eq!(snapshot.recoveries_total, 1);
-    assert_ne!(
-        snapshot.active_generation, before,
-        "a rotated credential must publish a different redacted generation"
+    assert_eq!(
+        snapshot.acceptances_total,
+        accepted_before + 1,
+        "a rotation is one acceptance, and publishes no identifier of what was rotated"
     );
 }
 
@@ -257,7 +254,7 @@ async fn a_later_valid_candidate_clears_stale_and_restores_admission() {
     assert!(status.admission_blocked());
 
     status.record_attempt();
-    status.record_accepted(generation(KID, NAMESPACE, SECRET), false);
+    status.record_accepted(false);
 
     let snapshot = status.snapshot();
     assert!(!snapshot.stale, "acceptance clears the sticky bit");
@@ -285,7 +282,11 @@ async fn unbounded_retention_never_blocks_but_stays_visibly_degraded() {
     );
     assert_eq!(snapshot.max_stale_seconds, 0);
     assert!(snapshot.unbounded_stale_allowed);
-    assert!(snapshot.active_generation_age_seconds >= 86_400);
+    assert!(
+        snapshot
+            .last_acceptance_age_seconds
+            .is_some_and(|age| age >= 86_400)
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -298,7 +299,7 @@ async fn a_status_with_no_trust_bundle_never_blocks_anything() {
     assert!(!snapshot.readiness_blocked);
     assert!(!snapshot.configured);
     assert_eq!(snapshot.worker_state, "disabled");
-    assert!(snapshot.active_generation.is_none());
+    assert_eq!(snapshot.last_acceptance_age_seconds, None);
 }
 
 // ── Worker supervision ──────────────────────────────────────────────────
@@ -356,42 +357,74 @@ async fn a_worker_whose_attempts_stop_landing_reads_as_stalled() {
     );
 }
 
-// ── Redaction and replica convergence ───────────────────────────────────
+// ── Disclosure boundary ─────────────────────────────────────────────────
 
-#[tokio::test]
-async fn replicas_sharing_one_configuration_expose_the_same_redacted_generation() {
-    let left = generation(KID, NAMESPACE, SECRET);
-    let right = generation(KID, NAMESPACE, SECRET);
-    assert_eq!(left, right, "replica convergence must be checkable");
-    assert_eq!(left.len(), 16);
-    assert!(
-        left.chars()
-            .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
-        "generation identifier must be lowercase hex: {left}"
-    );
-
-    // A different credential, a different namespace ceiling, and a different
-    // `kid` must each be distinguishable.
-    for other in [
-        generation(KID, NAMESPACE, "a-different-tenant-a-secret-2026-ferrum"),
-        generation(KID, "tenant-b", SECRET),
-        generation("tenant-a-v2", NAMESPACE, SECRET),
-    ] {
-        assert_ne!(left, other);
+/// The longest run of ASCII hex digits in `text`.
+///
+/// A published generation identifier, fingerprint, or digest — whatever it is
+/// called — shows up as an unbroken hex run. The closed reason labels and the
+/// worker states are English words split by underscores, so their longest hex
+/// run is short.
+fn longest_hex_run(text: &str) -> usize {
+    let mut longest = 0usize;
+    let mut current = 0usize;
+    for ch in text.chars() {
+        if ch.is_ascii_hexdigit() {
+            current += 1;
+            longest = longest.max(current);
+        } else {
+            current = 0;
+        }
     }
+    longest
 }
 
-#[tokio::test]
-async fn the_redacted_generation_is_not_the_internal_fingerprint() {
-    // The internal fingerprint digests key material, so publishing it verbatim
-    // would be an offline verification oracle for a symmetric secret. The
-    // published value must be a re-hash, not a prefix of it.
-    let raw = [0x11u8; 32];
-    let redacted = redact_generation_fingerprint(&raw);
-    assert_eq!(redacted.len(), 16);
-    assert_ne!(redacted, "1111111111111111");
-    assert_eq!(redacted, redact_generation_fingerprint(&raw));
-    assert_ne!(redacted, redact_generation_fingerprint(&[0x12u8; 32]));
+/// No candidate-verifiable material may reach a published surface.
+///
+/// The trust source's configuration fingerprint hashes each credential identity
+/// (an HS\* secret-derived identity included), and every algorithm and domain
+/// involved is public. Publishing that fingerprint — or **any** deterministic
+/// unkeyed function of it, re-hashed, domain-separated, and truncated or not —
+/// lets an attacker who guesses a candidate symmetric secret recompute the
+/// value and confirm the guess offline. So the contract is not "redact it": it
+/// is that no such identifier exists on the health or metric surface at all.
+#[tokio::test(start_paused = true)]
+async fn the_published_projection_carries_no_generation_identifier_or_digest() {
+    let status = status_at(Instant::now(), BOUND);
+    status.record_attempt();
+    status.record_accepted(true);
+    status.record_attempt();
+    status.record_rejected(TrustReloadFailure::MaterialIntegrityMismatch);
+    let snapshot = status.snapshot();
+
+    // The projection's closed field set is pinned by
+    // `the_health_projection_is_fixed_cardinality`, so an added field cannot
+    // slip a derived identifier back in unnoticed. This asserts the content.
+    let rendered = serde_json::to_string(&snapshot).expect("snapshot serializes");
+    let mut metrics = String::new();
+    render_cp_dp_trust_reload_prometheus(&mut metrics, ",namespace=\"edge\"", Some(&snapshot));
+
+    for surface in [rendered.as_str(), metrics.as_str()] {
+        for forbidden in [
+            "active_generation",
+            "fingerprint",
+            "digest",
+            "sha256",
+            "candidate",
+            SECRET,
+            KID,
+            NAMESPACE,
+        ] {
+            assert!(
+                !surface.contains(forbidden),
+                "published trust health must not carry `{forbidden}`: {surface}"
+            );
+        }
+        assert!(
+            longest_hex_run(surface) < 16,
+            "a hex run this long is a generation identifier, fingerprint, or digest: {surface}"
+        );
+    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -448,7 +481,7 @@ async fn metric_labels_are_bounded_to_the_closed_reason_set() {
         "ferrum_cp_dp_trust_reload_rejections_total",
         "ferrum_cp_dp_trust_reload_recoveries_total",
         "ferrum_cp_dp_trust_reload_consecutive_failures",
-        "ferrum_cp_dp_trust_active_generation_age_seconds",
+        "ferrum_cp_dp_trust_last_acceptance_age_seconds",
         "ferrum_cp_dp_trust_max_stale_seconds",
         "ferrum_cp_dp_trust_degraded",
         "ferrum_cp_dp_trust_stale",
@@ -522,7 +555,6 @@ fn live_status() -> Arc<CpDpTrustReloadStatus> {
         Duration::from_secs(900),
         false,
         Duration::from_secs(1),
-        generation(KID, NAMESPACE, SECRET),
     ))
 }
 
@@ -584,12 +616,12 @@ async fn an_unreadable_bundle_document_publishes_the_closed_unreadable_reason() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_malformed_candidate_retains_the_previous_generation_and_degrades() {
+async fn a_malformed_candidate_retains_the_previous_verifier_and_degrades() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("bundle.json");
     std::fs::write(&path, bundle_document(KID, NAMESPACE, SECRET)).expect("write bundle");
     let status = live_status();
-    let generation = status.snapshot().active_generation.clone();
+    let accepted_before = status.snapshot().acceptances_total;
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let handle = spawn_worker(&path, status.clone(), shutdown_rx);
 
@@ -599,9 +631,9 @@ async fn a_malformed_candidate_retains_the_previous_generation_and_degrades() {
     })
     .await;
     assert_eq!(
-        status.snapshot().active_generation,
-        generation,
-        "a malformed candidate must never partially publish"
+        status.snapshot().acceptances_total,
+        accepted_before,
+        "a malformed candidate must never be accepted, even partially"
     );
 
     let _ = shutdown_tx.send(true);
@@ -609,12 +641,12 @@ async fn a_malformed_candidate_retains_the_previous_generation_and_degrades() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_rotated_bundle_publishes_a_new_redacted_generation() {
+async fn a_rotated_bundle_is_accepted_without_publishing_an_identifier() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("bundle.json");
     std::fs::write(&path, bundle_document(KID, NAMESPACE, SECRET)).expect("write bundle");
     let status = live_status();
-    let before = status.snapshot().active_generation.clone();
+    let accepted_before = status.snapshot().acceptances_total;
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let handle = spawn_worker(&path, status.clone(), shutdown_rx);
 
@@ -628,12 +660,15 @@ async fn a_rotated_bundle_publishes_a_new_redacted_generation() {
     )
     .expect("rotate bundle");
     wait_for_status(&status, "a rotated generation", |snapshot| {
-        snapshot.active_generation != before
+        snapshot.acceptances_total > accepted_before
     })
     .await;
     let snapshot = status.snapshot();
     assert!(!snapshot.degraded);
     assert!(snapshot.acceptances_total >= 2);
+    // The rotation is observable as an acceptance and a reset age — never as a
+    // value an attacker could recompute from a guessed secret.
+    assert_eq!(snapshot.reason, "ok");
 
     let _ = shutdown_tx.send(true);
     let _ = tokio::time::timeout(StdDuration::from_secs(5), handle).await;
@@ -659,8 +694,6 @@ async fn the_health_projection_is_fixed_cardinality() {
         keys,
         [
             "acceptances_total",
-            "active_generation",
-            "active_generation_age_seconds",
             "admission_blocked",
             "attempts_total",
             "configured",

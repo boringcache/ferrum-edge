@@ -2069,9 +2069,10 @@ async fn handle_admin_request_inner(
         }
         if let Some(trust) = cp_trust_reload.as_ref() {
             if detailed {
-                // Same discipline: booleans, seconds, counters, a closed-set
-                // reason, and a redacted generation identifier. Never a bundle
-                // path, key material, `kid`, namespace, or token.
+                // Same discipline: booleans, seconds, counters, and a
+                // closed-set reason. Never a bundle path, key material, `kid`,
+                // namespace, token, or any generation/fingerprint/digest
+                // derived from credential material.
                 health_status["cp_dp_trust"] = serde_json::to_value(trust).unwrap_or_default();
             }
             if trust.degraded && !cp_trust_blocked {
