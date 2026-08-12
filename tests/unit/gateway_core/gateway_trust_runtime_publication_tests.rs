@@ -8,6 +8,14 @@
 //! (`ProxyState::install_database_gateway_trust` /
 //! `ProxyState::publish_gateway_trust_generation`) and the production reload
 //! path (`ProxyState::update_config`) — never a duplicate of either.
+//!
+//! The second half of the file pins the **publication boundary** itself: an
+//! accepted configuration generation and the gateway trust it accepts must be
+//! ONE request-facing generation, so no request can pair new configuration with
+//! old trust roots or old configuration with new ones. Those cases drive the
+//! production seam step by step (`stage_database_gateway_trust` →
+//! `fence_gateway_trust_generation` → `commit_gateway_trust_generation`) and
+//! assert at the barrier, rather than racing a window.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -19,7 +27,9 @@ use ferrum_edge::identity::{
     spiffe::{SpiffeId, TrustDomain},
 };
 use ferrum_edge::modes::mesh::config::{TrustBundle, TrustBundleSet};
-use ferrum_edge::proxy::{ConfigApplyOutcome, DatabaseGatewayTrustInstall, ProxyState};
+use ferrum_edge::proxy::{
+    ConfigApplyOutcome, DatabaseGatewayTrustInstall, GatewayTrustCommit, ProxyState,
+};
 
 const TEST_NAMESPACE: &str = "ferrum";
 
@@ -107,14 +117,35 @@ fn active_svid_domain(state: &ProxyState) -> Option<String> {
         .map(|svid| svid.trust_bundles.local.trust_domain.as_str().to_string())
 }
 
+/// Install a source-loaded gateway SVID exactly the way the SVID source
+/// watcher does, so the live slots AND the published request epoch agree about
+/// which identity this process has.
 fn seed_source_loaded_svid(state: &ProxyState) {
-    let file_svid = source_loaded_svid("file.local", &[1, 2, 3]);
-    state
-        .gateway_file_svid_bundle
-        .store(std::sync::Arc::new(Some(file_svid.clone())));
-    state
-        .gateway_svid_bundle
-        .store(std::sync::Arc::new(Some(file_svid)));
+    state.install_gateway_runtime_svid_bundle(source_loaded_svid("file.local", &[1, 2, 3]));
+}
+
+/// Whether request paths may authenticate gateway-to-mesh peers right now,
+/// read exactly the way the dispatch/egress admission gates read it.
+fn mesh_admission_open(state: &ProxyState) -> bool {
+    state.admits_gateway_mesh_identity()
+}
+
+/// `(config generation, gateway trust generation, trust is live)` for the
+/// currently published request epoch — the one snapshot a request path loads.
+fn published_generations(state: &ProxyState) -> (u64, u64, bool) {
+    let epoch = state.request_epoch.load();
+    let trust = epoch.gateway_trust();
+    (
+        epoch.config_generation(),
+        trust.generation(),
+        trust.is_live(),
+    )
+}
+
+fn runtime_bundles(trust_domain: &str, authority: &[u8]) -> RuntimeTrustBundleSet {
+    stored_bundle(trust_domain, authority)
+        .to_runtime()
+        .expect("test bundle should convert to runtime trust material")
 }
 
 #[tokio::test]
@@ -241,4 +272,335 @@ async fn non_database_modes_do_not_touch_the_gateway_trust_override() {
     assert_eq!(outcome, DatabaseGatewayTrustInstall::NotApplicable);
     assert_eq!(live_override_domain(&state), None);
     assert_eq!(active_svid_domain(&state).as_deref(), Some("file.local"));
+}
+
+// ─── Coherent config/trust publication boundary (issue #3727) ───────────────
+//
+// A bundle update and the configuration that depends on it are two writes. The
+// tests below pin the property that makes them ONE request-facing generation:
+// for the whole interval between publishing an accepted configuration and
+// installing the trust it accepted, `ProxyState::admits_gateway_mesh_identity`
+// — the predicate every gateway-to-mesh admission gate reads — is CLOSED.
+//
+// They drive the production publication seam step by step
+// (`stage_database_gateway_trust` → `fence_gateway_trust_generation` →
+// `commit_gateway_trust_generation`), which is the same sequence
+// `ProxyState::update_config` runs internally, so the barrier is the test's own
+// control flow rather than a timing window. No sleeps, no spin loops, no
+// eventual assertions.
+
+#[tokio::test]
+async fn rotation_closes_mesh_admission_for_the_whole_publication_boundary() {
+    let initial = config_with(vec![record("db-v1.local", &[1])]);
+    let state = database_mode_state(initial.clone()).await;
+    seed_source_loaded_svid(&state);
+    state.publish_gateway_trust_generation(&initial);
+    assert!(
+        mesh_admission_open(&state),
+        "the steady state must admit gateway-to-mesh authentication"
+    );
+    let (_, trust_before, _) = published_generations(&state);
+
+    let rotated = config_with(vec![record("db-v2.local", &[2])]);
+    let commit = state
+        .stage_database_gateway_trust(&rotated)
+        .expect("a convertible candidate must stage");
+    assert!(
+        commit.changes_live_trust(),
+        "a rotation to different material must be staged as a live-trust change"
+    );
+
+    // Step 1 of the publication: the accepted generation is published FENCED.
+    state.fence_gateway_trust_generation();
+
+    // ── BARRIER ──────────────────────────────────────────────────────────
+    // This is the exact instant the old ordering exposed: the accepted
+    // generation is live but the verifier still holds the material it
+    // replaced. Admission must be refused here, not served from the previous
+    // generation's roots.
+    assert!(
+        !mesh_admission_open(&state),
+        "a published generation whose trust is not installed must refuse \
+         gateway-to-mesh authentication"
+    );
+    assert_eq!(
+        active_svid_domain(&state).as_deref(),
+        Some("db-v1.local"),
+        "the fence must not have swapped material yet — that is what makes this \
+         interval observable"
+    );
+    let (_, trust_at_barrier, live_at_barrier) = published_generations(&state);
+    assert!(!live_at_barrier);
+    assert_eq!(
+        trust_at_barrier, trust_before,
+        "a fence marks the generation pending; it does not advance it"
+    );
+
+    // Step 2: install the material and republish the admission live.
+    state.commit_gateway_trust_generation(commit);
+
+    assert!(mesh_admission_open(&state));
+    assert_eq!(live_override_domain(&state).as_deref(), Some("db-v2.local"));
+    assert_eq!(active_svid_domain(&state).as_deref(), Some("db-v2.local"));
+    let (_, trust_after, live_after) = published_generations(&state);
+    assert!(live_after);
+    assert!(
+        trust_after > trust_at_barrier,
+        "committing the material must advance the gateway trust generation"
+    );
+}
+
+#[tokio::test]
+async fn revocation_closes_mesh_admission_until_the_root_is_withdrawn() {
+    let initial = config_with(vec![record("db.local", &[1])]);
+    let state = database_mode_state(initial.clone()).await;
+    seed_source_loaded_svid(&state);
+    state.publish_gateway_trust_generation(&initial);
+    assert!(mesh_admission_open(&state));
+
+    // Explicit record deletion: the direction where an un-fenced boundary keeps
+    // authenticating a peer the accepted generation withdrew.
+    let revoked = config_with(Vec::new());
+    let commit = state
+        .stage_database_gateway_trust(&revoked)
+        .expect("a revocation stages without conversion work");
+    assert!(commit.changes_live_trust());
+
+    state.fence_gateway_trust_generation();
+    assert!(
+        !mesh_admission_open(&state),
+        "a revocation must refuse gateway-to-mesh authentication rather than keep \
+         validating against the withdrawn root"
+    );
+    assert_eq!(
+        active_svid_domain(&state).as_deref(),
+        Some("db.local"),
+        "the withdrawn root is still installed at the barrier, which is exactly \
+         why admission must be closed"
+    );
+
+    state.commit_gateway_trust_generation(commit);
+    assert!(mesh_admission_open(&state));
+    assert_eq!(live_override_domain(&state), None);
+    assert_eq!(active_svid_domain(&state).as_deref(), Some("file.local"));
+}
+
+#[tokio::test]
+async fn accepted_rotation_through_update_config_publishes_one_coherent_generation() {
+    let initial = config_with(vec![record("db-v1.local", &[1])]);
+    let state = database_mode_state(initial.clone()).await;
+    seed_source_loaded_svid(&state);
+    state.publish_gateway_trust_generation(&initial);
+    let (config_before, trust_before, _) = published_generations(&state);
+
+    let rotated = config_with(vec![record("db-v2.local", &[2])]);
+    assert_eq!(state.update_config(rotated), ConfigApplyOutcome::Applied);
+
+    let (config_after, trust_after, live_after) = published_generations(&state);
+    assert!(config_after > config_before);
+    assert!(
+        trust_after > trust_before,
+        "the accepted configuration generation must carry its own trust generation"
+    );
+    assert!(
+        live_after,
+        "the production reload must leave the accepted generation authenticating, \
+         never parked behind its own fence"
+    );
+    assert!(mesh_admission_open(&state));
+    assert_eq!(active_svid_domain(&state).as_deref(), Some("db-v2.local"));
+    assert_eq!(
+        state
+            .request_epoch
+            .load()
+            .config()
+            .gateway_trust_bundle_for(TEST_NAMESPACE)
+            .map(|record| record.bundle.local.trust_domain.as_str().to_string())
+            .as_deref(),
+        Some("db-v2.local"),
+        "the published configuration and the live verifier must name the same \
+         trust domain"
+    );
+}
+
+#[tokio::test]
+async fn unconvertible_candidate_rejects_the_apply_and_retains_the_whole_generation() {
+    let initial = config_with(vec![record("db.local", &[1])]);
+    let state = database_mode_state(initial.clone()).await;
+    seed_source_loaded_svid(&state);
+    state.publish_gateway_trust_generation(&initial);
+    let before = published_generations(&state);
+
+    // Admission guarantees convertibility, so this is the broken-invariant
+    // case. It must reject the whole apply: publishing the candidate
+    // configuration beside the previous trust and calling it live is exactly
+    // the half-updated pair issue #3727 forbids.
+    let mut broken = record("db-broken.local", &[1]);
+    broken.bundle.local.x509_authorities = vec!["not-valid-base64!!!".to_string()];
+    let candidate = config_with(vec![broken]);
+
+    assert!(state.stage_database_gateway_trust(&candidate).is_err());
+    let outcome = state.update_config(candidate);
+
+    assert!(
+        matches!(outcome, ConfigApplyOutcome::Rejected { .. }),
+        "a failed trust stage must reject the configuration apply, not publish it"
+    );
+    assert_eq!(
+        published_generations(&state),
+        before,
+        "the complete previous generation — configuration AND trust — must stay live"
+    );
+    assert!(mesh_admission_open(&state));
+    assert_eq!(live_override_domain(&state).as_deref(), Some("db.local"));
+    assert_eq!(active_svid_domain(&state).as_deref(), Some("db.local"));
+}
+
+#[tokio::test]
+async fn a_reload_that_changes_no_trust_never_closes_mesh_admission() {
+    let initial = config_with(vec![record("db.local", &[1])]);
+    let state = database_mode_state(initial.clone()).await;
+    seed_source_loaded_svid(&state);
+    state.publish_gateway_trust_generation(&initial);
+    let (_, trust_before, _) = published_generations(&state);
+
+    // Byte-identical trust inputs: an ordinary reload on a gateway that HAS a
+    // trust record must cost nothing and must not fence the admission gate,
+    // otherwise every poll tick would briefly refuse mesh traffic. The live
+    // config is the candidate a re-poll of the same unchanged row produces —
+    // record equality includes the stored `created_at`/`updated_at`, so
+    // reconstructing the record here would compare unequal for reasons a real
+    // poll never sees.
+    let same_trust = state.config.load_full().as_ref().clone();
+    let commit = state
+        .stage_database_gateway_trust(&same_trust)
+        .expect("an unchanged candidate stages");
+    assert!(
+        !commit.changes_live_trust(),
+        "unchanged trust inputs must stage as Unchanged"
+    );
+
+    state.commit_gateway_trust_generation(commit);
+    let (_, trust_after, live_after) = published_generations(&state);
+    assert!(live_after);
+    assert_eq!(
+        trust_after, trust_before,
+        "an unchanged commit must not advance the gateway trust generation"
+    );
+    assert!(mesh_admission_open(&state));
+}
+
+#[tokio::test]
+async fn ambiguous_authority_stages_unchanged_and_keeps_the_complete_generation() {
+    let initial = config_with(vec![record("db.local", &[1])]);
+    let state = database_mode_state(initial.clone()).await;
+    seed_source_loaded_svid(&state);
+    state.publish_gateway_trust_generation(&initial);
+    let before = published_generations(&state);
+
+    let mut ambiguous = config_with(vec![record("db-v2.local", &[2])]);
+    ambiguous.trust_bundles = Some(Box::new(stored_bundle("overlay.local", &[3])));
+
+    let commit = state
+        .stage_database_gateway_trust(&ambiguous)
+        .expect("ambiguity is a refusal, not a staging error");
+    assert!(
+        !commit.changes_live_trust(),
+        "two authorities must keep the last known good generation rather than \
+         publishing either one"
+    );
+
+    state.commit_gateway_trust_generation(commit);
+    assert_eq!(published_generations(&state), before);
+    assert!(mesh_admission_open(&state));
+    assert_eq!(live_override_domain(&state).as_deref(), Some("db.local"));
+}
+
+// ─── DP FULL_SNAPSHOT: CP trust rides WITH the snapshot ─────────────────────
+
+#[tokio::test]
+async fn dp_snapshot_publishes_cp_trust_with_its_own_configuration_generation() {
+    let state = state_in_mode(GatewayConfig::default(), OperatingMode::DataPlane).await;
+    seed_source_loaded_svid(&state);
+    let (config_before, trust_before, _) = published_generations(&state);
+    assert!(mesh_admission_open(&state));
+
+    // A CP snapshot carrying a namespace-projected trust Replace. The DP's
+    // configuration never carries `gateway_trust_bundles` (the CP strips it),
+    // so the decision must be handed to the publication rather than applied
+    // after it.
+    let snapshot = GatewayConfig {
+        version: "dp-1".to_string(),
+        ..GatewayConfig::default()
+    };
+    let outcome = state.update_config_with_gateway_trust(
+        snapshot,
+        GatewayTrustCommit::Replace(runtime_bundles("cp.local", &[7, 7, 7])),
+    );
+    assert!(matches!(
+        outcome,
+        ConfigApplyOutcome::Applied | ConfigApplyOutcome::Unchanged
+    ));
+
+    let (config_after, trust_after, live_after) = published_generations(&state);
+    assert!(live_after, "the accepted snapshot must end up authenticating");
+    assert!(mesh_admission_open(&state));
+    assert!(
+        trust_after > trust_before,
+        "CP-delivered trust must advance the published trust generation"
+    );
+    assert!(config_after >= config_before);
+    assert_eq!(live_override_domain(&state).as_deref(), Some("cp.local"));
+    assert_eq!(active_svid_domain(&state).as_deref(), Some("cp.local"));
+}
+
+#[tokio::test]
+async fn dp_unchanged_side_channel_leaves_the_live_trust_generation_untouched() {
+    let state = state_in_mode(GatewayConfig::default(), OperatingMode::DataPlane).await;
+    seed_source_loaded_svid(&state);
+    state.update_config_with_gateway_trust(
+        GatewayConfig::default(),
+        GatewayTrustCommit::Replace(runtime_bundles("cp.local", &[7])),
+    );
+    let before = published_generations(&state);
+
+    // An ordinary delta with an empty side channel means "no trust change".
+    let next = GatewayConfig {
+        version: "dp-2".to_string(),
+        ..GatewayConfig::default()
+    };
+    state.update_config_with_gateway_trust(next, GatewayTrustCommit::Unchanged);
+
+    assert_eq!(
+        published_generations(&state),
+        before,
+        "an Unchanged side channel must not rotate, withdraw, or re-publish trust"
+    );
+    assert_eq!(live_override_domain(&state).as_deref(), Some("cp.local"));
+    assert!(mesh_admission_open(&state));
+}
+
+#[tokio::test]
+async fn dp_snapshot_clear_withdraws_cp_trust_with_the_accepted_generation() {
+    let state = state_in_mode(GatewayConfig::default(), OperatingMode::DataPlane).await;
+    seed_source_loaded_svid(&state);
+    state.update_config_with_gateway_trust(
+        GatewayConfig::default(),
+        GatewayTrustCommit::Replace(runtime_bundles("cp.local", &[7])),
+    );
+    assert_eq!(active_svid_domain(&state).as_deref(), Some("cp.local"));
+
+    let cleared = GatewayConfig {
+        version: "dp-3".to_string(),
+        ..GatewayConfig::default()
+    };
+    state.update_config_with_gateway_trust(cleared, GatewayTrustCommit::Clear);
+
+    assert!(mesh_admission_open(&state));
+    assert_eq!(live_override_domain(&state), None);
+    assert_eq!(
+        active_svid_domain(&state).as_deref(),
+        Some("file.local"),
+        "an explicit CP clear must restore the source-loaded gateway trust"
+    );
 }

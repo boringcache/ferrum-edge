@@ -1216,6 +1216,7 @@ pub mod _test_support {
             consumer_index: std::sync::Arc::clone(&current.consumer_index),
             load_balancer: std::sync::Arc::clone(&current.load_balancer),
             gateway_listener_admission: std::sync::Arc::clone(&current.gateway_listener_admission),
+            gateway_trust: std::sync::Arc::clone(&current.gateway_trust),
             config_generation: current.config_generation,
             route_generation: current.route_generation,
             lb_generation,

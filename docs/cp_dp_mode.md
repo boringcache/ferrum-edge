@@ -373,15 +373,61 @@ namespace partitioning clears the unpartitioned slot
 record-plus-file deployment look database-only on a claim-requiring scope, and
 the ambiguity would be silently resolved.
 
+##### One coherent config/trust generation
+
+A bundle update and the configuration that depends on it are two writes to two
+lock-free slots, so publishing them independently leaves an interval where a
+request pairs one generation's configuration with another generation's trust
+roots. Published configuration-first, that interval is **fail-open**: a
+revocation the accepted generation committed is not yet in the live verifier,
+so a withdrawn peer still authenticates. Publishing trust first only inverts the
+mismatch.
+
+Ferrum removes the interval instead of choosing a side. The request-facing
+gateway trust snapshot lives **inside `RequestEpoch`** (`GatewayTrustEpoch`), so
+one `ArcSwap` load at admission yields configuration, routing/listener
+admission, and gateway trust from the same generation, and the publication runs
+as one fenced sequence
+(`ProxyState::publish_request_epoch_with_gateway_trust`):
+
+1. **Stage.** The candidate's trust is validated and converted *before*
+   anything is published. A candidate that cannot convert **rejects the whole
+   configuration apply** — the complete previous generation (configuration and
+   trust) stays live. A candidate whose trust inputs are unchanged stages
+   `Unchanged`, so an ordinary reload costs nothing.
+2. **Fence.** A generation that changes the live verifier is published with its
+   gateway-to-mesh admission CLOSED. For the whole install,
+   `ProxyState::admits_gateway_mesh_identity` — the predicate every
+   gateway-to-mesh admission gate reads (HBONE and sidecar-mTLS HTTP dispatch,
+   native-gRPC mesh transport resolution, raw-TCP mesh egress, mesh UDP egress,
+   HBONE capability probing) — is false, so those paths **fail closed** rather
+   than authenticate against the generation this one replaced.
+3. **Commit.** The material is installed and the admission is republished live,
+   advancing the gateway trust generation. Status and `/metrics` are recorded
+   last, after a verifier a request path can actually select is live.
+
+Trust material is only ever advanced after the fence, so a request admitted
+under an older generation can at worst use trust the operator has already
+committed — the same forward-only contract gateway SVID rotation has always had
+— and never trust the accepted generation withdrew.
+
+The gateway SVID slot (`ProxyState.gateway_svid_bundle`) remains the *material*
+the mesh pools and the inbound resolver originate from. It is not the admission
+predicate; gating dispatch on "is a bundle loaded" is exactly the split read
+this design removes. Every writer of that slot
+(`update_gateway_trust_bundles`, `clear_gateway_trust_bundles`,
+`install_gateway_runtime_svid_bundle`) fences and republishes the admission
+around its store, so a CP-delivered update and a source SVID rotation are
+covered by the same boundary as a database record.
+
 ##### Database serving mode applies its own record
 
 A `database`-mode gateway is both the store's reader and a proxy, so it has no
 side channel to deliver trust to itself. At the same publication boundary that
-makes a configuration generation live —
-`ProxyState::publish_gateway_trust_generation`, called from the request-epoch
-swap and once at startup for an already-persisted record — it installs its
-configured namespace's singleton record into the live gateway SVID verifier
-(`ProxyState::install_database_gateway_trust`). An accepted rotation replaces
+makes a configuration generation live — the fenced request-epoch sequence above,
+plus one `ProxyState::publish_gateway_trust_generation` at startup for an
+already-persisted record — it installs its configured namespace's singleton
+record into the live gateway SVID verifier. An accepted rotation replaces
 the live trust, and an explicit record deletion **withdraws** the database
 override so the ordinary source-loaded gateway SVID trust becomes live again —
 the same withdrawal the data plane performs on a `Clear`.
@@ -399,7 +445,18 @@ peers are still validated against the previous one. Stored material that cannot
 be converted to runtime trust — an invariant admission validation is supposed to
 guarantee — fails closed without panicking: the previous generation stays live,
 `..._load_rejections_total` increments with the `invalid_material` reason, and
-the candidate is not published.
+the candidate is not published. On a reload that failure happens at the staging
+step, so the *configuration* apply is rejected too and the candidate never
+becomes live beside the previous trust.
+
+A data plane's configuration never carries the resource, so its trust arrives on
+the ConfigSync side channel — and it is handed to the snapshot/delta
+publication (`update_config_off_thread_with_gateway_trust` /
+`apply_incremental_with_gateway_trust`) rather than applied afterwards, so the
+DP boundary is the same single fenced generation. An `Unchanged` side channel
+changes nothing; explicit `Replace`/`Clear` semantics, cross-CP equivalence, and
+snapshot/delta freshness fencing are unaffected, and a rejected apply discards
+the trust decision with the configuration it arrived with.
 
 ##### Observability
 
