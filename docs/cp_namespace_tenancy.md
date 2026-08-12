@@ -277,6 +277,9 @@ Concretely:
 - **Traversal and escapes are refused.** A `..` component in a referenced path,
   and a symlink planted inside a pinned generation directory, are both closed
   rejections.
+- **Candidate memory is bounded.** Each path-backed file and the aggregate
+  path-backed material retained while one coherent candidate is assembled are
+  limited to 1 MiB.
 
 Rejections are classified into a closed, fixed-cardinality set
 (`document_unreadable`, `document_invalid`, `material_unreadable`,

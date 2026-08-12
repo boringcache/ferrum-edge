@@ -79,7 +79,9 @@
 //!    generation — an arbitrary external path, an ordinary filesystem, a
 //!    non-Unix host — has no generation to be pinned to and must instead carry
 //!    a manifest-bound `material_sha256`, which binds the bytes to the document
-//!    that named them. Absence and mismatch are both fail-closed.
+//!    that named them. Absence and mismatch are both fail-closed. Each file and
+//!    the aggregate path-backed material retained for one candidate are bounded
+//!    to 1 MiB.
 //!
 //! Inline `public_key_pem`, inline `secret`, and `secret_env` are read
 //! atomically from the document or the process environment and keep their
@@ -123,6 +125,12 @@ const TRUST_BUNDLE_MAX_BYTES: u64 = 1024 * 1024;
 /// keeps the operator surface simple while preventing a path swap from turning
 /// the periodic reload worker into an unbounded file reader.
 const TRUST_MATERIAL_MAX_BYTES: u64 = TRUST_BUNDLE_MAX_BYTES;
+
+/// Maximum total path-backed material retained while one coherent candidate is
+/// assembled. Phase one intentionally resolves every source before semantic
+/// construction, so the per-file ceiling alone would permit a small manifest
+/// containing thousands of references to retain gigabytes at once.
+const TRUST_MATERIAL_TOTAL_MAX_BYTES: u64 = TRUST_BUNDLE_MAX_BYTES;
 
 /// A stalled network filesystem must not silently stop trust-bundle reloads
 /// forever. The blocking read itself runs on a detached OS thread because a
@@ -168,11 +176,11 @@ pub enum TrustBundleRejectReason {
     /// Resolved material does not match the digest the document binds it to.
     MaterialIntegrityMismatch,
     /// A reference that claims to live in the pinned generation traverses out
-    /// of it, is a symlink inside it, or names no file in it.
+    /// of it, is a symlink inside it, or does not name a file.
     SourceGenerationEscape,
-    /// The pinned generation could not be established, or its entries vanished
-    /// while they were being read — the ordinary shape of a rotation that
-    /// landed mid-load.
+    /// The pinned generation could not be established or was reclaimed while
+    /// it was being read — the ordinary shape of a rotation that landed
+    /// mid-load.
     SourceGenerationUnstable,
     /// A projected generation was detected but this platform offers no way to
     /// pin it. Refused rather than downgraded to independent re-resolution.
@@ -568,23 +576,51 @@ fn read_pinned_material(
             ),
         ));
     };
-    let file = open_at_nofollow(dir, name).map_err(|e| {
-        // A symlink inside the generation directory would resolve against the
-        // live filesystem, which is an escape. Anything else — most often the
-        // generation being reclaimed underneath us — is an unstable source.
-        let reason = if e.raw_os_error() == Some(libc::ELOOP) {
-            TrustBundleRejectReason::SourceGenerationEscape
-        } else {
-            TrustBundleRejectReason::SourceGenerationUnstable
-        };
-        TrustBundleLoadError::new(
-            reason,
-            format!(
-                "CP/DP trust bundle '{origin}': key '{kid}' could not be resolved inside the \
-                 pinned projected generation: {e}"
-            ),
-        )
-    })?;
+    let file = match open_at_nofollow(dir, name) {
+        Ok(file) => file,
+        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
+            use std::os::unix::fs::MetadataExt;
+
+            // ENOENT has two materially different meanings. If kubelet
+            // reclaimed the directory behind our pinned fd, the generation is
+            // transiently unstable. If the pinned directory still exists, the
+            // reference simply is not one of its entries: let it use the same
+            // digest-bound external-file contract as a path in another
+            // directory. This makes a typo fail permanently as unbound instead
+            // of masquerading as a rotation race, and lets an explicit digest
+            // bind a legitimate regular file beside the projected entries.
+            let generation_reclaimed = dir
+                .metadata()
+                .map_or(true, |metadata| metadata.nlink() == 0);
+            if !generation_reclaimed {
+                return Ok(None);
+            }
+            return Err(TrustBundleLoadError::new(
+                TrustBundleRejectReason::SourceGenerationUnstable,
+                format!(
+                    "CP/DP trust bundle '{origin}': key '{kid}' could not be resolved inside the \
+                     pinned projected generation: {e}"
+                ),
+            ));
+        }
+        Err(e) => {
+            // Linux reports ELOOP for O_NOFOLLOW against a symlink; Darwin and
+            // FreeBSD report EMLINK. Both are a deliberate in-generation escape
+            // attempt, not a retryable projection race.
+            let reason = if matches!(e.raw_os_error(), Some(libc::ELOOP) | Some(libc::EMLINK)) {
+                TrustBundleRejectReason::SourceGenerationEscape
+            } else {
+                TrustBundleRejectReason::SourceGenerationUnstable
+            };
+            return Err(TrustBundleLoadError::new(
+                reason,
+                format!(
+                    "CP/DP trust bundle '{origin}': key '{kid}' could not be resolved inside the \
+                     pinned projected generation: {e}"
+                ),
+            ));
+        }
+    };
     read_open_file_bounded(file, subject, TRUST_MATERIAL_MAX_BYTES)
         .map(Some)
         .map_err(|detail| {
@@ -618,6 +654,27 @@ fn resolve_entry_material(
 ) -> Result<Option<Vec<u8>>, TrustBundleLoadError> {
     let kid = diagnostic_kid(&entry.kid);
 
+    let source_count = [
+        entry.secret.is_some(),
+        entry.secret_env.is_some(),
+        entry.secret_path.is_some(),
+        entry.public_key_pem.is_some(),
+        entry.public_key_path.is_some(),
+    ]
+    .into_iter()
+    .filter(|present| *present)
+    .count();
+    if source_count != 1 {
+        return Err(TrustBundleLoadError::new(
+            TrustBundleRejectReason::DocumentInvalid,
+            format!(
+                "CP/DP trust bundle '{origin}': key '{kid}' must declare exactly one of \
+                 `secret`, `secret_env`, `secret_path`, `public_key_pem`, or \
+                 `public_key_path` (found {source_count})"
+            ),
+        ));
+    }
+
     let expected = match entry.material_sha256.as_deref() {
         Some(raw) => Some(parse_material_sha256(raw).ok_or_else(|| {
             TrustBundleLoadError::new(
@@ -631,22 +688,13 @@ fn resolve_entry_material(
         None => None,
     };
 
-    let path = match (
-        entry.secret_path.as_deref(),
-        entry.public_key_path.as_deref(),
-    ) {
-        (Some(_), Some(_)) => {
-            return Err(TrustBundleLoadError::new(
-                TrustBundleRejectReason::DocumentInvalid,
-                format!(
-                    "CP/DP trust bundle '{origin}': key '{kid}' must declare exactly one of \
-                     `secret`, `secret_env`, `secret_path`, `public_key_pem`, or \
-                     `public_key_path` (found 2)"
-                ),
-            ));
-        }
-        (Some(path), None) | (None, Some(path)) => path,
-        (None, None) => {
+    let path = match entry
+        .secret_path
+        .as_deref()
+        .or(entry.public_key_path.as_deref())
+    {
+        Some(path) => path,
+        None => {
             if expected.is_some() {
                 return Err(TrustBundleLoadError::new(
                     TrustBundleRejectReason::DocumentInvalid,
@@ -1197,8 +1245,23 @@ impl CpDpTrustBundle {
         // `TrustedKey` — or the fingerprint that would publish it — comes into
         // being.
         let mut materials = Vec::with_capacity(document.keys.len());
+        let mut material_bytes = 0_u64;
         for entry in &document.keys {
-            materials.push(resolve_entry_material(entry, origin, generation)?);
+            let material = resolve_entry_material(entry, origin, generation)?;
+            if let Some(bytes) = material.as_ref() {
+                material_bytes = material_bytes.saturating_add(bytes.len() as u64);
+                if material_bytes > TRUST_MATERIAL_TOTAL_MAX_BYTES {
+                    return Err(TrustBundleLoadError::new(
+                        TrustBundleRejectReason::MaterialUnreadable,
+                        format!(
+                            "CP/DP trust bundle '{origin}' resolves more than \
+                             {TRUST_MATERIAL_TOTAL_MAX_BYTES} bytes of path-backed key material \
+                             in one candidate"
+                        ),
+                    ));
+                }
+            }
+            materials.push(material);
         }
         let candidate = CoherentBundleSources {
             document,

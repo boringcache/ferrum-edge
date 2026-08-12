@@ -141,11 +141,12 @@ namespace ceiling with another generation's key material. A Kubernetes projected
 mount is pinned by `..data` descriptor before the document is read; any path
 outside a pinned generation must carry a `material_sha256`. A candidate that
 cannot prove coherence is rejected with a closed reason label and retains the
-entire prior verifier — it is never partially applied. See
+entire prior verifier — it is never partially applied. Each referenced file and
+the aggregate path-backed material retained for one candidate are limited to 1
+MiB. See
 [cp_namespace_tenancy.md](cp_namespace_tenancy.md#rotation-is-atomic-per-source-generation).
 
-DPs and mesh/xDS
-clients use their existing bounded reconnect backoff and reread
+DPs and mesh/xDS clients use their existing bounded reconnect backoff and reread
 `FERRUM_DP_CP_GRPC_TOKEN_FILE` (or mint a new short-lived token) on each attempt.
 The fixed-cardinality
 `ferrum_grpc_config_stream_terminations_total{surface,reason}` metric and

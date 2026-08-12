@@ -2175,15 +2175,16 @@ async fn handle_admin_request_inner(
             }
         }
 
-        // Config-rejection signal (issues #2158 / #2997 / #2979): the latest
+        // Config-rejection signal (issues #2158 / #2997 / #2979 / #3776): the latest
         // full config load was rejected by the runtime-config validation
-        // contract or by typed SQL row decoding (DB/CP), or a file-mode SIGHUP
-        // candidate failed read/parse/validation/apply, while the previous
+        // contract or by typed SQL row decoding (DB/CP), a file-mode SIGHUP
+        // candidate failed read/parse/validation/apply, or a localized mesh
+        // file / stock-xDS policy reload failed, while the previous
         // generation kept serving. In DB/CP, admin writes remain ENABLED (they
         // are the in-band repair path — `db_available` is left `true`), so
         // surface the condition as a coarse `"degraded"` status plus a
-        // `config_rejected` detail flag. File mode has `db_available: None`
-        // (treated as reachable below) and stays read-only; repair is a fixed
+        // `config_rejected` detail flag. File/mesh modes have `db_available: None`
+        // (treated as reachable below) and stay read-only; repair is a fixed
         // file + reload. The boolean detail is authenticated-only: it is added
         // to `health_status`, which the minimal unauthenticated body below does
         // not echo. The coarse status is consistent with the other degradations

@@ -2679,6 +2679,144 @@ mod projected_generation {
         );
     }
 
+    /// A digest remains load-bearing even when the path also belongs to the
+    /// pinned generation. The pin proves generation membership; the digest
+    /// independently proves the manifest named these exact bytes.
+    #[test]
+    fn a_digest_is_verified_in_addition_to_the_generation_pin() {
+        let mount = ProjectedMount::new();
+        let document = |digest: String| {
+            json!({
+                "version": 1,
+                "keys": [{
+                    "kid": TENANT_A,
+                    "algorithm": "HS256",
+                    "secret_path": mount.entry_path("tenant.secret"),
+                    "material_sha256": digest,
+                    "namespaces": [TENANT_A],
+                }]
+            })
+            .to_string()
+        };
+        mount.write_generation(
+            "gen-a",
+            &[
+                (
+                    "bundle.json",
+                    document(sha256_hex(TENANT_A_SECRET.as_bytes())),
+                ),
+                ("tenant.secret", TENANT_A_SECRET.to_string()),
+            ],
+        );
+        mount.write_generation(
+            "gen-b",
+            &[
+                (
+                    "bundle.json",
+                    document(sha256_hex(TENANT_B_SECRET.as_bytes())),
+                ),
+                ("tenant.secret", TENANT_A_SECRET.to_string()),
+            ],
+        );
+        mount.activate("gen-a");
+        mount.publish(&["bundle.json", "tenant.secret"]);
+        CpDpTrustBundle::load_coherent_from_path(&mount.bundle_path(), None)
+            .expect("matching digest and pin must load");
+
+        mount.activate("gen-b");
+        let error = CpDpTrustBundle::load_coherent_from_path(&mount.bundle_path(), None)
+            .expect_err("a pinned entry with the wrong digest must still be refused");
+        assert_eq!(
+            error.reason(),
+            TrustBundleRejectReason::MaterialIntegrityMismatch
+        );
+    }
+
+    /// A regular file that is not an entry in the pinned projection can still
+    /// be used when the manifest binds it by digest. Exercise both a sibling
+    /// path (the pinned open returns ENOENT) and a path in another directory.
+    #[test]
+    fn digest_bound_external_files_can_accompany_a_pinned_document() {
+        let mount = ProjectedMount::new();
+        let outside = tempfile::tempdir().expect("outside material directory");
+        let sibling_path = mount.root().join("sibling.secret");
+        let outside_path = outside.path().join("outside.secret");
+        std::fs::write(&sibling_path, TENANT_A_SECRET).expect("write sibling material");
+        std::fs::write(&outside_path, TENANT_B_SECRET).expect("write outside material");
+        let document = json!({
+            "version": 1,
+            "keys": [
+                {
+                    "kid": TENANT_A,
+                    "algorithm": "HS256",
+                    "secret_path": sibling_path,
+                    "material_sha256": sha256_hex(TENANT_A_SECRET.as_bytes()),
+                    "namespaces": [TENANT_A],
+                },
+                {
+                    "kid": TENANT_B,
+                    "algorithm": "HS256",
+                    "secret_path": outside_path,
+                    "material_sha256": sha256_hex(TENANT_B_SECRET.as_bytes()),
+                    "namespaces": [TENANT_B],
+                },
+            ]
+        })
+        .to_string();
+        mount.write_generation("gen-a", &[("bundle.json", document)]);
+        mount.activate("gen-a");
+        mount.publish(&["bundle.json"]);
+
+        let verifier = CpDpVerifier::TrustBundle(
+            CpDpTrustBundle::load_coherent_from_path(&mount.bundle_path(), None)
+                .expect("digest-bound external material must load"),
+        );
+        assert_eq!(
+            accepted_binding(&verifier, TENANT_A, TENANT_A_SECRET),
+            (true, vec![TENANT_A.to_string()])
+        );
+        assert_eq!(
+            accepted_binding(&verifier, TENANT_B, TENANT_B_SECRET),
+            (true, vec![TENANT_B.to_string()])
+        );
+    }
+
+    /// The per-file ceiling also has an aggregate counterpart. Phase one holds
+    /// every resolved source until the candidate is coherent, so two individually
+    /// bounded files must not multiply retained memory beyond the candidate cap.
+    #[test]
+    fn aggregate_path_backed_material_is_bounded() {
+        let mount = ProjectedMount::new();
+        let document = json!({
+            "version": 1,
+            "keys": [
+                { "kid": TENANT_A, "algorithm": "HS256",
+                  "secret_path": mount.entry_path("tenant-a.secret"),
+                  "namespaces": [TENANT_A] },
+                { "kid": TENANT_B, "algorithm": "HS256",
+                  "secret_path": mount.entry_path("tenant-b.secret"),
+                  "namespaces": [TENANT_B] },
+            ]
+        })
+        .to_string();
+        let large_a = "a".repeat(600 * 1024);
+        let large_b = "b".repeat(600 * 1024);
+        mount.write_generation(
+            "gen-a",
+            &[
+                ("bundle.json", document),
+                ("tenant-a.secret", large_a),
+                ("tenant-b.secret", large_b),
+            ],
+        );
+        mount.activate("gen-a");
+        mount.publish(&["bundle.json", "tenant-a.secret", "tenant-b.secret"]);
+
+        let error = CpDpTrustBundle::load_coherent_from_path(&mount.bundle_path(), None)
+            .expect_err("aggregate path-backed material must stay bounded");
+        assert_eq!(error.reason(), TrustBundleRejectReason::MaterialUnreadable);
+    }
+
     /// A symlink planted inside the pinned generation would resolve against the
     /// live filesystem, which is the escape the whole pin exists to prevent.
     #[test]
@@ -2787,9 +2925,11 @@ mod projected_generation {
         .await
         .expect("reload must accept a coherent generation");
 
-        // Incoherent: the referenced entry is missing from the generation the
-        // document was read from. Both surfaces refuse with the same closed
-        // classification.
+        // Unbound: the referenced entry is absent from the live pinned
+        // generation. Without a digest it cannot fall back to an external
+        // regular file, and both surfaces refuse with the same closed
+        // classification rather than calling a permanent omission a transient
+        // rotation race.
         mount.write_generation("gen-c", &[("bundle.json", slot_document(&mount, TENANT_A))]);
         mount.activate("gen-c");
 
@@ -2797,7 +2937,7 @@ mod projected_generation {
             .expect_err("startup must fail closed on an incoherent generation");
         assert_eq!(
             startup.reason(),
-            TrustBundleRejectReason::SourceGenerationUnstable
+            TrustBundleRejectReason::MaterialIntegrityUnbound
         );
         assert_eq!(
             ferrum_edge::_test_support::load_cp_dp_trust_bundle_for_reload_for_test(
