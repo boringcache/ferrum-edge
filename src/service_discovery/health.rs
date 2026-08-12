@@ -289,6 +289,17 @@ pub fn override_discovery_staleness_policy_for_test(policy: Option<DiscoveryStal
     }
 }
 
+/// Resolved staleness bound for one upstream, plus whether an unsafe unbounded
+/// request had to be refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResolvedUpstreamStaleness {
+    /// Effective bound and expiry policy for the task.
+    pub staleness: DiscoveryStaleness,
+    /// The upstream asked for unbounded retention (`max_stale_seconds: 0`)
+    /// without the process opt-in, so the bounded default was applied instead.
+    pub unbounded_request_refused: bool,
+}
+
 /// Resolve the effective staleness bound for one upstream, applying the
 /// per-upstream override when present and the unsafe unbounded opt-in gate.
 ///
@@ -296,29 +307,32 @@ pub fn override_discovery_staleness_policy_for_test(policy: Option<DiscoveryStal
 /// `FERRUM_SERVICE_DISCOVERY_ALLOW_UNBOUNDED_STALE=true` is refused in favor of
 /// the bounded process default: an unbounded window must never be reachable by
 /// editing one upstream's row.
+///
+/// The refusal is *reported*, never logged here. This function runs from
+/// `DiscoveryTaskSpec::build`, which reconcile calls for every discovery-backed
+/// upstream on every config change — warning from inside it would repeat the
+/// same operator message for unrelated config churn, forever. The manager emits
+/// the warning once when it starts the task generation carrying the refused
+/// request instead, so the message is bounded to one per active occurrence of
+/// the condition and reappears only if the upstream is corrected (or removed)
+/// and the invalid request is later reintroduced.
 pub fn resolve_upstream_staleness(
-    upstream_id: &str,
     configured: Option<u64>,
     policy_override: Option<SdStalePolicy>,
     poll_interval_seconds: u64,
-) -> DiscoveryStaleness {
+) -> ResolvedUpstreamStaleness {
     let process = effective_discovery_staleness_policy();
     let policy = policy_override.unwrap_or(process.policy);
+    let unbounded_request_refused = configured == Some(0) && !process.allow_unbounded;
     let seconds = match configured {
-        Some(0) if !process.allow_unbounded => {
-            tracing::warn!(
-                upstream = %upstream_id,
-                fallback_max_stale_seconds = process.max_stale_seconds,
-                "Service discovery: upstream requested unbounded last-known retention \
-                 (max_stale_seconds=0) without FERRUM_SERVICE_DISCOVERY_ALLOW_UNBOUNDED_STALE=true; \
-                 applying the bounded process default"
-            );
-            process.max_stale_seconds
-        }
+        Some(0) if !process.allow_unbounded => process.max_stale_seconds,
         Some(configured) => configured,
         None => process.max_stale_seconds,
     };
-    resolve_staleness(seconds, policy, poll_interval_seconds)
+    ResolvedUpstreamStaleness {
+        staleness: resolve_staleness(seconds, policy, poll_interval_seconds),
+        unbounded_request_refused,
+    }
 }
 
 static REGISTRY: OnceLock<DashMap<String, TaskHealth>> = OnceLock::new();
@@ -540,8 +554,10 @@ pub(crate) fn record_success(key: &str, generation: u64) {
         // are derived from the staleness anchor at compute time rather than
         // stored, so a success that clears a stale window whose expiry episode
         // has not been claimed yet must invalidate the cache as well. A task is
-        // stale-but-unclaimed while its poller is mid-publication (the deadline
-        // is not armed across DNS warmup and installation); a coarse recompute
+        // stale-but-unclaimed while its poller is mid-publication: the deadline
+        // is armed across asynchronous preparation, but a preparation step that
+        // completes first wins that select and the anchor can still cross the
+        // bound during the synchronous fenced installation. A coarse recompute
         // driven by any other task's transition inside that window would
         // otherwise latch `ready: false` on `/health` and `/status` long after
         // discovery recovered, with no further transition to clear it.

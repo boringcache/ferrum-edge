@@ -1141,6 +1141,10 @@ pub mod _test_support {
             dns_cache,
             health_checker,
             lifecycle.as_ref(),
+            // No supervised task context behind this seam: staleness expiry
+            // during publication preparation is covered against the live
+            // supervisor in the lifecycle integration suite.
+            None,
         )
         .await
         {

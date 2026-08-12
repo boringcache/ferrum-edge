@@ -34,6 +34,9 @@ static REGISTRY_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(()
 async fn isolated() -> tokio::sync::MutexGuard<'static, ()> {
     let guard = REGISTRY_GUARD.lock().await;
     health::reset_for_test();
+    // The publication-preparation hold is process-global too; a test that
+    // panicked while holding one must not block the next test's publications.
+    ferrum_edge::service_discovery::clear_discovery_publication_preparation_hold_for_test();
     guard
 }
 
@@ -769,8 +772,10 @@ async fn a_superseded_generation_publishes_no_discovered_snapshot() {
 ///
 /// `stale` and `readiness_failing` are derived from the staleness anchor at
 /// compute time, not stored, and a task is stale-but-unclaimed for as long as
-/// its poller sits mid-publication (the staleness deadline is not armed across
-/// DNS warmup and installation). A coarse recompute driven by any *other*
+/// its poller sits mid-publication: the deadline is armed across asynchronous
+/// preparation, but preparation that completes first wins that select and the
+/// anchor can still cross the bound during the synchronous fenced
+/// installation. A coarse recompute driven by any *other*
 /// task's lifecycle transition inside that window caches `ready: false`, so the
 /// success that ends the window has to refresh it — otherwise `/health` and
 /// `/status` keep answering 503 after discovery has fully recovered, with no
@@ -1431,12 +1436,22 @@ async fn per_upstream_unbounded_retention_falls_back_to_the_bounded_default() {
 
     // No unsafe opt-in installed for this process: an upstream asking for
     // unbounded retention must not get it.
-    let staleness = health::resolve_upstream_staleness("risky", Some(0), None, 30);
+    let resolved = health::resolve_upstream_staleness(Some(0), None, 30);
 
     assert!(
-        staleness.max_stale.is_some(),
+        resolved.staleness.max_stale.is_some(),
         "unbounded retention must not be reachable by editing one upstream"
     );
+    assert!(
+        resolved.unbounded_request_refused,
+        "the refusal must be reported to the caller that starts the task"
+    );
+
+    // A valid per-upstream bound reports no refusal, so nothing warns.
+    let ordinary = health::resolve_upstream_staleness(Some(120), None, 30);
+    assert!(!ordinary.unbounded_request_refused);
+    let defaulted = health::resolve_upstream_staleness(None, None, 30);
+    assert!(!defaulted.unbounded_request_refused);
 }
 
 #[tokio::test]
@@ -1451,10 +1466,14 @@ async fn per_upstream_unbounded_retention_is_honored_under_the_opt_in() {
         },
     ));
 
-    let staleness = health::resolve_upstream_staleness("risky", Some(0), None, 30);
+    let resolved = health::resolve_upstream_staleness(Some(0), None, 30);
     health::override_discovery_staleness_policy_for_test(None);
 
-    assert_eq!(staleness.max_stale, None);
+    assert_eq!(resolved.staleness.max_stale, None);
+    assert!(
+        !resolved.unbounded_request_refused,
+        "an admitted opt-in is not a refusal and must not warn"
+    );
 }
 
 // ── #3717 × #3721: expiry must lose to cancellation and shutdown ──────
@@ -1821,4 +1840,357 @@ async fn a_crash_looping_poller_still_expires_and_withdraws_during_restart_backo
 
     let _ = task.cancel_tx.send(true);
     let _ = task.handle.await;
+}
+
+// ── #3717: the deadline stays armed across publication preparation ────
+//
+// Admission is not publication. After a snapshot is admitted the poller still
+// has to prepare it — DNS warmup for every discovered hostname — before
+// anything becomes routable, and that step is unbounded in principle: a large
+// catalog or a slow/unresponsive DNS set can hold it open arbitrarily long.
+// While it was unfenced, the *old* dynamic targets stayed routable for exactly
+// that long, no matter what `max_stale_seconds` promised.
+//
+// Real DNS latency is not controllable, so these tests block preparation at an
+// exact point instead, and run on a paused clock so the staleness deadline is
+// virtual time rather than seconds of real sleeping.
+
+/// RAII wrapper: the hold is process-global, so it must not outlive its test.
+struct PreparationHold(Arc<ferrum_edge::service_discovery::PublicationPreparationHold>);
+
+impl PreparationHold {
+    fn install() -> Self {
+        Self(ferrum_edge::service_discovery::hold_discovery_publication_preparation_for_test())
+    }
+
+    /// How many publication preparations have parked on this hold.
+    fn entered(&self) -> u64 {
+        self.0.entered()
+    }
+}
+
+impl Drop for PreparationHold {
+    fn drop(&mut self) {
+        ferrum_edge::service_discovery::clear_discovery_publication_preparation_hold_for_test();
+    }
+}
+
+/// Per-upstream lifecycle detail for `key`, if it is registered.
+fn task_status(key: &str) -> Option<health::DiscoveryTaskStatus> {
+    health::snapshot()
+        .upstreams
+        .into_iter()
+        .find(|upstream| upstream.upstream == key)
+}
+
+/// Whether `host` is currently routable for `upstream_id`.
+fn lb_has_host(lb_cache: &LoadBalancerCache, upstream_id: &str, host: &str) -> bool {
+    lb_hosts(lb_cache, upstream_id).iter().any(|h| h == host)
+}
+
+/// Effective staleness window for the tasks below is `max(5, 3 x poll)`.
+const BLOCKED_PREPARATION_POLL_SECONDS: u64 = 1;
+const BLOCKED_PREPARATION_MAX_STALE_SECONDS: u64 = 5;
+
+/// A withdrawing policy must fail closed on time even though the pending
+/// snapshot was already admitted, and must not let that snapshot publish (or
+/// commit its cursor) over the withdrawal afterwards.
+#[tokio::test(start_paused = true)]
+async fn expiry_withdraws_on_time_while_publication_preparation_is_blocked() {
+    let _guard = isolated().await;
+    let hold = PreparationHold::install();
+
+    let statics = vec![target("static.local", 9000)];
+    let config = config_with(vec![upstream_with_sd(
+        "blocked-warmup",
+        statics.clone(),
+        None,
+    )]);
+    let lb_cache = Arc::new(LoadBalancerCache::new(&config));
+    let discoverer = Arc::new(ScriptedDiscoverer::new(vec![target(
+        "discovered.local",
+        8080,
+    )]));
+
+    let task = spawn_supervised_discovery_task_for_test(
+        &default_namespace(),
+        "blocked-warmup",
+        "scripted",
+        discoverer,
+        Arc::clone(&lb_cache),
+        None,
+        Arc::new(HealthChecker::new()),
+        DnsCache::new(Default::default()),
+        statics,
+        LoadBalancerAlgorithm::RoundRobin,
+        BLOCKED_PREPARATION_POLL_SECONDS,
+        BLOCKED_PREPARATION_MAX_STALE_SECONDS,
+        SdStalePolicy::Withdraw,
+        1,
+    );
+
+    // The first admitted snapshot parks in preparation and never publishes.
+    assert!(
+        wait_for_within(2000, || hold.entered() >= 1).await,
+        "publication preparation was never reached"
+    );
+    assert!(
+        !lb_has_host(&lb_cache, "blocked-warmup", "discovered.local"),
+        "an unprepared snapshot must not already be routable"
+    );
+
+    // Nothing has ever published, so the anchor is task start and the deadline
+    // elapses while preparation is still parked.
+    let withdrew = wait_for_within(2000, || {
+        task_status(&task.key).is_some_and(|status| status.withdrawn)
+    })
+    .await;
+    assert!(
+        withdrew,
+        "the staleness deadline must withdraw while publication preparation is pending"
+    );
+
+    assert_eq!(
+        lb_hosts(&lb_cache, "blocked-warmup"),
+        vec!["static.local"],
+        "the fail-closed withdrawal must leave only static targets installed"
+    );
+    assert!(
+        task_status(&task.key).is_some_and(|status| status.last_success_age_seconds.is_none()),
+        "an abandoned snapshot must not advance the staleness anchor"
+    );
+
+    // The abandoned snapshot must not surface later either: give the poller
+    // room to loop while preparation is still blocked.
+    assert!(
+        wait_for_within(500, || hold.entered() >= 2).await,
+        "the next poll must re-enter preparation after the withdrawal"
+    );
+    assert_eq!(
+        lb_hosts(&lb_cache, "blocked-warmup"),
+        vec!["static.local"],
+        "a stale pending snapshot must never publish over the withdrawal"
+    );
+
+    // Recovery: release preparation and a later poll republishes normally,
+    // clearing stale/withdrawn state without a config reload.
+    drop(hold);
+
+    let republished = wait_for_within(2000, || {
+        lb_has_host(&lb_cache, "blocked-warmup", "discovered.local")
+    })
+    .await;
+    assert!(
+        republished,
+        "a later fresh poll must recover once preparation can complete"
+    );
+    let recovered = wait_for_within(2000, || {
+        task_status(&task.key).is_some_and(|status| !status.withdrawn && !status.stale)
+    })
+    .await;
+    assert!(recovered, "recovery must clear stale and withdrawn state");
+
+    let _ = task.cancel_tx.send(true);
+    let _ = task.handle.await;
+}
+
+/// A reconcile signals exactly this cancel channel before it registers the
+/// replacement generation, so a task parked in publication preparation has to
+/// observe it promptly instead of waiting out an unbounded warmup.
+#[tokio::test(start_paused = true)]
+async fn cancellation_stops_a_task_parked_in_publication_preparation() {
+    let _guard = isolated().await;
+    let hold = PreparationHold::install();
+
+    let config = config_with(vec![upstream_with_sd("canceled-warmup", Vec::new(), None)]);
+    let lb_cache = Arc::new(LoadBalancerCache::new(&config));
+    let discoverer = Arc::new(ScriptedDiscoverer::new(vec![target(
+        "discovered.local",
+        8080,
+    )]));
+
+    let task = spawn_supervised_discovery_task_for_test(
+        &default_namespace(),
+        "canceled-warmup",
+        "scripted",
+        discoverer,
+        Arc::clone(&lb_cache),
+        None,
+        Arc::new(HealthChecker::new()),
+        DnsCache::new(Default::default()),
+        Vec::new(),
+        LoadBalancerAlgorithm::RoundRobin,
+        BLOCKED_PREPARATION_POLL_SECONDS,
+        // Far beyond this test: cancellation, not expiry, must end the task.
+        3600,
+        SdStalePolicy::Withdraw,
+        1,
+    );
+
+    assert!(
+        wait_for_within(2000, || hold.entered() >= 1).await,
+        "publication preparation was never reached"
+    );
+
+    let _ = task.cancel_tx.send(true);
+    let stopped = tokio::time::timeout(std::time::Duration::from_secs(30), task.handle).await;
+    let joined = stopped.expect("a task parked in preparation must stop promptly on cancel");
+    assert!(joined.is_ok(), "the supervisor must exit cleanly, not panic");
+
+    assert!(
+        !lb_has_host(&lb_cache, "canceled-warmup", "discovered.local"),
+        "a canceled task must not publish the snapshot it was preparing"
+    );
+}
+
+/// `retain` records the episode without touching routing, so it must not
+/// discard the pending publication: the same preparation stays parked and
+/// completes once it is released.
+#[tokio::test(start_paused = true)]
+async fn a_retain_policy_expiry_keeps_a_pending_publication_alive() {
+    let _guard = isolated().await;
+    let hold = PreparationHold::install();
+
+    let config = config_with(vec![upstream_with_sd("retain-warmup", Vec::new(), None)]);
+    let lb_cache = Arc::new(LoadBalancerCache::new(&config));
+    let discoverer = Arc::new(ScriptedDiscoverer::new(vec![target(
+        "discovered.local",
+        8080,
+    )]));
+
+    let task = spawn_supervised_discovery_task_for_test(
+        &default_namespace(),
+        "retain-warmup",
+        "scripted",
+        discoverer,
+        Arc::clone(&lb_cache),
+        None,
+        Arc::new(HealthChecker::new()),
+        DnsCache::new(Default::default()),
+        Vec::new(),
+        LoadBalancerAlgorithm::RoundRobin,
+        BLOCKED_PREPARATION_POLL_SECONDS,
+        BLOCKED_PREPARATION_MAX_STALE_SECONDS,
+        SdStalePolicy::Retain,
+        1,
+    );
+
+    assert!(
+        wait_for_within(2000, || hold.entered() >= 1).await,
+        "publication preparation was never reached"
+    );
+    let claimed = wait_for_within(2000, || {
+        health::expiry_applied_for_test(&task.key) == Some(true)
+    })
+    .await;
+    assert!(
+        claimed,
+        "the retain policy must still claim its expiry episode on time"
+    );
+
+    assert!(
+        task_status(&task.key).is_some_and(|status| status.stale && !status.withdrawn),
+        "retain reports staleness without withdrawing"
+    );
+    assert_eq!(
+        hold.entered(),
+        1,
+        "retain does not touch routing, so the pending publication must stay \
+         parked rather than being discarded and re-prepared"
+    );
+
+    drop(hold);
+    let published = wait_for_within(2000, || {
+        lb_has_host(&lb_cache, "retain-warmup", "discovered.local")
+    })
+    .await;
+    assert!(
+        published,
+        "the retained pending publication must complete once preparation is released"
+    );
+
+    let _ = task.cancel_tx.send(true);
+    let _ = task.handle.await;
+}
+
+// ── #3717: the refused unbounded-retention request is reported once ───
+
+fn mesh_sd_config_requesting_unbounded(
+    service_name: &str,
+    poll_interval_seconds: u64,
+) -> ServiceDiscoveryConfig {
+    ServiceDiscoveryConfig {
+        max_stale_seconds: Some(0),
+        ..mesh_sd_config(service_name, poll_interval_seconds)
+    }
+}
+
+fn risky_upstream(poll_interval_seconds: u64) -> Upstream {
+    upstream_with_sd(
+        "risky",
+        Vec::new(),
+        Some(mesh_sd_config_requesting_unbounded(
+            "svc-risky",
+            poll_interval_seconds,
+        )),
+    )
+}
+
+fn neighbor_upstream(poll_interval_seconds: u64) -> Upstream {
+    upstream_with_sd(
+        "neighbor",
+        Vec::new(),
+        Some(mesh_sd_config("svc-neighbor", poll_interval_seconds)),
+    )
+}
+
+/// The refusal is reported when a task generation *starts*, not when its spec
+/// is rebuilt. Reconcile rebuilds every discovery-backed upstream's spec on
+/// every config change, so resolve-time logging repeated the same operator
+/// warning for unrelated churn forever. A kept task cannot re-report; a removed
+/// and later reintroduced upstream starts a new generation and reports again.
+#[tokio::test]
+async fn a_refused_unbounded_retention_request_is_bounded_to_one_active_task() {
+    let _guard = isolated().await;
+
+    let config = config_with(vec![risky_upstream(30), neighbor_upstream(30)]);
+    let manager = manager(&config);
+    manager.start(&config, None);
+
+    let risky = health::generation_for_test(&task_key("risky")).expect("task registered");
+    assert!(
+        task_status(&task_key("risky")).is_some_and(|status| status.max_stale_seconds > 0),
+        "a refused unbounded request must run under the bounded default"
+    );
+
+    // Unrelated churn (another upstream's poll interval) and repeated identical
+    // reconciles must keep the task carrying the refused request, so there is
+    // no second active occurrence of the condition to report.
+    let churned = config_with(vec![risky_upstream(30), neighbor_upstream(15)]);
+    for _ in 0..3 {
+        manager.reconcile(&churned, None);
+    }
+    assert_eq!(
+        health::generation_for_test(&task_key("risky")),
+        Some(risky),
+        "reconcile must keep the unchanged task, so its refusal is reported once"
+    );
+
+    // Removing the upstream retires the condition ...
+    let without_risky = config_with(vec![neighbor_upstream(15)]);
+    manager.reconcile(&without_risky, None);
+    assert!(
+        wait_for(|| health::generation_for_test(&task_key("risky")).is_none()).await,
+        "a removed upstream must retire its discovery task"
+    );
+
+    // ... and reintroducing it is a new active occurrence, reported again.
+    manager.reconcile(&churned, None);
+    let reintroduced = health::generation_for_test(&task_key("risky")).expect("task restarted");
+    assert_ne!(
+        reintroduced, risky,
+        "a reintroduced invalid request must start a new generation"
+    );
+
+    manager.stop();
 }

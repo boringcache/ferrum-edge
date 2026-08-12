@@ -64,11 +64,22 @@ pub(crate) struct DiscoveryTaskSpec {
     /// Resolved (not merely configured) staleness bound and expiry policy, so a
     /// changed poll interval or policy override replaces the task.
     staleness: DiscoveryStaleness,
+    /// Whether this upstream requested unbounded retention without the process
+    /// opt-in. Carried here rather than warned about during `build` so the
+    /// operator message is emitted exactly once per started task generation
+    /// (see [`health::resolve_upstream_staleness`]) instead of once per
+    /// reconcile, including reconciles caused by unrelated config churn.
+    unbounded_request_refused: bool,
 }
 
 impl DiscoveryTaskSpec {
     fn build(upstream: &Upstream, sd_config: &ServiceDiscoveryConfig) -> Self {
         let poll_interval = sd_poll_interval_seconds(sd_config);
+        let resolved = health::resolve_upstream_staleness(
+            sd_config.max_stale_seconds,
+            sd_config.stale_policy,
+            poll_interval,
+        );
         Self {
             namespace: upstream.namespace.clone(),
             upstream_id: upstream.id.clone(),
@@ -76,12 +87,8 @@ impl DiscoveryTaskSpec {
             static_targets: upstream.targets.clone(),
             algorithm: upstream.algorithm,
             hash_on: upstream.hash_on.clone(),
-            staleness: health::resolve_upstream_staleness(
-                &upstream.id,
-                sd_config.max_stale_seconds,
-                sd_config.stale_policy,
-                poll_interval,
-            ),
+            staleness: resolved.staleness,
+            unbounded_request_refused: resolved.unbounded_request_refused,
         }
     }
 }
@@ -779,6 +786,26 @@ impl ServiceDiscoveryManager {
 
         let max_stale_seconds = spec.staleness.max_stale_seconds();
         let stale_policy = spec.staleness.policy.as_str();
+        // Emitted here, not from the staleness resolver: reconcile rebuilds
+        // every discovery-backed upstream's spec on every config change, so
+        // warning at resolve time repeated this message for unrelated churn.
+        // A started generation is exactly one active occurrence of the
+        // condition — an upstream that keeps the invalid request across a
+        // spec-preserving reconcile keeps its running task and stays quiet,
+        // and a corrected/removed upstream that later reintroduces the request
+        // starts a new generation and warns again. No warning-key cache and no
+        // new metric labels are involved.
+        if spec.unbounded_request_refused {
+            warn!(
+                upstream = %upstream_id,
+                namespace = %upstream_namespace,
+                generation,
+                effective_max_stale_seconds = max_stale_seconds,
+                "Service discovery: upstream requested unbounded last-known retention \
+                 (max_stale_seconds=0) without FERRUM_SERVICE_DISCOVERY_ALLOW_UNBOUNDED_STALE=true; \
+                 applying the bounded default"
+            );
+        }
         self.tasks.insert(
             task_key,
             TaskEntry {
@@ -1411,6 +1438,170 @@ pub enum StalenessExpiryOutcome {
     PublishFailed,
 }
 
+/// Outcome of awaiting one asynchronous publication-preparation step under the
+/// owning generation's staleness deadline and lifecycle signals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreparationOutcome {
+    /// Preparation finished; publication may proceed.
+    Ready,
+    /// The staleness deadline elapsed while preparation was pending and the
+    /// configured policy withdraws, so the fenced static-only withdrawal ran
+    /// (or is retrying) and this pending snapshot must be abandoned.
+    Expired,
+    /// Cancellation or global shutdown was observed.
+    Aborted,
+    /// A replacement generation owns the key.
+    Superseded,
+}
+
+/// Test-only hold on asynchronous publication preparation.
+///
+/// External lifecycle tests need an *admitted* snapshot whose preparation is
+/// provably still pending while the staleness deadline elapses or a reconcile
+/// cancels the task. Real DNS warmup latency is not controllable, so a
+/// deliberately blocked step is the only deterministic way to cover the
+/// contract. Production never installs a hold.
+#[allow(dead_code)] // reached from the external test crate; dead in the bin target
+pub struct PublicationPreparationHold {
+    gate: tokio::sync::Semaphore,
+    entered: AtomicU64,
+}
+
+#[allow(dead_code)] // reached from the external test crate; dead in the bin target
+impl PublicationPreparationHold {
+    /// How many publication preparations have parked on this hold.
+    pub fn entered(&self) -> u64 {
+        self.entered.load(Ordering::SeqCst)
+    }
+
+    /// Let every parked and future preparation through.
+    pub fn release(&self) {
+        self.gate.close();
+    }
+
+    async fn wait(&self) {
+        self.entered.fetch_add(1, Ordering::SeqCst);
+        // `Err` means the hold was released; either way, proceed.
+        let _ = self.gate.acquire().await;
+    }
+}
+
+static PUBLICATION_PREPARATION_HOLD: std::sync::RwLock<Option<Arc<PublicationPreparationHold>>> =
+    std::sync::RwLock::new(None);
+
+/// Install a hold that blocks publication preparation until it is released.
+#[allow(dead_code)] // reached from the external test crate; dead in the bin target
+pub fn hold_discovery_publication_preparation_for_test() -> Arc<PublicationPreparationHold> {
+    let hold = Arc::new(PublicationPreparationHold {
+        gate: tokio::sync::Semaphore::new(0),
+        entered: AtomicU64::new(0),
+    });
+    if let Ok(mut guard) = PUBLICATION_PREPARATION_HOLD.write() {
+        *guard = Some(Arc::clone(&hold));
+    }
+    hold
+}
+
+/// Remove any installed hold, releasing whatever is parked on it.
+#[allow(dead_code)] // reached from the external test crate; dead in the bin target
+pub fn clear_discovery_publication_preparation_hold_for_test() {
+    let previous = PUBLICATION_PREPARATION_HOLD
+        .write()
+        .ok()
+        .and_then(|mut guard| guard.take());
+    if let Some(hold) = previous {
+        hold.release();
+    }
+}
+
+/// Installed hold, if any. One uncontended read lock per publishing poll —
+/// never on a request path.
+fn publication_preparation_hold() -> Option<Arc<PublicationPreparationHold>> {
+    PUBLICATION_PREPARATION_HOLD
+        .read()
+        .ok()
+        .and_then(|guard| guard.as_ref().map(Arc::clone))
+}
+
+/// Await one asynchronous publication-preparation step (DNS warmup) while the
+/// owning generation's staleness deadline, cancel signal, global shutdown, and
+/// supersession stay live (issue #3717).
+///
+/// A large catalog or an unresponsive DNS set must not postpone fail-closed
+/// withdrawal past `max_stale_seconds`: the advertised bound is on how long the
+/// old dynamic targets may stay routable, and admission alone does not make
+/// them fresh. At the deadline the expiry action runs through exactly the same
+/// fenced static-only withdrawal the poll loop uses, and the pending snapshot
+/// (and its uncommitted provider cursor) is abandoned rather than published
+/// over that action.
+///
+/// Preparation is polled *first*: a step that is already complete publishes as
+/// before, so an ordinary poll that lands on an already-elapsed anchor still
+/// recovers by publishing instead of withdrawing. The deadline and lifecycle
+/// branches act only while preparation is genuinely pending.
+///
+/// `state` is the poller's own installed view, reborrowed exclusively inside
+/// the timer branch while `prepare` is suspended — there is no concurrent
+/// mutable access.
+async fn prepare_publication_under_deadline(
+    prepare: impl std::future::Future<Output = ()>,
+    ctx: Option<&DiscoveryTaskContext>,
+    state: &mut DiscoveryLoopState,
+    cancel_rx: &tokio::sync::watch::Receiver<bool>,
+    shutdown_rx: &Option<tokio::sync::watch::Receiver<bool>>,
+) -> PreparationOutcome {
+    tokio::pin!(prepare);
+    loop {
+        // `None` without a supervised generation (external test seam), and
+        // `None` once this episode's expiry action has been claimed — which is
+        // what keeps an expired generation from spinning on an elapsed
+        // deadline while it finishes preparing.
+        let stale_deadline =
+            ctx.and_then(|ctx| health::next_stale_deadline(&ctx.key, ctx.generation));
+
+        tokio::select! {
+            biased;
+            () = &mut prepare => return PreparationOutcome::Ready,
+            _ = wait_for_cancel(cancel_rx.clone()) => return PreparationOutcome::Aborted,
+            _ = async {
+                if let Some(ref rx) = shutdown_rx {
+                    wait_for_shutdown(rx.clone()).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => return PreparationOutcome::Aborted,
+            _ = async {
+                match stale_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                // Unreachable without a ctx: `stale_deadline` is `None` there,
+                // so this branch stays pending.
+                let Some(ctx) = ctx else { continue };
+                match apply_staleness_expiry(ctx, Some(&mut *state), cancel_rx, shutdown_rx) {
+                    StalenessExpiryOutcome::Aborted => return PreparationOutcome::Aborted,
+                    StalenessExpiryOutcome::Superseded => return PreparationOutcome::Superseded,
+                    StalenessExpiryOutcome::Applied | StalenessExpiryOutcome::PublishFailed => {
+                        if ctx.staleness.policy.withdraws() {
+                            // Routing is now static-only (or a bounded
+                            // withdrawal retry is armed). Publishing this
+                            // snapshot — or committing its cursor — would
+                            // undo the fail-closed action with data that is
+                            // stale by the operator's own definition.
+                            return PreparationOutcome::Expired;
+                        }
+                        // `retain` records the episode without touching
+                        // routing, so the pending snapshot is still exactly
+                        // what should publish once preparation finishes. The
+                        // claim clears the deadline, so this cannot spin.
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Outcome of one fenced installation of a merged target set.
 #[derive(Debug)]
 enum FencedInstall {
@@ -1443,6 +1634,12 @@ pub(crate) async fn apply_discovered_snapshot(
     dns_cache: &DnsCache,
     health_checker: &HealthChecker,
     lifecycle: Option<&DiscoveryLifecycle>,
+    // Supervised task context, when one exists. Carries the staleness policy
+    // and the withdrawal inputs that keep the deadline armed across
+    // asynchronous publication preparation; `lifecycle` is the same
+    // generation's fence handle. `None` from the external test seam, which has
+    // no supervised generation at all.
+    supervised: Option<&DiscoveryTaskContext>,
 ) -> DiscoveryApplyControl {
     let admission = admit_discovered_snapshot(
         upstream_id,
@@ -1587,8 +1784,57 @@ pub(crate) async fn apply_discovered_snapshot(
             .iter()
             .map(|t| (t.host.clone(), None, None))
             .collect();
-        if !hostnames.is_empty() {
-            dns_cache.warmup(hostnames).await;
+
+        // Publication preparation is asynchronous and unbounded in principle: a
+        // large catalog or a slow/unresponsive DNS set can take arbitrarily
+        // long. It runs under this generation's staleness deadline, cancel
+        // signal, shutdown signal, and ownership fence so the advertised bound
+        // on how long unconfirmed dynamic targets stay routable holds across it
+        // (issue #3717).
+        let prepared = prepare_publication_under_deadline(
+            async {
+                if let Some(hold) = publication_preparation_hold() {
+                    // Test-only: never installed in production.
+                    hold.wait().await;
+                }
+                if !hostnames.is_empty() {
+                    dns_cache.warmup(hostnames).await;
+                }
+            },
+            supervised,
+            state,
+            cancel_rx,
+            shutdown_rx,
+        )
+        .await;
+
+        match prepared {
+            PreparationOutcome::Ready => {}
+            PreparationOutcome::Superseded => {
+                info!(
+                    upstream = %upstream_id,
+                    "Service discovery: superseded task discarding discovery results without publishing"
+                );
+                return DiscoveryApplyControl::Stop;
+            }
+            PreparationOutcome::Aborted => {
+                debug!(
+                    "Service discovery: task for upstream {} canceled or shutting down while preparing publication, discarding results",
+                    upstream_id,
+                );
+                return DiscoveryApplyControl::Stop;
+            }
+            PreparationOutcome::Expired => {
+                // The fenced static-only withdrawal already ran (or armed its
+                // bounded retry). Drop the pending cursor uncommitted and let
+                // the next poll recover through the ordinary path.
+                warn!(
+                    upstream = %upstream_id,
+                    provider = provider_name,
+                    "Service discovery: staleness bound elapsed while preparing publication; the pending snapshot was discarded without publishing or committing its cursor"
+                );
+                return DiscoveryApplyControl::Continue;
+            }
         }
 
         // Everything that decides whether this task may still write routing
@@ -1884,6 +2130,7 @@ async fn run_discovery_loop(
                     &ctx.dns_cache,
                     &ctx.health_checker,
                     Some(&lifecycle),
+                    Some(ctx.as_ref()),
                 )
                 .await
                 {
