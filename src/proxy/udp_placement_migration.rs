@@ -291,9 +291,11 @@ pub fn withhold_node_cleanup_proof_after_deadline(registry_dir: &Path) -> Result
                 Ok(()) => Err(format!(
                     "could not retract ({retract_error}) the node cleanup proof after the deadline, and invalidation left a usable attestation"
                 )),
-                Err(invalidate_error) if node_cleanup_proof_is_usable(registry_dir) => Err(format!(
-                    "could not retract ({retract_error}) or invalidate ({invalidate_error}) the node cleanup proof after the deadline; a usable attestation may remain"
-                )),
+                Err(invalidate_error) if node_cleanup_proof_is_usable(registry_dir) => {
+                    Err(format!(
+                        "could not retract ({retract_error}) or invalidate ({invalidate_error}) the node cleanup proof after the deadline; a usable attestation may remain"
+                    ))
+                }
                 Err(invalidate_error) => Err(format!(
                     "node cleanup proof retraction failed ({retract_error}); invalidation also failed ({invalidate_error}) but no usable attestation remains"
                 )),

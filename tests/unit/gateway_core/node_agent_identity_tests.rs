@@ -6,8 +6,8 @@
 //! ordering with closures so recovery, same-name UID change, and
 //! retraction/publication failure are deterministic and never log the UID.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ferrum_edge::_test_support::{
     NodeIdentityRefreshForTest, refresh_node_identity_binding_for_test,
@@ -42,7 +42,10 @@ impl IdentityJournal {
     }
 
     fn publish(&self, uid: &str) -> Result<(), String> {
-        self.publishes.lock().expect("journal").push(uid.to_string());
+        self.publishes
+            .lock()
+            .expect("journal")
+            .push(uid.to_string());
         Ok(())
     }
 }

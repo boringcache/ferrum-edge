@@ -2420,9 +2420,11 @@ fn preflight_deadline_does_not_publish_when_it_has_already_elapsed() {
         context,
         source,
         shutdown_rx,
-        Some(tokio::time::Instant::now()
-            .checked_sub(std::time::Duration::from_secs(1))
-            .expect("tokio instant")),
+        Some(
+            tokio::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(1))
+                .expect("tokio instant"),
+        ),
         ImmediateHostReaper,
     ));
     assert_eq!(outcome, UdpCleanupOutcome::DeadlineElapsed);
@@ -2509,11 +2511,7 @@ fn deadline_withhold_reports_retract_failure_and_leaves_no_usable_proof() {
     );
     let decision = prepare_placement(
         registry.path(),
-        &stable_attested_on_node(
-            UdpPlacement::HostNetns,
-            UdpPlacement::HostNetns,
-            &node,
-        ),
+        &stable_attested_on_node(UdpPlacement::HostNetns, UdpPlacement::HostNetns, &node),
     );
     assert!(
         !matches!(decision, Ok(UdpPlacementDecision::RunStable)),

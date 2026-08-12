@@ -5,11 +5,8 @@ use ferrum_edge::proxy::owned_shell::{self, OwnedShellError};
 #[test]
 fn empty_script_is_a_noop() {
     owned_shell::run_sh_c("  \n", None).expect("empty script");
-    owned_shell::run_sh_c(
-        "",
-        Some(Instant::now() + Duration::from_secs(1)),
-    )
-    .expect("empty script with deadline");
+    owned_shell::run_sh_c("", Some(Instant::now() + Duration::from_secs(1)))
+        .expect("empty script with deadline");
 }
 
 #[test]

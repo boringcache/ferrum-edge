@@ -279,10 +279,7 @@ fn run_until_unix(script: &str, deadline: Instant) -> Result<(), OwnedShellError
     }
 }
 
-fn finish_status(
-    status: std::process::ExitStatus,
-    stderr: Vec<u8>,
-) -> Result<(), OwnedShellError> {
+fn finish_status(status: std::process::ExitStatus, stderr: Vec<u8>) -> Result<(), OwnedShellError> {
     if status.success() {
         Ok(())
     } else {

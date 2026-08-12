@@ -537,13 +537,10 @@ pub fn execute_ambient_udp_preflight(args: &AmbientUdpPreflightArgs) -> Result<(
         .build()
         .map_err(|error| format!("could not build the preflight runtime: {error}"))?;
     let timeout_seconds = args.timeout_seconds.clamp(1, 3600);
-    let std_deadline =
-        std::time::Instant::now() + std::time::Duration::from_secs(timeout_seconds);
+    let std_deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_seconds);
     let outcome = runtime.block_on(async move {
         if crate::proxy::owned_shell::deadline_elapsed(Some(std_deadline)) {
-            return Ok(
-                crate::proxy::udp_placement_cleanup::UdpCleanupOutcome::DeadlineElapsed,
-            );
+            return Ok(crate::proxy::udp_placement_cleanup::UdpCleanupOutcome::DeadlineElapsed);
         }
         let lookup_timeout = std::time::Duration::from_secs(NODE_UID_LOOKUP_TIMEOUT_SECONDS).min(
             crate::proxy::owned_shell::remaining(Some(std_deadline))
@@ -565,9 +562,7 @@ pub fn execute_ambient_udp_preflight(args: &AmbientUdpPreflightArgs) -> Result<(
         // pod's own authoritative lookup and two complete passes succeed.
         retract_node_cleanup_proof(&registry_dir)?;
         if crate::proxy::owned_shell::deadline_elapsed(Some(std_deadline)) {
-            return Ok(
-                crate::proxy::udp_placement_cleanup::UdpCleanupOutcome::DeadlineElapsed,
-            );
+            return Ok(crate::proxy::udp_placement_cleanup::UdpCleanupOutcome::DeadlineElapsed);
         }
 
         match crate::proxy::netns_udp_capture::preflight_capture_tools_until(
@@ -576,11 +571,10 @@ pub fn execute_ambient_udp_preflight(args: &AmbientUdpPreflightArgs) -> Result<(
         ) {
             Ok(()) => {}
             Err(error)
-                if error.contains("within its timeout") || error.contains("exceeded its deadline") =>
+                if error.contains("within its timeout")
+                    || error.contains("exceeded its deadline") =>
             {
-                return Ok(
-                    crate::proxy::udp_placement_cleanup::UdpCleanupOutcome::DeadlineElapsed,
-                );
+                return Ok(crate::proxy::udp_placement_cleanup::UdpCleanupOutcome::DeadlineElapsed);
             }
             Err(error) if error.contains("bounded command collector") => {
                 return Err(error);
@@ -652,8 +646,7 @@ async fn fetch_this_node_uid(
     let client = kube::Client::try_from(config)
         .map_err(|error| format!("could not build a Kubernetes client: {error}"))?;
     let nodes: Api<Node> = Api::all(client);
-    let node = match tokio::time::timeout(timeout, nodes.get(&node_name)).await
-    {
+    let node = match tokio::time::timeout(timeout, nodes.get(&node_name)).await {
         Ok(Ok(node)) => node,
         Ok(Err(error)) => {
             return Err(format!(
