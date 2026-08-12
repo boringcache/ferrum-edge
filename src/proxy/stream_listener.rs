@@ -1511,7 +1511,7 @@ impl StreamListenerManager {
             .node_waypoint_udp_steering
             .load_full()
             .as_ref()
-            .cloned()
+            .clone()
         else {
             return;
         };
@@ -2787,7 +2787,7 @@ impl StreamListenerManager {
                 self.node_waypoint_udp_steering
                     .load_full()
                     .as_ref()
-                    .cloned()
+                    .clone()
                     .map(|steering| (steering, started.clone(), shutdown_tx.subscribe()))
             } else {
                 None
@@ -2928,7 +2928,7 @@ impl StreamListenerManager {
             .node_waypoint_udp_steering
             .load_full()
             .as_ref()
-            .cloned()
+            .clone()
         else {
             return;
         };
