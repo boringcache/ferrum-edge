@@ -12,9 +12,10 @@ use ferrum_edge::config::types::{GatewayConfig, Proxy, Upstream};
 use ferrum_edge::http3::connect_udp::{
     AdmittedConnectUdpDestination, CONNECT_UDP_MAX_PAYLOAD_BYTES, CapsuleDecodeError,
     CapsuleDecoder, CapsuleEvent, ConnectUdpDestinationRefusal, ConnectUdpRequestRejection,
-    ConnectUdpTargetRejection, H3ExtendedConnect, UdpSendFault, admit_connect_udp_destination,
-    classify_h3_extended_connect, classify_udp_send_error, destination_is_configured,
-    encode_udp_datagram_capsule, first_forbidden_capsule_protocol_field, parse_connect_udp_target,
+    ConnectUdpTargetRejection, H3ExtendedConnect, SessionEnd, StreamCloseKind, UdpSendFault,
+    admit_connect_udp_destination, classify_h3_extended_connect, classify_udp_send_error,
+    destination_is_configured, dns_override_pin_unchanged, encode_udp_datagram_capsule,
+    first_forbidden_capsule_protocol_field, parse_connect_udp_target,
     strip_forbidden_capsule_protocol_response_fields, validate_connect_udp_request_shape,
 };
 use ferrum_edge::load_balancer::{LoadBalancerCache, LoadBalancerCacheInner};
@@ -967,6 +968,149 @@ fn an_oversized_datagram_is_dropped_but_an_unusable_socket_is_terminal() {
 
     assert_eq!(UdpSendFault::DropDatagram.as_str(), "datagram_dropped");
     assert_eq!(UdpSendFault::Terminal.as_str(), "socket_unusable");
+}
+
+// ---------------------------------------------------------------------------
+// Session teardown classification
+//
+// Which outcomes may FIN the capsule stream and which must reset it is a
+// client-visible security contract, and a live tunnel is the wrong place to
+// pin it down: the relay task that owns the QUIC send half classifies its own
+// terminal outcomes through `SessionEnd::close_kind` (the supervisor cannot
+// change a send half after that task has already returned), so asserting this
+// one mapping is what makes the relay's decision structurally testable.
+// ---------------------------------------------------------------------------
+
+/// Every session end, listed once. A new arm that is not classified here fails
+/// this module rather than silently defaulting to a clean FIN somewhere.
+const EVERY_SESSION_END: [SessionEnd; 9] = [
+    SessionEnd::ClientClosed,
+    SessionEnd::TargetRelayEnded,
+    SessionEnd::TargetSocketUnusable,
+    SessionEnd::Idle,
+    SessionEnd::Draining,
+    SessionEnd::RouteWithdrawn,
+    SessionEnd::RouteTargetPinChanged,
+    SessionEnd::RouteAuthorizationUnreconstructable,
+    SessionEnd::CapsuleProtocolError,
+];
+
+#[test]
+fn an_unusable_tunnel_socket_resets_instead_of_presenting_a_clean_fin() {
+    // The target-bound relay's terminal `recv` failure and the client-bound
+    // relay's terminal `send` fault are the same condition — the tunnel's own
+    // connected socket is unusable — so they end the session the same way. A
+    // FIN here would tell the client the tunnel ended normally while the
+    // gateway silently stopped being able to carry its traffic.
+    assert_eq!(
+        SessionEnd::TargetSocketUnusable.close_kind(),
+        StreamCloseKind::InternalError
+    );
+    assert_eq!(
+        SessionEnd::TargetSocketUnusable.as_str(),
+        "target_socket_unusable"
+    );
+}
+
+#[test]
+fn a_capsule_fault_still_closes_with_the_rfc_9114_message_error() {
+    // Unchanged by the internal-error classification above: RFC 9297 §3.3/§3.5
+    // makes a malformed capsule stream a malformed HTTP MESSAGE, which is
+    // `H3_MESSAGE_ERROR`, not an internal failure of the gateway.
+    assert_eq!(
+        SessionEnd::CapsuleProtocolError.close_kind(),
+        StreamCloseKind::MessageError
+    );
+    assert_eq!(
+        SessionEnd::CapsuleProtocolError.as_str(),
+        "capsule_protocol_error"
+    );
+    // And those two outcomes are the ONLY non-clean closes, so no ordinary end
+    // of tunnel can drift into a reset either.
+    for end in EVERY_SESSION_END {
+        let must_reset = matches!(
+            end,
+            SessionEnd::TargetSocketUnusable | SessionEnd::CapsuleProtocolError
+        );
+        assert_eq!(
+            end.close_kind() != StreamCloseKind::Clean,
+            must_reset,
+            "{} classifies its stream close wrong",
+            end.as_str()
+        );
+    }
+}
+
+#[test]
+fn every_session_end_reason_is_a_distinct_fixed_cardinality_token() {
+    // These reach logs (and, through them, operators' metric labels), so they
+    // must stay a closed set of fixed literals: no target host, address, or
+    // errno may reach a session-end token.
+    let mut reasons: Vec<&'static str> = EVERY_SESSION_END
+        .into_iter()
+        .map(SessionEnd::as_str)
+        .collect();
+    let count = reasons.len();
+    reasons.sort_unstable();
+    reasons.dedup();
+    assert_eq!(reasons.len(), count, "session-end reasons must be distinct");
+    for reason in reasons {
+        assert!(
+            reason.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'),
+            "{reason} must be a lowercase snake_case literal"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Live re-check: the destination ADDRESS pin, not just the destination name
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_unchanged_effective_dns_override_keeps_the_tunnel_pinned() {
+    // The ordinary reload: the generation moved, but the route still maps this
+    // destination exactly where the connected socket already points.
+    assert!(dns_override_pin_unchanged(None, None));
+    assert!(dns_override_pin_unchanged(
+        Some("10.0.0.7"),
+        Some("10.0.0.7")
+    ));
+    assert!(dns_override_pin_unchanged(
+        Some("2001:db8::7"),
+        Some("2001:db8::7")
+    ));
+}
+
+#[test]
+fn any_effective_dns_override_change_fails_the_live_tunnel_closed() {
+    // A connected UDP socket cannot be re-pinned, and the requested host:port
+    // is still configured in every one of these shapes — so `destination_is_
+    // configured` alone would keep relaying to the address the route has just
+    // stopped naming. Some/None changes count in both directions.
+    for (admitted, live) in [
+        (Some("10.0.0.7"), Some("10.0.0.8")),
+        (Some("10.0.0.7"), None),
+        (None, Some("10.0.0.7")),
+        (Some("10.0.0.7"), Some("2001:db8::7")),
+        // Same address, different spelling. The comparison is exact and
+        // resolves nothing, so this fails closed — the safe direction.
+        (Some("10.0.0.7"), Some("::ffff:10.0.0.7")),
+    ] {
+        assert!(
+            !dns_override_pin_unchanged(admitted, live),
+            "{admitted:?} -> {live:?} moves the address this tunnel is pinned to"
+        );
+    }
+    // It ends the session the way every other config withdrawal does: an
+    // orderly close, with a fixed reason that names no address.
+    assert_eq!(
+        SessionEnd::RouteTargetPinChanged.close_kind(),
+        StreamCloseKind::Clean
+    );
+    assert_eq!(
+        SessionEnd::RouteTargetPinChanged.as_str(),
+        "route_target_pin_changed"
+    );
 }
 
 #[cfg(unix)]

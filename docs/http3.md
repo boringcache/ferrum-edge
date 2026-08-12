@@ -969,8 +969,13 @@ How the stream is closed depends on why:
   RFC 9297 §3.3/§3.5 and RFC 9114 §4.1.2, so the receive half is halted with
   `STOP_SENDING(H3_MESSAGE_ERROR)` and the send half is reset with
   `H3_MESSAGE_ERROR`. It is never a clean EOF.
-- A tunnel the gateway can no longer honour (unusable target socket) resets with
-  `H3_INTERNAL_ERROR`.
+- A tunnel the gateway can no longer honour resets with `H3_INTERNAL_ERROR`.
+  That covers the tunnel socket failing in **either** direction: a terminal
+  client-to-target `send` fault and a terminal target-to-client `recv` failure
+  are the same condition, and neither may present a clean FIN. The relay task
+  that owns the QUIC send half classifies its own terminal outcomes through the
+  single `SessionEnd::close_kind` mapping, because the supervisor cannot change
+  a send half after that task has already returned.
 
 Route withdrawal is checked against the currently published config generation,
 not the one the request was admitted under: a reload that deletes the proxy or
@@ -981,6 +986,17 @@ live lookup by `(namespace, id)` recovers only the unoverridden base route, so
 the exact effective authorization cannot be reconstructed — a generation change
 then closes the tunnel outright instead of re-admitting it against a route it
 was never admitted against.
+
+The same re-check also compares the route's **effective `dns_override`** against
+the one the session was admitted with. A tunnel owns one *connected* UDP socket,
+fixed at establishment to the address admission resolved, so "the requested
+`host:port` is still configured" does not mean the tunnel still points where the
+live route says: an override that changed — in either direction, including
+`Some` → `None` and `None` → `Some` — leaves the socket pinned to the address
+the route has stopped naming. There is no re-pin; the session ends. The
+comparison is exact and resolves nothing, so it performs no lookup and neither
+logs nor returns any target material, and a merely re-spelled override fails
+closed. This is deliberately not general policy reauthentication.
 
 ### Refusals
 
@@ -1005,8 +1021,11 @@ was never admitted against.
   §3.2 forbidden-field boundary in both directions, destination admission,
   capsule decoding (context IDs, unknown capsule types, oversize, truncation,
   split frames, and a FIN mid-capsule), capsule encoding, `:protocol`
-  classification, the UDP send-error classifier, and the do-not-fragment
-  socket option installing on a real UDP socket.
+  classification, the UDP send-error classifier, the do-not-fragment socket
+  option installing on a real UDP socket, the session-end → stream-close
+  classification (which outcomes may FIN and which must reset, over the closed
+  set of session ends), and the live re-check's effective-`dns_override`
+  address-pin comparison.
 - `tests/unit/gateway_core/dns_tests.rs` — the fresh all-candidates dial path
   honouring a per-proxy `dns_override` and still screening a denied one.
 - `tests/unit/config/cp_grpc_conn_limit_tests.rs` — the CONNECT-UDP session cap

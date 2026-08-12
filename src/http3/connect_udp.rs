@@ -85,7 +85,12 @@
 //!
 //! Live sessions are re-checked against the published config generation. A
 //! reload that deletes the proxy or removes the destination from its upstream
-//! tears the session down; it is never grandfathered.
+//! tears the session down; it is never grandfathered. So does a reload that
+//! moves the route's effective `dns_override`
+//! ([`dns_override_pin_unchanged`]): the tunnel owns one CONNECTED socket,
+//! fixed to the address admission resolved, so a route that now maps this
+//! destination somewhere else can only be honoured by ending the session — the
+//! established pin is never silently kept.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -605,6 +610,31 @@ pub fn destination_is_configured(
     admit_connect_udp_destination(proxy, lb_snapshot, host, port).is_ok()
 }
 
+/// Whether a live route still pins the tunnel's destination address the way the
+/// session was admitted under.
+///
+/// A CONNECT-UDP tunnel owns ONE connected `UdpSocket`, fixed at establishment
+/// to the address the admitted route resolved (RFC 9298 §3.1). The route's
+/// effective `dns_override` is what decides that address with highest
+/// precedence, so a generation that changes it — in either direction, including
+/// `Some` → `None` and `None` → `Some` — now maps this logical destination
+/// somewhere else while the live socket stays pinned to the old address. There
+/// is no re-pin: `destination_is_configured` alone would keep relaying to the
+/// withdrawn address because the requested `host:port` is still configured.
+///
+/// The comparison is exact rather than resolved: it asks only whether the route
+/// still says the same thing, so it performs no lookup, reads no target
+/// material, and reports nothing about either value. A merely re-spelled
+/// override counts as a change and fails the tunnel closed, which is the safe
+/// direction.
+///
+/// This is deliberately NOT general policy reauthentication — the admitted
+/// destination set is re-checked by `destination_is_configured`, and plugin
+/// route overrides already fail closed on any generation change.
+pub fn dns_override_pin_unchanged(admitted: Option<&str>, live: Option<&str>) -> bool {
+    admitted == live
+}
+
 // ---------------------------------------------------------------------------
 // QUIC varints (RFC 9000 §16) — the capsule and context-ID encoding
 // ---------------------------------------------------------------------------
@@ -955,20 +985,41 @@ fn bind_tunnel_socket(bind_addr: SocketAddr) -> std::io::Result<std::net::UdpSoc
 // ---------------------------------------------------------------------------
 
 /// Why a tunnel ended. Low-cardinality: safe as a log field and a metric label.
+///
+/// Public so the close classification below is asserted by the external unit
+/// tests rather than only by a live tunnel: which outcomes may present a clean
+/// FIN, and which must reset, is a security-visible contract (a reset outcome
+/// that FINs tells the client the session ended normally).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SessionEnd {
+pub enum SessionEnd {
+    /// The client ended the tunnel, or its receive side went away.
     ClientClosed,
+    /// The client-bound relay task produced no outcome of its own — it was
+    /// cancelled or it panicked, so the supervisor labels the join failure.
+    /// Every outcome that task decides for itself is one of the other arms.
     TargetRelayEnded,
+    /// The connected tunnel socket is unusable in either direction.
     TargetSocketUnusable,
+    /// No datagram crossed the tunnel within the configured idle window.
     Idle,
+    /// The gateway began a graceful drain.
     Draining,
+    /// A reload deleted the route, or removed the destination from it.
     RouteWithdrawn,
+    /// A generation change moved the route's effective `dns_override`, so the
+    /// address this tunnel's connected socket is pinned to is no longer the
+    /// address the live route maps the destination to.
+    RouteTargetPinChanged,
+    /// The session was admitted under a plugin route override, which a new
+    /// generation's `(namespace, id)` lookup cannot reconstruct.
     RouteAuthorizationUnreconstructable,
+    /// RFC 9297 capsule-stream fault: a malformed HTTP message.
     CapsuleProtocolError,
 }
 
 impl SessionEnd {
-    fn as_str(self) -> &'static str {
+    /// Stable, low-cardinality reason token. Never carries target material.
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::ClientClosed => "client_closed",
             Self::TargetRelayEnded => "target_relay_ended",
@@ -976,13 +1027,19 @@ impl SessionEnd {
             Self::Idle => "idle_timeout",
             Self::Draining => "gateway_draining",
             Self::RouteWithdrawn => "route_withdrawn",
+            Self::RouteTargetPinChanged => "route_target_pin_changed",
             Self::RouteAuthorizationUnreconstructable => "route_authorization_unreconstructable",
             Self::CapsuleProtocolError => "capsule_protocol_error",
         }
     }
 
     /// How the CONNECT stream's send half must be closed for this outcome.
-    fn close_kind(self) -> StreamCloseKind {
+    ///
+    /// This is the ONE mapping: the client-bound relay classifies the outcomes
+    /// it decides for itself through this function, and the supervisor hands
+    /// the same function's result over for the outcomes it observes. Nothing
+    /// re-derives it inline, so no arm can drift into presenting a clean FIN.
+    pub fn close_kind(self) -> StreamCloseKind {
         match self {
             // RFC 9297 §3.3 / §3.5: a malformed or truncated capsule stream is
             // a malformed HTTP message, not a successful end of response.
@@ -995,6 +1052,7 @@ impl SessionEnd {
             | Self::Idle
             | Self::Draining
             | Self::RouteWithdrawn
+            | Self::RouteTargetPinChanged
             | Self::RouteAuthorizationUnreconstructable => StreamCloseKind::Clean,
         }
     }
@@ -1002,7 +1060,7 @@ impl SessionEnd {
 
 /// How the client-bound relay terminates the QUIC send half.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StreamCloseKind {
+pub enum StreamCloseKind {
     /// Ordinary end of tunnel: FIN the capsule stream.
     Clean,
     /// RFC 9114 §4.1.2 malformed request/response: reset with
@@ -1680,17 +1738,18 @@ async fn relay(
         // silently truncated into a corrupted tunnel payload.
         let mut buf = vec![0u8; max_payload + 1];
         let mut out = BytesMut::with_capacity(4096);
-        // How the send half must be closed. The supervisor decides for the
-        // outcomes it observes and hands the verdict over `close_rx`; the two
-        // outcomes this task decides for itself are ordinary ends of tunnel.
-        let mut close_kind = StreamCloseKind::Clean;
+        // How the send half must be closed, when the SUPERVISOR is the one that
+        // decided. It cannot classify an outcome this task reached on its own:
+        // by the time the supervisor observes the join, this task has already
+        // returned, the send half is gone, and `close_tx.send` has no receiver.
+        // So a self-decided outcome classifies itself below, through the same
+        // `SessionEnd::close_kind` mapping the supervisor's verdict comes from.
+        let mut supervisor_close_kind: Option<StreamCloseKind> = None;
         let end = loop {
             let received = tokio::select! {
                 biased;
                 supervisor = &mut close_rx => {
-                    if let Ok(kind) = supervisor {
-                        close_kind = kind;
-                    }
+                    supervisor_close_kind = supervisor.ok();
                     break SessionEnd::ClientClosed;
                 }
                 received = from_target_socket.recv(&mut buf) => received,
@@ -1719,14 +1778,26 @@ async fn relay(
                     }
                 }
                 Err(error) => {
-                    debug!(
+                    // The tunnel's own connected socket failed. That is an
+                    // internal failure of the tunnel exactly as a terminal
+                    // client-to-target `send` fault is (`UdpSendFault::Terminal`
+                    // on the other relay), not an ordinary end of session: the
+                    // gateway can no longer deliver target traffic, so it must
+                    // not present the client a clean end of the capsule stream.
+                    warn!(
                         proxy_id = %from_target_proxy_id,
-                        "H3 CONNECT-UDP target relay: socket error: {error}"
+                        reason = SessionEnd::TargetSocketUnusable.as_str(),
+                        "H3 CONNECT-UDP target relay: tunnel socket is unusable: {error}"
                     );
-                    break SessionEnd::TargetRelayEnded;
+                    break SessionEnd::TargetSocketUnusable;
                 }
             }
         };
+        // A supervisor verdict applies only to the outcome the supervisor
+        // observed; anything this task decided for itself carries its own
+        // classification, because that decision is already final by the time
+        // the supervisor could speak.
+        let close_kind = supervisor_close_kind.unwrap_or_else(|| end.close_kind());
         match close_kind {
             // Ordinary end of tunnel: FIN so the client sees an orderly end of
             // the capsule stream.
@@ -1753,6 +1824,10 @@ async fn relay(
     });
 
     let admitted_generation = epoch.config_generation;
+    // The effective (route-override-applied) address pin this tunnel's socket
+    // was connected under. Cloned once at establishment, not read per tick, so
+    // the comparison below is against what THIS session was admitted with.
+    let admitted_dns_override = proxy.dns_override.clone();
     let mut ticker = tokio::time::interval(SUPERVISOR_TICK);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Consume the immediate first tick so the first liveness check happens one
@@ -1804,22 +1879,33 @@ async fn relay(
                     if route_overrides_applied {
                         break SessionEnd::RouteAuthorizationUnreconstructable;
                     }
+                    let Some(live) = current.proxy_by_namespaced_id(&proxy.namespace, &proxy.id)
+                    else {
+                        break SessionEnd::RouteWithdrawn;
+                    };
+                    // The socket is CONNECTED to the address admission resolved,
+                    // so "still configured" is not enough: a route whose
+                    // effective `dns_override` moved now maps this destination
+                    // to a different address than the one the live socket is
+                    // pinned to. No re-pin, no lookup, nothing about either
+                    // value logged — the tunnel just fails closed.
+                    if !dns_override_pin_unchanged(
+                        admitted_dns_override.as_deref(),
+                        live.dns_override.as_deref(),
+                    ) {
+                        break SessionEnd::RouteTargetPinChanged;
+                    }
                     // Re-runs the FULL admission, transport screening included,
                     // so a reload that newly requires HBONE / mesh mTLS /
                     // cross-cluster / Unix dispatch for this destination
                     // withdraws the live direct-UDP tunnel instead of letting it
                     // outlive the policy that would now refuse it.
-                    let still_admitted = current
-                        .proxy_by_namespaced_id(&proxy.namespace, &proxy.id)
-                        .is_some_and(|live| {
-                            destination_is_configured(
-                                live,
-                                &current.load_balancer,
-                                &target.host,
-                                target.port,
-                            )
-                        });
-                    if !still_admitted {
+                    if !destination_is_configured(
+                        live,
+                        &current.load_balancer,
+                        &target.host,
+                        target.port,
+                    ) {
                         break SessionEnd::RouteWithdrawn;
                     }
                 }
