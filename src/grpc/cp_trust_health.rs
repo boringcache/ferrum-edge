@@ -552,7 +552,10 @@ impl CpDpTrustReloadStatus {
             .swap(failure.index() as u8 + 1, Ordering::AcqRel);
         let consecutive = self.consecutive_failures.fetch_add(1, Ordering::AcqRel) + 1;
         let reason_changed = previous != failure.index() as u8 + 1;
-        if consecutive == 1 || reason_changed || consecutive % FAILURE_LOG_EVERY == 0 {
+        if consecutive == 1
+            || reason_changed
+            || consecutive.is_multiple_of(FAILURE_LOG_EVERY)
+        {
             tracing::warn!(
                 audit.event = "cp_dp_trust_bundle_reload_rejected",
                 reason = failure.as_str(),

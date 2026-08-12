@@ -2350,7 +2350,7 @@ fn trust_bundle_reject_reasons_are_a_closed_bounded_label_set() {
     ];
     let labels: std::collections::HashSet<&str> = reasons
         .iter()
-        .map(|reason| reason.as_metric_label())
+        .map(|reason| TrustReloadFailure::from_reject_reason(*reason).as_str())
         .collect();
     assert_eq!(labels.len(), reasons.len(), "labels must be distinct");
     for label in labels {
@@ -2806,7 +2806,7 @@ mod projected_generation {
             )
             .await
             .expect_err("reload must fail closed on an incoherent generation"),
-            startup.reason().as_metric_label(),
+            TrustReloadFailure::from_reject_reason(startup.reason()).as_str(),
             "startup and reload must classify identically"
         );
     }
