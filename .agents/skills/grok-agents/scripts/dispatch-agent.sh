@@ -9,8 +9,8 @@ usage() {
     '                         [--name NAME]' \
     '' \
     'Runs the standalone `cursor-agent` CLI in print mode against a non-Fast' \
-    'Cursor Grok 4.5 SKU. --effort selects the SKU (default high); Cursor exposes' \
-    'low/medium/high only, so xhigh and max both resolve to high.' >&2
+    'Cursor Grok 4.6 SKU. --effort selects the SKU (default high); Cursor exposes' \
+    'low/medium/high/xhigh, so max resolves to xhigh.' >&2
 }
 
 worktree=''
@@ -69,15 +69,16 @@ while (($#)); do
 done
 
 # Non-Fast SKUs only: the `-fast` variants bill fast credits. Cursor publishes
-# three Grok 4.5 reasoning tiers, so xhigh/max clamp to high rather than
+# four Grok 4.6 reasoning tiers, so max clamps to xhigh rather than
 # silently pretending a higher tier was applied.
 case "$effort" in
-  low) model='cursor-grok-4.5-low' ;;
-  medium) model='cursor-grok-4.5-medium' ;;
-  high) model='cursor-grok-4.5-high' ;;
-  xhigh|max)
-    model='cursor-grok-4.5-high'
-    printf '[grok-agents] clamping --effort %s to high: Cursor Grok 4.5 tops out at high\n' \
+  low) model='cursor-grok-4.6-low' ;;
+  medium) model='cursor-grok-4.6-medium' ;;
+  high) model='cursor-grok-4.6-high' ;;
+  xhigh) model='cursor-grok-4.6-xhigh' ;;
+  max)
+    model='cursor-grok-4.6-xhigh'
+    printf '[grok-agents] clamping --effort %s to xhigh: Cursor Grok 4.6 tops out at xhigh\n' \
       "$effort" >&2
     ;;
   *)
