@@ -12139,6 +12139,8 @@ components:
           admission_blocked,
           readiness_blocked,
           reason,
+          last_attempt_age_seconds,
+          last_acceptance_age_seconds,
           max_stale_seconds,
           unbounded_stale_allowed,
           consecutive_failures,
