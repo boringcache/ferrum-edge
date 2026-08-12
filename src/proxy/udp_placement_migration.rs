@@ -133,8 +133,8 @@ impl UdpNodeIdentity {
     /// a fail-closed refusal.
     pub fn resolve(registry_dir: &Path) -> Option<Self> {
         let boot_id = current_boot_id()?;
-        if let Some(node_uid) = resolve_ferrum_var("FERRUM_K8S_NODE_UID")
-            .filter(|value| !value.trim().is_empty())
+        if let Some(node_uid) =
+            resolve_ferrum_var("FERRUM_K8S_NODE_UID").filter(|value| !value.trim().is_empty())
             && let Ok(identity) = Self::new(&node_uid, &boot_id)
         {
             return Some(identity);
@@ -816,10 +816,28 @@ pub fn prepare_placement(
     // node UID belongs to another machine (a restored registry hostPath, a
     // recycled node name, a copied artifact) is refused in EVERY phase before
     // any of it is trusted — including as a predecessor claim for cleanup.
+    //
+    // An identity-bound record therefore cannot be compared away by LOSING the
+    // comparison input. If this process cannot resolve the current node
+    // identity at all (the node-agent could not read `Node.metadata.uid`
+    // because of an RBAC or API-server failure, no `FERRUM_K8S_NODE_UID` was
+    // supplied, or the boot id is unreadable), then a restored or reused
+    // registry directory carrying another machine's record would be trusted
+    // verbatim — exactly the node-name-reuse inheritance this binding exists to
+    // refuse. Unresolvable identity is a closed refusal in every phase, before
+    // any phase reads the record. A record with NO recorded incarnation is the
+    // pre-identity legacy shape: it asserts no ownership claim to verify, so it
+    // keeps its previous handling.
+    let recorded_incarnation = state.as_ref().and_then(|state| state.incarnation.clone());
     let mut incarnation_changed = false;
-    if let (Some(state), Some(node)) = (state.as_ref(), request.node.as_ref())
-        && let Some(recorded) = state.incarnation.as_ref()
-    {
+    if let Some(recorded) = recorded_incarnation.as_ref() {
+        let Some(node) = request.node.as_ref() else {
+            set_failure(UdpMigrationFailureReason::NodeIdentityUnresolved);
+            return Err(
+                "the durable Ambient UDP placement record on this registry directory is bound to a Kubernetes node UID and boot id, but this node's current identity could not be resolved; supply FERRUM_K8S_NODE_UID (or restore the node-agent's node-identity publication) before any placement decision trusts that record"
+                    .to_string(),
+            );
+        };
         if recorded.node_uid != node.node_uid {
             set_failure(UdpMigrationFailureReason::NodeIdentityMismatch);
             return Err(
@@ -1167,7 +1185,9 @@ fn write_node_attestation(
         format!("could not encode the Ambient UDP node placement attestation: {error}")
     })?;
     if bytes.len() as u64 > MAX_NODE_ATTESTATION_BYTES {
-        return Err("the Ambient UDP node placement attestation exceeds its size limit".to_string());
+        return Err(
+            "the Ambient UDP node placement attestation exceeds its size limit".to_string(),
+        );
     }
     atomic_write(
         registry_dir,
@@ -1638,6 +1658,12 @@ pub enum UdpMigrationFailureReason {
     /// Durable ownership or a node attestation named a different Kubernetes
     /// node UID than this machine.
     NodeIdentityMismatch,
+    /// A durable record is bound to a node identity, but this process could not
+    /// resolve the CURRENT node identity to compare it against, so the record's
+    /// ownership claim can neither be confirmed nor refuted. Refused rather than
+    /// trusted: a restored or reused registry directory would otherwise inherit
+    /// another machine's ownership whenever identity resolution fails.
+    NodeIdentityUnresolved,
 }
 
 impl UdpMigrationFailureReason {
@@ -1661,6 +1687,7 @@ impl UdpMigrationFailureReason {
             12 => Self::DurableStateRejected,
             13 => Self::NodeProofMissing,
             14 => Self::NodeIdentityMismatch,
+            15 => Self::NodeIdentityUnresolved,
             _ => Self::None,
         }
     }
@@ -1682,6 +1709,7 @@ impl UdpMigrationFailureReason {
             Self::DurableStateRejected => "durable_state_rejected",
             Self::NodeProofMissing => "node_proof_missing",
             Self::NodeIdentityMismatch => "node_identity_mismatch",
+            Self::NodeIdentityUnresolved => "node_identity_unresolved",
         }
     }
 }
@@ -1690,7 +1718,7 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
 static STATUS_PHASE: AtomicU8 = AtomicU8::new(0);
 static OUTSTANDING: AtomicU64 = AtomicU64::new(0);
 static FAILURE_REASON: AtomicU8 = AtomicU8::new(0);
-static FAILURES_TOTAL: [AtomicU64; 15] = [const { AtomicU64::new(0) }; 15];
+static FAILURES_TOTAL: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
 static ESTABLISHED_ADOPTIONS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static ADOPTION_PROOF: AtomicU8 = AtomicU8::new(0);
 static ADOPTIONS_TOTAL: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
@@ -1710,6 +1738,15 @@ pub struct UdpMigrationStatusSnapshot {
     pub adoption_proof: UdpAdoptionProof,
 }
 
+/// Record one adoption that started WITHOUT a same-incarnation durable record.
+///
+/// `ESTABLISHED_ADOPTIONS_TOTAL` is the compatibility roll-up of the per-proof
+/// breakdown, not a release-attestation counter: `new_boot` (including a durable
+/// record that survived from an earlier boot of this same node UID) counts here
+/// exactly like `node_cleanup` and `operator_exempt`. The name predates the
+/// node-specific proof boundary (#3809) and is kept so existing dashboards and
+/// alerts keep working; `..._adoptions_total{proof}` is the surface to key new
+/// alerting on.
 fn record_adoption(proof: UdpAdoptionProof) {
     ENABLED.store(true, Ordering::Relaxed);
     ADOPTION_PROOF.store(proof.code(), Ordering::Relaxed);
@@ -1786,7 +1823,7 @@ pub fn render_prometheus(output: &mut String, gateway_ns_label: &str) {
         gateway_ns_label,
     );
     output.push_str(
-        "# HELP ferrum_mesh_udp_placement_migration_established_adoptions_total Ambient UDP placements adopted from the release-attested established placement without a node-local durable record.\n",
+        "# HELP ferrum_mesh_udp_placement_migration_established_adoptions_total Ambient UDP placements adopted without a same-incarnation node-local durable record, summed over every node-specific proof; equals the sum of ferrum_mesh_udp_placement_migration_adoptions_total.\n",
     );
     output.push_str(
         "# TYPE ferrum_mesh_udp_placement_migration_established_adoptions_total counter\n",
@@ -1849,6 +1886,7 @@ pub fn render_prometheus(output: &mut String, gateway_ns_label: &str) {
         UdpMigrationFailureReason::DurableStateRejected,
         UdpMigrationFailureReason::NodeProofMissing,
         UdpMigrationFailureReason::NodeIdentityMismatch,
+        UdpMigrationFailureReason::NodeIdentityUnresolved,
     ] {
         output.push_str(&format!(
             "ferrum_mesh_udp_placement_migration_failures_total{{reason=\"{}\"{}}} {}\n",

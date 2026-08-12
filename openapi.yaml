@@ -11572,11 +11572,15 @@ components:
             - durable_state_rejected
             - node_proof_missing
             - node_identity_mismatch
+            - node_identity_unresolved
           description: |
             Closed-set node-local failure reason; never includes pod UIDs,
-            generations, node identity, or paths. `node_proof_missing` and
-            `node_identity_mismatch` are the ambiguous-adoption refusals added by
-            the node-specific proof boundary (issue #3809).
+            generations, node identity, or paths. `node_proof_missing`,
+            `node_identity_mismatch`, and `node_identity_unresolved` are the
+            ambiguous-adoption refusals added by the node-specific proof boundary
+            (issue #3809). `node_identity_unresolved` means the durable record is
+            bound to a node identity while this process could not resolve the
+            current one, so the record is refused rather than trusted.
         established_adoption:
           type: boolean
           description: |

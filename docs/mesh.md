@@ -3836,10 +3836,18 @@ predecessor producer. From the stable release onward the chart therefore renders
 `ferrum-mesh-udp-placement-<release>` ConfigMap — only when that installed
 contract already records the same target in a `stable` or `finalize` phase, so
 the release that performs a change can never attest itself. A node with no
-durable record then adopts that placement, records it durably, logs the
-adoption, sets `mesh.udp_placement_migration.established_adoption` on
-authenticated `/health`, and increments
-`ferrum_mesh_udp_placement_migration_established_adoptions_total`. The
+durable record then adopts that placement (once the node-specific proof below
+also agrees), records it durably, logs the adoption, sets
+`mesh.udp_placement_migration.established_adoption` on authenticated `/health`,
+and increments
+`ferrum_mesh_udp_placement_migration_established_adoptions_total`. That counter
+is the compatibility **roll-up over every proof kind** — `new_boot` (including a
+durable record that survived from an earlier boot of this same node UID),
+`node_cleanup`, and `operator_exempt` alike — not a count of release-attested
+recordless adoptions; its name predates the node-specific proof boundary and is
+kept so existing dashboards keep working. It always equals the sum of
+`ferrum_mesh_udp_placement_migration_adoptions_total{proof}`, which is the
+surface to key new alerting on. The
 attestation is consulted **only** when the durable record is absent: a present
 record that disagrees with the requested placement is still the hard rejection
 above, so an in-place flip on a running node can never be authorized this way.
@@ -3874,11 +3882,28 @@ and a bounded failure reason: `node_proof_missing` (no attestation, an
 attestation from an earlier boot, a target mismatch, or no node identity at
 all), `node_identity_mismatch` (durable ownership or an attestation naming a
 different Kubernetes node UID — a reused node name can never inherit another
-machine's evidence), `generation_mismatch` (a superseded node-proof
+machine's evidence), `node_identity_unresolved` (see below),
+`generation_mismatch` (a superseded node-proof
 generation), and `durable_state_rejected` (unreadable, oversized, symlinked,
 multiply-linked, foreign-UID, or malformed evidence). A
 `.udp-placement-quarantined` tombstone still refuses every absent-state
 bootstrap ahead of all of this.
+
+**An identity-bound durable record fails closed when current identity is
+unknown.** The node-UID comparison above is only a boundary while BOTH sides of
+it exist. If the durable record carries an incarnation but this process cannot
+resolve the current node identity — the node-agent could not read
+`Node.metadata.uid` (RBAC removed, API server unreachable), no
+`FERRUM_K8S_NODE_UID` was supplied, or the boot id is unreadable — then a
+restored `hostPath`, a copied registry artifact, or a rebuilt machine reusing a
+node name would have its record trusted verbatim, because there is nothing left
+to compare it against. Every phase therefore refuses such a record BEFORE
+reading it, with failure reason `node_identity_unresolved`, and the operator
+recovers by restoring the node-agent's `nodes: get` permission (or supplying
+`FERRUM_K8S_NODE_UID` directly). A record written by a release that PREDATES
+this binding carries no incarnation and asserts no ownership claim, so it keeps
+its previous identity-free handling; it is re-stamped with this node's identity
+on the next stable start that can resolve one.
 
 The proof is visible on authenticated `/health` as
 `mesh.udp_placement_migration.adoption_proof` (with `established_adoption` true
@@ -3944,17 +3969,45 @@ value may set `FERRUM_K8S_NODE_UID` directly, which takes precedence. If neither
 is available the node has no identity, and every recordless host adoption stays
 fail-closed.
 
-**Live coverage residual.** The deterministic external suites cover the whole
-proof boundary (pre-contract same-boot refusal, explicit cleanup proof,
-same-node-UID reboot adoption, node-name reuse under a different UID, the
-cleanup-complete/finalize-missed resumption, stale/malformed/release-only
-evidence, and the dual-stack both-domains retirement plan). The **hosted
-`ambient-host-udp-live` gate is unchanged**: a live proof that workload pods and
-their network namespaces survive a missed-rollout/rejoin with no UDP blackhole
-needs a multi-pod privileged fixture the current gate does not build, and its
-`run.sh` asserts exact pass counts, so adding it belongs in its own change
-rather than folded blind into a required merge gate. That live datapath proof is
-tracked as follow-up work.
+**Coverage.** The deterministic external suites cover the whole proof boundary
+(pre-contract same-boot refusal, explicit cleanup proof, same-node-UID reboot
+adoption, node-name reuse under a different UID, an identity-bound record with
+no resolvable current identity, the cleanup-complete/finalize-missed
+resumption, stale/malformed/release-only evidence, and the dual-stack
+both-domains retirement plan).
+
+The **missed-rollout/rejoin scenario itself is proven on the hosted live
+kernel** by the required `ambient-host-udp-live` gate
+(`host_udp_live_kernel_missed_rollout_rejoin_refuses_then_recovers_without_a_blackhole`
+in `src/proxy/host_udp_capture_live_tests.rs`). It builds the multi-pod
+privileged fixture the scenario needs and keeps the workload pods and their
+network namespaces alive from beginning to end — nothing is restarted or
+recreated:
+
+1. The real predecessor pod-netns TPROXY placement (`IptablesPlan::udp_setup_script`,
+   IPv4 and IPv6) is installed inside two live workload namespaces with no
+   listener behind it — the exact state a skipped node still carries.
+2. The incoming host producer is brought up and the blackhole is DEMONSTRATED:
+   IPv4 and IPv6 workload egress is swallowed inside the pod netns and never
+   reaches the host capture socket.
+3. `prepare_placement` refuses the settled host release for that recordless
+   same-boot node (`migration_required`) and writes no ownership — so a real
+   deployment never reaches step 2's outcome.
+4. The **production** retirement supervisor (`for_node_preflight` +
+   `run_udp_placement_cleanup`, driven inside the fixture's host namespace over
+   a real node-agent pod registry) enumerates both namespaces through the
+   production `cgroup.procs` → PID → `/proc/<pid>/ns/net` path and retires both
+   ownership domains for both families. Nothing is simulated or hand-deleted.
+5. The same release is then admitted with `adoption_proof=node_cleanup`, and the
+   SAME never-restarted workloads' UDP reaches the host producer with exact
+   ingress-interface attribution, correct original destinations for IPv4 and
+   IPv6, and a working transparent return path — the executable proof that no
+   blackhole survives.
+
+The gate's `run.sh` pins the lib live pass count at three and its timeout covers
+the supervisor's polling window; `ambient_host_udp_live_contract_tests.rs` pins
+that the scenario, its production supervisor, and its dual-stack blackhole
+demonstration all remain in the live module.
 
 **Helm and client-render parity.** The boundary lives in the runtime and in
 node-local files, so a GitOps/client-render pipeline enforces exactly the same

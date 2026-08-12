@@ -185,7 +185,7 @@ fn ambient_host_udp_live_runner_fail_closed_and_bounded_diagnostics() {
         "runner must execute the production ProxyHostUdpBackend functional live test"
     );
     assert!(
-        runner.contains("expected exactly 2 ambient host-UDP lib live tests"),
+        runner.contains("expected exactly 3 ambient host-UDP lib live tests"),
         "runner must pin the lib live pass count"
     );
     assert!(
@@ -228,6 +228,31 @@ fn ambient_host_udp_live_kernel_module_uses_production_scripts_and_skip_or_fail(
     assert!(
         live.contains("redact_diag"),
         "live diagnostics must be redacted"
+    );
+    // Issue #3809's acceptance criterion: the missed-rollout/rejoin scenario is
+    // proven on the live kernel with the workload pods and their network
+    // namespaces kept alive throughout, using the production retirement
+    // supervisor rather than a simulated cleanup.
+    assert!(
+        live.contains("host_udp_live_kernel_missed_rollout_rejoin_refuses_then_recovers_without_a_blackhole"),
+        "live gate must prove the #3809 missed-rollout/rejoin scenario"
+    );
+    assert!(
+        live.contains("IptablesPlan::udp_setup_script"),
+        "the rejoin proof must install the REAL predecessor pod-netns placement"
+    );
+    assert!(
+        live.contains("run_udp_placement_cleanup") && live.contains("for_node_preflight"),
+        "the rejoin proof must run the production node-preflight retirement supervisor"
+    );
+    assert!(
+        live.contains("prepare_placement") && live.contains("UdpAdoptionProof::NodeCleanup"),
+        "the rejoin proof must exercise the runtime adoption guard and its proof"
+    );
+    assert!(
+        live.contains("assert_not_captured(capture_fd, b\"blackholed-a4\"")
+            && live.contains("assert_not_captured(capture_fd, b\"blackholed-b6\""),
+        "the rejoin proof must demonstrate the dual-stack blackhole it prevents"
     );
     assert!(
         live.contains("DIAG_CAP"),

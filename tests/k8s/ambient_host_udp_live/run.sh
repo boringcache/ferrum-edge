@@ -135,8 +135,11 @@ collect_diag "$RESULTS/pre-run-diagnostics.txt"
 echo "Running ambient host-UDP live-kernel lib tests via $LIB_BIN"
 lib_raw="$(mktemp "${TMPDIR:-/tmp}/ferrum-host-udp-lib.XXXXXX")"
 set +e
+# The missed-rollout/rejoin proof (#3809) drives the real retirement supervisor,
+# whose completion window is several polling passes wide, so the budget covers
+# all three tests running serially rather than the original two.
 FERRUM_LIVE_TESTS_REQUIRED=1 \
-  timeout --signal=KILL 180s \
+  timeout --signal=KILL 420s \
   "$LIB_BIN" proxy::host_udp_capture_live_tests --ignored --nocapture --test-threads=1 \
   >"$lib_raw" 2>&1
 lib_status=$?
@@ -148,8 +151,8 @@ fi
 if grep -q '^SKIP:' "$lib_raw"; then
   fail_required "ambient host-UDP lib live tests skipped under required CI mode"
 fi
-if ! grep -Eq '^test result: ok\. 2 passed; 0 failed;' "$lib_raw"; then
-  fail_required "expected exactly 2 ambient host-UDP lib live tests to pass"
+if ! grep -Eq '^test result: ok\. 3 passed; 0 failed;' "$lib_raw"; then
+  fail_required "expected exactly 3 ambient host-UDP lib live tests to pass"
 fi
 rm -f -- "$lib_raw"
 lib_raw=""

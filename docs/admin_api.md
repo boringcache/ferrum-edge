@@ -107,7 +107,9 @@ predecessor placements on this exact node UID and boot id), `operator_exempt`
 attestation alone never authorizes adoption: a recordless node with no
 node-specific proof reports failure reason `node_proof_missing` (or
 `node_identity_mismatch` when the evidence names another machine) and stays
-unready. The authenticated `/overload`
+unready. A durable record that IS identity-bound while this node's current
+identity cannot be resolved reports `node_identity_unresolved` and is refused
+rather than trusted. The authenticated `/overload`
 snapshot also includes `node_waypoint_drops`, with monotonic counters for
 missing/unknown socket-cookie metadata, missing pod/workload identity data,
 unknown pods, and workload-hash mismatches. These fields are omitted from the

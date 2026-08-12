@@ -2831,11 +2831,7 @@ fn has_pending_capture_failures(pod_states: &DashMap<String, PodAttachmentState>
 /// proof. Every failure path warns and returns: the proxy fails closed on a
 /// missing identity, so a best-effort publication can only ever withhold an
 /// adoption, never authorize one.
-async fn publish_node_identity(
-    client: &Client,
-    node_name: &str,
-    registry_dir: &std::path::Path,
-) {
+async fn publish_node_identity(client: &Client, node_name: &str, registry_dir: &std::path::Path) {
     let nodes: Api<Node> = Api::all(client.clone());
     let node = match tokio::time::timeout(Duration::from_secs(10), nodes.get(node_name)).await {
         Ok(Ok(node)) => node,
@@ -2856,7 +2852,9 @@ async fn publish_node_identity(
         }
     };
     let Some(uid) = node.metadata.uid.as_deref() else {
-        warn!("this node's Kubernetes object carries no UID; Ambient UDP host-placement adoption will stay fail-closed");
+        warn!(
+            "this node's Kubernetes object carries no UID; Ambient UDP host-placement adoption will stay fail-closed"
+        );
         return;
     };
     if let Err(error) =

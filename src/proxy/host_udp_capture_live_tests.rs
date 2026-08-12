@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use crate::capture::{
     CaptureConfig, Ip6TablesMode, IptablesPlan, TPROXY_HOST_ROUTE_RULE_PRIORITY,
-    TPROXY_HOST_ROUTE_TABLE, UDP_HOST_CAPTURE_CHAIN, UDP_HOST_GUARD_CHAIN_A,
+    TPROXY_HOST_ROUTE_TABLE, TPROXY_ROUTE_TABLE, UDP_HOST_CAPTURE_CHAIN, UDP_HOST_GUARD_CHAIN_A,
     UDP_HOST_GUARD_CHAIN_B,
 };
 use crate::identity::spiffe::SpiffeId;
@@ -34,7 +34,14 @@ use crate::proxy::host_udp_capture::{
     ResolvedInterface, dedicated_host_ifindex, plan_host_udp_bindings,
 };
 use crate::proxy::mesh_udp_capture::bind_mesh_udp_capture_socket_with_pktinfo;
+use crate::proxy::netns_capture::DirectoryCaptureSource;
 use crate::proxy::udp_batch::RecvMmsgBatch;
+use crate::proxy::udp_placement_cleanup::{UdpCleanupOutcome, run_udp_placement_cleanup};
+use crate::proxy::udp_placement_migration::{
+    UdpAdoptionProof, UdpMigrationContext, UdpMigrationFailureReason, UdpMigrationPhase,
+    UdpNodeIdentity, UdpPlacement, UdpPlacementDecision, UdpPlacementRequest, prepare_placement,
+    publish_registry_sync_marker_for_pods,
+};
 
 const CAPTURE_PORT: u16 = crate::capture::DEFAULT_UDP_OUTBOUND_PORT;
 const REMOTE_V4: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 80);
@@ -1249,4 +1256,436 @@ fn host_udp_live_kernel_fail_closed_prerequisites_and_partial_install() {
             "host teardown must address owned object {owned}"
         );
     }
+}
+
+// ── Missed-rollout / rejoin proof (issue #3809) ─────────────────────────────
+//
+// The acceptance criterion this section exists for: a pre-contract node that
+// stayed BOOTED with live workload pods and their network namespaces intact,
+// missed the cleanup and finalize rollout, and later rejoins the settled
+// host-netns release must not be admitted while stale pod-netns interception
+// rules are live, and must serve workload UDP with no blackhole once the
+// privileged node preflight has retired them. Everything below runs on the
+// hosted live kernel against the SAME workload namespaces throughout — no pod
+// is restarted, no namespace is recreated, and every retirement is performed by
+// the production supervisor rather than simulated.
+
+/// A stable Kubernetes node UID + boot id for the fixture node. Supplied
+/// EXPLICITLY so the proof assertions never depend on a shared env var or on
+/// the runner's `/proc/sys/kernel/random/boot_id`.
+const LIVE_NODE_UID: &str = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+const LIVE_BOOT_ID: &str = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+const LIVE_PROOF_GENERATION: &str = "host-netns-stable";
+
+/// The PREDECESSOR (pod-netns) placement configuration, dual-stack. This is the
+/// exact plan the Ambient per-pod-netns producer installs inside a workload
+/// netns, so the rules this test leaves behind are the real predecessor state a
+/// skipped node would still be carrying.
+fn pod_capture_config() -> CaptureConfig {
+    let mut config = CaptureConfig::explicit(15006, 15001);
+    config.udp_capture_enabled = true;
+    config.host_netns = false;
+    config.proxy_uid = None;
+    config.ip6tables_mode = Ip6TablesMode::Required;
+    config.include_cidrs = vec!["0.0.0.0/0".to_string(), "::/0".to_string()];
+    config.include_cidrs_explicit = true;
+    config.udp_outbound_port = CAPTURE_PORT;
+    config
+}
+
+/// Install the predecessor pod-netns TPROXY rules inside a live workload netns
+/// and leave NO listener bound behind them — the exact state a node carries
+/// after the predecessor producer went away but its rules did not.
+fn install_predecessor_pod_capture(pod_pid: u32) -> Result<(), String> {
+    let script = IptablesPlan::udp_setup_script(&pod_capture_config());
+    if script.is_empty() {
+        return Err("pod-netns UDP setup produced no rules".to_string());
+    }
+    run_in_netns(pod_pid, move || {
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .output()
+            .map_err(|error| format!("predecessor install spawn: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "predecessor pod-netns install failed ({:?}): {}",
+                output.status.code(),
+                redact_diag(&String::from_utf8_lossy(&output.stderr))
+            ));
+        }
+        Ok(())
+    })
+}
+
+/// Assert whether a workload netns still carries Ferrum-owned predecessor UDP
+/// state, for IPv4 AND IPv6 alike. Proving PRESENCE first is what makes the
+/// later absence assertion meaningful.
+fn assert_predecessor_pod_state(pod_pid: u32, present: bool) -> Result<(), String> {
+    // Read each mangle implementation separately: a v4-only match must never
+    // satisfy a dual-stack claim in either direction.
+    let v4_rules = nsenter_sh(pod_pid, "iptables-save -t mangle")?;
+    let v6_rules = nsenter_sh(pod_pid, "ip6tables-save -t mangle")?;
+    let policy = nsenter_sh(pod_pid, "ip rule show; ip -6 rule show")?;
+    let owned_lookup = format!("lookup {TPROXY_ROUTE_TABLE}");
+    let v4 = v4_rules.contains("FERRUM_MESH_UDP");
+    let v6 = v6_rules.contains("FERRUM_MESH_UDP");
+    let routed = policy.contains(&owned_lookup);
+    let installed = v4 && v6 && routed;
+    let clean = !v4 && !v6 && !routed;
+    if (present && installed) || (!present && clean) {
+        return Ok(());
+    }
+    let expectation = if present { "installed" } else { "retired" };
+    Err(format!(
+        "predecessor pod-netns state is not {expectation} (v4={v4} v6={v6} routed={routed}): {}",
+        redact_diag(&policy)
+    ))
+}
+
+fn live_node_identity() -> UdpNodeIdentity {
+    UdpNodeIdentity::new(LIVE_NODE_UID, LIVE_BOOT_ID).expect("valid fixture node identity")
+}
+
+/// The settled host-netns release as it reaches a recordless node: release-level
+/// desired state PLUS this node's identity and the release's node-proof
+/// generation. Whether it is admitted is exactly the question under test.
+fn settled_host_release(node: &UdpNodeIdentity) -> UdpPlacementRequest {
+    UdpPlacementRequest {
+        phase: UdpMigrationPhase::Stable,
+        target: UdpPlacement::HostNetns,
+        generation: None,
+        from: None,
+        to: None,
+        established: Some(UdpPlacement::HostNetns),
+        node: Some(node.clone()),
+        node_proof_generation: Some(LIVE_PROOF_GENERATION.to_string()),
+    }
+}
+
+/// Publish the node-agent's per-pod registry entry for a live workload, pointing
+/// at a cgroup directory whose `cgroup.procs` names that pod's PID. This is the
+/// production resolution path (`cgroup.procs` -> PID -> `/proc/<pid>/ns/net`),
+/// so the preflight below resolves and enters the REAL workload namespaces.
+fn publish_pod_registry_entry(
+    registry_dir: &std::path::Path,
+    cgroup_root: &std::path::Path,
+    pod_uid: &str,
+    pod_pid: u32,
+) -> Result<(), String> {
+    let cgroup = cgroup_root.join(pod_uid);
+    std::fs::create_dir_all(&cgroup).map_err(|error| format!("create fixture cgroup: {error}"))?;
+    std::fs::write(cgroup.join("cgroup.procs"), format!("{pod_pid}\n"))
+        .map_err(|error| format!("write fixture cgroup.procs: {error}"))?;
+    std::fs::create_dir_all(registry_dir).map_err(|error| format!("create registry: {error}"))?;
+    let entry = registry_dir.join(pod_uid);
+    std::fs::write(entry, format!("{}\n", cgroup.display()))
+        .map_err(|error| format!("write registry entry: {error}"))
+}
+
+/// Run the privileged node preflight's retirement supervisor INSIDE the
+/// fixture's host-shaped namespace, exactly as the init container runs it in the
+/// node's host netns. The runtime is single-threaded and pinned to the entered
+/// thread, so every `setns` the supervisor performs starts from that namespace.
+fn run_node_preflight_in_host_netns(
+    host_pid: u32,
+    context: UdpMigrationContext,
+    registry_dir: PathBuf,
+    budget: Duration,
+) -> Result<UdpCleanupOutcome, String> {
+    std::thread::spawn(move || {
+        let ns = std::fs::File::open(format!("/proc/{host_pid}/ns/net"))
+            .map_err(|error| format!("open host netns: {error}"))?;
+        // Safety: the namespace handle is owned by this throwaway thread, which
+        // exits before the fixture is torn down.
+        if unsafe { libc::setns(ns.as_raw_fd(), libc::CLONE_NEWNET) } != 0 {
+            return Err(format!(
+                "setns into the fixture host netns failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let source = std::sync::Arc::new(DirectoryCaptureSource::new(registry_dir));
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| format!("build preflight runtime: {error}"))?;
+        Ok(runtime.block_on(async move {
+            let deadline = tokio::time::Instant::now() + budget;
+            run_udp_placement_cleanup(context, source, shutdown_rx, Some(deadline)).await
+        }))
+    })
+    .join()
+    .map_err(|_| "node preflight thread panicked".to_string())?
+}
+
+#[test]
+#[ignore = "requires root + dual-stack netns + iptables/ip6tables TPROXY + iproute2"]
+fn host_udp_live_kernel_missed_rollout_rejoin_refuses_then_recovers_without_a_blackhole() {
+    if !is_root() {
+        skip_or_fail("not root; cannot create host/pod netns or install TPROXY");
+        return;
+    }
+    for binary in [
+        "unshare",
+        "nsenter",
+        "ip",
+        "iptables",
+        "ip6tables",
+        "iptables-save",
+        "ip6tables-save",
+    ] {
+        let present = Command::new("sh")
+            .args(["-c", &format!("command -v {binary} >/dev/null 2>&1")])
+            .status()
+            .is_ok_and(|status| status.success());
+        if !present {
+            skip_or_fail(&format!("`{binary}` is unavailable"));
+            return;
+        }
+    }
+
+    let topo = match LiveTopology::create() {
+        Ok(topo) => topo,
+        Err(error) if error.contains("exit 98") || error.contains("load-bearing") => {
+            panic!("host-UDP live fixture failed closed on load-bearing setup: {error}");
+        }
+        Err(error) => {
+            skip_or_fail(&error);
+            return;
+        }
+    };
+    let host_pid = topo.host_pid;
+
+    // 1. The node is mid-history: the predecessor pod-netns placement is live
+    //    inside BOTH workloads, dual-stack, and its listener is gone. The pods
+    //    and their namespaces stay up for the whole test from here on.
+    for (label, pid) in [("pod A", topo.pod_a_pid), ("pod B", topo.pod_b_pid)] {
+        install_predecessor_pod_capture(pid)
+            .unwrap_or_else(|error| panic!("{label} predecessor install: {error}"));
+        if let Err(error) = assert_predecessor_pod_state(pid, true) {
+            panic!("{label}: {error}");
+        }
+    }
+
+    // 2. Bring up the incoming host producer so the blackhole is demonstrated
+    //    against a REAL capture socket rather than argued about. This is the
+    //    counterfactual the guard exists to prevent, so it is proven first.
+    install_production_host_capture(host_pid, &[topo.if_a.clone(), topo.if_b.clone()])
+        .unwrap_or_else(|error| {
+            panic!(
+                "production host UDP capture install failed: {error}\n{}",
+                bounded_host_diag(host_pid)
+            )
+        });
+    let bound = run_in_netns(host_pid, move || {
+        let bind = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), CAPTURE_PORT);
+        let (capture, _, v4_ok, v6_ok) = bind_mesh_udp_capture_socket_with_pktinfo(bind, true)
+            .map_err(|error| format!("bind production host capture socket: {error}"))?;
+        if !v4_ok || !v6_ok {
+            return Err(format!(
+                "production socket must enable both orig-dst families (v4={v4_ok} v6={v6_ok})"
+            ));
+        }
+        let fd = capture.as_raw_fd();
+        Ok((capture, fd))
+    });
+    let (capture, capture_fd) = match bound {
+        Ok(pair) => pair,
+        Err(error) => panic!("bind failed: {error}\n{}", bounded_host_diag(host_pid)),
+    };
+    let _capture = capture;
+
+    // The stale pod-netns rules swallow the workload's egress inside the pod:
+    // it is TPROXY'd to a predecessor listener that no longer exists and never
+    // reaches the host producer. IPv4 and IPv6 alike.
+    send_from_pod(
+        topo.pod_a_pid,
+        SocketAddr::new(IpAddr::V4(POD_A_V4), 46001),
+        SocketAddr::new(IpAddr::V4(REMOTE_V4), DIAL_PORT),
+        b"blackholed-a4",
+    )
+    .expect("pod A IPv4 send under stale predecessor rules");
+    let blackhole_window = Duration::from_millis(750);
+    if let Err(error) = assert_not_captured(capture_fd, b"blackholed-a4", blackhole_window) {
+        panic!(
+            "stale predecessor rules must black-hole workload UDP (this is the failure the guard prevents): {error}\n{}",
+            bounded_host_diag(host_pid)
+        );
+    }
+    send_from_pod(
+        topo.pod_b_pid,
+        SocketAddr::new(IpAddr::V6(POD_B_V6), 46002),
+        SocketAddr::new(IpAddr::V6(REMOTE_V6), DIAL_PORT),
+        b"blackholed-b6",
+    )
+    .expect("pod B IPv6 send under stale predecessor rules");
+    if let Err(error) = assert_not_captured(capture_fd, b"blackholed-b6", blackhole_window) {
+        panic!(
+            "stale predecessor IPv6 rules must black-hole workload UDP: {error}\n{}",
+            bounded_host_diag(host_pid)
+        );
+    }
+
+    // 3. The guard refuses the rejoin. The node carries no durable record (it
+    //    predates the contract), the release attests `host-netns`, and no
+    //    node-specific proof exists — so the settled release must be refused
+    //    BEFORE the producer is allowed to serve, and must write nothing.
+    let registry = tempfile::tempdir().expect("registry dir");
+    let cgroups = tempfile::tempdir().expect("fixture cgroup root");
+    let node = live_node_identity();
+    let error = prepare_placement(registry.path(), &settled_host_release(&node))
+        .err()
+        .expect("a recordless same-boot node must be refused");
+    assert!(
+        error.contains("no node-specific cleanup attestation"),
+        "{error}"
+    );
+    assert_eq!(
+        crate::proxy::udp_placement_migration::snapshot().failure_reason,
+        UdpMigrationFailureReason::MigrationRequired
+    );
+    let state_file = registry.path().join(".udp-placement-state-v1.json");
+    assert!(!state_file.exists(), "a refused rejoin must write nothing");
+
+    // 4. Run the privileged node preflight for real. It enumerates the
+    //    node-agent registry, enters each LIVE workload netns, and retires both
+    //    predecessor placements by exact Ferrum-owned name for IPv4 and IPv6.
+    for (uid, pid) in [(POD_A_UID, topo.pod_a_pid), (POD_B_UID, topo.pod_b_pid)] {
+        publish_pod_registry_entry(registry.path(), cgroups.path(), uid, pid)
+            .unwrap_or_else(|error| panic!("publish registry entry for {uid}: {error}"));
+    }
+    let mut expected = std::collections::HashSet::new();
+    expected.insert(POD_A_UID.to_string());
+    expected.insert(POD_B_UID.to_string());
+    assert_eq!(
+        publish_registry_sync_marker_for_pods(registry.path(), LIVE_PROOF_GENERATION, &expected),
+        Ok(true),
+        "the node-agent's authoritative registry publication must be current"
+    );
+    let context = UdpMigrationContext::for_node_preflight(
+        registry.path(),
+        UdpPlacement::HostNetns,
+        node.clone(),
+        LIVE_PROOF_GENERATION,
+    )
+    .expect("node preflight context");
+    let outcome = run_node_preflight_in_host_netns(
+        host_pid,
+        context,
+        registry.path().to_path_buf(),
+        Duration::from_secs(120),
+    )
+    .unwrap_or_else(|error| panic!("node preflight: {error}\n{}", bounded_host_diag(host_pid)));
+    assert_eq!(
+        outcome,
+        UdpCleanupOutcome::Complete,
+        "the node preflight must prove predecessor retirement before publishing\n{}",
+        bounded_host_diag(host_pid)
+    );
+
+    // Both workload namespaces are clean, dual-stack, and both pods are still
+    // the SAME running namespaces they were in step 1.
+    for (label, pid) in [("pod A", topo.pod_a_pid), ("pod B", topo.pod_b_pid)] {
+        if let Err(error) = assert_predecessor_pod_state(pid, false) {
+            panic!("{label}: {error}");
+        }
+    }
+
+    // 5. The same settled release is now admitted, on node-specific proof.
+    assert!(
+        matches!(
+            prepare_placement(registry.path(), &settled_host_release(&node)),
+            Ok(UdpPlacementDecision::RunStable)
+        ),
+        "a node that completed the preflight must be admitted\n{}",
+        bounded_host_diag(host_pid)
+    );
+    let snapshot = crate::proxy::udp_placement_migration::snapshot();
+    assert_eq!(snapshot.adoption_proof, UdpAdoptionProof::NodeCleanup);
+    assert!(snapshot.established_adoption);
+
+    // 6. No blackhole: the host producer is reinstalled (the preflight retired
+    //    the host domain too) and the SAME never-restarted workloads reach it,
+    //    with exact ingress-interface attribution and a working return path.
+    install_production_host_capture(host_pid, &[topo.if_a.clone(), topo.if_b.clone()])
+        .unwrap_or_else(|error| panic!("post-preflight host capture install: {error}"));
+    let index = publish_index(&topo);
+
+    send_from_pod(
+        topo.pod_a_pid,
+        SocketAddr::new(IpAddr::V4(POD_A_V4), 47001),
+        SocketAddr::new(IpAddr::V4(REMOTE_V4), DIAL_PORT),
+        b"recovered-a4",
+    )
+    .expect("pod A IPv4 send after retirement");
+    let (payload, source, orig, ifindex) =
+        recv_one(capture_fd, Instant::now() + Duration::from_secs(3)).unwrap_or_else(|error| {
+            panic!(
+                "workload UDP must reach the host producer after retirement (a surviving blackhole is the #3809 failure): {error}\n{}",
+                bounded_host_diag(host_pid)
+            )
+        });
+    assert_eq!(payload, b"recovered-a4");
+    assert_eq!(source.ip(), IpAddr::V4(POD_A_V4));
+    assert_eq!(
+        orig,
+        Some(SocketAddr::new(IpAddr::V4(REMOTE_V4), DIAL_PORT))
+    );
+    assert_eq!(ifindex, topo.ifindex_a);
+    index
+        .authorize(Some(ifindex), source.ip())
+        .expect("recovered pod A must attribute");
+
+    send_from_pod(
+        topo.pod_b_pid,
+        SocketAddr::new(IpAddr::V6(POD_B_V6), 47002),
+        SocketAddr::new(IpAddr::V6(REMOTE_V6), DIAL_PORT),
+        b"recovered-b6",
+    )
+    .expect("pod B IPv6 send after retirement");
+    let (payload, source, orig, ifindex) =
+        recv_one(capture_fd, Instant::now() + Duration::from_secs(3)).unwrap_or_else(|error| {
+            panic!(
+                "IPv6 workload UDP must reach the host producer after retirement: {error}\n{}",
+                bounded_host_diag(host_pid)
+            )
+        });
+    assert_eq!(payload, b"recovered-b6");
+    assert_eq!(source.ip(), IpAddr::V6(POD_B_V6));
+    assert_eq!(
+        orig,
+        Some(SocketAddr::new(IpAddr::V6(REMOTE_V6), DIAL_PORT))
+    );
+    assert_eq!(ifindex, topo.ifindex_b);
+
+    // The return path is the other half of "no blackhole": a reply sourced from
+    // the address the workload dialed must arrive inside the same pod netns.
+    let pod_a_reply = SocketAddr::new(IpAddr::V4(POD_A_V4), 47001);
+    let waiter = spawn_reply_waiter(topo.pod_a_pid, pod_a_reply);
+    std::thread::sleep(Duration::from_millis(100));
+    transparent_reply(
+        host_pid,
+        SocketAddr::new(IpAddr::V4(REMOTE_V4), DIAL_PORT),
+        pod_a_reply,
+        b"recovered-reply",
+    )
+    .unwrap_or_else(|error| {
+        panic!(
+            "post-retirement transparent reply failed: {error}\n{}",
+            bounded_host_diag(host_pid)
+        )
+    });
+    let recovered = waiter
+        .join()
+        .expect("post-retirement reply waiter thread")
+        .expect("pod A must receive the post-retirement transparent reply");
+    assert_eq!(recovered.0, b"recovered-reply");
+    assert_eq!(recovered.1.ip(), IpAddr::V4(REMOTE_V4));
+
+    // 7. Exact Ferrum-owned teardown, as every live path must leave the node.
+    teardown_production_host_capture(host_pid)
+        .unwrap_or_else(|error| panic!("final teardown: {error}\n{}", bounded_host_diag(host_pid)));
+    assert_no_ferrum_host_state(host_pid)
+        .unwrap_or_else(|error| panic!("{error}\n{}", bounded_host_diag(host_pid)));
 }

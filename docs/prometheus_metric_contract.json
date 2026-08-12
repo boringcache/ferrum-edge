@@ -2515,7 +2515,7 @@
   {
     "name": "ferrum_mesh_udp_placement_migration_established_adoptions_total",
     "type": "counter",
-    "help": "Ambient UDP placements adopted from the release-attested established placement without a node-local durable record.",
+    "help": "Ambient UDP placements adopted without a same-incarnation node-local durable record, summed over every node-specific proof; equals the sum of ferrum_mesh_udp_placement_migration_adoptions_total.",
     "labels": [
       "gateway_namespace"
     ],
