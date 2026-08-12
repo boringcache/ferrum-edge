@@ -560,6 +560,21 @@ decode surface is a field-exact **projection** of the upstream Envoy v3 messages
 every field number is taken from Envoy `v1.31.0` and a field that can change
 routing, trust, or identity is either consumed or refused.
 
+**Namespace scope.** Discovery is projected onto the typed mesh model first and
+narrowed to this workload's namespace view second, exactly like every other
+config source. A cluster for a service in ANOTHER namespace is therefore
+published by the projection and then narrowed out of the slice, so it is never
+dialable here — even when its endpoints are genuinely reachable. Its endpoints
+narrow **with** it: when a stock cluster's endpoint carries an identity from
+this namespace, the projection records a cross-namespace attachment, and Ferrum
+admits such an attachment only together with the `MeshService` that authorizes
+it (the target service must list the workload's SPIFFE id). Once narrowing has
+removed that service, the endpoint is dropped rather than retained as an
+unauthorizable attachment — a slice carrying one would be refused at apply, and
+the resulting rollback to the last applied generation would block every LATER
+control-plane change, including a state-of-the-world withdrawal, instead of
+losing just the out-of-view resource.
+
 A `TcpProxy` filter chain does classify its port as `AppProtocol::Tcp`, but
 raw-TCP mesh egress matches captured **original destinations** against the
 service VIP (a raw stream carries no `Host`), so a stock-discovered TCP port is

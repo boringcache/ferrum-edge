@@ -1804,6 +1804,10 @@ impl MeshSlice {
             waypoint_resources
         };
 
+        // A cross-namespace attachment must survive narrowing together with the
+        // MeshService that AUTHORIZES it, or not at all.
+        let workloads = retain_authorized_cross_namespace_attachments(workloads, &services);
+
         // Bind `request.namespace` so we can both move it into `self` and
         // borrow it inside the `multi_cluster` `.retain` closure below without
         // E0382. `String: Clone` is cheap relative to a slice-apply cycle and
@@ -1933,6 +1937,54 @@ fn service_waypoint_resource_namespaces(
             .map(|service| service.namespace.clone()),
     );
     Some(namespaces)
+}
+
+/// Drop workloads whose CROSS-NAMESPACE attachment lost the [`MeshService`]
+/// that authorizes it during this projection.
+///
+/// A workload may attach to a Service in another namespace (Istio
+/// `WorkloadEntry.service`), and Ferrum treats that attachment as authorized
+/// only when the target `MeshService` lists the workload's SPIFFE id —
+/// `validate_mesh_config_internal` enforces exactly that, so a bare
+/// `service_namespace` stamp cannot spoof membership. But the narrowing above
+/// keys services on the SERVICE namespace and workloads on the workload's own
+/// identity namespace, so an attachment pointing outside this view keeps the
+/// workload while its authorizing Service is dropped. The resulting slice fails
+/// that very check at proxy apply, and the rejection rolls the runtime back to
+/// the last applied generation — so ONE out-of-view resource (a stock xDS
+/// cluster for another namespace, say) would keep every LATER generation from
+/// being applied, including a legitimate state-of-the-world withdrawal.
+///
+/// Narrowing the endpoint away instead is the safe reading: without its Service
+/// this view has no route to it either way. Same-namespace attachments (every
+/// Pod-derived workload, and every author that omits the field) are untouched,
+/// and an attachment this view still admits — the Service survived namespace
+/// visibility or Sidecar egress narrowing — is retained with its Service.
+///
+/// This is the ROUTING view only. The separate inbound anchor
+/// (`local_inbound_workloads` / `local_inbound_services`, resolved above and
+/// deliberately exempt from namespace visibility) is untouched, so an
+/// authorized cross-namespace WorkloadEntry keeps serving its own inbound
+/// traffic (issue #3244) — that path reads the anchor, never this set.
+fn retain_authorized_cross_namespace_attachments(
+    workloads: Vec<Workload>,
+    services: &[MeshService],
+) -> Vec<Workload> {
+    workloads
+        .into_iter()
+        .filter(|workload| {
+            let attached_namespace = workload.attached_service_namespace();
+            attached_namespace == workload.namespace
+                || services.iter().any(|service| {
+                    service.namespace == attached_namespace
+                        && service.name == workload.service_name
+                        && service
+                            .workloads
+                            .iter()
+                            .any(|reference| reference.spiffe_id == workload.spiffe_id)
+                })
+        })
+        .collect()
 }
 
 fn resource_namespace_visible(
