@@ -5017,9 +5017,12 @@ async fn handle_h3_request(
         // BASE shape and can therefore neither confirm nor reconstruct the
         // effective authorization. The tunnel fails closed on a generation
         // change instead of being re-admitted against a different route.
-        let route_overrides_applied = ctx.route_override_upstream_id.is_some()
-            || ctx.route_override_backend_host.is_some()
-            || ctx.route_override_backend_port.is_some();
+        // Use the shared whole-shape predicate. In particular, a scheme-only
+        // direct-backend override can clear an upstream and therefore change
+        // the admitted destination set even when host and port are untouched.
+        // Omitting that (or another effective override field) would let a
+        // reload re-authorize the tunnel against the unoverridden base route.
+        let route_overrides_applied = ctx.has_route_overrides();
         return crate::http3::connect_udp::handle_h3_connect_udp(
             stream,
             crate::http3::connect_udp::ConnectUdpRequest {

@@ -279,7 +279,7 @@ fn datagram_capsule(context_id: u8, payload: &[u8]) -> Vec<u8> {
 fn drain(decoder: &mut CapsuleDecoder) -> Vec<CapsuleEvent> {
     let mut events = Vec::new();
     loop {
-        match decoder.next().expect("no decode fault expected") {
+        match decoder.decode_next().expect("no decode fault expected") {
             Some(event) => events.push(event),
             None => return events,
         }
@@ -380,7 +380,7 @@ fn refuses_a_datagram_capsule_with_no_context_id() {
     // Type 0x00, length 0 — no room for the mandatory Context ID varint.
     decoder.push(&[0x00, 0x00]).expect("push must succeed");
     assert_eq!(
-        decoder.next(),
+        decoder.decode_next(),
         Err(CapsuleDecodeError::DatagramCapsuleTruncated)
     );
 }
@@ -392,7 +392,10 @@ fn refuses_a_capsule_declaring_a_length_above_the_ceiling() {
     decoder
         .push(&[0x00, 0x44, 0x00])
         .expect("push must succeed");
-    assert_eq!(decoder.next(), Err(CapsuleDecodeError::CapsuleTooLarge));
+    assert_eq!(
+        decoder.decode_next(),
+        Err(CapsuleDecodeError::CapsuleTooLarge)
+    );
 }
 
 #[test]
@@ -402,7 +405,10 @@ fn refuses_a_context_zero_payload_above_the_configured_ceiling() {
     decoder
         .push(&datagram_capsule(0, b"1234567"))
         .expect("push must succeed");
-    assert_eq!(decoder.next(), Err(CapsuleDecodeError::PayloadTooLarge));
+    assert_eq!(
+        decoder.decode_next(),
+        Err(CapsuleDecodeError::PayloadTooLarge)
+    );
 }
 
 #[test]
@@ -436,7 +442,7 @@ fn encoder_and_decoder_round_trip_at_the_rfc_payload_ceiling() {
     for chunk in capsule.chunks(feed_limit) {
         decoder.push(chunk).expect("push must succeed");
     }
-    match decoder.next().expect("decode must succeed") {
+    match decoder.decode_next().expect("decode must succeed") {
         Some(CapsuleEvent::UdpPayload(decoded)) => assert_eq!(decoded.len(), payload.len()),
         other => panic!("expected a context-0 payload, got {other:?}"),
     }

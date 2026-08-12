@@ -651,9 +651,9 @@ impl CapsuleDecoder {
     }
 
     /// Accept up to [`Self::feed_limit`] bytes of the CONNECT stream. The
-    /// caller must drain [`Self::next`] to exhaustion between pushes; the hard
-    /// ceiling here is twice one capsule, which is reachable only when a chunk
-    /// completes a partial capsule and opens the next one.
+    /// caller must drain [`Self::decode_next`] to exhaustion between pushes;
+    /// the hard ceiling here is twice one capsule, which is reachable only when
+    /// a chunk completes a partial capsule and opens the next one.
     pub fn push(&mut self, chunk: &[u8]) -> Result<(), CapsuleDecodeError> {
         if self.buf.len().saturating_add(chunk.len()) > self.buffer_ceiling().saturating_mul(2) {
             return Err(CapsuleDecodeError::BufferOverflow);
@@ -663,7 +663,7 @@ impl CapsuleDecoder {
     }
 
     /// Bytes of a partially received capsule still held after the caller has
-    /// drained [`Self::next`] to exhaustion.
+    /// drained [`Self::decode_next`] to exhaustion.
     ///
     /// Only ever nonzero mid-capsule, so it is exactly the RFC 9297 §3.3
     /// "stream closed in the middle of a capsule" predicate.
@@ -693,7 +693,7 @@ impl CapsuleDecoder {
     }
 
     /// Pop the next complete capsule, or `None` when more bytes are needed.
-    pub fn next(&mut self) -> Result<Option<CapsuleEvent>, CapsuleDecodeError> {
+    pub fn decode_next(&mut self) -> Result<Option<CapsuleEvent>, CapsuleDecodeError> {
         let mut cursor = 0usize;
         let Some(capsule_type) = read_varint(&self.buf, &mut cursor) else {
             return Ok(None);
@@ -1399,7 +1399,7 @@ async fn relay_client_chunk(
         }
         chunk.advance(slice_len);
         loop {
-            match decoder.next() {
+            match decoder.decode_next() {
                 Ok(Some(CapsuleEvent::UdpPayload(payload))) => {
                     activity.store(session_start.elapsed().as_millis() as u64, Ordering::Relaxed);
                     if let Err(error) = socket.send(&payload).await {
@@ -1681,9 +1681,10 @@ async fn relay(
     // the caller dropped the session permit and the connection guard at that
     // point, the gateway would advertise a free tunnel slot (and a drained
     // connection) while an aborted task still owned the resources. So every
-    // handle is joined before this function returns — bounded, never
-    // indefinite: the abort is what makes the join finite, and each join is
-    // additionally capped by `CLOSE_GRACE`.
+    // handle is joined before this function returns. The graceful send-half
+    // close is capped by `CLOSE_GRACE`; after that, cancellation is requested
+    // and its acknowledgement is awaited so a second timeout cannot detach a
+    // task that still owns session resources.
     //
     // Order matters: stop reading the client stream first, then let the
     // client-bound relay flush and close within its grace before it is aborted.
@@ -1702,13 +1703,17 @@ async fn relay(
         // A `JoinHandle` must never be polled after it has completed, so this
         // second wait is reached only on the timed-out branch.
         from_target.abort();
-        let _ = tokio::time::timeout(CLOSE_GRACE, from_target).await;
+        // Await the cancellation acknowledgement itself. A second timeout
+        // would be allowed to drop this handle and detach the task, releasing
+        // the session permit while it could still own the QUIC send half and
+        // socket clone.
+        let _ = from_target.await;
     }
     if !to_target_finished {
         // Aborted above and never polled to completion, so joining it here is
         // both safe and the point at which the receive half and the socket
         // clone are provably gone.
-        let _ = tokio::time::timeout(CLOSE_GRACE, to_target).await;
+        let _ = to_target.await;
     }
     end
 }
