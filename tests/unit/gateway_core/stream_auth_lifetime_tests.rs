@@ -1648,17 +1648,26 @@ fn every_h1h2_response_header_wait_composes_the_authorization_lifetime() {
         9,
         "an H1/H2 dispatch phase lost its authorization attribution"
     );
-    // Every one of those exits returns the health-neutral placeholder: the
-    // definition plus twenty-two call sites — the twelve that already existed
-    // (buffered request-body collects, the five header waits, the direct-H2
-    // header wait, the direct-H2 upload join, and the direct-H2 fail-closed
-    // guard) plus the ten buffered RESPONSE collects.
+    // Every one of those exits returns the health-neutral placeholder. Seventeen
+    // references name it directly: the definition, the out-of-line wrapper's own
+    // single use, the three `proxy_to_backend_retry` returns, and the twelve
+    // tuple-returning exits across HBONE, Unix, mesh mTLS, direct-H2, and the
+    // native-H3 backend. The seven `proxy_to_backend` exits reach the same value
+    // through that wrapper.
     assert_eq!(
         PROXY_SOURCE
             .matches("authorization_expired_dispatch_placeholder(")
             .count(),
-        23,
+        17,
         "an H1/H2 authorization exit stopped being health-neutral"
+    );
+    // The wrapper's definition plus its seven `proxy_to_backend` call sites.
+    assert_eq!(
+        PROXY_SOURCE
+            .matches("authorization_expired_backend_dispatch(")
+            .count(),
+        8,
+        "a reqwest-dispatch authorization exit stopped being health-neutral"
     );
 }
 
@@ -1690,7 +1699,8 @@ fn every_buffered_response_collect_is_authorization_bounded() {
             .next()
             .expect("bounded authorization arm");
         assert!(
-            branch.contains("authorization_expired_dispatch_placeholder("),
+            branch.contains("authorization_expired_dispatch_placeholder(")
+                || branch.contains("authorization_expired_backend_dispatch("),
             "a buffered response collect expiry stopped being health-neutral: {branch}"
         );
     }
@@ -1704,23 +1714,25 @@ fn every_buffered_response_collect_is_authorization_bounded() {
 #[test]
 fn a_final_authorization_gate_precedes_response_head_commitment() {
     let gate = PROXY_SOURCE
-        .split("let final_precommit_authorization_termination =")
+        .split("let final_precommit_authorization_terminal =")
         .nth(1)
         .expect("the final pre-commitment authorization gate");
     let gate = gate
         .split("let total_ms =")
         .next()
         .expect("bounded final gate");
-    assert!(gate.contains("expired_authorization("));
-    assert!(gate.contains("authorization_expired_pre_commitment_response("));
-    assert!(gate.contains("ctx.latch_authorization_termination(termination);"));
+    // The decision, the once-only latch record, and the fixed terminal all live
+    // in the shared out-of-line applier (asserted in
+    // `the_precommit_authorization_terminal_is_applied_out_of_line`), so the gate
+    // itself only has to invoke it and correct the streamed classification.
+    assert!(gate.contains("apply_precommit_authorization_terminal("));
     assert!(
         gate.contains("is_streaming_response = false;"),
         "the fixed terminal is buffered, so the summary must not describe it as streamed"
     );
     // The gate must precede the response builder, not follow it.
     let gate_at = PROXY_SOURCE
-        .find("let final_precommit_authorization_termination =")
+        .find("let final_precommit_authorization_terminal =")
         .expect("gate present");
     let builder_at = PROXY_SOURCE
         .find("    // Build final response\n    let mut resp_builder = Response::builder()")
@@ -2233,6 +2245,79 @@ fn the_authorization_expired_rejection_future_is_built_out_of_line() {
         "the factory must stay `#[inline(never)]`: inlining it back into the \
          caller restores the frame slot it exists to remove"
     );
+}
+
+/// The same stack-budget invariant, for the authorization terminals that are
+/// SYNCHRONOUS rather than awaited.
+///
+/// Boxing only helps a future. A cold block of straight-line code inside one of
+/// the two deepest coroutines — `handle_proxy_request_inner` and
+/// `proxy_to_backend` — still costs a permanent frame slot per temporary at
+/// `opt-level = 0`, because every alloca is emitted on function entry whichever
+/// branch runs. Three of this contract's constructions are wide
+/// (`(status, HeaderMap, ResponseBody)` terminals, `ProxyBody` moves, and
+/// `retry::BackendResponse`), and inlining them across eleven cold sites
+/// overflowed a tokio worker stack on the coverage profile for a plain
+/// unauthenticated non-gRPC request that can reach none of them. Each must stay
+/// behind an `#[inline(never)]` frame that returns before anything is awaited.
+#[test]
+fn the_precommit_authorization_terminal_is_applied_out_of_line() {
+    for (callee, expected_calls) in [
+        ("apply_precommit_authorization_terminal(", 2),
+        ("install_response_authorization_deadline(", 2),
+        ("authorization_expired_backend_dispatch(", 7),
+    ] {
+        let definition = format!("fn {callee}");
+        let before_definition = PROXY_SOURCE
+            .split(definition.as_str())
+            .next()
+            .expect("the out-of-line helper must remain present");
+        assert!(
+            before_definition.ends_with("#[inline(never)]\n"),
+            "{callee} must stay `#[inline(never)]`: inlining it back into the \
+             caller restores the frame slots it exists to remove"
+        );
+        assert_eq!(
+            PROXY_SOURCE.matches(callee).count(),
+            expected_calls + 1,
+            "{callee} lost a call site, so a cold authorization terminal is built \
+             inline in a hot coroutine's frame again"
+        );
+    }
+
+    // Moving the work out of line must not move the security decision: the
+    // shared latch is still consulted first, an unlatched-but-elapsed plan is
+    // still recorded exactly once through it, and the only terminal selectable
+    // is still the fixed, redacted pre-commitment one.
+    let applier = PROXY_SOURCE
+        .split("fn apply_precommit_authorization_terminal(")
+        .nth(1)
+        .expect("the out-of-line applier body")
+        .split("\n}\n")
+        .next()
+        .expect("bounded applier body");
+    assert!(applier.contains("ctx.authorization_termination_latch.observed()"));
+    assert!(applier.contains("expired_authorization("));
+    assert!(applier.contains("record_once(elapsed, family)"));
+    assert!(applier.contains("authorization_expired_pre_commitment_response("));
+    assert!(applier.contains("ctx.latch_authorization_termination(termination);"));
+
+    // The response funnels keep the family selection and the shared latch/closer
+    // wiring they had inline.
+    let installer = PROXY_SOURCE
+        .split("fn install_response_authorization_deadline(")
+        .nth(1)
+        .expect("the out-of-line response installer body")
+        .split("\n}\n")
+        .next()
+        .expect("bounded installer body");
+    assert!(installer.contains("effective_request_auth_deadline("));
+    assert!(installer.contains("StreamAuthProtocolFamily::GrpcWeb"));
+    assert!(installer.contains("StreamAuthProtocolFamily::Grpc"));
+    assert!(installer.contains("StreamAuthProtocolFamily::Http"));
+    assert!(installer.contains("with_authorization_deadline("));
+    assert!(installer.contains("Some(ctx.authorization_termination_latch())"));
+    assert!(installer.contains("ctx.authorization_connection_closer.clone()"));
 }
 
 // ---------------------------------------------------------------------------

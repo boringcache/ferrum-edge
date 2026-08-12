@@ -31938,32 +31938,17 @@ async fn handle_proxy_request_inner(
                 // second completion. Attached before the gRPC-Web adapter so a
                 // translated stream terminates with the equivalent bounded
                 // trailer frame rather than native trailers.
-                if let Some(auth_deadline) =
-                    crate::proxy::auth_lifetime::effective_request_auth_deadline(
-                        &ctx,
-                        state.env_config.authenticated_stream_max_lifetime_seconds,
-                    )
-                {
-                    let auth_family = if grpc_web_streaming_content_type.is_some() {
-                        crate::proxy::auth_lifetime::StreamAuthProtocolFamily::GrpcWeb
-                    } else {
-                        crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Grpc
-                    };
-                    body = body.with_authorization_deadline(
-                        auth_deadline,
-                        grpc_web_streaming_content_type,
-                        auth_family,
-                        // Shared with the request-upload seam: on a
-                        // bidirectional stream both directions race the same
-                        // absolute plan, and exactly one termination is counted.
-                        Some(ctx.authorization_termination_latch()),
-                        // Last-resort transport lever for a client that stops
-                        // granting HTTP/2 flow-control credit (or stops reading
-                        // an HTTP/1.1 socket) and therefore never lets hyper
-                        // poll the terminal above.
-                        ctx.authorization_connection_closer.clone(),
-                    );
-                }
+                //
+                // Installed out of line so the `ProxyBody` moves are not
+                // permanent frame slots here; see
+                // `install_response_authorization_deadline`.
+                body = install_response_authorization_deadline(
+                    body,
+                    &ctx,
+                    state.env_config.authenticated_stream_max_lifetime_seconds,
+                    grpc_web_streaming_content_type,
+                    true,
+                );
                 if let Some(content_type) = grpc_web_streaming_content_type {
                     body = body.into_grpc_web_streaming(
                         content_type,
@@ -34128,36 +34113,21 @@ async fn handle_proxy_request_inner(
     // response head (a request with no body to bound). Both are pre-commitment,
     // so both take the same fixed terminal; the second case is the response-head
     // race, resolved at the point the head actually becomes available.
-    let precommit_authorization_termination =
-        ctx.authorization_termination_latch.observed().or_else(|| {
-            let elapsed = crate::proxy::auth_lifetime::expired_authorization(
-                crate::proxy::auth_lifetime::effective_request_auth_deadline(
-                    &ctx,
-                    state.env_config.authenticated_stream_max_lifetime_seconds,
-                ),
-            )?;
-            // Record through the shared latch so this counts exactly once for
-            // the request even though no body wrapper fired.
-            ctx.authorization_termination_latch
-                .record_once(elapsed, request_upload_auth_family(&ctx));
-            Some(elapsed)
-        });
-    if let Some(termination) = precommit_authorization_termination {
-        let (terminal_status, terminal_headers, terminal_body) =
-            authorization_expired_pre_commitment_response(
-                &ctx,
-                termination,
-                request_uses_grpc_content_type,
-            );
-        response_status = terminal_status;
-        response_headers = terminal_headers;
-        response_body = terminal_body;
+    //
+    // Decided, recorded, and applied out of line so this cold terminal is not a
+    // permanent frame slot in the generic request future; see
+    // `apply_precommit_authorization_terminal`.
+    let precommit_authorization_terminal = apply_precommit_authorization_terminal(
+        &mut ctx,
+        state.env_config.authenticated_stream_max_lifetime_seconds,
+        request_uses_grpc_content_type,
+        &mut response_status,
+        &mut response_headers,
+        &mut response_body,
+    );
+    if precommit_authorization_terminal.is_some() {
         backend_resp.connection_error = false;
         backend_resp.error_class = Some(retry::ErrorClass::ClientDisconnect);
-        // Bounded class into the transaction summary through the ordinary
-        // latch. First writer wins, so a relay that already classified this
-        // request keeps its classification.
-        ctx.latch_authorization_termination(termination);
     }
     // Authoritative gRPC response messages for a buffered backend body are
     // counted here, from the backend's native length-prefixed representation and
@@ -34963,33 +34933,20 @@ async fn handle_proxy_request_inner(
     // Idempotent: when the earlier gate already replaced the response, the
     // latch is already set and the same fixed terminal is re-selected. An
     // unauthenticated request has no plan and is untouched.
-    let final_precommit_authorization_termination =
-        ctx.authorization_termination_latch.observed().or_else(|| {
-            let elapsed = crate::proxy::auth_lifetime::expired_authorization(
-                crate::proxy::auth_lifetime::effective_request_auth_deadline(
-                    &ctx,
-                    state.env_config.authenticated_stream_max_lifetime_seconds,
-                ),
-            )?;
-            // Counted exactly once for the request through the shared latch.
-            ctx.authorization_termination_latch
-                .record_once(elapsed, request_upload_auth_family(&ctx));
-            Some(elapsed)
-        });
-    if let Some(termination) = final_precommit_authorization_termination {
-        let (terminal_status, terminal_headers, terminal_body) =
-            authorization_expired_pre_commitment_response(
-                &ctx,
-                termination,
-                request_uses_grpc_content_type,
-            );
-        response_status = terminal_status;
-        response_headers = terminal_headers;
-        response_body = terminal_body;
+    //
+    // Same out-of-line application as the earlier gate.
+    let final_precommit_authorization_terminal = apply_precommit_authorization_terminal(
+        &mut ctx,
+        state.env_config.authenticated_stream_max_lifetime_seconds,
+        request_uses_grpc_content_type,
+        &mut response_status,
+        &mut response_headers,
+        &mut response_body,
+    );
+    if final_precommit_authorization_terminal.is_some() {
         // The terminal is fully buffered, so the summary and the latency
         // derivation below must not describe this as a streamed response.
         is_streaming_response = false;
-        ctx.latch_authorization_termination(termination);
     }
 
     let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
@@ -35930,31 +35887,16 @@ async fn handle_proxy_request_inner(
     // never both complete. Unauthenticated requests get `None` here and are
     // completely unaffected. A buffered body is already fully committed and is
     // returned unchanged.
-    if let Some(auth_deadline) = crate::proxy::auth_lifetime::effective_request_auth_deadline(
+    //
+    // Installed out of line for the same stack-budget reason as the native-gRPC
+    // funnel above; see `install_response_authorization_deadline`.
+    body = install_response_authorization_deadline(
+        body,
         &ctx,
         state.env_config.authenticated_stream_max_lifetime_seconds,
-    ) {
-        let auth_family = if grpc_web_response_content_type.is_some() {
-            crate::proxy::auth_lifetime::StreamAuthProtocolFamily::GrpcWeb
-        } else if flavor == HttpFlavor::Grpc {
-            crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Grpc
-        } else {
-            crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http
-        };
-        body = body.with_authorization_deadline(
-            auth_deadline,
-            grpc_web_response_content_type,
-            auth_family,
-            // Shared with the request-upload seam: on a bidirectional stream
-            // both directions race the same absolute plan, and exactly one
-            // termination is counted.
-            Some(ctx.authorization_termination_latch()),
-            // Last-resort transport lever for a client that stops granting
-            // HTTP/2 flow-control credit (or stops reading an HTTP/1.1 socket)
-            // and therefore never lets hyper poll the terminal above.
-            ctx.authorization_connection_closer.clone(),
-        );
-    }
+        grpc_web_response_content_type,
+        flavor == HttpFlavor::Grpc,
+    );
     let body = if let Some((content_type, initial_terminal_metadata)) = grpc_web_streaming_adapter {
         body.into_grpc_web_streaming(
             &content_type,
@@ -39827,8 +39769,8 @@ async fn proxy_to_backend(
                         // pre-commitment terminal in `handle_proxy_request_inner`
                         // decides the client-visible shape.
                         Err(AuthorizedUploadWaitError::AuthorizationExpired(_)) => {
-                            return backend_dispatch_response(
-                                authorization_expired_dispatch_placeholder(resolved_ip.clone()),
+                            return authorization_expired_backend_dispatch(
+                                resolved_ip.clone(),
                                 None,
                                 None,
                             );
@@ -39885,8 +39827,8 @@ async fn proxy_to_backend(
                         // See the size-limited arm above: latched once, no
                         // backend dialed, terminal decided pre-commitment.
                         Err(AuthorizedUploadWaitError::AuthorizationExpired(_)) => {
-                            return backend_dispatch_response(
-                                authorization_expired_dispatch_placeholder(resolved_ip.clone()),
+                            return authorization_expired_backend_dispatch(
+                                resolved_ip.clone(),
                                 None,
                                 None,
                             );
@@ -40127,8 +40069,8 @@ async fn proxy_to_backend(
             if dispatch_phase_authorization_expiry(send_bound, send_auth_deadline.as_ref())
                 .is_some()
             {
-                return backend_dispatch_response(
-                    authorization_expired_dispatch_placeholder(resolved_ip),
+                return authorization_expired_backend_dispatch(
+                    resolved_ip,
                     retained_body,
                     backend_admission_permits,
                 );
@@ -40302,8 +40244,8 @@ async fn proxy_to_backend(
                                 // once. The partially collected buffer and its
                                 // charged budget reservation drop with the
                                 // cancelled future.
-                                return backend_dispatch_response(
-                                    authorization_expired_dispatch_placeholder(resolved_ip.clone()),
+                                return authorization_expired_backend_dispatch(
+                                    resolved_ip.clone(),
                                     retained_body,
                                     backend_admission_permits,
                                 );
@@ -40386,8 +40328,8 @@ async fn proxy_to_backend(
                         );
                     }
                     Err(ResponseCollectBound::AuthorizationExpired) => {
-                        return backend_dispatch_response(
-                            authorization_expired_dispatch_placeholder(resolved_ip.clone()),
+                        return authorization_expired_backend_dispatch(
+                            resolved_ip.clone(),
                             retained_body,
                             backend_admission_permits,
                         );
@@ -40456,8 +40398,8 @@ async fn proxy_to_backend(
                             );
                         }
                         Err(ResponseCollectBound::AuthorizationExpired) => {
-                            return backend_dispatch_response(
-                                authorization_expired_dispatch_placeholder(resolved_ip.clone()),
+                            return authorization_expired_backend_dispatch(
+                                resolved_ip.clone(),
                                 retained_body,
                                 backend_admission_permits,
                             );
@@ -40514,8 +40456,8 @@ async fn proxy_to_backend(
                         );
                     }
                     Err(ResponseCollectBound::AuthorizationExpired) => {
-                        return backend_dispatch_response(
-                            authorization_expired_dispatch_placeholder(resolved_ip.clone()),
+                        return authorization_expired_backend_dispatch(
+                            resolved_ip.clone(),
                             retained_body,
                             backend_admission_permits,
                         );
@@ -42704,6 +42646,139 @@ pub(crate) fn authorization_expired_pre_commitment_response(
         StatusCode::UNAUTHORIZED.as_u16(),
         headers,
         ResponseBody::buffered(r#"{"error":"Unauthorized"}"#.as_bytes().to_vec()),
+    )
+}
+
+/// Decide, record, and APPLY the fixed pre-commitment authorization terminal —
+/// entirely out of line (issues #3815 / #3764).
+///
+/// `handle_proxy_request_inner` runs both pre-commitment gates through this one
+/// function for a stack-budget reason, not a stylistic one. At the coverage
+/// profile's `opt-level = 0` every temporary in that coroutine's `poll` body is
+/// a fixed frame slot allocated on entry, whether or not the branch that needs
+/// it ever runs — so writing the gate inline charged EVERY request (including an
+/// unauthenticated non-gRPC fall-through with no plan at all) for two
+/// `(status, HeaderMap, ResponseBody)` terminals plus their moves, in the
+/// deepest frame the proxy has. Building and applying the terminal in a
+/// `#[inline(never)]` leaf frame that returns before anything is awaited keeps
+/// those slots out of the request future, exactly as
+/// `boxed_finalize_authorization_expired_rejection` and
+/// `boxed_proxy_to_backend_unix` do for their futures.
+///
+/// Behaviour is unchanged and still fail-closed: the shared latch is consulted
+/// first, an unlatched-but-elapsed plan is recorded exactly once through it, an
+/// unauthenticated request returns `None` and is not touched, and the terminal
+/// written back is the same fixed, redacted one
+/// [`authorization_expired_pre_commitment_response`] selects.
+#[inline(never)]
+fn apply_precommit_authorization_terminal(
+    ctx: &mut RequestContext,
+    max_lifetime_seconds: u64,
+    request_uses_grpc_content_type: bool,
+    response_status: &mut u16,
+    response_headers: &mut HashMap<String, String>,
+    response_body: &mut ResponseBody,
+) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
+    use crate::proxy::auth_lifetime::{effective_request_auth_deadline, expired_authorization};
+
+    let termination = match ctx.authorization_termination_latch.observed() {
+        Some(termination) => termination,
+        None => {
+            let plan = effective_request_auth_deadline(ctx, max_lifetime_seconds);
+            let elapsed = expired_authorization(plan)?;
+            // Record through the shared latch so this counts exactly once for
+            // the request even though no body wrapper fired.
+            let family = request_upload_auth_family(ctx);
+            ctx.authorization_termination_latch
+                .record_once(elapsed, family);
+            elapsed
+        }
+    };
+    let (terminal_status, terminal_headers, terminal_body) =
+        authorization_expired_pre_commitment_response(
+            ctx,
+            termination,
+            request_uses_grpc_content_type,
+        );
+    *response_status = terminal_status;
+    *response_headers = terminal_headers;
+    *response_body = terminal_body;
+    // Bounded class into the transaction summary through the ordinary latch.
+    // First writer wins, so a relay that already classified this request keeps
+    // its classification.
+    ctx.latch_authorization_termination(termination);
+    Some(termination)
+}
+
+/// Install the admitted stream's authorization lifetime on a CLIENT-VISIBLE
+/// response body, out of line (issues #3815 / #3764).
+///
+/// Same stack-budget contract as [`apply_precommit_authorization_terminal`]:
+/// `ProxyBody` is a wide struct, and rebinding it through the
+/// `with_authorization_deadline` builder inline costs the enclosing coroutine two
+/// permanent frame slots per site — the argument move and the return move. Both
+/// response funnels — the native-gRPC streaming branch and the shared
+/// H1/H2/H3-downstream funnel — go through here instead, so those moves live in a
+/// leaf frame.
+///
+/// Ordering, family selection, and the closer are unchanged: attached AFTER the
+/// client `grpc-timeout` wrapper and BEFORE the gRPC-Web adapter, so whichever
+/// deadline is earlier fires first and the two can never both complete. An
+/// unauthenticated request (no plan) is returned untouched.
+#[inline(never)]
+fn install_response_authorization_deadline(
+    body: ProxyBody,
+    ctx: &RequestContext,
+    max_lifetime_seconds: u64,
+    grpc_web_response_content_type: Option<&str>,
+    request_is_native_grpc: bool,
+) -> ProxyBody {
+    use crate::proxy::auth_lifetime::{StreamAuthProtocolFamily, effective_request_auth_deadline};
+
+    let Some(auth_deadline) = effective_request_auth_deadline(ctx, max_lifetime_seconds) else {
+        return body;
+    };
+    let auth_family = if grpc_web_response_content_type.is_some() {
+        StreamAuthProtocolFamily::GrpcWeb
+    } else if request_is_native_grpc {
+        StreamAuthProtocolFamily::Grpc
+    } else {
+        StreamAuthProtocolFamily::Http
+    };
+    body.with_authorization_deadline(
+        auth_deadline,
+        grpc_web_response_content_type,
+        auth_family,
+        // Shared with the request-upload seam: on a bidirectional stream both
+        // directions race the same absolute plan, and exactly one termination is
+        // counted.
+        Some(ctx.authorization_termination_latch()),
+        // Last-resort transport lever for a client that stops granting HTTP/2
+        // flow-control credit (or stops reading an HTTP/1.1 socket) and
+        // therefore never lets hyper poll the terminal above.
+        ctx.authorization_connection_closer.clone(),
+    )
+}
+
+/// The health-neutral dispatch outcome for a phase the gateway itself cancelled
+/// on an authorization expiry, built out of line (issues #3815 / #3764).
+///
+/// `proxy_to_backend` reaches this from seven cold arms. Constructing the
+/// `retry::BackendResponse` inline at each of them charged that coroutine's
+/// `poll` frame seven fixed slots — for a plain unauthenticated request that can
+/// never take any of them. One `#[inline(never)]` leaf frame builds it instead.
+/// The value is the same health-neutral placeholder wrapped in the same dispatch
+/// result; only where the temporaries live changes.
+#[inline(never)]
+fn authorization_expired_backend_dispatch(
+    resolved_ip: Option<String>,
+    retained_body: Option<Bytes>,
+    backend_admission_permits: Option<BackendAdmissionPermitSet>,
+) -> BackendDispatchResult {
+    backend_dispatch_response(
+        authorization_expired_dispatch_placeholder(resolved_ip),
+        retained_body,
+        backend_admission_permits,
     )
 }
 
