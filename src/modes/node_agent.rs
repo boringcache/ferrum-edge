@@ -2968,10 +2968,7 @@ impl NodeIdentityRefresh {
     /// Whether this outcome retracted the registry-synchronization marker and
     /// the caller must republish only after inventory converges.
     pub fn registry_sync_was_retracted(&self) -> bool {
-        !matches!(
-            self,
-            Self::Unchanged { .. } | Self::Interrupted { .. }
-        )
+        !matches!(self, Self::Unchanged { .. } | Self::Interrupted { .. })
     }
 }
 
