@@ -651,14 +651,16 @@ async fn an_upload_shares_one_latch_with_the_response_direction() {
     let (_, _, upload_latch) = request_upload_auth_deadline_for_test(&ctx, DEFAULT_MAX).unwrap();
     let (_, _, second_handle) = request_upload_auth_deadline_for_test(&ctx, DEFAULT_MAX).unwrap();
 
+    // `WebSocket` keeps this test's increments clear of the `http` /
+    // `stream_udp` delta assertions elsewhere in this binary.
     assert!(upload_latch.record_once(
         StreamAuthTermination::CredentialExpired,
-        StreamAuthProtocolFamily::Http
+        StreamAuthProtocolFamily::WebSocket
     ));
     assert!(
         !second_handle.record_once(
             StreamAuthTermination::CredentialExpired,
-            StreamAuthProtocolFamily::Http
+            StreamAuthProtocolFamily::WebSocket
         ),
         "both directions of one request share a single termination"
     );

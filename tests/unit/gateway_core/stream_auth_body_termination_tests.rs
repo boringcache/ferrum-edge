@@ -221,19 +221,22 @@ async fn the_shared_latch_records_exactly_one_termination_per_request() {
     // The request-upload body and the response body race the same absolute
     // plan on a bidirectional stream. The latch is what makes the pair record
     // one termination for the stream instead of two.
+    // The family here is incidental to the latch contract; `WebSocket` keeps
+    // this test's counter increments clear of the delta assertions other tests
+    // in this binary make on the `http` / `stream_udp` families.
     let latch = StreamAuthTerminationLatch::default();
     assert_eq!(latch.observed(), None);
     assert!(
         latch.record_once(
             StreamAuthTermination::CredentialExpired,
-            StreamAuthProtocolFamily::Http
+            StreamAuthProtocolFamily::WebSocket
         ),
         "the first direction to fire owns the termination"
     );
     assert!(
         !latch.record_once(
             StreamAuthTermination::CredentialExpired,
-            StreamAuthProtocolFamily::Http
+            StreamAuthProtocolFamily::WebSocket
         ),
         "the opposite direction must not count a second termination"
     );
