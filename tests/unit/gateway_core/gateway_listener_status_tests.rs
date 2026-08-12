@@ -837,8 +837,14 @@ fn overflow_prioritizes_ledger_keys_over_new_admissions_in_encounter_order() {
         oversubscribed_failures(tracked_ports.clone()),
         1_000,
     ));
-    assert_eq!(tcp_bind_failures_total(&status), MAX_ACTIVE_TRACKED_FAILURES as u64);
-    assert_eq!(status.snapshot().active_failures, MAX_ACTIVE_TRACKED_FAILURES);
+    assert_eq!(
+        tcp_bind_failures_total(&status),
+        MAX_ACTIVE_TRACKED_FAILURES as u64
+    );
+    assert_eq!(
+        status.snapshot().active_failures,
+        MAX_ACTIVE_TRACKED_FAILURES
+    );
 
     // Adversarial encounter order: brand-new keys first, every tracked key last.
     let mut observations = oversubscribed_failures((60_000..60_500).collect::<Vec<_>>());
@@ -991,8 +997,7 @@ fn new_identities_compete_for_remaining_slots_in_key_order_not_encounter_order()
         let snapshot = status.snapshot();
         assert!(snapshot.overflowed, "{label}");
         assert_eq!(
-            snapshot.active_failures,
-            MAX_ACTIVE_TRACKED_FAILURES,
+            snapshot.active_failures, MAX_ACTIVE_TRACKED_FAILURES,
             "{label}"
         );
         assert_eq!(
@@ -1019,13 +1024,7 @@ fn new_identities_compete_for_remaining_slots_in_key_order_not_encounter_order()
         MAX_ACTIVE_TRACKED_FAILURES as u64
     );
 
-    assert!(high_then_low.publish(
-        1,
-        prior.len(),
-        0,
-        oversubscribed_failures(prior),
-        4_000,
-    ));
+    assert!(high_then_low.publish(1, prior.len(), 0, oversubscribed_failures(prior), 4_000,));
     assert_eq!(
         tcp_bind_recoveries_total(&high_then_low),
         6,

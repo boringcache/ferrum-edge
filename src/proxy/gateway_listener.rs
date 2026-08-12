@@ -1147,9 +1147,7 @@ impl GatewayListenerManager {
 
         let status_observations: Vec<GatewayListenerFailureObservation> = failures
             .iter()
-            .filter(|failure| {
-                failure.category != GatewayListenerFailureCategory::ListenerTaskEnded
-            })
+            .filter(|failure| failure.category != GatewayListenerFailureCategory::ListenerTaskEnded)
             .map(GatewayListenerBindFailure::observation)
             .collect();
         // A transient pair is valid only when that exact protocol half is live
