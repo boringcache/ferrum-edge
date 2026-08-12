@@ -12125,14 +12125,12 @@ components:
             ]
           description: Closed-set reason currently blocking rotation.
         last_attempt_age_seconds:
-          type: integer
+          type: [integer, "null"]
           format: uint64
-          nullable: true
           description: Seconds since the last completed reload attempt.
         last_acceptance_age_seconds:
-          type: integer
+          type: [integer, "null"]
           format: uint64
-          nullable: true
           description: Seconds since the last accepted reload.
         max_stale_seconds:
           type: integer
