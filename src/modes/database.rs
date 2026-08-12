@@ -1650,6 +1650,11 @@ pub async fn run(
     // supervisor reconciles on each config publication, so database polling —
     // add, update, delete, and Gateway/Route withdrawal — reaches the socket
     // set without a restart.
+    // Bounded realization status shared with `AdminState` and `/metrics`
+    // (issue #3810).
+    let gateway_listener_status =
+        Arc::new(crate::proxy::gateway_listener_status::GatewayListenerStatus::new());
+    crate::proxy::gateway_listener_status::install_for_metrics(&gateway_listener_status);
     let gateway_listener_manager = crate::proxy::gateway_listener::GatewayListenerManager::new(
         proxy_state.clone(),
         env_config.proxy_socket_addr(0).ip(),
@@ -1659,7 +1664,8 @@ pub async fn run(
                 .as_ref()
                 .and_then(|h| h.slot.clone()),
         },
-    );
+    )
+    .with_status(gateway_listener_status.clone());
     // Every TLS-class Gateway listener port also gets its own QUIC socket, so
     // a port-scoped HTTPS route is reachable over HTTP/3 exactly as it is over
     // HTTP/1.1 and HTTP/2.
@@ -1846,6 +1852,11 @@ pub async fn run(
         // readiness; readiness is governed by `startup_ready` alone.
         serving_degraded: None,
         serving_listener_failures: None,
+        // Recoverable, per-port, and cleared by the next successful retry —
+        // deliberately not folded into the sticky `serving_degraded` signal.
+        gateway_listener_status: Some(gateway_listener_status.clone()),
+        gateway_listener_failure_fails_readiness: env_config
+            .gateway_listener_failure_fails_readiness,
         db_available: Some(db_available.clone()),
         config_rejected: Some(config_rejected.clone()),
         admin_restore_max_body_size_mib: env_config.admin_restore_max_body_size_mib,

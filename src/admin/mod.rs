@@ -360,6 +360,24 @@ pub struct AdminState {
     /// Durable sanitized details for post-start listener failures. Populated by
     /// mesh mode and exposed only on authenticated observability responses.
     pub serving_listener_failures: Option<Arc<crate::startup::ServingListenerFailures>>,
+    /// Bounded realization status for dynamic Gateway API listener ports
+    /// (issue #3810). Populated in file, database, and data-plane modes — the
+    /// modes that run
+    /// [`crate::proxy::gateway_listener::GatewayListenerManager`].
+    ///
+    /// Deliberately NOT `serving_listener_failures`: that surface is sticky by
+    /// design for fatal post-start serve-task exits, while a Gateway listener
+    /// bind failure is retried every 30s and must clear on recovery. Active
+    /// entries degrade `status` (and, when
+    /// `FERRUM_GATEWAY_LISTENER_FAILURE_FAILS_READINESS` is enabled, readiness)
+    /// without ever making liveness fail or withdrawing healthy listeners.
+    pub gateway_listener_status:
+        Option<Arc<crate::proxy::gateway_listener_status::GatewayListenerStatus>>,
+    /// Whether an active dynamic Gateway listener failure also degrades
+    /// readiness (`FERRUM_GATEWAY_LISTENER_FAILURE_FAILS_READINESS`). Default
+    /// `false`: one unbindable port must not withdraw a replica whose other
+    /// listeners are serving normally.
+    pub gateway_listener_failure_fails_readiness: bool,
     /// Dynamic flag set by the DB polling loop. When `false`, write operations
     /// are rejected early to preserve the cached config until the DB recovers.
     /// This flag is orthogonal to `startup_ready` — a gateway can be ready to
@@ -2066,9 +2084,39 @@ async fn handle_admin_request_inner(
         let dp_config_stale = dp_config_freshness
             .as_ref()
             .is_some_and(|freshness| freshness.stale);
-        let ready =
-            startup_ready && !serving_degraded && jwks_ready && discovery_ready && !dp_config_stale;
+        // Dynamic Gateway API listener realization (issue #3810). One lock-free
+        // `ArcSwap` load with no allocation, no I/O, and no lock, so an
+        // unauthenticated probe flood cannot drive work. Unlike
+        // `serving_degraded` this signal is RECOVERABLE: it clears as soon as a
+        // retry binds the port, so it must not be folded into the sticky flag.
+        let gateway_listener_snapshot = state
+            .gateway_listener_status
+            .as_ref()
+            .map(|status| status.snapshot());
+        let gateway_listeners_degraded = gateway_listener_snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.degraded());
+        // Healthy listeners keep serving either way; this only decides whether
+        // orchestration is told to stop steering new traffic at the replica.
+        let gateway_listeners_not_ready =
+            gateway_listeners_degraded && state.gateway_listener_failure_fails_readiness;
+        let ready = startup_ready
+            && !serving_degraded
+            && jwks_ready
+            && discovery_ready
+            && !dp_config_stale
+            && !gateway_listeners_not_ready;
         health_status["ready"] = json!(ready);
+        if gateway_listeners_degraded {
+            health_status["status"] = json!("degraded");
+        }
+        // Ports, sanitized error detail, config generation, and occurrence
+        // history are authenticated-tier only. The minimal body below carries
+        // neither this object nor any derived count.
+        if detailed && let Some(snapshot) = gateway_listener_snapshot.as_ref() {
+            health_status["gateway_listeners"] =
+                serde_json::to_value(&**snapshot).unwrap_or_default();
+        }
         if detailed && let Some(freshness) = dp_config_freshness.as_ref() {
             // Fixed-cardinality only: booleans, seconds, counters, and
             // closed-set reason/action labels. Never a CP URL, token,
@@ -2288,10 +2336,18 @@ async fn handle_admin_request_inner(
             // started ready and lost its authority, which is not "starting".
             // A discovery task with fail-readiness policy, or a failed
             // fail-closed withdrawal publication, is likewise unavailable.
+            // A dynamic Gateway listener failure is recoverable and partial:
+            // healthy listeners are still serving and the next retry can clear
+            // it. When an operator opted into failing readiness on it, the
+            // status stays `degraded` rather than becoming `unavailable`, so a
+            // recoverable partial outage is never reported as a lost
+            // dependency.
             health_status["status"] =
                 json!(
                     if serving_degraded || !jwks_ready || !discovery_ready || dp_config_stale {
                         "unavailable"
+                    } else if gateway_listeners_not_ready {
+                        "degraded"
                     } else {
                         "starting"
                     }

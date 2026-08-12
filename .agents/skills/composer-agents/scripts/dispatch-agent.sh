@@ -115,9 +115,13 @@ fi
 
 # Auth: cursor-agent reads CURSOR_API_KEY from the environment when it is
 # exported, and otherwise uses the CLI's own stored login (`cursor-agent status`).
-# Never pass the key on argv — it would be visible in `ps`.
+# Current Cursor CLI releases can initialize the default macOS credential
+# manager before reaching their environment-key fallback. Force the process-local
+# memory store for API-key runs so they never consult or mutate Keychain. Never
+# pass the key on argv — it would be visible in `ps`.
 if [[ -n "${CURSOR_API_KEY:-}" ]]; then
   auth_source='CURSOR_API_KEY'
+  export AGENT_CLI_CREDENTIAL_STORE=memory
 else
   auth_source='cursor-agent login'
 fi
