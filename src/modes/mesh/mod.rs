@@ -57,8 +57,8 @@ use crate::modes::mesh::config::{
     MeshEgressUdpDestination, MeshEgressUdpDialEndpoint, MeshExternalUdpEgressRoute,
     MeshInboundTcpRoute, MeshJwtRule, MeshLoadBalancer, MeshLocalityLbSetting,
     MeshOutlierDetection, MeshPolicy, MeshRequestAuthentication, MeshSimpleLb, MeshTelemetryConfig,
-    MeshTrafficPolicy, MeshTrafficPolicyTls, MtlsMode, PolicyAction, PolicyScope, Resolution,
-    ServiceEntry, ServiceEntryLocation, ServiceTargetPort, destination_rule_exported_to_namespace,
+    MeshTrafficPolicy, MeshTrafficPolicyTls, MtlsMode, PolicyScope, Resolution, ServiceEntry,
+    ServiceEntryLocation, ServiceTargetPort, destination_rule_exported_to_namespace,
     destination_rule_lookup_tier, resolve_target_port, service_entry_exported_to_namespace,
 };
 use crate::modes::mesh::config_consumer::native_client::NativeMeshClientConfig;
@@ -1748,10 +1748,9 @@ fn service_entry_has_udp_port(entry: &ServiceEntry) -> bool {
 }
 
 fn mesh_policy_has_enforcing_rule(policy: &MeshPolicy) -> bool {
-    policy
-        .rules
-        .iter()
-        .any(|rule| matches!(rule.action, PolicyAction::Allow | PolicyAction::Deny))
+    // `Custom` is enforcing: an unexecutable CUSTOM delegation denies, so a
+    // policy carrying one must never be treated as a droppable no-op.
+    policy.rules.iter().any(|rule| rule.action.is_enforcing())
 }
 
 fn scoped_policy_label(policy: &MeshPolicy) -> String {
@@ -26221,6 +26220,7 @@ mod tests {
             sidecar_ingress_declared: false,
             declared_ingress_http_ports: 0,
             mesh_policies: Vec::new(),
+            ext_authz_providers: Vec::new(),
             peer_authentications: Vec::new(),
             service_entries: Vec::new(),
             request_authentications: Vec::new(),

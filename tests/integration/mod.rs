@@ -85,6 +85,7 @@ mod mesh_destination_rule_tls_tests;
 mod mesh_destination_rule_visibility_tests;
 mod mesh_dr_service_entry_e2e_tests;
 mod mesh_ew_egress_e2e_tests;
+mod mesh_ext_authz_custom_tests;
 mod mesh_federation_poller_tests;
 mod mesh_file_source_tests;
 mod mesh_grpc_transport_tests;
