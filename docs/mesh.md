@@ -554,7 +554,10 @@ header/regex matching, retries, timeouts, fault injection, mirroring),
 DestinationRule subsets and traffic policy, external
 `STRICT_DNS` / `LOGICAL_DNS` / `ORIGINAL_DST` clusters (so third-party egress
 still needs a local `ServiceEntry`), inbound listener materialization (Ferrum
-builds its own from the policy document), SDS, ECDS/RTDS, and delta xDS. The
+builds its own inbound routes from the discovered services under the policy
+document's enforcement posture, and never from the control plane's inbound
+`Listener` resources — see "Inbound identity for a multi-Service pod" below for
+the one shape that materializes none), SDS, ECDS/RTDS, and delta xDS. The
 decode surface is a field-exact **projection** of the upstream Envoy v3 messages
 (`proto/envoy/stock/v3/stock_xds.proto`), not the vendored upstream proto tree;
 every field number is taken from Envoy `v1.31.0` and a field that can change
@@ -577,6 +580,22 @@ losing just the out-of-view resource. Shared identity/address endpoints are
 projected as **per-service** workload records, so a foreign service that sorts
 first in BTree order cannot stamp itself as the owner of a visible service's
 endpoint and take that reachability with it when it narrows away.
+
+**Inbound identity for a multi-Service pod.** Those per-service workload records
+are also what the local sidecar's own inbound materialization reads, and this
+projection has no pod-identity field to populate: a standard EDS endpoint
+carries no Kubernetes pod UID, so `Workload.pod_uid` is always unset here.
+Sidecar inbound treats several workload records that share the local SPIFFE id
+but name different Services as one pod only when every record carries the same
+non-empty pod UID, so a local pod a stock control plane publishes under **two or
+more Services materializes no inbound routes** on this profile and participates
+in egress only. That is deliberate and fail closed: a shared service-account
+SPIFFE plus a shared endpoint address cannot distinguish one multi-Service pod
+from two distinct pods (hostNetwork pods can share an IP), and guessing would
+relay mesh-authorized traffic to the wrong loopback application. A pod backed by
+a single Service is unaffected. Where a multi-Service pod must also serve mesh
+inbound traffic, drive that workload from native/file config or a Ferrum CP,
+which carry `pod_uid`.
 
 A `TcpProxy` filter chain does classify its port as `AppProtocol::Tcp`, but
 raw-TCP mesh egress matches captured **original destinations** against the

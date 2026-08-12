@@ -17,6 +17,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one synthetic destination-pod UID on every Service that pod backs so a
   representable extra cluster can reach the backend through preserved Host
   headers (issue #3317).
+- A workload whose cross-namespace attachment (Istio `WorkloadEntry.service`)
+  lost the authorizing `MeshService` to namespace or Sidecar-egress narrowing is
+  now dropped from the slice's routing view instead of being retained as an
+  attachment nothing in that view can authorize. This applies to every config
+  source, not just `stock_xds`: such a slice failed `validate_mesh_config` at
+  proxy apply, and the resulting rollback to the last applied generation blocked
+  every LATER control-plane change — including a legitimate withdrawal — rather
+  than losing just the out-of-view resource. Same-namespace attachments (every
+  Pod-derived workload) are untouched, and the separate inbound anchor
+  (`local_inbound_workloads` / `local_inbound_services`) is unaffected, so an
+  authorized cross-namespace WorkloadEntry keeps serving its own inbound traffic
+  (issue #3244) (issue #3317).
 
 ### Added
 
