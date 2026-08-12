@@ -1288,7 +1288,11 @@ fn host_to_pod_cleanup_and_finalize_are_symmetric() {
     );
     let context = cleanup_context(registry.path(), &reverse);
     assert!(
-        prepare_placement(registry.path(), &stable_on_node(UdpPlacement::PodNetns, &node)).is_err()
+        prepare_placement(
+            registry.path(),
+            &stable_on_node(UdpPlacement::PodNetns, &node)
+        )
+        .is_err()
     );
     complete_cleanup(&context);
     prepare_placement(
@@ -1435,7 +1439,10 @@ fn interrupted_cleanup_rejects_stale_generation_and_predecessor() {
     )
     .err()
     .expect("a reversed predecessor must not finalize the pending migration");
-    assert!(error.contains("does not match durable cleanup ownership"), "{error}");
+    assert!(
+        error.contains("does not match durable cleanup ownership"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -1814,8 +1821,7 @@ fn a_recurring_node_proof_generation_can_never_bind_a_proof() {
         "era3.pod-to-host",
     ] {
         assert!(
-            validate_node_proof_generation(recurring)
-                .is_err(),
+            validate_node_proof_generation(recurring).is_err(),
             "{recurring} must not be accepted as a node-proof generation"
         );
 
@@ -1860,12 +1866,7 @@ fn a_recurring_node_proof_generation_can_never_bind_a_proof() {
     }
 
     // The era-qualified shape is what both ends accept.
-    assert!(
-        validate_node_proof_generation(
-            PROOF_GENERATION
-        )
-        .is_ok()
-    );
+    assert!(validate_node_proof_generation(PROOF_GENERATION).is_ok());
 }
 
 #[test]
@@ -1890,7 +1891,10 @@ fn a_proof_earned_in_an_earlier_placement_era_is_refused_by_the_next_one() {
     let error = prepare_placement(registry.path(), &later_era)
         .err()
         .expect("an earlier era's proof must not authorize a later one");
-    assert!(error.contains("superseded node-proof generation"), "{error}");
+    assert!(
+        error.contains("superseded node-proof generation"),
+        "{error}"
+    );
     assert!(
         !registry
             .path()
@@ -1940,19 +1944,18 @@ async fn a_same_boot_node_object_recreation_cannot_hand_over_its_identity_or_pro
     assert_eq!(published_identity(registry.path()), Some(predecessor));
 
     // The preflight asks the API server instead, bound to this pod's node name.
-    let resolved =
-        resolve_authoritative_node_identity_with_boot_id(
-            registry.path(),
-            BOOT_1,
-            None,
-            Some("reused-node-name"),
-            |node_name| async move {
-                assert_eq!(node_name, "reused-node-name");
-                Ok(NODE_A.to_string())
-            },
-        )
-        .await
-        .expect("the authoritative lookup resolves this node");
+    let resolved = resolve_authoritative_node_identity_with_boot_id(
+        registry.path(),
+        BOOT_1,
+        None,
+        Some("reused-node-name"),
+        |node_name| async move {
+            assert_eq!(node_name, "reused-node-name");
+            Ok(NODE_A.to_string())
+        },
+    )
+    .await
+    .expect("the authoritative lookup resolves this node");
     assert_eq!(resolved, identity(NODE_A, BOOT_1));
     assert_eq!(
         published_identity(registry.path()),
@@ -1982,8 +1985,7 @@ async fn a_same_boot_node_object_recreation_cannot_hand_over_its_identity_or_pro
     assert!(error.contains("different Kubernetes node UID"), "{error}");
 
     // And the stale proof does not survive the run that refused it.
-    retract_node_cleanup_proof(registry.path())
-        .expect("stale proof retraction");
+    retract_node_cleanup_proof(registry.path()).expect("stale proof retraction");
     assert!(
         !registry
             .path()
@@ -2000,16 +2002,15 @@ async fn the_preflight_resolves_its_identity_before_the_node_agent_has_published
     let registry = tempfile::tempdir().expect("registry");
     assert_eq!(published_identity(registry.path()), None);
 
-    let resolved =
-        resolve_authoritative_node_identity_with_boot_id(
-            registry.path(),
-            BOOT_1,
-            None,
-            Some("fresh-node"),
-            |_| async { Ok(NODE_A.to_string()) },
-        )
-        .await
-        .expect("the preflight resolves its own identity");
+    let resolved = resolve_authoritative_node_identity_with_boot_id(
+        registry.path(),
+        BOOT_1,
+        None,
+        Some("fresh-node"),
+        |_| async { Ok(NODE_A.to_string()) },
+    )
+    .await
+    .expect("the preflight resolves its own identity");
     assert_eq!(resolved, identity(NODE_A, BOOT_1));
     assert_eq!(
         published_identity(registry.path()),
@@ -2017,16 +2018,15 @@ async fn the_preflight_resolves_its_identity_before_the_node_agent_has_published
     );
 
     // An explicit client-render value short-circuits the lookup entirely.
-    let explicit =
-        resolve_authoritative_node_identity_with_boot_id(
-            registry.path(),
-            BOOT_1,
-            Some(NODE_B),
-            Some("fresh-node"),
-            |_| async { panic!("an explicit node UID must not consult Kubernetes") },
-        )
-        .await
-        .expect("an explicit node UID resolves without a lookup");
+    let explicit = resolve_authoritative_node_identity_with_boot_id(
+        registry.path(),
+        BOOT_1,
+        Some(NODE_B),
+        Some("fresh-node"),
+        |_| async { panic!("an explicit node UID must not consult Kubernetes") },
+    )
+    .await
+    .expect("an explicit node UID resolves without a lookup");
     assert_eq!(explicit, identity(NODE_B, BOOT_1));
 }
 
@@ -2051,7 +2051,12 @@ async fn every_failed_lookup_or_publication_path_leaves_no_published_identity() 
             Some("some-node"),
             Ok("../../etc/passwd".to_string()),
         ),
-        ("no node name and no explicit UID", None, None, Ok(String::new())),
+        (
+            "no node name and no explicit UID",
+            None,
+            None,
+            Ok(String::new()),
+        ),
     ] {
         let registry = tempfile::tempdir().expect("registry");
         // A publication from a PREVIOUS Kubernetes Node object is present, which
@@ -2059,17 +2064,16 @@ async fn every_failed_lookup_or_publication_path_leaves_no_published_identity() 
         publish_node_identity_for(registry.path(), &identity(NODE_B, BOOT_1))
             .expect("predecessor publication");
 
-        let error =
-            resolve_authoritative_node_identity_with_boot_id(
-                registry.path(),
-                BOOT_1,
-                explicit,
-                node_name,
-                |_| async move { fetch_result },
-            )
-            .await
-            .err()
-            .unwrap_or_else(|| panic!("{label} must fail closed"));
+        let error = resolve_authoritative_node_identity_with_boot_id(
+            registry.path(),
+            BOOT_1,
+            explicit,
+            node_name,
+            |_| async move { fetch_result },
+        )
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("{label} must fail closed"));
         assert!(!error.is_empty(), "{label}");
         assert_eq!(
             published_identity(registry.path()),
@@ -2266,7 +2270,10 @@ fn finalize_refuses_to_leave_an_unbound_producer_owning_record() {
     let error = prepare_placement(registry.path(), &finalize)
         .err()
         .expect("finalize must refuse to bind nothing to a producer placement");
-    assert!(error.contains("naming no owning Kubernetes node UID"), "{error}");
+    assert!(
+        error.contains("naming no owning Kubernetes node UID"),
+        "{error}"
+    );
 
     // Supplying the identity completes the same generation, and the record it
     // leaves behind is this node's own ownership.

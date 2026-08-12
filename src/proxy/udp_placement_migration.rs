@@ -699,8 +699,7 @@ pub fn node_proof_generation_from_env() -> Result<Option<String>, String> {
     Ok(value)
 }
 
-const NODE_PROOF_GENERATION_SHAPE: &str =
-    "FERRUM_MESH_CAPTURE_UDP_NODE_PROOF_GENERATION must be an era-qualified `e<era>.<migration generation>` token of 1..=64 ASCII alphanumeric/./_/- bytes, where <era> is a 1..=10 digit ordinal with no leading zero";
+const NODE_PROOF_GENERATION_SHAPE: &str = "FERRUM_MESH_CAPTURE_UDP_NODE_PROOF_GENERATION must be an era-qualified `e<era>.<migration generation>` token of 1..=64 ASCII alphanumeric/./_/- bytes, where <era> is a 1..=10 digit ordinal with no leading zero";
 
 /// Validate the ERA-QUALIFIED node-proof generation.
 ///

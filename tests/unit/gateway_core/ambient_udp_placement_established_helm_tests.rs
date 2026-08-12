@@ -326,8 +326,15 @@ fn the_placement_contract_persists_a_non_recurring_node_proof_era() {
          the installed contract's value forward"
     );
     assert!(
+        contract.contains("hasKey $previous \"nodeProofEra\"")
+            && contract.contains("hasKey $previous \"nodeProofGeneration\"")
+            && contract.contains("{{- $hasPreviousEra = true -}}")
+            && contract.contains("{{- $hasPreviousGeneration = true -}}"),
+        "the carried-forward token must track installed map-key presence, not rendered value truthiness"
+    );
+    assert!(
         contract.contains(
-            "$previousNodeProofGeneration = trim (toString (default \"\" (index $previous \"nodeProofGeneration\")))"
+            "$previousNodeProofGeneration = trim (toString (index $previous \"nodeProofGeneration\"))"
         ),
         "the carried-forward token must come from the installed contract"
     );
@@ -340,17 +347,21 @@ fn the_placement_contract_persists_a_non_recurring_node_proof_era() {
 fn the_placement_contract_fails_closed_on_a_present_malformed_or_inconsistent_era_pair() {
     let contract = read("templates/udp-placement-contract.yaml");
 
-    // Validation runs only when at least one field is present. Absence of BOTH
-    // is the pre-contract cleanup entry that may stamp era 1.
+    // Validation runs only when at least one key is present. Absence of BOTH
+    // keys is the pre-contract cleanup entry that may stamp era 1.
     assert!(
-        contract.contains("{{- if or $rawEra $previousNodeProofGeneration -}}"),
-        "pair validation must run only when an installed era or generation is present"
+        contract.contains("{{- if or $hasPreviousEra $hasPreviousGeneration -}}"),
+        "pair validation must run only when an installed era or generation key is present"
+    );
+    assert!(
+        contract.contains("{{- if or (not $hasPreviousEra) (not $hasPreviousGeneration) -}}"),
+        "a partial key pair must fail before validating present values"
     );
     assert!(
         contract.contains(
             "fail \"installed Ambient UDP nodeProofEra/nodeProofGeneration pair is incomplete"
         ),
-        "a partial pair must fail rendering rather than filling the missing half"
+        "a partial key pair must fail rendering rather than filling the missing half"
     );
     assert!(
         contract.contains(
@@ -432,6 +443,35 @@ fn the_placement_contract_fails_closed_on_a_present_malformed_or_inconsistent_er
     );
 }
 
+/// Helm treats explicit numeric zero and empty values as empty when coerced
+/// through `default`, so presence must be tracked with `hasKey`.
+#[test]
+fn the_placement_contract_rejects_present_but_empty_or_zero_era_pair_keys() {
+    let contract = read("templates/udp-placement-contract.yaml");
+
+    assert!(
+        !contract.contains("default \"\" (index $previous \"nodeProofEra\")")
+            && !contract.contains("default \"\" (index $previous \"nodeProofGeneration\")"),
+        "installed era/generation presence must not rely on default-empty coercion"
+    );
+    assert!(
+        contract.contains("{{- $rawEra = trim (toString (index $previous \"nodeProofEra\")) -}}")
+            && contract.contains(
+                "$previousNodeProofGeneration = trim (toString (index $previous \"nodeProofGeneration\"))"
+            ),
+        "present keys must still be validated even when their rendered values are empty or zero"
+    );
+    assert!(
+        contract.contains("{{- if or (not $hasPreviousEra) (not $hasPreviousGeneration) -}}"),
+        "only one present key must fail closed before the pre-contract era-1 path"
+    );
+    assert!(
+        contract.contains("{{- if or $hasPreviousEra $hasPreviousGeneration -}}")
+            && contract.contains("regexMatch \"^[1-9][0-9]{0,9}$\" $rawEra"),
+        "both keys present with explicit zero or empty values must still hit malformed-era validation"
+    );
+}
+
 /// The preflight resolves this node's UID itself, so it can never pair a stale
 /// identity publication with the stale cleanup proof written under it.
 #[test]
@@ -459,7 +499,13 @@ fn the_preflight_binds_its_node_lookup_to_this_pods_node_name() {
     // treat a get without resourceNames as a single-object restriction; the
     // runtime request is bound to spec.nodeName.
     for forbidden in [
-        "\"list\"", "\"watch\"", "\"create\"", "\"update\"", "\"patch\"", "\"delete\"", "\"*\"",
+        "\"list\"",
+        "\"watch\"",
+        "\"create\"",
+        "\"update\"",
+        "\"patch\"",
+        "\"delete\"",
+        "\"*\"",
     ] {
         assert!(
             !rbac.contains(forbidden),

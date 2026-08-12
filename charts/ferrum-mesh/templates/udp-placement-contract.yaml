@@ -78,13 +78,21 @@
        fallback for a partial or malformed pair. */ -}}
 {{- $previousEra := 0 -}}
 {{- $previousNodeProofGeneration := "" -}}
+{{- $hasPreviousEra := false -}}
+{{- $hasPreviousGeneration := false -}}
 {{- $rawEra := "" -}}
 {{- if $previous -}}
-{{- $rawEra = trim (toString (default "" (index $previous "nodeProofEra"))) -}}
-{{- $previousNodeProofGeneration = trim (toString (default "" (index $previous "nodeProofGeneration"))) -}}
+{{- if hasKey $previous "nodeProofEra" -}}
+{{- $hasPreviousEra = true -}}
+{{- $rawEra = trim (toString (index $previous "nodeProofEra")) -}}
 {{- end -}}
-{{- if or $rawEra $previousNodeProofGeneration -}}
-{{- if or (not $rawEra) (not $previousNodeProofGeneration) -}}
+{{- if hasKey $previous "nodeProofGeneration" -}}
+{{- $hasPreviousGeneration = true -}}
+{{- $previousNodeProofGeneration = trim (toString (index $previous "nodeProofGeneration")) -}}
+{{- end -}}
+{{- end -}}
+{{- if or $hasPreviousEra $hasPreviousGeneration -}}
+{{- if or (not $hasPreviousEra) (not $hasPreviousGeneration) -}}
 {{- fail "installed Ambient UDP nodeProofEra/nodeProofGeneration pair is incomplete; both must be present and consistent, or both absent so cleanup can stamp era 1" -}}
 {{- end -}}
 {{- if not (regexMatch "^[1-9][0-9]{0,9}$" $rawEra) -}}
