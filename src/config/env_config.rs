@@ -257,11 +257,13 @@ pub const SERVICE_DISCOVERY_ALLOW_UNBOUNDED_STALE_KEY: &str =
 pub const DEFAULT_SERVICE_DISCOVERY_MAX_STALE_SECONDS: u64 = 300;
 /// Hard maximum discovery staleness bound (24 hours). Larger values clamp down;
 /// unbounded retention is `0` plus the explicit unsafe opt-in.
-pub const HARD_MAX_SERVICE_DISCOVERY_MAX_STALE_SECONDS: u64 = 86_400;
+pub const HARD_MAX_SERVICE_DISCOVERY_MAX_STALE_SECONDS: u64 =
+    crate::config::types::MAX_SD_MAX_STALE_SECONDS;
 /// Minimum discovery staleness bound. A window shorter than one poll interval
 /// would expire between healthy polls, so short values clamp up here and are
 /// additionally floored at three poll intervals per task at runtime.
-pub const MIN_SERVICE_DISCOVERY_MAX_STALE_SECONDS: u64 = 5;
+pub const MIN_SERVICE_DISCOVERY_MAX_STALE_SECONDS: u64 =
+    crate::config::types::MIN_SD_MAX_STALE_SECONDS;
 
 /// Validated provider-neutral discovery staleness policy (issue #3717).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -11381,6 +11381,8 @@ components:
         max_stale_seconds:
           type: [integer, "null"]
           format: uint64
+          minimum: 0
+          maximum: 86400
           description: |
             Per-upstream override of the maximum age of the last successfully
             admitted **and published** discovery snapshot before the expiry
@@ -11390,7 +11392,7 @@ components:
             configured provider. `0` means unbounded last-known retention and is
             honored only when `FERRUM_SERVICE_DISCOVERY_ALLOW_UNBOUNDED_STALE`
             is `true`; otherwise the gateway warns and applies the bounded
-            process default.
+            process default. Non-zero values must be between 5 and 86400.
         stale_policy:
           type: [string, "null"]
           enum: [retain, withdraw, fail_readiness, null]

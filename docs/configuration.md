@@ -1322,7 +1322,7 @@ Expiry actions:
 Notes:
 
 - The effective window is never shorter than three poll intervals, so a slow-polling provider is not reported permanently stale.
-- `max_stale_seconds: 0` means unbounded last-known retention. It is refused — process-wide and per upstream — unless `FERRUM_SERVICE_DISCOVERY_ALLOW_UNBOUNDED_STALE=true`; an upstream that asks for it without the opt-in warns once and falls back to the bounded process default.
+- Per-upstream `max_stale_seconds` accepts `5`–`86400`; `0` means unbounded last-known retention. The unbounded sentinel is refused — process-wide and per upstream — unless `FERRUM_SERVICE_DISCOVERY_ALLOW_UNBOUNDED_STALE=true`; an upstream that asks for it without the opt-in warns once and falls back to the bounded process default.
 - Expiry acts once per stale episode, on a timer armed at the deadline rather than at the next poll tick, so withdrawal is prompt and does not republish on every wakeup. A failed withdrawal publication retries with bounded backoff and fails readiness until stale dynamic targets have actually been removed.
 - Active health checks do not substitute for expiry: a reachable but *recycled* endpoint still passes health checks while no longer being the intended workload.
 - Recovery needs no config reload — the next admitted snapshot republishes, clears stale/withdrawn state, and restores readiness.

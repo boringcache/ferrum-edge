@@ -631,6 +631,77 @@ async fn apply_under_generation(
 }
 
 #[tokio::test]
+async fn a_closed_lifecycle_channel_prevents_discovery_publication() {
+    let _guard = isolated().await;
+
+    let static_target = target("static.local", 9000);
+    let config = config_with(vec![upstream_with_sd(
+        "closed-lifecycle",
+        vec![static_target.clone()],
+        None,
+    )]);
+    let lb_cache = LoadBalancerCache::new(&config);
+    let dns_cache = DnsCache::new(Default::default());
+    let health_checker = HealthChecker::new();
+
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    drop(cancel_tx);
+    let mut canceled_state = ferrum_edge::_test_support::DiscoveryLoopStateForTest::new();
+    let canceled = ferrum_edge::_test_support::apply_service_discovery_snapshot_for_test(
+        &default_namespace(),
+        "closed-lifecycle",
+        "scripted",
+        DiscoverySnapshot::from_targets(vec![target("canceled.local", 8080)]),
+        &mut canceled_state,
+        &lb_cache,
+        &None,
+        std::slice::from_ref(&static_target),
+        LoadBalancerAlgorithm::RoundRobin,
+        &None,
+        &cancel_rx,
+        &None,
+        &dns_cache,
+        &health_checker,
+    )
+    .await;
+    assert_eq!(
+        canceled,
+        ferrum_edge::_test_support::DiscoveryApplyControlForTest::Stop
+    );
+
+    let (_live_cancel_tx, live_cancel_rx) = tokio::sync::watch::channel(false);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    drop(shutdown_tx);
+    let mut shutdown_state = ferrum_edge::_test_support::DiscoveryLoopStateForTest::new();
+    let shut_down = ferrum_edge::_test_support::apply_service_discovery_snapshot_for_test(
+        &default_namespace(),
+        "closed-lifecycle",
+        "scripted",
+        DiscoverySnapshot::from_targets(vec![target("shutdown.local", 8080)]),
+        &mut shutdown_state,
+        &lb_cache,
+        &None,
+        std::slice::from_ref(&static_target),
+        LoadBalancerAlgorithm::RoundRobin,
+        &None,
+        &live_cancel_rx,
+        &Some(shutdown_rx),
+        &dns_cache,
+        &health_checker,
+    )
+    .await;
+    assert_eq!(
+        shut_down,
+        ferrum_edge::_test_support::DiscoveryApplyControlForTest::Stop
+    );
+
+    let hosts = lb_hosts(&lb_cache, "closed-lifecycle");
+    assert!(hosts.contains(&"static.local".to_string()));
+    assert!(!hosts.contains(&"canceled.local".to_string()));
+    assert!(!hosts.contains(&"shutdown.local".to_string()));
+}
+
+#[tokio::test]
 async fn a_superseded_generation_publishes_no_discovered_snapshot() {
     let _guard = isolated().await;
 

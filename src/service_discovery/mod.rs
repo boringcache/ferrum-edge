@@ -1296,16 +1296,22 @@ fn lifecycle_signaled(
     cancel_rx: &tokio::sync::watch::Receiver<bool>,
     shutdown_rx: &Option<tokio::sync::watch::Receiver<bool>>,
 ) -> bool {
-    if *cancel_rx.borrow() {
+    // The async wait helpers treat a dropped sender as a lifecycle signal.
+    // Keep the synchronous in-fence check identical: otherwise a sender could
+    // disappear after the select woke but before publication and the task
+    // would still be allowed to mutate routing state.
+    if *cancel_rx.borrow() || cancel_rx.has_changed().is_err() {
         return true;
     }
-    shutdown_rx.as_ref().is_some_and(|rx| *rx.borrow())
+    shutdown_rx
+        .as_ref()
+        .is_some_and(|rx| *rx.borrow() || rx.has_changed().is_err())
 }
 
 /// Classify a loop exit taken because a lifecycle signal was observed off the
 /// select's own cancel/shutdown branches.
 fn lifecycle_exit(cancel_rx: &tokio::sync::watch::Receiver<bool>) -> DiscoveryLoopExit {
-    if *cancel_rx.borrow() {
+    if *cancel_rx.borrow() || cancel_rx.has_changed().is_err() {
         DiscoveryLoopExit::Canceled
     } else {
         DiscoveryLoopExit::Shutdown
@@ -1538,18 +1544,9 @@ pub(crate) async fn apply_discovered_snapshot(
     // signal fired. Check before publishing so we never overwrite the new
     // config's LB state with stale data. Drop the pending cursor without
     // committing.
-    if *cancel_rx.borrow() {
+    if lifecycle_signaled(cancel_rx, shutdown_rx) {
         info!(
-            "Service discovery: task for upstream {} canceled during discovery, discarding results",
-            upstream_id,
-        );
-        return DiscoveryApplyControl::Stop;
-    }
-    if let Some(rx) = shutdown_rx
-        && *rx.borrow()
-    {
-        info!(
-            "Service discovery: shutting down task for upstream {} during discovery, discarding results",
+            "Service discovery: task for upstream {} canceled or shutting down during discovery, discarding results",
             upstream_id,
         );
         return DiscoveryApplyControl::Stop;
@@ -1601,12 +1598,7 @@ pub(crate) async fn apply_discovered_snapshot(
         // cannot register the replacement generation, so the check and the
         // publication cannot be interleaved.
         let install = || {
-            if *cancel_rx.borrow() {
-                return FencedInstall::Aborted;
-            }
-            if let Some(rx) = shutdown_rx
-                && *rx.borrow()
-            {
+            if lifecycle_signaled(cancel_rx, shutdown_rx) {
                 return FencedInstall::Aborted;
             }
             match install_merged_targets(

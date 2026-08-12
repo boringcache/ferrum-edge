@@ -339,6 +339,11 @@ pub const MAX_BACKOFF_MS: u64 = 300_000;
 pub const MAX_TARGET_WEIGHT: u32 = 65_535;
 /// Maximum service discovery poll interval in seconds (1 hour).
 pub const MAX_SD_POLL_INTERVAL: u64 = 3600;
+/// Minimum non-zero service-discovery staleness window. `0` is the explicit
+/// unbounded sentinel and is separately gated by the process unsafe opt-in.
+pub const MIN_SD_MAX_STALE_SECONDS: u64 = 5;
+/// Hard maximum service-discovery staleness window (24 hours).
+pub const MAX_SD_MAX_STALE_SECONDS: u64 = 86_400;
 /// Maximum health check interval in seconds (1 hour).
 pub const MAX_HEALTH_CHECK_INTERVAL: u64 = 3600;
 /// Maximum UDP idle timeout in seconds (1 hour).
@@ -1964,7 +1969,7 @@ impl SdStalePolicy {
     pub fn parse_token(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "retain" => Some(Self::Retain),
-            "withdraw" | "withdraw_discovered" => Some(Self::Withdraw),
+            "withdraw" => Some(Self::Withdraw),
             "fail_readiness" => Some(Self::FailReadiness),
             _ => None,
         }
@@ -9581,6 +9586,18 @@ impl ServiceDiscoveryConfig {
                 "default_weight must be between 1 and {} (got {})",
                 MAX_TARGET_WEIGHT, self.default_weight
             ));
+        }
+
+        if let Some(max_stale_seconds) = self.max_stale_seconds
+            && max_stale_seconds != 0
+            && let Err(error) = validate_u64_range(
+                "max_stale_seconds",
+                max_stale_seconds,
+                MIN_SD_MAX_STALE_SECONDS,
+                MAX_SD_MAX_STALE_SECONDS,
+            )
+        {
+            errors.push(error);
         }
 
         match self.provider {

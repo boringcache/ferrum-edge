@@ -676,7 +676,16 @@ pub fn resolve_staleness(
     if configured_max_stale_seconds == 0 {
         return DiscoveryStaleness::unbounded(policy);
     }
-    let floor = poll_interval_seconds.saturating_mul(DISCOVERY_MIN_STALE_POLL_INTERVALS);
+    // Field validation rejects out-of-range per-upstream values. Clamp again
+    // at this runtime boundary so a caller that constructs a config or test
+    // seam directly still cannot overflow `Instant + Duration` below.
+    let configured_max_stale_seconds = configured_max_stale_seconds.clamp(
+        crate::config::types::MIN_SD_MAX_STALE_SECONDS,
+        crate::config::types::MAX_SD_MAX_STALE_SECONDS,
+    );
+    let floor = poll_interval_seconds
+        .min(crate::config::types::MAX_SD_POLL_INTERVAL)
+        .saturating_mul(DISCOVERY_MIN_STALE_POLL_INTERVALS);
     DiscoveryStaleness {
         max_stale: Some(Duration::from_secs(configured_max_stale_seconds.max(floor))),
         policy,

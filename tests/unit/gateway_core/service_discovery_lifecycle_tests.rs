@@ -84,6 +84,7 @@ fn staleness_policy_tokens_round_trip_and_reject_unknown_values() {
     }
 
     assert!(parse_discovery_staleness_policy(None, Some("drop_everything"), None).is_err());
+    assert!(parse_discovery_staleness_policy(None, Some("withdraw_discovered"), None).is_err());
 }
 
 #[test]
@@ -195,4 +196,41 @@ fn service_discovery_config_round_trips_staleness_overrides() {
     let encoded = serde_json::to_value(&config).expect("config serializes");
     assert_eq!(encoded["max_stale_seconds"], 45);
     assert_eq!(encoded["stale_policy"], "fail_readiness");
+}
+
+#[test]
+fn per_upstream_staleness_window_rejects_values_outside_the_documented_bounds() {
+    let mut config: ServiceDiscoveryConfig = serde_json::from_str(
+        r#"{"provider":"dns_sd","dns_sd":{"service_name":"_http._tcp.example"}}"#,
+    )
+    .expect("service-discovery fixture");
+
+    for invalid in [4, 86_401] {
+        config.max_stale_seconds = Some(invalid);
+        assert!(
+            config.validate_fields("default").is_err_and(|errors| {
+                errors
+                    .iter()
+                    .any(|error| error.contains("max_stale_seconds"))
+            }),
+            "out-of-range per-upstream staleness {invalid} must fail validation"
+        );
+    }
+
+    config.max_stale_seconds = Some(0);
+    assert!(
+        config.validate_fields("default").is_ok(),
+        "the process unsafe opt-in gates the explicit unbounded sentinel"
+    );
+}
+
+#[test]
+fn direct_staleness_resolution_clamps_hostile_values_before_deadline_arithmetic() {
+    let resolved = resolve_staleness(u64::MAX, SdStalePolicy::Withdraw, u64::MAX);
+    assert_eq!(
+        resolved.max_stale,
+        Some(Duration::from_secs(
+            HARD_MAX_SERVICE_DISCOVERY_MAX_STALE_SECONDS
+        ))
+    );
 }
