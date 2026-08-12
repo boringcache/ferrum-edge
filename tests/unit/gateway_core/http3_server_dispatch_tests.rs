@@ -646,8 +646,9 @@ fn h3_cross_protocol_streaming_grpc_consumes_deadline_and_read_bounds() {
         relay
             .matches("grpc_deadline_can_send_terminal_status(")
             .count(),
-        2,
-        "write-bound and select-loop deadlines must both use client-visible DATA"
+        3,
+        "write-bound client expiry plus the authorization and client select arms must all use \
+         client-visible DATA"
     );
     assert!(relay.contains("abort_response_stream(stream)"));
     assert!(relay.contains("_ = &mut read_deadline"));

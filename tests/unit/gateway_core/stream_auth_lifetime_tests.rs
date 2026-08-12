@@ -218,8 +218,13 @@ fn termination_classes_are_a_closed_set_of_compiled_in_literals() {
 
 #[test]
 fn client_visible_messages_never_carry_credential_or_expiry_detail() {
+    // Match the `exp` claim as a field/token rather than as a raw substring:
+    // the fixed, non-sensitive word "expired" is intentionally client-visible.
     let forbidden = [
-        "exp",
+        "\"exp\"",
+        "exp=",
+        "exp:",
+        "exp ",
         "notAfter",
         "not_after",
         "notBefore",
