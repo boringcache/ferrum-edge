@@ -16,6 +16,9 @@ use ferrum_edge::plugin_cache::PluginCache;
 use ferrum_edge::proxy::client_ip::TrustedProxies;
 use ferrum_edge::proxy::stream_listener::{StreamListenerDegradation, StreamListenerManager};
 use ferrum_edge::proxy::stream_match::{StreamMatchArm, StreamMatchCriteria};
+use ferrum_edge::proxy::node_waypoint_udp_steering::{
+    NodeWaypointUdpSteerBackend, NodeWaypointUdpSteering,
+};
 use ferrum_edge::request_epoch::RequestEpochStore;
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -2244,5 +2247,206 @@ async fn test_reconcile_restarts_on_dedicated_bind_address_change() {
         .await
         .expect("new dedicated bind must accept after rebind");
 
+    manager.shutdown_all().await;
+}
+
+// ============================================================================
+// Tests: NodeWaypoint UDP Service-path steering ownership (issue #3286)
+// ============================================================================
+
+struct NoopSteerBackend;
+
+impl NodeWaypointUdpSteerBackend for NoopSteerBackend {
+    fn run_script(&self, _script: &str) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+fn attach_steering(manager: &StreamListenerManager) -> Arc<NodeWaypointUdpSteering> {
+    let steering = Arc::new(NodeWaypointUdpSteering::new(Arc::new(NoopSteerBackend)));
+    manager.set_node_waypoint_udp_steering(steering.clone());
+    steering
+}
+
+fn node_waypoint_udp_proxy(port: u16) -> Proxy {
+    let id = ferrum_edge::modes::mesh::node_waypoint_udp_proxy_id(
+        &ferrum_edge::config::types::default_namespace(),
+        "dns",
+        port,
+    );
+    create_stream_proxy(&id, BackendScheme::Udp, port)
+}
+
+fn steer_destination(
+    ip: &str,
+    port: u16,
+) -> ferrum_edge::capture::NodeWaypointUdpSteerDestination {
+    ferrum_edge::capture::NodeWaypointUdpSteerDestination {
+        ip: ip.parse().expect("destination ip"),
+        port,
+    }
+}
+
+fn config_with_nw_udp(
+    port: u16,
+    destinations: Vec<ferrum_edge::capture::NodeWaypointUdpSteerDestination>,
+) -> GatewayConfig {
+    GatewayConfig {
+        proxies: vec![node_waypoint_udp_proxy(port)],
+        node_waypoint_udp_steer_destinations: destinations,
+        ..empty_config()
+    }
+}
+
+#[tokio::test]
+async fn node_waypoint_udp_steering_is_not_published_until_the_listener_binds() {
+    let holder = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("udp holder");
+    let port = holder.local_addr().unwrap().port();
+    let dest = vec![steer_destination("10.96.0.10", port)];
+    let config = config_with_nw_udp(port, dest);
+    let manager = create_manager(config);
+    let steering = attach_steering(&manager);
+
+    manager.sync_node_waypoint_udp_steering().await;
+    assert!(
+        steering.bound_destinations().is_empty(),
+        "desired metadata on an unbound listener must not be steered"
+    );
+
+    let failures = manager.reconcile().await;
+    assert!(
+        !failures.is_empty(),
+        "the held UDP port must fail the bind probe: {failures:?}"
+    );
+    assert!(
+        steering.bound_destinations().is_empty(),
+        "a failed bind must never be steered"
+    );
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn node_waypoint_udp_steering_is_not_published_for_deferred_dtls() {
+    let holder = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("udp holder");
+    let port = holder.local_addr().unwrap().port();
+    let mut proxy = node_waypoint_udp_proxy(port);
+    proxy.frontend_tls = true;
+    let config = GatewayConfig {
+        proxies: vec![proxy],
+        node_waypoint_udp_steer_destinations: vec![steer_destination("10.96.0.10", port)],
+        ..empty_config()
+    };
+    let manager = create_manager(config);
+    let steering = attach_steering(&manager);
+
+    let failures = manager.reconcile().await;
+    assert!(
+        failures.is_empty(),
+        "deferred DTLS must not be a hard bind failure: {failures:?}"
+    );
+    assert!(
+        steering.bound_destinations().is_empty(),
+        "a deferred DTLS listener must never be steered"
+    );
+    drop(holder);
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn node_waypoint_udp_successful_bind_publishes_and_shutdown_retracts() {
+    let dest_ip = "10.96.0.10";
+    let mut started = None;
+    let mut last_failures = Vec::new();
+    for _ in 0..8 {
+        let probe = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("udp probe");
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let dest = vec![steer_destination(dest_ip, port)];
+        let config = config_with_nw_udp(port, dest.clone());
+        let manager = create_manager(config);
+        let steering = attach_steering(&manager);
+        let failures = manager.reconcile().await;
+        if failures.is_empty()
+            && manager
+                .wait_until_started(Duration::from_secs(5))
+                .await
+                .is_ok()
+        {
+            started = Some((manager, steering, dest));
+            break;
+        }
+        last_failures = failures;
+        manager.shutdown_all().await;
+    }
+    let (manager, steering, dest) = started.unwrap_or_else(|| {
+        panic!("NodeWaypoint UDP listener did not start: {last_failures:?}")
+    });
+
+    assert_eq!(
+        steering.bound_destinations(),
+        dest,
+        "a successful bind must publish the accepted destination"
+    );
+
+    manager.shutdown_all().await;
+    assert!(
+        steering.bound_destinations().is_empty(),
+        "shutdown must retract the serving plan before sockets go away"
+    );
+}
+
+#[tokio::test]
+async fn node_waypoint_udp_withdrawal_retracts_steering() {
+    let dest_ip = "10.96.0.10";
+    let mut started = None;
+    let mut last_failures = Vec::new();
+    let mut config_arc = None;
+    for _ in 0..8 {
+        let probe = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("udp probe");
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let dest = vec![steer_destination(dest_ip, port)];
+        let config = config_with_nw_udp(port, dest);
+        let arc = Arc::new(ArcSwap::from_pointee(config.clone()));
+        let manager = create_manager_with_config_arc(arc.clone(), &config);
+        let steering = attach_steering(&manager);
+        let failures = manager.reconcile().await;
+        if failures.is_empty()
+            && manager
+                .wait_until_started(Duration::from_secs(5))
+                .await
+                .is_ok()
+        {
+            started = Some((manager, steering));
+            config_arc = Some(arc);
+            break;
+        }
+        last_failures = failures;
+        manager.shutdown_all().await;
+    }
+    let (manager, steering) = started.unwrap_or_else(|| {
+        panic!("NodeWaypoint UDP listener did not start: {last_failures:?}")
+    });
+    assert!(
+        !steering.bound_destinations().is_empty(),
+        "the bound listener must be steered before withdrawal"
+    );
+
+    config_arc
+        .expect("config arc")
+        .store(Arc::new(empty_config()));
+    let _ = manager.reconcile().await;
+    assert!(
+        steering.bound_destinations().is_empty(),
+        "withdrawing the listener must retract its destination before the socket is gone"
+    );
     manager.shutdown_all().await;
 }

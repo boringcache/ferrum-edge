@@ -60,10 +60,14 @@
 //!
 //! # Ownership and lifecycle
 //!
-//! The desired destination set is published by mesh config apply
-//! ([`publish_plan`], from `materialize_node_waypoint_udp_listeners`). The
-//! interface set is the EXACT set of interfaces the source-attribution index
-//! successfully published this pass
+//! Mesh config preparation may *derive* the desired destination set and carry
+//! it as candidate metadata. It must not publish the live datapath: preparation
+//! is not commit, and read-only callers reach the same materializer. The
+//! serving [`NodeWaypointUdpSteering`] instance owns the bound destination set
+//! and is updated only from the accepted serving generation, and only for
+//! destinations whose UDP/DTLS listeners are actually bound
+//! (`StreamListenerManager`). The interface set is the EXACT set of interfaces
+//! the source-attribution index successfully published this pass
 //! (`NodeWaypointUdpSourceIndex::publish` → `PublishedSourceGeneration::ifaces`),
 //! not the planner's pre-publication wish list: publication is where a
 //! contested interface refuses every claimant, a malformed or UID-mismatched
@@ -108,18 +112,21 @@ pub struct NodeWaypointUdpSteerPlan {
     pub published: bool,
 }
 
-/// Process-wide published steering plan.
+/// Process-wide diagnostic snapshot of the last serving plan a
+/// [`NodeWaypointUdpSteering`] instance installed.
 ///
-/// ONE writer — mesh config apply, which is already serialized — and readers on
-/// the reconcile loop. A shared `ArcSwap` rather than a threaded handle because
-/// the producer (`prepare_normalized_gateway_config_for_mesh`) is a pure
-/// config-normalization function reached from several apply paths and carries no
-/// runtime state; giving it one would mean threading a handle through every
-/// caller and every test fixture for a value only the steering loop reads.
+/// Not a control plane. Mesh preparation must never write this; the serving
+/// manager is the only writer, and only after the accepted generation's
+/// listeners are actually bound. Kept so external tests can prove a pure
+/// preparer has no live datapath side effect.
 static PUBLISHED_PLAN: std::sync::LazyLock<ArcSwap<NodeWaypointUdpSteerPlan>> =
     std::sync::LazyLock::new(|| ArcSwap::from_pointee(NodeWaypointUdpSteerPlan::default()));
 
 /// Publish the steered destination set for the generation being applied.
+///
+/// Production ownership is [`NodeWaypointUdpSteering::set_bound_destinations`];
+/// this remains a test/diagnostic seam.
+#[allow(dead_code)] // Test/diagnostic seam; serving writes go through the instance.
 pub fn publish_plan(destinations: Vec<NodeWaypointUdpSteerDestination>) {
     let mut destinations = destinations;
     destinations.sort_unstable();
@@ -130,15 +137,14 @@ pub fn publish_plan(destinations: Vec<NodeWaypointUdpSteerDestination>) {
     }));
 }
 
-/// The currently published plan. An unpublished plan steers nothing.
+/// The currently published diagnostic plan. An unpublished plan steers nothing.
+#[allow(dead_code)] // Test/diagnostic seam for preparer side-effect proofs.
 pub fn published_plan() -> Arc<NodeWaypointUdpSteerPlan> {
     PUBLISHED_PLAN.load_full()
 }
 
-/// Retract the published plan. Used when a topology/feature switch means no
-/// NodeWaypoint UDP listener may exist any more, so the next reconcile tears the
-/// datapath down instead of holding the last-good generation.
-#[allow(dead_code)] // Retraction seam for the disabled path and external tests.
+/// Retract the published diagnostic plan.
+#[allow(dead_code)] // Test/diagnostic seam.
 pub fn retract_plan() {
     PUBLISHED_PLAN.store(Arc::new(NodeWaypointUdpSteerPlan::default()));
 }
@@ -269,6 +275,12 @@ pub struct NodeWaypointUdpSteering {
     /// Guarded by a plain `Mutex` because it is touched once per registry poll
     /// (seconds), never on a datagram path.
     state: Mutex<SteeringState>,
+    /// Destinations whose corresponding UDP/DTLS listeners are currently bound
+    /// and serving on the accepted generation. Empty means steer nothing.
+    bound_destinations: ArcSwap<Vec<NodeWaypointUdpSteerDestination>>,
+    /// Last published attribution interfaces, so a destination-plan change can
+    /// apply immediately without waiting for the next registry poll.
+    last_ifaces: ArcSwap<Vec<String>>,
 }
 
 impl NodeWaypointUdpSteering {
@@ -276,12 +288,57 @@ impl NodeWaypointUdpSteering {
         Self {
             backend,
             state: Mutex::new(SteeringState::default()),
+            bound_destinations: ArcSwap::from_pointee(Vec::new()),
+            last_ifaces: ArcSwap::from_pointee(Vec::new()),
         }
+    }
+
+    /// Destinations currently owned by this serving instance.
+    #[allow(dead_code)] // External tests assert the serving plan without racing a global.
+    pub fn bound_destinations(&self) -> Vec<NodeWaypointUdpSteerDestination> {
+        self.bound_destinations.load_full().as_ref().clone()
+    }
+
+    /// Replace the bound destination set and apply it immediately against the
+    /// last published attribution interfaces (or `ifaces` when supplied).
+    ///
+    /// Whole-plan replacement: a generation is applied or it is not. An empty
+    /// set tears the datapath down. Callers must pass only destinations whose
+    /// listeners are actually bound on the accepted serving generation.
+    pub fn set_bound_destinations(
+        &self,
+        destinations: Vec<NodeWaypointUdpSteerDestination>,
+        ifaces: Option<&[String]>,
+    ) -> SteerReconcileOutcome {
+        let mut destinations = destinations;
+        destinations.sort_unstable();
+        destinations.dedup();
+        self.bound_destinations
+            .store(Arc::new(destinations.clone()));
+        if let Some(ifaces) = ifaces {
+            self.last_ifaces.store(Arc::new(ifaces.to_vec()));
+        }
+        let ifaces = self.last_ifaces.load_full();
+        self.reconcile_with(&ifaces, &destinations)
+    }
+
+    /// Drop every destination served on `port` and apply immediately. Used when
+    /// a bound listener fails asynchronously so the destination cannot remain
+    /// marked without a serving socket until the next full reconcile.
+    pub fn retract_port(&self, port: u16) -> SteerReconcileOutcome {
+        let remaining: Vec<NodeWaypointUdpSteerDestination> = self
+            .bound_destinations
+            .load()
+            .iter()
+            .copied()
+            .filter(|destination| destination.port != port)
+            .collect();
+        self.set_bound_destinations(remaining, None)
     }
 
     /// Reconcile the datapath against `ifaces` — the interfaces the source
     /// attribution index actually PUBLISHED this pass, never the planner's
-    /// pre-publication list — and the published destination plan.
+    /// pre-publication list — and this instance's bound destination set.
     ///
     /// A poisoned lock is treated as "nothing known about the node": both the
     /// applied generation and the teardown proof are dropped, so the pass runs
@@ -289,13 +346,13 @@ impl NodeWaypointUdpSteering {
     /// the previous generation is still installed is the one answer that could
     /// leave marked-but-unserved destinations behind.
     pub fn reconcile(&self, ifaces: &[String]) -> SteerReconcileOutcome {
-        let plan = published_plan();
-        self.reconcile_with(ifaces, &plan.destinations)
+        self.last_ifaces.store(Arc::new(ifaces.to_vec()));
+        let destinations = self.bound_destinations.load_full();
+        self.reconcile_with(ifaces, destinations.as_slice())
     }
 
-    /// [`Self::reconcile`] against an explicit destination set. The published
-    /// plan is a process-wide value, so tests drive this form instead of racing
-    /// every other test that applies a mesh generation.
+    /// [`Self::reconcile`] against an explicit destination set. Tests drive this
+    /// form so they do not depend on another task mutating this instance.
     pub fn reconcile_with(
         &self,
         ifaces: &[String],
@@ -425,8 +482,10 @@ impl NodeWaypointUdpSteering {
     /// Always runs the script, even when this process installed nothing: a
     /// previous process generation's objects survive this process, and they are
     /// exactly the marked-without-a-serving-socket state that must not outlive
-    /// it.
+    /// it. Also forgets the bound destination set so a later reconcile cannot
+    /// reinstall destinations whose listeners are already gone.
     pub fn shutdown(&self) {
+        self.bound_destinations.store(Arc::new(Vec::new()));
         let mut state = match self.state.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),

@@ -347,3 +347,58 @@ fn every_rule_is_scoped_by_interface_and_exact_service_address() {
         assert!(line.contains("--dport 5300"), "unscoped port: {line}");
     }
 }
+
+/// Bound destinations are instance-owned. Setting them applies immediately
+/// against the supplied interfaces; clearing them tears the datapath down.
+#[test]
+fn set_bound_destinations_applies_immediately_and_empty_tears_down() {
+    let backend = RecordingBackend::new(false);
+    let steering = NodeWaypointUdpSteering::new(backend.clone());
+    let ifaces = vec!["veth0".to_string()];
+    let destinations = vec![destination("10.96.0.10", 5300)];
+
+    assert_eq!(
+        steering.set_bound_destinations(destinations.clone(), Some(&ifaces)),
+        SteerReconcileOutcome::Applied
+    );
+    assert_eq!(steering.bound_destinations(), destinations);
+    let first = backend.take();
+    assert!(is_teardown(&first[0]));
+    assert!(!is_teardown(&first[1]));
+
+    assert_eq!(
+        steering.set_bound_destinations(Vec::new(), Some(&ifaces)),
+        SteerReconcileOutcome::Removed
+    );
+    assert!(steering.bound_destinations().is_empty());
+    let second = backend.take();
+    assert_eq!(second.len(), 1);
+    assert!(is_teardown(&second[0]));
+    forget(steering);
+}
+
+/// A bind-loss retraction of one port must not keep that destination marked.
+#[test]
+fn retract_port_drops_only_that_destination() {
+    let backend = RecordingBackend::new(false);
+    let steering = NodeWaypointUdpSteering::new(backend.clone());
+    let ifaces = vec!["veth0".to_string()];
+    steering.set_bound_destinations(
+        vec![
+            destination("10.96.0.10", 5300),
+            destination("10.96.0.11", 5301),
+        ],
+        Some(&ifaces),
+    );
+    backend.take();
+
+    assert_eq!(
+        steering.retract_port(5300),
+        SteerReconcileOutcome::Applied
+    );
+    assert_eq!(
+        steering.bound_destinations(),
+        vec![destination("10.96.0.11", 5301)]
+    );
+    forget(steering);
+}

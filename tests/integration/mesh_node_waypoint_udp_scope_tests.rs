@@ -1282,3 +1282,89 @@ fn a_udp_port_already_claimed_by_a_stream_proxy_is_refused() {
         "a port already claimed by a stream proxy must not be re-claimed by a datagram listener"
     );
 }
+
+#[test]
+fn preparation_attaches_desired_steering_metadata_without_publishing_the_live_plan() {
+    use ferrum_edge::proxy::node_waypoint_udp_steering::{
+        NodeWaypointUdpSteerBackend, NodeWaypointUdpSteering, published_plan,
+    };
+
+    struct NoopBackend;
+    impl NodeWaypointUdpSteerBackend for NoopBackend {
+        fn run_script(&self, _script: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    let _env = UdpListenerEnvGuard::set(Some("true"));
+    let runtime = node_waypoint_runtime();
+    let backend = workload_for("dns", DEFAULT_NAMESPACE, [("app", "udp")], ["10.244.3.11"]);
+
+    let serving = NodeWaypointUdpSteering::new(std::sync::Arc::new(NoopBackend));
+    let prior = vec![ferrum_edge::capture::NodeWaypointUdpSteerDestination {
+        ip: "10.96.0.99".parse().expect("ip"),
+        port: 9999,
+    }];
+    serving.set_bound_destinations(prior.clone(), Some(&["veth0".to_string()]));
+    let before_global = published_plan();
+
+    let config = prepare(
+        &runtime,
+        vec![udp_service("dns", 5353, AppProtocol::Udp, &[&backend])],
+        vec![backend],
+    );
+
+    assert_eq!(
+        config.node_waypoint_udp_steer_destinations,
+        vec![ferrum_edge::capture::NodeWaypointUdpSteerDestination {
+            ip: "10.96.0.10".parse().expect("cluster ip"),
+            port: 5353,
+        }],
+        "preparation must carry desired destinations on the candidate"
+    );
+    assert_eq!(
+        serving.bound_destinations(),
+        prior,
+        "a rejected or merely inspected candidate must leave the serving plan untouched"
+    );
+    assert_eq!(
+        published_plan().as_ref(),
+        before_global.as_ref(),
+        "read-only preparation must not mutate the process-global diagnostic plan"
+    );
+    std::mem::forget(serving);
+}
+
+#[test]
+fn a_withdrawn_or_disabled_generation_clears_desired_steering_metadata() {
+    let _env = UdpListenerEnvGuard::set(Some("true"));
+    let runtime = node_waypoint_runtime();
+    let backend = workload_for("dns", DEFAULT_NAMESPACE, [("app", "udp")], ["10.244.3.11"]);
+    let prepared = prepare(
+        &runtime,
+        vec![udp_service("dns", 5353, AppProtocol::Udp, &[&backend])],
+        vec![backend],
+    );
+    assert!(
+        !prepared.node_waypoint_udp_steer_destinations.is_empty(),
+        "a materialized ClusterIP listener must carry desired steering metadata"
+    );
+
+    let withdrawn = prepare(&runtime, Vec::new(), Vec::new());
+    assert!(
+        withdrawn.node_waypoint_udp_steer_destinations.is_empty(),
+        "withdrawing every UDP service must clear desired steering metadata"
+    );
+
+    let _off = UdpListenerEnvGuard::set(None);
+    let backend = workload_for("dns", DEFAULT_NAMESPACE, [("app", "udp")], ["10.244.3.11"]);
+    let disabled = prepare(
+        &runtime,
+        vec![udp_service("dns", 5353, AppProtocol::Udp, &[&backend])],
+        vec![backend],
+    );
+    assert!(
+        disabled.node_waypoint_udp_steer_destinations.is_empty(),
+        "disabling the listener switch must clear desired steering metadata"
+    );
+}

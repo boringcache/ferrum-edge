@@ -10763,6 +10763,15 @@ impl ProxyState {
         // `mirror_request_epoch_wrappers` published its wrapper views above.
         let Some(delta) = applied_delta else {
             debug!("Config update: out-of-band mesh/MMDB generation republished");
+            // ClusterIP-only mesh updates do not restart stream listeners, but
+            // they can change the desired NodeWaypoint UDP steering set. Sync
+            // against currently bound sockets so a rejected-or-unbound
+            // destination cannot stay marked, and a newly desired VIP on an
+            // already-bound port is published without waiting for a proxy delta.
+            let slm = self.stream_listener_manager.clone();
+            tokio::spawn(async move {
+                slm.sync_node_waypoint_udp_steering().await;
+            });
             return ConfigApplyOutcome::Applied;
         };
         let proxy_plugin_rebuild_count = proxy_plugin_rebuild_count.get();
@@ -10903,6 +10912,11 @@ impl ProxyState {
                         err
                     );
                 }
+            });
+        } else {
+            let slm = self.stream_listener_manager.clone();
+            tokio::spawn(async move {
+                slm.sync_node_waypoint_udp_steering().await;
             });
         }
 
@@ -11461,6 +11475,10 @@ impl ProxyState {
                     err
                 );
             }
+        } else {
+            self.stream_listener_manager
+                .sync_node_waypoint_udp_steering()
+                .await;
         }
 
         info!(
@@ -55716,6 +55734,7 @@ mod tests {
             mesh: None,
             http_tls_listen_ports: Default::default(),
             mesh_revision: None,
+            node_waypoint_udp_steer_destinations: Vec::new(),
             k8s_mesh_overlay: Default::default(),
         }
     }

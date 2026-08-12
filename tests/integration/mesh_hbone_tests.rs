@@ -118,6 +118,7 @@ fn create_mesh_proxy_state_with_config(
         mesh: None,
         http_tls_listen_ports: Default::default(),
         mesh_revision: None,
+        node_waypoint_udp_steer_destinations: Vec::new(),
         k8s_mesh_overlay: Default::default(),
     };
     let env_config = EnvConfig {
@@ -828,6 +829,7 @@ fn create_egress_udp_gateway_state(mesh: MeshConfig) -> ProxyState {
         mesh: Some(Box::new(mesh)),
         http_tls_listen_ports: Default::default(),
         mesh_revision: None,
+        node_waypoint_udp_steer_destinations: Vec::new(),
         k8s_mesh_overlay: Default::default(),
     };
     let env_config = EnvConfig {
@@ -1250,6 +1252,7 @@ fn materialize_source_side_external_udp(
         mesh: Some(Box::new(mesh)),
         http_tls_listen_ports: Default::default(),
         mesh_revision: None,
+        node_waypoint_udp_steer_destinations: Vec::new(),
         k8s_mesh_overlay: Default::default(),
     };
 

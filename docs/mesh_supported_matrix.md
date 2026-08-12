@@ -293,6 +293,13 @@ need them, or because they are blocked upstream / architecturally:
     own refusals — a contested ingress interface (refused for both claimants), a
     malformed or UID-mismatched binding, a duplicate, and an over-bound
     generation all contribute nothing to steering.
+  - **Serving-generation ownership.** Mesh preparation may carry desired
+    destinations as candidate metadata; it must not publish the live datapath.
+    `StreamListenerManager` publishes only destinations whose UDP/DTLS listeners
+    are actually bound on the accepted serving generation, and retracts them
+    before those sockets go away (bind failure, deferred DTLS, withdrawal, task
+    failure, shutdown). A rejected or merely inspected candidate cannot change
+    steering, and a destination is never marked without a serving socket.
 
 
   **The listener configuration surface.** The attribution channel is reachable

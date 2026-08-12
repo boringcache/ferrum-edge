@@ -3038,6 +3038,19 @@ pub struct GatewayConfig {
     /// has already accepted a revisioned slice.
     #[serde(skip)]
     pub mesh_revision: Option<crate::modes::mesh::revision::MeshConfigRevision>,
+    /// Desired NodeWaypoint UDP/DTLS Service-path steering destinations
+    /// derived during mesh materialization (issue #3286).
+    ///
+    /// Runtime-only (`serde(skip)`): never operator input and never on the
+    /// ConfigSync `config_json` wire. Preparation attaches this metadata
+    /// without publishing the live datapath. `StreamListenerManager` publishes
+    /// only the subset whose UDP/DTLS listeners are actually bound on the
+    /// accepted serving generation, so a rejected or merely inspected
+    /// candidate cannot change steering, and a destination is never marked
+    /// without a serving socket.
+    #[serde(skip)]
+    pub node_waypoint_udp_steer_destinations:
+        Vec<crate::capture::NodeWaypointUdpSteerDestination>,
     /// Kubernetes mesh-overlay ownership marker (issue #2452).
     ///
     /// DERIVED, CP-in-memory only (`#[serde(skip)]`, same contract as

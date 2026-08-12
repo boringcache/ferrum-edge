@@ -451,6 +451,26 @@ impl NodeWaypointUdpSourceIndex {
         self.len() == 0
     }
 
+    /// Interfaces that survived the current published attribution generation.
+    ///
+    /// Empty when the index is unpublished or published nothing. This is the
+    /// same set [`Self::publish`] returns; Service-path steering must consume
+    /// it rather than the planner's pre-publication list.
+    pub fn published_ifaces(&self) -> Vec<String> {
+        let snapshot = self.current.load();
+        if !snapshot.published {
+            return Vec::new();
+        }
+        let mut ifaces: Vec<String> = snapshot
+            .by_ifindex
+            .values()
+            .map(|binding| binding.iface.clone())
+            .collect();
+        ifaces.sort_unstable();
+        ifaces.dedup();
+        ifaces
+    }
+
     /// Per-datagram admission: one lock-free snapshot load, one hash lookup, one
     /// address comparison, one `Arc` retain.
     pub fn authorize(
@@ -976,9 +996,10 @@ impl<R: NodeWaypointUdpInterfaceResolver> NodeWaypointUdpSourceIndexManager<R> {
             );
         }
         let published = self.index.publish(&desired.bindings);
-        // Steering follows publication, never precedes it: a datagram may only
-        // be diverted to the waypoint once the interface it arrives on can be
-        // attributed to a source workload.
+        // Steering follows publication of attribution AND of a bound serving
+        // listener: a datagram may only be diverted to the waypoint once the
+        // interface it arrives on can be attributed AND the destination's
+        // UDP/DTLS listener is actually bound on the accepted generation.
         //
         // The interface set is taken from `published`, NOT from
         // `desired.bindings`. Publication is the final authorization boundary

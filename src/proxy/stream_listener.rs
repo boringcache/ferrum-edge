@@ -33,6 +33,13 @@ type DtlsServerSlot = Arc<arc_swap::ArcSwap<Option<Arc<crate::dtls::DtlsServer>>
 
 const STREAM_LISTENER_SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
 
+/// How long reconcile waits for a newly spawned NodeWaypoint UDP/DTLS listener
+/// to set `started` after a successful port probe. Steering is published only
+/// for listeners that actually bound. A timeout leaves that destination
+/// unsteered (fail-closed) until the bind-success watch observes `started` or
+/// the next reconcile; it must never mark a port with no serving socket.
+const NODE_WAYPOINT_UDP_STEER_BIND_WAIT: Duration = Duration::from_secs(2);
+
 /// Bounded, redacted frontend DTLS live-reload status.
 ///
 /// Exposes generation/convergence counters only — never PEM, key bytes, secret
@@ -818,7 +825,7 @@ enum StreamBackendMetricEntry {
 /// All state is behind a tokio `Mutex` to serialize reconciliation calls.
 /// Reconciliation happens only on config reload — not on the hot request path.
 pub struct StreamListenerManager {
-    listeners: tokio::sync::Mutex<std::collections::HashMap<String, ListenerHandle>>,
+    listeners: Arc<tokio::sync::Mutex<std::collections::HashMap<String, ListenerHandle>>>,
     dtls_metrics: arc_swap::ArcSwap<Vec<DtlsDemuxMetricEntry>>,
     stream_backend_metrics: arc_swap::ArcSwap<Vec<StreamBackendMetricEntry>>,
     /// Structured snapshot of the most recent `reconcile()`'s stream-listener
@@ -983,6 +990,13 @@ pub struct StreamListenerManager {
     /// before `mesh_authz` evaluates scoped policy.
     node_waypoint_udp_source_index: arc_swap::ArcSwap<
         Option<Arc<crate::proxy::node_waypoint_udp_identity::NodeWaypointUdpSourceIndex>>,
+    >,
+    /// Service-path steering datapath (issue #3286). Populated by the mesh
+    /// runtime in NodeWaypoint topology only. The manager publishes bound
+    /// destinations into this instance after a successful listener bind on the
+    /// accepted serving generation — never from config preparation.
+    node_waypoint_udp_steering: arc_swap::ArcSwap<
+        Option<Arc<crate::proxy::node_waypoint_udp_steering::NodeWaypointUdpSteering>>,
     >,
     /// Pre-parsed trusted proxy CIDR set (from `FERRUM_TRUSTED_PROXIES`).
     /// Shared with each spawned TCP stream accept loop that has
@@ -1191,7 +1205,7 @@ impl StreamListenerManager {
         trusted_proxies: Arc<crate::proxy::client_ip::TrustedProxies>,
     ) -> Self {
         Self {
-            listeners: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            listeners: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             dtls_metrics: arc_swap::ArcSwap::new(Arc::new(Vec::new())),
             stream_backend_metrics: arc_swap::ArcSwap::new(Arc::new(Vec::new())),
             bind_failures: Arc::new(arc_swap::ArcSwap::new(Arc::new(Vec::new()))),
@@ -1240,6 +1254,7 @@ impl StreamListenerManager {
             stream_gateway_ref,
             node_waypoint_identity_resolver: arc_swap::ArcSwap::new(Arc::new(None)),
             node_waypoint_udp_source_index: arc_swap::ArcSwap::new(Arc::new(None)),
+            node_waypoint_udp_steering: arc_swap::ArcSwap::new(Arc::new(None)),
             trusted_proxies,
             backend_conn_limit: std::sync::OnceLock::new(),
             stream_sni_plaintext_fallback: AtomicBool::new(false),
@@ -1366,6 +1381,30 @@ impl StreamListenerManager {
     ) {
         self.node_waypoint_udp_source_index
             .store(Arc::new(Some(index)));
+    }
+
+    /// Install the NodeWaypoint UDP/DTLS Service-path steering instance.
+    ///
+    /// Must be called after [`Self::new`] and BEFORE the first `reconcile()`,
+    /// alongside [`Self::set_node_waypoint_udp_source_index`]. `None` (the
+    /// default) leaves the Service path unsteered.
+    pub fn set_node_waypoint_udp_steering(
+        &self,
+        steering: Arc<crate::proxy::node_waypoint_udp_steering::NodeWaypointUdpSteering>,
+    ) {
+        self.node_waypoint_udp_steering
+            .store(Arc::new(Some(steering)));
+    }
+
+    /// Recompute the serving steering plan from the accepted config and the
+    /// listeners that are actually bound. Safe to call without a prior
+    /// `reconcile()` — an empty listener set publishes nothing.
+    pub async fn sync_node_waypoint_udp_steering(&self) {
+        let listeners = self.listeners.lock().await;
+        self.publish_serving_node_waypoint_udp_steering(
+            &listeners,
+            &std::collections::HashSet::new(),
+        );
     }
 
     /// Update the frontend TLS configuration used for TCP stream proxies with `frontend_tls: true`.
@@ -2071,6 +2110,12 @@ impl StreamListenerManager {
             to_remove.push(key.clone());
         }
 
+        // Retract steering for listeners about to stop BEFORE the sockets go
+        // away, so an old rule cannot outlive its listener. New destinations
+        // are not added here — they wait until bind succeeds below.
+        let exclude: std::collections::HashSet<String> = to_remove.iter().cloned().collect();
+        self.publish_serving_node_waypoint_udp_steering(&listeners, &exclude);
+
         let mut removed_listeners = Vec::new();
         for key in &to_remove {
             if let Some(handle) = listeners.remove(key) {
@@ -2089,6 +2134,7 @@ impl StreamListenerManager {
         }
 
         // Start listeners for new or restarted entries
+        let mut newly_started_nw_udp: Vec<String> = Vec::new();
         for (key, desired_listener) in &effective_desired {
             if listeners.contains_key(key) {
                 continue;
@@ -2325,6 +2371,11 @@ impl StreamListenerManager {
                             resolver,
                         }
                     });
+                let node_waypoint_udp_steering = self
+                    .node_waypoint_udp_steering
+                    .load_full()
+                    .as_ref()
+                    .clone();
                 let bind_failures = Arc::clone(&self.bind_failures);
                 let async_bind_failures = Arc::clone(&self.async_bind_failures);
                 let async_failure_tx = async_failure_tx.clone();
@@ -2395,6 +2446,12 @@ impl StreamListenerManager {
                             append_bind_failure(&async_bind_failures, failure.clone());
                             append_bind_failure(&bind_failures, failure.clone());
                             let _ = async_failure_tx.send(failure);
+                        }
+                        if proxy_id_owned
+                            .contains(crate::modes::mesh::MESH_NODE_WAYPOINT_UDP_PROXY_ID_PREFIX)
+                            && let Some(steering) = node_waypoint_udp_steering.as_ref()
+                        {
+                            steering.retract_port(port_val);
                         }
                     }
                 });
@@ -2601,7 +2658,36 @@ impl StreamListenerManager {
                     dtls_server,
                 },
             );
+            if scheme.is_udp() && is_node_waypoint_udp_listener_key(key) {
+                newly_started_nw_udp.push(key.clone());
+                if let Some(steering) = self
+                    .node_waypoint_udp_steering
+                    .load_full()
+                    .as_ref()
+                    .cloned()
+                {
+                    spawn_node_waypoint_udp_steer_bind_watch(
+                        started.clone(),
+                        shutdown_tx.subscribe(),
+                        steering,
+                        self.config.clone(),
+                        self.node_waypoint_udp_source_index.load_full(),
+                        Arc::clone(&self.listeners),
+                        key.clone(),
+                    );
+                }
+            }
         }
+
+        for key in &newly_started_nw_udp {
+            if let Some(handle) = listeners.get(key) {
+                wait_for_listener_started(handle, NODE_WAYPOINT_UDP_STEER_BIND_WAIT).await;
+            }
+        }
+        self.publish_serving_node_waypoint_udp_steering(
+            &listeners,
+            &std::collections::HashSet::new(),
+        );
 
         let mut dtls_entries: Vec<DtlsDemuxMetricEntry> = listeners
             .iter()
@@ -2660,6 +2746,26 @@ impl StreamListenerManager {
         }
 
         bind_failures
+    }
+
+    /// Publish desired ∩ actually-bound NodeWaypoint UDP destinations into the
+    /// serving steering instance. `exclude` are listener keys about to stop, so
+    /// their destinations are retracted before the sockets go away.
+    fn publish_serving_node_waypoint_udp_steering(
+        &self,
+        listeners: &std::collections::HashMap<String, ListenerHandle>,
+        exclude: &std::collections::HashSet<String>,
+    ) {
+        let Some(steering) = self.node_waypoint_udp_steering.load_full().as_ref().cloned() else {
+            return;
+        };
+        publish_bound_node_waypoint_udp_destinations(
+            &steering,
+            &self.config.load().node_waypoint_udp_steer_destinations,
+            self.node_waypoint_udp_source_index.load_full().as_ref(),
+            listeners,
+            exclude,
+        );
     }
 
     /// Build-validate the cached backend TLS `ClientConfig` for a TCP+TLS
@@ -2834,6 +2940,11 @@ impl StreamListenerManager {
     /// ensures the `JoinHandle` set is cleared even when the global channel
     /// is not injected (e.g. unit tests that build a manager standalone).
     pub async fn shutdown_all(&self) {
+        if let Some(steering) = self.node_waypoint_udp_steering.load_full().as_ref() {
+            // Retract every steered destination before the sockets go away so
+            // shutdown cannot leave marked-without-a-serving-socket state.
+            steering.shutdown();
+        }
         let mut listeners = self.listeners.lock().await;
         for (listener_key, handle) in listeners.drain() {
             info!(
@@ -2843,6 +2954,112 @@ impl StreamListenerManager {
             );
             let _ = handle.shutdown_tx.send(true);
         }
+    }
+}
+
+fn is_node_waypoint_udp_listener_key(key: &str) -> bool {
+    key.contains(crate::modes::mesh::MESH_NODE_WAYPOINT_UDP_PROXY_ID_PREFIX)
+}
+
+fn node_waypoint_udp_published_ifaces(
+    source_index: &Option<
+        Arc<crate::proxy::node_waypoint_udp_identity::NodeWaypointUdpSourceIndex>,
+    >,
+) -> Vec<String> {
+    source_index
+        .as_ref()
+        .map(|index| index.published_ifaces())
+        .unwrap_or_default()
+}
+
+fn publish_bound_node_waypoint_udp_destinations(
+    steering: &crate::proxy::node_waypoint_udp_steering::NodeWaypointUdpSteering,
+    desired: &[crate::capture::NodeWaypointUdpSteerDestination],
+    source_index: &Option<
+        Arc<crate::proxy::node_waypoint_udp_identity::NodeWaypointUdpSourceIndex>,
+    >,
+    listeners: &std::collections::HashMap<String, ListenerHandle>,
+    exclude: &std::collections::HashSet<String>,
+) {
+    let serving_ports: std::collections::HashSet<u16> = listeners
+        .iter()
+        .filter(|(key, handle)| {
+            !exclude.contains(*key)
+                && handle.scheme.is_udp()
+                && is_node_waypoint_udp_listener_key(key)
+                && handle.started.load(Ordering::Acquire)
+                && !handle.join_handle.is_finished()
+        })
+        .map(|(_, handle)| handle.listen_port)
+        .collect();
+    let destinations: Vec<crate::capture::NodeWaypointUdpSteerDestination> = desired
+        .iter()
+        .copied()
+        .filter(|destination| serving_ports.contains(&destination.port))
+        .collect();
+    let ifaces = node_waypoint_udp_published_ifaces(source_index);
+    steering.set_bound_destinations(destinations, Some(&ifaces));
+}
+
+/// Wait until this NodeWaypoint UDP/DTLS listener actually binds, then publish
+/// desired ∩ currently-bound destinations. Taking the listener map lock after
+/// `started` means a concurrent reconcile that already withdrew the key cannot
+/// be raced into re-steering a socket that is gone. Bind failure / shutdown
+/// exits without publishing.
+fn spawn_node_waypoint_udp_steer_bind_watch(
+    started: Arc<AtomicBool>,
+    mut shutdown_rx: watch::Receiver<bool>,
+    steering: Arc<crate::proxy::node_waypoint_udp_steering::NodeWaypointUdpSteering>,
+    config: Arc<arc_swap::ArcSwap<GatewayConfig>>,
+    source_index: Arc<
+        Option<Arc<crate::proxy::node_waypoint_udp_identity::NodeWaypointUdpSourceIndex>>,
+    >,
+    listeners: Arc<tokio::sync::Mutex<std::collections::HashMap<String, ListenerHandle>>>,
+    key: String,
+) {
+    tokio::spawn(async move {
+        loop {
+            if *shutdown_rx.borrow() {
+                return;
+            }
+            if started.load(Ordering::Acquire) {
+                break;
+            }
+            tokio::select! {
+                _ = shutdown_rx.changed() => return,
+                _ = tokio::time::sleep(Duration::from_millis(2)) => {}
+            }
+        }
+        if *shutdown_rx.borrow() {
+            return;
+        }
+        let guard = listeners.lock().await;
+        if *shutdown_rx.borrow() {
+            return;
+        }
+        let Some(handle) = guard.get(&key) else {
+            return;
+        };
+        if !handle.started.load(Ordering::Acquire) || handle.join_handle.is_finished() {
+            return;
+        }
+        publish_bound_node_waypoint_udp_destinations(
+            &steering,
+            &config.load().node_waypoint_udp_steer_destinations,
+            source_index.as_ref(),
+            &guard,
+            &std::collections::HashSet::new(),
+        );
+    });
+}
+
+async fn wait_for_listener_started(handle: &ListenerHandle, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if handle.started.load(Ordering::Acquire) || handle.join_handle.is_finished() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
     }
 }
 

@@ -1673,30 +1673,37 @@ pub fn node_waypoint_udp_upstream_id(namespace: &str, name: &str, port: u16) -> 
 /// Listener BIND failures (including a `dtls` port with no usable frontend DTLS
 /// material, and a scoped listener whose socket cannot report ingress
 /// interfaces) are reported by `StreamListenerManager` as `StreamBindFailure`
-/// entries and surface in readiness/status; no black-hole listener is started.
+/// entries and surface in readiness/status; no black-hole listener is started,
+/// and Service-path steering is published only for listeners that actually
+/// bound on the accepted serving generation.
+///
+/// This function is a pure preparer: it may attach desired steering metadata
+/// to the candidate `GatewayConfig`, but it must not publish or retract the
+/// live process-global steering datapath. Preparation is not commit —
+/// `apply_destination_rules`, validation, and revision acceptance can still
+/// reject the candidate, and read-only callers reach this path too.
 fn materialize_node_waypoint_udp_listeners(
     config: &mut GatewayConfig,
     runtime: &MeshRuntimeConfig,
     mesh_slice: &MeshSlice,
 ) {
+    // A cloned previous generation can carry desired destinations. Every path
+    // that materializes nothing for THIS candidate must clear them so a
+    // later accepted apply cannot keep steering a withdrawn surface.
     if runtime.topology != MeshTopology::NodeWaypoint {
+        config.node_waypoint_udp_steer_destinations.clear();
         return;
     }
-    // Every early return below is also a RETRACTION of the Service-steering
-    // plan: leaving the previous generation's destinations published would keep
-    // enrolled workloads' Service datagrams diverted to listeners this
-    // generation no longer materializes. Retracting steers nothing, which
-    // fails closed at the pod-veth guard.
     // A parse error is reported (and made fatal) by
     // `validate_node_waypoint_udp_listener_settings` on the serving path; this
     // cold materialization path must stay infallible for read-only callers, so
     // an unparseable value materializes nothing.
     if !node_waypoint_udp_listeners_enabled_from_env().unwrap_or(false) {
-        crate::proxy::node_waypoint_udp_steering::retract_plan();
+        config.node_waypoint_udp_steer_destinations.clear();
         return;
     }
     let Some(local_node_name) = node_waypoint_udp_local_node_name_from_env() else {
-        crate::proxy::node_waypoint_udp_steering::retract_plan();
+        config.node_waypoint_udp_steer_destinations.clear();
         warn!(
             "Skipping NodeWaypoint UDP/DTLS listener materialization: \
              FERRUM_K8S_NODE_NAME is missing or empty"
@@ -1852,11 +1859,13 @@ fn materialize_node_waypoint_udp_listeners(
             dtls_listeners += 1;
         }
         materialized += 1;
-        // Service-path steering is published only for the listener that
+        // Desired Service-path steering is recorded only for the listener that
         // actually won this port, AFTER every fail-closed refusal above. A port
         // two services contested, a port a mesh runtime listener owns, and a
-        // port with no reachable endpoint therefore never appear here — steering
-        // a destination with no serving listener would black-hole it.
+        // port with no reachable endpoint therefore never appear here. The
+        // serving StreamListenerManager publishes this set only for listeners
+        // that actually bind on the accepted generation — attaching it here
+        // must not divert traffic.
         //
         // `udp` and `dtls` listeners are steered identically. A `DtlsServer`
         // pins each session's captured local destination (the ClusterIP a
@@ -1907,12 +1916,11 @@ fn materialize_node_waypoint_udp_listeners(
              over the documented direct-node-address boundary"
         );
     }
-    // Publish the steering plan for EVERY generation, including the empty one:
-    // a generation that materializes nothing must retract the previous
-    // generation's steering rather than leave workloads diverted to listeners
-    // that no longer exist.
+    // Carry the desired plan on THIS candidate only. An empty set is a
+    // positive "steer nothing" statement for the serving manager if this
+    // generation is later accepted; it must not mutate the live datapath here.
     let steer_destination_count = steer_destinations.len();
-    crate::proxy::node_waypoint_udp_steering::publish_plan(steer_destinations);
+    config.node_waypoint_udp_steer_destinations = steer_destinations;
 
     if materialized > 0 {
         info!(
@@ -1922,9 +1930,9 @@ fn materialize_node_waypoint_udp_listeners(
             "Materialized NodeWaypoint UDP/DTLS service listeners; each session's source pod is \
              attributed from the kernel-reported ingress interface and its scoped \
              AuthorizationPolicies are enforced before any datagram reaches a backend. Every \
-             ClusterIP-bearing listener, `udp` and `dtls` alike, is published for Service-path \
-             steering; the rules are installed by the source-attribution reconcile loop, so a \
-             published destination becomes reachable only once its steering apply succeeds"
+             ClusterIP-bearing listener, `udp` and `dtls` alike, carries desired Service-path \
+             steering metadata; the serving manager publishes a destination only after its \
+             listener is bound on the accepted generation"
         );
     }
 }
@@ -2157,6 +2165,10 @@ fn fail_closed_node_waypoint_udp_dtls_scoped_policies(
             .upstreams
             .retain(|upstream| !is_node_waypoint_suppressible_udp_upstream_id(&upstream.id));
     }
+    // Listeners are gone; desired steering metadata must not survive on this
+    // candidate. Serving publishes only bound listeners, but a stripped
+    // generation should carry a positive "steer nothing" statement.
+    config.node_waypoint_udp_steer_destinations.clear();
 
     warn!(
         topology = "node_waypoint",
@@ -13318,6 +13330,7 @@ async fn arm_mesh_runtime_startup(
 ) -> Result<(), anyhow::Error> {
     let shutdown_tx = owner.shutdown_tx.clone();
     let proxy_state = owner.proxy_state.clone();
+    let mut serving_udp_steering = None;
     let proxy_state = if runtime.topology == MeshTopology::NodeWaypoint {
         info!(
             "Node-waypoint identity resolver enabled; unknown outbound capture socket cookies fail closed"
@@ -13406,13 +13419,15 @@ async fn arm_mesh_runtime_startup(
             // without them fails the plan closed and logs it, leaving the
             // Service path unsteered rather than unauthorized.
             if crate::proxy::node_waypoint_udp_steering::steering_supported() {
-                manager = manager.with_steering(std::sync::Arc::new(
+                let steering = std::sync::Arc::new(
                     crate::proxy::node_waypoint_udp_steering::NodeWaypointUdpSteering::new(
                         std::sync::Arc::new(
                             crate::proxy::node_waypoint_udp_steering::HostNamespaceSteerBackend,
                         ),
                     ),
-                ));
+                );
+                manager = manager.with_steering(steering.clone());
+                serving_udp_steering = Some(steering);
             }
             let manager_shutdown = shutdown_tx.subscribe();
             info!(
@@ -13901,6 +13916,11 @@ async fn arm_mesh_runtime_startup(
         proxy_state
             .stream_listener_manager
             .set_node_waypoint_udp_source_index(index.clone());
+    }
+    if let Some(steering) = serving_udp_steering {
+        proxy_state
+            .stream_listener_manager
+            .set_node_waypoint_udp_steering(steering);
     }
     if let Some(resolver) = proxy_state.node_waypoint_identity_resolver.as_ref() {
         proxy_state
