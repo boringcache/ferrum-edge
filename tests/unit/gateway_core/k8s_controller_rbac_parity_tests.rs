@@ -33,29 +33,29 @@ const STATUS_WRITTEN_PLURALS: &[&str] = &[
     "listenersets",
 ];
 
-fn grants_resource(plural: &str) -> bool {
-    CONTROL_PLANE_RBAC.lines().any(|line| {
-        line.trim()
-            .strip_prefix("- ")
-            .is_some_and(|resource| resource == plural)
-    })
-}
-
-fn grants_api_group(group: &str) -> bool {
-    CONTROL_PLANE_RBAC.contains(&format!("apiGroups: [\"{group}\"]"))
+fn rule_grants(group: &str, plural: &str) -> bool {
+    let expected_group = format!("[\"{group}\"]");
+    CONTROL_PLANE_RBAC
+        .split("  - apiGroups: ")
+        .skip(1)
+        .any(|rule| {
+            let Some((declared_group, body)) = rule.split_once('\n') else {
+                return false;
+            };
+            declared_group.trim() == expected_group
+                && body.lines().any(|line| {
+                    line.trim()
+                        .strip_prefix("- ")
+                        .is_some_and(|resource| resource == plural)
+                })
+        })
 }
 
 #[test]
 fn every_watched_gateway_api_crd_is_granted_by_the_control_plane_cluster_role() {
     for crd in GATEWAY_API_CRDS {
         assert!(
-            grants_api_group(crd.group),
-            "chart RBAC must name apiGroup {} for watched kind {}",
-            crd.group,
-            crd.kind
-        );
-        assert!(
-            grants_resource(crd.plural),
+            rule_grants(crd.group, crd.plural),
             "chart RBAC must grant list/watch on {} ({}) or its watcher 403-loops for the \
              life of the control plane",
             crd.plural,
@@ -67,13 +67,14 @@ fn every_watched_gateway_api_crd_is_granted_by_the_control_plane_cluster_role() 
 #[test]
 fn every_status_written_gateway_api_kind_is_granted_its_status_subresource() {
     for plural in STATUS_WRITTEN_PLURALS {
+        let crd = GATEWAY_API_CRDS
+            .iter()
+            .find(|crd| crd.plural == *plural)
+            .unwrap_or_else(|| panic!("{plural} is claimed as status-written but is not watched"));
         assert!(
-            GATEWAY_API_CRDS.iter().any(|crd| crd.plural == *plural),
-            "{plural} is claimed as status-written but is not watched"
-        );
-        assert!(
-            grants_resource(&format!("{plural}/status")),
-            "chart RBAC must grant the {plural} status subresource"
+            rule_grants(crd.group, &format!("{plural}/status")),
+            "chart RBAC must grant the {plural} status subresource under apiGroup {}",
+            crd.group
         );
     }
 }
@@ -90,7 +91,7 @@ fn the_namespace_watch_backing_allowed_routes_selectors_is_granted() {
         "the Namespace watch must stay cluster-scoped"
     );
     assert!(
-        grants_resource("namespaces"),
+        rule_grants("", "namespaces"),
         "chart RBAC must grant the cluster-scoped Namespace watch that \
          allowedRoutes namespace selectors resolve against"
     );
