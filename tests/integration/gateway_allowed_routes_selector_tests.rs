@@ -647,7 +647,10 @@ fn same_namespace_listener_still_refuses_a_labelled_foreign_namespace() {
     });
     let objects = vec![
         namespace(CONFORMANCE_INFRA_NS, &[("gateway-conformance", "infra")]),
-        namespace(CONFORMANCE_WEB_BACKEND_NS, &[("gateway-conformance", "backend")]),
+        namespace(
+            CONFORMANCE_WEB_BACKEND_NS,
+            &[("gateway-conformance", "backend")],
+        ),
         same_gateway,
         conformance_route(),
     ];

@@ -2327,15 +2327,16 @@ async fn handle_admin_request_inner(
             // status stays `degraded` rather than becoming `unavailable`, so a
             // recoverable partial outage is never reported as a lost
             // dependency.
-            health_status["status"] = json!(
-                if serving_degraded || !jwks_ready || !discovery_ready || dp_config_stale {
-                    "unavailable"
-                } else if gateway_listeners_not_ready {
-                    "degraded"
-                } else {
-                    "starting"
-                }
-            );
+            health_status["status"] =
+                json!(
+                    if serving_degraded || !jwks_ready || !discovery_ready || dp_config_stale {
+                        "unavailable"
+                    } else if gateway_listeners_not_ready {
+                        "degraded"
+                    } else {
+                        "starting"
+                    }
+                );
             StatusCode::SERVICE_UNAVAILABLE
         } else {
             StatusCode::OK
