@@ -32,7 +32,7 @@ use crate::admin::{self, AdminState};
 use crate::config::EnvConfig;
 use crate::config::db_backend::{self, DatabaseBackend, FullConfigLoadPurpose, IncrementalResult};
 use crate::config::db_loader::{DatabaseStore, DbPoolConfig};
-use crate::config::gateway_trust::detect_gateway_trust_drift;
+use crate::config::gateway_trust::{TrustPublicationScope, detect_gateway_trust_drift};
 use crate::config::incremental_apply::apply_incremental_to_config_snapshot as apply_incremental_to_config;
 use crate::config::types::GatewayConfig;
 use crate::config::validation_pipeline::{
@@ -1406,6 +1406,26 @@ async fn settle_full_reload_rejection_state(
     crate::modes::clear_config_rejected_after_accepted_full_reload(config_rejected, context);
 }
 
+/// Classify a full reload's coverage for the gateway-trust publication
+/// boundary (#3727).
+///
+/// A namespace that was REJECTED kept its previous generation, and one whose
+/// load merely FAILED was not re-read at all, so neither can be said to have
+/// resolved a standing trust refusal. Both make the publication partial: the
+/// accepted namespaces still publish and count, but the bounded failure reason
+/// stands until a reload covers everything. This deliberately mirrors
+/// [`settle_full_reload_rejection_state`]'s rule for `config_rejected`.
+fn trust_publication_scope(
+    rejected_namespaces: &[(String, String)],
+    failed_namespaces: &[String],
+) -> TrustPublicationScope {
+    if rejected_namespaces.is_empty() && failed_namespaces.is_empty() {
+        TrustPublicationScope::Complete
+    } else {
+        TrustPublicationScope::Partial
+    }
+}
+
 /// Publish a DB full-reload snapshot with K8s overlay re-merge + CAS, then
 /// broadcast only namespaces that successfully refreshed (#2982 / #2983 / #2984).
 ///
@@ -1417,6 +1437,11 @@ async fn settle_full_reload_rejection_state(
 /// When `refreshed_namespaces` is empty, nothing is committed or broadcast —
 /// callers still settle rejection/failure state from the load outcome, and
 /// subscribers keep last-known-good.
+///
+/// `trust_scope` says whether this reload covered every namespace it polled.
+/// A reload that left a rejected or unreachable namespace on last-known-good
+/// must not clear the standing gateway-trust failure while publishing the
+/// namespaces that did load — see [`TrustPublicationScope`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn publish_cp_full_reload(
     publication_gate: &CpPublicationGate,
@@ -1424,6 +1449,7 @@ pub(crate) fn publish_cp_full_reload(
     overlay_slot: &K8sOverlaySlot,
     db_config: GatewayConfig,
     refreshed_namespaces: &[String],
+    trust_scope: TrustPublicationScope,
     broadcasts: &crate::grpc::cp_server::NamespaceBroadcasts,
     dp_registry: &crate::grpc::cp_server::DpNodeRegistry,
     cp_scope: &CpScope,
@@ -1449,10 +1475,11 @@ pub(crate) fn publish_cp_full_reload(
         // record the projection was about to refuse. That slot is one value
         // compared against every namespace, so the refusal is all-or-nothing
         // and a genuinely accepted multi-namespace generation still counts once.
-        crate::config::gateway_trust::record_trust_generation_published(
+        crate::config::gateway_trust::record_trust_generation_published_scoped(
             &published.gateway_trust_bundles,
             published.trust_bundles.as_deref(),
             chrono::Utc::now().timestamp().max(0) as u64,
+            trust_scope,
         );
         for namespace in refreshed_namespaces {
             CpGrpcServer::broadcast_namespace_update(
@@ -3063,6 +3090,10 @@ pub async fn run(
                                     &overlay_poll,
                                     outcome.config,
                                     &outcome.refreshed_namespaces,
+                                    trust_publication_scope(
+                                        &outcome.rejected_namespaces,
+                                        &outcome.failed_namespaces,
+                                    ),
                                     poll_broadcasts.as_ref(),
                                     &dp_registry_poll,
                                     &poll_scope,
@@ -3350,6 +3381,10 @@ pub async fn run(
                                                     &overlay_poll,
                                                     outcome.config,
                                                     &outcome.refreshed_namespaces,
+                                                    trust_publication_scope(
+                                                        &outcome.rejected_namespaces,
+                                                        &outcome.failed_namespaces,
+                                                    ),
                                                     poll_broadcasts.as_ref(),
                                                     &dp_registry_poll,
                                                     &poll_scope,
@@ -3495,6 +3530,10 @@ pub async fn run(
                                             &overlay_poll,
                                             outcome.config,
                                             &outcome.refreshed_namespaces,
+                                            trust_publication_scope(
+                                                &outcome.rejected_namespaces,
+                                                &outcome.failed_namespaces,
+                                            ),
                                             poll_broadcasts.as_ref(),
                                             &dp_registry_poll,
                                             &poll_scope,
@@ -3584,6 +3623,10 @@ pub async fn run(
                                                             &overlay_poll,
                                                             outcome.config,
                                                             &outcome.refreshed_namespaces,
+                                                            trust_publication_scope(
+                                                                &outcome.rejected_namespaces,
+                                                                &outcome.failed_namespaces,
+                                                            ),
                                                             poll_broadcasts.as_ref(),
                                                             &dp_registry_poll,
                                                             &poll_scope,

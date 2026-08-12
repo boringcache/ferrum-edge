@@ -23,13 +23,17 @@ use ferrum_edge::config::gateway_trust::{
     GatewayTrustDriftSource, GatewayTrustFailureReason, GatewayTrustPublication,
     MAX_FEDERATED_BUNDLES, MAX_JWT_AUTHORITIES_PER_BUNDLE, MAX_TRUST_BUNDLE_JSON_BYTES,
     MAX_X509_AUTHORITIES_PER_BUNDLE, NamespaceTrustProjection, TrustAuthorityResolution,
+    TrustPublicationScope,
     detect_gateway_trust_drift, gateway_trust_state_drifted, observability_snapshot,
     project_namespace_trust, published_namespace_generation, published_namespace_state,
-    record_ambiguous_authority, record_trust_generation_published, record_trust_load_rejection,
+    record_ambiguous_authority, record_trust_generation_published,
+    record_trust_generation_published_scoped, record_trust_load_rejection,
     reset_observability_for_tests, resolve_trust_authority, trust_generation_fingerprint,
 };
 use ferrum_edge::config::types::GatewayConfig;
 use ferrum_edge::identity::TrustDomain;
+use ferrum_edge::identity::ca::PublishedJwtAuthority;
+use ferrum_edge::identity::jwt_svid::jwks_document;
 use ferrum_edge::modes::mesh::config::{JwtAuthority, TrustBundle, TrustBundleSet};
 
 use async_trait::async_trait;
@@ -61,6 +65,21 @@ fn usable_public_key_pem() -> String {
     rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
         .expect("test key generates")
         .public_key_pem()
+}
+
+/// A bare public JWK in the exact representation federation can persist in a
+/// `JwtAuthority.public_key_pem` field.
+fn usable_public_jwk() -> String {
+    let pem = usable_public_key_pem();
+    let document = jwks_document(&[PublishedJwtAuthority::new(
+        trust_domain("cluster.local"),
+        "rotation-1",
+        pem,
+    )])
+    .expect("test public key publishes as JWKS");
+    let document: serde_json::Value =
+        serde_json::from_slice(&document).expect("published JWKS is valid JSON");
+    serde_json::to_string(&document["keys"][0]).expect("published JWK serializes")
 }
 
 fn trust_domain(value: &str) -> TrustDomain {
@@ -229,6 +248,77 @@ fn a_private_key_pasted_into_a_jwt_authority_is_rejected() {
             .any(|error| error.contains("not a usable PEM public key")),
         "expected a public-key admission error, got {errors:?}"
     );
+}
+
+#[test]
+fn bare_jwk_admission_refuses_private_policy_conflicting_and_ambiguous_material() {
+    let baseline = usable_public_jwk();
+    let mut record = valid_record();
+    record.bundle.local.jwt_authorities = vec![JwtAuthority {
+        key_id: "rotation-1".to_string(),
+        public_key_pem: baseline.clone(),
+    }];
+    record
+        .validate_fields()
+        .expect("a genuine bare public JWK must be admitted");
+
+    let baseline_object: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(&baseline).expect("baseline JWK is an object");
+    for (label, member, value) in [
+        (
+            "private EC scalar",
+            "d",
+            serde_json::Value::String("private-scalar-must-never-persist".to_string()),
+        ),
+        (
+            "RSA private CRT member",
+            "p",
+            serde_json::Value::String("private-prime-must-never-persist".to_string()),
+        ),
+        (
+            "symmetric key material",
+            "k",
+            serde_json::Value::String("symmetric-secret-must-never-persist".to_string()),
+        ),
+        (
+            "encryption use",
+            "use",
+            serde_json::Value::String("enc".to_string()),
+        ),
+        (
+            "encryption key operation",
+            "key_ops",
+            serde_json::json!(["encrypt"]),
+        ),
+        (
+            "algorithm the P-256 key cannot produce",
+            "alg",
+            serde_json::Value::String("ES384".to_string()),
+        ),
+    ] {
+        let mut hostile = baseline_object.clone();
+        hostile.insert(member.to_string(), value);
+        record.bundle.local.jwt_authorities[0].public_key_pem =
+            serde_json::to_string(&hostile).expect("hostile JWK serializes");
+        let errors = record
+            .validate_fields()
+            .err()
+            .unwrap_or_else(|| panic!("{label}: hostile bare JWK must be refused"));
+        let rendered = errors.join(" ");
+        assert!(
+            !rendered.contains("must-never-persist"),
+            "{label}: admission diagnostics must not echo JWK material"
+        );
+    }
+
+    let duplicate_use = format!(
+        "{},\"use\":\"enc\"}}",
+        baseline.strip_suffix('}').expect("JWK object closes")
+    );
+    record.bundle.local.jwt_authorities[0].public_key_pem = duplicate_use;
+    record
+        .validate_fields()
+        .expect_err("a duplicate policy member is ambiguous and must be refused");
 }
 
 #[test]
@@ -615,6 +705,34 @@ fn observability_counters_are_bounded_and_material_free() {
         "an accepted publication clears the standing failure reason"
     );
     assert!(published_namespace_state("staging").is_some());
+
+    // A mixed full reload can publish the namespaces that refreshed while a
+    // rejected namespace retains its last-known-good generation. That is a
+    // PARTIAL publication, not recovery: the bounded refusal must stay visible
+    // until a later complete reload covers every namespace.
+    record_trust_load_rejection(GatewayTrustFailureReason::InvalidMaterial);
+    record_trust_generation_published_scoped(
+        &multi_namespace,
+        None,
+        1_925_000_000,
+        TrustPublicationScope::Partial,
+    );
+    assert_eq!(
+        observability_snapshot().last_failure_reason,
+        "invalid_material",
+        "an accepted sibling namespace must not clear a rejected namespace's failure"
+    );
+    record_trust_generation_published_scoped(
+        &multi_namespace,
+        None,
+        1_930_000_000,
+        TrustPublicationScope::Complete,
+    );
+    assert_eq!(
+        observability_snapshot().last_failure_reason,
+        "none",
+        "only a complete full reload proves the standing refusal recovered"
+    );
 
     // An accepted empty generation is an explicit live revocation. It does not
     // increment the database-record counter, but status must stop reporting

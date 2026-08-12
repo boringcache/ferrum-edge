@@ -814,6 +814,34 @@ impl GatewayTrustFailureReason {
     }
 }
 
+/// Whether a publication carried EVERY namespace the loader was asked to
+/// refresh, or only the ones that survived.
+///
+/// A multi-namespace control-plane reload is per-namespace isolated (#2983): a
+/// namespace whose trust candidate is refused keeps its last-known-good
+/// generation while the namespaces that loaded cleanly are still committed and
+/// broadcast. That partial publication must not read as recovery on the
+/// gateway-trust status surface — the refused candidate is still refused — so
+/// the scope is carried explicitly to the publication boundary instead of being
+/// inferred from the accepted records (which say nothing about the namespace
+/// that never got there).
+///
+/// This mirrors `settle_full_reload_rejection_state`'s rule for the generic
+/// `config_rejected` signal: only a reload that refreshed every polled
+/// namespace may clear a standing failure. It carries no namespace name and no
+/// material — it is a two-valued flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustPublicationScope {
+    /// Every namespace in scope was re-read and accepted. A standing
+    /// gateway-trust failure is genuinely resolved by this publication.
+    Complete,
+    /// At least one namespace was rejected or could not be refreshed, and is
+    /// serving last-known-good. Accepted namespaces still publish and still
+    /// count; any standing bounded failure reason is preserved until a
+    /// complete publication proves it resolved.
+    Partial,
+}
+
 /// Record a trust generation that reached the ACTUAL publication boundary —
 /// the `ArcSwap` store that makes a configuration generation live.
 ///
@@ -852,6 +880,36 @@ pub fn record_trust_generation_published(
     file_sourced: Option<&TrustBundleSet>,
     now_unix_seconds: u64,
 ) {
+    record_trust_generation_published_scoped(
+        records,
+        file_sourced,
+        now_unix_seconds,
+        TrustPublicationScope::Complete,
+    );
+}
+
+/// [`record_trust_generation_published`] for a publication that may have
+/// covered only part of its namespace scope.
+///
+/// `scope` decides one thing and one thing only: whether this publication is
+/// allowed to clear the standing bounded failure reason. Everything else —
+/// the published namespace view, the generation counter, the timestamp, the
+/// ambiguity refusal accounting — is identical, so an accepted namespace is
+/// never denied its successful generation accounting because a *different*
+/// namespace was refused. No rejection counter is touched here either: the
+/// refusal already counted itself at the load that refused it, and counting it
+/// again per publication would inflate `load_rejections_total` once per poll
+/// cycle for as long as the bad material stayed stored.
+pub fn record_trust_generation_published_scoped(
+    records: &[GatewayTrustBundleRecord],
+    file_sourced: Option<&TrustBundleSet>,
+    now_unix_seconds: u64,
+    scope: TrustPublicationScope,
+) {
+    // A publication that left a rejected namespace on last-known-good has not
+    // resolved that namespace's refusal, so the standing reason survives until
+    // a complete publication proves it did.
+    let resolves_standing_failure = matches!(scope, TrustPublicationScope::Complete);
     if file_sourced.is_some() {
         // Every CURRENT database record is ambiguous and keeps its prior live
         // state. A namespace whose database record was revoked is no longer
@@ -876,8 +934,12 @@ pub fn record_trust_generation_published(
         } else {
             // File-only/empty state is a valid, unambiguous publication. It
             // does not count as a database trust generation, but it does
-            // resolve any standing load/authority failure.
-            LAST_FAILURE_REASON.store(GatewayTrustFailureReason::None.code(), Ordering::Relaxed);
+            // resolve any standing load/authority failure — provided it covered
+            // every namespace in scope.
+            if resolves_standing_failure {
+                LAST_FAILURE_REASON
+                    .store(GatewayTrustFailureReason::None.code(), Ordering::Relaxed);
+            }
             if revoked_database_state {
                 LAST_PUBLISHED_UNIX_SECONDS.store(now_unix_seconds, Ordering::Relaxed);
             }
@@ -907,8 +969,14 @@ pub fn record_trust_generation_published(
     PUBLISHED_NAMESPACE_STATES.store(Arc::new(published));
     // An accepted explicit revocation is still a successful trust publication:
     // clear the standing failure even though an empty database generation does
-    // not advance the record-bearing generation counter or timestamp.
-    LAST_FAILURE_REASON.store(GatewayTrustFailureReason::None.code(), Ordering::Relaxed);
+    // not advance the record-bearing generation counter or timestamp. A
+    // PARTIAL publication does not clear it: a namespace whose trust candidate
+    // was refused is still serving last-known-good, and letting the namespaces
+    // that did load report the failure away is exactly the false recovery this
+    // scope exists to prevent.
+    if resolves_standing_failure {
+        LAST_FAILURE_REASON.store(GatewayTrustFailureReason::None.code(), Ordering::Relaxed);
+    }
 
     if records.is_empty() {
         if revoked_database_state {
