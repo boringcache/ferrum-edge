@@ -3049,8 +3049,7 @@ pub struct GatewayConfig {
     /// candidate cannot change steering, and a destination is never marked
     /// without a serving socket.
     #[serde(skip)]
-    pub node_waypoint_udp_steer_destinations:
-        Vec<crate::capture::NodeWaypointUdpSteerDestination>,
+    pub node_waypoint_udp_steer_destinations: Vec<crate::capture::NodeWaypointUdpSteerDestination>,
     /// Kubernetes mesh-overlay ownership marker (issue #2452).
     ///
     /// DERIVED, CP-in-memory only (`#[serde(skip)]`, same contract as

@@ -2543,6 +2543,8 @@ async fn node_waypoint_udp_old_generation_failure_does_not_retract_replacement()
         .await;
     assert!(
         steering.bound_destinations().is_empty(),
+        "retracting the serving generation must clear bound destinations"
+    );
     manager.shutdown_all().await;
 }
 

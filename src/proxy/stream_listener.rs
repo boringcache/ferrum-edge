@@ -1507,7 +1507,12 @@ impl StreamListenerManager {
         key: &str,
         generation: u64,
     ) {
-        let Some(steering) = self.node_waypoint_udp_steering.load_full().as_ref().cloned() else {
+        let Some(steering) = self
+            .node_waypoint_udp_steering
+            .load_full()
+            .as_ref()
+            .cloned()
+        else {
             return;
         };
         retract_owned_node_waypoint_udp_listener(
@@ -2492,11 +2497,8 @@ impl StreamListenerManager {
                             resolver,
                         }
                     });
-                let node_waypoint_udp_steering = self
-                    .node_waypoint_udp_steering
-                    .load_full()
-                    .as_ref()
-                    .clone();
+                let node_waypoint_udp_steering =
+                    self.node_waypoint_udp_steering.load_full().as_ref().clone();
                 let bind_failures = Arc::clone(&self.bind_failures);
                 let async_bind_failures = Arc::clone(&self.async_bind_failures);
                 let async_failure_tx = async_failure_tx.clone();
@@ -2578,9 +2580,7 @@ impl StreamListenerManager {
                             let _ = async_failure_tx.send(failure);
                         }
                     }
-                    if owner_for_exit
-                        && let Some(steering) = node_waypoint_udp_steering
-                    {
+                    if owner_for_exit && let Some(steering) = node_waypoint_udp_steering {
                         // Do not await the listener map here: reconcile joins this
                         // task while holding that lock. A helper observes the
                         // non-serving mark and generation fence once the owner
@@ -2924,7 +2924,12 @@ impl StreamListenerManager {
                 return;
             }
         }
-        let Some(steering) = self.node_waypoint_udp_steering.load_full().as_ref().cloned() else {
+        let Some(steering) = self
+            .node_waypoint_udp_steering
+            .load_full()
+            .as_ref()
+            .cloned()
+        else {
             return;
         };
         publish_bound_node_waypoint_udp_destinations(
