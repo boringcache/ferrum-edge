@@ -317,9 +317,12 @@ pub struct CpDpTrustReloadSnapshot {
     pub recoveries_total: u64,
     /// Reload attempts **started** since process start. Incremented when the
     /// worker begins a read, before a verdict exists, so a wedged in-flight
-    /// operation is visible. `acceptances_total + rejections_total` may trail
-    /// this by one in-flight attempt; the startup-accepted generation is
-    /// counted in `acceptances_total` without a corresponding attempt.
+    /// operation is visible. For candidate verdicts,
+    /// `acceptances_total + rejections_total` may trail this by one in-flight
+    /// attempt. The startup-accepted generation is counted in
+    /// `acceptances_total` without a corresponding attempt, and an unexpected
+    /// worker exit is counted as a closed rejection reason without fabricating
+    /// an attempt.
     pub attempts_total: u64,
     /// Replica-stable HMAC-SHA-256 identifier of the accepted trust generation
     /// (`HMAC-SHA-256(status_hmac_key, domain || fingerprint)` as 64 lowercase
@@ -328,7 +331,8 @@ pub struct CpDpTrustReloadSnapshot {
     pub active_generation: Option<String>,
     /// Attempts that produced a usable generation (replaced or confirmed).
     pub acceptances_total: u64,
-    /// Attempts refused, across every closed reason.
+    /// Candidate refusals plus unexpected worker exits, across every closed
+    /// reason. The latter is not a fabricated reload attempt.
     pub rejections_total: u64,
     /// Refusals per closed reason. Exactly [`TRUST_RELOAD_FAILURES`] keys.
     pub rejections_by_reason: BTreeMap<&'static str, u64>,
@@ -571,8 +575,9 @@ impl CpDpTrustReloadStatus {
     /// its verdict is what keeps a wedged reader visible: `attempts_total`
     /// advances before the read, the attempt stamp stops advancing until a
     /// verdict lands, and the worker reads as `stalled` once the stall window
-    /// elapses. `acceptances_total + rejections_total` may therefore trail
-    /// `attempts_total` by one in-flight operation.
+    /// elapses. Candidate verdicts may therefore trail `attempts_total` by one
+    /// in-flight operation. An unexpected worker exit is accounted as a
+    /// rejection reason without fabricating an attempt.
     pub fn record_attempt(&self) {
         self.attempts_total.fetch_add(1, Ordering::Relaxed);
     }

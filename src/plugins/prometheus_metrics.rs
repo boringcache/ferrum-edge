@@ -4962,7 +4962,7 @@ pub fn render_cp_dp_trust_reload_prometheus(
     );
 
     output.push_str(
-        "# HELP ferrum_cp_dp_trust_reload_rejections_total Reload attempts refused, by closed reason. The previous verifier was retained.\n",
+        "# HELP ferrum_cp_dp_trust_reload_rejections_total Reload candidates refused or reload workers exited unexpectedly, by closed reason. The previous verifier was retained when applicable.\n",
     );
     output.push_str("# TYPE ferrum_cp_dp_trust_reload_rejections_total counter\n");
     for failure in crate::grpc::cp_trust_health::TRUST_RELOAD_FAILURES {
@@ -4991,7 +4991,7 @@ pub fn render_cp_dp_trust_reload_prometheus(
     );
 
     output.push_str(
-        "# HELP ferrum_cp_dp_trust_reload_consecutive_failures Consecutive refused reload attempts since the last accepted generation.\n",
+        "# HELP ferrum_cp_dp_trust_reload_consecutive_failures Consecutive refused reload candidates or fatal worker exits since the last accepted generation.\n",
     );
     output.push_str("# TYPE ferrum_cp_dp_trust_reload_consecutive_failures gauge\n");
     render_process_counter(

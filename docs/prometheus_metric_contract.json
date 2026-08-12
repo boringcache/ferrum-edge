@@ -1189,7 +1189,7 @@
   {
     "name": "ferrum_cp_dp_trust_reload_consecutive_failures",
     "type": "gauge",
-    "help": "Consecutive refused reload attempts since the last accepted generation.",
+    "help": "Consecutive refused reload candidates or fatal worker exits since the last accepted generation.",
     "labels": [
       "namespace"
     ],
@@ -1213,7 +1213,7 @@
   {
     "name": "ferrum_cp_dp_trust_reload_rejections_total",
     "type": "counter",
-    "help": "Reload attempts refused, by closed reason. The previous verifier was retained.",
+    "help": "Reload candidates refused or reload workers exited unexpectedly, by closed reason. The previous verifier was retained when applicable.",
     "labels": [
       "reason",
       "namespace"
