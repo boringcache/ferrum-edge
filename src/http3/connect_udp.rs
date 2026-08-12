@@ -256,7 +256,7 @@ pub fn validate_connect_udp_request_shape(
 ) -> Result<(), ConnectUdpRequestRejection> {
     match uri.scheme_str() {
         None => return Err(ConnectUdpRequestRejection::SchemeMissing),
-        Some(scheme) if scheme.is_empty() => {
+        Some("") => {
             return Err(ConnectUdpRequestRejection::SchemeMissing);
         }
         Some(scheme) if !scheme.eq_ignore_ascii_case(CONNECT_UDP_SCHEME) => {
