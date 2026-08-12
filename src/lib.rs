@@ -1038,6 +1038,93 @@ pub mod _test_support {
         dns_cache: &crate::dns::DnsCache,
         health_checker: &crate::health_check::HealthChecker,
     ) -> DiscoveryApplyControlForTest {
+        apply_service_discovery_snapshot_inner(
+            upstream_namespace,
+            upstream_id,
+            provider_name,
+            snapshot,
+            state,
+            lb_cache,
+            request_epoch,
+            static_targets,
+            algorithm,
+            hash_on,
+            cancel_rx,
+            shutdown_rx,
+            dns_cache,
+            health_checker,
+            // No supervised task generation behind this seam: external tests
+            // drive the pipeline directly, so there is no lifecycle entry to
+            // fence or to advance the staleness anchor on.
+            None,
+        )
+        .await
+    }
+
+    /// Same production pipeline, but bound to a supervised generation's health
+    /// registry entry so the publication fence is exercised. `lifecycle_key` /
+    /// `generation` must already be registered
+    /// (`service_discovery::health::register_task_for_test`).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn apply_service_discovery_snapshot_for_generation_for_test(
+        upstream_namespace: &str,
+        upstream_id: &str,
+        provider_name: &str,
+        snapshot: crate::service_discovery::DiscoverySnapshot,
+        state: &mut DiscoveryLoopStateForTest,
+        lb_cache: &crate::load_balancer::LoadBalancerCache,
+        request_epoch: &Option<std::sync::Arc<crate::request_epoch::RequestEpochStore>>,
+        static_targets: &[crate::config::types::UpstreamTarget],
+        algorithm: crate::config::types::LoadBalancerAlgorithm,
+        hash_on: &Option<String>,
+        cancel_rx: &tokio::sync::watch::Receiver<bool>,
+        shutdown_rx: &Option<tokio::sync::watch::Receiver<bool>>,
+        dns_cache: &crate::dns::DnsCache,
+        health_checker: &crate::health_check::HealthChecker,
+        lifecycle_key: &str,
+        generation: u64,
+    ) -> DiscoveryApplyControlForTest {
+        apply_service_discovery_snapshot_inner(
+            upstream_namespace,
+            upstream_id,
+            provider_name,
+            snapshot,
+            state,
+            lb_cache,
+            request_epoch,
+            static_targets,
+            algorithm,
+            hash_on,
+            cancel_rx,
+            shutdown_rx,
+            dns_cache,
+            health_checker,
+            Some(crate::service_discovery::DiscoveryLifecycle::new(
+                lifecycle_key.to_string(),
+                generation,
+            )),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_service_discovery_snapshot_inner(
+        upstream_namespace: &str,
+        upstream_id: &str,
+        provider_name: &str,
+        snapshot: crate::service_discovery::DiscoverySnapshot,
+        state: &mut DiscoveryLoopStateForTest,
+        lb_cache: &crate::load_balancer::LoadBalancerCache,
+        request_epoch: &Option<std::sync::Arc<crate::request_epoch::RequestEpochStore>>,
+        static_targets: &[crate::config::types::UpstreamTarget],
+        algorithm: crate::config::types::LoadBalancerAlgorithm,
+        hash_on: &Option<String>,
+        cancel_rx: &tokio::sync::watch::Receiver<bool>,
+        shutdown_rx: &Option<tokio::sync::watch::Receiver<bool>>,
+        dns_cache: &crate::dns::DnsCache,
+        health_checker: &crate::health_check::HealthChecker,
+        lifecycle: Option<crate::service_discovery::DiscoveryLifecycle>,
+    ) -> DiscoveryApplyControlForTest {
         match crate::service_discovery::apply_discovered_snapshot(
             upstream_namespace,
             upstream_id,
@@ -1053,6 +1140,11 @@ pub mod _test_support {
             shutdown_rx,
             dns_cache,
             health_checker,
+            lifecycle.as_ref(),
+            // No supervised task context behind this seam: staleness expiry
+            // during publication preparation is covered against the live
+            // supervisor in the lifecycle integration suite.
+            None,
         )
         .await
         {
