@@ -3587,13 +3587,7 @@ impl RequestContext {
             self,
             crate::proxy::auth_lifetime::authenticated_stream_max_lifetime_seconds(),
         );
-        PrecommitResponsePhaseBound {
-            at: crate::proxy::auth_lifetime::compose_absolute_bound(
-                self.grpc_deadline_at(),
-                authorization,
-            ),
-            authorization,
-        }
+        PrecommitResponsePhaseBound::compose(self.grpc_deadline_at(), authorization)
     }
 
     /// Record ONE authorization-lifetime termination for this request: the
@@ -5861,26 +5855,52 @@ impl RequestPluginDeadlineResult {
 /// toward commitment.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct PrecommitResponsePhaseBound {
-    at: Option<tokio::time::Instant>,
-    authorization: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+    bound: crate::proxy::auth_lifetime::ComposedAuthBound,
 }
 
 impl PrecommitResponsePhaseBound {
-    /// The instant the awaited phase runs under: the earliest of the two.
-    pub(crate) fn deadline(self) -> Option<tokio::time::Instant> {
-        self.at
+    /// Compose one pre-commitment phase bound, deciding the winning owner where
+    /// both instants are known.
+    pub(crate) fn compose(
+        protocol_deadline_at: Option<tokio::time::Instant>,
+        authorization: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+    ) -> Self {
+        Self {
+            bound: crate::proxy::auth_lifetime::ComposedAuthBound::compose(
+                protocol_deadline_at,
+                authorization,
+            ),
+        }
     }
 
-    /// The winning bound, once the composed deadline has elapsed. `Some` when
-    /// the authorization lifetime is the one that expired.
+    /// The instant the awaited phase runs under: the earliest of the two.
+    pub(crate) fn deadline(self) -> Option<tokio::time::Instant> {
+        self.bound.deadline()
+    }
+
+    /// The admitted credential's absolute authorization deadline, whether or
+    /// not it is the winning bound. This is what bounds work that a phase
+    /// legitimately DETACHES at the client's own earlier RPC deadline, which
+    /// would otherwise keep holding the cloned request context and the
+    /// protected response body past the credential's lifetime.
+    pub(crate) fn authorization_deadline_at(self) -> Option<tokio::time::Instant> {
+        self.bound.authorization_deadline_at()
+    }
+
+    /// The winning bound, once the composed deadline has elapsed. `Some` only
+    /// when the authorization lifetime is the bound that established it and
+    /// that instant has actually elapsed.
     ///
-    /// A tie is attributed to authorization, matching the biased select-arm
-    /// ordering every relay uses: when both bounds are eligible, the security
-    /// decision is the one reported.
+    /// Attribution comes from the CAPTURED composition, never from re-reading
+    /// the clock: a strictly earlier client `grpc-timeout` stays attributed to
+    /// the client even when the phase was not polled again until after the
+    /// later authorization deadline had also passed. A genuine tie still goes
+    /// to authorization, matching the biased select-arm ordering every relay
+    /// uses.
     pub(crate) fn expired_authorization(
         self,
     ) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
-        crate::proxy::auth_lifetime::expired_authorization(self.authorization)
+        self.bound.expired_authorization()
     }
 }
 

@@ -7274,6 +7274,94 @@ pub mod _test_support {
         ctx.precommit_response_phase_deadline_at()
     }
 
+    /// A composed PRE-COMMITMENT response-phase bound, carried from composition
+    /// time to attribution time so a test can put arbitrary scheduling delay
+    /// between the two (issue #3815).
+    #[derive(Clone, Copy, Debug)]
+    pub struct PrecommitResponsePhaseBoundForTest(crate::plugins::PrecommitResponsePhaseBound);
+
+    impl PrecommitResponsePhaseBoundForTest {
+        /// The instant the awaited phase runs under: the earliest of the two.
+        #[must_use]
+        pub fn deadline(&self) -> Option<tokio::time::Instant> {
+            self.0.deadline()
+        }
+
+        /// The admitted credential's own absolute authorization deadline,
+        /// whether or not it is the winning bound.
+        #[must_use]
+        pub fn authorization_deadline_at(&self) -> Option<tokio::time::Instant> {
+            self.0.authorization_deadline_at()
+        }
+
+        /// Attribute an already-fired bound from the CAPTURED composition.
+        #[must_use]
+        pub fn expired_authorization(
+            &self,
+        ) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
+            self.0.expired_authorization()
+        }
+    }
+
+    /// Compose one pre-commitment response-phase bound from the two absolute
+    /// instants, exactly as `RequestContext::precommit_response_phase_bound`
+    /// does (issue #3815).
+    #[must_use]
+    pub fn compose_precommit_response_phase_bound_for_test(
+        protocol_deadline_at: Option<tokio::time::Instant>,
+        authorization: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+    ) -> PrecommitResponsePhaseBoundForTest {
+        PrecommitResponsePhaseBoundForTest(crate::plugins::PrecommitResponsePhaseBound::compose(
+            protocol_deadline_at,
+            authorization,
+        ))
+    }
+
+    /// The absolute authorization bound a DETACHED committed-response cleanup
+    /// inherits from one request's composed pre-commitment bound (issue #3815).
+    ///
+    /// This is `Some` even when the client's own earlier RPC deadline owns the
+    /// phase, which is exactly the case the detached lifecycle must still be
+    /// bounded by.
+    #[must_use]
+    pub fn detached_response_committed_authorization_bound_for_test(
+        ctx: &crate::plugins::RequestContext,
+    ) -> Option<tokio::time::Instant> {
+        ctx.precommit_response_phase_bound()
+            .authorization_deadline_at()
+    }
+
+    /// Detach one committed-response observer chain exactly as the reject and
+    /// client-deadline lifecycles do, with a caller-owned pending hook so an
+    /// external test can observe WHEN the detached work is dropped
+    /// (issue #3815).
+    ///
+    /// `authorization_at` is the admitted credential's absolute authorization
+    /// deadline; `None` reproduces an unauthenticated request, whose cleanup
+    /// keeps only the fixed post-response timeout.
+    pub fn spawn_detached_response_committed_hook_for_test(
+        pending_hook: std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::plugins::RequestContext> + Send + 'static>,
+        >,
+        authorization_at: Option<tokio::time::Instant>,
+    ) {
+        crate::proxy::spawn_detached_response_committed_hooks(
+            pending_hook,
+            Vec::new(),
+            200,
+            std::sync::Arc::new(HashMap::new()),
+            bytes::Bytes::new(),
+            crate::proxy::DetachedResponseCommittedBound { authorization_at },
+        );
+    }
+
+    /// The fixed post-response cleanup timeout a detached committed-response
+    /// chain falls back to when no authorization bound is earlier.
+    #[must_use]
+    pub fn detached_response_committed_cleanup_timeout() -> std::time::Duration {
+        crate::proxy::DETACHED_REJECTION_CLEANUP_TIMEOUT
+    }
+
     /// Publish the validated authenticated-stream maximum, as
     /// `EnvConfig::validate` does, so a test can control the process-wide value
     /// [`precommit_response_phase_deadline_for_test`] reads.

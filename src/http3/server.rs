@@ -12025,22 +12025,25 @@ async fn dispatch_grpc_native_h3(
     // encoding plus a QUIC stream the client is not reading can park
     // `send_response` indefinitely, and the gate above only proves the
     // credential was live when the write was OFFERED.
-    let response_header_write_deadline_at =
-        crate::proxy::auth_lifetime::compose_absolute_bound(grpc_deadline_at, auth_deadline_plan);
+    let response_header_write_bound = crate::proxy::auth_lifetime::ComposedAuthBound::compose(
+        grpc_deadline_at,
+        auth_deadline_plan,
+    );
     let response_header_write = crate::http3::stream_util::await_response_write_before_deadline(
-        response_header_write_deadline_at,
+        response_header_write_bound.deadline(),
         send_half.send_response(resp),
     )
     .await;
-    // An expiry on that write is attributed to whichever bound actually
-    // elapsed. Authorization wins a tie, matching every composed seam: the head
-    // is aborted and reported as an authorization termination rather than
-    // misreported as the client's DEADLINE_EXCEEDED.
+    // An expiry on that write is attributed from the CAPTURED composition, not
+    // by re-reading the clock: a strictly earlier client `grpc-timeout` stays
+    // the client's DEADLINE_EXCEEDED even when this task was not scheduled again
+    // until after the later authorization deadline had also passed. A genuine
+    // tie goes to authorization, matching every composed seam: the head is
+    // aborted and reported as an authorization termination.
     if matches!(
         response_header_write,
         Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded)
-    ) && let Some(termination) =
-        crate::proxy::auth_lifetime::expired_authorization(auth_deadline_plan)
+    ) && let Some(termination) = response_header_write_bound.expired_authorization()
     {
         warn!(
             "native H3 gRPC response head could not be written before the authorization lifetime \
@@ -14390,33 +14393,34 @@ async fn run_h3_deadline_bounded_reject_committed_hooks_with_policy(
             continue;
         }
         let terminal_gateway_deadline = ctx.gateway_deadline_response_selected();
-        let pending_hook = match crate::proxy::run_response_committed_hook_until_deadline(
-            Arc::clone(plugin),
-            ctx,
-            committed_status.as_u16(),
-            &committed_headers,
-            committed_body.clone(),
-            terminal_gateway_deadline,
-        )
-        .await
-        {
-            crate::proxy::ResponseCommittedHookOutcome::Completed => continue,
-            crate::proxy::ResponseCommittedHookOutcome::Detach(hook) => hook,
-            // Authorization expiry (issue #3815). The pending observer is
-            // already dropped, together with the cloned request context and the
-            // response body it owned, and every remaining observer is skipped:
-            // detaching here would run protected-data side effects after the
-            // credential stopped being authorized. The bounded class is already
-            // latched. No deadline provenance is marked, so the representation
-            // the caller writes is unchanged — it is the gateway's own
-            // rejection, not backend payload, so there is nothing left to
-            // withhold.
-            crate::proxy::ResponseCommittedHookOutcome::AuthorizationExpired(_) => {
-                ctx.metadata
-                    .remove(crate::proxy::FINALIZED_SYNTHETIC_RESPONSE_METADATA_KEY);
-                return false;
-            }
-        };
+        let (pending_hook, detached_bound) =
+            match crate::proxy::run_response_committed_hook_until_deadline(
+                Arc::clone(plugin),
+                ctx,
+                committed_status.as_u16(),
+                &committed_headers,
+                committed_body.clone(),
+                terminal_gateway_deadline,
+            )
+            .await
+            {
+                crate::proxy::ResponseCommittedHookOutcome::Completed => continue,
+                crate::proxy::ResponseCommittedHookOutcome::Detach(hook, bound) => (hook, bound),
+                // Authorization expiry (issue #3815). The pending observer is
+                // already dropped, together with the cloned request context and
+                // the response body it owned, and every remaining observer is
+                // skipped: detaching here would run protected-data side effects
+                // after the credential stopped being authorized. The bounded
+                // class is already latched. No deadline provenance is marked, so
+                // the representation the caller writes is unchanged — it is the
+                // gateway's own rejection, not backend payload, so there is
+                // nothing left to withhold.
+                crate::proxy::ResponseCommittedHookOutcome::AuthorizationExpired(_) => {
+                    ctx.metadata
+                        .remove(crate::proxy::FINALIZED_SYNTHETIC_RESPONSE_METADATA_KEY);
+                    return false;
+                }
+            };
 
         if terminal_gateway_deadline {
             ctx.metadata
@@ -14427,6 +14431,7 @@ async fn run_h3_deadline_bounded_reject_committed_hooks_with_policy(
                 committed_status.as_u16(),
                 Arc::new(committed_headers.clone()),
                 committed_body.clone(),
+                detached_bound,
             );
             return false;
         }
@@ -14463,6 +14468,7 @@ async fn run_h3_deadline_bounded_reject_committed_hooks_with_policy(
             deadline_status.as_u16(),
             Arc::new(deadline_headers),
             deadline_body,
+            detached_bound,
         );
         return true;
     }

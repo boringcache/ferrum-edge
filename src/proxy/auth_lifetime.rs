@@ -467,6 +467,101 @@ fn earliest(
     }
 }
 
+/// A composed absolute bound whose WINNING OWNER was decided where both
+/// instants were known (issue #3815).
+///
+/// Two very different owners can drive the same instant: a bound the protocol
+/// already established (the client's own `grpc-timeout` / RPC deadline, an
+/// operator stall timeout) and the admitted credential's authorization
+/// lifetime. Once the bound has fired, "was the authorization deadline in the
+/// past?" is NOT a sound way to ask which of them ended the phase: a task that
+/// is not polled again until after the LATER of the two instants sees both as
+/// elapsed and would report the security decision even though a strictly
+/// earlier protocol bound is what actually bounded it.
+///
+/// Attribution is therefore taken HERE, where both instants are known, and
+/// survives arbitrary observation delay — the same contract
+/// `crate::proxy::DispatchPhaseBound` applies to the dispatch phases.
+///
+/// A tie still goes to authorization, matching the biased select-arm ordering
+/// every relay and write seam uses: when both bounds are genuinely eligible,
+/// the security decision is the one reported.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ComposedAuthBound {
+    at: Option<tokio::time::Instant>,
+    /// The admitted request's authorization plan, retained whether or not it
+    /// won: a caller that must bound DETACHED work by the credential's absolute
+    /// lifetime needs the instant even when a strictly earlier protocol bound
+    /// owns this phase.
+    authorization: Option<StreamAuthDeadline>,
+    /// Whether `at` came from `authorization`.
+    authorization_wins: bool,
+}
+
+impl ComposedAuthBound {
+    /// Compose an admitted request's authorization deadline with whatever
+    /// absolute bound the protocol already established, keeping the winning
+    /// source.
+    #[inline]
+    #[must_use]
+    pub fn compose(
+        protocol_deadline_at: Option<tokio::time::Instant>,
+        auth_deadline: Option<StreamAuthDeadline>,
+    ) -> Self {
+        match (protocol_deadline_at, auth_deadline) {
+            // Authorization wins only when it is genuinely the earliest bound;
+            // a tie goes to authorization.
+            (Some(protocol), Some(plan)) if plan.at <= protocol => Self {
+                at: Some(plan.at),
+                authorization: Some(plan),
+                authorization_wins: true,
+            },
+            (Some(protocol), authorization) => Self {
+                at: Some(protocol),
+                authorization,
+                authorization_wins: false,
+            },
+            (None, Some(plan)) => Self {
+                at: Some(plan.at),
+                authorization: Some(plan),
+                authorization_wins: true,
+            },
+            (None, None) => Self::default(),
+        }
+    }
+
+    /// The instant the bounded work runs under: the earliest of the two.
+    #[inline]
+    #[must_use]
+    pub fn deadline(self) -> Option<tokio::time::Instant> {
+        self.at
+    }
+
+    /// The admitted credential's own absolute authorization deadline, whether
+    /// or not it is the winning bound. `None` for an unauthenticated request.
+    #[inline]
+    #[must_use]
+    pub fn authorization_deadline_at(self) -> Option<tokio::time::Instant> {
+        self.authorization.map(|plan| plan.at)
+    }
+
+    /// The winning bound, once the composed deadline has fired: `Some` only
+    /// when the authorization lifetime is the bound that established it AND
+    /// that instant has actually elapsed.
+    ///
+    /// The clock is still consulted so a bound that fired for some other reason
+    /// can never fabricate an expiry; it is never consulted to CHOOSE between
+    /// the two owners.
+    #[inline]
+    #[must_use]
+    pub fn expired_authorization(self) -> Option<StreamAuthTermination> {
+        if !self.authorization_wins {
+            return None;
+        }
+        expired_authorization(self.authorization)
+    }
+}
+
 /// Compose an admitted request's authorization deadline with whatever absolute
 /// bound the protocol already established (a client `grpc-timeout`, an RPC
 /// deadline), returning the earliest.
@@ -476,16 +571,16 @@ fn earliest(
 /// operator timeout) — neither of which stops a **continuously active** upload
 /// or a **parked** downstream write from outliving the credential that
 /// admitted the stream.
+///
+/// This projection keeps only the instant. A seam that also ATTRIBUTES an
+/// expiry must carry [`ComposedAuthBound`] itself rather than re-deriving the
+/// owner from the clock.
 #[inline]
 pub fn compose_absolute_bound(
     protocol_deadline_at: Option<tokio::time::Instant>,
     auth_deadline: Option<StreamAuthDeadline>,
 ) -> Option<tokio::time::Instant> {
-    match (protocol_deadline_at, auth_deadline.map(|plan| plan.at)) {
-        (Some(protocol), Some(authorization)) => Some(protocol.min(authorization)),
-        (Some(protocol), None) => Some(protocol),
-        (None, authorization) => authorization,
-    }
+    ComposedAuthBound::compose(protocol_deadline_at, auth_deadline).deadline()
 }
 
 /// Attribute an already-fired composed bound: `Some` when the authorization

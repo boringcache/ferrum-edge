@@ -8257,25 +8257,28 @@ async fn run_cross_protocol_reject_committed_hooks(
         let (status, headers, body) =
             reject_committed_response_view(normalized, translated.as_ref());
         let terminal_gateway_deadline = ctx.gateway_deadline_response_selected();
-        let pending_hook = match crate::proxy::run_response_committed_hook_until_deadline(
-            Arc::clone(plugin),
-            ctx,
-            status,
-            headers,
-            body,
-            terminal_gateway_deadline,
-        )
-        .await
-        {
-            crate::proxy::ResponseCommittedHookOutcome::Completed => continue,
-            crate::proxy::ResponseCommittedHookOutcome::Detach(hook) => hook,
-            // Authorization expiry (issue #3815): the pending observer is
-            // already dropped with the cloned request context and the response
-            // body it owned, and every remaining observer is skipped. Nothing
-            // protected is detached past the credential's lifetime; the bounded
-            // class is already latched.
-            crate::proxy::ResponseCommittedHookOutcome::AuthorizationExpired(_) => return false,
-        };
+        let (pending_hook, detached_bound) =
+            match crate::proxy::run_response_committed_hook_until_deadline(
+                Arc::clone(plugin),
+                ctx,
+                status,
+                headers,
+                body,
+                terminal_gateway_deadline,
+            )
+            .await
+            {
+                crate::proxy::ResponseCommittedHookOutcome::Completed => continue,
+                crate::proxy::ResponseCommittedHookOutcome::Detach(hook, bound) => (hook, bound),
+                // Authorization expiry (issue #3815): the pending observer is
+                // already dropped with the cloned request context and the
+                // response body it owned, and every remaining observer is
+                // skipped. Nothing protected is detached past the credential's
+                // lifetime; the bounded class is already latched.
+                crate::proxy::ResponseCommittedHookOutcome::AuthorizationExpired(_) => {
+                    return false;
+                }
+            };
 
         let deadline_replaced = !terminal_gateway_deadline;
         if deadline_replaced {
@@ -8297,6 +8300,7 @@ async fn run_cross_protocol_reject_committed_hooks(
             status,
             Arc::new(headers.clone()),
             body,
+            detached_bound,
         );
         return deadline_replaced;
     }
@@ -8860,24 +8864,26 @@ where
             continue;
         }
         let terminal_gateway_deadline = ctx.gateway_deadline_response_selected();
-        let pending_hook = match crate::proxy::run_response_committed_hook_until_deadline(
-            Arc::clone(plugin),
-            ctx,
-            normalized.http_status.as_u16(),
-            &normalized.headers,
-            normalized.body.clone(),
-            terminal_gateway_deadline,
-        )
-        .await
-        {
-            crate::proxy::ResponseCommittedHookOutcome::Completed => continue,
-            crate::proxy::ResponseCommittedHookOutcome::Detach(hook) => hook,
-            // Authorization expiry (issue #3815): the pending observer is
-            // already dropped with the cloned request context and the response
-            // body it owned, and every remaining observer is skipped rather
-            // than detached. The bounded class is already latched.
-            crate::proxy::ResponseCommittedHookOutcome::AuthorizationExpired(_) => break,
-        };
+        let (pending_hook, detached_bound) =
+            match crate::proxy::run_response_committed_hook_until_deadline(
+                Arc::clone(plugin),
+                ctx,
+                normalized.http_status.as_u16(),
+                &normalized.headers,
+                normalized.body.clone(),
+                terminal_gateway_deadline,
+            )
+            .await
+            {
+                crate::proxy::ResponseCommittedHookOutcome::Completed => continue,
+                crate::proxy::ResponseCommittedHookOutcome::Detach(hook, bound) => (hook, bound),
+                // Authorization expiry (issue #3815): the pending observer is
+                // already dropped with the cloned request context and the
+                // response body it owned, and every remaining observer is
+                // skipped rather than detached. The bounded class is already
+                // latched.
+                crate::proxy::ResponseCommittedHookOutcome::AuthorizationExpired(_) => break,
+            };
         if !terminal_gateway_deadline {
             ctx.mark_gateway_deadline_response_selected();
             normalized = normalized_h3_grpc_deadline();
@@ -8889,6 +8895,7 @@ where
             normalized.http_status.as_u16(),
             Arc::new(normalized.headers.clone()),
             normalized.body.clone(),
+            detached_bound,
         );
         break;
     }

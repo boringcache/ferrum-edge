@@ -19367,7 +19367,7 @@ fn replace_rejection_with_gateway_deadline(
     ctx.sync_deadline_response_terminal_headers(response_headers);
 }
 
-const DETACHED_REJECTION_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const DETACHED_REJECTION_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct OwnedRejectionHookResult {
     ctx: RequestContext,
@@ -21085,7 +21085,7 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
                 continue;
             }
             let terminal_gateway_deadline = ctx.gateway_deadline_response_selected();
-            let pending_hook = match run_response_committed_hook_until_deadline(
+            let (pending_hook, detached_bound) = match run_response_committed_hook_until_deadline(
                 Arc::clone(plugin),
                 ctx,
                 normalized.http_status.as_u16(),
@@ -21096,7 +21096,7 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
             .await
             {
                 ResponseCommittedHookOutcome::Completed => continue,
-                ResponseCommittedHookOutcome::Detach(hook) => hook,
+                ResponseCommittedHookOutcome::Detach(hook, bound) => (hook, bound),
                 // Authorization expiry: the pending observer is already
                 // dropped, every remaining observer is skipped, and the fixed
                 // authorization terminal replaces the response. Nothing is
@@ -21122,6 +21122,7 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
                 *status,
                 Arc::new(headers.clone()),
                 body.clone(),
+                detached_bound,
             );
             break;
         }
@@ -24192,7 +24193,17 @@ pub(crate) enum ResponseCommittedHookOutcome {
     /// The CLIENT's own RPC deadline is the winning bound. Legacy semantics:
     /// the pending invocation moves to bounded, owned post-response cleanup so
     /// it can finish without borrowing the response writer.
-    Detach(OwnedResponseCommittedHookFuture),
+    ///
+    /// The carried bound is the admitted credential's ABSOLUTE authorization
+    /// deadline (issue #3815). The client's RPC deadline winning does not make
+    /// the credential's lifetime irrelevant: the detached invocation still owns
+    /// a clone of the request context and the protected response body, and the
+    /// fixed five-second cleanup timeout alone would let it keep processing
+    /// them past that instant.
+    Detach(
+        OwnedResponseCommittedHookFuture,
+        DetachedResponseCommittedBound,
+    ),
     /// The admitted credential's authorization lifetime is the winning bound
     /// (issue #3815). The pending invocation was DROPPED here — together with
     /// the cloned request context and the protected response body it owned —
@@ -24219,6 +24230,9 @@ pub(crate) async fn run_response_committed_hook_until_deadline(
 ) -> ResponseCommittedHookOutcome {
     let bound = ctx.precommit_response_phase_bound();
     let deadline = bound.deadline();
+    let detached_bound = DetachedResponseCommittedBound {
+        authorization_at: bound.authorization_deadline_at(),
+    };
     if !terminal_gateway_deadline && deadline.is_none() {
         plugin
             .on_response_committed(
@@ -24258,10 +24272,10 @@ pub(crate) async fn run_response_committed_hook_until_deadline(
             *ctx = completed;
             return ResponseCommittedHookOutcome::Completed;
         }
-        return ResponseCommittedHookOutcome::Detach(hook);
+        return ResponseCommittedHookOutcome::Detach(hook, detached_bound);
     }
     let Some(deadline) = deadline else {
-        return ResponseCommittedHookOutcome::Detach(hook);
+        return ResponseCommittedHookOutcome::Detach(hook, detached_bound);
     };
     let deadline_sleep = tokio::time::sleep_until(deadline);
     tokio::pin!(deadline_sleep);
@@ -24282,21 +24296,56 @@ pub(crate) async fn run_response_committed_hook_until_deadline(
                 ctx.record_authorization_termination_once(termination, family);
                 ResponseCommittedHookOutcome::AuthorizationExpired(termination)
             }
-            None => ResponseCommittedHookOutcome::Detach(hook),
+            None => ResponseCommittedHookOutcome::Detach(hook, detached_bound),
         };
     };
     *ctx = completed;
     ResponseCommittedHookOutcome::Completed
 }
 
+/// The absolute authorization bound a DETACHED committed-response cleanup runs
+/// under (issue #3815).
+///
+/// Produced by [`run_response_committed_hook_until_deadline`] from the SAME
+/// composed pre-commitment bound the synchronous phase used, and consumed by
+/// [`spawn_detached_response_committed_hooks`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DetachedResponseCommittedBound {
+    /// The admitted credential's absolute authorization deadline, when this
+    /// request carried one. `None` for an unauthenticated request, which this
+    /// contract does not bound at all — its cleanup keeps exactly the fixed
+    /// post-response timeout it always had.
+    pub(crate) authorization_at: Option<tokio::time::Instant>,
+}
+
+/// Continue a committed-response observer chain off the response frame, bounded
+/// by the EARLIEST of the fixed post-response cleanup timeout and the admitted
+/// credential's absolute authorization deadline.
+///
+/// The client's own RPC deadline can be strictly earlier than the credential's
+/// lifetime, so this cleanup is entered while the credential is still
+/// authorized. Bounding it by the five-second timeout alone let the pending
+/// hook and every remaining observer keep holding and processing the cloned
+/// request context and the protected response body after that lifetime elapsed.
+/// `timeout_at` cancels the whole chain, so the hook, the remaining observers,
+/// the context clone, and the body are all dropped no later than the bound.
+///
+/// The response the client already received is untouched: this is post-terminal
+/// observer work, the RPC terminal was decided by the client deadline, and
+/// nothing here records an authorization termination — counting one would
+/// double-count a stream that was already ended by another bound.
 pub(crate) fn spawn_detached_response_committed_hooks(
     pending_hook: OwnedResponseCommittedHookFuture,
     remaining_plugins: Vec<Arc<dyn Plugin>>,
     response_status: u16,
     response_headers: Arc<HashMap<String, String>>,
     response_body: Bytes,
+    bound: DetachedResponseCommittedBound,
 ) {
     std::mem::drop(tokio::spawn(async move {
+        let cleanup_at = tokio::time::Instant::now() + DETACHED_REJECTION_CLEANUP_TIMEOUT;
+        let authorization_at = bound.authorization_at.filter(|at| *at < cleanup_at);
+        let deadline = authorization_at.unwrap_or(cleanup_at);
         let cleanup = async move {
             let mut ctx = pending_hook.await;
             for plugin in remaining_plugins {
@@ -24313,14 +24362,20 @@ pub(crate) fn spawn_detached_response_committed_hooks(
                     .await;
             }
         };
-        if tokio::time::timeout(DETACHED_REJECTION_CLEANUP_TIMEOUT, cleanup)
-            .await
-            .is_err()
-        {
-            warn!(
-                timeout_seconds = DETACHED_REJECTION_CLEANUP_TIMEOUT.as_secs(),
-                "detached committed-response cleanup exceeded its post-response bound"
-            );
+        if tokio::time::timeout_at(deadline, cleanup).await.is_err() {
+            if authorization_at.is_some() {
+                // A compiled-in literal: no expiry instant, claim, subject,
+                // certificate field, or provider detail.
+                warn!(
+                    "detached committed-response cleanup was cancelled at the admitted stream's \
+                     authorization lifetime"
+                );
+            } else {
+                warn!(
+                    timeout_seconds = DETACHED_REJECTION_CLEANUP_TIMEOUT.as_secs(),
+                    "detached committed-response cleanup exceeded its post-response bound"
+                );
+            }
         }
     }));
 }
@@ -24344,7 +24399,7 @@ pub(crate) async fn run_deadline_bounded_response_committed_hooks(
             continue;
         }
         let terminal_gateway_deadline = ctx.gateway_deadline_response_selected();
-        let pending_hook = match run_response_committed_hook_until_deadline(
+        let (pending_hook, detached_bound) = match run_response_committed_hook_until_deadline(
             Arc::clone(plugin),
             ctx,
             *response_status,
@@ -24355,7 +24410,7 @@ pub(crate) async fn run_deadline_bounded_response_committed_hooks(
         .await
         {
             ResponseCommittedHookOutcome::Completed => continue,
-            ResponseCommittedHookOutcome::Detach(hook) => hook,
+            ResponseCommittedHookOutcome::Detach(hook, bound) => (hook, bound),
             // Authorization expiry: the observer is already dropped and every
             // remaining observer is skipped. The fixed authorization terminal
             // replaces the buffered response; nothing protected is detached.
@@ -24413,6 +24468,7 @@ pub(crate) async fn run_deadline_bounded_response_committed_hooks(
             *response_status,
             Arc::new(response_headers.clone()),
             response_body.clone(),
+            detached_bound,
         );
         return true;
     }
@@ -24487,7 +24543,7 @@ async fn build_grpc_web_reject_response(
                 continue;
             }
             let terminal_gateway_deadline = ctx.gateway_deadline_response_selected();
-            let pending_hook = match run_response_committed_hook_until_deadline(
+            let (pending_hook, detached_bound) = match run_response_committed_hook_until_deadline(
                 Arc::clone(plugin),
                 ctx,
                 StatusCode::OK.as_u16(),
@@ -24498,7 +24554,7 @@ async fn build_grpc_web_reject_response(
             .await
             {
                 ResponseCommittedHookOutcome::Completed => continue,
-                ResponseCommittedHookOutcome::Detach(hook) => hook,
+                ResponseCommittedHookOutcome::Detach(hook, bound) => (hook, bound),
                 // Authorization expiry: the observer is already dropped, every
                 // remaining observer is skipped, and the gRPC-Web terminal
                 // becomes the fixed body-framed `UNAUTHENTICATED` one. Nothing
@@ -24556,6 +24612,7 @@ async fn build_grpc_web_reject_response(
                 StatusCode::OK.as_u16(),
                 Arc::new(translated.headers.clone()),
                 Bytes::from(translated.body.clone()),
+                detached_bound,
             );
             break;
         }

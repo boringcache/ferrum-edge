@@ -396,8 +396,9 @@ direction.
 
 **Ownership.** The pump is the upstream body's sole owner and sole poller. The
 client-visible body holds only the receiving end of a bounded channel. Nothing
-is shared between them except that channel and three write-once flags, so there
-is **no lock on the response path** — the hot-path invariant forbids one, and a
+is shared between them except that channel and a handful of write-once flags, so
+there is **no lock on the response path** — the hot-path invariant forbids one,
+and a
 lock would also let a task enforcing the deadline block behind somebody else's
 inner `poll_frame`. Single ownership is what makes the terminal winner
 authoritative: one task decides, in one biased `select!`, whether this response
@@ -405,6 +406,24 @@ completed or expired. A response that reached its own terminal before the
 deadline can no longer be counted or closed by a racing watchdog, and a response
 still in flight at the deadline cannot escape it by completing in parallel. At
 the exact deadline instant the security bound wins, deterministically.
+
+**One owner means one clock.** The protocol adapter wrapped around the pump —
+`TotalDeadlineBody`, which owns the client-visible terminal *shapes* (native
+`grpc-status: 16` trailers, the bounded gRPC-Web frame, the deterministic
+HTTP/SSE transport error) and the deferred-accounting classification — carries
+**no authorization timer of its own**. It observes the pump's published
+decision instead. A second timer there would be a second owner and would reopen
+exactly the race single ownership exists to close: the pump can reach a clean
+upstream EOF (or an upstream error) well before the deadline and queue that
+terminal, while a downstream parked on flow control does not poll it until long
+after; an independent sleep in the adapter would then overwrite that completed
+response with an authorization terminal, set the classification flag, and record
+the shared latch for a stream this contract never terminated. The decision is
+published with `Release` **before** the channel closure that wakes the adapter,
+so the wake-up can never be observed ahead of the decision that explains it, and
+it is read **before** the channel, so a frame the pump handed over just before
+the deadline is not delivered ahead of the terminal. The client `grpc-timeout`
+wrapper installed *inside* this one keeps its own timer and is unchanged.
 
 **Backpressure.** The channel bound is one frame, and the pump reserves capacity
 *before* it reads the next frame, so at most one frame is ever in flight and the
@@ -481,6 +500,18 @@ resolved by `PrecommitPhaseResult`:
   is the fixed, redacted pre-commitment one. A tie is attributed to
   authorization, matching every relay's biased select ordering.
 
+Attribution comes from the **captured composition**, never from re-reading the
+clock once the bound has fired. Asking "is the authorization deadline in the
+past?" after the fact is a scheduling race: a phase that is not polled again
+until after the *later* of the two instants sees both as elapsed, and a strictly
+earlier client `grpc-timeout` would be reattributed to the gateway's security
+decision — silently changing client `grpc-timeout` behavior. The winning owner
+is decided in `ComposedAuthBound::compose`, where both instants are known, and
+survives arbitrary observation delay; the clock is still consulted for the
+authorization case, so a bound that fired for some other reason can never
+fabricate an expiry. The native-H3 response-head write uses the same typed
+bound.
+
 The committed-response observer is the one phase where an elapsed bound used to
 mean "continue in the background". That detach survives only for the
 client-owned RPC deadline. When the authorization bound wins, the pending hook —
@@ -489,6 +520,19 @@ is dropped rather than spawned, and every remaining observer is skipped: a
 detached continuation is precisely a protected-data side effect running after
 the credential stopped being authorized. An already-elapsed bound is decided
 before the observer is constructed at all, so no clone is ever handed out.
+
+When the **client's** RPC deadline is the earlier bound the hook is still
+detached — but the credential's own lifetime does not stop mattering, because
+the detached invocation keeps holding that context clone and that protected body.
+The detached cleanup therefore runs under the **earliest** of the fixed
+five-second post-response timeout and the admitted credential's absolute
+authorization deadline, so the pending hook and every remaining observer are
+cancelled and dropped no later than that instant. The client's RPC terminal is
+untouched — this is post-terminal observer work — and nothing here records an
+authorization termination: the stream's terminal was decided by another bound,
+so counting one would be a false, and on a bidirectional stream a double,
+termination. An unauthenticated request carries no bound and keeps exactly the
+fixed timeout it always had.
 
 Native HTTP/3 gRPC has its own equivalents, because that relay writes its own
 response head instead of returning a `ProxyBody`. A gate runs immediately before

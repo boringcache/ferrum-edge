@@ -2750,10 +2750,15 @@ fn every_precommit_h3_grpc_terminal_is_preceded_by_the_authorization_gate() {
 /// The response HEADERS write is bounded by the COMPOSED bound, and an
 /// authorization expiry on it resets rather than misreporting the client's
 /// `DEADLINE_EXCEEDED`.
+///
+/// The composition is the TYPED one: attribution must come from the captured
+/// bound rather than from re-reading the clock after the write returns, or a
+/// strictly earlier client `grpc-timeout` observed after a late wake would be
+/// reattributed to the security decision.
 #[test]
 fn the_h3_grpc_response_head_write_is_bounded_by_the_composed_deadline() {
     let region = H3_SERVER_SOURCE
-        .split("let response_header_write_deadline_at =")
+        .split("let response_header_write_bound =")
         .nth(1)
         .expect("composed response-header write bound");
     let assignment = region
@@ -2761,21 +2766,28 @@ fn the_h3_grpc_response_head_write_is_bounded_by_the_composed_deadline() {
         .next()
         .expect("the composed bound assignment");
     assert!(
-        assignment.contains("compose_absolute_bound(")
+        assignment.contains("ComposedAuthBound::compose(")
             && assignment.contains("grpc_deadline_at")
             && assignment.contains("auth_deadline_plan"),
         "the head write must race the EARLIEST of the client RPC deadline and the \
-         authorization deadline, not the client deadline alone"
+         authorization deadline, not the client deadline alone, and must keep the \
+         winning source"
     );
     let bounded = region
         .split("if let Err(write_error) = response_header_write {")
         .next()
         .expect("bounded head-write region");
     assert!(bounded.contains("send_half.send_response(resp),"));
+    assert!(
+        !bounded.contains("expired_authorization(auth_deadline_plan)"),
+        "the head write must not re-derive the winning owner from the clock; a strictly \
+         earlier client deadline observed after a late wake would be misattributed to \
+         authorization"
+    );
     // Authorization is attributed BEFORE the generic deadline branch, and the
     // generic branch is the only one that may report DEADLINE_EXCEEDED.
     let auth_at = bounded
-        .find("crate::proxy::auth_lifetime::expired_authorization(auth_deadline_plan)")
+        .find("response_header_write_bound.expired_authorization()")
         .expect("authorization attribution");
     let terminal_at = bounded
         .find("h3_grpc_authorization_precommit_terminal!(termination, false)")
@@ -2822,4 +2834,305 @@ fn every_h3_authorization_exit_records_through_the_request_latch() {
         .expect("blocked-write seam");
     assert!(seam.contains("latch: &crate::proxy::auth_lifetime::StreamAuthTerminationLatch,"));
     assert!(seam.contains("latch.record_once(plan.termination, family);"));
+}
+
+// --- Captured attribution for the pre-commitment phase bound ----------------
+//
+// Two very different owners can drive the same instant: the client's own
+// `grpc-timeout` and the admitted credential's authorization lifetime. Once the
+// bound has fired, "is the authorization deadline in the past?" is not a sound
+// way to ask which of them ended the phase — a task that is not polled again
+// until after the LATER of the two sees both as elapsed. Attribution must come
+// from the composition, where both instants were known.
+
+fn plan_after(
+    after: Duration,
+    termination: StreamAuthTermination,
+) -> Option<StreamAuthDeadline> {
+    Some(StreamAuthDeadline {
+        at: tokio::time::Instant::now() + after,
+        termination,
+    })
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_strictly_earlier_protocol_bound_stays_the_protocols_after_a_late_wake() {
+    let protocol_at = tokio::time::Instant::now() + Duration::from_secs(5);
+    let bound = ferrum_edge::_test_support::compose_precommit_response_phase_bound_for_test(
+        Some(protocol_at),
+        plan_after(
+            Duration::from_secs(30),
+            StreamAuthTermination::CredentialExpired,
+        ),
+    );
+    assert_eq!(
+        bound.deadline(),
+        Some(protocol_at),
+        "the earliest bound owns the phase"
+    );
+
+    // The phase fires at the client's deadline, and the task that must
+    // attribute it is not scheduled again until long after the LATER
+    // authorization deadline has also passed.
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    assert_eq!(
+        bound.expired_authorization(),
+        None,
+        "a strictly earlier client RPC deadline must stay the client's own bound; \
+         re-reading the clock after a late wake would reattribute it to the gateway's \
+         security decision and change client grpc-timeout behavior"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_earlier_authorization_bound_is_reported_once_its_instant_elapsed() {
+    let bound = ferrum_edge::_test_support::compose_precommit_response_phase_bound_for_test(
+        Some(tokio::time::Instant::now() + Duration::from_secs(30)),
+        plan_after(
+            Duration::from_secs(5),
+            StreamAuthTermination::CredentialExpired,
+        ),
+    );
+    // Composed, but not yet elapsed: an early gate must not report an expiry
+    // for a credential that is still authorized.
+    assert_eq!(bound.expired_authorization(), None);
+
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    assert_eq!(
+        bound.expired_authorization(),
+        Some(StreamAuthTermination::CredentialExpired),
+        "the earlier authorization bound owns the phase once its instant has elapsed"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_exact_tie_between_the_two_bounds_goes_to_authorization() {
+    let at = tokio::time::Instant::now() + Duration::from_secs(5);
+    let bound = ferrum_edge::_test_support::compose_precommit_response_phase_bound_for_test(
+        Some(at),
+        Some(StreamAuthDeadline {
+            at,
+            termination: StreamAuthTermination::AuthenticatedStreamMaxLifetime,
+        }),
+    );
+    assert_eq!(bound.deadline(), Some(at));
+
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    assert_eq!(
+        bound.expired_authorization(),
+        Some(StreamAuthTermination::AuthenticatedStreamMaxLifetime),
+        "a genuine tie resolves to the security decision, matching every biased select arm"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unauthenticated_precommit_phase_never_reports_an_authorization_expiry() {
+    let bound = ferrum_edge::_test_support::compose_precommit_response_phase_bound_for_test(
+        Some(tokio::time::Instant::now() + Duration::from_secs(1)),
+        None,
+    );
+    assert_eq!(bound.authorization_deadline_at(), None);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(bound.expired_authorization(), None);
+}
+
+// --- Detached committed-response cleanup ------------------------------------
+//
+// `run_response_committed_hook_until_deadline` detaches a pending observer when
+// the CLIENT's own RPC deadline is the winning bound. That detached invocation
+// still owns a clone of the request context and the protected response body, so
+// the fixed post-response cleanup timeout alone would let it keep them past the
+// credential's authorization lifetime whenever
+// `client_deadline < authorization_deadline < client_deadline + 5s`.
+
+/// A detached hook that never completes and reports when it is dropped.
+struct NeverCompletingHook(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for NeverCompletingHook {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+fn never_completing_hook(
+    dropped: &Arc<std::sync::atomic::AtomicBool>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = RequestContext> + Send + 'static>> {
+    let guard = NeverCompletingHook(Arc::clone(dropped));
+    Box::pin(async move {
+        // The guard is owned by the future, exactly as the real detached hook
+        // owns the cloned request context and the protected response body.
+        let _guard = guard;
+        std::future::pending::<()>().await;
+        unreachable!("the pending hook never completes")
+    })
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_detached_committed_hook_is_cancelled_at_the_authorization_bound() {
+    let cleanup_timeout = ferrum_edge::_test_support::detached_response_committed_cleanup_timeout();
+    // The client RPC deadline already won and detached this hook; the
+    // credential's own lifetime is still ahead, but strictly inside the fixed
+    // cleanup window.
+    let authorization_at = tokio::time::Instant::now() + Duration::from_secs(2);
+    assert!(
+        Duration::from_secs(2) < cleanup_timeout,
+        "this test only means anything while the authorization bound is inside the \
+         fixed cleanup window"
+    );
+    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    ferrum_edge::_test_support::spawn_detached_response_committed_hook_for_test(
+        never_completing_hook(&dropped),
+        Some(authorization_at),
+    );
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(
+        !dropped.load(std::sync::atomic::Ordering::SeqCst),
+        "the detached observer runs normally while the credential is still authorized"
+    );
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        dropped.load(std::sync::atomic::Ordering::SeqCst),
+        "the detached hook — and with it the cloned request context and the protected \
+         response body — must be dropped at the authorization lifetime, not held for the \
+         remainder of the fixed cleanup timeout"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_detached_committed_hook_keeps_the_fixed_timeout_without_an_authorization_bound() {
+    let cleanup_timeout = ferrum_edge::_test_support::detached_response_committed_cleanup_timeout();
+    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    ferrum_edge::_test_support::spawn_detached_response_committed_hook_for_test(
+        never_completing_hook(&dropped),
+        None,
+    );
+
+    tokio::time::sleep(cleanup_timeout - Duration::from_millis(500)).await;
+    assert!(
+        !dropped.load(std::sync::atomic::Ordering::SeqCst),
+        "an unauthenticated request is not bounded by this contract at all"
+    );
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(
+        dropped.load(std::sync::atomic::Ordering::SeqCst),
+        "the fixed post-response cleanup timeout still applies"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_later_authorization_bound_never_extends_the_fixed_cleanup_timeout() {
+    let cleanup_timeout = ferrum_edge::_test_support::detached_response_committed_cleanup_timeout();
+    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    ferrum_edge::_test_support::spawn_detached_response_committed_hook_for_test(
+        never_completing_hook(&dropped),
+        Some(tokio::time::Instant::now() + cleanup_timeout * 10),
+    );
+
+    tokio::time::sleep(cleanup_timeout + Duration::from_secs(1)).await;
+    assert!(
+        dropped.load(std::sync::atomic::Ordering::SeqCst),
+        "the EARLIEST of the two bounds wins; a long-lived credential may not extend the \
+         fixed post-response cleanup window"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_already_elapsed_authorization_bound_detaches_nothing() {
+    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    ferrum_edge::_test_support::spawn_detached_response_committed_hook_for_test(
+        never_completing_hook(&dropped),
+        tokio::time::Instant::now().checked_sub(Duration::from_secs(1)),
+    );
+
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    assert!(
+        dropped.load(std::sync::atomic::Ordering::SeqCst),
+        "a credential that is already unauthorized must not get a cleanup window at all"
+    );
+}
+
+#[tokio::test]
+async fn the_detached_bound_carries_the_credential_lifetime_even_when_the_client_wins() {
+    // The seam that produces the detached bound is the same composed
+    // pre-commitment bound the synchronous phase used, so a client `grpc-timeout`
+    // winning the phase must NOT erase the credential's absolute deadline.
+    ferrum_edge::_test_support::publish_authenticated_stream_max_lifetime_seconds_for_test(120);
+    let ctx = authenticated_ctx();
+    let authorization_at =
+        ferrum_edge::_test_support::detached_response_committed_authorization_bound_for_test(&ctx)
+            .expect("an admitted authenticated request carries an absolute authorization bound");
+    assert!(
+        authorization_at <= tokio::time::Instant::now() + Duration::from_secs(120),
+        "the detached bound must never exceed the finite authenticated-stream maximum"
+    );
+    assert_eq!(
+        ferrum_edge::_test_support::detached_response_committed_authorization_bound_for_test(
+            &anonymous_ctx()
+        ),
+        None,
+        "an unauthenticated request carries no authorization bound"
+    );
+    ferrum_edge::_test_support::publish_authenticated_stream_max_lifetime_seconds_for_test(3_600);
+}
+
+/// Every detached committed-response handoff carries the bound (issue #3815).
+///
+/// The spawner is reached from six lifecycles across `proxy/mod.rs`,
+/// `http3/server.rs`, and `http3/cross_protocol.rs`; a call site that forgot the
+/// bound would silently restore the unbounded-past-expiry shape.
+#[test]
+fn every_detached_committed_hook_handoff_carries_the_authorization_bound() {
+    for (name, source) in [
+        ("proxy/mod.rs", include_str!("../../../src/proxy/mod.rs")),
+        ("http3/server.rs", H3_SERVER_SOURCE),
+        (
+            "http3/cross_protocol.rs",
+            include_str!("../../../src/http3/cross_protocol.rs"),
+        ),
+    ] {
+        for (index, call) in source
+            .split("spawn_detached_response_committed_hooks(")
+            .skip(1)
+            .enumerate()
+        {
+            // Skip the definition and the doc/test-support references, which do
+            // not open an argument list ending in `);`.
+            let args = call.split(");").next().expect("bounded argument list");
+            if args.contains("pending_hook: OwnedResponseCommittedHookFuture") {
+                continue;
+            }
+            assert!(
+                args.contains("detached_bound") || args.contains("DetachedResponseCommittedBound"),
+                "{name} handoff #{index} detaches committed-response work without the \
+                 admitted credential's absolute authorization bound"
+            );
+        }
+    }
+
+    // Cancelling that cleanup must not record a termination: the RPC terminal
+    // was already decided by the client's own deadline, so counting one here
+    // would be a false — and, on a stream the response body also bounded, a
+    // double — authorization termination.
+    let spawner = include_str!("../../../src/proxy/mod.rs")
+        .split("pub(crate) fn spawn_detached_response_committed_hooks(")
+        .nth(1)
+        .expect("the detached committed-response spawner")
+        .split("\n/// ")
+        .next()
+        .expect("bounded spawner body");
+    assert!(
+        !spawner.contains("record_once(") && !spawner.contains("record_termination("),
+        "the detached cleanup must not record an authorization termination for a response \
+         whose terminal another bound already decided"
+    );
+    assert!(
+        spawner.contains("timeout_at("),
+        "the detached cleanup must run under an ABSOLUTE bound, not a fresh relative timeout"
+    );
 }

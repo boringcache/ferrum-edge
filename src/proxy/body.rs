@@ -1040,6 +1040,20 @@ impl ProxyBody {
     /// completed or expired, so a response that reached its own terminal before
     /// the deadline can never be counted or closed by a racing watchdog.
     ///
+    /// The [`TotalDeadlineBody`] wrapped around that pump therefore carries NO
+    /// authorization timer of its own; it reacts to the pump's published
+    /// decision. It exists here only to own the client-visible terminal SHAPES
+    /// (native `grpc-status: 16` trailers, the bounded gRPC-Web frame, the
+    /// deterministic HTTP/SSE transport error) and the deferred-accounting
+    /// classification. A second timer would be a second owner: the pump can
+    /// reach a clean upstream EOF (or an upstream error) well before the
+    /// deadline and queue that terminal, while a downstream parked on flow
+    /// control does not poll it until long after — and an independent sleep
+    /// here would then overwrite that completed response with an authorization
+    /// terminal, set `fired`, and record the latch for a stream this contract
+    /// never terminated. The client `grpc-timeout` wrapper installed INSIDE
+    /// this one keeps its own timer and is unaffected.
+    ///
     /// `closer` is `None` for frontends that own their own downstream writes and
     /// already bound every one of them (the native HTTP/3 relays), where a
     /// transport close would be both unnecessary and wrong.
@@ -1095,14 +1109,17 @@ impl ProxyBody {
                     Arc::clone(&fired),
                     closer,
                 );
+                let expiry = guarded.expiry_decision();
                 let bounded = TotalDeadlineBody::with_terminal(
                     guarded,
-                    Some(deadline.at),
+                    // No timer here: the pump owns the decision.
+                    None,
                     deadline_frame,
                     Arc::clone(&fired),
                     terminal,
                     Some(auth_latch),
-                );
+                )
+                .with_pump_expiry(expiry);
                 ProxyBodyKind::Stream(Box::pin(bounded))
             }
             ProxyBodyKind::Tracked(body) => {
@@ -1114,14 +1131,17 @@ impl ProxyBody {
                     Arc::clone(&fired),
                     closer,
                 );
+                let expiry = guarded.expiry_decision();
                 let bounded = TotalDeadlineBody::with_terminal(
                     guarded,
-                    Some(deadline.at),
+                    // No timer here: the pump owns the decision.
+                    None,
                     deadline_frame,
                     Arc::clone(&fired),
                     terminal,
                     Some(auth_latch),
-                );
+                )
+                .with_pump_expiry(expiry);
                 ProxyBodyKind::Stream(Box::pin(bounded))
             }
             full @ ProxyBodyKind::Full(_) => full,
@@ -3813,6 +3833,18 @@ struct TotalDeadlineBody<B> {
     /// the authorization-lifetime regime, where the request-upload body may be
     /// racing the same absolute plan in the opposite direction.
     auth_latch: Option<crate::proxy::auth_lifetime::StreamAuthTerminationLatch>,
+    /// The gateway-owned response pump's completed-versus-expired decision.
+    ///
+    /// Present ONLY in the authorization-lifetime regime, and when it is
+    /// present `deadline` is deliberately `None`: the pump is the sole owner of
+    /// that decision, and a second timer here would overwrite a response that
+    /// reached its own terminal BEFORE the deadline with an authorization
+    /// terminal whenever the transport did not poll this body until after it
+    /// (see `crate::proxy::response_watchdog`). Enforcement is the pump's, so
+    /// deferring to it costs nothing: it releases the upstream and closes the
+    /// transport without any downstream poll, and the closure that publishes
+    /// its decision is exactly what wakes this body.
+    pump_expiry: Option<crate::proxy::response_watchdog::AuthorizationExpiryDecision>,
     saw_data: bool,
     done: bool,
 }
@@ -3908,13 +3940,92 @@ impl<B> TotalDeadlineBody<B> {
             deadline_fired,
             terminal,
             auth_latch,
+            pump_expiry: None,
             saw_data: false,
             done: false,
         }
     }
 
+    /// Settle this adapter's authorization terminal from the gateway-owned
+    /// response pump's decision instead of a timer of its own.
+    fn with_pump_expiry(
+        mut self,
+        expiry: crate::proxy::response_watchdog::AuthorizationExpiryDecision,
+    ) -> Self {
+        debug_assert!(
+            self.deadline.is_none(),
+            "the pump owns the authorization decision; this adapter must not also arm a timer"
+        );
+        self.deadline = None;
+        self.pump_expiry = Some(expiry);
+        self
+    }
+
     fn deadline_fired_handle(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.deadline_fired)
+    }
+
+    /// Emit this regime's protocol-correct terminal for a bound that has been
+    /// decided to have fired — either by this adapter's own timer (the client
+    /// `grpc-timeout` regime) or by the gateway-owned response pump (the
+    /// authorization regime).
+    ///
+    /// Reachable at most once per body: the `done` flag is set here and checked
+    /// at the top of `poll_frame`.
+    fn emit_deadline_terminal(&mut self) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+        self.done = true;
+        self.deadline = None;
+        self.deadline_fired.store(true, Ordering::Release);
+        // The `done` guard makes this reachable at most once per body. The
+        // shared latch additionally makes it at most once per REQUEST: a
+        // bidirectional stream whose request-upload body is racing the same
+        // absolute plan records the class from whichever direction fires first,
+        // and the pump that owns this decision already recorded through the same
+        // latch, so the fixed-cardinality counter is incremented exactly once
+        // per terminated stream.
+        if let Some((termination, family)) = self.terminal.auth_termination {
+            match self.auth_latch.as_ref() {
+                Some(latch) => {
+                    latch.record_once(termination, family);
+                }
+                None => crate::proxy::auth_lifetime::record_termination(termination, family),
+            }
+        }
+        // Cancel upstream work and release its stream/accounting guards as soon
+        // as the deadline fires, before the downstream polls again.
+        self.inner.take();
+        if !self.saw_data {
+            if let Some(frame) = self.deadline_frame.take() {
+                return Poll::Ready(Some(Ok(frame)));
+            }
+            if !self.terminal.native_grpc_trailers {
+                // Ordinary HTTP or SSE: the response head is already committed
+                // and there is no legal terminal metadata for this flavor. End
+                // with a transport error — which resets H2/H3 and terminates an
+                // H1 chunked/SSE body — rather than fabricating `grpc-status`
+                // trailers for a client that never spoke gRPC, and rather than a
+                // clean EOF that would be indistinguishable from a complete
+                // response.
+                return Poll::Ready(Some(Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    self.terminal.pre_data_message,
+                )) as BoxError)));
+            }
+            let mut trailers = http::HeaderMap::new();
+            trailers.insert(
+                "grpc-status",
+                http::HeaderValue::from_static(self.terminal.grpc_status_header),
+            );
+            trailers.insert(
+                "grpc-message",
+                http::HeaderValue::from_static(self.terminal.grpc_message_header),
+            );
+            return Poll::Ready(Some(Ok(Frame::trailers(trailers))));
+        }
+        Poll::Ready(Some(Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            self.terminal.post_data_message,
+        )) as BoxError)))
     }
 }
 
@@ -3941,66 +4052,28 @@ where
         if this.done {
             return Poll::Ready(None);
         }
+        // The AUTHORIZATION regime has no clock here: the gateway-owned pump is
+        // the sole owner of the completed-versus-expired decision, and it
+        // publishes an expiry before the channel closure that wakes this body.
+        // Read it BEFORE the channel, so a frame the pump had already handed
+        // over when the deadline arrived is not delivered ahead of the terminal.
+        if this
+            .pump_expiry
+            .as_ref()
+            .is_some_and(crate::proxy::response_watchdog::AuthorizationExpiryDecision::expired)
+        {
+            return this.emit_deadline_terminal();
+        }
         // Check the absolute deadline FIRST and on EVERY poll. Unlike the
         // per-frame idle timer it is armed once and never reset, so it must fire
         // at the client deadline even for a backend that streams frames
         // continuously (which would never yield a `Pending` inner poll to drive
-        // an idle check). A `None` deadline (unrepresentable) is inert.
+        // an idle check). A `None` deadline (unrepresentable, or owned by the
+        // pump above) is inert.
         if let Some(deadline) = this.deadline.as_mut()
             && std::future::Future::poll(deadline.as_mut(), cx).is_ready()
         {
-            this.done = true;
-            this.deadline = None;
-            this.deadline_fired.store(true, Ordering::Release);
-            // The `done` guard above makes this branch reachable at most once
-            // per body. The shared latch additionally makes it at most once per
-            // REQUEST: a bidirectional stream whose request-upload body is
-            // racing the same absolute plan records the class from whichever
-            // direction fires first, so the fixed-cardinality counter is
-            // incremented exactly once per terminated stream.
-            if let Some((termination, family)) = this.terminal.auth_termination {
-                match this.auth_latch.as_ref() {
-                    Some(latch) => {
-                        latch.record_once(termination, family);
-                    }
-                    None => crate::proxy::auth_lifetime::record_termination(termination, family),
-                }
-            }
-            // Cancel upstream work and release its stream/accounting guards as
-            // soon as the deadline fires, before the downstream polls again.
-            this.inner.take();
-            if !this.saw_data {
-                if let Some(frame) = this.deadline_frame.take() {
-                    return Poll::Ready(Some(Ok(frame)));
-                }
-                if !this.terminal.native_grpc_trailers {
-                    // Ordinary HTTP or SSE: the response head is already
-                    // committed and there is no legal terminal metadata for
-                    // this flavor. End with a transport error — which resets
-                    // H2/H3 and terminates an H1 chunked/SSE body — rather than
-                    // fabricating `grpc-status` trailers for a client that
-                    // never spoke gRPC, and rather than a clean EOF that would
-                    // be indistinguishable from a complete response.
-                    return Poll::Ready(Some(Err(Box::new(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        this.terminal.pre_data_message,
-                    )) as BoxError)));
-                }
-                let mut trailers = http::HeaderMap::new();
-                trailers.insert(
-                    "grpc-status",
-                    http::HeaderValue::from_static(this.terminal.grpc_status_header),
-                );
-                trailers.insert(
-                    "grpc-message",
-                    http::HeaderValue::from_static(this.terminal.grpc_message_header),
-                );
-                return Poll::Ready(Some(Ok(Frame::trailers(trailers))));
-            }
-            return Poll::Ready(Some(Err(Box::new(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                this.terminal.post_data_message,
-            )) as BoxError)));
+            return this.emit_deadline_terminal();
         }
         let Some(inner) = this.inner.as_mut() else {
             this.done = true;
@@ -4045,11 +4118,12 @@ where
     fn size_hint(&self) -> http_body::SizeHint {
         if self.done {
             http_body::SizeHint::with_exact(0)
-        } else if self.deadline.is_some() {
+        } else if self.deadline.is_some() || self.pump_expiry.is_some() {
             // The deadline may replace the remaining body with native trailers
             // or a differently-sized gRPC-Web terminal DATA frame. Do not let
             // hyper reconstruct the stripped backend Content-Length from an
-            // exact inner size hint before that decision is known.
+            // exact inner size hint before that decision is known — whether the
+            // bound lives here or in the gateway-owned pump.
             http_body::SizeHint::default()
         } else {
             self.inner
