@@ -509,7 +509,8 @@ cargo clippy --all-targets -- -D warnings
 
 The planner schedules this job on PRs only when files under `ebpf/` changed, so
 unrelated PRs consume no runner; pushes to `main` and manual runs force it on.
-The job installs stable and nightly Rust toolchains plus `bpf-linker`, uses
+The job installs stable and nightly Rust toolchains plus the repository-pinned,
+SHA-256-verified upstream `bpf-linker` static release, uses
 nightly to build `ferrum-ebpf`, uses stable to run
 `cargo test -p ferrum-ebpf-common`, and uploads the compiled `ebpf-programs`
 artifact with 14-day retention. If this job is edited, preserve the intent that
