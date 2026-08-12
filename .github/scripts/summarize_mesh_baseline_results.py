@@ -401,9 +401,53 @@ def criterion_mean(path: Path) -> dict[str, Any] | None:
     }
 
 
-def extract_json_blobs(text: str) -> list[Any]:
+def hbone_text_looks_relevant(fragment: str) -> bool:
+    """Heuristic for syntactically broken top-level HBONE record candidates."""
+    return (
+        "hbone_e2e" in fragment
+        or '"rps"' in fragment
+        or '"target"' in fragment
+        or '"label"' in fragment
+    )
+
+
+def dns_text_looks_relevant(fragment: str) -> bool:
+    """Heuristic for syntactically broken top-level DNS record candidates."""
+    return '"reports"' in fragment and '"target"' in fragment
+
+
+def _malformed_top_level_record_end(text: str, start: int) -> int:
+    """Exclusive end of a top-level ``{`` record that failed JSON decode."""
+    i = start + 1
+    while i < len(text):
+        if text[i] == "\n":
+            j = i + 1
+            while j < len(text) and text[j] in " \t\r":
+                j += 1
+            if j < len(text) and text[j] == "{":
+                return j
+        i += 1
+    return len(text)
+
+
+def extract_json_blobs(text: str, *, suite: str | None = None) -> tuple[list[Any], int]:
+    """Extract top-level JSON objects; count syntactically broken relevant candidates.
+
+    Pretty-printed harness output is one top-level object per record. When
+    ``suite`` is ``hbone`` or ``dns``, a ``{`` that begins a fragment matching
+    that suite's relevance markers but cannot be ``raw_decode``d is counted as a
+    malformed relevant candidate (fail closed). Unrelated brace-bearing log
+    lines are skipped without advancing the malformed counter.
+    """
     decoder = json.JSONDecoder()
     blobs: list[Any] = []
+    malformed_relevant = 0
+    relevance_check = None
+    if suite == "hbone":
+        relevance_check = hbone_text_looks_relevant
+    elif suite == "dns":
+        relevance_check = dns_text_looks_relevant
+
     i = 0
     while i < len(text):
         idx = text.find("{", i)
@@ -414,8 +458,15 @@ def extract_json_blobs(text: str) -> list[Any]:
             blobs.append(obj)
             i = end
         except json.JSONDecodeError:
+            if relevance_check is not None:
+                end = _malformed_top_level_record_end(text, idx)
+                fragment = text[idx:end]
+                if relevance_check(fragment):
+                    malformed_relevant += 1
+                    i = end
+                    continue
             i = idx + 1
-    return blobs
+    return blobs, malformed_relevant
 
 
 def summarize_mesh(criterion_root: Path) -> dict[str, Any]:
@@ -652,7 +703,9 @@ def summarize_hbone(hbone_root: Path, required_reps: int) -> dict[str, Any]:
             gateway_for_run: list[dict[str, Any]] = []
             direct_for_run: list[dict[str, Any]] = []
             run_rejected = 0
-            for blob in extract_json_blobs(text):
+            blobs, malformed_relevant = extract_json_blobs(text, suite="hbone")
+            run_rejected += malformed_relevant
+            for blob in blobs:
                 if not isinstance(blob, dict):
                     continue
                 if not hbone_blob_looks_relevant(blob):
@@ -807,7 +860,9 @@ def summarize_dns(dns_root: Path, required_reps: int) -> dict[str, Any]:
         run_rejected = 0
         gateway_blobs = 0
         direct_blobs = 0
-        for blob in extract_json_blobs(text):
+        blobs, malformed_relevant = extract_json_blobs(text, suite="dns")
+        run_rejected += malformed_relevant
+        for blob in blobs:
             if not isinstance(blob, dict) or "reports" not in blob:
                 continue
             target = str(blob.get("target", ""))
@@ -1637,6 +1692,47 @@ def self_test() -> int:
         assert hbone_malformed["1kib_c50_30s"]["rejected_blobs"] >= 1
         assert hbone_malformed["1kib_c50_30s"]["repetition_evidence"]["gateway"]["actual"] == 0
 
+        # --- syntactically malformed relevant top-level records fail closed ---
+        hbone_syntax = root / "malformed_syntax" / "hbone" / "1kib_c50_30s"
+        hbone_syntax.mkdir(parents=True)
+        truncated_hbone = (
+            '{\n  "label": "hbone_e2e",\n'
+            '  "target": "http://127.0.0.1:18000/echo",\n'
+            '  "rps": 80\n'
+        )
+        for run in range(1, 4):
+            _write_hbone_run(
+                hbone_syntax / f"run_{run}.txt",
+                gateway_rps=80.0 + run,
+                direct_rps=100.0 + run,
+            )
+            with (hbone_syntax / f"run_{run}.txt").open("a", encoding="utf-8") as handle:
+                handle.write(truncated_hbone)
+        hbone_syntax_summary = summarize_hbone(hbone_syntax.parent, required_repetitions(3))
+        assert hbone_syntax_summary["1kib_c50_30s"]["complete"] is False
+        assert hbone_syntax_summary["1kib_c50_30s"]["errors_ok"] is False
+        assert hbone_syntax_summary["1kib_c50_30s"]["rejected_blobs"] >= 1
+        assert hbone_syntax_summary["1kib_c50_30s"]["shape_failures"] >= 1
+        assert hbone_syntax_summary["1kib_c50_30s"]["repetition_evidence"]["gateway"]["actual"] == 0
+        assert hbone_syntax_summary["1kib_c50_30s"]["repetition_evidence"]["direct"]["actual"] == 0
+
+        # --- unrelated brace-bearing logs must not disturb valid runs ---
+        brace_logs = root / "brace_logs" / "hbone" / "1kib_c50_30s"
+        brace_logs.mkdir(parents=True)
+        for run in range(1, 4):
+            _write_hbone_run(
+                brace_logs / f"run_{run}.txt",
+                gateway_rps=80.0 + run,
+                direct_rps=100.0 + run,
+            )
+            with (brace_logs / f"run_{run}.txt").open("a", encoding="utf-8") as handle:
+                handle.write("info: kernel said {oops not json}\n")
+                handle.write("debug: map={broken\n")
+        hbone_brace = summarize_hbone(brace_logs.parent, required_repetitions(3))
+        assert hbone_brace["1kib_c50_30s"]["complete"] is True
+        assert hbone_brace["1kib_c50_30s"]["errors_ok"] is True
+        assert hbone_brace["1kib_c50_30s"]["repetition_evidence"]["gateway"]["actual"] == 3
+
         # --- missing counterpart (gateway without direct) fails the run ---
         missing_direct = root / "missing_counterpart" / "hbone" / "1kib_c50_30s"
         missing_direct.mkdir(parents=True)
@@ -1722,6 +1818,42 @@ def self_test() -> int:
         assert dns_bad_target["rejected_blobs"] >= 1
         assert dns_bad_target["repetition_evidence"]["gateway"]["mesh-internal/udp"]["actual"] == 0
         assert classify_dns_target("127.0.0.1:9999") is None
+
+        # --- syntactically malformed relevant DNS records fail closed ---
+        dns_syntax = root / "dns_syntax"
+        dns_syntax.mkdir()
+        truncated_dns = (
+            '{\n  "target": "127.0.0.1:15053",\n'
+            '  "concurrency": 100,\n'
+            '  "duration_secs": 60,\n'
+            '  "reports": [\n'
+            '    {"name_class": "mesh-internal", "transport": "udp"\n'
+        )
+        for run in range(1, 4):
+            _write_full_dns_run(dns_syntax / f"run_{run}.txt")
+            with (dns_syntax / f"run_{run}.txt").open("a", encoding="utf-8") as handle:
+                handle.write(truncated_dns)
+        dns_syntax_summary = summarize_dns(dns_syntax, required_repetitions(3))
+        assert dns_syntax_summary["complete"] is False
+        assert dns_syntax_summary["errors_ok"] is False
+        assert dns_syntax_summary["rejected_blobs"] >= 1
+        assert dns_syntax_summary["shape_failures"] >= 1
+        assert dns_syntax_summary["repetition_evidence"]["gateway"]["mesh-internal/udp"]["actual"] == 0
+        assert dns_syntax_summary["repetition_evidence"]["direct_stub"]["upstream-forward/udp"]["actual"] == 0
+
+        # --- unrelated brace-bearing logs must not disturb valid DNS runs ---
+        dns_brace = root / "dns_brace"
+        dns_brace.mkdir()
+        for run in range(1, 4):
+            _write_full_dns_run(dns_brace / f"run_{run}.txt")
+            with (dns_brace / f"run_{run}.txt").open("a", encoding="utf-8") as handle:
+                handle.write("stderr: retry {unclosed\n")
+                handle.write("note: value={not json either\n")
+        dns_brace_summary = summarize_dns(dns_brace, required_repetitions(3))
+        assert dns_brace_summary["complete"] is True
+        assert dns_brace_summary["errors_ok"] is True
+        assert dns_brace_summary["repetition_evidence"]["gateway"]["mesh-internal/udp"]["actual"] == 3
+
         assert classify_dns_target("127.0.0.1:15053") == "gateway"
         assert classify_dns_target("127.0.0.1:17053") == "direct"
         assert classify_dns_target("evil:15053") is None
