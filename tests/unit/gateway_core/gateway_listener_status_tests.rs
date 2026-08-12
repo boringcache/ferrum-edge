@@ -698,12 +698,15 @@ fn a_category_change_is_a_recovery_plus_a_new_failure() {
         snapshot.failed_ports, 100,
         "both halves of 9091 belong to one port"
     );
-    let by_category: Vec<(GatewayListenerProtocolHalf, GatewayListenerFailureCategory, u64)> =
-        snapshot
-            .active_by_category
-            .iter()
-            .map(|active| (active.protocol, active.category, active.count))
-            .collect();
+    let by_category: Vec<(
+        GatewayListenerProtocolHalf,
+        GatewayListenerFailureCategory,
+        u64,
+    )> = snapshot
+        .active_by_category
+        .iter()
+        .map(|active| (active.protocol, active.category, active.count))
+        .collect();
     assert_eq!(
         by_category,
         vec![
