@@ -176,6 +176,7 @@ pub enum TrustBundleRejectReason {
     SourceGenerationUnstable,
     /// A projected generation was detected but this platform offers no way to
     /// pin it. Refused rather than downgraded to independent re-resolution.
+    #[allow(dead_code)] // Constructed on non-Unix; external tests assert the closed reason on Unix.
     SourceGenerationUnsupported,
 }
 
@@ -1158,6 +1159,7 @@ impl CpDpTrustBundle {
     ///
     /// The document carries no pinned generation here, so every `secret_path` /
     /// `public_key_path` it names must be bound by `material_sha256`.
+    #[allow(dead_code)] // Public library API exercised by the external integration-test crate.
     pub fn from_document_str(
         raw: &str,
         origin: &str,
