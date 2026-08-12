@@ -405,9 +405,10 @@ fn refusal_reasons_are_a_closed_label_set_and_are_counted_per_reason() {
     assert_eq!(counts.get("no_ingress_interface"), Some(&1));
     assert_eq!(counts.get("unenrolled_interface"), Some(&1));
     assert_eq!(counts.get("source_address_mismatch"), Some(&2));
+    assert_eq!(counts.get("policy_generation_changed"), Some(&0));
     assert_eq!(
         counts.len(),
-        6,
+        NodeWaypointUdpSourceRefusal::COUNT,
         "the label set is a closed enum; no registry- or peer-supplied value may become a label"
     );
 }
