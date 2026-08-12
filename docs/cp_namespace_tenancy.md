@@ -185,6 +185,7 @@ token. `FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH` points at a JSON document:
       "kid": "tenant-a",
       "algorithm": "ES256",
       "public_key_path": "/etc/ferrum/trust/tenant-a.pub",
+      "material_sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
       "namespaces": ["tenant-a"]
     },
     {
@@ -222,9 +223,119 @@ token. `FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH` points at a JSON document:
   diagnostic names only the bundle path, the `kid`, and the variable name —
   never key material. Generate one fresh secret per credential — or, better,
   use an asymmetric key so the data plane cannot sign at all.
+- `material_sha256` is the lowercase hex SHA-256 of the exact bytes of that
+  key's `secret_path` / `public_key_path` file, as `sha256sum` prints them. It
+  binds the material to the document that names it — see
+  [Rotation is atomic per source generation](#rotation-is-atomic-per-source-generation)
+  for when it is required. It is parsed strictly (exactly 64 lowercase hex
+  digits, no `sha256:` prefix, no surrounding whitespace) and is rejected on
+  inline and environment-backed sources, which have nothing to bind.
 - Startup refuses duplicate `kid`s (ambiguous key selection), unknown
   algorithms, algorithm/material mismatches, empty namespace lists, and
   unreadable material.
+
+### Rotation is atomic per source generation
+
+The bundle document is a policy statement *about* the files it names. If the
+document is read from one filesystem generation and each referenced key is then
+resolved independently a moment later, a rotation can pair one generation's
+namespace ceiling with another generation's key material. Both halves are
+individually valid and the result is internally self-consistent, so a signing
+key ends up bound to a namespace allow-list that existed in neither the old nor
+the new configuration. Ferrum loads the document and every file it references as
+**one coherent source generation** instead.
+
+Which combinations are atomic:
+
+| Shape | Atomic? | Why |
+|---|---|---|
+| One self-contained document (`public_key_pem` / `secret` inline) | Yes | One bounded read of one file. The safest default for public verification material. |
+| `secret_env` | Yes | Resolved from the process environment, not the filesystem. |
+| Document and every referenced file in one Kubernetes projected mount | Yes | The mount's `..data` generation directory is pinned by descriptor **before** the document is read, and every same-mount file is opened through that descriptor. |
+| Any path outside that pinned generation | Only with `material_sha256` | Nothing else proves the bytes read belong to the generation the document came from. |
+| Several separate `mv`/`rename` operations over unrelated paths | **No** | Refused unless every referenced file carries `material_sha256`. |
+
+Concretely:
+
+- **Kubernetes projected ConfigMap/Secret mounts are the supported zero-effort
+  shape.** Put `bundle.json` and every `secret_path` / `public_key_path` file in
+  the *same* volume and reference them by their mount-visible paths
+  (`/etc/ferrum/cp-trust/tenant-a.pub`). Ferrum opens `..data` once, reads the
+  document through it, and resolves every reference against that one pinned
+  directory with `openat(…, O_NOFOLLOW)`. A rotation that lands mid-load cannot
+  redirect anything — including a rapid A→B→A sequence, which a document
+  re-read stability check would not notice.
+- **Anywhere else, declare `material_sha256`.** An arbitrary external path, an
+  ordinary filesystem, or a document that does not itself live in the projected
+  mount all fall here. A path-backed key with no digest is refused at startup
+  and on reload. There is deliberately **no unsafe compatibility opt-in**;
+  inline `public_key_pem` is the escape hatch when a digest is impractical.
+- **Non-Unix hosts cannot pin a generation.** A projected `..data` layout is
+  refused outright there rather than silently downgraded to per-file symlink
+  re-resolution; ordinary path-backed material still works with
+  `material_sha256`.
+- **Traversal and escapes are refused.** A `..` component in a referenced path,
+  and a symlink planted inside a pinned generation directory, are both closed
+  rejections.
+
+Rejections are classified into a closed, fixed-cardinality set
+(`document_unreadable`, `document_invalid`, `material_unreadable`,
+`material_integrity_unbound`, `material_integrity_malformed`,
+`material_integrity_mismatch`, `source_generation_escape`,
+`source_generation_unstable`, `source_generation_unsupported`). The reason label
+is all that is ever logged: material bytes, referenced paths, namespace
+inventories, and digests never appear in logs, metrics, or errors — a digest
+over a symmetric secret is an offline verification oracle for that secret. A
+rejected candidate never partially replaces anything; the entire last accepted
+verifier is retained, and startup fails closed.
+
+#### Safe rotation example
+
+Rotating a credential's key material *and* its namespace binding together is the
+case the coherence contract exists for. With a projected mount, do it in one
+Secret update so the kubelet swaps `..data` atomically:
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ferrum-cp-trust
+stringData:
+  # Both the policy and the material it describes move in one generation.
+  bundle.json: |
+    {
+      "version": 1,
+      "keys": [
+        { "kid": "tenant-a",
+          "algorithm": "ES256",
+          "public_key_path": "/etc/ferrum/cp-trust/tenant-a.pub",
+          "namespaces": ["tenant-a", "tenant-a-stage"] }
+      ]
+    }
+  tenant-a.pub: |
+    -----BEGIN PUBLIC KEY-----
+    ...the new key...
+    -----END PUBLIC KEY-----
+```
+
+mounted at `/etc/ferrum/cp-trust` with
+`FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH=/etc/ferrum/cp-trust/bundle.json`. The next
+poll observes both halves of the new generation or neither.
+
+Outside Kubernetes, update the material file first, then write the document that
+carries its new `material_sha256` (a `rename(2)` over the bundle path):
+
+```bash
+install -m 0644 tenant-a.pub.new /etc/ferrum/trust/tenant-a.pub
+digest=$(sha256sum /etc/ferrum/trust/tenant-a.pub | cut -d' ' -f1)
+jq --arg d "$digest" '.keys[0].material_sha256 = $d | .keys[0].namespaces = ["tenant-a","tenant-a-stage"]' \
+  /etc/ferrum/cp-dp-trust.json > /etc/ferrum/cp-dp-trust.json.new
+mv /etc/ferrum/cp-dp-trust.json.new /etc/ferrum/cp-dp-trust.json
+```
+
+Between the two steps the old document's digest no longer matches, so the
+candidate is refused and the CP keeps the last accepted verifier — the window is
+fail-closed rather than mixed.
 
 ### mTLS / SPIFFE intersection
 
