@@ -32,6 +32,25 @@ workflow definitions as text — it executes nothing — and asserts:
   checker with its trusted-execution pins. A `run: |` block on the credential
   step would let arbitrary shell run beside the checker with the credential
   already in the environment;
+* that step's `env:` is an *exact closed mapping* — every admitted key with its
+  exact admitted value and nothing else. An anchored command is only as exact as
+  the environment that resolves it: `BASH_ENV`, `PATH`, `PYTHONPATH`,
+  `LD_PRELOAD`, or any interpreter/loader variable nobody has named yet would
+  make Bash or Python execute something other than the command the contract just
+  matched. Missing, duplicate, extra, empty, block-scalar, flow-mapping, or
+  anchor/alias/merge-key entries are all refused, and an env line this parser
+  cannot parse is an error rather than a silently ignored entry;
+* the trusted workflow declares no inherited execution surface at all: its
+  top-level keys are a closed allowlist, so a workflow-level `env:` or
+  `defaults:` (`run.shell`, `run.working-directory`) — which every job inherits
+  without appearing in either validated step — is refused, as is any unparseable
+  top-level or `jobs:`-level entry and any YAML anchor, alias, or merge key in
+  the credential job;
+* `establish-trust` runs both secretless preflights as real executable steps
+  before the protected environment can release the credential: the launch
+  readiness checker's own self-test and *this* verifier's `--self-test`, so the
+  boundary contract is proved on the trusted tree in the same run that then uses
+  the credential;
 * the trusted anchor is proved fail-closed in the secretless job: derived from
   the literal protected-branch checkout, validated as a 40-hex commit, and
   required to be reachable from protected `main` before it is exported;
@@ -63,8 +82,11 @@ step that extracts the candidate from `$GITHUB_EVENT_PATH` and replaces the
 checker without naming any candidate expression, an extra step appended after the
 credential step, a swapped or unpinned checkout action, a redirected checkout
 ref, a dropped or altered checkout input, a checkout step that also runs a
-command, a swapped step order, a job-level `defaults:` working directory, the
-self-test moved back into the credential job, a dropped trusted-anchor ancestry
+command, a swapped step order, a job-level `defaults:` working directory, a `BASH_ENV`
+or `PATH` redirect on the credential step, a duplicated or unparseable env
+entry, a workflow-level `env:` or `defaults:` shell/working-directory, an
+anchor/alias/merge-key bypass, either secretless self-test dropped, commented
+out, or relocated into the credential job, a dropped trusted-anchor ancestry
 proof, a missing environment binding, a dropped trust edge, a constant
 commit-wide status context, an omitted run-attempt binding, a `requested`-only
 trigger, a release gate that reuses another run's status, and a release job that
@@ -183,6 +205,55 @@ BLOCK_SCALAR = re.compile(r"^[|>][+-]?[0-9]*[+-]?$")
 # `working-directory` are each a way to redirect or duplicate the execution
 # surface while the credential is already bound to the step.
 CREDENTIAL_STEP_ALLOWED_KEYS = frozenset({"name", "id", "if", "env", "run"})
+
+# The complete environment the credential-bearing step may declare: an exact
+# allowlist of key AND value. Anchoring the command is not enough on its own,
+# because the environment decides how that command resolves — `BASH_ENV` runs a
+# file before the shell reaches the command, `PATH` picks a different `python3`,
+# `PYTHONPATH`/`PYTHONSTARTUP`/`LD_PRELOAD` reach inside the interpreter. An
+# allowlist (rather than a blacklist of known-bad names) is the point: a variable
+# nobody has thought of yet fails closed because it is simply not in this map.
+CREDENTIAL_STEP_ENV = {
+    "GITHUB_TOKEN": "${{ github.token }}",
+    "LAUNCH_TIER": "ga",
+    "LAUNCH_TARGET_SHA": "${{ needs.establish-trust.outputs.candidate_sha }}",
+    "TRUSTED_SHA": "${{ needs.establish-trust.outputs.trusted_sha }}",
+    "LAUNCH_PRIVATE_BLOCKER_COUNT": "${{ vars.LAUNCH_PRIVATE_BLOCKER_COUNT }}",
+    "LAUNCH_PRIVATE_ADVISORY_AS_OF": "${{ vars.LAUNCH_PRIVATE_ADVISORY_AS_OF }}",
+    "LAUNCH_ADVISORY_READ_TOKEN": "${{ secrets.LAUNCH_ADVISORY_READ_TOKEN }}",
+}
+# Environment variable names only: no dashes, no dotted paths, no sequence items.
+# Anything in an `env:` body that does not match this exactly, at exactly the
+# mapping's own indentation, is reported rather than skipped.
+ENV_ENTRY = re.compile(r"^(?P<indent> *)(?P<key>[A-Za-z_][A-Za-z0-9_]*):(?P<rest>.*)$")
+
+# YAML aliasing forms. An anchor defined anywhere and merged or aliased into the
+# credential job would inject keys this contract never saw in the two validated
+# steps. Deliberately narrow so shell text (`&&`, `2>&1`, `*)` case patterns, a
+# `* * *` cron) cannot false-positive: a marker only counts where YAML would
+# read a node — right after `key:` or a `- ` sequence dash.
+YAML_MERGE_KEY = re.compile(r"^\s*(?:-\s+)?<<\s*:")
+YAML_ANCHOR_DECL = re.compile(r"(?::|^\s*-)\s+&[A-Za-z_][A-Za-z0-9_-]*(?=\s|$)")
+YAML_ALIAS_USE = re.compile(r"(?::|^\s*-)\s+\*[A-Za-z_][A-Za-z0-9_-]*(?=\s|$)")
+
+
+def yaml_aliasing_marker(line: str) -> bool:
+    """True if `line` declares a YAML anchor, uses an alias, or merges a map."""
+
+    return bool(
+        YAML_MERGE_KEY.search(line)
+        or YAML_ANCHOR_DECL.search(line)
+        or YAML_ALIAS_USE.search(line)
+    )
+
+
+# Top-level keys the trusted workflow may declare. `env:` and `defaults:` are the
+# load-bearing exclusions: both are inherited by every job, so either could
+# redirect the credential step's shell, working directory, or environment without
+# ever appearing inside the two steps this contract validates.
+TRUSTED_WORKFLOW_ALLOWED_TOP_LEVEL_KEYS = frozenset(
+    {"name", "on", "concurrency", "permissions", "jobs"}
+)
 
 # The credential-bearing job is a closed sequence: the trusted-anchor checkout
 # and then the credential step. Nothing else may run in that workspace.
@@ -512,6 +583,100 @@ def check_trusted_checkout_step(step_lines: list[str]) -> list[str]:
     return errors
 
 
+def check_credential_step_env(
+    entries: list[tuple[str, str, list[str]]],
+) -> list[str]:
+    """The exact closed-environment contract for the credential-bearing step.
+
+    The command is anchored end to end, but a command is only as exact as the
+    environment that resolves it. `BASH_ENV` makes Bash source a file before it
+    reaches the command; `PATH` chooses a different `python3`; `PYTHONPATH`,
+    `PYTHONSTARTUP`, and `LD_PRELOAD` reach inside the interpreter. So the
+    environment is verified as an *exact mapping* — the admitted keys, their
+    admitted values, and nothing else — instead of a blacklist of names anyone
+    has happened to think of.
+    """
+
+    where = f"{TRUSTED_WORKFLOW} job `{SECRET_JOB}`"
+    errors: list[str] = []
+
+    env_blocks = [(value, body) for key, value, body in entries if key == "env"]
+    if len(env_blocks) != 1:
+        errors.append(
+            f"{where} credential-bearing step must declare exactly one `env:` "
+            f"block mapping (found {len(env_blocks)}); the whole environment that "
+            "resolves the anchored command is part of the contract"
+        )
+        return errors
+
+    inline, body = env_blocks[0]
+    if inline.strip():
+        errors.append(
+            f"{where} credential-bearing step declares a flow, alias, or inline "
+            f"`env:` value {inline.strip()!r}; the environment must be an explicit "
+            "block mapping so every key and every value is individually verified"
+        )
+        return errors
+    if not body:
+        errors.append(
+            f"{where} credential-bearing step declares an empty `env:` mapping; it "
+            f"must declare exactly {sorted(CREDENTIAL_STEP_ENV)}"
+        )
+        return errors
+
+    entry_indent = len(body[0]) - len(body[0].lstrip())
+    declared: dict[str, str] = {}
+    duplicates: list[str] = []
+    for line in body:
+        if yaml_aliasing_marker(line):
+            errors.append(
+                f"{where} credential-bearing step env entry {line.strip()!r} uses a "
+                "YAML anchor, alias, or merge key; the environment must be written "
+                "out literally so no key or value can be injected from elsewhere in "
+                "the document"
+            )
+            continue
+        match = ENV_ENTRY.match(line)
+        if match is None or len(match.group("indent")) != entry_indent:
+            # Never skipped: an entry this parser cannot read is exactly how a
+            # nested or reshaped mapping would slip past an allowlist.
+            errors.append(
+                f"{where} credential-bearing step declares an env entry this "
+                f"contract cannot parse ({line.strip()!r}); every entry must be one "
+                "`NAME: value` pair at the mapping's own indentation, so nothing is "
+                "silently ignored"
+            )
+            continue
+        key = match.group("key")
+        value = inline_value(match.group("rest"))
+        if not value or BLOCK_SCALAR.match(value):
+            errors.append(
+                f"{where} credential-bearing step declares env key {key} with a "
+                "block-scalar, nested, or empty value; every admitted value is an "
+                "exact single-line scalar"
+            )
+            continue
+        if key in declared:
+            duplicates.append(key)
+        declared[key] = value
+
+    if duplicates:
+        errors.append(
+            f"{where} credential-bearing step declares duplicate env key(s) "
+            f"{', '.join(sorted(set(duplicates)))}; YAML keeps only the last "
+            "occurrence, so a duplicate silently overrides a verified binding"
+        )
+    if declared != CREDENTIAL_STEP_ENV:
+        errors.append(
+            f"{where} credential-bearing step declares environment {declared!r}; it "
+            f"must declare exactly {CREDENTIAL_STEP_ENV!r}. This is an allowlist of "
+            "key and value, not a blacklist: any other name — `BASH_ENV`, `PATH`, "
+            "`PYTHONPATH`, `LD_PRELOAD`, or one nobody has named yet — could make "
+            "Bash or Python resolve something other than the anchored command"
+        )
+    return errors
+
+
 def check_credential_job_steps(steps: list[list[str]]) -> list[str]:
     """The closed step-sequence contract for the credential-bearing job.
 
@@ -613,6 +778,8 @@ def check_credential_step(steps: list[list[str]]) -> list[str]:
             "the credential is bound"
         )
 
+    errors.extend(check_credential_step_env(entries))
+
     runs = [(value, body) for key, value, body in entries if key == "run"]
     if len(runs) != 1:
         errors.append(
@@ -649,10 +816,74 @@ def check_credential_step(steps: list[list[str]]) -> list[str]:
     return errors
 
 
+def job_runs_exact_command(steps: list[list[str]], command: str) -> bool:
+    """True if some step of `steps` is a real single-line `run:` of `command`.
+
+    Structural on purpose: a comment, a `name:` mentioning the command, or an
+    occurrence in a different job does not satisfy it, and neither does a
+    multiline block that merely contains the command among other shell.
+    """
+
+    for step in steps:
+        for key, value, body in step_entries(step):
+            if key != "run" or body or BLOCK_SCALAR.match(value):
+                continue
+            if inline_value(value) == command:
+                return True
+    return False
+
+
+def check_trusted_workflow_structure(text: str) -> list[str]:
+    """Close the inherited execution surfaces outside the two validated steps.
+
+    A workflow-level `env:` or `defaults:` is inherited by every job, so either
+    can change how the credential step's anchored command resolves — the shell it
+    runs under, the directory it runs in, the variables it sees — without
+    appearing anywhere in the two steps this contract validates. The top-level
+    key set is therefore an allowlist, and any structural line the reader cannot
+    place is an error rather than a line it quietly drops.
+    """
+
+    errors: list[str] = []
+    blocks = top_level_blocks(text)
+
+    extra = sorted(set(blocks) - TRUSTED_WORKFLOW_ALLOWED_TOP_LEVEL_KEYS)
+    if extra:
+        errors.append(
+            f"{TRUSTED_WORKFLOW} declares top-level {', '.join(extra)}; only "
+            f"{'/'.join(sorted(TRUSTED_WORKFLOW_ALLOWED_TOP_LEVEL_KEYS))} are "
+            f"admitted. A workflow-level `env:` or `defaults:` (`run.shell`, "
+            f"`run.working-directory`) is inherited by `{SECRET_JOB}` and would "
+            "redirect the credential step's environment, interpreter, or working "
+            "directory without appearing in either validated step"
+        )
+
+    for line in code_lines(text.splitlines()):
+        if len(line) - len(line.lstrip()) == 0 and not TOP_LEVEL_KEY.match(line):
+            errors.append(
+                f"{TRUSTED_WORKFLOW} declares a top-level entry this contract "
+                f"cannot parse ({line.strip()!r}); an unreadable document node "
+                "could carry inherited environment, shell, or merge keys"
+            )
+
+    jobs_block = blocks.get("jobs")
+    if jobs_block is not None:
+        for line in code_lines(jobs_block):
+            if len(line) - len(line.lstrip()) <= 2 and not NESTED_KEY.match(line):
+                errors.append(
+                    f"{TRUSTED_WORKFLOW} declares an entry at the `jobs:` mapping "
+                    f"level this contract cannot parse ({line.strip()!r}); a merge "
+                    "key or alias there would inject keys into every job"
+                )
+    return errors
+
+
 def check_trusted_workflow(text: str) -> list[str]:
     errors: list[str] = []
     lines = code_lines(text.splitlines())
     jobs = job_blocks(text)
+
+    errors.extend(check_trusted_workflow_structure(text))
 
     events = event_names(text)
     if not events:
@@ -752,14 +983,25 @@ def check_trusted_workflow(text: str) -> list[str]:
         )
 
     # Secretless prerequisites belong here, not in the credential job, whose
-    # workspace must reach the credential step untouched by any other step.
-    if CHECKER_SELF_TEST_STEP not in trust_text:
-        errors.append(
-            f"{TRUSTED_WORKFLOW} job `{TRUST_JOB}` must run the secretless checker "
-            f"self-test `{CHECKER_SELF_TEST_STEP}`; it cannot live in "
-            f"`{SECRET_JOB}`, where it would be an executable step sharing the "
-            "credential step's workspace"
-        )
+    # workspace must reach the credential step untouched by any other step. Both
+    # must be *real* executable steps of this job: the protected environment
+    # releases the credential only after this job succeeds, so this is the only
+    # place the boundary contract can be proved on the trusted tree in the same
+    # run that then uses the credential.
+    trust_steps = job_steps(jobs[TRUST_JOB])
+    for command, detail in (
+        (CHECKER_SELF_TEST_STEP, "the secretless launch-readiness checker self-test"),
+        (SELF_TEST_STEP, "this trust-boundary verifier's own self-test"),
+    ):
+        if not job_runs_exact_command(trust_steps, command):
+            errors.append(
+                f"{TRUSTED_WORKFLOW} job `{TRUST_JOB}` must run {detail} as a real "
+                f"executable step (`run: {command}`) before the protected "
+                f"environment can release the credential. A comment, a mention in "
+                f"another job, or a relocation into `{SECRET_JOB}` — where it would "
+                "be an executable step sharing the credential step's workspace — "
+                "does not satisfy it"
+            )
 
     # The verdict must be bound to the exact Release run AND run attempt that
     # asked for it, or an older success on the same commit satisfies a newer
@@ -819,6 +1061,18 @@ def check_trusted_workflow(text: str) -> list[str]:
                     f"input {expression!r} outside the inert LAUNCH_TARGET_SHA "
                     "environment binding"
                 )
+
+    # The credential job must be written out literally. An anchor defined
+    # anywhere in the document and aliased or merged in here would add keys —
+    # `env:`, `defaults:`, a whole extra step — that neither the job-key
+    # allowlist nor the two-step contract ever saw in source form.
+    for line in secret_lines:
+        if yaml_aliasing_marker(line):
+            errors.append(
+                f"{TRUSTED_WORKFLOW} job `{SECRET_JOB}` uses a YAML anchor, alias, "
+                f"or merge key ({line.strip()!r}); every key and value in this job "
+                "must be literal, so what this contract validated is what runs"
+            )
 
     for line in secret_lines:
         stripped = line.strip()
@@ -996,6 +1250,8 @@ jobs:
           ref: refs/heads/main
       - name: Synthetic policy/checker self-tests
         run: python3 -I scripts/check_launch_readiness.py --self-test
+      - name: Trust-boundary contract self-test
+        run: python3 -I .github/scripts/verify_launch_advisory_trust.py --self-test
       - name: Resolve
         id: candidate
         env:
@@ -1023,8 +1279,12 @@ jobs:
           persist-credentials: false
       - name: Evaluate
         env:
+          GITHUB_TOKEN: ${{ github.token }}
+          LAUNCH_TIER: ga
           LAUNCH_TARGET_SHA: ${{ needs.establish-trust.outputs.candidate_sha }}
           TRUSTED_SHA: ${{ needs.establish-trust.outputs.trusted_sha }}
+          LAUNCH_PRIVATE_BLOCKER_COUNT: ${{ vars.LAUNCH_PRIVATE_BLOCKER_COUNT }}
+          LAUNCH_PRIVATE_ADVISORY_AS_OF: ${{ vars.LAUNCH_PRIVATE_ADVISORY_AS_OF }}
           LAUNCH_ADVISORY_READ_TOKEN: ${{ secrets.LAUNCH_ADVISORY_READ_TOKEN }}
         run: python3 -I scripts/check_launch_readiness.py --verify --trusted-execution --trusted-tree-sha "$TRUSTED_SHA"
 
@@ -1390,12 +1650,303 @@ def run_self_test() -> int:  # noqa: C901 — a flat fixture table stays readabl
         str(self_test_errors),
     )
     check(
-        "dropping the self-test from the secretless trust job is rejected",
+        "dropping the checker self-test from the secretless trust job is rejected",
         any(
-            "must run the secretless checker self-test" in err
+            "the secretless launch-readiness checker self-test" in err
             for err in self_test_errors
         ),
         str(self_test_errors),
+    )
+
+    # ---- The trusted preflight that must run before the credential is released
+    #
+    # `establish-trust` is the only place this whole contract can be proved on the
+    # trusted tree in the same run that then uses the credential: the protected
+    # environment releases the credential only after that job succeeds.
+
+    boundary_self_test_block = (
+        "      - name: Trust-boundary contract self-test\n"
+        f"        run: {SELF_TEST_STEP}\n"
+    )
+
+    dropped_boundary_self_test = FIXTURE_TRUSTED.replace(boundary_self_test_block, "")
+    check(
+        "dropping the trusted-job boundary self-test is rejected",
+        any(
+            "this trust-boundary verifier's own self-test" in err
+            for err in evaluate(mutated(TRUSTED_WORKFLOW, dropped_boundary_self_test))
+        ),
+        str(evaluate(mutated(TRUSTED_WORKFLOW, dropped_boundary_self_test))),
+    )
+
+    commented_boundary_self_test = FIXTURE_TRUSTED.replace(
+        f"        run: {SELF_TEST_STEP}\n",
+        f"        # run: {SELF_TEST_STEP}\n        run: true\n",
+    )
+    check(
+        "a trusted-job boundary self-test surviving only as a comment is rejected",
+        any(
+            "this trust-boundary verifier's own self-test" in err
+            for err in evaluate(mutated(TRUSTED_WORKFLOW, commented_boundary_self_test))
+        ),
+    )
+
+    # Relocating it into the credential job breaks it twice: the trust job no
+    # longer runs it, and it becomes an executable step sharing the credential
+    # step's workspace.
+    relocated_boundary_self_test = FIXTURE_TRUSTED.replace(
+        boundary_self_test_block, ""
+    ).replace(
+        "      - name: Evaluate",
+        boundary_self_test_block + "      - name: Evaluate",
+    )
+    relocated_errors = evaluate(mutated(TRUSTED_WORKFLOW, relocated_boundary_self_test))
+    check(
+        "relocating the boundary self-test into the credential job is rejected",
+        any("must consist of exactly 2 steps" in err for err in relocated_errors),
+        str(relocated_errors),
+    )
+    check(
+        "and the trust job is then reported as no longer running it",
+        any(
+            "this trust-boundary verifier's own self-test" in err
+            for err in relocated_errors
+        ),
+        str(relocated_errors),
+    )
+
+    # ---- The credential step's environment is an exact closed mapping --------
+    #
+    # An anchored command is only as exact as the environment that resolves it.
+    # Every fixture below leaves the command byte-identical and still changes
+    # what actually executes, so a verifier that closes only the command accepts
+    # all of them.
+
+    credential_env_block = (
+        "        env:\n"
+        "          GITHUB_TOKEN: ${{ github.token }}\n"
+        "          LAUNCH_TIER: ga\n"
+        "          LAUNCH_TARGET_SHA: "
+        "${{ needs.establish-trust.outputs.candidate_sha }}\n"
+        "          TRUSTED_SHA: ${{ needs.establish-trust.outputs.trusted_sha }}\n"
+        "          LAUNCH_PRIVATE_BLOCKER_COUNT: "
+        "${{ vars.LAUNCH_PRIVATE_BLOCKER_COUNT }}\n"
+        "          LAUNCH_PRIVATE_ADVISORY_AS_OF: "
+        "${{ vars.LAUNCH_PRIVATE_ADVISORY_AS_OF }}\n"
+        "          LAUNCH_ADVISORY_READ_TOKEN: "
+        "${{ secrets.LAUNCH_ADVISORY_READ_TOKEN }}\n"
+    )
+    check(
+        "the fixture's credential env block is the one the contract admits",
+        credential_env_block in FIXTURE_TRUSTED,
+    )
+    tier_line = "          LAUNCH_TIER: ga\n"
+
+    # Bash sources `$BASH_ENV` before it reaches the command line, so this runs
+    # candidate-authored shell with the credential already bound.
+    bash_env_redirect = FIXTURE_TRUSTED.replace(
+        tier_line, "          BASH_ENV: ./candidate/preamble.sh\n" + tier_line
+    )
+    check(
+        "a BASH_ENV preamble on the credential step is rejected",
+        any(
+            "declares environment" in err
+            for err in evaluate(mutated(TRUSTED_WORKFLOW, bash_env_redirect))
+        ),
+        str(evaluate(mutated(TRUSTED_WORKFLOW, bash_env_redirect))),
+    )
+
+    # `python3` in the anchored command is resolved through PATH.
+    path_redirect = FIXTURE_TRUSTED.replace(
+        tier_line, "          PATH: ./candidate/bin:/usr/bin:/bin\n" + tier_line
+    )
+    check(
+        "a PATH redirect on the credential step is rejected",
+        any(
+            "declares environment" in err
+            for err in evaluate(mutated(TRUSTED_WORKFLOW, path_redirect))
+        ),
+    )
+
+    # Not in any blacklist this module maintains; refused because it is not in
+    # the allowlist, which is the whole point of an allowlist.
+    unknown_loader_variable = FIXTURE_TRUSTED.replace(
+        tier_line, "          NODE_OPTIONS: --require ./candidate/hook.js\n" + tier_line
+    )
+    check(
+        "an unnamed future interpreter variable fails closed on the allowlist",
+        any(
+            "declares environment" in err
+            for err in evaluate(mutated(TRUSTED_WORKFLOW, unknown_loader_variable))
+        ),
+    )
+
+    duplicate_env_key = FIXTURE_TRUSTED.replace(
+        tier_line, tier_line + "          LAUNCH_TIER: ${{ vars.CANDIDATE_TIER }}\n"
+    )
+    check(
+        "a duplicated credential env key is rejected",
+        any(
+            "duplicate env key" in err
+            for err in evaluate(mutated(TRUSTED_WORKFLOW, duplicate_env_key))
+        ),
+        str(evaluate(mutated(TRUSTED_WORKFLOW, duplicate_env_key))),
+    )
+
+    unparseable_env_entry = FIXTURE_TRUSTED.replace(
+        tier_line, tier_line + "          - BASH_ENV=./candidate/preamble.sh\n"
+    )
+    check(
+        "an env entry the contract cannot parse is reported, not ignored",
+        any(
+            "cannot parse" in err
+            for err in evaluate(mutated(TRUSTED_WORKFLOW, unparseable_env_entry))
+        ),
+        str(evaluate(mutated(TRUSTED_WORKFLOW, unparseable_env_entry))),
+    )
+
+    nested_env_mapping = FIXTURE_TRUSTED.replace(
+        tier_line, "          LAUNCH_TIER:\n            from: ./candidate/tier\n"
+    )
+    check(
+        "a nested credential env value is rejected",
+        any(
+            "block-scalar, nested, or empty value" in err
+            for err in evaluate(mutated(TRUSTED_WORKFLOW, nested_env_mapping))
+        ),
+        str(evaluate(mutated(TRUSTED_WORKFLOW, nested_env_mapping))),
+    )
+
+    block_scalar_env_value = FIXTURE_TRUSTED.replace(
+        tier_line, "          LAUNCH_TIER: |\n            ga\n"
+    )
+    check(
+        "a block-scalar credential env value is rejected",
+        any(
+            "block-scalar, nested, or empty value" in err
+            for err in evaluate(mutated(TRUSTED_WORKFLOW, block_scalar_env_value))
+        ),
+    )
+
+    flow_env_mapping = FIXTURE_TRUSTED.replace(
+        credential_env_block,
+        "        env: { LAUNCH_ADVISORY_READ_TOKEN: "
+        '"${{ secrets.LAUNCH_ADVISORY_READ_TOKEN }}", BASH_ENV: ./candidate/p.sh }\n',
+    )
+    check(
+        "a flow-mapping credential env is rejected",
+        any(
+            "flow, alias, or inline" in err
+            for err in evaluate(mutated(TRUSTED_WORKFLOW, flow_env_mapping))
+        ),
+        str(evaluate(mutated(TRUSTED_WORKFLOW, flow_env_mapping))),
+    )
+
+    anchored_env_value = FIXTURE_TRUSTED.replace(
+        tier_line, "          LAUNCH_TIER: &tier ga\n"
+    )
+    check(
+        "a YAML anchor on a credential env value is rejected",
+        any(
+            "credential-bearing step env entry" in err
+            for err in evaluate(mutated(TRUSTED_WORKFLOW, anchored_env_value))
+        ),
+        str(evaluate(mutated(TRUSTED_WORKFLOW, anchored_env_value))),
+    )
+
+    merged_env_mapping = FIXTURE_TRUSTED.replace(
+        tier_line, tier_line + "          <<: *hostile\n"
+    )
+    check(
+        "a merge key inside the credential env mapping is rejected",
+        any(
+            "credential-bearing step env entry" in err
+            for err in evaluate(mutated(TRUSTED_WORKFLOW, merged_env_mapping))
+        ),
+        str(evaluate(mutated(TRUSTED_WORKFLOW, merged_env_mapping))),
+    )
+
+    merged_credential_job = FIXTURE_TRUSTED.replace(
+        "    environment: launch-advisory\n",
+        "    environment: launch-advisory\n    <<: *hostile\n",
+    )
+    check(
+        "a merge key at the credential job level is rejected",
+        any(
+            "uses a YAML anchor, alias, or merge key" in err
+            for err in evaluate(mutated(TRUSTED_WORKFLOW, merged_credential_job))
+        ),
+        str(evaluate(mutated(TRUSTED_WORKFLOW, merged_credential_job))),
+    )
+
+    # ---- Inherited workflow-level execution surfaces -------------------------
+    #
+    # None of these appear in either validated step, and all of them are
+    # inherited by the credential job.
+
+    top_permissions = "permissions:\n  contents: read\n"
+
+    workflow_level_env = FIXTURE_TRUSTED.replace(
+        top_permissions,
+        top_permissions + "env:\n  BASH_ENV: ./candidate/preamble.sh\n",
+    )
+    check(
+        "a workflow-level env: is rejected",
+        any(
+            "declares top-level env" in err
+            for err in evaluate(mutated(TRUSTED_WORKFLOW, workflow_level_env))
+        ),
+        str(evaluate(mutated(TRUSTED_WORKFLOW, workflow_level_env))),
+    )
+
+    workflow_level_shell = FIXTURE_TRUSTED.replace(
+        top_permissions,
+        top_permissions
+        + "defaults:\n  run:\n    shell: bash -x ./candidate/wrapper.sh {0}\n",
+    )
+    check(
+        "a workflow-level defaults.run.shell is rejected",
+        any(
+            "declares top-level defaults" in err
+            for err in evaluate(mutated(TRUSTED_WORKFLOW, workflow_level_shell))
+        ),
+        str(evaluate(mutated(TRUSTED_WORKFLOW, workflow_level_shell))),
+    )
+
+    workflow_level_workdir = FIXTURE_TRUSTED.replace(
+        top_permissions,
+        top_permissions + "defaults:\n  run:\n    working-directory: ./candidate\n",
+    )
+    check(
+        "a workflow-level defaults.run.working-directory is rejected",
+        any(
+            "declares top-level defaults" in err
+            for err in evaluate(mutated(TRUSTED_WORKFLOW, workflow_level_workdir))
+        ),
+    )
+
+    top_level_anchor = FIXTURE_TRUSTED.replace(
+        "jobs:\n", "x-shared: &hostile\n  shell: bash\njobs:\n"
+    )
+    check(
+        "a top-level anchor block outside the admitted keys is rejected",
+        any(
+            "declares top-level x-shared" in err
+            for err in evaluate(mutated(TRUSTED_WORKFLOW, top_level_anchor))
+        ),
+        str(evaluate(mutated(TRUSTED_WORKFLOW, top_level_anchor))),
+    )
+
+    jobs_level_merge = FIXTURE_TRUSTED.replace(
+        "jobs:\n  establish-trust:\n", "jobs:\n  <<: *hostile\n  establish-trust:\n"
+    )
+    check(
+        "a merge key at the jobs mapping level is rejected",
+        any(
+            "at the `jobs:` mapping level" in err
+            for err in evaluate(mutated(TRUSTED_WORKFLOW, jobs_level_merge))
+        ),
+        str(evaluate(mutated(TRUSTED_WORKFLOW, jobs_level_merge))),
     )
 
     # ---- The trusted-anchor checkout itself ----------------------------------

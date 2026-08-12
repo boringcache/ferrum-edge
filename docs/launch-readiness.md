@@ -209,7 +209,10 @@ branch or tag ref, so a manual dispatch is not intrinsically trusted code.
    resolves that checkout's `HEAD` to the trusted anchor commit, validates it as
    a 40-hex commit, requires it to be reachable from protected `main`, and
    exports it as `trusted_sha`. It also runs every secretless prerequisite —
-   the checker self-tests — because the credential job may not run one. It then
+   the checker's own self-test **and** `verify_launch_advisory_trust.py
+   --self-test`, so this whole boundary contract is proved on the trusted tree
+   before the protected environment can release the credential — because the
+   credential job may not run one. It then
    treats the candidate purely as data: normalized tag format, exactly one
    unambiguous remote tag ref, tag resolution to exactly one commit, agreement
    with the triggering event's head (a tag moved after the event is refused as
@@ -298,8 +301,21 @@ So `advisory-verdict` has **exactly two steps and no others**:
    needed to put it there.
 2. The credential-bearing checker invocation.
 
-Every secretless prerequisite — the checker self-tests — lives in
-`establish-trust` instead, where it cannot touch this workspace.
+Every secretless prerequisite lives in `establish-trust` instead, where it
+cannot touch this workspace. Two run there as real executable steps, and the
+verifier requires both structurally — a comment, a `name:` that mentions the
+command, or an occurrence in another job does not satisfy it:
+
+| Step | What it proves |
+|------|----------------|
+| `python3 -I scripts/check_launch_readiness.py --self-test` | the readiness checker's own deterministic fixtures |
+| `python3 -I .github/scripts/verify_launch_advisory_trust.py --self-test` | this trust-boundary contract, evaluated against the real `.github/workflows` tree |
+
+The second is the preflight that matters here: the protected `launch-advisory`
+environment releases the credential only after `establish-trust` succeeds, so a
+protected `main` that no longer satisfies the boundary contract cannot reach the
+credential step at all. Running the verifier only on pull requests would leave
+the trusted lane itself unchecked at release time.
 
 `.github/scripts/verify_launch_advisory_trust.py` parses that job's `steps:`
 list by indentation and enforces the sequence structurally:
@@ -341,6 +357,54 @@ its own:
   `;`, a pipe, a command substitution in the pin, an alternate interpreter, or an
   alternate path to the checker all fail the match.
 
+### Anchoring the command is not enough: the environment is closed too
+
+A command is only as exact as the environment that resolves it. With the `run:`
+scalar matched byte for byte, `BASH_ENV` still makes Bash source a file before it
+reaches that line, `PATH` still chooses which `python3` runs, and
+`PYTHONPATH` / `PYTHONSTARTUP` / `LD_PRELOAD` still reach inside the interpreter.
+So the credential step's `env:` is verified as an **exact closed mapping** —
+these keys, these values, nothing else:
+
+| Key | Admitted value |
+|-----|----------------|
+| `GITHUB_TOKEN` | `${{ github.token }}` |
+| `LAUNCH_TIER` | `ga` |
+| `LAUNCH_TARGET_SHA` | `${{ needs.establish-trust.outputs.candidate_sha }}` |
+| `TRUSTED_SHA` | `${{ needs.establish-trust.outputs.trusted_sha }}` |
+| `LAUNCH_PRIVATE_BLOCKER_COUNT` | `${{ vars.LAUNCH_PRIVATE_BLOCKER_COUNT }}` |
+| `LAUNCH_PRIVATE_ADVISORY_AS_OF` | `${{ vars.LAUNCH_PRIVATE_ADVISORY_AS_OF }}` |
+| `LAUNCH_ADVISORY_READ_TOKEN` | `${{ secrets.LAUNCH_ADVISORY_READ_TOKEN }}` |
+
+This is an **allowlist, not a blacklist of known-bad names**: a loader or
+interpreter variable nobody has thought of yet is refused because it is simply
+not in the map. A missing key, a duplicate key (YAML keeps only the last, so a
+duplicate silently overrides a verified binding), a changed value, an empty or
+block-scalar or nested value, a flow mapping (`env: {…}`), and a YAML anchor,
+alias, or merge key inside the mapping are each rejected. An `env:` line the
+parser cannot read is reported as an error rather than skipped, so a reshaped
+entry cannot slip past the allowlist by being invisible to it.
+
+The same reasoning closes the **inherited** environment, which appears in
+neither validated step:
+
+- `launch-advisory-trust.yml`'s top-level keys are an allowlist —
+  `name`/`on`/`concurrency`/`permissions`/`jobs`. A workflow-level `env:` or
+  `defaults:` (`run.shell`, `run.working-directory`) is inherited by
+  `advisory-verdict` and would redirect the credential step's environment,
+  interpreter, or working directory without touching either step, so both are
+  refused outright.
+- Any unparseable node at the document's top level, or at the `jobs:` mapping
+  level, is an error — a merge key or alias there would inject keys into every
+  job.
+- No YAML anchor, alias, or merge key may appear anywhere in `advisory-verdict`.
+  Every key and value in that job must be literal, so what the contract
+  validated is what runs.
+
+The job-level closed-key contract is unchanged and still applies:
+`advisory-verdict` may declare only
+`name`/`needs`/`runs-on`/`timeout-minutes`/`environment`/`permissions`/`steps`.
+
 Separately, and as defence in depth, **no** step of that job — inside multiline
 blocks included — may expand a candidate-derived variable such as
 `$LAUNCH_TARGET_SHA` on an executable line, and no candidate expression may
@@ -369,10 +433,18 @@ both to be rejected *and* to be invisible to the candidate-expansion rule, so
 the closed sequence is proved to be what catches it), an extra step appended
 after the credential step, the credential step and the checkout in swapped
 order, a block-scalar body line beginning with `- ` that must not hide an extra
-step, the self-test moved back into the credential job, a redirected checkout
+step, a self-test moved back into the credential job, a redirected checkout
 ref, a dropped or extra checkout input, a swapped checkout action, a checkout
 step that also runs a command or carries an `if:`, a job-level `defaults:`
-working directory, a trusted anchor exported without its protected-main
+working directory, a `BASH_ENV` preamble, a `PATH` redirect and an unnamed
+future interpreter variable (`NODE_OPTIONS`) on the credential step, a
+duplicated env key, an env entry the parser cannot read, a nested or
+block-scalar env value, a flow-mapping `env:`, an anchor on an env value, a
+merge key inside the env mapping and at the credential job level, a
+workflow-level `env:`, a workflow-level `defaults.run.shell` and
+`defaults.run.working-directory`, a top-level anchor block, a merge key at the
+`jobs:` mapping level, the trusted-job boundary self-test dropped, commented
+out, or relocated into the credential job, a trusted anchor exported without its protected-main
 ancestry proof or without coming from the protected-branch checkout, a
 commented-out credential binding, a self-test surviving only as a comment, a
 tag-reachable trust workflow, a tag checkout in the secretless trust job, a
@@ -435,7 +507,10 @@ future provisioning safe rather than exploitable.
   or pushed SHA) and asserts that the checkout is that commit. It holds no
   advisory credential on any event and reads only the redacted variables.
 - `.github/workflows/launch-advisory-trust.yml` — the sole credential holder,
-  reachable only from `workflow_run` (`in_progress`) and `schedule`. Its daily
+  reachable only from `workflow_run` (`in_progress`) and `schedule`. Its
+  secretless `establish-trust` job runs both the checker self-test and this
+  trust-boundary verifier's `--self-test` on the trusted tree before the
+  protected environment can release the credential. Its daily
   schedule is the live private-advisory re-audit
   of protected `main`, published under the separate `.../main-audit` context.
 - `.github/workflows/release.yml` — the `validate-launch-readiness` job gates

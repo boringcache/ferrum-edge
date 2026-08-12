@@ -15,11 +15,13 @@ name: Trusted Launch Advisory Gate
 # candidate commit is carried only as an inert 40-hex SHA:
 #
 #   1. `establish-trust` holds no secret. It pins the trusted anchor from the
-#      literal protected-branch checkout, runs the checker/verifier self-tests,
-#      resolves the tag to exactly one commit, requires that commit to be
-#      reachable from protected `main`, and requires successful push CI/coverage
-#      runs for that exact SHA. Anything missing, ambiguous, or stale fails
-#      closed.
+#      literal protected-branch checkout, runs both secretless preflights — the
+#      checker's self-test AND this boundary verifier's own `--self-test`, so the
+#      contract below is proved on the trusted tree before the protected
+#      environment can release the credential — resolves the tag to exactly one
+#      commit, requires that commit to be reachable from protected `main`, and
+#      requires successful push CI/coverage runs for that exact SHA. Anything
+#      missing, ambiguous, or stale fails closed.
 #   2. `advisory-verdict` is a CLOSED two-step job: a pinned `actions/checkout`
 #      directly at that same trusted anchor commit, immediately followed by the
 #      one credential-bearing checker invocation. There is deliberately no other
@@ -28,7 +30,10 @@ name: Trusted Launch Advisory Gate
 #      `scripts/check_launch_readiness.py` (or derive the candidate indirectly
 #      from the event payload, the API, or the environment) before the checker
 #      runs with the credential bound. It never checks out, fetches, imports, or
-#      executes a single byte of the candidate tree.
+#      executes a single byte of the candidate tree. Its `env:` is an exact
+#      closed mapping, and this workflow declares no top-level `env:` or
+#      `defaults:`, because the anchored command is only as exact as the
+#      environment that resolves it.
 #   3. `publish-verdict` holds no secret and publishes a fixed-text commit
 #      status on the candidate SHA, under a context bound to the exact Release
 #      run and run attempt that asked for it. `release.yml` consumes only its
@@ -99,6 +104,14 @@ jobs:
       # its workspace before the credential is used.
       - name: Synthetic policy/checker self-tests
         run: python3 -I scripts/check_launch_readiness.py --self-test
+
+      # The boundary contract itself, proved on the trusted tree in the same run
+      # that then uses the credential. The protected `launch-advisory`
+      # environment releases the credential only after this job succeeds, so a
+      # `main` that no longer satisfies the contract cannot reach the credential
+      # step. Secretless, and hosted here for the same reason as above.
+      - name: Trust-boundary contract self-test
+        run: python3 -I .github/scripts/verify_launch_advisory_trust.py --self-test
 
       - name: Resolve the trusted anchor and the candidate commit
         id: candidate
@@ -311,6 +324,16 @@ jobs:
     # `printenv`, then fetch candidate bytes or simply overwrite
     # `scripts/check_launch_readiness.py` — and the exact credential command
     # below would then execute the replaced file with the credential bound.
+    #
+    # The credential step's `env:` below is likewise an EXACT CLOSED MAPPING:
+    # exactly these keys with exactly these values. An anchored command is only
+    # as exact as the environment that resolves it — `BASH_ENV` runs a file
+    # before Bash reaches the command, `PATH` picks a different `python3`,
+    # `PYTHONPATH`/`LD_PRELOAD` reach inside the interpreter. The verifier
+    # enforces the mapping as an allowlist of key and value, so a variable nobody
+    # has named yet fails closed, and it refuses any top-level `env:` or
+    # `defaults:` in this file for the same reason: both are inherited here
+    # without appearing in either step below.
     steps:
       # Checked out directly AT the trusted anchor commit resolved by the
       # literal `refs/heads/main` checkout in `establish-trust`, so no in-job
