@@ -157,6 +157,10 @@ def check_scripts(failures: list[str]) -> None:
     require("unexpected DNS target" in summary, "summarizer self-test must cover unexpected DNS targets", failures)
     require("unsupported suite selection" in summary, "summarizer self-test must cover invalid suites", failures)
     require("shape_failures" in summary, "summarizer must track per-run shape failures", failures)
+    require("provenance_complete" in summary, "summarizer must gate incomplete provenance", failures)
+    require("expected_health_probe_ids" in summary, "summarizer must gate every E2E health probe", failures)
+    require("payload_size" in summary, "summarizer must validate HBONE scenario parameters", failures)
+    require("DNS_DURATION_SECS" in summary, "summarizer must validate DNS scenario parameters", failures)
 
 def check_docs_and_baselines(failures: list[str]) -> None:
     protocol = PROTOCOL_DOC.read_text(encoding="utf-8")

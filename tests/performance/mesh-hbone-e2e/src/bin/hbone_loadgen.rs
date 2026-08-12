@@ -129,7 +129,8 @@ async fn run(args: &RunArgs) -> Result<()> {
                 label,
                 &args.target,
                 args.concurrency,
-                args.duration
+                args.duration,
+                args.payload_size,
             ))
             .unwrap_or_default()
         );

@@ -3174,7 +3174,7 @@ expect_attributed_forged_assertion_blocked() {
   # NodeWaypoint Ready with a live slice while HBONE peers are still coming
   # up. Prefer wall-clock over a fixed attempt count so slow curls cannot burn
   # the whole budget in a handful of probes (mirrors wait_for_ambient_mesh_slice).
-  local dispatch_wait_deadline=$((SECONDS + 90))
+  dispatch_wait_deadline=$((SECONDS + 90))
   attempt=0
   while ((SECONDS < dispatch_wait_deadline)); do
     attempt=$((attempt + 1))

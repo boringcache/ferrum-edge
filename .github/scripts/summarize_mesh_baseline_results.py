@@ -54,8 +54,10 @@ MIN_E2E_REPETITIONS = 3
 # Ferrum hosted perf workflows. Collections above this are not publication-ready.
 MAX_CPU_STEAL_PERCENT = 5.0
 SUPPORTED_SUITES = frozenset({"all", "mesh", "hbone", "dns"})
-DNS_GATEWAY_TARGET_MARKER = ":15053"
-DNS_DIRECT_TARGET_MARKER = ":17053"
+DNS_GATEWAY_TARGET = "127.0.0.1:15053"
+DNS_DIRECT_TARGET = "127.0.0.1:17053"
+DNS_CONCURRENCY = 100
+DNS_DURATION_SECS = 60
 HBONE_GATEWAY_PORT = 18_000
 
 
@@ -127,6 +129,137 @@ def normalize_suites(suites: str | None) -> str | None:
 
 def suites_supported(suites: str | None) -> bool:
     return normalize_suites(suites) is not None
+
+
+def _present_text(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value.strip())
+        and not value.lstrip().startswith("<unavailable:")
+    )
+
+
+def provenance_complete(
+    provenance: dict[str, Any],
+    suites: str,
+    required_reps: int,
+) -> bool:
+    """Require the issue's minimum reproducibility evidence before acceptance."""
+    normalized = normalize_suites(suites)
+    if normalized is None or provenance.get("schema_version") != 1:
+        return False
+    commit_sha = provenance.get("commit_sha")
+    if (
+        not isinstance(commit_sha, str)
+        or len(commit_sha) != 40
+        or any(char not in "0123456789abcdefABCDEF" for char in commit_sha)
+        or not _present_text(provenance.get("collected_at_utc"))
+    ):
+        return False
+
+    github = provenance.get("github")
+    runner = provenance.get("runner")
+    toolchain = provenance.get("toolchain")
+    build = provenance.get("build")
+    dependencies = provenance.get("dependency_harness_versions")
+    repetitions = provenance.get("warmup_and_repetitions")
+    formulas = provenance.get("overhead_formula")
+    if not all(
+        isinstance(section, dict)
+        for section in (github, runner, toolchain, build, dependencies, repetitions, formulas)
+    ):
+        return False
+    if not all(
+        _present_text(github.get(key))
+        for key in ("run_id", "run_attempt", "workflow", "job", "repository", "ref", "server_url")
+    ):
+        return False
+    if not all(
+        _present_text(runner.get(key))
+        for key in ("class", "name", "os", "arch", "cpu_model", "lscpu_raw", "uname", "kernel")
+    ):
+        return False
+    if runner.get("class") != "ubuntu-24.04":
+        return False
+    nproc = parse_non_negative_int(runner.get("nproc"))
+    topology = runner.get("cpu_topology")
+    ram = runner.get("ram")
+    if (
+        nproc is None
+        or nproc < 1
+        or not isinstance(topology, dict)
+        or not all(
+            _present_text(topology.get(key))
+            for key in ("cpus", "threads_per_core", "cores_per_socket", "sockets")
+        )
+        or not isinstance(ram, dict)
+        or (parse_non_negative_int(ram.get("memtotal_kib")) or 0) < 1
+    ):
+        return False
+    if not all(
+        _present_text(toolchain.get(key))
+        for key in ("rustc_verbose", "cargo_verbose", "rust_toolchain_file")
+    ):
+        return False
+    if not all(
+        _present_text(build.get(key))
+        for key in ("gateway_profile", "gateway_features", "harness_profile", "non_default_settings_note")
+    ):
+        return False
+    if (
+        build.get("gateway_profile") != "release"
+        or build.get("harness_profile") != "release"
+    ):
+        return False
+    if not all(
+        _present_text(dependencies.get(key))
+        for key in (
+            "mesh_criterion",
+            "mesh_crate",
+            "hbone_crate",
+            "dns_crate",
+            "hdrhistogram_hbone",
+            "hdrhistogram_dns",
+        )
+    ):
+        return False
+    if (
+        not _present_text(repetitions.get("mesh_microbench"))
+        or parse_non_negative_int(repetitions.get("e2e_repetitions")) != required_reps
+        or not _present_text(repetitions.get("e2e_policy"))
+        or not all(
+            _present_text(formulas.get(key))
+            for key in (
+                "hbone_rps_overhead_percent",
+                "dns_upstream_forward_overhead_percent",
+                "notes",
+            )
+        )
+    ):
+        return False
+
+    selected = {"mesh", "hbone", "dns"} if normalized == "all" else {normalized}
+    expected_counts = {
+        "mesh": 4,
+        "hbone": 1 + len(HBONE_SCENARIOS) * required_reps,
+        "dns": 1 + required_reps,
+    }
+    actual_counts = {suite: 0 for suite in selected}
+    commands = provenance.get("suite_commands")
+    if not isinstance(commands, list):
+        return False
+    for command in commands:
+        if not isinstance(command, dict):
+            return False
+        suite = command.get("suite")
+        if (
+            not isinstance(suite, str)
+            or suite not in selected
+            or not _present_text(command.get("command"))
+        ):
+            return False
+        actual_counts[suite] += 1
+    return actual_counts == {suite: expected_counts[suite] for suite in selected}
 
 
 def expected_run_paths(root: Path, required_reps: int) -> list[Path]:
@@ -383,15 +516,19 @@ def classify_hbone_blob(blob: dict[str, Any]) -> str | None:
 
 
 def classify_dns_target(target: str) -> str | None:
-    """Map DNS report targets to gateway/direct; unknown targets fail closed."""
-    if DNS_GATEWAY_TARGET_MARKER in target:
+    """Map the exact harness socket identities; lookalikes fail closed."""
+    if target == DNS_GATEWAY_TARGET:
         return "gateway"
-    if DNS_DIRECT_TARGET_MARKER in target:
+    if target == DNS_DIRECT_TARGET:
         return "direct"
     return None
 
 
-def parse_hbone_sample(blob: dict[str, Any], source: str) -> dict[str, Any] | None:
+def parse_hbone_sample(
+    blob: dict[str, Any],
+    source: str,
+    scenario: dict[str, Any],
+) -> dict[str, Any] | None:
     """Fail closed on malformed / non-finite / non-positive HBONE metrics."""
     if "rps" not in blob:
         return None
@@ -402,7 +539,16 @@ def parse_hbone_sample(blob: dict[str, Any], source: str) -> dict[str, Any] | No
     if "total_errors" not in blob:
         return None
     errors = parse_non_negative_int(blob.get("total_errors"))
-    if None in (rps, p50, p95, p99, errors):
+    concurrency = parse_non_negative_int(blob.get("concurrency"))
+    duration_secs = parse_non_negative_int(blob.get("duration_secs"))
+    payload_size = parse_non_negative_int(blob.get("payload_size"))
+    if None in (rps, p50, p95, p99, errors, concurrency, duration_secs, payload_size):
+        return None
+    if (
+        concurrency != scenario["concurrency"]
+        or duration_secs != scenario["duration"]
+        or payload_size != scenario["payload"]
+    ):
         return None
     kind = classify_hbone_blob(blob)
     if kind is None:
@@ -418,7 +564,11 @@ def parse_hbone_sample(blob: dict[str, Any], source: str) -> dict[str, Any] | No
     }
 
 
-def parse_dns_report(report: dict[str, Any], source: str) -> dict[str, Any] | None:
+def parse_dns_report(
+    report: dict[str, Any],
+    source: str,
+    expected_duration_secs: int,
+) -> dict[str, Any] | None:
     """Fail closed on malformed / non-finite / non-positive DNS report rows."""
     class_name = report.get("name_class")
     transport = report.get("transport")
@@ -433,7 +583,10 @@ def parse_dns_report(report: dict[str, Any], source: str) -> dict[str, Any] | No
     if "total_errors" not in report:
         return None
     errors = parse_non_negative_int(report.get("total_errors"))
-    if None in (qps, p50, p90, p99, errors):
+    duration_secs = parse_non_negative_int(report.get("duration_secs"))
+    if None in (qps, p50, p90, p99, errors, duration_secs):
+        return None
+    if duration_secs != expected_duration_secs:
         return None
     return {
         "name_class": class_name,
@@ -503,7 +656,7 @@ def summarize_hbone(hbone_root: Path, required_reps: int) -> dict[str, Any]:
                     continue
                 if not hbone_blob_looks_relevant(blob):
                     continue
-                sample = parse_hbone_sample(blob, str(run_path))
+                sample = parse_hbone_sample(blob, str(run_path), scenario)
                 if sample is None:
                     run_rejected += 1
                     continue
@@ -594,8 +747,14 @@ def _parse_dns_blob_rows(
     expected_keys: set[tuple[str, str]],
 ) -> tuple[dict[tuple[str, str], dict[str, Any]] | None, int]:
     """Parse one DNS identity blob; None means malformed/conflicting shape."""
+    concurrency = parse_non_negative_int(blob.get("concurrency"))
+    duration_secs = parse_non_negative_int(blob.get("duration_secs"))
     reports = blob.get("reports")
-    if not isinstance(reports, list):
+    if (
+        concurrency != DNS_CONCURRENCY
+        or duration_secs != DNS_DURATION_SECS
+        or not isinstance(reports, list)
+    ):
         return None, 1
     parsed: dict[tuple[str, str], dict[str, Any]] = {}
     rejected = 0
@@ -603,7 +762,7 @@ def _parse_dns_blob_rows(
         if not isinstance(report, dict):
             rejected += 1
             continue
-        sample = parse_dns_report(report, source)
+        sample = parse_dns_report(report, source, DNS_DURATION_SECS)
         if sample is None:
             rejected += 1
             continue
@@ -782,7 +941,27 @@ def mesh_complete(mesh: dict[str, Any]) -> bool:
     return True
 
 
-def load_runner_health(results_root: Path) -> dict[str, Any]:
+def expected_health_probe_ids(
+    suites: str,
+    required_reps: int,
+) -> set[tuple[str, str, int]]:
+    normalized = normalize_suites(suites)
+    expected: set[tuple[str, str, int]] = set()
+    if normalized in ("all", "hbone"):
+        for scenario in HBONE_SCENARIOS:
+            for repetition in range(1, required_reps + 1):
+                expected.add(("hbone", scenario["key"], repetition))
+    if normalized in ("all", "dns"):
+        for repetition in range(1, required_reps + 1):
+            expected.add(("dns", "", repetition))
+    return expected
+
+
+def load_runner_health(
+    results_root: Path,
+    suites: str,
+    required_reps: int,
+) -> dict[str, Any]:
     health_path = results_root / "runner_health.json"
     probes_path = results_root / "logs" / "runner_health_probes.jsonl"
     health = load_json(health_path)
@@ -807,16 +986,40 @@ def load_runner_health(results_root: Path) -> dict[str, Any]:
     pre = parse_finite_number(health.get("avg_steal_percent"), non_negative=True)
     if pre is not None:
         steal_values.append(pre)
+    actual_probe_ids: set[tuple[str, str, int]] = set()
+    malformed_probe = False
     for probe in probes:
         if probe.get("parse_error"):
+            malformed_probe = True
             continue
         steal = parse_finite_number(probe.get("avg_steal_percent"), non_negative=True)
-        if steal is not None:
-            steal_values.append(steal)
+        repetition = parse_non_negative_int(probe.get("repetition"))
+        phase = probe.get("phase")
+        scenario = probe.get("scenario", "")
+        if (
+            steal is None
+            or repetition is None
+            or repetition < 1
+            or not isinstance(phase, str)
+            or not isinstance(scenario, str)
+        ):
+            malformed_probe = True
+            continue
+        probe_id = (phase, scenario, repetition)
+        if probe_id in actual_probe_ids:
+            malformed_probe = True
+            continue
+        actual_probe_ids.add(probe_id)
+        steal_values.append(steal)
     max_steal = max(steal_values) if steal_values else None
     # Missing health evidence fails closed: publication requires machine-readable
-    # steal samples from the pre-collection probe at minimum.
-    evidence_ok = pre is not None and not any(p.get("parse_error") for p in probes)
+    # steal samples from the pre-collection probe and every selected E2E run.
+    expected_probe_ids = expected_health_probe_ids(suites, required_reps)
+    evidence_ok = (
+        pre is not None
+        and not malformed_probe
+        and actual_probe_ids == expected_probe_ids
+    )
     steal_ok = (
         evidence_ok
         and max_steal is not None
@@ -826,6 +1029,8 @@ def load_runner_health(results_root: Path) -> dict[str, Any]:
         "path": str(health_path) if health_path.is_file() else None,
         "pre_collection": health,
         "probes": probes,
+        "expected_probe_count": len(expected_probe_ids),
+        "valid_probe_count": len(actual_probe_ids),
         "threshold_percent": MAX_CPU_STEAL_PERCENT,
         "max_steal_percent": max_steal,
         "evidence_present": evidence_ok,
@@ -840,6 +1045,7 @@ def selected_suite_gates(
     normalized = normalize_suites(suites)
     required: dict[str, bool] = {
         "suites_supported": normalized is not None,
+        "provenance_complete": bool(acceptance.get("provenance_complete")),
         "runner_health_ok": bool(acceptance.get("runner_health_ok")),
     }
     if normalized is None:
@@ -1059,10 +1265,21 @@ def write_draft_markdown(
     )
 
 
-def _write_hbone_run(path: Path, *, gateway_rps: float, direct_rps: float, errors: int = 0) -> None:
+def _write_hbone_run(
+    path: Path,
+    *,
+    gateway_rps: float,
+    direct_rps: float,
+    errors: int = 0,
+    scenario: dict[str, Any] | None = None,
+) -> None:
+    scenario = scenario or HBONE_SCENARIOS[0]
     gateway = {
         "label": "hbone_e2e",
         "target": "http://127.0.0.1:18000/echo",
+        "concurrency": scenario["concurrency"],
+        "duration_secs": scenario["duration"],
+        "payload_size": scenario["payload"],
         "rps": gateway_rps,
         "p50_us": 100,
         "p95_us": 200,
@@ -1072,6 +1289,9 @@ def _write_hbone_run(path: Path, *, gateway_rps: float, direct_rps: float, error
     direct = {
         "label": "hbone_e2e",
         "target": "http://127.0.0.1:19000/echo",
+        "concurrency": scenario["concurrency"],
+        "duration_secs": scenario["duration"],
+        "payload_size": scenario["payload"],
         "rps": direct_rps,
         "p50_us": 80,
         "p95_us": 160,
@@ -1087,10 +1307,13 @@ def _write_hbone_run(path: Path, *, gateway_rps: float, direct_rps: float, error
 def _dns_blob(*, target: str, rows: list[tuple[str, str, float]], errors: int = 0) -> dict[str, Any]:
     return {
         "target": target,
+        "concurrency": DNS_CONCURRENCY,
+        "duration_secs": DNS_DURATION_SECS,
         "reports": [
             {
                 "name_class": cls,
                 "transport": transport,
+                "duration_secs": DNS_DURATION_SECS,
                 "qps": qps,
                 "p50_us": 50,
                 "p90_us": 90,
@@ -1171,11 +1394,112 @@ def _populate_valid_mesh(criterion_root: Path) -> None:
         )
 
 
+def _self_test_provenance(required_reps: int) -> dict[str, Any]:
+    commands = [
+        {"suite": "mesh", "command": f"cargo bench --bench mesh-{index}"}
+        for index in range(4)
+    ]
+    commands.append({"suite": "hbone", "command": "build hbone"})
+    commands.extend(
+        {"suite": "hbone", "command": f"run hbone {scenario['key']} {repetition}"}
+        for scenario in HBONE_SCENARIOS
+        for repetition in range(1, required_reps + 1)
+    )
+    commands.append({"suite": "dns", "command": "build dns"})
+    commands.extend(
+        {"suite": "dns", "command": f"run dns {repetition}"}
+        for repetition in range(1, required_reps + 1)
+    )
+    return {
+        "schema_version": 1,
+        "collected_at_utc": "2026-08-12T00:00:00+00:00",
+        "commit_sha": "d" * 40,
+        "github": {
+            "run_id": "1",
+            "run_attempt": "1",
+            "workflow": "Mesh Performance Baselines",
+            "job": "collect",
+            "repository": "ferrum-edge/ferrum-edge",
+            "ref": "refs/heads/main",
+            "server_url": "https://github.com",
+        },
+        "runner": {
+            "class": "ubuntu-24.04",
+            "name": "GitHub Actions 1",
+            "os": "Linux",
+            "arch": "X64",
+            "nproc": "4",
+            "cpu_model": "test cpu",
+            "cpu_topology": {
+                "cpus": "CPU(s): 4",
+                "threads_per_core": "Thread(s) per core: 2",
+                "cores_per_socket": "Core(s) per socket: 2",
+                "sockets": "Socket(s): 1",
+            },
+            "lscpu_raw": "test lscpu",
+            "ram": {"memtotal_kib": 8_388_608},
+            "uname": "Linux test",
+            "kernel": "test-kernel",
+        },
+        "toolchain": {
+            "rustc_verbose": "rustc test",
+            "cargo_verbose": "cargo test",
+            "rust_toolchain_file": "rust-toolchain.toml channel=stable",
+        },
+        "build": {
+            "gateway_profile": "release",
+            "gateway_features": "default (no --features)",
+            "harness_profile": "release",
+            "non_default_settings_note": "documented harness settings",
+        },
+        "dependency_harness_versions": {
+            "mesh_criterion": "0.5.1",
+            "mesh_crate": "mesh-perf",
+            "hbone_crate": "mesh-hbone-e2e-perf",
+            "dns_crate": "mesh-dns-e2e-perf",
+            "hdrhistogram_hbone": "7.5.4",
+            "hdrhistogram_dns": "7.5.4",
+        },
+        "warmup_and_repetitions": {
+            "mesh_microbench": "Criterion warmup",
+            "e2e_repetitions": required_reps,
+            "e2e_policy": "three clean repetitions",
+        },
+        "suite_commands": commands,
+        "overhead_formula": {
+            "hbone_rps_overhead_percent": "hbone formula",
+            "dns_upstream_forward_overhead_percent": "dns formula",
+            "notes": "same-run comparison",
+        },
+    }
+
+
+def _self_test_health_probes(required_reps: int) -> str:
+    probes = [
+        {
+            "phase": "hbone",
+            "scenario": scenario["key"],
+            "repetition": repetition,
+            "avg_steal_percent": 3.0,
+        }
+        for scenario in HBONE_SCENARIOS
+        for repetition in range(1, required_reps + 1)
+    ]
+    probes.extend(
+        {
+            "phase": "dns",
+            "repetition": repetition,
+            "avg_steal_percent": 2.0,
+        }
+        for repetition in range(1, required_reps + 1)
+    )
+    return "".join(json.dumps(probe) + "\n" for probe in probes)
+
+
 def self_test() -> int:
     assert abs((((100.0 - 80.0) / 100.0) * 100.0) - 20.0) < 1e-9
     assert "µs" in fmt_duration_ns(1500.0) or "us" in fmt_duration_ns(1500.0)
     assert required_repetitions(None) == 3
-    assert required_repetitions(2) == 3
     assert required_repetitions(5) == 5
     assert parse_finite_number("nan", positive=True) is None
     assert parse_finite_number(-1.0, positive=True) is None
@@ -1190,13 +1514,7 @@ def self_test() -> int:
         prov_path = root / "provenance.json"
         out_path = root / "summary.json"
         prov_path.write_text(
-            json.dumps(
-                {
-                    "commit_sha": "deadbeef",
-                    "runner": {"class": "ubuntu-24.04", "cpu_model": "test"},
-                }
-            )
-            + "\n",
+            json.dumps(_self_test_provenance(3)) + "\n",
             encoding="utf-8",
         )
         (root / "runner_health.json").write_text(
@@ -1217,7 +1535,12 @@ def self_test() -> int:
         for scenario in HBONE_SCENARIOS:
             scenario_dir = under / "hbone" / scenario["key"]
             scenario_dir.mkdir(parents=True)
-            _write_hbone_run(scenario_dir / "run_1.txt", gateway_rps=80.0, direct_rps=100.0)
+            _write_hbone_run(
+                scenario_dir / "run_1.txt",
+                gateway_rps=80.0,
+                direct_rps=100.0,
+                scenario=scenario,
+            )
         hbone_under = summarize_hbone(under / "hbone", required_repetitions(3))
         assert all(not row["complete"] for row in hbone_under.values())
         evidence = hbone_under["1kib_c50_30s"]["repetition_evidence"]
@@ -1232,6 +1555,9 @@ def self_test() -> int:
         gateway = {
             "label": "hbone_e2e",
             "target": "http://127.0.0.1:18000/echo",
+            "concurrency": 50,
+            "duration_secs": 30,
+            "payload_size": 1024,
             "rps": 80.0,
             "p50_us": 100,
             "p95_us": 200,
@@ -1241,6 +1567,9 @@ def self_test() -> int:
         direct = {
             "label": "hbone_e2e",
             "target": "http://127.0.0.1:19000/echo",
+            "concurrency": 50,
+            "duration_secs": 30,
+            "payload_size": 1024,
             "rps": 100.0,
             "p50_us": 80,
             "p95_us": 160,
@@ -1339,6 +1668,9 @@ def self_test() -> int:
                 "rps": 1.0,
             }
         ) is None
+        wrong_hbone_shape = dict(gateway)
+        wrong_hbone_shape["concurrency"] = 51
+        assert parse_hbone_sample(wrong_hbone_shape, "x", HBONE_SCENARIOS[0]) is None
 
         # --- missing DNS rows / incomplete per-run shape ---
         dns_missing = root / "dns_missing"
@@ -1387,6 +1719,19 @@ def self_test() -> int:
         assert classify_dns_target("127.0.0.1:9999") is None
         assert classify_dns_target("127.0.0.1:15053") == "gateway"
         assert classify_dns_target("127.0.0.1:17053") == "direct"
+        assert classify_dns_target("evil:15053") is None
+        assert classify_dns_target("127.0.0.1:15053-extra") is None
+        assert classify_dns_target("prefix-127.0.0.1:17053") is None
+        wrong_dns_shape = _dns_blob(
+            target=DNS_GATEWAY_TARGET,
+            rows=[(cls, transport, 50.0) for cls, transport in DNS_GATEWAY_ROWS],
+        )
+        wrong_dns_shape["duration_secs"] = 59
+        assert _parse_dns_blob_rows(
+            wrong_dns_shape,
+            "x",
+            set(DNS_GATEWAY_ROWS),
+        )[0] is None
 
         dns_extra = root / "dns_extra_runs"
         dns_extra.mkdir()
@@ -1431,9 +1776,9 @@ def self_test() -> int:
             "\n".join(json.dumps(x) for x in (bad_blob, nan_blob, zero_blob)) + "\n",
             encoding="utf-8",
         )
-        assert parse_hbone_sample(bad_blob, "x") is None
-        assert parse_hbone_sample(nan_blob, "x") is None
-        assert parse_hbone_sample(zero_blob, "x") is None
+        assert parse_hbone_sample(bad_blob, "x", HBONE_SCENARIOS[0]) is None
+        assert parse_hbone_sample(nan_blob, "x", HBONE_SCENARIOS[0]) is None
+        assert parse_hbone_sample(zero_blob, "x", HBONE_SCENARIOS[0]) is None
         missing_hbone_errors = {
             "label": "hbone_e2e",
             "target": "http://127.0.0.1:18000/echo",
@@ -1442,7 +1787,7 @@ def self_test() -> int:
             "p95_us": 2,
             "p99_us": 3,
         }
-        assert parse_hbone_sample(missing_hbone_errors, "x") is None
+        assert parse_hbone_sample(missing_hbone_errors, "x", HBONE_SCENARIOS[0]) is None
         assert parse_dns_report(
             {
                 "name_class": "mesh-internal",
@@ -1454,6 +1799,7 @@ def self_test() -> int:
                 "total_errors": 0,
             },
             "x",
+            DNS_DURATION_SECS,
         ) is None
         assert parse_dns_report(
             {
@@ -1465,6 +1811,7 @@ def self_test() -> int:
                 "p99_us": 3,
             },
             "x",
+            DNS_DURATION_SECS,
         ) is None
         assert criterion_mean(Path("/no/such/estimates.json")) is None
 
@@ -1479,6 +1826,7 @@ def self_test() -> int:
                     gateway_rps=80.0,
                     direct_rps=100.0,
                     errors=1,
+                    scenario=scenario,
                 )
         hbone_err = summarize_hbone(err_root / "hbone", required_repetitions(3))
         assert all(row["complete"] for row in hbone_err.values())
@@ -1503,6 +1851,7 @@ def self_test() -> int:
                     scenario_dir / f"run_{run}.txt",
                     gateway_rps=80.0 + run,
                     direct_rps=100.0 + run,
+                    scenario=scenario,
                 )
         (valid / "dns").mkdir(parents=True)
         for run in range(1, 4):
@@ -1513,23 +1862,7 @@ def self_test() -> int:
         )
         (valid / "logs").mkdir(parents=True, exist_ok=True)
         (valid / "logs" / "runner_health_probes.jsonl").write_text(
-            json.dumps(
-                {
-                    "phase": "hbone",
-                    "scenario": "1kib_c50_30s",
-                    "repetition": 1,
-                    "avg_steal_percent": 3.0,
-                }
-            )
-            + "\n"
-            + json.dumps(
-                {
-                    "phase": "dns",
-                    "repetition": 1,
-                    "avg_steal_percent": 2.0,
-                }
-            )
-            + "\n",
+            _self_test_health_probes(3),
             encoding="utf-8",
         )
         (valid / "provenance.json").write_text(prov_path.read_text(encoding="utf-8"), encoding="utf-8")
@@ -1544,12 +1877,47 @@ def self_test() -> int:
         assert summary["acceptance_gate"]["hbone_errors_ok"] is True
         assert summary["acceptance_gate"]["dns_complete"] is True
         assert summary["acceptance_gate"]["dns_errors_ok"] is True
+        assert summary["acceptance_gate"]["provenance_complete"] is True
         assert summary["acceptance_gate"]["runner_health_ok"] is True
         assert summary["ready_to_publish_baselines"] is True
         assert summary["hbone"]["1kib_c50_30s"]["repetition_evidence"]["gateway"]["actual"] == 3
         assert summary["dns"]["repetition_evidence"]["gateway"]["upstream-forward/tcp"]["actual"] == 3
         write_draft_markdown(drafts, summary["provenance"], summary["mesh"], summary["hbone"], summary["dns"])
         assert (drafts / "mesh_baseline_draft.md").is_file()
+
+        # Complete measurements without complete provenance must not pass.
+        summary_without_provenance = build_summary(
+            valid,
+            {},
+            required_repetitions(3),
+            suites="all",
+        )
+        assert summary_without_provenance["acceptance_gate"]["provenance_complete"] is False
+        assert summary_without_provenance["ready_to_publish_baselines"] is False
+
+        # A malformed per-run steal probe must not be silently ignored.
+        probes_path = valid / "logs" / "runner_health_probes.jsonl"
+        probes_path.write_text(
+            _self_test_health_probes(3)
+            + json.dumps(
+                {
+                    "phase": "dns",
+                    "repetition": 4,
+                    "avg_steal_percent": "not-a-number",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        summary_bad_probe = build_summary(
+            valid,
+            load_json(valid / "provenance.json") or {},
+            required_repetitions(3),
+            suites="all",
+        )
+        assert summary_bad_probe["acceptance_gate"]["runner_health_ok"] is False
+        assert summary_bad_probe["ready_to_publish_baselines"] is False
+        probes_path.write_text(_self_test_health_probes(3), encoding="utf-8")
 
         # excessive steal fails publication even with complete metrics
         (valid / "runner_health.json").write_text(
@@ -1579,6 +1947,7 @@ def self_test() -> int:
                 "hbone_errors_ok": True,
                 "dns_complete": False,
                 "dns_errors_ok": False,
+                "provenance_complete": True,
                 "runner_health_ok": True,
                 "ready_to_publish_baselines": False,
             },
@@ -1594,6 +1963,7 @@ def self_test() -> int:
                 "hbone_errors_ok": True,
                 "dns_complete": False,
                 "dns_errors_ok": False,
+                "provenance_complete": True,
                 "runner_health_ok": True,
                 "ready_to_publish_baselines": False,
             },
@@ -1606,6 +1976,7 @@ def self_test() -> int:
                 "hbone_errors_ok": True,
                 "dns_complete": True,
                 "dns_errors_ok": True,
+                "provenance_complete": True,
                 "runner_health_ok": True,
                 "ready_to_publish_baselines": False,
             },
@@ -1623,6 +1994,7 @@ def self_test() -> int:
                 "hbone_errors_ok": True,
                 "dns_complete": True,
                 "dns_errors_ok": True,
+                "provenance_complete": True,
                 "runner_health_ok": True,
                 "ready_to_publish_baselines": True,
             },
@@ -1630,6 +2002,7 @@ def self_test() -> int:
         )
         assert invalid_gates == {
             "suites_supported": False,
+            "provenance_complete": True,
             "runner_health_ok": True,
         }
         assert not selected_suite_accepted(
@@ -1639,6 +2012,7 @@ def self_test() -> int:
                 "hbone_errors_ok": True,
                 "dns_complete": True,
                 "dns_errors_ok": True,
+                "provenance_complete": True,
                 "runner_health_ok": True,
                 "ready_to_publish_baselines": True,
             },
@@ -1674,11 +2048,16 @@ def build_summary(
     mesh = summarize_mesh(results_root / "mesh" / "criterion")
     hbone = summarize_hbone(results_root / "hbone", required_reps)
     dns = summarize_dns(results_root / "dns", required_reps)
-    runner_health = load_runner_health(results_root)
+    runner_health = load_runner_health(results_root, suites, required_reps)
     suites_ok = suites_supported(suites)
 
     acceptance = {
         "suites_supported": suites_ok,
+        "provenance_complete": provenance_complete(
+            provenance,
+            suites,
+            required_reps,
+        ),
         "mesh_complete": mesh_complete(mesh),
         "hbone_complete": all(v.get("complete") for v in hbone.values()) if hbone else False,
         "hbone_errors_ok": all(v.get("errors_ok") for v in hbone.values()) if hbone else False,
@@ -1692,6 +2071,7 @@ def build_summary(
     ready = all(
         [
             suites_ok,
+            acceptance["provenance_complete"],
             acceptance["mesh_complete"],
             acceptance["hbone_complete"],
             acceptance["hbone_errors_ok"],
