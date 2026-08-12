@@ -584,6 +584,51 @@ upstreams:
     assert!(!message.contains("mesh.unix_socket"), "{message}");
 }
 
+/// A mixed upstream with a complete same-cluster Ambient HBONE member is still
+/// operator-forged `mesh.*` material when it arrives as file YAML. File mode
+/// must refuse it the same way it refuses a Unix-socket tag: the live
+/// CONNECT-UDP mixed-upstream case feeds this shape through trusted
+/// projection, not the operator loader.
+#[test]
+fn test_file_load_rejects_hand_authored_mesh_hbone_target_in_a_mixed_upstream() {
+    let yaml = r#"
+version: "1"
+proxies: []
+consumers: []
+plugin_configs: []
+upstreams:
+  - id: "masque-pool"
+    targets:
+      - host: "127.0.0.1"
+        port: 1
+      - host: "127.0.0.1"
+        port: 2
+        tags:
+          mesh.hbone: "true"
+          mesh.spiffe_id: "spiffe://cluster.local/ns/ferrum/sa/udp-echo"
+          mesh.trust_domain: "cluster.local"
+          mesh.namespace: "ferrum"
+          mesh.protocol: "udp"
+"#;
+    let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
+    write!(file, "{}", yaml).unwrap();
+
+    let err = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        "ferrum",
+    )
+    .expect_err("file mode must reject a hand-authored mesh.hbone mixed upstream");
+    let message = err.to_string();
+    assert!(
+        message.contains("targets[1].tags") && message.contains("reserved mesh.* namespace"),
+        "error should identify the HBONE member without echoing tag content: {message}"
+    );
+    assert!(!message.contains("mesh.hbone"), "{message}");
+    assert!(!message.contains("spiffe://"), "{message}");
+}
+
 /// A clean operator file (no mesh-projected fields) still loads — the rejection
 /// must not be over-broad.
 #[test]

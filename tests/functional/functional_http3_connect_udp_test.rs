@@ -12,7 +12,9 @@
 //!   above did not widen the bound on capsules the gateway materializes
 //! - a spoofed destination that the matched proxy is not configured to reach
 //! - a mixed upstream where the client-requested member requires HBONE while a
-//!   sibling is directly dialable: the requested member is still refused
+//!   sibling is directly dialable: the requested member is still refused.
+//!   Reserved `mesh.*` tags enter through trusted projection (the same
+//!   boundary mesh materialization uses), not operator file YAML
 //! - an open backend circuit breaker not governing a tunnel that dials no
 //!   HTTP backend
 //! - malformed URI-template expansions
@@ -32,9 +34,10 @@
 
 use std::time::Duration;
 
+use ferrum_edge::config::EnvConfig;
 use tokio::net::{TcpListener, UdpSocket};
 
-use crate::common::TestGateway;
+use crate::common::{TestGateway, TrustedProjectedGateway, TrustedProjectedGatewayOptions};
 use crate::scaffolding::clients::{Http3Client, Http3ConnectUdp};
 
 const MASQUE_PREFIX: &str = "/.well-known/masque";
@@ -116,6 +119,13 @@ plugin_configs: []
 /// `backend_host`/`backend_port` are deliberately a third address that the
 /// upstream does not contain, so nothing here can be admitted by the route
 /// backend rule.
+///
+/// The HBONE member is a complete same-cluster Ambient projection
+/// (`mesh.hbone` plus the identity tags `mesh_hbone_target_tags` always
+/// stamps). It is still not directly dialable: CONNECT-UDP admission refuses
+/// any matching target that requires HBONE, mesh mTLS, east-west, or Unix
+/// dispatch. These reserved `mesh.*` tags cannot be loaded through operator
+/// file/admin config; the live case feeds them through trusted projection.
 fn masque_mixed_upstream_config(direct_port: u16, hbone_port: u16, unused_port: u16) -> String {
     format!(
         r#"version: "1"
@@ -128,6 +138,10 @@ upstreams:
         port: {hbone_port}
         tags:
           mesh.hbone: "true"
+          mesh.spiffe_id: "spiffe://cluster.local/ns/ferrum/sa/udp-echo"
+          mesh.trust_domain: "cluster.local"
+          mesh.namespace: "ferrum"
+          mesh.protocol: "udp"
 proxies:
   - id: "masque"
     listen_path: "{MASQUE_PREFIX}"
@@ -179,6 +193,48 @@ async fn start_masque_gateway(config: String, extra_env: &[(&str, &str)]) -> (Te
         "failed to start CONNECT-UDP gateway after 3 attempts: {}",
         last_error.unwrap_or_else(|| "no error recorded".to_string())
     );
+}
+
+/// Spawn the mixed-upstream MASQUE gateway through trusted projection.
+///
+/// Reserved `mesh.*` target tags are mesh-materialized. Operator file-mode
+/// (`TestGateway` / `validate_operator_provided_fields`) rejects them at
+/// startup before any listener binds — which is the correct fail-closed
+/// operator boundary, but it cannot host this live case. Production mesh
+/// projection deserializes + normalizes the same document and never runs
+/// that operator check; this helper uses that boundary.
+async fn start_masque_gateway_with_projected_mesh_tags(
+    config: String,
+    excluded_ports: &[u16],
+) -> (TrustedProjectedGateway, u16) {
+    let env = EnvConfig {
+        enable_http3: true,
+        http3_connect_udp_enabled: true,
+        pool_warmup_enabled: false,
+        log_level: "warn".into(),
+        frontend_tls_cert_path: Some("tests/certs/server.crt".into()),
+        frontend_tls_key_path: Some("tests/certs/server.key".into()),
+        ..Default::default()
+    };
+    let gateway = TrustedProjectedGateway::spawn_from_yaml(
+        &config,
+        TrustedProjectedGatewayOptions {
+            env,
+            enable_https: true,
+            excluded_ports: excluded_ports.to_vec(),
+            ..TrustedProjectedGatewayOptions::default()
+        },
+    )
+    .await
+    .expect("spawn CONNECT-UDP gateway via trusted projection");
+    gateway
+        .wait_for_proxy_port(Duration::from_secs(15))
+        .await
+        .expect("CONNECT-UDP trusted projected proxy port");
+    let https_port = gateway
+        .proxy_https_port
+        .expect("CONNECT-UDP gateway must expose an HTTPS/QUIC port");
+    (gateway, https_port)
 }
 
 fn tunnel_url(https_port: u16, target_host: &str, target_port: u16) -> String {
@@ -398,9 +454,9 @@ async fn functional_h3_connect_udp_refuses_a_transport_constrained_target_in_a_m
     let direct = UdpEcho::spawn().await;
     let hbone = UdpEcho::spawn().await;
     let unused = UdpEcho::spawn().await;
-    let (mut gateway, https_port) = start_masque_gateway(
+    let (mut gateway, https_port) = start_masque_gateway_with_projected_mesh_tags(
         masque_mixed_upstream_config(direct.port, hbone.port, unused.port),
-        &[("FERRUM_HTTP3_CONNECT_UDP_ENABLED", "true")],
+        &[direct.port, hbone.port, unused.port],
     )
     .await;
 
@@ -442,7 +498,7 @@ async fn functional_h3_connect_udp_refuses_a_transport_constrained_target_in_a_m
         "the refusal must not disclose the directly dialable member: {body}"
     );
 
-    gateway.shutdown();
+    gateway.shutdown().await;
 }
 
 #[ignore]
