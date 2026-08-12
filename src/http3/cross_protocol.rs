@@ -2775,11 +2775,10 @@ where
                     // literal: no expiry value, claim, subject, certificate
                     // field, or provider detail reaches the client.
                     if let Some(termination) = upload_auth_expired {
-                        crate::proxy::auth_lifetime::record_termination(
+                        ctx.record_authorization_termination_once(
                             termination,
                             crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
                         );
-                        ctx.latch_authorization_termination(termination);
                         record_cross_protocol_backend_admission_outcome(
                             &mut backend_admission_permits,
                             401,
@@ -3416,11 +3415,10 @@ where
                     // the protocol-correct terminal is the FIXED redacted 401.
                     // The body is a compiled-in literal — no expiry value, claim,
                     // subject, certificate field, or provider detail.
-                    crate::proxy::auth_lifetime::record_termination(
+                    ctx.record_authorization_termination_once(
                         termination,
                         crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
                     );
-                    ctx.latch_authorization_termination(termination);
                     return write_plain_gateway_error(
                         stream,
                         ctx,
@@ -3508,11 +3506,10 @@ where
                         // a fabricated clean finish and never an appended
                         // gateway frame the client is no longer authorized to
                         // receive. Recorded exactly once: this arm returns.
-                        crate::proxy::auth_lifetime::record_termination(
+                        ctx.record_authorization_termination_once(
                             termination,
                             crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
                         );
-                        ctx.latch_authorization_termination(termination);
                         crate::http3::stream_util::abort_response_stream(stream);
                         return Ok(CrossProtocolOutcome {
                             response_status,
@@ -3664,11 +3661,10 @@ where
                 // the protocol-correct terminal is the FIXED redacted 401.
                 // The body is a compiled-in literal — no expiry value, claim,
                 // subject, certificate field, or provider detail.
-                crate::proxy::auth_lifetime::record_termination(
+                ctx.record_authorization_termination_once(
                     termination,
                     crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
                 );
-                ctx.latch_authorization_termination(termination);
                 return write_plain_gateway_error(
                     stream,
                     ctx,
@@ -3729,6 +3725,10 @@ where
         ctx,
         state.env_config.authenticated_stream_max_lifetime_seconds,
     );
+    // Cloned once (an `Arc` bump) before the relay borrows the stream, so every
+    // blocked-write exit inside it records through the REQUEST's shared latch
+    // rather than the bare counter.
+    let auth_latch = ctx.authorization_termination_latch();
     let stream_response = async {
         if let Some(inspector) = response_inspector {
             stream_inspected_reqwest_response(
@@ -3737,6 +3737,7 @@ where
                 inspector,
                 max_resp_bytes,
                 auth_deadline_plan,
+                &auth_latch,
             )
             .await
         } else {
@@ -3746,6 +3747,7 @@ where
                 coalesce,
                 max_resp_bytes,
                 auth_deadline_plan,
+                &auth_latch,
             )
             .await
         }
@@ -4363,6 +4365,10 @@ where
         streaming.grpc_deadline_at,
         auth_deadline_plan,
     );
+    // Cloned once (an `Arc` bump) before the relay borrows the context, so every
+    // authorization exit inside it records through the REQUEST's shared latch
+    // rather than the bare counter.
+    let auth_latch = ctx.authorization_termination_latch();
     let (
         mut bytes_streamed,
         body_completed,
@@ -4385,6 +4391,7 @@ where
             // captured from the accepted context before the relay borrows it
             // and never recomputed from relay activity.
             auth_deadline: auth_deadline_plan,
+            auth_latch: &auth_latch,
         },
     )
     .await;
@@ -4537,12 +4544,11 @@ where
                 // itself did not already record one for this stream.
                 match crate::proxy::auth_lifetime::expired_authorization(auth_deadline_plan) {
                     Some(termination) if auth_termination.is_none() => {
-                        crate::proxy::auth_lifetime::record_termination(
+                        ctx.record_authorization_termination_once(
                             termination,
                             terminal_auth_family,
                         );
                         auth_termination = Some(termination);
-                        ctx.latch_authorization_termination(termination);
                     }
                     Some(_) => {}
                     None => client_deadline_expired = true,
@@ -4636,12 +4642,11 @@ where
                     // itself did not already record one for this stream.
                     match crate::proxy::auth_lifetime::expired_authorization(auth_deadline_plan) {
                         Some(termination) if auth_termination.is_none() => {
-                            crate::proxy::auth_lifetime::record_termination(
+                            ctx.record_authorization_termination_once(
                                 termination,
                                 terminal_auth_family,
                             );
                             auth_termination = Some(termination);
-                            ctx.latch_authorization_termination(termination);
                         }
                         Some(_) => {}
                         None => client_deadline_expired = true,
@@ -4680,12 +4685,11 @@ where
                 // itself did not already record one for this stream.
                 match crate::proxy::auth_lifetime::expired_authorization(auth_deadline_plan) {
                     Some(termination) if auth_termination.is_none() => {
-                        crate::proxy::auth_lifetime::record_termination(
+                        ctx.record_authorization_termination_once(
                             termination,
                             terminal_auth_family,
                         );
                         auth_termination = Some(termination);
-                        ctx.latch_authorization_termination(termination);
                     }
                     Some(_) => {}
                     None => client_deadline_expired = true,
@@ -7067,6 +7071,10 @@ async fn stream_reqwest_response<S>(
     coalesce: CoalesceConfig,
     max_response_body_size_bytes: usize,
     auth_deadline: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+    // The REQUEST's shared once-only termination latch, so a write that parks
+    // past the credential records through the same latch as the upload
+    // direction, the pre-commitment gates, and this relay's own idle arm.
+    auth_latch: &crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
 ) -> (
     u64,
     bool,
@@ -7111,6 +7119,7 @@ where
             match crate::http3::stream_util::await_authorized_response_write(
                 auth_deadline,
                 crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
+                auth_latch,
                 $write,
             )
             .await
@@ -7223,8 +7232,10 @@ where
                 coalesce_buf.clear();
                 crate::http3::stream_util::abort_response_stream(stream);
                 body_error_class = Some(ErrorClass::ClientDisconnect);
-                // `break 'outer` makes this arm reachable at most once.
-                crate::proxy::auth_lifetime::record_termination(
+                // Through the REQUEST latch: `break 'outer` makes this arm
+                // reachable at most once, and the latch keeps a concurrent
+                // blocked-write exit from counting the same stream twice.
+                auth_latch.record_once(
                     termination,
                     crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
                 );
@@ -7284,6 +7295,10 @@ async fn stream_inspected_reqwest_response<S>(
     mut inspector: Box<dyn ResponseStreamInspector>,
     max_response_body_size_bytes: usize,
     auth_deadline: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+    // The REQUEST's shared once-only termination latch, so a write that parks
+    // past the credential records through the same latch as the upload
+    // direction, the pre-commitment gates, and this relay's own idle arm.
+    auth_latch: &crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
 ) -> (
     u64,
     bool,
@@ -7323,6 +7338,7 @@ where
             match crate::http3::stream_util::await_authorized_response_write(
                 auth_deadline,
                 crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
+                auth_latch,
                 $write,
             )
             .await
@@ -7372,8 +7388,10 @@ where
                     );
                     crate::http3::stream_util::abort_response_stream(stream);
                     body_error_class = Some(ErrorClass::ClientDisconnect);
-                    // The loop breaks here, so this is recorded exactly once.
-                    crate::proxy::auth_lifetime::record_termination(
+                    // Through the REQUEST latch: the loop breaks here, and the
+                    // latch keeps a concurrent blocked-write exit from counting
+                    // the same stream twice.
+                    auth_latch.record_once(
                         termination,
                         crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
                     );
@@ -7538,6 +7556,10 @@ struct StreamHyperIncomingOpts<'a> {
     /// captured once from the accepted `RequestContext` before the relay took
     /// ownership. `None` for an unauthenticated request.
     auth_deadline: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+    /// The REQUEST's shared once-only termination latch. Every authorization
+    /// exit inside the relay records through it, so the idle arm, the
+    /// blocked-write seam, and the terminal FIN cannot double count one stream.
+    auth_latch: &'a crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
 }
 
 /// Stream a hyper `Incoming` body into the H3 stream, separating trailer
@@ -7572,6 +7594,7 @@ where
         grpc_web_translation_mode,
         grpc_response_messages,
         auth_deadline,
+        auth_latch,
     } = opts;
     let mut coalesce_buf = BytesMut::with_capacity(coalesce.max_bytes);
     let mut total_streamed: usize = 0;
@@ -7660,10 +7683,7 @@ where
                         // Every call site breaks the relay loop, so this is
                         // recorded exactly once and the select arm cannot also
                         // fire for the same stream.
-                        crate::proxy::auth_lifetime::record_termination(
-                            plan.termination,
-                            auth_family,
-                        );
+                        auth_latch.record_once(plan.termination, auth_family);
                         auth_termination = Some(plan.termination);
                     } else {
                         client_deadline_expired = true;
@@ -7752,7 +7772,7 @@ where
                 }
                 // Health-neutral: a gateway policy expiry, not a backend fault.
                 body_error_class = Some(ErrorClass::ClientDisconnect);
-                crate::proxy::auth_lifetime::record_termination(termination, auth_family);
+                auth_latch.record_once(termination, auth_family);
                 auth_termination = Some(termination);
                 break 'outer;
             }
@@ -7937,10 +7957,7 @@ where
                     // terminal FIN, so the counter cannot double-count.
                     match crate::proxy::auth_lifetime::expired_authorization(auth_deadline) {
                         Some(termination) => {
-                            crate::proxy::auth_lifetime::record_termination(
-                                termination,
-                                auth_family,
-                            );
+                            auth_latch.record_once(termination, auth_family);
                             auth_termination = Some(termination);
                         }
                         None => client_deadline_expired = true,
@@ -8240,7 +8257,7 @@ async fn run_cross_protocol_reject_committed_hooks(
         let (status, headers, body) =
             reject_committed_response_view(normalized, translated.as_ref());
         let terminal_gateway_deadline = ctx.gateway_deadline_response_selected();
-        let Some(pending_hook) = crate::proxy::run_response_committed_hook_until_deadline(
+        let pending_hook = match crate::proxy::run_response_committed_hook_until_deadline(
             Arc::clone(plugin),
             ctx,
             status,
@@ -8249,8 +8266,15 @@ async fn run_cross_protocol_reject_committed_hooks(
             terminal_gateway_deadline,
         )
         .await
-        else {
-            continue;
+        {
+            crate::proxy::ResponseCommittedHookOutcome::Completed => continue,
+            crate::proxy::ResponseCommittedHookOutcome::Detach(hook) => hook,
+            // Authorization expiry (issue #3815): the pending observer is
+            // already dropped with the cloned request context and the response
+            // body it owned, and every remaining observer is skipped. Nothing
+            // protected is detached past the credential's lifetime; the bounded
+            // class is already latched.
+            crate::proxy::ResponseCommittedHookOutcome::AuthorizationExpired(_) => return false,
         };
 
         let deadline_replaced = !terminal_gateway_deadline;
@@ -8836,7 +8860,7 @@ where
             continue;
         }
         let terminal_gateway_deadline = ctx.gateway_deadline_response_selected();
-        let Some(pending_hook) = crate::proxy::run_response_committed_hook_until_deadline(
+        let pending_hook = match crate::proxy::run_response_committed_hook_until_deadline(
             Arc::clone(plugin),
             ctx,
             normalized.http_status.as_u16(),
@@ -8845,8 +8869,14 @@ where
             terminal_gateway_deadline,
         )
         .await
-        else {
-            continue;
+        {
+            crate::proxy::ResponseCommittedHookOutcome::Completed => continue,
+            crate::proxy::ResponseCommittedHookOutcome::Detach(hook) => hook,
+            // Authorization expiry (issue #3815): the pending observer is
+            // already dropped with the cloned request context and the response
+            // body it owned, and every remaining observer is skipped rather
+            // than detached. The bounded class is already latched.
+            crate::proxy::ResponseCommittedHookOutcome::AuthorizationExpired(_) => break,
         };
         if !terminal_gateway_deadline {
             ctx.mark_gateway_deadline_response_selected();

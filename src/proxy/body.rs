@@ -1024,15 +1024,21 @@ impl ProxyBody {
     /// reading. Both are client-controlled, so the adapter alone is not an
     /// enforceable authorization lifetime.
     ///
-    /// The inner body is therefore ALSO placed under a gateway-owned watchdog
+    /// The inner body is therefore MOVED into a gateway-owned response pump
     /// (`response_watchdog::AuthorizationCancellableBody`), armed from the same
-    /// absolute plan and settling through the same once-only latch. It runs in a
-    /// task the gateway schedules, so at the deadline it releases the backend
-    /// body — and with it the upstream stream, its pooled connection, and every
-    /// guard rooted in that body — regardless of what the transport is doing,
-    /// and then, after a bounded grace in which the downstream may still drain
-    /// the terminal above, asks `closer` to close the client connection so the
+    /// absolute plan and settling through the same once-only latch. That pump
+    /// is the upstream's sole owner and sole poller, and it runs in a task the
+    /// gateway schedules, so at the deadline it releases the backend body — and
+    /// with it the upstream stream, its pooled connection, and every guard
+    /// rooted in that body — regardless of what the transport is doing, and
+    /// then, after a bounded grace in which the downstream may still drain the
+    /// terminal above, asks `closer` to close the client connection so the
     /// request/session accounting held by `ProxyBody` itself is released too.
+    ///
+    /// Single ownership is also what makes the terminal winner authoritative:
+    /// one task decides, in one biased `select!`, whether this response
+    /// completed or expired, so a response that reached its own terminal before
+    /// the deadline can never be counted or closed by a racing watchdog.
     ///
     /// `closer` is `None` for frontends that own their own downstream writes and
     /// already bound every one of them (the native HTTP/3 relays), where a

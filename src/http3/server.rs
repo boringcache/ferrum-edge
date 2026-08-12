@@ -562,6 +562,10 @@ async fn finish_h3_response_with_backend_trailers<S>(
     // downstream writes of a streaming relay and are just as parkable as a DATA
     // frame, so they race the same plan through the shared seam.
     auth_deadline: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+    // The REQUEST's shared once-only termination latch, so a trailer/FIN write
+    // that parks past the credential cannot count a second termination for a
+    // stream the relay's own arms already settled.
+    auth_latch: &crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
 ) -> Result<(), H3TrailerFinishError>
 where
     S: SendStream<Bytes>,
@@ -571,6 +575,7 @@ where
             match crate::http3::stream_util::await_authorized_response_write(
                 auth_deadline,
                 crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
+                auth_latch,
                 $write,
             )
             .await
@@ -6215,11 +6220,17 @@ async fn handle_h3_request(
         // HEADERS are already committed, so the expired branch RESETS — never a
         // fabricated clean finish — and the buffered coalesce tail is dropped
         // because those bytes are no longer authorized.
+        // The REQUEST's shared once-only termination latch, cloned once per
+        // relay (an `Arc` bump) so every write below records through it instead
+        // of the bare counter. Concurrent upload / response / terminal paths on
+        // one stream therefore cannot double count.
+        let auth_latch = ctx.authorization_termination_latch();
         macro_rules! authorized_send {
             ($write:expr) => {
                 match crate::http3::stream_util::await_authorized_response_write(
                     auth_deadline_plan,
                     crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
+                    &auth_latch,
                     $write,
                 )
                 .await
@@ -6450,14 +6461,14 @@ async fn handle_h3_request(
                     coalesce_buf.clear();
                     crate::http3::stream_util::abort_response_stream(&mut stream);
                     body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
-                    // `break 'outer` makes this arm reachable at most once, so
-                    // the fixed-cardinality counter and the bounded termination
-                    // class are recorded exactly once per terminated stream.
-                    crate::proxy::auth_lifetime::record_termination(
+                    // Through the REQUEST latch: `break 'outer` makes this arm
+                    // reachable at most once, and the latch additionally keeps a
+                    // concurrent blocked-write or upload exit from counting the
+                    // same stream twice.
+                    ctx.record_authorization_termination_once(
                         termination,
                         crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
                     );
-                    ctx.latch_authorization_termination(termination);
                     break 'outer;
                 }
             }
@@ -6516,6 +6527,7 @@ async fn handle_h3_request(
                             section: TrailerSectionKind::PlainResponse,
                         },
                         auth_deadline_plan,
+                        &auth_latch,
                     )
                     .await
                 };
@@ -8267,13 +8279,10 @@ async fn handle_h3_request(
                                     crate::proxy::grpc_proxy::grpc_status::UNAUTHENTICATED,
                                     termination.grpc_message(),
                                 );
-                                if ctx.authorization_termination().is_none() {
-                                    crate::proxy::auth_lifetime::record_termination(
-                                        termination,
-                                        crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
-                                    );
-                                }
-                                ctx.latch_authorization_termination(termination);
+                                ctx.record_authorization_termination_once(
+                                    termination,
+                                    crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
+                                );
                             }
                             None => {
                                 crate::proxy::insert_grpc_error_metadata(
@@ -9888,11 +9897,17 @@ async fn stream_h3_open_response_to_client(
     // and drops the unauthorized coalesce tail rather than fabricating a clean
     // finish. Health-neutral: a gateway policy expiry must not move the circuit
     // breaker, passive health, or the H3 capability registry.
+    // The REQUEST's shared once-only termination latch, cloned once per relay
+    // (an `Arc` bump) so every write below records through it instead of the
+    // bare counter. Concurrent upload / response / terminal paths on one stream
+    // therefore cannot double count.
+    let auth_latch = ctx.authorization_termination_latch();
     macro_rules! authorized_send {
         ($write:expr) => {
             match crate::http3::stream_util::await_authorized_response_write(
                 auth_deadline_plan,
                 crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
+                &auth_latch,
                 $write,
             )
             .await
@@ -10051,14 +10066,14 @@ async fn stream_h3_open_response_to_client(
                 crate::http3::stream_util::abort_response_stream(h3_stream);
                 terminal_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
                 body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
-                // `break 'outer` makes this arm reachable at most once, so the
-                // fixed-cardinality counter and the bounded termination class are
-                // recorded exactly once per terminated stream.
-                crate::proxy::auth_lifetime::record_termination(
+                // Through the REQUEST latch: `break 'outer` makes this arm
+                // reachable at most once, and the latch additionally keeps a
+                // concurrent blocked-write or upload exit from counting the same
+                // stream twice.
+                ctx.record_authorization_termination_once(
                     termination,
                     crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
                 );
-                ctx.latch_authorization_termination(termination);
                 break 'outer;
             }
         }
@@ -10083,6 +10098,7 @@ async fn stream_h3_open_response_to_client(
                     section: TrailerSectionKind::PlainResponse,
                 },
                 auth_deadline_plan,
+                &auth_latch,
             )
             .await
             {
@@ -11561,6 +11577,133 @@ async fn dispatch_grpc_native_h3(
             || response_headers.contains_key("content-length"),
     );
 
+    // The ONE fixed PRE-COMMITMENT authorization terminal for this relay
+    // (issue #3815). Every point at which a client-visible terminal is about to
+    // be produced while the response head is still uncommitted — the
+    // declared-size refusal, the `after_proxy` rejection, and the response head
+    // itself — checks the authorization plan first and expands this, so an
+    // expired credential always yields the same trailers-only
+    // `grpc-status: 16` and never the phase's own terminal (a
+    // `RESOURCE_EXHAUSTED` refusal, a plugin reject, or a protected head).
+    //
+    // `$write_terminal == false` is the downstream-cannot-accept case: the
+    // stream is reset instead, because a client that could not take the HEADERS
+    // cannot take a clean status either.
+    //
+    // Ordering in every expansion: response BEFORE teardown; then cancel-and-
+    // join the gateway-owned upload pump so no detached producer survives;
+    // then release the admission permit set exactly once. Circuit breaker,
+    // passive health, and the adaptive limiter see the TRUE backend status with
+    // NO error class — the backend answered, and the gateway's own security
+    // decision is never charged to it.
+    macro_rules! h3_grpc_authorization_precommit_terminal {
+        ($termination:expr, $write_terminal:expr) => {{
+            let termination: crate::proxy::auth_lifetime::StreamAuthTermination = $termination;
+            // Exactly once for the request, through the shared latch: the
+            // upload pump may already have settled the same plan in the other
+            // direction.
+            ctx.record_authorization_termination_once(
+                termination,
+                crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Grpc,
+            );
+            crate::proxy::insert_grpc_error_metadata(
+                &mut ctx.metadata,
+                crate::proxy::grpc_proxy::grpc_status::UNAUTHENTICATED,
+                termination.grpc_message(),
+            );
+            let terminal_sent = if $write_terminal {
+                let mut terminal_headers = HashMap::with_capacity(3);
+                terminal_headers.insert("content-type".to_string(), "application/grpc".to_string());
+                terminal_headers.insert(
+                    "grpc-status".to_string(),
+                    crate::proxy::auth_lifetime::AUTHORIZATION_EXPIRED_GRPC_STATUS_HEADER
+                        .to_string(),
+                );
+                terminal_headers.insert(
+                    "grpc-message".to_string(),
+                    termination.grpc_message().to_string(),
+                );
+                let sent = await_h3_grpc_terminal_write_with_grace(
+                    send_h3_grpc_reject_trailers_only(
+                        &mut send_half,
+                        StatusCode::OK,
+                        Bytes::new(),
+                        &terminal_headers,
+                        crate::proxy::FramedGrpcUnaryProvenance::NONE,
+                    ),
+                )
+                .await;
+                if !sent {
+                    crate::http3::stream_util::abort_response_stream(&mut send_half);
+                }
+                sent
+            } else {
+                crate::http3::stream_util::abort_response_stream(&mut send_half);
+                false
+            };
+            pump_guard.retire().await;
+            crate::proxy::backend_dispatch::record_backend_outcome(
+                state,
+                proxy,
+                &epoch.load_balancer,
+                upstream_balancer,
+                upstream_target,
+                cb_target_key,
+                response_status,
+                false,
+                None,
+                cb_is_half_open_probe,
+                false,
+                backend_start.elapsed(),
+            );
+            record_h3_backend_admission_outcome(
+                &mut backend_admission_permits,
+                response_status,
+                false,
+                None,
+                backend_admission_response_elapsed,
+            );
+            log_h3_grpc_transaction(
+                proxy,
+                ctx,
+                plugins,
+                method,
+                original_request_path,
+                backend_url,
+                backend_resolved_ip,
+                proxy_headers,
+                StatusCode::OK.as_u16(),
+                upload.bytes(),
+                0,
+                terminal_sent,
+                !terminal_sent,
+                // Health-neutral: a gateway policy expiry, never a backend fault.
+                Some(crate::retry::ErrorClass::ClientDisconnect),
+                None,
+                start_time,
+                backend_admission_response_elapsed.as_secs_f64() * 1000.0,
+                *plugin_execution_ns,
+            )
+            .await;
+            record_request(state, StatusCode::OK.as_u16());
+            return Ok(());
+        }};
+    }
+
+    // PRE-COMMITMENT authorization gate ahead of the first client-visible
+    // terminal this relay can produce. The backend head has arrived but nothing
+    // is on the wire, so an expired credential must take the fixed terminal
+    // rather than a `RESOURCE_EXHAUSTED` refusal that describes the backend.
+    if let Some(termination) =
+        crate::proxy::auth_lifetime::expired_authorization(auth_deadline_plan)
+    {
+        warn!(
+            "native H3 gRPC response reached its authorization lifetime before any response-header \
+             phase ran; emitting the fixed trailers-only UNAUTHENTICATED terminal"
+        );
+        h3_grpc_authorization_precommit_terminal!(termination, true);
+    }
+
     // Response body size ceiling (Content-Length fast path). Backend RESPONSE
     // bytes are bounded by `max_response_body_size_bytes` — the same limit the
     // plain native-H3 streaming path and the cross-protocol streaming gRPC bridge
@@ -11665,6 +11808,21 @@ async fn dispatch_grpc_native_h3(
     )
     .await
     {
+        // The hook chain is bounded by the composed pre-commitment bound, so it
+        // may legitimately have consumed time right up to the credential's
+        // deadline. Authorization is checked BEFORE the rejection reaches the
+        // wire: a plugin's own reject must not be the client-visible terminal
+        // for a stream whose credential is no longer authorized.
+        if let Some(termination) =
+            crate::proxy::auth_lifetime::expired_authorization(auth_deadline_plan)
+        {
+            warn!(
+                "native H3 gRPC response reached its authorization lifetime during the \
+                 response-header phases; emitting the fixed trailers-only UNAUTHENTICATED \
+                 terminal instead of the hook rejection"
+            );
+            h3_grpc_authorization_precommit_terminal!(termination, true);
+        }
         let reject_status =
             StatusCode::from_u16(reject.status_code).unwrap_or(StatusCode::BAD_GATEWAY);
         // gRPC-flavor tail of `send_h3_reject_flavor_aware`, called directly
@@ -11829,6 +11987,31 @@ async fn dispatch_grpc_native_h3(
         ClientResponseFraming::Streaming,
     );
 
+    // ── Final PRE-COMMITMENT authorization gate (issue #3815) ───────────────
+    //
+    // Everything between the backend head and this point — the `after_proxy`
+    // chain, the final client-visible header policy, sticky-cookie injection,
+    // terminal-metadata stripping, the wire sanitizer — is awaited or run while
+    // NOTHING is client-visible, and the phases that await are bounded by the
+    // composed pre-commitment bound rather than by `grpc_deadline_at` alone. A
+    // hook may legitimately consume time right up to that bound, and the
+    // backend-open / header-wait race may itself have ended at it.
+    //
+    // This is therefore the LAST instant at which no protected response head
+    // exists on the wire, and the first at which the complete header map is
+    // known. An expired credential here takes the fixed trailers-only
+    // `grpc-status: 16` terminal instead: no protected head, no protected
+    // trailing metadata, and no backend payload is committed.
+    if let Some(termination) =
+        crate::proxy::auth_lifetime::expired_authorization(auth_deadline_plan)
+    {
+        warn!(
+            "native H3 gRPC response reached its authorization lifetime before the response head \
+             was committed; emitting the fixed trailers-only UNAUTHENTICATED terminal"
+        );
+        h3_grpc_authorization_precommit_terminal!(termination, true);
+    }
+
     // Send response headers. gRPC carries its own `content-type`
     // (`application/grpc`); never override it with the plain JSON default.
     let status = StatusCode::from_u16(response_status).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -11837,11 +12020,37 @@ async fn dispatch_grpc_native_h3(
     let resp = resp_builder
         .body(())
         .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 gRPC response: {}", e))?;
+    // The head write itself is bounded by the EARLIEST of the client's optional
+    // RPC deadline and the admitted credential's authorization deadline. QPACK
+    // encoding plus a QUIC stream the client is not reading can park
+    // `send_response` indefinitely, and the gate above only proves the
+    // credential was live when the write was OFFERED.
+    let response_header_write_deadline_at =
+        crate::proxy::auth_lifetime::compose_absolute_bound(grpc_deadline_at, auth_deadline_plan);
     let response_header_write = crate::http3::stream_util::await_response_write_before_deadline(
-        grpc_deadline_at,
+        response_header_write_deadline_at,
         send_half.send_response(resp),
     )
     .await;
+    // An expiry on that write is attributed to whichever bound actually
+    // elapsed. Authorization wins a tie, matching every composed seam: the head
+    // is aborted and reported as an authorization termination rather than
+    // misreported as the client's DEADLINE_EXCEEDED.
+    if matches!(
+        response_header_write,
+        Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded)
+    ) && let Some(termination) =
+        crate::proxy::auth_lifetime::expired_authorization(auth_deadline_plan)
+    {
+        warn!(
+            "native H3 gRPC response head could not be written before the authorization lifetime \
+             elapsed; resetting the stream"
+        );
+        // The downstream demonstrably cannot accept even the HEADERS, so a
+        // clean terminal status cannot be written either — reset rather than
+        // park again on a trailer write.
+        h3_grpc_authorization_precommit_terminal!(termination, false);
+    }
     if let Err(write_error) = response_header_write {
         // The response write already happened (and failed), so this is still
         // response-before-teardown: retire the upload pump before recording.
@@ -12050,14 +12259,15 @@ async fn dispatch_grpc_native_h3(
                         crate::proxy::grpc_proxy::grpc_status::UNAUTHENTICATED,
                         termination.grpc_message(),
                     );
-                    // Every call site ends the relay on `false`, and the select
-                    // arm below also ends it, so exactly one of the two records
-                    // per terminated stream.
-                    crate::proxy::auth_lifetime::record_termination(
+                    // Through the REQUEST latch, not the bare counter: the
+                    // upload pump, the pre-commitment gates, and the select arm
+                    // below can all reach an authorization exit for the same
+                    // stream, and only the first of them may count. Every call
+                    // site ends the relay on `false`.
+                    ctx.record_authorization_termination_once(
                         termination,
                         crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Grpc,
                     );
-                    ctx.latch_authorization_termination(termination);
                     // Health-neutral: a gateway policy expiry, not a backend fault.
                     body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
                     false
@@ -12198,13 +12408,13 @@ async fn dispatch_grpc_native_h3(
                     crate::proxy::grpc_proxy::grpc_status::UNAUTHENTICATED,
                     termination.grpc_message(),
                 );
-                // Fixed-cardinality counter and bounded termination class,
-                // recorded exactly once: this arm breaks the relay loop.
-                crate::proxy::auth_lifetime::record_termination(
+                // Fixed-cardinality counter and bounded termination class
+                // through the REQUEST latch, so this idle arm and the
+                // blocked-write seam above cannot both count the same stream.
+                ctx.record_authorization_termination_once(
                     termination,
                     crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Grpc,
                 );
-                ctx.latch_authorization_termination(termination);
                 break 'outer;
             }
             _ = &mut grpc_deadline_sleep, if grpc_deadline_active && !stream_done => {
@@ -13292,11 +13502,17 @@ async fn proxy_to_backend_h3_streaming(
     // and drops the unauthorized coalesce tail rather than fabricating a clean
     // finish. Health-neutral: a gateway policy expiry must not move the circuit
     // breaker, passive health, or the H3 capability registry.
+    // The REQUEST's shared once-only termination latch, cloned once per relay
+    // (an `Arc` bump) so every write below records through it instead of the
+    // bare counter. Concurrent upload / response / terminal paths on one stream
+    // therefore cannot double count.
+    let auth_latch = ctx.authorization_termination_latch();
     macro_rules! authorized_send {
         ($write:expr) => {
             match crate::http3::stream_util::await_authorized_response_write(
                 auth_deadline_plan,
                 crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
+                &auth_latch,
                 $write,
             )
             .await
@@ -13469,14 +13685,14 @@ async fn proxy_to_backend_h3_streaming(
                 crate::http3::stream_util::abort_response_stream(h3_stream);
                 terminal_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
                 body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
-                // `break 'outer` makes this arm reachable at most once, so the
-                // fixed-cardinality counter and the bounded termination class are
-                // recorded exactly once per terminated stream.
-                crate::proxy::auth_lifetime::record_termination(
+                // Through the REQUEST latch: `break 'outer` makes this arm
+                // reachable at most once, and the latch additionally keeps a
+                // concurrent blocked-write or upload exit from counting the same
+                // stream twice.
+                ctx.record_authorization_termination_once(
                     termination,
                     crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
                 );
-                ctx.latch_authorization_termination(termination);
                 break 'outer;
             }
         }
@@ -13502,6 +13718,7 @@ async fn proxy_to_backend_h3_streaming(
                     section: TrailerSectionKind::PlainResponse,
                 },
                 auth_deadline_plan,
+                &auth_latch,
             )
             .await
             {
@@ -14173,7 +14390,7 @@ async fn run_h3_deadline_bounded_reject_committed_hooks_with_policy(
             continue;
         }
         let terminal_gateway_deadline = ctx.gateway_deadline_response_selected();
-        let Some(pending_hook) = crate::proxy::run_response_committed_hook_until_deadline(
+        let pending_hook = match crate::proxy::run_response_committed_hook_until_deadline(
             Arc::clone(plugin),
             ctx,
             committed_status.as_u16(),
@@ -14182,8 +14399,23 @@ async fn run_h3_deadline_bounded_reject_committed_hooks_with_policy(
             terminal_gateway_deadline,
         )
         .await
-        else {
-            continue;
+        {
+            crate::proxy::ResponseCommittedHookOutcome::Completed => continue,
+            crate::proxy::ResponseCommittedHookOutcome::Detach(hook) => hook,
+            // Authorization expiry (issue #3815). The pending observer is
+            // already dropped, together with the cloned request context and the
+            // response body it owned, and every remaining observer is skipped:
+            // detaching here would run protected-data side effects after the
+            // credential stopped being authorized. The bounded class is already
+            // latched. No deadline provenance is marked, so the representation
+            // the caller writes is unchanged — it is the gateway's own
+            // rejection, not backend payload, so there is nothing left to
+            // withhold.
+            crate::proxy::ResponseCommittedHookOutcome::AuthorizationExpired(_) => {
+                ctx.metadata
+                    .remove(crate::proxy::FINALIZED_SYNTHETIC_RESPONSE_METADATA_KEY);
+                return false;
+            }
         };
 
         if terminal_gateway_deadline {
@@ -14269,9 +14501,10 @@ async fn finalize_h3_upload_deadline_rejection(
             // marker makes the shared writer replace the selected representation
             // with the gRPC deadline one, which would overwrite this terminal.
             //
-            // Exactly once per stream: this is a pre-dispatch terminal that
-            // returns immediately, so no relay can also record for it.
-            crate::proxy::auth_lifetime::record_termination(
+            // Through the REQUEST latch, so this pre-dispatch terminal and any
+            // upload-direction exit for the same stream count exactly once
+            // between them.
+            ctx.record_authorization_termination_once(
                 termination,
                 match flavor {
                     HttpFlavor::Grpc => crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Grpc,
@@ -14281,7 +14514,6 @@ async fn finalize_h3_upload_deadline_rejection(
                     _ => crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
                 },
             );
-            ctx.latch_authorization_termination(termination);
             (
                 "authorization_lifetime_h3_upload",
                 crate::plugins::authorization_expired_plugin_result(

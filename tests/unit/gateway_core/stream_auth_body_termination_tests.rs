@@ -556,10 +556,9 @@ async fn the_watchdog_releases_the_upstream_while_the_transport_polls_nothing() 
     // Nothing polls the body — the whole point of the watchdog.
     tokio::time::sleep(Duration::from_secs(6)).await;
 
-    assert_eq!(
-        polls.load(Ordering::SeqCst),
-        0,
-        "the transport polled nothing, exactly as a zero-credit HTTP/2 client forces"
+    assert!(
+        polls.load(Ordering::SeqCst) >= 1,
+        "the GATEWAY owns and polls the upstream now, so progress does not depend on the          transport polling this body — which it never did here, exactly as a zero-credit          HTTP/2 client forces"
     );
     assert!(
         body.upstream_released(),
@@ -628,10 +627,9 @@ async fn a_downstream_that_never_drains_the_terminal_is_closed_at_the_transport(
         StreamAuthTermination::CredentialExpired,
         StreamAuthProtocolFamily::Http
     ));
-    assert_eq!(
-        polls.load(Ordering::SeqCst),
-        0,
-        "no poll of the response body was needed to reach either outcome"
+    assert!(
+        polls.load(Ordering::SeqCst) >= 1,
+        "the gateway-owned pump is what made progress; no poll of the CLIENT-VISIBLE body          was needed to reach either outcome"
     );
 }
 
@@ -669,5 +667,273 @@ async fn a_drained_terminal_never_costs_the_client_its_connection() {
         !closer.close_requested(),
         "a client that drained the terminal must keep its connection: the transport close is a \
          last resort, not the normal path"
+    );
+}
+
+// --- The gateway-owned response pump: terminal-winner authority -------------
+//
+// The upstream body is owned by ONE task, which decides in ONE biased `select!`
+// whether this response completed or expired. There is no shared mutex on the
+// response path and no check-then-act window in which a watchdog can count a
+// response that had already finished, or in which a finishing poll can escape a
+// deadline that had already elapsed.
+
+/// A body that yields a ready DATA frame forever. Stands in for a backend that
+/// keeps producing while the client stops reading, which is what fills the
+/// pump's bounded channel.
+struct FloodBody {
+    dropped: Arc<AtomicBool>,
+}
+
+impl http_body::Body for FloodBody {
+    type Data = Bytes;
+    type Error = ProxyBodyError;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        std::task::Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(b"flood")))))
+    }
+}
+
+impl Drop for FloodBody {
+    fn drop(&mut self) {
+        self.dropped.store(true, Ordering::SeqCst);
+    }
+}
+
+fn pump_body(
+    inner: ferrum_edge::proxy::ProxyBody,
+    deadline: StreamAuthDeadline,
+    latch: &StreamAuthTerminationLatch,
+    fired: &Arc<AtomicBool>,
+    closer: Option<AuthorizationConnectionCloser>,
+) -> ferrum_edge::proxy::response_watchdog::AuthorizationCancellableBody {
+    ferrum_edge::_test_support::authorization_cancellable_body_for_test(
+        inner,
+        deadline,
+        StreamAuthProtocolFamily::Http,
+        latch.clone(),
+        Arc::clone(fired),
+        closer,
+    )
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_response_that_completed_before_the_deadline_is_never_counted_or_closed() {
+    let latch = StreamAuthTerminationLatch::default();
+    let fired = Arc::new(AtomicBool::new(false));
+    let closer = AuthorizationConnectionCloser::new();
+    let grace = ferrum_edge::_test_support::authorization_transport_close_grace();
+    let mut body = pump_body(
+        proxy_body_streaming_for_test(Box::pin(StreamBody::new(stream::iter(vec![Ok::<
+            _,
+            ProxyBodyError,
+        >(
+            Frame::data(Bytes::from_static(b"complete")),
+        )])))),
+        future_deadline(
+            Duration::from_secs(5),
+            StreamAuthTermination::CredentialExpired,
+        ),
+        &latch,
+        &fired,
+        Some(closer.clone()),
+    );
+
+    // Drained to a clean end of stream WELL before the deadline.
+    assert_eq!(
+        body.frame()
+            .await
+            .expect("one data frame")
+            .expect("frame is not an error")
+            .data_ref()
+            .expect("data frame")
+            .as_ref(),
+        b"complete".as_slice()
+    );
+    assert!(
+        body.frame().await.is_none(),
+        "a clean upstream EOF must stay a clean end of stream, never a synthesized error"
+    );
+
+    tokio::time::sleep(Duration::from_secs(10) + grace).await;
+    assert_eq!(
+        latch.observed(),
+        None,
+        "a response that completed before the deadline is NOT an authorization termination, \
+         however long the transport then holds the finished body"
+    );
+    assert!(
+        !fired.load(Ordering::Acquire),
+        "the classification flag must stay clear for a completed response"
+    );
+    assert!(
+        !closer.close_requested(),
+        "a completed response must never cost the client its connection"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_upstream_error_immediately_before_the_deadline_stays_an_error() {
+    let latch = StreamAuthTerminationLatch::default();
+    let fired = Arc::new(AtomicBool::new(false));
+    let closer = AuthorizationConnectionCloser::new();
+    let grace = ferrum_edge::_test_support::authorization_transport_close_grace();
+    let mut body = pump_body(
+        proxy_body_streaming_for_test(Box::pin(StreamBody::new(stream::iter(vec![Err::<
+            Frame<Bytes>,
+            ProxyBodyError,
+        >(
+            Box::new(std::io::Error::other("backend failed")) as ProxyBodyError,
+        )])))),
+        future_deadline(
+            Duration::from_secs(5),
+            StreamAuthTermination::CredentialExpired,
+        ),
+        &latch,
+        &fired,
+        Some(closer.clone()),
+    );
+
+    let terminal = body.frame().await.expect("a terminal frame");
+    let error = terminal.err().expect("an upstream error must stay an error");
+    assert!(
+        error.to_string().contains("backend failed"),
+        "the upstream error must be delivered verbatim, never collapsed into a clean EOF or \
+         replaced by the authorization terminal"
+    );
+    assert!(body.frame().await.is_none());
+
+    tokio::time::sleep(Duration::from_secs(10) + grace).await;
+    assert_eq!(
+        latch.observed(),
+        None,
+        "a backend failure before the deadline is not an authorization termination"
+    );
+    assert!(!fired.load(Ordering::Acquire));
+    assert!(!closer.close_requested());
+}
+
+#[tokio::test(start_paused = true)]
+async fn at_the_exact_deadline_the_security_bound_wins_over_a_ready_frame() {
+    let latch = StreamAuthTerminationLatch::default();
+    let fired = Arc::new(AtomicBool::new(false));
+    let dropped = Arc::new(AtomicBool::new(false));
+    // `at` is exactly now: the expiry timer and the ready upstream frame become
+    // eligible in the SAME poll. The biased select must resolve that tie to the
+    // security decision, deterministically, every time.
+    let mut body = pump_body(
+        proxy_body_streaming_for_test(Box::pin(FloodBody {
+            dropped: Arc::clone(&dropped),
+        })),
+        StreamAuthDeadline {
+            at: tokio::time::Instant::now(),
+            termination: StreamAuthTermination::CredentialExpired,
+        },
+        &latch,
+        &fired,
+        None,
+    );
+
+    let terminal = body.frame().await.expect("a terminal");
+    assert!(
+        terminal.is_err(),
+        "a tie at the exact deadline must terminate, never deliver the simultaneously ready \
+         protected frame"
+    );
+    assert!(
+        body.upstream_released(),
+        "the upstream must be released at the tie, not after one more frame"
+    );
+    assert!(dropped.load(Ordering::SeqCst));
+    assert!(fired.load(Ordering::Acquire));
+    assert_eq!(
+        latch.observed(),
+        Some(StreamAuthTermination::CredentialExpired)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_full_channel_cannot_postpone_the_deadline() {
+    let latch = StreamAuthTerminationLatch::default();
+    let fired = Arc::new(AtomicBool::new(false));
+    let dropped = Arc::new(AtomicBool::new(false));
+    let body = pump_body(
+        proxy_body_streaming_for_test(Box::pin(FloodBody {
+            dropped: Arc::clone(&dropped),
+        })),
+        future_deadline(
+            Duration::from_secs(5),
+            StreamAuthTermination::AuthenticatedStreamMaxLifetime,
+        ),
+        &latch,
+        &fired,
+        None,
+    );
+
+    // A backend producing without pause plus a downstream that never reads
+    // fills the pump's one-frame channel immediately and parks it on `reserve`.
+    // Backpressure may delay delivery; it may never delay enforcement.
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    assert!(
+        body.upstream_released(),
+        "the deadline arm must win over a full channel"
+    );
+    assert!(
+        dropped.load(Ordering::SeqCst),
+        "the flooding backend body must be dropped at the deadline"
+    );
+    assert!(fired.load(Ordering::Acquire));
+    assert_eq!(
+        latch.observed(),
+        Some(StreamAuthTermination::AuthenticatedStreamMaxLifetime)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn dropping_the_response_body_cancels_the_pump_and_releases_the_upstream() {
+    let polls = Arc::new(AtomicUsize::new(0));
+    let dropped = Arc::new(AtomicBool::new(false));
+    let fired = Arc::new(AtomicBool::new(false));
+    let latch = StreamAuthTerminationLatch::default();
+    let closer = AuthorizationConnectionCloser::new();
+    let grace = ferrum_edge::_test_support::authorization_transport_close_grace();
+    let body = pump_body(
+        probe_body(&polls, &dropped),
+        future_deadline(
+            Duration::from_secs(30),
+            StreamAuthTermination::CredentialExpired,
+        ),
+        &latch,
+        &fired,
+        Some(closer.clone()),
+    );
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(
+        !dropped.load(Ordering::SeqCst),
+        "the pump owns the upstream while the body lives"
+    );
+
+    drop(body);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(
+        dropped.load(Ordering::SeqCst),
+        "cancellation must terminate the pump and RELEASE the upstream — no detached producer \
+         may survive the response body"
+    );
+
+    tokio::time::sleep(grace * 2 + Duration::from_secs(1)).await;
+    assert_eq!(
+        latch.observed(),
+        None,
+        "a cancelled body is a client disconnect, not an authorization termination"
+    );
+    assert!(!fired.load(Ordering::Acquire));
+    assert!(
+        !closer.close_requested(),
+        "a connection whose body was already dropped needs no transport close"
     );
 }

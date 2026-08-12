@@ -7211,7 +7211,7 @@ pub mod _test_support {
         crate::proxy::response_watchdog::TRANSPORT_CLOSE_GRACE
     }
 
-    /// Install the gateway-owned response watchdog directly over one body, as
+    /// Move one body into the gateway-owned response pump, as
     /// `ProxyBody::with_authorization_deadline` does, so an external test can
     /// observe the upstream release without going through `ProxyBody`
     /// (issue #3815).
@@ -7222,7 +7222,7 @@ pub mod _test_support {
         latch: crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
         fired: std::sync::Arc<std::sync::atomic::AtomicBool>,
         closer: Option<crate::proxy::auth_lifetime::AuthorizationConnectionCloser>,
-    ) -> crate::proxy::response_watchdog::AuthorizationCancellableBody<crate::proxy::ProxyBody> {
+    ) -> crate::proxy::response_watchdog::AuthorizationCancellableBody {
         crate::proxy::response_watchdog::AuthorizationCancellableBody::new(
             inner, deadline, family, latch, fired, closer,
         )

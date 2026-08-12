@@ -147,9 +147,12 @@ pub(crate) enum H3AuthorizedWrite {
     ClientWriteFailed,
     /// The absolute authorization bound elapsed while the write was parked in
     /// flow control (or was already elapsed when the write was offered). The
-    /// fixed-cardinality termination counter has ALREADY been recorded here,
-    /// exactly once. The caller must drop any buffered tail, reset the send
-    /// half, latch the bounded class, and end its relay.
+    /// termination has ALREADY been recorded here through the REQUEST's shared
+    /// latch, so it is counted at most once for the stream even when the
+    /// upload direction, a pre-commitment gate, or the relay's own idle arm
+    /// reaches an authorization exit concurrently. The caller must drop any
+    /// buffered tail, reset the send half, latch the bounded class into its
+    /// summary, and end its relay.
     AuthorizationExpired(crate::proxy::auth_lifetime::StreamAuthTermination),
 }
 
@@ -168,9 +171,15 @@ pub(crate) enum H3AuthorizedWrite {
 /// passed down by value, so calling this per frame can neither refresh nor
 /// re-derive it, and an unauthenticated request (`None`) pays nothing at all —
 /// no timer is registered on that path.
+/// `latch` is the REQUEST's shared once-only termination latch. Routing the
+/// blocked-write class through it — rather than incrementing the counter
+/// directly — is what keeps the upload direction, the pre-commitment gates, the
+/// relay's idle arm, and this seam from double counting one stream when several
+/// of them become eligible at the same absolute instant.
 pub(crate) async fn await_authorized_response_write<F, T, E>(
     plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
     family: crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
+    latch: &crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
     write: F,
 ) -> H3AuthorizedWrite
 where
@@ -186,10 +195,7 @@ where
         Ok(_) => H3AuthorizedWrite::Written,
         Err(H3ResponseWriteError::Write(_)) => H3AuthorizedWrite::ClientWriteFailed,
         Err(H3ResponseWriteError::DeadlineExceeded) => {
-            // Sole recorder for the parked-write class. Every caller ends its
-            // relay on this outcome and the read-side `select!` arm ends it on
-            // the other, so at most one of the two records per stream.
-            crate::proxy::auth_lifetime::record_termination(plan.termination, family);
+            latch.record_once(plan.termination, family);
             H3AuthorizedWrite::AuthorizationExpired(plan.termination)
         }
     }

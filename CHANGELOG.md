@@ -39,25 +39,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   detail.
 
   Client-visible response bodies additionally get a **gateway-owned response
-  watchdog**, for the same reason the upload direction needs a pump: hyper does
-  not poll a response body while its HTTP/2 pipe is parked on stream send
-  capacity (a client advertising `SETTINGS_INITIAL_WINDOW_SIZE: 0`) or its
-  HTTP/1.1 connection is parked flushing a socket the client stopped reading, so
-  a body-only deadline is not enforceable. At the deadline a gateway-scheduled
-  task releases the backend body — cancelling the upstream stream, its pooled
-  connection, and every guard rooted in it — and, if the downstream still has
-  not drained the protocol-correct terminal a bounded grace later, closes that
-  client connection so the request guard, per-IP guard, admission permits, and
-  load-balancer accounting the response body holds are released exactly once.
-  HTTP/2 gives a server no way to reset one stream from outside hyper, so that
-  close is connection-scoped and is preceded by `GOAWAY` plus a bounded settle
-  window; it is only ever reached for a connection that is demonstrably refusing
-  to drain an already-expired authenticated stream.
+  pump**, for the same reason the upload direction needs one: hyper does not
+  poll a response body while its HTTP/2 pipe is parked on stream send capacity
+  (a client advertising `SETTINGS_INITIAL_WINDOW_SIZE: 0`) or its HTTP/1.1
+  connection is parked flushing a socket the client stopped reading, so a
+  body-only deadline is not enforceable. The backend body moves into ONE
+  gateway-scheduled task that is its sole owner and sole poller and delivers
+  frames through a one-slot channel, so there is no lock on the response path
+  and exactly one task decides — in one biased `select!` — whether the response
+  completed or expired. A response that reached its own terminal before the
+  deadline is never counted or closed; at the exact deadline the security bound
+  wins deterministically; a full channel delays delivery but never enforcement.
+  Frames, trailers, and errors keep their order, an upstream error is never
+  collapsed into a clean end of stream, and cancelling or dropping the response
+  body terminates the pump and releases the upstream so no detached producer
+  survives. At the deadline the pump releases the backend body — cancelling the
+  upstream stream, its pooled connection, and every guard rooted in it — and, if
+  the downstream still has not drained the protocol-correct terminal a bounded
+  grace later, closes that client connection so the request guard, per-IP guard,
+  admission permits, and load-balancer accounting the response body holds are
+  released exactly once. HTTP/2 gives a server no way to reset one stream from
+  outside hyper, so that close is connection-scoped and is preceded by `GOAWAY`
+  plus a bounded settle window; it is only ever reached for a connection that is
+  demonstrably refusing to drain an already-expired authenticated stream.
+
+  Every awaited pre-commitment response phase now carries the authorization
+  **plan** beside the composed instant, so an elapsed bound is attributed to its
+  real owner. A client `grpc-timeout` keeps its existing behavior byte for byte;
+  an authorization expiry cancels the phase, records the request's shared latch
+  exactly once, marks no RPC-deadline provenance (the plugin and the backend are
+  blameless), and can select only the fixed pre-commitment terminal. The
+  committed-response observer is no longer detached on that outcome: the pending
+  hook owns a clone of the request context plus the protected response body, so
+  it — and every remaining observer — is dropped instead of being spawned after
+  the credential stopped being authorized. Legacy detach survives for the
+  client-owned RPC deadline only.
 
   A final authoritative gate immediately before response-head commitment turns a
   credential that expired while the response phases were running into the fixed
   pre-commitment terminal, rather than committing a protected head (or
   committing a streaming head only to terminal-error it immediately afterwards).
+  Native HTTP/3 gRPC gets the same gate on its own writer: once before the first
+  client-visible terminal it can produce (the declared-size refusal) and once
+  after every response-header hook and policy, immediately before the response
+  HEADERS. Either produces the fixed trailers-only `grpc-status: 16` through the
+  bounded write-grace path, retires the gateway-owned upload pump, releases the
+  admission permits exactly once, and stays circuit-breaker, passive-health, and
+  adaptive-concurrency neutral. The response-header write itself is bounded by
+  the earliest of the client RPC deadline and the authorization deadline, and a
+  downstream that cannot accept the HEADERS by expiry is reset rather than
+  waited on again or misreported as `DEADLINE_EXCEEDED`. Every HTTP/3
+  authorization exit — pre-commitment, blocked write, idle, and mid-body — now
+  records through the request's shared latch, so concurrent upload, response,
+  and terminal paths cannot double count one stream.
 
 - TCP/TLS stream connect-**retry backoff** is bounded by the admitted session's
   authorization lifetime (issue #3816). `retry_delay` grows with the attempt

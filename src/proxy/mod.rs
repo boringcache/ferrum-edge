@@ -19293,6 +19293,59 @@ async fn log_rejected_request_with_path_and_backend_state(
     crate::plugins::log_with_mirror_before_buffered_response(plugins, summary, ctx).await;
 }
 
+/// Replace an uncommitted rejection with the fixed PRE-COMMITMENT
+/// authorization terminal (issue #3815).
+///
+/// The rejection-path analogue of
+/// [`replace_buffered_response_with_authorization_terminal`], built from the
+/// same provenance-aware header retention as
+/// [`replace_rejection_with_gateway_deadline`] so the two cannot drift. It
+/// records the request's shared authorization latch exactly once and never
+/// marks the client RPC deadline provenance.
+fn replace_rejection_with_authorization_terminal(
+    ctx: &mut RequestContext,
+    termination: crate::proxy::auth_lifetime::StreamAuthTermination,
+    status_code: &mut u16,
+    response_body: Option<&mut Bytes>,
+    response_headers: &mut HashMap<String, String>,
+) {
+    let family = request_upload_auth_family(ctx);
+    ctx.record_authorization_termination_once(termination, family);
+    ctx.retain_deadline_response_gateway_headers(response_headers);
+    let native_grpc = is_native_grpc_request(ctx);
+    let (status, headers, body) =
+        authorization_expired_pre_commitment_response(ctx, termination, native_grpc);
+    *status_code = status;
+    if let Some(response_body) = response_body {
+        // Drop any retained shared capacity; do not clear-in-place.
+        *response_body = match body {
+            ResponseBody::Buffered(bytes) => bytes,
+            // Unreachable: the pre-commitment terminal is always buffered.
+            // Fail closed with an empty body rather than publishing anything
+            // else.
+            _ => Bytes::new(),
+        };
+    }
+    if native_grpc {
+        // Keep the gateway decorations the retention step preserved and layer
+        // the terminal metadata over them, exactly as the deadline path does.
+        grpc_proxy::finalize_grpc_error_response_headers(
+            response_headers,
+            grpc_proxy::grpc_status::UNAUTHENTICATED,
+            termination.grpc_message(),
+            &[],
+        );
+    } else {
+        response_headers.extend(headers);
+    }
+    ctx.sync_deadline_response_terminal_headers(response_headers);
+    insert_grpc_error_metadata(
+        &mut ctx.metadata,
+        grpc_proxy::grpc_status::UNAUTHENTICATED,
+        termination.grpc_message(),
+    );
+}
+
 fn replace_rejection_with_gateway_deadline(
     ctx: &mut RequestContext,
     status_code: &mut u16,
@@ -21032,7 +21085,7 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
                 continue;
             }
             let terminal_gateway_deadline = ctx.gateway_deadline_response_selected();
-            let Some(pending_hook) = run_response_committed_hook_until_deadline(
+            let pending_hook = match run_response_committed_hook_until_deadline(
                 Arc::clone(plugin),
                 ctx,
                 normalized.http_status.as_u16(),
@@ -21041,8 +21094,23 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
                 terminal_gateway_deadline,
             )
             .await
-            else {
-                continue;
+            {
+                ResponseCommittedHookOutcome::Completed => continue,
+                ResponseCommittedHookOutcome::Detach(hook) => hook,
+                // Authorization expiry: the pending observer is already
+                // dropped, every remaining observer is skipped, and the fixed
+                // authorization terminal replaces the response. Nothing is
+                // detached, so no protected data outlives the credential.
+                ResponseCommittedHookOutcome::AuthorizationExpired(termination) => {
+                    replace_rejection_with_authorization_terminal(
+                        ctx,
+                        termination,
+                        status,
+                        Some(body),
+                        headers,
+                    );
+                    break;
+                }
             };
             if !terminal_gateway_deadline {
                 ctx.mark_gateway_deadline_response_selected();
@@ -21190,19 +21258,13 @@ pub(crate) async fn run_after_proxy_hooks(
             ctx.metadata.remove(LATER_STRONG_ETAG_RESPONSE_METADATA_KEY);
         }
 
-        let deadline = ctx.precommit_response_phase_deadline_at();
-        let result = match crate::plugins::await_grpc_deadline(
-            deadline,
+        let bound = ctx.precommit_response_phase_bound();
+        let result = crate::plugins::await_precommit_response_phase(
+            bound,
             plugin.after_proxy(ctx, response_status, response_headers),
         )
         .await
-        {
-            Ok(result) => result,
-            Err(()) => {
-                ctx.mark_gateway_deadline_response_selected();
-                crate::plugins::grpc_deadline_exceeded_plugin_result()
-            }
-        };
+        .into_plugin_result(ctx);
         match result {
             PluginResult::Continue => {
                 // After the last eligible response_transformer static-rule pass,
@@ -22396,6 +22458,85 @@ fn finalize_grpc_web_error_response_headers_with_policy_source(
     );
 }
 
+/// Replace an uncommitted buffered response with the fixed PRE-COMMITMENT
+/// authorization terminal (issue #3815).
+///
+/// Built from exactly the same three-branch machinery as
+/// [`replace_buffered_grpc_response_with_deadline`] — provenance-aware header
+/// retention, gRPC-Web body-framed terminal metadata, native-gRPC terminal
+/// header finalization — so the two cannot drift in protocol shape. The
+/// differences are the ones that must differ:
+///
+/// * the status is `grpc-status: 16` (`UNAUTHENTICATED`), not `4`;
+/// * the request's shared authorization latch is recorded exactly once instead
+///   of `mark_gateway_deadline_response_selected`, because this is the
+///   gateway's own security decision and not the client's chosen RPC deadline —
+///   marking that provenance would drive `grpc-status: 4` terminal write bias
+///   in the protocol writers and blame the RPC deadline;
+/// * a non-gRPC flavor gets the fixed redacted `401`, which the deadline
+///   terminal has no equivalent of.
+///
+/// Returns the client-visible HTTP status.
+pub(crate) fn replace_buffered_response_with_authorization_terminal(
+    ctx: &mut RequestContext,
+    termination: crate::proxy::auth_lifetime::StreamAuthTermination,
+    grpc_web_response_content_type: Option<&str>,
+    response_headers: &mut HashMap<String, String>,
+    response_body: &mut Bytes,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+) -> u16 {
+    let family = request_upload_auth_family(ctx);
+    ctx.record_authorization_termination_once(termination, family);
+    ctx.retain_deadline_response_gateway_headers(response_headers);
+    let status = if let Some(content_type) = grpc_web_response_content_type {
+        let mut response = crate::plugins::grpc_web::error_response_for_content_type(
+            content_type,
+            grpc_proxy::grpc_status::UNAUTHENTICATED,
+            termination.grpc_message(),
+        );
+        response.headers.extend(response_headers.drain());
+        finalize_grpc_web_error_response_headers(
+            &mut response,
+            initial_response_header_policy_plugins,
+            None,
+        );
+        *response_headers = response.headers;
+        *response_body = Bytes::from(response.body);
+        StatusCode::OK.as_u16()
+    } else if is_native_grpc_request(ctx) {
+        grpc_proxy::finalize_grpc_error_response_headers(
+            response_headers,
+            grpc_proxy::grpc_status::UNAUTHENTICATED,
+            termination.grpc_message(),
+            initial_response_header_policy_plugins,
+        );
+        *response_body = Bytes::new();
+        StatusCode::OK.as_u16()
+    } else {
+        // No gRPC terminal metadata exists for an ordinary HTTP response, so
+        // the fixed redacted `401` is the terminal. Nothing here echoes an
+        // expiry instant, claim, subject, or provider.
+        let (status, headers, body) =
+            authorization_expired_pre_commitment_response(ctx, termination, false);
+        *response_headers = headers;
+        *response_body = match body {
+            ResponseBody::Buffered(bytes) => bytes,
+            // Unreachable: the pre-commitment terminal is always buffered.
+            // Fail closed with an empty body rather than publishing anything
+            // else.
+            _ => Bytes::new(),
+        };
+        status
+    };
+    ctx.sync_deadline_response_terminal_headers(response_headers);
+    insert_grpc_error_metadata(
+        &mut ctx.metadata,
+        grpc_proxy::grpc_status::UNAUTHENTICATED,
+        termination.grpc_message(),
+    );
+    status
+}
+
 /// Replace an uncommitted buffered native gRPC or gRPC-Web response with the
 /// canonical gateway deadline result. All buffered frontends use this helper
 /// so the terminal status, browser framing, CORS exposure, and initial-header
@@ -23034,9 +23175,9 @@ async fn run_final_client_visible_response_body_policy(
         if !plugin.enforces_final_client_visible_response_body(ctx) {
             continue;
         }
-        let deadline = ctx.precommit_response_phase_deadline_at();
-        let result = crate::plugins::await_request_plugin_deadline_with_provenance(
-            deadline,
+        let bound = ctx.precommit_response_phase_bound();
+        let result = crate::plugins::await_precommit_response_phase(
+            bound,
             plugin.finalize_client_visible_response_body(
                 ctx,
                 *response_status,
@@ -23411,9 +23552,9 @@ async fn evaluate_final_client_visible_response_header_policy(
         if !plugin.enforces_final_client_visible_response_headers(ctx) {
             continue;
         }
-        let deadline = ctx.precommit_response_phase_deadline_at();
-        let result = crate::plugins::await_request_plugin_deadline_with_provenance(
-            deadline,
+        let bound = ctx.precommit_response_phase_bound();
+        let result = crate::plugins::await_precommit_response_phase(
+            bound,
             plugin.finalize_client_visible_response_headers(ctx, response_status, response_headers),
         )
         .await
@@ -23863,8 +24004,8 @@ async fn transform_buffered_response_body_with_deadline_inner(
                 );
                 return (true, body_transformed);
             }
-            let transformed = match crate::plugins::await_grpc_deadline(
-                ctx.precommit_response_phase_deadline_at(),
+            let transformed = match crate::plugins::await_precommit_response_phase(
+                ctx.precommit_response_phase_bound(),
                 plugin.transform_response_body_with_context(
                     ctx,
                     response_body,
@@ -23874,8 +24015,26 @@ async fn transform_buffered_response_body_with_deadline_inner(
             )
             .await
             {
-                Ok(transformed) => transformed,
-                Err(()) => {
+                crate::plugins::PrecommitPhaseResult::Completed(transformed) => transformed,
+                // The admitted credential's authorization lifetime is the
+                // winning bound. The transform was cancelled, nothing it was
+                // producing can be published, and the only selectable terminal
+                // is the fixed pre-commitment authorization one — never the
+                // client `grpc-timeout` terminal, which would blame the RPC
+                // deadline for the gateway's own security decision.
+                crate::plugins::PrecommitPhaseResult::Expired(Some(termination)) => {
+                    let _ = ctx.take_buffered_response_capacity_refusal_pending();
+                    *response_status = replace_buffered_response_with_authorization_terminal(
+                        ctx,
+                        termination,
+                        grpc_web_response_content_type,
+                        response_headers,
+                        response_body,
+                        initial_response_header_policy_plugins,
+                    );
+                    return (true, body_transformed);
+                }
+                crate::plugins::PrecommitPhaseResult::Expired(None) => {
                     // An elapsed authoritative deadline owns the outcome; discard any
                     // pending transform capacity signal so it cannot leak.
                     let _ = ctx.take_buffered_response_capacity_refusal_pending();
@@ -24025,10 +24184,31 @@ fn owned_response_committed_hook_future(
     })
 }
 
+/// What happened to one committed-response observer that could not finish
+/// inside the phase's absolute bound.
+pub(crate) enum ResponseCommittedHookOutcome {
+    /// The observer ran to completion; its owned context was folded back in.
+    Completed,
+    /// The CLIENT's own RPC deadline is the winning bound. Legacy semantics:
+    /// the pending invocation moves to bounded, owned post-response cleanup so
+    /// it can finish without borrowing the response writer.
+    Detach(OwnedResponseCommittedHookFuture),
+    /// The admitted credential's authorization lifetime is the winning bound
+    /// (issue #3815). The pending invocation was DROPPED here — together with
+    /// the cloned request context and the protected response body it owned —
+    /// and every remaining observer must be skipped. Nothing is detached,
+    /// because a detached future is exactly a protected-data side effect
+    /// running after the credential is no longer authorized.
+    AuthorizationExpired(crate::proxy::auth_lifetime::StreamAuthTermination),
+}
+
 /// Await a committed observer only while it can still affect the synchronous
 /// terminal lifecycle. Once the client deadline is selected, give an
 /// immediately-ready observer one poll; a pending observer is returned with
 /// owned state so cleanup can continue without borrowing the response writer.
+///
+/// An authorization expiry is deliberately NOT detachable — see
+/// [`ResponseCommittedHookOutcome::AuthorizationExpired`].
 pub(crate) async fn run_response_committed_hook_until_deadline(
     plugin: Arc<dyn Plugin>,
     ctx: &mut RequestContext,
@@ -24036,8 +24216,9 @@ pub(crate) async fn run_response_committed_hook_until_deadline(
     response_headers: &HashMap<String, String>,
     response_body: Bytes,
     terminal_gateway_deadline: bool,
-) -> Option<OwnedResponseCommittedHookFuture> {
-    let deadline = ctx.precommit_response_phase_deadline_at();
+) -> ResponseCommittedHookOutcome {
+    let bound = ctx.precommit_response_phase_bound();
+    let deadline = bound.deadline();
     if !terminal_gateway_deadline && deadline.is_none() {
         plugin
             .on_response_committed(
@@ -24047,7 +24228,16 @@ pub(crate) async fn run_response_committed_hook_until_deadline(
                 response_body.as_ref(),
             )
             .await;
-        return None;
+        return ResponseCommittedHookOutcome::Completed;
+    }
+    // An already-elapsed authorization bound is decided BEFORE the observer is
+    // constructed, so a credential that is no longer authorized never gets even
+    // the single courtesy poll, and no clone of the request context or the
+    // protected body is handed to a future that could outlive this frame.
+    if let Some(termination) = bound.expired_authorization() {
+        let family = request_upload_auth_family(ctx);
+        ctx.record_authorization_termination_once(termination, family);
+        return ResponseCommittedHookOutcome::AuthorizationExpired(termination);
     }
     let mut hook = owned_response_committed_hook_future(
         plugin,
@@ -24066,23 +24256,37 @@ pub(crate) async fn run_response_committed_hook_until_deadline(
         .await;
         if let Some(completed) = completed {
             *ctx = completed;
-            return None;
+            return ResponseCommittedHookOutcome::Completed;
         }
-        return Some(hook);
+        return ResponseCommittedHookOutcome::Detach(hook);
     }
     let Some(deadline) = deadline else {
-        return Some(hook);
+        return ResponseCommittedHookOutcome::Detach(hook);
     };
     let deadline_sleep = tokio::time::sleep_until(deadline);
     tokio::pin!(deadline_sleep);
-    tokio::select! {
+    let completed = tokio::select! {
         biased;
-        () = &mut deadline_sleep => Some(hook),
-        completed = &mut hook => {
-            *ctx = completed;
-            None
-        },
-    }
+        () = &mut deadline_sleep => None,
+        completed = &mut hook => Some(completed),
+    };
+    let Some(completed) = completed else {
+        // The bound elapsed with the observer still pending. Which owner it
+        // belongs to decides whether the pending work may survive this frame.
+        return match bound.expired_authorization() {
+            Some(termination) => {
+                // Drop the hook — and with it the cloned request context and
+                // the protected response body — before anything else runs.
+                drop(hook);
+                let family = request_upload_auth_family(ctx);
+                ctx.record_authorization_termination_once(termination, family);
+                ResponseCommittedHookOutcome::AuthorizationExpired(termination)
+            }
+            None => ResponseCommittedHookOutcome::Detach(hook),
+        };
+    };
+    *ctx = completed;
+    ResponseCommittedHookOutcome::Completed
 }
 
 pub(crate) fn spawn_detached_response_committed_hooks(
@@ -24140,7 +24344,7 @@ pub(crate) async fn run_deadline_bounded_response_committed_hooks(
             continue;
         }
         let terminal_gateway_deadline = ctx.gateway_deadline_response_selected();
-        let Some(pending_hook) = run_response_committed_hook_until_deadline(
+        let pending_hook = match run_response_committed_hook_until_deadline(
             Arc::clone(plugin),
             ctx,
             *response_status,
@@ -24149,8 +24353,36 @@ pub(crate) async fn run_deadline_bounded_response_committed_hooks(
             terminal_gateway_deadline,
         )
         .await
-        else {
-            continue;
+        {
+            ResponseCommittedHookOutcome::Completed => continue,
+            ResponseCommittedHookOutcome::Detach(hook) => hook,
+            // Authorization expiry: the observer is already dropped and every
+            // remaining observer is skipped. The fixed authorization terminal
+            // replaces the buffered response; nothing protected is detached.
+            ResponseCommittedHookOutcome::AuthorizationExpired(termination) => {
+                let owned_grpc_web_response_content_type =
+                    crate::plugins::grpc_web::retained_response_content_type(ctx)
+                        .map(str::to_owned)
+                        .or_else(|| {
+                            response_headers
+                                .get("content-type")
+                                .filter(|content_type| {
+                                    crate::plugins::grpc_web::is_grpc_web_content_type(content_type)
+                                })
+                                .map(|content_type| {
+                                    crate::plugins::grpc_web::response_content_type(content_type)
+                                })
+                        });
+                *response_status = replace_buffered_response_with_authorization_terminal(
+                    ctx,
+                    termination,
+                    owned_grpc_web_response_content_type.as_deref(),
+                    response_headers,
+                    response_body,
+                    initial_response_header_policy_plugins,
+                );
+                return true;
+            }
         };
 
         let owned_grpc_web_response_content_type =
@@ -24255,7 +24487,7 @@ async fn build_grpc_web_reject_response(
                 continue;
             }
             let terminal_gateway_deadline = ctx.gateway_deadline_response_selected();
-            let Some(pending_hook) = run_response_committed_hook_until_deadline(
+            let pending_hook = match run_response_committed_hook_until_deadline(
                 Arc::clone(plugin),
                 ctx,
                 StatusCode::OK.as_u16(),
@@ -24264,8 +24496,37 @@ async fn build_grpc_web_reject_response(
                 terminal_gateway_deadline,
             )
             .await
-            else {
-                continue;
+            {
+                ResponseCommittedHookOutcome::Completed => continue,
+                ResponseCommittedHookOutcome::Detach(hook) => hook,
+                // Authorization expiry: the observer is already dropped, every
+                // remaining observer is skipped, and the gRPC-Web terminal
+                // becomes the fixed body-framed `UNAUTHENTICATED` one. Nothing
+                // protected is detached.
+                ResponseCommittedHookOutcome::AuthorizationExpired(termination) => {
+                    let family = request_upload_auth_family(ctx);
+                    ctx.record_authorization_termination_once(termination, family);
+                    grpc_status = grpc_proxy::grpc_status::UNAUTHENTICATED;
+                    message = termination.grpc_message().to_string();
+                    translated = crate::plugins::grpc_web::error_response_for_content_type(
+                        content_type,
+                        grpc_status,
+                        &message,
+                    );
+                    let mut terminal_headers = reject.headers.clone();
+                    terminal_headers.retain(|name, _| {
+                        !["grpc-status", "grpc-message", "grpc-status-details-bin"]
+                            .iter()
+                            .any(|terminal| name.eq_ignore_ascii_case(terminal))
+                    });
+                    finalize_grpc_web_error_response_headers(
+                        &mut translated,
+                        &[],
+                        Some(&terminal_headers),
+                    );
+                    insert_grpc_error_metadata(&mut ctx.metadata, grpc_status, &message);
+                    break;
+                }
             };
             if !terminal_gateway_deadline {
                 ctx.mark_gateway_deadline_response_selected();
@@ -34316,9 +34577,9 @@ async fn handle_proxy_request_inner(
         let phase_start = Instant::now();
         let mut response_body_reject = None;
         for plugin in plugins.iter() {
-            let deadline = ctx.precommit_response_phase_deadline_at();
-            let result = crate::plugins::await_request_plugin_deadline_with_provenance(
-                deadline,
+            let bound = ctx.precommit_response_phase_bound();
+            let result = crate::plugins::await_precommit_response_phase(
+                bound,
                 plugin.on_response_body(&mut ctx, response_status, &mut response_headers, data),
             )
             .await
@@ -34477,9 +34738,9 @@ async fn handle_proxy_request_inner(
             if plugin.enforces_final_client_visible_response_body(&ctx) {
                 continue;
             }
-            let deadline = ctx.precommit_response_phase_deadline_at();
-            let result = crate::plugins::await_request_plugin_deadline_with_provenance(
-                deadline,
+            let bound = ctx.precommit_response_phase_bound();
+            let result = crate::plugins::await_precommit_response_phase(
+                bound,
                 plugin.on_final_response_body(&mut ctx, response_status, &response_headers, data),
             )
             .await
@@ -42178,6 +42439,51 @@ pub(crate) fn authorization_expired_dispatch_placeholder(
         backend_resolved_ip: resolved_ip,
         error_class: Some(retry::ErrorClass::ClientDisconnect),
     }
+}
+
+/// Settle a PRE-COMMITMENT response phase that the admitted credential's
+/// authorization lifetime cancelled (issue #3815).
+///
+/// The phase future has already been dropped by the composed bound, so nothing
+/// it was producing can reach the client. This records the request's shared
+/// termination latch exactly once — the counter, the bounded class in the
+/// transaction summary — and returns the ONLY terminal selectable from here:
+/// the fixed, redacted pre-commitment response for this request's flavor.
+///
+/// Deliberately does NOT call `mark_gateway_deadline_response_selected`: that
+/// provenance means "the client's own RPC deadline chose this response" and
+/// drives `grpc-status: 4` terminal write bias in the protocol writers. An
+/// authorization expiry is the gateway's decision, is `grpc-status: 16`, and
+/// must not be charged to the plugin that was running or the backend that
+/// answered.
+pub(crate) fn settle_precommit_authorization_expiry(
+    ctx: &mut RequestContext,
+    termination: crate::proxy::auth_lifetime::StreamAuthTermination,
+) -> PluginResult {
+    let family = request_upload_auth_family(ctx);
+    ctx.record_authorization_termination_once(termination, family);
+    let (status_code, headers, body) =
+        authorization_expired_pre_commitment_response(ctx, termination, is_native_grpc_request(ctx));
+    let body = match body {
+        ResponseBody::Buffered(bytes) => bytes,
+        // Unreachable: the pre-commitment terminal is always buffered. Fail
+        // closed with an empty body rather than publishing anything else.
+        _ => Bytes::new(),
+    };
+    PluginResult::RejectBinary {
+        status_code,
+        body,
+        headers,
+    }
+}
+
+/// Whether this request is native gRPC (not gRPC-Web, which
+/// [`authorization_expired_pre_commitment_response`] frames for itself).
+fn is_native_grpc_request(ctx: &RequestContext) -> bool {
+    matches!(
+        request_upload_auth_family(ctx),
+        crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Grpc
+    )
 }
 
 /// Bounded protocol family for a request-upload termination counter. Derived

@@ -3573,13 +3573,48 @@ impl RequestContext {
     /// `None` for an unauthenticated request with no RPC deadline — byte for
     /// byte the previous behavior.
     pub(crate) fn precommit_response_phase_deadline_at(&self) -> Option<tokio::time::Instant> {
-        crate::proxy::auth_lifetime::compose_absolute_bound(
-            self.grpc_deadline_at(),
-            crate::proxy::auth_lifetime::effective_request_auth_deadline(
-                self,
-                crate::proxy::auth_lifetime::authenticated_stream_max_lifetime_seconds(),
+        self.precommit_response_phase_bound().deadline()
+    }
+
+    /// The composed bound for one pre-commitment response phase, captured
+    /// together with the authorization plan that a later expiry must be
+    /// attributed against (issue #3815).
+    ///
+    /// Taken BEFORE the phase future borrows this context, because attributing
+    /// the expiry afterwards needs `&mut self` again.
+    pub(crate) fn precommit_response_phase_bound(&self) -> PrecommitResponsePhaseBound {
+        let authorization = crate::proxy::auth_lifetime::effective_request_auth_deadline(
+            self,
+            crate::proxy::auth_lifetime::authenticated_stream_max_lifetime_seconds(),
+        );
+        PrecommitResponsePhaseBound {
+            at: crate::proxy::auth_lifetime::compose_absolute_bound(
+                self.grpc_deadline_at(),
+                authorization,
             ),
-        )
+            authorization,
+        }
+    }
+
+    /// Record ONE authorization-lifetime termination for this request: the
+    /// fixed-cardinality counter through the shared latch (first writer only)
+    /// and the bounded class into the transaction summary.
+    ///
+    /// This is the single entry point for every termination arm — the
+    /// pre-commitment gates, the blocked-write seam, the idle/mid-body relay
+    /// arms, and the body adapters — so concurrent upload, response, and
+    /// terminal paths on one stream cannot double count. Returns `true` when
+    /// this call owned the termination.
+    pub(crate) fn record_authorization_termination_once(
+        &mut self,
+        termination: crate::proxy::auth_lifetime::StreamAuthTermination,
+        family: crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
+    ) -> bool {
+        let won = self
+            .authorization_termination_latch
+            .record_once(termination, family);
+        self.latch_authorization_termination(termination);
+        won
     }
 
     /// Clone this request's shared authorization-lifetime termination latch for
@@ -5805,6 +5840,93 @@ impl RequestPluginDeadlineResult {
         match self {
             Self::Completed(result) => result,
             Self::DeadlineExceeded => {
+                ctx.mark_gateway_deadline_response_selected();
+                grpc_deadline_exceeded_plugin_result()
+            }
+        }
+    }
+}
+
+/// The composed absolute bound for one PRE-COMMITMENT response phase, captured
+/// together with the authorization plan an expiry must be attributed against
+/// (issue #3815).
+///
+/// Two very different owners can drive the same instant: the client's own
+/// `grpc-timeout` (an RPC bound the client chose) and the admitted credential's
+/// authorization lifetime (a gateway security decision). Collapsing them into
+/// one `Option<Instant>` is what made every bounded phase synthesize
+/// `grpc-status: 4 DEADLINE_EXCEEDED`, mark gateway/RPC deadline provenance,
+/// and run ordinary rejection handling — blaming the plugin or the backend for
+/// the gateway's own expiry, and letting a protected response head continue
+/// toward commitment.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct PrecommitResponsePhaseBound {
+    at: Option<tokio::time::Instant>,
+    authorization: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+}
+
+impl PrecommitResponsePhaseBound {
+    /// The instant the awaited phase runs under: the earliest of the two.
+    pub(crate) fn deadline(self) -> Option<tokio::time::Instant> {
+        self.at
+    }
+
+    /// The winning bound, once the composed deadline has elapsed. `Some` when
+    /// the authorization lifetime is the one that expired.
+    ///
+    /// A tie is attributed to authorization, matching the biased select-arm
+    /// ordering every relay uses: when both bounds are eligible, the security
+    /// decision is the one reported.
+    pub(crate) fn expired_authorization(
+        self,
+    ) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
+        crate::proxy::auth_lifetime::expired_authorization(self.authorization)
+    }
+}
+
+/// Outcome of one awaited PRE-COMMITMENT response phase.
+pub(crate) enum PrecommitPhaseResult<T> {
+    /// The phase produced its own result inside the bound.
+    Completed(T),
+    /// The bound elapsed and the phase was CANCELLED. `Some` names the
+    /// authorization termination class when the credential's lifetime is the
+    /// winning bound; `None` means only the client's own RPC deadline elapsed.
+    Expired(Option<crate::proxy::auth_lifetime::StreamAuthTermination>),
+}
+
+/// Await one pre-commitment response phase under its composed bound, keeping
+/// the provenance of an expiry.
+pub(crate) async fn await_precommit_response_phase<F, T>(
+    bound: PrecommitResponsePhaseBound,
+    future: F,
+) -> PrecommitPhaseResult<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    match await_grpc_deadline(bound.deadline(), future).await {
+        Ok(value) => PrecommitPhaseResult::Completed(value),
+        Err(()) => PrecommitPhaseResult::Expired(bound.expired_authorization()),
+    }
+}
+
+impl PrecommitPhaseResult<PluginResult> {
+    /// Resolve an awaited plugin phase into the result the caller must act on.
+    ///
+    /// * Completed — unchanged.
+    /// * Client RPC deadline — unchanged: gateway deadline provenance is marked
+    ///   and the canonical `grpc-status: 4` terminal is selected, so client
+    ///   `grpc-timeout` behavior is byte for byte what it was.
+    /// * Authorization lifetime — the request's shared termination latch is
+    ///   recorded exactly once, NO gateway/RPC deadline provenance is marked
+    ///   (the plugin and the backend are blameless), and the only terminal
+    ///   selectable is the fixed pre-commitment authorization one.
+    pub(crate) fn into_plugin_result(self, ctx: &mut RequestContext) -> PluginResult {
+        match self {
+            Self::Completed(result) => result,
+            Self::Expired(Some(termination)) => {
+                crate::proxy::settle_precommit_authorization_expiry(ctx, termination)
+            }
+            Self::Expired(None) => {
                 ctx.mark_gateway_deadline_response_selected();
                 grpc_deadline_exceeded_plugin_result()
             }

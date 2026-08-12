@@ -375,7 +375,7 @@ request guard, per-IP guard, circuit-breaker and load-balancer accounting,
 backend-admission permits, and body-buffer budget are released exactly once
 through the same deferred machinery every other terminal path uses.
 
-### The gateway-owned response watchdog
+### The gateway-owned response pump
 
 The response-body adapter only acts when the transport **polls** it, and hyper
 does not always poll a response body:
@@ -388,31 +388,60 @@ does not always poll a response body:
   before it polls the body, so a client that stops reading parks the write.
 
 Both are client-controlled, so a body-only bound is not an enforceable
-authorization lifetime. Authenticated streaming responses therefore also carry a
-watchdog (`src/proxy/response_watchdog.rs`), which mirrors what
+authorization lifetime. Authenticated streaming responses therefore move the
+backend body into a gateway-owned **response pump**
+(`src/proxy/response_watchdog.rs`), which mirrors what
 [the upload pump](#the-gateway-owned-upload-pump) does for the request
-direction:
+direction.
 
-1. **Upstream cancellation.** The backend body lives in a shared slot. At the
-   deadline a task the *gateway* schedules takes it out and drops it. From that
-   instant the gateway reads no further protected byte, and the backend stream,
-   its pooled connection, and every guard rooted in that body are released —
-   whatever the transport is parked on.
+**Ownership.** The pump is the upstream body's sole owner and sole poller. The
+client-visible body holds only the receiving end of a bounded channel. Nothing
+is shared between them except that channel and three write-once flags, so there
+is **no lock on the response path** — the hot-path invariant forbids one, and a
+lock would also let a task enforcing the deadline block behind somebody else's
+inner `poll_frame`. Single ownership is what makes the terminal winner
+authoritative: one task decides, in one biased `select!`, whether this response
+completed or expired. A response that reached its own terminal before the
+deadline can no longer be counted or closed by a racing watchdog, and a response
+still in flight at the deadline cannot escape it by completing in parallel. At
+the exact deadline instant the security bound wins, deterministically.
+
+**Backpressure.** The channel bound is one frame, and the pump reserves capacity
+*before* it reads the next frame, so at most one frame is ever in flight and the
+backend feels the downstream's backpressure almost exactly as it did when hyper
+polled it directly. A full channel parks the pump on `reserve()`, which is
+precisely why the deadline arm is biased ahead of it: backpressure delays
+delivery, it never delays enforcement.
+
+**Ordering.** Frames, trailers, and the terminal travel in order through one
+FIFO channel. An upstream error is delivered as an error, never collapsed into a
+clean end of stream, and an expiry closes the channel *without* a terminal so
+the downstream cannot mistake it for a complete response either.
+
+The two guarantees the pump provides:
+
+1. **Upstream cancellation.** At the deadline the pump drops the backend body it
+   owns. From that instant the gateway reads no further protected byte, and the
+   backend stream, its pooled connection, and every guard rooted in that body
+   are released — whatever the transport is parked on. A cancelled or dropped
+   pump reaches the same state through the ordinary task drop, so no detached
+   producer can survive the response body.
 2. **Transport close.** Dropping the upstream does not release what the response
    body itself owns: the request guard, the per-IP guard, circuit-breaker and
    load-balancer accounting, backend-admission permits, and the deferred
    transaction logger all live in `ProxyBody`, which hyper owns. If the
    downstream still has not drained the terminal a bounded grace after the
-   deadline, the watchdog asks the connection task to close the client
-   connection. hyper then drops the response body, releasing all of the above
-   exactly once through the ordinary `Drop` path, and the client observes a
-   protocol-visible termination — a `GOAWAY` then a close on HTTP/2, and a
-   chunked or SSE body that ends **without** its terminating chunk on HTTP/1.1.
+   deadline, the pump asks the connection task to close the client connection.
+   hyper then drops the response body, releasing all of the above exactly once
+   through the ordinary `Drop` path, and the client observes a protocol-visible
+   termination — a `GOAWAY` then a close on HTTP/2, and a chunked or SSE body
+   that ends **without** its terminating chunk on HTTP/1.1.
 
 A client that *is* draining never reaches step 2: the adapter's own terminal is
-delivered on the next poll, the body is dropped, and the watchdog is aborted
-with it. The steady-state cost is one `Sleep` and one uncontended lock per
-polled frame, on authenticated streaming responses only.
+delivered on the next poll, the body is dropped, and the pump is aborted with
+it. The steady-state cost is one `Sleep`, one task, and one one-slot channel on
+authenticated streaming responses only; an unauthenticated or buffered response
+never constructs any of it.
 
 **Deliberate trade-off.** HTTP/2 gives a server no way to reset one stream from
 outside hyper — the `SendStream` is owned by the parked pipe — so the transport
@@ -435,6 +464,45 @@ HTTP request — so a slow hook could carry an admitted credential past its own
 expiry and then commit a **protected** response head, or commit a streaming head
 only to terminal-error it immediately afterwards when the fixed pre-commitment
 terminal was still available.
+
+Composing the two owners into one instant is not enough on its own, because the
+two owners want different outcomes. Each awaited phase therefore carries the
+authorization **plan** beside the composed instant
+(`RequestContext::precommit_response_phase_bound`), and an elapsed bound is
+resolved by `PrecommitPhaseResult`:
+
+- **Client RPC deadline.** Unchanged, byte for byte: gateway deadline
+  provenance is marked and the canonical `grpc-status: 4` terminal is selected.
+- **Authorization lifetime.** The phase is cancelled, the request's shared
+  termination latch records the bounded class **exactly once**, no RPC-deadline
+  provenance is marked — the plugin that was running and the backend that
+  answered are blameless, and that marker would otherwise drive `grpc-status: 4`
+  terminal write bias in the protocol writers — and the only selectable terminal
+  is the fixed, redacted pre-commitment one. A tie is attributed to
+  authorization, matching every relay's biased select ordering.
+
+The committed-response observer is the one phase where an elapsed bound used to
+mean "continue in the background". That detach survives only for the
+client-owned RPC deadline. When the authorization bound wins, the pending hook —
+which owns a **clone of the request context and the protected response body** —
+is dropped rather than spawned, and every remaining observer is skipped: a
+detached continuation is precisely a protected-data side effect running after
+the credential stopped being authorized. An already-elapsed bound is decided
+before the observer is constructed at all, so no clone is ever handed out.
+
+Native HTTP/3 gRPC has its own equivalents, because that relay writes its own
+response head instead of returning a `ProxyBody`. A gate runs immediately before
+the first client-visible terminal the relay can produce (the declared-size
+refusal), and again after every response-header hook and policy, immediately
+before the response HEADERS are written. Either gate turns an expired credential
+into the fixed trailers-only `grpc-status: 16` through the bounded write-grace
+path, retires (cancels and joins) the gateway-owned upload pump, releases the
+admission permits exactly once, and leaves the circuit breaker, passive health,
+and the adaptive limiter to record the backend's own status with no error class.
+The response-header write itself is bounded by the earliest of the client RPC
+deadline and the authorization deadline; a downstream that cannot accept the
+HEADERS by expiry is reset rather than waited on again or misreported as
+`DEADLINE_EXCEEDED`.
 
 ### Observability
 
@@ -464,7 +532,7 @@ The `grpc-message` and the internal termination text are compiled-in literals.
 
 | Surface | Enforced |
 |---------|----------|
-| Generic HTTP/1.1 and HTTP/2 streaming responses, including SSE | Yes — two mechanisms, armed from the same absolute plan. The body adapter emits the protocol-correct terminal when the transport polls it, and a **gateway-owned response watchdog** releases the backend body — and, after a bounded grace, closes the client connection — when it does not. See [The gateway-owned response watchdog](#the-gateway-owned-response-watchdog) |
+| Generic HTTP/1.1 and HTTP/2 streaming responses, including SSE | Yes — two mechanisms, armed from the same absolute plan. The body adapter emits the protocol-correct terminal when the transport polls it, and a **gateway-owned response pump** owns and polls the backend body, releases it at the deadline — and, after a bounded grace, closes the client connection — when the transport does not. See [The gateway-owned response pump](#the-gateway-owned-response-pump) |
 | HTTP/1.1 and HTTP/2 streaming and bidirectional request **uploads** | Yes — two mechanisms, armed from the same absolute plan. The client body adapter every streaming dispatch path installs (reqwest, direct-H2, mesh mTLS, HBONE, Unix socket, and the fully-streamed native-gRPC body) refuses to hand the transport another client byte after expiry, and a **gateway-owned upload pump** owns the inbound body in a task the gateway schedules, so the bound fires — and the client body is released — even while the backend transport is parked on flow control and is polling nothing. See [The gateway-owned upload pump](#the-gateway-owned-upload-pump) |
 | HTTP/1.1 and HTTP/2 request uploads the gateway **buffers** before dispatch | Yes — a body a request-body plugin, a gRPC-Web translation, or retry replay forces into memory never reaches those adapters, so the collect itself carries the plan (`collect_request_body_under_authorization`). Covers the reqwest buffered arms, the H3-backend bridge's buffered arms, and both buffered native-gRPC arms |
 | The response-**header** wait on every H1/H2 dispatch path | Yes — reqwest (initial attempt and retry), direct-H2, mesh mTLS, HBONE, and Unix socket compose the plan over the client RPC deadline and `backend_read_timeout_ms`, so a backend that withholds its response head cannot hold an authenticated request open past expiry even when both of those bounds are disabled |

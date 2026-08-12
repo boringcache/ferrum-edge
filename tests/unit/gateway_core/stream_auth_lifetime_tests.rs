@@ -1717,14 +1717,114 @@ fn a_final_authorization_gate_precedes_response_head_commitment() {
 /// `grpc_deadline_at()` alone is `None` for an ordinary HTTP request, which left
 /// `after_proxy`, the buffered body hooks, the final client-visible body and
 /// header policies, and the response-committed hook completely unbounded.
+///
+/// The bound carries the authorization PLAN, not just the composed instant, so
+/// the phase that ends at it can tell whose deadline it was.
 #[test]
 fn every_precommit_response_phase_composes_the_authorization_lifetime() {
     assert_eq!(
         PROXY_SOURCE
-            .matches("ctx.precommit_response_phase_deadline_at()")
+            .matches("ctx.precommit_response_phase_bound()")
             .count(),
         7,
         "a pre-commitment response phase lost its authorization bound"
+    );
+    assert!(
+        !PROXY_SOURCE.contains("ctx.precommit_response_phase_deadline_at()"),
+        "a pre-commitment phase that keeps only the composed instant cannot tell an \
+         authorization expiry from the client's own RPC deadline"
+    );
+}
+
+/// An authorization expiry never blames the plugin or the backend, and never
+/// selects the client `grpc-timeout` terminal (issue #3815, root finding 3).
+#[test]
+fn a_precommit_phase_authorization_expiry_selects_only_the_fixed_terminal() {
+    let settle = PROXY_SOURCE
+        .split("pub(crate) fn settle_precommit_authorization_expiry(")
+        .nth(1)
+        .expect("pre-commitment authorization settlement")
+        .split("\n}\n")
+        .next()
+        .expect("bounded settlement");
+    assert!(
+        settle.contains("record_authorization_termination_once("),
+        "the request's shared latch must record the class exactly once"
+    );
+    assert!(
+        settle.contains("authorization_expired_pre_commitment_response("),
+        "only the fixed, redacted pre-commitment terminal may be selected"
+    );
+    assert!(
+        !settle.contains("mark_gateway_deadline_response_selected"),
+        "RPC-deadline provenance would drive grpc-status 4 terminal write bias and blame \
+         the client's own deadline for the gateway's security decision"
+    );
+    assert!(
+        !settle.contains("grpc_deadline_exceeded_plugin_result"),
+        "an authorization expiry must never synthesize DEADLINE_EXCEEDED"
+    );
+
+    // The generic resolver keeps the client `grpc-timeout` behavior byte for
+    // byte on the OTHER arm.
+    let plugins = include_str!("../../../src/plugins/mod.rs");
+    let resolver = plugins
+        .split("impl PrecommitPhaseResult<PluginResult> {")
+        .nth(1)
+        .expect("pre-commitment phase resolver")
+        .split("\n}\n")
+        .next()
+        .expect("bounded resolver");
+    assert!(resolver.contains("Self::Expired(Some(termination)) =>"));
+    assert!(resolver.contains("crate::proxy::settle_precommit_authorization_expiry("));
+    assert!(resolver.contains("Self::Expired(None) =>"));
+    assert!(resolver.contains("ctx.mark_gateway_deadline_response_selected();"));
+    assert!(resolver.contains("grpc_deadline_exceeded_plugin_result()"));
+}
+
+/// A pending committed-response observer is DROPPED on authorization expiry,
+/// never detached (issue #3815, root finding 4).
+#[test]
+fn an_expired_committed_hook_is_dropped_rather_than_detached() {
+    let hook = PROXY_SOURCE
+        .split("pub(crate) async fn run_response_committed_hook_until_deadline(")
+        .nth(1)
+        .expect("response-committed deadline hook")
+        .split("pub(crate) fn spawn_detached_response_committed_hooks(")
+        .next()
+        .expect("bounded response-committed deadline hook");
+    // Legacy detach survives for the client-owned RPC deadline only.
+    assert!(hook.contains("ResponseCommittedHookOutcome::Detach(hook)"));
+    // An ALREADY-elapsed authorization bound is decided before the observer —
+    // and the clone of the request context and protected body it would own —
+    // is even constructed.
+    let early_gate_at = hook
+        .find("if let Some(termination) = bound.expired_authorization() {")
+        .expect("pre-construction authorization gate");
+    let construct_at = hook
+        .find("owned_response_committed_hook_future(")
+        .expect("observer construction");
+    assert!(
+        early_gate_at < construct_at,
+        "an expired credential must not have a clone of the request context or the \
+         protected response body handed to a future at all"
+    );
+    // A hook that was already pending when the bound elapsed is DROPPED.
+    assert!(
+        hook.contains("drop(hook);"),
+        "the pending hook — with the cloned request context and the protected response \
+         body it owns — must be dropped rather than detached"
+    );
+    assert!(
+        hook.contains("record_authorization_termination_once("),
+        "the class is recorded exactly once through the request's shared latch"
+    );
+    assert_eq!(
+        hook.matches("ResponseCommittedHookOutcome::AuthorizationExpired(termination)")
+            .count(),
+        2,
+        "both the pre-construction gate and the pending-observer arm must report the \
+         non-detachable authorization outcome"
     );
 }
 
@@ -2571,4 +2671,155 @@ fn the_native_h3_grpc_precommit_terminal_is_unauthenticated_and_health_neutral()
         !terminal.contains("DEADLINE_EXCEEDED"),
         "an expired credential is never reported as a client-chosen RPC deadline"
     );
+}
+
+// --- Native HTTP/3 gRPC: the post-head gap (issue #3815, root finding 5) -----
+
+/// The native-H3 gRPC relay writes its own response head, so a `ProxyBody`
+/// adapter cannot bound it. Every client-visible terminal it can produce while
+/// the head is still uncommitted — the declared-size refusal, the `after_proxy`
+/// rejection, and the HEADERS themselves — must be preceded by the same
+/// authorization gate, and the gate must produce the ONE fixed terminal.
+#[test]
+fn every_precommit_h3_grpc_terminal_is_preceded_by_the_authorization_gate() {
+    let relay = H3_SERVER_SOURCE
+        .split("macro_rules! h3_grpc_authorization_precommit_terminal {")
+        .nth(1)
+        .expect("the native H3 gRPC pre-commitment authorization terminal");
+
+    // The gate expands at exactly three uncommitted-head points.
+    assert_eq!(
+        relay
+            .matches("h3_grpc_authorization_precommit_terminal!(")
+            .count(),
+        4,
+        "the declared-size refusal, the hook rejection, the response head, and the \
+         head-write expiry must each take the SAME fixed authorization terminal"
+    );
+
+    let terminal = relay
+        .split("\n    }\n")
+        .next()
+        .expect("bounded terminal macro body");
+    // The fixed trailers-only `grpc-status: 16`, through the bounded write grace.
+    assert!(terminal.contains("AUTHORIZATION_EXPIRED_GRPC_STATUS_HEADER"));
+    assert!(terminal.contains("await_h3_grpc_terminal_write_with_grace("));
+    assert!(terminal.contains("send_h3_grpc_reject_trailers_only("));
+    // Counted once, through the request's shared latch.
+    assert!(terminal.contains("ctx.record_authorization_termination_once("));
+    // Cancel-and-join the gateway-owned upload pump, then release the permits
+    // exactly once — response BEFORE teardown.
+    let write_at = terminal
+        .find("await_h3_grpc_terminal_write_with_grace(")
+        .expect("terminal write");
+    let retire_at = terminal.find("pump_guard.retire().await;").expect("pump retire");
+    let permits_at = terminal
+        .find("record_h3_backend_admission_outcome(")
+        .expect("admission permit release");
+    assert!(
+        write_at < retire_at && retire_at < permits_at,
+        "the terminal must reach the wire before the upload pump is retired and the \
+         admission permits are released"
+    );
+    assert_eq!(
+        terminal.matches("record_h3_backend_admission_outcome(").count(),
+        1,
+        "the admission permit set must be released exactly once"
+    );
+    // CB / passive health / adaptive concurrency stay neutral: the TRUE backend
+    // status with NO error class.
+    let outcome = terminal
+        .split("record_backend_outcome(")
+        .nth(1)
+        .expect("backend outcome")
+        .split(");")
+        .next()
+        .expect("bounded backend outcome");
+    assert!(
+        outcome.contains("response_status,"),
+        "the gateway's own security decision must never rewrite the backend's status"
+    );
+    assert!(
+        !outcome.contains("ErrorClass::"),
+        "no error class may be charged to the backend for a gateway policy expiry"
+    );
+    // A gateway policy expiry is never a capability signal.
+    assert!(!terminal.contains("mark_h3_unsupported"));
+}
+
+/// The response HEADERS write is bounded by the COMPOSED bound, and an
+/// authorization expiry on it resets rather than misreporting the client's
+/// `DEADLINE_EXCEEDED`.
+#[test]
+fn the_h3_grpc_response_head_write_is_bounded_by_the_composed_deadline() {
+    let region = H3_SERVER_SOURCE
+        .split("let response_header_write_deadline_at =")
+        .nth(1)
+        .expect("composed response-header write bound");
+    let assignment = region
+        .split(';')
+        .next()
+        .expect("the composed bound assignment");
+    assert!(
+        assignment.contains("compose_absolute_bound(")
+            && assignment.contains("grpc_deadline_at")
+            && assignment.contains("auth_deadline_plan"),
+        "the head write must race the EARLIEST of the client RPC deadline and the \
+         authorization deadline, not the client deadline alone"
+    );
+    let bounded = region
+        .split("if let Err(write_error) = response_header_write {")
+        .next()
+        .expect("bounded head-write region");
+    assert!(bounded.contains("send_half.send_response(resp),"));
+    // Authorization is attributed BEFORE the generic deadline branch, and the
+    // generic branch is the only one that may report DEADLINE_EXCEEDED.
+    let auth_at = bounded
+        .find("crate::proxy::auth_lifetime::expired_authorization(auth_deadline_plan)")
+        .expect("authorization attribution");
+    let terminal_at = bounded
+        .find("h3_grpc_authorization_precommit_terminal!(termination, false)")
+        .expect("reset-instead-of-wait terminal");
+    assert!(
+        auth_at < terminal_at,
+        "an expiry on the head write must be attributed before a terminal is chosen"
+    );
+    assert!(
+        !bounded.contains("GATEWAY_DEADLINE_EXCEEDED_MESSAGE"),
+        "an authorization expiry on the head write must not be misreported as the \
+         client's own DEADLINE_EXCEEDED"
+    );
+}
+
+/// Every HTTP/3 authorization exit records through the REQUEST's shared latch,
+/// so concurrent upload / response / terminal paths cannot double count
+/// (issue #3815, root finding 6).
+#[test]
+fn every_h3_authorization_exit_records_through_the_request_latch() {
+    for (name, source) in [
+        ("http3/server.rs", H3_SERVER_SOURCE),
+        (
+            "http3/cross_protocol.rs",
+            include_str!("../../../src/http3/cross_protocol.rs"),
+        ),
+        (
+            "http3/stream_util.rs",
+            include_str!("../../../src/http3/stream_util.rs"),
+        ),
+    ] {
+        assert!(
+            !source.contains("auth_lifetime::record_termination("),
+            "{name} still increments the fixed-cardinality counter directly; every \
+             precommit, blocked-write, idle, and mid-body authorization exit must go \
+             through the request's shared once-only latch"
+        );
+    }
+    // The shared blocked-write seam takes the latch rather than owning the
+    // counter.
+    let seam = include_str!("../../../src/http3/stream_util.rs")
+        .split("pub(crate) async fn await_authorized_response_write<F, T, E>(")
+        .nth(1)
+        .expect("blocked-write seam");
+    assert!(seam.contains("latch: &crate::proxy::auth_lifetime::StreamAuthTerminationLatch,"));
+    assert!(seam.contains("latch.record_once(plan.termination, family);"));
 }
