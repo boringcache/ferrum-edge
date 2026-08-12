@@ -873,10 +873,32 @@ before a socket exists, so a CONNECT-UDP route can never reach further than the
 ordinary HTTP route on the same proxy. Operators express the allow-list simply
 by pointing the proxy's upstream at the destinations they intend to expose.
 
-Two deliberate consequences of not dialling an HTTP backend: a claimed
-half-open circuit-breaker probe slot is released immediately (a tunnel is not a
-probe outcome and holding the slot would wedge the breaker), and no
-load-balancer connection is charged.
+"Not load balanced" is structural, not incidental: the HTTP/3 handler runs no
+upstream selection at all for a CONNECT-UDP request
+(`UpstreamSelection::unselected()`), so no member the client did not name can
+authorize, refuse, or describe the tunnel. Concretely, an unrelated member's
+health, circuit-breaker state, or transport tags never decide a requested
+destination, no round-robin / least-connections cursor is advanced for a
+request that dials no HTTP backend, and no load-balancer connection is charged.
+The circuit breaker is not consulted at all — a tunnel is not a probe outcome,
+and an HTTP backend's failure history is not evidence about a UDP destination
+(the handler still releases any probe slot it is handed, as defence in depth).
+
+Admission is bound to the exact requested member, which is what makes the
+transport screening sound: the matched target must be one a **direct UDP dial**
+may reach. A destination tagged for HBONE, sidecar mTLS, cross-cluster
+east-west, or Unix-socket dispatch is refused, even when another member of the
+same upstream is directly dialable, and even when the same `host:port` also
+appears untagged — the whole matching set is screened, so a duplicate cannot
+launder a transport-constrained sibling. Both refusal kinds return the same 403
+and the same body, so the response discloses neither the configured destination
+set nor which of its members are directly dialable. The backend egress policy
+is likewise evaluated against the requested host and this route's effective
+`dns_override`, not against a selected backend.
+
+The live generation re-check re-runs this same admission, transport screening
+included, so a reload that newly requires another transport for the destination
+withdraws the tunnel instead of letting it outlive the policy.
 
 Target resolution goes through the dial-time, policy-screened resolver, so the
 same backend IP policy that guards ordinary backend dialling guards the tunnel;
@@ -970,7 +992,7 @@ was never admitted against.
 | `:scheme` absent, empty, or not the listener's HTTPS scheme; `:authority` absent | `400` with a field-specific body — a tunnel is never established on an assumed scheme |
 | `Content-Length`, `Content-Type`, or `Transfer-Encoding` present (RFC 9297 §3.2), on the client request **or** on the plugin/policy-finalized outbound headers | `400`, before a socket exists |
 | Path is not an RFC 9298 template expansion, or `target_host` / `target_port` is empty, oversized, or malformed | `400` with a field-specific body |
-| Destination not configured for the matched proxy | `403` (the configured set is never echoed) |
+| Destination not configured for the matched proxy; configured but requiring a non-direct transport (HBONE, sidecar mTLS, cross-cluster, Unix socket); or denied by the backend egress policy | `403` — one status and one body for all three, so the configured set and its dialability are never echoed |
 | Session limit reached | `503` |
 | DNS failure / policy refusal | `502` with `Proxy-Status: ferrum-edge; error=dns_error` |
 | DNS timeout | `504` |
@@ -993,8 +1015,10 @@ was never admitted against.
   CONNECT-UDP traffic against a real UDP echo server, plus spoofed-destination,
   malformed-template, non-HTTPS-`:scheme`, forbidden-field,
   unknown-`:protocol`, oversize-capsule, FIN-mid-capsule, disabled-profile,
-  and reload-withdrawal coverage. The stream-end assertions distinguish a
-  clean FIN from a reset; neither accepts "either".
+  and reload-withdrawal coverage, plus a mixed upstream whose HBONE-tagged
+  member is refused while its directly dialable sibling relays, and an open
+  backend circuit breaker that does not govern the tunnel. The stream-end
+  assertions distinguish a clean FIN from a reset; neither accepts "either".
 
 ## QUIC connection migration
 

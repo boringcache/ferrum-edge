@@ -7,6 +7,10 @@
 //! - `Capsule-Protocol: ?1` on the 200
 //! - unregistered Context IDs and unknown capsule types dropped, not proxied
 //! - a spoofed destination that the matched proxy is not configured to reach
+//! - a mixed upstream where the client-requested member requires HBONE while a
+//!   sibling is directly dialable: the requested member is still refused
+//! - an open backend circuit breaker not governing a tunnel that dials no
+//!   HTTP backend
 //! - malformed URI-template expansions
 //! - a registered-but-unimplemented `:protocol` (`webtransport`)
 //! - the profile disabled by default
@@ -71,6 +75,62 @@ proxies:
     backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {target_port}
+    strip_listen_path: false
+consumers: []
+plugin_configs: []
+"#
+    )
+}
+
+/// The MASQUE route with a hair-trigger circuit breaker on its HTTP backend.
+///
+/// The backend address is a UDP socket, so any ordinary HTTP request to this
+/// route is a connection failure and opens the breaker immediately.
+fn masque_config_with_circuit_breaker(target_port: u16) -> String {
+    format!(
+        r#"version: "1"
+proxies:
+  - id: "masque"
+    listen_path: "{MASQUE_PREFIX}"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: {target_port}
+    strip_listen_path: false
+    circuit_breaker:
+      failure_threshold: 1
+      timeout_seconds: 300
+      trip_on_connection_errors: true
+consumers: []
+plugin_configs: []
+"#
+    )
+}
+
+/// The same MASQUE route, but its destinations come from a MIXED upstream: one
+/// ordinary direct target and one that is tagged as requiring HBONE dispatch.
+///
+/// `backend_host`/`backend_port` are deliberately a third address that the
+/// upstream does not contain, so nothing here can be admitted by the route
+/// backend rule.
+fn masque_mixed_upstream_config(direct_port: u16, hbone_port: u16, unused_port: u16) -> String {
+    format!(
+        r#"version: "1"
+upstreams:
+  - id: "masque-pool"
+    targets:
+      - host: "127.0.0.1"
+        port: {direct_port}
+      - host: "127.0.0.1"
+        port: {hbone_port}
+        tags:
+          mesh.hbone: "true"
+proxies:
+  - id: "masque"
+    listen_path: "{MASQUE_PREFIX}"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: {unused_port}
+    upstream_id: "masque-pool"
     strip_listen_path: false
 consumers: []
 plugin_configs: []
@@ -234,6 +294,121 @@ async fn functional_h3_connect_udp_refuses_an_unconfigured_target() {
     assert!(
         !body.contains(&echo.port.to_string()),
         "the refusal must not disclose the configured destination: {body}"
+    );
+
+    gateway.shutdown();
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_h3_connect_udp_is_not_governed_by_backend_circuit_breaker_state() {
+    // A CONNECT-UDP tunnel dials no HTTP backend, so an HTTP backend's failure
+    // history must not decide it. Ordinary requests to the same route open the
+    // breaker (the "backend" is a UDP socket, so every HTTP dial is refused);
+    // the tunnel to the destination the client named and the route admits must
+    // still be established and relay.
+    let echo = UdpEcho::spawn().await;
+    let (mut gateway, https_port) = start_masque_gateway(
+        masque_config_with_circuit_breaker(echo.port),
+        &[("FERRUM_HTTP3_CONNECT_UDP_ENABLED", "true")],
+    )
+    .await;
+
+    let client = Http3Client::insecure().expect("H3 client");
+    let probe_url = format!("https://localhost:{https_port}{MASQUE_PREFIX}/health-probe");
+
+    // Drive the breaker open, and prove it with the gateway's own 503 rather
+    // than assuming the threshold was reached.
+    let mut breaker_open = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(40);
+    while std::time::Instant::now() < deadline {
+        match client.get(&probe_url).await {
+            Ok(response) if response.status.as_u16() == 503 => {
+                breaker_open = true;
+                break;
+            }
+            Ok(_) | Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
+    assert!(
+        breaker_open,
+        "the route's circuit breaker never reported open; the exemption below would be vacuous"
+    );
+
+    let mut tunnel = open_tunnel(&client, &tunnel_url(https_port, "127.0.0.1", echo.port)).await;
+    assert_eq!(
+        tunnel.status.as_u16(),
+        200,
+        "an open backend circuit breaker must not refuse a CONNECT-UDP tunnel"
+    );
+    tunnel
+        .send_datagram(b"breaker-open")
+        .await
+        .expect("send datagram");
+    let echoed = tunnel
+        .recv_datagram(Duration::from_secs(10))
+        .await
+        .expect("receive echoed datagram");
+    assert_eq!(echoed, b"breaker-open");
+    tunnel.close().await;
+
+    gateway.shutdown();
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_h3_connect_udp_refuses_a_transport_constrained_target_in_a_mixed_upstream() {
+    // Both members of one upstream are live UDP echo sockets, so the only thing
+    // separating them is the transport the operator configured. The direct
+    // member proves the route works end to end; the HBONE-tagged member must
+    // still be refused, because a direct UDP dial would bypass exactly the
+    // transport its tag requires. Whichever member load balancing would have
+    // selected is irrelevant — no member is selected for a CONNECT-UDP request.
+    let direct = UdpEcho::spawn().await;
+    let hbone = UdpEcho::spawn().await;
+    let unused = UdpEcho::spawn().await;
+    let (mut gateway, https_port) = start_masque_gateway(
+        masque_mixed_upstream_config(direct.port, hbone.port, unused.port),
+        &[("FERRUM_HTTP3_CONNECT_UDP_ENABLED", "true")],
+    )
+    .await;
+
+    let client = Http3Client::insecure().expect("H3 client");
+
+    let mut tunnel = open_tunnel(&client, &tunnel_url(https_port, "127.0.0.1", direct.port)).await;
+    assert_eq!(
+        tunnel.status.as_u16(),
+        200,
+        "the directly dialable member of the upstream must tunnel"
+    );
+    tunnel
+        .send_datagram(b"direct-member")
+        .await
+        .expect("send datagram");
+    let echoed = tunnel
+        .recv_datagram(Duration::from_secs(10))
+        .await
+        .expect("receive echoed datagram");
+    assert_eq!(echoed, b"direct-member");
+    tunnel.close().await;
+
+    let mut refused = open_tunnel(&client, &tunnel_url(https_port, "127.0.0.1", hbone.port)).await;
+    assert_eq!(
+        refused.status.as_u16(),
+        403,
+        "a target requiring HBONE dispatch must never be tunnelled over a direct UDP socket"
+    );
+    let body = refused
+        .recv_body_text(Duration::from_secs(5))
+        .await
+        .expect("drain refusal body");
+    assert!(
+        body.contains("not an allowed destination"),
+        "unexpected refusal body: {body}"
+    );
+    assert!(
+        !body.contains(&direct.port.to_string()),
+        "the refusal must not disclose the directly dialable member: {body}"
     );
 
     gateway.shutdown();

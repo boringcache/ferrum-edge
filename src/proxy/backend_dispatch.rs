@@ -188,6 +188,28 @@ pub(crate) struct UpstreamSelection {
     pub sticky_cookie_needed: bool,
 }
 
+impl UpstreamSelection {
+    /// The "no member was selected" selection, for a dispatch surface that
+    /// deliberately does not load balance.
+    ///
+    /// This is byte-for-byte what [`select_upstream_target`] returns for a proxy
+    /// with no upstream, so every downstream selected-target gate degrades to
+    /// its no-target arm. RFC 9298 CONNECT-UDP is the caller: its destination is
+    /// client-named and merely admitted, so running load-balancer selection
+    /// would both perturb round-robin/least-connections accounting for a request
+    /// that dials no HTTP backend and let an unrelated member's health, breaker
+    /// state, or transport tags decide someone else's tunnel.
+    pub fn unselected() -> Self {
+        Self {
+            lb_hash_key: None,
+            target: None,
+            balancer: None,
+            is_fallback: false,
+            sticky_cookie_needed: false,
+        }
+    }
+}
+
 /// Whether a direct HTTP-family dial would bypass a target's required mesh
 /// transport.
 ///

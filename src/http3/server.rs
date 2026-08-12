@@ -3627,15 +3627,28 @@ async fn handle_h3_request(
     // provider claim can rebind them against the route-override base (not the
     // DestinationRule-effective `proxy`) before query capture / dial. Keep the
     // gated rebind below in sync with `handle_proxy_request_inner`.
+    //
+    // RFC 9298 CONNECT-UDP deliberately selects nothing. Its destination is
+    // client-named and merely ADMITTED against the route's configured set
+    // (`connect_udp::admit_connect_udp_destination`), so balancing here would
+    // both perturb round-robin / least-connections accounting for a request
+    // that dials no HTTP backend and hand every selected-target gate below an
+    // arbitrary member the client never named — whose breaker state could
+    // refuse a valid tunnel and whose transport tags describe a different
+    // destination entirely.
     let mut routing_proxy = Arc::clone(&proxy);
-    let mut selection = crate::proxy::backend_dispatch::select_upstream_target(
-        &proxy,
-        &state,
-        &epoch,
-        &ctx.client_ip,
-        &proxy_headers,
-        None,
-    );
+    let mut selection = if is_connect_udp_request {
+        crate::proxy::backend_dispatch::UpstreamSelection::unselected()
+    } else {
+        crate::proxy::backend_dispatch::select_upstream_target(
+            &proxy,
+            &state,
+            &epoch,
+            &ctx.client_ip,
+            &proxy_headers,
+            None,
+        )
+    };
     // Fields are moved out with `Option::take` so the deferred-override rebind
     // can replace the whole selection (balancer / sticky) rather than only the
     // target text.
@@ -3931,14 +3944,23 @@ async fn handle_h3_request(
             // `balancer` and `sticky_cookie_needed` are read after this point,
             // so same-generation load-balancer accounting and sticky-cookie
             // issuance must describe the target that is actually dialed.
-            selection = crate::proxy::backend_dispatch::select_upstream_target(
-                &routing_proxy,
-                &state,
-                &epoch,
-                &ctx.client_ip,
-                &proxy_headers,
-                None,
-            );
+            // Still unselected for CONNECT-UDP: a deferred hook can move the
+            // ROUTE (and therefore the admitted destination set, which is
+            // recomputed from this rebound proxy), but it must not introduce a
+            // load-balanced member into a tunnel that is admitted, never
+            // balanced.
+            selection = if is_connect_udp_request {
+                crate::proxy::backend_dispatch::UpstreamSelection::unselected()
+            } else {
+                crate::proxy::backend_dispatch::select_upstream_target(
+                    &routing_proxy,
+                    &state,
+                    &epoch,
+                    &ctx.client_ip,
+                    &proxy_headers,
+                    None,
+                )
+            };
             lb_hash_key = selection.lb_hash_key.take();
             upstream_target =
                 crate::proxy::backend_dispatch::concretize_wildcard_target_for_request(
@@ -4350,12 +4372,25 @@ async fn handle_h3_request(
     // H3 records the circuit-breaker outcome at header time (it does not defer the
     // dispatch outcome like the direct-H2 path), so the admission open-epoch is
     // unused here.
+    //
+    // CONNECT-UDP is exempt: it dials no HTTP backend, so it can neither
+    // confirm nor refute a breaker cycle, and no upstream member was selected
+    // for it. Consulting the breaker anyway would let an unrelated backend's
+    // failure history refuse a tunnel to a destination the client named and the
+    // route already admits, while a claimed HALF_OPEN probe slot would have to
+    // be released again untested a few lines into the handler.
+    let circuit_breaker_admission: Result<(Option<String>, bool, u64), ()> =
+        if is_connect_udp_request {
+            Ok((None, false, 0))
+        } else {
+            crate::proxy::backend_dispatch::check_circuit_breaker(
+                &proxy,
+                &state,
+                upstream_target.as_deref(),
+            )
+        };
     let (cb_target_key, cb_is_half_open_probe, _cb_admission_open_epoch) =
-        match crate::proxy::backend_dispatch::check_circuit_breaker(
-            &proxy,
-            &state,
-            upstream_target.as_deref(),
-        ) {
+        match circuit_breaker_admission {
             Ok(result) => result,
             Err(()) => {
                 let phase_start = std::time::Instant::now();
@@ -4472,7 +4507,13 @@ async fn handle_h3_request(
             upstream_target.as_deref(),
         )
         .is_some();
+    // Never for CONNECT-UDP: the DATA frames after the 200 are RFC 9297
+    // capsules, so draining them here as a request body would consume the
+    // tunnel. That exclusion has to be explicit rather than inherited from the
+    // selected-target dispatch-policy gate above, which is now a no-op for
+    // CONNECT-UDP precisely because no target is selected for it.
     if reevaluate_response_policy_after_request_body
+        && !is_connect_udp_request
         && !request_body_prepared
         && !preparation_blocked_by_dispatch_policy
     {
@@ -4832,11 +4873,18 @@ async fn handle_h3_request(
     // client could still dial a denied literal (e.g. a DB row load only warned
     // about) that H1/H2 clients are already blocked from. Hostname backends are
     // screened by the resolver at dial time on every H3 dispatch path.
-    if let Some(reason) = crate::proxy::denied_literal_backend_or_dns_override(
-        effective_host,
-        &proxy,
-        &state.env_config.backend_allow_ips,
-    ) {
+    //
+    // CONNECT-UDP is screened against its own client-named destination inside
+    // `handle_h3_connect_udp` instead: `effective_host` here is the route's
+    // `backend_host` (nothing is selected for a tunnel), which is not the host
+    // a CONNECT-UDP session dials and would refuse or admit the wrong one.
+    if !is_connect_udp_request
+        && let Some(reason) = crate::proxy::denied_literal_backend_or_dns_override(
+            effective_host,
+            &proxy,
+            &state.env_config.backend_allow_ips,
+        )
+    {
         warn!(
             proxy_id = %proxy.id,
             backend = %effective_host,

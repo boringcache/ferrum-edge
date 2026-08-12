@@ -4,19 +4,23 @@
 //! These exercise the production functions the H3 listener calls, not
 //! re-implementations: `handle_h3_connect_udp` parses its target with
 //! [`parse_connect_udp_target`], admits its destination with
-//! [`destination_is_configured`], decodes the client stream with
+//! [`admit_connect_udp_destination`], decodes the client stream with
 //! [`CapsuleDecoder`], and frames target datagrams with
 //! [`encode_udp_datagram_capsule`].
 
 use ferrum_edge::config::types::{GatewayConfig, Proxy, Upstream};
 use ferrum_edge::http3::connect_udp::{
-    CONNECT_UDP_MAX_PAYLOAD_BYTES, CapsuleDecodeError, CapsuleDecoder, CapsuleEvent,
-    ConnectUdpRequestRejection, ConnectUdpTargetRejection, H3ExtendedConnect, UdpSendFault,
+    AdmittedConnectUdpDestination, CONNECT_UDP_MAX_PAYLOAD_BYTES, CapsuleDecodeError,
+    CapsuleDecoder, CapsuleEvent, ConnectUdpDestinationRefusal, ConnectUdpRequestRejection,
+    ConnectUdpTargetRejection, H3ExtendedConnect, UdpSendFault, admit_connect_udp_destination,
     classify_h3_extended_connect, classify_udp_send_error, destination_is_configured,
     encode_udp_datagram_capsule, first_forbidden_capsule_protocol_field, parse_connect_udp_target,
     strip_forbidden_capsule_protocol_response_fields, validate_connect_udp_request_shape,
 };
 use ferrum_edge::load_balancer::{LoadBalancerCache, LoadBalancerCacheInner};
+use ferrum_edge::proxy::hbone_pool::HBONE_TARGET_TAG;
+use ferrum_edge::proxy::mesh_mtls_pool::{MESH_CROSS_CLUSTER_TAG, MESH_MTLS_TARGET_TAG};
+use ferrum_edge::proxy::unix_backend::MESH_UNIX_SOCKET_TAG;
 
 // ---------------------------------------------------------------------------
 // URI Template parsing (RFC 9298 §2 / §3)
@@ -258,6 +262,196 @@ fn a_withdrawn_upstream_admits_nothing() {
         "relay-a.internal",
         5353
     ));
+}
+
+// ---------------------------------------------------------------------------
+// Requested-target transport screening
+//
+// The destination a CONNECT-UDP request names is admitted, never load
+// balanced, so admission has to be evaluated against the member the CLIENT
+// named — and that member's own transport requirement decides whether a direct
+// UDP socket may reach it at all.
+// ---------------------------------------------------------------------------
+
+/// An upstream built from a literal JSON document, so a target can carry the
+/// mesh transport tags that `upstream_with_targets` deliberately never sets.
+fn upstream_from_json(document: serde_json::Value) -> Upstream {
+    serde_json::from_value(document).expect("minimal tagged upstream")
+}
+
+#[test]
+fn a_transport_constrained_target_is_refused_even_when_a_sibling_is_directly_dialable() {
+    // The exact mixed-upstream hazard: one member of the SAME upstream is an
+    // ordinary direct target, the other must ride HBONE. Whichever member a
+    // load balancer would have picked is irrelevant — the client named the
+    // HBONE one, so tunnelling it over a direct UDP socket would bypass the
+    // transport the operator configured for it.
+    let upstream = upstream_from_json(serde_json::json!({
+        "id": "mixed-pool",
+        "targets": [
+            { "host": "direct.internal", "port": 5353 },
+            {
+                "host": "hbone.internal",
+                "port": 5353,
+                "tags": { (HBONE_TARGET_TAG): "true" }
+            }
+        ]
+    }));
+    let cache = lb_cache(vec![upstream]);
+    let guard = cache.load();
+    let lb: &LoadBalancerCacheInner = &guard;
+    let proxy = upstream_proxy("mixed-pool");
+
+    let admitted = admit_connect_udp_destination(&proxy, lb, "direct.internal", 5353)
+        .expect("the direct member is tunnelable");
+    match admitted {
+        AdmittedConnectUdpDestination::UpstreamTarget(target) => {
+            assert_eq!(target.host, "direct.internal");
+            assert_eq!(target.port, 5353);
+        }
+        other => panic!("expected the requested upstream target, got {other:?}"),
+    }
+
+    assert_eq!(
+        admit_connect_udp_destination(&proxy, lb, "hbone.internal", 5353).unwrap_err(),
+        ConnectUdpDestinationRefusal::TransportRequired(
+            "HBONE dispatch required for this backend target"
+        ),
+        "a directly dialable sibling must not make an HBONE target tunnelable"
+    );
+    // And the boolean projection the live re-check uses agrees.
+    assert!(!destination_is_configured(&proxy, lb, "hbone.internal", 5353));
+}
+
+#[test]
+fn every_non_direct_transport_class_is_refused() {
+    let upstream = upstream_from_json(serde_json::json!({
+        "id": "mesh-pool",
+        "targets": [
+            {
+                "host": "mtls.internal",
+                "port": 5353,
+                "tags": { (MESH_MTLS_TARGET_TAG): "true" }
+            },
+            {
+                "host": "xc.internal",
+                "port": 5353,
+                "tags": {
+                    (MESH_MTLS_TARGET_TAG): "true",
+                    (MESH_CROSS_CLUSTER_TAG): "true"
+                }
+            },
+            {
+                "host": "unix.internal",
+                "port": 5353,
+                "tags": { (MESH_UNIX_SOCKET_TAG): "/run/ferrum/app.sock" }
+            }
+        ]
+    }));
+    let cache = lb_cache(vec![upstream]);
+    let guard = cache.load();
+    let lb: &LoadBalancerCacheInner = &guard;
+    let proxy = upstream_proxy("mesh-pool");
+
+    for host in ["mtls.internal", "xc.internal", "unix.internal"] {
+        assert!(
+            matches!(
+                admit_connect_udp_destination(&proxy, lb, host, 5353),
+                Err(ConnectUdpDestinationRefusal::TransportRequired(_))
+            ),
+            "{host} requires a transport a direct UDP dial cannot provide"
+        );
+    }
+}
+
+#[test]
+fn a_direct_duplicate_cannot_launder_a_transport_constrained_sibling() {
+    // Same host:port listed twice — legitimate for weights, localities, and
+    // subsets. Screening only the first match would let the untagged copy
+    // authorize a direct dial to a destination another copy says must ride
+    // HBONE, so the whole matching set is screened.
+    let upstream = upstream_from_json(serde_json::json!({
+        "id": "duplicate-pool",
+        "targets": [
+            { "host": "relay.internal", "port": 5353 },
+            {
+                "host": "relay.internal",
+                "port": 5353,
+                "tags": { (HBONE_TARGET_TAG): "true" }
+            }
+        ]
+    }));
+    let cache = lb_cache(vec![upstream]);
+    let guard = cache.load();
+    let lb: &LoadBalancerCacheInner = &guard;
+    let proxy = upstream_proxy("duplicate-pool");
+
+    assert!(
+        matches!(
+            admit_connect_udp_destination(&proxy, lb, "relay.internal", 5353),
+            Err(ConnectUdpDestinationRefusal::TransportRequired(_))
+        ),
+        "admission must fail closed across every matching target"
+    );
+}
+
+#[test]
+fn admission_returns_the_requested_member_never_a_balanced_one() {
+    // Admission is a pure function of the requested host:port and the epoch's
+    // snapshot: it is stable across repeats (no round-robin cursor is touched)
+    // and every member is independently reachable, so no single "selected"
+    // target can stand in for another.
+    let cache = lb_cache(vec![upstream_with_targets(
+        "udp-pool",
+        &[("relay-a.internal", 5353), ("relay-b.internal", 5353)],
+    )]);
+    let guard = cache.load();
+    let lb: &LoadBalancerCacheInner = &guard;
+    let proxy = upstream_proxy("udp-pool");
+
+    for _ in 0..8 {
+        for host in ["relay-a.internal", "relay-b.internal"] {
+            let admitted = admit_connect_udp_destination(&proxy, lb, host, 5353)
+                .expect("every configured member is admissible");
+            match admitted {
+                AdmittedConnectUdpDestination::UpstreamTarget(target) => {
+                    assert_eq!(target.host, host, "must describe the requested member");
+                }
+                other => panic!("expected an upstream target, got {other:?}"),
+            }
+        }
+    }
+}
+
+#[test]
+fn a_route_backend_destination_is_admitted_as_the_route_backend() {
+    let cache = lb_cache(Vec::new());
+    let guard = cache.load();
+    let lb: &LoadBalancerCacheInner = &guard;
+    let proxy = direct_proxy("dns.example", 853);
+
+    assert!(matches!(
+        admit_connect_udp_destination(&proxy, lb, "dns.example", 853),
+        Ok(AdmittedConnectUdpDestination::RouteBackend)
+    ));
+    assert_eq!(
+        admit_connect_udp_destination(&proxy, lb, "attacker.example", 853).unwrap_err(),
+        ConnectUdpDestinationRefusal::NotConfigured
+    );
+}
+
+#[test]
+fn both_refusal_kinds_carry_distinct_gateway_reasons() {
+    // The client-visible refusal is identical for both (403, one body), so the
+    // only place they may differ is the gateway-side log/phase token.
+    assert_eq!(
+        ConnectUdpDestinationRefusal::NotConfigured.reason(),
+        "connect_udp_target_not_allowed"
+    );
+    assert_eq!(
+        ConnectUdpDestinationRefusal::TransportRequired("HBONE dispatch required").reason(),
+        "connect_udp_target_transport_required"
+    );
 }
 
 // ---------------------------------------------------------------------------

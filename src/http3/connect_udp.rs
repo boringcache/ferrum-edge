@@ -99,7 +99,7 @@ use http::{Response, StatusCode};
 use tokio::net::UdpSocket;
 use tracing::{debug, info, warn};
 
-use crate::config::types::Proxy;
+use crate::config::types::{Proxy, UpstreamTarget};
 use crate::load_balancer::LoadBalancerCache;
 use crate::plugins::{Plugin, RequestContext, TransactionSummary};
 use crate::proxy::ProxyState;
@@ -491,31 +491,118 @@ fn validate_target_port(raw: &str) -> Result<u16, ConnectUdpTargetRejection> {
 // Destination admission
 // ---------------------------------------------------------------------------
 
-/// Whether `proxy` is configured to reach `host:port`.
+/// The configured destination a CONNECT-UDP request named, once admitted.
 ///
-/// This is the whole CONNECT-UDP authorization surface for the destination:
-/// the client picks the target (RFC 9298), but the set it may pick from is the
-/// set the operator already configured for this route. Evaluated against the
+/// The variant carries the matched [`UpstreamTarget`] rather than collapsing to
+/// a bool, because the transport a destination requires is per-target metadata:
+/// screening it is only sound against the member the CLIENT named, never
+/// against whichever member a load balancer happened to pick.
+#[derive(Debug, Clone)]
+pub enum AdmittedConnectUdpDestination {
+    /// The route's own `backend_host:backend_port`. A route backend carries no
+    /// per-target transport tags, so a direct UDP dial is the only transport it
+    /// can describe.
+    RouteBackend,
+    /// A target of the route's upstream, already screened for direct dialability.
+    UpstreamTarget(Box<UpstreamTarget>),
+}
+
+/// Why a client-named CONNECT-UDP destination was refused.
+///
+/// Both variants produce the same client-visible 403 with the same body: a
+/// probe must not learn from the refusal whether the destination exists in the
+/// route's configuration. They differ only in the gateway-side log/phase reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectUdpDestinationRefusal {
+    /// Not a destination this route is configured to reach.
+    NotConfigured,
+    /// Configured, but reaching it requires a transport that a direct UDP
+    /// socket cannot provide — HBONE, sidecar mTLS, cross-cluster east-west, or
+    /// a Unix socket.
+    TransportRequired(&'static str),
+}
+
+impl ConnectUdpDestinationRefusal {
+    /// Stable gateway-side reason token (logs and the rejection phase label).
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::NotConfigured => "connect_udp_target_not_allowed",
+            Self::TransportRequired(_) => "connect_udp_target_transport_required",
+        }
+    }
+}
+
+/// Admit the CLIENT-REQUESTED `host:port` against `proxy`'s configured
+/// destination set, screening the exact matched target's required transport.
+///
+/// This is the whole CONNECT-UDP authorization surface for the destination: the
+/// client picks the target (RFC 9298), but the set it may pick from is the set
+/// the operator already configured for this route, and it may only be tunnelled
+/// if THAT target is one a direct UDP socket may reach. Evaluated against the
 /// load-balancer snapshot of the request's epoch, so it cannot straddle two
 /// reload generations.
+///
+/// Two properties are deliberate:
+///
+/// * No load-balancer selection is consulted. A CONNECT-UDP tunnel is admitted,
+///   never balanced, so an unrelated member's health, circuit-breaker state, or
+///   transport tags can neither authorize nor refuse the requested destination.
+/// * The screening runs over EVERY matching target, not the first one. An
+///   upstream may legitimately list one `host:port` more than once (differing
+///   weights, localities, or subsets), and a direct duplicate must not launder a
+///   sibling that requires HBONE, mesh mTLS, cross-cluster, or Unix dispatch.
+pub fn admit_connect_udp_destination(
+    proxy: &Proxy,
+    lb_snapshot: &crate::load_balancer::LoadBalancerCacheInner,
+    host: &str,
+    port: u16,
+) -> Result<AdmittedConnectUdpDestination, ConnectUdpDestinationRefusal> {
+    let Some(upstream_id) = proxy.upstream_id.as_deref() else {
+        return if proxy.backend_port == port && proxy.backend_host.eq_ignore_ascii_case(host) {
+            Ok(AdmittedConnectUdpDestination::RouteBackend)
+        } else {
+            Err(ConnectUdpDestinationRefusal::NotConfigured)
+        };
+    };
+    let Some(upstream) =
+        LoadBalancerCache::get_upstream_from(lb_snapshot, &proxy.namespace, upstream_id)
+    else {
+        return Err(ConnectUdpDestinationRefusal::NotConfigured);
+    };
+
+    let mut admitted: Option<&UpstreamTarget> = None;
+    for target in &upstream.targets {
+        if target.port != port || !target.host.eq_ignore_ascii_case(host) {
+            continue;
+        }
+        if let Some(reason) =
+            crate::proxy::backend_dispatch::direct_network_http_transport_refusal(Some(target))
+        {
+            return Err(ConnectUdpDestinationRefusal::TransportRequired(reason));
+        }
+        if admitted.is_none() {
+            admitted = Some(target);
+        }
+    }
+    match admitted {
+        Some(target) => Ok(AdmittedConnectUdpDestination::UpstreamTarget(Box::new(
+            target.clone(),
+        ))),
+        None => Err(ConnectUdpDestinationRefusal::NotConfigured),
+    }
+}
+
+/// Boolean projection of [`admit_connect_udp_destination`] for callers that only
+/// need "is this still an admissible destination" — notably the live
+/// generation re-check, which fails the tunnel closed on any refusal, including
+/// a reload that newly tags the destination as requiring another transport.
 pub fn destination_is_configured(
     proxy: &Proxy,
     lb_snapshot: &crate::load_balancer::LoadBalancerCacheInner,
     host: &str,
     port: u16,
 ) -> bool {
-    if let Some(upstream_id) = &proxy.upstream_id {
-        let upstream =
-            LoadBalancerCache::get_upstream_from(lb_snapshot, &proxy.namespace, upstream_id);
-        return match upstream {
-            Some(upstream) => upstream
-                .targets
-                .iter()
-                .any(|target| target.port == port && target.host.eq_ignore_ascii_case(host)),
-            None => false,
-        };
-    }
-    proxy.backend_port == port && proxy.backend_host.eq_ignore_ascii_case(host)
+    admit_connect_udp_destination(proxy, lb_snapshot, host, port).is_ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -1001,8 +1088,10 @@ pub(crate) async fn handle_h3_connect_udp(
     } = request;
 
     // A CONNECT-UDP tunnel dials no HTTP backend, so it can neither confirm nor
-    // refute a half-open circuit-breaker probe. Release the slot immediately —
-    // holding it for the session lifetime would wedge the breaker closed.
+    // refute a half-open circuit-breaker probe. The dispatcher therefore does
+    // not consult the breaker for CONNECT-UDP at all and these arrive as
+    // `(None, false)`; this stays as defense in depth, because a claimed slot
+    // held for the session lifetime would wedge the breaker closed.
     crate::http3::websocket::release_h3_ws_circuit_breaker_probe_on_admission_reject(
         &state,
         &proxy,
@@ -1086,12 +1175,68 @@ pub(crate) async fn handle_h3_connect_udp(
         }
     };
 
-    if !destination_is_configured(&proxy, &epoch.load_balancer, &target.host, target.port) {
-        // No target identity is echoed: a probe must not learn the configured
-        // destination set from the refusal.
+    // The ONE destination decision, bound to the client-requested target on the
+    // request's own epoch and against the route-override-effective proxy. No
+    // load-balanced member was selected for this request (see
+    // `UpstreamSelection::unselected` on the H3 dispatch path), so nothing here
+    // can be decided by a target the client did not name — and the matched
+    // target's own transport requirement is screened, so a destination that
+    // must ride HBONE, sidecar mTLS, an east-west cross-cluster leg, or a Unix
+    // socket is never tunnelled over a direct UDP dial.
+    let destination =
+        admit_connect_udp_destination(&proxy, &epoch.load_balancer, &target.host, target.port);
+    let admitted = match destination {
+        Ok(admitted) => admitted,
+        Err(refusal) => {
+            // No target identity is echoed, and both refusal kinds share one
+            // status and body: a probe must learn neither the configured
+            // destination set nor which of its members are directly dialable.
+            warn!(
+                proxy_id = %proxy.id,
+                reason = refusal.reason(),
+                "Rejected HTTP/3 CONNECT-UDP: target is not an admissible destination"
+            );
+            return reject(
+                &mut stream,
+                &state,
+                &plugins,
+                &ctx,
+                &initial_response_header_policy_plugins,
+                StatusCode::FORBIDDEN,
+                r#"{"error":"CONNECT-UDP target is not an allowed destination for this route"}"#,
+                refusal.reason(),
+                plugin_execution_ns,
+                start_time,
+                &request_path,
+                HashMap::new(),
+            )
+            .await;
+        }
+    };
+    let via_upstream_target = matches!(admitted, AdmittedConnectUdpDestination::UpstreamTarget(_));
+    debug!(
+        proxy_id = %proxy.id,
+        via_upstream_target,
+        "HTTP/3 CONNECT-UDP: client-requested destination admitted"
+    );
+
+    // Backend egress policy, applied to the REQUESTED host (and this route's
+    // effective `dns_override`) rather than to whatever host an LB selection
+    // would have produced. The generic H3 dispatch path runs this guard on its
+    // selected target and is deliberately skipped for CONNECT-UDP, so this is
+    // where a denied literal is refused. The dial-time resolver below screens
+    // resolved addresses too; this additionally covers the override and keeps
+    // the refusal ahead of any lookup. Same status and body as an unconfigured
+    // destination, so it stays a non-disclosing refusal.
+    if let Some(reason) = crate::proxy::denied_literal_backend_or_dns_override(
+        &target.host,
+        &proxy,
+        &state.env_config.backend_allow_ips,
+    ) {
         warn!(
             proxy_id = %proxy.id,
-            "Rejected HTTP/3 CONNECT-UDP: target is not a configured destination for this route"
+            reason,
+            "Rejected HTTP/3 CONNECT-UDP: backend egress policy denies the requested target"
         );
         return reject(
             &mut stream,
@@ -1101,7 +1246,7 @@ pub(crate) async fn handle_h3_connect_udp(
             &initial_response_header_policy_plugins,
             StatusCode::FORBIDDEN,
             r#"{"error":"CONNECT-UDP target is not an allowed destination for this route"}"#,
-            "connect_udp_target_not_allowed",
+            "connect_udp_target_egress_denied",
             plugin_execution_ns,
             start_time,
             &request_path,
@@ -1659,6 +1804,11 @@ async fn relay(
                     if route_overrides_applied {
                         break SessionEnd::RouteAuthorizationUnreconstructable;
                     }
+                    // Re-runs the FULL admission, transport screening included,
+                    // so a reload that newly requires HBONE / mesh mTLS /
+                    // cross-cluster / Unix dispatch for this destination
+                    // withdraws the live direct-UDP tunnel instead of letting it
+                    // outlive the policy that would now refuse it.
                     let still_admitted = current
                         .proxy_by_namespaced_id(&proxy.namespace, &proxy.id)
                         .is_some_and(|live| {
