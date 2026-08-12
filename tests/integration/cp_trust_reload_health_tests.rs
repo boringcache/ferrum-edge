@@ -404,22 +404,39 @@ async fn the_published_projection_carries_no_generation_identifier_or_digest() {
     let mut metrics = String::new();
     render_cp_dp_trust_reload_prometheus(&mut metrics, ",namespace=\"edge\"", Some(&snapshot));
 
+    for forbidden in [
+        "active_generation",
+        "fingerprint",
+        "digest",
+        "sha256",
+        "candidate",
+        SECRET,
+        KID,
+        NAMESPACE,
+    ] {
+        assert!(
+            !rendered.contains(forbidden),
+            "published trust health must not carry `{forbidden}`: {rendered}"
+        );
+    }
+    // Prometheus HELP prose may safely describe a reload candidate. Reject a
+    // candidate label/value while allowing that fixed explanatory word.
+    for forbidden in [
+        "active_generation",
+        "fingerprint",
+        "digest",
+        "sha256",
+        "candidate=\"",
+        SECRET,
+        KID,
+        NAMESPACE,
+    ] {
+        assert!(
+            !metrics.contains(forbidden),
+            "published trust metrics must not carry `{forbidden}`: {metrics}"
+        );
+    }
     for surface in [rendered.as_str(), metrics.as_str()] {
-        for forbidden in [
-            "active_generation",
-            "fingerprint",
-            "digest",
-            "sha256",
-            "candidate",
-            SECRET,
-            KID,
-            NAMESPACE,
-        ] {
-            assert!(
-                !surface.contains(forbidden),
-                "published trust health must not carry `{forbidden}`: {surface}"
-            );
-        }
         assert!(
             longest_hex_run(surface) < 16,
             "a hex run this long is a generation identifier, fingerprint, or digest: {surface}"
