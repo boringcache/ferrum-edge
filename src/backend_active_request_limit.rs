@@ -56,6 +56,7 @@
 //! * `subset` is the selected DestinationRule subset (`None` is a distinct lane
 //!   from every named subset), length-prefixed so a hostile subset name cannot
 //!   collide with a sibling lane.
+//!
 //! The lane is deliberately stable across config generations. A reload must
 //! not mint a fresh allowance while requests admitted by the previous config
 //! are still active: every acquire applies the current cap to the shared count.
