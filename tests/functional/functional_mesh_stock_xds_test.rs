@@ -109,6 +109,10 @@ const SERVICE_HOST: &str = "svc-b.ferrum.svc.cluster.local";
 const NO_PIN_HOST: &str = "svc-nopin.ferrum.svc.cluster.local";
 const SUBSET_HOST: &str = "svc-subset.ferrum.svc.cluster.local";
 const FOREIGN_NAMESPACE_HOST: &str = "svc-other.other.svc.cluster.local";
+/// Synthetic Kubernetes pod UID for the one destination pod. Every Service
+/// that pod backs carries this same non-empty UID so inbound can prove they
+/// are one pod (addresses are not identity).
+const DESTINATION_POD_UID: &str = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
 
 const UPSTREAM_TLS_TYPE_URL: &str =
     "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext";
@@ -604,7 +608,7 @@ fn stock_policy_document() -> String {
 
 /// One local Service this destination pod backs, plus the per-service workload
 /// record stock xDS also emits for a shared endpoint (same SPIFFE, same
-/// address, distinct `service_name`).
+/// synthetic pod UID, distinct `service_name`).
 fn destination_local_service(
     name: &str,
     backend_port: u16,
@@ -632,7 +636,7 @@ fn destination_local_service(
         weight: None,
         locality: None,
         service_account: Some("svc-b".to_string()),
-        pod_uid: None,
+        pod_uid: Some(DESTINATION_POD_UID.to_string()),
         node_waypoint: None,
         remote_provenance: false,
     };
@@ -660,9 +664,11 @@ fn destination_local_service(
 /// control plane drives only gateway A.
 ///
 /// Phase 2a publishes additional representable clusters (`svc-nopin`,
-/// `svc-subset`) that share this pod's endpoint and SAN pin. A's outbound
-/// preserves the client Host, so B must materialize inbound Host routes for
-/// those Services or the pre-state probe 404s at B after a successful mTLS hop.
+/// `svc-subset`) that share this pod's endpoint, SAN pin, and synthetic pod
+/// UID. A's outbound preserves the client Host, so B must materialize inbound
+/// Host routes for those Services or the pre-state probe 404s at B after a
+/// successful mTLS hop. The shared non-empty UID is the same-pod proof;
+/// matching addresses alone are not.
 fn destination_slice(node_id: &str, backend_port: u16) -> MeshSlice {
     let b_id = SpiffeId::new(B_SPIFFE).expect("destination SPIFFE id");
     let trust_domain = TrustDomain::new("cluster.local").expect("trust domain");

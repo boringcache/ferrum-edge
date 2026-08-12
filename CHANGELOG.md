@@ -10,12 +10,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Sidecar inbound now treats one pod selected by multiple Services as the same
-  local identity when those workload records share a SPIFFE and either the same
-  pod UID or the same non-empty endpoint address set, and materializes one
-  inbound Host route per Service. Distinct pods that only share a
-  service-account SPIFFE still fail closed. The stock xDS live matrix needs
-  this so a representable extra cluster that shares the destination pod's
-  endpoint can reach the backend through preserved Host headers (issue #3317).
+  local identity only when those workload records share a SPIFFE and the same
+  non-empty pod UID, and materializes one inbound Host route per Service.
+  Missing or divergent UIDs stay fail-closed even when endpoint addresses
+  match (hostNetwork pods can share an IP). The stock xDS live matrix stamps
+  one synthetic destination-pod UID on every Service that pod backs so a
+  representable extra cluster can reach the backend through preserved Host
+  headers (issue #3317).
 
 ### Added
 

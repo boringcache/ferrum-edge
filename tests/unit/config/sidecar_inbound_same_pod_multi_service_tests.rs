@@ -1,6 +1,7 @@
 //! Same-pod multi-Service inbound identity: one pod selected by several
-//! Services must stay in the local-inbound view, while distinct pods that only
-//! share a service-account SPIFFE stay fail-closed.
+//! Services must stay in the local-inbound view when every record carries the
+//! same non-empty pod UID. Missing or divergent UIDs stay fail-closed even
+//! when addresses match; addresses and labels are not same-pod proof.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -12,11 +13,19 @@ use ferrum_edge::modes::mesh::config::{
 };
 use ferrum_edge::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
 
+const POD_UID: &str = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
+const OTHER_POD_UID: &str = "16b2c3d4-9dad-11d1-80b4-00c04fd430c8";
+
 fn trust_domain() -> TrustDomain {
     TrustDomain::new("cluster.local").expect("trust domain")
 }
 
-fn local_workload(service_name: &str, spiffe: &str, addresses: &[&str]) -> Workload {
+fn local_workload(
+    service_name: &str,
+    spiffe: &str,
+    addresses: &[&str],
+    pod_uid: Option<&str>,
+) -> Workload {
     Workload {
         spiffe_id: SpiffeId::new(spiffe).expect("spiffe"),
         selector: WorkloadSelector {
@@ -41,7 +50,7 @@ fn local_workload(service_name: &str, spiffe: &str, addresses: &[&str]) -> Workl
         weight: None,
         locality: None,
         service_account: Some("shared".to_string()),
-        pod_uid: None,
+        pod_uid: pod_uid.map(str::to_string),
         node_waypoint: None,
         remote_provenance: false,
     }
@@ -150,13 +159,26 @@ fn assert_slice_validates_as_mesh_config(slice: &MeshSlice) {
     );
 }
 
+fn assert_inbound_is_empty(slice: &MeshSlice, reason: &str) {
+    assert_eq!(
+        slice.local_inbound_workloads.as_deref().map(Vec::len),
+        Some(0),
+        "{reason}"
+    );
+    assert!(
+        slice.local_inbound_services.is_empty(),
+        "an ambiguous local identity must not keep either Service as an inbound anchor"
+    );
+    assert_slice_validates_as_mesh_config(slice);
+}
+
 #[test]
-fn same_pod_selected_by_multiple_services_stays_in_the_local_inbound_view() {
+fn same_nonempty_pod_uid_across_multiple_services_materializes_all_inbound_hosts() {
     let spiffe = "spiffe://cluster.local/ns/default/sa/shared";
     let slice = slice_for(
         vec![
-            local_workload("reviews", spiffe, &["10.0.0.7"]),
-            local_workload("ratings", spiffe, &["10.0.0.7"]),
+            local_workload("reviews", spiffe, &["10.0.0.7"], Some(POD_UID)),
+            local_workload("ratings", spiffe, &["10.0.0.7"], Some(POD_UID)),
         ],
         vec![
             mesh_service("reviews", spiffe),
@@ -179,12 +201,12 @@ fn same_pod_selected_by_multiple_services_stays_in_the_local_inbound_view() {
 }
 
 #[test]
-fn distinct_pods_sharing_a_spiffe_are_not_an_inbound_anchor() {
+fn divergent_pod_uids_with_the_same_address_fail_closed() {
     let spiffe = "spiffe://cluster.local/ns/default/sa/shared";
     let slice = slice_for(
         vec![
-            local_workload("reviews", spiffe, &["10.0.0.7"]),
-            local_workload("ratings", spiffe, &["10.0.0.8"]),
+            local_workload("reviews", spiffe, &["10.0.0.7"], Some(POD_UID)),
+            local_workload("ratings", spiffe, &["10.0.0.7"], Some(OTHER_POD_UID)),
         ],
         vec![
             mesh_service("reviews", spiffe),
@@ -193,26 +215,20 @@ fn distinct_pods_sharing_a_spiffe_are_not_an_inbound_anchor() {
         spiffe,
     );
 
-    assert_eq!(
-        slice.local_inbound_workloads.as_deref().map(Vec::len),
-        Some(0),
-        "distinct addresses are distinct pods; the inbound view must stay empty rather than \
-         guess which loopback app this sidecar serves"
+    assert_inbound_is_empty(
+        &slice,
+        "divergent pod UIDs are distinct pods even when addresses match; \
+         hostNetwork sharing an IP must not materialize inbound Hosts",
     );
-    assert!(
-        slice.local_inbound_services.is_empty(),
-        "an ambiguous local identity must not keep either Service as an inbound anchor"
-    );
-    assert_slice_validates_as_mesh_config(&slice);
 }
 
 #[test]
-fn empty_addresses_cannot_prove_two_services_are_the_same_pod() {
+fn missing_pod_uids_with_the_same_address_fail_closed() {
     let spiffe = "spiffe://cluster.local/ns/default/sa/shared";
     let slice = slice_for(
         vec![
-            local_workload("reviews", spiffe, &[]),
-            local_workload("ratings", spiffe, &[]),
+            local_workload("reviews", spiffe, &["10.0.0.7"], None),
+            local_workload("ratings", spiffe, &["10.0.0.7"], None),
         ],
         vec![
             mesh_service("reviews", spiffe),
@@ -221,10 +237,32 @@ fn empty_addresses_cannot_prove_two_services_are_the_same_pod() {
         spiffe,
     );
 
-    assert_eq!(
-        slice.local_inbound_workloads.as_deref().map(Vec::len),
-        Some(0),
-        "empty addresses are not a same-pod proof"
+    assert_inbound_is_empty(
+        &slice,
+        "missing pod UIDs cannot prove sameness from a shared address set",
     );
-    assert_slice_validates_as_mesh_config(&slice);
+}
+
+#[test]
+fn mixed_missing_and_divergent_pod_uids_cannot_fall_back_to_addresses() {
+    let spiffe = "spiffe://cluster.local/ns/default/sa/shared";
+    let slice = slice_for(
+        vec![
+            local_workload("reviews", spiffe, &["10.0.0.7"], Some(POD_UID)),
+            local_workload("ratings", spiffe, &["10.0.0.7"], None),
+            local_workload("details", spiffe, &["10.0.0.7"], Some(OTHER_POD_UID)),
+        ],
+        vec![
+            mesh_service("reviews", spiffe),
+            mesh_service("ratings", spiffe),
+            mesh_service("details", spiffe),
+        ],
+        spiffe,
+    );
+
+    assert_inbound_is_empty(
+        &slice,
+        "a set mixing missing UIDs with divergent known UIDs must stay \
+         ambiguous even when every address set matches",
+    );
 }

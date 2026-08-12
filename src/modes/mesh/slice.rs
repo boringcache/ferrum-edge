@@ -3789,15 +3789,14 @@ pub(crate) fn workload_is_local(
 /// A SPIFFE id is a service-account identity, not pod-unique, and labels aren't
 /// necessarily pod-unique either. After matching by SPIFFE + labels + cluster
 /// (`workload_is_local`), a matched set that backs **more than one distinct
-/// service** is the Kubernetes-normal "one pod, several Services" case when
-/// those records are the same pod (shared non-empty pod UID, or else the same
-/// non-empty endpoint address set). Keep every record so inbound can
-/// materialize a Host route per Service. Distinct pods that only share a
-/// service-account SPIFFE — different addresses, divergent pod UIDs, or no
-/// identity key that can prove sameness — stay ambiguous and return empty
-/// rather than materialize inbound routes to the wrong loopback app. Replicas
-/// of one service share its `service_name` and collapse to a single distinct
-/// entry.
+/// service** is the Kubernetes-normal "one pod, several Services" case only
+/// when every record carries the same non-empty pod UID. Keep every record so
+/// inbound can materialize a Host route per Service. hostNetwork pods can share
+/// an IP, so equal address sets are not identity. A missing UID, an empty UID,
+/// or any divergent UID stays ambiguous — even when addresses or labels match
+/// — and returns empty rather than materialize inbound routes to the wrong
+/// loopback app. Replicas of one service share its `service_name` and collapse
+/// to a single distinct entry.
 pub(crate) fn resolve_local_workloads<'a>(
     workloads: &'a [Workload],
     local_spiffe: &str,
@@ -3828,40 +3827,22 @@ pub(crate) fn resolve_local_workloads<'a>(
 
 /// True when every matched workload is the same local pod.
 ///
-/// A non-empty pod UID is the strongest key: all records must carry it, and
-/// they must agree. Divergent UIDs are distinct pods even when addresses
-/// collide (hostNetwork). When a UID is missing, the same non-empty address
-/// set is the remaining same-pod proof. Empty addresses cannot prove sameness,
-/// so two service-account copies without a UID or address stay ambiguous.
+/// A non-empty pod UID is the only same-pod proof for a multi-Service match:
+/// every record must carry it, and they must agree. hostNetwork pods can share
+/// an IP, so equal address sets are not identity. A missing UID, an empty UID,
+/// or any divergent UID stays ambiguous even when addresses match — never fall
+/// back to addresses or labels.
 fn matched_workloads_are_same_pod(matched: &[&Workload]) -> bool {
     if matched.len() <= 1 {
         return true;
     }
-
-    let uids: Vec<Option<&str>> = matched
+    let mut uids = matched
         .iter()
-        .map(|workload| workload.pod_uid.as_deref().filter(|uid| !uid.is_empty()))
-        .collect();
-    if uids.iter().all(Option::is_some) {
-        let first = uids[0];
-        return uids.iter().all(|uid| *uid == first);
-    }
-
-    let address_sets: Vec<BTreeSet<&str>> = matched
-        .iter()
-        .map(|workload| {
-            workload
-                .addresses
-                .iter()
-                .map(String::as_str)
-                .filter(|address| !address.is_empty())
-                .collect()
-        })
-        .collect();
-    let Some(first) = address_sets.first() else {
+        .map(|workload| workload.pod_uid.as_deref().filter(|uid| !uid.is_empty()));
+    let Some(first) = uids.next().flatten() else {
         return false;
     };
-    !first.is_empty() && address_sets.iter().all(|set| set == first)
+    uids.all(|uid| uid == Some(first))
 }
 
 fn narrow_service_ports(

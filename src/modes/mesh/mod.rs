@@ -23778,19 +23778,23 @@ mod tests {
 
     #[test]
     fn sidecar_inbound_proxies_materialize_for_same_pod_selected_by_multiple_services() {
-        // One pod selected by two Services (same SPIFFE, same endpoint address,
+        // One pod selected by two Services (same SPIFFE, same non-empty pod UID,
         // distinct service_name) is Kubernetes-normal. Inbound must emit a Host
         // route per Service rather than treating the shared service-account
-        // SPIFFE as ambiguous and materializing nothing.
+        // SPIFFE as ambiguous and materializing nothing. Matching addresses
+        // alone are not same-pod proof.
         let shared = "spiffe://cluster.local/ns/default/sa/shared";
         let runtime = MeshRuntimeConfig {
             workload_spiffe_id: Some(shared.to_string()),
             ..test_mesh_runtime_config()
         };
+        let pod_uid = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
         let mut reviews = workload_with_address("reviews", "shared-app", "10.0.0.7");
         reviews.spiffe_id = SpiffeId::new(shared).unwrap();
+        reviews.pod_uid = Some(pod_uid.to_string());
         let mut ratings = workload_with_address("ratings", "shared-app", "10.0.0.7");
         ratings.spiffe_id = SpiffeId::new(shared).unwrap();
+        ratings.pod_uid = Some(pod_uid.to_string());
         let slice = MeshSlice {
             node_id: "node-a".to_string(),
             namespace: "default".to_string(),
@@ -23850,10 +23854,126 @@ mod tests {
     }
 
     #[test]
+    fn sidecar_inbound_proxies_skip_divergent_pod_uids_with_the_same_address() {
+        // hostNetwork pods can share an IP. Divergent UIDs are distinct pods
+        // and must fail closed even when every address set matches.
+        let shared = "spiffe://cluster.local/ns/default/sa/shared";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(shared.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let mut reviews = workload_with_address("reviews", "shared-app", "10.0.0.7");
+        reviews.spiffe_id = SpiffeId::new(shared).unwrap();
+        reviews.pod_uid = Some("6ba7b810-9dad-11d1-80b4-00c04fd430c8".into());
+        let mut ratings = workload_with_address("ratings", "shared-app", "10.0.0.7");
+        ratings.spiffe_id = SpiffeId::new(shared).unwrap();
+        ratings.pod_uid = Some("16b2c3d4-9dad-11d1-80b4-00c04fd430c8".into());
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![reviews, ratings],
+            services: vec![
+                http_mesh_service("reviews", 8080, shared),
+                http_mesh_service("ratings", 8080, shared),
+            ],
+            ..MeshSlice::default()
+        };
+
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+        assert!(
+            !config
+                .proxies
+                .iter()
+                .any(|p| p.id.starts_with("__mesh-inbound-")),
+            "divergent pod UIDs with a shared address must not materialize inbound routes"
+        );
+    }
+
+    #[test]
+    fn sidecar_inbound_proxies_skip_missing_pod_uids_with_the_same_address() {
+        // Equal address sets are not same-pod identity. Missing UIDs stay
+        // ambiguous even when every record shares an endpoint.
+        let shared = "spiffe://cluster.local/ns/default/sa/shared";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(shared.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let mut reviews = workload_with_address("reviews", "shared-app", "10.0.0.7");
+        reviews.spiffe_id = SpiffeId::new(shared).unwrap();
+        let mut ratings = workload_with_address("ratings", "shared-app", "10.0.0.7");
+        ratings.spiffe_id = SpiffeId::new(shared).unwrap();
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![reviews, ratings],
+            services: vec![
+                http_mesh_service("reviews", 8080, shared),
+                http_mesh_service("ratings", 8080, shared),
+            ],
+            ..MeshSlice::default()
+        };
+
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+        assert!(
+            !config
+                .proxies
+                .iter()
+                .any(|p| p.id.starts_with("__mesh-inbound-")),
+            "missing pod UIDs with a shared address must not materialize inbound routes"
+        );
+    }
+
+    #[test]
+    fn sidecar_inbound_proxies_skip_mixed_missing_and_divergent_pod_uids() {
+        // A set that mixes a missing UID with divergent known UIDs must not
+        // fall back to matching addresses.
+        let shared = "spiffe://cluster.local/ns/default/sa/shared";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(shared.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let mut reviews = workload_with_address("reviews", "shared-app", "10.0.0.7");
+        reviews.spiffe_id = SpiffeId::new(shared).unwrap();
+        reviews.pod_uid = Some("6ba7b810-9dad-11d1-80b4-00c04fd430c8".into());
+        let mut ratings = workload_with_address("ratings", "shared-app", "10.0.0.7");
+        ratings.spiffe_id = SpiffeId::new(shared).unwrap();
+        let mut details = workload_with_address("details", "shared-app", "10.0.0.7");
+        details.spiffe_id = SpiffeId::new(shared).unwrap();
+        details.pod_uid = Some("16b2c3d4-9dad-11d1-80b4-00c04fd430c8".into());
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![reviews, ratings, details],
+            services: vec![
+                http_mesh_service("reviews", 8080, shared),
+                http_mesh_service("ratings", 8080, shared),
+                http_mesh_service("details", 8080, shared),
+            ],
+            ..MeshSlice::default()
+        };
+
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+        assert!(
+            !config
+                .proxies
+                .iter()
+                .any(|p| p.id.starts_with("__mesh-inbound-")),
+            "mixed missing and divergent UID evidence must not fall back to addresses"
+        );
+    }
+
+    #[test]
     fn sidecar_inbound_proxies_skip_shared_spiffe_with_distinct_pod_addresses() {
         // Same service-account SPIFFE backing two services on DIFFERENT
-        // addresses is two pods, not one pod selected by two Services. Fail
-        // closed rather than materialize inbound to the wrong loopback app.
+        // addresses, with no pod UID, is two pods. Fail closed rather than
+        // materialize inbound to the wrong loopback app. Addresses are not a
+        // same-pod fallback even when they do match.
         let shared = "spiffe://cluster.local/ns/default/sa/shared";
         let runtime = MeshRuntimeConfig {
             workload_spiffe_id: Some(shared.to_string()),
@@ -23928,8 +24048,9 @@ mod tests {
     fn sidecar_inbound_proxies_skip_ambiguous_shared_spiffe_with_matching_labels() {
         // Two workloads share the service-account SPIFFE AND the same labels but
         // back different services. The sidecar's labels match BOTH, so labels do
-        // not disambiguate (they aren't pod-unique) — the identity is still
-        // ambiguous and must materialize NO routes.
+        // not disambiguate (they aren't pod-unique) — without a shared
+        // non-empty pod UID the identity is still ambiguous and must
+        // materialize NO routes.
         let shared = "spiffe://cluster.local/ns/default/sa/shared";
         let runtime = MeshRuntimeConfig {
             workload_spiffe_id: Some(shared.to_string()),
