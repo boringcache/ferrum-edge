@@ -1050,16 +1050,12 @@ mesh:
         // The stale generation-1 candidate is discarded and exactly one
         // follow-up generation runs, loading the FINAL document.
         wait_until("final document installed", || {
-            state
-                .snapshot()
-                .as_ref()
-                .as_ref()
-                .is_some_and(|slice| {
-                    slice
-                        .services
-                        .first()
-                        .is_some_and(|svc| svc.name == "renamed-after-reload")
-                })
+            state.snapshot().as_ref().as_ref().is_some_and(|slice| {
+                slice
+                    .services
+                    .first()
+                    .is_some_and(|svc| svc.name == "renamed-after-reload")
+            })
         })
         .await;
         assert_eq!(

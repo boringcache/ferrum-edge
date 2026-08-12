@@ -52,7 +52,10 @@ fn exact_limit_loads_and_limit_plus_one_is_refused() {
             assert_eq!(max_bytes, TEST_LIMIT);
             assert!(len > TEST_LIMIT);
             // Metadata already knew the real size here, so it is exact.
-            assert!(!len_is_lower_bound, "metadata refusal reports an exact size");
+            assert!(
+                !len_is_lower_bound,
+                "metadata refusal reports an exact size"
+            );
         }
         other => panic!("expected TooLarge, got {other}"),
     }
