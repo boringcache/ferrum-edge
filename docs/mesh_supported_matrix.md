@@ -209,18 +209,46 @@ need them, or because they are blocked upstream / architecturally:
   node-agent registry's published pod addresses and attested SPIFFE identity. The
   resolved pod's `PolicyScopeCache` is stamped before `mesh_authz`, so
   namespace/selector-scoped `AuthorizationPolicy` enforces per source workload and
-  UDP/DTLS service ports and proxies stay routable. Everything unattributable
-  fails closed at the session boundary — no ingress-interface cmsg, an interface
-  no enrolled pod owns (all off-node traffic), an interface two enrolled pods
-  claim, a source address the interface's pod does not own, a registry entry with
-  no attested identity or address, and a pod whose workload has left the live
-  slice. Admitted sessions are re-authorized per datagram, so pod churn, veth
-  reuse, and registry removal terminate them; a datagram that merely names an
+  UDP/DTLS service ports and proxies stay routable. A session is unattributable
+  when there is no ingress-interface cmsg, when the interface is one no enrolled
+  pod owns (all off-node traffic), when two enrolled pods claim it, when the
+  source address is not one the interface's pod owns, when the registry entry
+  carries no attested identity or address, or when the pod's workload has left
+  the live slice. Such a session carries no per-pod scope, and `mesh_authz`
+  then applies **exactly the same rule as the TCP stream path**: it is denied
+  whenever any enforcing namespace/selector-scoped `AuthorizationPolicy` is
+  loaded, and it falls through to mesh-wide evaluation in a mesh that carries
+  only mesh-wide policies (which is fully evaluable without a per-pod scope, and
+  is the pre-#3286 behaviour for those meshes). It is therefore not true that
+  every unattributable UDP/DTLS session is refused at the session boundary
+  regardless of policy — scoped enforcement is what makes the refusal.
+  Admitted sessions are re-authorized per datagram, so pod churn, veth reuse,
+  and registry removal terminate them; a datagram that merely names an
   established session's (forgeable) source tuple from a different ingress
-  interface is refused on its own without ending that session. The blanket
-  config-preparation
-  suppression of NodeWaypoint UDP/DTLS remains only on builds where the channel
-  cannot exist (non-Linux). Mesh-wide UDP/DTLS policy is unchanged.
+  interface is refused on its own without ending that session. A scoped
+  listener whose socket cannot report ingress interfaces at all does not start:
+  the bind is reported as failed rather than serving a listener that could only
+  deny. The blanket config-preparation suppression of NodeWaypoint UDP/DTLS
+  remains only on builds where the channel cannot exist (non-Linux). Mesh-wide
+  UDP/DTLS policy is unchanged.
+
+
+  **What is and is not proven, precisely.** What the lifted suppression restores
+  *today* is the UDP/DTLS half of the mesh service metadata and its mesh-DNS
+  visibility, plus the per-datagram attribution the listener path consumes. A
+  NodeWaypoint mesh data plane still has no configuration surface that
+  materializes a UDP/DTLS **listener**: `start_udp_listener` is reached only
+  from `StreamListenerManager` over `GatewayConfig.proxies`; in mesh mode those
+  proxies come only from `decode_virtual_service_l4_proxies`, whose CP-side
+  candidate filter requires a non-empty `stream_match`, and `Proxy::validate`
+  rejects `stream_match` on `udp`/`dtls` schemes; the localized file source
+  rejects a `proxies:` section outright. So the attribution channel, the
+  fail-closed listener startup, and the per-datagram revalidation are exercised
+  at unit and integration level and by the compiled NodeWaypoint runtime in the
+  `node-waypoint-ebpf-live` gate, but **there is no live UDP or DTLS traffic
+  assertion through a NodeWaypoint listener, because no supported configuration
+  can create one.** Issue #3286 is therefore not fully closed: adding such a
+  configuration surface, and a live gate over it, is follow-up work.
 - **DR `connectionPool.http.maxRequestsPerConnection`** — parsed and validated
   but **Deferred** in status; backend close-after-N-requests is unsupported, so
   it is not projected as effective policy. Use `http2MaxRequests`.

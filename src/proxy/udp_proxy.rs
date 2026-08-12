@@ -1891,6 +1891,46 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
     let addr = SocketAddr::new(bind_addr, port);
     let frontend_socket = Arc::new(UdpSocket::bind(addr).await?);
 
+    // A NodeWaypoint scoped listener has no datapath at all without the
+    // kernel's ingress-interface cmsg: every session would resolve to "no
+    // attribution" and `mesh_authz` would deny it. Enabling the option for the
+    // family this socket actually serves is therefore a startup precondition,
+    // not an optimization — reporting the listener as started while it can only
+    // fail closed is a black hole that looks healthy. Ordinary (non-scoped) UDP
+    // listeners are untouched and keep the best-effort behaviour below.
+    if node_waypoint_udp_source.is_some() {
+        let local = frontend_socket.local_addr().unwrap_or(addr);
+        #[cfg(target_os = "linux")]
+        let fd = {
+            use std::os::unix::io::AsRawFd;
+            frontend_socket.as_raw_fd()
+        };
+        #[cfg(not(target_os = "linux"))]
+        let fd = 0;
+        match crate::socket_opts::enable_ingress_pktinfo(fd, local) {
+            Ok(families) => info!(
+                proxy_id = %proxy_id,
+                port = port,
+                families = ?families,
+                "NodeWaypoint scoped UDP listener armed ingress-interface capture for every family \
+                 it serves"
+            ),
+            Err(error) => {
+                error!(
+                    proxy_id = %proxy_id,
+                    port = port,
+                    "NodeWaypoint scoped UDP listener cannot enable ingress-interface capture; \
+                     refusing to start a listener that could only deny every scoped session: {}",
+                    error
+                );
+                return Err(anyhow::Error::new(error).context(format!(
+                    "NodeWaypoint scoped UDP listener {proxy_id} on {local} cannot capture the \
+                     datagram ingress interface required for source-workload authorization"
+                )));
+            }
+        }
+    }
+
     // Apply Linux socket optimizations on the frontend UDP socket.
     #[cfg(target_os = "linux")]
     let mut pktinfo_active = false;
@@ -4001,6 +4041,48 @@ async fn dtls_shared_idle_watchdog(
     }
 }
 
+/// Which of a DTLS session's two relay tasks (if either) resolved on its own
+/// before the handler stopped waiting.
+///
+/// A `JoinHandle` panics if it is polled again after it has yielded its output,
+/// so the winner of the `select!` must be excluded from the post-abort join.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DtlsRelayCompletion {
+    /// The client → backend relay resolved.
+    ClientToBackend,
+    /// The backend → client relay resolved.
+    BackendToClient,
+    /// Neither relay resolved — the idle watchdog fired.
+    Neither,
+}
+
+/// Abort both DTLS relay tasks and await the ones that had not already
+/// resolved, so neither can still be executing once the caller returns.
+///
+/// `JoinHandle::abort` is a request: the task stops at its next await point, so
+/// without this join a losing relay could forward one more datagram *after* the
+/// handler reported the session terminated and released its scope pin and
+/// session accounting. Awaiting an aborted handle resolves as soon as the task
+/// observes the cancellation, and the relays are pure socket-await loops, so
+/// this cannot outlive one in-flight datagram copy.
+///
+/// The already-resolved handle named by `finished` is deliberately not polled
+/// again.
+pub async fn abort_and_join_dtls_relays<T>(
+    client_to_backend: &mut tokio::task::JoinHandle<T>,
+    backend_to_client: &mut tokio::task::JoinHandle<T>,
+    finished: DtlsRelayCompletion,
+) {
+    client_to_backend.abort();
+    backend_to_client.abort();
+    if finished != DtlsRelayCompletion::ClientToBackend {
+        let _ = client_to_backend.await;
+    }
+    if finished != DtlsRelayCompletion::BackendToClient {
+        let _ = backend_to_client.await;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_dtls_client_inner(
     client_conn: crate::dtls::DtlsServerConn,
@@ -4448,19 +4530,23 @@ async fn handle_dtls_client_inner(
     let mut client_to_backend = client_to_backend;
     let mut backend_to_client = backend_to_client;
     let mut idle_watchdog = Box::pin(dtls_shared_idle_watchdog(shared_activity_ms, idle_timeout));
-    let outcome = tokio::select! {
-        result = &mut client_to_backend => match result {
+    let (outcome, finished) = tokio::select! {
+        result = &mut client_to_backend => (match result {
             Ok(outcome) => outcome,
             Err(error) => Err(anyhow::anyhow!("DTLS client forwarding task failed: {error}")),
-        },
-        result = &mut backend_to_client => match result {
+        }, DtlsRelayCompletion::ClientToBackend),
+        result = &mut backend_to_client => (match result {
             Ok(outcome) => outcome,
             Err(error) => Err(anyhow::anyhow!("DTLS backend forwarding task failed: {error}")),
-        },
-        result = &mut idle_watchdog => result,
+        }, DtlsRelayCompletion::BackendToClient),
+        result = &mut idle_watchdog => (result, DtlsRelayCompletion::Neither),
     };
-    client_to_backend.abort();
-    backend_to_client.abort();
+    // Aborting only *requests* cancellation. Returning here would release the
+    // session's security and accounting lifetime (scope pin, session slot, byte
+    // counters, disconnect summary) while a losing relay could still be inside
+    // an await and forward one more datagram. Join the losers first so the
+    // handler's termination is also the relays' termination.
+    abort_and_join_dtls_relays(&mut client_to_backend, &mut backend_to_client, finished).await;
 
     client_close.close().await;
     if let Some(ref dtls) = backend_dtls_cleanup {

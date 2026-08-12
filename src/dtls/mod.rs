@@ -1066,11 +1066,7 @@ impl DtlsServer {
         let socket = UdpSocket::bind(addr)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to bind DTLS server on {}: {}", addr, e))?;
-        Ok(Self::from_socket_with_limits(
-            socket,
-            frontend_config,
-            limits,
-        ))
+        Self::from_socket_with_limits(socket, frontend_config, limits)
     }
 
     /// Create a `DtlsServer` from an already-bound `UdpSocket`. Useful when the
@@ -1081,11 +1077,71 @@ impl DtlsServer {
     /// release/rebind window.
     #[allow(dead_code)] // Public helper used by tests and scripted DTLS backends.
     pub fn from_socket(socket: UdpSocket, frontend_config: FrontendDtlsConfig) -> Self {
-        Self::from_socket_with_limits(socket, frontend_config, DtlsServerLimits::default())
+        // `DtlsServerLimits::default()` leaves `capture_ingress_ifindex` off,
+        // which is the only fallible part of construction, so this stays
+        // infallible by construction.
+        Self::build(socket, frontend_config, DtlsServerLimits::default())
     }
 
-    /// Create a `DtlsServer` from an already-bound `UdpSocket` with admission limits.
+    /// Create a `DtlsServer` from an already-bound `UdpSocket` with admission
+    /// limits.
+    ///
+    /// Fails when `DtlsServerLimits::capture_ingress_ifindex` is set and the
+    /// socket cannot report a datagram's ingress interface. That flag is only
+    /// set by the NodeWaypoint scoped DTLS path, whose entire source-workload
+    /// authorization decision is derived from that interface: without it every
+    /// session is unattributable and denied, so a server that reports itself
+    /// constructed would be a black hole that looks healthy. Ordinary DTLS
+    /// listeners never set the flag and cannot fail here.
     pub fn from_socket_with_limits(
+        socket: UdpSocket,
+        frontend_config: FrontendDtlsConfig,
+        limits: DtlsServerLimits,
+    ) -> Result<Self, anyhow::Error> {
+        let capture_ingress_ifindex = limits.capture_ingress_ifindex;
+        let server = Self::build(socket, frontend_config, limits);
+        if capture_ingress_ifindex {
+            server.arm_ingress_ifindex_capture()?;
+        }
+        Ok(server)
+    }
+
+    /// Enable the ingress-interface cmsg for every address family this bound
+    /// socket actually serves, failing closed otherwise.
+    ///
+    /// Deliberately shares [`crate::socket_opts::enable_ingress_pktinfo`] with
+    /// the plain-UDP scoped listener so the two cannot disagree about which
+    /// family a dual-stack bind must cover.
+    fn arm_ingress_ifindex_capture(&self) -> Result<(), anyhow::Error> {
+        let local = self
+            .socket
+            .local_addr()
+            .map_err(|e| anyhow::anyhow!("DTLS demux cannot read its own bound address: {e}"))?;
+        #[cfg(target_os = "linux")]
+        let fd = {
+            use std::os::fd::AsRawFd;
+            self.socket.as_raw_fd()
+        };
+        #[cfg(not(target_os = "linux"))]
+        let fd = 0;
+        match crate::socket_opts::enable_ingress_pktinfo(fd, local) {
+            Ok(families) => {
+                info!(
+                    local = %local,
+                    families = ?families,
+                    "DTLS demux armed ingress-interface capture for NodeWaypoint source attribution"
+                );
+                Ok(())
+            }
+            Err(error) => Err(anyhow::Error::new(error).context(format!(
+                "NodeWaypoint scoped DTLS listener on {local} cannot capture the datagram ingress \
+                 interface required for source-workload authorization"
+            ))),
+        }
+    }
+
+    /// Assemble the server without touching socket options.
+    fn build(
         socket: UdpSocket,
         frontend_config: FrontendDtlsConfig,
         limits: DtlsServerLimits,
@@ -1099,26 +1155,6 @@ impl DtlsServer {
             certificate: frontend_config.certificate,
             client_cert_verifier: frontend_config.client_cert_verifier,
         });
-
-        #[cfg(target_os = "linux")]
-        if limits.capture_ingress_ifindex {
-            use std::os::fd::AsRawFd;
-            let fd = socket.as_raw_fd();
-            // A dual-stack listener may receive either family, so both are
-            // attempted and the failure is reported rather than swallowed: the
-            // NodeWaypoint path treats a missing ingress interface as
-            // unattributable and denies the session, so an operator must be able
-            // to see why every DTLS session started failing closed.
-            let v4 = crate::socket_opts::set_ip_pktinfo(fd).is_ok();
-            let v6 = crate::socket_opts::set_ipv6_recvpktinfo(fd).is_ok();
-            if !v4 && !v6 {
-                warn!(
-                    "DTLS demux: IP_PKTINFO/IPV6_RECVPKTINFO setsockopt failed on both families; \
-                     NodeWaypoint UDP/DTLS source attribution is unavailable on this listener and \
-                     scoped AuthorizationPolicy will deny its sessions"
-                );
-            }
-        }
 
         Self {
             socket,
@@ -2223,6 +2259,7 @@ mod tests {
             },
             limits,
         )
+        .expect("construct DTLS test server")
     }
 
     fn client_hello_packet() -> Vec<u8> {

@@ -526,3 +526,143 @@ fn live_kernel_reports_an_ingress_interface_that_drives_attribution() {
         NodeWaypointUdpSourceRefusal::UnenrolledInterface
     );
 }
+
+// ---------------------------------------------------------------------------
+// Listener-startup fail-closed decision (issue #3286 repair r3)
+// ---------------------------------------------------------------------------
+//
+// Attribution is only possible when the kernel reports a datagram's ingress
+// interface, which needs `IP_PKTINFO` / `IPV6_RECVPKTINFO` on the family the
+// bound socket actually serves. These pin the decision itself — no socket, no
+// platform — so the "either option succeeded" shortcut cannot come back: it
+// would let a listener report itself started while every scoped session on the
+// family it really serves is denied for want of an ingress interface.
+
+use ferrum_edge::socket_opts::{
+    IngressPktinfoFamilies, ingress_pktinfo_outcome, required_ingress_pktinfo_families,
+};
+
+fn refused() -> std::io::Error {
+    std::io::Error::from(std::io::ErrorKind::PermissionDenied)
+}
+
+#[test]
+fn required_pktinfo_families_follow_the_bound_socket_family() {
+    assert_eq!(
+        required_ingress_pktinfo_families("0.0.0.0:5353".parse().expect("v4 bind"), false),
+        IngressPktinfoFamilies::V4,
+        "an AF_INET socket can only ever deliver IP_PKTINFO"
+    );
+    assert_eq!(
+        required_ingress_pktinfo_families("0.0.0.0:5353".parse().expect("v4 bind"), true),
+        IngressPktinfoFamilies::V4,
+        "IPV6_V6ONLY cannot apply to an IPv4 bind and must not change the requirement"
+    );
+    assert_eq!(
+        required_ingress_pktinfo_families("[::]:5353".parse().expect("v6 bind"), true),
+        IngressPktinfoFamilies::V6,
+        "a v6-only socket receives no IPv4 datagram, so IP_PKTINFO is irrelevant to it"
+    );
+    assert_eq!(
+        required_ingress_pktinfo_families("[::]:5353".parse().expect("v6 bind"), false),
+        IngressPktinfoFamilies::Both,
+        "a dual-stack bind serves IPv4-mapped clients too, so BOTH options are required"
+    );
+    assert_eq!(
+        required_ingress_pktinfo_families("[::1]:5353".parse().expect("v6 bind"), false),
+        IngressPktinfoFamilies::Both,
+        "dual-stack is a property of the socket, not of a wildcard address"
+    );
+}
+
+#[test]
+fn an_irrelevant_family_success_never_masks_the_served_family() {
+    // v4 socket: IPV6_RECVPKTINFO always fails with ENOPROTOOPT and must be
+    // ignored, while IP_PKTINFO failing is fatal.
+    assert!(ingress_pktinfo_outcome(IngressPktinfoFamilies::V4, Ok(()), Err(refused())).is_ok());
+    assert!(ingress_pktinfo_outcome(IngressPktinfoFamilies::V4, Err(refused()), Ok(())).is_err());
+
+    // v6-only socket: the mirror image.
+    assert!(ingress_pktinfo_outcome(IngressPktinfoFamilies::V6, Err(refused()), Ok(())).is_ok());
+    assert!(ingress_pktinfo_outcome(IngressPktinfoFamilies::V6, Ok(()), Err(refused())).is_err());
+
+    // Dual-stack: either half failing is fatal. This is the case the old
+    // `v4_ok || v6_ok` test accepted, leaving one family unattributable.
+    assert!(ingress_pktinfo_outcome(IngressPktinfoFamilies::Both, Ok(()), Ok(())).is_ok());
+    let v4_missing = ingress_pktinfo_outcome(IngressPktinfoFamilies::Both, Err(refused()), Ok(()))
+        .expect_err("a dual-stack socket without IP_PKTINFO cannot attribute IPv4-mapped clients");
+    assert!(v4_missing.v4.is_some() && v4_missing.v6.is_none());
+    let v6_missing = ingress_pktinfo_outcome(IngressPktinfoFamilies::Both, Ok(()), Err(refused()))
+        .expect_err("a dual-stack socket without IPV6_PKTINFO cannot attribute native IPv6");
+    assert!(v6_missing.v6.is_some() && v6_missing.v4.is_none());
+    assert_eq!(v6_missing.required, IngressPktinfoFamilies::Both);
+}
+
+// ---------------------------------------------------------------------------
+// DTLS relay supervision (issue #3286 repair r3)
+// ---------------------------------------------------------------------------
+
+use ferrum_edge::proxy::udp_proxy::{DtlsRelayCompletion, abort_and_join_dtls_relays};
+
+/// A losing relay must not still be running once the handler returns: its
+/// session accounting and per-pod scope pin are released at that point.
+#[tokio::test]
+async fn losing_dtls_relays_are_joined_before_the_handler_returns() {
+    let still_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observed = still_running.clone();
+    // Models the losing relay: parked on an await, so `abort()` alone leaves it
+    // scheduled rather than stopped.
+    let mut loser = tokio::spawn(async move {
+        let _guard = RunningFlag::new(observed);
+        std::future::pending::<()>().await;
+    });
+    // Models the winner: already resolved, so it must not be polled again.
+    let mut winner = tokio::spawn(async {});
+    let _ = (&mut winner).await;
+
+    abort_and_join_dtls_relays(&mut winner, &mut loser, DtlsRelayCompletion::ClientToBackend).await;
+
+    assert!(
+        !still_running.load(std::sync::atomic::Ordering::SeqCst),
+        "the aborted relay must have observed cancellation and unwound before the join returned"
+    );
+    assert!(
+        loser.is_finished(),
+        "the aborted relay must be finished, not merely asked to stop"
+    );
+}
+
+/// When the idle watchdog wins, BOTH relays are losers and both must be joined.
+#[tokio::test]
+async fn an_idle_timeout_joins_both_dtls_relays() {
+    let mut client_to_backend = tokio::spawn(std::future::pending::<()>());
+    let mut backend_to_client = tokio::spawn(std::future::pending::<()>());
+
+    abort_and_join_dtls_relays(
+        &mut client_to_backend,
+        &mut backend_to_client,
+        DtlsRelayCompletion::Neither,
+    )
+    .await;
+
+    assert!(client_to_backend.is_finished());
+    assert!(backend_to_client.is_finished());
+}
+
+/// Drop-flag helper: flips the shared flag to `true` while the task body is
+/// live and back to `false` as it unwinds, so the assertion above observes
+/// "still executing" rather than "was ever executing".
+struct RunningFlag(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl RunningFlag {
+    fn new(flag: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        Self(flag)
+    }
+}
+
+impl Drop for RunningFlag {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
