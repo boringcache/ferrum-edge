@@ -402,14 +402,63 @@ as one fenced sequence
    native-gRPC mesh transport resolution, raw-TCP mesh egress, mesh UDP egress,
    HBONE capability probing) — is false, so those paths **fail closed** rather
    than authenticate against the generation this one replaced.
-3. **Commit.** The material is installed and the admission is republished live,
-   advancing the gateway trust generation. Status and `/metrics` are recorded
-   last, after a verifier a request path can actually select is live.
+3. **Commit.** The material is installed, the **backend security generation** is
+   advanced (below), and the admission is republished live, advancing the
+   gateway trust generation. All three happen inside the fence, in that order,
+   so there is no point at which admission is open while any of them is still
+   pending. Status and `/metrics` are recorded last, after a verifier a request
+   path can actually select is live.
 
 Trust material is only ever advanced after the fence, so a request admitted
 under an older generation can at worst use trust the operator has already
 committed — the same forward-only contract gateway SVID rotation has always had
 — and never trust the accepted generation withdrew.
+
+##### Committed trust retires the transports it authenticated
+
+Installing the accepted verifier is only half of a rotation or revocation.
+Every backend and mesh transport already in a pool was authenticated under the
+**outgoing** roots, so a `Replace` or `Clear` also advances the shared backend
+security (SVID) generation — the same counter a gateway SVID rotation advances,
+and therefore the same machinery:
+
+- fresh dials and TLS-config construction key on the new generation
+  (`|svidg=<n>` pool keys and backend TLS config caches partition on it), so an
+  entry from the withdrawn generation cannot be selected;
+- the outgoing generation's cached backend TLS configs are invalidated and
+  active health checks are restarted;
+- HTTP/2, gRPC, H3, HBONE, mesh-mTLS, and connection-pool entries from the
+  outgoing generation are force-drained on the operator's configured
+  `FERRUM_MESH_SVID_ROTATION_DRAIN_SECONDS` schedule — the same window a gateway
+  SVID rotation uses, with the same meaning for `0` (the default): no forced
+  drain, existing connections are kept until normal idle/health cleanup.
+
+The counter is advanced **synchronously**, on the publishing thread, while the
+epoch is still fenced. Publishing only on the rotation watch channel and leaving
+the store to the asynchronous rotation consumer would let the fence lift before
+that task was scheduled, and every request admitted in the gap would key its
+pool and TLS-config lookups on the generation the publication had just
+withdrawn. The watch send still happens — it is what schedules the cache
+invalidation, health-check restart, and bounded drain — but no request-visible
+decision waits on it.
+
+Adding a root is overlap and may honour the drain window. An explicit removal or
+`Clear` is **not usable for new validation** the moment the commit returns —
+every verifier is rebuilt from the accepted material and no cached config or
+pool entry from the withdrawn generation is reachable by key — and the
+transports the removed root already authenticated are retired on that same
+schedule. Deployments that revoke gateway trust roots should therefore set a
+non-zero `FERRUM_MESH_SVID_ROTATION_DRAIN_SECONDS`, which is what bounds how
+long an already-authenticated transport may outlive the root that admitted it.
+
+`Unchanged` advances nothing, so an ordinary reload on a gateway that has a
+trust record never churns a pool. The database serving-mode startup install
+(`ProxyState::publish_gateway_trust_generation`) runs before any listener binds
+and has no pooled transport to retire, so it does not advance the counter
+either. The mesh slice apply loop publishes its federation-derived gateway trust
+unconditionally on every accepted slice and is therefore not on this path;
+`update_gateway_trust_bundles` / `clear_gateway_trust_bundles` keep their
+fence-install-republish behaviour for it.
 
 The gateway SVID slot (`ProxyState.gateway_svid_bundle`) remains the *material*
 the mesh pools and the inbound resolver originate from. It is not the admission

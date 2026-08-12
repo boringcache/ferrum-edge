@@ -6093,9 +6093,19 @@ pub struct ProxyState {
     /// `SvidFetchHandle::with_revision_tx`. Until at least one producer is
     /// bound, the channel stays at generation 0 — pool keys carry `|svidg=0`
     /// and no rotation drain fires.
+    ///
+    /// A committed gateway trust change is the one producer that does NOT wait
+    /// for the consumer: [`ProxyState::advance_backend_security_generation`]
+    /// sends here AND stores into `backend_svid_generation` itself, because the
+    /// publication fence lifts before the consumer task can be scheduled.
     #[allow(dead_code)]
     pub backend_svid_rotation_tx: tokio::sync::watch::Sender<u64>,
     /// Current backend client SVID generation shared by backend pools.
+    ///
+    /// Written by [`spawn_backend_svid_rotation_task`] and, synchronously,
+    /// by [`ProxyState::advance_backend_security_generation`]. Both use
+    /// `fetch_max`, so the generation is monotonic under any interleaving of
+    /// the two writers.
     #[allow(dead_code)] // Observability/test surface; runtime pools hold their own Arc clone.
     pub backend_svid_generation: BackendSvidGeneration,
     /// Shared SOCK_OPS metrics state populated by the kernel ringbuf
@@ -6697,6 +6707,33 @@ impl BackendSvidRotationConsumer {
     }
 }
 
+/// Upper bound on how many coalesced generations one rotation wake-up retires.
+///
+/// Each retired generation costs one `retain` pass per pool, so an arbitrarily
+/// long span would let a starved consumer turn a single wake-up into unbounded
+/// sweep work on the pools' hot `DashMap`s.
+const MAX_COALESCED_ROTATION_DRAIN_GENERATIONS: u64 = 8;
+
+/// The half-open span of generations that advancing `old` → `next` retires.
+///
+/// Normally `old + 1 == next` and this is the single generation `old..next`,
+/// exactly what the pre-coalescing drain targeted. When the watch coalesced
+/// several publications — publishers advance the shared counter synchronously,
+/// so requests can be served under a generation this task never observed
+/// individually — every generation in `[old, next)` was live at some point and
+/// can hold pool entries, so all of them retire together.
+///
+/// Clamped to the newest [`MAX_COALESCED_ROTATION_DRAIN_GENERATIONS`]. The
+/// HBONE / mesh-mTLS pools sweep `<= generation`, so their highest call still
+/// covers the clamped tail; the exact-match pools leave it to idle pruning,
+/// which is the same outcome the uncapped loop would reach far more slowly.
+/// A non-advancing `next` (a test that replaces the revision downward) yields
+/// an empty span and retires nothing.
+fn outgoing_generation_span(old: u64, next: u64) -> std::ops::Range<u64> {
+    let oldest = next.saturating_sub(MAX_COALESCED_ROTATION_DRAIN_GENERATIONS);
+    oldest.max(old)..next
+}
+
 fn spawn_backend_svid_rotation_task(
     mut revision_rx: tokio::sync::watch::Receiver<u64>,
     generation: BackendSvidGeneration,
@@ -6706,7 +6743,12 @@ fn spawn_backend_svid_rotation_task(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut current_generation = *revision_rx.borrow();
-        generation.store(current_generation, Ordering::Release);
+        // `fetch_max`, never `store`: a synchronous publisher
+        // (`ProxyState::advance_backend_security_generation`) advances the
+        // counter on its own thread before this task is first scheduled, so a
+        // plain store here could walk the live generation backwards onto one
+        // whose pool entries are already being drained.
+        generation.fetch_max(current_generation, Ordering::AcqRel);
         let mut shutdown_rx = shutdown_rx;
 
         // Each rotation spawns its own delayed force-drain task targeting the
@@ -6759,13 +6801,27 @@ fn spawn_backend_svid_rotation_task(
 
             let old_generation = current_generation;
             current_generation = next_generation;
-            generation.store(next_generation, Ordering::Release);
-            consumer.pools.drain_tls_config_cache(old_generation);
+            generation.fetch_max(next_generation, Ordering::AcqRel);
+            // The watch coalesces, and publishers now advance the counter
+            // synchronously, so several generations can retire between two
+            // wake-ups and each of them can have carried live pool entries.
+            // The HTTP/H2/gRPC/H3 pools match their `|svidg=` key field
+            // EXACTLY (`SvidGenerationMatcher`), so draining only
+            // `old_generation` would leave every skipped generation's entries
+            // to idle pruning — an unbounded withdrawal window. Retire the
+            // whole outgoing span instead; the HBONE and mesh-mTLS pools sweep
+            // `<= generation`, so the repeated calls are cheap no-ops for them
+            // after the first.
+            let retiring = outgoing_generation_span(old_generation, next_generation);
+            for outgoing in retiring.clone() {
+                consumer.pools.drain_tls_config_cache(outgoing);
+            }
             consumer.restart_health_checks();
 
             info!(
                 old_svid_generation = old_generation,
                 new_svid_generation = next_generation,
+                retiring_from = retiring.start,
                 drain_seconds,
                 "Backend client SVID rotation observed; new backend TLS connections will use fresh identity"
             );
@@ -6784,9 +6840,12 @@ fn spawn_backend_svid_rotation_task(
                     } else {
                         sleep.as_mut().await;
                     }
-                    pools_for_drain.force_drain(old_generation);
+                    for outgoing in retiring.clone() {
+                        pools_for_drain.force_drain(outgoing);
+                    }
                     info!(
                         old_svid_generation = old_generation,
+                        retiring_from = retiring.start,
                         "Forced drain of backend pool entries from previous SVID generation completed"
                     );
                 }));
@@ -6906,20 +6965,7 @@ impl ProxyState {
     /// (issue #3727).
     pub fn update_gateway_trust_bundles(&self, trust_bundles: RuntimeTrustBundleSet) {
         self.fence_gateway_trust_generation();
-        {
-            let _guard = self
-                .gateway_svid_update_lock
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            self.gateway_trust_bundles
-                .store(Arc::new(Some(trust_bundles.clone())));
-
-            let current = self.gateway_svid_bundle.load_full();
-            if let Some(mut bundle) = current.as_ref().clone() {
-                bundle.trust_bundles = trust_bundles;
-                self.gateway_svid_bundle.store(Arc::new(Some(bundle)));
-            }
-        }
+        self.store_gateway_trust_material(Some(trust_bundles));
         self.publish_live_gateway_trust();
     }
 
@@ -6930,16 +6976,98 @@ impl ProxyState {
     /// keep authenticating a peer the accepted generation revoked.
     pub fn clear_gateway_trust_bundles(&self) {
         self.fence_gateway_trust_generation();
-        {
-            let _guard = self
-                .gateway_svid_update_lock
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            self.gateway_trust_bundles.store(Arc::new(None));
-            self.gateway_svid_bundle
-                .store(self.gateway_file_svid_bundle.load_full());
-        }
+        self.store_gateway_trust_material(None);
         self.publish_live_gateway_trust();
+    }
+
+    /// Write one gateway trust decision into the two live slots it spans.
+    ///
+    /// SLOT WRITES ONLY: this neither fences, nor republishes the admission,
+    /// nor advances the backend security generation. Owning those three steps
+    /// is the caller's job, which is exactly what lets
+    /// [`Self::commit_gateway_trust_generation`] install the material, advance
+    /// the backend security generation, and re-open gateway-to-mesh admission
+    /// as ONE fenced transaction rather than as three independently observable
+    /// ones (issue #3727).
+    ///
+    /// `Some(bundles)` installs the database/CP override; `None` withdraws it
+    /// and restores the latest source-loaded SVID. Both are serialized by
+    /// `gateway_svid_update_lock` against the gateway SVID source watcher,
+    /// which is the other writer of `gateway_svid_bundle`.
+    fn store_gateway_trust_material(&self, trust_bundles: Option<RuntimeTrustBundleSet>) {
+        let _guard = self
+            .gateway_svid_update_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match trust_bundles {
+            Some(trust_bundles) => {
+                self.gateway_trust_bundles
+                    .store(Arc::new(Some(trust_bundles.clone())));
+
+                let current = self.gateway_svid_bundle.load_full();
+                if let Some(mut bundle) = current.as_ref().clone() {
+                    bundle.trust_bundles = trust_bundles;
+                    self.gateway_svid_bundle.store(Arc::new(Some(bundle)));
+                }
+            }
+            None => {
+                self.gateway_trust_bundles.store(Arc::new(None));
+                self.gateway_svid_bundle
+                    .store(self.gateway_file_svid_bundle.load_full());
+            }
+        }
+    }
+
+    /// Advance the shared backend security (SVID) generation for a gateway
+    /// trust change this publication has just committed, and hand the pool
+    /// follow-through to the existing rotation consumer.
+    ///
+    /// Replacing or withdrawing gateway trust roots retires every backend and
+    /// mesh transport that authenticated under the outgoing roots, exactly as a
+    /// gateway SVID rotation does. Without this the accepted generation would
+    /// install a new verifier while an HBONE / mesh-mTLS / backend-TLS
+    /// connection authenticated under a root the same generation WITHDREW
+    /// stayed poolable until idle pruning — unbounded reuse of revoked trust,
+    /// which is precisely what issue #3727's rotation/revocation criterion
+    /// forbids.
+    ///
+    /// The counter is advanced SYNCHRONOUSLY, on the publishing thread, while
+    /// the request epoch is still fenced. Publishing only on the watch channel
+    /// and leaving the store to [`spawn_backend_svid_rotation_task`] would let
+    /// the fence lift before the consumer task was scheduled, and every request
+    /// admitted in that window would key its pool and backend-TLS-config
+    /// lookups on the WITHDRAWN generation and reuse its entries. The watch
+    /// send still happens — it is what drives the outgoing generation's TLS
+    /// config-cache invalidation, the health-check restart, and the bounded
+    /// force-drain — but no request-visible decision depends on when the
+    /// consumer observes it.
+    ///
+    /// `fetch_max`, not `store`: a concurrent gateway SVID rotation can publish
+    /// a higher revision between the modify below and the write, and the
+    /// rotation consumer may already have adopted it. The generation is
+    /// monotonic, so never walk it back onto a generation whose drain is
+    /// already scheduled.
+    fn advance_backend_security_generation(&self) -> u64 {
+        // Same publish shape the gateway SVID rotation paths use: bump the
+        // revision, then read the published value back. A concurrent producer
+        // can only make that read HIGHER, never lower, which the monotonic
+        // store below is already built for.
+        self.backend_svid_rotation_tx
+            .send_modify(|revision| *revision = revision.saturating_add(1));
+        let advanced = *self.backend_svid_rotation_tx.borrow();
+        let live = self
+            .backend_svid_generation
+            .fetch_max(advanced, Ordering::AcqRel)
+            .max(advanced);
+        info!(
+            backend_svid_generation = live,
+            namespace = %self.env_config.namespace,
+            "Advanced the backend security generation for a committed gateway trust change; \
+             new backend and mesh transports build from the accepted trust and pooled \
+             transports from the withdrawn generation drain on the configured rotation \
+             schedule"
+        );
+        live
     }
 
     /// Close gateway-to-mesh admission for the published configuration
@@ -7204,13 +7332,38 @@ impl ProxyState {
     /// Status/metrics are recorded LAST — after the verifier a request path can
     /// actually select is live — so no surface ever claims a generation whose
     /// trust is not yet authenticating.
+    ///
+    /// A decision that changes the live verifier also advances the backend
+    /// security generation EXACTLY ONCE, between the material install and the
+    /// re-opened admission, so no request can be admitted under this generation
+    /// while still keying pools and backend TLS config caches on the withdrawn
+    /// one (see [`Self::advance_backend_security_generation`]). The steps run
+    /// against the slot writer directly rather than through
+    /// [`Self::update_gateway_trust_bundles`] / [`Self::clear_gateway_trust_bundles`]
+    /// precisely so the fence spans all of them: those two fence and republish
+    /// internally, so routing the commit through them would lift the fence
+    /// before the generation advanced and would make the advance observable as
+    /// a second, independent rotation.
     pub fn commit_gateway_trust_generation(&self, commit: GatewayTrustCommit) {
+        // `Unchanged` changes no material and must never churn the backend
+        // pools: an ordinary resource reload on a gateway that HAS a trust
+        // record stages `Unchanged`, and rotating every pooled transport on
+        // each such reload would be a self-inflicted reconnect storm.
+        let advances_backend_security = commit.changes_live_trust();
+        if advances_backend_security {
+            // Idempotent. A configuration publication that staged this decision
+            // already published FENCED; a trust-only commit (empty resource
+            // delta, or a gateway serving no resources at all) has no
+            // configuration publication to inherit a fence from and fences
+            // here.
+            self.fence_gateway_trust_generation();
+        }
         match commit {
             GatewayTrustCommit::Unchanged => {}
             GatewayTrustCommit::Replace(trust_bundles) => {
                 let trust_domain = trust_bundles.local.trust_domain.clone();
                 let federated_count = trust_bundles.federated.len();
-                self.update_gateway_trust_bundles(trust_bundles);
+                self.store_gateway_trust_material(Some(trust_bundles));
                 info!(
                     %trust_domain,
                     federated_count,
@@ -7220,13 +7373,19 @@ impl ProxyState {
                 );
             }
             GatewayTrustCommit::Clear => {
-                self.clear_gateway_trust_bundles();
+                self.store_gateway_trust_material(None);
                 info!(
                     namespace = %self.env_config.namespace,
                     "Withdrew gateway SPIFFE trust bundles with the accepted configuration \
                      generation; restored source-loaded gateway trust"
                 );
             }
+        }
+        if advances_backend_security {
+            // Still fenced: gateway-to-mesh admission is refused for the whole
+            // of install → advance, so the generation a request observes when
+            // the fence lifts below is already the accepted one.
+            self.advance_backend_security_generation();
         }
         // Re-open admission for a generation that published fenced. Idempotent,
         // so an unchanged commit and a repeated commit cost nothing.
@@ -7248,7 +7407,8 @@ impl ProxyState {
     ///    complete previous generation stays live.
     /// 2. publish the request epoch, FENCED when the decision changes the live
     ///    verifier. Gateway-to-mesh admission is refused from here.
-    /// 3. install the material and republish the admission live.
+    /// 3. install the material, advance the backend security generation, and
+    ///    republish the admission live.
     ///
     /// There is therefore no interval in which a request pairs this
     /// generation's configuration with the previous generation's trust roots:

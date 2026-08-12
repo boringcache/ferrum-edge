@@ -604,3 +604,321 @@ async fn dp_snapshot_clear_withdraws_cp_trust_with_the_accepted_generation() {
         "an explicit CP clear must restore the source-loaded gateway trust"
     );
 }
+
+// ─── Backend security generation: withdrawn trust must not stay poolable ────
+//
+// Installing the accepted verifier is only half of a rotation/revocation. Every
+// backend and mesh transport already in a pool was authenticated under the
+// OUTGOING roots, so a generation that replaces or withdraws gateway trust must
+// also advance the shared backend security (SVID) generation — the counter that
+// partitions `|svidg=` pool keys and backend TLS config caches, invalidates the
+// outgoing generation's cached TLS configs, restarts health checks, and
+// schedules the bounded force-drain of HTTP/2, gRPC, H3, HBONE, and
+// mesh-mTLS/connection-pool entries. Without it an HBONE or mesh-mTLS
+// connection authenticated under a root the accepted generation withdrew stays
+// reusable until idle pruning, which is unbounded.
+//
+// The advance must also be SYNCHRONOUS: publishing only on the rotation watch
+// and leaving the counter to the consumer task would let the fence lift before
+// the consumer was scheduled, and every request admitted in that window would
+// key its pool lookups on the withdrawn generation.
+//
+// These tests run on the default `#[tokio::test]` current-thread runtime, so
+// the rotation consumer task cannot be polled between two synchronous
+// statements. Every assertion below is therefore about the publishing call's
+// OWN writes, not about eventual observation by another task.
+
+/// The counter backend pools stamp into their keys and the TLS config caches
+/// partition on — read exactly the way a dispatching request reads it.
+fn backend_security_generation(state: &ProxyState) -> u64 {
+    state
+        .backend_svid_generation
+        .load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// The rotation revision the drain consumer keys off. Equal to the live
+/// generation means the outgoing generation's cache invalidation, health-check
+/// restart, and bounded force-drain are scheduled for exactly the generation
+/// that just retired.
+fn scheduled_rotation_revision(state: &ProxyState) -> u64 {
+    *state.backend_svid_rotation_tx.borrow()
+}
+
+fn empty_delta() -> ferrum_edge::config::db_loader::IncrementalResult {
+    ferrum_edge::config::db_loader::IncrementalResult {
+        added_or_modified_proxies: Vec::new(),
+        removed_proxy_ids: Vec::new(),
+        added_or_modified_consumers: Vec::new(),
+        removed_consumer_ids: Vec::new(),
+        added_or_modified_plugin_configs: Vec::new(),
+        removed_plugin_config_ids: Vec::new(),
+        added_or_modified_upstreams: Vec::new(),
+        removed_upstream_ids: Vec::new(),
+        sequence_cursor: 0,
+        poll_timestamp: chrono::DateTime::from_timestamp(1_700_000_000, 0)
+            .expect("valid test timestamp"),
+    }
+}
+
+#[tokio::test]
+async fn a_committed_rotation_advances_the_backend_security_generation_inside_the_fence() {
+    let initial = config_with(vec![record("db-v1.local", &[1])]);
+    let state = database_mode_state(initial.clone()).await;
+    seed_source_loaded_svid(&state);
+    state.publish_gateway_trust_generation(&initial);
+    let before = backend_security_generation(&state);
+
+    let rotated = config_with(vec![record("db-v2.local", &[2])]);
+    let commit = state
+        .stage_database_gateway_trust(&rotated)
+        .expect("a convertible candidate must stage");
+    assert!(commit.changes_live_trust());
+
+    state.fence_gateway_trust_generation();
+
+    // ── BARRIER ──────────────────────────────────────────────────────────
+    // Admission is closed, so nothing can dispatch to the mesh here. Staging
+    // and fencing are not a rotation: the counter must not move until the
+    // material is actually installed.
+    assert!(!mesh_admission_open(&state));
+    assert_eq!(
+        backend_security_generation(&state),
+        before,
+        "fencing a pending generation must not rotate the backend pools"
+    );
+
+    state.commit_gateway_trust_generation(commit);
+
+    // One synchronous call installed the material, advanced the generation, and
+    // only then re-opened admission. Nothing can observe an intermediate state,
+    // so no request is ever admitted under the accepted trust while still
+    // keying its pool lookups on the withdrawn generation.
+    assert!(mesh_admission_open(&state));
+    assert_eq!(
+        backend_security_generation(&state),
+        before + 1,
+        "committing replaced gateway trust must advance the backend security \
+         generation exactly once"
+    );
+    assert_eq!(
+        scheduled_rotation_revision(&state),
+        before + 1,
+        "the rotation consumer must be told to invalidate caches, restart health \
+         checks, and force-drain exactly the generation that just retired"
+    );
+}
+
+#[tokio::test]
+async fn a_committed_revocation_retires_the_withdrawn_generation_exactly_once() {
+    let initial = config_with(vec![record("db.local", &[1])]);
+    let state = database_mode_state(initial.clone()).await;
+    seed_source_loaded_svid(&state);
+    state.publish_gateway_trust_generation(&initial);
+    let before = backend_security_generation(&state);
+
+    // Explicit record deletion: the direction where a pooled transport
+    // authenticated under the withdrawn root must not survive unbounded.
+    let revoked = config_with(Vec::new());
+    let commit = state
+        .stage_database_gateway_trust(&revoked)
+        .expect("a revocation stages without conversion work");
+    assert!(commit.changes_live_trust());
+
+    state.commit_gateway_trust_generation(commit);
+
+    assert_eq!(live_override_domain(&state), None);
+    assert_eq!(
+        backend_security_generation(&state),
+        before + 1,
+        "an explicit clear must retire the transports the withdrawn root \
+         authenticated"
+    );
+    assert_eq!(scheduled_rotation_revision(&state), before + 1);
+}
+
+#[tokio::test]
+async fn an_unchanged_commit_never_churns_the_backend_pools() {
+    let initial = config_with(vec![record("db.local", &[1])]);
+    let state = database_mode_state(initial.clone()).await;
+    seed_source_loaded_svid(&state);
+    state.publish_gateway_trust_generation(&initial);
+    let before = backend_security_generation(&state);
+    let revision_before = scheduled_rotation_revision(&state);
+
+    // The live config is the candidate a re-poll of the same unchanged row
+    // produces (see `a_reload_that_changes_no_trust_never_closes_mesh_admission`
+    // for why it is read back rather than reconstructed).
+    let same_trust = state.config.load_full().as_ref().clone();
+    let commit = state
+        .stage_database_gateway_trust(&same_trust)
+        .expect("an unchanged candidate stages");
+    assert!(!commit.changes_live_trust());
+
+    state.commit_gateway_trust_generation(commit);
+
+    assert_eq!(
+        backend_security_generation(&state),
+        before,
+        "an Unchanged commit changes no material, so rotating every pooled \
+         transport would be a self-inflicted reconnect storm on every poll tick"
+    );
+    assert_eq!(scheduled_rotation_revision(&state), revision_before);
+    assert!(mesh_admission_open(&state));
+}
+
+#[tokio::test]
+async fn the_database_full_apply_advances_the_backend_security_generation_once() {
+    let initial = config_with(vec![record("db-v1.local", &[1])]);
+    let state = database_mode_state(initial.clone()).await;
+    seed_source_loaded_svid(&state);
+    state.publish_gateway_trust_generation(&initial);
+    let before = backend_security_generation(&state);
+
+    // The production reload path, not the step-by-step seam: it stages, fences,
+    // publishes, installs, and re-opens admission internally. Exactly one of
+    // those steps may rotate the pools — a helper that fences and commits twice
+    // would double-rotate here.
+    let rotated = config_with(vec![record("db-v2.local", &[2])]);
+    assert_eq!(state.update_config(rotated), ConfigApplyOutcome::Applied);
+
+    assert_eq!(
+        backend_security_generation(&state),
+        before + 1,
+        "a database full apply that replaces gateway trust must rotate the \
+         backend pools exactly once"
+    );
+    assert_eq!(scheduled_rotation_revision(&state), before + 1);
+    assert_eq!(active_svid_domain(&state).as_deref(), Some("db-v2.local"));
+
+    // An ordinary reload behind it must be free.
+    let steady = state.config.load_full().as_ref().clone();
+    state.update_config(steady);
+    assert_eq!(
+        backend_security_generation(&state),
+        before + 1,
+        "a reload that changes no trust must not rotate the pools again"
+    );
+}
+
+#[tokio::test]
+async fn dp_snapshot_replace_then_clear_each_rotate_the_backend_pools_once() {
+    let state = state_in_mode(GatewayConfig::default(), OperatingMode::DataPlane).await;
+    seed_source_loaded_svid(&state);
+    let before = backend_security_generation(&state);
+
+    let replaced = GatewayConfig {
+        version: "dp-1".to_string(),
+        ..GatewayConfig::default()
+    };
+    state.update_config_with_gateway_trust(
+        replaced,
+        GatewayTrustCommit::Replace(runtime_bundles("cp.local", &[7, 7, 7])),
+    );
+    assert_eq!(active_svid_domain(&state).as_deref(), Some("cp.local"));
+    assert_eq!(
+        backend_security_generation(&state),
+        before + 1,
+        "a CP-delivered Replace riding a full snapshot must rotate the pools once"
+    );
+
+    let steady = GatewayConfig {
+        version: "dp-2".to_string(),
+        ..GatewayConfig::default()
+    };
+    state.update_config_with_gateway_trust(steady, GatewayTrustCommit::Unchanged);
+    assert_eq!(
+        backend_security_generation(&state),
+        before + 1,
+        "an Unchanged side channel must not rotate the pools"
+    );
+
+    let cleared = GatewayConfig {
+        version: "dp-3".to_string(),
+        ..GatewayConfig::default()
+    };
+    state.update_config_with_gateway_trust(cleared, GatewayTrustCommit::Clear);
+    assert_eq!(active_svid_domain(&state).as_deref(), Some("file.local"));
+    assert_eq!(
+        backend_security_generation(&state),
+        before + 2,
+        "a CP-delivered Clear must retire the transports the withdrawn CP root \
+         authenticated"
+    );
+    assert_eq!(scheduled_rotation_revision(&state), before + 2);
+}
+
+#[tokio::test]
+async fn a_cp_trust_only_delta_rotates_the_backend_pools_once() {
+    let state = state_in_mode(GatewayConfig::default(), OperatingMode::DataPlane).await;
+    seed_source_loaded_svid(&state);
+    let before = backend_security_generation(&state);
+
+    // A CP trust-only update carries no resources at all, so the incremental
+    // apply short-circuits before any configuration publication. That path has
+    // no fenced publication to inherit, so it must fence, install, rotate, and
+    // re-open admission on its own.
+    let replace = GatewayTrustCommit::Replace(runtime_bundles("cp-delta.local", &[4, 2]));
+    let outcome = state
+        .apply_incremental_with_gateway_trust(empty_delta(), Some(replace))
+        .await;
+
+    assert_eq!(outcome, ConfigApplyOutcome::Unchanged);
+    assert_eq!(active_svid_domain(&state).as_deref(), Some("cp-delta.local"));
+    assert!(mesh_admission_open(&state));
+    assert_eq!(
+        backend_security_generation(&state),
+        before + 1,
+        "a trust-only delta must rotate the backend pools exactly once"
+    );
+    assert_eq!(scheduled_rotation_revision(&state), before + 1);
+
+    let unchanged = state
+        .apply_incremental_with_gateway_trust(empty_delta(), Some(GatewayTrustCommit::Unchanged))
+        .await;
+    assert_eq!(unchanged, ConfigApplyOutcome::Unchanged);
+    assert_eq!(
+        backend_security_generation(&state),
+        before + 1,
+        "an empty delta with an Unchanged side channel must change nothing"
+    );
+}
+
+#[tokio::test]
+async fn the_new_generation_is_visible_without_the_rotation_consumer_running() {
+    let state = state_in_mode(GatewayConfig::default(), OperatingMode::DataPlane).await;
+    seed_source_loaded_svid(&state);
+    let before = backend_security_generation(&state);
+
+    let snapshot = GatewayConfig {
+        version: "dp-sync".to_string(),
+        ..GatewayConfig::default()
+    };
+
+    // No `.await` between the publishing call and the assertions, on a
+    // current-thread runtime: the rotation consumer task cannot have been
+    // polled. Anything observed here was written by the publishing call itself.
+    // This is the property that closes the post-unfence reuse window — a watch
+    // send alone would leave the counter at `before` right here, and every
+    // request admitted after the fence lifted would select pool entries and
+    // cached backend TLS configs belonging to the withdrawn generation.
+    state.update_config_with_gateway_trust(
+        snapshot,
+        GatewayTrustCommit::Replace(runtime_bundles("cp-sync.local", &[5])),
+    );
+
+    assert!(
+        mesh_admission_open(&state),
+        "the accepted generation must be authenticating once the call returns"
+    );
+    assert_eq!(
+        backend_security_generation(&state),
+        before + 1,
+        "the publishing call must make the new backend security generation \
+         visible itself, not leave it to an asynchronous watch consumer"
+    );
+    assert_eq!(
+        scheduled_rotation_revision(&state),
+        backend_security_generation(&state),
+        "the live generation and the drain consumer's target must not diverge"
+    );
+}
