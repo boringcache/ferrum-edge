@@ -12,7 +12,7 @@ use ferrum_edge::_test_support::{
     request_received_at_for_test, set_request_credential_deadline_for_test,
 };
 use ferrum_edge::config::types::Consumer;
-use ferrum_edge::plugins::{Plugin, RequestContext};
+use ferrum_edge::plugins::RequestContext;
 use ferrum_edge::proxy::auth_lifetime::{
     StreamAuthDeadline, StreamAuthProtocolFamily, StreamAuthTermination, compose_absolute_bound,
     counters, effective_request_auth_deadline, effective_stream_auth_deadline,
