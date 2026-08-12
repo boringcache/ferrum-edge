@@ -1347,3 +1347,25 @@ fn drift_is_decided_by_identity_alone_in_both_directions() {
         "a different trust domain is different material"
     );
 }
+
+#[test]
+fn detect_gateway_trust_drift_read_failure_logs_a_bounded_classification_only() {
+    const SOURCE: &str = include_str!("../../../src/config/gateway_trust.rs");
+    let body = SOURCE
+        .split("pub async fn detect_gateway_trust_drift")
+        .nth(1)
+        .and_then(|rest| rest.split("\npub async fn ").next())
+        .expect("detect_gateway_trust_drift body");
+    assert!(
+        !body.contains("error = %error"),
+        "drift read failures must not render raw store errors:\n{body}"
+    );
+    assert!(
+        body.contains("failure_class"),
+        "drift read failures must log a fixed-cardinality classification:\n{body}"
+    );
+    assert!(
+        body.contains("detail_withheld = true"),
+        "drift read failures must withhold backend detail:\n{body}"
+    );
+}

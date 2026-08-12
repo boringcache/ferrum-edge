@@ -5493,6 +5493,23 @@ mod inner {
     /// Missing, non-integer, or non-positive values are corrupt security
     /// metadata and are refused rather than defaulted; the diagnostic names the
     /// field only and drives the bounded `undecodable` failure reason.
+    fn strict_stored_str_field(doc: &Document, field: &'static str) -> Result<String, anyhow::Error> {
+        match doc.get_str(field) {
+            Ok(value) => Ok(value.to_string()),
+            Err(_) => {
+                crate::config::gateway_trust::record_trust_load_rejection(
+                    crate::config::gateway_trust::GatewayTrustFailureReason::Undecodable,
+                );
+                anyhow::bail!("gateway trust bundle {field} field is unreadable");
+            }
+        }
+    }
+
+    /// Strictly decode a stored gateway trust-bundle `revision`.
+    ///
+    /// Missing, non-integer, or non-positive values are corrupt security
+    /// metadata and are refused rather than defaulted; the diagnostic names the
+    /// field only and drives the bounded `undecodable` failure reason.
     fn strict_stored_revision(doc: &Document) -> Result<u64, anyhow::Error> {
         let value = match doc.get("revision") {
             Some(Bson::Int64(value)) => *value,
@@ -9248,8 +9265,8 @@ mod inner {
             // published one and suppress the reload that reports it.
             let revision = strict_stored_revision(&doc)?;
             Ok(Some(GatewayTrustBundleIdentity {
-                id: doc.get_str("id").unwrap_or_default().to_string(),
-                trust_domain: doc.get_str("trust_domain").unwrap_or_default().to_string(),
+                id: strict_stored_str_field(&doc, "id")?,
+                trust_domain: strict_stored_str_field(&doc, "trust_domain")?,
                 revision,
             }))
         }

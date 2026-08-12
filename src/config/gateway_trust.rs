@@ -562,7 +562,8 @@ pub trait GatewayTrustDriftSource: Send + Sync {
 ///   converted into a reload or a withdrawal — an unreadable stored document
 ///   could not be published by a full reload either, so forcing one would only
 ///   spin while the running configuration is already the last known good state.
-/// - **Redaction.** Only the namespace and the two revisions are logged.
+/// - **Redaction.** Drift and read-failure logs carry only the namespace and
+///   fixed-cardinality classifications; store/driver errors are never rendered.
 pub async fn detect_gateway_trust_drift<S: GatewayTrustDriftSource + ?Sized>(
     source: &S,
     namespaces: &[String],
@@ -575,10 +576,11 @@ pub async fn detect_gateway_trust_drift<S: GatewayTrustDriftSource + ?Sized>(
     for namespace in namespaces {
         let stored = match source.gateway_trust_bundle_identity(namespace).await {
             Ok(stored) => stored,
-            Err(error) => {
+            Err(_error) => {
                 tracing::warn!(
                     namespace = %namespace,
-                    error = %error,
+                    failure_class = "identity_read_failed",
+                    detail_withheld = true,
                     "Gateway trust drift check could not read the stored trust identity; \
                      keeping the running trust state and retrying on the next poll"
                 );

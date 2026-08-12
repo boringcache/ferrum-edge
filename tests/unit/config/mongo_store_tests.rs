@@ -1426,3 +1426,16 @@ async fn delayed_primary_publish_cannot_overwrite_later_failover_topology() {
         "active bundle must match the later failover publication"
     );
 }
+
+#[test]
+fn gateway_trust_bundle_identity_parses_id_and_trust_domain_strictly() {
+    let body = mongo_method("gateway_trust_bundle_identity");
+    assert!(
+        !body.contains("unwrap_or_default()"),
+        "identity fields must not silently default on parse failure:\n{body}"
+    );
+    assert!(
+        body.contains("strict_stored_str_field"),
+        "identity id/trust_domain must use strict stored-field decoding:\n{body}"
+    );
+}
