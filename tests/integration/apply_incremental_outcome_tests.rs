@@ -435,14 +435,18 @@ async fn update_config_publishes_trust_only_create_rotation_and_revocation() {
     let mut record = GatewayTrustBundleRecord::new("ferrum", "ferrum", bundle);
     record.revision = 1;
 
-    let mut created = GatewayConfig::default();
-    created.gateway_trust_bundles = vec![record.clone()];
+    let created = GatewayConfig {
+        gateway_trust_bundles: vec![record.clone()],
+        ..Default::default()
+    };
     assert_eq!(state.update_config(created), ConfigApplyOutcome::Applied);
     assert_eq!(state.config.load().gateway_trust_bundles[0].revision, 1);
 
     record.revision = 2;
-    let mut rotated = GatewayConfig::default();
-    rotated.gateway_trust_bundles = vec![record];
+    let rotated = GatewayConfig {
+        gateway_trust_bundles: vec![record],
+        ..Default::default()
+    };
     assert_eq!(state.update_config(rotated), ConfigApplyOutcome::Applied);
     assert_eq!(state.config.load().gateway_trust_bundles[0].revision, 2);
 

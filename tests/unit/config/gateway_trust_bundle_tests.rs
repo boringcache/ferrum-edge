@@ -274,10 +274,7 @@ fn an_oversized_bundle_is_rejected_and_the_error_carries_no_material() {
     let jwt_authorities = |bundle_index: usize| -> Vec<JwtAuthority> {
         (0..MAX_JWT_AUTHORITIES_PER_BUNDLE)
             .map(|authority_index| JwtAuthority {
-                key_id: format!(
-                    "key-{bundle_index}-{authority_index}-{}",
-                    "x".repeat(230)
-                ),
+                key_id: format!("key-{bundle_index}-{authority_index}-{}", "x".repeat(230)),
                 public_key_pem: public_key_pem.clone(),
             })
             .collect()
