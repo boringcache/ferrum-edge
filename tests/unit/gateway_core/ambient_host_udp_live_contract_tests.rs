@@ -373,7 +373,7 @@ fn ambient_host_udp_live_runner_uses_disposable_outer_netns_ownership_boundary()
 
     // IPv4 and IPv6 live coverage stay pinned by the runner's pass counts.
     assert!(
-        runner.contains("expected exactly 2 ambient host-UDP lib live tests")
+        runner.contains("expected exactly 3 ambient host-UDP lib live tests")
             && runner.contains("expected exactly 1 ambient host-UDP functional live test"),
         "runner must keep dual-stack live pass-count pins"
     );
