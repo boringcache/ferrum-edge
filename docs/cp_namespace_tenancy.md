@@ -356,25 +356,27 @@ has a finite default.
 families. Both are fixed-cardinality: booleans, counters, seconds, the closed
 reason set above (plus `reader_unavailable`, `reload_reader_failed`,
 `reload_read_timed_out`, `scope_validation_failed`, and `worker_exited`).
-Nothing more. No path, `kid`, namespace, token, or key byte appears in any of
-it — and **no generation identifier, fingerprint, or digest** either, not even
-a re-hashed or truncated one. Any deterministic identifier computed from
-credential material is an offline verification oracle: an attacker holding a
-candidate symmetric secret can recompute it with public algorithms and compare
-it against the published value, and domain separation or truncation only
-shortens the comparison, it does not remove it. The internal configuration
-fingerprint therefore stays private to the reload worker, where it is used only
-to tell a semantic change from a confirmation. The consequence is deliberate:
-**you cannot check fleet generation convergence from this surface.** Compare
-what you deployed at the source of truth instead. Unauthenticated probes still
-receive only the documented coarse `status` / `ready` pair.
+Nothing more on Prometheus: no path, `kid`, namespace, token, key byte, or
+generation identifier. Authenticated health additionally carries
+`active_generation`, a replica-stable HMAC-SHA-256 of the private configuration
+fingerprint under the fleet-shared `FERRUM_ADMIN_JWT_SECRET` (domain
+`ferrum-cp-dp-trust-status-id-v1\0`). Replicas that share the same accepted
+bundle and the same HMAC key publish the same 64-hex value; a semantic bundle
+change mints a new value; an unchanged revalidation keeps it. Replicas that do
+not share the HMAC key are incomparable. An admin JWT lets an operator *see*
+the identifier; it does not reveal the HMAC key. An unkeyed digest of the
+fingerprint is never published — that would be an offline oracle against a
+guessed HS\* secret. The private fingerprint stays inside the reload worker.
+Unauthenticated probes still receive only the documented coarse `status` /
+`ready` pair.
 
 **What the states mean.**
 
 | State | Trigger | Effect |
 |---|---|---|
-| degraded | The first refused attempt in an episode | `status: degraded`; `ferrum_cp_dp_trust_degraded 1`. Streams and admission are unaffected — the retained verifier is still serving. |
+| degraded | The first refused attempt in an episode, a stalled worker, or an unexpected worker exit | `status: degraded`; `ferrum_cp_dp_trust_degraded 1`. Streams and admission are unaffected inside the bound — the retained verifier is still serving. A stalled worker is also `ferrum_cp_dp_trust_reload_worker_stalled 1`. |
 | stale | The active generation reaches `FERRUM_CP_DP_TRUST_MAX_STALE_SECONDS` | `ready: false`, `status: unavailable`; new ConfigSync, local/remote MeshSubscribe, SotW ADS, and Delta ADS streams are refused with `UNAVAILABLE`, and established streams end at the same boundary through the shared authorization lease. |
+| worker stalled | No attempt has completed inside three poll intervals (floored at 60s) | Immediately degraded and `worker_state=stalled`. Readiness still follows the stale bound. Cleared by the next completed attempt (acceptance or rejection); a valid candidate also clears degraded. |
 | worker failed | The reload task exited or panicked without being asked to | `ready: false` immediately, independent of the bound: nothing in that process can publish a revocation again. A shutdown-signalled exit is `stopped` and is never reported as a failure. |
 | recovered | A valid candidate is accepted | Degraded and stale clear, admission and readiness return, and `ferrum_cp_dp_trust_reload_recoveries_total` increments exactly once for the episode. |
 
@@ -394,8 +396,11 @@ default.
 
 Suggested alerts: `ferrum_cp_dp_trust_degraded == 1` for longer than one poll
 interval (a rotation is not landing), `ferrum_cp_dp_trust_stale == 1` (this
-replica is refusing its data planes), `ferrum_cp_dp_trust_reload_worker_running
-== 0` (supervision failure), and
+replica is refusing its data planes), `ferrum_cp_dp_trust_reload_worker_stalled
+== 1` (the watcher is wedged), `ferrum_cp_dp_trust_reload_worker_running
+== 0` (supervision failure), disagreement of authenticated
+`cp_dp_trust.active_generation` across replicas that share
+`FERRUM_ADMIN_JWT_SECRET` (a replica has not accepted the same bundle), and
 `max(ferrum_cp_dp_trust_last_acceptance_age_seconds) > 3 *
 FERRUM_SECRET_REFRESH_INTERVAL_SECONDS` (some replica has stopped revalidating
 even if it has not yet reached its bound).

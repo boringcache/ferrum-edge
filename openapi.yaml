@@ -12074,17 +12074,20 @@ components:
         CP/DP verification trust-bundle reload worker and the bounded window in
         which an unrevalidatable verifier may keep authorizing (issue #3813).
 
-        Every field is fixed-cardinality — booleans, seconds, counters, and a
-        closed reason label. Nothing here carries a bundle path, key material, a
-        JWT, a `kid`, a namespace inventory, or any credential identifier, and
-        nothing here is *derived* from credential material either: no generation
-        identifier, fingerprint, or digest is published. A deterministic,
-        replica-comparable identifier computed from key material would let an
-        attacker who guesses a candidate symmetric secret confirm the guess
-        offline, and re-hashing, domain separation, or truncation does not
-        remove that property. Convergence across replicas is therefore **not**
-        checkable from this payload; the internal configuration fingerprint
-        stays private to the reload worker as a change detector only.
+        Every field is fixed-cardinality — booleans, seconds, counters, a
+        closed reason label, and `active_generation`. `active_generation` is a
+        replica-stable HMAC-SHA-256 identifier:
+        `HMAC-SHA-256(FERRUM_ADMIN_JWT_SECRET, "ferrum-cp-dp-trust-status-id-v1\0" || private_configuration_fingerprint)`
+        rendered as 64 lowercase hex characters. It is identical across
+        replicas that share the same accepted trust bundle and the same HMAC
+        key, changes when the accepted bundle changes semantically, and stays
+        identical across an unchanged revalidation. Replicas that do not share
+        the HMAC key are incomparable. An admin JWT authorizes seeing this
+        value; it does not reveal the HMAC key. The private fingerprint, an
+        unkeyed digest of it, bundle paths, key material, JWTs, `kid`s, and
+        namespace inventories are never published. Prometheus, logs, error
+        messages, and unauthenticated `/health`/`/status` never carry
+        `active_generation`.
 
         Ages are measured on a monotonic clock, so a wall-clock/NTP step can
         neither extend nor shorten the window. Only an accepted reload resets
@@ -12093,6 +12096,8 @@ components:
         `admission_blocked` turns true for every configuration stream family,
         and `/health` reports `ready: false` with `status: "unavailable"`. The
         configured maximum is the boundary: no grace period is added to it.
+        A stalled reload worker sets `degraded` immediately and
+        `worker_state=stalled` without failing readiness inside the bound.
       required:
         [
           configured,
@@ -12111,6 +12116,7 @@ components:
           acceptances_total,
           rejections_total,
           rejections_by_reason,
+          active_generation,
         ]
       properties:
         configured:
@@ -12122,17 +12128,21 @@ components:
           description: >
             Closed-set supervision state. `stalled` is alive but with no
             completed attempt in three poll intervals (a read parked in the
-            kernel); `stopped` is a clean shutdown and is never a failure;
-            `failed` is an unexpected exit or panic and fails readiness
-            immediately.
+            kernel); it is immediately `degraded` and
+            `ferrum_cp_dp_trust_reload_worker_stalled=1`, while readiness still
+            follows the stale bound. `stopped` is a clean shutdown and is never
+            a failure. `failed` is an unexpected exit or panic and fails
+            readiness immediately.
         worker_running:
           type: boolean
-          description: Whether the reload worker is still alive.
+          description: Whether the reload worker is still alive. True while stalled.
         degraded:
           type: boolean
           description: >
             Whether the control plane is authorizing with a trust generation it
-            could not revalidate. True from the first refused attempt.
+            could not revalidate, the reload worker is stalled, or the worker
+            died unexpectedly. True from the first refused attempt, and true
+            immediately on stall or unexpected exit.
         stale:
           type: boolean
           description: >
@@ -12198,7 +12208,11 @@ components:
         attempts_total:
           type: integer
           format: uint64
-          description: Reload attempts that produced a verdict.
+          description: >
+            Reload attempts started since process start. Incremented when the
+            worker begins a read, before a verdict exists, so a wedged in-flight
+            operation is visible. `acceptances_total + rejections_total` may
+            trail this by one in-flight attempt.
         acceptances_total:
           type: integer
           format: uint64
@@ -12215,6 +12229,18 @@ components:
           description: >
             Refusals per closed reason. Exactly the `reason` enum minus `ok`;
             no key is derived from operator or attacker input.
+        active_generation:
+          type: [string, "null"]
+          description: >
+            Replica-stable HMAC-SHA-256 identifier of the accepted trust
+            generation, 64 lowercase hex characters. Constructed as
+            HMAC-SHA-256(FERRUM_ADMIN_JWT_SECRET,
+            "ferrum-cp-dp-trust-status-id-v1\0" || private fingerprint).
+            Identical across replicas that share the accepted bundle and HMAC
+            key; incomparable if HMAC keys differ. Null when no bundle is
+            watched. Authenticated `/health`/`/status` only — never Prometheus,
+            logs, errors, or unauthenticated output. Does not reveal the HMAC
+            key.
 
     ServiceDiscoveryHealthSnapshot:
       type: object

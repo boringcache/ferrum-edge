@@ -2052,16 +2052,15 @@ async fn handle_admin_request_inner(
             .as_ref()
             .is_some_and(|freshness| freshness.stale);
         // Bounded CP/DP trust-reload health (issue #3813). `None` outside a CP
-        // that watches a trust bundle. Evaluating here keeps the probe exact at
-        // the boundary; it is a handful of atomic loads with no allocation, no
-        // lock, and no I/O, so an unauthenticated probe flood drives no work.
-        // Readiness fails once the CP is authorizing under a trust generation
-        // it could not revalidate within the bound, or once the reload worker
-        // has died and no revocation can ever be published again.
-        let cp_trust_reload = crate::grpc::cp_trust_health::snapshot();
-        let cp_trust_blocked = cp_trust_reload
-            .as_ref()
-            .is_some_and(|trust| trust.readiness_blocked);
+        // that watches a trust bundle. The unauthenticated probe uses the
+        // lock-free coarse verdict (atomic loads, no heap) so a probe flood
+        // cannot allocate the closed reason map. Readiness fails once the CP
+        // is authorizing under a trust generation it could not revalidate
+        // within the bound, or once the reload worker has died and no
+        // revocation can ever be published again. A stalled worker degrades
+        // immediately but does not fail readiness inside the stale window.
+        let cp_trust_coarse = crate::grpc::cp_trust_health::coarse();
+        let cp_trust_blocked = cp_trust_coarse.is_some_and(|trust| trust.readiness_blocked);
         let ready = startup_ready
             && !serving_degraded
             && jwks_ready
@@ -2075,14 +2074,17 @@ async fn handle_admin_request_inner(
             // namespace, node id, or config content.
             health_status["dp_config"] = serde_json::to_value(freshness).unwrap_or_default();
         }
-        if let Some(trust) = cp_trust_reload.as_ref() {
-            if detailed {
-                // Same discipline: booleans, seconds, counters, and a
-                // closed-set reason. Never a bundle path, key material, `kid`,
-                // namespace, token, or any generation/fingerprint/digest
-                // derived from credential material.
+        if detailed {
+            // Allocates the closed reason map and the keyed generation
+            // identifier. Authenticated detail only — never the coarse probe.
+            if let Some(trust) = crate::grpc::cp_trust_health::snapshot() {
+                // Booleans, seconds, counters, a closed-set reason, and the
+                // keyed HMAC generation identifier. Never a bundle path, key
+                // material, `kid`, namespace, token, or the private fingerprint.
                 health_status["cp_dp_trust"] = serde_json::to_value(trust).unwrap_or_default();
             }
+        }
+        if let Some(trust) = cp_trust_coarse.as_ref() {
             if trust.degraded && !cp_trust_blocked {
                 health_status["status"] = json!("degraded");
             }

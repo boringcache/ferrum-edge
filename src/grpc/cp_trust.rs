@@ -1387,8 +1387,10 @@ impl CpDpVerifier {
     /// secret can recompute it offline; publishing it — or any deterministic
     /// unkeyed function of it, however domain-separated or truncated — would be
     /// a credential-verification oracle. It exists solely so the reload worker
-    /// can tell a semantic change from a confirmation.
-    fn configuration_fingerprint(&self) -> [u8; 32] {
+    /// can tell a semantic change from a confirmation, and so the health
+    /// module can HMAC it into a replica-stable identifier under a fleet-shared
+    /// key that is never this fingerprint.
+    pub(crate) fn configuration_fingerprint(&self) -> [u8; 32] {
         match self {
             Self::SharedSecret(secret) => {
                 credential_identity(None, Algorithm::HS256, secret.as_bytes()).0
@@ -1770,9 +1772,9 @@ async fn trust_bundle_reload_worker(
             status.record_rejected(TrustReloadFailure::ScopeValidationFailed);
             continue;
         }
-        // The fingerprint never leaves this loop: it is a change detector, not
-        // an observable value (publishing it, or any unkeyed derivative, would
-        // let a guessed secret be confirmed offline).
+        // The fingerprint never leaves this loop in the clear: it is a change
+        // detector, and the only external form is the keyed HMAC identifier
+        // published on authenticated health (never logs, metrics, or errors).
         let fingerprint = candidate.configuration_fingerprint();
         let changed = accepted_fingerprint != fingerprint;
         if changed {
@@ -1787,8 +1789,8 @@ async fn trust_bundle_reload_worker(
         // was read coherently and re-validated, which is exactly what the stale
         // bound asks about. Recording it is what lets an outage that ends
         // without any configuration change clear degraded state and count one
-        // recovery.
-        status.record_accepted(changed);
+        // recovery. The same fingerprint yields the same keyed identifier.
+        status.record_accepted(changed, &fingerprint);
     }
 }
 

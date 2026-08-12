@@ -2741,11 +2741,11 @@ impl MetricsRegistry {
     /// Append the bounded CP/DP trust-reload families from live state.
     ///
     /// Kept off the render cache for the same reason as the DP families
-    /// (issue #3813): the active-generation age and the degraded/stale bits
-    /// come from process-static atomics and the passage of time, so a memoized
-    /// body would report a stale-trust state that is wrong by however long the
-    /// cache has been held — exactly the window an operator is watching during
-    /// a failed rotation.
+    /// (issue #3813): the last-acceptance age, the degraded/stale bits, and
+    /// the stalled-worker gauge come from process-static atomics and the
+    /// passage of time, so a memoized body would report a stale-trust state
+    /// that is wrong by however long the cache has been held — exactly the
+    /// window an operator is watching during a failed rotation.
     fn append_cp_dp_trust_reload_prometheus(&self, output: &mut String) {
         let ns_label = self
             .namespace_label
@@ -4928,8 +4928,9 @@ pub fn render_dp_config_freshness_prometheus(
 /// `None` everywhere else). Every series is fixed-cardinality: `namespace` and
 /// the closed [`crate::grpc::cp_trust_health::TrustReloadFailure`] set are the
 /// only labels. No bundle path, `kid`, namespace inventory, credential
-/// identifier, generation identifier, fingerprint, or any other value derived
-/// from key material is ever a label value or a sample value.
+/// identifier, generation identifier, fingerprint, HMAC tag, or any other
+/// value derived from key material is ever a label value or a sample value.
+/// The keyed `active_generation` identifier is authenticated `/health` only.
 pub fn render_cp_dp_trust_reload_prometheus(
     output: &mut String,
     ns_label: &str,
@@ -4939,7 +4940,7 @@ pub fn render_cp_dp_trust_reload_prometheus(
         return;
     };
     output.push_str(
-        "# HELP ferrum_cp_dp_trust_reload_attempts_total CP/DP trust-bundle reload attempts that produced a verdict since process start.\n",
+        "# HELP ferrum_cp_dp_trust_reload_attempts_total CP/DP trust-bundle reload attempts started since process start. A wedged in-flight read is counted here before it produces an acceptance or rejection.\n",
     );
     output.push_str("# TYPE ferrum_cp_dp_trust_reload_attempts_total counter\n");
     render_process_counter(
@@ -5023,7 +5024,7 @@ pub fn render_cp_dp_trust_reload_prometheus(
     );
 
     output.push_str(
-        "# HELP ferrum_cp_dp_trust_degraded Whether the CP is authorizing with a trust generation it could not revalidate (1) or not (0).\n",
+        "# HELP ferrum_cp_dp_trust_degraded Whether the CP is authorizing with a trust generation it could not revalidate, or the reload worker is stalled or failed (1) or not (0).\n",
     );
     output.push_str("# TYPE ferrum_cp_dp_trust_degraded gauge\n");
     render_process_counter(
@@ -5045,13 +5046,24 @@ pub fn render_cp_dp_trust_reload_prometheus(
     );
 
     output.push_str(
-        "# HELP ferrum_cp_dp_trust_reload_worker_running Whether the trust-bundle reload worker is alive (1) or stopped/failed (0).\n",
+        "# HELP ferrum_cp_dp_trust_reload_worker_running Whether the trust-bundle reload worker is alive (1) or stopped/failed (0). A stalled worker is still alive.\n",
     );
     output.push_str("# TYPE ferrum_cp_dp_trust_reload_worker_running gauge\n");
     render_process_counter(
         output,
         "ferrum_cp_dp_trust_reload_worker_running",
         u64::from(status.worker_running),
+        ns_label,
+    );
+
+    output.push_str(
+        "# HELP ferrum_cp_dp_trust_reload_worker_stalled Whether the trust-bundle reload worker is alive but has not completed an attempt inside the stall window (1) or not (0).\n",
+    );
+    output.push_str("# TYPE ferrum_cp_dp_trust_reload_worker_stalled gauge\n");
+    render_process_counter(
+        output,
+        "ferrum_cp_dp_trust_reload_worker_stalled",
+        u64::from(status.worker_state == "stalled"),
         ns_label,
     );
 }

@@ -3168,12 +3168,28 @@ fn non_unix_hosts_fail_closed_instead_of_re_resolving_live_symlinks() {
 
 // ── Stale-trust boundary across every configuration surface (issue #3813) ──
 
+fn watching_status_at(
+    max_stale: Duration,
+    unbounded_allowed: bool,
+    interval: Duration,
+    now: tokio::time::Instant,
+) -> CpDpTrustReloadStatus {
+    CpDpTrustReloadStatus::watching_at(
+        max_stale,
+        unbounded_allowed,
+        interval,
+        now,
+        b"ferrum-test-status-hmac-key-32b!",
+        &[0x11; 32],
+    )
+}
+
 /// A verifier store whose trust source has already aged past its bound.
 ///
 /// The bound is the boundary and nothing else: no failure needs to be recorded
 /// for the age to grow, because only an *accepted* reload resets it.
 fn stale_trust_store() -> Arc<CpDpVerifierStore> {
-    let status = CpDpTrustReloadStatus::watching_at(
+    let status = watching_status_at(
         // A millisecond bound keeps this test on real time without a sleep
         // long enough to slow the suite; the boundary semantics are identical
         // and are pinned exactly in `cp_trust_reload_health_tests.rs`.
@@ -3347,7 +3363,7 @@ async fn stale_trust_terminates_established_streams_on_every_surface() {
         StreamAuthSurface::XdsDelta,
     ] {
         let bound = Duration::from_secs(60);
-        let status = Arc::new(CpDpTrustReloadStatus::watching_at(
+        let status = Arc::new(watching_status_at(
             bound,
             false,
             Duration::from_secs(30),
@@ -3403,7 +3419,7 @@ async fn stale_trust_terminates_established_streams_on_every_surface() {
 #[tokio::test(start_paused = true)]
 async fn stale_trust_ends_the_shared_authorization_lease() {
     let bound = Duration::from_secs(120);
-    let status = Arc::new(CpDpTrustReloadStatus::watching_at(
+    let status = Arc::new(watching_status_at(
         bound,
         false,
         Duration::from_secs(30),

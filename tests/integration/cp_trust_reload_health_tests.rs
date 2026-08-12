@@ -13,11 +13,11 @@
 //!   it blocks admission and readiness;
 //! * an unexpectedly dead worker fails readiness immediately, while a clean
 //!   shutdown is never reported as a failure;
-//! * nothing published anywhere — health JSON, metrics text, or logs — carries
-//!   a path, a `kid`, a namespace, key material, or any value *derived* from
-//!   key material: no generation identifier, fingerprint, or digest, however
-//!   re-hashed or truncated, because such a value is an offline oracle against
-//!   a guessed symmetric secret.
+//! * nothing published in unauthenticated output, logs, or Prometheus carries
+//!   a path, a `kid`, a namespace, key material, or the private configuration
+//!   fingerprint. Authenticated `/health`/`/status` detail carries a keyed
+//!   HMAC-SHA-256 generation identifier that is replica-stable under a shared
+//!   HMAC key and is never an unkeyed digest.
 //!
 //! The five gRPC stream families' behaviour at the boundary is covered in
 //! `cp_tenant_trust_binding_tests.rs`, which already owns the multi-surface
@@ -31,7 +31,8 @@ use tokio::time::{Duration, Instant, advance};
 
 use ferrum_edge::grpc::cp_trust::{CpDpTrustBundle, CpDpVerifier};
 use ferrum_edge::grpc::cp_trust_health::{
-    CpDpTrustReloadStatus, TRUST_RELOAD_FAILURES, TrustReloadFailure,
+    CpDpTrustReloadStatus, STATUS_GENERATION_HMAC_DOMAIN, STATUS_HMAC_KEY_MIN_BYTES,
+    TRUST_RELOAD_FAILURES, TrustReloadFailure, keyed_generation_id,
 };
 use ferrum_edge::plugins::prometheus_metrics::render_cp_dp_trust_reload_prometheus;
 
@@ -40,6 +41,10 @@ const NAMESPACE: &str = "tenant-a";
 const SECRET: &str = "tenant-a-cp-dp-secret-2026-ferrum-edge";
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
 const BOUND: Duration = Duration::from_secs(900);
+const STATUS_HMAC_KEY: &[u8] = b"ferrum-test-status-hmac-key-32b!";
+const OTHER_STATUS_HMAC_KEY: &[u8] = b"other-test-status-hmac-key-32byt";
+const INITIAL_FINGERPRINT: [u8; 32] = [0x11; 32];
+const ROTATED_FINGERPRINT: [u8; 32] = [0x22; 32];
 
 fn bundle_document(kid: &str, namespace: &str, secret: &str) -> String {
     json!({
@@ -66,7 +71,14 @@ fn verifier(kid: &str, namespace: &str, secret: &str) -> CpDpVerifier {
 }
 
 fn status_at(now: Instant, max_stale: Duration) -> CpDpTrustReloadStatus {
-    CpDpTrustReloadStatus::watching_at(max_stale, max_stale.is_zero(), POLL_INTERVAL, now)
+    CpDpTrustReloadStatus::watching_at(
+        max_stale,
+        max_stale.is_zero(),
+        POLL_INTERVAL,
+        now,
+        STATUS_HMAC_KEY,
+        &INITIAL_FINGERPRINT,
+    )
 }
 
 // ── Degraded state and the closed reason set ─────────────────────────────
@@ -178,7 +190,7 @@ async fn unchanged_candidate_after_an_outage_clears_degraded_and_counts_one_reco
     // trust source was read coherently and revalidated, which is exactly the
     // question the bound asks.
     status.record_attempt();
-    status.record_accepted(false);
+    status.record_accepted(false, &INITIAL_FINGERPRINT);
 
     let snapshot = status.snapshot();
     assert!(!snapshot.degraded, "recovery clears degraded: {snapshot:?}");
@@ -190,7 +202,7 @@ async fn unchanged_candidate_after_an_outage_clears_degraded_and_counts_one_reco
 
     // A second healthy poll is not a second recovery.
     status.record_attempt();
-    status.record_accepted(false);
+    status.record_accepted(false, &INITIAL_FINGERPRINT);
     assert_eq!(status.snapshot().recoveries_total, 1);
 }
 
@@ -202,7 +214,7 @@ async fn changed_candidate_recovers_and_counts_one_recovery() {
     status.record_rejected(TrustReloadFailure::DocumentInvalid);
 
     status.record_attempt();
-    status.record_accepted(true);
+    status.record_accepted(true, &ROTATED_FINGERPRINT);
 
     let snapshot = status.snapshot();
     assert!(!snapshot.degraded);
@@ -254,7 +266,7 @@ async fn a_later_valid_candidate_clears_stale_and_restores_admission() {
     assert!(status.admission_blocked());
 
     status.record_attempt();
-    status.record_accepted(false);
+    status.record_accepted(false, &INITIAL_FINGERPRINT);
 
     let snapshot = status.snapshot();
     assert!(!snapshot.stale, "acceptance clears the sticky bit");
@@ -355,16 +367,108 @@ async fn a_worker_whose_attempts_stop_landing_reads_as_stalled() {
         snapshot.worker_running,
         "a stalled worker is still alive, and is reported separately from a dead one"
     );
+    assert!(
+        snapshot.degraded,
+        "stalled is immediately degraded so it is alertable: {snapshot:?}"
+    );
+    assert!(
+        !snapshot.readiness_blocked && !snapshot.admission_blocked,
+        "readiness still follows the stale bound: {snapshot:?}"
+    );
+    let coarse = status.coarse();
+    assert!(coarse.degraded && coarse.worker_stalled && !coarse.readiness_blocked);
+}
+
+#[tokio::test(start_paused = true)]
+async fn stall_is_strictly_after_the_configured_window() {
+    let status = status_at(Instant::now(), BOUND);
+    let stall_after = status.stall_after();
+    assert_eq!(stall_after, POLL_INTERVAL * 3);
+
+    advance(stall_after).await;
+    let at_bound = status.snapshot();
+    assert_eq!(
+        at_bound.worker_state, "running",
+        "the stall window is exclusive: {at_bound:?}"
+    );
+    assert!(!at_bound.degraded);
+
+    advance(Duration::from_nanos(1)).await;
+    let past = status.snapshot();
+    assert_eq!(past.worker_state, "stalled");
+    assert!(past.degraded);
+    assert!(!past.readiness_blocked);
+    assert!(past.worker_running);
+
+    let mut metrics = String::new();
+    render_cp_dp_trust_reload_prometheus(&mut metrics, "", Some(&past));
+    assert!(
+        metrics.contains("ferrum_cp_dp_trust_reload_worker_stalled 1\n"),
+        "{metrics}"
+    );
+    assert!(metrics.contains("ferrum_cp_dp_trust_degraded 1\n"), "{metrics}");
+    assert!(metrics.contains("ferrum_cp_dp_trust_reload_worker_running 1\n"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_completed_valid_candidate_clears_stalled() {
+    let status = status_at(Instant::now(), BOUND);
+    advance(status.stall_after() + Duration::from_secs(1)).await;
+    assert_eq!(status.snapshot().worker_state, "stalled");
+    assert!(status.snapshot().degraded);
+
+    status.record_attempt();
+    status.record_accepted(false, &INITIAL_FINGERPRINT);
+
+    let recovered = status.snapshot();
+    assert_eq!(recovered.worker_state, "running");
+    assert!(!recovered.degraded);
+    assert_eq!(recovered.reason, "ok");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_completed_rejection_clears_stall_but_stays_degraded() {
+    let status = status_at(Instant::now(), BOUND);
+    advance(status.stall_after() + Duration::from_secs(1)).await;
+    assert_eq!(status.snapshot().worker_state, "stalled");
+
+    status.record_attempt();
+    status.record_rejected(TrustReloadFailure::ReadTimedOut);
+
+    let snapshot = status.snapshot();
+    assert_eq!(snapshot.worker_state, "running");
+    assert!(snapshot.degraded);
+    assert_eq!(snapshot.reason, "reload_read_timed_out");
+    assert!(!snapshot.readiness_blocked);
+}
+
+#[tokio::test(start_paused = true)]
+async fn attempts_count_starts_not_verdicts() {
+    let status = status_at(Instant::now(), BOUND);
+    let healthy = status.snapshot();
+    assert_eq!(healthy.attempts_total, 0);
+    assert_eq!(healthy.acceptances_total, 1, "startup seeds one acceptance");
+    assert_eq!(healthy.rejections_total, 0);
+
+    status.record_attempt();
+    let in_flight = status.snapshot();
+    assert_eq!(in_flight.attempts_total, 1);
+    assert_eq!(
+        in_flight.acceptances_total + in_flight.rejections_total,
+        healthy.acceptances_total,
+        "an in-flight attempt has no verdict yet: {in_flight:?}"
+    );
+
+    status.record_rejected(TrustReloadFailure::DocumentInvalid);
+    let completed = status.snapshot();
+    assert_eq!(completed.attempts_total, 1);
+    assert_eq!(completed.rejections_total, 1);
+    assert_eq!(completed.acceptances_total, 1);
 }
 
 // ── Disclosure boundary ─────────────────────────────────────────────────
 
 /// The longest run of ASCII hex digits in `text`.
-///
-/// A published generation identifier, fingerprint, or digest — whatever it is
-/// called — shows up as an unbroken hex run. The closed reason labels and the
-/// worker states are English words split by underscores, so their longest hex
-/// run is short.
 fn longest_hex_run(text: &str) -> usize {
     let mut longest = 0usize;
     let mut current = 0usize;
@@ -379,69 +483,135 @@ fn longest_hex_run(text: &str) -> usize {
     longest
 }
 
-/// No candidate-verifiable material may reach a published surface.
-///
-/// The trust source's configuration fingerprint hashes each credential identity
-/// (an HS\* secret-derived identity included), and every algorithm and domain
-/// involved is public. Publishing that fingerprint — or **any** deterministic
-/// unkeyed function of it, re-hashed, domain-separated, and truncated or not —
-/// lets an attacker who guesses a candidate symmetric secret recompute the
-/// value and confirm the guess offline. So the contract is not "redact it": it
-/// is that no such identifier exists on the health or metric surface at all.
 #[tokio::test(start_paused = true)]
-async fn the_published_projection_carries_no_generation_identifier_or_digest() {
+async fn the_keyed_generation_id_is_stable_across_replicas_and_changes_with_the_bundle() {
+    let expected = keyed_generation_id(STATUS_HMAC_KEY, &INITIAL_FINGERPRINT)
+        .expect("test HMAC key is 32 bytes");
+    assert_eq!(expected.len(), 64);
+    assert!(expected.chars().all(|ch| ch.is_ascii_hexdigit()));
+    assert_ne!(expected, hex::encode(INITIAL_FINGERPRINT));
+
+    let replica_a = status_at(Instant::now(), BOUND);
+    let replica_b = status_at(Instant::now(), BOUND);
+    assert_eq!(replica_a.snapshot().active_generation.as_deref(), Some(expected.as_str()));
+    assert_eq!(
+        replica_a.snapshot().active_generation,
+        replica_b.snapshot().active_generation,
+        "replicas sharing a bundle and HMAC key must converge"
+    );
+
+    replica_a.record_attempt();
+    replica_a.record_accepted(false, &INITIAL_FINGERPRINT);
+    assert_eq!(
+        replica_a.snapshot().active_generation.as_deref(),
+        Some(expected.as_str()),
+        "an unchanged acceptance must keep the identifier"
+    );
+
+    replica_a.record_attempt();
+    replica_a.record_accepted(true, &ROTATED_FINGERPRINT);
+    let rotated = replica_a.snapshot().active_generation.expect("rotated id");
+    assert_ne!(rotated, expected, "a semantic change must mint a new identifier");
+    assert_eq!(
+        rotated,
+        keyed_generation_id(STATUS_HMAC_KEY, &ROTATED_FINGERPRINT).expect("key")
+    );
+
+    let other_key = keyed_generation_id(OTHER_STATUS_HMAC_KEY, &INITIAL_FINGERPRINT)
+        .expect("other key");
+    assert_ne!(
+        other_key, expected,
+        "replicas with different HMAC keys are incomparable"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_short_hmac_key_does_not_fall_back_to_an_unkeyed_digest() {
+    assert!(STATUS_HMAC_KEY.len() >= STATUS_HMAC_KEY_MIN_BYTES);
+    assert!(keyed_generation_id(&STATUS_HMAC_KEY[..8], &INITIAL_FINGERPRINT).is_none());
+
+    let status = CpDpTrustReloadStatus::watching_at(
+        BOUND,
+        false,
+        POLL_INTERVAL,
+        Instant::now(),
+        &STATUS_HMAC_KEY[..8],
+        &INITIAL_FINGERPRINT,
+    );
+    let snapshot = status.snapshot();
+    assert!(
+        snapshot.active_generation.is_none(),
+        "a short key must not publish any identifier: {snapshot:?}"
+    );
+    let rendered = serde_json::to_string(&snapshot).expect("snapshot serializes");
+    assert!(!rendered.contains(&hex::encode(INITIAL_FINGERPRINT)));
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_keyed_identifier_is_authenticated_health_only() {
     let status = status_at(Instant::now(), BOUND);
     status.record_attempt();
-    status.record_accepted(true);
+    status.record_accepted(true, &ROTATED_FINGERPRINT);
     status.record_attempt();
     status.record_rejected(TrustReloadFailure::MaterialIntegrityMismatch);
     let snapshot = status.snapshot();
+    let id = snapshot
+        .active_generation
+        .as_deref()
+        .expect("watching status publishes a keyed identifier");
+    assert_eq!(id.len(), 64);
+    assert_eq!(
+        id,
+        keyed_generation_id(STATUS_HMAC_KEY, &ROTATED_FINGERPRINT).expect("key")
+    );
 
-    // The projection's closed field set is pinned by
-    // `the_health_projection_is_fixed_cardinality`, so an added field cannot
-    // slip a derived identifier back in unnoticed. This asserts the content.
     let rendered = serde_json::to_string(&snapshot).expect("snapshot serializes");
     let mut metrics = String::new();
     render_cp_dp_trust_reload_prometheus(&mut metrics, ",namespace=\"edge\"", Some(&snapshot));
+    let domain = std::str::from_utf8(
+        STATUS_GENERATION_HMAC_DOMAIN
+            .strip_suffix(&[0])
+            .unwrap_or(STATUS_GENERATION_HMAC_DOMAIN),
+    )
+    .expect("domain is ascii");
+    assert!(
+        !rendered.contains(domain) && !metrics.contains(domain),
+        "the HMAC domain string must not appear on a published surface"
+    );
 
-    for forbidden in [
-        "active_generation",
-        "fingerprint",
-        "digest",
-        "sha256",
-        "candidate",
-        SECRET,
-        KID,
-        NAMESPACE,
-    ] {
+    assert!(
+        rendered.contains(id),
+        "authenticated health JSON publishes the keyed identifier"
+    );
+    assert!(
+        !metrics.contains(id),
+        "Prometheus must not carry the keyed identifier: {metrics}"
+    );
+    assert!(
+        !metrics.contains("active_generation"),
+        "Prometheus must not name the identifier: {metrics}"
+    );
+
+    for forbidden in ["fingerprint", "digest", "sha256", SECRET, KID, NAMESPACE] {
         assert!(
             !rendered.contains(forbidden),
             "published trust health must not carry `{forbidden}`: {rendered}"
         );
-    }
-    // Prometheus HELP prose may safely describe a reload candidate. Reject a
-    // candidate label/value while allowing that fixed explanatory word.
-    for forbidden in [
-        "active_generation",
-        "fingerprint",
-        "digest",
-        "sha256",
-        "candidate=\"",
-        SECRET,
-        KID,
-        NAMESPACE,
-    ] {
         assert!(
             !metrics.contains(forbidden),
             "published trust metrics must not carry `{forbidden}`: {metrics}"
         );
     }
-    for surface in [rendered.as_str(), metrics.as_str()] {
-        assert!(
-            longest_hex_run(surface) < 16,
-            "a hex run this long is a generation identifier, fingerprint, or digest: {surface}"
-        );
-    }
+
+    let health_without_id = rendered.replace(id, "");
+    assert!(
+        longest_hex_run(&health_without_id) < 16,
+        "aside from the keyed identifier, health JSON must not carry a digest: {health_without_id}"
+    );
+    assert!(
+        longest_hex_run(&metrics) < 16,
+        "metrics must not carry a generation identifier, fingerprint, or digest: {metrics}"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -503,6 +673,7 @@ async fn metric_labels_are_bounded_to_the_closed_reason_set() {
         "ferrum_cp_dp_trust_degraded",
         "ferrum_cp_dp_trust_stale",
         "ferrum_cp_dp_trust_reload_worker_running",
+        "ferrum_cp_dp_trust_reload_worker_stalled",
     ] {
         assert!(
             output.contains(&format!("# TYPE {family} ")),
@@ -572,6 +743,8 @@ fn live_status() -> Arc<CpDpTrustReloadStatus> {
         Duration::from_secs(900),
         false,
         Duration::from_secs(1),
+        STATUS_HMAC_KEY,
+        &INITIAL_FINGERPRINT,
     ))
 }
 
@@ -683,9 +856,13 @@ async fn a_rotated_bundle_is_accepted_without_publishing_an_identifier() {
     let snapshot = status.snapshot();
     assert!(!snapshot.degraded);
     assert!(snapshot.acceptances_total >= 2);
-    // The rotation is observable as an acceptance and a reset age — never as a
-    // value an attacker could recompute from a guessed secret.
+    // The rotation is observable as an acceptance, a reset age, and a new keyed
+    // identifier — never as the private fingerprint.
     assert_eq!(snapshot.reason, "ok");
+    assert_ne!(
+        snapshot.active_generation.as_deref(),
+        keyed_generation_id(STATUS_HMAC_KEY, &INITIAL_FINGERPRINT).as_deref()
+    );
 
     let _ = shutdown_tx.send(true);
     let _ = tokio::time::timeout(StdDuration::from_secs(5), handle).await;
@@ -711,6 +888,7 @@ async fn the_health_projection_is_fixed_cardinality() {
         keys,
         [
             "acceptances_total",
+            "active_generation",
             "admission_blocked",
             "attempts_total",
             "configured",
@@ -732,4 +910,60 @@ async fn the_health_projection_is_fixed_cardinality() {
     );
     assert_eq!(object["reason"], json!("reader_unavailable"));
     assert_eq!(object["configured"], json!(true));
+    assert!(object["active_generation"].as_str().is_some_and(|id| id.len() == 64));
+}
+
+#[test]
+fn coarse_health_projection_is_copy_and_has_no_reason_map() {
+    fn assert_copy<T: Copy>(value: T) -> T {
+        value
+    }
+    let status = CpDpTrustReloadStatus::watching(
+        BOUND,
+        false,
+        POLL_INTERVAL,
+        STATUS_HMAC_KEY,
+        &INITIAL_FINGERPRINT,
+    );
+    let coarse = assert_copy(status.coarse());
+    assert!(coarse.configured);
+    assert!(!coarse.degraded);
+    assert!(!coarse.worker_stalled);
+    assert!(
+        std::mem::size_of::<ferrum_edge::grpc::cp_trust_health::CpDpTrustCoarse>()
+            <= 16,
+        "coarse verdict must stay a handful of booleans, not a snapshot"
+    );
+}
+
+#[test]
+fn unauthenticated_health_path_must_not_allocate_a_full_trust_snapshot() {
+    let admin = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/admin/mod.rs"));
+    let start = admin
+        .find("Bounded CP/DP trust-reload health (issue #3813)")
+        .expect("trust-reload health comment");
+    let block = &admin[start..];
+    let end = block
+        .find("if jwks_degraded")
+        .expect("jwks degraded follows trust health");
+    let block = &block[..end];
+    assert!(
+        block.contains("cp_trust_health::coarse()"),
+        "unauthenticated /health must evaluate coarse trust state"
+    );
+    assert_eq!(
+        block.matches("cp_trust_health::snapshot()").count(),
+        1,
+        "exactly one snapshot() call, for authenticated detail: {block}"
+    );
+    let snapshot_at = block
+        .find("cp_trust_health::snapshot()")
+        .expect("authenticated snapshot");
+    let gate = block[..snapshot_at]
+        .rfind("if detailed")
+        .expect("snapshot must sit under an if detailed gate");
+    assert!(
+        !block[gate..snapshot_at].contains("cp_trust_coarse"),
+        "coarse evaluation must not be inside the snapshot allocation gate"
+    );
 }

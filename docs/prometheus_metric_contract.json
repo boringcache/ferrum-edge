@@ -1129,7 +1129,7 @@
   {
     "name": "ferrum_cp_dp_trust_degraded",
     "type": "gauge",
-    "help": "Whether the CP is authorizing with a trust generation it could not revalidate (1) or not (0).",
+    "help": "Whether the CP is authorizing with a trust generation it could not revalidate, or the reload worker is stalled or failed (1) or not (0).",
     "labels": [
       "namespace"
     ],
@@ -1177,7 +1177,7 @@
   {
     "name": "ferrum_cp_dp_trust_reload_attempts_total",
     "type": "counter",
-    "help": "CP/DP trust-bundle reload attempts that produced a verdict since process start.",
+    "help": "CP/DP trust-bundle reload attempts started since process start. A wedged in-flight read is counted here before it produces an acceptance or rejection.",
     "labels": [
       "namespace"
     ],
@@ -1226,7 +1226,19 @@
   {
     "name": "ferrum_cp_dp_trust_reload_worker_running",
     "type": "gauge",
-    "help": "Whether the trust-bundle reload worker is alive (1) or stopped/failed (0).",
+    "help": "Whether the trust-bundle reload worker is alive (1) or stopped/failed (0). A stalled worker is still alive.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "cp_dp_trust",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_cp_dp_trust_reload_worker_stalled",
+    "type": "gauge",
+    "help": "Whether the trust-bundle reload worker is alive but has not completed an attempt inside the stall window (1) or not (0).",
     "labels": [
       "namespace"
     ],

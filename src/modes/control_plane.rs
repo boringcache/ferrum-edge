@@ -2088,14 +2088,30 @@ pub async fn run(
                      authorizing under its last accepted trust generation for as long as every \
                      reload keeps failing. A credential removed from the bundle stays usable \
                      until a valid reload lands or the process restarts. Alert on \
-                     ferrum_cp_dp_trust_degraded."
+                     ferrum_cp_dp_trust_degraded and ferrum_cp_dp_trust_reload_worker_stalled."
                 );
+            }
+            let status_hmac_key = env_config.admin_jwt_secret.as_deref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "FERRUM_ADMIN_JWT_SECRET must be set to publish a replica-stable CP/DP trust \
+                     generation identifier; an unkeyed digest is not a substitute"
+                )
+            })?;
+            if status_hmac_key.len() < crate::config::types::MIN_JWT_SECRET_LENGTH {
+                return Err(anyhow::anyhow!(
+                    "FERRUM_ADMIN_JWT_SECRET must be at least {} characters to publish a \
+                     replica-stable CP/DP trust generation identifier; an unkeyed digest is not \
+                     a substitute",
+                    crate::config::types::MIN_JWT_SECRET_LENGTH
+                ));
             }
             let status = Arc::new(
                 crate::grpc::cp_trust_health::CpDpTrustReloadStatus::watching(
                     max_stale,
                     env_config.cp_dp_trust_allow_unbounded_stale,
                     trust_reload_interval,
+                    status_hmac_key.as_bytes(),
+                    &cp_dp_verifier.configuration_fingerprint(),
                 ),
             );
             crate::grpc::cp_trust_health::install(status)
