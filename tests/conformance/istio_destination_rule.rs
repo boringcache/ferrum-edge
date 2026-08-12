@@ -277,7 +277,7 @@ fn dr_connection_pool_http_http2_max_requests() {
         category = CATEGORY,
         feature = "trafficPolicy.connectionPool.http.http2MaxRequests",
         status = Status::Supported,
-        notes = "Issue #3775: destination-wide ACTIVE-REQUEST breaker applying to HTTP/1.1 and HTTP/2 alike. Projects onto UpstreamPortOverride.http2_max_requests; a permit is taken during backend admission (before any dial) per (namespace, logical destination, policy port, selected subset, config generation) and released only when the response exchange terminates, so connection count, pool shards, retries, and peer SETTINGS cannot multiply or raise it. Over-budget requests are shed with a backend-neutral 503 / gRPC UNAVAILABLE. The per-connection stream knob is the separate maxConcurrentStreams field.",
+        notes = "Issue #3775: destination-wide ACTIVE-REQUEST breaker applying to HTTP/1.1 and HTTP/2 alike. Projects onto UpstreamPortOverride.http2_max_requests; a permit is taken during backend admission (before any dial) per stable (namespace, logical destination, policy port, selected subset) lane and released only when the response exchange terminates, so connection count, pool shards, config reloads, retries, and peer SETTINGS cannot multiply or raise it. Over-budget requests are shed with a backend-neutral 503 / gRPC UNAVAILABLE. The per-connection stream knob is the separate maxConcurrentStreams field.",
     );
     let dr = translated(json!({
         "host": "echo.default.svc.cluster.local",

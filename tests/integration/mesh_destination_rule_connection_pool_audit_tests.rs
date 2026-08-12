@@ -705,7 +705,6 @@ async fn destination_active_request_permit_releases_on_task_cancellation() {
         destination: "reviews-u",
         policy_port: 8080,
         subset: Some("stable"),
-        config_generation: 4,
     };
     let limiter = Arc::new(BackendActiveRequestLimiter::new());
     let task_limiter = Arc::clone(&limiter);

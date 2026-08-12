@@ -912,11 +912,7 @@ pub(crate) fn run_backend_admission_plugins(
 
     let mut permits: Vec<Arc<dyn BackendAdmissionPermit>> = Vec::new();
     if destination_cap.is_some() {
-        let scope = crate::proxy::destination_active_request_scope(
-            proxy,
-            policy_port,
-            ctx.config_generation,
-        );
+        let scope = crate::proxy::destination_active_request_scope(proxy, policy_port);
         match state
             .backend_active_request_limit
             .try_acquire(scope, destination_cap)

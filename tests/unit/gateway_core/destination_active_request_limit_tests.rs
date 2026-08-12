@@ -9,8 +9,8 @@
 //!   endpoint rotation cannot multiply it;
 //! * independent namespaces, destinations, ports, and subsets never consume one
 //!   another's budget even when they share backend endpoints;
-//! * a config generation retires a lane without disturbing permits held under
-//!   the previous one;
+//! * reloads keep one stable lane, so active requests admitted by the previous
+//!   config still count against the current cap;
 //! * permits release exactly once, freeing the slot for a sequential retry, and
 //!   idle lanes are evicted so churn cannot grow the map.
 
@@ -25,19 +25,17 @@ fn scope<'a>(
     destination: &'a str,
     policy_port: u16,
     subset: Option<&'a str>,
-    config_generation: u64,
 ) -> DestinationScope<'a> {
     DestinationScope {
         namespace,
         destination,
         policy_port,
         subset,
-        config_generation,
     }
 }
 
 fn reviews(subset: Option<&str>) -> DestinationScope<'_> {
-    scope("default", "reviews", 9080, subset, 1)
+    scope("default", "reviews", 9080, subset)
 }
 
 #[test]
@@ -101,35 +99,35 @@ fn budgets_are_isolated_by_policy_identity_not_by_endpoint() {
     let limiter = BackendActiveRequestLimiter::new();
     let held = vec![
         limiter
-            .try_acquire(scope("default", "reviews", 9080, None, 1), Some(1))
+            .try_acquire(scope("default", "reviews", 9080, None), Some(1))
             .expect("baseline")
             .expect("permit"),
         limiter
-            .try_acquire(scope("payments", "reviews", 9080, None, 1), Some(1))
+            .try_acquire(scope("payments", "reviews", 9080, None), Some(1))
             .expect("another namespace has its own budget")
             .expect("permit"),
         limiter
-            .try_acquire(scope("default", "ratings", 9080, None, 1), Some(1))
+            .try_acquire(scope("default", "ratings", 9080, None), Some(1))
             .expect("another logical destination has its own budget")
             .expect("permit"),
         limiter
-            .try_acquire(scope("default", "reviews", 9081, None, 1), Some(1))
+            .try_acquire(scope("default", "reviews", 9081, None), Some(1))
             .expect("another policy port has its own budget")
             .expect("permit"),
         limiter
-            .try_acquire(scope("default", "reviews", 9080, Some("v1"), 1), Some(1))
+            .try_acquire(scope("default", "reviews", 9080, Some("v1")), Some(1))
             .expect("a named subset has its own budget")
             .expect("permit"),
         limiter
-            .try_acquire(scope("default", "reviews", 9080, Some("v2"), 1), Some(1))
+            .try_acquire(scope("default", "reviews", 9080, Some("v2")), Some(1))
             .expect("a sibling subset has its own budget")
             .expect("permit"),
     ];
     assert_eq!(held.len(), 6);
     assert_eq!(limiter.resident_lanes(), 6);
     for scope_at_cap in [
-        scope("default", "reviews", 9080, None, 1),
-        scope("default", "reviews", 9080, Some("v1"), 1),
+        scope("default", "reviews", 9080, None),
+        scope("default", "reviews", 9080, Some("v1")),
     ] {
         limiter
             .try_acquire(scope_at_cap, Some(1))
@@ -150,57 +148,82 @@ fn a_hostile_subset_name_cannot_forge_another_lane() {
     let limiter = BackendActiveRequestLimiter::new();
     let _hostile = limiter
         .try_acquire(
-            scope("default", "reviews", 9080, Some("v1|9080|n|g1"), 1),
+            scope("default", "reviews", 9080, Some("v1|9080|n")),
             Some(1),
         )
         .expect("hostile subset name admitted into its own lane")
         .expect("permit");
     let _unmatched = limiter
-        .try_acquire(scope("default", "reviews", 9080, None, 1), Some(1))
+        .try_acquire(scope("default", "reviews", 9080, None), Some(1))
         .expect("the unmatched-destination lane is untouched")
         .expect("permit");
     let _sibling = limiter
-        .try_acquire(scope("default", "reviews", 9080, Some("v1"), 1), Some(1))
+        .try_acquire(scope("default", "reviews", 9080, Some("v1")), Some(1))
         .expect("the real v1 lane is untouched")
         .expect("permit");
     assert_eq!(limiter.resident_lanes(), 3);
 }
 
 #[test]
-fn a_config_generation_retires_a_lane_without_disturbing_held_permits() {
-    // Updating or deleting a DestinationRule must apply the new limit to future
-    // attempts while old-generation guards keep decrementing their own lane —
-    // never double-decrementing or orphaning it.
+fn a_reload_keeps_one_lane_and_applies_the_current_cap_to_old_permits() {
+    // The request admitted before a reload must still consume the destination's
+    // authoritative allowance. A generation-keyed lane would incorrectly let
+    // the first post-reload request through and multiply the configured cap.
     let limiter = BackendActiveRequestLimiter::new();
-    let old_generation = limiter
-        .try_acquire(scope("default", "reviews", 9080, None, 7), Some(1))
-        .expect("admitted under the old generation")
+    let pre_reload = limiter
+        .try_acquire(scope("default", "reviews", 9080, None), Some(1))
+        .expect("admitted before reload")
         .expect("permit");
-    limiter
-        .try_acquire(scope("default", "reviews", 9080, None, 7), Some(1))
-        .expect_err("the old lane is still at its cap while its permit is held");
-    let _new_generation = limiter
-        .try_acquire(scope("default", "reviews", 9080, None, 8), Some(1))
-        .expect("the reloaded policy admits under its own lane")
-        .expect("permit");
-    assert_eq!(limiter.resident_lanes(), 2);
+    let unchanged = limiter
+        .try_acquire(scope("default", "reviews", 9080, None), Some(1))
+        .expect_err("an unrelated reload cannot mint another allowance");
+    assert_eq!(unchanged.current, 1);
+    assert_eq!(unchanged.cap, 1);
+    assert_eq!(limiter.resident_lanes(), 1);
 
-    drop(old_generation);
+    let post_reload = limiter
+        .try_acquire(scope("default", "reviews", 9080, None), Some(2))
+        .expect("raising the reloaded cap takes effect on the shared lane")
+        .expect("permit");
+    assert_eq!(limiter.current(scope("default", "reviews", 9080, None)), 2);
+    let lowered = limiter
+        .try_acquire(scope("default", "reviews", 9080, None), Some(1))
+        .expect_err("lowering the cap sheds while the shared count is above it");
+    assert_eq!(lowered.current, 2);
+    assert_eq!(lowered.cap, 1);
+
+    drop(pre_reload);
     assert_eq!(
-        limiter.current(scope("default", "reviews", 9080, None, 7)),
-        0,
-        "the retired generation's permit released into its own lane"
-    );
-    assert_eq!(
-        limiter.current(scope("default", "reviews", 9080, None, 8)),
+        limiter.current(scope("default", "reviews", 9080, None)),
         1,
-        "the live generation's count is untouched by the retirement"
+        "the pre-reload guard releases from the shared lane"
     );
-    assert_eq!(
-        limiter.resident_lanes(),
-        1,
-        "the drained old-generation lane must be evicted"
+    drop(post_reload);
+    assert_eq!(limiter.resident_lanes(), 0);
+}
+
+#[test]
+fn removing_and_readding_a_cap_cannot_forget_active_old_permits() {
+    let limiter = BackendActiveRequestLimiter::new();
+    let pre_remove = limiter
+        .try_acquire(reviews(None), Some(1))
+        .expect("admitted before cap removal")
+        .expect("permit");
+    assert!(
+        limiter
+            .try_acquire(reviews(None), None)
+            .expect("an uncapped reload does not acquire")
+            .is_none()
     );
+    assert_eq!(limiter.current(reviews(None)), 1);
+    limiter
+        .try_acquire(reviews(None), Some(1))
+        .expect_err("a re-added cap still counts the pre-removal request");
+    drop(pre_remove);
+    let _after_drain = limiter
+        .try_acquire(reviews(None), Some(1))
+        .expect("the re-added cap admits after the old request drains")
+        .expect("permit");
 }
 
 #[test]
@@ -267,8 +290,7 @@ fn concurrent_attempts_never_exceed_the_destination_budget() {
 fn churn_leaves_no_stranded_lanes() {
     // Over-cap rejections racing the last release must not strand a zero-count
     // lane, and a drained destination must not stay resident: destination /
-    // subset / generation churn otherwise grows the map for the process
-    // lifetime.
+    // subset churn otherwise grows the map for the process lifetime.
     let limiter = Arc::new(BackendActiveRequestLimiter::new());
     let mut handles = Vec::new();
     for _ in 0..8 {
@@ -290,9 +312,10 @@ fn churn_leaves_no_stranded_lanes() {
     assert_eq!(limiter.current(reviews(None)), 0);
     assert_eq!(limiter.resident_lanes(), 0);
 
-    for generation in 0..1_000 {
+    for destination_index in 0..1_000 {
+        let destination = format!("reviews-{destination_index}");
         let permit = limiter
-            .try_acquire(scope("default", "reviews", 9080, None, generation), Some(1))
+            .try_acquire(scope("default", &destination, 9080, None), Some(1))
             .expect("admitted")
             .expect("permit");
         drop(permit);
@@ -300,7 +323,7 @@ fn churn_leaves_no_stranded_lanes() {
     assert_eq!(
         limiter.resident_lanes(),
         0,
-        "retired generations must not accumulate"
+        "drained destination lanes must not accumulate"
     );
 }
 
@@ -309,7 +332,7 @@ fn exported_metrics_are_fixed_cardinality() {
     // Destination identity is operator-controlled and unbounded, so it must
     // never become a metric label; only the process totals are exported.
     let limiter = BackendActiveRequestLimiter::new();
-    let probe = scope("tenant-a", "cardinality-probe", 8080, Some("v9"), 3);
+    let probe = scope("tenant-a", "cardinality-probe", 8080, Some("v9"));
     let held = limiter
         .try_acquire(probe, Some(2))
         .expect("admitted")

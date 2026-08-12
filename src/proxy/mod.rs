@@ -6135,7 +6135,7 @@ pub struct ProxyState {
     /// `connectionPool.http.http2MaxRequests` across HTTP/1.1 AND HTTP/2 — every
     /// transport, every connection, every pool shard. Keyed by the effective
     /// policy identity (`namespace`, logical destination, DestinationRule policy
-    /// port, selected subset, config generation), never by a socket address, so
+    /// port, selected subset), never by a socket address, so
     /// one destination has ONE budget and two Services sharing endpoints keep
     /// their own. The permit is taken during backend admission (before any dial)
     /// and released only when the client-visible response body reaches a
@@ -34926,14 +34926,12 @@ pub(crate) fn resolve_backend_http2_max_requests(
 pub(crate) fn destination_active_request_scope<'a>(
     proxy: &'a Proxy,
     policy_port: u16,
-    config_generation: u64,
 ) -> crate::backend_active_request_limit::DestinationScope<'a> {
     crate::backend_active_request_limit::DestinationScope {
         namespace: proxy.namespace.as_str(),
         destination: proxy.upstream_id.as_deref().unwrap_or(proxy.id.as_str()),
         policy_port,
         subset: proxy.upstream_subset.as_deref(),
-        config_generation,
     }
 }
 

@@ -38,7 +38,7 @@
 //! The lane is keyed by the **effective policy identity** of the destination:
 //!
 //! ```text
-//! <namespace>|<logical destination>|<policy port>|<subset>|<config generation>
+//! <namespace>|<logical destination>|<policy port>|<subset>
 //! ```
 //!
 //! * `namespace` isolates tenants.
@@ -56,11 +56,14 @@
 //! * `subset` is the selected DestinationRule subset (`None` is a distinct lane
 //!   from every named subset), length-prefixed so a hostile subset name cannot
 //!   collide with a sibling lane.
-//! * `config generation` retires a lane on update/delete: guards held under the
-//!   previous generation keep decrementing their own lane (never double-charging
-//!   or orphaning), while new attempts admit under the new generation's limit.
-//!   A lane is evicted the moment its count returns to zero, so service/subset
-//!   churn and generation churn cannot grow the map without bound.
+//! The lane is deliberately stable across config generations. A reload must
+//! not mint a fresh allowance while requests admitted by the previous config
+//! are still active: every acquire applies the current cap to the shared count.
+//! Lowering a cap therefore sheds until the count drains below the new value;
+//! raising it takes effect immediately; removing a cap stops new acquisitions
+//! while existing guards keep the lane counted; and re-adding it cannot ignore
+//! those guards. A lane is evicted the moment its count returns to zero, so
+//! service/subset churn cannot grow the map without bound.
 //!
 //! # Lifetime — the whole exchange, not the headers
 //!
@@ -147,8 +150,6 @@ pub struct DestinationScope<'a> {
     pub policy_port: u16,
     /// Selected DestinationRule subset. `None` is its own lane.
     pub subset: Option<&'a str>,
-    /// Config generation the admitting policy came from.
-    pub config_generation: u64,
 }
 
 /// Write the flat lane key. Every variable-length component is length-prefixed
@@ -167,7 +168,6 @@ fn write_active_key(buf: &mut String, scope: &DestinationScope<'_>) {
         }
         None => buf.push('n'),
     }
-    let _ = write!(buf, "|g{}", scope.config_generation);
 }
 
 /// Shared per-destination active-request counter map.
@@ -326,7 +326,7 @@ impl Drop for BackendActiveRequestGuard {
         // zero-count lane structurally impossible.
         //
         // `fetch_sub` returning 1 means this drop took the lane to zero → remove
-        // it, so destination/subset/generation churn cannot grow the map for the
+        // it, so destination/subset churn cannot grow the map for the
         // gateway lifetime. `fetch_sub` (not `saturating_sub`) so a
         // double-release bug underflows loudly instead of being masked.
         self.counters
