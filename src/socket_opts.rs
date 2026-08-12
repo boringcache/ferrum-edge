@@ -886,6 +886,101 @@ pub fn set_ipv6_recvpktinfo(_fd: i32) -> std::io::Result<()> {
     Ok(())
 }
 
+// ── Do-not-fragment / path-MTU discovery (RFC 9298 §3.1) ────────────────────
+
+/// Whether the running target exposes a usable do-not-fragment socket option.
+///
+/// RFC 9298 §3.1 says a UDP proxy "MUST NOT introduce IP fragmentation" and
+/// that the DF bit "MUST be set if possible" on IPv4. Where the platform gives
+/// us the knob, [`set_udp_dont_fragment`] installs it and a failure is fatal to
+/// the caller (fail closed). Where it does not, the caller documents an
+/// explicit best-effort fallback rather than pretending the bit was set.
+///
+/// Supported here: Linux (`IP_MTU_DISCOVER` / `IPV6_MTU_DISCOVER` set to the
+/// `PMTUDISC_DO` policy, which both sets DF and reports oversized sends as
+/// `EMSGSIZE`) and Apple/BSD (`IP_DONTFRAG` / `IPV6_DONTFRAG`). Windows exposes
+/// `IP_DONTFRAGMENT`, but Ferrum links no Winsock binding (`libc` is a
+/// `cfg(unix)` dependency and `socket2` 0.6 has no fragmentation setter), so
+/// installing it there would mean adding a dependency for one `setsockopt`.
+pub const UDP_DONT_FRAGMENT_SUPPORTED: bool =
+    cfg!(any(target_os = "linux", target_os = "android")) || cfg!(target_vendor = "apple");
+
+/// Set the do-not-fragment / path-MTU-discovery policy on a UDP socket.
+///
+/// `is_ipv4` selects the address-family option; pass the family the socket was
+/// actually created with, because the IPv4 option is meaningless on an
+/// `AF_INET6` socket and vice versa.
+///
+/// Returns `Ok(())` without touching the socket on targets where
+/// [`UDP_DONT_FRAGMENT_SUPPORTED`] is `false`. On supported targets a
+/// `setsockopt` failure is surfaced verbatim so the caller can refuse the
+/// tunnel instead of relaying datagrams the kernel may fragment.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn set_udp_dont_fragment(fd: std::os::unix::io::RawFd, is_ipv4: bool) -> std::io::Result<()> {
+    let (level, name, value) = if is_ipv4 {
+        (libc::IPPROTO_IP, libc::IP_MTU_DISCOVER, libc::IP_PMTUDISC_DO)
+    } else {
+        (
+            libc::IPPROTO_IPV6,
+            libc::IPV6_MTU_DISCOVER,
+            libc::IPV6_PMTUDISC_DO,
+        )
+    };
+    let value: libc::c_int = value;
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            level,
+            name,
+            &value as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(target_vendor = "apple")]
+pub fn set_udp_dont_fragment(fd: std::os::unix::io::RawFd, is_ipv4: bool) -> std::io::Result<()> {
+    let (level, name) = if is_ipv4 {
+        (libc::IPPROTO_IP, libc::IP_DONTFRAG)
+    } else {
+        (libc::IPPROTO_IPV6, libc::IPV6_DONTFRAG)
+    };
+    let value: libc::c_int = 1;
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            level,
+            name,
+            &value as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "linux", target_os = "android")),
+    not(target_vendor = "apple")
+))]
+#[allow(dead_code)]
+pub fn set_udp_dont_fragment(_fd: std::os::unix::io::RawFd, _is_ipv4: bool) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+#[allow(dead_code)]
+pub fn set_udp_dont_fragment(_fd: i32, _is_ipv4: bool) -> std::io::Result<()> {
+    Ok(())
+}
+
 /// Captured local (reply-source) address from an `IP_PKTINFO` / `IPV6_PKTINFO`
 /// cmsg. The interface index is preserved so scoped IPv6 replies (notably
 /// link-local `fe80::/10`) egress the correct interface zone on send; for IPv4

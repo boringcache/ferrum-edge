@@ -2645,11 +2645,19 @@ pub struct EnvConfig {
     pub http3_connect_udp_enabled: bool,
     /// Maximum concurrent RFC 9298 CONNECT-UDP tunnels for this gateway
     /// process (default 256). `0` disables the limit.
+    ///
+    /// Bounded by [`crate::util::conn_limit::MAX_CONN_LIMIT`]: the value is
+    /// handed to `tokio::sync::Semaphore::new`, which panics above
+    /// `Semaphore::MAX_PERMITS`. A larger configured value is a validation
+    /// error, never a silent clamp and never a silent "unlimited".
     pub http3_connect_udp_max_sessions: usize,
     /// Seconds a CONNECT-UDP tunnel may carry no datagram in either direction
-    /// before it is closed (default 60). The QUIC connection idle timeout
-    /// (`FERRUM_HTTP3_IDLE_TIMEOUT`) applies independently and may close an
-    /// otherwise-idle connection sooner.
+    /// before it is closed (default 120). RFC 9298 §3.2 recommends that a UDP
+    /// proxy "SHOULD NOT" use an idle timeout shorter than two minutes, so the
+    /// default is exactly that; the accepted range stays 1–86400 so an operator
+    /// can deliberately choose a tighter bound. The QUIC connection idle
+    /// timeout (`FERRUM_HTTP3_IDLE_TIMEOUT`) applies independently and may
+    /// close an otherwise-idle connection sooner.
     pub http3_connect_udp_idle_timeout_seconds: u64,
     /// Largest UDP payload relayed in either direction (default 65527, the
     /// RFC 9298 §5 ceiling for Context ID 0). Larger datagrams received from
@@ -3599,7 +3607,7 @@ impl Default for EnvConfig {
             http3_websocket_enabled: true,
             http3_connect_udp_enabled: false,
             http3_connect_udp_max_sessions: 256,
-            http3_connect_udp_idle_timeout_seconds: 60,
+            http3_connect_udp_idle_timeout_seconds: 120,
             http3_connect_udp_max_datagram_bytes:
                 crate::http3::connect_udp::CONNECT_UDP_MAX_PAYLOAD_BYTES,
             h3_request_body_drain_ms: 50,
@@ -4176,7 +4184,7 @@ impl EnvConfig {
             http3_websocket_enabled: bool = "FERRUM_HTTP3_WEBSOCKET_ENABLED" => true;
             http3_connect_udp_enabled: bool = "FERRUM_HTTP3_CONNECT_UDP_ENABLED" => false;
             http3_connect_udp_max_sessions: usize = "FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS" => 256usize;
-            http3_connect_udp_idle_timeout_seconds: u64 = "FERRUM_HTTP3_CONNECT_UDP_IDLE_TIMEOUT_SECONDS" => 60u64, clamp(1u64, 86_400u64);
+            http3_connect_udp_idle_timeout_seconds: u64 = "FERRUM_HTTP3_CONNECT_UDP_IDLE_TIMEOUT_SECONDS" => 120u64, clamp(1u64, 86_400u64);
             http3_connect_udp_max_datagram_bytes: usize = "FERRUM_HTTP3_CONNECT_UDP_MAX_DATAGRAM_BYTES" => crate::http3::connect_udp::CONNECT_UDP_MAX_PAYLOAD_BYTES, clamp(1usize, crate::http3::connect_udp::CONNECT_UDP_MAX_PAYLOAD_BYTES);
             h3_request_body_drain_ms: u64 = "FERRUM_H3_REQUEST_BODY_DRAIN_MS" => 50u64, clamp(0u64, 1000u64);
             http3_initial_mtu: u16 = "FERRUM_HTTP3_INITIAL_MTU" => 1500u16;
@@ -5963,6 +5971,8 @@ impl EnvConfig {
             ));
         }
 
+        self.validate_h3_connect_udp_limits()?;
+
         // Mesh config ordering domains (issues #2473 / #3611). Both are
         // validated here, at the single configuration boundary, and neither
         // error echoes the operator-supplied value: an authority that reaches
@@ -7027,6 +7037,31 @@ impl EnvConfig {
                  per-IP cap, raise the global cap, or set the per-IP cap to 0 to disable it \
                  deliberately.",
                 self.cp_grpc_max_connections_per_ip, self.cp_grpc_max_connections
+            ));
+        }
+        Ok(())
+    }
+
+    /// Refuse an RFC 9298 CONNECT-UDP session cap that cannot be enforced.
+    ///
+    /// The value becomes the permit count of a `tokio::sync::Semaphore`, whose
+    /// constructor **panics** above `Semaphore::MAX_PERMITS`, so an
+    /// out-of-range value has to be refused at the configuration boundary
+    /// rather than reaching `ProxyState::new`. It is deliberately neither
+    /// clamped nor folded into the `0` ("no limit") sentinel: silently turning
+    /// an operator's typo into "unlimited concurrent UDP tunnels" is the
+    /// opposite of what they asked for, and a silent clamp would advertise a
+    /// bound that is not the configured one.
+    ///
+    /// Shares [`crate::util::conn_limit::MAX_CONN_LIMIT`] with the CP gRPC
+    /// listener so the two admission surfaces cannot disagree about the ceiling.
+    pub fn validate_h3_connect_udp_limits(&self) -> Result<(), String> {
+        if self.http3_connect_udp_max_sessions > crate::util::conn_limit::MAX_CONN_LIMIT {
+            return Err(format!(
+                "FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS ({}) exceeds the maximum supported value \
+                 {}. Use 0 to disable the limit entirely.",
+                self.http3_connect_udp_max_sessions,
+                crate::util::conn_limit::MAX_CONN_LIMIT
             ));
         }
         Ok(())

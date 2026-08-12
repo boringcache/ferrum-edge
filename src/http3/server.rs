@@ -1720,6 +1720,43 @@ async fn handle_h3_request(
         .await?;
         return Ok(());
     }
+    // RFC 9298 §3 request shape and RFC 9297 §3.2 forbidden fields, both
+    // decided before routing, plugins, or any socket work.
+    //
+    // The classifier above reads only `:method` and `:protocol`, so without
+    // this the handler would silently *assume* HTTPS and open a tunnel for a
+    // request whose `:scheme` was absent, empty, or something else entirely.
+    // RFC 9297 §3.2 additionally forbids `Content-Length`, `Content-Type`, and
+    // `Transfer-Encoding` on a Capsule Protocol message; this is the raw
+    // client header block, and the handler repeats the check over the
+    // plugin-finalized outbound map so neither side can violate the boundary.
+    if is_connect_udp_request {
+        let malformed = crate::http3::connect_udp::validate_connect_udp_request_shape(req.uri())
+            .err()
+            .or_else(|| {
+                crate::http3::connect_udp::first_forbidden_capsule_protocol_field(
+                    req.headers().keys().map(|name| name.as_str()),
+                )
+            });
+        if let Some(rejection) = malformed {
+            warn!(
+                reason = rejection.reason(),
+                "Rejected HTTP/3 CONNECT-UDP request: malformed message"
+            );
+            record_h3_flavor_aware_reject(&state, http_flavor, 400);
+            send_h3_error_flavor_aware(
+                &mut stream,
+                http_flavor,
+                grpc_web_response_content_type,
+                StatusCode::BAD_REQUEST,
+                rejection.client_error_body(),
+                crate::proxy::grpc_proxy::grpc_status::INVALID_ARGUMENT,
+                "CONNECT-UDP request is malformed",
+            )
+            .await?;
+            return Ok(());
+        }
+    }
 
     // Reject disallowed methods on 0-RTT early data connections (RFC 8470).
     // Early data is replayable, so only operator-configured safe methods are
@@ -4973,6 +5010,16 @@ async fn handle_h3_request(
     // additionally requires the client-named destination to be one the matched
     // proxy is already configured to reach.
     if is_connect_udp_request {
+        // Whether `apply_route_overrides_with_upstreams` shaped the proxy this
+        // request was admitted against. Deliberately conservative — an override
+        // that resolved to a no-op still counts — because the reload re-check
+        // can only look the proxy up by `(namespace, id)`, which recovers the
+        // BASE shape and can therefore neither confirm nor reconstruct the
+        // effective authorization. The tunnel fails closed on a generation
+        // change instead of being re-admitted against a different route.
+        let route_overrides_applied = ctx.route_override_upstream_id.is_some()
+            || ctx.route_override_backend_host.is_some()
+            || ctx.route_override_backend_port.is_some();
         return crate::http3::connect_udp::handle_h3_connect_udp(
             stream,
             crate::http3::connect_udp::ConnectUdpRequest {
@@ -4980,10 +5027,14 @@ async fn handle_h3_request(
                 request_guard,
                 per_ip_guard,
                 epoch,
-                // The BASE route proxy, not the per-target effective overlay:
-                // the destination allow-list and the reload re-check both read
-                // route configuration, and the live re-lookup by
-                // (namespace, id) can only ever return the base shape.
+                // The route-override-effective BASE proxy, not the per-target
+                // effective overlay: the destination allow-list and the reload
+                // re-check both read route configuration, while the per-target
+                // overlay is a dispatch-time concern. Note this IS shaped by
+                // plugin route overrides, which is why
+                // `route_overrides_applied` travels with it — the live
+                // re-lookup by (namespace, id) recovers only the unoverridden
+                // shape.
                 proxy: Arc::clone(&selected_base_proxy),
                 ctx,
                 plugins,
@@ -4994,6 +5045,7 @@ async fn handle_h3_request(
                 proxy_headers,
                 cb_target_key,
                 cb_is_half_open_probe,
+                route_overrides_applied,
             },
         )
         .await;

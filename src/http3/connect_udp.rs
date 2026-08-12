@@ -47,14 +47,29 @@
 //! | Idle lifetime | `FERRUM_HTTP3_CONNECT_UDP_IDLE_TIMEOUT_SECONDS` |
 //! | Datagram payload | `FERRUM_HTTP3_CONNECT_UDP_MAX_DATAGRAM_BYTES`, itself capped by the RFC 9298 §5 ceiling of 65527 |
 //! | Capsule length | payload ceiling + [`CAPSULE_FRAMING_SLACK_BYTES`] |
-//! | Buffered partial capsule | one capsule, never more |
+//! | Buffered partial capsule | at most [`CapsuleDecoder::feed_limit`] × 2 (the decoder's documented hard ceiling), reachable when one chunk completes a partial capsule and opens the next |
 //! | Target | must be a configured upstream destination of the matched proxy |
 //!
-//! There is no queue between the two directions: the client-bound relay awaits
-//! `send_data` (QUIC stream flow control is the backpressure) and the
-//! target-bound relay awaits `UdpSocket::send`. Excess is dropped by the
-//! kernel socket buffer, which is the correct behaviour for a UDP tunnel and
-//! keeps the session's memory footprint a pair of fixed buffers.
+//! There is no *queue* between the two directions: the client-bound relay
+//! awaits `send_data` (QUIC stream flow control is the backpressure) and the
+//! target-bound relay awaits `UdpSocket::send`. Excess is dropped by the kernel
+//! socket buffer, which is the correct behaviour for a UDP tunnel.
+//!
+//! That is not the same as "one buffer per session". Writing `P` for the
+//! configured payload ceiling, a live tunnel can concurrently hold:
+//!
+//! * the decoder's transient buffer, bounded at `2 × (P + 8 + 16)` — the
+//!   ceiling above, not one capsule;
+//! * the target-bound receive buffer, `P + 1` (one extra byte so an oversized
+//!   datagram is detectable rather than silently truncated);
+//! * the client-bound framing scratch plus the framed capsule still owned by an
+//!   `h3` `send_data` future that QUIC send flow control has blocked, roughly
+//!   `2 × (P + 9)`.
+//!
+//! So the conservative per-session bound is about `5 × P` — roughly 320 KiB at
+//! the 65527-byte default, and roughly 80 MiB across the 256-session default.
+//! Operators who care about footprint should lower
+//! `FERRUM_HTTP3_CONNECT_UDP_MAX_DATAGRAM_BYTES`, which scales every term.
 //!
 //! # Relationship to Ferrum policy
 //!
@@ -155,6 +170,150 @@ pub fn classify_h3_extended_connect<B>(req: &http::Request<B>) -> H3ExtendedConn
         }
         Some(_) => H3ExtendedConnect::Unsupported,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Request shape (RFC 9298 §3 pseudo-headers, RFC 9297 §3.2 forbidden fields)
+// ---------------------------------------------------------------------------
+
+/// The only `:scheme` an RFC 9298 request may carry on this listener. RFC 9298
+/// §3 bootstraps over an HTTPS origin, and the H3 frontend has no other scheme
+/// to offer, so anything else is a malformed message rather than a route miss.
+pub const CONNECT_UDP_SCHEME: &str = "https";
+
+/// Why a `connect-udp` Extended CONNECT is malformed independently of its URI
+/// template expansion.
+///
+/// Every arm is a fixed, field-specific client body; none echoes attacker
+/// bytes. All of them are decided **before** a UDP socket exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectUdpRequestRejection {
+    /// `:scheme` absent or empty.
+    SchemeMissing,
+    /// `:scheme` present but not the HTTPS scheme this listener serves.
+    SchemeNotHttps,
+    /// `:authority` absent or empty — RFC 9298 §3 requires the proxy authority.
+    AuthorityMissing,
+    /// RFC 9297 §3.2: `Content-Length` is forbidden on a Capsule Protocol
+    /// message.
+    ForbiddenContentLength,
+    /// RFC 9297 §3.2: `Content-Type` is forbidden on a Capsule Protocol
+    /// message.
+    ForbiddenContentType,
+    /// RFC 9297 §3.2: `Transfer-Encoding` is forbidden on a Capsule Protocol
+    /// message.
+    ForbiddenTransferEncoding,
+}
+
+impl ConnectUdpRequestRejection {
+    /// Stable, low-cardinality label for logs and transaction records.
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::SchemeMissing => "connect_udp_scheme_missing",
+            Self::SchemeNotHttps => "connect_udp_scheme_not_https",
+            Self::AuthorityMissing => "connect_udp_authority_missing",
+            Self::ForbiddenContentLength => "connect_udp_content_length_forbidden",
+            Self::ForbiddenContentType => "connect_udp_content_type_forbidden",
+            Self::ForbiddenTransferEncoding => "connect_udp_transfer_encoding_forbidden",
+        }
+    }
+
+    /// Field-specific client diagnostic. Fixed literal: never interpolated.
+    pub fn client_error_body(self) -> &'static str {
+        match self {
+            Self::SchemeMissing => r#"{"error":"CONNECT-UDP requires the :scheme pseudo-header"}"#,
+            Self::SchemeNotHttps => {
+                r#"{"error":"CONNECT-UDP requires the https :scheme on this listener"}"#
+            }
+            Self::AuthorityMissing => {
+                r#"{"error":"CONNECT-UDP requires the :authority pseudo-header"}"#
+            }
+            Self::ForbiddenContentLength => {
+                r#"{"error":"Content-Length is forbidden on a Capsule Protocol message"}"#
+            }
+            Self::ForbiddenContentType => {
+                r#"{"error":"Content-Type is forbidden on a Capsule Protocol message"}"#
+            }
+            Self::ForbiddenTransferEncoding => {
+                r#"{"error":"Transfer-Encoding is forbidden on a Capsule Protocol message"}"#
+            }
+        }
+    }
+}
+
+/// Validate the RFC 9298 §3 request pseudo-header shape.
+///
+/// The dispatcher classifies only `:method` + `:protocol`; without this the
+/// handler would *assume* HTTPS and open a tunnel for a request whose `:scheme`
+/// was absent, empty, or something else entirely. Authority and path stay the
+/// router's business — the path is validated by
+/// [`parse_connect_udp_target`] after the shared H3 policy-path
+/// canonicalization, and the authority is the same one
+/// `check_host_authority_consistency` already reconciled against `Host` — so
+/// this only adds the two checks neither of those makes.
+pub fn validate_connect_udp_request_shape(
+    uri: &http::Uri,
+) -> Result<(), ConnectUdpRequestRejection> {
+    match uri.scheme_str() {
+        None => return Err(ConnectUdpRequestRejection::SchemeMissing),
+        Some(scheme) if scheme.is_empty() => {
+            return Err(ConnectUdpRequestRejection::SchemeMissing);
+        }
+        Some(scheme) if !scheme.eq_ignore_ascii_case(CONNECT_UDP_SCHEME) => {
+            return Err(ConnectUdpRequestRejection::SchemeNotHttps);
+        }
+        Some(_) => {}
+    }
+    match uri.authority() {
+        None => Err(ConnectUdpRequestRejection::AuthorityMissing),
+        Some(authority) if authority.as_str().is_empty() => {
+            Err(ConnectUdpRequestRejection::AuthorityMissing)
+        }
+        Some(_) => Ok(()),
+    }
+}
+
+/// Classify one header field name against RFC 9297 §3.2, which forbids
+/// `Content-Length`, `Content-Type`, and `Transfer-Encoding` on any message
+/// that uses the Capsule Protocol.
+///
+/// Returns `None` for every other name, including `Capsule-Protocol` itself.
+#[inline]
+pub fn forbidden_capsule_protocol_field(name: &str) -> Option<ConnectUdpRequestRejection> {
+    if name.eq_ignore_ascii_case("content-length") {
+        Some(ConnectUdpRequestRejection::ForbiddenContentLength)
+    } else if name.eq_ignore_ascii_case("content-type") {
+        Some(ConnectUdpRequestRejection::ForbiddenContentType)
+    } else if name.eq_ignore_ascii_case("transfer-encoding") {
+        Some(ConnectUdpRequestRejection::ForbiddenTransferEncoding)
+    } else {
+        None
+    }
+}
+
+/// First RFC 9297 §3.2 violation in a field-name sequence, if any.
+///
+/// Used on both the raw client header block (before routing and plugins) and
+/// the plugin/policy-finalized outbound map (immediately before a socket would
+/// be created), so neither a client nor a `request_transformer` can put a
+/// forbidden field on a Capsule Protocol message.
+pub fn first_forbidden_capsule_protocol_field<'a, I>(
+    names: I,
+) -> Option<ConnectUdpRequestRejection>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    names.into_iter().find_map(forbidden_capsule_protocol_field)
+}
+
+/// Strip the RFC 9297 §3.2 fields a *response* may not carry.
+///
+/// `Transfer-Encoding` is already removed by the shared hop-by-hop strip; the
+/// other two are ordinary end-to-end fields that response-header policy is free
+/// to author, so they are removed here — after that policy runs and before the
+/// transport writes `Capsule-Protocol` — rather than merely rejected.
+pub fn strip_forbidden_capsule_protocol_response_fields(headers: &mut HashMap<String, String>) {
+    headers.retain(|name, _| forbidden_capsule_protocol_field(name).is_none());
 }
 
 // ---------------------------------------------------------------------------
@@ -436,6 +595,11 @@ pub enum CapsuleDecodeError {
     /// More unparsed bytes accumulated than one maximum capsule can occupy —
     /// a peer dribbling an unterminated capsule header.
     BufferOverflow,
+    /// The client closed its send direction with a partially received capsule
+    /// still buffered. RFC 9297 §3.3: "If the stream is closed in the middle of
+    /// a capsule, this MUST be treated as a malformed message" — a clean FIN
+    /// does not make a truncated capsule stream a successful EOF.
+    TruncatedAtStreamEnd,
 }
 
 impl CapsuleDecodeError {
@@ -445,6 +609,7 @@ impl CapsuleDecodeError {
             Self::DatagramCapsuleTruncated => "datagram_capsule_truncated",
             Self::PayloadTooLarge => "payload_too_large",
             Self::BufferOverflow => "capsule_buffer_overflow",
+            Self::TruncatedAtStreamEnd => "capsule_truncated_at_stream_end",
         }
     }
 }
@@ -495,6 +660,36 @@ impl CapsuleDecoder {
         }
         self.buf.extend_from_slice(chunk);
         Ok(())
+    }
+
+    /// Bytes of a partially received capsule still held after the caller has
+    /// drained [`Self::next`] to exhaustion.
+    ///
+    /// Only ever nonzero mid-capsule, so it is exactly the RFC 9297 §3.3
+    /// "stream closed in the middle of a capsule" predicate.
+    ///
+    /// `#[allow(dead_code)]` because the binary target compiles this module
+    /// tree separately from the library and only the external test crates read
+    /// this accessor; production asks the same question via
+    /// [`Self::finish_stream`].
+    #[allow(dead_code)]
+    pub fn buffered_len(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// Classify the end of the client's send direction.
+    ///
+    /// A FIN with nothing buffered is an ordinary, clean close of the capsule
+    /// stream (RFC 9298 §3.1 ends the tunnel with the stream). A FIN with a
+    /// partial capsule still buffered is a malformed message, NOT an EOF, and
+    /// the caller must terminate the request stream with an error rather than
+    /// finishing the response cleanly.
+    pub fn finish_stream(&self) -> Result<(), CapsuleDecodeError> {
+        if self.buf.is_empty() {
+            Ok(())
+        } else {
+            Err(CapsuleDecodeError::TruncatedAtStreamEnd)
+        }
     }
 
     /// Pop the next complete capsule, or `None` when more bytes are needed.
@@ -554,6 +749,123 @@ pub fn encode_udp_datagram_capsule(out: &mut BytesMut, payload: &[u8]) -> Bytes 
 }
 
 // ---------------------------------------------------------------------------
+// Tunnel socket (RFC 9298 §3.1)
+// ---------------------------------------------------------------------------
+
+/// What a `UdpSocket::send` failure means for the tunnel.
+///
+/// Factored out of the relay so the policy is one testable decision rather than
+/// an inline `debug!` that swallows everything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UdpSendFault {
+    /// Drop this datagram and keep relaying. Either the datagram was too large
+    /// for the path (RFC 9298 §3.1 forbids fragmenting it, so dropping is the
+    /// required behaviour) or the error is an ICMP-derived / transient
+    /// condition reported for an earlier datagram on a connected socket. UDP is
+    /// lossy by design; the tunnel is not.
+    DropDatagram,
+    /// The socket itself is unusable. Continuing would present a live tunnel
+    /// that silently discards everything the client sends, so the request
+    /// stream is torn down instead.
+    Terminal,
+}
+
+impl UdpSendFault {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DropDatagram => "datagram_dropped",
+            Self::Terminal => "socket_unusable",
+        }
+    }
+}
+
+/// Whether an `io::Error` from a connected UDP `send` is per-datagram loss
+/// rather than a dead socket.
+///
+/// `EMSGSIZE` (and its Windows spelling `WSAEMSGSIZE`) is called out
+/// explicitly: with the do-not-fragment policy installed by
+/// [`bind_tunnel_socket`], an over-MTU datagram is *supposed* to fail this way,
+/// and treating it as a dead socket would let one oversized payload kill a
+/// healthy tunnel.
+pub fn classify_udp_send_error(error: &std::io::Error) -> UdpSendFault {
+    #[cfg(unix)]
+    if let Some(code) = error.raw_os_error()
+        && matches!(
+            code,
+            libc::EMSGSIZE
+                | libc::EAGAIN
+                | libc::ENOBUFS
+                | libc::EINTR
+                | libc::ECONNREFUSED
+                | libc::EHOSTUNREACH
+                | libc::ENETUNREACH
+                | libc::ENETDOWN
+                | libc::EHOSTDOWN
+        )
+    {
+        return UdpSendFault::DropDatagram;
+    }
+    // `WSAEMSGSIZE`. Windows links no `libc` here, so the code is spelled out.
+    #[cfg(windows)]
+    if error.raw_os_error() == Some(10040) {
+        return UdpSendFault::DropDatagram;
+    }
+    match error.kind() {
+        std::io::ErrorKind::WouldBlock
+        | std::io::ErrorKind::Interrupted
+        | std::io::ErrorKind::ConnectionRefused
+        | std::io::ErrorKind::HostUnreachable
+        | std::io::ErrorKind::NetworkUnreachable
+        | std::io::ErrorKind::NetworkDown => UdpSendFault::DropDatagram,
+        _ => UdpSendFault::Terminal,
+    }
+}
+
+#[cfg(unix)]
+fn apply_dont_fragment(socket: &socket2::Socket, is_ipv4: bool) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    crate::socket_opts::set_udp_dont_fragment(socket.as_raw_fd(), is_ipv4)
+}
+
+#[cfg(not(unix))]
+fn apply_dont_fragment(_socket: &socket2::Socket, _is_ipv4: bool) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Build the tunnel's UDP socket with IP fragmentation disabled.
+///
+/// RFC 9298 §3.1: "the proxy MUST NOT introduce IP fragmentation" and the IPv4
+/// DF bit "MUST be set if possible". The socket is therefore constructed
+/// through `socket2` so the platform option can be installed *before* the
+/// socket is handed to Tokio and before a single datagram can be sent:
+///
+/// * Linux — `IP_MTU_DISCOVER` / `IPV6_MTU_DISCOVER` = `PMTUDISC_DO`, which
+///   sets DF and turns an over-MTU send into `EMSGSIZE`
+///   ([`classify_udp_send_error`] keeps that per-datagram).
+/// * Apple/BSD — `IP_DONTFRAG` / `IPV6_DONTFRAG`.
+/// * Everywhere else (notably Windows, where Ferrum links no Winsock binding) —
+///   [`crate::socket_opts::UDP_DONT_FRAGMENT_SUPPORTED`] is `false` and this is
+///   documented best effort: the socket is created without the option and the
+///   caller logs that the guarantee is unavailable.
+///
+/// On a platform that *does* expose the option, a `setsockopt` failure is
+/// fatal: the tunnel is refused rather than opened without the guarantee.
+fn bind_tunnel_socket(bind_addr: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
+    let is_ipv4 = bind_addr.is_ipv4();
+    let domain = if is_ipv4 {
+        socket2::Domain::IPV4
+    } else {
+        socket2::Domain::IPV6
+    };
+    let socket = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
+    // Before bind, so no datagram can ever leave this socket fragmentable.
+    apply_dont_fragment(&socket, is_ipv4)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&bind_addr.into())?;
+    Ok(socket.into())
+}
+
+// ---------------------------------------------------------------------------
 // Session
 // ---------------------------------------------------------------------------
 
@@ -562,9 +874,11 @@ pub fn encode_udp_datagram_capsule(out: &mut BytesMut, payload: &[u8]) -> Bytes 
 enum SessionEnd {
     ClientClosed,
     TargetRelayEnded,
+    TargetSocketUnusable,
     Idle,
     Draining,
     RouteWithdrawn,
+    RouteAuthorizationUnreconstructable,
     CapsuleProtocolError,
 }
 
@@ -573,12 +887,65 @@ impl SessionEnd {
         match self {
             Self::ClientClosed => "client_closed",
             Self::TargetRelayEnded => "target_relay_ended",
+            Self::TargetSocketUnusable => "target_socket_unusable",
             Self::Idle => "idle_timeout",
             Self::Draining => "gateway_draining",
             Self::RouteWithdrawn => "route_withdrawn",
+            Self::RouteAuthorizationUnreconstructable => "route_authorization_unreconstructable",
             Self::CapsuleProtocolError => "capsule_protocol_error",
         }
     }
+
+    /// How the CONNECT stream's send half must be closed for this outcome.
+    fn close_kind(self) -> StreamCloseKind {
+        match self {
+            // RFC 9297 §3.3 / §3.5: a malformed or truncated capsule stream is
+            // a malformed HTTP message, not a successful end of response.
+            Self::CapsuleProtocolError => StreamCloseKind::MessageError,
+            // The tunnel was established and then could not be honoured. A
+            // clean FIN would tell the client the session ended normally.
+            Self::TargetSocketUnusable => StreamCloseKind::InternalError,
+            Self::ClientClosed
+            | Self::TargetRelayEnded
+            | Self::Idle
+            | Self::Draining
+            | Self::RouteWithdrawn
+            | Self::RouteAuthorizationUnreconstructable => StreamCloseKind::Clean,
+        }
+    }
+}
+
+/// How the client-bound relay terminates the QUIC send half.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamCloseKind {
+    /// Ordinary end of tunnel: FIN the capsule stream.
+    Clean,
+    /// RFC 9114 §4.1.2 malformed request/response: reset with
+    /// `H3_MESSAGE_ERROR`.
+    MessageError,
+    /// The gateway cannot complete the tunnel honestly: reset with
+    /// `H3_INTERNAL_ERROR`.
+    InternalError,
+}
+
+/// Outcome of one `recv_data` round in the client-bound relay.
+///
+/// Carries no borrow of the QUIC receive half on purpose: `recv_data` hands
+/// back an `impl Buf` that captures `&mut` on the stream, so the halt decision
+/// has to be made *after* that borrow ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClientRelayStep {
+    /// Chunk consumed; keep reading.
+    Continue,
+    /// Clean FIN on a capsule boundary.
+    ClientFin,
+    /// Transport-level read failure; the client is gone.
+    StreamError,
+    /// RFC 9297 capsule-stream fault. Halt the receive half and reset the send
+    /// half — never a clean EOF.
+    CapsuleFault(CapsuleDecodeError),
+    /// The connected UDP socket is unusable (see [`UdpSendFault::Terminal`]).
+    SocketUnusable,
 }
 
 /// Everything the handler needs that is not already an `Arc` on `ProxyState`.
@@ -598,6 +965,16 @@ pub(crate) struct ConnectUdpRequest {
     pub(crate) proxy_headers: HashMap<String, String>,
     pub(crate) cb_target_key: Option<String>,
     pub(crate) cb_is_half_open_probe: bool,
+    /// Whether plugin/policy route overrides shaped the proxy this request was
+    /// admitted against.
+    ///
+    /// The admitted destination set is computed from the *route-override
+    /// effective* proxy, but the reload re-check can only look the proxy up by
+    /// `(namespace, id)` and therefore only ever recovers the base shape. When
+    /// overrides were in play the exact effective authorization cannot be
+    /// reconstructed from a new generation, so the tunnel fails closed instead
+    /// of being re-admitted against a route it was never admitted against.
+    pub(crate) route_overrides_applied: bool,
 }
 
 /// RFC 9298 entry point, called from `handle_h3_request` once routing,
@@ -622,6 +999,7 @@ pub(crate) async fn handle_h3_connect_udp(
         proxy_headers,
         cb_target_key,
         cb_is_half_open_probe,
+        route_overrides_applied,
     } = request;
 
     // A CONNECT-UDP tunnel dials no HTTP backend, so it can neither confirm nor
@@ -645,6 +1023,37 @@ pub(crate) async fn handle_h3_connect_udp(
             StatusCode::NOT_IMPLEMENTED,
             r#"{"error":"CONNECT-UDP over HTTP/3 is disabled on this gateway"}"#,
             "connect_udp_disabled",
+            plugin_execution_ns,
+            start_time,
+            &request_path,
+            HashMap::new(),
+        )
+        .await;
+    }
+
+    // RFC 9297 §3.2 forbids Content-Length, Content-Type, and Transfer-Encoding
+    // on a message that uses the Capsule Protocol. The dispatcher already
+    // refused a client that sent one; this repeats the check over the
+    // POLICY-FINALIZED outbound map, so a `request_transformer` (or any other
+    // `before_proxy` plugin) cannot add one back. Still before any socket
+    // exists.
+    if let Some(rejection) =
+        first_forbidden_capsule_protocol_field(proxy_headers.keys().map(String::as_str))
+    {
+        warn!(
+            proxy_id = %proxy.id,
+            reason = rejection.reason(),
+            "Rejected HTTP/3 CONNECT-UDP: policy-finalized headers violate RFC 9297 §3.2"
+        );
+        return reject(
+            &mut stream,
+            &state,
+            &plugins,
+            &ctx,
+            &initial_response_header_policy_plugins,
+            StatusCode::BAD_REQUEST,
+            rejection.client_error_body(),
+            rejection.reason(),
             plugin_execution_ns,
             start_time,
             &request_path,
@@ -738,10 +1147,19 @@ pub(crate) async fn handle_h3_connect_udp(
     // checked against the backend IP policy as one set, so a mixed answer
     // cannot smuggle a denied address (the same guard ordinary backend dialling
     // uses). Bounded by the route's connect budget.
+    //
+    // The effective per-proxy `dns_override` is passed through with the same
+    // highest precedence ordinary dispatch gives it, so a route that pins its
+    // destination address does not silently dial a different one here — while a
+    // denied override still fails the whole lookup instead of becoming an
+    // unscreened dial. `proxy` is the route-override-effective shape, so an
+    // override installed by a plugin route override is the one honoured.
     let connect_budget = Duration::from_millis(proxy.backend_connect_timeout_ms.max(1));
     let resolved = match tokio::time::timeout(
         connect_budget,
-        state.dns_cache.resolve_all_fresh(&target.host),
+        state
+            .dns_cache
+            .resolve_all_fresh_with_override(&target.host, proxy.dns_override.as_deref()),
     )
     .await
     {
@@ -815,13 +1233,20 @@ pub(crate) async fn handle_h3_connect_udp(
         IpAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
         IpAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
     };
-    let socket = match UdpSocket::bind(bind_addr).await {
+    if !crate::socket_opts::UDP_DONT_FRAGMENT_SUPPORTED {
+        debug!(
+            proxy_id = %proxy.id,
+            "HTTP/3 CONNECT-UDP: this target exposes no do-not-fragment socket option; \
+             RFC 9298 §3.1 non-fragmentation is best effort here"
+        );
+    }
+    let socket = match bind_tunnel_socket(bind_addr).and_then(UdpSocket::from_std) {
         Ok(socket) => socket,
         Err(error) => {
             warn!(
                 proxy_id = %proxy.id,
                 error = %error,
-                "HTTP/3 CONNECT-UDP: failed to bind tunnel socket"
+                "HTTP/3 CONNECT-UDP: failed to create the non-fragmenting tunnel socket"
             );
             return reject(
                 &mut stream,
@@ -876,6 +1301,12 @@ pub(crate) async fn handle_h3_connect_udp(
         &mut response_headers,
     );
     crate::proxy::headers::strip_client_response_hop_by_hop_headers(&mut response_headers);
+    // RFC 9297 §3.2 forbids Content-Length, Content-Type, and Transfer-Encoding
+    // on a Capsule Protocol message. The hop-by-hop strip above already removed
+    // Transfer-Encoding; the other two are ordinary end-to-end fields that
+    // response-header policy is free to author, so they are removed here —
+    // after that policy has run, before the transport-owned signal is written.
+    strip_forbidden_capsule_protocol_response_fields(&mut response_headers);
     // Transport-owned and written last: policy may not remove or forge the
     // signal that puts this stream into the Capsule Protocol.
     response_headers.insert("capsule-protocol".to_string(), "?1".to_string());
@@ -921,7 +1352,17 @@ pub(crate) async fn handle_h3_connect_udp(
         "HTTP/3 CONNECT-UDP (RFC 9298) tunnel established"
     );
 
-    let end = relay(stream, &state, &proxy, &epoch, socket, &target, start_time).await;
+    let end = relay(
+        stream,
+        &state,
+        &proxy,
+        &epoch,
+        socket,
+        &target,
+        start_time,
+        route_overrides_applied,
+    )
+    .await;
 
     debug!(
         proxy_id = %proxy.id,
@@ -936,7 +1377,68 @@ pub(crate) async fn handle_h3_connect_udp(
     Ok(())
 }
 
+/// Feed one client DATA chunk through the capsule decoder and relay every
+/// complete Context ID 0 payload to the tunnel target.
+///
+/// Extracted from the relay task so the borrow of the QUIC receive half ends
+/// with the call: the caller acts on the returned step *after* that, which is
+/// what lets it halt the receive half on a fault.
+async fn relay_client_chunk(
+    decoder: &mut CapsuleDecoder,
+    chunk: &mut impl Buf,
+    socket: &UdpSocket,
+    activity: &AtomicU64,
+    session_start: Instant,
+    proxy_id: &str,
+) -> ClientRelayStep {
+    let feed_limit = decoder.feed_limit();
+    while chunk.has_remaining() {
+        let slice_len = chunk.chunk().len().min(feed_limit);
+        if let Err(error) = decoder.push(&chunk.chunk()[..slice_len]) {
+            return ClientRelayStep::CapsuleFault(error);
+        }
+        chunk.advance(slice_len);
+        loop {
+            match decoder.next() {
+                Ok(Some(CapsuleEvent::UdpPayload(payload))) => {
+                    activity.store(session_start.elapsed().as_millis() as u64, Ordering::Relaxed);
+                    if let Err(error) = socket.send(&payload).await {
+                        match classify_udp_send_error(&error) {
+                            // Includes the `EMSGSIZE` that the RFC 9298 §3.1
+                            // do-not-fragment policy produces for an over-path
+                            // datagram: drop it, keep the tunnel.
+                            UdpSendFault::DropDatagram => debug!(
+                                proxy_id = %proxy_id,
+                                "H3 CONNECT-UDP client relay: datagram dropped: {error}"
+                            ),
+                            // The socket is unusable. Continuing would present
+                            // a live tunnel that silently discards everything
+                            // the client sends.
+                            UdpSendFault::Terminal => {
+                                warn!(
+                                    proxy_id = %proxy_id,
+                                    fault = UdpSendFault::Terminal.as_str(),
+                                    "H3 CONNECT-UDP client relay: tunnel socket is unusable: \
+                                     {error}"
+                                );
+                                return ClientRelayStep::SocketUnusable;
+                            }
+                        }
+                    }
+                }
+                // RFC 9298 §4 / RFC 9297 §3.1: drop and keep parsing.
+                Ok(Some(CapsuleEvent::UnregisteredContext(_)))
+                | Ok(Some(CapsuleEvent::UnknownCapsuleType(_))) => {}
+                Ok(None) => break,
+                Err(error) => return ClientRelayStep::CapsuleFault(error),
+            }
+        }
+    }
+    ClientRelayStep::Continue
+}
+
 /// Drive both directions until one ends or a lifecycle bound fires.
+#[allow(clippy::too_many_arguments)]
 async fn relay(
     stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     state: &Arc<ProxyState>,
@@ -945,6 +1447,7 @@ async fn relay(
     socket: Arc<UdpSocket>,
     target: &ConnectUdpTarget,
     session_start: Instant,
+    route_overrides_applied: bool,
 ) -> SessionEnd {
     let max_payload = state.env_config.http3_connect_udp_max_datagram_bytes;
     let idle_seconds = state.env_config.http3_connect_udp_idle_timeout_seconds;
@@ -964,67 +1467,64 @@ async fn relay(
     let mut to_target = tokio::spawn(async move {
         let mut decoder = CapsuleDecoder::new(max_payload);
         loop {
-            let chunk = match h3_recv.recv_data().await {
-                Ok(Some(chunk)) => chunk,
-                // FIN: RFC 9298 §3.1 ends the tunnel with the stream.
-                Ok(None) => return SessionEnd::ClientClosed,
+            // The chunk `recv_data` yields captures `&mut h3_recv`, so the
+            // decision it produces has to be a borrow-free value: the halt
+            // calls below need the receive half back.
+            let step = match h3_recv.recv_data().await {
+                Ok(Some(mut chunk)) => {
+                    relay_client_chunk(
+                        &mut decoder,
+                        &mut chunk,
+                        &to_target_socket,
+                        &to_target_activity,
+                        session_start,
+                        &to_target_proxy_id,
+                    )
+                    .await
+                }
+                // FIN. RFC 9298 §3.1 ends the tunnel with the stream — but only
+                // a FIN on a capsule boundary is an EOF. RFC 9297 §3.3: a
+                // stream closed in the middle of a capsule is a malformed
+                // message, never a successful end of the capsule stream.
+                Ok(None) => match decoder.finish_stream() {
+                    Ok(()) => ClientRelayStep::ClientFin,
+                    Err(error) => ClientRelayStep::CapsuleFault(error),
+                },
                 Err(error) => {
                     debug!(
                         proxy_id = %to_target_proxy_id,
                         "H3 CONNECT-UDP client relay: stream error: {error}"
                     );
-                    return SessionEnd::ClientClosed;
+                    ClientRelayStep::StreamError
                 }
             };
-            let mut chunk = chunk;
-            let feed_limit = decoder.feed_limit();
-            while chunk.has_remaining() {
-                let slice_len = chunk.chunk().len().min(feed_limit);
-                if let Err(error) = decoder.push(&chunk.chunk()[..slice_len]) {
+            match step {
+                ClientRelayStep::Continue => {}
+                ClientRelayStep::ClientFin | ClientRelayStep::StreamError => {
+                    return SessionEnd::ClientClosed;
+                }
+                ClientRelayStep::CapsuleFault(error) => {
                     warn!(
                         proxy_id = %to_target_proxy_id,
                         reason = error.reason(),
                         "H3 CONNECT-UDP client relay: capsule stream fault"
                     );
+                    // RFC 9114 §4.1.2 malformed message. Halting with an
+                    // explicit code — rather than dropping the half, which
+                    // surfaces as `STOP_SENDING(0)` — is what makes the fault
+                    // distinguishable from a clean end of request.
+                    h3_recv.stop_sending(h3::error::Code::H3_MESSAGE_ERROR);
                     return SessionEnd::CapsuleProtocolError;
                 }
-                chunk.advance(slice_len);
-                loop {
-                    match decoder.next() {
-                        Ok(Some(CapsuleEvent::UdpPayload(payload))) => {
-                            to_target_activity.store(
-                                session_start.elapsed().as_millis() as u64,
-                                Ordering::Relaxed,
-                            );
-                            // A send failure on a connected UDP socket is an
-                            // ICMP-derived or local error; drop the datagram
-                            // rather than tearing down a lossy-by-design tunnel.
-                            if let Err(error) = to_target_socket.send(&payload).await {
-                                debug!(
-                                    proxy_id = %to_target_proxy_id,
-                                    "H3 CONNECT-UDP client relay: datagram dropped: {error}"
-                                );
-                            }
-                        }
-                        // RFC 9298 §4 / RFC 9297 §3.1: drop and keep parsing.
-                        Ok(Some(CapsuleEvent::UnregisteredContext(_)))
-                        | Ok(Some(CapsuleEvent::UnknownCapsuleType(_))) => {}
-                        Ok(None) => break,
-                        Err(error) => {
-                            warn!(
-                                proxy_id = %to_target_proxy_id,
-                                reason = error.reason(),
-                                "H3 CONNECT-UDP client relay: capsule stream fault"
-                            );
-                            return SessionEnd::CapsuleProtocolError;
-                        }
-                    }
+                ClientRelayStep::SocketUnusable => {
+                    h3_recv.stop_sending(h3::error::Code::H3_INTERNAL_ERROR);
+                    return SessionEnd::TargetSocketUnusable;
                 }
             }
         }
     });
 
-    let (close_tx, mut close_rx) = tokio::sync::oneshot::channel::<()>();
+    let (close_tx, mut close_rx) = tokio::sync::oneshot::channel::<StreamCloseKind>();
     let from_target_socket = Arc::clone(&socket);
     let from_target_activity = Arc::clone(&last_activity);
     let from_target_proxy_id = proxy.id.clone();
@@ -1034,10 +1534,19 @@ async fn relay(
         // silently truncated into a corrupted tunnel payload.
         let mut buf = vec![0u8; max_payload + 1];
         let mut out = BytesMut::with_capacity(4096);
+        // How the send half must be closed. The supervisor decides for the
+        // outcomes it observes and hands the verdict over `close_rx`; the two
+        // outcomes this task decides for itself are ordinary ends of tunnel.
+        let mut close_kind = StreamCloseKind::Clean;
         let end = loop {
             let received = tokio::select! {
                 biased;
-                _ = &mut close_rx => break SessionEnd::ClientClosed,
+                supervisor = &mut close_rx => {
+                    if let Ok(kind) = supervisor {
+                        close_kind = kind;
+                    }
+                    break SessionEnd::ClientClosed;
+                }
                 received = from_target_socket.recv(&mut buf) => received,
             };
             match received {
@@ -1072,12 +1581,27 @@ async fn relay(
                 }
             }
         };
-        // Clean FIN so the client sees an orderly end of the capsule stream.
-        if let Err(error) = h3_send.finish().await {
-            debug!(
-                proxy_id = %from_target_proxy_id,
-                "H3 CONNECT-UDP target relay: finish failed: {error}"
-            );
+        match close_kind {
+            // Ordinary end of tunnel: FIN so the client sees an orderly end of
+            // the capsule stream.
+            StreamCloseKind::Clean => {
+                if let Err(error) = h3_send.finish().await {
+                    debug!(
+                        proxy_id = %from_target_proxy_id,
+                        "H3 CONNECT-UDP target relay: finish failed: {error}"
+                    );
+                }
+            }
+            // RFC 9297 §3.3/§3.5 malformed capsule stream, or a tunnel the
+            // gateway can no longer honour. A clean FIN here would tell the
+            // client the session ended normally, which is exactly the
+            // indistinguishability RFC 9114 §4.1.2 exists to prevent.
+            StreamCloseKind::MessageError => {
+                h3_send.stop_stream(h3::error::Code::H3_MESSAGE_ERROR);
+            }
+            StreamCloseKind::InternalError => {
+                h3_send.stop_stream(h3::error::Code::H3_INTERNAL_ERROR);
+            }
         }
         end
     });
@@ -1120,6 +1644,20 @@ async fn relay(
                 // epoch, not the one this request was admitted under.
                 let current = state.request_epoch.load();
                 if current.config_generation != admitted_generation {
+                    // The admitted destination set was computed from the
+                    // ROUTE-OVERRIDE-EFFECTIVE proxy, but the only handle a new
+                    // generation gives us is `(namespace, id)`, which resolves
+                    // to the BASE shape. When overrides were applied, a
+                    // targeted destination recheck against the base route would
+                    // silently re-admit a tunnel whose overriding policy or
+                    // upstream may have been changed or removed — and it would
+                    // pass whenever the requested destination also happens to
+                    // sit on the base route. That is not the authorization this
+                    // request was admitted under, so it fails closed instead of
+                    // being approximated.
+                    if route_overrides_applied {
+                        break SessionEnd::RouteAuthorizationUnreconstructable;
+                    }
                     let still_admitted = current
                         .proxy_by_namespaced_id(&proxy.namespace, &proxy.id)
                         .is_some_and(|live| {
@@ -1138,18 +1676,39 @@ async fn relay(
         }
     };
 
-    // Stop reading the client stream first, then let the client-bound relay
-    // flush and FIN within a bounded grace before it is aborted.
+    // Teardown. `abort()` only *requests* cancellation: it returns before the
+    // task has released the QUIC stream half and its `Arc<UdpSocket>` clone. If
+    // the caller dropped the session permit and the connection guard at that
+    // point, the gateway would advertise a free tunnel slot (and a drained
+    // connection) while an aborted task still owned the resources. So every
+    // handle is joined before this function returns — bounded, never
+    // indefinite: the abort is what makes the join finite, and each join is
+    // additionally capped by `CLOSE_GRACE`.
+    //
+    // Order matters: stop reading the client stream first, then let the
+    // client-bound relay flush and close within its grace before it is aborted.
     if !to_target_finished {
         to_target.abort();
     }
-    let _ = close_tx.send(());
+    let _ = close_tx.send(end.close_kind());
     if !from_target_finished
         && tokio::time::timeout(CLOSE_GRACE, &mut from_target)
             .await
             .is_err()
     {
+        // Still running after the flush grace. Abort, then join: an aborted
+        // handle resolves as `Err(JoinError::cancelled)` only once the task has
+        // actually stopped, which is what proves the send half is released.
+        // A `JoinHandle` must never be polled after it has completed, so this
+        // second wait is reached only on the timed-out branch.
         from_target.abort();
+        let _ = tokio::time::timeout(CLOSE_GRACE, from_target).await;
+    }
+    if !to_target_finished {
+        // Aborted above and never polled to completion, so joining it here is
+        // both safe and the point at which the receive half and the socket
+        // clone are provably gone.
+        let _ = tokio::time::timeout(CLOSE_GRACE, to_target).await;
     }
     end
 }

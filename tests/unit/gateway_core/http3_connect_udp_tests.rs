@@ -11,8 +11,10 @@
 use ferrum_edge::config::types::{GatewayConfig, Proxy, Upstream};
 use ferrum_edge::http3::connect_udp::{
     CONNECT_UDP_MAX_PAYLOAD_BYTES, CapsuleDecodeError, CapsuleDecoder, CapsuleEvent,
-    ConnectUdpTargetRejection, H3ExtendedConnect, classify_h3_extended_connect,
-    destination_is_configured, encode_udp_datagram_capsule, parse_connect_udp_target,
+    ConnectUdpRequestRejection, ConnectUdpTargetRejection, H3ExtendedConnect, UdpSendFault,
+    classify_h3_extended_connect, classify_udp_send_error, destination_is_configured,
+    encode_udp_datagram_capsule, first_forbidden_capsule_protocol_field, parse_connect_udp_target,
+    strip_forbidden_capsule_protocol_response_fields, validate_connect_udp_request_shape,
 };
 use ferrum_edge::load_balancer::{LoadBalancerCache, LoadBalancerCacheInner};
 
@@ -504,4 +506,262 @@ fn a_bare_connect_and_a_non_connect_request_are_not_extended_connect() {
     // reach the tunnel dispatcher.
     get.extensions_mut().insert(h3::ext::Protocol::CONNECT_UDP);
     assert_eq!(classify_h3_extended_connect(&get), H3ExtendedConnect::None);
+}
+
+// ---------------------------------------------------------------------------
+// RFC 9298 §3 request shape
+// ---------------------------------------------------------------------------
+
+fn uri(text: &str) -> http::Uri {
+    text.parse().expect("test uri")
+}
+
+#[test]
+fn accepts_the_rfc9298_https_bootstrap_shape() {
+    validate_connect_udp_request_shape(&uri(
+        "https://gateway.test/.well-known/masque/udp/dns.example/853/",
+    ))
+    .expect("the RFC 9298 §3 shape must be accepted");
+}
+
+#[test]
+fn refuses_a_connect_udp_request_without_the_https_scheme() {
+    // The classifier reads only :method and :protocol, so without this check
+    // the handler would assume HTTPS and tunnel anyway.
+    assert_eq!(
+        validate_connect_udp_request_shape(&uri(
+            "http://gateway.test/.well-known/masque/udp/dns.example/853/"
+        )),
+        Err(ConnectUdpRequestRejection::SchemeNotHttps)
+    );
+    assert_eq!(
+        validate_connect_udp_request_shape(&uri(
+            "ftp://gateway.test/.well-known/masque/udp/dns.example/853/"
+        )),
+        Err(ConnectUdpRequestRejection::SchemeNotHttps)
+    );
+    // An origin-form URI carries no :scheme at all.
+    assert_eq!(
+        validate_connect_udp_request_shape(&uri("/.well-known/masque/udp/dns.example/853/")),
+        Err(ConnectUdpRequestRejection::SchemeMissing)
+    );
+}
+
+#[test]
+fn refuses_a_connect_udp_request_without_an_authority() {
+    assert_eq!(
+        validate_connect_udp_request_shape(&uri("https:///udp/dns.example/853/")),
+        Err(ConnectUdpRequestRejection::AuthorityMissing)
+    );
+}
+
+#[test]
+fn request_shape_diagnostics_are_field_specific_and_echo_nothing() {
+    let rejection = validate_connect_udp_request_shape(&uri(
+        "http://secret-tenant.internal/udp/dns.example/853/",
+    ))
+    .expect_err("must reject");
+    assert_eq!(rejection.reason(), "connect_udp_scheme_not_https");
+    assert!(rejection.client_error_body().contains(":scheme"));
+    assert!(
+        !rejection
+            .client_error_body()
+            .contains("secret-tenant.internal")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// RFC 9297 §3.2 forbidden fields
+// ---------------------------------------------------------------------------
+
+#[test]
+fn refuses_every_field_the_capsule_protocol_forbids() {
+    for (name, expected) in [
+        ("content-length", ConnectUdpRequestRejection::ForbiddenContentLength),
+        ("Content-Length", ConnectUdpRequestRejection::ForbiddenContentLength),
+        ("content-type", ConnectUdpRequestRejection::ForbiddenContentType),
+        ("CONTENT-TYPE", ConnectUdpRequestRejection::ForbiddenContentType),
+        (
+            "transfer-encoding",
+            ConnectUdpRequestRejection::ForbiddenTransferEncoding,
+        ),
+        (
+            "Transfer-Encoding",
+            ConnectUdpRequestRejection::ForbiddenTransferEncoding,
+        ),
+    ] {
+        assert_eq!(
+            first_forbidden_capsule_protocol_field([name]),
+            Some(expected),
+            "{name} must be refused on a Capsule Protocol message"
+        );
+    }
+}
+
+#[test]
+fn permits_the_fields_the_capsule_protocol_requires() {
+    assert_eq!(
+        first_forbidden_capsule_protocol_field(["capsule-protocol", "user-agent", "authorization"]),
+        None
+    );
+}
+
+#[test]
+fn strips_forbidden_fields_a_response_policy_tried_to_author() {
+    // A plugin/policy-finalized response map is the second half of the
+    // boundary: rejecting only the client's headers would let
+    // `response_transformer` put Content-Type on a Capsule Protocol message.
+    let mut headers = std::collections::HashMap::from([
+        ("content-length".to_string(), "42".to_string()),
+        ("Content-Type".to_string(), "text/plain".to_string()),
+        ("transfer-encoding".to_string(), "chunked".to_string()),
+        ("x-tenant".to_string(), "keep-me".to_string()),
+    ]);
+    strip_forbidden_capsule_protocol_response_fields(&mut headers);
+    assert_eq!(
+        headers,
+        std::collections::HashMap::from([("x-tenant".to_string(), "keep-me".to_string())]),
+        "only the RFC 9297 §3.2 fields may be removed, and all of them must be"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// RFC 9297 §3.3: a FIN mid-capsule is malformed, not EOF
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_client_fin_on_a_capsule_boundary_is_a_clean_end_of_stream() {
+    let mut decoder = CapsuleDecoder::new(1200);
+    decoder
+        .push(&datagram_capsule(0, b"complete"))
+        .expect("push");
+    assert_eq!(drain(&mut decoder).len(), 1);
+    assert_eq!(decoder.buffered_len(), 0);
+    decoder
+        .finish_stream()
+        .expect("a FIN with nothing buffered is an ordinary close");
+}
+
+#[test]
+fn a_client_fin_inside_a_capsule_is_a_malformed_message_not_an_eof() {
+    let mut decoder = CapsuleDecoder::new(1200);
+    // Header declares 32 bytes of value; only 3 arrive.
+    decoder.push(&[0x00, 0x20, 0x00, 0xde, 0xad]).expect("push");
+    assert!(
+        drain(&mut decoder).is_empty(),
+        "an incomplete capsule must not yield an event"
+    );
+    assert!(
+        decoder.buffered_len() > 0,
+        "the partial capsule must still be buffered"
+    );
+    assert_eq!(
+        decoder.finish_stream(),
+        Err(CapsuleDecodeError::TruncatedAtStreamEnd),
+        "RFC 9297 §3.3: a stream closed mid-capsule is malformed, never a clean EOF"
+    );
+    assert_eq!(
+        CapsuleDecodeError::TruncatedAtStreamEnd.reason(),
+        "capsule_truncated_at_stream_end"
+    );
+}
+
+#[test]
+fn a_dangling_capsule_header_prefix_is_also_a_truncated_stream() {
+    let mut decoder = CapsuleDecoder::new(1200);
+    // A 2-byte varint type whose second byte never arrives.
+    decoder.push(&[0x40]).expect("push");
+    assert!(drain(&mut decoder).is_empty());
+    assert_eq!(
+        decoder.finish_stream(),
+        Err(CapsuleDecodeError::TruncatedAtStreamEnd)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// RFC 9298 §3.1 socket behaviour
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_oversized_datagram_is_dropped_but_an_unusable_socket_is_terminal() {
+    // Portable, errno-free arms first: `io::Error::from(ErrorKind)` carries no
+    // raw OS error, so these exercise the kind-based fallback directly.
+    for kind in [
+        std::io::ErrorKind::WouldBlock,
+        std::io::ErrorKind::Interrupted,
+        std::io::ErrorKind::ConnectionRefused,
+        std::io::ErrorKind::HostUnreachable,
+        std::io::ErrorKind::NetworkUnreachable,
+        std::io::ErrorKind::NetworkDown,
+    ] {
+        assert_eq!(
+            classify_udp_send_error(&std::io::Error::from(kind)),
+            UdpSendFault::DropDatagram,
+            "{kind:?} is per-datagram loss on a lossy-by-design transport"
+        );
+    }
+    for kind in [
+        std::io::ErrorKind::PermissionDenied,
+        std::io::ErrorKind::BrokenPipe,
+        std::io::ErrorKind::NotConnected,
+        std::io::ErrorKind::Other,
+    ] {
+        assert_eq!(
+            classify_udp_send_error(&std::io::Error::from(kind)),
+            UdpSendFault::Terminal,
+            "{kind:?} means the socket itself is unusable"
+        );
+    }
+
+    // EMSGSIZE is the expected result of the RFC 9298 §3.1 do-not-fragment
+    // policy for an over-path datagram, so it must NOT kill the tunnel. Spelled
+    // numerically because the test crate does not link `libc`.
+    #[cfg(target_os = "linux")]
+    const EMSGSIZE: i32 = 90;
+    #[cfg(target_vendor = "apple")]
+    const EMSGSIZE: i32 = 40;
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    {
+        assert_eq!(
+            classify_udp_send_error(&std::io::Error::from_raw_os_error(EMSGSIZE)),
+            UdpSendFault::DropDatagram,
+            "EMSGSIZE must drop one datagram, never tear down the tunnel"
+        );
+        // EBADF is 9 on both.
+        assert_eq!(
+            classify_udp_send_error(&std::io::Error::from_raw_os_error(9)),
+            UdpSendFault::Terminal,
+            "a closed descriptor is not per-datagram loss"
+        );
+    }
+
+    assert_eq!(UdpSendFault::DropDatagram.as_str(), "datagram_dropped");
+    assert_eq!(UdpSendFault::Terminal.as_str(), "socket_unusable");
+}
+
+#[cfg(unix)]
+#[test]
+fn the_do_not_fragment_option_installs_on_a_real_udp_socket() {
+    use std::os::unix::io::AsRawFd;
+
+    use ferrum_edge::socket_opts::{UDP_DONT_FRAGMENT_SUPPORTED, set_udp_dont_fragment};
+
+    // The runtime contract the tunnel socket depends on: on a platform that
+    // advertises the option, installing it on a freshly bound UDP socket must
+    // succeed — the production path refuses the tunnel when it does not.
+    for bind in ["127.0.0.1:0", "[::1]:0"] {
+        let Ok(socket) = std::net::UdpSocket::bind(bind) else {
+            // No IPv6 loopback on this runner; the IPv4 arm still runs.
+            continue;
+        };
+        let is_ipv4 = socket.local_addr().expect("local addr").is_ipv4();
+        let result = set_udp_dont_fragment(socket.as_raw_fd(), is_ipv4);
+        if UDP_DONT_FRAGMENT_SUPPORTED {
+            result.unwrap_or_else(|error| {
+                panic!("do-not-fragment must install on {bind}: {error}");
+            });
+        } else {
+            result.expect("the unsupported-platform shim never fails");
+        }
+    }
 }

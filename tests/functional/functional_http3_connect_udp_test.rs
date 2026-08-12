@@ -10,7 +10,11 @@
 //! - malformed URI-template expansions
 //! - a registered-but-unimplemented `:protocol` (`webtransport`)
 //! - the profile disabled by default
-//! - an oversized capsule terminating the tunnel
+//! - an oversized capsule RESETTING the tunnel (never a clean FIN), and a
+//!   client FIN in the middle of a capsule doing the same
+//! - the RFC 9298 §3 pseudo-header shape (a non-HTTPS `:scheme` never tunnels)
+//! - the RFC 9297 §3.2 forbidden fields refused on the request and absent from
+//!   the successful response
 //! - the concurrent-session limit
 //! - a live tunnel torn down by a SIGHUP reload that withdraws the destination
 //!
@@ -379,10 +383,14 @@ async fn functional_h3_connect_udp_terminates_on_an_oversized_capsule() {
         .send_capsule(0x00, &value)
         .await
         .expect("send oversized capsule");
+    // RFC 9297 §3.5 / RFC 9114 §4.1.2: a capsule over the ceiling is a
+    // MALFORMED message. A clean FIN here would be indistinguishable from a
+    // successful end of response, so the assertion is a reset specifically —
+    // never "either is fine".
     tunnel
-        .expect_stream_end(Duration::from_secs(10))
+        .expect_stream_reset(Duration::from_secs(10))
         .await
-        .expect("an oversized capsule must terminate the tunnel");
+        .expect("an oversized capsule must RESET the tunnel, not FIN it");
 
     gateway.shutdown();
 }
@@ -482,8 +490,11 @@ async fn functional_h3_connect_udp_closes_live_tunnels_on_route_withdrawal() {
         .args(["-HUP", &pid.to_string()])
         .output();
 
+    // Route withdrawal is an ordinary end of tunnel, not a protocol fault, so
+    // the client must observe a clean FIN — the counterpart assertion to the
+    // malformed-capsule reset above.
     tunnel
-        .expect_stream_end(Duration::from_secs(20))
+        .expect_clean_stream_end(Duration::from_secs(20))
         .await
         .expect("a withdrawn destination must tear the live tunnel down");
 
@@ -508,6 +519,145 @@ async fn functional_h3_connect_udp_closes_live_tunnels_on_route_withdrawal() {
         b"reloaded"
     );
     reopened.close().await;
+
+    gateway.shutdown();
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_h3_connect_udp_resets_on_a_client_fin_inside_a_capsule() {
+    let echo = UdpEcho::spawn().await;
+    let (mut gateway, https_port) = start_masque_gateway(
+        masque_config(echo.port),
+        &[("FERRUM_HTTP3_CONNECT_UDP_ENABLED", "true")],
+    )
+    .await;
+
+    let client = Http3Client::insecure().expect("H3 client");
+    let url = tunnel_url(https_port, "127.0.0.1", echo.port);
+    let mut tunnel = open_tunnel(&client, &url).await;
+    assert_eq!(tunnel.status.as_u16(), 200);
+
+    // Prove the tunnel is live first, so the reset below cannot be confused
+    // with a failure to establish.
+    tunnel.send_datagram(b"live").await.expect("send");
+    assert_eq!(
+        tunnel
+            .recv_datagram(Duration::from_secs(10))
+            .await
+            .expect("receive"),
+        b"live"
+    );
+
+    // A DATAGRAM capsule header declaring 32 bytes of value, followed by 4.
+    // Then a clean FIN. RFC 9297 §3.3: "If the stream is closed in the middle
+    // of a capsule, this MUST be treated as a malformed message." A tidy FIN
+    // from the client does not make a truncated capsule stream an EOF.
+    tunnel
+        .send_raw(&[0x00, 0x20, 0x00, 0xde, 0xad, 0xbe])
+        .await
+        .expect("send a truncated capsule");
+    tunnel.half_close().await.expect("client FIN");
+
+    tunnel
+        .expect_stream_reset(Duration::from_secs(15))
+        .await
+        .expect("a FIN in the middle of a capsule must RESET, never FIN cleanly");
+
+    gateway.shutdown();
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_h3_connect_udp_refuses_a_non_https_scheme() {
+    let echo = UdpEcho::spawn().await;
+    let (mut gateway, https_port) = start_masque_gateway(
+        masque_config(echo.port),
+        &[("FERRUM_HTTP3_CONNECT_UDP_ENABLED", "true")],
+    )
+    .await;
+
+    let client = Http3Client::insecure().expect("H3 client");
+    // Same QUIC listener, same expansion — only `:scheme` differs. RFC 9298 §3
+    // bootstraps over HTTPS; the handler must not assume it.
+    let http_scheme =
+        format!("http://localhost:{https_port}{MASQUE_PREFIX}/udp/127.0.0.1/{}/", echo.port);
+    let mut tunnel = open_tunnel(&client, &http_scheme).await;
+
+    assert_eq!(
+        tunnel.status.as_u16(),
+        400,
+        "a connect-udp request whose :scheme is not https must never tunnel"
+    );
+    let body = tunnel
+        .recv_body_text(Duration::from_secs(5))
+        .await
+        .expect("drain body");
+    assert!(body.contains(":scheme"), "unexpected body: {body}");
+
+    gateway.shutdown();
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_h3_connect_udp_refuses_capsule_protocol_forbidden_fields() {
+    let echo = UdpEcho::spawn().await;
+    let (mut gateway, https_port) = start_masque_gateway(
+        masque_config(echo.port),
+        &[("FERRUM_HTTP3_CONNECT_UDP_ENABLED", "true")],
+    )
+    .await;
+
+    let client = Http3Client::insecure().expect("H3 client");
+    let url = tunnel_url(https_port, "127.0.0.1", echo.port);
+
+    // RFC 9297 §3.2: none of these may appear on a message that uses the
+    // Capsule Protocol. Each must be refused before a UDP socket exists.
+    for (name, value, marker) in [
+        ("content-length", "0", "Content-Length"),
+        ("content-type", "application/octet-stream", "Content-Type"),
+    ] {
+        let mut last_error = None;
+        let deadline = std::time::Instant::now() + Duration::from_secs(40);
+        let mut tunnel = loop {
+            match client.connect_udp_with_headers(&url, &[(name, value)]).await {
+                Ok(tunnel) => break tunnel,
+                Err(error) if std::time::Instant::now() < deadline => {
+                    last_error = Some(error.to_string());
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(error) => panic!("request never completed; last={last_error:?}; final={error}"),
+            }
+        };
+        assert_eq!(
+            tunnel.status.as_u16(),
+            400,
+            "{name} must be refused on a Capsule Protocol message"
+        );
+        let body = tunnel
+            .recv_body_text(Duration::from_secs(5))
+            .await
+            .expect("drain body");
+        assert!(body.contains(marker), "unexpected body for {name}: {body}");
+    }
+
+    // And the successful response must not carry them either.
+    let mut tunnel = open_tunnel(&client, &url).await;
+    assert_eq!(tunnel.status.as_u16(), 200);
+    for forbidden in ["content-length", "content-type", "transfer-encoding"] {
+        assert!(
+            tunnel.headers.get(forbidden).is_none(),
+            "RFC 9297 §3.2 forbids {forbidden} on the CONNECT-UDP response"
+        );
+    }
+    assert_eq!(
+        tunnel
+            .headers
+            .get("capsule-protocol")
+            .and_then(|v| v.to_str().ok()),
+        Some("?1")
+    );
+    tunnel.close().await;
 
     gateway.shutdown();
 }

@@ -207,3 +207,64 @@ fn ipv4_and_ipv6_sources_are_accounted_separately() {
     );
     assert_eq!(limiter.tracked_source_ips(), 2);
 }
+
+
+// ============================================================================
+// RFC 9298 CONNECT-UDP session admission shares the same ceiling contract
+// ============================================================================
+
+fn connect_udp_config(max_sessions: usize) -> EnvConfig {
+    EnvConfig {
+        http3_connect_udp_max_sessions: max_sessions,
+        ..EnvConfig::default()
+    }
+}
+
+#[test]
+fn connect_udp_session_defaults_are_bounded_and_rfc_aligned() {
+    let defaults = EnvConfig::default();
+    assert_eq!(defaults.http3_connect_udp_max_sessions, 256);
+    assert_eq!(
+        defaults.http3_connect_udp_idle_timeout_seconds, 120,
+        "RFC 9298 §3.2: a UDP proxy SHOULD NOT use an idle timeout below two minutes"
+    );
+    defaults
+        .validate_h3_connect_udp_limits()
+        .expect("the shipped default must validate");
+}
+
+#[test]
+fn connect_udp_session_cap_at_the_ceiling_is_accepted() {
+    connect_udp_config(MAX_CONN_LIMIT)
+        .validate_h3_connect_udp_limits()
+        .expect("exactly the semaphore ceiling is enforceable");
+    // The value the accepted boundary is handed to must itself be constructible.
+    let _ = tokio::sync::Semaphore::new(MAX_CONN_LIMIT);
+}
+
+#[test]
+fn connect_udp_session_cap_above_the_ceiling_is_refused_not_clamped_or_unlimited() {
+    let error = connect_udp_config(MAX_CONN_LIMIT + 1)
+        .validate_h3_connect_udp_limits()
+        .expect_err("a cap `Semaphore::new` would panic on must be refused");
+    assert!(
+        error.contains("FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS"),
+        "the error must name the offending variable: {error}"
+    );
+    assert!(
+        error.contains("0 to disable"),
+        "the error must point at the explicit unlimited opt-out: {error}"
+    );
+
+    let error = connect_udp_config(usize::MAX)
+        .validate_h3_connect_udp_limits()
+        .expect_err("usize::MAX is the obvious operator typo");
+    assert!(error.contains("FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS"), "{error}");
+}
+
+#[test]
+fn connect_udp_session_cap_of_zero_is_the_explicit_unlimited_opt_out() {
+    connect_udp_config(0)
+        .validate_h3_connect_udp_limits()
+        .expect("0 disables the limit deliberately");
+}

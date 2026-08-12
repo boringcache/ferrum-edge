@@ -617,12 +617,35 @@ impl Http3Client {
             .await
     }
 
+    /// [`Self::connect_udp`] with extra request header fields.
+    ///
+    /// Used to prove the gateway refuses the RFC 9297 §3.2 fields
+    /// (`Content-Length`, `Content-Type`, `Transfer-Encoding`) that a Capsule
+    /// Protocol message may not carry.
+    pub async fn connect_udp_with_headers(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+    ) -> Result<Http3ConnectUdp, Box<dyn std::error::Error + Send + Sync>> {
+        self.connect_udp_inner(url, h3::ext::Protocol::CONNECT_UDP, headers)
+            .await
+    }
+
     /// [`Self::connect_udp`] with a caller-selected `:protocol`, for
     /// unsupported-profile assertions.
     pub async fn connect_udp_with_protocol(
         &self,
         url: &str,
         protocol: h3::ext::Protocol,
+    ) -> Result<Http3ConnectUdp, Box<dyn std::error::Error + Send + Sync>> {
+        self.connect_udp_inner(url, protocol, &[]).await
+    }
+
+    async fn connect_udp_inner(
+        &self,
+        url: &str,
+        protocol: h3::ext::Protocol,
+        extra_headers: &[(&str, &str)],
     ) -> Result<Http3ConnectUdp, Box<dyn std::error::Error + Send + Sync>> {
         let parsed: http::Uri = url.parse()?;
         let host = parsed.host().ok_or("missing host in url")?.to_string();
@@ -641,12 +664,16 @@ impl Http3Client {
             let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
         });
 
-        let mut req = Request::builder()
+        let mut builder = Request::builder()
             .method(http::Method::CONNECT)
             .version(http::Version::HTTP_3)
             .uri(url)
             .header("capsule-protocol", "?1")
-            .header("user-agent", "ferrum-test-h3-connect-udp/1.0")
+            .header("user-agent", "ferrum-test-h3-connect-udp/1.0");
+        for (name, value) in extra_headers {
+            builder = builder.header(*name, *value);
+        }
+        let mut req = builder
             .body(())
             .map_err(|e| format!("build request: {e}"))?;
         req.extensions_mut().insert(protocol);
@@ -999,6 +1026,16 @@ pub struct Http3ConnectUdp {
     pub headers: HeaderMap,
 }
 
+/// How a CONNECT-UDP capsule stream ended, as the client observed it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectUdpStreamEnd {
+    /// Orderly end of the capsule stream (HTTP/3 FIN).
+    CleanFin,
+    /// The gateway reset the stream; the payload is the client-side error text
+    /// so an assertion can report which code arrived.
+    Reset(String),
+}
+
 /// Encode a QUIC varint (RFC 9000 §16).
 fn put_varint(out: &mut Vec<u8>, value: u64) {
     if value < 1 << 6 {
@@ -1110,12 +1147,26 @@ impl Http3ConnectUdp {
         }
     }
 
-    /// Whether the gateway has closed the capsule stream. Used by the
-    /// withdrawal / disabled-profile assertions.
-    pub async fn expect_stream_end(
+    /// Half-close the client's send direction without tearing down the QUIC
+    /// connection, so a gateway-side reaction to the FIN stays observable.
+    pub async fn half_close(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        tokio::time::timeout(Duration::from_secs(15), self.stream.finish())
+            .await
+            .map_err(|_| "connect-udp finish timed out")?
+            .map_err(|e| format!("connect-udp finish: {e}"))?;
+        Ok(())
+    }
+
+    /// How the gateway ended the capsule stream.
+    ///
+    /// The distinction is the whole point of the RFC 9297 §3.3/§3.5 assertions:
+    /// a malformed capsule stream must NOT be indistinguishable from a
+    /// successful end of response, so tests assert one arm or the other and
+    /// never "either is fine".
+    pub async fn await_stream_end(
         &mut self,
         timeout: Duration,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<ConnectUdpStreamEnd, Box<dyn std::error::Error + Send + Sync>> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -1123,10 +1174,37 @@ impl Http3ConnectUdp {
                 return Err("CONNECT-UDP stream stayed open".into());
             }
             match tokio::time::timeout(remaining, self.stream.recv_data()).await {
-                // A reset is also an end of the tunnel from the client's view.
-                Ok(Ok(None)) | Ok(Err(_)) => return Ok(()),
+                Ok(Ok(None)) => return Ok(ConnectUdpStreamEnd::CleanFin),
+                Ok(Err(error)) => return Ok(ConnectUdpStreamEnd::Reset(error.to_string())),
                 Ok(Ok(Some(_))) => continue,
                 Err(_) => return Err("CONNECT-UDP stream stayed open".into()),
+            }
+        }
+    }
+
+    /// The gateway must FIN the capsule stream (ordinary end of tunnel).
+    pub async fn expect_clean_stream_end(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        match self.await_stream_end(timeout).await? {
+            ConnectUdpStreamEnd::CleanFin => Ok(()),
+            ConnectUdpStreamEnd::Reset(error) => {
+                Err(format!("expected a clean FIN, got a stream reset: {error}").into())
+            }
+        }
+    }
+
+    /// The gateway must RESET the capsule stream — a clean FIN here would make
+    /// a malformed capsule stream look like a successful end of response.
+    pub async fn expect_stream_reset(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        match self.await_stream_end(timeout).await? {
+            ConnectUdpStreamEnd::Reset(error) => Ok(error),
+            ConnectUdpStreamEnd::CleanFin => {
+                Err("expected a stream reset (RFC 9297 malformed message), got a clean FIN".into())
             }
         }
     }

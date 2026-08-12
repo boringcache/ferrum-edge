@@ -7409,10 +7409,16 @@ impl ProxyState {
         } else {
             None
         };
+        // `EnvConfig::validate` refuses anything above `MAX_CONN_LIMIT`, so the
+        // saturating `min` here is defense in depth for callers that build a
+        // `ProxyState` from a hand-assembled `EnvConfig` (tests, CP-pushed
+        // shapes): `Semaphore::new` panics above `MAX_PERMITS`, and a panic
+        // during state construction takes the whole gateway down.
         let h3_connect_udp_sessions = if env_config.http3_connect_udp_max_sessions > 0 {
-            Some(Arc::new(tokio::sync::Semaphore::new(
-                env_config.http3_connect_udp_max_sessions,
-            )))
+            let permits = env_config
+                .http3_connect_udp_max_sessions
+                .min(crate::util::conn_limit::MAX_CONN_LIMIT);
+            Some(Arc::new(tokio::sync::Semaphore::new(permits)))
         } else {
             None
         };

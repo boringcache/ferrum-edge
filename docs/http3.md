@@ -843,7 +843,7 @@ private Ferrum framing.
 | --- | --- |
 | Bootstrap | RFC 9298 §3 over HTTP/3: `:method=CONNECT`, `:protocol=connect-udp`, `:scheme=https`, `:authority` = gateway authority |
 | URI Template | RFC 9298 §2. The default `https://$HOST:$PORT/.well-known/masque/udp/{target_host}/{target_port}/` works verbatim. Any operator prefix is accepted as long as the expanded path ends with `udp/{target_host}/{target_port}/`, trailing slash included |
-| Success response | `200` with `Capsule-Protocol: ?1` (RFC 9297 §3.4), written after response-header policy so no plugin can remove or forge it |
+| Success response | `200` with `Capsule-Protocol: ?1` (RFC 9297 §3.4), written after response-header policy so no plugin can remove or forge it. `Content-Length` and `Content-Type` are force-removed at the same boundary (RFC 9297 §3.2 forbids them; the hop-by-hop strip already removes `Transfer-Encoding`) |
 | Payload encoding | HTTP Datagrams as RFC 9297 **DATAGRAM capsules** (`Capsule Type = 0x00`) on the CONNECT stream |
 | `SETTINGS_H3_DATAGRAM` | Never negotiated. QUIC DATAGRAM frames are not used in either direction |
 | Datagram payload | RFC 9298 §5: Context ID varint + unmodified UDP payload. Only Context ID `0` is registered |
@@ -880,7 +880,11 @@ load-balancer connection is charged.
 
 Target resolution goes through the dial-time, policy-screened resolver, so the
 same backend IP policy that guards ordinary backend dialling guards the tunnel;
-a mixed DNS answer containing a denied address fails the whole lookup.
+a mixed DNS answer containing a denied address fails the whole lookup. The
+effective per-proxy `dns_override` is honoured with the same highest precedence
+ordinary dispatch gives it, so a route that pins its destination address does
+not dial a different one through the tunnel — and a denied override still fails
+the lookup instead of becoming an unscreened dial.
 
 ### Bounds and lifecycle
 
@@ -890,27 +894,71 @@ a mixed DNS answer containing a denied address fails the whole lookup.
 | Idle lifetime | `FERRUM_HTTP3_CONNECT_UDP_IDLE_TIMEOUT_SECONDS` |
 | Datagram payload | `FERRUM_HTTP3_CONNECT_UDP_MAX_DATAGRAM_BYTES`, itself capped at the RFC 9298 §5 ceiling of 65527 |
 | Capsule length | payload ceiling + 8 bytes of Context ID slack |
-| Buffered partial capsule | one capsule, never more |
+| Buffered partial capsule | the decoder's documented hard ceiling, twice one maximum capsule plus header |
 
-There is no queue between the directions. The client-bound relay awaits
+There is no *queue* between the directions. The client-bound relay awaits
 `send_data` (QUIC stream flow control is the backpressure) and the target-bound
 relay awaits `UdpSocket::send`; excess is dropped by the kernel socket buffer,
-which is the correct behaviour for a UDP tunnel and keeps a session's footprint
-to a pair of fixed buffers.
+which is the correct behaviour for a UDP tunnel.
+
+That is not the same as one buffer per session. Writing `P` for the configured
+payload ceiling, a live tunnel can concurrently hold the decoder's transient
+buffer (bounded at `2 × (P + 8 + 16)` — the ceiling above, not one capsule),
+the `P + 1`-byte target receive buffer, and the client-bound framing scratch
+plus a framed capsule still owned by a `send_data` future that QUIC send flow
+control has blocked (about `2 × (P + 9)`). The conservative per-session bound is
+therefore about `5 × P` — roughly 320 KiB at the 65527-byte default, or roughly
+80 MiB across the 256-session default. Lower
+`FERRUM_HTTP3_CONNECT_UDP_MAX_DATAGRAM_BYTES` to scale every term down.
 
 Each tunnel uses one *connected* UDP socket (RFC 9298 §3.1), so the kernel
-enforces the 5-tuple and off-path packets never enter the session. A datagram
-from the target larger than the configured ceiling is silently dropped rather
-than fragmented or truncated; an oversized or malformed capsule from the client
-terminates the tunnel.
+enforces the 5-tuple and off-path packets never enter the session. The socket is
+built through `socket2` so the platform do-not-fragment / path-MTU-discovery
+option is installed **before** it is handed to Tokio and before any datagram can
+leave it — `IP_MTU_DISCOVER` / `IPV6_MTU_DISCOVER` = `PMTUDISC_DO` on Linux,
+`IP_DONTFRAG` / `IPV6_DONTFRAG` on Apple/BSD. RFC 9298 §3.1 requires that the
+proxy not introduce IP fragmentation and that IPv4 DF be set if possible, so on
+a platform that exposes the option a `setsockopt` failure **refuses the tunnel**
+(502) rather than opening it without the guarantee. On a platform that exposes
+no usable option (notably Windows, where Ferrum links no Winsock binding) this
+is documented best effort and is logged.
 
-A tunnel ends — sockets closed, session permit and connection guard released —
-on any of: client FIN or stream error, target socket error, idle expiry,
-capsule protocol fault, gateway drain (`SIGTERM`), or **route withdrawal**. The
-last is checked against the currently published config generation, not the one
-the request was admitted under: a reload that deletes the proxy or removes the
-destination from its upstream tears live tunnels down within one supervisor
-tick rather than grandfathering them.
+A datagram from the target larger than the configured ceiling is silently
+dropped rather than fragmented or truncated. Client-to-target `send` failures
+are classified: `EMSGSIZE` (the expected result of the DF policy for an
+over-path datagram) and ICMP-derived or transient conditions drop that datagram
+and keep the tunnel; anything indicating the socket itself is unusable tears the
+request stream down with `H3_INTERNAL_ERROR` rather than presenting a live
+tunnel that silently discards traffic.
+
+A tunnel ends — sockets closed, both relay tasks **joined**, and only then the
+session permit and connection guard released — on any of: client FIN or stream
+error, target socket error, idle expiry, capsule protocol fault, gateway drain
+(`SIGTERM`), or **route withdrawal**. Teardown aborts each relay and then joins
+its handle within a bounded grace, so an aborted task can never still own the
+QUIC stream half or the UDP socket while the gateway advertises the slot as
+free.
+
+How the stream is closed depends on why:
+
+- An ordinary end of tunnel FINs the capsule stream.
+- A capsule protocol fault — a malformed capsule, a capsule over the ceiling, or
+  a client FIN **in the middle of a capsule** — is a malformed HTTP message per
+  RFC 9297 §3.3/§3.5 and RFC 9114 §4.1.2, so the receive half is halted with
+  `STOP_SENDING(H3_MESSAGE_ERROR)` and the send half is reset with
+  `H3_MESSAGE_ERROR`. It is never a clean EOF.
+- A tunnel the gateway can no longer honour (unusable target socket) resets with
+  `H3_INTERNAL_ERROR`.
+
+Route withdrawal is checked against the currently published config generation,
+not the one the request was admitted under: a reload that deletes the proxy or
+removes the destination from its upstream tears live tunnels down within one
+supervisor tick rather than grandfathering them. When the request was admitted
+against a **plugin route override** (`mesh_route_dispatch` and friends), the
+live lookup by `(namespace, id)` recovers only the unoverridden base route, so
+the exact effective authorization cannot be reconstructed — a generation change
+then closes the tunnel outright instead of re-admitting it against a route it
+was never admitted against.
 
 ### Refusals
 
@@ -919,6 +967,8 @@ tick rather than grandfathering them.
 | Profile disabled | `501` |
 | Unregistered `:protocol` token | h3 resets the stream with `H3_MESSAGE_ERROR` before the gateway sees it |
 | Registered but unimplemented `:protocol` (e.g. `webtransport`), or CONNECT with no `:protocol` | `405` |
+| `:scheme` absent, empty, or not the listener's HTTPS scheme; `:authority` absent | `400` with a field-specific body — a tunnel is never established on an assumed scheme |
+| `Content-Length`, `Content-Type`, or `Transfer-Encoding` present (RFC 9297 §3.2), on the client request **or** on the plugin/policy-finalized outbound headers | `400`, before a socket exists |
 | Path is not an RFC 9298 template expansion, or `target_host` / `target_port` is empty, oversized, or malformed | `400` with a field-specific body |
 | Destination not configured for the matched proxy | `403` (the configured set is never echoed) |
 | Session limit reached | `503` |
@@ -929,13 +979,22 @@ tick rather than grandfathering them.
 ### Testing
 
 - `tests/unit/gateway_core/http3_connect_udp_tests.rs` — URI-template parsing
-  and hostile-input rejection, destination admission, capsule decoding
-  (context IDs, unknown capsule types, oversize, truncation, split frames),
-  capsule encoding, and `:protocol` classification.
+  and hostile-input rejection, the RFC 9298 §3 pseudo-header shape, the RFC 9297
+  §3.2 forbidden-field boundary in both directions, destination admission,
+  capsule decoding (context IDs, unknown capsule types, oversize, truncation,
+  split frames, and a FIN mid-capsule), capsule encoding, `:protocol`
+  classification, the UDP send-error classifier, and the do-not-fragment
+  socket option installing on a real UDP socket.
+- `tests/unit/gateway_core/dns_tests.rs` — the fresh all-candidates dial path
+  honouring a per-proxy `dns_override` and still screening a denied one.
+- `tests/unit/config/cp_grpc_conn_limit_tests.rs` — the CONNECT-UDP session cap
+  at and above the semaphore ceiling.
 - `tests/functional/functional_http3_connect_udp_test.rs` — live H3
   CONNECT-UDP traffic against a real UDP echo server, plus spoofed-destination,
-  malformed-template, unknown-`:protocol`, oversize-capsule, disabled-profile,
-  and reload-withdrawal coverage.
+  malformed-template, non-HTTPS-`:scheme`, forbidden-field,
+  unknown-`:protocol`, oversize-capsule, FIN-mid-capsule, disabled-profile,
+  and reload-withdrawal coverage. The stream-end assertions distinguish a
+  clean FIN from a reset; neither accepts "either".
 
 ## QUIC connection migration
 
@@ -977,4 +1036,8 @@ The frontend HTTP/2 listener applies the same conservative-by-default philosophy
 | `FERRUM_HTTP3_FLUSH_INTERVAL_MICROS` | `200` | Response coalesce time-based flush interval. H3-specific (the H1/H2-via-reqwest path uses opportunistic Pending-flush instead, so it has no flush-interval knob). |
 | `FERRUM_HTTP3_REQUEST_BODY_CHANNEL_CAPACITY` | `32` | Cross-protocol bridge mpsc capacity (range: 1–1024) |
 | `FERRUM_HTTP3_WEBSOCKET_ENABLED` | `true` | Advertise `SETTINGS_ENABLE_CONNECT_PROTOCOL` and accept RFC 9220 Extended CONNECT WebSocket. See [WebSocket over HTTP/3](#websocket-over-http3-rfc-9220-extended-connect). |
+| `FERRUM_HTTP3_CONNECT_UDP_ENABLED` | `false` | Accept RFC 9298 UDP proxying Extended CONNECT (`:protocol=connect-udp`). Off by default; `501` while disabled. See [CONNECT-UDP over HTTP/3](#connect-udp-over-http3-rfc-9298). |
+| `FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS` | `256` | Maximum concurrent CONNECT-UDP tunnels for this process; `503` over the limit. `0` disables the limit. A value above the tokio semaphore permit ceiling is a startup validation error, never a silent clamp or a silent "unlimited". |
+| `FERRUM_HTTP3_CONNECT_UDP_IDLE_TIMEOUT_SECONDS` | `120` | Seconds a tunnel may carry no datagram in either direction (clamped 1–86400). The default is the two minutes RFC 9298 §3.2 says a UDP proxy SHOULD NOT go below. |
+| `FERRUM_HTTP3_CONNECT_UDP_MAX_DATAGRAM_BYTES` | `65,527` | Largest relayed UDP payload (clamped 1–65527, the RFC 9298 §5 Context ID 0 ceiling). Scales every per-session buffer — see [Bounds and lifecycle](#bounds-and-lifecycle). |
 | `FERRUM_HTTP3_INITIAL_MTU` | `1500` | Initial QUIC path MTU (quinn clamps 1200–65527) |
