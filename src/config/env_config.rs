@@ -338,9 +338,10 @@ pub fn parse_discovery_staleness_policy(
                 }
                 0
             } else {
-                value
-                    .max(MIN_SERVICE_DISCOVERY_MAX_STALE_SECONDS)
-                    .min(HARD_MAX_SERVICE_DISCOVERY_MAX_STALE_SECONDS)
+                value.clamp(
+                    MIN_SERVICE_DISCOVERY_MAX_STALE_SECONDS,
+                    HARD_MAX_SERVICE_DISCOVERY_MAX_STALE_SECONDS,
+                )
             }
         }
     };

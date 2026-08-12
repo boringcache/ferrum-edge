@@ -1083,6 +1083,8 @@ async fn failed_expiry_publication_retries_and_fails_readiness_closed() {
         "stale-discovered.local",
         8080,
     )]));
+    let calls = discoverer.calls.clone();
+    let hang = discoverer.hang.clone();
 
     let task = spawn_supervised_discovery_task_for_test(
         &default_namespace(),
@@ -1109,6 +1111,12 @@ async fn failed_expiry_publication_retries_and_fails_readiness_closed() {
         })
         .await,
         "initial discovered snapshot must publish before LB generation exhaustion"
+    );
+    let calls_before_hang = calls.load(Ordering::SeqCst);
+    hang.store(true, Ordering::SeqCst);
+    assert!(
+        wait_for(|| calls.load(Ordering::SeqCst) > calls_before_hang).await,
+        "the provider must enter a post-snapshot hang before staleness is forced"
     );
     assert!(health::age_anchor_for_test(&task.key, 600));
     assert!(
