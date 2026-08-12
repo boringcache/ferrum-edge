@@ -24327,8 +24327,20 @@ pub(crate) struct DetachedResponseCommittedBound {
 /// authorized. Bounding it by the five-second timeout alone let the pending
 /// hook and every remaining observer keep holding and processing the cloned
 /// request context and the protected response body after that lifetime elapsed.
-/// `timeout_at` cancels the whole chain, so the hook, the remaining observers,
-/// the context clone, and the body are all dropped no later than the bound.
+///
+/// # Why not `timeout_at`
+///
+/// `tokio::time::timeout_at` polls its INNER future before it observes the
+/// timer, so a chain whose pending observer and remaining hooks are all ready
+/// on their first poll runs to completion even when the bound elapsed before
+/// this task was ever scheduled. Spawning is not running: between the spawn and
+/// the first poll an unbounded amount of time can pass on a loaded runtime, and
+/// that window is exactly where an expired credential must not be able to
+/// execute one more protected side effect. The bound is therefore enforced
+/// twice — an explicit past-deadline REFUSAL that polls nothing at all, and a
+/// deadline-biased race whose clock gate re-checks the same instant before
+/// every resumption — so the chain is never first-polled, and never resumed,
+/// at/after the authorization bound.
 ///
 /// The response the client already received is untouched: this is post-terminal
 /// observer work, the RPC terminal was decided by the client deadline, and
@@ -24343,8 +24355,23 @@ pub(crate) fn spawn_detached_response_committed_hooks(
     bound: DetachedResponseCommittedBound,
 ) {
     std::mem::drop(tokio::spawn(async move {
-        let cleanup_at = tokio::time::Instant::now() + DETACHED_REJECTION_CLEANUP_TIMEOUT;
+        let started_at = tokio::time::Instant::now();
+        let cleanup_at = started_at + DETACHED_REJECTION_CLEANUP_TIMEOUT;
         let authorization_at = bound.authorization_at.filter(|at| *at < cleanup_at);
+        // PAST-DEADLINE REFUSAL. Returning here drops the pending observer, the
+        // remaining observers, the cloned request context, and the protected
+        // response body without polling any of them.
+        if let Some(at) = authorization_at
+            && started_at >= at
+        {
+            // A compiled-in literal: no expiry instant, claim, subject,
+            // certificate field, or provider detail.
+            warn!(
+                "detached committed-response cleanup was refused: the admitted stream's \
+                 authorization lifetime had already elapsed when it was scheduled"
+            );
+            return;
+        }
         let deadline = authorization_at.unwrap_or(cleanup_at);
         let cleanup = async move {
             let mut ctx = pending_hook.await;
@@ -24362,10 +24389,32 @@ pub(crate) fn spawn_detached_response_committed_hooks(
                     .await;
             }
         };
-        if tokio::time::timeout_at(deadline, cleanup).await.is_err() {
+        let mut cleanup = Box::pin(cleanup);
+        // Per-poll clock gate: an authorization bound is re-checked before the
+        // chain is resumed, so a wake-up that lands at/after it cannot run one
+        // more observer just because a tokio timer had not fired yet.
+        let mut guarded = std::future::poll_fn(move |cx| {
+            if let Some(at) = authorization_at
+                && tokio::time::Instant::now() >= at
+            {
+                return Poll::Ready(false);
+            }
+            std::future::Future::poll(cleanup.as_mut(), cx).map(|()| true)
+        });
+        let deadline_sleep = tokio::time::sleep_until(deadline);
+        tokio::pin!(deadline_sleep);
+        // Deadline-biased: the bound is polled FIRST, so a chain that becomes
+        // ready in the same wake-up as the bound loses to it. The fixed
+        // post-response timeout is unchanged for unauthenticated work — with no
+        // authorization bound the gate above is inert and this is exactly the
+        // five-second cancellation it always was.
+        let completed = tokio::select! {
+            biased;
+            () = &mut deadline_sleep => false,
+            completed = &mut guarded => completed,
+        };
+        if !completed {
             if authorization_at.is_some() {
-                // A compiled-in literal: no expiry instant, claim, subject,
-                // certificate field, or provider detail.
                 warn!(
                     "detached committed-response cleanup was cancelled at the admitted stream's \
                      authorization lifetime"
@@ -40254,9 +40303,7 @@ async fn proxy_to_backend(
                                 // charged budget reservation drop with the
                                 // cancelled future.
                                 return backend_dispatch_response(
-                                    authorization_expired_dispatch_placeholder(
-                                        resolved_ip.clone(),
-                                    ),
+                                    authorization_expired_dispatch_placeholder(resolved_ip.clone()),
                                     retained_body,
                                     backend_admission_permits,
                                 );
@@ -42519,8 +42566,11 @@ pub(crate) fn settle_precommit_authorization_expiry(
 ) -> PluginResult {
     let family = request_upload_auth_family(ctx);
     ctx.record_authorization_termination_once(termination, family);
-    let (status_code, headers, body) =
-        authorization_expired_pre_commitment_response(ctx, termination, is_native_grpc_request(ctx));
+    let (status_code, headers, body) = authorization_expired_pre_commitment_response(
+        ctx,
+        termination,
+        is_native_grpc_request(ctx),
+    );
     let body = match body {
         ResponseBody::Buffered(bytes) => bytes,
         // Unreachable: the pre-commitment terminal is always buffered. Fail
@@ -46563,7 +46613,10 @@ async fn proxy_to_backend_http2(
             // Health-neutral and already latched/counted once; the
             // pre-commitment terminal owns the client-visible shape.
             Err(ResponseCollectBound::AuthorizationExpired) => {
-                return (authorization_expired_dispatch_placeholder(resolved_ip), None);
+                return (
+                    authorization_expired_dispatch_placeholder(resolved_ip),
+                    None,
+                );
             }
         };
         let body_bytes = match collect_result {

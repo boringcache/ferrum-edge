@@ -1192,8 +1192,11 @@ async fn h3_auth_lifetime_native_h3_grpc_withheld_head_is_a_precommit_unauthenti
     // `backend_read_timeout_ms: 0` removes the operator fallback, and the
     // client sends no `grpc-timeout`, so the authorization deadline is the ONLY
     // bound in existence for the open + header race.
-    let (harness, https_port) =
-        spawn_h3_gateway(protected_proxy_yaml_with_read_timeout(backend_port, 0), false).await;
+    let (harness, https_port) = spawn_h3_gateway(
+        protected_proxy_yaml_with_read_timeout(backend_port, 0),
+        false,
+    )
+    .await;
     let entry = wait_for_h3_supported(&harness, Duration::from_secs(20)).await;
     assert!(
         entry.is_some(),

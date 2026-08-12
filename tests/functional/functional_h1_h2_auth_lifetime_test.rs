@@ -223,7 +223,11 @@ async fn h1_h2_auth_lifetime_zero_flow_credit_h2_client_cannot_outlive_the_crede
     let reservation = reserve_port().await.expect("backend port");
     let backend_port = reservation.port;
     let _backend = ScriptedTcpBackend::builder(reservation.into_listener())
-        .steps(chatty_sse_script(120, 16 * 1024, Duration::from_millis(250)))
+        .steps(chatty_sse_script(
+            120,
+            16 * 1024,
+            Duration::from_millis(250),
+        ))
         .spawn()
         .expect("spawn chatty sse backend");
 

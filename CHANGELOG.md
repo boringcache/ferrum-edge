@@ -45,11 +45,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   connection is parked flushing a socket the client stopped reading, so a
   body-only deadline is not enforceable. The backend body moves into ONE
   gateway-scheduled task that is its sole owner and sole poller and delivers
-  frames through a one-slot channel, so there is no lock on the response path
-  and exactly one task decides — in one biased `select!` — whether the response
-  completed or expired. A response that reached its own terminal before the
-  deadline is never counted or closed; at the exact deadline the security bound
-  wins deterministically; a full channel delays delivery but never enforcement.
+  frames through a one-slot channel, so there is no lock on the response path.
+  The pump and the protocol adapter wrapped around it settle ONE shared
+  compare-and-swap over `{Open, InnerCompletion, AuthorizationExpiry}` carrying
+  the single absolute deadline instant, so which of the two independently
+  scheduled observers settles the response never depends on the runtime's
+  scheduling order: either may claim the bound the moment the clock reaches it,
+  the upstream's own terminal is claimable only while the clock is still before
+  the deadline, and the first claim is final. A response that reached its own
+  terminal before the deadline is never counted or closed; a protected frame
+  queued before the bound is never delivered after it; at the exact deadline the
+  security bound wins deterministically; a full channel delays delivery but
+  never enforcement.
   Frames, trailers, and errors keep their order, an upstream error is never
   collapsed into a clean end of stream, and cancelling or dropping the response
   body terminates the pump and releases the upstream so no detached producer
@@ -73,7 +80,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hook owns a clone of the request context plus the protected response body, so
   it — and every remaining observer — is dropped instead of being spawned after
   the credential stopped being authorized. Legacy detach survives for the
-  client-owned RPC deadline only.
+  client-owned RPC deadline only, and that detached cleanup is bounded by the
+  earliest of the fixed five-second post-response timeout and the credential's
+  own deadline — enforced by an explicit past-deadline refusal that polls
+  nothing plus a deadline-biased race with a per-poll clock gate, rather than by
+  `timeout_at`, which polls its inner future before it observes the timer and so
+  would let a chain that is ready on its first poll execute once after the bound
+  had already elapsed.
 
   A final authoritative gate immediately before response-head commitment turns a
   credential that expired while the response phases were running into the fixed
@@ -88,7 +101,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   adaptive-concurrency neutral. The response-header write itself is bounded by
   the earliest of the client RPC deadline and the authorization deadline, and a
   downstream that cannot accept the HEADERS by expiry is reset rather than
-  waited on again or misreported as `DEADLINE_EXCEEDED`. Every HTTP/3
+  waited on again or misreported as `DEADLINE_EXCEEDED`. Every composed HTTP/3
+  dispatch and write seam carries that bound as a TYPED composition rather than
+  a bare instant — the native-H3 gRPC backend open and response-head race, the
+  buffered and streaming native-H3 downstream writes, and the cross-protocol
+  plain, terminal, and streaming writes — so a task that is not observed again
+  until after the LATER of the two instants still attributes the phase to the
+  bound that actually owned it instead of reporting a strictly earlier client
+  `grpc-timeout` as a security decision. Every HTTP/3
   authorization exit — pre-commitment, blocked write, idle, and mid-body — now
   records through the request's shared latch, so concurrent upload, response,
   and terminal paths cannot double count one stream.

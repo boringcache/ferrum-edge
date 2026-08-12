@@ -8238,7 +8238,12 @@ async fn handle_h3_request(
                 &ctx,
                 state.env_config.authenticated_stream_max_lifetime_seconds,
             );
-        let buffered_write_deadline_at = crate::proxy::auth_lifetime::compose_absolute_bound(
+        // TYPED, not just the instant: the buffered writer can be parked in QUIC
+        // flow control for as long as the client likes, so the task that must
+        // attribute the expiry is routinely not scheduled again until after BOTH
+        // instants have passed. Attribution therefore comes from the captured
+        // composition, never from re-reading the clock.
+        let buffered_write_bound = crate::proxy::auth_lifetime::ComposedAuthBound::compose(
             grpc_deadline_at,
             buffered_auth_deadline_plan,
         );
@@ -8246,13 +8251,13 @@ async fn handle_h3_request(
             ($write:expr) => {{
                 match if terminal_gateway_deadline {
                     crate::http3::stream_util::await_terminal_response_write_before_deadline(
-                        buffered_write_deadline_at,
+                        buffered_write_bound.deadline(),
                         $write,
                     )
                     .await
                 } else {
                     crate::http3::stream_util::await_response_write_before_deadline(
-                        buffered_write_deadline_at,
+                        buffered_write_bound.deadline(),
                         $write,
                     )
                     .await
@@ -8266,13 +8271,11 @@ async fn handle_h3_request(
                         false
                     }
                     Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
-                        // Attribute the composed bound. Authorization wins a tie,
-                        // matching every relay's biased select ordering, and the
-                        // fixed-cardinality counter is recorded only for the
-                        // first expiry on this stream.
-                        match crate::proxy::auth_lifetime::expired_authorization(
-                            buffered_auth_deadline_plan,
-                        ) {
+                        // Attribute the CAPTURED composition. Authorization wins
+                        // a tie, matching every relay's biased select ordering,
+                        // and the fixed-cardinality counter is recorded only for
+                        // the first expiry on this stream.
+                        match buffered_write_bound.expired_authorization() {
                             Some(termination) => {
                                 crate::proxy::insert_grpc_error_metadata(
                                     &mut ctx.metadata,
@@ -11266,10 +11269,18 @@ async fn dispatch_grpc_native_h3(
     // unbounded, so a continuously active upload plus a backend that withholds
     // its response head kept an admitted credential authorized indefinitely.
     // Earliest-wins, and a tie is attributed to authorization.
-    let dispatch_deadline_at = crate::proxy::auth_lifetime::compose_absolute_bound(
+    //
+    // TYPED, not just the instant: attribution is taken where BOTH instants
+    // were known and survives arbitrary observation delay. Re-reading the clock
+    // after the timeout returns would report the security decision for a phase
+    // a strictly earlier client `grpc-timeout` actually bounded, whenever this
+    // task was not scheduled again until after the later authorization deadline
+    // had also passed.
+    let dispatch_bound = crate::proxy::auth_lifetime::ComposedAuthBound::compose(
         protocol_dispatch_deadline_at,
         auth_deadline_plan,
     );
+    let dispatch_deadline_at = dispatch_bound.deadline();
 
     // Everything the failure/reject bookkeeping needs, bundled once so the
     // pre-split (backend open) and post-split (response header) failure paths
@@ -11331,7 +11342,7 @@ async fn dispatch_grpc_native_h3(
             // capability downgrade below must not run for a gateway policy
             // decision. A tie between the two bounds is attributed here,
             // matching every other composed seam.
-            Err(_) => match crate::proxy::auth_lifetime::expired_authorization(auth_deadline_plan) {
+            Err(_) => match dispatch_bound.expired_authorization() {
                 Some(termination) => Err(termination),
                 // The COLD connect (QUIC/TLS/H3) was still in flight. Under the
                 // operator `backend_read_timeout_ms` FALLBACK that is a genuine
@@ -11457,7 +11468,7 @@ async fn dispatch_grpc_native_h3(
             // backend that simply withholds its response head keeps this race
             // parked, so this is the arm that would otherwise let an admitted
             // credential outlive itself before ANY response head existed.
-            Err(_) => match crate::proxy::auth_lifetime::expired_authorization(auth_deadline_plan) {
+            Err(_) => match dispatch_bound.expired_authorization() {
                 Some(termination) => Err(termination),
                 None => {
                     // Attribute the expiry to whoever the gateway was actually
@@ -11623,16 +11634,15 @@ async fn dispatch_grpc_native_h3(
                     "grpc-message".to_string(),
                     termination.grpc_message().to_string(),
                 );
-                let sent = await_h3_grpc_terminal_write_with_grace(
-                    send_h3_grpc_reject_trailers_only(
+                let sent =
+                    await_h3_grpc_terminal_write_with_grace(send_h3_grpc_reject_trailers_only(
                         &mut send_half,
                         StatusCode::OK,
                         Bytes::new(),
                         &terminal_headers,
                         crate::proxy::FramedGrpcUnaryProvenance::NONE,
-                    ),
-                )
-                .await;
+                    ))
+                    .await;
                 if !sent {
                     crate::http3::stream_util::abort_response_stream(&mut send_half);
                 }
@@ -12227,27 +12237,33 @@ async fn dispatch_grpc_native_h3(
     // own `grpc-timeout` is optional, which leaves the common case completely
     // unbounded. When both have elapsed, the authorization bound is the one
     // attributed, matching the select-arm ordering.
-    let downstream_write_deadline_at =
-        crate::proxy::auth_lifetime::compose_absolute_bound(grpc_deadline_at, auth_deadline_plan);
+    //
+    // TYPED, not just the instant: the winner is decided here, where both
+    // instants are known, so a write that is not observed again until after the
+    // LATER of the two is still attributed to whichever bound actually owned
+    // it. Re-reading the clock would turn every late-observed client
+    // `grpc-timeout` into a security decision.
+    let downstream_write_bound = crate::proxy::auth_lifetime::ComposedAuthBound::compose(
+        grpc_deadline_at,
+        auth_deadline_plan,
+    );
     macro_rules! await_downstream_grpc_write {
         ($write:expr) => {{
             match crate::http3::stream_util::await_response_write_before_deadline(
-                downstream_write_deadline_at,
+                downstream_write_bound.deadline(),
                 $write,
             )
             .await
             {
                 Ok(()) => true,
                 Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded)
-                    if crate::proxy::auth_lifetime::expired_authorization(auth_deadline_plan)
-                        .is_some() =>
+                    if downstream_write_bound.expired_authorization().is_some() =>
                 {
                     // `is_some()` above proves the unwrap-free read below.
-                    let termination =
-                        crate::proxy::auth_lifetime::expired_authorization(auth_deadline_plan)
-                            .unwrap_or(
-                            crate::proxy::auth_lifetime::StreamAuthTermination::CredentialExpired,
-                        );
+                    let expiry = downstream_write_bound.expired_authorization();
+                    let termination = expiry.unwrap_or(
+                        crate::proxy::auth_lifetime::StreamAuthTermination::CredentialExpired,
+                    );
                     warn!(
                         "native H3 gRPC stream reached its authorization lifetime while the \
                          client was not consuming; resetting the stream"
@@ -12384,7 +12400,7 @@ async fn dispatch_grpc_native_h3(
                         // so a ready client still receives the clean status
                         // while a flow-control-blocked one cannot park the
                         // terminal write past the credential.
-                        downstream_write_deadline_at,
+                        downstream_write_bound.deadline(),
                     )
                     .await
                     {

@@ -7228,6 +7228,67 @@ pub mod _test_support {
         )
     }
 
+    /// Which owner settled one authenticated streaming response (issue #3815).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum AuthorizationTerminalOwnershipForTest {
+        Open,
+        InnerCompletion,
+        AuthorizationExpiry,
+    }
+
+    fn ownership_for_test(
+        ownership: crate::proxy::response_watchdog::AuthorizationTerminalOwnership,
+    ) -> AuthorizationTerminalOwnershipForTest {
+        use crate::proxy::response_watchdog::AuthorizationTerminalOwnership as Inner;
+        match ownership {
+            Inner::Open => AuthorizationTerminalOwnershipForTest::Open,
+            Inner::InnerCompletion => AuthorizationTerminalOwnershipForTest::InnerCompletion,
+            Inner::AuthorizationExpiry => {
+                AuthorizationTerminalOwnershipForTest::AuthorizationExpiry
+            }
+        }
+    }
+
+    /// The ONE terminal owner the gateway-owned response pump and the protocol
+    /// adapter that wraps it both settle (issue #3815), so a test can drive the
+    /// interleaving directly instead of racing two scheduled tasks.
+    #[derive(Clone, Debug)]
+    pub struct AuthorizationTerminalOwnerForTest(
+        crate::proxy::response_watchdog::AuthorizationTerminalOwner,
+    );
+
+    impl AuthorizationTerminalOwnerForTest {
+        #[must_use]
+        pub fn new(deadline_at: tokio::time::Instant) -> Self {
+            use crate::proxy::response_watchdog::AuthorizationTerminalOwner;
+            Self(AuthorizationTerminalOwner::new(deadline_at))
+        }
+
+        /// The hot-path gate every response poll takes: claims the bound itself
+        /// when this call lands at/after the deadline.
+        #[must_use]
+        pub fn observe(&self) -> AuthorizationTerminalOwnershipForTest {
+            ownership_for_test(self.0.observe())
+        }
+
+        /// Whether the bound has ALREADY been claimed, without consulting the
+        /// clock — the re-check a poll takes after its inner body returns.
+        #[must_use]
+        pub fn expiry_claimed(&self) -> bool {
+            self.0.expiry_claimed()
+        }
+
+        /// The pump claiming the upstream's OWN terminal. `false` when refused.
+        pub fn claim_inner_completion(&self) -> bool {
+            self.0.claim_inner_completion()
+        }
+
+        /// The pump's deadline arm claiming the authorization bound.
+        pub fn claim_authorization_expiry(&self) -> AuthorizationTerminalOwnershipForTest {
+            ownership_for_test(self.0.claim_authorization_expiry())
+        }
+    }
+
     /// Which bound ended a buffered response-body collection, as
     /// [`collect_response_under_authorization_for_test`] reports it.
     #[derive(Debug, PartialEq, Eq)]

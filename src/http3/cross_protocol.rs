@@ -1780,7 +1780,11 @@ where
         ctx,
         state.env_config.authenticated_stream_max_lifetime_seconds,
     );
-    let plain_write_deadline_at = crate::proxy::auth_lifetime::compose_absolute_bound(
+    // TYPED, not just the instant: a write parked in QUIC flow control is
+    // routinely not observed again until after BOTH instants have passed, so
+    // the winner is captured here rather than re-derived from the clock in the
+    // deadline branches below.
+    let plain_write_bound = crate::proxy::auth_lifetime::ComposedAuthBound::compose(
         grpc_web_deadline_at,
         plain_auth_deadline_plan,
     );
@@ -3382,7 +3386,7 @@ where
             response_body.len(),
         );
         if let Err(error) = crate::http3::stream_util::await_response_write_before_deadline(
-            plain_write_deadline_at,
+            plain_write_bound.deadline(),
             send_response_headers_with_framing(
                 stream,
                 response_status,
@@ -3408,9 +3412,7 @@ where
                     &mut backend_admission_permits,
                     backend_admission_elapsed,
                 );
-                if let Some(termination) =
-                    crate::proxy::auth_lifetime::expired_authorization(plain_auth_deadline_plan)
-                {
+                if let Some(termination) = plain_write_bound.expired_authorization() {
                     // Pre-commitment: no response HEADERS reached the client, so
                     // the protocol-correct terminal is the FIXED redacted 401.
                     // The body is a compiled-in literal — no expiry value, claim,
@@ -3475,7 +3477,7 @@ where
         };
         let (body_completed, client_disconnected) =
             match crate::http3::stream_util::await_response_write_before_deadline(
-                plain_write_deadline_at,
+                plain_write_bound.deadline(),
                 buffered_write,
             )
             .await
@@ -3498,9 +3500,7 @@ where
                         &mut backend_admission_permits,
                         backend_admission_elapsed,
                     );
-                    if let Some(termination) =
-                        crate::proxy::auth_lifetime::expired_authorization(plain_auth_deadline_plan)
-                    {
+                    if let Some(termination) = plain_write_bound.expired_authorization() {
                         // Post-commitment: response HEADERS are already on the
                         // wire, so the deterministic terminal is a RESET — never
                         // a fabricated clean finish and never an appended
@@ -3633,7 +3633,7 @@ where
 
     // Send response headers, then stream the body.
     if let Err(error) = crate::http3::stream_util::await_response_write_before_deadline(
-        plain_write_deadline_at,
+        plain_write_bound.deadline(),
         send_response_headers(stream, &ctx.method, status, &response_headers),
     )
     .await
@@ -3654,9 +3654,7 @@ where
                 &mut backend_admission_permits,
                 backend_admission_elapsed,
             );
-            if let Some(termination) =
-                crate::proxy::auth_lifetime::expired_authorization(plain_auth_deadline_plan)
-            {
+            if let Some(termination) = plain_write_bound.expired_authorization() {
                 // Pre-commitment: no response HEADERS reached the client, so
                 // the protocol-correct terminal is the FIXED redacted 401.
                 // The body is a compiled-in literal — no expiry value, claim,
@@ -4361,7 +4359,12 @@ where
     // The terminal trailer/FIN writes after the relay are as parkable as a DATA
     // frame, and the client `grpc-timeout` that used to bound them alone is
     // OPTIONAL. Bound them by the earliest of the two absolute plans.
-    let terminal_write_deadline_at = crate::proxy::auth_lifetime::compose_absolute_bound(
+    //
+    // TYPED, not just the instant: a parked terminal write is exactly the case
+    // where this task is not observed again until after BOTH instants have
+    // passed, so attribution is taken here — where both are known — instead of
+    // by re-reading the clock in the three deadline branches below.
+    let terminal_write_bound = crate::proxy::auth_lifetime::ComposedAuthBound::compose(
         streaming.grpc_deadline_at,
         auth_deadline_plan,
     );
@@ -4503,13 +4506,13 @@ where
         let terminal_len = terminal_data.len() as u64;
         let terminal_write = if gateway_terminal_selected {
             crate::http3::stream_util::await_terminal_response_write_before_deadline(
-                terminal_write_deadline_at,
+                terminal_write_bound.deadline(),
                 stream.send_data(terminal_data),
             )
             .await
         } else {
             crate::http3::stream_util::await_response_write_before_deadline(
-                terminal_write_deadline_at,
+                terminal_write_bound.deadline(),
                 stream.send_data(terminal_data),
             )
             .await
@@ -4518,7 +4521,7 @@ where
             Ok(()) if gateway_terminal_selected => {
                 bytes_streamed += terminal_len;
                 crate::http3::stream_util::await_terminal_response_write_before_deadline(
-                    terminal_write_deadline_at,
+                    terminal_write_bound.deadline(),
                     stream.finish(),
                 )
                 .await
@@ -4526,7 +4529,7 @@ where
             Ok(()) => {
                 bytes_streamed += terminal_len;
                 crate::http3::stream_util::await_response_write_before_deadline(
-                    terminal_write_deadline_at,
+                    terminal_write_bound.deadline(),
                     stream.finish(),
                 )
                 .await
@@ -4542,7 +4545,7 @@ where
                 // tie, matching every relay's biased select ordering, and the
                 // fixed-cardinality counter is recorded only when the relay
                 // itself did not already record one for this stream.
-                match crate::proxy::auth_lifetime::expired_authorization(auth_deadline_plan) {
+                match terminal_write_bound.expired_authorization() {
                     Some(termination) if auth_termination.is_none() => {
                         ctx.record_authorization_termination_once(
                             termination,
@@ -4603,13 +4606,13 @@ where
                 // Give an immediately-writable terminal frame one chance, but
                 // still cancel it if QUIC flow control would block.
                 crate::http3::stream_util::await_terminal_response_write_before_deadline(
-                    terminal_write_deadline_at,
+                    terminal_write_bound.deadline(),
                     stream.send_trailers(trailers),
                 )
                 .await
             } else {
                 crate::http3::stream_util::await_response_write_before_deadline(
-                    terminal_write_deadline_at,
+                    terminal_write_bound.deadline(),
                     stream.send_trailers(trailers),
                 )
                 .await
@@ -4617,14 +4620,14 @@ where
             let trailer_and_finish = match trailer_write {
                 Ok(()) if gateway_terminal_selected => {
                     crate::http3::stream_util::await_terminal_response_write_before_deadline(
-                        terminal_write_deadline_at,
+                        terminal_write_bound.deadline(),
                         stream.finish(),
                     )
                     .await
                 }
                 Ok(()) => {
                     crate::http3::stream_util::await_response_write_before_deadline(
-                        terminal_write_deadline_at,
+                        terminal_write_bound.deadline(),
                         stream.finish(),
                     )
                     .await
@@ -4640,7 +4643,7 @@ where
                     // tie, matching every relay's biased select ordering, and the
                     // fixed-cardinality counter is recorded only when the relay
                     // itself did not already record one for this stream.
-                    match crate::proxy::auth_lifetime::expired_authorization(auth_deadline_plan) {
+                    match terminal_write_bound.expired_authorization() {
                         Some(termination) if auth_termination.is_none() => {
                             ctx.record_authorization_termination_once(
                                 termination,
@@ -4660,7 +4663,7 @@ where
             }
         } else if had_trailers
             && let Err(error) = crate::http3::stream_util::await_response_write_before_deadline(
-                terminal_write_deadline_at,
+                terminal_write_bound.deadline(),
                 stream.finish(),
             )
             .await
@@ -4683,7 +4686,7 @@ where
                 // tie, matching every relay's biased select ordering, and the
                 // fixed-cardinality counter is recorded only when the relay
                 // itself did not already record one for this stream.
-                match crate::proxy::auth_lifetime::expired_authorization(auth_deadline_plan) {
+                match terminal_write_bound.expired_authorization() {
                     Some(termination) if auth_termination.is_none() => {
                         ctx.record_authorization_termination_once(
                             termination,
@@ -7651,25 +7654,25 @@ where
     // alone leaves the common case completely unbounded. Race the EARLIEST of
     // the two absolute bounds; when both have elapsed the authorization bound
     // is the one attributed, matching the select-arm ordering above.
-    let authorization_deadline_at = auth_deadline.map(|plan| plan.at);
-    let downstream_write_deadline_at = match (grpc_deadline_at, authorization_deadline_at) {
-        (Some(client), Some(authorization)) => Some(client.min(authorization)),
-        (Some(client), None) => Some(client),
-        (None, authorization) => authorization,
-    };
+    //
+    // TYPED, and composed in the shared helper rather than by a local `min`:
+    // the winner has to be decided where both instants are known. A parked
+    // write is precisely the case where this task is not observed again until
+    // after BOTH have passed, and re-reading the clock there would turn a
+    // strictly earlier client `grpc-timeout` into a security decision.
+    let downstream_write_bound =
+        crate::proxy::auth_lifetime::ComposedAuthBound::compose(grpc_deadline_at, auth_deadline);
     macro_rules! await_downstream_write {
         ($write:expr) => {{
             match crate::http3::stream_util::await_response_write_before_deadline(
-                downstream_write_deadline_at,
+                downstream_write_bound.deadline(),
                 $write,
             )
             .await
             {
                 Ok(()) => true,
                 Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
-                    let expired_authorization =
-                        auth_deadline.filter(|plan| tokio::time::Instant::now() >= plan.at);
-                    if let Some(plan) = expired_authorization {
+                    if let Some(termination) = downstream_write_bound.expired_authorization() {
                         warn!(
                             "cross-protocol H3 gRPC response reached its authorization lifetime \
                              while the client was not consuming; resetting the stream"
@@ -7683,8 +7686,8 @@ where
                         // Every call site breaks the relay loop, so this is
                         // recorded exactly once and the select arm cannot also
                         // fire for the same stream.
-                        auth_latch.record_once(plan.termination, auth_family);
-                        auth_termination = Some(plan.termination);
+                        auth_latch.record_once(termination, auth_family);
+                        auth_termination = Some(termination);
                     } else {
                         client_deadline_expired = true;
                         coalesce_buf.clear();
@@ -7941,7 +7944,7 @@ where
                     // The composed earliest-of bound, not the OPTIONAL client
                     // deadline alone: this terminal FIN is as parkable as a DATA
                     // frame (issue #3815).
-                    downstream_write_deadline_at,
+                    downstream_write_bound.deadline(),
                     stream.finish(),
                 )
                 .await
@@ -7950,12 +7953,12 @@ where
                     error,
                     crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded
                 ) {
-                    // Attribute the composed bound: authorization wins a tie,
-                    // matching this relay's biased select ordering. Reachable at
-                    // most once — the authorization select arm and every
-                    // `await_downstream_write!` end the relay before this
+                    // Attribute the CAPTURED composition: authorization wins a
+                    // tie, matching this relay's biased select ordering.
+                    // Reachable at most once — the authorization select arm and
+                    // every `await_downstream_write!` end the relay before this
                     // terminal FIN, so the counter cannot double-count.
-                    match crate::proxy::auth_lifetime::expired_authorization(auth_deadline) {
+                    match downstream_write_bound.expired_authorization() {
                         Some(termination) => {
                             auth_latch.record_once(termination, auth_family);
                             auth_termination = Some(termination);

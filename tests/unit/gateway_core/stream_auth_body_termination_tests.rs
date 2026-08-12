@@ -81,6 +81,18 @@ fn pending_body() -> ferrum_edge::proxy::ProxyBody {
     >())))
 }
 
+/// Give the current-thread runtime a scheduling turn so the gateway-owned pump
+/// task can run — or, once its body has been dropped, be reaped.
+///
+/// This is NOT a timing sleep: no wall-clock or virtual time passes. The
+/// client-visible terminal is decided synchronously by whichever observer claims
+/// the shared bound; RELEASING the upstream is the pump's own work, which the
+/// runtime performs when that task is next scheduled.
+async fn pump_scheduling_turn() {
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+}
+
 // --- Before response commitment --------------------------------------------
 
 #[tokio::test]
@@ -331,11 +343,15 @@ async fn the_upstream_body_is_dropped_exactly_once_at_expiry() {
     );
 
     let _terminal = body.frame().await.unwrap().unwrap();
-    assert!(dropped.load(Ordering::SeqCst));
     assert_eq!(
         polls.load(Ordering::SeqCst),
         0,
         "an already-elapsed deadline is checked before the inner body is polled"
+    );
+    pump_scheduling_turn().await;
+    assert!(
+        dropped.load(Ordering::SeqCst),
+        "claiming the bound cancels the gateway-owned pump, whose drop releases the upstream"
     );
     // Draining again must not produce a second completion.
     assert!(body.frame().await.is_none());
@@ -844,16 +860,19 @@ async fn at_the_exact_deadline_the_security_bound_wins_over_a_ready_frame() {
         "a tie at the exact deadline must terminate, never deliver the simultaneously ready \
          protected frame"
     );
-    assert!(
-        body.upstream_released(),
-        "the upstream must be released at the tie, not after one more frame"
-    );
-    assert!(dropped.load(Ordering::SeqCst));
+    // Claimed and accounted by this very poll, with the pump not yet scheduled.
     assert!(fired.load(Ordering::Acquire));
     assert_eq!(
         latch.observed(),
         Some(StreamAuthTermination::CredentialExpired)
     );
+
+    pump_scheduling_turn().await;
+    assert!(
+        body.upstream_released(),
+        "the upstream must be released at the tie, not after one more frame"
+    );
+    assert!(dropped.load(Ordering::SeqCst));
 }
 
 #[tokio::test(start_paused = true)]
@@ -1162,9 +1181,206 @@ async fn the_exact_deadline_still_resolves_to_the_security_decision_through_the_
         "a tie at the exact deadline must terminate, never deliver the simultaneously ready \
          protected frame"
     );
-    assert!(dropped.load(Ordering::SeqCst));
+    // Claimed synchronously by this poll, so the accounting is settled before
+    // the pump has been scheduled even once.
     assert_eq!(
         latch.observed(),
         Some(StreamAuthTermination::CredentialExpired)
     );
+    pump_scheduling_turn().await;
+    assert!(dropped.load(Ordering::SeqCst));
+}
+
+// --- One winner, decided by a CAS (issue #3815) ------------------------------
+//
+// The gateway-owned pump and the protocol adapter that wraps it are two
+// independently scheduled observers of ONE response, and which of them settles
+// it may not depend on the runtime's scheduling order. These drive the
+// interleaving directly — an explicit claim, a manual poll with no scheduling
+// turn, a frame parked in the pump's channel across the bound — instead of
+// racing two tasks, so each window is exercised on every run.
+
+type TerminalOwner = ferrum_edge::_test_support::AuthorizationTerminalOwnerForTest;
+type TerminalOwnership = ferrum_edge::_test_support::AuthorizationTerminalOwnershipForTest;
+
+/// Poll the client-visible body exactly once with a no-op waker, WITHOUT giving
+/// the runtime a chance to schedule the gateway-owned pump.
+fn poll_once<B>(body: &mut B) -> std::task::Poll<Option<Result<Frame<Bytes>, ProxyBodyError>>>
+where
+    B: Body<Data = Bytes, Error = ProxyBodyError> + Unpin,
+{
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    std::pin::Pin::new(body).poll_frame(&mut cx)
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_poll_that_reaches_the_bound_claims_it_with_no_timer_having_run() {
+    let owner = TerminalOwner::new(tokio::time::Instant::now() + Duration::from_secs(5));
+    assert_eq!(owner.observe(), TerminalOwnership::Open);
+    assert!(!owner.expiry_claimed());
+
+    // Exactly AT the bound: the observing poll itself settles it. No task ran,
+    // no timer fired, no channel closed — which is what keeps enforcement off
+    // the runtime's scheduling order.
+    tokio::time::advance(Duration::from_secs(5)).await;
+    assert_eq!(owner.observe(), TerminalOwnership::AuthorizationExpiry);
+    assert!(owner.expiry_claimed());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_completion_claimed_before_the_bound_survives_an_arbitrarily_late_observation() {
+    let owner = TerminalOwner::new(tokio::time::Instant::now() + Duration::from_secs(5));
+    assert!(owner.claim_inner_completion());
+
+    // The transport is parked on flow control for ten minutes. The response
+    // still completed, so nothing may reclassify it.
+    tokio::time::advance(Duration::from_secs(600)).await;
+    assert_eq!(owner.observe(), TerminalOwnership::InnerCompletion);
+    assert!(!owner.expiry_claimed());
+    assert_eq!(
+        owner.claim_authorization_expiry(),
+        TerminalOwnership::InnerCompletion,
+        "the first claim is final; a later deadline arm cannot take the response back"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_completion_reached_at_or_after_the_bound_is_refused_fail_closed() {
+    let owner = TerminalOwner::new(tokio::time::Instant::now() + Duration::from_secs(5));
+    tokio::time::advance(Duration::from_secs(5)).await;
+
+    assert!(
+        !owner.claim_inner_completion(),
+        "the upstream's own terminal is claimable only while the credential is still \
+         authorized — a tokio timer that has not fired yet may not widen that window"
+    );
+    assert_eq!(
+        owner.observe(),
+        TerminalOwnership::AuthorizationExpiry,
+        "a refused completion settles the response as an expiry, not as unclaimed"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn only_the_first_claim_of_the_bound_counts() {
+    let owner = TerminalOwner::new(tokio::time::Instant::now() + Duration::from_secs(5));
+    tokio::time::advance(Duration::from_secs(6)).await;
+
+    assert_eq!(
+        owner.claim_authorization_expiry(),
+        TerminalOwnership::AuthorizationExpiry
+    );
+    assert_eq!(
+        owner.claim_authorization_expiry(),
+        TerminalOwnership::AuthorizationExpiry,
+        "re-claiming is idempotent, so the pump's deadline arm and an adapter poll may \
+         both run it"
+    );
+    assert!(!owner.claim_inner_completion());
+}
+
+#[tokio::test]
+async fn a_poll_after_the_bound_settles_the_protocol_terminal_without_the_pump() {
+    // NOTHING has been awaited since this body was built, so the gateway-owned
+    // pump task has provably not been polled even once. This is the exact
+    // interleaving a "did the pump decide?" boolean cannot survive: the observer
+    // is at/after the bound and the pump has not spoken.
+    let latch = StreamAuthTerminationLatch::default();
+    let mut body = Box::pin(proxy_body_with_authorization_deadline_for_test(
+        pending_body(),
+        elapsed_deadline(StreamAuthTermination::CredentialExpired),
+        None,
+        StreamAuthProtocolFamily::Grpc,
+        Some(latch.clone()),
+    ));
+
+    let frame = match poll_once(&mut body) {
+        std::task::Poll::Ready(Some(Ok(frame))) => frame,
+        _ => panic!("the bound must settle in this very poll, never park on the pump"),
+    };
+    let trailers = frame
+        .trailers_ref()
+        .expect("native gRPC terminates with HTTP trailers");
+    assert_eq!(trailers.get("grpc-status").unwrap().to_str().unwrap(), "16");
+    assert_eq!(
+        latch.observed(),
+        Some(StreamAuthTermination::CredentialExpired),
+        "the claiming observer records the bounded class itself"
+    );
+}
+
+#[tokio::test]
+async fn the_client_never_sees_the_pumps_generic_released_upstream_message() {
+    // Ordinary HTTP/SSE has no terminal metadata, so the terminal is an error —
+    // but it must be the FIXED authorization message, not the pump's internal
+    // released-upstream one, which is what a lost check-then-act race delivered.
+    let mut body = Box::pin(proxy_body_with_authorization_deadline_for_test(
+        pending_body(),
+        elapsed_deadline(StreamAuthTermination::CredentialExpired),
+        None,
+        StreamAuthProtocolFamily::Http,
+        None,
+    ));
+
+    let error = match poll_once(&mut body) {
+        std::task::Poll::Ready(Some(Err(error))) => error.to_string(),
+        _ => panic!("an expired HTTP/SSE response must end with a transport error"),
+    };
+    assert!(
+        error.contains("credential expired"),
+        "the client-visible terminal must be the fixed authorization message: {error}"
+    );
+    assert!(
+        !error.contains("upstream released"),
+        "the pump's internal released-upstream terminal must never reach a client: {error}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_frame_queued_before_the_bound_is_never_delivered_after_it() {
+    let latch = StreamAuthTerminationLatch::default();
+    let closer = AuthorizationConnectionCloser::new();
+    let polls = Arc::new(AtomicUsize::new(0));
+    let dropped = Arc::new(AtomicBool::new(false));
+    // One protected frame, then a backend that never produces again. The pump
+    // reads that frame while the credential is still authorized and parks it in
+    // its one-slot channel, because the downstream is not reading.
+    let mut body = wrapped_body(
+        proxy_body_streaming_for_test(Box::pin(ProbeBody {
+            frames: VecDeque::from(vec![Frame::data(Bytes::from_static(b"protected"))]),
+            polls: Arc::clone(&polls),
+            dropped: Arc::clone(&dropped),
+        })),
+        future_deadline(
+            Duration::from_secs(5),
+            StreamAuthTermination::CredentialExpired,
+        ),
+        &latch,
+        &closer,
+    );
+
+    // The pump queues the frame here, with the transport polling nothing...
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    // ...and the bound then elapses with that protected frame still queued.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    let error = body
+        .frame()
+        .await
+        .expect("a terminal")
+        .err()
+        .expect("the queued protected frame must not be delivered");
+    assert!(
+        error.to_string().contains("credential expired"),
+        "a frame queued before the bound must lose to the authorization terminal: {error}"
+    );
+    assert!(
+        dropped.load(Ordering::SeqCst),
+        "the upstream is released at the bound, not after the queued frame drains"
+    );
+    assert_eq!(
+        latch.observed(),
+        Some(StreamAuthTermination::CredentialExpired)
+    );
+    assert!(body.frame().await.is_none(), "no second completion");
 }

@@ -29,6 +29,7 @@ use crate::retry::ErrorClass;
 pub type ProxyBodyError = Box<dyn std::error::Error + Send + Sync>;
 
 use crate::proxy::auth_lifetime::AUTHORIZATION_EXPIRED_GRPC_STATUS_HEADER;
+use crate::proxy::response_watchdog::AuthorizationTerminalOwner;
 
 /// Authorization-lifetime state carried on a client-visible response body.
 ///
@@ -1035,24 +1036,25 @@ impl ProxyBody {
     /// terminal above, asks `closer` to close the client connection so the
     /// request/session accounting held by `ProxyBody` itself is released too.
     ///
-    /// Single ownership is also what makes the terminal winner authoritative:
-    /// one task decides, in one biased `select!`, whether this response
-    /// completed or expired, so a response that reached its own terminal before
-    /// the deadline can never be counted or closed by a racing watchdog.
+    /// The terminal winner is authoritative because BOTH observers settle one
+    /// shared compare-and-swap
+    /// (`response_watchdog::AuthorizationTerminalOwner`) carrying the single
+    /// absolute deadline instant, rather than each running its own clock:
     ///
-    /// The [`TotalDeadlineBody`] wrapped around that pump therefore carries NO
-    /// authorization timer of its own; it reacts to the pump's published
-    /// decision. It exists here only to own the client-visible terminal SHAPES
-    /// (native `grpc-status: 16` trailers, the bounded gRPC-Web frame, the
-    /// deterministic HTTP/SSE transport error) and the deferred-accounting
-    /// classification. A second timer would be a second owner: the pump can
-    /// reach a clean upstream EOF (or an upstream error) well before the
-    /// deadline and queue that terminal, while a downstream parked on flow
-    /// control does not poll it until long after — and an independent sleep
-    /// here would then overwrite that completed response with an authorization
-    /// terminal, set `fired`, and record the latch for a stream this contract
-    /// never terminated. The client `grpc-timeout` wrapper installed INSIDE
-    /// this one keeps its own timer and is unaffected.
+    /// * the pump may claim the upstream's own terminal only while that instant
+    ///   is still in the future, so a completed response can never be
+    ///   reclassified by a downstream that parks past the deadline;
+    /// * the [`TotalDeadlineBody`] wrapped around the pump may claim the bound
+    ///   the moment a poll reaches it, so enforcement never waits on the pump's
+    ///   timer task being scheduled;
+    /// * whichever claim lands first is final, so `fired`, the shared latch, and
+    ///   the fixed-cardinality counter describe exactly one outcome.
+    ///
+    /// That wrapper still carries no timer of its own: it owns the
+    /// client-visible terminal SHAPES (native `grpc-status: 16` trailers, the
+    /// bounded gRPC-Web frame, the deterministic HTTP/SSE transport error) and
+    /// the deferred-accounting classification. The client `grpc-timeout` wrapper
+    /// installed INSIDE this one keeps its own timer and is unaffected.
     ///
     /// `closer` is `None` for frontends that own their own downstream writes and
     /// already bound every one of them (the native HTTP/3 relays), where a
@@ -1109,17 +1111,17 @@ impl ProxyBody {
                     Arc::clone(&fired),
                     closer,
                 );
-                let expiry = guarded.expiry_decision();
+                let owner = guarded.terminal_owner();
                 let bounded = TotalDeadlineBody::with_terminal(
                     guarded,
-                    // No timer here: the pump owns the decision.
+                    // No timer here: the shared CAS settles this bound.
                     None,
                     deadline_frame,
                     Arc::clone(&fired),
                     terminal,
                     Some(auth_latch),
                 )
-                .with_pump_expiry(expiry);
+                .with_authorization_terminal_owner(owner);
                 ProxyBodyKind::Stream(Box::pin(bounded))
             }
             ProxyBodyKind::Tracked(body) => {
@@ -1131,17 +1133,17 @@ impl ProxyBody {
                     Arc::clone(&fired),
                     closer,
                 );
-                let expiry = guarded.expiry_decision();
+                let owner = guarded.terminal_owner();
                 let bounded = TotalDeadlineBody::with_terminal(
                     guarded,
-                    // No timer here: the pump owns the decision.
+                    // No timer here: the shared CAS settles this bound.
                     None,
                     deadline_frame,
                     Arc::clone(&fired),
                     terminal,
                     Some(auth_latch),
                 )
-                .with_pump_expiry(expiry);
+                .with_authorization_terminal_owner(owner);
                 ProxyBodyKind::Stream(Box::pin(bounded))
             }
             full @ ProxyBodyKind::Full(_) => full,
@@ -3833,18 +3835,18 @@ struct TotalDeadlineBody<B> {
     /// the authorization-lifetime regime, where the request-upload body may be
     /// racing the same absolute plan in the opposite direction.
     auth_latch: Option<crate::proxy::auth_lifetime::StreamAuthTerminationLatch>,
-    /// The gateway-owned response pump's completed-versus-expired decision.
+    /// The ONE terminal owner this adapter shares with the gateway-owned
+    /// response pump.
     ///
     /// Present ONLY in the authorization-lifetime regime, and when it is
-    /// present `deadline` is deliberately `None`: the pump is the sole owner of
-    /// that decision, and a second timer here would overwrite a response that
-    /// reached its own terminal BEFORE the deadline with an authorization
-    /// terminal whenever the transport did not poll this body until after it
-    /// (see `crate::proxy::response_watchdog`). Enforcement is the pump's, so
-    /// deferring to it costs nothing: it releases the upstream and closes the
-    /// transport without any downstream poll, and the closure that publishes
-    /// its decision is exactly what wakes this body.
-    pump_expiry: Option<crate::proxy::response_watchdog::AuthorizationExpiryDecision>,
+    /// present `deadline` is deliberately `None`: an independent sleep here
+    /// would be a SECOND owner, and would overwrite a response that reached its
+    /// own terminal BEFORE the deadline with an authorization terminal whenever
+    /// the transport did not poll this body until after it. Deferring the
+    /// decision to the pump alone is equally wrong in the other direction, so
+    /// this adapter settles the shared CAS itself — see
+    /// `crate::proxy::response_watchdog`.
+    authorization_terminal: Option<AuthorizationTerminalOwner>,
     saw_data: bool,
     done: bool,
 }
@@ -3940,24 +3942,22 @@ impl<B> TotalDeadlineBody<B> {
             deadline_fired,
             terminal,
             auth_latch,
-            pump_expiry: None,
+            authorization_terminal: None,
             saw_data: false,
             done: false,
         }
     }
 
-    /// Settle this adapter's authorization terminal from the gateway-owned
-    /// response pump's decision instead of a timer of its own.
-    fn with_pump_expiry(
-        mut self,
-        expiry: crate::proxy::response_watchdog::AuthorizationExpiryDecision,
-    ) -> Self {
+    /// Settle this adapter's authorization terminal through the ONE shared
+    /// terminal owner instead of a timer of its own.
+    fn with_authorization_terminal_owner(mut self, owner: AuthorizationTerminalOwner) -> Self {
         debug_assert!(
             self.deadline.is_none(),
-            "the pump owns the authorization decision; this adapter must not also arm a timer"
+            "the shared owner settles the authorization bound; this adapter must not also arm \
+             a timer"
         );
         self.deadline = None;
-        self.pump_expiry = Some(expiry);
+        self.authorization_terminal = Some(owner);
         self
     }
 
@@ -4052,15 +4052,15 @@ where
         if this.done {
             return Poll::Ready(None);
         }
-        // The AUTHORIZATION regime has no clock here: the gateway-owned pump is
-        // the sole owner of the completed-versus-expired decision, and it
-        // publishes an expiry before the channel closure that wakes this body.
-        // Read it BEFORE the channel, so a frame the pump had already handed
-        // over when the deadline arrived is not delivered ahead of the terminal.
+        // The AUTHORIZATION regime settles through the ONE shared terminal
+        // owner, ahead of the inner body. `observe()` claims the bound itself
+        // when this poll arrives at/after it, so enforcement never waits on the
+        // pump's timer task being scheduled, and a frame the pump queued while
+        // the credential was still authorized is never delivered after it.
         if this
-            .pump_expiry
+            .authorization_terminal
             .as_ref()
-            .is_some_and(crate::proxy::response_watchdog::AuthorizationExpiryDecision::expired)
+            .is_some_and(AuthorizationTerminalOwner::observe_expiry)
         {
             return this.emit_deadline_terminal();
         }
@@ -4069,7 +4069,7 @@ where
         // at the client deadline even for a backend that streams frames
         // continuously (which would never yield a `Pending` inner poll to drive
         // an idle check). A `None` deadline (unrepresentable, or owned by the
-        // pump above) is inert.
+        // shared CAS above) is inert.
         if let Some(deadline) = this.deadline.as_mut()
             && std::future::Future::poll(deadline.as_mut(), cx).is_ready()
         {
@@ -4079,7 +4079,21 @@ where
             this.done = true;
             return Poll::Ready(None);
         };
-        match Pin::new(inner).poll_frame(cx) {
+        let polled = Pin::new(inner).poll_frame(cx);
+        // RE-OBSERVE after the inner poll. A concurrent pump can claim the
+        // bound while this poll is in flight, and whatever the inner body just
+        // produced — a queued protected frame, or its own generic
+        // released-upstream error — must lose to the protocol-correct
+        // authorization terminal. One acquire load: the clock was already read
+        // above, so it cannot decide anything new here.
+        if this
+            .authorization_terminal
+            .as_ref()
+            .is_some_and(AuthorizationTerminalOwner::expiry_claimed)
+        {
+            return this.emit_deadline_terminal();
+        }
+        match polled {
             Poll::Ready(Some(Ok(frame))) => {
                 if frame.data_ref().is_some_and(|data| !data.is_empty()) {
                     this.saw_data = true;
@@ -4118,7 +4132,7 @@ where
     fn size_hint(&self) -> http_body::SizeHint {
         if self.done {
             http_body::SizeHint::with_exact(0)
-        } else if self.deadline.is_some() || self.pump_expiry.is_some() {
+        } else if self.deadline.is_some() || self.authorization_terminal.is_some() {
             // The deadline may replace the remaining body with native trailers
             // or a differently-sized gRPC-Web terminal DATA frame. Do not let
             // hyper reconstruct the stripped backend Content-Length from an

@@ -26,41 +26,59 @@
 //! The upstream body is moved into ONE gateway-scheduled task — the response
 //! pump — which is its sole owner and sole poller for the rest of its life. The
 //! client-visible [`AuthorizationCancellableBody`] holds only the receiving end
-//! of a bounded channel. Nothing is shared between the two except the channel
-//! and a handful of write-once flags, so:
+//! of a bounded channel. Nothing is shared between the two except the channel,
+//! a handful of write-once flags, and the terminal-owner CAS below, so:
 //!
 //! * There is **no lock on the response path.** The previous shape put the
 //!   upstream behind a `std::sync::Mutex` and acquired it for every
 //!   authenticated response frame, which both violates the repository's
 //!   no-avoidable-locks hot-path invariant and lets a task enforcing the
 //!   deadline block behind somebody else's inner `poll_frame`.
-//! * There is **no terminal race.** Exactly one task decides whether this
-//!   response completed or expired, in one biased `select!`. A body that
-//!   reached its own terminal before the deadline can no longer be counted or
-//!   closed by a concurrent watchdog, and a body still in flight at the
-//!   deadline cannot escape it by completing in parallel.
+//! * There is **no terminal race.** Every terminal — the upstream's own and the
+//!   authorization bound's — is settled by one compare-and-swap
+//!   ([`AuthorizationTerminalOwner`]), so a body that reached its own terminal
+//!   before the deadline can no longer be counted or closed by a concurrent
+//!   observer, and a body still in flight at the deadline cannot escape it by
+//!   completing in parallel.
 //!
-//! # The pump is the SOLE terminal winner
+//! # One winner, decided by a CAS rather than by who is scheduled first
 //!
-//! The protocol adapter that wraps this body ([`TotalDeadlineBody`], which owns
-//! the client-visible gRPC / gRPC-Web / HTTP terminal shapes) deliberately does
-//! NOT arm an authorization timer of its own. It reacts to
-//! [`AuthorizationExpiryDecision`], which this pump publishes.
+//! The pump and the protocol adapter that wraps this body ([`TotalDeadlineBody`],
+//! which owns the client-visible gRPC / gRPC-Web / HTTP terminal shapes) are two
+//! independently scheduled observers of ONE response. Exactly one of them must
+//! settle it, and which one may not depend on the runtime's scheduling order:
 //!
-//! An independent timer there would reopen exactly the race single ownership
-//! exists to close: the pump can poll the upstream to its own terminal well
-//! BEFORE the deadline and queue it, and — because the downstream transport is
-//! parked on flow control or on an unreadable socket — that queued terminal may
-//! not be polled until long after the deadline. A second timer would then see
-//! its own sleep elapsed, overwrite a completed response with an authorization
-//! terminal, set the classification flag, and record the latch for a stream
-//! that was never terminated by this contract.
+//! * A **boolean** "did it expire?" flag is not enough. The adapter reads it,
+//!   the pump publishes an expiry and closes the channel, and the adapter — in
+//!   the SAME poll — then delivers the frame the pump had already queued, or the
+//!   generic released-upstream error instead of the protocol-correct
+//!   authorization terminal.
+//! * A **timer** in the adapter is not enough either, in the other direction:
+//!   the pump can poll the upstream to its own terminal well BEFORE the deadline
+//!   and queue it, and — because the downstream transport is parked on flow
+//!   control or on an unreadable socket — that queued terminal may not be polled
+//!   until long after the deadline. An independent sleep would then overwrite a
+//!   completed response with an authorization terminal, set the classification
+//!   flag, and record the latch for a stream this contract never terminated.
+//! * Reading NEITHER, and simply deferring to the pump, makes a poll that
+//!   arrives at/after the deadline depend on the pump's timer task having been
+//!   scheduled first — which the client, not the gateway, decides.
 //!
-//! `TotalDeadlineBody` therefore has no clock in this regime. It observes the
-//! decision, which is published with `Release` BEFORE the channel closure that
-//! wakes the receiver, so the wake-up can never be observed before the decision
-//! that explains it. Enforcement is unaffected: releasing the upstream and
-//! closing the transport are the pump's own work and never waited on a
+//! [`AuthorizationTerminalOwner`] resolves all three. It is a shared
+//! compare-and-swap over `{Open, InnerCompletion, AuthorizationExpiry}` carrying
+//! the ONE absolute deadline instant, so:
+//!
+//! * either observer may claim the bound the moment the clock reaches it, with
+//!   no timer and no allocation, and the first claim is final;
+//! * the upstream's own terminal is claimable only while the clock is still
+//!   BEFORE the deadline, so a completion can never overtake an elapsed bound
+//!   because a tokio timer had not fired yet;
+//! * a claimed expiry is visible to every observer before the channel closure
+//!   that wakes them, so no protected frame queued before the bound can be
+//!   delivered after it.
+//!
+//! Enforcement is unaffected by which side claims: releasing the upstream and
+//! closing the transport are the pump's own work and are never waited on a
 //! downstream poll.
 //!
 //! [`TotalDeadlineBody`]: crate::proxy::body
@@ -124,7 +142,7 @@
 
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -135,7 +153,7 @@ use tokio::sync::mpsc;
 
 use crate::proxy::auth_lifetime::{
     AuthorizationConnectionCloser, StreamAuthDeadline, StreamAuthProtocolFamily,
-    StreamAuthTerminationLatch,
+    StreamAuthTermination, StreamAuthTerminationLatch,
 };
 use crate::proxy::body::ProxyBodyError;
 
@@ -160,10 +178,14 @@ pub(crate) const TRANSPORT_CLOSE_GRACE: Duration = Duration::from_secs(2);
 const RESPONSE_PUMP_CAPACITY: usize = 1;
 
 /// Fixed terminal for a body whose pump ended without delivering a terminal of
-/// its own — the authorization deadline elapsed, or the pump was cancelled.
+/// its own — an expiry this body itself observed, or a cancelled/dead pump.
 ///
 /// Deliberately an error rather than a clean end of stream: a client must be
-/// able to tell an authorization termination from a complete response.
+/// able to tell an authorization termination from a complete response. The
+/// protocol adapter outside this body substitutes the protocol-correct terminal
+/// (native `grpc-status: 16` trailers, the bounded gRPC-Web frame, the fixed
+/// HTTP/SSE message) for the expiry case, so this message reaches a client only
+/// when nothing wrapped this body.
 const RELEASED_MESSAGE: &str =
     "authenticated stream terminated: authorization lifetime elapsed, upstream released";
 
@@ -179,30 +201,130 @@ enum PumpItem {
     Error(ProxyBodyError),
 }
 
-/// The pump's authoritative answer to "did this response expire?", shared with
-/// the protocol adapter outside the body.
-///
-/// Set — once, by the pump, with `Release` — only on
-/// [`PumpExit::Expired`], and always BEFORE the channel closure that wakes the
-/// receiver. Everything else (a clean upstream end, an upstream error, a
-/// cancelled pump) leaves it clear, so a response that reached its own terminal
-/// before the deadline can never be reclassified as an authorization
-/// termination by a late downstream poll.
-///
-/// Carries no class, instant, or identity: the bounded termination class
-/// travels through [`StreamAuthTerminationLatch`] exactly as before.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct AuthorizationExpiryDecision(Arc<AtomicBool>);
+/// Which owner settled one authenticated streaming response.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AuthorizationTerminalOwnership {
+    /// Unclaimed: the upstream has not reached a terminal of its own and the
+    /// authorization bound has not elapsed. Protected frames may be delivered.
+    Open,
+    /// The upstream reached its OWN terminal — a clean end of stream or an
+    /// upstream error — while the credential was still authorized. That
+    /// terminal is the client-visible one, however long the transport then
+    /// takes to drain it.
+    InnerCompletion,
+    /// The admitted credential's authorization lifetime elapsed first. The
+    /// protocol-correct authorization terminal is the client-visible one and no
+    /// queued protected frame may be delivered.
+    AuthorizationExpiry,
+}
 
-impl AuthorizationExpiryDecision {
-    /// Whether the pump decided this response was terminated by the
-    /// authorization lifetime.
-    pub(crate) fn expired(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+const TERMINAL_OPEN: u8 = 0;
+const TERMINAL_INNER_COMPLETION: u8 = 1;
+const TERMINAL_AUTHORIZATION_EXPIRY: u8 = 2;
+
+const fn decode_ownership(claimed: u8) -> AuthorizationTerminalOwnership {
+    match claimed {
+        TERMINAL_INNER_COMPLETION => AuthorizationTerminalOwnership::InnerCompletion,
+        TERMINAL_AUTHORIZATION_EXPIRY => AuthorizationTerminalOwnership::AuthorizationExpiry,
+        _ => AuthorizationTerminalOwnership::Open,
+    }
+}
+
+#[derive(Debug)]
+struct TerminalOwnerState {
+    /// The admitted credential's ONE absolute authorization deadline. Every
+    /// observer decides "is this at/after expiry?" from this instant, so a poll
+    /// arriving at/after the bound settles it itself instead of depending on
+    /// the pump's timer task having been scheduled first.
+    deadline_at: tokio::time::Instant,
+    claimed: AtomicU8,
+}
+
+/// The single terminal owner for one authenticated streaming response, shared
+/// by the gateway-owned pump and the protocol adapter outside the body.
+///
+/// Carries no class, instant beyond the bound, or identity: the bounded
+/// termination class travels through [`StreamAuthTerminationLatch`] as before.
+#[derive(Clone, Debug)]
+pub(crate) struct AuthorizationTerminalOwner(Arc<TerminalOwnerState>);
+
+impl AuthorizationTerminalOwner {
+    pub(crate) fn new(deadline_at: tokio::time::Instant) -> Self {
+        Self(Arc::new(TerminalOwnerState {
+            deadline_at,
+            claimed: AtomicU8::new(TERMINAL_OPEN),
+        }))
     }
 
-    fn publish_expired(&self) {
-        self.0.store(true, Ordering::Release);
+    /// The hot-path gate every response poll takes BEFORE it can deliver a
+    /// frame: one acquire load, plus one monotonic clock read while the
+    /// response is still unclaimed. No lock, no allocation, and no timer
+    /// registration — a poll that never happens is enforced by the pump's own
+    /// deadline arm instead.
+    ///
+    /// A poll at/after the bound CLAIMS the expiry here, so the security
+    /// decision does not wait on another task being scheduled.
+    #[inline]
+    pub(crate) fn observe(&self) -> AuthorizationTerminalOwnership {
+        let claimed = self.0.claimed.load(Ordering::Acquire);
+        if claimed != TERMINAL_OPEN {
+            return decode_ownership(claimed);
+        }
+        if tokio::time::Instant::now() < self.0.deadline_at {
+            return AuthorizationTerminalOwnership::Open;
+        }
+        self.claim(TERMINAL_AUTHORIZATION_EXPIRY)
+    }
+
+    /// [`Self::observe`] projected to the only question a response poll asks:
+    /// "is this response settled as an authorization expiry?"
+    #[inline]
+    pub(crate) fn observe_expiry(&self) -> bool {
+        self.observe() == AuthorizationTerminalOwnership::AuthorizationExpiry
+    }
+
+    /// Whether the authorization bound has ALREADY been claimed, without
+    /// consulting the clock.
+    ///
+    /// Used for the re-check immediately after an inner poll, where the only
+    /// new information is a concurrent claim: the clock was read at the top of
+    /// the same poll, so reading it again would decide nothing.
+    #[inline]
+    pub(crate) fn expiry_claimed(&self) -> bool {
+        self.0.claimed.load(Ordering::Acquire) == TERMINAL_AUTHORIZATION_EXPIRY
+    }
+
+    /// Claim this response for the upstream's OWN terminal. `true` when this
+    /// call won.
+    ///
+    /// Refused once the authorization deadline has elapsed, measured against
+    /// the same instant every observer uses — so a terminal produced at/after
+    /// the bound can never overtake it merely because a tokio timer had not
+    /// fired yet. A refusal settles the response as an expiry, fail-closed.
+    pub(crate) fn claim_inner_completion(&self) -> bool {
+        if tokio::time::Instant::now() >= self.0.deadline_at {
+            self.claim(TERMINAL_AUTHORIZATION_EXPIRY);
+            return false;
+        }
+        self.claim(TERMINAL_INNER_COMPLETION) == AuthorizationTerminalOwnership::InnerCompletion
+    }
+
+    /// Claim this response for the authorization bound, returning the winner.
+    /// Idempotent: a bound another observer already claimed stays claimed.
+    pub(crate) fn claim_authorization_expiry(&self) -> AuthorizationTerminalOwnership {
+        self.claim(TERMINAL_AUTHORIZATION_EXPIRY)
+    }
+
+    fn claim(&self, owner: u8) -> AuthorizationTerminalOwnership {
+        match self.0.claimed.compare_exchange(
+            TERMINAL_OPEN,
+            owner,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => decode_ownership(owner),
+            Err(claimed) => decode_ownership(claimed),
+        }
     }
 }
 
@@ -247,11 +369,31 @@ pub struct AuthorizationCancellableBody {
     /// Set by the pump once it no longer owns the upstream body. Observed
     /// through `crate::_test_support`.
     released: Arc<AtomicBool>,
-    /// The pump's completed-versus-expired decision, handed to the protocol
+    /// The ONE terminal owner, shared with the pump and with the protocol
     /// adapter that wraps this body.
-    expiry: AuthorizationExpiryDecision,
+    terminal: AuthorizationTerminalOwner,
+    /// Bounded class, family, shared latch, and classification flag, so a bound
+    /// this body claims on its own poll is accounted exactly once even when the
+    /// pump is cancelled before its own deadline arm runs. Every one of these
+    /// is idempotent, so the pump and the adapter may repeat it.
+    termination: StreamAuthTermination,
+    family: StreamAuthProtocolFamily,
+    latch: StreamAuthTerminationLatch,
+    fired: Arc<AtomicBool>,
     /// Held only for its `Drop`.
     _pump: AbortPumpOnDrop,
+}
+
+/// The fixed terminal for a body whose pump ended without delivering one.
+///
+/// Reachable only when this body is polled directly (the protocol adapter
+/// outside it observes the same owner first and substitutes the
+/// protocol-correct authorization terminal) or when the pump died.
+fn released_terminal() -> ProxyBodyError {
+    Box::new(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        RELEASED_MESSAGE,
+    )) as ProxyBodyError
 }
 
 /// The gateway-owned response pump: sole owner and sole poller of `inner`.
@@ -265,7 +407,7 @@ async fn run_response_pump<B>(
     fired: Arc<AtomicBool>,
     released: Arc<AtomicBool>,
     settled: Arc<AtomicBool>,
-    expiry_decision: AuthorizationExpiryDecision,
+    terminal: AuthorizationTerminalOwner,
     closer: Option<AuthorizationConnectionCloser>,
 ) where
     B: http_body::Body<Data = Bytes, Error = ProxyBodyError> + Send + Unpin + 'static,
@@ -298,14 +440,36 @@ async fn run_response_pump<B>(
             frame = inner.frame() => frame,
         };
         match frame {
-            Some(Ok(frame)) => permit.send(PumpItem::Frame(frame)),
+            Some(Ok(frame)) => {
+                // A protected frame may only be queued while the bound is
+                // unclaimed. The receiving side gates DELIVERY on the same
+                // owner, so this is belt and braces — but it also stops the
+                // pump reading one more frame past a bound another observer
+                // has already settled.
+                if terminal.expiry_claimed() {
+                    break PumpExit::Expired;
+                }
+                permit.send(PumpItem::Frame(frame));
+            }
             // Errors stay errors. Turning one into `End` would let a failed
             // backend look like a complete response.
+            //
+            // CLAIM BEFORE SENDING, on both terminal arms: the upstream's own
+            // terminal is the client-visible one only if it wins the shared
+            // CAS, which refuses once the bound has elapsed. Losing the claim
+            // means an observer already settled this response as an expiry, so
+            // the terminal is dropped rather than queued behind it.
             Some(Err(error)) => {
+                if !terminal.claim_inner_completion() {
+                    break PumpExit::Expired;
+                }
                 permit.send(PumpItem::Error(error));
                 break PumpExit::Completed;
             }
             None => {
+                if !terminal.claim_inner_completion() {
+                    break PumpExit::Expired;
+                }
                 permit.send(PumpItem::End);
                 break PumpExit::Completed;
             }
@@ -335,16 +499,17 @@ async fn run_response_pump<B>(
             drop(sender);
         }
         PumpExit::Expired => {
+            // CLAIM BEFORE CLOSING. The closure below is what wakes a parked
+            // receiver, and every observer reads the owner before it reads the
+            // channel — so the claim must be visible to anything the closure
+            // can wake. Idempotent: an observer that already claimed the bound
+            // from its own poll stays the winner.
+            terminal.claim_authorization_expiry();
             fired.store(true, Ordering::Release);
             // ONE latch, shared with the adapter outside this body, so the two
             // mechanisms record exactly one termination for the stream no
             // matter which of them fires first.
             latch.record_once(deadline.termination, family);
-            // PUBLISH BEFORE CLOSING. The closure below is what wakes a parked
-            // receiver, and the adapter outside this body reads this decision
-            // instead of racing a timer of its own — so the decision must be
-            // visible to anything the closure can wake.
-            expiry_decision.publish_expired();
             drop(sender);
             let Some(closer) = closer else {
                 return;
@@ -385,17 +550,17 @@ impl AuthorizationCancellableBody {
         let (sender, receiver) = mpsc::channel(RESPONSE_PUMP_CAPACITY);
         let settled = Arc::new(AtomicBool::new(false));
         let released = Arc::new(AtomicBool::new(false));
-        let expiry = AuthorizationExpiryDecision::default();
+        let terminal = AuthorizationTerminalOwner::new(deadline.at);
         let handle = tokio::spawn(run_response_pump(
             inner,
             sender,
             deadline,
             family,
-            latch,
-            fired,
+            latch.clone(),
+            Arc::clone(&fired),
             Arc::clone(&released),
             Arc::clone(&settled),
-            expiry.clone(),
+            terminal.clone(),
             closer,
         ));
         Self {
@@ -403,22 +568,33 @@ impl AuthorizationCancellableBody {
             settled,
             finished: false,
             released,
-            expiry,
+            terminal,
+            termination: deadline.termination,
+            family,
+            latch,
+            fired,
             _pump: AbortPumpOnDrop(handle),
         }
     }
 
-    /// The pump's completed-versus-expired decision, for the protocol adapter
-    /// that wraps this body. That adapter owns the client-visible terminal
-    /// shapes but MUST NOT own a second authorization timer — see the module
-    /// documentation.
-    pub(crate) fn expiry_decision(&self) -> AuthorizationExpiryDecision {
-        self.expiry.clone()
+    /// The ONE terminal owner, for the protocol adapter that wraps this body.
+    /// That adapter owns the client-visible terminal shapes and settles them
+    /// through this same CAS — see the module documentation.
+    pub(crate) fn terminal_owner(&self) -> AuthorizationTerminalOwner {
+        self.terminal.clone()
     }
 
     fn settle(&mut self) {
         self.finished = true;
         self.settled.store(true, Ordering::Release);
+    }
+
+    /// Settle a bound this body observed itself. Every step is idempotent, so
+    /// the pump's own expiry path and the adapter's terminal may repeat it.
+    fn settle_authorization_expiry(&mut self) {
+        self.settle();
+        self.fired.store(true, Ordering::Release);
+        self.latch.record_once(self.termination, self.family);
     }
 
     /// Whether the pump has released the upstream body. Reached through
@@ -442,6 +618,15 @@ impl http_body::Body for AuthorizationCancellableBody {
         if this.finished {
             return Poll::Ready(None);
         }
+        // ONE-WINNER GATE, ahead of the channel and fail-closed. A frame the
+        // pump queued while the credential was still authorized must not be
+        // handed downstream once the bound has been reached, and a poll that
+        // arrives at/after the bound claims it here rather than depending on
+        // the pump's timer task having run first.
+        if this.terminal.observe() == AuthorizationTerminalOwnership::AuthorizationExpiry {
+            this.settle_authorization_expiry();
+            return Poll::Ready(Some(Err(released_terminal())));
+        }
         match this.receiver.poll_recv(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Some(PumpItem::Frame(frame))) => Poll::Ready(Some(Ok(frame))),
@@ -453,16 +638,13 @@ impl http_body::Body for AuthorizationCancellableBody {
                 this.settle();
                 Poll::Ready(Some(Err(error)))
             }
-            // The pump ended without a terminal: the authorization deadline
-            // elapsed, or the pump was cancelled. Deliberately an error — a
-            // clean end of stream here would be indistinguishable from a
-            // complete response.
+            // The pump ended without a terminal: it was cancelled, or it died.
+            // An expiry is settled by the gate above instead, so this stays the
+            // defensive shape. Deliberately an error — a clean end of stream
+            // here would be indistinguishable from a complete response.
             Poll::Ready(None) => {
                 this.settle();
-                Poll::Ready(Some(Err(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    RELEASED_MESSAGE,
-                )) as ProxyBodyError)))
+                Poll::Ready(Some(Err(released_terminal())))
             }
         }
     }

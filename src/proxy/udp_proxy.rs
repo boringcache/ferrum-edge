@@ -3799,7 +3799,8 @@ pub(crate) fn dtls_authorization_expired_before_relay(
     plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
     now: tokio::time::Instant,
 ) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
-    plan.filter(|plan| now >= plan.at).map(|plan| plan.termination)
+    plan.filter(|plan| now >= plan.at)
+        .map(|plan| plan.termination)
 }
 
 /// Run one awaitable post-admission DTLS setup stage (DNS resolution, backend
