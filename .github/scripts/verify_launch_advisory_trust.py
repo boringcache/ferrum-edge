@@ -51,17 +51,25 @@ workflow definitions as text — it executes nothing — and asserts:
   workflow that does not exist. A duplicate mapping key is not an error GitHub
   reports — one occurrence wins, and *which* one is a property of the consumer —
   so a workflow could keep the safe block-form `on:` this contract derives events
-  from and append a duplicate `on: [push]` that makes it tag-reachable. Every
-  duplicate key is therefore refused: top-level keys (including the admitted
-  `on`, `jobs`, `permissions`, `concurrency`), event keys under `on:`, job IDs,
-  the credential job's own keys (`needs`, `environment`, `permissions`, `steps`,
-  …), top-level step keys, the credential step's `env:` entries, and the
-  trusted-anchor checkout's `with:` inputs. An inline flow value written where
-  this contract reads a block is the other half of the family — `on: [push]`,
-  `jobs: {…}`, `steps: [{run: …}]`, `with: {ref: …}` are not "an empty block" but
-  a whole structure the block reader never sees — so it is reported rather than
-  discarded, and every other top-level/job-level value must be a plain scalar or
-  an explicit block;
+  from and append a duplicate `on: [push]` that makes it tag-reachable. The same
+  ambiguity reaches every other mapping: a duplicate last `steps:` on
+  `establish-trust` that exports a candidate-controlled `trusted_sha`, a
+  duplicate `outputs:` redirecting the anchor, a duplicate `run:` on a trust step
+  behind the exact admitted command, a duplicate or flow `steps:`/`env:` on the
+  publisher. So the refusal is *whole-document*: one indentation-aware,
+  block-scalar-aware structural pass over `launch-advisory-trust.yml` refuses a
+  repeated key in ANY mapping — the document root, `on`, `jobs`, every job
+  mapping, `outputs`/`permissions`/`env`/`with`, and every step mapping,
+  sequence items included — and refuses every value that puts structure where a
+  block reader sees none: a flow collection (`on: [push]`, `jobs: {…}`,
+  `steps: [{run: …}]`, `with: {ref: …}`), an anchor, an alias, a merge key, a
+  block scalar with an explicit indentation indicator, a second YAML document,
+  tab indentation, and any node the pass cannot classify. It fails closed and
+  never deserializes or executes the document; shell inside a `run: |` body is
+  skipped whole, so YAML-shaped text in a command is neither a duplicate key nor
+  a way to end the enclosing mapping. The per-surface duplicate/flow checks for
+  the credential job, its steps, its `env:`, and the checkout `with:` remain as
+  defence in depth;
 * `establish-trust` runs both secretless preflights as real executable steps
   before the protected environment can release the credential: the launch
   readiness checker's own self-test and *this* verifier's `--self-test`, so the
@@ -109,11 +117,16 @@ trigger, a release gate that reuses another run's status, a release job that
 stops requiring the trusted verdict, a safe block-form `on:` followed by a
 duplicate `on: [push]` (and the reversed ordering), a duplicate `jobs:`,
 `advisory-verdict`, `needs`, `environment`, `steps`, step key, or checkout input,
-and an `on:`/`steps:`/`with:` written as an inline flow collection — and then
-applies the same contract to the real `.github/workflows` tree. Each duplicate
-and flow fixture asserts the structural rejection AND, where it matters, that the
-corresponding value-level check did not fire: that absence is the proof the
-structural refusal is what catches the bypass.
+an `on:`/`steps:`/`with:` written as an inline flow collection, a duplicate
+`steps:` or `outputs:` on `establish-trust` (both orderings), a duplicate `run:`
+on a trust step behind the exact admitted command, a duplicate flow
+`steps:`/`env:` on the publisher, a duplicate key in a mapping no value-level
+check reads, an unclassifiable document node, and YAML-shaped shell inside a
+`run: |` body that must NOT be read as structure — and then applies the same
+contract to the real `.github/workflows` tree. Each duplicate and flow fixture
+asserts the structural rejection AND, where it matters, that the corresponding
+value-level check did not fire: that absence is the proof the structural refusal
+is what catches the bypass.
 Comments are stripped before every contract decision, so prose can neither
 satisfy a requirement nor stand in for a rejected command.
 """
@@ -587,6 +600,302 @@ def step_run_text(step_lines: list[str]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Document-wide structural ambiguity pass
+# ---------------------------------------------------------------------------
+#
+# Every other check in this module is a *single structural reading* of some part
+# of the workflow. That reading is a proof only if GitHub's YAML parser cannot
+# read the same bytes differently, and a duplicate mapping key is exactly where
+# the two diverge: it is not an error GitHub reports, one occurrence wins, and
+# *which* one is a property of the consumer. The block readers above stop at the
+# first occurrence of a key, so a safe first `steps:`/`outputs:`/`run:` can stand
+# in front of a hostile last one and satisfy every value-level check while a
+# different occurrence is what actually runs.
+#
+# Scoping that refusal to one job or one step is what left the residual this pass
+# closes. So the pass is deliberately *whole-document* and *uniform*: one
+# indentation-aware walk of `launch-advisory-trust.yml` that refuses a repeated
+# key in any mapping — the document root, `on`, `jobs`, every job mapping,
+# `outputs`/`permissions`/`env`/`with`, and every step mapping including
+# sequence items — plus every value that puts structure where this contract's
+# block readers see none.
+#
+# It reads text and nothing else: no YAML library, no deserialization of
+# candidate bytes, no execution. It is conservative by construction — a line it
+# cannot classify is an error rather than a line it drops — and it is aware of
+# block scalars, so the shell inside `run: |` is skipped whole instead of being
+# mistaken for YAML structure.
+
+# A key is `name:` followed by end-of-line or whitespace. `key:value` with no
+# space is a plain scalar to YAML, not a mapping entry, so it deliberately does
+# not match here and is reported as unclassifiable instead.
+STRUCT_PLAIN_KEY = re.compile(
+    r"^(?P<key>[A-Za-z_][A-Za-z0-9_.-]*):(?P<rest>(?:\s.*)?)$"
+)
+# `"steps":` and `steps:` are the same key to YAML. Quoted keys are normalized so
+# a quoted duplicate cannot hide from the bare-name comparison.
+STRUCT_QUOTED_KEY = re.compile(
+    r"^(?P<quote>[\"'])(?P<key>[^\"']+)(?P=quote):(?P<rest>(?:\s.*)?)$"
+)
+STRUCT_SEQUENCE_ITEM = re.compile(r"^-(?:\s|$)")
+STRUCT_MERGE_KEY = re.compile(r"^<<\s*:")
+STRUCT_DOCUMENT_MARKER = re.compile(r"^(?:---|\.\.\.)(?:\s|$)")
+# A block scalar with an explicit indentation indicator (`|2`) decides its own
+# body extent, so this reader could disagree with YAML about where the shell
+# ends and the next mapping key begins. Refused rather than guessed at.
+STRUCT_INDENTED_BLOCK_SCALAR = re.compile(r"^[|>][+-]?[0-9]")
+
+STRUCT_ROOT_LABEL = "<document root>"
+
+
+class _StructuralFrame:
+    """One open block collection: a mapping's keys or a sequence's item count."""
+
+    __slots__ = ("indent", "path", "is_mapping", "keys", "items")
+
+    def __init__(self, indent: int, path: str, is_mapping: bool) -> None:
+        self.indent = indent
+        self.path = path
+        self.is_mapping = is_mapping
+        self.keys: set[str] = set()
+        self.items = 0
+
+    def label(self) -> str:
+        return self.path or STRUCT_ROOT_LABEL
+
+
+def structural_value_kind(value: str) -> str:
+    """Classify a node's inline value without interpreting it.
+
+    Returns `empty` (a block may open below), `scalar`, `block` (a block-scalar
+    header), `indented-block` (a block scalar with an explicit indentation
+    indicator), `flow`, `alias`, or `unreadable`.
+    """
+
+    text = value.strip()
+    if text.startswith("#"):
+        text = ""
+    else:
+        text = text.split(" #", 1)[0].strip()
+    if not text:
+        return "empty"
+    # A quoted scalar is a scalar whatever it starts with, so a value like
+    # `"[not a flow sequence]"` is not misread as structure.
+    if text[0] in "\"'":
+        return "scalar"
+    if STRUCT_INDENTED_BLOCK_SCALAR.match(text):
+        return "indented-block"
+    if BLOCK_SCALAR.match(text):
+        return "block"
+    if text[0] in "[{":
+        return "flow"
+    if text[0] in "&*":
+        return "alias"
+    if text[0] in "|>":
+        return "unreadable"
+    return "scalar"
+
+
+def _skip_block_scalar(lines: list[str], index: int, indent: int) -> int:
+    """Consume a block scalar body: everything more indented than its key.
+
+    This is what keeps shell out of the structural reading. `fail() {`,
+    `case … in`, and a line that happens to read `name: value` are opaque text
+    inside a `run: |`, not mapping entries, so they can neither be counted as a
+    duplicate key nor terminate an enclosing mapping.
+    """
+
+    while index < len(lines):
+        line = lines[index]
+        if line.strip() and (len(line) - len(line.lstrip(" "))) <= indent:
+            break
+        index += 1
+    return index
+
+
+def structural_ambiguity_errors(text: str, label: str) -> list[str]:  # noqa: C901
+    """Refuse duplicate keys and inline structure anywhere in one document.
+
+    One indentation-aware walk, applied uniformly to every mapping in the file
+    rather than to the handful of jobs a value-level check happens to read. It
+    fails closed: a sequence item where a key belongs, an unexpected indentation,
+    a merge key, a document marker, a tab, and any line it cannot classify are
+    all reported, because an unreadable node is exactly where a second `steps:`
+    or a redirected `outputs:` would hide.
+    """
+
+    errors: list[str] = []
+    lines = text.splitlines()
+    stack: list[_StructuralFrame] = []
+    # The path a block collection would take if one opens at a deeper indent.
+    # `None` means the previous node already took its value, so nothing deeper
+    # may follow it.
+    pending_path: str | None = ""
+    index = 0
+
+    while index < len(lines):
+        raw = lines[index]
+        index += 1
+        body = raw.lstrip(" ")
+        if not body.strip() or body.startswith("#"):
+            continue
+        indent = len(raw) - len(body)
+        content = body.rstrip()
+        if "\t" in raw[:indent] or content.startswith("\t"):
+            errors.append(
+                f"{label} indents {content.strip()!r} with a tab; YAML forbids tab "
+                "indentation, so this contract's structural reading of the document "
+                "cannot be trusted to match GitHub's"
+            )
+            pending_path = None
+            continue
+        if STRUCT_DOCUMENT_MARKER.match(content):
+            errors.append(
+                f"{label} declares the YAML document marker {content.strip()!r}; the "
+                "trusted workflow must be a single implicit document, because a "
+                "second document is a whole second workflow definition this "
+                "contract's readers never see"
+            )
+            pending_path = None
+            continue
+
+        while stack and indent < stack[-1].indent:
+            stack.pop()
+
+        if STRUCT_SEQUENCE_ITEM.match(content):
+            frame: _StructuralFrame | None = None
+            if stack and not stack[-1].is_mapping and stack[-1].indent == indent:
+                frame = stack[-1]
+            elif pending_path is not None and (not stack or indent >= stack[-1].indent):
+                frame = _StructuralFrame(indent, pending_path, is_mapping=False)
+                stack.append(frame)
+            if frame is None:
+                errors.append(
+                    f"{label} declares the sequence item {content.strip()!r} where "
+                    "this contract reads a mapping key; a node it cannot place is "
+                    "refused rather than skipped"
+                )
+                pending_path = None
+                continue
+            frame.items += 1
+            item_path = f"{frame.path}[{frame.items}]"
+            pending_path = None
+
+            after = content[1:]
+            rest = after.lstrip(" ")
+            if not rest:
+                # The item's own collection opens on the following lines.
+                pending_path = item_path
+                continue
+            node_indent = indent + 1 + (len(after) - len(rest))
+            if STRUCT_MERGE_KEY.match(rest):
+                errors.append(
+                    f"{label} merges a mapping into `{item_path}` ({rest.strip()!r}); "
+                    "a merge key injects keys this contract never saw in source form"
+                )
+                continue
+            item_key = STRUCT_PLAIN_KEY.match(rest) or STRUCT_QUOTED_KEY.match(rest)
+            if item_key is None:
+                kind = structural_value_kind(rest)
+                if kind == "scalar":
+                    continue
+                if kind == "block":
+                    index = _skip_block_scalar(lines, index, indent)
+                    continue
+                errors.append(
+                    f"{label} declares the sequence item `{item_path}` as "
+                    f"{rest.strip()!r}; every value in this workflow must be a plain "
+                    "scalar or an explicit block, never a flow collection, an "
+                    "anchor, an alias, or a block scalar this reader cannot bound"
+                )
+                continue
+            # An item that opens with a key is a mapping whose keys all start in
+            # the column that first key starts in.
+            stack.append(_StructuralFrame(node_indent, item_path, is_mapping=True))
+            indent = node_indent
+            content = rest
+            # Falls through to the mapping-key handling below.
+
+        if STRUCT_MERGE_KEY.match(content):
+            top = stack[-1].label() if stack else STRUCT_ROOT_LABEL
+            errors.append(
+                f"{label} merges a mapping into `{top}` ({content.strip()!r}); a "
+                "merge key injects keys this contract never saw in source form"
+            )
+            pending_path = None
+            continue
+
+        key_match = STRUCT_PLAIN_KEY.match(content) or STRUCT_QUOTED_KEY.match(content)
+        if key_match is None:
+            errors.append(
+                f"{label} declares {content.strip()!r}, which this contract cannot "
+                "classify as a mapping key, a sequence item, or block-scalar text; an "
+                "unreadable node is refused rather than dropped, because dropping it "
+                "is how a duplicate or redirected key would survive"
+            )
+            pending_path = None
+            continue
+
+        # A block sequence written at its parent key's own indentation ends here.
+        while stack and not stack[-1].is_mapping and stack[-1].indent == indent:
+            stack.pop()
+
+        mapping: _StructuralFrame | None = None
+        if stack and stack[-1].is_mapping and stack[-1].indent == indent:
+            mapping = stack[-1]
+        elif pending_path is not None and (not stack or indent > stack[-1].indent):
+            mapping = _StructuralFrame(indent, pending_path, is_mapping=True)
+            stack.append(mapping)
+        if mapping is None:
+            errors.append(
+                f"{label} declares {content.strip()!r} at an indentation this "
+                "contract cannot place in the surrounding mapping; an unplaceable key "
+                "is refused rather than attached to a guess"
+            )
+            pending_path = None
+            continue
+
+        key = key_match.group("key")
+        if key in mapping.keys:
+            errors.append(
+                f"{label} declares the mapping key `{key}` more than once in "
+                f"`{mapping.label()}`; a duplicated mapping key is not an error "
+                "GitHub reports — one occurrence wins, and which one is a property "
+                "of the consumer, so a safe occurrence this contract reads can stand "
+                "in front of an untrusted one that actually runs"
+            )
+        mapping.keys.add(key)
+        node_path = f"{mapping.path}.{key}" if mapping.path else key
+        pending_path = None
+
+        kind = structural_value_kind(key_match.group("rest"))
+        if kind == "empty":
+            pending_path = node_path
+        elif kind == "block":
+            index = _skip_block_scalar(lines, index, indent)
+        elif kind == "indented-block":
+            errors.append(
+                f"{label} declares `{node_path}` as a block scalar with an explicit "
+                "indentation indicator; that indicator decides where the scalar ends, "
+                "so this reader and GitHub could disagree about which lines are shell "
+                "and which are mapping keys"
+            )
+            index = _skip_block_scalar(lines, index, indent)
+        elif kind in ("flow", "alias", "unreadable"):
+            errors.append(
+                f"{label} declares `{node_path}` with the "
+                f"{'flow' if kind == 'flow' else 'aliased or unreadable'} value "
+                f"{key_match.group('rest').strip()!r}; every value in this workflow "
+                "must be a plain scalar or an explicit block, because a flow "
+                "collection, anchor, or alias carries whole entries — a `steps:`, an "
+                "`outputs:`, an `env:`, a `with:` — that this contract's block "
+                "readers never see"
+            )
+
+    return errors
+
+
+# ---------------------------------------------------------------------------
 # Contract
 # ---------------------------------------------------------------------------
 
@@ -980,6 +1289,14 @@ def check_trusted_workflow_structure(text: str) -> list[str]:
     """
 
     errors: list[str] = []
+    # The whole-document pass first: it is the general gate for the ambiguity
+    # family, and it covers every mapping in the file — `establish-trust`'s
+    # `steps:`/`outputs:`, a trust step's `run:`, the publisher's `steps:`/`env:`,
+    # and every job or step key nobody has enumerated below. The per-surface
+    # checks that follow stay as defence in depth and for their specific
+    # value-level messages.
+    errors.extend(structural_ambiguity_errors(text, TRUSTED_WORKFLOW))
+
     mapping = top_level_blocks(text)
     blocks = mapping.blocks
 
@@ -2514,6 +2831,265 @@ def run_self_test() -> int:  # noqa: C901 — a flat fixture table stays readabl
             for err in flow_checkout_errors
         ),
         str(flow_checkout_errors),
+    )
+
+    # ---- The same ambiguity outside the credential job ------------------------
+    #
+    # Scoping the duplicate/flow refusal to `advisory-verdict` left the rest of
+    # the document ambiguous, and the rest of the document is what *derives* the
+    # trusted anchor and *publishes* the verdict. Every fixture below leaves the
+    # credential job byte-identical; each one is caught only by the whole-document
+    # structural pass, and each also asserts that the value-level proof it
+    # subverts still reads as satisfied.
+
+    # First: the pass must not mistake shell for structure. A `run: |` body is
+    # opaque text, so YAML-shaped lines inside it are neither duplicate keys nor
+    # a way to close the enclosing mapping early.
+    yaml_shaped_shell = FIXTURE_TRUSTED.replace(
+        '          trusted_sha="$(git rev-parse HEAD)"\n',
+        '          trusted_sha="$(git rev-parse HEAD)"\n'
+        "          steps: not a key\n"
+        "          steps: still not a key\n"
+        "          with: { ref: shell text }\n",
+    )
+    yaml_shaped_shell_errors = evaluate(mutated(TRUSTED_WORKFLOW, yaml_shaped_shell))
+    check(
+        "YAML-shaped shell inside a block scalar is not read as structure",
+        not yaml_shaped_shell_errors,
+        str(yaml_shaped_shell_errors),
+    )
+
+    trust_job_tail = (
+        '          echo "status_context=${status_context}" >> "$GITHUB_OUTPUT"\n'
+        "\n  advisory-verdict:"
+    )
+    check(
+        "the fixture's trust job ends where these fixtures append",
+        trust_job_tail in FIXTURE_TRUSTED,
+    )
+
+    # A safe first `steps:` block that satisfies both secretless preflights and
+    # the anchor proofs, followed by a duplicate last `steps:` that exports a
+    # candidate-controlled `trusted_sha` — which the credential job then checks
+    # out and executes.
+    duplicate_trust_steps = FIXTURE_TRUSTED.replace(
+        trust_job_tail,
+        '          echo "status_context=${status_context}" >> "$GITHUB_OUTPUT"\n'
+        "    steps:\n"
+        "      - id: candidate\n"
+        '        run: echo "trusted_sha=$(cat ./candidate/sha)" >> "$GITHUB_OUTPUT"\n'
+        "\n  advisory-verdict:",
+    )
+    duplicate_trust_steps_errors = evaluate(
+        mutated(TRUSTED_WORKFLOW, duplicate_trust_steps)
+    )
+    check(
+        "a duplicated `steps:` on the trust job is rejected",
+        any(
+            "mapping key `steps` more than once in `jobs.establish-trust`" in err
+            for err in duplicate_trust_steps_errors
+        ),
+        str(duplicate_trust_steps_errors),
+    )
+    check(
+        "both secretless preflights still read as real steps, so only the "
+        "structural pass catches a second `steps:`",
+        not any(
+            "self-test" in err and "as a real" in err
+            for err in duplicate_trust_steps_errors
+        ),
+        str(duplicate_trust_steps_errors),
+    )
+    check(
+        "and the trusted-anchor proofs still read as satisfied",
+        not any(
+            "literal protected-branch checkout" in err
+            or "40-hex commit" in err
+            or "reachable from protected `main`" in err
+            or "must export `trusted_sha`" in err
+            for err in duplicate_trust_steps_errors
+        ),
+        str(duplicate_trust_steps_errors),
+    )
+
+    trust_outputs_block = (
+        "    outputs:\n"
+        "      candidate_sha: ${{ steps.candidate.outputs.candidate_sha }}\n"
+        "      trusted_sha: ${{ steps.candidate.outputs.trusted_sha }}\n"
+        "      status_context: ${{ steps.candidate.outputs.status_context }}\n"
+    )
+    check(
+        "the fixture's trust outputs block is the one the contract reads",
+        trust_outputs_block in FIXTURE_TRUSTED,
+    )
+    # A second `outputs:` redirecting the trusted anchor at the candidate. The
+    # line-oriented export binding still matches the safe first occurrence.
+    redirected_outputs_block = (
+        "    outputs:\n"
+        "      trusted_sha: ${{ steps.candidate.outputs.candidate_sha }}\n"
+    )
+    for ordering, mutation in (
+        ("appended", trust_outputs_block + redirected_outputs_block),
+        ("prepended", redirected_outputs_block + trust_outputs_block),
+    ):
+        duplicate_outputs_errors = evaluate(
+            mutated(
+                TRUSTED_WORKFLOW,
+                FIXTURE_TRUSTED.replace(trust_outputs_block, mutation),
+            )
+        )
+        check(
+            f"a duplicated `outputs:` on the trust job is rejected ({ordering})",
+            any(
+                "mapping key `outputs` more than once in `jobs.establish-trust`" in err
+                for err in duplicate_outputs_errors
+            ),
+            str(duplicate_outputs_errors),
+        )
+        check(
+            f"the `trusted_sha` export still reads as bound ({ordering}), so only "
+            "the structural pass catches the redirect",
+            not any(
+                "must export `trusted_sha`" in err for err in duplicate_outputs_errors
+            ),
+            str(duplicate_outputs_errors),
+        )
+
+    # A trust step carrying the exact admitted command AND a duplicate `run:`.
+    # `job_runs_exact_command` finds the admitted occurrence and is satisfied.
+    duplicate_trust_run = FIXTURE_TRUSTED.replace(
+        boundary_self_test_block,
+        boundary_self_test_block + "        run: sh ./candidate/preflight.sh\n",
+    )
+    duplicate_trust_run_errors = evaluate(mutated(TRUSTED_WORKFLOW, duplicate_trust_run))
+    check(
+        "a duplicated `run:` on a trust-job step is rejected",
+        any(
+            "mapping key `run` more than once" in err
+            and "jobs.establish-trust.steps" in err
+            for err in duplicate_trust_run_errors
+        ),
+        str(duplicate_trust_run_errors),
+    )
+    check(
+        "the boundary self-test still reads as a real executable step, so only "
+        "the structural pass catches the second `run:`",
+        not any(
+            "this trust-boundary verifier's own self-test" in err
+            for err in duplicate_trust_run_errors
+        ),
+        str(duplicate_trust_run_errors),
+    )
+
+    # The publisher is the only writer of the verdict status. A duplicate flow
+    # `steps:` replaces what it publishes while every publisher binding this
+    # contract reads still matches the block form above it.
+    duplicate_publisher_steps = (
+        FIXTURE_TRUSTED.rstrip("\n")
+        + "\n    steps: [{ run: sh ./candidate/publish.sh }]\n"
+    )
+    duplicate_publisher_steps_errors = evaluate(
+        mutated(TRUSTED_WORKFLOW, duplicate_publisher_steps)
+    )
+    check(
+        "a duplicated `steps:` on the publisher is rejected",
+        any(
+            "mapping key `steps` more than once in `jobs.publish-verdict`" in err
+            for err in duplicate_publisher_steps_errors
+        ),
+        str(duplicate_publisher_steps_errors),
+    )
+    check(
+        "and its flow value is itself reported, not discarded",
+        any(
+            "declares `jobs.publish-verdict.steps` with the flow value" in err
+            for err in duplicate_publisher_steps_errors
+        ),
+        str(duplicate_publisher_steps_errors),
+    )
+    check(
+        "every publisher binding still reads as satisfied, so only the structural "
+        "pass catches a second `steps:`",
+        not any(
+            "must consume the established `status_context` output" in err
+            or "must publish against the established candidate SHA" in err
+            or "publishes a constant commit-wide status context" in err
+            or "must publish the `trusted-launch-advisory-gate` commit status" in err
+            for err in duplicate_publisher_steps_errors
+        ),
+        str(duplicate_publisher_steps_errors),
+    )
+
+    publisher_env_block = (
+        "        env:\n"
+        "          CANDIDATE_SHA: ${{ needs.establish-trust.outputs.candidate_sha }}\n"
+        "          STATUS_CONTEXT: ${{ needs.establish-trust.outputs.status_context }}\n"
+    )
+    check(
+        "the fixture's publisher env block is the one the contract reads",
+        publisher_env_block in FIXTURE_TRUSTED,
+    )
+    duplicate_publisher_env = FIXTURE_TRUSTED.replace(
+        publisher_env_block,
+        publisher_env_block
+        + "        env: { PATH: ./candidate/bin, BASH_ENV: ./candidate/p.sh }\n",
+    )
+    duplicate_publisher_env_errors = evaluate(
+        mutated(TRUSTED_WORKFLOW, duplicate_publisher_env)
+    )
+    check(
+        "a duplicated flow `env:` on the publisher step is rejected",
+        any(
+            "mapping key `env` more than once" in err
+            and "jobs.publish-verdict.steps" in err
+            for err in duplicate_publisher_env_errors
+        ),
+        str(duplicate_publisher_env_errors),
+    )
+    check(
+        "and that flow env mapping is itself reported",
+        any(
+            "with the flow value" in err and ".env" in err
+            for err in duplicate_publisher_env_errors
+        ),
+        str(duplicate_publisher_env_errors),
+    )
+    check(
+        "the publisher's established bindings still read as satisfied under the "
+        "duplicate env",
+        not any(
+            "must consume the established `status_context` output" in err
+            or "must publish against the established candidate SHA" in err
+            for err in duplicate_publisher_env_errors
+        ),
+        str(duplicate_publisher_env_errors),
+    )
+
+    # Ambiguity anywhere else in the document, including a mapping no
+    # value-level check reads at all.
+    duplicate_permission_key = FIXTURE_TRUSTED.replace(
+        "permissions:\n  contents: read\n",
+        "permissions:\n  contents: read\n  contents: write\n",
+    )
+    check(
+        "a duplicated key in the top-level permissions mapping is rejected",
+        any(
+            "mapping key `contents` more than once in `permissions`" in err
+            for err in evaluate(mutated(TRUSTED_WORKFLOW, duplicate_permission_key))
+        ),
+        str(evaluate(mutated(TRUSTED_WORKFLOW, duplicate_permission_key))),
+    )
+
+    unreadable_node = FIXTURE_TRUSTED.replace(
+        "jobs:\n", "jobs:\n  &hostile\n", 1
+    )
+    check(
+        "a document node this contract cannot classify is refused, not dropped",
+        any(
+            "cannot classify" in err
+            for err in evaluate(mutated(TRUSTED_WORKFLOW, unreadable_node))
+        ),
+        str(evaluate(mutated(TRUSTED_WORKFLOW, unreadable_node))),
     )
 
     # ---- The trusted-anchor checkout itself ----------------------------------
