@@ -766,6 +766,10 @@ fn destination_active_request_breaker_is_wired_into_backend_admission() {
         "the lane must be keyed by the effective policy identity"
     );
     assert!(
+        gate.contains("record_rejection_warning") && gate.contains("suppressed_rejections"),
+        "destination saturation warnings must be rate-limited and report suppressed rejections"
+    );
+    assert!(
         gate.contains("status_code: 503"),
         "a saturated destination must shed with a 503 before any backend attempt"
     );

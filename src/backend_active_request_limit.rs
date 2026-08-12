@@ -111,13 +111,14 @@
 //! Fixed-cardinality process totals only ([`render_prometheus`]): active
 //! permits, admitted total, and rejected total. Raw Service / subset / host /
 //! namespace identity is deliberately never a metric label — it is unbounded
-//! operator-controlled input. Per-lane detail stays in the (bounded) rejection
-//! log line.
+//! operator-controlled input. A lock-free gateway-wide limiter bounds the
+//! rejection summary to one line per second and reports the suppressed count.
 
 use std::cell::RefCell;
 use std::fmt::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use crossbeam_utils::CachePadded;
 use dashmap::DashMap;
@@ -178,6 +179,8 @@ fn write_active_key(buf: &mut String, scope: &DestinationScope<'_>) {
 /// per logical destination across all transports, connections, and pool shards.
 pub struct BackendActiveRequestLimiter {
     inner: Arc<DashMap<String, Arc<BackendActiveRequestCounter>>>,
+    rejection_warn: crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter,
+    rejection_warn_epoch: Instant,
 }
 
 #[derive(Debug)]
@@ -206,7 +209,20 @@ impl BackendActiveRequestLimiter {
     pub fn with_shard_amount(shards: usize) -> Self {
         Self {
             inner: Arc::new(DashMap::with_shard_amount(shards)),
+            rejection_warn: crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter::new(),
+            rejection_warn_epoch: Instant::now(),
         }
+    }
+
+    /// Record one saturation diagnostic and return the number suppressed since
+    /// the previous emitted summary. One limiter covers the gateway-wide
+    /// destination map, bounding adversarial saturation logs without adding a
+    /// second per-destination map or retaining churned destination identities.
+    #[inline]
+    pub(crate) fn record_rejection_warning(&self) -> Option<u64> {
+        let now_ms = u64::try_from(self.rejection_warn_epoch.elapsed().as_millis())
+            .unwrap_or(u64::MAX);
+        self.rejection_warn.on_event(now_ms)
     }
 
     /// Reserve one active-request slot for `scope`.

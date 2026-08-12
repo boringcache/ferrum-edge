@@ -925,13 +925,19 @@ pub(crate) fn run_backend_admission_plugins(
             // Unreachable while `destination_cap.is_some()`; keep the arm total.
             Ok(None) => {}
             Err(limit) => {
-                warn!(
-                    proxy_id = %proxy.id,
-                    policy_port,
-                    active_requests = limit.current,
-                    max_active_requests = limit.cap,
-                    "Shedding request: DestinationRule http2MaxRequests reached for destination (upstream overflow)"
-                );
+                if let Some(suppressed_rejections) = state
+                    .backend_active_request_limit
+                    .record_rejection_warning()
+                {
+                    warn!(
+                        proxy_id = %proxy.id,
+                        policy_port,
+                        active_requests = limit.current,
+                        max_active_requests = limit.cap,
+                        suppressed_rejections,
+                        "Shedding request: DestinationRule http2MaxRequests reached for destination (upstream overflow)"
+                    );
+                }
                 return Err(BackendAdmissionRejection {
                     plugin_name: DESTINATION_ACTIVE_REQUEST_REJECTION_SOURCE.to_string(),
                     status_code: 503,
