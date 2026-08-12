@@ -5,6 +5,19 @@ computed by `scripts/check_launch_readiness.py` from GitHub issue and advisory
 state plus the checked-in policy; it is **not** the historical static-audit prose
 in `PRODUCTION_READINESS.md`.
 
+Two checks with different jobs (issue #3803):
+
+| Check | Question | Required on PRs? | Red when blockers are open? |
+|---|---|---|---|
+| `Launch Readiness Integrity` | Did this revision preserve the gate contract? | **Yes** | No |
+| `Launch Readiness Gate` | Is the product launchable right now? | No — release/tag blocking | Yes, truthfully |
+
+Keeping them separate is what makes enforcement possible: a truthful go/no-go
+verdict is `FAIL` while any blocker is open, so requiring *it* on every pull
+request would deadlock the very pull requests that fix blockers. The integrity
+check never reads live issue or advisory state, so it stays green for a normal
+blocker-fix change and red only when the governance contract itself is weakened.
+
 ## Authoritative inputs
 
 | Input | Role |
@@ -109,13 +122,134 @@ No credential is stored in this repository, and none is printed.
   `main` pushes, `v*` tags, a daily schedule, and `workflow_dispatch`. It runs
   the deterministic self-tests, then verifies the live verdict for the exact
   commit under test (PR head, merge-group head, or pushed SHA) and asserts that
-  the checkout is that commit.
+  the checkout is that commit. This is the go/no-go signal and is expected to be
+  red while blockers are open; it is not a required pull-request context.
+- `.github/workflows/launch-integrity.yml` — the required
+  `Launch Readiness Integrity` context on every pull request and merge group.
+  See [Trusted integrity check](#trusted-integrity-check) below.
 - `.github/workflows/release.yml` — the `validate-launch-readiness` job gates
   every tag release on a computed `PASS` for the tagged commit resolved from the
-  checked-out tag ref.
-- Both keep `persist-credentials: false` and least permissions.
-- `.github/CODEOWNERS` covers the policy, the exemptions, the checker, the
-  workflow, and `PRODUCTION_READINESS.md`.
+  checked-out tag ref. Every other release job is downstream of it, which the
+  integrity verifier re-checks as a `needs` reachability property.
+- All keep `persist-credentials: false` and least permissions.
+- `.github/CODEOWNERS` covers the policy, the exemptions, the checker, both
+  workflows, the integrity verifier, `PRODUCTION_READINESS.md`, and itself.
+
+## Trusted integrity check
+
+`Launch Readiness Integrity` exists because the gate previously judged itself:
+the workflow checked out the candidate head and ran that checkout's evaluator
+and that checkout's self-tests, so one change could weaken the checker, its
+policy, and its tests together.
+
+**Trust anchor.** The workflow triggers on `pull_request_target` (loaded and
+checked out from the base branch) and on `merge_group` (the synthesized queue
+commit, whose entry already cleared this same check on its pull request). It
+resolves and pins a trusted commit — the live `main` tip for a pull request,
+authenticated as a descendant of the event base; the queue `base_sha` for a
+merge group — and reads `.github/scripts/verify_launch_integrity.py` from that
+commit. That file is the only code the job executes.
+
+**Candidate as inert data.** The candidate revision is never checked out into
+the execution path. Each governed file is extracted with `git show` into a fixed
+slot name under `$RUNNER_TEMP`, after its tree entry is confirmed to be a
+regular non-symlink blob, so no candidate-controlled path component is ever
+joined into a filesystem path. The candidate checker is read with `ast.parse`,
+which never runs module code, and nothing from the candidate is imported. A
+missing slot is the signal that a protected file was deleted or renamed.
+
+**Permissions.** `contents: read`, `persist-credentials: false`, no secrets at
+all. `.github/scripts/verify_required_ci.py` re-asserts those properties, the
+`merge_group` trigger, and the exact check name so the required context cannot
+be silently renamed or downgraded.
+
+**Self-protection.** `.github/workflows/launch-integrity.yml` and
+`.github/scripts/verify_launch_integrity.py` must be byte-identical to the
+trusted base. Changing the judge is therefore an administrative action, not an
+ordinary pull request — the same posture as `Trusted Cross Build Policy`. The
+proposed copy still gets hosted execution of its own fixtures in the isolated
+`trusted-policy-candidate.yml` lane, which produces nothing another job reads.
+
+On the single adoption commit the trusted base carries no verifier at all, so
+there is no protected contract to preserve and nothing trustworthy to execute:
+that run reports success with an explicit `::notice::` instead of pretending to
+have enforced anything. Every later revision takes the enforcing path, and once
+the base carries the anchor neither deletion nor modification is accepted.
+
+### What the verifier enforces
+
+- **Deletion/rename:** every protected gate path is still present and non-empty.
+- **Checker semantics:** frozen constants (state machine, closed-reason sets,
+  never-emit fields, banned output tokens, forbidden policy keys, severity and
+  verdict vocabularies, API origin), ceilings that may tighten but never loosen
+  (`MAX_FALLBACK_AGE_SECONDS`, `MAX_FALLBACK_COUNT`, `MAX_PAGES`), the required
+  function set, and the fail-closed text each evaluator function must still
+  carry (for example `evaluation.verdict != "PASS"`).
+- **Unconditional success:** a required function reduced to `pass`,
+  `return 0/True/None/"PASS"`, or `sys.exit(0)` is rejected, as is any
+  module-level statement that could short-circuit evaluation before it runs.
+- **Dependency surface:** the checker's imports must stay within the recorded
+  allowlist, so an evaluator cannot grow a shell-out or exfiltration path.
+- **Candidate-test rewriting:** the self-test corpus may not fall below its
+  assertion floor and must keep every named adversarial fixture (state-machine
+  downgrade, merged-PR clearing, duplicate-as-completed, fallback age ceiling,
+  redaction, pagination truncation, and the rest).
+- **Policy downgrade:** frozen state machine and reason sets; GA blocking every
+  severity; no tier dropping a severity the trusted base blocked; the label
+  contract unchanged (a rename silently empties the blocker set); private
+  advisories enabled, redacted-count-only, unpublished states blocking, the
+  never-emit set intact, the freshness window never widened, and no
+  checked-in count/as-of key anywhere in the file.
+- **Exemption schema:** required fields, ISO timestamps, unique ids, at least
+  one launch tier, and an expiry strictly after approval.
+- **Document markers:** exactly one begin/end/historical marker, in order, with
+  the marker contract itself unchanged from the trusted base.
+- **Workflow bypass:** the gate workflow keeps its triggers, unfiltered
+  `pull_request` / `merge_group` events, job id and check name, least
+  permissions, and the byte-frozen ref/target-SHA/self-test/verify lines; the
+  release workflow keeps `validate-launch-readiness` and every other job stays
+  downstream of it.
+- **Secret exposure:** the privileged advisory token may appear only in
+  `launch-readiness.yml` (inside the frozen expression that hands
+  pull-request and merge-group runs an empty value) and in `release.yml`.
+- **Check-run producer identity:** the required check names may be produced by
+  exactly one workflow file each, so a candidate cannot add a second workflow
+  that reports an identically named, trivially green context.
+- **Ownership evasion:** every governed path still has an owner in
+  `.github/CODEOWNERS`, and no trusted-base owner was removed. GitHub evaluates
+  CODEOWNERS from the base branch, so editing that file inside a pull request
+  cannot relax that pull request's own review requirement; this check keeps the
+  coverage from being dropped on the way in.
+
+What it deliberately does **not** judge: live issue/advisory state, and the
+*content* of the tracked-blocker inventory or the exemption list. Those are
+governed by CODEOWNER review; the verifier only enforces their schema so a
+malformed or unbounded entry cannot slip through.
+
+### Required repository settings (root-only)
+
+These cannot be set from a pull request and must be applied by a repository
+administrator:
+
+1. Add the required status check `Launch Readiness Integrity` (source app
+   **GitHub Actions**, app id `15368`) to the `main` ruleset and to the merge
+   queue's required checks. Do **not** add `Launch Readiness Gate`.
+2. Set `pull_request.require_code_owner_review = true` for `main` (or add a
+   narrower path-scoped ruleset) so the CODEOWNERS entries for
+   `PRODUCTION_READINESS.md`, `docs/launch-blocker-policy.json`,
+   `docs/launch-exemptions.json`, `docs/launch-readiness.md`,
+   `scripts/check_launch_readiness.py`,
+   `.github/workflows/launch-readiness.yml`,
+   `.github/workflows/launch-integrity.yml`,
+   `.github/scripts/verify_launch_integrity.py`,
+   `.github/workflows/release.yml`, and `.github/CODEOWNERS` are enforced rather
+   than advisory.
+3. Keep the organization-admin bypass auditable: an emergency merge that skips
+   the integrity context should be followed by a post-merge run on `main`.
+
+Until step 1 and step 2 are applied the check is advisory. Drift in either is
+detectable by re-querying the ruleset; the repository-side half of the control
+(workflow, verifier, contracts, ownership map) is enforced in-tree.
 
 ## Determinism
 
@@ -131,6 +265,7 @@ Hosted CI is the execution gate; the deterministic self-test is offline.
 ```bash
 python3 scripts/check_launch_readiness.py --self-test
 python3 scripts/check_launch_readiness.py --verify --launch-tier ga --target-sha "$GITHUB_SHA"
+python3 .github/scripts/verify_launch_integrity.py --self-test
 ```
 
 `--verify` requires a computed `PASS`; `--require-pass` is accepted for release
