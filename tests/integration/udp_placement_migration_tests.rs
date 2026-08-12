@@ -5,6 +5,10 @@ use ferrum_edge::proxy::netns_capture::{
     DirectoryCaptureSource, PodCaptureSource, PodCaptureSourceIps, PodCaptureTarget,
 };
 use ferrum_edge::proxy::netns_udp_capture::{NetnsUdpCleanupBackend, NetnsUdpCleanupManager};
+use ferrum_edge::proxy::owned_shell::{self, OwnedShellError};
+use ferrum_edge::proxy::udp_placement_cleanup::{
+    HostUdpCleanupReaper, UdpCleanupOutcome, run_udp_placement_cleanup_with_host_reaper,
+};
 use ferrum_edge::proxy::udp_placement_migration::{
     UdpAdoptionProof, UdpCleanupProofWindow, UdpMigrationFailureReason, UdpMigrationPhase,
     UdpNodeIdentity, UdpPlacement, UdpPlacementDecision, UdpPlacementRequest, UdpRegistrySyncProof,
@@ -2313,4 +2317,116 @@ fn finalize_refuses_to_leave_an_unbound_producer_owning_record() {
         ),
         Ok(UdpPlacementDecision::RunStable)
     ));
+}
+
+struct HungHostReaper {
+    script: String,
+}
+
+impl HostUdpCleanupReaper for HungHostReaper {
+    fn reap_host_udp_state(
+        &mut self,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<(), OwnedShellError> {
+        owned_shell::run_sh_c(&self.script, deadline)
+    }
+}
+
+struct ImmediateHostReaper;
+
+impl HostUdpCleanupReaper for ImmediateHostReaper {
+    fn reap_host_udp_state(
+        &mut self,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<(), OwnedShellError> {
+        if owned_shell::deadline_elapsed(deadline) {
+            Err(OwnedShellError::DeadlineElapsed)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn node_preflight_registry() -> (
+    tempfile::TempDir,
+    ferrum_edge::proxy::udp_placement_migration::UdpMigrationContext,
+) {
+    let registry = tempfile::tempdir().expect("registry");
+    let node = identity(NODE_A, BOOT_1);
+    assert_eq!(
+        publish_registry_sync_marker_for_pods(
+            registry.path(),
+            PROOF_GENERATION,
+            &HashSet::new(),
+            Some(NODE_A),
+        ),
+        Ok(true)
+    );
+    let context =
+        ferrum_edge::proxy::udp_placement_migration::UdpMigrationContext::for_node_preflight(
+            registry.path(),
+            UdpPlacement::HostNetns,
+            node,
+            PROOF_GENERATION,
+        )
+        .expect("node preflight context");
+    (registry, context)
+}
+
+#[test]
+fn preflight_deadline_kills_a_hung_host_reap_and_publishes_no_proof() {
+    let (registry, context) = node_preflight_registry();
+    let proof = registry.path().join(".udp-node-cleanup-proof-v1.json");
+    let source = std::sync::Arc::new(DirectoryCaptureSource::new(registry.path()));
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("current-thread runtime");
+    let start = std::time::Instant::now();
+    let outcome = runtime.block_on(run_udp_placement_cleanup_with_host_reaper(
+        context,
+        source,
+        shutdown_rx,
+        Some(tokio::time::Instant::now() + std::time::Duration::from_millis(250)),
+        HungHostReaper {
+            script: "sleep 30".to_string(),
+        },
+    ));
+    let elapsed = start.elapsed();
+    assert_eq!(outcome, UdpCleanupOutcome::DeadlineElapsed);
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "current-thread runtime must not block on the hung sleep, took {elapsed:?}"
+    );
+    assert!(
+        !proof.exists(),
+        "no cleanup attestation may be published after the deadline wins"
+    );
+}
+
+#[test]
+fn preflight_deadline_does_not_publish_when_it_has_already_elapsed() {
+    let (registry, context) = node_preflight_registry();
+    let proof = registry.path().join(".udp-node-cleanup-proof-v1.json");
+    let source = std::sync::Arc::new(DirectoryCaptureSource::new(registry.path()));
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("current-thread runtime");
+    let outcome = runtime.block_on(run_udp_placement_cleanup_with_host_reaper(
+        context,
+        source,
+        shutdown_rx,
+        Some(tokio::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(1))
+            .expect("tokio instant")),
+        ImmediateHostReaper,
+    ));
+    assert_eq!(outcome, UdpCleanupOutcome::DeadlineElapsed);
+    assert!(
+        !proof.exists(),
+        "an already-elapsed deadline must not publish cleanup proof"
+    );
 }

@@ -452,12 +452,17 @@ pub struct AmbientUdpPreflightArgs {
 /// Retire both Ambient UDP predecessor placements on this node and publish the
 /// node-scoped cleanup attestation.
 ///
-/// This is deliberately the ONLY producer of that attestation. It is idempotent
-/// (an attestation already bound to this node UID, boot id, target and
-/// node-proof generation short-circuits), it publishes nothing it could not
-/// prove under one continuous node-agent registry publication, and it never
-/// writes durable placement ownership — the steady-state process still decides
-/// that from its own guard.
+/// This is deliberately the ONLY producer of that attestation. Every invocation
+/// retracts any leftover proof and re-runs predecessor retirement; an existing
+/// attestation is never treated as authority to skip the work. Cleanup itself is
+/// ownership-safe to repeat. The command publishes nothing it could not prove
+/// under one continuous node-agent registry publication, and it never writes
+/// durable placement ownership — the steady-state process still decides that
+/// from its own guard.
+///
+/// `--timeout-seconds` is a hard wall-clock ceiling: stalled `sh`/iptables/ip
+/// children are killed with their process group before this process reports
+/// timeout, and no attestation is published after the deadline wins.
 ///
 /// Node identity is resolved AUTHORITATIVELY here, from this node's own
 /// Kubernetes object, and never from the node-agent's published
@@ -530,12 +535,23 @@ pub fn execute_ambient_udp_preflight(args: &AmbientUdpPreflightArgs) -> Result<(
         .build()
         .map_err(|error| format!("could not build the preflight runtime: {error}"))?;
     let timeout_seconds = args.timeout_seconds.clamp(1, 3600);
+    let std_deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(timeout_seconds);
     let outcome = runtime.block_on(async move {
+        if crate::proxy::owned_shell::deadline_elapsed(Some(std_deadline)) {
+            return Ok(
+                crate::proxy::udp_placement_cleanup::UdpCleanupOutcome::DeadlineElapsed,
+            );
+        }
+        let lookup_timeout = std::time::Duration::from_secs(NODE_UID_LOOKUP_TIMEOUT_SECONDS).min(
+            crate::proxy::owned_shell::remaining(Some(std_deadline))
+                .unwrap_or(std::time::Duration::from_secs(0)),
+        );
         let node = resolve_authoritative_node_identity(
             &registry_dir,
             explicit_node_uid.as_deref(),
             node_name.as_deref(),
-            fetch_this_node_uid,
+            |name| fetch_this_node_uid(name, lookup_timeout),
         )
         .await?;
 
@@ -543,18 +559,39 @@ pub fn execute_ambient_udp_preflight(args: &AmbientUdpPreflightArgs) -> Result<(
         // re-applied historical manifest, or a restored ConfigMap can recreate
         // an earlier era's generation token, and a mutable monotonic counter
         // cannot prove that did not happen. Retract whatever is present and run
-        // the idempotent retirement on every invocation; publish only after
-        // this pod's own authoritative lookup and two complete passes succeed.
+        // predecessor retirement on every invocation; publish only after this
+        // pod's own authoritative lookup and two complete passes succeed.
         retract_node_cleanup_proof(&registry_dir)?;
+        if crate::proxy::owned_shell::deadline_elapsed(Some(std_deadline)) {
+            return Ok(
+                crate::proxy::udp_placement_cleanup::UdpCleanupOutcome::DeadlineElapsed,
+            );
+        }
 
-        crate::proxy::netns_udp_capture::preflight_capture_tools(true).map_err(|error| {
-            format!("the Ambient UDP node preflight image cannot run the required tooling: {error}")
-        })?;
+        match crate::proxy::netns_udp_capture::preflight_capture_tools_until(
+            true,
+            Some(std_deadline),
+        ) {
+            Ok(()) => {}
+            Err(error)
+                if error.contains("within its timeout") || error.contains("exceeded its deadline") =>
+            {
+                return Ok(
+                    crate::proxy::udp_placement_cleanup::UdpCleanupOutcome::DeadlineElapsed,
+                );
+            }
+            Err(error) => {
+                return Err(format!(
+                    "the Ambient UDP node preflight image cannot run the required tooling: {error}"
+                ));
+            }
+        }
 
         let context =
             UdpMigrationContext::for_node_preflight(&registry_dir, target, node, &generation)?;
-        let deadline =
-            tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_seconds);
+        let remaining = crate::proxy::owned_shell::remaining(Some(std_deadline))
+            .unwrap_or(std::time::Duration::from_secs(0));
+        let deadline = tokio::time::Instant::now() + remaining;
         let outcome = crate::proxy::udp_placement_cleanup::run_udp_placement_cleanup(
             context,
             source,
@@ -591,7 +628,10 @@ pub fn execute_ambient_udp_preflight(args: &AmbientUdpPreflightArgs) -> Result<(
 /// name the caller already knows. The runtime request is the binding, not the
 /// Role. Nothing from the returned object other than the UID is read. The UID
 /// itself is never logged: it is an identity binding, not diagnostics.
-async fn fetch_this_node_uid(node_name: String) -> Result<String, String> {
+async fn fetch_this_node_uid(
+    node_name: String,
+    timeout: std::time::Duration,
+) -> Result<String, String> {
     use k8s_openapi::api::core::v1::Node;
     use kube::Api;
 
@@ -607,11 +647,7 @@ async fn fetch_this_node_uid(node_name: String) -> Result<String, String> {
     let client = kube::Client::try_from(config)
         .map_err(|error| format!("could not build a Kubernetes client: {error}"))?;
     let nodes: Api<Node> = Api::all(client);
-    let node = match tokio::time::timeout(
-        std::time::Duration::from_secs(NODE_UID_LOOKUP_TIMEOUT_SECONDS),
-        nodes.get(&node_name),
-    )
-    .await
+    let node = match tokio::time::timeout(timeout, nodes.get(&node_name)).await
     {
         Ok(Ok(node)) => node,
         Ok(Err(error)) => {

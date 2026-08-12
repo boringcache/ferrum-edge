@@ -68,6 +68,7 @@ mod node_agent_watcher_exit_tests;
 mod node_waypoint_observability_tests;
 mod observability_delivery_tests;
 mod overload_tests;
+mod owned_shell_tests;
 mod per_port_load_balancer_tests;
 mod policy_path_tests;
 mod pool_create_failure_classification_tests;

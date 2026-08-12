@@ -14,13 +14,16 @@
 //! table, never removes a chain by pattern, and never touches a co-resident
 //! CNI's or service mesh's state.
 
+use std::future::pending;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::watch;
 use tracing::{info, warn};
 
+use super::host_udp_capture::HostUdpRecoverOnce;
 use super::netns_capture::PodCaptureSource;
+use super::owned_shell::{self, OwnedShellError};
 use super::udp_placement_migration::{
     UdpCleanupProofWindow, UdpMigrationContext, UdpMigrationFailureReason, UdpMigrationStatusPhase,
     clear_failure, set_failure, set_phase,
@@ -39,18 +42,65 @@ pub enum UdpCleanupOutcome {
     DeadlineElapsed,
 }
 
+/// Host-namespace Ferrum UDP teardown used by one supervisor pass.
+///
+/// Production runs the exact-name dual-stack host teardown script. Tests inject
+/// a stalled command to prove the preflight deadline owns subprocess lifetime
+/// and never publishes attestation after timeout.
+pub trait HostUdpCleanupReaper: Send {
+    fn reap_host_udp_state(
+        &mut self,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<(), OwnedShellError>;
+}
+
+/// Production host reap: exact Ferrum-owned host-netns UDP objects, IPv4 and IPv6.
+pub struct ProductionHostUdpCleanupReaper;
+
+impl HostUdpCleanupReaper for ProductionHostUdpCleanupReaper {
+    fn reap_host_udp_state(
+        &mut self,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<(), OwnedShellError> {
+        super::host_udp_capture::reap_stale_host_udp_state(deadline)
+    }
+}
+
 /// Run predecessor retirement until it is provably complete.
 ///
 /// `deadline` bounds only the *caller*: the one-shot preflight needs to fail
 /// the init container rather than block pod creation forever, while the mesh
 /// data-plane cleanup phase deliberately retries indefinitely (its readiness
-/// stays false and an operator drives the rollout).
+/// stays false and an operator drives the rollout). The deadline is converted
+/// to a wall-clock instant and threaded into every synchronous `sh`/iptables/ip
+/// child so a hung command cannot freeze the current-thread runtime past it.
+/// Nothing is published once the deadline has won.
 pub async fn run_udp_placement_cleanup(
+    context: UdpMigrationContext,
+    source: Arc<dyn PodCaptureSource>,
+    shutdown: watch::Receiver<bool>,
+    deadline: Option<tokio::time::Instant>,
+) -> UdpCleanupOutcome {
+    run_udp_placement_cleanup_with_host_reaper(
+        context,
+        source,
+        shutdown,
+        deadline,
+        ProductionHostUdpCleanupReaper,
+    )
+    .await
+}
+
+/// Same supervisor as [`run_udp_placement_cleanup`], with an injectable host
+/// reap so deadline ownership can be proven without a live iptables fixture.
+pub async fn run_udp_placement_cleanup_with_host_reaper<R: HostUdpCleanupReaper>(
     context: UdpMigrationContext,
     source: Arc<dyn PodCaptureSource>,
     mut shutdown: watch::Receiver<bool>,
     deadline: Option<tokio::time::Instant>,
+    mut host_reaper: R,
 ) -> UdpCleanupOutcome {
+    let std_deadline = deadline.map(owned_shell::std_deadline_from_tokio);
     let ready_dir = context.registry_dir().join(".udp-ready");
     let mut pod_cleanup = context.cleanup_pod_netns().then(|| {
         super::netns_udp_capture::NetnsUdpCleanupManager::new(
@@ -59,6 +109,7 @@ pub async fn run_udp_placement_cleanup(
             Duration::from_secs(2),
         )
         .with_ready_dir(Some(ready_dir.clone()))
+        .with_deadline(std_deadline)
     });
     let mut host_recovery = context
         .cleanup_host_netns()
@@ -73,7 +124,7 @@ pub async fn run_udp_placement_cleanup(
         if *shutdown.borrow() {
             return UdpCleanupOutcome::ShuttingDown;
         }
-        if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+        if owned_shell::deadline_elapsed(std_deadline) {
             return UdpCleanupOutcome::DeadlineElapsed;
         }
         if let Some(proof_before) = context.registry_sync_proof() {
@@ -81,15 +132,25 @@ pub async fn run_udp_placement_cleanup(
             let mut host_outstanding = 0;
             let mut failure_reason = None;
             if let Some(recovery) = host_recovery.as_mut() {
-                if super::host_udp_capture::recover_and_reap_once(recovery).await {
-                    host_pass_complete = true;
-                } else {
-                    host_pass_complete = false;
-                    failure_reason = Some(if recovery.outstanding() == 0 {
-                        UdpMigrationFailureReason::HostCleanupFailed
-                    } else {
-                        UdpMigrationFailureReason::GateAcknowledgementMissing
-                    });
+                match super::host_udp_capture::recover_and_reap_until(
+                    recovery,
+                    std_deadline,
+                    &mut |deadline| host_reaper.reap_host_udp_state(deadline),
+                )
+                .await
+                {
+                    HostUdpRecoverOnce::Reaped => host_pass_complete = true,
+                    HostUdpRecoverOnce::Incomplete => {
+                        host_pass_complete = false;
+                        failure_reason = Some(if recovery.outstanding() == 0 {
+                            UdpMigrationFailureReason::HostCleanupFailed
+                        } else {
+                            UdpMigrationFailureReason::GateAcknowledgementMissing
+                        });
+                    }
+                    HostUdpRecoverOnce::DeadlineElapsed => {
+                        return UdpCleanupOutcome::DeadlineElapsed;
+                    }
                 }
                 host_outstanding = recovery.outstanding();
             }
@@ -98,6 +159,9 @@ pub async fn run_udp_placement_cleanup(
             let mut pod_outstanding = 0;
             if let Some(manager) = pod_cleanup.as_mut() {
                 let progress = manager.migration_cleanup_once().await;
+                if progress.deadline_elapsed {
+                    return UdpCleanupOutcome::DeadlineElapsed;
+                }
                 pod_outstanding = progress.outstanding;
                 if let Some(reason) = progress.failure_reason {
                     failure_reason = Some(reason);
@@ -119,7 +183,11 @@ pub async fn run_udp_placement_cleanup(
             if !proof_progress.proof_is_valid() {
                 set_phase(UdpMigrationStatusPhase::WaitingForRegistry, 0);
                 set_failure(UdpMigrationFailureReason::RegistryNotSynchronized);
-                ticker.tick().await;
+                if let Some(outcome) =
+                    wait_for_next_pass(&mut ticker, &mut shutdown, std_deadline).await
+                {
+                    return outcome;
+                }
                 continue;
             }
 
@@ -140,8 +208,22 @@ pub async fn run_udp_placement_cleanup(
             }
 
             if let Some(proof) = proof_progress.completion_proof() {
+                if owned_shell::deadline_elapsed(std_deadline) {
+                    return UdpCleanupOutcome::DeadlineElapsed;
+                }
                 match context.mark_cleanup_complete(proof) {
                     Ok(()) => {
+                        if owned_shell::deadline_elapsed(std_deadline) {
+                            // A write that raced the deadline is not a published
+                            // success: retract and fail closed so the caller never
+                            // reports completion after timeout.
+                            if context.is_node_preflight() {
+                                let _ = super::udp_placement_migration::retract_node_cleanup_proof(
+                                    context.registry_dir(),
+                                );
+                            }
+                            return UdpCleanupOutcome::DeadlineElapsed;
+                        }
                         set_phase(UdpMigrationStatusPhase::CleanupComplete, 0);
                         clear_failure();
                         if context.is_node_preflight() {
@@ -174,13 +256,32 @@ pub async fn run_udp_placement_cleanup(
             set_failure(UdpMigrationFailureReason::RegistryNotSynchronized);
         }
 
-        tokio::select! {
-            _ = ticker.tick() => {}
-            changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() {
-                    return UdpCleanupOutcome::ShuttingDown;
-                }
+        if let Some(outcome) = wait_for_next_pass(&mut ticker, &mut shutdown, std_deadline).await {
+            return outcome;
+        }
+    }
+}
+
+/// Wait for the next retry tick, shutdown, or the wall-clock deadline.
+async fn wait_for_next_pass(
+    ticker: &mut tokio::time::Interval,
+    shutdown: &mut watch::Receiver<bool>,
+    deadline: Option<std::time::Instant>,
+) -> Option<UdpCleanupOutcome> {
+    tokio::select! {
+        _ = ticker.tick() => None,
+        changed = shutdown.changed() => {
+            if changed.is_err() || *shutdown.borrow() {
+                Some(UdpCleanupOutcome::ShuttingDown)
+            } else {
+                None
             }
         }
+        _ = async {
+            match owned_shell::remaining(deadline) {
+                Some(remaining) => tokio::time::sleep(remaining).await,
+                None => pending().await,
+            }
+        } => Some(UdpCleanupOutcome::DeadlineElapsed),
     }
 }

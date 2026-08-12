@@ -1006,7 +1006,21 @@ fn ambient_udp_production_entry_points_are_scheduled_by_the_trusted_classifier()
         .expect("preflight runs the shared retirement supervisor");
     assert!(
         retract_at < cleanup_at,
-        "leftover proof must be retracted before the idempotent cleanup runs"
+        "leftover proof must be retracted before predecessor retirement runs"
+    );
+    assert!(
+        cli.contains("preflight_capture_tools_until")
+            && cli.contains("owned_shell::deadline_elapsed")
+            && !cli.contains("short-circuits"),
+        "the preflight must bound tool/cleanup work by the wall-clock deadline and must not \
+         short-circuit on leftover proof"
+    );
+
+    let mesh = read("src/modes/mesh/mod.rs");
+    assert!(
+        mesh.contains("run_udp_placement_cleanup(\n        context,\n        source,\n        shutdown.clone(),\n        None,")
+            || mesh.contains("shutdown.clone(),\n        None,"),
+        "ordinary migration cleanup must keep an unbounded supervisor (deadline None)"
     );
 
     let migration = read("src/proxy/udp_placement_migration.rs");

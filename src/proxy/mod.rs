@@ -98,6 +98,7 @@ pub mod mesh_udp_capture;
 pub mod mesh_udp_frame;
 pub mod netns_capture;
 pub mod netns_udp_capture;
+pub mod owned_shell;
 pub(crate) mod node_waypoint_ingress_capture;
 pub mod proxy_protocol;
 pub(crate) mod response_buffer_budget;

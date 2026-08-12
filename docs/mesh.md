@@ -4344,7 +4344,12 @@ default `true`). It runs `ferrum-edge ambient-udp-preflight` from the same
 
 It exits non-zero without publishing anything on any failure or on its
 `--timeout-seconds` budget (default 300), so the unprivileged steady-state
-container never starts on a node whose retirement could not be proven. Only the
+container never starts on a node whose retirement could not be proven. That
+budget is a wall-clock ceiling: the preflight owns every `sh`/iptables/ip child
+it starts, waits with `try_wait`, and SIGKILLs the child's process group if the
+deadline wins, so a stalled cleanup command cannot pin the current-thread
+runtime or leave an orphan mutating network state after timeout. No attestation
+is published after the deadline wins. Only the
 init stage receives `hostPID`, `SYS_ADMIN`, and `SYS_PTRACE`; it has exited
 before the producer starts, so the host placement keeps its narrow
 `NET_ADMIN`/`NET_RAW` steady-state posture. The elevated stage is also narrower
