@@ -2629,6 +2629,34 @@ pub struct EnvConfig {
     /// to constrain the attack surface of a public H3 listener until you
     /// have validated WebSocket-over-H3 in your environment.
     pub http3_websocket_enabled: bool,
+    /// Enable RFC 9298 UDP proxying (`:protocol = connect-udp`) on the HTTP/3
+    /// listener. Default `false`.
+    ///
+    /// When `true`, an Extended CONNECT request whose `:path` expands the
+    /// RFC 9298 URI Template establishes a bounded UDP tunnel to a destination
+    /// that is **already configured** for the matched proxy (its backend, or a
+    /// target of its upstream). Payloads ride RFC 9297 DATAGRAM capsules on
+    /// the CONNECT stream; `SETTINGS_H3_DATAGRAM` is never negotiated.
+    ///
+    /// When `false` (the default) a `connect-udp` Extended CONNECT is refused
+    /// with 501, and the setting is not advertised unless the WebSocket
+    /// profile is separately enabled. Enabling UDP tunnelling changes what a
+    /// route can reach, so it is opt-in rather than derived.
+    pub http3_connect_udp_enabled: bool,
+    /// Maximum concurrent RFC 9298 CONNECT-UDP tunnels for this gateway
+    /// process (default 256). `0` disables the limit.
+    pub http3_connect_udp_max_sessions: usize,
+    /// Seconds a CONNECT-UDP tunnel may carry no datagram in either direction
+    /// before it is closed (default 60). The QUIC connection idle timeout
+    /// (`FERRUM_HTTP3_IDLE_TIMEOUT`) applies independently and may close an
+    /// otherwise-idle connection sooner.
+    pub http3_connect_udp_idle_timeout_seconds: u64,
+    /// Largest UDP payload relayed in either direction (default 65527, the
+    /// RFC 9298 §5 ceiling for Context ID 0). Larger datagrams received from
+    /// the target are silently dropped rather than fragmented or truncated;
+    /// larger client capsules terminate the session. Lower this to bound
+    /// per-session buffers or to keep tunnelled datagrams inside the path MTU.
+    pub http3_connect_udp_max_datagram_bytes: usize,
     /// Milliseconds the HTTP/3 listener spends draining already-buffered
     /// request-body bytes before issuing STOP_SENDING when a
     /// small/successful response is emitted while the client is likely
@@ -3569,6 +3597,11 @@ impl Default for EnvConfig {
             http3_flush_interval_micros: 200,
             http3_request_body_channel_capacity: 32,
             http3_websocket_enabled: true,
+            http3_connect_udp_enabled: false,
+            http3_connect_udp_max_sessions: 256,
+            http3_connect_udp_idle_timeout_seconds: 60,
+            http3_connect_udp_max_datagram_bytes:
+                crate::http3::connect_udp::CONNECT_UDP_MAX_PAYLOAD_BYTES,
             h3_request_body_drain_ms: 50,
             http3_initial_mtu: 1500,
             grpc_pool_ready_wait_ms: 1,
@@ -4141,6 +4174,10 @@ impl EnvConfig {
             http3_flush_interval_micros: u64 = "FERRUM_HTTP3_FLUSH_INTERVAL_MICROS" => 200u64, clamp(crate::http3::config::H3_FLUSH_INTERVAL_MIN_MICROS, crate::http3::config::H3_FLUSH_INTERVAL_MAX_MICROS);
             http3_request_body_channel_capacity: usize = "FERRUM_HTTP3_REQUEST_BODY_CHANNEL_CAPACITY" => 32usize, clamp(1usize, 1024usize);
             http3_websocket_enabled: bool = "FERRUM_HTTP3_WEBSOCKET_ENABLED" => true;
+            http3_connect_udp_enabled: bool = "FERRUM_HTTP3_CONNECT_UDP_ENABLED" => false;
+            http3_connect_udp_max_sessions: usize = "FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS" => 256usize;
+            http3_connect_udp_idle_timeout_seconds: u64 = "FERRUM_HTTP3_CONNECT_UDP_IDLE_TIMEOUT_SECONDS" => 60u64, clamp(1u64, 86_400u64);
+            http3_connect_udp_max_datagram_bytes: usize = "FERRUM_HTTP3_CONNECT_UDP_MAX_DATAGRAM_BYTES" => crate::http3::connect_udp::CONNECT_UDP_MAX_PAYLOAD_BYTES, clamp(1usize, crate::http3::connect_udp::CONNECT_UDP_MAX_PAYLOAD_BYTES);
             h3_request_body_drain_ms: u64 = "FERRUM_H3_REQUEST_BODY_DRAIN_MS" => 50u64, clamp(0u64, 1000u64);
             http3_initial_mtu: u16 = "FERRUM_HTTP3_INITIAL_MTU" => 1500u16;
             grpc_pool_ready_wait_ms: u64 = "FERRUM_GRPC_POOL_READY_WAIT_MS" => 1u64;
@@ -4920,6 +4957,10 @@ impl EnvConfig {
             http3_flush_interval_micros,
             http3_request_body_channel_capacity,
             http3_websocket_enabled,
+            http3_connect_udp_enabled,
+            http3_connect_udp_max_sessions,
+            http3_connect_udp_idle_timeout_seconds,
+            http3_connect_udp_max_datagram_bytes,
             h3_request_body_drain_ms,
             http3_initial_mtu,
             grpc_pool_ready_wait_ms,

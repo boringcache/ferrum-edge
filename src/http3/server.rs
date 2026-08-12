@@ -1127,14 +1127,19 @@ async fn handle_h3_connection(
         crate::plugins::PeerConnectionSignal::new(std::sync::Arc::new(QuicPeerConnectionWatch {
             connection: connection.clone(),
         }));
-    // RFC 9220: advertise SETTINGS_ENABLE_CONNECT_PROTOCOL so H3 clients can
-    // bootstrap a WebSocket via Extended CONNECT (:method=CONNECT,
-    // :protocol=websocket). Mirrors the H2 listener's `enable_connect_protocol()`
-    // call. Gated by `FERRUM_HTTP3_WEBSOCKET_ENABLED` so operators can disable
-    // the path without disabling HTTP/3 entirely; the dispatch site still
-    // returns 501 if a client manages to send the Extended CONNECT anyway.
+    // RFC 9220 / RFC 9298: advertise SETTINGS_ENABLE_CONNECT_PROTOCOL so H3
+    // clients can bootstrap an Extended CONNECT profile (:method=CONNECT plus
+    // :protocol=websocket or :protocol=connect-udp). Mirrors the H2 listener's
+    // `enable_connect_protocol()` call. Advertised when EITHER profile is
+    // enabled, so disabling one does not silently disable the other; each
+    // dispatch site still refuses its own disabled profile as defense in
+    // depth. SETTINGS_H3_DATAGRAM is deliberately left unnegotiated: the
+    // CONNECT-UDP profile carries HTTP Datagrams as RFC 9297 DATAGRAM capsules
+    // on the CONNECT stream (see `crate::http3::connect_udp`).
+    let extended_connect_enabled = state.env_config.http3_websocket_enabled
+        || state.env_config.http3_connect_udp_enabled;
     let mut h3_conn = h3::server::builder()
-        .enable_extended_connect(state.env_config.http3_websocket_enabled)
+        .enable_extended_connect(extended_connect_enabled)
         .build(h3_quinn::Connection::new(connection))
         .await?;
 
@@ -1330,6 +1335,11 @@ async fn handle_h3_request(
     // flavor around lets every dispatch and rejection stay flavor-aware
     // (trailers-only gRPC status vs JSON).
     let detected_http_flavor = crate::proxy::backend_dispatch::detect_http_flavor(&req);
+    // Classify the Extended CONNECT `:protocol` once, alongside the flavor, so
+    // both the CONNECT admission gate and the dispatch site below read the
+    // same decision. An unregistered `:protocol` token never reaches here: h3
+    // fails to parse it and resets the stream with H3_MESSAGE_ERROR.
+    let extended_connect = crate::http3::connect_udp::classify_h3_extended_connect(&req);
     // Enforce configured HTTP/3 header limits before deriving any gRPC-Web
     // response encoding from request headers. gRPC-Web media negotiation may
     // preserve custom +suffix values in owned response Content-Type strings,
@@ -1665,14 +1675,19 @@ async fn handle_h3_request(
         return Ok(());
     }
 
-    // Block non-WebSocket CONNECT requests. HTTP/3 Extended CONNECT for
-    // WebSocket (RFC 9220) is classified above as `HttpFlavor::WebSocket`
-    // and falls through to the dedicated bridge later in this handler. Other
-    // CONNECT-style protocols (for example CONNECT-UDP) are not supported by
-    // this proxy and must be rejected to prevent tunnel establishment that
-    // bypasses proxy routing.
-    if method == "CONNECT" && http_flavor != HttpFlavor::WebSocket {
-        warn!("Rejected non-WebSocket HTTP/3 CONNECT request");
+    // Extended CONNECT admission. Exactly two profiles are dispatchable:
+    // RFC 9220 WebSocket (classified above as `HttpFlavor::WebSocket`, handled
+    // by the bridge later in this handler) and RFC 9298 CONNECT-UDP (handled
+    // by `crate::http3::connect_udp`, and only when the operator enabled it).
+    // Every other CONNECT — plain CONNECT with no `:protocol`, or a registered
+    // `:protocol` this gateway does not implement such as `webtransport` — is
+    // refused here so no tunnel can be established that bypasses proxy
+    // routing. An unregistered `:protocol` token never gets this far: h3
+    // treats it as a malformed request and resets the stream.
+    let is_connect_udp_request = method == "CONNECT"
+        && extended_connect == crate::http3::connect_udp::H3ExtendedConnect::ConnectUdp;
+    if method == "CONNECT" && http_flavor != HttpFlavor::WebSocket && !is_connect_udp_request {
+        warn!("Rejected unsupported HTTP/3 CONNECT request");
         record_h3_flavor_aware_reject(&state, http_flavor, 405);
         send_h3_error_flavor_aware(
             &mut stream,
@@ -1682,6 +1697,25 @@ async fn handle_h3_request(
             r#"{"error":"CONNECT method is not allowed"}"#,
             crate::proxy::grpc_proxy::grpc_status::UNIMPLEMENTED,
             "CONNECT method is not allowed",
+        )
+        .await?;
+        return Ok(());
+    }
+    // The CONNECT-UDP profile is off by default: enabling UDP tunnelling
+    // changes what a route can reach. Refuse before routing, plugins, or any
+    // socket work, and name the profile so a client can tell "not implemented
+    // here" from "not a valid request".
+    if is_connect_udp_request && !state.env_config.http3_connect_udp_enabled {
+        warn!("Rejected HTTP/3 CONNECT-UDP request: profile disabled");
+        record_h3_flavor_aware_reject(&state, http_flavor, 501);
+        send_h3_error_flavor_aware(
+            &mut stream,
+            http_flavor,
+            grpc_web_response_content_type,
+            StatusCode::NOT_IMPLEMENTED,
+            r#"{"error":"CONNECT-UDP over HTTP/3 is disabled on this gateway"}"#,
+            crate::proxy::grpc_proxy::grpc_status::UNIMPLEMENTED,
+            "CONNECT-UDP over HTTP/3 is disabled on this gateway",
         )
         .await?;
         return Ok(());
@@ -2065,8 +2099,12 @@ async fn handle_h3_request(
             .entry("request_protocol".to_string())
             .or_insert_with(|| "grpc".to_string());
     }
-    let allows_request_body_buffering =
-        crate::proxy::http_flavor_allows_request_body_buffering(http_flavor);
+    // A CONNECT-UDP request has no request body: the DATA frames after the 200
+    // are RFC 9297 capsules. Draining them as a body would consume the tunnel,
+    // exactly as it would for a WebSocket Extended CONNECT (which
+    // `http_flavor_allows_request_body_buffering` already excludes).
+    let allows_request_body_buffering = !is_connect_udp_request
+        && crate::proxy::http_flavor_allows_request_body_buffering(http_flavor);
 
     // Load plugin-cache values once for this request. Every plugin list,
     // capability bitset, and buffering flag below is derived from the same
@@ -4925,6 +4963,42 @@ async fn handle_h3_request(
     // response streamed) and why that matches the rest of the codebase's two-tier
     // buffering logic. A non-H3-capable gRPC backend (h2/h2c only) still routes
     // through this bridge to the H2 gRPC pool.
+    // RFC 9298: HTTP/3 Extended CONNECT for UDP proxying. Admitted by the gate
+    // near the top of this handler, so reaching here means the operator
+    // enabled the profile. Dispatch takes ownership of the QUIC stream so the
+    // capsule relay can `.split()` it into independent halves. Routing,
+    // authentication, authorization, admission/overload, rate limiting, and
+    // the `before_proxy` plugin phase have all already run — a CONNECT-UDP
+    // tunnel is an ordinary Ferrum request until this point, and the handler
+    // additionally requires the client-named destination to be one the matched
+    // proxy is already configured to reach.
+    if is_connect_udp_request {
+        return crate::http3::connect_udp::handle_h3_connect_udp(
+            stream,
+            crate::http3::connect_udp::ConnectUdpRequest {
+                state,
+                request_guard,
+                per_ip_guard,
+                epoch,
+                // The BASE route proxy, not the per-target effective overlay:
+                // the destination allow-list and the reload re-check both read
+                // route configuration, and the live re-lookup by
+                // (namespace, id) can only ever return the base shape.
+                proxy: Arc::clone(&selected_base_proxy),
+                ctx,
+                plugins,
+                initial_response_header_policy_plugins,
+                plugin_execution_ns,
+                start_time,
+                request_path: original_request_path.clone(),
+                proxy_headers,
+                cb_target_key,
+                cb_is_half_open_probe,
+            },
+        )
+        .await;
+    }
+
     // RFC 9220: HTTP/3 Extended CONNECT for WebSocket. The request was
     // classified as `HttpFlavor::WebSocket` by `detect_http_flavor` (which
     // accepts both H2 and H3 Extended CONNECT). Dispatch into the

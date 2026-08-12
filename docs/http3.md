@@ -15,6 +15,7 @@ Ferrum Edge accepts HTTP/3 client traffic on a dedicated QUIC listener and proxi
 - [Backend trailers and response header policy](#backend-trailers-and-response-header-policy)
   - [Native gRPC terminal metadata](#native-grpc-terminal-metadata)
 - [WebSocket over HTTP/3 (RFC 9220 Extended CONNECT)](#websocket-over-http3-rfc-9220-extended-connect)
+- [CONNECT-UDP over HTTP/3 (RFC 9298)](#connect-udp-over-http3-rfc-9298)
 - [QUIC connection migration](#quic-connection-migration)
 - [Header size limits](#header-size-limits)
 - [Flow-control window tuning](#flow-control-window-tuning)
@@ -827,6 +828,114 @@ case, backend retry target rotation, failed backend upgrade responses,
 per-IP request-slot release after the 200 CONNECT response, and
 `FERRUM_HTTP3_WEBSOCKET_ENABLED=false` rejecting Extended CONNECT while
 plain H3 requests continue to route.
+
+## CONNECT-UDP over HTTP/3 (RFC 9298)
+
+Implementation: `src/http3/connect_udp.rs`. Off by default; enable with
+`FERRUM_HTTP3_CONNECT_UDP_ENABLED=true`.
+
+### Interoperability profile
+
+This is the complete profile. Anything outside it is refused; there is no
+private Ferrum framing.
+
+| Aspect | Behavior |
+| --- | --- |
+| Bootstrap | RFC 9298 §3 over HTTP/3: `:method=CONNECT`, `:protocol=connect-udp`, `:scheme=https`, `:authority` = gateway authority |
+| URI Template | RFC 9298 §2. The default `https://$HOST:$PORT/.well-known/masque/udp/{target_host}/{target_port}/` works verbatim. Any operator prefix is accepted as long as the expanded path ends with `udp/{target_host}/{target_port}/`, trailing slash included |
+| Success response | `200` with `Capsule-Protocol: ?1` (RFC 9297 §3.4), written after response-header policy so no plugin can remove or forge it |
+| Payload encoding | HTTP Datagrams as RFC 9297 **DATAGRAM capsules** (`Capsule Type = 0x00`) on the CONNECT stream |
+| `SETTINGS_H3_DATAGRAM` | Never negotiated. QUIC DATAGRAM frames are not used in either direction |
+| Datagram payload | RFC 9298 §5: Context ID varint + unmodified UDP payload. Only Context ID `0` is registered |
+| Unknown context IDs | Well-formed but unregistered contexts are dropped (RFC 9298 §4), never proxied |
+| Unknown capsule types | Silently dropped and skipped (RFC 9297 §3.1), subject to the same length ceiling |
+
+RFC 9297 §3.5 states that HTTP Datagrams sent in a DATAGRAM capsule "have the
+same semantics as those sent in QUIC DATAGRAM frames", and a compliant RFC 9298
+client that has not received `SETTINGS_H3_DATAGRAM = 1` uses exactly this
+encoding. The capsule profile is therefore an interoperable encoding of the
+same HTTP Datagrams, not an alternative wire format.
+
+### Routing, policy, and destination admission
+
+A CONNECT-UDP request is an ordinary Ferrum request up to the point of
+dispatch. Routing (`hosts` + `listen_path`), authentication, authorization,
+overload admission, per-IP limits, rate limiting, `before_proxy` plugins,
+`TransactionSummary` access logging, and the request/status metrics all run
+first and unchanged. The tunnel is dispatched at the same point in
+`handle_h3_request` as the RFC 9220 WebSocket bridge.
+
+RFC 9298 lets the *client* name the destination, so the destination is
+**admitted, not load balanced**: the requested `target_host:target_port` must
+already be configured for the matched proxy — its `backend_host:backend_port`,
+or one of the referenced upstream's targets. Anything else is refused with 403
+before a socket exists, so a CONNECT-UDP route can never reach further than the
+ordinary HTTP route on the same proxy. Operators express the allow-list simply
+by pointing the proxy's upstream at the destinations they intend to expose.
+
+Two deliberate consequences of not dialling an HTTP backend: a claimed
+half-open circuit-breaker probe slot is released immediately (a tunnel is not a
+probe outcome and holding the slot would wedge the breaker), and no
+load-balancer connection is charged.
+
+Target resolution goes through the dial-time, policy-screened resolver, so the
+same backend IP policy that guards ordinary backend dialling guards the tunnel;
+a mixed DNS answer containing a denied address fails the whole lookup.
+
+### Bounds and lifecycle
+
+| Bound | Source |
+| --- | --- |
+| Concurrent tunnels | `FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS` (503 over the limit) |
+| Idle lifetime | `FERRUM_HTTP3_CONNECT_UDP_IDLE_TIMEOUT_SECONDS` |
+| Datagram payload | `FERRUM_HTTP3_CONNECT_UDP_MAX_DATAGRAM_BYTES`, itself capped at the RFC 9298 §5 ceiling of 65527 |
+| Capsule length | payload ceiling + 8 bytes of Context ID slack |
+| Buffered partial capsule | one capsule, never more |
+
+There is no queue between the directions. The client-bound relay awaits
+`send_data` (QUIC stream flow control is the backpressure) and the target-bound
+relay awaits `UdpSocket::send`; excess is dropped by the kernel socket buffer,
+which is the correct behaviour for a UDP tunnel and keeps a session's footprint
+to a pair of fixed buffers.
+
+Each tunnel uses one *connected* UDP socket (RFC 9298 §3.1), so the kernel
+enforces the 5-tuple and off-path packets never enter the session. A datagram
+from the target larger than the configured ceiling is silently dropped rather
+than fragmented or truncated; an oversized or malformed capsule from the client
+terminates the tunnel.
+
+A tunnel ends — sockets closed, session permit and connection guard released —
+on any of: client FIN or stream error, target socket error, idle expiry,
+capsule protocol fault, gateway drain (`SIGTERM`), or **route withdrawal**. The
+last is checked against the currently published config generation, not the one
+the request was admitted under: a reload that deletes the proxy or removes the
+destination from its upstream tears live tunnels down within one supervisor
+tick rather than grandfathering them.
+
+### Refusals
+
+| Condition | Status |
+| --- | --- |
+| Profile disabled | `501` |
+| Unregistered `:protocol` token | h3 resets the stream with `H3_MESSAGE_ERROR` before the gateway sees it |
+| Registered but unimplemented `:protocol` (e.g. `webtransport`), or CONNECT with no `:protocol` | `405` |
+| Path is not an RFC 9298 template expansion, or `target_host` / `target_port` is empty, oversized, or malformed | `400` with a field-specific body |
+| Destination not configured for the matched proxy | `403` (the configured set is never echoed) |
+| Session limit reached | `503` |
+| DNS failure / policy refusal | `502` with `Proxy-Status: ferrum-edge; error=dns_error` |
+| DNS timeout | `504` |
+| Socket bind/connect failure | `502` |
+
+### Testing
+
+- `tests/unit/gateway_core/http3_connect_udp_tests.rs` — URI-template parsing
+  and hostile-input rejection, destination admission, capsule decoding
+  (context IDs, unknown capsule types, oversize, truncation, split frames),
+  capsule encoding, and `:protocol` classification.
+- `tests/functional/functional_http3_connect_udp_test.rs` — live H3
+  CONNECT-UDP traffic against a real UDP echo server, plus spoofed-destination,
+  malformed-template, unknown-`:protocol`, oversize-capsule, disabled-profile,
+  and reload-withdrawal coverage.
 
 ## QUIC connection migration
 

@@ -5940,6 +5940,10 @@ pub struct ProxyState {
     /// Optional dedicated WebSocket admission control.
     /// Enforced only on the upgrade path, never on the frame-forwarding hot path.
     pub websocket_conn_limit: Option<Arc<tokio::sync::Semaphore>>,
+    /// Concurrent RFC 9298 CONNECT-UDP tunnel admission for the HTTP/3
+    /// frontend. `None` when `FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS=0`
+    /// (unlimited). Held for the tunnel lifetime, never on a datagram path.
+    pub h3_connect_udp_sessions: Option<Arc<tokio::sync::Semaphore>>,
     /// True only after the serving mode actually starts an H3 listener whose
     /// extended CONNECT/WebSocket support is enabled.
     ///
@@ -7405,6 +7409,13 @@ impl ProxyState {
         } else {
             None
         };
+        let h3_connect_udp_sessions = if env_config.http3_connect_udp_max_sessions > 0 {
+            Some(Arc::new(tokio::sync::Semaphore::new(
+                env_config.http3_connect_udp_max_sessions,
+            )))
+        } else {
+            None
+        };
         warn_if_websocket_idle_disabled(&config, env_config.websocket_idle_timeout_seconds);
         // Create connection pools with global configuration from environment
         let global_pool_config = PoolConfig::from_env();
@@ -7890,6 +7901,7 @@ impl ProxyState {
             websocket_tunnel_mode,
             trusted_proxies,
             websocket_conn_limit,
+            h3_connect_udp_sessions,
             h3_websocket_reachable: Arc::new(AtomicBool::new(false)),
             per_ip_request_counts: if max_concurrent_requests_per_ip > 0 {
                 Some(Arc::new(dashmap::DashMap::with_shard_amount(
