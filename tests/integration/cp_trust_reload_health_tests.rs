@@ -548,7 +548,7 @@ async fn a_short_hmac_key_does_not_fall_back_to_an_unkeyed_digest() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn the_keyed_identifier_is_authenticated_health_only() {
+async fn the_keyed_identifier_is_detailed_health_only() {
     let status = status_at(Instant::now(), BOUND);
     status.record_attempt();
     status.record_accepted(true, &ROTATED_FINGERPRINT);
@@ -581,7 +581,7 @@ async fn the_keyed_identifier_is_authenticated_health_only() {
 
     assert!(
         rendered.contains(id),
-        "authenticated health JSON publishes the keyed identifier"
+        "authorized detailed health JSON publishes the keyed identifier"
     );
     assert!(
         !metrics.contains(id),
@@ -831,7 +831,7 @@ async fn a_malformed_candidate_retains_the_previous_verifier_and_degrades() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_rotated_bundle_is_accepted_without_publishing_an_identifier() {
+async fn a_rotated_bundle_is_accepted_and_publishes_a_keyed_identifier() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("bundle.json");
     std::fs::write(&path, bundle_document(KID, NAMESPACE, SECRET)).expect("write bundle");
