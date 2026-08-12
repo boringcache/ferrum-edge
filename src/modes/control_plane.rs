@@ -2293,6 +2293,8 @@ pub async fn run(
         startup_ready: Some(startup_ready.clone()),
         serving_degraded: Some(serving_degraded.clone()),
         serving_listener_failures: None,
+        gateway_listener_status: None,
+        gateway_listener_failure_fails_readiness: false,
         db_available: Some(db_available.clone()),
         config_rejected: Some(config_rejected.clone()),
         admin_restore_max_body_size_mib: env_config.admin_restore_max_body_size_mib,

@@ -2697,6 +2697,16 @@ pub struct EnvConfig {
     /// Mirrors `FERRUM_CP_REQUIRE_NAMESPACE_CLAIM` on the gRPC plane.
     /// Default: false (namespace header is a routing selector only).
     pub admin_require_namespace_claim: bool,
+    /// Whether an active dynamic Gateway API listener bind failure degrades
+    /// `/health` readiness in addition to reporting `status: "degraded"`
+    /// (issue #3810).
+    ///
+    /// Default `false`: a Gateway listener port is control-plane input and its
+    /// failure is recoverable on the 30s retry, so one unbindable port must not
+    /// withdraw a replica whose other listeners are serving. Operators who
+    /// would rather drain such a replica set this to `true`; either way
+    /// liveness (`/live`) stays healthy and no healthy listener is closed.
+    pub gateway_listener_failure_fails_readiness: bool,
     /// Disable admin TLS certificate verification (for testing only)
     pub admin_tls_no_verify: bool,
 
@@ -3703,6 +3713,7 @@ impl Default for EnvConfig {
             audit_retention_max_rows: Some(crate::admin::audit::AUDIT_RETENTION_MAX_ROWS_DEFAULT),
             admin_audit_pipeline: crate::admin::audit::AuditPipelineConfig::default(),
             admin_require_namespace_claim: false,
+            gateway_listener_failure_fails_readiness: false,
             admin_tls_no_verify: false,
             stream_proxy_bind_address: "0.0.0.0".into(),
             stream_gateway_ref: None,
@@ -3949,6 +3960,8 @@ impl EnvConfig {
             admin_audit_max_delivery_attempts: u32 = "FERRUM_ADMIN_AUDIT_MAX_DELIVERY_ATTEMPTS"
                 => crate::admin::audit::AUDIT_MAX_DELIVERY_ATTEMPTS_DEFAULT;
             admin_require_namespace_claim: bool = "FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM" => false;
+            gateway_listener_failure_fails_readiness: bool
+                = "FERRUM_GATEWAY_LISTENER_FAILURE_FAILS_READINESS" => false;
         }
         // Durable HTTPS-intent signal: the inherited default `9443` alone is not
         // an operator request. Capture whether the port key was actually present
@@ -5083,6 +5096,7 @@ impl EnvConfig {
             audit_retention_max_rows,
             admin_audit_pipeline,
             admin_require_namespace_claim,
+            gateway_listener_failure_fails_readiness,
             admin_tls_no_verify,
             enable_http3,
             http3_idle_timeout,
