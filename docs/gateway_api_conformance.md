@@ -402,10 +402,10 @@ without a restart. These bounds are deliberate and tested:
   (`:80` / `:443` without `CAP_NET_BIND_SERVICE`) fails and is retried. Either
   way the failure is logged and surfaced on
   `GatewayListenerManager::bind_failures`, and routes scoped to a genuinely
-  refused listener stay unreachable rather than being served somewhere else.
-  Once the matching generation is acknowledged, an ordinary OS bind failure
-  remains eligible for the intentional Service-fronted remap; only admission
-  refusals suppress routing.
+  refused or bind-failed listener stay unreachable rather than being served
+  somewhere else. Once the matching generation is acknowledged, both admission
+  refusals and ordinary OS bind failures suppress the intentional
+  Service-fronted remap.
 - **An HTTP↔HTTPS class flip retires the old generation first.** The retiring
   accept-loop task is awaited before the replacement binds, so with
   `FERRUM_ACCEPT_THREADS > 1` the `SO_REUSEPORT` sockets of the two classes
@@ -435,6 +435,18 @@ really exists, so a client is never steered from a port-scoped listener to the
 global HTTPS port whose route table cannot match the port-scoped route. A port
 whose QUIC bind fails keeps serving H1/H2, reports the failure on
 `GatewayListenerManager::bind_failures`, advertises no HTTP/3, and is retried.
+
+A UDP/DTLS stream proxy on the same **numeric** port is a QUIC-only conflict:
+TCP and UDP are independent socket namespaces, so the HTTPS TCP listener stays
+bound and keeps serving H1/H2. The optional QUIC half is refused with a bounded
+`udp_stream_collision` reason, `ensure_quic` is not called while the claim
+exists, and the TCP port is **not** added to the whole-listener refused-route
+set. Adding the UDP/DTLS claim on reload drains only QUIC (existing H1/H2
+connections continue); removing it starts QUIC on the already-running TCP
+listener. A stale reconcile cannot restore QUIC after a newer epoch reserved
+the UDP port. TCP/TLS raw-stream collisions still refuse the whole HTTP-family
+listener; plaintext HTTP listeners remain unaffected by UDP/DTLS same-port
+claims.
 
 **Single-listener protocol remap.** When the whole route table declares exactly
 one listener port of a protocol class, a request arriving on the global process

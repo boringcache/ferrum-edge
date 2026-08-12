@@ -30,6 +30,11 @@ mod consumer_index;
 mod custom_plugins;
 mod date_cache;
 mod dns;
+// Test-facing constructors/accessors (deterministic-clock variants) are used by
+// the external unit suites and the library target; the binary only reaches the
+// runtime entry points, so the rest is dead code *here* only.
+#[allow(dead_code)]
+mod dp_config_freshness;
 mod dtls;
 mod ebpf;
 // Most of this module is consumed by the library target, `validate`, the admin
@@ -794,6 +799,22 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
             max_response_bytes: env_config.service_discovery_max_response_body_bytes,
             max_error_bytes: env_config.service_discovery_max_error_body_bytes,
             body_budget_bytes: env_config.service_discovery_body_budget_bytes,
+        },
+    ) {
+        error!(
+            "Configuration error: {}",
+            secrets::redact_external_secret_values(&e)
+        );
+        return 1;
+    }
+
+    // Publish the bounded discovery staleness policy on the same seam, so an
+    // expiry policy can never be resolved from defaults after a poller started.
+    if let Err(e) = crate::service_discovery::health::install_discovery_staleness_policy(
+        crate::config::env_config::DiscoveryStalenessPolicy {
+            max_stale_seconds: env_config.service_discovery_max_stale_seconds,
+            policy: env_config.service_discovery_stale_policy,
+            allow_unbounded: env_config.service_discovery_allow_unbounded_stale,
         },
     ) {
         error!(

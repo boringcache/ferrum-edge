@@ -2034,9 +2034,36 @@ async fn handle_admin_request_inner(
         let jwks_now = tokio::time::Instant::now();
         let jwks_ready = jwks_trust.ready(jwks_now);
         let jwks_degraded = jwks_trust.degraded(jwks_now);
-        let ready = startup_ready && !serving_degraded && jwks_ready;
+        // Service-discovery task lifecycle and bounded staleness (issues #3717 /
+        // #3721). Readiness fails for an explicit `fail_readiness` policy and
+        // while a default fail-closed withdrawal is still retrying publication.
+        // A crash-looping, restarting, or successfully withdrawn task only
+        // degrades coarse health.
+        let discovery_health = crate::service_discovery::health::coarse_aggregate();
+        let discovery_ready = discovery_health.ready();
+        // Bounded last-known-good DP configuration age (issue #3726). `None`
+        // outside DP mode, so no other mode's readiness changes. Evaluating
+        // here (rather than reading a cached bit) keeps the probe exact at the
+        // boundary; it is a handful of relaxed atomic loads with no allocation,
+        // no lock, and no I/O, so an unauthenticated probe flood cannot drive
+        // work. The projection below is authenticated-detail only.
+        let dp_config_freshness = crate::dp_config_freshness::snapshot();
+        let dp_config_stale = dp_config_freshness
+            .as_ref()
+            .is_some_and(|freshness| freshness.stale);
+        let ready =
+            startup_ready && !serving_degraded && jwks_ready && discovery_ready && !dp_config_stale;
         health_status["ready"] = json!(ready);
+        if detailed && let Some(freshness) = dp_config_freshness.as_ref() {
+            // Fixed-cardinality only: booleans, seconds, counters, and
+            // closed-set reason/action labels. Never a CP URL, token,
+            // namespace, node id, or config content.
+            health_status["dp_config"] = serde_json::to_value(freshness).unwrap_or_default();
+        }
         if jwks_degraded && jwks_ready {
+            health_status["status"] = json!("degraded");
+        }
+        if discovery_health.degraded() && discovery_ready {
             health_status["status"] = json!("degraded");
         }
 
@@ -2133,15 +2160,16 @@ async fn handle_admin_request_inner(
             }
         }
 
-        // Config-rejection signal (issues #2158 / #2997 / #2979): the latest
+        // Config-rejection signal (issues #2158 / #2997 / #2979 / #3776): the latest
         // full config load was rejected by the runtime-config validation
-        // contract or by typed SQL row decoding (DB/CP), or a file-mode SIGHUP
-        // candidate failed read/parse/validation/apply, while the previous
+        // contract or by typed SQL row decoding (DB/CP), a file-mode SIGHUP
+        // candidate failed read/parse/validation/apply, or a localized mesh
+        // file / stock-xDS policy reload failed, while the previous
         // generation kept serving. In DB/CP, admin writes remain ENABLED (they
         // are the in-band repair path — `db_available` is left `true`), so
         // surface the condition as a coarse `"degraded"` status plus a
-        // `config_rejected` detail flag. File mode has `db_available: None`
-        // (treated as reachable below) and stays read-only; repair is a fixed
+        // `config_rejected` detail flag. File/mesh modes have `db_available: None`
+        // (treated as reachable below) and stay read-only; repair is a fixed
         // file + reload. The boolean detail is authenticated-only: it is added
         // to `health_status`, which the minimal unauthenticated body below does
         // not echo. The coarse status is consistent with the other degradations
@@ -2211,6 +2239,15 @@ async fn handle_admin_request_inner(
                     .unwrap_or_default();
             // Fixed-cardinality active-remote JWKS trust health only — never
             // URLs, kids, tokens, claims, or key material (issue #3739).
+            // Per-upstream discovery lifecycle detail (issues #3717 / #3721).
+            // Upstream identity is operator-configured, so it stays inside the
+            // authenticated tier; every other field is a count, an age, or a
+            // closed-set token — never a registry URL, token, or payload.
+            if crate::service_discovery::health::has_tasks() {
+                health_status["service_discovery"] =
+                    serde_json::to_value(crate::service_discovery::health::snapshot())
+                        .unwrap_or_default();
+            }
             health_status["jwks_trust"] = json!({
                 "fresh": jwks_trust.fresh,
                 "grace": jwks_trust.grace,
@@ -2231,12 +2268,19 @@ async fn handle_admin_request_inner(
             // status off `!startup_ready` would mislabel a post-start
             // degradation as "starting". Use the sticky flag instead.
             // Expired active JWKS trust is also an operator-visible outage of a
-            // previously-ready dependency, so it shares `unavailable`.
-            health_status["status"] = json!(if serving_degraded || !jwks_ready {
-                "unavailable"
-            } else {
-                "starting"
-            });
+            // previously-ready dependency, so it shares `unavailable`. So does
+            // a DP whose applied configuration aged past its bound (#3726): it
+            // started ready and lost its authority, which is not "starting".
+            // A discovery task with fail-readiness policy, or a failed
+            // fail-closed withdrawal publication, is likewise unavailable.
+            health_status["status"] =
+                json!(
+                    if serving_degraded || !jwks_ready || !discovery_ready || dp_config_stale {
+                        "unavailable"
+                    } else {
+                        "starting"
+                    }
+                );
             StatusCode::SERVICE_UNAVAILABLE
         } else {
             StatusCode::OK

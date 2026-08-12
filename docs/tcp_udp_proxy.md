@@ -806,7 +806,11 @@ downstream behaviour:
   issue #3288) — one transparent socket in the mesh proxy's own namespace, with
   `mangle PREROUTING` rules scoped per enrolled pod's host-side interface and each
   datagram attributed to a pod by that interface plus its registered source
-  address.
+  address. The production datapath is live-gated by the required
+  `ambient-host-udp-live` workflow (#3705): real TPROXY delivery, `IP_PKTINFO` /
+  `IPV6_PKTINFO` ingress ifindex attribution, dual-stack original-destination
+  recovery, transparent replies, multi-veth identity isolation, and exact
+  Ferrum-owned cleanup under `FERRUM_LIVE_TESTS_REQUIRED=1`.
 
 See [mesh.md](mesh.md) → "UDP TPROXY capture" and "Host-network UDP capture" for
 the capture rules, identity model, fail-closed contract, and the mandatory
@@ -1037,6 +1041,7 @@ Outbound PROXY can be combined with inbound `stream_proxy_protocol: true`: Ferru
 - `listen_port` must be unique across stream proxies unless every sharer forms one opaque-TLS SNI listener (homogeneous passthrough or ordinary opaque TCP) or one L4 `stream_match` group
 - `listen_port` must not conflict with gateway reserved ports — the proxy HTTP/HTTPS ports (`FERRUM_PROXY_HTTP_PORT`, `FERRUM_PROXY_HTTPS_PORT`), admin HTTP/HTTPS ports (`FERRUM_ADMIN_HTTP_PORT`, `FERRUM_ADMIN_HTTPS_PORT`), or CP gRPC port (`FERRUM_CP_GRPC_LISTEN_ADDR`)
 - `listen_port` is optional for HTTP-family proxies; when present it scopes the route to that frontend port and does not join stream-port sharing
+- A TCP/TLS stream `listen_port` still collides with an HTTP-family Gateway listener on that port (whole-listener refusal). A UDP/DTLS stream may share the numeric port with an HTTP-family listener: plaintext is unaffected, and a TLS-class listener with HTTP/3 enabled keeps TCP/H1/H2 while refusing only QUIC/H3 for that port (see [gateway_api_conformance.md](gateway_api_conformance.md) and [http3.md](http3.md))
 - `stream_proxy_protocol` may only be set on `tcp` / `tcp_tls` proxies; setting it on `udp`, `dtls`, or HTTP proxies is a validation error
 - `backend_proxy_protocol` may only be set on `tcp` / `tcps` proxies; setting it on `udp`, `dtls`, or HTTP proxies is a validation error
 - Stream proxies are excluded from the HTTP router (routed by port, not path)

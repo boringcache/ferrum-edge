@@ -258,12 +258,14 @@ REQUIRED_MERGE_GROUP_WORKFLOWS = {
     ".github/workflows/gateway-api-conformance.yml": "Gateway API Conformance",
     ".github/workflows/mesh-e2e-sidecar-live.yml": "Mesh E2E Sidecar Live",
     ".github/workflows/cross-build-policy.yml": "Trusted Cross Build Policy",
+    ".github/workflows/launch-integrity.yml": "Launch Readiness Integrity",
     ".github/workflows/multicluster-federation-live.yml": (
         "Multicluster Federation Live"
     ),
     ".github/workflows/multicluster-poller-partition-live.yml": (
         "Multicluster Poller Partition Live"
     ),
+    ".github/workflows/ambient-host-udp-live.yml": "Ambient Host UDP Live",
 }
 
 # Markers that prove merge-group runs bind validation to the synthesized SHA /
@@ -823,6 +825,26 @@ def main() -> int:
                 planner_errors.append(
                     f"{workflow_path} must not grant contents: write"
                 )
+        if workflow_path == ".github/workflows/launch-integrity.yml":
+            # The integrity lane must stay a trusted-base evaluator: no secret,
+            # no write scope, and no credentialed checkout of candidate code.
+            if "pull_request_target:" not in workflow_yml:
+                planner_errors.append(
+                    f"{workflow_path} must keep pull_request_target so the "
+                    "verifier runs from the trusted base"
+                )
+            if "persist-credentials: false" not in workflow_yml:
+                planner_errors.append(
+                    f"{workflow_path} must keep persist-credentials disabled"
+                )
+            if "secrets." in workflow_yml:
+                planner_errors.append(
+                    f"{workflow_path} must not consume repository secrets"
+                )
+            if re.search(r"(?m)^\s+(?:contents|packages|id-token|actions):\s+write\s*$", workflow_yml):
+                planner_errors.append(
+                    f"{workflow_path} must not grant a write permission"
+                )
         if workflow_path == ".github/workflows/ci.yml":
             if "github.event_name == 'merge_group'" not in workflow_yml:
                 planner_errors.append(
@@ -1113,6 +1135,12 @@ def main() -> int:
     node_waypoint_yml = Path(
         ".github/workflows/node-waypoint-ebpf-live.yml"
     ).read_text(encoding="utf-8")
+    # `ambient-host-udp-live.yml` deliberately carries NO top-level `paths:`
+    # block: it runs unconditionally on every pull_request / merge_group and
+    # decides relevance from a trusted-base classifier instead, so it has no
+    # documentation paths to extract. Its documentation trigger set lives in
+    # `AMBIENT_HOST_UDP_DOCUMENTATION_PATHS`, already folded into the shared
+    # `LIVE_SUITE_DOCUMENTATION_PATHS` below.
     required_full_ci_docs = LIVE_SUITE_DOCUMENTATION_PATHS | extract_documentation_paths(
         node_waypoint_yml
     )

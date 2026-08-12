@@ -745,6 +745,24 @@ pub struct MetricsRegistry {
     /// Kubernetes EndpointSliceList envelopes rejected as malformed (missing /
     /// null / non-array `items`, invalid JSON, incompatible top-level shape).
     service_discovery_malformed_envelope: AtomicU64,
+    /// Supervised discovery pollers that exited unexpectedly (panic or abort).
+    service_discovery_task_panics: AtomicU64,
+    /// Supervised discovery pollers restarted after an unexpected exit.
+    service_discovery_task_restarts: AtomicU64,
+    /// Discovery tasks whose last admitted snapshot crossed the staleness bound.
+    service_discovery_stale_expiries: AtomicU64,
+    /// Stale episodes whose expiry policy withdrew discovered targets.
+    service_discovery_stale_withdrawals: AtomicU64,
+    /// Stale episodes cleared by a freshly admitted and published snapshot.
+    service_discovery_stale_recoveries: AtomicU64,
+    /// Reconciles that kept an unchanged discovery task running.
+    service_discovery_tasks_kept: AtomicU64,
+    /// Discovery tasks started for newly configured upstreams.
+    service_discovery_tasks_started: AtomicU64,
+    /// Discovery tasks replaced because their effective specification changed.
+    service_discovery_tasks_replaced: AtomicU64,
+    /// Discovery tasks stopped because their upstream was removed.
+    service_discovery_tasks_stopped: AtomicU64,
     /// Current ai_federation circuits in an open/half-open recovery state.
     ai_federation_circuits_open: AtomicI64,
     /// ai_federation closed-to-open transitions.
@@ -937,6 +955,15 @@ impl MetricsRegistry {
             service_discovery_response_oversized: AtomicU64::new(0),
             service_discovery_body_budget_rejected: AtomicU64::new(0),
             service_discovery_malformed_envelope: AtomicU64::new(0),
+            service_discovery_task_panics: AtomicU64::new(0),
+            service_discovery_task_restarts: AtomicU64::new(0),
+            service_discovery_stale_expiries: AtomicU64::new(0),
+            service_discovery_stale_withdrawals: AtomicU64::new(0),
+            service_discovery_stale_recoveries: AtomicU64::new(0),
+            service_discovery_tasks_kept: AtomicU64::new(0),
+            service_discovery_tasks_started: AtomicU64::new(0),
+            service_discovery_tasks_replaced: AtomicU64::new(0),
+            service_discovery_tasks_stopped: AtomicU64::new(0),
             ai_federation_circuits_open: AtomicI64::new(0),
             ai_federation_circuits_opened: AtomicU64::new(0),
             ai_federation_circuits_closed: AtomicU64::new(0),
@@ -1464,6 +1491,125 @@ impl MetricsRegistry {
         self.service_discovery_malformed_envelope
             .fetch_add(1, Ordering::Relaxed);
         self.maybe_invalidate_cache();
+    }
+
+    // Discovery task lifecycle / staleness (issues #3717 / #3721 / #3722).
+    // Fixed-cardinality process counters only: namespaced upstream identity is
+    // operator-supplied and never becomes a Prometheus label. Per-upstream
+    // detail lives on the authenticated `/health` and `/status` surfaces.
+    pub fn record_service_discovery_task_panic(&self) {
+        self.service_discovery_task_panics
+            .fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    pub fn record_service_discovery_task_restart(&self) {
+        self.service_discovery_task_restarts
+            .fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    pub fn record_service_discovery_stale_expiry(&self) {
+        self.service_discovery_stale_expiries
+            .fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    pub fn record_service_discovery_stale_withdrawal(&self) {
+        self.service_discovery_stale_withdrawals
+            .fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    pub fn record_service_discovery_stale_recovery(&self) {
+        self.service_discovery_stale_recoveries
+            .fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    pub fn record_service_discovery_tasks_kept(&self, count: u64) {
+        if count == 0 {
+            return;
+        }
+        self.service_discovery_tasks_kept
+            .fetch_add(count, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    pub fn record_service_discovery_tasks_started(&self, count: u64) {
+        if count == 0 {
+            return;
+        }
+        self.service_discovery_tasks_started
+            .fetch_add(count, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    pub fn record_service_discovery_tasks_replaced(&self, count: u64) {
+        if count == 0 {
+            return;
+        }
+        self.service_discovery_tasks_replaced
+            .fetch_add(count, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    pub fn record_service_discovery_tasks_stopped(&self, count: u64) {
+        if count == 0 {
+            return;
+        }
+        self.service_discovery_tasks_stopped
+            .fetch_add(count, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    #[allow(dead_code)]
+    pub fn service_discovery_task_panics_total(&self) -> u64 {
+        self.service_discovery_task_panics.load(Ordering::Relaxed)
+    }
+
+    #[allow(dead_code)]
+    pub fn service_discovery_task_restarts_total(&self) -> u64 {
+        self.service_discovery_task_restarts.load(Ordering::Relaxed)
+    }
+
+    #[allow(dead_code)]
+    pub fn service_discovery_stale_expiries_total(&self) -> u64 {
+        self.service_discovery_stale_expiries
+            .load(Ordering::Relaxed)
+    }
+
+    #[allow(dead_code)]
+    pub fn service_discovery_stale_withdrawals_total(&self) -> u64 {
+        self.service_discovery_stale_withdrawals
+            .load(Ordering::Relaxed)
+    }
+
+    #[allow(dead_code)]
+    pub fn service_discovery_stale_recoveries_total(&self) -> u64 {
+        self.service_discovery_stale_recoveries
+            .load(Ordering::Relaxed)
+    }
+
+    #[allow(dead_code)]
+    pub fn service_discovery_tasks_kept_total(&self) -> u64 {
+        self.service_discovery_tasks_kept.load(Ordering::Relaxed)
+    }
+
+    #[allow(dead_code)]
+    pub fn service_discovery_tasks_started_total(&self) -> u64 {
+        self.service_discovery_tasks_started.load(Ordering::Relaxed)
+    }
+
+    #[allow(dead_code)]
+    pub fn service_discovery_tasks_replaced_total(&self) -> u64 {
+        self.service_discovery_tasks_replaced
+            .load(Ordering::Relaxed)
+    }
+
+    #[allow(dead_code)]
+    pub fn service_discovery_tasks_stopped_total(&self) -> u64 {
+        self.service_discovery_tasks_stopped.load(Ordering::Relaxed)
     }
 
     // Test-crate observation seams for issue #3719 / #3718 / #3720 counters.
@@ -2564,8 +2710,31 @@ impl MetricsRegistry {
         };
         self.append_mesh_observability_prometheus(&mut output);
         self.append_node_waypoint_observability_prometheus(&mut output);
+        self.append_grpc_stream_auth_prometheus(&mut output);
         self.append_udp_placement_migration_prometheus(&mut output);
+        self.append_dp_config_freshness_prometheus(&mut output);
         output
+    }
+
+    /// Append the bounded DP configuration-freshness families from live state.
+    ///
+    /// Kept off the render cache (issue #3726): every one of these series comes
+    /// from process-static atomics and from the passage of time — snapshot age,
+    /// the stale/blocked bits, and counters that no registry producer can
+    /// invalidate the cache for. A memoized body would report an age and an
+    /// admission state that are wrong by however long the cache has been held,
+    /// which is exactly the window an operator is watching during an outage.
+    fn append_dp_config_freshness_prometheus(&self, output: &mut String) {
+        let ns_label = self
+            .namespace_label
+            .read()
+            .map(|label| label.clone())
+            .unwrap_or_default();
+        render_dp_config_freshness_prometheus(
+            output,
+            &ns_label,
+            crate::dp_config_freshness::snapshot().as_ref(),
+        );
     }
 
     /// Append the process-static mesh observability families from live state.
@@ -2600,6 +2769,22 @@ impl MetricsRegistry {
             output,
             &gateway_ns_label,
         );
+        // Issue #3235: CUSTOM external-authorization outcomes. Rendered here,
+        // outside the render cache, for the same reason as the series above —
+        // the counters are process-static and a fail-closed spike must be
+        // visible on the next scrape. Labels are a closed outcome enum plus the
+        // gateway namespace; never provider, policy, route, host, or principal.
+        crate::plugins::mesh::ext_authz::render_prometheus(output, &gateway_ns_label);
+    }
+
+    fn append_grpc_stream_auth_prometheus(&self, output: &mut String) {
+        let ns_label = self
+            .namespace_label
+            .read()
+            .map(|label| label.clone())
+            .unwrap_or_default();
+        let gateway_ns_label = gateway_namespace_label(&ns_label);
+        crate::grpc::auth::render_stream_auth_metrics(output, &gateway_ns_label);
     }
 
     /// Append the bounded Ambient UDP placement migration state outside the
@@ -2629,7 +2814,9 @@ impl MetricsRegistry {
         let mut output = self.render_cacheable_body();
         self.append_mesh_observability_prometheus(&mut output);
         self.append_node_waypoint_observability_prometheus(&mut output);
+        self.append_grpc_stream_auth_prometheus(&mut output);
         self.append_udp_placement_migration_prometheus(&mut output);
+        self.append_dp_config_freshness_prometheus(&mut output);
         output
     }
 
@@ -3173,10 +3360,116 @@ impl MetricsRegistry {
                 self.service_discovery_shared_admission_rejected
                     .load(Ordering::Relaxed),
             ),
+            (
+                "ferrum_service_discovery_stale_expiries_total",
+                "Service-discovery tasks whose last admitted snapshot crossed the configured staleness bound.",
+                self.service_discovery_stale_expiries
+                    .load(Ordering::Relaxed),
+            ),
+            (
+                "ferrum_service_discovery_stale_recoveries_total",
+                "Service-discovery stale episodes cleared by a freshly admitted and published snapshot.",
+                self.service_discovery_stale_recoveries
+                    .load(Ordering::Relaxed),
+            ),
+            (
+                "ferrum_service_discovery_stale_withdrawals_total",
+                "Service-discovery stale episodes whose expiry policy withdrew discovered targets and retained static targets.",
+                self.service_discovery_stale_withdrawals
+                    .load(Ordering::Relaxed),
+            ),
+            (
+                "ferrum_service_discovery_task_panics_total",
+                "Service-discovery pollers that exited unexpectedly instead of stopping cleanly.",
+                self.service_discovery_task_panics.load(Ordering::Relaxed),
+            ),
+            (
+                "ferrum_service_discovery_task_restarts_total",
+                "Service-discovery pollers restarted by their supervisor after an unexpected exit.",
+                self.service_discovery_task_restarts.load(Ordering::Relaxed),
+            ),
+            (
+                "ferrum_service_discovery_tasks_kept_total",
+                "Service-discovery tasks kept running across a config reconcile because their effective specification was unchanged.",
+                self.service_discovery_tasks_kept.load(Ordering::Relaxed),
+            ),
+            (
+                "ferrum_service_discovery_tasks_replaced_total",
+                "Service-discovery tasks replaced across a config reconcile because their effective specification changed.",
+                self.service_discovery_tasks_replaced
+                    .load(Ordering::Relaxed),
+            ),
+            (
+                "ferrum_service_discovery_tasks_started_total",
+                "Service-discovery tasks started for newly configured upstreams.",
+                self.service_discovery_tasks_started.load(Ordering::Relaxed),
+            ),
+            (
+                "ferrum_service_discovery_tasks_stopped_total",
+                "Service-discovery tasks stopped because their upstream no longer configures service discovery.",
+                self.service_discovery_tasks_stopped.load(Ordering::Relaxed),
+            ),
         ] {
             output.push_str(&format!("# HELP {name} {help}\n"));
             output.push_str(&format!("# TYPE {name} counter\n"));
             render_process_counter(&mut output, name, value, &ns_label);
+        }
+
+        // Service-discovery task lifecycle / staleness gauges (issues #3717 /
+        // #3721 / #3722). Aggregated across every configured upstream — the
+        // namespaced upstream identity stays off `/metrics` entirely and is
+        // exposed only on the authenticated `/health` and `/status` surfaces.
+        let discovery_health = crate::service_discovery::health::aggregate();
+        for (name, help, value) in [
+            (
+                "ferrum_service_discovery_tasks",
+                "Service-discovery tasks currently supervised.",
+                discovery_health.tasks as i64,
+            ),
+            (
+                "ferrum_service_discovery_tasks_running",
+                "Service-discovery tasks whose poller is running.",
+                discovery_health.running as i64,
+            ),
+            (
+                "ferrum_service_discovery_tasks_restarting",
+                "Service-discovery tasks waiting out a restart backoff after an unexpected poller exit.",
+                discovery_health.restarting as i64,
+            ),
+            (
+                "ferrum_service_discovery_tasks_crash_looping",
+                "Service-discovery tasks that exited unexpectedly repeatedly without an intervening published snapshot.",
+                discovery_health.crash_looping as i64,
+            ),
+            (
+                "ferrum_service_discovery_tasks_stale",
+                "Service-discovery tasks whose last admitted snapshot is older than the configured staleness bound.",
+                discovery_health.stale as i64,
+            ),
+            (
+                "ferrum_service_discovery_tasks_withdrawn",
+                "Service-discovery tasks whose discovered targets are currently withdrawn by the staleness policy.",
+                discovery_health.withdrawn as i64,
+            ),
+            (
+                "ferrum_service_discovery_tasks_readiness_failing",
+                "Stale service-discovery tasks failing readiness by policy or because withdrawal publication is still retrying.",
+                discovery_health.readiness_failing as i64,
+            ),
+            (
+                "ferrum_service_discovery_tasks_never_succeeded",
+                "Service-discovery tasks that have never published an admitted snapshot.",
+                discovery_health.never_succeeded as i64,
+            ),
+            (
+                "ferrum_service_discovery_last_success_age_seconds_max",
+                "Maximum age in seconds of the staleness anchor across service-discovery tasks (task start when no snapshot has ever been published).",
+                discovery_health.max_anchor_age_seconds as i64,
+            ),
+        ] {
+            output.push_str(&format!("# HELP {name} {help}\n"));
+            output.push_str(&format!("# TYPE {name} gauge\n"));
+            render_process_gauge(&mut output, name, value, &ns_label);
         }
 
         // Compression codec admission / worker outcomes (process-wide).
@@ -4481,6 +4774,125 @@ fn render_ai_counter_family(
             proxy_id, key.provider, ns_label, value
         ));
     }
+}
+
+/// Render the bounded DP last-known-good configuration families (issue #3726).
+///
+/// A free function taking the projection explicitly so the exact rendered text
+/// is testable without installing the process-global DP tracker, which would
+/// publish a process-wide admission flag inside a shared test binary.
+///
+/// Present only in DP mode (`freshness` is `None` everywhere else). Every
+/// series is fixed-cardinality: `namespace` is the only standard metric label.
+/// CP endpoint, credential, node id, and configuration content are not exposed
+/// as labels — the closed-set reason is exposed on authenticated `/health`
+/// instead.
+pub fn render_dp_config_freshness_prometheus(
+    output: &mut String,
+    ns_label: &str,
+    freshness: Option<&crate::dp_config_freshness::DpConfigFreshnessSnapshot>,
+) {
+    let Some(freshness) = freshness else {
+        return;
+    };
+    output.push_str(
+        "# HELP ferrum_dp_config_snapshot_age_seconds Age of the DP's last validated and successfully applied CP configuration snapshot, on a monotonic clock.\n",
+    );
+    output.push_str("# TYPE ferrum_dp_config_snapshot_age_seconds gauge\n");
+    render_process_counter(
+        output,
+        "ferrum_dp_config_snapshot_age_seconds",
+        freshness.snapshot_age_seconds,
+        ns_label,
+    );
+
+    output.push_str(
+        "# HELP ferrum_dp_config_max_stale_seconds Configured maximum applied-snapshot age before the DP degrades readiness (0 = bound disabled).\n",
+    );
+    output.push_str("# TYPE ferrum_dp_config_max_stale_seconds gauge\n");
+    render_process_counter(
+        output,
+        "ferrum_dp_config_max_stale_seconds",
+        freshness.max_stale_seconds,
+        ns_label,
+    );
+
+    output.push_str(
+        "# HELP ferrum_dp_config_stale Whether the DP's applied configuration is past its bound with no authoritative CP (1) or not (0).\n",
+    );
+    output.push_str("# TYPE ferrum_dp_config_stale gauge\n");
+    render_process_counter(
+        output,
+        "ferrum_dp_config_stale",
+        u64::from(freshness.stale),
+        ns_label,
+    );
+
+    output.push_str(
+        "# HELP ferrum_dp_config_new_traffic_blocked Whether the DP is refusing new HTTP/TCP/UDP-session/DTLS-session admissions because its configuration is stale (1) or not (0).\n",
+    );
+    output.push_str("# TYPE ferrum_dp_config_new_traffic_blocked gauge\n");
+    render_process_counter(
+        output,
+        "ferrum_dp_config_new_traffic_blocked",
+        u64::from(freshness.new_traffic_blocked),
+        ns_label,
+    );
+
+    output.push_str(
+        "# HELP ferrum_dp_config_cp_connected Whether the DP currently has a ConfigSync stream to some control plane (1) or none (0).\n",
+    );
+    output.push_str("# TYPE ferrum_dp_config_cp_connected gauge\n");
+    render_process_counter(
+        output,
+        "ferrum_dp_config_cp_connected",
+        u64::from(freshness.cp_connected),
+        ns_label,
+    );
+
+    output.push_str(
+        "# HELP ferrum_dp_config_stale_transitions_total Transitions into the stale state since process start.\n",
+    );
+    output.push_str("# TYPE ferrum_dp_config_stale_transitions_total counter\n");
+    render_process_counter(
+        output,
+        "ferrum_dp_config_stale_transitions_total",
+        freshness.stale_transitions_total,
+        ns_label,
+    );
+
+    output.push_str(
+        "# HELP ferrum_dp_config_snapshots_applied_total CP snapshots/deltas validated and successfully applied since process start.\n",
+    );
+    output.push_str("# TYPE ferrum_dp_config_snapshots_applied_total counter\n");
+    render_process_counter(
+        output,
+        "ferrum_dp_config_snapshots_applied_total",
+        freshness.applied_total,
+        ns_label,
+    );
+
+    output.push_str(
+        "# HELP ferrum_dp_config_snapshots_rejected_total CP payloads refused before apply since process start.\n",
+    );
+    output.push_str("# TYPE ferrum_dp_config_snapshots_rejected_total counter\n");
+    render_process_counter(
+        output,
+        "ferrum_dp_config_snapshots_rejected_total",
+        freshness.rejected_total,
+        ns_label,
+    );
+
+    output.push_str(
+        "# HELP ferrum_dp_config_snapshot_apply_failures_total CP snapshots that were admitted and then failed to apply since process start.\n",
+    );
+    output.push_str("# TYPE ferrum_dp_config_snapshot_apply_failures_total counter\n");
+    render_process_counter(
+        output,
+        "ferrum_dp_config_snapshot_apply_failures_total",
+        freshness.apply_failed_total,
+        ns_label,
+    );
 }
 
 fn render_process_counter(output: &mut String, metric_name: &str, value: u64, ns_label: &str) {

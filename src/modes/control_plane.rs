@@ -39,7 +39,9 @@ use crate::config::validation_pipeline::{
 };
 use crate::dns::{DnsCache, DnsConfig};
 use crate::grpc::cp_server::{CpGrpcServer, CpScope};
-use crate::grpc::cp_trust::{CpDpTrustBundle, CpDpVerifier, CpGrpcConnectInfo, PeerNamespaceScope};
+use crate::grpc::cp_trust::{
+    CpDpTrustBundle, CpDpVerifier, CpDpVerifierStore, CpGrpcConnectInfo, PeerNamespaceScope,
+};
 use crate::grpc::mesh_registry::{
     MESH_NODE_REGISTRY_REAPER_INTERVAL, mesh_node_registry_stale_ttl,
 };
@@ -2035,11 +2037,11 @@ pub async fn run(
             // The legacy secret stays optional here: with a trust bundle
             // configured it is no longer an authorization input, and CP mode
             // mints nothing with it. Every server builder below is seeded with
-            // it purely so the pre-`.verifier(..)` shape stays uniform; the
-            // seeded `SharedSecret` arm is replaced before any request is
-            // served. An absent secret therefore leaves that seed empty, which
-            // `CpDpVerifier::with_decoding_key` refuses outright rather than
-            // verifying against an empty HS256 key.
+            // it purely so the builders' seeded shape stays uniform; the
+            // shared reloadable verifier store replaces that seed before any
+            // request is served. An absent secret therefore leaves the seed
+            // empty, which `CpDpVerifier::with_decoding_key` refuses outright
+            // rather than verifying against an empty HS256 key.
             //
             // In particular this is NOT the cross-cluster remote-discovery
             // minting key. That minting happens on a mesh-mode node
@@ -2072,7 +2074,18 @@ pub async fn run(
         "CP/DP gRPC namespace authorization source: {}",
         cp_dp_verifier.describe()
     );
-    let cp_dp_verifier = Arc::new(cp_dp_verifier);
+    let cp_dp_verifier = Arc::new(CpDpVerifierStore::new(cp_dp_verifier));
+    let max_stream_lifetime = Duration::from_secs(env_config.cp_grpc_max_stream_lifetime_seconds);
+    let trust_bundle_reload_handle = env_config.cp_dp_grpc_trust_bundle_path.clone().map(|path| {
+        crate::grpc::cp_trust::spawn_trust_bundle_reload(
+            path,
+            env_config.cp_dp_grpc_jwt_secret.clone(),
+            cp_dp_verifier.clone(),
+            cp_scope.requires_namespace_claim_by_default(),
+            Duration::from_secs(env_config.secret_refresh_interval_seconds),
+            shutdown_tx.subscribe(),
+        )
+    });
 
     // Create gRPC server with shared DP node registry. The expected JWT
     // issuer and namespace are threaded in from EnvConfig: DPs must mint
@@ -2086,7 +2099,8 @@ pub async fn run(
     let (grpc_server, update_tx) = CpGrpcServer::builder(config_arc.clone(), grpc_secret.clone())
         .channel_capacity(env_config.cp_broadcast_channel_capacity)
         .registry(dp_registry.clone())
-        .verifier(cp_dp_verifier.clone())
+        .verifier_store(cp_dp_verifier.clone())
+        .max_stream_lifetime(max_stream_lifetime)
         .expected_issuer(env_config.cp_dp_grpc_jwt_issuer.clone())
         .scope(cp_scope.clone())
         .require_ns_claim(env_config.cp_require_namespace_claim)
@@ -2098,7 +2112,8 @@ pub async fn run(
             .channel_capacity(env_config.cp_broadcast_channel_capacity)
             .registry(mesh_registry.clone())
             .drift(mesh_slice_drift.clone())
-            .verifier(cp_dp_verifier.clone())
+            .verifier_store(cp_dp_verifier.clone())
+            .max_stream_lifetime(max_stream_lifetime)
             .expected_issuer(env_config.cp_dp_grpc_jwt_issuer.clone())
             .namespace(env_config.namespace.clone())
             .scope(cp_scope.clone())
@@ -2124,6 +2139,32 @@ pub async fn run(
     }
     let xds_server = if env_config.xds_enabled {
         info!("FERRUM_XDS_ENABLED=true — mounting xDS ADS on the CP gRPC listener");
+        let xds_admission_limits = env_config.xds_admission_limits();
+        let unbounded_xds_scopes = xds_admission_limits.unbounded_scope_names();
+        if unbounded_xds_scopes.is_empty() {
+            info!(
+                max_total_streams = xds_admission_limits.max_total_streams,
+                max_streams_per_namespace = xds_admission_limits.max_streams_per_namespace,
+                max_streams_per_principal = xds_admission_limits.max_streams_per_principal,
+                max_streams_per_node = xds_admission_limits.max_streams_per_node,
+                max_active_nodes = xds_admission_limits.max_active_nodes,
+                max_node_id_bytes = xds_admission_limits.max_node_id_bytes,
+                first_request_timeout_seconds =
+                    xds_admission_limits.first_request_timeout.as_secs(),
+                "xDS ADS admission budgets active"
+            );
+        } else {
+            // `EnvConfig::validate()` already refused this combination under
+            // production posture unless the operator set the explicit unsafe
+            // override, so reaching here is either dev/test or an acknowledged
+            // risk. Either way it stays loud.
+            warn!(
+                unbounded_scopes = %unbounded_xds_scopes.join(", "),
+                "xDS ADS admission has unbounded (0) budgets: one authenticated bearer can \
+                 exhaust control-plane tasks, channels, and snapshot memory by cycling Node.id \
+                 values. Set finite values for production."
+            );
+        }
         Some(
             XdsAdsServer::with_sidecar_enforcement(
                 config_arc.clone(),
@@ -2137,11 +2178,12 @@ pub async fn run(
             .with_sidecar_enforcement_dry_run(env_config.mesh_sidecar_enforced_dry_run)
             .with_sidecar_identity_narrowing(env_config.mesh_sidecar_identity_narrowing)
             .with_cluster_domain(env_config.k8s_cluster_domain.clone())
-            .with_verifier(cp_dp_verifier.clone())
+            .with_verifier_store(cp_dp_verifier.clone())
+            .with_max_stream_lifetime(max_stream_lifetime)
             .with_scope(cp_scope.clone())
             .with_require_namespace_claim(env_config.cp_require_namespace_claim)
             .with_namespace_broadcasts(broadcasts.clone())
-            .with_max_streams_per_node(env_config.xds_max_streams_per_node),
+            .with_admission_limits(xds_admission_limits),
         )
     } else {
         None
@@ -3695,6 +3737,9 @@ pub async fn run(
     if let Some(handle) = db_tls_reload_handle {
         background_handles.push(handle);
     }
+    if let Some(handle) = trust_bundle_reload_handle {
+        background_handles.push(handle);
+    }
     crate::modes::file::join_background_handles(background_handles, Duration::from_secs(5)).await;
 
     // Drain accepted audit events while the database Arc is still alive (issue
@@ -4018,6 +4063,7 @@ mod tests {
             compiled_stream_match: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            pending_limit_scope: None,
         }
     }
 
