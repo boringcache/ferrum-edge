@@ -20,17 +20,27 @@
 //!   ([`GatewayListenerFailureOrigin`]), the config generation that decided it,
 //!   first/last observation timestamps, and how many consecutive reconcile
 //!   passes have observed it.
-//! * **Bounded.** At most [`MAX_TRACKED_FAILURES`] entries are retained (the
-//!   configured listener set is itself bounded, but the cap is unconditional)
-//!   and each `detail` string is sanitized to printable ASCII and truncated to
-//!   [`MAX_DETAIL_CHARS`]. Counters still account for everything that was
-//!   observed, so truncation loses per-port detail and never loses the signal.
-//! * **Generation-fenced.** [`GatewayListenerStatus::publish`] refuses a
-//!   publication whose config generation is older than the one already
-//!   published, mirroring
+//! * **Bounded, on two separate axes.** The *public* detail vector retains at
+//!   most [`MAX_TRACKED_FAILURES`] entries, each `detail` sanitized to
+//!   printable ASCII and truncated to [`MAX_DETAIL_CHARS`]. Behind it, a
+//!   *private* lightweight ledger keeps first-seen time and observation count
+//!   for every currently-active `(port, protocol half, reason)` identity up to
+//!   [`MAX_ACTIVE_TRACKED_FAILURES`], carrying no free-form text at all. That
+//!   separation is what makes the counters honest: an identity outside the
+//!   public 64 is still a known, aged identity, so it is not re-counted as a
+//!   fresh onset on every retry and its later recovery is still counted. Beyond
+//!   the ledger bound the snapshot reports `overflowed` rather than silently
+//!   mis-counting.
+//! * **Generation-fenced under one lock.** [`GatewayListenerStatus::publish`]
+//!   refuses a publication whose config generation is older than the one
+//!   already published, mirroring
 //!   `ProxyState::publish_gateway_listener_admission`. A reconcile pass that
 //!   awaited socket retirement while a newer config was published can therefore
-//!   never overwrite the newer generation's status.
+//!   never overwrite the newer generation's status. Acceptance and the
+//!   snapshot/ledger/counter read-modify-write are **one** serialized decision:
+//!   deciding acceptance outside the critical section would let an older
+//!   publisher that passed the fence first be overtaken by a newer one and then
+//!   overwrite it.
 //! * **Recoverable.** A failure that is absent from the next publication is
 //!   cleared from the snapshot and counted in
 //!   `ferrum_gateway_listener_recoveries_total`. This is deliberately *not*
@@ -45,18 +55,36 @@
 //! detail on the **authenticated** `/health` tier — never a metric label and
 //! never part of an unauthenticated response body.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use arc_swap::ArcSwap;
 
-/// Hard cap on retained per-listener failure entries.
+/// Hard cap on retained per-listener failure entries in the **public**
+/// snapshot, each of which carries a free-form (sanitized) `detail`.
 ///
 /// The desired listener set already bounds this in practice; the cap is the
 /// unconditional guarantee that a hostile or pathological configuration cannot
 /// grow the snapshot without limit.
 pub const MAX_TRACKED_FAILURES: usize = 64;
+
+/// Hard cap on the **private** active-identity ledger.
+///
+/// The ledger holds no free-form text: one entry is a `(port, protocol half,
+/// reason)` key plus a first-seen timestamp and an observation count, so an
+/// entry costs a few tens of bytes and the whole ledger is bounded at a few
+/// hundred kilobytes in the worst case.
+///
+/// The bound is deliberately far above any realistic Gateway listener set — a
+/// deployment would have to have 4096 distinct *simultaneously failing*
+/// `(port, half, reason)` triples to reach it — because everything the ledger
+/// holds is what keeps the cumulative counters correct. Once the bound is
+/// reached, further distinct identities in the same pass are dropped and
+/// [`GatewayListenerStatusSnapshot::overflowed`] is set: the snapshot then says
+/// out loud that its identity accounting is incomplete for this pass instead of
+/// re-counting onsets or losing recoveries in silence.
+pub const MAX_ACTIVE_TRACKED_FAILURES: usize = 4096;
 
 /// Hard cap on the sanitized `detail` retained for one entry.
 pub const MAX_DETAIL_CHARS: usize = 200;
@@ -258,13 +286,25 @@ pub struct GatewayListenerStatusSnapshot {
     pub active_listeners: usize,
     /// Distinct ports carrying at least one active failure.
     pub failed_ports: usize,
-    /// Active failure entries, counting entries dropped by the retention cap.
+    /// Active failure identities tracked for this generation, including those
+    /// dropped from `failures` by the [`MAX_TRACKED_FAILURES`] detail cap.
+    ///
+    /// Capped by [`MAX_ACTIVE_TRACKED_FAILURES`]; see `overflowed`.
     pub active_failures: usize,
     /// Entries actually retained in `failures`.
     pub retained_failures: usize,
     /// Whether `failures` was truncated by [`MAX_TRACKED_FAILURES`].
     pub truncated: bool,
-    /// Active counts by bounded (protocol, category), never truncated.
+    /// Whether this pass observed more distinct failure identities than
+    /// [`MAX_ACTIVE_TRACKED_FAILURES`].
+    ///
+    /// When set, `active_failures`, `failed_ports`, `active_by_category`, and
+    /// the cumulative counters account only for the tracked identities: the
+    /// input exceeded the representable domain and the snapshot says so rather
+    /// than reporting totals it cannot stand behind.
+    pub overflowed: bool,
+    /// Active counts by bounded (protocol, category). Exact for every tracked
+    /// identity — never truncated by the [`MAX_TRACKED_FAILURES`] detail cap.
     pub active_by_category: Vec<GatewayListenerActiveCategory>,
     pub failures: Vec<GatewayListenerFailureEntry>,
 }
@@ -272,7 +312,7 @@ pub struct GatewayListenerStatusSnapshot {
 impl GatewayListenerStatusSnapshot {
     /// Whether any dynamic Gateway listener is currently not serving.
     pub fn degraded(&self) -> bool {
-        self.active_failures > 0
+        self.active_failures > 0 || self.overflowed
     }
 }
 
@@ -294,7 +334,11 @@ pub struct GatewayListenerCumulativeMetrics {
 }
 
 /// Snapshot key: one failure is identified by port, protocol half, and reason.
-type FailureKey = (u16, GatewayListenerProtocolHalf, GatewayListenerFailureCategory);
+type FailureKey = (
+    u16,
+    GatewayListenerProtocolHalf,
+    GatewayListenerFailureCategory,
+);
 
 const PROTOCOL_COUNT: usize = GatewayListenerProtocolHalf::ALL.len();
 const CATEGORY_COUNT: usize = GatewayListenerFailureCategory::ALL.len();
@@ -324,21 +368,47 @@ fn read(
     grid[protocol_index(protocol)][category.index()].load(Ordering::Relaxed)
 }
 
+/// Lightweight per-identity history, kept for every tracked active failure —
+/// including identities the public snapshot had to drop.
+///
+/// Deliberately free of any free-form text: this is the state that keeps
+/// onset/recovery accounting correct, not an operator-facing detail record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ActiveFailureHistory {
+    first_observed_unix_ms: u64,
+    /// Consecutive reconcile/retry passes that have observed this identity.
+    observations: u64,
+}
+
+/// Everything a publication reads and writes, under one lock.
+#[derive(Debug, Default)]
+struct PublishLedger {
+    /// `config_generation + 1`; `0` means "nothing published yet". Biased so
+    /// generation `0` is still distinguishable from the initial state.
+    published_fence: u64,
+    /// Every currently-active failure identity, bounded by
+    /// [`MAX_ACTIVE_TRACKED_FAILURES`].
+    active: BTreeMap<FailureKey, ActiveFailureHistory>,
+}
+
 /// Shared, atomically replaced Gateway listener realization status.
 ///
 /// One instance is owned by the mode, handed to the listener manager as its
-/// publisher and to `AdminState` as a reader. Reads are lock-free `ArcSwap`
-/// loads so an unauthenticated `/health` probe flood cannot drive work or
-/// contend with a reconcile.
+/// publisher and to `AdminState` as a reader. Reads are lock-free `ArcSwap` and
+/// atomic loads so an unauthenticated `/health` probe flood cannot drive work,
+/// block, or contend with a reconcile. The mutex below is only ever taken by a
+/// publisher.
 #[derive(Debug)]
 pub struct GatewayListenerStatus {
     snapshot: ArcSwap<GatewayListenerStatusSnapshot>,
-    /// `config_generation + 1`; `0` means "nothing published yet". Biased so
-    /// generation `0` is still distinguishable from the initial state.
+    /// Lock-free mirror of [`PublishLedger::published_fence`], stored **after**
+    /// the snapshot it belongs to is visible. It therefore never advertises a
+    /// generation whose status has not been published yet.
     published_generation: AtomicU64,
-    /// Serializes the read-modify-write of `snapshot` during a publication.
-    /// Never held by a reader.
-    publish_lock: Mutex<()>,
+    /// Serializes generation acceptance together with the read-modify-write of
+    /// the snapshot, the active ledger, and the cumulative counters. Never held
+    /// by a reader.
+    ledger: Mutex<PublishLedger>,
     failures_total: CounterGrid,
     recoveries_total: CounterGrid,
 }
@@ -354,7 +424,7 @@ impl GatewayListenerStatus {
         Self {
             snapshot: ArcSwap::from_pointee(GatewayListenerStatusSnapshot::default()),
             published_generation: AtomicU64::new(0),
-            publish_lock: Mutex::new(()),
+            ledger: Mutex::new(PublishLedger::default()),
             failures_total: Default::default(),
             recoveries_total: Default::default(),
         }
@@ -363,6 +433,21 @@ impl GatewayListenerStatus {
     /// Lock-free current status.
     pub fn snapshot(&self) -> Arc<GatewayListenerStatusSnapshot> {
         self.snapshot.load_full()
+    }
+
+    /// The last config generation whose status was accepted, lock-free.
+    ///
+    /// `None` before the first accepted publication. This never runs ahead of
+    /// [`Self::snapshot`]: it is stored inside the publication's critical
+    /// section, after the snapshot it describes is already visible.
+    // The binary target re-declares these modules, so a `pub` item consumed
+    // only by `tests/` reads as dead code there.
+    #[allow(dead_code)]
+    pub fn published_generation(&self) -> Option<u64> {
+        match self.published_generation.load(Ordering::Acquire) {
+            0 => None,
+            fence => Some(fence - 1),
+        }
     }
 
     /// Cumulative failure/recovery counters, non-zero entries only.
@@ -405,97 +490,108 @@ impl GatewayListenerStatus {
     ///
     /// An equal generation is accepted: the supervisor re-reconciles the same
     /// generation on every retry tick, and that is how a recovery clears.
+    ///
+    /// Acceptance is decided *inside* the same critical section that performs
+    /// the merge, so the whole decision — accept/reject, ledger ageing,
+    /// counters, snapshot — is one serialized read-modify-write. Deciding
+    /// acceptance first and merging afterwards would be unsound: an older
+    /// publisher that cleared the fence could be overtaken by a newer one and
+    /// then overwrite the newer status with its own.
+    ///
+    /// `observations` is consumed inside that critical section, so a rejected
+    /// publication leaves the snapshot, the active ledger, the cumulative
+    /// counters, and every timestamp exactly as they were.
     pub fn publish(
         &self,
         config_generation: u64,
         desired_listeners: usize,
         active_listeners: usize,
-        observations: Vec<GatewayListenerFailureObservation>,
+        observations: impl IntoIterator<Item = GatewayListenerFailureObservation>,
         now_unix_ms: u64,
     ) -> bool {
         let fence = config_generation.saturating_add(1);
-        loop {
-            let current = self.published_generation.load(Ordering::Acquire);
-            if fence < current {
-                return false;
-            }
-            if self
-                .published_generation
-                .compare_exchange(current, fence, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                break;
-            }
-        }
 
-        // The manager already serializes reconcile passes, but the snapshot
-        // merge is a read-modify-write over first-seen/occurrence history and
-        // over the cumulative counters: keep it atomic against any other
-        // publisher rather than relying on a caller-side invariant.
-        let _guard = match self.publish_lock.lock() {
+        let mut ledger = match self.ledger.lock() {
             Ok(guard) => guard,
-            // A panicking publisher cannot corrupt the snapshot (it is replaced
-            // wholesale), so recover rather than propagating the poison into an
-            // observability path.
+            // A panicking publisher cannot corrupt the ledger (it is replaced
+            // wholesale below), so recover rather than propagating the poison
+            // into an observability path.
             Err(poisoned) => poisoned.into_inner(),
         };
 
-        let previous = self.snapshot.load_full();
-        let mut retained: BTreeMap<FailureKey, &GatewayListenerFailureEntry> = BTreeMap::new();
-        for entry in &previous.failures {
-            retained.insert((entry.port, entry.protocol, entry.category), entry);
+        if fence < ledger.published_fence {
+            return false;
         }
 
-        let mut entries: BTreeMap<FailureKey, GatewayListenerFailureEntry> = BTreeMap::new();
+        // Pass 1: the observed identity set for this generation, deduplicated
+        // and hard-bounded, plus the sanitized detail for the identities that
+        // will actually be published. Detail is retained only for the
+        // lowest-keyed `MAX_TRACKED_FAILURES` identities — exactly the ones the
+        // public vector keeps — so an overflow identity never costs a string.
+        let mut observed: BTreeSet<FailureKey> = BTreeSet::new();
+        let mut details: BTreeMap<FailureKey, String> = BTreeMap::new();
+        let mut overflowed = false;
         for observation in observations {
             let key = observation.key();
-            if entries.contains_key(&key) {
+            if observed.contains(&key) {
                 // One pass can legitimately record the same port twice (for
                 // example a dead-task reap followed by a rebind failure). Keep
                 // the first detail and do not double-count the occurrence.
                 continue;
             }
-            let (first_observed_unix_ms, observations_count) = match retained.get(&key) {
-                Some(previous_entry) => (
-                    previous_entry.first_observed_unix_ms,
-                    previous_entry.observations.saturating_add(1),
-                ),
-                None => {
-                    let protocol = observation.protocol;
-                    bump(&self.failures_total, protocol, observation.category);
-                    (now_unix_ms, 1)
-                }
-            };
-            entries.insert(
-                key,
-                GatewayListenerFailureEntry {
-                    port: observation.port,
-                    protocol: observation.protocol,
-                    category: observation.category,
-                    origin: observation.category.origin(),
-                    config_generation,
-                    detail: sanitize_detail(&observation.detail),
-                    first_observed_unix_ms,
-                    last_observed_unix_ms: now_unix_ms,
-                    observations: observations_count,
-                },
-            );
-        }
-
-        // Anything that was failing and is not observed now has recovered.
-        for (key, entry) in &retained {
-            if entries.contains_key(key) {
+            if observed.len() >= MAX_ACTIVE_TRACKED_FAILURES {
+                overflowed = true;
                 continue;
             }
-            bump(&self.recoveries_total, entry.protocol, entry.category);
+            observed.insert(key);
+            retain_detail(&mut details, key, &observation.detail);
         }
 
-        let active_failures = entries.len();
-        let mut failed_ports: Vec<u16> = entries.keys().map(|(port, _, _)| *port).collect();
-        failed_ports.dedup();
+        // Pass 2: age every identity that was already active, count an onset
+        // for every identity that was not. The previous state comes from the
+        // private ledger, never from the truncated public vector: an identity
+        // the detail cap dropped is still a known, aged identity.
+        let mut next_active: BTreeMap<FailureKey, ActiveFailureHistory> = BTreeMap::new();
+        for key in observed.iter().copied() {
+            let (_, protocol, category) = key;
+            let history = match ledger.active.get(&key) {
+                Some(previous) => ActiveFailureHistory {
+                    first_observed_unix_ms: previous.first_observed_unix_ms,
+                    observations: previous.observations.saturating_add(1),
+                },
+                None => {
+                    bump(&self.failures_total, protocol, category);
+                    ActiveFailureHistory {
+                        first_observed_unix_ms: now_unix_ms,
+                        observations: 1,
+                    }
+                }
+            };
+            next_active.insert(key, history);
+        }
+
+        // Anything that was failing and is not observed now has recovered —
+        // including identities that were never published in `failures`.
+        for key in ledger.active.keys() {
+            if next_active.contains_key(key) {
+                continue;
+            }
+            let (_, protocol, category) = *key;
+            bump(&self.recoveries_total, protocol, category);
+        }
+
+        let active_failures = next_active.len();
+        let mut failed_ports = 0usize;
+        let mut last_port: Option<u16> = None;
         let mut active_counts = [[0u64; CATEGORY_COUNT]; PROTOCOL_COUNT];
-        for entry in entries.values() {
-            active_counts[protocol_index(entry.protocol)][entry.category.index()] += 1;
+        for (port, protocol, category) in next_active.keys().copied() {
+            // Keys are ordered by port first, so a change of port is a new
+            // distinct port.
+            if last_port != Some(port) {
+                failed_ports += 1;
+                last_port = Some(port);
+            }
+            active_counts[protocol_index(protocol)][category.index()] += 1;
         }
         let mut active_by_category: Vec<GatewayListenerActiveCategory> = Vec::new();
         for protocol in GatewayListenerProtocolHalf::ALL {
@@ -511,23 +607,67 @@ impl GatewayListenerStatus {
             }
         }
 
-        let mut failures: Vec<GatewayListenerFailureEntry> = entries.into_values().collect();
-        let truncated = failures.len() > MAX_TRACKED_FAILURES;
-        failures.truncate(MAX_TRACKED_FAILURES);
+        let failures: Vec<GatewayListenerFailureEntry> = details
+            .into_iter()
+            .filter_map(|(key, detail)| {
+                let (port, protocol, category) = key;
+                // Every retained-detail key was inserted into `next_active` in
+                // the same pass; skipping rather than indexing keeps this
+                // panic-free regardless.
+                let history = next_active.get(&key)?;
+                Some(GatewayListenerFailureEntry {
+                    port,
+                    protocol,
+                    category,
+                    origin: category.origin(),
+                    config_generation,
+                    detail,
+                    first_observed_unix_ms: history.first_observed_unix_ms,
+                    last_observed_unix_ms: now_unix_ms,
+                    observations: history.observations,
+                })
+            })
+            .collect();
+        let truncated = active_failures > failures.len();
 
+        ledger.active = next_active;
+        ledger.published_fence = fence;
         self.snapshot.store(Arc::new(GatewayListenerStatusSnapshot {
             config_generation,
             desired_listeners,
             active_listeners,
-            failed_ports: failed_ports.len(),
+            failed_ports,
             active_failures,
             retained_failures: failures.len(),
             truncated,
+            overflowed,
             active_by_category,
             failures,
         }));
+        // Published last, so a lock-free reader can never see this generation
+        // advertised before the snapshot that belongs to it.
+        self.published_generation.store(fence, Ordering::Release);
         true
     }
+}
+
+/// Keep the sanitized `detail` for `key` only while it belongs to the
+/// lowest-keyed [`MAX_TRACKED_FAILURES`] identities seen so far.
+///
+/// The public vector is the first `MAX_TRACKED_FAILURES` entries in key order,
+/// so evicting the current largest key keeps exactly that set while never
+/// holding more than the cap in strings — and never sanitizing a string that
+/// cannot be retained.
+fn retain_detail(details: &mut BTreeMap<FailureKey, String>, key: FailureKey, detail: &str) {
+    if details.len() >= MAX_TRACKED_FAILURES {
+        match details.keys().next_back().copied() {
+            Some(largest) if key < largest => {
+                details.remove(&largest);
+            }
+            _ => return,
+        }
+    }
+    details.insert(key, sanitize_detail(detail));
 }
 
 /// The installed process-wide Gateway listener status, if this mode binds

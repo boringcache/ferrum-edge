@@ -12382,12 +12382,23 @@ components:
         rather than `"unavailable"` — the outage is partial and recoverable.
         `/live` is never affected.
 
-        Bounded on every axis: at most 64 entries are retained (`truncated`
-        reports whether the cap dropped any, while the counts and the
-        `active_by_category` breakdown still account for everything observed),
-        and `detail` is sanitized to printable ASCII and truncated to 200
-        characters. Ports, `detail`, and `config_generation` appear here only —
-        they are never Prometheus labels and never appear in the unauthenticated
+        Bounded on two separate axes. The `failures` detail vector retains at
+        most 64 entries (`truncated` reports whether the cap dropped any) and
+        each `detail` is sanitized to printable ASCII and truncated to 200
+        characters. Behind it, a private text-free ledger keeps the first-seen
+        time and observation count of every active `(port, protocol half,
+        reason)` identity up to a hard bound of 4096, so `active_failures`,
+        `failed_ports`, the `active_by_category` breakdown, and the cumulative
+        `ferrum_gateway_listener_{failures,recoveries}_total` counters stay exact
+        for every active identity even when its detail was dropped: a retry does
+        not re-count an onset it already counted, and an identity that recovers
+        is counted once whether or not it was ever shown here. If a single pass
+        somehow exceeds the 4096-identity bound, `overflowed` is `true` and those
+        totals account only for the tracked identities — the snapshot reports
+        the gap instead of publishing figures it cannot stand behind.
+
+        Ports, `detail`, and `config_generation` appear here only — they are
+        never Prometheus labels and never appear in the unauthenticated
         `/health` body.
       required:
         - config_generation
@@ -12397,6 +12408,7 @@ components:
         - active_failures
         - retained_failures
         - truncated
+        - overflowed
         - active_by_category
         - failures
       properties:
@@ -12422,18 +12434,28 @@ components:
         active_failures:
           type: integer
           description: >-
-            Active failure entries, including any dropped by the retention cap.
+            Active failure identities tracked for this generation, including any
+            whose detail was dropped by the 64-entry `failures` cap. Bounded by
+            the 4096-identity ledger; see `overflowed`.
         retained_failures:
           type: integer
           description: Entries actually present in `failures`.
         truncated:
           type: boolean
           description: Whether `failures` was truncated by the 64-entry cap.
+        overflowed:
+          type: boolean
+          description: >-
+            Whether this pass observed more distinct failure identities than the
+            4096-entry ledger can represent. When `true`, `active_failures`,
+            `failed_ports`, `active_by_category`, and the cumulative counters
+            account only for the tracked identities.
         active_by_category:
           type: array
           description: >-
             Fixed-cardinality active counts by protocol half and bounded
-            reason. Never truncated.
+            reason. Exact for every tracked identity — never reduced by the
+            64-entry `failures` detail cap.
           items:
             type: object
             required: [protocol, category, count]

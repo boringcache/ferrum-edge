@@ -111,8 +111,8 @@ part of the configuration is not realized.
 | `ferrum_gateway_listeners_active` | gauge | `namespace` | Gateway listener ports with a live accept loop. `desired - active` is the unrealized listener count. |
 | `ferrum_gateway_listener_failed_ports` | gauge | `namespace` | Distinct ports with at least one active failure. |
 | `ferrum_gateway_listener_failures_active` | gauge | `protocol`, `reason`, `namespace` | Currently-failing listener halves. `protocol` is `tcp` or `quic`; a QUIC-only failure means HTTP/1.1 and HTTP/2 are still served on that port and `Alt-Svc` simply stops advertising HTTP/3. |
-| `ferrum_gateway_listener_failures_total` | counter | `protocol`, `reason`, `namespace` | Failure onsets since process start. A retry that keeps failing does not re-increment; it raises `observations` on the `/health` entry instead. |
-| `ferrum_gateway_listener_recoveries_total` | counter | `protocol`, `reason`, `namespace` | Failures cleared by a later reconcile. Pairs with the active gauge returning to `0`. |
+| `ferrum_gateway_listener_failures_total` | counter | `protocol`, `reason`, `namespace` | Failure onsets since process start. A retry that keeps failing does not re-increment; it raises `observations` on the `/health` entry instead. This holds for every active identity, including ones the authenticated `/health` detail dropped at its 64-entry cap — the onset/recovery ledger behind the counters is separate from that cap and tracks up to 4096 identities. |
+| `ferrum_gateway_listener_recoveries_total` | counter | `protocol`, `reason`, `namespace` | Failures cleared by a later reconcile, counted once per `(port, protocol half, reason)` identity — including identities that were never shown in the bounded `/health` detail. Pairs with the active gauge returning to `0`. |
 
 `reason` is a closed set: `port_reserved`, `process_global_class_mismatch`,
 `stream_port_collision`, `udp_stream_collision`, `class_conflict`,

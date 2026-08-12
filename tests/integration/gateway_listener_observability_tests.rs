@@ -328,6 +328,7 @@ async fn authenticated_health_exposes_detail_and_unauthenticated_health_stays_mi
     assert_eq!(listeners["failed_ports"], 1);
     assert_eq!(listeners["active_failures"], 1);
     assert_eq!(listeners["truncated"], false);
+    assert_eq!(listeners["overflowed"], false);
     assert_eq!(listeners["config_generation"], 3);
     let entry = &listeners["failures"][0];
     assert_eq!(entry["port"], 18_443);

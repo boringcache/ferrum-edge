@@ -629,10 +629,7 @@ impl GatewayListenerManager {
                     expected.config_generation,
                     desired_listeners,
                     active_listeners,
-                    failures
-                        .iter()
-                        .map(GatewayListenerBindFailure::observation)
-                        .collect(),
+                    failures.iter().map(GatewayListenerBindFailure::observation),
                     crate::proxy::gateway_listener_status::now_unix_ms(),
                 );
             }

@@ -8,14 +8,20 @@
 //! * a failure appears with a bounded category, protocol half, and origin;
 //! * a repeat observation ages the entry instead of re-counting a new failure;
 //! * a recovery clears the entry and counts a recovery;
-//! * a stale config generation cannot overwrite the current generation;
-//! * the retained set and every detail string are hard-bounded;
+//! * a stale config generation cannot overwrite the current generation, even
+//!   under concurrent publishers;
+//! * the retained set and every detail string are hard-bounded, while the
+//!   onset/recovery accounting stays exact for identities the detail cap
+//!   dropped — and reports an honest overflow past its own hard bound;
 //! * the Prometheus surface has fixed cardinality and never carries a port,
 //!   config generation, or error text.
 
+use std::sync::Arc;
+
 use ferrum_edge::proxy::gateway_listener_status::{
-    GatewayListenerFailureCategory, GatewayListenerFailureObservation, GatewayListenerFailureOrigin,
-    GatewayListenerProtocolHalf, GatewayListenerStatus, MAX_DETAIL_CHARS, MAX_TRACKED_FAILURES,
+    GatewayListenerFailureCategory, GatewayListenerFailureObservation,
+    GatewayListenerFailureOrigin, GatewayListenerProtocolHalf, GatewayListenerStatus,
+    MAX_ACTIVE_TRACKED_FAILURES, MAX_DETAIL_CHARS, MAX_TRACKED_FAILURES,
 };
 
 const NS_LABEL: &str = ",namespace=\"ferrum\"";
@@ -154,7 +160,10 @@ fn a_recovered_listener_clears_the_active_failure_and_counts_a_recovery() {
     assert!(status.publish(1, 1, 1, Vec::new(), 31_000));
 
     let snapshot = status.snapshot();
-    assert!(!snapshot.degraded(), "recovery must clear the active failure");
+    assert!(
+        !snapshot.degraded(),
+        "recovery must clear the active failure"
+    );
     assert_eq!(snapshot.active_failures, 0);
     assert_eq!(snapshot.failed_ports, 0);
     assert_eq!(snapshot.active_listeners, 1);
@@ -234,7 +243,10 @@ fn a_quic_only_failure_is_distinguished_from_the_tcp_half() {
     assert!(status.publish(1, 2, 2, vec![quic_bind_failure(8443)], 1_000));
 
     let snapshot = status.snapshot();
-    assert_eq!(snapshot.active_listeners, 2, "the TCP half is still serving");
+    assert_eq!(
+        snapshot.active_listeners, 2,
+        "the TCP half is still serving"
+    );
     assert_eq!(snapshot.active_failures, 1);
     assert_eq!(
         snapshot.failures[0].protocol,
@@ -389,7 +401,12 @@ fn the_metric_surface_has_fixed_cardinality_and_leaks_no_listener_identity() {
 
     // No port, config generation, or error text may reach a label.
     for forbidden in [
-        "30000", "30039", "12345", "Address already in use", "os error", "port=",
+        "30000",
+        "30039",
+        "12345",
+        "Address already in use",
+        "os error",
+        "port=",
     ] {
         assert!(
             !rendered.contains(forbidden),
@@ -462,4 +479,513 @@ fn every_category_has_a_stable_label_and_origin() {
     }
     assert_eq!(GatewayListenerProtocolHalf::Tcp.as_str(), "tcp");
     assert_eq!(GatewayListenerProtocolHalf::Quic.as_str(), "quic");
+}
+
+// ---------------------------------------------------------------------------
+// Identity/history ledger beyond the public detail cap
+//
+// The public `failures` vector is capped at `MAX_TRACKED_FAILURES` entries, but
+// the onset/recovery accounting must not be. These tests pin the separation:
+// an identity the detail cap dropped is still a known, aged identity, so a
+// retry never re-counts its onset and its recovery is still counted exactly
+// once.
+// ---------------------------------------------------------------------------
+
+/// Ports used by the >64-failure tests. Chosen so key order is plain numeric
+/// port order: the retained detail set is the 64 lowest ports.
+fn oversubscribed_ports() -> Vec<u16> {
+    (9_000..9_100).collect()
+}
+
+fn oversubscribed_failures(
+    ports: impl IntoIterator<Item = u16>,
+) -> Vec<GatewayListenerFailureObservation> {
+    ports.into_iter().map(tcp_bind_failure).collect()
+}
+
+fn tcp_bind_failures_total(status: &GatewayListenerStatus) -> u64 {
+    cumulative_failures(
+        status,
+        GatewayListenerProtocolHalf::Tcp,
+        GatewayListenerFailureCategory::BindFailed,
+    )
+}
+
+fn tcp_bind_recoveries_total(status: &GatewayListenerStatus) -> u64 {
+    cumulative_recoveries(
+        status,
+        GatewayListenerProtocolHalf::Tcp,
+        GatewayListenerFailureCategory::BindFailed,
+    )
+}
+
+/// 100 simultaneously failing listeners — well past the 64-entry detail cap —
+/// must be counted once on onset, aged (not re-counted) on every equal-generation
+/// retry, and recovered exactly once each, including the 36 identities that were
+/// never published in `failures`.
+#[test]
+fn identities_beyond_the_detail_cap_are_aged_and_recovered_exactly_once() {
+    let status = GatewayListenerStatus::new();
+    let all = oversubscribed_ports();
+    assert_eq!(all.len(), 100);
+    assert!(all.len() > MAX_TRACKED_FAILURES);
+
+    // Onset.
+    assert!(status.publish(5, 120, 20, oversubscribed_failures(all.clone()), 1_000));
+    let snapshot = status.snapshot();
+    assert_eq!(snapshot.active_failures, 100, "every identity is tracked");
+    assert_eq!(snapshot.retained_failures, MAX_TRACKED_FAILURES);
+    assert!(snapshot.truncated);
+    assert!(!snapshot.overflowed, "100 is far below the ledger bound");
+    assert_eq!(snapshot.failed_ports, 100);
+    assert_eq!(snapshot.active_by_category.len(), 1);
+    assert_eq!(
+        snapshot.active_by_category[0].count, 100,
+        "the fixed-cardinality breakdown is never reduced by the detail cap"
+    );
+    assert_eq!(tcp_bind_failures_total(&status), 100);
+    assert_eq!(tcp_bind_recoveries_total(&status), 0);
+    // The retained detail set is the 64 lowest ports.
+    let retained: Vec<u16> = snapshot.failures.iter().map(|entry| entry.port).collect();
+    assert_eq!(retained, all[..MAX_TRACKED_FAILURES].to_vec());
+
+    // Two equal-generation retries: the same 100 identities keep failing. This
+    // is the case the pre-repair merge got wrong — it re-derived "what was
+    // failing" from the truncated public vector, so the 36 omitted identities
+    // looked brand new on every pass.
+    assert!(status.publish(5, 120, 20, oversubscribed_failures(all.clone()), 2_000));
+    assert!(status.publish(5, 120, 20, oversubscribed_failures(all.clone()), 3_000));
+    assert_eq!(
+        tcp_bind_failures_total(&status),
+        100,
+        "a retry ages an existing failure; it never re-counts an onset"
+    );
+    assert_eq!(tcp_bind_recoveries_total(&status), 0);
+    let snapshot = status.snapshot();
+    assert_eq!(snapshot.active_failures, 100);
+    assert_eq!(snapshot.failures[0].observations, 3);
+    assert_eq!(snapshot.failures[0].first_observed_unix_ms, 1_000);
+    assert_eq!(snapshot.failures[0].last_observed_unix_ms, 3_000);
+
+    // Partial recovery: the 50 lowest ports bind. The survivors are ports
+    // 9050..9100, every one of which was outside the retained detail set on the
+    // passes above — their history must still be intact.
+    let survivors: Vec<u16> = all[50..].to_vec();
+    assert!(status.publish(5, 120, 70, oversubscribed_failures(survivors), 4_000));
+    assert_eq!(
+        tcp_bind_recoveries_total(&status),
+        50,
+        "every cleared identity is counted once, retained or not"
+    );
+    assert_eq!(
+        tcp_bind_failures_total(&status),
+        100,
+        "a partial recovery must not look like 50 new onsets"
+    );
+    let snapshot = status.snapshot();
+    assert_eq!(snapshot.active_failures, 50);
+    assert_eq!(snapshot.retained_failures, 50);
+    assert!(!snapshot.truncated, "50 fits inside the detail cap");
+    assert_eq!(snapshot.failed_ports, 50);
+    assert_eq!(snapshot.active_by_category[0].count, 50);
+
+    // A previously omitted identity is now retained: it must carry its ORIGINAL
+    // first-seen time and its cumulative observation count, not a fresh one.
+    let promoted = snapshot
+        .failures
+        .iter()
+        .find(|entry| entry.port == 9_080)
+        .expect("port 9080 is now inside the retained detail set");
+    assert_eq!(
+        promoted.first_observed_unix_ms, 1_000,
+        "an identity promoted into the detail set keeps its original first-seen time"
+    );
+    assert_eq!(
+        promoted.observations, 4,
+        "and its cumulative observation count across all four passes"
+    );
+    assert_eq!(promoted.last_observed_unix_ms, 4_000);
+
+    // Full recovery: the remaining 50 clear.
+    assert!(status.publish(5, 120, 120, Vec::new(), 5_000));
+    let snapshot = status.snapshot();
+    assert!(!snapshot.degraded());
+    assert_eq!(snapshot.active_failures, 0);
+    assert_eq!(snapshot.failed_ports, 0);
+    assert!(snapshot.active_by_category.is_empty());
+    assert_eq!(
+        tcp_bind_recoveries_total(&status),
+        100,
+        "recoveries balance onsets exactly, across the detail cap"
+    );
+    assert_eq!(tcp_bind_failures_total(&status), 100);
+}
+
+/// The same identity observed twice in one pass is one identity: one onset, one
+/// observation increment, one entry.
+#[test]
+fn a_duplicate_observation_within_one_pass_is_not_double_counted() {
+    let status = GatewayListenerStatus::new();
+    let mut observations = oversubscribed_failures(oversubscribed_ports());
+    observations.extend(oversubscribed_failures(oversubscribed_ports()));
+    assert_eq!(observations.len(), 200);
+    assert!(status.publish(2, 100, 0, observations, 1_000));
+
+    let snapshot = status.snapshot();
+    assert_eq!(snapshot.active_failures, 100);
+    assert_eq!(snapshot.failed_ports, 100);
+    assert_eq!(snapshot.active_by_category[0].count, 100);
+    assert_eq!(tcp_bind_failures_total(&status), 100);
+    assert_eq!(snapshot.failures[0].observations, 1);
+}
+
+/// A port whose failure changes category (or protocol half) is an honest
+/// recovery of the old identity plus an onset of the new one — including when
+/// both identities live beyond the detail cap.
+#[test]
+fn a_category_change_is_a_recovery_plus_a_new_failure() {
+    let status = GatewayListenerStatus::new();
+    let all = oversubscribed_ports();
+    assert!(status.publish(1, 120, 20, oversubscribed_failures(all.clone()), 1_000));
+    assert_eq!(tcp_bind_failures_total(&status), 100);
+
+    // Port 9090 (outside the retained detail set) flips from a runtime bind
+    // failure to an admission refusal; port 9091 flips to the QUIC half.
+    let mut next: Vec<GatewayListenerFailureObservation> = all
+        .iter()
+        .filter(|port| **port != 9_090 && **port != 9_091)
+        .map(|port| tcp_bind_failure(*port))
+        .collect();
+    next.push(GatewayListenerFailureObservation::new(
+        9_090,
+        GatewayListenerProtocolHalf::Tcp,
+        GatewayListenerFailureCategory::PortReserved,
+        "port 9090 is reserved by another Ferrum listener",
+    ));
+    next.push(quic_bind_failure(9_091));
+    assert!(status.publish(1, 120, 20, next, 2_000));
+
+    assert_eq!(
+        tcp_bind_recoveries_total(&status),
+        2,
+        "both old identities cleared exactly once"
+    );
+    assert_eq!(
+        tcp_bind_failures_total(&status),
+        100,
+        "the 98 unchanged identities were aged, not re-counted"
+    );
+    assert_eq!(
+        cumulative_failures(
+            &status,
+            GatewayListenerProtocolHalf::Tcp,
+            GatewayListenerFailureCategory::PortReserved,
+        ),
+        1
+    );
+    assert_eq!(
+        cumulative_failures(
+            &status,
+            GatewayListenerProtocolHalf::Quic,
+            GatewayListenerFailureCategory::BindFailed,
+        ),
+        1
+    );
+
+    let snapshot = status.snapshot();
+    assert_eq!(snapshot.active_failures, 100);
+    assert_eq!(
+        snapshot.failed_ports, 100,
+        "both halves of 9091 belong to one port"
+    );
+    let by_category: Vec<(GatewayListenerProtocolHalf, GatewayListenerFailureCategory, u64)> =
+        snapshot
+            .active_by_category
+            .iter()
+            .map(|active| (active.protocol, active.category, active.count))
+            .collect();
+    assert_eq!(
+        by_category,
+        vec![
+            (
+                GatewayListenerProtocolHalf::Tcp,
+                GatewayListenerFailureCategory::PortReserved,
+                1
+            ),
+            (
+                GatewayListenerProtocolHalf::Tcp,
+                GatewayListenerFailureCategory::BindFailed,
+                98
+            ),
+            (
+                GatewayListenerProtocolHalf::Quic,
+                GatewayListenerFailureCategory::BindFailed,
+                1
+            ),
+        ]
+    );
+}
+
+/// A stale generation must leave the *whole* ledger untouched — snapshot,
+/// history, and both cumulative counters — even when the current state is a
+/// large truncated failure set.
+#[test]
+fn a_stale_generation_changes_no_history_or_counter_beyond_the_detail_cap() {
+    let status = GatewayListenerStatus::new();
+    let all = oversubscribed_ports();
+    assert!(status.publish(11, 120, 20, oversubscribed_failures(all.clone()), 1_000));
+    let before = status.snapshot();
+    let failures_before = tcp_bind_failures_total(&status);
+    let recoveries_before = tcp_bind_recoveries_total(&status);
+
+    // An older generation arriving late, carrying a completely different
+    // observation set (which, if merged, would count 100 recoveries and one
+    // onset).
+    assert!(!status.publish(10, 1, 0, vec![tcp_bind_failure(7_777)], 2_000));
+
+    let after = status.snapshot();
+    assert_eq!(after.config_generation, 11);
+    assert_eq!(*after, *before, "a refused publication replaces nothing");
+    assert_eq!(tcp_bind_failures_total(&status), failures_before);
+    assert_eq!(tcp_bind_recoveries_total(&status), recoveries_before);
+    assert_eq!(status.published_generation(), Some(11));
+
+    // The refused pass must not have aged the ledger either: the next accepted
+    // retry is observation 2, not 3.
+    assert!(status.publish(11, 120, 20, oversubscribed_failures(all), 3_000));
+    assert_eq!(status.snapshot().failures[0].observations, 2);
+    assert_eq!(tcp_bind_failures_total(&status), failures_before);
+}
+
+/// Beyond the hard ledger bound the snapshot reports an honest overflow rather
+/// than silently mis-counting onsets and recoveries.
+#[test]
+fn exceeding_the_identity_ledger_bound_is_reported_not_silently_corrupted() {
+    let status = GatewayListenerStatus::new();
+    // Two halves per port, ordered so the dropped identities are deterministic.
+    let mut observations = Vec::new();
+    for port in 1..=2_100u16 {
+        observations.push(tcp_bind_failure(port));
+        observations.push(quic_bind_failure(port));
+    }
+    assert!(observations.len() > MAX_ACTIVE_TRACKED_FAILURES);
+    assert!(status.publish(1, 2_100, 0, observations, 1_000));
+
+    let snapshot = status.snapshot();
+    assert!(snapshot.overflowed, "the input exceeded the ledger bound");
+    assert!(snapshot.degraded());
+    assert_eq!(snapshot.active_failures, MAX_ACTIVE_TRACKED_FAILURES);
+    assert_eq!(snapshot.retained_failures, MAX_TRACKED_FAILURES);
+    assert!(snapshot.truncated);
+    let tracked: u64 = snapshot
+        .active_by_category
+        .iter()
+        .map(|active| active.count)
+        .sum();
+    assert_eq!(tracked, MAX_ACTIVE_TRACKED_FAILURES as u64);
+    assert_eq!(
+        tcp_bind_failures_total(&status)
+            + cumulative_failures(
+                &status,
+                GatewayListenerProtocolHalf::Quic,
+                GatewayListenerFailureCategory::BindFailed,
+            ),
+        MAX_ACTIVE_TRACKED_FAILURES as u64,
+        "onsets are counted for tracked identities only, and the snapshot says so"
+    );
+
+    // Clearing everything recovers exactly what was tracked — the counters stay
+    // balanced instead of drifting.
+    assert!(status.publish(1, 2_100, 2_100, Vec::new(), 2_000));
+    assert!(!status.snapshot().overflowed);
+    assert!(!status.snapshot().degraded());
+    assert_eq!(
+        tcp_bind_recoveries_total(&status)
+            + cumulative_recoveries(
+                &status,
+                GatewayListenerProtocolHalf::Quic,
+                GatewayListenerFailureCategory::BindFailed,
+            ),
+        MAX_ACTIVE_TRACKED_FAILURES as u64
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Generation fencing under concurrent publishers
+//
+// Acceptance and the snapshot/ledger/counter read-modify-write are one
+// serialized decision. The earlier design advanced the generation fence with a
+// CAS *before* taking the publish lock, which left two observable defects:
+//
+//   1. the fence advertised a generation whose snapshot had not been written
+//      yet, and
+//   2. a publisher that cleared the fence first could be overtaken by a newer
+//      publisher and then overwrite the newer status with its own, because it
+//      never re-checked the fence inside the serialized section.
+//
+// The first test pins (1) deterministically by holding one publisher inside the
+// critical section for a controlled window; the second pins (2) by racing an
+// older and a newer generation directly.
+// ---------------------------------------------------------------------------
+
+/// Observations that stall the publisher on the first item until released.
+///
+/// The status object consumes `observations` inside its critical section, so
+/// this is a test-only synchronization seam that holds a publication open
+/// without any production sleep, hook, or timing dependency.
+struct StallingObservations {
+    items: std::vec::IntoIter<GatewayListenerFailureObservation>,
+    entered: Option<std::sync::mpsc::Sender<()>>,
+    release: Option<std::sync::mpsc::Receiver<()>>,
+}
+
+impl Iterator for StallingObservations {
+    type Item = GatewayListenerFailureObservation;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(entered) = self.entered.take() {
+            let _ = entered.send(());
+        }
+        if let Some(release) = self.release.take() {
+            let _ = release.recv();
+        }
+        self.items.next()
+    }
+}
+
+/// While a publication is in flight, no generation may be advertised: the
+/// lock-free `published_generation` mirror is written only after the snapshot
+/// it describes is visible.
+///
+/// This is the invariant the pre-repair design broke, and the seam makes the
+/// breach hold for a test-controlled window rather than a race window: that
+/// design advanced the fence with a CAS *before* taking the publish lock, so
+/// the overtaking publisher would advertise generation 11 for the entire
+/// duration of the first publisher's stall while the published snapshot was
+/// still the empty initial one. Advertising a generation it has not committed
+/// is exactly the state that let an older publisher win the fence and then
+/// overwrite a newer snapshot.
+#[test]
+fn no_generation_is_advertised_before_its_snapshot_is_published() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let status = Arc::new(GatewayListenerStatus::new());
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+
+    let stalled = {
+        let status = Arc::clone(&status);
+        std::thread::spawn(move || {
+            status.publish(
+                10,
+                2,
+                1,
+                StallingObservations {
+                    items: vec![tcp_bind_failure(8443)].into_iter(),
+                    entered: Some(entered_tx),
+                    release: Some(release_rx),
+                },
+                1_000,
+            )
+        })
+    };
+
+    entered_rx
+        .recv()
+        .expect("the first publisher must reach its critical section");
+    assert_eq!(status.published_generation(), None);
+
+    let overtaking = {
+        let status = Arc::clone(&status);
+        std::thread::spawn(move || status.publish(11, 2, 2, Vec::new(), 2_000))
+    };
+
+    // The newer publisher is now contending for a publication that has not
+    // committed. Nothing may become visible on either lock-free reader.
+    for _ in 0..100 {
+        assert_eq!(
+            status.published_generation(),
+            None,
+            "a generation was advertised before any snapshot was published"
+        );
+        assert_eq!(status.snapshot().config_generation, 0);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    release_tx.send(()).expect("release the stalled publisher");
+    assert!(stalled.join().expect("stalled publisher"));
+    assert!(overtaking.join().expect("overtaking publisher"));
+
+    let snapshot = status.snapshot();
+    assert_eq!(snapshot.config_generation, 11);
+    assert_eq!(status.published_generation(), Some(11));
+    assert!(
+        !snapshot.degraded(),
+        "the newer generation's clean status is the one that stands"
+    );
+}
+
+/// Two publishers racing an older and a newer generation: the newer one always
+/// stands. The older publication either lands first and is replaced, or is
+/// refused outright — it can never be applied *after* the newer one.
+///
+/// The outcome is deterministic for the repaired design (both orderings end at
+/// the newer generation), which is what makes it a usable assertion; against
+/// the pre-repair design it is a direct reproducer of the lost update, since
+/// that design's window sat between its fence CAS and its lock acquisition and
+/// so cannot be pinned open from outside. The rounds are there to hit it.
+#[test]
+fn an_older_generation_never_overwrites_a_newer_published_one() {
+    use std::sync::Barrier;
+
+    for round in 0..200u64 {
+        let older_generation = round * 2;
+        let newer_generation = older_generation + 1;
+        let status = Arc::new(GatewayListenerStatus::new());
+        let barrier = Arc::new(Barrier::new(2));
+
+        let older = {
+            let status = Arc::clone(&status);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                status.publish(
+                    older_generation,
+                    2,
+                    0,
+                    vec![tcp_bind_failure(8443), quic_bind_failure(8443)],
+                    1_000,
+                )
+            })
+        };
+        let newer = {
+            let status = Arc::clone(&status);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                status.publish(newer_generation, 2, 2, Vec::new(), 2_000)
+            })
+        };
+
+        let older_accepted = older.join().expect("older publisher");
+        assert!(
+            newer.join().expect("newer publisher"),
+            "a strictly newer generation is always accepted"
+        );
+
+        let snapshot = status.snapshot();
+        assert_eq!(
+            snapshot.config_generation, newer_generation,
+            "round {round}: an older generation overwrote a newer published status \
+             (older_accepted={older_accepted})"
+        );
+        assert_eq!(status.published_generation(), Some(newer_generation));
+        assert_eq!(
+            snapshot.active_failures, 0,
+            "round {round}: the newer generation reports both halves healthy"
+        );
+        assert!(!snapshot.degraded());
+        assert_eq!(snapshot.active_listeners, 2);
+    }
 }
