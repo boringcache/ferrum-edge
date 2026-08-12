@@ -21,6 +21,7 @@ use crate::config::types::{
 use crate::health_check::HealthChecker;
 use crate::load_balancer::{
     HashOnStrategy, HealthContext, LoadBalancer, LoadBalancerCache, LoadBalancerCacheInner,
+    RetryCandidateFilter,
 };
 use crate::plugins::{
     BackendAdmissionContext, BackendAdmissionDecision, BackendAdmissionPermit,
@@ -1432,23 +1433,23 @@ pub(crate) fn select_next_retry_target(
     prev_target: &UpstreamTarget,
     request: RetryTargetRequest<'_>,
 ) -> Option<Arc<UpstreamTarget>> {
-    select_next_retry_target_excluding(state, epoch, proxy, prev_target, &[], request)
+    select_next_retry_target_filtered(state, epoch, proxy, prev_target, None, request)
 }
 
-/// Like [`select_next_retry_target`], but also excludes every additional
-/// already-seen identity in `additional_excludes`.
+/// Like [`select_next_retry_target`], but additionally requires `eligible` of
+/// every candidate.
 ///
-/// Retry-only. `prev_target` still drives per-port lane / hash recomputation;
-/// `additional_excludes` only widen the sticky-identity exclusion set so an
-/// eligibility filter can skip ineligible candidates without revisiting them
-/// or the original failed endpoint. Empty `additional_excludes` is identical
-/// to [`select_next_retry_target`].
-pub(crate) fn select_next_retry_target_excluding(
+/// Retry-only. `prev_target` still drives per-port lane / hash recomputation
+/// and remains the excluded identity; `eligible` is handed to the load balancer
+/// so it is applied in the SAME bounded pass that builds the candidate lane.
+/// One selection runs regardless of how many pool entries are ineligible.
+/// `None` for `eligible` is identical to [`select_next_retry_target`].
+fn select_next_retry_target_filtered(
     state: &ProxyState,
     epoch: &RequestEpoch,
     proxy: &Proxy,
     prev_target: &UpstreamTarget,
-    additional_excludes: &[&UpstreamTarget],
+    eligible: Option<&dyn Fn(&UpstreamTarget) -> bool>,
     request: RetryTargetRequest<'_>,
 ) -> Option<Arc<UpstreamTarget>> {
     let upstream_id = proxy.upstream_id.as_deref()?;
@@ -1461,20 +1462,12 @@ pub(crate) fn select_next_retry_target_excluding(
         prev_target,
     );
 
-    // Reconcile each additional dial / seen candidate back to its configured
-    // sticky identity before exclusion (same contract as `prev_target`).
-    let mut extra_configured: Vec<&UpstreamTarget> = Vec::with_capacity(additional_excludes.len());
-    for seen in additional_excludes {
-        extra_configured.push(LoadBalancerCache::configured_sticky_identity_target_from(
-            &epoch.load_balancer,
-            &proxy.namespace,
-            upstream_id,
-            seen,
-        ));
-    }
-    let mut excludes: Vec<&UpstreamTarget> = Vec::with_capacity(1 + extra_configured.len());
-    excludes.push(primary_exclude);
-    excludes.extend_from_slice(&extra_configured);
+    // Stack-only: a borrowed exclude plus an optional borrowed predicate. No
+    // heap allocation on the ordinary single-exclusion retry path.
+    let filter = match eligible {
+        Some(eligible) => RetryCandidateFilter::excluding_eligible(primary_exclude, eligible),
+        None => RetryCandidateFilter::excluding(primary_exclude),
+    };
 
     let retry_override_port =
         crate::proxy::retry_port_override_dispatch_port(proxy, primary_exclude).filter(|port| {
@@ -1523,44 +1516,44 @@ pub(crate) fn select_next_retry_target_excluding(
 
     let selected = if let Some(subset_name) = proxy.upstream_subset.as_deref() {
         if let Some(port) = retry_override_port {
-            LoadBalancerCache::select_next_target_for_port_subset_excluding_from(
+            LoadBalancerCache::select_next_target_for_port_subset_filtered_from(
                 &epoch.load_balancer,
                 &proxy.namespace,
                 upstream_id,
                 retry_key,
                 port,
                 subset_name,
-                &excludes,
+                filter,
                 Some(&health_ctx),
             )
         } else {
-            LoadBalancerCache::select_next_target_subset_excluding_from(
+            LoadBalancerCache::select_next_target_subset_filtered_from(
                 &epoch.load_balancer,
                 &proxy.namespace,
                 upstream_id,
                 retry_key,
                 subset_name,
-                &excludes,
+                filter,
                 Some(&health_ctx),
             )
         }
     } else if let Some(port) = retry_override_port {
-        LoadBalancerCache::select_next_target_for_port_excluding_from(
+        LoadBalancerCache::select_next_target_for_port_filtered_from(
             &epoch.load_balancer,
             &proxy.namespace,
             upstream_id,
             retry_key,
             port,
-            &excludes,
+            filter,
             Some(&health_ctx),
         )
     } else {
-        LoadBalancerCache::select_next_target_excluding_from(
+        LoadBalancerCache::select_next_target_filtered_from(
             &epoch.load_balancer,
             &proxy.namespace,
             upstream_id,
             retry_key,
-            &excludes,
+            filter,
             Some(&health_ctx),
         )
     }?;
@@ -1573,53 +1566,33 @@ pub(crate) fn select_next_retry_target_excluding(
 ///
 /// Shared by the H3→HTTP plain and H3 WebSocket retry paths (issue #3620).
 /// Preserves the ordinary retry contract (LB algorithm, health/ejection,
-/// subset / per-port lanes, wildcard concretization) while:
+/// locality, subset / per-port lanes, per-port `hash_on` recomputation,
+/// wildcard concretization) while excluding the original failed identity.
 ///
-/// - always excluding the original failed identity;
-/// - accumulating every ineligible candidate already encountered so selection
-///   cannot revisit them or oscillate among Unix-only endpoints;
-/// - terminating after at most [`crate::config::types::MAX_TARGETS_PER_UPSTREAM`]
-///   probes so an all-ineligible pool fails closed deterministically.
+/// `is_eligible` is pushed DOWN into load-balancer selection so ineligible
+/// pool entries are dropped in the same bounded pass that already builds the
+/// candidate mask. Exactly one selection runs, costing one scan of the target
+/// lane and no additional allocation, regardless of how many entries are
+/// ineligible. An all-ineligible lane therefore fails closed (`None`)
+/// immediately rather than re-running selection per skipped target.
 ///
-/// Allocation is retry-only and bounded by that same 1,000-target ceiling
-/// (one `Arc` retain per skipped ineligible candidate). The ordinary no-retry
-/// and single-exclude retry paths do not call this helper.
+/// The predicate sees CONFIGURED pool entries, before wildcard concretization.
+/// That is sound for transport eligibility, which reads only tags / port /
+/// policy lane — fields concretization preserves — and it is what keeps the
+/// filter inside the single selection pass. Do not reintroduce an outer
+/// probe loop with a growing exclusion set: with
+/// [`crate::config::types::MAX_TARGETS_PER_UPSTREAM`] configured targets that
+/// is quadratic work plus a per-probe allocation on a request path.
 pub(crate) fn select_next_eligible_retry_target(
     state: &ProxyState,
     epoch: &RequestEpoch,
     proxy: &Proxy,
     prev_target: &UpstreamTarget,
     request: RetryTargetRequest<'_>,
-    mut is_eligible: impl FnMut(&UpstreamTarget) -> bool,
+    is_eligible: &dyn Fn(&UpstreamTarget) -> bool,
 ) -> Option<Arc<UpstreamTarget>> {
-    use crate::config::types::MAX_TARGETS_PER_UPSTREAM;
-
-    let mut candidate =
-        select_next_retry_target_excluding(state, epoch, proxy, prev_target, &[], request)?;
-    if is_eligible(&candidate) {
-        return Some(candidate);
-    }
-
-    // Retain dial identities of every ineligible candidate already seen.
-    // Bound: at most MAX_TARGETS_PER_UPSTREAM-1 further probes after the first
-    // ineligible pick, covering a full configured upstream without cycling.
-    let mut seen_ineligible: Vec<Arc<UpstreamTarget>> = Vec::new();
-    for _ in 0..MAX_TARGETS_PER_UPSTREAM.saturating_sub(1) {
-        seen_ineligible.push(Arc::clone(&candidate));
-        let additional: Vec<&UpstreamTarget> = seen_ineligible.iter().map(|t| t.as_ref()).collect();
-        candidate = select_next_retry_target_excluding(
-            state,
-            epoch,
-            proxy,
-            prev_target,
-            &additional,
-            request,
-        )?;
-        if is_eligible(&candidate) {
-            return Some(candidate);
-        }
-    }
-    None
+    let eligible: Option<&dyn Fn(&UpstreamTarget) -> bool> = Some(is_eligible);
+    select_next_retry_target_filtered(state, epoch, proxy, prev_target, eligible, request)
 }
 
 /// H3-eligible variant of [`select_next_eligible_retry_target`].
@@ -1639,7 +1612,7 @@ pub(crate) fn select_next_h3_eligible_retry_target(
         proxy,
         prev_target,
         request,
-        h3_dispatch_target_eligible,
+        &h3_dispatch_target_eligible,
     )
 }
 

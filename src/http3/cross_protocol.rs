@@ -539,12 +539,11 @@ fn select_next_cross_protocol_retry_target(
     };
 
     // Shared H3-eligible retry selection (issue #3620): excludes the original
-    // failed identity plus every Unix-ineligible candidate already seen, up to
-    // MAX_TARGETS_PER_UPSTREAM, so mixed plain+mesh+unix upstreams land on an
-    // eligible target instead of oscillating among Unix-only endpoints or
-    // burning the attempt on a guaranteed fail-closed dial. When every
-    // remaining candidate is ineligible the caller sees Unchanged and the
-    // attempt fails closed.
+    // failed identity and drops every Unix-ineligible pool entry inside the one
+    // load-balancer selection pass, so mixed plain+mesh+unix upstreams land on
+    // an eligible target instead of burning the attempt on a guaranteed
+    // fail-closed dial. When no eligible candidate remains the caller sees
+    // Unchanged and the attempt fails closed.
     let Some(next) = crate::proxy::backend_dispatch::select_next_h3_eligible_retry_target(
         state,
         epoch,

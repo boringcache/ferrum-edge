@@ -1674,33 +1674,31 @@ impl LoadBalancerCache {
         exclude: &UpstreamTarget,
         health: Option<&HealthContext<'_>>,
     ) -> Option<Arc<UpstreamTarget>> {
-        Self::select_next_target_excluding_from(
+        Self::select_next_target_filtered_from(
             snapshot,
             namespace,
             upstream_id,
             ctx_key,
-            std::slice::from_ref(&exclude),
+            RetryCandidateFilter::excluding(exclude),
             health,
         )
     }
 
-    /// Retry-only multi-identity exclusion for HTTP/H3 selection lanes.
+    /// Retry-only eligibility-aware selection for HTTP/H3 lanes.
     ///
-    /// `excludes` must list every already-tried / already-seen configured
-    /// identity that must not be reselected. Empty input fails closed.
-    pub fn select_next_target_excluding_from(
+    /// `filter` carries the already-tried configured identity and an optional
+    /// transport-eligibility predicate; both are applied while the candidate
+    /// mask is built.
+    pub fn select_next_target_filtered_from(
         snapshot: &LoadBalancerCacheInner,
         namespace: &str,
         upstream_id: &str,
         ctx_key: &str,
-        excludes: &[&UpstreamTarget],
+        filter: RetryCandidateFilter<'_>,
         health: Option<&HealthContext<'_>>,
     ) -> Option<Arc<UpstreamTarget>> {
-        if excludes.is_empty() {
-            return None;
-        }
         let balancer = snapshot.balancer(namespace, upstream_id)?;
-        balancer.select_excluding_many(ctx_key, excludes, health)
+        balancer.select_filtered(ctx_key, filter, health)
     }
 
     /// TCP/stream connect-retry variant of [`Self::select_next_target_from`].
@@ -1728,32 +1726,29 @@ impl LoadBalancerCache {
         exclude: &UpstreamTarget,
         health: Option<&HealthContext<'_>>,
     ) -> Option<Arc<UpstreamTarget>> {
-        Self::select_next_target_for_port_excluding_from(
+        Self::select_next_target_for_port_filtered_from(
             snapshot,
             namespace,
             upstream_id,
             ctx_key,
             port,
-            std::slice::from_ref(&exclude),
+            RetryCandidateFilter::excluding(exclude),
             health,
         )
     }
 
-    /// Retry-only multi-identity exclusion on a live per-port override lane.
-    pub fn select_next_target_for_port_excluding_from(
+    /// Retry-only eligibility-aware selection on a live per-port override lane.
+    pub fn select_next_target_for_port_filtered_from(
         snapshot: &LoadBalancerCacheInner,
         namespace: &str,
         upstream_id: &str,
         ctx_key: &str,
         port: u16,
-        excludes: &[&UpstreamTarget],
+        filter: RetryCandidateFilter<'_>,
         health: Option<&HealthContext<'_>>,
     ) -> Option<Arc<UpstreamTarget>> {
-        if excludes.is_empty() {
-            return None;
-        }
         let balancer = snapshot.balancer(namespace, upstream_id)?;
-        balancer.select_excluding_for_port_many(ctx_key, port, excludes, health)
+        balancer.select_filtered_for_port(ctx_key, port, filter, health)
     }
 
     /// TCP/stream connect-retry variant of [`Self::select_next_target_for_port_from`].
@@ -1779,32 +1774,29 @@ impl LoadBalancerCache {
         exclude: &UpstreamTarget,
         health: Option<&HealthContext<'_>>,
     ) -> Option<Arc<UpstreamTarget>> {
-        Self::select_next_target_subset_excluding_from(
+        Self::select_next_target_subset_filtered_from(
             snapshot,
             namespace,
             upstream_id,
             ctx_key,
             subset_name,
-            std::slice::from_ref(&exclude),
+            RetryCandidateFilter::excluding(exclude),
             health,
         )
     }
 
-    /// Retry-only multi-identity exclusion inside a named subset lane.
-    pub fn select_next_target_subset_excluding_from(
+    /// Retry-only eligibility-aware selection inside a named subset lane.
+    pub fn select_next_target_subset_filtered_from(
         snapshot: &LoadBalancerCacheInner,
         namespace: &str,
         upstream_id: &str,
         ctx_key: &str,
         subset_name: &str,
-        excludes: &[&UpstreamTarget],
+        filter: RetryCandidateFilter<'_>,
         health: Option<&HealthContext<'_>>,
     ) -> Option<Arc<UpstreamTarget>> {
-        if excludes.is_empty() {
-            return None;
-        }
         let balancer = snapshot.balancer(namespace, upstream_id)?;
-        balancer.select_excluding_from_subset_many(ctx_key, subset_name, excludes, health)
+        balancer.select_filtered_from_subset(ctx_key, subset_name, filter, health)
     }
 
     /// TCP/stream connect-retry variant of [`Self::select_next_target_subset_from`].
@@ -1832,41 +1824,32 @@ impl LoadBalancerCache {
         exclude: &UpstreamTarget,
         health: Option<&HealthContext<'_>>,
     ) -> Option<Arc<UpstreamTarget>> {
-        Self::select_next_target_for_port_subset_excluding_from(
+        Self::select_next_target_for_port_subset_filtered_from(
             snapshot,
             namespace,
             upstream_id,
             ctx_key,
             port,
             subset_name,
-            std::slice::from_ref(&exclude),
+            RetryCandidateFilter::excluding(exclude),
             health,
         )
     }
 
-    /// Retry-only multi-identity exclusion on a live per-port × subset lane.
+    /// Retry-only eligibility-aware selection on a live per-port × subset lane.
     #[allow(clippy::too_many_arguments)]
-    pub fn select_next_target_for_port_subset_excluding_from(
+    pub fn select_next_target_for_port_subset_filtered_from(
         snapshot: &LoadBalancerCacheInner,
         namespace: &str,
         upstream_id: &str,
         ctx_key: &str,
         port: u16,
         subset_name: &str,
-        excludes: &[&UpstreamTarget],
+        filter: RetryCandidateFilter<'_>,
         health: Option<&HealthContext<'_>>,
     ) -> Option<Arc<UpstreamTarget>> {
-        if excludes.is_empty() {
-            return None;
-        }
         let balancer = snapshot.balancer(namespace, upstream_id)?;
-        balancer.select_excluding_for_port_from_subset_many(
-            ctx_key,
-            port,
-            subset_name,
-            excludes,
-            health,
-        )
+        balancer.select_filtered_for_port_from_subset(ctx_key, port, subset_name, filter, health)
     }
 
     /// TCP/stream connect-retry variant of
@@ -2411,37 +2394,70 @@ fn retry_exclude_matches(
     }
 }
 
-/// Whether `target` matches any identity in `excludes` under `contract`.
-#[inline]
-fn retry_exclude_matches_any(
-    target: &UpstreamTarget,
-    excludes: &[&UpstreamTarget],
-    contract: RetryExcludeContract,
-) -> bool {
-    excludes
-        .iter()
-        .any(|exclude| retry_exclude_matches(target, exclude, contract))
+/// Constraints a retry candidate must satisfy to stay in the candidate lane.
+///
+/// Carries the already-tried identity plus an optional per-candidate
+/// eligibility predicate (H3 Unix refusal, issue #3620). Both are applied in
+/// the SAME bounded pass that builds the candidate mask, so a transport-filtered
+/// retry costs one lane scan — never one full selection per ineligible target.
+///
+/// The predicate is evaluated against CONFIGURED pool entries. It must therefore
+/// only read fields that survive wildcard concretization (tags / port / policy
+/// lane), which is exactly what transport eligibility inspects, and it must be
+/// side-effect free: selection may consult it for any subset of the lane.
+#[derive(Clone, Copy)]
+pub struct RetryCandidateFilter<'a> {
+    exclude: &'a UpstreamTarget,
+    eligible: Option<&'a dyn Fn(&UpstreamTarget) -> bool>,
 }
 
-/// Drop every pool entry matching any identity in `excludes` under `contract`
-/// from `candidate_mask`.
+impl<'a> RetryCandidateFilter<'a> {
+    /// Ordinary retry: exclude the already-tried identity, accept any survivor.
+    #[inline]
+    pub fn excluding(exclude: &'a UpstreamTarget) -> Self {
+        Self {
+            exclude,
+            eligible: None,
+        }
+    }
+
+    /// Retry that additionally requires `eligible` of every candidate.
+    ///
+    /// Fails closed: when no eligible candidate survives exclusion, selection
+    /// returns `None` rather than falling back to an ineligible target.
+    #[inline]
+    pub fn excluding_eligible(
+        exclude: &'a UpstreamTarget,
+        eligible: &'a dyn Fn(&UpstreamTarget) -> bool,
+    ) -> Self {
+        Self {
+            exclude,
+            eligible: Some(eligible),
+        }
+    }
+
+    /// Whether `target` must be dropped from the candidate lane.
+    #[inline]
+    fn rejects(&self, target: &UpstreamTarget, contract: RetryExcludeContract) -> bool {
+        retry_exclude_matches(target, self.exclude, contract)
+            || self.eligible.is_some_and(|eligible| !eligible(target))
+    }
+}
+
+/// Drop every pool entry rejected by `filter` under `contract` from
+/// `candidate_mask`.
 ///
-/// Retry-only and bounded by the configured target pool. The ordinary no-retry
-/// hot path never reaches this helper. Callers that accumulate previously seen
-/// ineligible candidates (H3 Unix filtering) pass the full exclusion set so
-/// selection cannot revisit them or the original failed identity.
+/// Retry-only and bounded by the configured target pool: one pass, no
+/// allocation. The ordinary no-retry hot path never reaches this helper.
 #[inline]
 fn clear_retry_exclusions(
     targets: &[Arc<UpstreamTarget>],
-    excludes: &[&UpstreamTarget],
+    filter: RetryCandidateFilter<'_>,
     contract: RetryExcludeContract,
     candidate_mask: &mut HealthBitset,
 ) {
-    if excludes.is_empty() {
-        return;
-    }
     for (idx, target) in targets.iter().enumerate() {
-        if retry_exclude_matches_any(target, excludes, contract) {
+        if filter.rejects(target, contract) {
             candidate_mask.clear(idx);
         }
     }
@@ -5633,19 +5649,20 @@ impl LoadBalancer {
         exclude: &UpstreamTarget,
         health: Option<&HealthContext<'_>>,
     ) -> Option<Arc<UpstreamTarget>> {
-        self.select_excluding_many(ctx_key, std::slice::from_ref(&exclude), health)
+        self.select_filtered(ctx_key, RetryCandidateFilter::excluding(exclude), health)
     }
 
-    /// Retry-only: exclude every sticky identity in `excludes` before selecting.
-    pub fn select_excluding_many(
+    /// Retry-only: apply `filter` (sticky exclusion + optional eligibility)
+    /// while building the candidate lane, then select once.
+    pub fn select_filtered(
         &self,
         ctx_key: &str,
-        excludes: &[&UpstreamTarget],
+        filter: RetryCandidateFilter<'_>,
         health: Option<&HealthContext<'_>>,
     ) -> Option<Arc<UpstreamTarget>> {
         self.select_excluding_with(
             ctx_key,
-            excludes,
+            filter,
             health,
             RetryExcludeContract::ConfiguredStickyIdentity,
         )
@@ -5661,7 +5678,7 @@ impl LoadBalancer {
     ) -> Option<Arc<UpstreamTarget>> {
         self.select_excluding_with(
             ctx_key,
-            std::slice::from_ref(&exclude),
+            RetryCandidateFilter::excluding(exclude),
             health,
             RetryExcludeContract::EffectiveEndpointLane,
         )
@@ -5670,18 +5687,18 @@ impl LoadBalancer {
     fn select_excluding_with(
         &self,
         ctx_key: &str,
-        excludes: &[&UpstreamTarget],
+        filter: RetryCandidateFilter<'_>,
         health: Option<&HealthContext<'_>>,
         contract: RetryExcludeContract,
     ) -> Option<Arc<UpstreamTarget>> {
         let n = self.targets.len();
-        if n == 0 || excludes.is_empty() {
+        if n == 0 {
             return None;
         }
 
         // For >128 targets, fall back to Vec-based path.
         if n > MAX_BITSET_TARGETS {
-            return self.select_excluding_vec_fallback(ctx_key, excludes, health, contract);
+            return self.select_excluding_vec_fallback(ctx_key, filter, health, contract);
         }
 
         // Drop excluded (previously tried) target(s) from the candidate mask
@@ -5690,7 +5707,7 @@ impl LoadBalancer {
         // leaves viable retry candidates ejected.
         let scope = HealthBitset::all(n);
         let mut candidate_mask = scope;
-        clear_retry_exclusions(&self.targets, excludes, contract, &mut candidate_mask);
+        clear_retry_exclusions(&self.targets, filter, contract, &mut candidate_mask);
         if candidate_mask.is_empty() {
             return None;
         }
@@ -5719,21 +5736,22 @@ impl LoadBalancer {
         exclude: &UpstreamTarget,
         health: Option<&HealthContext<'_>>,
     ) -> Option<Arc<UpstreamTarget>> {
-        self.select_excluding_for_port_many(ctx_key, port, std::slice::from_ref(&exclude), health)
+        let filter = RetryCandidateFilter::excluding(exclude);
+        self.select_filtered_for_port(ctx_key, port, filter, health)
     }
 
-    /// Retry-only multi-identity exclusion on a live per-port override lane.
-    pub fn select_excluding_for_port_many(
+    /// Retry-only eligibility-aware selection on a live per-port override lane.
+    pub fn select_filtered_for_port(
         &self,
         ctx_key: &str,
         port: u16,
-        excludes: &[&UpstreamTarget],
+        filter: RetryCandidateFilter<'_>,
         health: Option<&HealthContext<'_>>,
     ) -> Option<Arc<UpstreamTarget>> {
         self.select_excluding_for_port_with(
             ctx_key,
             port,
-            excludes,
+            filter,
             health,
             RetryExcludeContract::ConfiguredStickyIdentity,
         )
@@ -5749,7 +5767,7 @@ impl LoadBalancer {
         self.select_excluding_for_port_with(
             ctx_key,
             port,
-            std::slice::from_ref(&exclude),
+            RetryCandidateFilter::excluding(exclude),
             health,
             RetryExcludeContract::EffectiveEndpointLane,
         )
@@ -5759,27 +5777,27 @@ impl LoadBalancer {
         &self,
         ctx_key: &str,
         port: u16,
-        excludes: &[&UpstreamTarget],
+        filter: RetryCandidateFilter<'_>,
         health: Option<&HealthContext<'_>>,
         contract: RetryExcludeContract,
     ) -> Option<Arc<UpstreamTarget>> {
         let Some(port_state) = self.port_overrides.get(&port) else {
-            return self.select_excluding_with(ctx_key, excludes, health, contract);
+            return self.select_excluding_with(ctx_key, filter, health, contract);
         };
         let n = self.targets.len();
-        if n == 0 || port_state.target_indices.is_empty() || excludes.is_empty() {
+        if n == 0 || port_state.target_indices.is_empty() {
             return None;
         }
 
         if n > MAX_BITSET_TARGETS {
             return self.select_excluding_port_vec_fallback(
-                ctx_key, port_state, excludes, health, contract,
+                ctx_key, port_state, filter, health, contract,
             );
         }
 
         let scope = bitset_for_indices(&port_state.target_indices);
         let mut candidate_mask = scope;
-        clear_retry_exclusions(&self.targets, excludes, contract, &mut candidate_mask);
+        clear_retry_exclusions(&self.targets, filter, contract, &mut candidate_mask);
         if candidate_mask.is_empty() {
             return None;
         }
@@ -5819,26 +5837,26 @@ impl LoadBalancer {
         exclude: &UpstreamTarget,
         health: Option<&HealthContext<'_>>,
     ) -> Option<Arc<UpstreamTarget>> {
-        self.select_excluding_from_subset_many(
+        self.select_filtered_from_subset(
             ctx_key,
             subset_name,
-            std::slice::from_ref(&exclude),
+            RetryCandidateFilter::excluding(exclude),
             health,
         )
     }
 
-    /// Retry-only multi-identity exclusion inside a named subset lane.
-    pub fn select_excluding_from_subset_many(
+    /// Retry-only eligibility-aware selection inside a named subset lane.
+    pub fn select_filtered_from_subset(
         &self,
         ctx_key: &str,
         subset_name: &str,
-        excludes: &[&UpstreamTarget],
+        filter: RetryCandidateFilter<'_>,
         health: Option<&HealthContext<'_>>,
     ) -> Option<Arc<UpstreamTarget>> {
         self.select_excluding_from_subset_with(
             ctx_key,
             subset_name,
-            excludes,
+            filter,
             health,
             RetryExcludeContract::ConfiguredStickyIdentity,
         )
@@ -5854,7 +5872,7 @@ impl LoadBalancer {
         self.select_excluding_from_subset_with(
             ctx_key,
             subset_name,
-            std::slice::from_ref(&exclude),
+            RetryCandidateFilter::excluding(exclude),
             health,
             RetryExcludeContract::EffectiveEndpointLane,
         )
@@ -5864,12 +5882,12 @@ impl LoadBalancer {
         &self,
         ctx_key: &str,
         subset_name: &str,
-        excludes: &[&UpstreamTarget],
+        filter: RetryCandidateFilter<'_>,
         health: Option<&HealthContext<'_>>,
         contract: RetryExcludeContract,
     ) -> Option<Arc<UpstreamTarget>> {
         let n = self.targets.len();
-        if n == 0 || excludes.is_empty() {
+        if n == 0 {
             return None;
         }
         let subset_target_indices = match self.subset_indices.get(subset_name) {
@@ -5883,7 +5901,7 @@ impl LoadBalancer {
                 ctx_key,
                 subset_name,
                 subset_target_indices,
-                excludes,
+                filter,
                 health,
                 contract,
             );
@@ -5898,7 +5916,7 @@ impl LoadBalancer {
         // mask is an alloc-free stack `u128` (no per-request `Vec`).
         let strict_scope = bitset_for_indices(subset_target_indices);
         let mut candidate_mask = strict_scope;
-        clear_retry_exclusions(&self.targets, excludes, contract, &mut candidate_mask);
+        clear_retry_exclusions(&self.targets, filter, contract, &mut candidate_mask);
         if candidate_mask.is_empty() {
             return None;
         }
@@ -5933,29 +5951,29 @@ impl LoadBalancer {
         exclude: &UpstreamTarget,
         health: Option<&HealthContext<'_>>,
     ) -> Option<Arc<UpstreamTarget>> {
-        self.select_excluding_for_port_from_subset_many(
+        self.select_filtered_for_port_from_subset(
             ctx_key,
             port,
             subset_name,
-            std::slice::from_ref(&exclude),
+            RetryCandidateFilter::excluding(exclude),
             health,
         )
     }
 
-    /// Retry-only multi-identity exclusion on a live per-port × subset lane.
-    pub fn select_excluding_for_port_from_subset_many(
+    /// Retry-only eligibility-aware selection on a live per-port × subset lane.
+    pub fn select_filtered_for_port_from_subset(
         &self,
         ctx_key: &str,
         port: u16,
         subset_name: &str,
-        excludes: &[&UpstreamTarget],
+        filter: RetryCandidateFilter<'_>,
         health: Option<&HealthContext<'_>>,
     ) -> Option<Arc<UpstreamTarget>> {
         self.select_excluding_for_port_from_subset_with(
             ctx_key,
             port,
             subset_name,
-            excludes,
+            filter,
             health,
             RetryExcludeContract::ConfiguredStickyIdentity,
         )
@@ -5973,7 +5991,7 @@ impl LoadBalancer {
             ctx_key,
             port,
             subset_name,
-            std::slice::from_ref(&exclude),
+            RetryCandidateFilter::excluding(exclude),
             health,
             RetryExcludeContract::EffectiveEndpointLane,
         )
@@ -5984,7 +6002,7 @@ impl LoadBalancer {
         ctx_key: &str,
         port: u16,
         subset_name: &str,
-        excludes: &[&UpstreamTarget],
+        filter: RetryCandidateFilter<'_>,
         health: Option<&HealthContext<'_>>,
         contract: RetryExcludeContract,
     ) -> Option<Arc<UpstreamTarget>> {
@@ -5992,13 +6010,13 @@ impl LoadBalancer {
             return self.select_excluding_from_subset_with(
                 ctx_key,
                 subset_name,
-                excludes,
+                filter,
                 health,
                 contract,
             );
         };
         let n = self.targets.len();
-        if n == 0 || port_state.target_indices.is_empty() || excludes.is_empty() {
+        if n == 0 || port_state.target_indices.is_empty() {
             return None;
         }
         let subset_target_indices = match self.subset_indices.get(subset_name) {
@@ -6013,7 +6031,7 @@ impl LoadBalancer {
                 port_state,
                 subset_name,
                 subset_target_indices,
-                excludes,
+                filter,
                 contract,
                 health,
             );
@@ -6026,7 +6044,7 @@ impl LoadBalancer {
         // an excluded target (see `select_excluding_from_subset`).
         let strict_scope = self.subset_port_mask(subset_target_indices, &port_state.target_indices);
         let mut candidate_mask = strict_scope;
-        clear_retry_exclusions(&self.targets, excludes, contract, &mut candidate_mask);
+        clear_retry_exclusions(&self.targets, filter, contract, &mut candidate_mask);
         if candidate_mask.is_empty() {
             return None;
         }
@@ -6061,7 +6079,7 @@ impl LoadBalancer {
     fn select_excluding_vec_fallback(
         &self,
         ctx_key: &str,
-        excludes: &[&UpstreamTarget],
+        filter: RetryCandidateFilter<'_>,
         health: Option<&HealthContext<'_>>,
         contract: RetryExcludeContract,
     ) -> Option<Arc<UpstreamTarget>> {
@@ -6071,7 +6089,7 @@ impl LoadBalancer {
         let candidate_indices: Vec<usize> = scope_indices
             .iter()
             .copied()
-            .filter(|&idx| !retry_exclude_matches_any(&self.targets[idx], excludes, contract))
+            .filter(|&idx| !filter.rejects(&self.targets[idx], contract))
             .collect();
         if candidate_indices.is_empty() {
             return None;
@@ -6094,7 +6112,7 @@ impl LoadBalancer {
         &self,
         ctx_key: &str,
         port_state: &PortLbState,
-        excludes: &[&UpstreamTarget],
+        filter: RetryCandidateFilter<'_>,
         health: Option<&HealthContext<'_>>,
         contract: RetryExcludeContract,
     ) -> Option<Arc<UpstreamTarget>> {
@@ -6105,7 +6123,7 @@ impl LoadBalancer {
             .target_indices
             .iter()
             .copied()
-            .filter(|&idx| !retry_exclude_matches_any(&self.targets[idx], excludes, contract))
+            .filter(|&idx| !filter.rejects(&self.targets[idx], contract))
             .collect();
         if candidate_indices.is_empty() {
             return None;
@@ -6143,7 +6161,7 @@ impl LoadBalancer {
         port_state: &PortLbState,
         subset_name: &str,
         subset_indices: &[usize],
-        excludes: &[&UpstreamTarget],
+        filter: RetryCandidateFilter<'_>,
         contract: RetryExcludeContract,
         health: Option<&HealthContext<'_>>,
     ) -> Option<Arc<UpstreamTarget>> {
@@ -6157,7 +6175,7 @@ impl LoadBalancer {
         let intersection: Vec<usize> = strict_scope
             .iter()
             .copied()
-            .filter(|&idx| !retry_exclude_matches_any(&self.targets[idx], excludes, contract))
+            .filter(|&idx| !filter.rejects(&self.targets[idx], contract))
             .collect();
         if intersection.is_empty() {
             return None;
@@ -6193,7 +6211,7 @@ impl LoadBalancer {
         ctx_key: &str,
         subset_name: &str,
         subset_indices: &[usize],
-        excludes: &[&UpstreamTarget],
+        filter: RetryCandidateFilter<'_>,
         health: Option<&HealthContext<'_>>,
         contract: RetryExcludeContract,
     ) -> Option<Arc<UpstreamTarget>> {
@@ -6206,7 +6224,7 @@ impl LoadBalancer {
         let candidate_indices: Vec<usize> = subset_indices
             .iter()
             .copied()
-            .filter(|&idx| !retry_exclude_matches_any(&self.targets[idx], excludes, contract))
+            .filter(|&idx| !filter.rejects(&self.targets[idx], contract))
             .collect();
         if candidate_indices.is_empty() {
             return None;

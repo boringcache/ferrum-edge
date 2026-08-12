@@ -3,17 +3,19 @@
 //! The plain H3 bridge and H3 WebSocket retry paths share
 //! `select_next_h3_eligible_retry_target`, which must:
 //! - exclude the original failed identity;
-//! - accumulate every ineligible (Unix) candidate already seen;
-//! - terminate deterministically for an all-Unix pool up to
-//!   `MAX_TARGETS_PER_UPSTREAM` without cycling;
-//! - still reach an eligible target after a long ineligible prefix (>32).
+//! - drop every ineligible (Unix) pool entry inside the SAME load-balancer
+//!   selection pass that builds the candidate lane — one bounded scan, no
+//!   repeated probing and no per-probe allocation;
+//! - fail closed (`None`) for an all-Unix remainder;
+//! - still reach an eligible target behind a long ineligible prefix, on both
+//!   the bitset lane (<= 128 targets) and the Vec fallback lane (> 128).
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::Utc;
 use ferrum_edge::config::types::{
-    GatewayConfig, LoadBalancerAlgorithm, MAX_TARGETS_PER_UPSTREAM, Proxy, Upstream, UpstreamTarget,
+    GatewayConfig, LoadBalancerAlgorithm, Proxy, Upstream, UpstreamTarget,
 };
 use ferrum_edge::proxy::unix_backend::MESH_UNIX_SOCKET_TAG;
 
@@ -188,32 +190,39 @@ async fn h3_eligible_retry_all_unix_pool_terminates_without_cycle() {
 }
 
 #[tokio::test]
-async fn h3_eligible_retry_bound_covers_configured_upstream_ceiling() {
-    // Guard the bound itself: the helper must be willing to walk past the
-    // old 32-iteration cap up to the configured MAX_TARGETS_PER_UPSTREAM.
-    const {
-        assert!(
-            MAX_TARGETS_PER_UPSTREAM > 32,
-            "regression depends on the configured upstream ceiling exceeding the old hard-coded 32"
-        );
-    }
-
-    // Keep the fixture smaller than the absolute ceiling for unit-test speed,
-    // but still well above 32, with the eligible target last.
-    let mut targets = Vec::with_capacity(65);
+async fn h3_eligible_retry_applies_eligibility_on_the_vec_fallback_lane() {
+    // Above MAX_BITSET_TARGETS (128) the load balancer takes its Vec fallback
+    // lane. Eligibility must be applied there too, in the same single pass.
+    let mut targets = Vec::with_capacity(160);
     let original = plain_target("10.0.0.1", 8080);
     targets.push(original.clone());
-    for i in 0..63 {
+    for i in 0..150 {
         targets.push(unix_target(i + 2));
     }
     let eligible = plain_target("10.0.0.200", 8080);
     targets.push(eligible.clone());
-    assert!(targets.len() > 32);
+    assert!(targets.len() > 128, "fixture must exceed the bitset lane");
 
     let (state, proxy) = retry_state_for(rr_upstream(targets)).await;
     let next = select_h3(&state, &proxy, &original)
-        .expect("eligible target beyond a >32 Unix prefix must still be selected");
+        .expect("eligible target behind a 150-Unix prefix must still be selected");
     assert_eq!(next.host, eligible.host);
+}
+
+#[tokio::test]
+async fn h3_eligible_retry_all_unix_pool_terminates_on_the_vec_fallback_lane() {
+    let original = plain_target("10.0.0.1", 8080);
+    let mut targets = vec![original.clone()];
+    for i in 0..150 {
+        targets.push(unix_target(i + 2));
+    }
+    assert!(targets.len() > 128, "fixture must exceed the bitset lane");
+
+    let (state, proxy) = retry_state_for(rr_upstream(targets)).await;
+    assert!(
+        select_h3(&state, &proxy, &original).is_none(),
+        "an all-Unix remainder must fail closed on the Vec fallback lane too"
+    );
 }
 
 #[test]
@@ -225,9 +234,8 @@ fn every_h3_retry_surface_shares_eligible_helper_not_ad_hoc_loops() {
 
     assert!(
         dispatch.contains("pub(crate) fn select_next_h3_eligible_retry_target(")
-            && dispatch.contains("pub(crate) fn select_next_eligible_retry_target(")
-            && dispatch.contains("MAX_TARGETS_PER_UPSTREAM"),
-        "shared eligibility helper must live in backend_dispatch and honour MAX_TARGETS_PER_UPSTREAM"
+            && dispatch.contains("pub(crate) fn select_next_eligible_retry_target("),
+        "shared eligibility helper must live in backend_dispatch"
     );
     assert_eq!(
         cross
@@ -277,5 +285,80 @@ fn every_h3_retry_surface_shares_eligible_helper_not_ad_hoc_loops() {
     assert!(
         cross.contains(") else {\n        return CrossProtocolRetryTarget::Unchanged;\n    };"),
         "cross-protocol must keep mapping helper None to Unchanged"
+    );
+}
+
+/// Hot-path shape guard: eligibility is a load-balancer input, not an outer
+/// retry loop.
+///
+/// The rejected design re-ran the full retry selection once per ineligible
+/// target with a growing exclusion slice. With `MAX_TARGETS_PER_UPSTREAM`
+/// (1,000) configured targets that is hundreds of millions of comparisons plus
+/// one temporary `Vec` per probe on a request/retry path, and it also forced
+/// the ordinary single-exclusion retry to build a heap `Vec` of capacity one.
+#[test]
+fn eligibility_is_pushed_into_selection_not_an_outer_probe_loop() {
+    let dispatch = include_str!("../../../src/proxy/backend_dispatch.rs");
+    let lb = include_str!("../../../src/load_balancer.rs");
+
+    // The eligibility predicate must reach the load balancer as part of the
+    // retry candidate filter.
+    assert!(
+        dispatch.contains("RetryCandidateFilter::excluding_eligible(primary_exclude, eligible)"),
+        "the eligibility predicate must be handed to the LB candidate filter"
+    );
+    assert!(
+        lb.contains("pub struct RetryCandidateFilter<'a>")
+            && lb.contains("fn rejects(&self, target: &UpstreamTarget"),
+        "load_balancer must own the combined exclusion + eligibility candidate test"
+    );
+
+    // Every retry selection lane (upstream, per-port, subset, per-port × subset,
+    // plus their >128-target Vec fallbacks) must consult that one filter while
+    // building its candidate lane. Eight sites: four bitset `clear_retry_exclusions`
+    // calls and four `filter.rejects(...)` fallback filters.
+    assert_eq!(
+        lb.matches("clear_retry_exclusions(&self.targets, filter,").count(),
+        4,
+        "all four bitset retry lanes must clear via the shared candidate filter"
+    );
+    assert_eq!(
+        lb.matches("!filter.rejects(&self.targets[idx]").count(),
+        4,
+        "all four Vec-fallback retry lanes must filter via the shared candidate filter"
+    );
+
+    // No outer probe loop and no accumulated exclusion set may return.
+    let helper = dispatch
+        .split("pub(crate) fn select_next_eligible_retry_target(")
+        .nth(1)
+        .expect("shared eligibility helper")
+        .split("\n/// H3-eligible variant of")
+        .next()
+        .expect("helper body ends before the H3 variant");
+    assert!(
+        !helper.contains("for ") && !helper.contains("while ") && !helper.contains("loop "),
+        "the eligibility helper must not re-run selection in a loop: {helper}"
+    );
+    assert!(
+        !helper.contains("Vec::") && !helper.contains("Arc::clone"),
+        "the eligibility helper must not allocate or retain per-candidate state: {helper}"
+    );
+    assert!(
+        !dispatch.contains("seen_ineligible") && !dispatch.contains("additional_excludes"),
+        "the accumulating growing-exclusion retry design must not return"
+    );
+
+    // The ordinary single-exclusion retry path must stay heap-free.
+    let ordinary = dispatch
+        .split("fn select_next_retry_target_filtered(")
+        .nth(1)
+        .expect("shared retry selection body")
+        .split("\n/// Select the next retry dial target")
+        .next()
+        .expect("body ends before the eligibility helper");
+    assert!(
+        !ordinary.contains("Vec::with_capacity") && !ordinary.contains("Vec<&UpstreamTarget>"),
+        "shared retry selection must not build an exclusion Vec: {ordinary}"
     );
 }

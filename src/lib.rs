@@ -288,8 +288,8 @@ pub mod _test_support {
 
     /// Test-only view of shared H3-eligible retry selection (issue #3620).
     ///
-    /// Excludes the original failed identity plus every Unix-ineligible
-    /// candidate already encountered, bounded by `MAX_TARGETS_PER_UPSTREAM`.
+    /// Excludes the original failed identity and drops every Unix-ineligible
+    /// pool entry inside the single load-balancer selection pass.
     pub fn select_next_h3_eligible_retry_target_for_test(
         state: &crate::proxy::ProxyState,
         epoch: &crate::request_epoch::RequestEpoch,
