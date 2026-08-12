@@ -23,10 +23,9 @@ use ferrum_edge::config::gateway_trust::{
     GatewayTrustDriftSource, GatewayTrustFailureReason, GatewayTrustPublication,
     MAX_FEDERATED_BUNDLES, MAX_JWT_AUTHORITIES_PER_BUNDLE, MAX_TRUST_BUNDLE_JSON_BYTES,
     MAX_X509_AUTHORITIES_PER_BUNDLE, NamespaceTrustProjection, TrustAuthorityResolution,
-    TrustPublicationScope,
-    detect_gateway_trust_drift, gateway_trust_state_drifted, observability_snapshot,
-    project_namespace_trust, published_namespace_generation, published_namespace_state,
-    record_ambiguous_authority, record_trust_generation_published,
+    TrustPublicationScope, detect_gateway_trust_drift, gateway_trust_state_drifted,
+    observability_snapshot, project_namespace_trust, published_namespace_generation,
+    published_namespace_state, record_ambiguous_authority, record_trust_generation_published,
     record_trust_generation_published_scoped, record_trust_load_rejection,
     reset_observability_for_tests, resolve_trust_authority, trust_generation_fingerprint,
 };
