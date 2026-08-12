@@ -5790,9 +5790,8 @@ impl LoadBalancer {
         }
 
         if n > MAX_BITSET_TARGETS {
-            return self.select_excluding_port_vec_fallback(
-                ctx_key, port_state, filter, health, contract,
-            );
+            return self
+                .select_excluding_port_vec_fallback(ctx_key, port_state, filter, health, contract);
         }
 
         let scope = bitset_for_indices(&port_state.target_indices);

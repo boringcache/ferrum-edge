@@ -3280,8 +3280,7 @@ where
         &response_headers,
         effective_max_response_body_size_bytes,
     ) {
-        let terminal_backend_failure =
-            terminal_connection_error || terminal_error_class.is_some();
+        let terminal_backend_failure = terminal_connection_error || terminal_error_class.is_some();
         warn!(
             proxy_id = %proxy.id,
             response_body_bytes = len,
@@ -3295,7 +3294,11 @@ where
             upstream_balancer,
             current_target.as_deref(),
             current_cb_target_key.as_deref(),
-            if terminal_backend_failure { status } else { 502 },
+            if terminal_backend_failure {
+                status
+            } else {
+                502
+            },
             terminal_connection_error,
             if terminal_backend_failure {
                 terminal_error_class
@@ -3308,7 +3311,11 @@ where
         );
         record_cross_protocol_backend_admission_outcome(
             &mut backend_admission_permits,
-            if terminal_backend_failure { status } else { 502 },
+            if terminal_backend_failure {
+                status
+            } else {
+                502
+            },
             terminal_connection_error,
             if terminal_backend_failure {
                 terminal_error_class
@@ -3922,9 +3929,8 @@ where
         // adaptive limiter shrink/grow on a signal that does not reflect backend
         // health. Matches the streaming path below and the H1/H2 path, which
         // capture the backend status before response-body hooks run.
-        let admission_error_class = terminal_error_class.or_else(|| {
-            (!body_completed).then_some(ErrorClass::ClientDisconnect)
-        });
+        let admission_error_class = terminal_error_class
+            .or_else(|| (!body_completed).then_some(ErrorClass::ClientDisconnect));
         record_cross_protocol_backend_admission_outcome(
             &mut backend_admission_permits,
             status,

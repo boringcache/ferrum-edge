@@ -318,7 +318,8 @@ fn eligibility_is_pushed_into_selection_not_an_outer_probe_loop() {
     // building its candidate lane. Eight sites: four bitset `clear_retry_exclusions`
     // calls and four `filter.rejects(...)` fallback filters.
     assert_eq!(
-        lb.matches("clear_retry_exclusions(&self.targets, filter,").count(),
+        lb.matches("clear_retry_exclusions(&self.targets, filter,")
+            .count(),
         4,
         "all four bitset retry lanes must clear via the shared candidate filter"
     );
