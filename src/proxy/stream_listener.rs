@@ -1280,10 +1280,14 @@ impl StreamListenerManager {
     ///
     /// Must be called after [`Self::new`] and BEFORE the first `reconcile()`, so
     /// no udp/dtls listener is spawned with a gate that would accept
-    /// unauthenticated metadata this deployment configured a secret for. An
-    /// empty value is treated as unset.
+    /// unauthenticated metadata this deployment configured a secret for.
+    ///
+    /// The configured bytes are published verbatim. Only an entirely empty
+    /// value is unset: trimming would either key listeners with different bytes
+    /// than `EnvConfig::validate_datagram_proxy_protocol_secret` accepted, or
+    /// turn a whitespace-only secret into no authentication requirement at all.
     pub fn set_datagram_client_address_secret(&self, secret: Option<String>) {
-        let secret = secret.filter(|value| !value.trim().is_empty());
+        let secret = secret.filter(|value| !value.is_empty());
         self.datagram_client_address_secret
             .store(secret.map(Arc::new));
     }

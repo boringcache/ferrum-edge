@@ -41,11 +41,12 @@
 //!   binds metadata to payload; it is not an anti-replay mechanism (a verbatim
 //!   replay of a datagram remains possible, exactly as it is for plain UDP).
 //! - Anything else fails closed: no signature, truncated header, oversized
-//!   address block, wrong address family, wrong transport (`STREAM` — i.e. a
-//!   TCP header replayed onto the datagram path), malformed TLVs, a missing or
-//!   invalid authentication tag. There is no fallback to the socket peer,
-//!   because that would silently downgrade a spoofed datagram into an accepted
-//!   one.
+//!   address block, wrong address family, any transport but `DGRAM` on a
+//!   `PROXY` command (`STREAM` — i.e. a TCP header replayed onto the datagram
+//!   path — is refused whatever family it declares, `AF_UNSPEC` included),
+//!   malformed TLVs, a missing or invalid authentication tag. There is no
+//!   fallback to the socket peer, because that would silently downgrade a
+//!   spoofed datagram into an accepted one.
 //!
 //! Diagnostics are field-specific but bounded: they name the field and, at
 //! most, the offending numeric code or length. Payload bytes, tag bytes, and
@@ -124,6 +125,9 @@ pub enum DatagramMetadataError {
     InvalidAuthenticationTagLength(usize),
     /// The authentication tag did not verify under the configured secret.
     AuthenticationTagMismatch,
+    /// A secret is configured but no key could be derived from it, so nothing
+    /// can be verified. Fail-closed rather than silently unauthenticated.
+    AuthenticationKeyUnavailable,
     /// A later datagram on an established session carried a different
     /// forwarded client than the one the session was admitted with.
     ForwardedClientChanged,
@@ -148,6 +152,7 @@ impl DatagramMetadataError {
             Self::MissingAuthenticationTag => "missing_authentication_tag",
             Self::InvalidAuthenticationTagLength(_) => "invalid_authentication_tag_length",
             Self::AuthenticationTagMismatch => "authentication_tag_mismatch",
+            Self::AuthenticationKeyUnavailable => "authentication_key_unavailable",
             Self::ForwardedClientChanged => "forwarded_client_changed",
         }
     }
@@ -213,6 +218,10 @@ impl std::fmt::Display for DatagramMetadataError {
             Self::AuthenticationTagMismatch => {
                 f.write_str("datagram authentication tag did not verify")
             }
+            Self::AuthenticationKeyUnavailable => f.write_str(
+                "FERRUM_DATAGRAM_PROXY_PROTOCOL_SECRET is configured but no authentication key \
+                 could be derived from it",
+            ),
             Self::ForwardedClientChanged => f.write_str(
                 "datagram carried a different forwarded client than the established session was \
                  admitted with",
@@ -283,8 +292,17 @@ pub struct DecodedDatagram<'a> {
 /// which allocates nothing.
 pub struct DatagramClientAddressGate {
     trusted_proxies: Arc<TrustedProxies>,
-    /// Pre-derived HMAC key. `None` leaves trust resting on the peer address
-    /// alone (documented as the weaker posture).
+    /// Whether the operator configured a secret. Derived from the exact
+    /// configured byte string: any nonempty value means authentication is
+    /// mandatory, and only an absent or empty value leaves trust resting on the
+    /// peer address alone (documented as the weaker posture). The value is
+    /// never trimmed, normalized, or measured — doing so could turn a
+    /// configured requirement into no requirement at all.
+    authentication_required: bool,
+    /// Pre-derived HMAC key over those exact bytes. `None` while
+    /// `authentication_required` only if the approved HMAC module refused the
+    /// key material, which then fails every datagram closed rather than
+    /// downgrading the listener to unauthenticated metadata.
     auth_key: Option<HmacSha256Key>,
 }
 
@@ -292,21 +310,27 @@ impl std::fmt::Debug for DatagramClientAddressGate {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Never render the key material or anything derived from it.
         f.debug_struct("DatagramClientAddressGate")
-            .field("authenticated", &self.auth_key.is_some())
+            .field("authenticated", &self.authentication_required)
             .finish()
     }
 }
 
 impl DatagramClientAddressGate {
     /// Build a gate. `secret` is the raw `FERRUM_DATAGRAM_PROXY_PROTOCOL_SECRET`
-    /// value; an absent or empty value leaves the gate on peer-address trust.
+    /// value, used verbatim: only an absent or empty value leaves the gate on
+    /// peer-address trust. A whitespace-only or whitespace-bearing secret is a
+    /// secret like any other — trimming it here would silently key the listener
+    /// with different bytes than `EnvConfig` validated, or drop the
+    /// authentication requirement entirely.
     pub fn new(trusted_proxies: Arc<TrustedProxies>, secret: Option<&str>) -> Self {
-        let auth_key = secret
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .and_then(|value| HmacSha256Key::new_from_slice(value.as_bytes()).ok());
+        let secret = secret.filter(|value| !value.is_empty());
+        let auth_key = match secret {
+            Some(value) => HmacSha256Key::new_from_slice(value.as_bytes()).ok(),
+            None => None,
+        };
         Self {
             trusted_proxies,
+            authentication_required: secret.is_some(),
             auth_key,
         }
     }
@@ -314,7 +338,7 @@ impl DatagramClientAddressGate {
     /// Whether every datagram must carry a valid authentication tag.
     #[inline]
     pub fn requires_authentication(&self) -> bool {
-        self.auth_key.is_some()
+        self.authentication_required
     }
 
     /// Whether any peer at all can satisfy the trust boundary.
@@ -344,7 +368,13 @@ impl DatagramClientAddressGate {
         // verifying nothing against nothing would present authenticated-looking
         // metadata. The tag bytes stay inside the address block either way and
         // never reach the payload.
-        if let Some(key) = self.auth_key.as_ref() {
+        if self.authentication_required {
+            // A configured secret that produced no key cannot verify anything,
+            // so the listener refuses rather than admitting metadata the
+            // operator asked to have authenticated.
+            let Some(key) = self.auth_key.as_ref() else {
+                return Err(DatagramMetadataError::AuthenticationKeyUnavailable);
+            };
             verify_authentication_tag(key, datagram, &parsed)?;
         }
         Ok(DecodedDatagram {
@@ -407,11 +437,25 @@ fn parse_datagram_header(datagram: &[u8]) -> Result<ParsedDatagramHeader, Datagr
         other => return Err(DatagramMetadataError::UnsupportedCommand(other)),
     };
 
+    // Every `PROXY` envelope must state that it describes a datagram flow —
+    // including the `AF_UNSPEC` shape, which carries no address to check. Doing
+    // this only for the address-bearing families would leave a TCP `STREAM`
+    // header accepted verbatim on a udp/dtls listener as long as its family
+    // nibble were zeroed, which is exactly the replay the module and
+    // `docs/tcp_udp_proxy.md` promise to refuse.
+    //
+    // `LOCAL` keeps the spec's semantics: the sender is speaking for itself,
+    // the receiver must ignore the address block, and `fam_transport` is
+    // conventionally `0x00`. It never sets a forwarded identity, so it cannot
+    // launder a stream header into a client address.
+    if !is_local {
+        require_datagram_transport(transport)?;
+    }
+
     let (forwarded, fixed_len) = match family {
         // AF_UNSPEC — no address is carried.
         0x00 => (None, 0usize),
         0x01 => {
-            require_datagram_transport(transport)?;
             if block.len() < INET_ADDR_LEN {
                 return Err(DatagramMetadataError::AddressBlockTooShortForFamily {
                     family,
@@ -423,7 +467,6 @@ fn parse_datagram_header(datagram: &[u8]) -> Result<ParsedDatagramHeader, Datagr
             (Some(SocketAddr::new(IpAddr::V4(src), port)), INET_ADDR_LEN)
         }
         0x02 => {
-            require_datagram_transport(transport)?;
             if block.len() < INET6_ADDR_LEN {
                 return Err(DatagramMetadataError::AddressBlockTooShortForFamily {
                     family,
@@ -455,8 +498,9 @@ fn parse_datagram_header(datagram: &[u8]) -> Result<ParsedDatagramHeader, Datagr
 
 #[inline]
 fn require_datagram_transport(transport: u8) -> Result<(), DatagramMetadataError> {
-    // 0x02 is DGRAM. UNSPEC (0x00) is refused here on purpose: an address-
-    // bearing envelope must state that it describes a datagram flow.
+    // 0x02 is DGRAM. UNSPEC (0x00) is refused here on purpose: a `PROXY`
+    // envelope must state that it describes a datagram flow, whatever family it
+    // declares.
     if transport == 0x02 {
         Ok(())
     } else {

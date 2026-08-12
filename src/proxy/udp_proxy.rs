@@ -3314,6 +3314,9 @@ async fn start_dtls_frontend_listener(
         // session slot.
         datagram_client_address,
         datagram_client_address_drops: Some(Arc::clone(&metrics.client_address_metadata_drops)),
+        // Refusal diagnostics on the demux path name the same listener the
+        // plain-UDP path's do. Built once here, never per datagram.
+        datagram_client_address_listener: Some((Arc::from(proxy_id.as_str()), port)),
     };
     let server =
         Arc::new(crate::dtls::DtlsServer::bind_with_limits(addr, dtls_config, dtls_limits).await?);
@@ -5360,8 +5363,14 @@ fn ensure_coarse_timer_started() {
 }
 
 /// Get the coarse-grained cached monotonic timestamp (updated every ~100ms).
+///
+/// Shared with the frontend DTLS demuxer so both datagram paths rate-limit
+/// their client-address metadata diagnostics on one clock without adding a
+/// per-datagram `Instant::now()`. Every DTLS listener calls
+/// [`ensure_coarse_timer_started`] before its recv loop runs, so the value is
+/// live wherever the gate can refuse anything.
 #[inline(always)]
-fn coarse_epoch_millis() -> u64 {
+pub(crate) fn coarse_epoch_millis() -> u64 {
     COARSE_EPOCH_MS.load(Ordering::Relaxed)
 }
 

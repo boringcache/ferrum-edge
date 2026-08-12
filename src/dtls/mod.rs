@@ -23,6 +23,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{debug, info, trace, warn};
 
 use crate::config::types::Proxy;
+use crate::proxy::datagram_client_address::DatagramMetadataError;
 use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 
 /// Default MTU for DTLS records. Conservative default that works over most networks.
@@ -165,6 +166,11 @@ pub struct DtlsServerLimits {
     /// owning UDP listener's metrics so plain-UDP and DTLS refusals are one
     /// number. `None` outside the proxy listener path.
     pub datagram_client_address_drops: Option<Arc<AtomicU64>>,
+    /// `(proxy_id, listen_port)` stamped on client-address metadata refusal
+    /// warnings so a DTLS refusal correlates with the plain-UDP listener's
+    /// record for the same proxy. Cloned once at listener spawn, never per
+    /// datagram. `None` outside the proxy listener path.
+    pub datagram_client_address_listener: Option<(Arc<str>, u16)>,
 }
 
 impl Default for DtlsServerLimits {
@@ -176,6 +182,7 @@ impl Default for DtlsServerLimits {
             active_session_mirror: None,
             datagram_client_address: None,
             datagram_client_address_drops: None,
+            datagram_client_address_listener: None,
         }
     }
 }
@@ -401,6 +408,9 @@ pub(crate) fn dtls_stale_session_removal_preserves_newer_generation_for_test() -
             incoming_tx: gen2_tx,
             shutdown_tx: gen2_shutdown_tx,
             generation: 2,
+            // Identity-aware removal is orthogonal to the client-address gate;
+            // this harness runs the ungated shape.
+            forwarded_client: None,
         },
     );
     active_sessions.fetch_add(1, Ordering::Relaxed);
@@ -874,6 +884,11 @@ pub struct DtlsServer {
     accept_tx: mpsc::Sender<(DtlsServerConn, SocketAddr)>,
     accept_rx: tokio::sync::Mutex<mpsc::Receiver<(DtlsServerConn, SocketAddr)>>,
     shutdown_tx: watch::Sender<bool>,
+    /// Bounds this listener's rate of client-address metadata refusal warnings.
+    /// A hostile flood of invalid datagrams must not become one log record per
+    /// datagram; the counter still moves for every one of them. Lock-free, so
+    /// the non-emitting path is two relaxed atomics and no allocation.
+    datagram_client_address_warn: crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter,
 }
 
 /// State for a server-side DTLS session being managed by the DtlsServer.
@@ -891,6 +906,111 @@ struct DtlsSessionState {
     /// same peer address asserting a different client is dropped rather than
     /// fed into a DTLS association admitted under another identity.
     forwarded_client: Option<SocketAddr>,
+}
+
+/// Count a datagram the client-address gate refused and emit a rate-limited
+/// structured diagnostic for it.
+///
+/// The DTLS demuxer is a distinct pre-association path from plain UDP's
+/// `process_datagram`, but it owes the same contract: every refusal moves the
+/// shared drop counter, and the operator gets a bounded record rather than one
+/// line per hostile datagram.
+///
+/// The record carries a fixed-cardinality `reason`, the owning listener, and
+/// the direct socket peer only. It never carries the payload, the
+/// authentication tag, the configured secret, or the forwarded address the
+/// sender was trying to assert — a refused datagram is attacker-controlled
+/// input, and echoing what it claimed would put that claim in the log as if it
+/// were an observation.
+///
+/// The non-emitting path is three relaxed atomic operations and no allocation
+/// or lock, so a flood costs the shared recv loop nothing beyond the drop.
+/// Returns the suppressed count when a record was emitted, so the limiter
+/// contract is assertable without a log-capture harness.
+fn record_datagram_metadata_refusal(
+    limiter: &crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter,
+    drops: Option<&AtomicU64>,
+    listener: Option<&(Arc<str>, u16)>,
+    peer_addr: SocketAddr,
+    reason: &'static str,
+    now_ms: u64,
+) -> Option<u64> {
+    if let Some(drops) = drops {
+        drops.fetch_add(1, Ordering::Relaxed);
+    }
+    let suppressed = limiter.on_event(now_ms)?;
+    let (proxy_id, listen_port) = match listener {
+        Some((proxy_id, listen_port)) => (proxy_id.as_ref(), *listen_port),
+        None => ("", 0u16),
+    };
+    warn!(
+        proxy_id = proxy_id,
+        listen_port = listen_port,
+        peer = %crate::util::client_identity::canonical_socket_addr(peer_addr),
+        reason = reason,
+        suppressed = suppressed,
+        "DTLS: dropping datagram with refused client-address metadata"
+    );
+    Some(suppressed)
+}
+
+/// Regression harness for the DTLS refusal diagnostic (issue #3289): every
+/// refusal is counted, while the warning is bounded to one record per limiter
+/// window and the next record reports what it suppressed.
+///
+/// Drives [`record_datagram_metadata_refusal`] directly with an injected clock
+/// so the contract is asserted without a live listener, a log-capture harness,
+/// or any wall-clock sleep. Sends `refusals_in_window` refusals inside one
+/// window and one more after it, returning
+/// `(drops, records_emitted, suppressed_reported_by_the_second_record)`.
+#[allow(dead_code)] // used through library `_test_support`
+pub(crate) fn dtls_datagram_metadata_refusal_accounting_for_test(
+    refusals_in_window: u64,
+) -> Result<(u64, u64, u64), String> {
+    let window_ms = crate::util::atomic_log_rate_limiter::DEFAULT_ATOMIC_LOG_RATE_LIMIT_WINDOW_MS;
+    let limiter = crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter::new();
+    let drops = AtomicU64::new(0);
+    let listener = (Arc::<str>::from("dtls-metadata-limiter"), 4433u16);
+    let peer_addr: SocketAddr = "127.0.0.1:3289"
+        .parse()
+        .map_err(|e| format!("parse peer addr: {e}"))?;
+    let now_ms = 1_000_000u64;
+
+    let mut emitted = 0u64;
+    for _ in 0..refusals_in_window {
+        if record_datagram_metadata_refusal(
+            &limiter,
+            Some(&drops),
+            Some(&listener),
+            peer_addr,
+            DatagramMetadataError::AuthenticationTagMismatch.reason(),
+            now_ms,
+        )
+        .is_some()
+        {
+            emitted += 1;
+        }
+    }
+
+    // One more once the window has elapsed: it must emit and report the
+    // refusals the limiter withheld in between.
+    let suppressed = record_datagram_metadata_refusal(
+        &limiter,
+        Some(&drops),
+        Some(&listener),
+        peer_addr,
+        DatagramMetadataError::AuthenticationTagMismatch.reason(),
+        now_ms + window_ms,
+    );
+    if suppressed.is_some() {
+        emitted += 1;
+    }
+
+    Ok((
+        drops.load(Ordering::Relaxed),
+        emitted,
+        suppressed.unwrap_or_default(),
+    ))
 }
 
 /// Remove the demux entry for `peer_addr` only when it still belongs to
@@ -1091,6 +1211,8 @@ impl DtlsServer {
             accept_tx,
             accept_rx: tokio::sync::Mutex::new(accept_rx),
             shutdown_tx,
+            datagram_client_address_warn:
+                crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter::new(),
         }
     }
 
@@ -1205,13 +1327,15 @@ impl DtlsServer {
                 Some(gate) => match gate.decode(&buf[..len], &peer_addr) {
                     Ok(decoded) => (decoded.payload, decoded.forwarded),
                     Err(error) => {
-                        if let Some(drops) = self.limits.datagram_client_address_drops.as_deref() {
-                            drops.fetch_add(1, Ordering::Relaxed);
-                        }
-                        trace!(
-                            client = %peer_addr,
-                            reason = error.reason(),
-                            "DTLS: dropping datagram with refused client-address metadata"
+                        // The emit decision is made inside; the returned
+                        // suppressed count is only for the test harness.
+                        let _ = record_datagram_metadata_refusal(
+                            &self.datagram_client_address_warn,
+                            self.limits.datagram_client_address_drops.as_deref(),
+                            self.limits.datagram_client_address_listener.as_ref(),
+                            peer_addr,
+                            error.reason(),
+                            crate::proxy::udp_proxy::coarse_epoch_millis(),
                         );
                         continue;
                     }
@@ -1234,12 +1358,13 @@ impl DtlsServer {
                 // a datagram asserting another is refused rather than decrypted
                 // under the first client's identity.
                 if session_forwarded != forwarded_client {
-                    if let Some(drops) = self.limits.datagram_client_address_drops.as_deref() {
-                        drops.fetch_add(1, Ordering::Relaxed);
-                    }
-                    trace!(
-                        client = %peer_addr,
-                        "DTLS: dropping datagram whose forwarded client differs from the session"
+                    let _ = record_datagram_metadata_refusal(
+                        &self.datagram_client_address_warn,
+                        self.limits.datagram_client_address_drops.as_deref(),
+                        self.limits.datagram_client_address_listener.as_ref(),
+                        peer_addr,
+                        DatagramMetadataError::ForwardedClientChanged.reason(),
+                        crate::proxy::udp_proxy::coarse_epoch_millis(),
                     );
                     continue;
                 }

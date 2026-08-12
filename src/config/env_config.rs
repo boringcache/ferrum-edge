@@ -538,6 +538,33 @@ pub fn tls_acme_terminal_order_history_from_env() -> Result<usize, String> {
     )
 }
 
+/// Reject a `FERRUM_DATAGRAM_PROXY_PROTOCOL_SECRET` that is too short to be an
+/// HMAC-SHA-256 key (issue #3289).
+///
+/// This key is what makes a datagram client-address envelope trustworthy on a
+/// path where the source address can be spoofed, so a weak value is a startup
+/// error rather than a warning. The value is judged exactly as configured —
+/// never trimmed, because the listener keys itself with those same bytes and a
+/// validator that disagreed with the gate would admit a shorter effective key.
+/// Only an absent or empty value is "not configured".
+///
+/// The diagnostic reports the requirement only — never the configured value,
+/// and never its length, which is a property of the secret itself.
+pub fn validate_datagram_proxy_protocol_secret_value(secret: Option<&str>) -> Result<(), String> {
+    let Some(secret) = secret.filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+    if secret.len() < crate::proxy::datagram_client_address::MIN_DATAGRAM_SECRET_BYTES {
+        return Err(format!(
+            "FERRUM_DATAGRAM_PROXY_PROTOCOL_SECRET must be at least {} bytes — it is the \
+             HMAC-SHA-256 key authenticating datagram client-address metadata on udp/dtls \
+             listeners.",
+            crate::proxy::datagram_client_address::MIN_DATAGRAM_SECRET_BYTES
+        ));
+    }
+    Ok(())
+}
+
 fn validate_discovery_body_limits(limits: DiscoveryBodyLimits) -> Result<(), String> {
     if limits.max_response_bytes == 0
         || limits.max_error_bytes == 0
@@ -7081,30 +7108,11 @@ impl EnvConfig {
     }
 
     /// Reject a `FERRUM_DATAGRAM_PROXY_PROTOCOL_SECRET` that is too short to be
-    /// an HMAC-SHA-256 key.
-    ///
-    /// This key is what makes a datagram client-address envelope trustworthy on
-    /// a path where the source address can be spoofed, so a weak value is a
-    /// startup error rather than a warning. The diagnostic reports the
-    /// requirement only — never the configured value, and never its length,
-    /// which is a property of the secret itself.
+    /// an HMAC-SHA-256 key. See
+    /// [`validate_datagram_proxy_protocol_secret_value`].
     fn validate_datagram_proxy_protocol_secret(&self) -> Result<(), String> {
-        let Some(secret) = self
-            .datagram_proxy_protocol_secret
-            .as_deref()
-            .filter(|value| !value.is_empty())
-        else {
-            return Ok(());
-        };
-        if secret.len() < crate::proxy::datagram_client_address::MIN_DATAGRAM_SECRET_BYTES {
-            return Err(format!(
-                "FERRUM_DATAGRAM_PROXY_PROTOCOL_SECRET must be at least {} bytes — it is the \
-                 HMAC-SHA-256 key authenticating datagram client-address metadata on udp/dtls \
-                 listeners.",
-                crate::proxy::datagram_client_address::MIN_DATAGRAM_SECRET_BYTES
-            ));
-        }
-        Ok(())
+        let secret = self.datagram_proxy_protocol_secret.as_deref();
+        validate_datagram_proxy_protocol_secret_value(secret)
     }
 
     /// Reject a `FERRUM_TRUSTED_PROXIES` list that is not entirely valid.

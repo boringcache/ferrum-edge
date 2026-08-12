@@ -1,4 +1,5 @@
-//! Live UDP datapath for the datagram client-address envelope (issue #3289).
+//! Live UDP and DTLS datapaths for the datagram client-address envelope
+//! (issue #3289).
 //!
 //! A real `start_udp_listener` runs with the gate engaged, a real UDP client
 //! plays the trusted datagram load balancer, and a real echo backend answers.
@@ -7,6 +8,13 @@
 //! stays the balancer's socket peer, the backend receives the payload with the
 //! envelope stripped, and every unauthenticated or malformed variant is dropped
 //! with nothing reaching the backend.
+//!
+//! The DTLS listener has its own pre-demux path, so it is covered separately
+//! against a real `DtlsServer`: a wrapping relay drives a real `dimpl`
+//! handshake through the gate, proving the envelope is validated and stripped
+//! before the record layer and that the authenticated forwarded client reaches
+//! the accepted `DtlsServerConn`, while handshake-shaped datagrams that fail
+//! the gate allocate no association at all.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -23,6 +31,9 @@ use ferrum_edge::adaptive_buffer::AdaptiveBufferTracker;
 use ferrum_edge::circuit_breaker::CircuitBreakerCache;
 use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, GatewayConfig, Proxy};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
+use ferrum_edge::dtls::{
+    BackendDtlsParams, DtlsConnection, DtlsServer, DtlsServerLimits, FrontendDtlsConfig,
+};
 use ferrum_edge::fips::approved::HmacSha256Key;
 use ferrum_edge::modes::mesh::outbound_enforcement::empty_slot;
 use ferrum_edge::overload::OverloadState;
@@ -331,6 +342,56 @@ fn key() -> HmacSha256Key {
     HmacSha256Key::new_from_slice(SECRET.as_bytes()).expect("hmac key")
 }
 
+/// Run a datagram load-balancer shim between one DTLS client and Ferrum's DTLS
+/// demuxer. The first ClientHello is deliberately replayed without an envelope
+/// and must be dropped; every retransmission and application packet is wrapped
+/// with authenticated client-address metadata. Server packets travel back
+/// unchanged because the envelope is an inbound load-balancer contract.
+async fn spawn_dtls_metadata_relay(
+    server_addr: SocketAddr,
+    forwarded_client: SocketAddr,
+) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let socket = Arc::new(
+        UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind DTLS metadata relay"),
+    );
+    let relay_addr = socket.local_addr().expect("DTLS metadata relay addr");
+    let task = tokio::spawn(async move {
+        let mut client_addr = None;
+        let mut replayed_bare_client_hello = false;
+        let mut buf = vec![0u8; 65_535];
+        while let Ok((len, peer)) = socket.recv_from(&mut buf).await {
+            if peer == server_addr {
+                if let Some(client_addr) = client_addr {
+                    let _ = socket.send_to(&buf[..len], client_addr).await;
+                }
+                continue;
+            }
+
+            if client_addr.is_some_and(|established| established != peer) {
+                continue;
+            }
+            client_addr = Some(peer);
+
+            if !replayed_bare_client_hello {
+                replayed_bare_client_hello = true;
+                let _ = socket.send_to(&buf[..len], server_addr).await;
+                continue;
+            }
+
+            let wrapped = encode_datagram_with_metadata(
+                forwarded_client,
+                server_addr,
+                &buf[..len],
+                Some(&key()),
+            );
+            let _ = socket.send_to(&wrapped, server_addr).await;
+        }
+    });
+    (relay_addr, task)
+}
+
 /// Receive one datagram, or `None` if the observation window elapses. Used both
 /// for success (a reply must arrive) and for refusal (nothing may arrive).
 async fn recv_within(socket: &UdpSocket, window: Duration) -> Option<Vec<u8>> {
@@ -339,6 +400,167 @@ async fn recv_within(socket: &UdpSocket, window: Duration) -> Option<Vec<u8>> {
         Ok(Ok((n, _))) => Some(buf[..n].to_vec()),
         _ => None,
     }
+}
+
+#[tokio::test]
+async fn authenticated_envelope_drives_the_live_dtls_demux_and_binds_identity() {
+    let _ =
+        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+
+    let frontend_config = FrontendDtlsConfig {
+        dimpl_config: Arc::new(dimpl::Config::builder().build().expect("DTLS server config")),
+        certificate: dimpl::certificate::generate_self_signed_certificate()
+            .expect("DTLS server certificate")
+            .into(),
+        client_cert_verifier: None,
+    };
+    let drops = Arc::new(AtomicU64::new(0));
+    let gate = Arc::new(DatagramClientAddressGate::new(
+        Arc::new(TrustedProxies::parse_strict("127.0.0.1", "test").expect("trust list")),
+        Some(SECRET),
+    ));
+    let server = Arc::new(
+        DtlsServer::bind_with_limits(
+            "127.0.0.1:0".parse().expect("DTLS bind addr"),
+            frontend_config,
+            DtlsServerLimits {
+                max_sessions: Some(16),
+                handshake_timeout: Some(Duration::from_secs(15)),
+                datagram_client_address: Some(gate),
+                datagram_client_address_drops: Some(Arc::clone(&drops)),
+                datagram_client_address_listener: Some((Arc::from(PROXY_ID), 0)),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("bind gated DTLS server"),
+    );
+    let server_addr = server.local_addr();
+    let server_runner = Arc::clone(&server);
+    let server_task = tokio::spawn(async move {
+        let _ = server_runner.run().await;
+    });
+
+    let forwarded_client: SocketAddr = "203.0.113.9:41234".parse().expect("client addr");
+
+    // Pre-association refusal: a handshake-shaped datagram is exactly what the
+    // demuxer would otherwise spawn a session for, so each of these proves the
+    // envelope decision happens before any per-peer state exists. They come
+    // from a trusted loopback peer, so only the envelope can refuse them.
+    let hostile = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind hostile sender");
+    let foreign_key =
+        HmacSha256Key::new_from_slice(b"ffffffffffffffffffffffffffffffff").expect("foreign key");
+    let client_hello_shaped = {
+        let mut packet = vec![0x16u8, 0xfe, 0xfd];
+        packet.extend_from_slice(&[0u8; 42]);
+        packet
+    };
+    let pre_association_refusals: Vec<Vec<u8>> = vec![
+        client_hello_shaped.clone(),
+        encode_datagram_with_metadata(forwarded_client, server_addr, &client_hello_shaped, None),
+        encode_datagram_with_metadata(
+            forwarded_client,
+            server_addr,
+            &client_hello_shaped,
+            Some(&foreign_key),
+        ),
+    ];
+    for datagram in &pre_association_refusals {
+        hostile
+            .send_to(datagram, server_addr)
+            .await
+            .expect("send refused datagram");
+    }
+    // Bounded wait for the demuxer to have consumed all three, so the
+    // accounting assertions below observe a settled state rather than racing
+    // the recv loop under CI load.
+    let expected_drops = pre_association_refusals.len() as u64;
+    let deadline = std::time::Instant::now() + RECV_TIMEOUT;
+    while drops.load(Ordering::Relaxed) < expected_drops && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // Nothing may come back, and nothing may be allocated for the sender.
+    assert!(
+        recv_within(&hostile, DROP_OBSERVATION_WINDOW).await.is_none(),
+        "a refused datagram must not be answered"
+    );
+    assert_eq!(
+        server.active_session_count(),
+        0,
+        "a refused datagram must not allocate a DTLS association"
+    );
+    assert_eq!(
+        drops.load(Ordering::Relaxed),
+        expected_drops,
+        "every pre-association refusal must be counted"
+    );
+
+    let (relay_addr, relay_task) = spawn_dtls_metadata_relay(server_addr, forwarded_client).await;
+    let client_socket = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind DTLS client");
+    client_socket
+        .connect(relay_addr)
+        .await
+        .expect("connect DTLS client to relay");
+    let client_params = BackendDtlsParams {
+        config: Arc::new(dimpl::Config::builder().build().expect("DTLS client config")),
+        certificate: dimpl::certificate::generate_self_signed_certificate()
+            .expect("DTLS client certificate")
+            .into(),
+        server_name: None,
+        server_cert_verifier: None,
+        connect_timeout_ms: 15_000,
+    };
+    let client = tokio::time::timeout(
+        Duration::from_secs(15),
+        DtlsConnection::connect(client_socket, client_params),
+    )
+    .await
+    .expect("authenticated DTLS handshake timed out")
+    .expect("authenticated DTLS handshake failed");
+
+    let (server_conn, direct_peer) = tokio::time::timeout(RECV_TIMEOUT, server.accept())
+        .await
+        .expect("DTLS accept timed out")
+        .expect("DTLS accept failed");
+    assert_eq!(direct_peer, relay_addr, "the socket peer must remain the relay");
+    assert_eq!(
+        server_conn.forwarded_client_addr,
+        Some(forwarded_client),
+        "the authenticated envelope must bind the forwarded client to the DTLS association"
+    );
+    assert_eq!(
+        drops.load(Ordering::Relaxed),
+        expected_drops + 1,
+        "the deliberately bare first ClientHello must be refused before association allocation"
+    );
+
+    client.send(b"dtls-through-envelope").await.expect("DTLS send");
+    assert_eq!(
+        tokio::time::timeout(RECV_TIMEOUT, server_conn.recv())
+            .await
+            .expect("server receive timed out")
+            .expect("server receive failed"),
+        b"dtls-through-envelope",
+        "the demuxer must strip every envelope before DTLS decryption"
+    );
+    server_conn.send(b"dtls-reply").await.expect("DTLS reply");
+    assert_eq!(
+        tokio::time::timeout(RECV_TIMEOUT, client.recv())
+            .await
+            .expect("client receive timed out")
+            .expect("client receive failed"),
+        b"dtls-reply",
+        "server ciphertext must traverse the relay unchanged"
+    );
+
+    client.close().await;
+    server.close().await;
+    relay_task.abort();
+    let _ = tokio::time::timeout(RECV_TIMEOUT, server_task).await;
 }
 
 #[tokio::test]

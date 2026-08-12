@@ -1023,7 +1023,7 @@ proxies:
 ```
 
 - `ver_cmd` is `0x21` (version 2, `PROXY`) or `0x20` (version 2, `LOCAL`).
-- `fam_tp` is `0x12` (`AF_INET` + `DGRAM`) or `0x22` (`AF_INET6` + `DGRAM`). `AF_UNSPEC` (`0x0*`) carries no address.
+- `fam_tp` is `0x12` (`AF_INET` + `DGRAM`) or `0x22` (`AF_INET6` + `DGRAM`). A `PROXY` command must declare the `DGRAM` transport whatever family it uses, so the address-less `AF_UNSPEC` shape is `0x02` — `0x00` there would be a TCP header replayed onto the datagram path. A `LOCAL` command keeps the spec's convention (`0x00` is fine) because it never sets a client identity.
 - The address block holds the fixed source/destination addresses and ports, optionally followed by TLVs. `addr_len` covers both; the payload begins immediately after.
 - Everything after the address block is the application payload, forwarded to the backend verbatim.
 
@@ -1036,6 +1036,7 @@ Source addresses are trivially spoofable on UDP. Set `FERRUM_DATAGRAM_PROXY_PROT
 - TLV type `0xE0` (the PROXY v2 application-reserved range), value length 32.
 - The tag is computed over the complete datagram with the 32 tag bytes elided — so the command, family, transport, addresses, every other TLV, and the payload are all bound to it.
 - A datagram with a missing, malformed, duplicated, or non-verifying tag is dropped.
+- The configured value is the key **verbatim** — it is never trimmed or normalized, so leading/trailing whitespace is key material and any nonempty value makes authentication mandatory. Only an unset or empty variable leaves the listener in the address-trust posture, and startup rejects a value shorter than 32 bytes without reporting the value or its length.
 
 The tag binds metadata to payload; it is **not** an anti-replay mechanism. A verbatim replay of a captured datagram remains possible, exactly as it is for plain UDP.
 
@@ -1048,11 +1049,11 @@ With no secret configured, trust rests on `FERRUM_TRUSTED_PROXIES` alone. That i
 | Trusted peer + valid envelope (+ valid tag when a secret is set) | `client_ip` = forwarded address; `direct_client_ip` = balancer socket peer |
 | Untrusted peer (not in `FERRUM_TRUSTED_PROXIES`) | Datagram **dropped** |
 | Missing / truncated / oversized / malformed envelope | Datagram **dropped** |
-| `STREAM` transport (a TCP PROXY header replayed onto the datagram path) | Datagram **dropped** |
+| Any transport but `DGRAM` on a `PROXY` command, `AF_UNSPEC` included (a TCP PROXY header replayed onto the datagram path) | Datagram **dropped** |
 | Unsupported address family (including `AF_UNIX`) | Datagram **dropped** |
 | Missing, duplicated, wrong-length, or invalid authentication tag | Datagram **dropped** |
 | Forwarded client differs from the established session's | Datagram **dropped** |
-| `LOCAL` command or `AF_UNSPEC` (balancer health probe) | `client_ip` = `direct_client_ip` = balancer socket peer |
+| `LOCAL` command, or `PROXY` + `AF_UNSPEC` + `DGRAM` (balancer health probe) | `client_ip` = `direct_client_ip` = balancer socket peer |
 
 A drop is silent on the wire (UDP has no reset). Each one increments the listener's client-address-metadata drop counter and emits a rate-limited structured warning naming the failing field; payload bytes, tag material, and rejected forwarded addresses are never logged.
 

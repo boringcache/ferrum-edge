@@ -41,6 +41,11 @@ fn key() -> HmacSha256Key {
     HmacSha256Key::new_from_slice(SECRET.as_bytes()).expect("hmac key")
 }
 
+/// The startup validator for the same variable the gate keys itself from.
+fn validate_secret(secret: Option<&str>) -> Result<(), String> {
+    ferrum_edge::config::env_config::validate_datagram_proxy_protocol_secret_value(secret)
+}
+
 /// Hand-build a header so tests can corrupt individual fields.
 fn header(ver_cmd: u8, fam_transport: u8, block: &[u8], payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
@@ -513,5 +518,151 @@ fn diagnostics_are_field_specific_and_carry_no_payload() {
     assert!(
         !rendered.contains(SECRET),
         "diagnostic must not echo the secret: {rendered}"
+    );
+}
+
+#[test]
+fn a_configured_secret_is_used_verbatim_and_always_requires_authentication() {
+    // Whitespace is key material, not decoration. Trimming these would either
+    // key the listener with different bytes than `EnvConfig` validated, or —
+    // for the whitespace-only value — silently drop the authentication
+    // requirement the operator configured.
+    for secret in [
+        "  0123456789abcdef0123456789abcdef  ",
+        "\t0123456789abcdef0123456789abcdef\n",
+        "                                ",
+    ] {
+        let gate = DatagramClientAddressGate::new(trusted("10.0.0.0/8"), Some(secret));
+        assert!(
+            gate.requires_authentication(),
+            "a nonempty secret must always require authentication: {secret:?}"
+        );
+
+        // The key is exactly the configured bytes: a tag minted over them
+        // verifies, and one minted over the trimmed form does not.
+        let exact = HmacSha256Key::new_from_slice(secret.as_bytes()).expect("hmac key");
+        let datagram = encode_datagram_with_metadata(
+            addr("203.0.113.9:41234"),
+            addr("10.0.0.5:5353"),
+            b"payload",
+            Some(&exact),
+        );
+        assert_eq!(
+            gate.decode(&datagram, &addr("10.0.0.1:60000"))
+                .expect("the exact configured bytes must be the key")
+                .forwarded,
+            Some(addr("203.0.113.9:41234"))
+        );
+
+        let trimmed_bytes = secret.trim().as_bytes().to_vec();
+        if trimmed_bytes != secret.as_bytes() {
+            let trimmed = HmacSha256Key::new_from_slice(&trimmed_bytes).expect("hmac key");
+            let forged = encode_datagram_with_metadata(
+                addr("203.0.113.9:41234"),
+                addr("10.0.0.5:5353"),
+                b"payload",
+                Some(&trimmed),
+            );
+            assert_eq!(
+                gate.decode(&forged, &addr("10.0.0.1:60000"))
+                    .expect_err("a tag over the trimmed secret must not verify"),
+                DatagramMetadataError::AuthenticationTagMismatch
+            );
+        }
+    }
+}
+
+#[test]
+fn only_an_absent_or_empty_secret_leaves_the_unauthenticated_posture() {
+    for secret in [None, Some("")] {
+        let gate = DatagramClientAddressGate::new(trusted("10.0.0.0/8"), secret);
+        assert!(
+            !gate.requires_authentication(),
+            "{secret:?} is the documented address-trust posture"
+        );
+        let datagram = encode_datagram_with_metadata(
+            addr("203.0.113.9:41234"),
+            addr("10.0.0.5:5353"),
+            b"payload",
+            None,
+        );
+        assert_eq!(
+            gate.decode(&datagram, &addr("10.0.0.1:60000"))
+                .expect("address trust admits an untagged datagram")
+                .forwarded,
+            Some(addr("203.0.113.9:41234"))
+        );
+    }
+}
+
+#[test]
+fn a_short_secret_is_a_startup_error_that_reports_neither_value_nor_length() {
+    // Startup validation is what stops a weak MAC key from ever reaching a
+    // listener; the gate itself has no length opinion.
+    let short = "0123456789abcdef";
+    let error =
+        validate_secret(Some(short)).expect_err("a secret below the minimum must fail startup");
+    assert!(
+        error.contains("FERRUM_DATAGRAM_PROXY_PROTOCOL_SECRET"),
+        "the diagnostic must name the variable: {error}"
+    );
+    assert!(
+        !error.contains(short),
+        "the diagnostic must not echo the secret: {error}"
+    );
+    assert!(
+        !error.contains(&short.len().to_string()),
+        "the diagnostic must not report the secret's length: {error}"
+    );
+
+    // Exactly the minimum, and the absent/empty postures, are accepted.
+    for accepted in [None, Some(""), Some(SECRET)] {
+        assert!(
+            validate_secret(accepted).is_ok(),
+            "{accepted:?} must pass startup validation"
+        );
+    }
+}
+
+#[test]
+fn a_proxy_command_must_declare_the_datagram_transport_even_with_af_unspec() {
+    let gate = address_trust_gate();
+
+    // A TCP `STREAM` header whose family nibble is zeroed: without the
+    // transport check on `AF_UNSPEC` this would be admitted verbatim on a
+    // udp/dtls listener, which is exactly the replay the module refuses.
+    let stream_unspec = header(0x21, 0x01, &[], b"payload");
+    assert_eq!(
+        gate.decode(&stream_unspec, &addr("10.0.0.1:60000"))
+            .expect_err("a STREAM header must not be laundered through AF_UNSPEC"),
+        DatagramMetadataError::NonDatagramTransport(0x01)
+    );
+
+    // `UNSPEC` transport is refused on the same grounds: a PROXY envelope must
+    // state that it describes a datagram flow.
+    let unspec_transport = header(0x21, 0x00, &[], b"payload");
+    assert_eq!(
+        gate.decode(&unspec_transport, &addr("10.0.0.1:60000"))
+            .expect_err("a PROXY envelope must declare DGRAM"),
+        DatagramMetadataError::NonDatagramTransport(0x00)
+    );
+
+    // The well-formed address-less shape is still admitted, with the socket
+    // peer left as the only identity.
+    let dgram_unspec = header(0x21, 0x02, &[], b"probe");
+    let decoded = gate
+        .decode(&dgram_unspec, &addr("10.0.0.1:60000"))
+        .expect("PROXY + AF_UNSPEC + DGRAM is a valid address-less envelope");
+    assert_eq!(decoded.forwarded, None);
+    assert_eq!(decoded.payload, b"probe");
+
+    // `LOCAL` keeps the spec's convention: it never sets an identity, so the
+    // conventional `0x00` transport byte stays valid.
+    let local = header(0x20, 0x00, &[], b"probe");
+    assert_eq!(
+        gate.decode(&local, &addr("10.0.0.1:60000"))
+            .expect("LOCAL probes remain admitted")
+            .forwarded,
+        None
     );
 }

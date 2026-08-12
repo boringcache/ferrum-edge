@@ -7448,6 +7448,16 @@ pub mod _test_support {
         crate::dtls::dtls_stale_session_removal_preserves_newer_generation_for_test()
     }
 
+    /// External coverage for the DTLS client-address metadata refusal
+    /// diagnostic (issue #3289): drops are counted per refusal while the
+    /// warning is rate-limited. See
+    /// [`crate::dtls::dtls_datagram_metadata_refusal_accounting_for_test`].
+    pub fn dtls_datagram_metadata_refusal_accounting_for_test(
+        refusals_in_window: u64,
+    ) -> Result<(u64, u64, u64), String> {
+        crate::dtls::dtls_datagram_metadata_refusal_accounting_for_test(refusals_in_window)
+    }
+
     /// Observe Ferrum-managed DTLS loader key DER after zeroization and before
     /// the backing allocation is released (issue #3224 loader ownership path).
     pub fn load_dtls_certificate_with_rustls_key_drop_hook_for_test(
