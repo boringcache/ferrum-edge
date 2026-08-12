@@ -19,13 +19,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   same fixture asserts, on that data path, that an endpoint withdrawal and a
   state-of-the-world cluster withdrawal each remove reachability while their
   replacements restore it, that a structurally invalid response is NACKed with a
-  field-specific `error_detail` while the last-good view keeps serving, that a
-  listener carrying `envoy.filters.http.rbac` and a route using
-  `weighted_clusters` are ACKed-but-refused and widen nothing, that an unpinned
-  / subset / foreign-namespace cluster with a genuinely reachable endpoint still
-  cannot be dialed, and that re-pinning a cluster's peer identity to an impostor
-  SPIFFE fails the dial closed. The discovery/policy split of authority,
-  refusal boundary, and out-of-scope list are unchanged.
+  field-specific `error_detail` while the last-good view keeps serving, that an
+  unpinned-peer or subset cluster first routes under a representable resource
+  and then loses reachability after only the refusal-causing field changes, that
+  a foreign-namespace cluster is ACKed into the applied generation without
+  freezing a later withdrawal, that a listener carrying `envoy.filters.http.rbac`
+  and a route using `weighted_clusters` are ACKed with field-specific refusal
+  diagnostics while the accepted service keeps serving (semantic coverage that
+  those constructs contribute no listener or virtual host lives in the
+  unit/integration suites), and that re-pinning a cluster's peer identity to an
+  impostor SPIFFE fails the dial closed. The discovery/policy split of
+  authority, refusal boundary, and out-of-scope list are unchanged.
 
 - Istio `AuthorizationPolicy` `action: CUSTOM` external authorization (issue
   #3235). A matching policy delegates the decision to a root-namespace

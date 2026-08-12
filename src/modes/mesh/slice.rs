@@ -1961,6 +1961,14 @@ fn service_waypoint_resource_namespaces(
 /// and an attachment this view still admits — the Service survived namespace
 /// visibility or Sidecar egress narrowing — is retained with its Service.
 ///
+/// Authorization is the set of `(service namespace, service name, SPIFFE)`
+/// triples. The index is borrowed from the already-narrowed service list
+/// (linear in that list's refs); each workload is then a hash lookup. A nested
+/// scan of every service and every ref for every workload would be
+/// `O(workloads × services × refs)` — stock xDS cardinalities are bounded but
+/// still control-plane influenced, and this is config-apply code, not a
+/// license for a large transient clone of the inventory.
+///
 /// This is the ROUTING view only. The separate inbound anchor
 /// (`local_inbound_workloads` / `local_inbound_services`, resolved above and
 /// deliberately exempt from namespace visibility) is untouched, so an
@@ -1970,19 +1978,28 @@ fn retain_authorized_cross_namespace_attachments(
     workloads: Vec<Workload>,
     services: &[MeshService],
 ) -> Vec<Workload> {
+    let authorized: HashSet<(&str, &str, &str)> = services
+        .iter()
+        .flat_map(|service| {
+            service.workloads.iter().map(move |reference| {
+                (
+                    service.namespace.as_str(),
+                    service.name.as_str(),
+                    reference.spiffe_id.as_str(),
+                )
+            })
+        })
+        .collect();
     workloads
         .into_iter()
         .filter(|workload| {
             let attached_namespace = workload.attached_service_namespace();
             attached_namespace == workload.namespace
-                || services.iter().any(|service| {
-                    service.namespace == attached_namespace
-                        && service.name == workload.service_name
-                        && service
-                            .workloads
-                            .iter()
-                            .any(|reference| reference.spiffe_id == workload.spiffe_id)
-                })
+                || authorized.contains(&(
+                    attached_namespace,
+                    workload.service_name.as_str(),
+                    workload.spiffe_id.as_str(),
+                ))
         })
         .collect()
 }
@@ -4408,6 +4425,45 @@ mod tests {
             .map(|spiffe_id| WorkloadRef { spiffe_id })
             .collect();
         service
+    }
+
+    #[test]
+    fn cross_namespace_authorization_index_is_the_service_ref_triple() {
+        // The retain path builds a borrowed (namespace, name, SPIFFE) index
+        // linear in the service-ref list, then one lookup per workload. A
+        // decoy MeshService in the attached namespace that does not list this
+        // SPIFFE must not keep the workload; the authorizing triple must,
+        // regardless of how many other services sit in the list.
+        let mut workload = make_workload("default", "payments", HashMap::new());
+        workload.service_namespace = Some("other".into());
+        let decoy_spiffe = SpiffeId::from_parts(&td(), "ns/default/sa/someone-else").unwrap();
+        let services = vec![
+            make_service("other", "alpha"),
+            make_service_with_workload_refs("other", "bravo", vec![decoy_spiffe]),
+            make_service_with_workload_refs(
+                "other",
+                "payments",
+                vec![workload.spiffe_id.clone()],
+            ),
+            make_service("other", "zulu"),
+            make_service("default", "checkout"),
+        ];
+
+        let retained =
+            retain_authorized_cross_namespace_attachments(vec![workload.clone()], &services);
+        assert_eq!(
+            retained.len(),
+            1,
+            "the exact (other, payments, SPIFFE) triple retains the attachment"
+        );
+
+        let mut unlisted = services;
+        unlisted[2] = make_service("other", "payments");
+        let dropped = retain_authorized_cross_namespace_attachments(vec![workload], &unlisted);
+        assert!(
+            dropped.is_empty(),
+            "a same-namespace decoy or an unlisted target must not authorize the attachment"
+        );
     }
 
     #[test]

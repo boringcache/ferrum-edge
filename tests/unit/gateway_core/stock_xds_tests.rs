@@ -335,6 +335,92 @@ fn stock_cds_eds_lds_rds_produce_a_routable_mesh_service() {
 }
 
 #[test]
+fn stock_shared_endpoint_keeps_per_service_workload_independent_of_btree_order() {
+    // Two services share one SPIFFE and one address. The foreign namespace
+    // (`aaa`) sorts BEFORE the visible one (`default`) in BTree service order,
+    // which is the reverse of the `default`/`other` pair that would mask an
+    // "first owner wins" collapse. Each service must keep its own Workload
+    // stamp so later namespace narrowing cannot drop the visible service's
+    // endpoint with the foreign attachment.
+    assert!(
+        "aaa" < "default",
+        "this regression is the reverse-lexicographic owner order"
+    );
+    const FOREIGN_CLUSTER: &str = "outbound|9080||payments.aaa.svc.cluster.local";
+    let mut accumulator = StockXdsAccumulator::default();
+    accumulator
+        .apply_sotw(
+            CDS_TYPE_URL,
+            &[
+                any(CDS_TYPE_URL, &eds_cluster(FOREIGN_CLUSTER, &[REVIEWS_SAN])),
+                any(CDS_TYPE_URL, &eds_cluster(REVIEWS_CLUSTER, &[REVIEWS_SAN])),
+            ],
+            "cds-1",
+        )
+        .expect("CDS applies");
+    accumulator
+        .apply_sotw(
+            EDS_TYPE_URL,
+            &[
+                any(
+                    EDS_TYPE_URL,
+                    &cla(FOREIGN_CLUSTER, vec![lb_endpoint("10.1.2.3", 9080, 1)]),
+                ),
+                any(
+                    EDS_TYPE_URL,
+                    &cla(REVIEWS_CLUSTER, vec![lb_endpoint("10.1.2.3", 9080, 1)]),
+                ),
+            ],
+            "eds-1",
+        )
+        .expect("EDS applies");
+
+    let discovery = accumulator.discovery();
+    assert_eq!(discovery.services.len(), 2);
+    let foreign = discovery
+        .services
+        .iter()
+        .find(|service| service.namespace == "aaa" && service.name == "payments")
+        .expect("foreign service is projected");
+    let local = discovery
+        .services
+        .iter()
+        .find(|service| service.namespace == "default" && service.name == "reviews")
+        .expect("visible service is projected");
+    assert_eq!(foreign.workloads[0].spiffe_id.as_str(), REVIEWS_SAN);
+    assert_eq!(local.workloads[0].spiffe_id.as_str(), REVIEWS_SAN);
+
+    let foreign_workload = discovery
+        .workloads
+        .iter()
+        .find(|workload| {
+            workload.service_name == "payments" && workload.attached_service_namespace() == "aaa"
+        })
+        .expect("foreign service keeps its own workload stamp");
+    let local_workload = discovery
+        .workloads
+        .iter()
+        .find(|workload| {
+            workload.service_name == "reviews"
+                && workload.attached_service_namespace() == "default"
+        })
+        .expect("visible service keeps its own workload stamp");
+    assert_eq!(foreign_workload.spiffe_id.as_str(), REVIEWS_SAN);
+    assert_eq!(local_workload.spiffe_id.as_str(), REVIEWS_SAN);
+    assert_eq!(foreign_workload.addresses, vec!["10.1.2.3".to_string()]);
+    assert_eq!(local_workload.addresses, vec!["10.1.2.3".to_string()]);
+    assert_eq!(
+        foreign_workload.service_namespace.as_deref(),
+        Some("aaa"),
+        "identity lives in default; the foreign service is a cross-namespace attachment"
+    );
+    assert!(
+        local_workload.service_namespace.is_none(),
+        "same-namespace attachment must not inherit the foreign owner"
+    );
+}
+
+#[test]
 fn stock_tcp_proxy_listener_classifies_the_port_as_tcp_and_names_the_vip() {
     let mut accumulator = StockXdsAccumulator::default();
     let cluster = "outbound|3306||mysql.data.svc.cluster.local";

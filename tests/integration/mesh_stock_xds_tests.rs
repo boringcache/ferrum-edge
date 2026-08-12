@@ -58,6 +58,11 @@ const REVIEWS_SAN: &str = "spiffe://cluster.local/ns/default/sa/bookinfo-reviews
 /// A cluster for a service in ANOTHER namespace, endpointed by an identity in
 /// THIS one. Ferrum's namespace narrowing keeps it out of this workload's view.
 const FOREIGN_CLUSTER: &str = "outbound|9080||payments.other.svc.cluster.local";
+/// Same shared-endpoint shape as `FOREIGN_CLUSTER`, but the foreign namespace
+/// sorts *before* the local `default` namespace. A projection that stamped the
+/// first BTree owner onto a shared (SPIFFE, address) workload would drop the
+/// local endpoint when this foreign service later narrowed away.
+const EARLIER_FOREIGN_CLUSTER: &str = "outbound|9080||payments.aaa.svc.cluster.local";
 const UPSTREAM_TLS_TYPE_URL: &str =
     "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext";
 
@@ -816,7 +821,9 @@ fn has_endpoint(slice: &MeshSlice, address: &str) -> bool {
 /// CDS/EDS in which the local `reviews` service and a service in ANOTHER
 /// namespace both carry the SAME reachable endpoint, pinned to an identity in
 /// THIS namespace.
-fn shared_endpoint_with_foreign_namespace_script() -> HashMap<String, Vec<ScriptedResponse>> {
+fn shared_endpoint_with_foreign_namespace_script(
+    foreign_cluster: &str,
+) -> HashMap<String, Vec<ScriptedResponse>> {
     HashMap::from([
         (
             CDS_TYPE_URL.to_string(),
@@ -826,7 +833,7 @@ fn shared_endpoint_with_foreign_namespace_script() -> HashMap<String, Vec<Script
                 nonce: "cds-n1".to_string(),
                 resources: vec![
                     any_resource(CDS_TYPE_URL, &eds_cluster(REVIEWS_CLUSTER, REVIEWS_SAN)),
-                    any_resource(CDS_TYPE_URL, &eds_cluster(FOREIGN_CLUSTER, REVIEWS_SAN)),
+                    any_resource(CDS_TYPE_URL, &eds_cluster(foreign_cluster, REVIEWS_SAN)),
                 ],
             }],
         ),
@@ -838,7 +845,7 @@ fn shared_endpoint_with_foreign_namespace_script() -> HashMap<String, Vec<Script
                 nonce: "eds-n1".to_string(),
                 resources: vec![
                     any_resource(EDS_TYPE_URL, &cla(REVIEWS_CLUSTER, "10.1.2.3", 9080)),
-                    any_resource(EDS_TYPE_URL, &cla(FOREIGN_CLUSTER, "10.1.2.3", 9080)),
+                    any_resource(EDS_TYPE_URL, &cla(foreign_cluster, "10.1.2.3", 9080)),
                 ],
             }],
         ),
@@ -851,7 +858,10 @@ async fn stock_foreign_namespace_cluster_narrows_while_the_local_service_stays_d
     // only Ferrum's own narrowing can keep it off this workload's data path.
     // The local service sharing that endpoint must be unaffected — which is what
     // makes the narrowing above a real observation rather than an empty slice.
-    let harness = StockHarness::start(shared_endpoint_with_foreign_namespace_script()).await;
+    let harness = StockHarness::start(shared_endpoint_with_foreign_namespace_script(
+        FOREIGN_CLUSTER,
+    ))
+    .await;
     let slice = harness
         .wait_for_slice("converged", |slice| has_endpoint(slice, "10.1.2.3"))
         .await;
@@ -879,6 +889,60 @@ async fn stock_foreign_namespace_cluster_narrows_while_the_local_service_stays_d
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn stock_shared_endpoint_survives_when_the_foreign_namespace_sorts_first() {
+    // `aaa` < `default`. A (SPIFFE, address) collapse would stamp the foreign
+    // service as the owner, and namespace narrowing would then drop the local
+    // reviews endpoint with it. Per-service workload records keep reviews
+    // dialable while the foreign attachment narrows.
+    assert!(
+        "aaa" < "default",
+        "this regression is the reverse-lexicographic owner order"
+    );
+    let harness = StockHarness::start(shared_endpoint_with_foreign_namespace_script(
+        EARLIER_FOREIGN_CLUSTER,
+    ))
+    .await;
+    let slice = harness
+        .wait_for_slice("converged", |slice| has_endpoint(slice, "10.1.2.3"))
+        .await;
+
+    assert!(
+        slice
+            .services
+            .iter()
+            .all(|service| service.namespace == "default"),
+        "a lexicographically-earlier foreign service still stays outside this view: {:?}",
+        slice
+            .services
+            .iter()
+            .map(|service| format!("{}/{}", service.namespace, service.name))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        slice
+            .workloads
+            .iter()
+            .any(|workload| {
+                workload.service_name == "reviews"
+                    && workload.attached_service_namespace() == "default"
+                    && workload
+                        .addresses
+                        .iter()
+                        .any(|address| address == "10.1.2.3")
+            }),
+        "the visible service must keep the shared endpoint after the earlier foreign owner narrows"
+    );
+    assert!(
+        slice
+            .workloads
+            .iter()
+            .all(|workload| workload.attached_service_namespace() == "default"),
+        "the foreign attachment must not survive as the owner of the shared endpoint"
+    );
+    assert_slice_validates_as_mesh_config(&slice, "reverse-lex shared endpoint");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn stock_foreign_namespace_cluster_does_not_block_a_later_endpoint_withdrawal() {
     // Once `reviews` loses its endpoint, the shared address is claimed by the
     // foreign-namespace service alone. Its endpoint must narrow WITH that
@@ -886,7 +950,7 @@ async fn stock_foreign_namespace_cluster_does_not_block_a_later_endpoint_withdra
     // attachment nothing in the view can authorize: such a slice is refused at
     // proxy apply, and the rollback to the last applied generation would keep
     // this withdrawal — and every later change — from ever being applied.
-    let mut script = shared_endpoint_with_foreign_namespace_script();
+    let mut script = shared_endpoint_with_foreign_namespace_script(FOREIGN_CLUSTER);
     // Released by the ACK for the first EDS response.
     script
         .get_mut(EDS_TYPE_URL)

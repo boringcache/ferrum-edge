@@ -8,7 +8,10 @@
 //! `tests/integration/mesh_stock_xds_tests.rs`, and the live traffic proof in
 //! `tests/functional/functional_mesh_stock_xds_test.rs` (a scripted third-party
 //! ADS server driving a real sidecar's data path through update, deletion,
-//! NACK, and refusal); these rows are the product contract.
+//! NACK, and refusal — unpinned-peer and subset refusals as reachability
+//! transitions; foreign-namespace narrowing and RBAC / weighted-route
+//! capability refusals as exact ACK + diagnostic + accepted-service continuity);
+//! these rows are the product contract.
 
 use prost::Message;
 
@@ -289,7 +292,10 @@ fn stock_enforcement_filters_fail_closed_rather_than_degrading_to_plain_routing(
                  and every non-allowlisted network/listener filter refuse the whole listener \
                  with a field-specific diagnostic. Reducing an Istio listener that carries an \
                  RBAC or JWT filter to plain routing would turn the control plane's DENY into \
-                 an ALLOW, so the listener contributes no protocol classification and no VIP.",
+                 an ALLOW, so the listener contributes no protocol classification and no VIP. \
+                 The live matrix asserts the exact ACK of that generation, the field-specific \
+                 diagnostic, and accepted-service continuity; it does not claim a traffic-effect \
+                 proof for a host that was never dialable.",
     );
     let hcm = sp::HttpConnectionManager {
         stat_prefix: "outbound".to_string(),

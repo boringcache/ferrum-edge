@@ -26,14 +26,23 @@
 //! SVID, and only then relays to the labelled echo backend whose body the test
 //! asserts.
 //!
-//! Phases (one fixture, in order — each transition is proven by a *change* in
-//! observable reachability, so no fail-closed assertion can pass vacuously):
+//! Phases (one fixture, in order). Fail-closed arms that can be represented as
+//! a reachable service first are proven by a *change* in reachability on that
+//! same host after the exact ACK of the refusal generation. Arms that cannot
+//! have a same-host representable pre-state (foreign-namespace narrowing;
+//! capability refusals of RBAC / weighted routes, which do not themselves
+//! program a dialable CDS/EDS cluster) are proven by the exact ACK of the
+//! generation that carried them, the field-specific diagnostic, accepted-service
+//! continuity, and — for foreign-namespace narrowing — that a later
+//! withdrawal still applies rather than freezing on an invalid projected slice.
 //!
 //! 1. CDS+EDS+LDS+RDS converge and the discovered service routes live traffic.
-//! 2. Well-formed-but-unrepresentable clusters (subset cluster, unpinned peer
-//!    identity, foreign namespace) are refused/narrowed: each is unreachable
-//!    while the good service keeps serving, and the refusal diagnostics appear
-//!    with their stable reason code and field path.
+//! 2. Unpinned-peer and subset clusters: first prove the exact host is routable
+//!    under a representable resource, then change only the refusal-causing
+//!    field, wait for the matching ACK nonce/version, and prove it stops
+//!    routing. A foreign-namespace cluster is ACKed into the same generation;
+//!    it cannot be made reachable in this namespace, so the applied-generation
+//!    proof is that exact ACK plus phases 4–7 still taking effect.
 //! 3. A structurally invalid response is NACKed with a field-specific
 //!    `error_detail` re-asserting the last accepted version, and the last-good
 //!    view keeps serving real traffic.
@@ -41,10 +50,12 @@
 //! 5. A replacement EDS assignment restores it.
 //! 6. A state-of-the-world CDS withdrawal removes reachability.
 //! 7. Re-publishing the cluster restores it.
-//! 8. A listener carrying an enforcement HTTP filter (`envoy.filters.http.rbac`)
-//!    and a route using `weighted_clusters` are ACKed-but-refused: they widen
-//!    nothing (the cluster they name stays unreachable) and the good service is
-//!    unaffected.
+//! 8. A listener carrying `envoy.filters.http.rbac` and a route using
+//!    `weighted_clusters` are ACKed (not NACKed) with field-specific refusal
+//!    diagnostics. The accepted service keeps serving. Semantic coverage that
+//!    those constructs contribute no route lives in the unit/integration
+//!    suites; this phase does not claim a live widening proof for a host that
+//!    was never dialable.
 //! 9. Re-pinning the cluster's peer identity to an impostor SPIFFE removes
 //!    reachability — the control plane's SAN pin is a real verification input,
 //!    not decoration.
@@ -98,9 +109,6 @@ const SERVICE_HOST: &str = "svc-b.ferrum.svc.cluster.local";
 const NO_PIN_HOST: &str = "svc-nopin.ferrum.svc.cluster.local";
 const SUBSET_HOST: &str = "svc-subset.ferrum.svc.cluster.local";
 const FOREIGN_NAMESPACE_HOST: &str = "svc-other.other.svc.cluster.local";
-/// Named only by a refused `weighted_clusters` route action, so it must never
-/// become reachable.
-const GHOST_HOST: &str = "svc-ghost.ferrum.svc.cluster.local";
 
 const UPSTREAM_TLS_TYPE_URL: &str =
     "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext";
@@ -260,62 +268,97 @@ impl StockAdsHandle {
 
     /// Publish one state-of-the-world response, and make it the state a
     /// reconnecting client would resume from.
-    fn push(&self, response: DiscoveryResponse) {
+    ///
+    /// Returns the recorder length at the moment of the push so a subsequent
+    /// ACK/NACK wait can ignore requests that arrived before this response.
+    fn push(&self, response: DiscoveryResponse) -> usize {
+        let watermark = self.recorder.snapshot().len();
         self.seeds
             .lock()
             .expect("ADS seed mutex is never held across a panic")
             .insert(response.type_url.clone(), response.clone());
         let _ = self.pushes.send(response);
+        watermark
     }
 
-    /// Wait for the gateway to ACK `version` for `type_url` (an ACK carries the
-    /// accepted version, the response nonce, and no `error_detail`).
-    async fn wait_for_ack(&self, type_url: &str, version: &str) -> Result<(), String> {
+    fn matching_request(
+        &self,
+        after: usize,
+        type_url: &str,
+        nonce: &str,
+        version: Option<&str>,
+        nack: bool,
+    ) -> Option<DiscoveryRequest> {
+        self.recorder
+            .snapshot()
+            .into_iter()
+            .skip(after)
+            .find(|request| {
+                request.type_url == type_url
+                    && request.response_nonce == nonce
+                    && !request.response_nonce.is_empty()
+                    && request.error_detail.is_some() == nack
+                    && version.is_none_or(|expected| request.version_info == expected)
+            })
+    }
+
+    /// Wait for the gateway to ACK this exact response (`version` + `nonce`)
+    /// with a request recorded after `after`. Reconnects after the push still
+    /// append, so a replayed ACK of the same nonce is accepted; an earlier
+    /// ACK of a different generation is not.
+    async fn wait_for_ack(
+        &self,
+        after: usize,
+        type_url: &str,
+        version: &str,
+        nonce: &str,
+    ) -> Result<(), String> {
         let deadline = Instant::now() + ADS_EXCHANGE_TIMEOUT;
         loop {
-            let acked = self.recorder.snapshot().into_iter().any(|request| {
-                request.type_url == type_url
-                    && request.version_info == version
-                    && request.error_detail.is_none()
-                    && !request.response_nonce.is_empty()
-            });
-            if acked {
+            if self
+                .matching_request(after, type_url, nonce, Some(version), false)
+                .is_some()
+            {
                 return Ok(());
             }
             if Instant::now() >= deadline {
                 return Err(format!(
-                    "the gateway never ACKed '{type_url}' version '{version}'"
+                    "the gateway never ACKed '{type_url}' version '{version}' nonce '{nonce}' \
+                     after request index {after}"
                 ));
             }
             tokio::time::sleep(CONVERGENCE_POLL_INTERVAL).await;
         }
     }
 
-    async fn wait_for_nack(&self, type_url: &str) -> Result<DiscoveryRequest, String> {
+    /// Wait for a NACK of this exact response nonce, recorded after `after`.
+    /// `version_info` on a NACK is the last *accepted* version, not the refused
+    /// one, so only the nonce identifies the response under test.
+    async fn wait_for_nack(
+        &self,
+        after: usize,
+        type_url: &str,
+        nonce: &str,
+    ) -> Result<DiscoveryRequest, String> {
         let deadline = Instant::now() + ADS_EXCHANGE_TIMEOUT;
         loop {
-            if let Some(nack) = self
-                .recorder
-                .snapshot()
-                .into_iter()
-                .find(|request| request.type_url == type_url && request.error_detail.is_some())
-            {
+            if let Some(nack) = self.matching_request(after, type_url, nonce, None, true) {
                 return Ok(nack);
             }
             if Instant::now() >= deadline {
-                return Err(format!("the gateway never NACKed a '{type_url}' response"));
+                return Err(format!(
+                    "the gateway never NACKed '{type_url}' nonce '{nonce}' after request index \
+                     {after}"
+                ));
             }
             tokio::time::sleep(CONVERGENCE_POLL_INTERVAL).await;
         }
     }
 
-    /// True when the gateway ever sent a request for `type_url` carrying an
-    /// `error_detail` — i.e. NACKed it.
-    fn nacked(&self, type_url: &str) -> bool {
-        self.recorder
-            .snapshot()
-            .iter()
-            .any(|request| request.type_url == type_url && request.error_detail.is_some())
+    /// True when a request recorded after `after` NACKed this exact nonce.
+    fn nacked_after(&self, after: usize, type_url: &str, nonce: &str) -> bool {
+        self.matching_request(after, type_url, nonce, None, true)
+            .is_some()
     }
 
     async fn shutdown(self) {
@@ -509,7 +552,10 @@ fn route_config(name: &str, domains: &[&str], cluster: &str) -> sp::RouteConfigu
 
 /// A route configuration whose action splits traffic with `weighted_clusters` —
 /// a traffic-shaping construct the stock profile refuses rather than
-/// approximating.
+/// approximating. Presence of the field is the refusal signal; this fixture
+/// replaces the accepted service's route so the live phase can prove the
+/// response is ACKed (not NACKed) without claiming a host that was never
+/// dialable became unreachable.
 fn weighted_route_config(name: &str, domains: &[&str]) -> sp::RouteConfiguration {
     sp::RouteConfiguration {
         name: name.to_string(),
@@ -684,9 +730,10 @@ impl Probe {
 /// bring-up covers the whole live matrix.
 struct StockLiveObservations {
     converged: Probe,
+    unpinned_peer_before: Probe,
     unpinned_peer: Probe,
+    subset_cluster_before: Probe,
     subset_cluster: Probe,
-    foreign_namespace: Probe,
     good_service_after_refusals: Probe,
     nack_version_info: String,
     nack_message: String,
@@ -697,7 +744,6 @@ struct StockLiveObservations {
     cluster_restored: Probe,
     lds_nacked: bool,
     rds_nacked: bool,
-    ghost_cluster: Probe,
     good_service_after_capability_refusal: Probe,
     impostor_pin: Probe,
     logs: String,
@@ -776,6 +822,7 @@ async fn drive_stock_xds_live_datapath() -> Result<StockLiveObservations, String
         let good_cluster = cluster_name(backend_port, "", SERVICE_HOST);
         let nopin_cluster = cluster_name(backend_port, "", NO_PIN_HOST);
         let subset_cluster = cluster_name(backend_port, "v1", SUBSET_HOST);
+        let subset_cluster_representable = cluster_name(backend_port, "", SUBSET_HOST);
         let foreign_cluster = cluster_name(backend_port, "", FOREIGN_NAMESPACE_HOST);
         // Istio names an outbound route configuration after the port.
         let route_config_name = backend_port.to_string();
@@ -958,6 +1005,7 @@ async fn drive_stock_xds_live_datapath() -> Result<StockLiveObservations, String
             &good_cluster,
             &nopin_cluster,
             &subset_cluster,
+            &subset_cluster_representable,
             &foreign_cluster,
             &route_config_name,
         )
@@ -1010,6 +1058,7 @@ async fn run_stock_live_phases(
     good_cluster: &str,
     nopin_cluster: &str,
     subset_cluster: &str,
+    subset_cluster_representable: &str,
     foreign_cluster: &str,
     route_config_name: &str,
 ) -> Result<StockLiveObservations, String> {
@@ -1018,29 +1067,65 @@ async fn run_stock_live_phases(
     // ── Phase 1: the converged stock resources route real traffic ──
     let converged = wait_until_reachable(outbound_port, SERVICE_HOST).await?;
 
-    // ── Phase 2: unrepresentable / out-of-scope clusters narrow, never widen ──
-    // Every one of these carries a REACHABLE endpoint, so only Ferrum's own
-    // refusal / narrowing can keep them off the data path.
-    ads.push(response(
+    // ── Phase 2a: representable pre-state for the hosts we will later refuse ──
+    // Unpinned-peer and subset refusals can only be a reachability *change* if
+    // the exact host was first routed under a representable resource. The
+    // foreign-namespace cluster is included in the same generation so a later
+    // withdrawal can prove that generation applied (the namespace itself
+    // prevents a same-host representable pre-state).
+    let cds_2 = ads.push(response(
         CDS_TYPE_URL,
         "cds-2",
         "cds-n2",
         vec![
             any_resource(CDS_TYPE_URL, &eds_cluster(good_cluster, Some(B_SPIFFE))),
-            // No `UpstreamTlsContext`: the CP asserted no peer identity, so
-            // Ferrum must publish the service shape with no dialable endpoint.
-            any_resource(CDS_TYPE_URL, &eds_cluster(nopin_cluster, None)),
-            // A DestinationRule subset cluster: refused, not approximated.
-            any_resource(CDS_TYPE_URL, &eds_cluster(subset_cluster, Some(B_SPIFFE))),
-            // A service in another namespace: existing mesh namespace narrowing
-            // must keep it out of this workload's slice.
+            any_resource(CDS_TYPE_URL, &eds_cluster(nopin_cluster, Some(B_SPIFFE))),
+            any_resource(
+                CDS_TYPE_URL,
+                &eds_cluster(subset_cluster_representable, Some(B_SPIFFE)),
+            ),
             any_resource(CDS_TYPE_URL, &eds_cluster(foreign_cluster, Some(B_SPIFFE))),
         ],
     ));
-    ads.push(response(
+    let eds_2 = ads.push(response(
         EDS_TYPE_URL,
         "eds-2",
         "eds-n2",
+        vec![
+            any_resource(EDS_TYPE_URL, &assignment(good_cluster, &endpoint)),
+            any_resource(EDS_TYPE_URL, &assignment(nopin_cluster, &endpoint)),
+            any_resource(
+                EDS_TYPE_URL,
+                &assignment(subset_cluster_representable, &endpoint),
+            ),
+            any_resource(EDS_TYPE_URL, &assignment(foreign_cluster, &endpoint)),
+        ],
+    ));
+    ads.wait_for_ack(cds_2, CDS_TYPE_URL, "cds-2", "cds-n2")
+        .await?;
+    ads.wait_for_ack(eds_2, EDS_TYPE_URL, "eds-2", "eds-n2")
+        .await?;
+    let unpinned_peer_before = wait_until_reachable(outbound_port, NO_PIN_HOST).await?;
+    let subset_cluster_before = wait_until_reachable(outbound_port, SUBSET_HOST).await?;
+
+    // ── Phase 2b: change only the refusal-causing field / shape ──
+    let cds_3 = ads.push(response(
+        CDS_TYPE_URL,
+        "cds-3",
+        "cds-n3",
+        vec![
+            any_resource(CDS_TYPE_URL, &eds_cluster(good_cluster, Some(B_SPIFFE))),
+            // Same cluster name as 2a; only the SAN pin is removed.
+            any_resource(CDS_TYPE_URL, &eds_cluster(nopin_cluster, None)),
+            // Same host as 2a; only the Istio subset name is introduced.
+            any_resource(CDS_TYPE_URL, &eds_cluster(subset_cluster, Some(B_SPIFFE))),
+            any_resource(CDS_TYPE_URL, &eds_cluster(foreign_cluster, Some(B_SPIFFE))),
+        ],
+    ));
+    let eds_3 = ads.push(response(
+        EDS_TYPE_URL,
+        "eds-3",
+        "eds-n3",
         vec![
             any_resource(EDS_TYPE_URL, &assignment(good_cluster, &endpoint)),
             any_resource(EDS_TYPE_URL, &assignment(nopin_cluster, &endpoint)),
@@ -1048,26 +1133,25 @@ async fn run_stock_live_phases(
             any_resource(EDS_TYPE_URL, &assignment(foreign_cluster, &endpoint)),
         ],
     ));
-    ads.wait_for_ack(CDS_TYPE_URL, "cds-2").await?;
-    ads.wait_for_ack(EDS_TYPE_URL, "eds-2").await?;
-    // The good service still serving is the proof this state is LIVE, so the
-    // three fail-closed observations below cannot pass vacuously.
+    ads.wait_for_ack(cds_3, CDS_TYPE_URL, "cds-3", "cds-n3")
+        .await?;
+    ads.wait_for_ack(eds_3, EDS_TYPE_URL, "eds-3", "eds-n3")
+        .await?;
     let good_service_after_refusals = wait_until_reachable(outbound_port, SERVICE_HOST).await?;
-    let unpinned_peer = probe(outbound_port, NO_PIN_HOST).await;
-    let subset_cluster_probe = probe(outbound_port, SUBSET_HOST).await;
-    let foreign_namespace = probe(outbound_port, FOREIGN_NAMESPACE_HOST).await;
+    let unpinned_peer = wait_until_unreachable(outbound_port, NO_PIN_HOST).await?;
+    let subset_cluster_probe = wait_until_unreachable(outbound_port, SUBSET_HOST).await?;
 
     // ── Phase 3: a structural error NACKs; the last-good view keeps serving ──
-    ads.push(response(
+    let cds_4 = ads.push(response(
         CDS_TYPE_URL,
-        "cds-3",
-        "cds-n3",
+        "cds-4",
+        "cds-n4",
         vec![
             any_resource(CDS_TYPE_URL, &eds_cluster(good_cluster, Some(B_SPIFFE))),
             any_resource(CDS_TYPE_URL, &eds_cluster(good_cluster, Some(B_SPIFFE))),
         ],
     ));
-    let nack = ads.wait_for_nack(CDS_TYPE_URL).await?;
+    let nack = ads.wait_for_nack(cds_4, CDS_TYPE_URL, "cds-n4").await?;
     let nack_message = nack
         .error_detail
         .as_ref()
@@ -1077,56 +1161,22 @@ async fn run_stock_live_phases(
     let good_service_after_nack = wait_until_reachable(outbound_port, SERVICE_HOST).await?;
 
     // ── Phase 4: withdrawing the endpoints removes reachability ──
-    // The cluster stays, so this isolates endpoint deletion.
-    ads.push(response(
-        EDS_TYPE_URL,
-        "eds-3",
-        "eds-n3",
-        vec![any_resource(EDS_TYPE_URL, &assignment(good_cluster, &[]))],
-    ));
-    ads.wait_for_ack(EDS_TYPE_URL, "eds-3").await?;
-    let endpoints_withdrawn = wait_until_unreachable(outbound_port, SERVICE_HOST).await?;
-
-    // ── Phase 5: a replacement assignment restores it ──
-    ads.push(response(
+    // The cluster stays, so this isolates endpoint deletion. It is also the
+    // proof that the foreign-namespace generation applied as a valid slice:
+    // an unauthorizable leftover attachment would freeze apply on the last
+    // good generation and this withdrawal would never land.
+    let eds_4 = ads.push(response(
         EDS_TYPE_URL,
         "eds-4",
         "eds-n4",
-        vec![any_resource(
-            EDS_TYPE_URL,
-            &assignment(good_cluster, &endpoint),
-        )],
+        vec![any_resource(EDS_TYPE_URL, &assignment(good_cluster, &[]))],
     ));
-    ads.wait_for_ack(EDS_TYPE_URL, "eds-4").await?;
-    let endpoints_restored = wait_until_reachable(outbound_port, SERVICE_HOST).await?;
+    ads.wait_for_ack(eds_4, EDS_TYPE_URL, "eds-4", "eds-n4")
+        .await?;
+    let endpoints_withdrawn = wait_until_unreachable(outbound_port, SERVICE_HOST).await?;
 
-    // ── Phase 6: state-of-the-world CDS withdrawal removes reachability ──
-    // `cds-4` no longer names the service's cluster. Under SotW that IS the
-    // deletion, and it must take the endpoints with it.
-    ads.push(response(
-        CDS_TYPE_URL,
-        "cds-4",
-        "cds-n4",
-        vec![any_resource(
-            CDS_TYPE_URL,
-            &eds_cluster(nopin_cluster, Some(B_SPIFFE)),
-        )],
-    ));
-    ads.wait_for_ack(CDS_TYPE_URL, "cds-4").await?;
-    let cluster_withdrawn = wait_until_unreachable(outbound_port, SERVICE_HOST).await?;
-
-    // ── Phase 7: re-publishing the cluster restores it ──
-    ads.push(response(
-        CDS_TYPE_URL,
-        "cds-5",
-        "cds-n5",
-        vec![any_resource(
-            CDS_TYPE_URL,
-            &eds_cluster(good_cluster, Some(B_SPIFFE)),
-        )],
-    ));
-    ads.wait_for_ack(CDS_TYPE_URL, "cds-5").await?;
-    ads.push(response(
+    // ── Phase 5: a replacement assignment restores it ──
+    let eds_5 = ads.push(response(
         EDS_TYPE_URL,
         "eds-5",
         "eds-n5",
@@ -1135,17 +1185,60 @@ async fn run_stock_live_phases(
             &assignment(good_cluster, &endpoint),
         )],
     ));
-    ads.wait_for_ack(EDS_TYPE_URL, "eds-5").await?;
+    ads.wait_for_ack(eds_5, EDS_TYPE_URL, "eds-5", "eds-n5")
+        .await?;
+    let endpoints_restored = wait_until_reachable(outbound_port, SERVICE_HOST).await?;
+
+    // ── Phase 6: state-of-the-world CDS withdrawal removes reachability ──
+    // `cds-5` no longer names the service's cluster. Under SotW that IS the
+    // deletion, and it must take the endpoints with it.
+    let cds_5 = ads.push(response(
+        CDS_TYPE_URL,
+        "cds-5",
+        "cds-n5",
+        vec![any_resource(
+            CDS_TYPE_URL,
+            &eds_cluster(nopin_cluster, Some(B_SPIFFE)),
+        )],
+    ));
+    ads.wait_for_ack(cds_5, CDS_TYPE_URL, "cds-5", "cds-n5")
+        .await?;
+    let cluster_withdrawn = wait_until_unreachable(outbound_port, SERVICE_HOST).await?;
+
+    // ── Phase 7: re-publishing the cluster restores it ──
+    let cds_6 = ads.push(response(
+        CDS_TYPE_URL,
+        "cds-6",
+        "cds-n6",
+        vec![any_resource(
+            CDS_TYPE_URL,
+            &eds_cluster(good_cluster, Some(B_SPIFFE)),
+        )],
+    ));
+    ads.wait_for_ack(cds_6, CDS_TYPE_URL, "cds-6", "cds-n6")
+        .await?;
+    let eds_6 = ads.push(response(
+        EDS_TYPE_URL,
+        "eds-6",
+        "eds-n6",
+        vec![any_resource(
+            EDS_TYPE_URL,
+            &assignment(good_cluster, &endpoint),
+        )],
+    ));
+    ads.wait_for_ack(eds_6, EDS_TYPE_URL, "eds-6", "eds-n6")
+        .await?;
     let cluster_restored = wait_until_reachable(outbound_port, SERVICE_HOST).await?;
 
     // ── Phase 8: unsupported enforcement + routing constructs are refused ──
     // An RBAC HTTP filter refuses the whole listener (reducing it to plain
     // routing would turn the control plane's DENY into an ALLOW), and a
     // `weighted_clusters` route action is refused rather than approximated.
-    // Both are CAPABILITY refusals: the response is ACKed, not NACKed, and the
-    // refusal narrows — the cluster the weighted route names must not become
-    // reachable, and the good service must be unaffected.
-    ads.push(response(
+    // Both are CAPABILITY refusals: the response is ACKed, not NACKed, with a
+    // field-specific diagnostic. FQDN routing comes from CDS, so this phase
+    // does not claim a live widening proof for a host that was never dialable;
+    // it proves the exact ACK, the diagnostic, and accepted-service continuity.
+    let lds_2 = ads.push(response(
         LDS_TYPE_URL,
         "lds-2",
         "lds-n2",
@@ -1159,53 +1252,57 @@ async fn run_stock_live_phases(
             ),
         )],
     ));
-    ads.wait_for_ack(LDS_TYPE_URL, "lds-2").await?;
-    ads.push(response(
+    ads.wait_for_ack(lds_2, LDS_TYPE_URL, "lds-2", "lds-n2")
+        .await?;
+    let rds_2 = ads.push(response(
         RDS_TYPE_URL,
         "rds-2",
         "rds-n2",
         vec![any_resource(
             RDS_TYPE_URL,
-            &weighted_route_config(route_config_name, &[GHOST_HOST, SERVICE_HOST]),
+            &weighted_route_config(route_config_name, &[SERVICE_HOST]),
         )],
     ));
-    ads.wait_for_ack(RDS_TYPE_URL, "rds-2").await?;
-    let lds_nacked = ads.nacked(LDS_TYPE_URL);
-    let rds_nacked = ads.nacked(RDS_TYPE_URL);
+    ads.wait_for_ack(rds_2, RDS_TYPE_URL, "rds-2", "rds-n2")
+        .await?;
+    let lds_nacked = ads.nacked_after(lds_2, LDS_TYPE_URL, "lds-n2");
+    let rds_nacked = ads.nacked_after(rds_2, RDS_TYPE_URL, "rds-n2");
     let good_service_after_capability_refusal =
         wait_until_reachable(outbound_port, SERVICE_HOST).await?;
-    let ghost_cluster_probe = probe(outbound_port, GHOST_HOST).await;
 
     // ── Phase 9: the CP's SAN pin is a verification input ──
     // Same cluster, same endpoint, only the pinned peer identity changes — so
     // losing reachability here can only come from the mTLS peer check.
-    ads.push(response(
+    let cds_7 = ads.push(response(
         CDS_TYPE_URL,
-        "cds-6",
-        "cds-n6",
+        "cds-7",
+        "cds-n7",
         vec![any_resource(
             CDS_TYPE_URL,
             &eds_cluster(good_cluster, Some(IMPOSTOR_SPIFFE)),
         )],
     ));
-    ads.wait_for_ack(CDS_TYPE_URL, "cds-6").await?;
-    ads.push(response(
+    ads.wait_for_ack(cds_7, CDS_TYPE_URL, "cds-7", "cds-n7")
+        .await?;
+    let eds_7 = ads.push(response(
         EDS_TYPE_URL,
-        "eds-6",
-        "eds-n6",
+        "eds-7",
+        "eds-n7",
         vec![any_resource(
             EDS_TYPE_URL,
             &assignment(good_cluster, &endpoint),
         )],
     ));
-    ads.wait_for_ack(EDS_TYPE_URL, "eds-6").await?;
+    ads.wait_for_ack(eds_7, EDS_TYPE_URL, "eds-7", "eds-n7")
+        .await?;
     let impostor_pin = wait_until_unreachable(outbound_port, SERVICE_HOST).await?;
 
     Ok(StockLiveObservations {
         converged,
+        unpinned_peer_before,
         unpinned_peer,
+        subset_cluster_before,
         subset_cluster: subset_cluster_probe,
-        foreign_namespace,
         good_service_after_refusals,
         nack_version_info,
         nack_message,
@@ -1216,7 +1313,6 @@ async fn run_stock_live_phases(
         cluster_restored,
         lds_nacked,
         rds_nacked,
-        ghost_cluster: ghost_cluster_probe,
         good_service_after_capability_refusal,
         impostor_pin,
         logs: String::new(),
@@ -1245,7 +1341,23 @@ async fn functional_mesh_stock_xds_live_datapath_matrix() {
         observed.converged.describe("converged probe")
     );
 
-    // Phase 2 — refusals and narrowing remove reachability, never add it.
+    // Phase 2 — unpinned/subset are transition proofs; foreign-namespace
+    // narrowing is proven by the exact ACK of cds-3 plus phases 4–7 still
+    // applying (an invalid leftover attachment would freeze those updates).
+    assert!(
+        observed.unpinned_peer_before.reached_backend(),
+        "the unpinned-peer host must first be routable under a representable pin — {}\n{logs}",
+        observed
+            .unpinned_peer_before
+            .describe("unpinned pre-state")
+    );
+    assert!(
+        observed.subset_cluster_before.reached_backend(),
+        "the subset host must first be routable as a non-subset cluster — {}\n{logs}",
+        observed
+            .subset_cluster_before
+            .describe("subset pre-state")
+    );
     assert!(
         observed.good_service_after_refusals.reached_backend(),
         "the accepted service must keep serving while other resources are refused — {}\n{logs}",
@@ -1267,7 +1379,8 @@ async fn functional_mesh_stock_xds_live_datapath_matrix() {
     ] {
         assert!(
             !probe.reached_backend(),
-            "{what} must not reach a backend even though its endpoint is reachable — {}\n{logs}",
+            "{what} must lose reachability after only the refusal-causing field changed — \
+             {}\n{logs}",
             probe.describe("refused probe")
         );
         assert!(
@@ -1275,14 +1388,6 @@ async fn functional_mesh_stock_xds_live_datapath_matrix() {
             "the refusal diagnostic '{reason}' must appear for {what}\n{logs}"
         );
     }
-    assert!(
-        !observed.foreign_namespace.reached_backend(),
-        "a discovered service in another namespace must stay outside this workload's slice — \
-         {}\n{logs}",
-        observed
-            .foreign_namespace
-            .describe("foreign-namespace probe")
-    );
 
     // Phase 3 — a structural error NACKs and the last-good view keeps serving.
     assert!(
@@ -1293,7 +1398,7 @@ async fn functional_mesh_stock_xds_live_datapath_matrix() {
         observed.nack_message
     );
     assert_eq!(
-        observed.nack_version_info, "cds-2",
+        observed.nack_version_info, "cds-3",
         "a NACK re-asserts the last version the client actually accepted\n{logs}"
     );
     assert!(
@@ -1302,7 +1407,10 @@ async fn functional_mesh_stock_xds_live_datapath_matrix() {
         observed.good_service_after_nack.describe("post-NACK probe")
     );
 
-    // Phases 4–7 — update / delete take effect on the live data path.
+    // Phases 4–7 — update / delete take effect on the live data path. Phase 4
+    // is also the applied-generation proof for foreign-namespace narrowing:
+    // an invalid leftover attachment would freeze apply and this withdrawal
+    // would never land.
     assert!(
         !observed.endpoints_withdrawn.reached_backend(),
         "withdrawing a cluster's endpoints must remove reachability — {}\n{logs}",
@@ -1331,16 +1439,19 @@ async fn functional_mesh_stock_xds_live_datapath_matrix() {
         observed.cluster_restored.describe("restored-cluster probe")
     );
 
-    // Phase 8 — capability refusals ACK, narrow, and never widen.
+    // Phase 8 — capability refusals ACK with a field-specific diagnostic and
+    // leave the accepted service serving. Semantic coverage that RBAC / weighted
+    // routes contribute no listener or virtual host lives in the unit suite;
+    // this phase does not claim a live widening proof for a never-dialable host.
     assert!(
         !observed.lds_nacked,
         "a well-formed listener carrying an unsupported enforcement filter is a CAPABILITY \
-         refusal, not a structural NACK\n{logs}"
+         refusal of lds-n2, not a structural NACK\n{logs}"
     );
     assert!(
         !observed.rds_nacked,
-        "a well-formed route using an unsupported action is a CAPABILITY refusal, not a \
-         structural NACK\n{logs}"
+        "a well-formed route using an unsupported action is a CAPABILITY refusal of rds-n2, \
+         not a structural NACK\n{logs}"
     );
     assert!(
         logs.contains("unsupported_http_filter") && logs.contains("envoy.filters.http.rbac"),
@@ -1350,12 +1461,6 @@ async fn functional_mesh_stock_xds_live_datapath_matrix() {
         logs.contains("unsupported_route_action")
             && logs.contains("routes[].route.weighted_clusters"),
         "the traffic-shaping refusal must name the offending route field\n{logs}"
-    );
-    assert!(
-        !observed.ghost_cluster.reached_backend(),
-        "a cluster named only by a REFUSED weighted-cluster route must not become reachable — \
-         {}\n{logs}",
-        observed.ghost_cluster.describe("ghost-cluster probe")
     );
     assert!(
         observed

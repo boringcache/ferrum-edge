@@ -165,7 +165,11 @@ need them, or because they are blocked upstream / architecturally:
   external DNS clusters, SDS, ECDS/RTDS, and delta xDS stay out of scope. That
   discovery half — including update, deletion, NACK, and capability-refusal
   behaviour — is proven on the live data path against a scripted third-party ADS
-  server in `tests/functional/functional_mesh_stock_xds_test.rs`. See
+  server in `tests/functional/functional_mesh_stock_xds_test.rs` (unpinned-peer
+  and subset refusals as reachability transitions; foreign-namespace narrowing
+  and RBAC / weighted-route capability refusals as exact ACK + diagnostic +
+  accepted-service continuity, with semantic unit/integration coverage that
+  those constructs contribute no route). See
   `docs/mesh.md` → "Stock Envoy / third-party Istio xDS interoperability".
 - **`EnvoyFilter` / `WasmPlugin`** — use Ferrum custom plugins (`custom_plugins/`).
 - **`AuthorizationPolicy` `when: experimental.envoy.filters.*`** — the key is

@@ -573,7 +573,10 @@ removed that service, the endpoint is dropped rather than retained as an
 unauthorizable attachment — a slice carrying one would be refused at apply, and
 the resulting rollback to the last applied generation would block every LATER
 control-plane change, including a state-of-the-world withdrawal, instead of
-losing just the out-of-view resource.
+losing just the out-of-view resource. Shared identity/address endpoints are
+projected as **per-service** workload records, so a foreign service that sorts
+first in BTree order cannot stamp itself as the owner of a visible service's
+endpoint and take that reachability with it when it narrows away.
 
 A `TcpProxy` filter chain does classify its port as `AppProtocol::Tcp`, but
 raw-TCP mesh egress matches captured **original destinations** against the
@@ -590,12 +593,19 @@ and SVID-mTLS into a second real sidecar and its backend. The same live fixture
 proves, on that data path, that an endpoint withdrawal and a state-of-the-world
 cluster withdrawal each remove reachability (and a replacement restores it),
 that a structurally invalid response is NACKed with a field-specific
-`error_detail` while the last-good view keeps serving, that a listener carrying
-`envoy.filters.http.rbac` and a route using `weighted_clusters` are ACKed but
-refused without widening anything, that an unpinned / subset / foreign-namespace
-cluster with a genuinely reachable endpoint still cannot be dialed, and that
-re-pinning the peer identity to an impostor SPIFFE fails the dial closed. It runs
-in the hosted `data-plane` functional shard.
+`error_detail` while the last-good view keeps serving, that an unpinned-peer or
+subset cluster first routes under a representable resource and then loses
+reachability after only the refusal-causing field changes, that a
+foreign-namespace cluster is ACKed into the applied generation without freezing
+a later withdrawal (the namespace itself prevents a same-host representable
+pre-state, so that arm is not a before/after reachability proof), that a
+listener carrying `envoy.filters.http.rbac` and a route using
+`weighted_clusters` are ACKed with field-specific refusal diagnostics while the
+accepted service keeps serving (semantic coverage that those constructs
+contribute no listener or virtual host lives in the unit/integration suites;
+the live phase does not claim a widening proof for a host that was never
+dialable), and that re-pinning the peer identity to an impostor SPIFFE fails
+the dial closed. It runs in the hosted `data-plane` functional shard.
 
 **Where the code lives.** `src/xds/stock.rs` (decode, capability classification,
 projection onto the typed mesh model) and
