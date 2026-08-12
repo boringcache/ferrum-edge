@@ -42,6 +42,8 @@ adding, removing, or materially changing a workflow.
 | `mesh-e2e-sidecar-live.yml` | Mesh E2E Sidecar Live Datapath | PRs, `merge_group`, push to `main`, manual | Release-blocking sidecar datapath validation; `Mesh E2E Sidecar Live` is directly required on PRs and merge-queue groups. |
 | `cross-build-policy.yml` | Cross Build Policy | `pull_request_target` for PRs to `main`, `merge_group` | Read-only trusted-base validation of every PR-controlled ARM64 Cross configuration and invocation surface on PRs; merge-group mode verifies the synthesized combined SHA with `contents: read` only. `Trusted Cross Build Policy` is directly required. |
 | `ambient-host-udp-live.yml` | Ambient Host UDP Live Kernel | Every PR, `merge_group`, manual | Privileged live-kernel gate for Ambient host-network UDP capture (`ProxyHostUdpBackend`), plus a production-image contract job that proves the chart-selected `-ebpf-tools` runtime can execute the shell/iptables tool set while `-ebpf` stays distroless; relevance is decided by a trusted-base classifier and `Ambient Host UDP Live` reports on every run. |
+| `launch-integrity.yml` | Launch Readiness Integrity | `pull_request_target` for PRs to `main`, `merge_group` | Read-only trusted-base validation that a candidate preserved the launch/release governance contract. Executable gate code (checker, readiness/release/integrity/advisory-trust workflows and verifiers) is byte-frozen to protected `main`; candidate-editable data (blocker policy, exemption schema, document markers, CODEOWNERS coverage) is structurally validated, and check-name/advisory-secret scanning covers every workflow including ones the candidate adds. It never computes a launch verdict, so open launch blockers keep it green. `Launch Readiness Integrity` is directly required. See [launch-readiness.md](launch-readiness.md). |
+| `launch-readiness.yml` | Launch Readiness | PRs, `merge_group`, push to `main`, `v*` tags, daily schedule, manual | Live go/no-go launch verdict (`Launch Readiness Gate`). Expected to stay red while real blockers are open; it is release-blocking, **not** a required PR context. |
 | `node-waypoint-ebpf-live.yml` | NodeWaypoint eBPF Live Datapath | Path-filtered PRs, manual | Live eBPF datapath validation in kind. |
 | `multicluster-federation-live.yml` | Multicluster Federation Live Datapath | PRs, `merge_group`, push to `main`, manual | Release-blocking multicluster federation datapath validation; `Multicluster Federation Live` is directly required on PRs and merge-queue groups. |
 | `multicluster-poller-partition-live.yml` | Multicluster Poller Partition Live | PRs, `merge_group`, push to `main`, manual | Release-blocking two-CP/two-DP trust/discovery partition and bounded last-good-retention validation; `Multicluster Poller Partition Live` is directly required. |
@@ -65,6 +67,9 @@ adding, removing, or materially changing a workflow.
 
 ```
 Pull Request / Merge Queue group
+    ├─► Launch Readiness Integrity
+            ├─► PR: `pull_request_target`, trusted-base verifier, candidate tree as data
+            └─► Merge group: synthesized queue SHA, `contents: read`, no secrets
     ├─► Trusted Cross Build Policy
             ├─► PR: `pull_request_target`, base code only, PR tree as data
             └─► Merge group: synthesized queue SHA, `contents: read`, no secrets
@@ -97,7 +102,7 @@ Push to main
 
 ### Required checks and merge queue
 
-Branch protection / repository rulesets for `main` must require these seven
+Branch protection / repository rulesets for `main` must require these nine
 GitHub Actions check names (exact spelling; source app is **GitHub Actions**,
 app id `15368`):
 
@@ -111,6 +116,14 @@ app id `15368`):
 | `Multicluster Federation Live` | `.github/workflows/multicluster-federation-live.yml` | `gate` |
 | `Multicluster Poller Partition Live` | `.github/workflows/multicluster-poller-partition-live.yml` | `gate` |
 | `Ambient Host UDP Live` | `.github/workflows/ambient-host-udp-live.yml` | `gate` |
+| `Launch Readiness Integrity` | `.github/workflows/launch-integrity.yml` | `verify` |
+
+`Launch Readiness Gate` (from `launch-readiness.yml`) is deliberately **not** in
+this list: it is the live go/no-go verdict and stays red while any real launch
+blocker is open, so requiring it would deadlock blocker-fix pull requests. The
+merge control is the separate integrity context above; the go/no-go verdict
+remains release-blocking through `release.yml`'s `validate-launch-readiness`
+job. See [launch-readiness.md](launch-readiness.md).
 
 Each owner declares a `merge_group` (`types: [checks_requested]`) trigger in
 addition to its existing `pull_request` / `pull_request_target` / `push` /
