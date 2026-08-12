@@ -149,7 +149,11 @@ instead of rewriting that protected README.
 
 ## Related surfaces
 
-- Mesh/HBONE/DNS baseline collection: `.github/workflows/mesh-performance-baselines.yml`
+- Mesh/HBONE/DNS baseline collection: `.github/workflows/mesh-performance-baselines.yml`,
+  with its non-literal computation in `.github/scripts/mesh_baseline_ledger.py`,
+  `.github/scripts/mesh_baseline_runner_health.py`, and
+  `.github/scripts/mesh_baseline_step_summary.py` (the workflow itself keeps a
+  literal command surface; see `verify_mesh_performance_baselines_workflow.py`)
 - Manual exploratory matrix: `.github/workflows/perf-benchmark.yml`
 - PR overhead gate: `tests/performance/ci_overhead_bench.py` via `ci.yml`
 - Connection saturation headlines: `docs/connection_saturation_benchmark.md`

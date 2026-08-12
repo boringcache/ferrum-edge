@@ -18,6 +18,9 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "mesh-performance-baselines.yml"
 PROVENANCE_SCRIPT = REPO_ROOT / ".github" / "scripts" / "collect_mesh_baseline_provenance.py"
 SUMMARY_SCRIPT = REPO_ROOT / ".github" / "scripts" / "summarize_mesh_baseline_results.py"
+LEDGER_SCRIPT = REPO_ROOT / ".github" / "scripts" / "mesh_baseline_ledger.py"
+HEALTH_SCRIPT = REPO_ROOT / ".github" / "scripts" / "mesh_baseline_runner_health.py"
+STEP_SUMMARY_SCRIPT = REPO_ROOT / ".github" / "scripts" / "mesh_baseline_step_summary.py"
 PROTOCOL_DOC = REPO_ROOT / "docs" / "protocol_perf_regression.md"
 CI_CD_DOC = REPO_ROOT / "docs" / "ci_cd.md"
 MESH_BASELINE = REPO_ROOT / "tests" / "performance" / "mesh" / "baseline.md"
@@ -64,8 +67,27 @@ def check_workflow(text: str, failures: list[str]) -> None:
     require("workflow_call:" in text, "trusted reusable entry point required", failures)
     require("BENCH_BUILD_PROFILE: release" in text, "release profile required", failures)
     require("BENCH_MAX_CPU_STEAL_PERCENT: \"5.0\"" in text or "BENCH_MAX_CPU_STEAL_PERCENT: '5.0'" in text, "documented CPU steal threshold required", failures)
-    require("runner_health.json" in text, "machine-readable runner_health.json required", failures)
     require("runner_health_probes.jsonl" in text, "per-E2E runner health probes required", failures)
+    require(
+        "mesh_baseline_runner_health.py" in text,
+        "runner health capture must be wired to the approved automation script",
+        failures,
+    )
+    # The trusted Cross build policy refuses a new workflow that carries a
+    # dynamic executable surface. Inline interpreter bodies are exactly that:
+    # a heredoc program or an awk/bc one-liner is a command the static scan
+    # cannot resolve to a literal argument vector. Keep those computations in
+    # .github/scripts/ instead of reintroducing them here.
+    require(
+        re.search(r"(?<!<)<<(?!<)", text) is None,
+        "no inline heredoc programs in this workflow",
+        failures,
+    )
+    require(
+        not re.search(r"(?<![A-Za-z0-9_-])(awk|bc|gawk|mawk|perl|node|ruby)(?![A-Za-z0-9_.-])", text),
+        "no inline non-shell interpreters in this workflow",
+        failures,
+    )
     require("--check-acceptance" in text, "selected-suite acceptance step required", failures)
     require(
         "unsupported suites value" in text,
@@ -137,8 +159,48 @@ def check_scripts(failures: list[str]) -> None:
     require(SUMMARY_SCRIPT.is_file(), "summary script missing", failures)
     require(WORKFLOW_PATH.is_file(), "workflow missing", failures)
 
+    require(LEDGER_SCRIPT.is_file(), "suite command ledger script missing", failures)
+    require(HEALTH_SCRIPT.is_file(), "runner health script missing", failures)
+    require(STEP_SUMMARY_SCRIPT.is_file(), "step summary script missing", failures)
+
     provenance = PROVENANCE_SCRIPT.read_text(encoding="utf-8")
     require("ubuntu-24.04" in provenance, "provenance default runner class must be ubuntu-24.04", failures)
+
+    ledger = LEDGER_SCRIPT.read_text(encoding="utf-8")
+    require(
+        'SUPPORTED_SUITES = ("all", "mesh", "hbone", "dns")' in ledger,
+        "ledger suite allowlist must be all|mesh|hbone|dns",
+        failures,
+    )
+    require(
+        "BENCH_ITERATIONS must be an integer from 3 to 5" in ledger,
+        "ledger must reject E2E repetition counts outside 3..5",
+        failures,
+    )
+    require(
+        "1kib_c50_30s" in ledger and "16kib_c50_30s" in ledger and "256kib_c100_60s" in ledger,
+        "ledger HBONE scenarios incomplete",
+        failures,
+    )
+    require(
+        all(bench in ledger for bench in ("authz_match", "ip_restriction", "slice_apply", "xds_translation")),
+        "ledger mesh benches incomplete",
+        failures,
+    )
+
+    health = HEALTH_SCRIPT.read_text(encoding="utf-8")
+    require("runner_health.json" in health, "machine-readable runner_health.json required", failures)
+    require("runner_health_probes.jsonl" in health, "per-E2E runner health probes required", failures)
+    require(
+        "BENCH_MAX_CPU_STEAL_PERCENT" in health,
+        "runner health script must honour the documented steal threshold",
+        failures,
+    )
+    require(
+        '["vmstat", "1", "6"]' in health and '["vmstat", "1", "3"]' in health,
+        "runner health sampling must use literal command vectors",
+        failures,
+    )
 
     summary = SUMMARY_SCRIPT.read_text(encoding="utf-8")
     require("repetition_evidence" in summary, "summarizer must expose repetition_evidence", failures)
@@ -219,6 +281,7 @@ jobs:
       - run: collect_mesh_baseline_provenance.py
       - run: summarize_mesh_baseline_results.py
       - run: runner_health.json runner_health_probes.jsonl
+      - run: python3 .github/scripts/mesh_baseline_runner_health.py --phase pre_collection
       - run: |
           case "${SUITES}" in
             all|mesh|hbone|dns) ;;
