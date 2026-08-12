@@ -24948,6 +24948,8 @@ mod tests {
                 topology: Default::default(),
             }),
             default_weight: 1,
+            max_stale_seconds: None,
+            stale_policy: None,
         });
         upstream.backend_tls_client_cert_path = Some("/existing/client.pem".to_string());
         upstream.backend_tls_client_key_path = Some("/existing/client.key".to_string());
@@ -25001,6 +25003,8 @@ mod tests {
                 topology: Default::default(),
             }),
             default_weight: 1,
+            max_stale_seconds: None,
+            stale_policy: None,
         });
 
         let runtime = MeshRuntimeConfig {
@@ -25048,6 +25052,8 @@ mod tests {
             consul: None,
             mesh: None,
             default_weight: 1,
+            max_stale_seconds: None,
+            stale_policy: None,
         });
 
         let runtime = MeshRuntimeConfig {
@@ -35997,6 +36003,8 @@ mod tests {
                 topology: Default::default(),
             }),
             default_weight: 1,
+            max_stale_seconds: None,
+            stale_policy: None,
         });
         let mut config = GatewayConfig {
             upstreams: vec![upstream],
@@ -36072,6 +36080,8 @@ mod tests {
                 topology: Default::default(),
             }),
             default_weight: 1,
+            max_stale_seconds: None,
+            stale_policy: None,
         });
         let mut config = GatewayConfig {
             upstreams: vec![upstream],

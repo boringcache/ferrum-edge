@@ -3411,6 +3411,18 @@
     "emission": "always"
   },
   {
+    "name": "ferrum_service_discovery_last_success_age_seconds_max",
+    "type": "gauge",
+    "help": "Maximum age in seconds of the staleness anchor across service-discovery tasks (task start when no snapshot has ever been published).",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "service_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
     "name": "ferrum_service_discovery_malformed_envelope_total",
     "type": "counter",
     "help": "Service-discovery Kubernetes EndpointSliceList envelopes rejected as malformed.",
@@ -3450,6 +3462,210 @@
     "name": "ferrum_service_discovery_shared_admission_rejected_total",
     "type": "counter",
     "help": "Service-discovery snapshots rejected by shared host/egress target admission.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "service_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_service_discovery_stale_expiries_total",
+    "type": "counter",
+    "help": "Service-discovery tasks whose last admitted snapshot crossed the configured staleness bound.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "service_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_service_discovery_stale_recoveries_total",
+    "type": "counter",
+    "help": "Service-discovery stale episodes cleared by a freshly admitted and published snapshot.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "service_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_service_discovery_stale_withdrawals_total",
+    "type": "counter",
+    "help": "Service-discovery stale episodes whose expiry policy withdrew discovered targets and retained static targets.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "service_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_service_discovery_task_panics_total",
+    "type": "counter",
+    "help": "Service-discovery pollers that exited unexpectedly instead of stopping cleanly.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "service_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_service_discovery_task_restarts_total",
+    "type": "counter",
+    "help": "Service-discovery pollers restarted by their supervisor after an unexpected exit.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "service_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_service_discovery_tasks",
+    "type": "gauge",
+    "help": "Service-discovery tasks currently supervised.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "service_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_service_discovery_tasks_crash_looping",
+    "type": "gauge",
+    "help": "Service-discovery tasks that exited unexpectedly repeatedly without an intervening published snapshot.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "service_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_service_discovery_tasks_kept_total",
+    "type": "counter",
+    "help": "Service-discovery tasks kept running across a config reconcile because their effective specification was unchanged.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "service_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_service_discovery_tasks_never_succeeded",
+    "type": "gauge",
+    "help": "Service-discovery tasks that have never published an admitted snapshot.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "service_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_service_discovery_tasks_readiness_failing",
+    "type": "gauge",
+    "help": "Stale service-discovery tasks failing readiness by policy or because withdrawal publication is still retrying.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "service_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_service_discovery_tasks_replaced_total",
+    "type": "counter",
+    "help": "Service-discovery tasks replaced across a config reconcile because their effective specification changed.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "service_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_service_discovery_tasks_restarting",
+    "type": "gauge",
+    "help": "Service-discovery tasks waiting out a restart backoff after an unexpected poller exit.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "service_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_service_discovery_tasks_running",
+    "type": "gauge",
+    "help": "Service-discovery tasks whose poller is running.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "service_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_service_discovery_tasks_stale",
+    "type": "gauge",
+    "help": "Service-discovery tasks whose last admitted snapshot is older than the configured staleness bound.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "service_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_service_discovery_tasks_started_total",
+    "type": "counter",
+    "help": "Service-discovery tasks started for newly configured upstreams.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "service_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_service_discovery_tasks_stopped_total",
+    "type": "counter",
+    "help": "Service-discovery tasks stopped because their upstream no longer configures service discovery.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "service_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_service_discovery_tasks_withdrawn",
+    "type": "gauge",
+    "help": "Service-discovery tasks whose discovered targets are currently withdrawn by the staleness policy.",
     "labels": [
       "namespace"
     ],

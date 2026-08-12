@@ -2052,6 +2052,13 @@ async fn handle_admin_request_inner(
         let jwks_now = tokio::time::Instant::now();
         let jwks_ready = jwks_trust.ready(jwks_now);
         let jwks_degraded = jwks_trust.degraded(jwks_now);
+        // Service-discovery task lifecycle and bounded staleness (issues #3717 /
+        // #3721). Readiness fails for an explicit `fail_readiness` policy and
+        // while a default fail-closed withdrawal is still retrying publication.
+        // A crash-looping, restarting, or successfully withdrawn task only
+        // degrades coarse health.
+        let discovery_health = crate::service_discovery::health::coarse_aggregate();
+        let discovery_ready = discovery_health.ready();
         // Bounded last-known-good DP configuration age (issue #3726). `None`
         // outside DP mode, so no other mode's readiness changes. Evaluating
         // here (rather than reading a cached bit) keeps the probe exact at the
@@ -2081,6 +2088,7 @@ async fn handle_admin_request_inner(
         let ready = startup_ready
             && !serving_degraded
             && jwks_ready
+            && discovery_ready
             && !dp_config_stale
             && !gateway_listeners_not_ready;
         health_status["ready"] = json!(ready);
@@ -2101,6 +2109,9 @@ async fn handle_admin_request_inner(
             health_status["dp_config"] = serde_json::to_value(freshness).unwrap_or_default();
         }
         if jwks_degraded && jwks_ready {
+            health_status["status"] = json!("degraded");
+        }
+        if discovery_health.degraded() && discovery_ready {
             health_status["status"] = json!("degraded");
         }
 
@@ -2276,6 +2287,15 @@ async fn handle_admin_request_inner(
                     .unwrap_or_default();
             // Fixed-cardinality active-remote JWKS trust health only — never
             // URLs, kids, tokens, claims, or key material (issue #3739).
+            // Per-upstream discovery lifecycle detail (issues #3717 / #3721).
+            // Upstream identity is operator-configured, so it stays inside the
+            // authenticated tier; every other field is a count, an age, or a
+            // closed-set token — never a registry URL, token, or payload.
+            if crate::service_discovery::health::has_tasks() {
+                health_status["service_discovery"] =
+                    serde_json::to_value(crate::service_discovery::health::snapshot())
+                        .unwrap_or_default();
+            }
             health_status["jwks_trust"] = json!({
                 "fresh": jwks_trust.fresh,
                 "grace": jwks_trust.grace,
@@ -2299,20 +2319,23 @@ async fn handle_admin_request_inner(
             // previously-ready dependency, so it shares `unavailable`. So does
             // a DP whose applied configuration aged past its bound (#3726): it
             // started ready and lost its authority, which is not "starting".
+            // A discovery task with fail-readiness policy, or a failed
+            // fail-closed withdrawal publication, is likewise unavailable.
             // A dynamic Gateway listener failure is recoverable and partial:
             // healthy listeners are still serving and the next retry can clear
             // it. When an operator opted into failing readiness on it, the
             // status stays `degraded` rather than becoming `unavailable`, so a
             // recoverable partial outage is never reported as a lost
             // dependency.
-            health_status["status"] =
-                json!(if serving_degraded || !jwks_ready || dp_config_stale {
+            health_status["status"] = json!(
+                if serving_degraded || !jwks_ready || !discovery_ready || dp_config_stale {
                     "unavailable"
                 } else if gateway_listeners_not_ready {
                     "degraded"
                 } else {
                     "starting"
-                });
+                }
+            );
             StatusCode::SERVICE_UNAVAILABLE
         } else {
             StatusCode::OK
