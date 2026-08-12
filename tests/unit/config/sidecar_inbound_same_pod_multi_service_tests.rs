@@ -161,7 +161,10 @@ fn assert_slice_validates_as_mesh_config(slice: &MeshSlice) {
 
 fn assert_inbound_is_empty(slice: &MeshSlice, reason: &str) {
     assert_eq!(
-        slice.local_inbound_workloads.as_deref().map(Vec::len),
+        slice
+            .local_inbound_workloads
+            .as_deref()
+            .map(|workloads| workloads.len()),
         Some(0),
         "{reason}"
     );
