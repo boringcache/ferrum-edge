@@ -123,8 +123,8 @@ pub fn read_mesh_config_document(
     let content = read_stable_file(path, options)
         .map_err(|error| stable_file_error_anyhow(path, options, error))?;
 
-    // Extension first; unknown/extensionless paths sniff once so a large
-    // document is not fully parsed twice merely to detect format.
+    // Extension first; unknown/extensionless paths use YAML, which also admits
+    // JSON without a separate full-document detection parse.
     let is_yaml = detect_json_or_yaml_extension(path, &content);
 
     let document: MeshFileDocument = if is_yaml {

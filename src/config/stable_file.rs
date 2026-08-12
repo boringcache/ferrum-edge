@@ -371,10 +371,13 @@ pub fn stable_file_error_anyhow(
     }
 }
 
-/// Select JSON vs YAML from a file extension, falling back to a single-byte
-/// sniff for extensionless/unknown paths so large documents are not parsed
-/// twice just to detect format.
-pub fn detect_json_or_yaml_extension(path: &Path, content: &str) -> bool {
+/// Select JSON vs YAML from a file extension.
+///
+/// Unknown or extensionless paths use YAML. JSON is a YAML subset, so this
+/// preserves the historical acceptance of both JSON documents and YAML flow
+/// mappings without parsing a large document once for detection and again for
+/// deserialization.
+pub fn detect_json_or_yaml_extension(path: &Path, _content: &str) -> bool {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -383,11 +386,6 @@ pub fn detect_json_or_yaml_extension(path: &Path, content: &str) -> bool {
     match ext.as_str() {
         "yaml" | "yml" => true,
         "json" => false,
-        _ => {
-            let trimmed = content.trim_start();
-            // JSON objects/arrays are also valid YAML; prefer JSON when the
-            // document clearly starts that way so unknown extensions parse once.
-            !(trimmed.starts_with('{') || trimmed.starts_with('['))
-        }
+        _ => true,
     }
 }

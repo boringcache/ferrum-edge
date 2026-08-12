@@ -232,9 +232,10 @@ fn mesh_file_at_documented_ceiling_constant_is_admitted_by_stable_reader() {
 }
 
 #[test]
-fn unknown_extension_json_object_parses_once_as_json() {
-    // Extensionless/unknown paths that start with `{` must take the JSON path
-    // without a prior full YAML probe parse.
+fn unknown_extension_json_object_parses_once_through_yaml_superset() {
+    // Unknown paths use the YAML parser directly. JSON remains accepted because
+    // it is a YAML subset, and YAML flow mappings retain their historical
+    // behavior instead of being misclassified as strict JSON.
     let json = serde_json::json!({
         "mesh": {
             "services": [{
@@ -252,6 +253,14 @@ fn unknown_extension_json_object_parses_once_as_json() {
     let slice = load_mesh_slice_from_file(file.path(), request_for_namespace("ferrum"))
         .expect("JSON-shaped unknown extension");
     assert_eq!(slice.services.len(), 1);
+
+    let flow_yaml = write_temp(
+        "unknown",
+        "{mesh: {services: [{name: api, namespace: ferrum, ports: [{port: 80, protocol: http}]}]}}",
+    );
+    let flow_slice = load_mesh_slice_from_file(&flow_yaml, request_for_namespace("ferrum"))
+        .expect("YAML flow mapping with unknown extension");
+    assert_eq!(flow_slice.services.len(), 1);
 }
 
 #[test]

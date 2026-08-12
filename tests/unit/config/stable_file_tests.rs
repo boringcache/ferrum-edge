@@ -95,14 +95,18 @@ fn invalid_utf8_is_rejected_without_byte_leakage() {
 }
 
 #[test]
-fn detect_format_sniffs_unknown_extensions_once() {
+fn detect_format_preserves_yaml_superset_for_unknown_extensions() {
     assert!(detect_json_or_yaml_extension(
         Path::new("mesh.unknown"),
         "mesh:\n  services: []\n"
     ));
-    assert!(!detect_json_or_yaml_extension(
+    assert!(detect_json_or_yaml_extension(
         Path::new("mesh.unknown"),
         "{\"mesh\":{}}"
+    ));
+    assert!(detect_json_or_yaml_extension(
+        Path::new("mesh.unknown"),
+        "{mesh: {services: []}}"
     ));
     assert!(detect_json_or_yaml_extension(
         Path::new("a.yaml"),

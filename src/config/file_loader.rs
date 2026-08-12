@@ -151,8 +151,8 @@ pub fn load_config_from_file(
     }
 
     let content = read_stable_config_file(file_path)?;
-    // Extension first; unknown/extensionless paths sniff once (JSON object/array
-    // marker) so large documents are not parsed twice merely to detect format.
+    // Extension first; unknown/extensionless paths use YAML, which also admits
+    // JSON without a separate full-document detection parse.
     let is_yaml = detect_json_or_yaml_extension(file_path, &content);
 
     if is_yaml {
