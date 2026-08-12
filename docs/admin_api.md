@@ -669,6 +669,15 @@ accepted on the next control-plane poll cycle
 restart, and certificate/key generations are never mixed because the resources
 and the trust side channel publish from one snapshot.
 
+An explicit `DELETE` is different from a rotation that merely drops an entry:
+the process that accepts the revocation withdraws the record from its own live
+configuration before answering `204`, so it never keeps serving — or reporting
+on `/gateway-trust/status` — trust it has already revoked while waiting for a
+poll tick. The row is gone from the store by then, so no later poll can bring it
+back, and other replicas converge on their own next cycle as usual. Writes stay
+poll-driven: a `POST`/`PUT` becomes live only once the poller has validated and
+published the authoritative snapshot.
+
 **Status payload.** `GET /gateway-trust/status` returns the trust domain,
 authority counts, this namespace's **live published** revision, timestamps, a bounded
 failure-reason enum (`none`, `invalid_material`, `undecodable`,
@@ -685,8 +694,10 @@ secret/provider URIs. `configured` and `bundle` describe the generation that
 actually reached that swap, not the newest database row: a freshly committed
 candidate remains absent/at the prior revision until the poller validates and
 publishes it, and a rejected candidate never replaces the reported
-last-known-good generation. Use the CRUD endpoints to inspect persisted
-candidate state.
+last-known-good generation. An accepted `DELETE` is the one transition that is
+reflected immediately on the accepting process, because withdrawal is the
+fail-closed direction. Use the CRUD endpoints to inspect persisted candidate
+state.
 
 See [CP/DP mode](cp_dp_mode.md#the-gateway_trust_bundles-resource-issue-3727)
 for the storage shape, propagation semantics, precedence rule, and metrics.
