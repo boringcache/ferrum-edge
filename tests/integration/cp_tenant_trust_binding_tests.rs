@@ -2354,9 +2354,7 @@ fn trust_bundle_reject_reasons_are_a_closed_bounded_label_set() {
     assert_eq!(labels.len(), reasons.len(), "labels must be distinct");
     for label in labels {
         assert!(
-            label
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c == '_'),
+            label.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
             "{label} is not a metric-safe label"
         );
     }

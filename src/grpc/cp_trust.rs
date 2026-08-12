@@ -444,14 +444,15 @@ impl PinnedTrustBundleSource {
                     if let Some(file_name) = bundle_path.file_name() {
                         let dir = open_projected_generation_dir(&data_link)?;
                         if let Ok(file) = open_at_nofollow(&dir, file_name) {
-                            let raw = read_open_file_bounded(file, &subject, TRUST_BUNDLE_MAX_BYTES)
-                                .and_then(|raw| decode_trust_utf8(raw, &subject))
-                                .map_err(|detail| {
-                                    TrustBundleLoadError::new(
-                                        TrustBundleRejectReason::DocumentUnreadable,
-                                        detail,
-                                    )
-                                })?;
+                            let raw =
+                                read_open_file_bounded(file, &subject, TRUST_BUNDLE_MAX_BYTES)
+                                    .and_then(|raw| decode_trust_utf8(raw, &subject))
+                                    .map_err(|detail| {
+                                        TrustBundleLoadError::new(
+                                            TrustBundleRejectReason::DocumentUnreadable,
+                                            detail,
+                                        )
+                                    })?;
                             return Ok(Self {
                                 generation: PinnedSourceGeneration::Projected {
                                     dir,
