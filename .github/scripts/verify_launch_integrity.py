@@ -12,8 +12,7 @@ The caller (`.github/workflows/launch-integrity.yml`) runs on
 `pull_request_target` / `merge_group`, checks out the *trusted base*, and loads
 this file from a pinned trusted-base commit. Candidate content is extracted
 with `git show` into a confined directory and is only ever read as inert data:
-nothing from the candidate is imported, executed, or evaluated. The candidate
-checker is parsed with `ast.parse`, which never runs module code.
+nothing from the candidate is imported, executed, or evaluated.
 
 Two roots are supplied:
 
@@ -26,23 +25,46 @@ is ever joined into a filesystem path:
 
     <root>/check_launch_readiness.py
     <root>/verify_launch_integrity.py
+    <root>/verify_launch_advisory_trust.py
     <root>/launch-blocker-policy.json
     <root>/launch-exemptions.json
     <root>/PRODUCTION_READINESS.md
     <root>/CODEOWNERS
-    <root>/launch-integrity.yml
     <root>/workflows/<workflow file>
     <root>/tree.txt
 
 A slot file that is absent means the path is absent from that commit, which is
 how deletion and renaming are detected. Everything else fails closed: an
 unreadable, unparsable, or unexpected input is an error, never a pass.
+
+Permission model
+----------------
+Executable launch-governance code — the checker, the release/readiness/
+integrity/advisory-trust workflows, this verifier, and the advisory-trust
+verifier — is **byte-frozen to the trusted base**. There is no semantic
+permission layer for those files, because no source or YAML heuristic can prove
+that arbitrary executable gate code is still equivalent to what was reviewed: a
+prepended `return 0`, an early `sys.exit(0)`, or an inserted unconditional
+branch leaves the original body and any required marker strings intact but
+unreachable. Byte identity is the only property that survives that class of
+rewrite, so it is the property enforced.
+
+Changing an anchored file is therefore an administrative trusted-base update
+(auditable bypass plus an immediate post-merge run on `main`), not an ordinary
+pull request. A pull request whose branch predates such an update must merge
+latest `main` before this check can go green.
+
+What is still validated semantically is exactly the data a candidate is
+*supposed* to edit: the blocker policy, the exemption list, the readiness
+document snapshot markers, and the CODEOWNERS map. Workflow enumeration
+(check-run producer identity and advisory-secret exposure) is retained as
+defense in depth over the *whole* workflow directory, including workflows a
+candidate adds; it is not the permission model for the anchored files.
 """
 
 from __future__ import annotations
 
 import argparse
-import ast
 import json
 import re
 import sys
@@ -57,6 +79,7 @@ from typing import Any, Iterable
 
 CHECKER_PATH = "scripts/check_launch_readiness.py"
 VERIFIER_PATH = ".github/scripts/verify_launch_integrity.py"
+ADVISORY_VERIFIER_PATH = ".github/scripts/verify_launch_advisory_trust.py"
 POLICY_PATH = "docs/launch-blocker-policy.json"
 EXEMPTIONS_PATH = "docs/launch-exemptions.json"
 DOCUMENT_PATH = "PRODUCTION_READINESS.md"
@@ -64,11 +87,13 @@ CODEOWNERS_PATH = ".github/CODEOWNERS"
 READINESS_WORKFLOW = ".github/workflows/launch-readiness.yml"
 INTEGRITY_WORKFLOW = ".github/workflows/launch-integrity.yml"
 RELEASE_WORKFLOW = ".github/workflows/release.yml"
+ADVISORY_WORKFLOW = ".github/workflows/launch-advisory-trust.yml"
 
 # Slot name -> repository path. Slots are flat file names inside a root.
 FILE_SLOTS = {
     "checker": CHECKER_PATH,
     "verifier": VERIFIER_PATH,
+    "advisory_verifier": ADVISORY_VERIFIER_PATH,
     "policy": POLICY_PATH,
     "exemptions": EXEMPTIONS_PATH,
     "document": DOCUMENT_PATH,
@@ -77,10 +102,14 @@ FILE_SLOTS = {
 SLOT_FILENAMES = {
     "checker": "check_launch_readiness.py",
     "verifier": "verify_launch_integrity.py",
+    "advisory_verifier": "verify_launch_advisory_trust.py",
     "policy": "launch-blocker-policy.json",
     "exemptions": "launch-exemptions.json",
     "document": "PRODUCTION_READINESS.md",
     "codeowners": "CODEOWNERS",
+}
+PATH_BY_SLOT_FILENAME = {
+    filename: FILE_SLOTS[slot] for slot, filename in SLOT_FILENAMES.items()
 }
 
 # Deleting or renaming any of these is an integrity failure on its own.
@@ -96,9 +125,26 @@ PROTECTED_PATHS = (
     RELEASE_WORKFLOW,
 )
 
-# The candidate may not edit the anchor that judges it. Changing either file
-# requires a trusted-base update rather than an ordinary pull request.
-ANCHOR_PATHS = (VERIFIER_PATH, INTEGRITY_WORKFLOW)
+# --- byte-frozen executable gate code ---------------------------------------
+#
+# `(slot, required)` / `(workflow filename, required)`. A *required* anchor must
+# exist on the trusted base: a base that cannot supply it is an incomplete
+# extraction, which fails closed rather than silently skipping enforcement. An
+# *optional* anchor is one a sibling change is still landing (issue #3802's
+# advisory-trust lane); it is unfrozen only while the trusted base also lacks
+# it, and becomes a hard anchor — deletion and byte changes both rejected — the
+# moment the base carries it.
+ANCHOR_FILE_SLOTS = (
+    ("verifier", True),
+    ("checker", True),
+    ("advisory_verifier", False),
+)
+ANCHOR_WORKFLOWS = (
+    ("launch-integrity.yml", True),
+    ("launch-readiness.yml", True),
+    ("release.yml", True),
+    ("launch-advisory-trust.yml", False),
+)
 
 # Required check contexts, keyed by the workflow file that must own them. A
 # candidate may not move, duplicate, or re-home a required check name: the
@@ -120,8 +166,14 @@ CODEOWNERS_GOVERNED_PATHS = (
     "/.github/scripts/verify_launch_integrity.py",
     "/.github/CODEOWNERS",
 )
+# Governed only once the repository actually carries the file, so the
+# advisory-trust lane can land in either merge order.
+CODEOWNERS_OPTIONAL_GOVERNED_PATHS = {
+    "/.github/workflows/launch-advisory-trust.yml": ADVISORY_WORKFLOW,
+    "/.github/scripts/verify_launch_advisory_trust.py": ADVISORY_VERIFIER_PATH,
+}
 
-# --- checker source contract ----------------------------------------------
+# --- blocker-policy contract (candidate-editable data) ----------------------
 
 REQUIRED_STATE_MACHINE = {
     "open": "blocking",
@@ -131,207 +183,46 @@ REQUIRED_STATE_MACHINE = {
     "closed_other": "blocking",
     "exempted": "cleared_for_listed_tiers",
 }
-REQUIRED_CHECKER_CONSTANTS: dict[str, Any] = {
-    "SEVERITIES": ("critical", "high", "medium"),
-    "VERDICTS": ("PASS", "FAIL", "UNKNOWN"),
-    "ADVISORY_STATES": ("triage", "draft", "published", "closed", "withdrawn"),
-    "ADVISORY_SEVERITIES": ("critical", "high", "medium", "low"),
-    "REQUIRED_STATE_MACHINE": REQUIRED_STATE_MACHINE,
-    "BELOW_TIER": "below_tier",
-    "REQUIRED_CLOSED_COMPLETED_REASONS": ("completed",),
-    "REQUIRED_CLOSED_OTHER_REASONS": ("not_planned", "duplicate", None),
-    "REQUIRED_NEVER_EMIT_FIELDS": (
-        "summary",
-        "description",
-        "ghsa_id",
-        "cve_id",
-        "html_url",
-        "url",
-        "vulnerabilities",
-        "identifiers",
-        "cvss",
-        "cwes",
-        "credits",
-    ),
-    "BANNED_OUTPUT_TOKENS": (
-        "ghsa_id",
-        "GHSA-",
-        "cve_id",
-        "CVE-",
-        "html_url",
-        "vulnerabilities",
-        "identifiers",
-        "credits",
-        "cvss",
-        "cwes",
-    ),
-    "FORBIDDEN_POLICY_KEYS": (
-        "opaque_input",
-        "redacted_blocking_count",
-        "as_of",
-        "private_blocker_count",
-    ),
-    "API_ORIGIN": "https://api.github.com/",
-}
 
-# Integer constants spelled as arithmetic (`1 << 20`) rather than as literals.
-REQUIRED_CHECKER_NUMBERS = {
-    "MAX_RESPONSE_BYTES": 1 << 20,
-    "PER_PAGE": 100,
-}
-
-# Ceilings, not tunables: the candidate may tighten them and never loosen them,
-# and may never exceed the frozen ceiling even if the trusted base did.
-CHECKER_CEILINGS = {
-    "MAX_FALLBACK_AGE_SECONDS": 30 * 24 * 60 * 60,
-    "MAX_FALLBACK_COUNT": 100000,
-    "MAX_PAGES": 50,
-}
-
-REQUIRED_CHECKER_FUNCTIONS = (
-    "validate_policy",
-    "validate_private_advisory_policy",
-    "validate_exemptions",
-    "severity_from_labels",
-    "classify_issue",
-    "blocking_classifications",
-    "issue_public_summary",
-    "fetch_advisories",
-    "count_private_blockers",
-    "resolve_trusted_fallback",
-    "resolve_private_blockers",
-    "compute_verdict",
-    "build_evaluation",
-    "unknown_evaluation",
-    "evaluate_live",
-    "extract_document_claim",
-    "assert_document_historical_separation",
-    "verify_claim_against_evaluation",
-    "safe_summary_text",
-    "print_safe_summary",
-    "resolve_checked_out_sha",
-    "http_get_json",
-    "paginate",
-    "verify_errors",
-    "verify_exit_code",
-    "run_verify",
-    "run_self_test",
-    "main",
+# Advisory evidence that must never be checked in: a pull-request-controlled
+# count is not evidence.
+FORBIDDEN_POLICY_KEYS = (
+    "opaque_input",
+    "redacted_blocking_count",
+    "as_of",
+    "private_blocker_count",
 )
 
-# A candidate may not widen the checker's dependency surface: a new import is
-# how an evaluator grows an exfiltration or shell-out path.
-ALLOWED_CHECKER_IMPORTS = frozenset(
-    {
-        "__future__",
-        "argparse",
-        "json",
-        "os",
-        "re",
-        "sys",
-        "urllib",
-        "urllib.error",
-        "urllib.parse",
-        "urllib.request",
-        "dataclasses",
-        "datetime",
-        "pathlib",
-        "typing",
-    }
+# Confidential advisory fields the policy must keep listed as never-emitted.
+REQUIRED_NEVER_EMIT_FIELDS = (
+    "summary",
+    "description",
+    "ghsa_id",
+    "cve_id",
+    "html_url",
+    "url",
+    "vulnerabilities",
+    "identifiers",
+    "cvss",
+    "cwes",
+    "credits",
 )
 
-# Behavioural text each evaluator function must still carry. These are the
-# exact fail-closed decisions an "always PASS" rewrite has to delete.
-REQUIRED_FUNCTION_MARKERS = {
-    "compute_verdict": ('"UNKNOWN"', '"FAIL"', '"PASS"'),
-    "verify_errors": ('evaluation.verdict != "PASS"', "errors.append"),
-    "verify_exit_code": ("verify_errors(", "return 1 if"),
-    "run_verify": ("verify_errors(", "return 1 if errors else 0"),
-    "run_self_test": ("failures", "return 1"),
-    "main": ("run_self_test()", "run_verify(", "return 1"),
-    "resolve_trusted_fallback": ("GateError", "max_age_seconds"),
-    "resolve_private_blockers": ("token_env", "resolve_trusted_fallback("),
-}
+# A ceiling, not a tunable: the policy may tighten it and never loosen it.
+MAX_FALLBACK_AGE_SECONDS_CEILING = 30 * 24 * 60 * 60
 
-# Adversarial fixtures the candidate self-test corpus must keep. Deleting a row
-# here is how "checker and tests weakened together" starts.
-REQUIRED_SELF_TEST_CASES = (
-    "base policy validates",
-    "repository policy validates",
-    "repository exemptions validate",
-    "state machine downgrade",
-    "in-flight clears blocker",
-    "merged clears blocker",
-    "duplicate counted as completed",
-    "severity label coverage",
-    "never_emit incomplete",
-    "fallback age ceiling",
-    "advisories disabled",
-    "checked-in private count",
-    "security-events sufficiency claim",
-    "tracked critical fails",
-    "labeled blocker fails",
-    "open PR does not clear",
-    "closed completed clears",
-    "expired exemption blocks",
-    "fresh external positive fails",
-    "fresh external zero clears",
-    "live draft advisory fails",
-    "no advisory identifier emitted",
-    "issue API failure is UNKNOWN",
-    "missing issue token is UNKNOWN",
-    "unscoped clean claim rejected",
-    "missing git dir fails closed",
-    "non-GitHub request refused",
-    "pagination rejects truncation",
-)
-MIN_SELF_TEST_CHECKS = 80
-
-# --- workflow contract ------------------------------------------------------
-
-READINESS_JOB = "launch-readiness"
-READINESS_JOB_NAME = "Launch Readiness Gate"
-INTEGRITY_JOB_NAME = "Launch Readiness Integrity"
-RELEASE_GATE_JOB = "validate-launch-readiness"
-
-# Byte-frozen lines (compared after stripping indentation). Each encodes a
-# decision that cannot be re-spelled without review: which commit is evaluated,
-# and that a privileged advisory token is never handed to candidate-triggered
-# runs.
-READINESS_FROZEN_LINES = (
-    "ref: ${{ github.event_name == 'pull_request' && "
-    "github.event.pull_request.head.sha || github.event_name == 'merge_group' "
-    "&& github.event.merge_group.head_sha || github.sha }}",
-    "LAUNCH_TARGET_SHA: ${{ github.event_name == 'pull_request' && "
-    "github.event.pull_request.head.sha || github.event_name == 'merge_group' "
-    "&& github.event.merge_group.head_sha || github.sha }}",
-    "LAUNCH_ADVISORY_READ_TOKEN: ${{ (github.event_name != 'pull_request' && "
-    "github.event_name != 'merge_group') && "
-    "secrets.LAUNCH_ADVISORY_READ_TOKEN || '' }}",
-    "persist-credentials: false",
-    "run: python3 -I scripts/check_launch_readiness.py --self-test",
-    "run: python3 -I scripts/check_launch_readiness.py --verify --verify-checkout",
-)
-READINESS_REQUIRED_EVENTS = (
-    "pull_request",
-    "merge_group",
-    "push",
-    "schedule",
-    "workflow_dispatch",
-)
-RELEASE_FROZEN_LINES = (
-    "run: python3 -I scripts/check_launch_readiness.py --self-test",
-    "run: python3 -I scripts/check_launch_readiness.py --verify --require-pass",
-)
-INTEGRITY_REQUIRED_EVENTS = ("pull_request_target", "merge_group")
+# --- workflow scan (defense in depth) ---------------------------------------
 
 ADVISORY_SECRET = "secrets.LAUNCH_ADVISORY_READ_TOKEN"
-CANDIDATE_TRIGGERED_EVENTS = (
-    "pull_request",
-    "pull_request_target",
-    "merge_group",
-    "workflow_run",
-    "issue_comment",
+# The privileged advisory credential may be referenced only by workflows that
+# are themselves byte-frozen anchors. Any other workflow — including one a
+# candidate adds — referencing it is a finding.
+ADVISORY_SECRET_HOLDERS = frozenset(
+    {
+        "launch-readiness.yml",
+        "release.yml",
+        "launch-advisory-trust.yml",
+    }
 )
 
 WORKFLOW_FILENAME_RE = re.compile(r"^[A-Za-z0-9._+@~ -]+\.(?:yml|yaml)$")
@@ -406,65 +297,6 @@ def read_optional(path: Path, label: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 
-def declared_events(workflow: str) -> set[str]:
-    """Return the top-level `on:` event names of a block-style workflow."""
-
-    lines = workflow.splitlines()
-    headers = [index for index, line in enumerate(lines) if line.rstrip() == "on:"]
-    if len(headers) != 1:
-        return set()
-    start = headers[0]
-    end = next(
-        (
-            index
-            for index in range(start + 1, len(lines))
-            if re.match(r"^[A-Za-z0-9_-]+:", lines[index])
-        ),
-        len(lines),
-    )
-    events: set[str] = set()
-    for line in lines[start + 1 : end]:
-        match = re.match(r"^  ([A-Za-z0-9_-]+):", line)
-        if match:
-            events.add(match.group(1))
-    return events
-
-
-def event_body(workflow: str, event: str) -> str | None:
-    lines = workflow.splitlines(keepends=True)
-    headers = [
-        index for index, line in enumerate(lines) if line.rstrip("\r\n") == "on:"
-    ]
-    if len(headers) != 1:
-        return None
-    start = headers[0]
-    end = next(
-        (
-            index
-            for index in range(start + 1, len(lines))
-            if re.match(r"^[A-Za-z0-9_-]+:", lines[index])
-        ),
-        len(lines),
-    )
-    event_headers = [
-        index
-        for index in range(start + 1, end)
-        if lines[index].rstrip("\r\n") == f"  {event}:"
-    ]
-    if len(event_headers) != 1:
-        return None
-    event_start = event_headers[0]
-    event_end = next(
-        (
-            index
-            for index in range(event_start + 1, end)
-            if re.match(r"^  [A-Za-z0-9_-]+:", lines[index])
-        ),
-        end,
-    )
-    return "".join(lines[event_start + 1 : event_end])
-
-
 def job_blocks(workflow: str) -> dict[str, str]:
     """Split `jobs:` into `job id -> block text` for a block-style workflow."""
 
@@ -502,31 +334,6 @@ def job_display_name(job_id: str, block: str) -> str:
     return match.group(1).strip().strip("'\"")
 
 
-def job_needs(block: str) -> set[str]:
-    scalar = re.search(r"(?m)^    needs:[ \t]*([A-Za-z0-9_-]+)[ \t]*$", block)
-    if scalar:
-        return {scalar.group(1)}
-    flow = re.search(r"(?m)^    needs:[ \t]*\[(?P<items>[^\]]*)\][ \t]*$", block)
-    if flow:
-        return {
-            item.strip().strip("'\"")
-            for item in flow.group("items").split(",")
-            if item.strip()
-        }
-    listed = re.search(r"(?m)^    needs:[ \t]*\n(?P<items>(?:^      - [^\n]+\n)+)", block)
-    if listed:
-        return {
-            line.strip().removeprefix("- ").strip().strip("'\"")
-            for line in listed.group("items").splitlines()
-            if line.strip().startswith("- ")
-        }
-    return set()
-
-
-def stripped_lines(text: str) -> set[str]:
-    return {line.strip() for line in text.splitlines()}
-
-
 def non_comment_text(text: str) -> str:
     """Drop `#` comments so prose about a check name is not read as YAML."""
 
@@ -534,70 +341,8 @@ def non_comment_text(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Candidate checker source contract
+# Policy, exemptions, document
 # ---------------------------------------------------------------------------
-
-
-def module_constants(tree: ast.Module) -> dict[str, ast.expr]:
-    values: dict[str, ast.expr] = {}
-    for node in tree.body:
-        if isinstance(node, ast.Assign):
-            for target in node.targets:
-                if isinstance(target, ast.Name):
-                    values[target.id] = node.value
-        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-            if node.value is not None:
-                values[node.target.id] = node.value
-    return values
-
-
-def literal(node: ast.expr) -> Any:
-    try:
-        return ast.literal_eval(node)
-    except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
-        return _UNREADABLE
-
-
-class _Unreadable:
-    def __repr__(self) -> str:  # pragma: no cover - diagnostic only
-        return "<unreadable>"
-
-
-_UNREADABLE = _Unreadable()
-
-
-def safe_number(node: ast.expr) -> int | None:
-    """Read an integer constant that may be spelled as plain arithmetic.
-
-    `MAX_FALLBACK_AGE_SECONDS = 30 * 24 * 60 * 60` and `1 << 20` are ordinary
-    declarations, but `ast.literal_eval` refuses them. Only integer literals
-    combined with a fixed operator set are accepted, so nothing is executed and
-    a computed value (a call, a name, a comprehension) stays unreadable.
-    """
-
-    if isinstance(node, ast.Constant):
-        if isinstance(node.value, int) and not isinstance(node.value, bool):
-            return node.value
-        return None
-    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
-        inner = safe_number(node.operand)
-        return None if inner is None else -inner
-    if isinstance(node, ast.BinOp):
-        left = safe_number(node.left)
-        right = safe_number(node.right)
-        if left is None or right is None:
-            return None
-        if isinstance(node.op, ast.Add):
-            return left + right
-        if isinstance(node.op, ast.Sub):
-            return left - right
-        if isinstance(node.op, ast.Mult):
-            return left * right
-        if isinstance(node.op, ast.LShift) and 0 <= right <= 64:
-            return left << right
-        if isinstance(node.op, ast.FloorDiv) and right != 0:
-            return left // right
-    return None
 
 
 def normalized(value: Any) -> Any:
@@ -608,221 +353,6 @@ def normalized(value: Any) -> Any:
     if isinstance(value, dict):
         return {key: normalized(item) for key, item in value.items()}
     return value
-
-
-def function_nodes(tree: ast.Module) -> dict[str, ast.AST]:
-    return {
-        node.name: node
-        for node in tree.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    }
-
-
-def effective_body(node: Any) -> list[ast.stmt]:
-    body = list(node.body)
-    if (
-        body
-        and isinstance(body[0], ast.Expr)
-        and isinstance(body[0].value, ast.Constant)
-        and isinstance(body[0].value.value, str)
-    ):
-        body = body[1:]
-    return body
-
-
-def returns_unconditional_success(node: Any) -> bool:
-    """Detect a body rewritten to an unconditional pass/zero/None result."""
-
-    body = effective_body(node)
-    if not body:
-        return True
-    if len(body) != 1:
-        return False
-    statement = body[0]
-    if isinstance(statement, ast.Pass):
-        return True
-    if isinstance(statement, ast.Return):
-        if statement.value is None:
-            return True
-        value = literal(statement.value)
-        if value is _UNREADABLE:
-            return False
-        # `1 == True` in Python, so success constants are matched by identity
-        # and type rather than by membership: `return 1` is a failure result.
-        if value is None or value is True:
-            return True
-        if isinstance(value, int) and not isinstance(value, bool) and value == 0:
-            return True
-        if isinstance(value, str) and value in ("PASS", ""):
-            return True
-        if isinstance(value, (list, tuple, dict, set)) and not value:
-            return True
-        return False
-    if isinstance(statement, ast.Expr):
-        call = statement.value
-        if (
-            isinstance(call, ast.Call)
-            and isinstance(call.func, ast.Attribute)
-            and call.func.attr == "exit"
-            and isinstance(call.func.value, ast.Name)
-            and call.func.value.id == "sys"
-            and len(call.args) == 1
-            and literal(call.args[0]) in (0, None)
-        ):
-            return True
-    return False
-
-
-def source_segment(source_lines: list[str], node: Any) -> str:
-    start = max(getattr(node, "lineno", 1) - 1, 0)
-    end = getattr(node, "end_lineno", start + 1)
-    return "".join(source_lines[start:end])
-
-
-def import_names(tree: ast.Module) -> set[str]:
-    names: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                names.add(alias.name)
-        elif isinstance(node, ast.ImportFrom):
-            names.add(node.module or "")
-    return names
-
-
-def checker_errors(candidate: str | None, base: str | None) -> list[str]:
-    errors: list[str] = []
-    if candidate is None:
-        return [f"{CHECKER_PATH} is missing from the candidate revision"]
-    try:
-        tree = ast.parse(candidate)
-    except SyntaxError as exc:
-        return [f"{CHECKER_PATH} does not parse: {exc.msg} (line {exc.lineno})"]
-    source_lines = candidate.splitlines(keepends=True)
-
-    # Module level must stay declarative. A top-level `sys.exit(0)` or any other
-    # statement could short-circuit every evaluation below it.
-    for node in tree.body:
-        if isinstance(
-            node,
-            (
-                ast.Import,
-                ast.ImportFrom,
-                ast.Assign,
-                ast.AnnAssign,
-                ast.FunctionDef,
-                ast.AsyncFunctionDef,
-                ast.ClassDef,
-            ),
-        ):
-            continue
-        if (
-            isinstance(node, ast.Expr)
-            and isinstance(node.value, ast.Constant)
-            and isinstance(node.value.value, str)
-        ):
-            continue
-        if isinstance(node, ast.If):
-            test = node.test
-            if (
-                isinstance(test, ast.Compare)
-                and isinstance(test.left, ast.Name)
-                and test.left.id == "__name__"
-                and len(test.comparators) == 1
-                and literal(test.comparators[0]) == "__main__"
-            ):
-                continue
-        errors.append(
-            f"{CHECKER_PATH} has a module-level statement on line "
-            f"{getattr(node, 'lineno', 0)} that can short-circuit evaluation"
-        )
-
-    unexpected = sorted(import_names(tree) - ALLOWED_CHECKER_IMPORTS)
-    for name in unexpected:
-        errors.append(f"{CHECKER_PATH} imports `{name}`, which is not in the contract")
-
-    constants = module_constants(tree)
-    for name, expected in REQUIRED_CHECKER_CONSTANTS.items():
-        if name not in constants:
-            errors.append(f"{CHECKER_PATH} no longer defines `{name}`")
-            continue
-        value = literal(constants[name])
-        if value is _UNREADABLE:
-            errors.append(f"{CHECKER_PATH} computes `{name}` instead of declaring it")
-            continue
-        if normalized(value) != normalized(expected):
-            errors.append(f"{CHECKER_PATH} changed the frozen contract value `{name}`")
-
-    for name, expected_number in REQUIRED_CHECKER_NUMBERS.items():
-        if name not in constants:
-            errors.append(f"{CHECKER_PATH} no longer defines `{name}`")
-            continue
-        if safe_number(constants[name]) != expected_number:
-            errors.append(f"{CHECKER_PATH} changed the frozen contract value `{name}`")
-
-    base_constants: dict[str, int | None] = {}
-    if base is not None:
-        try:
-            base_constants = {
-                name: safe_number(node)
-                for name, node in module_constants(ast.parse(base)).items()
-            }
-        except SyntaxError:
-            base_constants = {}
-    for name, ceiling in CHECKER_CEILINGS.items():
-        if name not in constants:
-            errors.append(f"{CHECKER_PATH} no longer defines `{name}`")
-            continue
-        value = safe_number(constants[name])
-        if value is None or value <= 0:
-            errors.append(f"{CHECKER_PATH} `{name}` is not a positive integer")
-            continue
-        if value > ceiling:
-            errors.append(f"{CHECKER_PATH} `{name}` exceeds the frozen ceiling")
-            continue
-        base_value = base_constants.get(name)
-        if base_value is not None and value > base_value:
-            errors.append(f"{CHECKER_PATH} `{name}` is looser than the trusted base")
-
-    functions = function_nodes(tree)
-    for name in REQUIRED_CHECKER_FUNCTIONS:
-        node = functions.get(name)
-        if node is None:
-            errors.append(f"{CHECKER_PATH} no longer defines `{name}()`")
-            continue
-        if returns_unconditional_success(node):
-            errors.append(f"{CHECKER_PATH} `{name}()` was reduced to an unconditional pass")
-    for name, markers in REQUIRED_FUNCTION_MARKERS.items():
-        node = functions.get(name)
-        if node is None:
-            continue
-        segment = source_segment(source_lines, node)
-        for marker in markers:
-            if marker not in segment:
-                errors.append(
-                    f"{CHECKER_PATH} `{name}()` no longer carries `{marker}`"
-                )
-
-    self_test = functions.get("run_self_test")
-    if self_test is not None:
-        segment = source_segment(source_lines, self_test)
-        assertions = segment.count("check(")
-        if assertions < MIN_SELF_TEST_CHECKS:
-            errors.append(
-                f"{CHECKER_PATH} self-test corpus shrank to {assertions} assertions "
-                f"(minimum {MIN_SELF_TEST_CHECKS})"
-            )
-        for case in REQUIRED_SELF_TEST_CASES:
-            if case not in segment:
-                errors.append(
-                    f"{CHECKER_PATH} self-test no longer covers `{case}`"
-                )
-    return errors
-
-
-# ---------------------------------------------------------------------------
-# Policy, exemptions, document
-# ---------------------------------------------------------------------------
 
 
 def load_json(text: str | None, path: str, errors: list[str]) -> Any:
@@ -867,7 +397,7 @@ def policy_errors(candidate_text: str | None, base_text: str | None) -> list[str
         if isinstance(loaded, dict):
             base = loaded
 
-    forbidden = contains_key(policy, REQUIRED_CHECKER_CONSTANTS["FORBIDDEN_POLICY_KEYS"])
+    forbidden = contains_key(policy, FORBIDDEN_POLICY_KEYS)
     if forbidden is not None:
         errors.append(
             f"{POLICY_PATH} carries pull-request-controlled advisory evidence "
@@ -934,7 +464,7 @@ def policy_errors(candidate_text: str | None, base_text: str | None) -> list[str
     ):
         errors.append(f"{POLICY_PATH} unpublished advisory states no longer block")
     never_emit = advisories.get("never_emit_fields")
-    required_never_emit = set(REQUIRED_CHECKER_CONSTANTS["REQUIRED_NEVER_EMIT_FIELDS"])
+    required_never_emit = set(REQUIRED_NEVER_EMIT_FIELDS)
     if not isinstance(never_emit, list) or not required_never_emit <= set(never_emit):
         errors.append(f"{POLICY_PATH} never_emit_fields dropped a confidential field")
     live_api = advisories.get("live_api")
@@ -952,7 +482,7 @@ def policy_errors(candidate_text: str | None, base_text: str | None) -> list[str
         if not isinstance(max_age, int) or isinstance(max_age, bool) or max_age <= 0:
             errors.append(f"{POLICY_PATH} fallback max_age_seconds is not a positive int")
         else:
-            if max_age > CHECKER_CEILINGS["MAX_FALLBACK_AGE_SECONDS"]:
+            if max_age > MAX_FALLBACK_AGE_SECONDS_CEILING:
                 errors.append(
                     f"{POLICY_PATH} fallback max_age_seconds exceeds the frozen ceiling"
                 )
@@ -1125,109 +655,8 @@ def document_errors(candidate_text: str | None, policy_text: str | None) -> list
 
 
 # ---------------------------------------------------------------------------
-# Workflow contracts
+# Workflow scan (defense in depth, not a permission model)
 # ---------------------------------------------------------------------------
-
-
-def readiness_workflow_errors(workflows: dict[str, str]) -> list[str]:
-    errors: list[str] = []
-    workflow = workflows.get("launch-readiness.yml")
-    if workflow is None:
-        return [f"{READINESS_WORKFLOW} is missing from the candidate revision"]
-    events = declared_events(workflow)
-    for event in READINESS_REQUIRED_EVENTS:
-        if event not in events:
-            errors.append(f"{READINESS_WORKFLOW} no longer runs on `{event}`")
-    push = event_body(workflow, "push")
-    if push is None or "main" not in push or 'v*' not in push:
-        errors.append(f"{READINESS_WORKFLOW} push trigger lost `main` or `v*` coverage")
-    for event in ("pull_request", "merge_group"):
-        body = event_body(workflow, event)
-        if body is not None and re.search(r"(?m)^    paths(?:-ignore)?:", body):
-            errors.append(f"{READINESS_WORKFLOW} path-filtered its `{event}` trigger")
-    lines = stripped_lines(workflow)
-    for frozen in READINESS_FROZEN_LINES:
-        if frozen not in lines:
-            errors.append(f"{READINESS_WORKFLOW} no longer carries `{frozen}`")
-    jobs = job_blocks(workflow)
-    block = jobs.get(READINESS_JOB)
-    if block is None:
-        errors.append(f"{READINESS_WORKFLOW} no longer defines jobs.{READINESS_JOB}")
-    else:
-        if job_display_name(READINESS_JOB, block) != READINESS_JOB_NAME:
-            errors.append(
-                f"{READINESS_WORKFLOW} jobs.{READINESS_JOB} must keep check name "
-                f"`{READINESS_JOB_NAME}`"
-            )
-        if re.search(r"(?m)^\s+contents:\s+write\s*$", block):
-            errors.append(f"{READINESS_WORKFLOW} grants contents: write")
-    if re.search(r"(?m)^\s+(?:contents|packages|id-token|actions):\s+write\s*$", workflow):
-        errors.append(f"{READINESS_WORKFLOW} grants a write permission")
-    return errors
-
-
-def release_workflow_errors(workflows: dict[str, str]) -> list[str]:
-    errors: list[str] = []
-    workflow = workflows.get("release.yml")
-    if workflow is None:
-        return [f"{RELEASE_WORKFLOW} is missing from the candidate revision"]
-    jobs = job_blocks(workflow)
-    gate = jobs.get(RELEASE_GATE_JOB)
-    if gate is None:
-        return errors + [
-            f"{RELEASE_WORKFLOW} no longer defines jobs.{RELEASE_GATE_JOB}"
-        ]
-    gate_lines = stripped_lines(gate)
-    for frozen in RELEASE_FROZEN_LINES:
-        if frozen not in gate_lines:
-            errors.append(
-                f"{RELEASE_WORKFLOW} jobs.{RELEASE_GATE_JOB} no longer runs `{frozen}`"
-            )
-    # Every publishing job must remain downstream of the go/no-go gate.
-    graph = {job: job_needs(block) for job, block in jobs.items()}
-    reachable: set[str] = set()
-    changed = True
-    while changed:
-        changed = False
-        for job, needs in graph.items():
-            if job in reachable:
-                continue
-            if RELEASE_GATE_JOB in needs or needs & reachable:
-                reachable.add(job)
-                changed = True
-    exempt = {RELEASE_GATE_JOB, *graph.get(RELEASE_GATE_JOB, set())}
-    for job in sorted(set(graph) - exempt - reachable):
-        errors.append(
-            f"{RELEASE_WORKFLOW} jobs.{job} is not downstream of "
-            f"`{RELEASE_GATE_JOB}`"
-        )
-    return errors
-
-
-def integrity_workflow_errors(workflows: dict[str, str]) -> list[str]:
-    errors: list[str] = []
-    workflow = workflows.get("launch-integrity.yml")
-    if workflow is None:
-        return [f"{INTEGRITY_WORKFLOW} is missing from the candidate revision"]
-    events = declared_events(workflow)
-    for event in INTEGRITY_REQUIRED_EVENTS:
-        if event not in events:
-            errors.append(f"{INTEGRITY_WORKFLOW} no longer runs on `{event}`")
-    for event in INTEGRITY_REQUIRED_EVENTS:
-        body = event_body(workflow, event)
-        if body is not None and re.search(r"(?m)^    paths(?:-ignore)?:", body):
-            errors.append(f"{INTEGRITY_WORKFLOW} path-filtered its `{event}` trigger")
-    if ADVISORY_SECRET in workflow or "secrets." in workflow:
-        errors.append(f"{INTEGRITY_WORKFLOW} must never consume a repository secret")
-    if re.search(r"(?m)^\s+(?:contents|packages|id-token|actions):\s+write\s*$", workflow):
-        errors.append(f"{INTEGRITY_WORKFLOW} grants a write permission")
-    if "persist-credentials: false" not in workflow:
-        errors.append(f"{INTEGRITY_WORKFLOW} must keep persist-credentials disabled")
-    if "merge_group base_sha missing or malformed" not in workflow:
-        errors.append(
-            f"{INTEGRITY_WORKFLOW} must fail closed on a malformed merge_group base"
-        )
-    return errors
 
 
 def check_run_identity_errors(workflows: dict[str, str]) -> list[str]:
@@ -1260,24 +689,15 @@ def check_run_identity_errors(workflows: dict[str, str]) -> list[str]:
 
 
 def secret_exposure_errors(workflows: dict[str, str]) -> list[str]:
+    """The advisory credential may only be named by byte-frozen workflows."""
+
     errors: list[str] = []
-    allowed = {"launch-readiness.yml", "release.yml"}
     for filename, workflow in sorted(workflows.items()):
         if ADVISORY_SECRET not in workflow:
             continue
-        if filename not in allowed:
+        if filename not in ADVISORY_SECRET_HOLDERS:
             errors.append(
                 f".github/workflows/{filename} must not reference the advisory token"
-            )
-            continue
-        if filename == "launch-readiness.yml":
-            continue
-        events = declared_events(workflow)
-        exposed = sorted(events & set(CANDIDATE_TRIGGERED_EVENTS))
-        if exposed:
-            errors.append(
-                f".github/workflows/{filename} exposes the advisory token to "
-                f"candidate-triggered events {exposed}"
             )
     return errors
 
@@ -1299,30 +719,66 @@ def presence_errors(candidate: Root) -> list[str]:
     return errors
 
 
+def anchor_pairs(
+    candidate: Root, base: Root
+) -> list[tuple[str, str | None, str | None, bool]]:
+    pairs: list[tuple[str, str | None, str | None, bool]] = []
+    for slot, required in ANCHOR_FILE_SLOTS:
+        pairs.append(
+            (FILE_SLOTS[slot], candidate.text(slot), base.text(slot), required)
+        )
+    for filename, required in ANCHOR_WORKFLOWS:
+        pairs.append(
+            (
+                f".github/workflows/{filename}",
+                candidate.workflows.get(filename),
+                base.workflows.get(filename),
+                required,
+            )
+        )
+    return pairs
+
+
 def anchor_errors(candidate: Root, base: Root) -> list[str]:
+    """Byte-freeze every piece of executable launch-governance code.
+
+    No source-level or YAML-level heuristic can prove that rewritten gate code
+    is still equivalent to the reviewed code: an early `return`/`sys.exit(0)`
+    or an inserted unconditional branch leaves the original statements and any
+    required marker strings present but unreachable. Byte identity against the
+    trusted base is the only property that class of rewrite cannot satisfy.
+    """
+
     errors: list[str] = []
-    pairs = (
-        (VERIFIER_PATH, candidate.text("verifier"), base.text("verifier")),
-        (
-            INTEGRITY_WORKFLOW,
-            candidate.workflows.get("launch-integrity.yml"),
-            base.workflows.get("launch-integrity.yml"),
-        ),
-    )
-    for path, candidate_text, base_text in pairs:
+    for path, candidate_text, base_text, required in anchor_pairs(candidate, base):
         if base_text is None:
-            # Adoption: the trusted base does not carry this anchor yet, so
-            # there is no protected content to preserve. Once the base has it,
-            # neither deletion nor modification is accepted below. The workflow
-            # cannot even load a verifier in this state, so this branch is only
-            # reachable on the one-time adoption commit.
+            if required:
+                # The workflow only reaches the verifier when the trusted base
+                # carries it, so a base missing a required anchor is a broken or
+                # tampered extraction, never the one-time adoption commit (which
+                # short-circuits before this program runs).
+                errors.append(
+                    f"the trusted base is missing the governed anchor {path}; "
+                    "refusing to certify a candidate against an incomplete base"
+                )
+            # Optional anchor not yet adopted on the trusted base: nothing to
+            # preserve. It freezes as soon as the base carries it.
+            continue
+        if not base_text.strip():
+            errors.append(
+                f"the trusted base copy of the governed anchor {path} is empty; "
+                "refusing to certify against it"
+            )
             continue
         if candidate_text is None:
-            errors.append(f"the integrity anchor {path} was deleted")
+            errors.append(f"the byte-frozen gate file {path} was deleted or renamed")
             continue
         if candidate_text != base_text:
             errors.append(
-                f"the integrity anchor {path} cannot be changed by a pull request"
+                f"the byte-frozen gate file {path} differs from the trusted base; "
+                "executable launch-governance code cannot be changed by an "
+                "ordinary pull request (merge the latest protected base, or land "
+                "the change as an administrative trusted-base update)"
             )
     return errors
 
@@ -1342,13 +798,22 @@ def codeowners_map(text: str | None) -> dict[str, set[str]]:
     return owners
 
 
-def codeowners_errors(candidate_text: str | None, base_text: str | None) -> list[str]:
+def codeowners_errors(
+    candidate_text: str | None,
+    base_text: str | None,
+    candidate_tree: set[str] | None = None,
+) -> list[str]:
     errors: list[str] = []
     if candidate_text is None:
         return [f"{CODEOWNERS_PATH} is missing from the candidate revision"]
     candidate = codeowners_map(candidate_text)
     base = codeowners_map(base_text)
-    for path in CODEOWNERS_GOVERNED_PATHS:
+    governed = list(CODEOWNERS_GOVERNED_PATHS)
+    tree = candidate_tree or set()
+    for owned_path, repo_path in CODEOWNERS_OPTIONAL_GOVERNED_PATHS.items():
+        if repo_path in tree:
+            governed.append(owned_path)
+    for path in governed:
         assigned = candidate.get(path, set())
         if not assigned:
             errors.append(f"{CODEOWNERS_PATH} no longer assigns an owner to {path}")
@@ -1370,17 +835,15 @@ def verify(base: Root, candidate: Root) -> list[str]:
     errors: list[str] = []
     errors.extend(presence_errors(candidate))
     errors.extend(anchor_errors(candidate, base))
-    errors.extend(checker_errors(candidate.text("checker"), base.text("checker")))
     errors.extend(policy_errors(candidate.text("policy"), base.text("policy")))
     errors.extend(exemption_errors(candidate.text("exemptions")))
     errors.extend(document_errors(candidate.text("document"), candidate.text("policy")))
-    errors.extend(readiness_workflow_errors(candidate.workflows))
-    errors.extend(integrity_workflow_errors(candidate.workflows))
-    errors.extend(release_workflow_errors(candidate.workflows))
     errors.extend(check_run_identity_errors(candidate.workflows))
     errors.extend(secret_exposure_errors(candidate.workflows))
     errors.extend(
-        codeowners_errors(candidate.text("codeowners"), base.text("codeowners"))
+        codeowners_errors(
+            candidate.text("codeowners"), base.text("codeowners"), candidate.tree
+        )
     )
     return list(dict.fromkeys(errors))
 
@@ -1390,107 +853,42 @@ def verify(base: Root, candidate: Root) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def _fixture_checker() -> str:
-    """A synthetic checker that satisfies the frozen source contract."""
+_FIXTURE_VERIFIER = "# trusted verifier anchor fixture\n"
 
-    constants = [
-        "SEVERITIES = ('critical', 'high', 'medium')",
-        "VERDICTS = ('PASS', 'FAIL', 'UNKNOWN')",
-        "ADVISORY_STATES = ('triage', 'draft', 'published', 'closed', 'withdrawn')",
-        "ADVISORY_SEVERITIES = ('critical', 'high', 'medium', 'low')",
-        f"REQUIRED_STATE_MACHINE = {REQUIRED_STATE_MACHINE!r}",
-        "BELOW_TIER = 'below_tier'",
-        "REQUIRED_CLOSED_COMPLETED_REASONS = ('completed',)",
-        "REQUIRED_CLOSED_OTHER_REASONS = ('not_planned', 'duplicate', None)",
-        "REQUIRED_NEVER_EMIT_FIELDS = "
-        + repr(REQUIRED_CHECKER_CONSTANTS["REQUIRED_NEVER_EMIT_FIELDS"]),
-        "BANNED_OUTPUT_TOKENS = "
-        + repr(REQUIRED_CHECKER_CONSTANTS["BANNED_OUTPUT_TOKENS"]),
-        "FORBIDDEN_POLICY_KEYS = "
-        + repr(REQUIRED_CHECKER_CONSTANTS["FORBIDDEN_POLICY_KEYS"]),
-        "MAX_RESPONSE_BYTES = 1 << 20",
-        "PER_PAGE = 100",
-        "API_ORIGIN = 'https://api.github.com/'",
-        "MAX_FALLBACK_AGE_SECONDS = 30 * 24 * 60 * 60",
-        "MAX_FALLBACK_COUNT = 100000",
-        "MAX_PAGES = 50",
-    ]
-    bodies = {
-        "compute_verdict": [
-            "    if unknown_reasons:",
-            '        return "UNKNOWN"',
-            "    if records:",
-            '        return "FAIL"',
-            '    return "PASS"',
-        ],
-        "verify_errors": [
-            "    errors = []",
-            '    if evaluation.verdict != "PASS":',
-            '        errors.append("fail closed")',
-            "    return errors",
-        ],
-        "verify_exit_code": [
-            "    return 1 if verify_errors(claim, evaluation) else 0",
-        ],
-        "run_verify": [
-            "    errors = verify_errors(claim, evaluation)",
-            "    return 1 if errors else 0",
-        ],
-        "main": [
-            "    if argv:",
-            "        return run_self_test()",
-            "    if not argv:",
-            "        return run_verify(argv)",
-            "    return 1",
-        ],
-        "resolve_trusted_fallback": [
-            "    if not policy:",
-            "        raise GateError('private_fallback', 'missing')",
-            "    limit = policy['max_age_seconds']",
-            "    return limit",
-        ],
-        "resolve_private_blockers": [
-            "    token_env = policy['token_env']",
-            "    if not token_env:",
-            "        return resolve_trusted_fallback(policy)",
-            "    return 0",
-        ],
-    }
-    lines = ['"""Synthetic launch checker fixture."""', "", "import json", "import re", ""]
-    lines.extend(constants)
-    lines.append("")
-    lines.append("class GateError(Exception):")
-    lines.append("    pass")
-    lines.append("")
-    for name in REQUIRED_CHECKER_FUNCTIONS:
-        if name == "run_self_test":
-            continue
-        lines.append(f"def {name}(*args, **kwargs):")
-        body = bodies.get(name)
-        if body is None:
-            lines.append("    if args:")
-            lines.append("        return list(args)")
-            lines.append("    return kwargs")
-        else:
-            lines.extend(body)
-        lines.append("")
-    lines.append("def run_self_test():")
-    lines.append("    failures = []")
-    lines.append("    def check(name, cond):")
-    lines.append("        if not cond:")
-    lines.append("            failures.append(name)")
-    for index, case in enumerate(REQUIRED_SELF_TEST_CASES):
-        lines.append(f'    check("{case}", {index} >= 0)')
-    for index in range(MIN_SELF_TEST_CHECKS + 4 - len(REQUIRED_SELF_TEST_CASES)):
-        lines.append(f'    check("fixture case {index}", True)')
-    lines.append("    if failures:")
-    lines.append("        return 1")
-    lines.append("    return 0")
-    lines.append("")
-    lines.append('if __name__ == "__main__":')
-    lines.append("    raise SystemExit(main())")
-    return "\n".join(lines) + "\n"
+_FIXTURE_ADVISORY_VERIFIER = "# trusted advisory-trust verifier fixture\n"
 
+_FIXTURE_CHECKER = '''"""Synthetic launch checker fixture."""
+
+import sys
+
+
+def compute_verdict(unknown_reasons, records):
+    if unknown_reasons:
+        return "UNKNOWN"
+    if records:
+        return "FAIL"
+    return "PASS"
+
+
+def verify_errors(claim, evaluation):
+    errors = []
+    if evaluation.verdict != "PASS":
+        errors.append("fail closed")
+    return errors
+
+
+def run_verify(argv):
+    errors = verify_errors(argv, argv)
+    return 1 if errors else 0
+
+
+def main(argv=None):
+    return run_verify(argv or [])
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+'''
 
 _FIXTURE_POLICY = {
     "policy_version": "2",
@@ -1527,9 +925,7 @@ _FIXTURE_POLICY = {
             "experimental": ["critical"],
         },
         "representation": "redacted_count_only",
-        "never_emit_fields": list(
-            REQUIRED_CHECKER_CONSTANTS["REQUIRED_NEVER_EMIT_FIELDS"]
-        ),
+        "never_emit_fields": list(REQUIRED_NEVER_EMIT_FIELDS),
         "live_api": {
             "token_env": "LAUNCH_ADVISORY_READ_TOKEN",
             "actions_security_events_permission_is_insufficient": True,
@@ -1558,7 +954,9 @@ _FIXTURE_DOCUMENT = (
 )
 
 _FIXTURE_CODEOWNERS = "\n".join(
-    f"{path}   @owner" for path in CODEOWNERS_GOVERNED_PATHS
+    f"{path}   @owner"
+    for path in list(CODEOWNERS_GOVERNED_PATHS)
+    + list(CODEOWNERS_OPTIONAL_GOVERNED_PATHS)
 ) + "\n"
 
 _FIXTURE_READINESS_WORKFLOW = """name: Launch Readiness
@@ -1671,24 +1069,47 @@ jobs:
       - run: echo publish
 """
 
+_FIXTURE_ADVISORY_WORKFLOW = """name: Trusted Launch Advisory Gate
+
+on:
+  workflow_run:
+    workflows:
+      - Release
+    types:
+      - requested
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  advisory-verdict:
+    name: Trusted advisory verdict
+    runs-on: ubuntu-latest
+    steps:
+      - name: Read the advisory credential
+        env:
+          LAUNCH_ADVISORY_READ_TOKEN: ${{ secrets.LAUNCH_ADVISORY_READ_TOKEN }}
+        run: echo verdict
+"""
+
 
 def _write_root(directory: Path, files: dict[str, str], workflows: dict[str, str]) -> None:
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "workflows").mkdir(exist_ok=True)
     for name, text in files.items():
         (directory / name).write_text(text, encoding="utf-8")
+    tree = [PATH_BY_SLOT_FILENAME[name] for name in files]
+    tree.extend(f".github/workflows/{name}" for name in workflows)
     for name, text in workflows.items():
         (directory / "workflows" / name).write_text(text, encoding="utf-8")
-    tree = list(PROTECTED_PATHS) + [
-        f".github/workflows/{name}" for name in workflows
-    ]
     (directory / "tree.txt").write_text("\n".join(sorted(set(tree))) + "\n", "utf-8")
 
 
-def _fixture_files(verifier_text: str) -> dict[str, str]:
+def _fixture_files() -> dict[str, str]:
     return {
-        SLOT_FILENAMES["checker"]: _fixture_checker(),
-        SLOT_FILENAMES["verifier"]: verifier_text,
+        SLOT_FILENAMES["checker"]: _FIXTURE_CHECKER,
+        SLOT_FILENAMES["verifier"]: _FIXTURE_VERIFIER,
         SLOT_FILENAMES["policy"]: json.dumps(_FIXTURE_POLICY, indent=2) + "\n",
         SLOT_FILENAMES["exemptions"]: json.dumps(
             {"exemptions_version": "1", "exemptions": []}, indent=2
@@ -1707,23 +1128,41 @@ def _fixture_workflows() -> dict[str, str]:
     }
 
 
+def _adopt_advisory(files: dict[str, str], workflows: dict[str, str]) -> None:
+    """Add the issue #3802 advisory-trust lane to a fixture root."""
+
+    files[SLOT_FILENAMES["advisory_verifier"]] = _FIXTURE_ADVISORY_VERIFIER
+    workflows["launch-advisory-trust.yml"] = _FIXTURE_ADVISORY_WORKFLOW
+
+
 def run_self_test() -> int:
     """Adversarial fixtures for every weakening this check must refuse."""
 
     failures: list[str] = []
-    verifier_text = "# trusted anchor fixture\n"
 
     def evaluate(
         mutate_files: Any = None,
         mutate_workflows: Any = None,
+        mutate_base_files: Any = None,
+        mutate_base_workflows: Any = None,
+        adopt_advisory_base: bool = False,
+        adopt_advisory_candidate: bool = False,
     ) -> list[str]:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
-            base_files = _fixture_files(verifier_text)
+            base_files = _fixture_files()
             base_workflows = _fixture_workflows()
+            if adopt_advisory_base:
+                _adopt_advisory(base_files, base_workflows)
+            if mutate_base_files is not None:
+                mutate_base_files(base_files)
+            if mutate_base_workflows is not None:
+                mutate_base_workflows(base_workflows)
             _write_root(root / "base", base_files, base_workflows)
-            files = _fixture_files(verifier_text)
+            files = _fixture_files()
             workflows = _fixture_workflows()
+            if adopt_advisory_candidate:
+                _adopt_advisory(files, workflows)
             if mutate_files is not None:
                 mutate_files(files)
             if mutate_workflows is not None:
@@ -1741,39 +1180,96 @@ def run_self_test() -> int:
 
     expect_clean("pristine candidate", evaluate())
 
-    # 1. Checker deletion.
+    # 1. Deletion of byte-frozen executable gate code.
     def delete_checker(files: dict[str, str]) -> None:
         files.pop(SLOT_FILENAMES["checker"])
 
     expect_rejected("checker deleted", evaluate(delete_checker))
 
-    # 2. Unconditional PASS rewrites.
-    def always_pass(files: dict[str, str]) -> None:
+    def delete_verifier(files: dict[str, str]) -> None:
+        files.pop(SLOT_FILENAMES["verifier"])
+
+    expect_rejected("verifier deleted", evaluate(delete_verifier))
+
+    def delete_release_workflow(workflows: dict[str, str]) -> None:
+        workflows.pop("release.yml")
+
+    expect_rejected("release workflow deleted", evaluate(None, delete_release_workflow))
+
+    def remove_gate_workflow(workflows: dict[str, str]) -> None:
+        workflows.pop("launch-readiness.yml")
+
+    expect_rejected("gate workflow deleted", evaluate(None, remove_gate_workflow))
+
+    # 2. Semantic-verifier bypass shapes. Each of these keeps every previous
+    #    statement and every historically required marker string present in the
+    #    file — an "is the old code still in there?" heuristic accepts them all,
+    #    because the retained code is merely unreachable. They must be refused
+    #    on bytes alone.
+    def prepend_unconditional_pass(files: dict[str, str]) -> None:
         files[SLOT_FILENAMES["checker"]] = files[SLOT_FILENAMES["checker"]].replace(
-            "def compute_verdict(*args, **kwargs):\n"
-            "    if unknown_reasons:\n"
-            '        return "UNKNOWN"\n'
-            "    if records:\n"
-            '        return "FAIL"\n'
-            '    return "PASS"\n',
-            'def compute_verdict(*args, **kwargs):\n    return "PASS"\n',
+            "def compute_verdict(unknown_reasons, records):\n",
+            'def compute_verdict(unknown_reasons, records):\n    return "PASS"\n',
         )
 
-    expect_rejected("compute_verdict always PASS", evaluate(always_pass))
+    expect_rejected(
+        "early return PASS above the retained body",
+        evaluate(prepend_unconditional_pass),
+    )
 
-    def exit_zero(files: dict[str, str]) -> None:
+    def prepend_zero_return(files: dict[str, str]) -> None:
         files[SLOT_FILENAMES["checker"]] = files[SLOT_FILENAMES["checker"]].replace(
-            "def main(*args, **kwargs):", "def main(*args, **kwargs):\n    return 0\n\ndef _unused(*args, **kwargs):"
+            "def run_verify(argv):\n",
+            "def run_verify(argv):\n    return 0\n",
         )
 
-    expect_rejected("main returns zero unconditionally", evaluate(exit_zero))
+    expect_rejected(
+        "early return 0 above the retained body", evaluate(prepend_zero_return)
+    )
 
-    def top_level_exit(files: dict[str, str]) -> None:
+    def prepend_sys_exit(files: dict[str, str]) -> None:
+        files[SLOT_FILENAMES["checker"]] = files[SLOT_FILENAMES["checker"]].replace(
+            "def main(argv=None):\n",
+            "def main(argv=None):\n    sys.exit(0)\n",
+        )
+
+    expect_rejected(
+        "early sys.exit(0) above the retained body", evaluate(prepend_sys_exit)
+    )
+
+    def prepend_unconditional_branch(files: dict[str, str]) -> None:
+        files[SLOT_FILENAMES["checker"]] = files[SLOT_FILENAMES["checker"]].replace(
+            "def verify_errors(claim, evaluation):\n",
+            "def verify_errors(claim, evaluation):\n    if True:\n        return []\n",
+        )
+
+    expect_rejected(
+        "always-true branch above the retained body",
+        evaluate(prepend_unconditional_branch),
+    )
+
+    def append_unreachable_old_body(files: dict[str, str]) -> None:
+        source = files[SLOT_FILENAMES["checker"]]
+        files[SLOT_FILENAMES["checker"]] = source.replace(
+            "def run_verify(argv):\n"
+            "    errors = verify_errors(argv, argv)\n"
+            "    return 1 if errors else 0\n",
+            "def run_verify(argv):\n"
+            "    return 0\n"
+            "    errors = verify_errors(argv, argv)\n"
+            "    return 1 if errors else 0\n",
+        )
+
+    expect_rejected(
+        "unreachable old body after return 0", evaluate(append_unreachable_old_body)
+    )
+
+    def module_level_short_circuit(files: dict[str, str]) -> None:
         files[SLOT_FILENAMES["checker"]] = (
             "import sys\nsys.exit(0)\n" + files[SLOT_FILENAMES["checker"]]
         )
 
-    expect_rejected("module-level short circuit", evaluate(top_level_exit))
+    expect_rejected("module-level short circuit", evaluate(module_level_short_circuit))
 
     def new_import(files: dict[str, str]) -> None:
         files[SLOT_FILENAMES["checker"]] = (
@@ -1782,28 +1278,202 @@ def run_self_test() -> int:
 
     expect_rejected("checker grows a process dependency", evaluate(new_import))
 
-    # 3. Candidate self-test rewriting.
-    def gut_self_test(files: dict[str, str]) -> None:
-        source = files[SLOT_FILENAMES["checker"]]
-        head, _, _ = source.partition("def run_self_test():")
-        files[SLOT_FILENAMES["checker"]] = (
-            head
-            + "def run_self_test():\n    failures = []\n    if failures:\n"
-            "        return 1\n    return 0\n\n"
-            'if __name__ == "__main__":\n    raise SystemExit(main())\n'
+    def whitespace_only_checker_edit(files: dict[str, str]) -> None:
+        files[SLOT_FILENAMES["checker"]] = files[SLOT_FILENAMES["checker"]] + "\n"
+
+    expect_rejected(
+        "whitespace-only checker edit", evaluate(whitespace_only_checker_edit)
+    )
+
+    # 3. YAML rewrites that retain every frozen substring.
+    def disable_readiness_job(workflows: dict[str, str]) -> None:
+        workflows["launch-readiness.yml"] = workflows["launch-readiness.yml"].replace(
+            "    runs-on: ubuntu-latest\n",
+            "    if: false\n    runs-on: ubuntu-latest\n",
+            1,
         )
 
-    expect_rejected("self-test corpus emptied", evaluate(gut_self_test))
+    expect_rejected(
+        "gate job disabled with every frozen line retained",
+        evaluate(None, disable_readiness_job),
+    )
 
-    def drop_one_case(files: dict[str, str]) -> None:
-        files[SLOT_FILENAMES["checker"]] = files[SLOT_FILENAMES["checker"]].replace(
-            '    check("fresh external positive fails", 18 >= 0)\n',
-            '    check("fixture replacement", True)\n',
+    def neutralize_verify_step(workflows: dict[str, str]) -> None:
+        # Keeps the frozen `run:` line verbatim and adds a step-level guard.
+        workflows["launch-readiness.yml"] = workflows["launch-readiness.yml"].replace(
+            "      - name: Verify live launch verdict\n",
+            "      - name: Verify live launch verdict\n        if: false\n",
         )
 
-    expect_rejected("adversarial fixture removed", evaluate(drop_one_case))
+    expect_rejected(
+        "live verdict step guarded off", evaluate(None, neutralize_verify_step)
+    )
 
-    # 4. Policy downgrades.
+    def continue_on_error_release_gate(workflows: dict[str, str]) -> None:
+        workflows["release.yml"] = workflows["release.yml"].replace(
+            "  validate-launch-readiness:\n    name: Validate launch readiness\n",
+            "  validate-launch-readiness:\n    continue-on-error: true\n"
+            "    name: Validate launch readiness\n",
+        )
+
+    expect_rejected(
+        "release gate made non-blocking", evaluate(None, continue_on_error_release_gate)
+    )
+
+    def sever_release_needs(workflows: dict[str, str]) -> None:
+        workflows["release.yml"] = workflows["release.yml"].replace(
+            "    needs:\n      - validate-release-version\n"
+            "      - validate-launch-readiness\n",
+            "    needs: validate-release-version\n",
+        )
+
+    expect_rejected("release gate unbound", evaluate(None, sever_release_needs))
+
+    def leak_secret(workflows: dict[str, str]) -> None:
+        workflows["launch-readiness.yml"] = workflows["launch-readiness.yml"].replace(
+            "LAUNCH_ADVISORY_READ_TOKEN: ${{ (github.event_name != 'pull_request'"
+            " && github.event_name != 'merge_group') && "
+            "secrets.LAUNCH_ADVISORY_READ_TOKEN || '' }}",
+            "LAUNCH_ADVISORY_READ_TOKEN: ${{ secrets.LAUNCH_ADVISORY_READ_TOKEN }}",
+        )
+
+    expect_rejected("advisory token exposed to candidates", evaluate(None, leak_secret))
+
+    def rename_gate_job(workflows: dict[str, str]) -> None:
+        workflows["launch-readiness.yml"] = workflows["launch-readiness.yml"].replace(
+            "    name: Launch Readiness Gate", "    name: Launch Readiness Advisory"
+        )
+
+    expect_rejected("required check renamed", evaluate(None, rename_gate_job))
+
+    def weaken_integrity_workflow(workflows: dict[str, str]) -> None:
+        workflows["launch-integrity.yml"] = workflows["launch-integrity.yml"].replace(
+            "  pull_request_target:\n    branches:\n      - main\n",
+            "  pull_request_target:\n    paths:\n      - docs/**\n",
+        )
+
+    expect_rejected("integrity anchor edited", evaluate(None, weaken_integrity_workflow))
+
+    def comment_only_integrity_edit(workflows: dict[str, str]) -> None:
+        workflows["launch-integrity.yml"] = (
+            "# harmless-looking comment\n" + workflows["launch-integrity.yml"]
+        )
+
+    expect_rejected(
+        "comment-only integrity anchor edit", evaluate(None, comment_only_integrity_edit)
+    )
+
+    # 4. Workflows a candidate adds are still scanned.
+    def duplicate_check_name(workflows: dict[str, str]) -> None:
+        workflows["shadow.yml"] = (
+            "name: Shadow\n\non:\n  pull_request:\n\njobs:\n"
+            "  shadow:\n    name: Launch Readiness Integrity\n"
+            "    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n"
+        )
+
+    expect_rejected("check-run producer spoofed", evaluate(None, duplicate_check_name))
+
+    def new_workflow_reads_token(workflows: dict[str, str]) -> None:
+        workflows["exfil.yml"] = (
+            "name: Exfil\n\non:\n  pull_request:\n\njobs:\n  go:\n"
+            "    runs-on: ubuntu-latest\n    steps:\n"
+            "      - env:\n"
+            "          T: ${{ secrets.LAUNCH_ADVISORY_READ_TOKEN }}\n"
+            "        run: echo ok\n"
+        )
+
+    expect_rejected(
+        "candidate workflow reads the advisory token",
+        evaluate(None, new_workflow_reads_token),
+    )
+
+    # 5. Trusted-base extraction must fail closed.
+    def base_loses_checker(files: dict[str, str]) -> None:
+        files.pop(SLOT_FILENAMES["checker"])
+
+    expect_rejected(
+        "trusted base missing a required anchor",
+        evaluate(mutate_base_files=base_loses_checker),
+    )
+
+    def base_loses_release_workflow(workflows: dict[str, str]) -> None:
+        workflows.pop("release.yml")
+
+    expect_rejected(
+        "trusted base missing an anchored workflow",
+        evaluate(mutate_base_workflows=base_loses_release_workflow),
+    )
+
+    def base_anchor_emptied(files: dict[str, str]) -> None:
+        files[SLOT_FILENAMES["verifier"]] = "   \n"
+
+    expect_rejected(
+        "trusted base anchor is empty", evaluate(mutate_base_files=base_anchor_emptied)
+    )
+
+    # 6. Optional advisory-trust anchors (issue #3802) in both merge orders.
+    expect_clean(
+        "advisory lane absent from both roots",
+        evaluate(adopt_advisory_base=False, adopt_advisory_candidate=False),
+    )
+    expect_clean(
+        "advisory lane adopted on an un-adopted base",
+        evaluate(adopt_advisory_base=False, adopt_advisory_candidate=True),
+    )
+    expect_clean(
+        "advisory lane present and unchanged",
+        evaluate(adopt_advisory_base=True, adopt_advisory_candidate=True),
+    )
+
+    def edit_advisory_verifier(files: dict[str, str]) -> None:
+        files[SLOT_FILENAMES["advisory_verifier"]] = "# rewritten\n"
+
+    expect_rejected(
+        "advisory verifier edited once anchored",
+        evaluate(
+            edit_advisory_verifier,
+            adopt_advisory_base=True,
+            adopt_advisory_candidate=True,
+        ),
+    )
+
+    def edit_advisory_workflow(workflows: dict[str, str]) -> None:
+        workflows["launch-advisory-trust.yml"] = (
+            "# rewritten\n" + workflows["launch-advisory-trust.yml"]
+        )
+
+    expect_rejected(
+        "advisory workflow edited once anchored",
+        evaluate(
+            None,
+            edit_advisory_workflow,
+            adopt_advisory_base=True,
+            adopt_advisory_candidate=True,
+        ),
+    )
+
+    expect_rejected(
+        "advisory lane deleted once anchored",
+        evaluate(adopt_advisory_base=True, adopt_advisory_candidate=False),
+    )
+
+    def drop_advisory_owner(files: dict[str, str]) -> None:
+        files[SLOT_FILENAMES["codeowners"]] = "\n".join(
+            line
+            for line in files[SLOT_FILENAMES["codeowners"]].splitlines()
+            if not line.startswith("/.github/scripts/verify_launch_advisory_trust.py")
+        ) + "\n"
+
+    expect_rejected(
+        "advisory owner removed once the file exists",
+        evaluate(
+            drop_advisory_owner,
+            adopt_advisory_base=True,
+            adopt_advisory_candidate=True,
+        ),
+    )
+
+    # 7. Policy, exemption, and document downgrades (candidate-editable data).
     def state_machine_downgrade(files: dict[str, str]) -> None:
         policy = json.loads(files[SLOT_FILENAMES["policy"]])
         policy["state_machine"]["in_flight"] = "cleared"
@@ -1876,65 +1546,7 @@ def run_self_test() -> int:
 
     expect_rejected("document marker removed", evaluate(marker_removed))
 
-    # 5. Workflow bypass.
-    def remove_gate_workflow(workflows: dict[str, str]) -> None:
-        workflows.pop("launch-readiness.yml")
-
-    expect_rejected("gate workflow deleted", evaluate(None, remove_gate_workflow))
-
-    def drop_verify_step(workflows: dict[str, str]) -> None:
-        workflows["launch-readiness.yml"] = workflows["launch-readiness.yml"].replace(
-            "        run: python3 -I scripts/check_launch_readiness.py "
-            "--verify --verify-checkout\n",
-            "        run: echo skipped\n",
-        )
-
-    expect_rejected("live verdict step removed", evaluate(None, drop_verify_step))
-
-    def leak_secret(workflows: dict[str, str]) -> None:
-        workflows["launch-readiness.yml"] = workflows["launch-readiness.yml"].replace(
-            "LAUNCH_ADVISORY_READ_TOKEN: ${{ (github.event_name != 'pull_request'"
-            " && github.event_name != 'merge_group') && "
-            "secrets.LAUNCH_ADVISORY_READ_TOKEN || '' }}",
-            "LAUNCH_ADVISORY_READ_TOKEN: ${{ secrets.LAUNCH_ADVISORY_READ_TOKEN }}",
-        )
-
-    expect_rejected("advisory token exposed to candidates", evaluate(None, leak_secret))
-
-    def rename_gate_job(workflows: dict[str, str]) -> None:
-        workflows["launch-readiness.yml"] = workflows["launch-readiness.yml"].replace(
-            "    name: Launch Readiness Gate", "    name: Launch Readiness Advisory"
-        )
-
-    expect_rejected("required check renamed", evaluate(None, rename_gate_job))
-
-    def duplicate_check_name(workflows: dict[str, str]) -> None:
-        workflows["shadow.yml"] = (
-            "name: Shadow\n\non:\n  pull_request:\n\njobs:\n"
-            "  shadow:\n    name: Launch Readiness Integrity\n"
-            "    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n"
-        )
-
-    expect_rejected("check-run producer spoofed", evaluate(None, duplicate_check_name))
-
-    def sever_release_needs(workflows: dict[str, str]) -> None:
-        workflows["release.yml"] = workflows["release.yml"].replace(
-            "    needs:\n      - validate-release-version\n"
-            "      - validate-launch-readiness\n",
-            "    needs: validate-release-version\n",
-        )
-
-    expect_rejected("release gate unbound", evaluate(None, sever_release_needs))
-
-    def weaken_integrity_workflow(workflows: dict[str, str]) -> None:
-        workflows["launch-integrity.yml"] = workflows["launch-integrity.yml"].replace(
-            "  pull_request_target:\n    branches:\n      - main\n",
-            "  pull_request_target:\n    paths:\n      - docs/**\n",
-        )
-
-    expect_rejected("integrity anchor edited", evaluate(None, weaken_integrity_workflow))
-
-    # 6. Ownership evasion.
+    # 8. Ownership evasion.
     def drop_owner(files: dict[str, str]) -> None:
         files[SLOT_FILENAMES["codeowners"]] = "\n".join(
             line

@@ -154,8 +154,8 @@ commit. That file is the only code the job executes.
 the execution path. Each governed file is extracted with `git show` into a fixed
 slot name under `$RUNNER_TEMP`, after its tree entry is confirmed to be a
 regular non-symlink blob, so no candidate-controlled path component is ever
-joined into a filesystem path. The candidate checker is read with `ast.parse`,
-which never runs module code, and nothing from the candidate is imported. A
+joined into a filesystem path. Nothing from the candidate is imported, parsed as
+code, or executed — every governed file is compared or schema-checked as text. A
 missing slot is the signal that a protected file was deleted or renamed.
 
 **Permissions.** `contents: read`, `persist-credentials: false`, no secrets at
@@ -163,37 +163,63 @@ all. `.github/scripts/verify_required_ci.py` re-asserts those properties, the
 `merge_group` trigger, and the exact check name so the required context cannot
 be silently renamed or downgraded.
 
-**Self-protection.** `.github/workflows/launch-integrity.yml` and
-`.github/scripts/verify_launch_integrity.py` must be byte-identical to the
-trusted base. Changing the judge is therefore an administrative action, not an
-ordinary pull request — the same posture as `Trusted Cross Build Policy`. The
-proposed copy still gets hosted execution of its own fixtures in the isolated
-`trusted-policy-candidate.yml` lane, which produces nothing another job reads.
+**Byte-frozen executable gate code.** Every file that *executes* as part of the
+launch/release gate must be byte-identical to the trusted base:
+
+| Anchored path | Frozen from |
+|---|---|
+| `scripts/check_launch_readiness.py` | always |
+| `.github/workflows/launch-readiness.yml` | always |
+| `.github/workflows/release.yml` | always |
+| `.github/workflows/launch-integrity.yml` | always |
+| `.github/scripts/verify_launch_integrity.py` | always |
+| `.github/workflows/launch-advisory-trust.yml` | once the trusted base carries it (issue #3802) |
+| `.github/scripts/verify_launch_advisory_trust.py` | once the trusted base carries it (issue #3802) |
+
+The two optional rows are treated as absent only while the trusted base also
+lacks them; the moment the base carries one, deleting it or changing a byte
+fails. A trusted base that is missing a *required* anchor is a broken or
+tampered extraction and fails closed rather than skipping enforcement.
+
+This is a deliberate replacement for a semantic contract. An earlier revision of
+this verifier tried to *permit* checker edits that "still looked fail-closed":
+it rejected a function whose body was reduced to a single success statement and
+separately required certain marker strings to appear somewhere in the function.
+Both are trivially defeated by prepending `return "PASS"`, `return 0`,
+`sys.exit(0)`, or `if True: return []` above the original body — every previous
+statement and every marker string is still present in the file, merely
+unreachable. No source-level or YAML-level heuristic can prove arbitrary
+executable gate code is still equivalent to what was reviewed, so byte identity
+is the enforced property and the heuristics are gone.
+
+**Consequences for contributors.**
+
+- An ordinary pull request cannot change any anchored file. If a change is
+  needed, it is an explicit administrative / root-orchestrator update: land it on
+  protected `main` through an auditable bypass and re-run the integrity workflow
+  (and `Launch Readiness Gate`) on `main` immediately afterwards, so the new
+  bytes are the enforced anchor for everything queued behind it.
+- A pull request whose branch predates such an update will go red on the anchor
+  it is stale against; merging the latest protected base fixes it. The merge
+  queue re-runs the same check against the synthesized commit, so the queue is
+  the authoritative enforcement point.
+- The proposed copy of the verifier still gets hosted execution of its own
+  fixtures in the isolated `trusted-policy-candidate.yml` lane, which produces
+  nothing another job reads — the same posture as `Trusted Cross Build Policy`.
 
 On the single adoption commit the trusted base carries no verifier at all, so
 there is no protected contract to preserve and nothing trustworthy to execute:
 that run reports success with an explicit `::notice::` instead of pretending to
-have enforced anything. Every later revision takes the enforcing path, and once
-the base carries the anchor neither deletion nor modification is accepted.
+have enforced anything. Every later revision takes the enforcing path.
 
 ### What the verifier enforces
 
+- **Byte anchors:** the table above. Deletion, rename, a whitespace-only edit, a
+  comment-only edit, an early `return`/`sys.exit(0)` with the old body retained
+  below it, or a YAML rewrite that keeps every historically frozen substring
+  (`if: false` on the gate job, `continue-on-error: true` on the release gate)
+  are all rejected on bytes alone.
 - **Deletion/rename:** every protected gate path is still present and non-empty.
-- **Checker semantics:** frozen constants (state machine, closed-reason sets,
-  never-emit fields, banned output tokens, forbidden policy keys, severity and
-  verdict vocabularies, API origin), ceilings that may tighten but never loosen
-  (`MAX_FALLBACK_AGE_SECONDS`, `MAX_FALLBACK_COUNT`, `MAX_PAGES`), the required
-  function set, and the fail-closed text each evaluator function must still
-  carry (for example `evaluation.verdict != "PASS"`).
-- **Unconditional success:** a required function reduced to `pass`,
-  `return 0/True/None/"PASS"`, or `sys.exit(0)` is rejected, as is any
-  module-level statement that could short-circuit evaluation before it runs.
-- **Dependency surface:** the checker's imports must stay within the recorded
-  allowlist, so an evaluator cannot grow a shell-out or exfiltration path.
-- **Candidate-test rewriting:** the self-test corpus may not fall below its
-  assertion floor and must keep every named adversarial fixture (state-machine
-  downgrade, merged-PR clearing, duplicate-as-completed, fallback age ceiling,
-  redaction, pagination truncation, and the rest).
 - **Policy downgrade:** frozen state machine and reason sets; GA blocking every
   severity; no tier dropping a severity the trusted base blocked; the label
   contract unchanged (a rename silently empties the blocker set); private
@@ -204,14 +230,10 @@ the base carries the anchor neither deletion nor modification is accepted.
   one launch tier, and an expiry strictly after approval.
 - **Document markers:** exactly one begin/end/historical marker, in order, with
   the marker contract itself unchanged from the trusted base.
-- **Workflow bypass:** the gate workflow keeps its triggers, unfiltered
-  `pull_request` / `merge_group` events, job id and check name, least
-  permissions, and the byte-frozen ref/target-SHA/self-test/verify lines; the
-  release workflow keeps `validate-launch-readiness` and every other job stays
-  downstream of it.
-- **Secret exposure:** the privileged advisory token may appear only in
-  `launch-readiness.yml` (inside the frozen expression that hands
-  pull-request and merge-group runs an empty value) and in `release.yml`.
+- **Secret exposure:** the privileged advisory token may be named only by a
+  workflow that is itself an anchor (`launch-readiness.yml`, `release.yml`,
+  `launch-advisory-trust.yml`). A workflow a candidate *adds* may not reference
+  it at all.
 - **Check-run producer identity:** the required check names may be produced by
   exactly one workflow file each, so a candidate cannot add a second workflow
   that reports an identically named, trivially green context.
@@ -221,10 +243,19 @@ the base carries the anchor neither deletion nor modification is accepted.
   cannot relax that pull request's own review requirement; this check keeps the
   coverage from being dropped on the way in.
 
+The last three run over the *whole* extracted workflow directory, including
+workflows the candidate adds. They are defense in depth against a bypass built
+beside the gate; they are explicitly **not** the permission model for changing
+an anchored file — that is the byte anchor and nothing else.
+
 What it deliberately does **not** judge: live issue/advisory state, and the
 *content* of the tracked-blocker inventory or the exemption list. Those are
 governed by CODEOWNER review; the verifier only enforces their schema so a
-malformed or unbounded entry cannot slip through.
+malformed or unbounded entry cannot slip through. It also no longer inspects
+checker semantics, workflow triggers, frozen `run:` lines, or release `needs:`
+reachability: those properties are now implied by byte identity, and enforcing
+them a second time from a hand-maintained contract table would only produce
+false reds whenever an administrative update legitimately changed them.
 
 ### Required repository settings (root-only)
 
@@ -246,6 +277,13 @@ administrator:
    than advisory.
 3. Keep the organization-admin bypass auditable: an emergency merge that skips
    the integrity context should be followed by a post-merge run on `main`.
+4. Land every change to an anchored file (the byte-frozen table above) the same
+   way: an explicit administrative update on protected `main` using an auditable
+   bypass, immediately followed by a hosted post-merge run of
+   `launch-integrity.yml` and `launch-readiness.yml` on the new `main` tip. The
+   new bytes become the anchor for every pull request queued behind it, so a
+   broken administrative update is visible on the very next run rather than at
+   release time.
 
 Until step 1 and step 2 are applied the check is advisory. Drift in either is
 detectable by re-querying the ruleset; the repository-side half of the control

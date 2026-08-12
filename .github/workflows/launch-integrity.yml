@@ -13,6 +13,14 @@ name: Launch Readiness Integrity
 # and the candidate tree is only ever extracted as inert data with `git show`
 # into a confined directory: no candidate code is checked out into the
 # execution path, imported, or run. No secret is available to this workflow.
+#
+# Permission model: every executable launch-governance file (the checker, this
+# workflow, `launch-readiness.yml`, `release.yml`, the verifier, and the
+# `launch-advisory-trust.yml` / `verify_launch_advisory_trust.py` pair once the
+# trusted base carries them) is byte-frozen to the trusted base. No source or
+# YAML heuristic can prove rewritten gate code is still equivalent to the
+# reviewed code, so byte identity is the enforced property and changing one of
+# those files is an administrative trusted-base update, not a pull request.
 
 on:
   pull_request_target:
@@ -196,6 +204,7 @@ jobs:
             local destination="$2"
             extract_slot "$commit" "$destination" scripts/check_launch_readiness.py check_launch_readiness.py
             extract_slot "$commit" "$destination" .github/scripts/verify_launch_integrity.py verify_launch_integrity.py
+            extract_slot "$commit" "$destination" .github/scripts/verify_launch_advisory_trust.py verify_launch_advisory_trust.py
             extract_slot "$commit" "$destination" docs/launch-blocker-policy.json launch-blocker-policy.json
             extract_slot "$commit" "$destination" docs/launch-exemptions.json launch-exemptions.json
             extract_slot "$commit" "$destination" PRODUCTION_READINESS.md PRODUCTION_READINESS.md
