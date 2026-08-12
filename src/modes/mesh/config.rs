@@ -2308,18 +2308,15 @@ pub struct MeshSidecarIngress {
     /// Istio `port.name` — informational; preserved for observability.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    /// Istio `bind` — the address the listener binds. Ferrum's capture model
-    /// funnels all inbound through the shared `:15006` listener, so a custom
-    /// `bind` does not create a separate OS listener; it is preserved for
-    /// observability and surfaced as a documented limitation when non-default.
-    /// Unix sockets are not valid here (Istio rejects them too).
+    /// Istio `bind` — the IP the listener binds (IPv4 or IPv6). Unix-domain
+    /// sockets are not valid here (Istio rejects them too).
     ///
-    /// **Scope boundary (issue #3266):** arbitrary Sidecar ingress `bind`
-    /// socket materialization is intentionally out of scope for stream-ingress
-    /// modeling (#3260). Supported non-HTTP ingress still requires the shared
-    /// capture-listener contract (orig-dst / authority selects the declared
-    /// listener port). Do not treat a non-default `bind` as opening a dedicated
-    /// socket here.
+    /// **Issue #3266:** omitted / empty / unspecified (`0.0.0.0` / `::`) keep
+    /// the shared capture-listener contract (`:15006`). A supported dedicated
+    /// loopback bind is conflict-checked and materialized as a real OS listener
+    /// through the Gateway/stream ownership path. Unsupported or unrepresentable values
+    /// fail closed at [`Self::resolve`] with a field-specific reason rather
+    /// than being accepted as inert metadata.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bind: Option<String>,
     /// Istio `defaultEndpoint` — where inbound traffic is forwarded. Supported
@@ -2429,6 +2426,14 @@ pub struct ResolvedIngressListener {
     /// `owner_namespace`).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub owner_service: String,
+    /// Dedicated OS bind IP for this listener (issue #3266).
+    ///
+    /// `None` means the shared capture contract (`:15006` / orig-dst). `Some`
+    /// is a conflict-checked dedicated bind that Gateway/stream listener
+    /// ownership must honor. An untrusted carrier that forges a non-loopback
+    /// address is rejected again at materialization before any socket is claimed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bind: Option<std::net::IpAddr>,
 }
 
 /// The typed, routable backend one [`ResolvedIngressListener`] forwards to.
@@ -2483,6 +2488,13 @@ impl ResolvedIngressListener {
     /// external mesh-validation test crate; it is a pure, side-effect-free
     /// validator over already-public fields.
     pub fn endpoint_is_valid(&self, allowed_roots: &[String]) -> bool {
+        // Hostile carriers can forge a non-loopback dedicated bind. Fail closed
+        // here so materialization never claims a socket resolve() would refuse.
+        if let Some(ip) = self.bind
+            && !ip.is_loopback()
+        {
+            return false;
+        }
         self.backend(allowed_roots).is_some()
     }
 
@@ -2598,6 +2610,66 @@ pub enum IngressListenerUnsupported {
     /// field-specific reason rather than materialized into a listener that
     /// would refuse every request at runtime (issue #3261).
     UnixProtocolUnsupported,
+    /// `bind` named a Unix-domain socket. Istio rejects UDS binds on ingress
+    /// listeners; Ferrum fails closed with the same field-specific reason
+    /// rather than accepting inert metadata (issue #3266).
+    UnixBindUnsupported,
+    /// A non-empty `bind` was not a bare IPv4/IPv6 address (hostname,
+    /// `ip:port`, or otherwise unparseable). Empty/whitespace-only values use
+    /// the shared-capture contract.
+    UnparseableBind,
+    /// `bind` named an IP Ferrum cannot represent as a dedicated socket at
+    /// resolve time (not loopback and not the unspecified wildcard that maps
+    /// to shared capture). Such addresses are rejected rather than deferred to
+    /// a later locality guess; resolve never silently accepts an arbitrary IP.
+    BindNotRepresentable,
+}
+
+/// Parsed Istio Sidecar ingress `bind` (issue #3266).
+///
+/// Distinguishes the shared capture contract from a dedicated OS bind so a
+/// custom address is never preserved as inert observability-only metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IngressBind {
+    /// Omitted, empty, or unspecified (`0.0.0.0` / `::`) — traffic stays on
+    /// the shared capture / `:15006` listener keyed by declared port.
+    SharedCapture,
+    /// Dedicated loopback IP the runtime must bind.
+    Dedicated(std::net::IpAddr),
+}
+
+impl IngressBind {
+    /// Dedicated bind IP, if any.
+    pub fn dedicated_ip(self) -> Option<std::net::IpAddr> {
+        match self {
+            Self::SharedCapture => None,
+            Self::Dedicated(ip) => Some(ip),
+        }
+    }
+}
+
+/// Parse Istio Sidecar ingress `bind` into a supported ownership class.
+///
+/// Fail closed with field-specific reasons: Unix sockets, hostnames,
+/// `ip:port` forms, and non-loopback / non-unspecified addresses that are not
+/// representable as shared capture or a dedicated loopback socket.
+pub fn parse_ingress_bind(bind: Option<&str>) -> Result<IngressBind, IngressListenerUnsupported> {
+    let Some(raw) = bind.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(IngressBind::SharedCapture);
+    };
+    if raw.starts_with("unix://") || raw.starts_with('/') || raw.starts_with('@') {
+        return Err(IngressListenerUnsupported::UnixBindUnsupported);
+    }
+    match raw.parse::<std::net::IpAddr>() {
+        Ok(ip) if ip.is_unspecified() => Ok(IngressBind::SharedCapture),
+        Ok(ip) if ip.is_loopback() => Ok(IngressBind::Dedicated(ip)),
+        Ok(_) => Err(IngressListenerUnsupported::BindNotRepresentable),
+        Err(_) => {
+            // `ip:port` / `[ip]:port` parse as SocketAddr but are not a bind
+            // address. Anything else (hostname, garbage) is likewise refused.
+            Err(IngressListenerUnsupported::UnparseableBind)
+        }
+    }
 }
 
 /// Which HTTP wire protocol Ferrum speaks to a Unix-stream backend for a given
@@ -2635,6 +2707,9 @@ impl MeshSidecarIngress {
         if self.port == 0 {
             return Err(IngressListenerUnsupported::ZeroPort);
         }
+        // Bind ownership is decided BEFORE endpoint parsing so a malformed
+        // bind cannot be papered over by a valid defaultEndpoint (issue #3266).
+        let bind = parse_ingress_bind(self.bind.as_deref())?.dedicated_ip();
         let (endpoint_host, endpoint_port, endpoint_unix_path, endpoint_unix_h2c) =
             match parse_ingress_default_endpoint(&self.default_endpoint)? {
                 MeshIngressBackend::Loopback { host, port } => (host, port, None, false),
@@ -2665,6 +2740,7 @@ impl MeshSidecarIngress {
             // Stamped by the slice builder once the local service is known.
             owner_namespace: String::new(),
             owner_service: String::new(),
+            bind,
         })
     }
 
@@ -3666,12 +3742,14 @@ pub struct MeshConfig {
     /// outbound registry / egress scope must not widen to the local service).
     #[serde(skip)]
     pub local_inbound_services: Option<Vec<MeshService>>,
-    /// Runtime-only back-projection of the slice's resolved Sidecar `ingress[]`
-    /// custom inbound listeners (`MeshSlice.local_ingress_listeners`), set by
-    /// mesh preparation. The router's INBOUND per-port sibling grouping and the
-    /// listen-path uniqueness exemption read this (via
-    /// `mesh_ingress_listener_groups`) so they see the same listeners
-    /// `materialize_sidecar_inbound_proxies` materialized. `serde(skip)`: never
+    /// Runtime-only projection of the slice's resolved Sidecar `ingress[]`
+    /// custom inbound listeners after cold-path admission
+    /// (`admit_sidecar_ingress_listeners` via `materialize_sidecar_ingress_listener_proxies`).
+    /// The router's INBOUND per-port sibling grouping, listen-path uniqueness
+    /// exemption, and authenticated CONNECT remap all read this so they see
+    /// the same surviving set the materializer emitted — including dedicated-bind
+    /// conflict rejection (issue #3266), which removes the whole entry rather
+    /// than silently degrading to shared capture / CONNECT. `serde(skip)`: never
     /// operator-settable, never serialized.
     #[serde(skip)]
     pub local_ingress_listeners: Vec<ResolvedIngressListener>,
@@ -3725,6 +3803,16 @@ pub struct MeshConfig {
     /// refused. `serde(skip)`: never operator-settable, never serialized.
     #[serde(skip)]
     pub local_workload_addresses: Vec<std::net::IpAddr>,
+    /// Runtime-only dedicated Sidecar ingress bind ownership (issue #3266).
+    ///
+    /// Populated by ingress materialization for every conflict-checked
+    /// dedicated `bind` that claimed a real OS listener. Gateway and stream
+    /// listener managers consult this map for per-port bind-address overrides
+    /// so ownership stays coordinated with those registries rather than a
+    /// second ad-hoc port table. Cleared / rewritten atomically with each
+    /// accepted slice apply (update and delete withdraw entries). `serde(skip)`.
+    #[serde(skip)]
+    pub sidecar_ingress_bind_overrides: std::collections::BTreeMap<u16, std::net::IpAddr>,
     /// Runtime-only allowlist of external UDP destinations this **EgressGateway**
     /// may relay datagram-over-mesh traffic to (issue #3263). Materialized by
     /// `materialize_egress_gateway_proxies` from `MESH_EXTERNAL` `ServiceEntry`
@@ -3852,8 +3940,8 @@ impl MeshConfig {
     ///    is not permission to remap a sibling replica's (or a bare loopback)
     ///    destination onto our application.
     /// 4. Malformed endpoint / unmodeled protocol / zero port, or a missing
-    ///    owner stamp ⇒ `Deny` (same pair of guards the back-projection
-    ///    chokepoint and the materializer apply).
+    ///    owner stamp ⇒ `Deny` (same admission guards the materializer applies
+    ///    before writing this prepared `local_ingress_listeners` set).
     /// 5. Not stream-family ⇒ `Deny`. An HTTP-family listener is served by its
     ///    materialized `__mesh-ingress-*` HTTP route; a bare byte-stream CONNECT
     ///    naming it is outside the declared contract and is refused rather than
@@ -4060,9 +4148,18 @@ impl Default for MeshConfig {
             declared_ingress_http_ports: 0,
             local_inbound_tcp_routes: Vec::new(),
             local_workload_addresses: Vec::new(),
+            sidecar_ingress_bind_overrides: std::collections::BTreeMap::new(),
             egress_udp_destinations: Vec::new(),
             external_udp_egress_routes: Vec::new(),
         }
+    }
+}
+
+impl MeshConfig {
+    /// Dedicated OS bind IP for Sidecar ingress `bind` ownership on `port`
+    /// (issue #3266), if materialization claimed one.
+    pub fn sidecar_ingress_bind_override(&self, port: u16) -> Option<std::net::IpAddr> {
+        self.sidecar_ingress_bind_overrides.get(&port).copied()
     }
 }
 
