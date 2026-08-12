@@ -829,7 +829,7 @@ impl ServiceDiscoveryManager {
 }
 
 /// Owned inputs shared by a supervisor and every poller generation it spawns.
-struct DiscoveryTaskContext {
+pub(crate) struct DiscoveryTaskContext {
     key: String,
     generation: u64,
     upstream_namespace: String,
