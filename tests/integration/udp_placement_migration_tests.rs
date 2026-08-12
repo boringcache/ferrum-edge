@@ -2119,8 +2119,7 @@ async fn an_unreadable_boot_id_retracts_stale_identity_before_failing() {
         },
     )
     .await
-    .err()
-    .expect("an unreadable boot id must fail closed");
+    .expect_err("an unreadable boot id must fail closed");
     assert!(error.contains("boot id"), "{error}");
     assert_eq!(
         published_identity(registry.path()),
