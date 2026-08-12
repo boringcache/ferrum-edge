@@ -242,6 +242,18 @@ rotation skips H3-ineligible candidates (Unix) and fails closed when no
 eligible secured or plain transport remains — there is never a plaintext
 fallback for a mesh-tagged target.
 
+The mesh egress pools return an already-buffered response rather than a live
+backend body, but that response re-enters the **same** client-facing plain
+pipeline as an ordinary bridged response: `after_proxy`, body normalization,
+`on_response_body`, the representation transform gate, `on_final_response_body`,
+`response_committed`, sticky-cookie provenance, exact `Content-Length` framing,
+and one backend/admission outcome record. Response inspection and security
+policy never depend on whether the selected target happened to be mesh-tagged.
+Because the mesh dispatch is buffered-mode, a streaming response body is
+structurally impossible there; if one appears the bridge fails closed with a
+`502` instead of publishing an uninspected or fabricated body under the
+backend's status.
+
 ## Buffering policy
 
 Mirrors the H1/H2 proxy path's plugin-driven decision (see `ClientRequestBody::{Streaming, Buffered}` in `src/proxy/mod.rs`): stream the request body by default, buffer only when a plugin explicitly demands the body pre-`before_proxy` or when the caller pre-buffered it upstream.

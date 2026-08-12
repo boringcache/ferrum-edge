@@ -83,6 +83,20 @@
 //!   here, it returns 501 rather than misbehaving silently. Controlled
 //!   by `FERRUM_HTTP3_WEBSOCKET_ENABLED` (default true).
 //!
+//! - **Mesh-tagged targets share the client-facing pipeline.** A mesh-tagged
+//!   plain target dispatches through the shared HBONE / Sidecar mesh-mTLS
+//!   pools, which return an already-buffered response instead of a live
+//!   `reqwest::Response` (issue #3620). That response re-enters the SAME
+//!   plain-response path as a reqwest-backed one — `after_proxy`, body
+//!   normalization, `on_response_body`, the representation transform gate,
+//!   `on_final_response_body`, `response_committed`, sticky-cookie provenance,
+//!   exact `Content-Length` framing, and outcome recording. Response
+//!   inspection and security policy must never depend on whether the selected
+//!   target happened to be mesh-tagged. Because the mesh dispatch is
+//!   buffered-mode, a streaming body variant is structurally impossible; both
+//!   the dispatch arm and the streaming writer fail closed with a gateway error
+//!   rather than publish an uninspected or fabricated body.
+//!
 //! ## Outcome reporting
 //!
 //! `CrossProtocolOutcome` captures everything the H3 listener needs to
@@ -1222,6 +1236,43 @@ struct PlainAttemptDispatch<'a> {
     sni_dial: Option<(std::borrow::Cow<'a, Proxy>, String)>,
 }
 
+/// Terminal backend response of the H3→HTTP plain bridge, before the shared
+/// client-facing response pipeline runs.
+///
+/// Mesh-tagged targets are dispatched through the shared HBONE / Sidecar
+/// mesh-mTLS pools, which return an already-buffered response instead of a
+/// live `reqwest::Response` (issue #3620). Both arms converge here so response
+/// inspection, body transforms, final client-visible validators,
+/// `response_committed` hooks, and client framing cannot depend on whether the
+/// selected target happened to be mesh-tagged.
+enum PlainBridgeResponse {
+    /// Live response from the shared reqwest client; its body is still on the
+    /// wire and may be buffered or streamed.
+    Reqwest(reqwest::Response),
+    /// Fully buffered response from a mesh-egress dispatch.
+    MeshBuffered(PlainBridgeMeshResponse),
+}
+
+/// Buffered mesh-egress response plus the backend metadata the shared pipeline
+/// needs for outcome recording (passive health, admission classification, and
+/// the transaction record).
+struct PlainBridgeMeshResponse {
+    status: u16,
+    headers: HashMap<String, String>,
+    body: Bytes,
+    connection_error: bool,
+    error_class: Option<ErrorClass>,
+    backend_resolved_ip: Option<String>,
+}
+
+/// Source of the client-visible response body once status/headers have been
+/// extracted. Mesh responses are already buffered; reqwest responses still own
+/// their body.
+enum PlainBridgeBodySource {
+    Reqwest(reqwest::Response),
+    MeshBuffered(Bytes),
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_plain_attempt_local_policy_or_reject<'a, S>(
     state: &ProxyState,
@@ -2107,136 +2158,83 @@ where
                             }
                         }
 
-                        // Terminal mesh attempt: record outcomes and write the
-                        // buffered response through the same after_proxy /
-                        // sticky / reject-write pipeline as the reqwest
-                        // buffered success path (issue #3620).
-                        let mesh_status = attempt_result.status_code;
-                        let mut response_headers = attempt_result.headers.clone();
-                        let mesh_body = match attempt_result.body {
-                            crate::retry::ResponseBody::Buffered(bytes) => bytes,
-                            crate::retry::ResponseBody::Streaming { .. }
-                            | crate::retry::ResponseBody::StreamingH2(_)
-                            | crate::retry::ResponseBody::StreamingH3(_) => {
-                                Bytes::from_static(br#"{"error":"Backend unavailable"}"#)
-                            }
-                        };
-                        let mesh_error_class = attempt_result.error_class;
-                        let mesh_connection_error = attempt_result.connection_error;
-                        let mesh_resolved_ip = attempt_result.backend_resolved_ip.clone();
-                        record_backend_outcome(
-                            state,
-                            proxy,
-                            &epoch.load_balancer,
-                            upstream_balancer,
-                            current_target.as_deref(),
-                            current_cb_target_key.as_deref(),
-                            mesh_status,
-                            mesh_connection_error,
-                            mesh_error_class,
-                            cb_retry_probe_slot_available,
-                            false,
-                            backend_start.elapsed(),
-                        );
-                        record_cross_protocol_backend_admission_outcome(
-                            &mut backend_admission_permits,
-                            mesh_status,
-                            mesh_connection_error,
-                            mesh_error_class,
-                            backend_admission_start.elapsed(),
-                        );
-                        let status =
-                            StatusCode::from_u16(mesh_status).unwrap_or(StatusCode::BAD_GATEWAY);
-                        crate::http3::server::stamp_h3_original_response_metadata(
-                            ctx,
-                            mesh_status,
-                            &response_headers,
-                        );
-                        if !plugins.is_empty()
-                            && let Some(reject) = crate::proxy::run_after_proxy_hooks(
-                                plugins,
-                                ctx,
-                                mesh_status,
-                                &mut response_headers,
-                            )
-                            .await
-                        {
-                            let reject_status = StatusCode::from_u16(reject.status_code)
-                                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                            let (mut normalized, mut translated) = normalize_reject_for_client(
-                                ctx,
-                                reject_status,
-                                reject.body,
-                                &reject.headers,
-                                false,
+                        // Terminal mesh attempt. `proxy_h3_plain_http_mesh_buffered`
+                        // is a buffered-mode dispatch, so a streaming body variant
+                        // here means that contract broke: fail closed with a
+                        // gateway error instead of publishing a fabricated body
+                        // under the backend's (possibly successful) status. The
+                        // buffered response leaves the loop as
+                        // `PlainBridgeResponse::MeshBuffered` and is handed to the
+                        // shared plain-response pipeline below, which applies the
+                        // identical after_proxy / body-normalization /
+                        // `on_response_body` / transform / `on_final_response_body`
+                        // / `response_committed` policy, sticky-cookie provenance,
+                        // exact framing, and outcome recording as a
+                        // reqwest-backed buffered response (issue #3620).
+                        let crate::retry::BackendResponse {
+                            status_code: mesh_status,
+                            body: mesh_response_body,
+                            headers: mesh_headers,
+                            connection_error: mesh_connection_error,
+                            backend_resolved_ip: mesh_resolved_ip,
+                            error_class: mesh_error_class,
+                        } = attempt_result;
+                        let crate::retry::ResponseBody::Buffered(mesh_body) = mesh_response_body
+                        else {
+                            warn!(
+                                proxy_id = %proxy.id,
+                                status = mesh_status,
+                                "cross-protocol H3→HTTP mesh dispatch returned a streaming \
+                                 response body in buffered mode; failing closed"
                             );
-                            run_cross_protocol_reject_committed_hooks(
-                                response_committed_plugins,
-                                ctx,
+                            record_backend_outcome(
+                                state,
+                                proxy,
+                                &epoch.load_balancer,
+                                upstream_balancer,
+                                current_target.as_deref(),
+                                current_cb_target_key.as_deref(),
+                                mesh_status,
+                                mesh_connection_error,
+                                mesh_error_class,
+                                cb_retry_probe_slot_available,
                                 false,
-                                &mut normalized,
-                                &mut translated,
+                                backend_start.elapsed(),
+                            );
+                            record_cross_protocol_backend_admission_outcome(
+                                &mut backend_admission_permits,
+                                mesh_status,
+                                mesh_connection_error,
+                                mesh_error_class,
+                                backend_admission_start.elapsed(),
+                            );
+                            let mut outcome = write_plain_gateway_error(
+                                stream,
+                                ctx,
+                                StatusCode::BAD_GATEWAY,
+                                r#"{"error":"Bad Gateway"}"#,
+                                None,
+                                backend_start,
+                                bytes_sent,
                             )
-                            .await;
-                            let mut outcome = if let Some(translated) = translated {
-                                write_reject_with_headers(
-                                    stream,
-                                    StatusCode::OK,
-                                    Bytes::from(translated.body),
-                                    &translated.headers,
-                                    backend_start,
-                                    bytes_sent,
-                                    RejectBodyDisposition::WireBody,
-                                )
-                                .await?
-                            } else {
-                                write_reject_with_headers(
-                                    stream,
-                                    normalized.http_status,
-                                    normalized.body,
-                                    &normalized.headers,
-                                    backend_start,
-                                    bytes_sent,
-                                    normalized.body_disposition,
-                                )
-                                .await?
-                            };
+                            .await?;
                             outcome.backend_target =
                                 Some(strip_query_from_backend_url(&current_url));
                             outcome.connection_error = mesh_connection_error;
                             outcome.error_class = mesh_error_class;
                             outcome.backend_resolved_ip = mesh_resolved_ip;
                             return Ok(outcome);
-                        }
-                        let sticky_reissue_target =
-                            crate::proxy::backend_dispatch::sticky_cookie_reissue_target(
-                                sticky_cookie_needed,
-                                upstream_target,
-                                current_target.as_deref(),
-                            );
-                        crate::http3::server::inject_sticky_cookie_with_deadline_provenance(
-                            ctx,
-                            epoch,
-                            proxy,
-                            sticky_reissue_target,
-                            sticky_reissue_target.is_some(),
-                            &mut response_headers,
-                        );
-                        let mut outcome = write_reject_with_headers(
-                            stream,
-                            status,
-                            mesh_body,
-                            &response_headers,
-                            backend_start,
-                            bytes_sent,
-                            RejectBodyDisposition::WireBody,
-                        )
-                        .await?;
-                        outcome.backend_target = Some(strip_query_from_backend_url(&current_url));
-                        outcome.connection_error = mesh_connection_error;
-                        outcome.error_class = mesh_error_class;
-                        outcome.backend_resolved_ip = mesh_resolved_ip;
-                        return Ok(outcome);
+                        };
+                        final_backend_admission_elapsed = backend_admission_start.elapsed();
+                        final_backend_admission_permits = backend_admission_permits;
+                        break PlainBridgeResponse::MeshBuffered(PlainBridgeMeshResponse {
+                            status: mesh_status,
+                            headers: mesh_headers,
+                            body: mesh_body,
+                            connection_error: mesh_connection_error,
+                            error_class: mesh_error_class,
+                            backend_resolved_ip: mesh_resolved_ip,
+                        });
                     }
 
                     let client_result = match crate::plugins::await_grpc_deadline(
@@ -2447,7 +2445,7 @@ where
                             }
                             final_backend_admission_elapsed = backend_admission_start.elapsed();
                             final_backend_admission_permits = backend_admission_permits;
-                            break response;
+                            break PlainBridgeResponse::Reqwest(response);
                         }
                         Err(e) => {
                             let attempt_result =
@@ -3086,7 +3084,7 @@ where
 
                 match send_result {
                     Ok(response) => (
-                        response,
+                        PlainBridgeResponse::Reqwest(response),
                         bytes_sent,
                         backend_admission_permits,
                         backend_admission_start.elapsed(),
@@ -3150,10 +3148,54 @@ where
             }
         };
 
-    let status = response.status().as_u16();
-    let mut response_headers = collect_reqwest_response_headers(&response);
-    let final_backend_resolved_ip =
-        resolve_cross_protocol_backend_ip(state, proxy, current_target.as_deref()).await;
+    // Both dispatch arms converge on one client-facing pipeline. `terminal_*`
+    // carries the mesh dispatch's backend classification so passive health,
+    // admission, and the transaction record still see what the mesh transport
+    // reported; a reqwest response reaching here already succeeded, so its
+    // classification is the previous unconditional `false` / `None`.
+    let (
+        body_source,
+        status,
+        mut response_headers,
+        terminal_connection_error,
+        terminal_error_class,
+        mesh_backend_resolved_ip,
+    ) = match response {
+        PlainBridgeResponse::Reqwest(response) => {
+            let status = response.status().as_u16();
+            let response_headers = collect_reqwest_response_headers(&response);
+            (
+                PlainBridgeBodySource::Reqwest(response),
+                status,
+                response_headers,
+                false,
+                None,
+                None,
+            )
+        }
+        PlainBridgeResponse::MeshBuffered(mesh) => {
+            let PlainBridgeMeshResponse {
+                status,
+                headers,
+                body,
+                connection_error,
+                error_class,
+                backend_resolved_ip,
+            } = mesh;
+            (
+                PlainBridgeBodySource::MeshBuffered(body),
+                status,
+                headers,
+                connection_error,
+                error_class,
+                backend_resolved_ip,
+            )
+        }
+    };
+    let final_backend_resolved_ip = match mesh_backend_resolved_ip {
+        Some(resolved_ip) => Some(resolved_ip),
+        None => resolve_cross_protocol_backend_ip(state, proxy, current_target.as_deref()).await,
+    };
 
     // Content-Length fast-path limit (mirrors the H3 pool path). Parsed per
     // comma-folded member so a repeated identical declaration is honored rather
@@ -3229,8 +3271,8 @@ where
             current_target.as_deref(),
             current_cb_target_key.as_deref(),
             status,
-            false,
-            None,
+            terminal_connection_error,
+            terminal_error_class,
             cb_retry_probe_slot_available,
             false,
             backend_start.elapsed(),
@@ -3238,8 +3280,8 @@ where
         record_cross_protocol_backend_admission_outcome(
             &mut backend_admission_permits,
             status,
-            false,
-            None,
+            terminal_connection_error,
+            terminal_error_class,
             backend_admission_elapsed,
         );
         let reject_status =
@@ -3279,6 +3321,8 @@ where
         };
         outcome.backend_target = Some(strip_query_from_backend_url(&current_url));
         outcome.backend_resolved_ip = final_backend_resolved_ip.clone();
+        outcome.connection_error = terminal_connection_error;
+        outcome.error_class = terminal_error_class;
         return Ok(outcome);
     }
 
@@ -3325,26 +3369,39 @@ where
         );
     let retry_ctx = has_retry.then(|| crate::proxy::retry_response_decision_context(&*ctx));
     let response_decision_ctx = retry_ctx.as_ref().unwrap_or(&*ctx);
-    let should_buffer_response = !crate::proxy::refine_stream_response_for_content_type(
-        !should_buffer_response,
-        proxy,
-        plugins,
-        Some(response_decision_ctx),
-        status,
-        &response_headers,
-    );
+    // A mesh-egress response is already fully retained, so it is pinned to the
+    // buffered pipeline: there is no live body left to stream, and buffering is
+    // the strictly more inspected of the two paths.
+    let should_buffer_response = matches!(body_source, PlainBridgeBodySource::MeshBuffered(_))
+        || !crate::proxy::refine_stream_response_for_content_type(
+            !should_buffer_response,
+            proxy,
+            plugins,
+            Some(response_decision_ctx),
+            status,
+            &response_headers,
+        );
 
     if should_buffer_response {
         let mut response_status = status;
-        let mut response_body = match crate::plugins::await_grpc_deadline(
-            grpc_web_deadline_at,
-            collect_reqwest_response_body_with_limit(
-                response,
-                effective_max_response_body_size_bytes,
-            ),
-        )
-        .await
-        {
+        // A mesh-egress response was retained by the mesh dispatch under the same
+        // response-size ceiling and aggregate retention budget this collector
+        // enforces, so it enters the plugin pipeline directly instead of being
+        // re-collected.
+        let collected_response_body = match body_source {
+            PlainBridgeBodySource::MeshBuffered(body) => Ok(Ok(body)),
+            PlainBridgeBodySource::Reqwest(response) => {
+                crate::plugins::await_grpc_deadline(
+                    grpc_web_deadline_at,
+                    collect_reqwest_response_body_with_limit(
+                        response,
+                        effective_max_response_body_size_bytes,
+                    ),
+                )
+                .await
+            }
+        };
+        let mut response_body = match collected_response_body {
             Ok(Ok(body)) => body,
             Ok(Err((reject_status, error_body, error_class))) => {
                 // `reject_status` distinguishes an origin-attributed refusal
@@ -3720,8 +3777,8 @@ where
             current_target.as_deref(),
             current_cb_target_key.as_deref(),
             response_status,
-            false,
-            None,
+            terminal_connection_error,
+            terminal_error_class,
             cb_retry_probe_slot_available,
             false,
             backend_start.elapsed(),
@@ -3736,9 +3793,9 @@ where
         record_cross_protocol_backend_admission_outcome(
             &mut backend_admission_permits,
             status,
-            false,
+            terminal_connection_error,
             if body_completed {
-                None
+                terminal_error_class
             } else {
                 Some(ErrorClass::ClientDisconnect)
             },
@@ -3754,8 +3811,8 @@ where
             backend_resolved_ip: final_backend_resolved_ip.clone(),
             body_completed,
             client_disconnected,
-            connection_error: false,
-            error_class: None,
+            connection_error: terminal_connection_error,
+            error_class: terminal_error_class,
             body_error_class: if body_completed {
                 None
             } else {
@@ -3766,6 +3823,59 @@ where
             rejection_logged: false,
         });
     }
+
+    // Only a live reqwest body can be streamed. A mesh-egress response is always
+    // buffered and the refinement above pins it to the buffered pipeline, so
+    // reaching here means that invariant broke: fail closed with a gateway error
+    // rather than continue on a path that skips the buffered body-policy phases.
+    // The backend's own classification is still recorded once, so a gateway-side
+    // structural failure is not charged to backend health as a transport error.
+    let response = match body_source {
+        PlainBridgeBodySource::Reqwest(response) => response,
+        PlainBridgeBodySource::MeshBuffered(_) => {
+            warn!(
+                proxy_id = %proxy.id,
+                status = status,
+                "cross-protocol H3→HTTP mesh response reached the streaming path; failing closed"
+            );
+            record_backend_outcome(
+                state,
+                proxy,
+                &epoch.load_balancer,
+                upstream_balancer,
+                current_target.as_deref(),
+                current_cb_target_key.as_deref(),
+                status,
+                terminal_connection_error,
+                terminal_error_class,
+                cb_retry_probe_slot_available,
+                false,
+                backend_start.elapsed(),
+            );
+            record_cross_protocol_backend_admission_outcome(
+                &mut backend_admission_permits,
+                status,
+                terminal_connection_error,
+                terminal_error_class,
+                backend_admission_elapsed,
+            );
+            let mut outcome = write_plain_gateway_error(
+                stream,
+                ctx,
+                StatusCode::BAD_GATEWAY,
+                r#"{"error":"Bad Gateway"}"#,
+                None,
+                backend_start,
+                bytes_sent,
+            )
+            .await?;
+            outcome.backend_target = Some(strip_query_from_backend_url(&current_url));
+            outcome.backend_resolved_ip = final_backend_resolved_ip.clone();
+            outcome.connection_error = terminal_connection_error;
+            outcome.error_class = terminal_error_class;
+            return Ok(outcome);
+        }
+    };
 
     // Resolve a response-stream inspector (e.g. ai_semantic_firewall `inspect`)
     // for this H3-client → non-H3-backend response. Without this, an H3 client
