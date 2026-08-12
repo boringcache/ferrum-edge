@@ -2084,10 +2084,11 @@ async fn handle_admin_request_inner(
                 health_status["cp_dp_trust"] = serde_json::to_value(trust).unwrap_or_default();
             }
         }
-        if let Some(trust) = cp_trust_coarse.as_ref() {
-            if trust.degraded && !cp_trust_blocked {
-                health_status["status"] = json!("degraded");
-            }
+        if let Some(trust) = cp_trust_coarse.as_ref()
+            && trust.degraded
+            && !cp_trust_blocked
+        {
+            health_status["status"] = json!("degraded");
         }
         if jwks_degraded && jwks_ready {
             health_status["status"] = json!("degraded");
