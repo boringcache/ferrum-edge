@@ -26,6 +26,38 @@ fn failed_command_is_not_a_deadline() {
 }
 
 #[test]
+fn failed_command_preserves_bounded_stderr_inside_the_deadline() {
+    let error = owned_shell::run_sh_c(
+        "printf 'iptables: No chain/target/match by that name\\n' >&2; exit 7",
+        Some(Instant::now() + Duration::from_secs(5)),
+    )
+    .expect_err("nonzero exit must fail");
+    assert!(!error.is_deadline_elapsed(), "{error}");
+    match error {
+        OwnedShellError::Failed { stderr, .. } => {
+            assert!(
+                stderr.contains("No chain/target/match by that name"),
+                "{stderr}"
+            );
+        }
+        other => panic!("expected Failed with stderr, got {other}"),
+    }
+}
+
+#[test]
+fn unbounded_path_still_surfaces_stderr_when_no_deadline_is_supplied() {
+    let error = owned_shell::run_sh_c("printf 'unbounded-diagnostic\\n' >&2; false", None)
+        .expect_err("false must fail");
+    assert!(!error.is_deadline_elapsed(), "{error}");
+    match error {
+        OwnedShellError::Failed { stderr, .. } => {
+            assert!(stderr.contains("unbounded-diagnostic"), "{stderr}");
+        }
+        other => panic!("expected Failed with stderr, got {other}"),
+    }
+}
+
+#[test]
 fn an_already_elapsed_deadline_does_not_spawn() {
     let error = owned_shell::run_sh_c(
         "echo spawned",
@@ -70,4 +102,47 @@ fn a_stalled_child_is_killed_with_its_process_group_at_deadline() {
             path.file_name().unwrap_or_default().to_string_lossy()
         );
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_shell_that_exits_while_a_descendant_holds_stderr_still_returns_by_the_deadline() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let child_pid_file = dir.path().join("sleep.pid");
+    // The shell exits immediately; the background sleep inherits the piped
+    // stderr fd. An unbounded `read_to_end` would block until that descendant
+    // exits. The deadline path must return within a bounded margin and must
+    // not leave the owned descendant running.
+    let script = format!(
+        "sleep 30 & echo $! > {sleep}; exit 0",
+        sleep = child_pid_file.display(),
+    );
+    let start = Instant::now();
+    let result = owned_shell::run_sh_c(&script, Some(start + Duration::from_millis(250)));
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "stderr held open by a descendant must not pin the caller, took {elapsed:?}"
+    );
+    match result {
+        Ok(()) => {}
+        Err(error) if error.is_deadline_elapsed() => {}
+        Err(error) => panic!("expected success or a deadline error, got {error}"),
+    }
+
+    let Ok(contents) = std::fs::read_to_string(&child_pid_file) else {
+        return;
+    };
+    let Ok(pid) = contents.trim().parse::<i32>() else {
+        return;
+    };
+    let gone_by = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < gone_by {
+        let alive = unsafe { libc::kill(pid, 0) == 0 };
+        if !alive {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("owned descendant pid {pid} must not survive the invocation");
 }

@@ -462,7 +462,9 @@ pub struct AmbientUdpPreflightArgs {
 ///
 /// `--timeout-seconds` is a hard wall-clock ceiling: stalled `sh`/iptables/ip
 /// children are killed with their process group before this process reports
-/// timeout, and no attestation is published after the deadline wins.
+/// timeout, stderr collection is bounded so an orphaned grandchild cannot pin
+/// the caller, process-group cleanup failure is reported rather than claimed as
+/// success, and no usable attestation remains after the deadline wins.
 ///
 /// Node identity is resolved AUTHORITATIVELY here, from this node's own
 /// Kubernetes object, and never from the node-agent's published

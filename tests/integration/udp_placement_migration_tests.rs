@@ -17,6 +17,7 @@ use ferrum_edge::proxy::udp_placement_migration::{
     resolve_authoritative_node_identity_reading_boot_id,
     resolve_authoritative_node_identity_with_boot_id, retract_node_cleanup_proof,
     retract_node_identity, validate_node_proof_generation,
+    withhold_node_cleanup_proof_after_deadline,
 };
 
 /// Node identity is supplied EXPLICITLY in these tests rather than resolved
@@ -2428,5 +2429,94 @@ fn preflight_deadline_does_not_publish_when_it_has_already_elapsed() {
     assert!(
         !proof.exists(),
         "an already-elapsed deadline must not publish cleanup proof"
+    );
+}
+
+#[test]
+fn deadline_withhold_retracts_a_raced_cleanup_attestation() {
+    let registry = tempfile::tempdir().expect("registry");
+    let node = identity(NODE_A, BOOT_1);
+    write_node_attestation(
+        registry.path(),
+        ".udp-node-cleanup-proof-v1.json",
+        &node,
+        UdpPlacement::HostNetns,
+        PROOF_GENERATION,
+    );
+    assert!(
+        node_cleanup_proof_is_current(
+            registry.path(),
+            UdpPlacement::HostNetns,
+            &node,
+            PROOF_GENERATION,
+        )
+        .expect("readable proof")
+    );
+
+    withhold_node_cleanup_proof_after_deadline(registry.path()).expect("retract raced proof");
+    assert!(
+        !registry
+            .path()
+            .join(".udp-node-cleanup-proof-v1.json")
+            .exists(),
+        "a deadline result must not leave a usable cleanup attestation behind"
+    );
+    assert!(
+        !node_cleanup_proof_is_current(
+            registry.path(),
+            UdpPlacement::HostNetns,
+            &node,
+            PROOF_GENERATION,
+        )
+        .expect("absent proof")
+    );
+}
+
+#[test]
+fn deadline_withhold_reports_retract_failure_and_leaves_no_usable_proof() {
+    let registry = tempfile::tempdir().expect("registry");
+    let node = identity(NODE_A, BOOT_1);
+    let proof = registry.path().join(".udp-node-cleanup-proof-v1.json");
+    write_node_attestation(
+        registry.path(),
+        ".udp-node-cleanup-proof-v1.json",
+        &node,
+        UdpPlacement::HostNetns,
+        PROOF_GENERATION,
+    );
+
+    // A non-empty directory at the proof path cannot be unlinked by the
+    // narrowly-scoped retract, and cannot be read as a version-1 attestation.
+    std::fs::remove_file(&proof).expect("remove file");
+    std::fs::create_dir(&proof).expect("directory occupying proof path");
+    std::fs::write(proof.join("occupant"), b"keep-dir").expect("non-empty directory");
+
+    let error = withhold_node_cleanup_proof_after_deadline(registry.path())
+        .expect_err("retract of a directory publication must be reported");
+    assert!(
+        error.contains("retract") || error.contains("invalidate"),
+        "{error}"
+    );
+    assert!(
+        !node_cleanup_proof_is_current(
+            registry.path(),
+            UdpPlacement::HostNetns,
+            &node,
+            PROOF_GENERATION,
+        )
+        .unwrap_or(false),
+        "a directory occupying the proof path must not authorize adoption"
+    );
+    let decision = prepare_placement(
+        registry.path(),
+        &stable_attested_on_node(
+            UdpPlacement::HostNetns,
+            UdpPlacement::HostNetns,
+            &node,
+        ),
+    );
+    assert!(
+        !matches!(decision, Ok(UdpPlacementDecision::RunStable)),
+        "deadline withhold must not leave a usable attestation, got {decision:?}"
     );
 }

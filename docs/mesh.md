@@ -4346,10 +4346,16 @@ It exits non-zero without publishing anything on any failure or on its
 `--timeout-seconds` budget (default 300), so the unprivileged steady-state
 container never starts on a node whose retirement could not be proven. That
 budget is a wall-clock ceiling: the preflight owns every `sh`/iptables/ip child
-it starts, waits with `try_wait`, and SIGKILLs the child's process group if the
-deadline wins, so a stalled cleanup command cannot pin the current-thread
-runtime or leave an orphan mutating network state after timeout. No attestation
-is published after the deadline wins. Only the
+it starts, waits with `try_wait`, collects stderr under the same ceiling, and
+SIGKILLs the child's process group if the deadline wins — including when the
+shell has already exited but a grandchild still holds the inherited stderr pipe
+or process state. Process-group cleanup failure is reported rather than claimed
+as a successful termination; the caller still fails closed and withholds proof.
+A proof publication that races the deadline is retracted (or invalidated into a
+record no reader will treat as attestation) before the deadline outcome is
+returned, so a timeout cannot leave a usable cleanup attestation behind. A
+stalled cleanup command cannot pin the current-thread runtime or leave an orphan
+mutating network state after timeout. Only the
 init stage receives `hostPID`, `SYS_ADMIN`, and `SYS_PTRACE`; it has exited
 before the producer starts, so the host placement keeps its narrow
 `NET_ADMIN`/`NET_RAW` steady-state posture. The elevated stage is also narrower
@@ -4375,10 +4381,18 @@ specifies:
 
 **Node identity.** The Kubernetes downward API exposes `spec.nodeName` but not
 the node UID, and the mesh proxy holds no Kubernetes client, so the node-agent
-resolves `Node.metadata.uid` with one bounded `get nodes` and publishes
+resolves `Node.metadata.uid` with a bounded `get nodes` and publishes
 `.node-identity-v1.json` beside the pod registry; the chart grants that
 read-only verb for Ambient releases. A published record is honoured only while
-the boot id it recorded is this incarnation's. A pipeline that already knows the
+the boot id it recorded is this incarnation's. A transient API, RBAC, or
+publication failure does not freeze that absence for the life of the process:
+the node-agent retries and revalidates on its existing enrollment-retry cadence
+(~30s), remaining fail-closed until it can read this Node object. A same-name
+Node recreation that resolves to a different UID never keeps using the
+predecessor: registry-sync is retracted before the identity change, the stale
+identity is retracted before the replacement is published, and a fresh
+registry-sync marker is bound to exactly the new UID only after the current pod
+inventory is converged. A pipeline that already knows the
 value may set `FERRUM_K8S_NODE_UID` directly, which takes precedence. If neither
 is available the node has no identity, and every recordless host adoption stays
 fail-closed.
@@ -4392,7 +4406,10 @@ publication before it consults Kubernetes and again after any failure, and treat
 a failed initial retraction as a hard stop rather than publishing over a file it
 could not clear: every failure path leaves NO identity rather than a
 predecessor's, and also withholds the node UID from its registry-synchronization
-publications.
+publications. The same retract-then-lookup ordering is reused on the
+enrollment-retry cadence so a recovered API/RBAC grant can publish identity
+later, and so a Node object recreated under the same name cannot keep the old
+UID in memory or on disk.
 
 That is a publisher-side mitigation, and the two DaemonSets have no startup
 ordering between them, so it cannot by itself close the window in which the

@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::watch;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use super::host_udp_capture::HostUdpRecoverOnce;
 use super::netns_capture::PodCaptureSource;
@@ -74,7 +74,9 @@ impl HostUdpCleanupReaper for ProductionHostUdpCleanupReaper {
 /// stays false and an operator drives the rollout). The deadline is converted
 /// to a wall-clock instant and threaded into every synchronous `sh`/iptables/ip
 /// child so a hung command cannot freeze the current-thread runtime past it.
-/// Nothing is published once the deadline has won.
+/// A deadline result never reports completion, and a publication that raced the
+/// ceiling is withheld (retracted or invalidated) so no usable node-cleanup
+/// attestation remains.
 pub async fn run_udp_placement_cleanup(
     context: UdpMigrationContext,
     source: Arc<dyn PodCaptureSource>,
@@ -125,7 +127,7 @@ pub async fn run_udp_placement_cleanup_with_host_reaper<R: HostUdpCleanupReaper>
             return UdpCleanupOutcome::ShuttingDown;
         }
         if owned_shell::deadline_elapsed(std_deadline) {
-            return UdpCleanupOutcome::DeadlineElapsed;
+            return fail_closed_on_deadline(&context);
         }
         if let Some(proof_before) = context.registry_sync_proof() {
             let mut host_pass_complete = host_recovery.is_none();
@@ -149,7 +151,7 @@ pub async fn run_udp_placement_cleanup_with_host_reaper<R: HostUdpCleanupReaper>
                         });
                     }
                     HostUdpRecoverOnce::DeadlineElapsed => {
-                        return UdpCleanupOutcome::DeadlineElapsed;
+                        return fail_closed_on_deadline(&context);
                     }
                 }
                 host_outstanding = recovery.outstanding();
@@ -160,7 +162,7 @@ pub async fn run_udp_placement_cleanup_with_host_reaper<R: HostUdpCleanupReaper>
             if let Some(manager) = pod_cleanup.as_mut() {
                 let progress = manager.migration_cleanup_once().await;
                 if progress.deadline_elapsed {
-                    return UdpCleanupOutcome::DeadlineElapsed;
+                    return fail_closed_on_deadline(&context);
                 }
                 pod_outstanding = progress.outstanding;
                 if let Some(reason) = progress.failure_reason {
@@ -186,7 +188,7 @@ pub async fn run_udp_placement_cleanup_with_host_reaper<R: HostUdpCleanupReaper>
                 if let Some(outcome) =
                     wait_for_next_pass(&mut ticker, &mut shutdown, std_deadline).await
                 {
-                    return outcome;
+                    return deadline_aware_outcome(&context, outcome);
                 }
                 continue;
             }
@@ -209,20 +211,17 @@ pub async fn run_udp_placement_cleanup_with_host_reaper<R: HostUdpCleanupReaper>
 
             if let Some(proof) = proof_progress.completion_proof() {
                 if owned_shell::deadline_elapsed(std_deadline) {
-                    return UdpCleanupOutcome::DeadlineElapsed;
+                    return fail_closed_on_deadline(&context);
                 }
                 match context.mark_cleanup_complete(proof) {
                     Ok(()) => {
                         if owned_shell::deadline_elapsed(std_deadline) {
                             // A write that raced the deadline is not a published
-                            // success: retract and fail closed so the caller never
-                            // reports completion after timeout.
-                            if context.is_node_preflight() {
-                                let _ = super::udp_placement_migration::retract_node_cleanup_proof(
-                                    context.registry_dir(),
-                                );
-                            }
-                            return UdpCleanupOutcome::DeadlineElapsed;
+                            // success: withhold any newly visible proof and fail
+                            // closed so the caller never reports completion after
+                            // timeout. Retraction failure is reported, never
+                            // claimed as a successful cleanup of the attestation.
+                            return fail_closed_on_deadline(&context);
                         }
                         set_phase(UdpMigrationStatusPhase::CleanupComplete, 0);
                         clear_failure();
@@ -257,9 +256,39 @@ pub async fn run_udp_placement_cleanup_with_host_reaper<R: HostUdpCleanupReaper>
         }
 
         if let Some(outcome) = wait_for_next_pass(&mut ticker, &mut shutdown, std_deadline).await {
-            return outcome;
+            return deadline_aware_outcome(&context, outcome);
         }
     }
+}
+
+fn deadline_aware_outcome(
+    context: &UdpMigrationContext,
+    outcome: UdpCleanupOutcome,
+) -> UdpCleanupOutcome {
+    if outcome == UdpCleanupOutcome::DeadlineElapsed {
+        fail_closed_on_deadline(context)
+    } else {
+        outcome
+    }
+}
+
+/// A deadline result must not leave a usable node-cleanup attestation behind,
+/// including when publication raced the ceiling. Always fail closed as
+/// `DeadlineElapsed` (never `Complete`); report retraction/invalidation
+/// failure instead of claiming the proof was removed.
+fn fail_closed_on_deadline(context: &UdpMigrationContext) -> UdpCleanupOutcome {
+    if context.is_node_preflight()
+        && let Err(error) =
+            super::udp_placement_migration::withhold_node_cleanup_proof_after_deadline(
+                context.registry_dir(),
+            )
+    {
+        error!(
+            %error,
+            "Ambient UDP preflight deadline elapsed; cleanup attestation could not be retracted cleanly"
+        );
+    }
+    UdpCleanupOutcome::DeadlineElapsed
 }
 
 /// Wait for the next retry tick, shutdown, or the wall-clock deadline.

@@ -1593,10 +1593,12 @@ pub fn preflight_capture_tools_until(
     let probe = preflight_capture_tools_probe(require_ip6tables);
     match owned_shell::run_sh_c(&probe, deadline) {
         Ok(()) => Ok(()),
-        Err(OwnedShellError::DeadlineElapsed) => Err(
-            "the Ambient UDP node preflight could not prove predecessor retirement within its timeout; no proof was published"
-                .to_string(),
-        ),
+        Err(
+            error @ (OwnedShellError::DeadlineElapsed
+            | OwnedShellError::DeadlineCleanupFailed { .. }),
+        ) => Err(format!(
+            "the Ambient UDP node preflight could not prove predecessor retirement within its timeout; no proof was published ({error})"
+        )),
         Err(OwnedShellError::Io(e)) => Err(format!(
             "Ambient UDP capture is enabled but `sh` is not available in the runtime image \
              (the producer runs in-netns `sh -c` scripts that call `ip`/`iptables`): {e}. Use a \
@@ -2374,9 +2376,12 @@ fn run_shell_script_until(
 ) -> std::io::Result<()> {
     match owned_shell::run_sh_c(script, deadline) {
         Ok(()) => Ok(()),
-        Err(OwnedShellError::DeadlineElapsed) => Err(std::io::Error::new(
+        Err(
+            error @ (OwnedShellError::DeadlineElapsed
+            | OwnedShellError::DeadlineCleanupFailed { .. }),
+        ) => Err(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
-            "in-netns script exceeded its deadline",
+            format!("in-netns script exceeded its deadline ({error})"),
         )),
         Err(OwnedShellError::Io(error)) => Err(error),
         Err(OwnedShellError::Failed { status, stderr }) => Err(std::io::Error::other(format!(

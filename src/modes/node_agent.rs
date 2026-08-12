@@ -10,6 +10,7 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -86,6 +87,10 @@ const INGRESS_TOPOLOGY_INITIAL_TIMEOUT: Duration = Duration::from_secs(2);
 const INGRESS_TOPOLOGY_DATAPATH_RETRY: Duration = Duration::from_secs(5);
 const UDP_REGISTRY_RETRACTION_RETRY: Duration = Duration::from_secs(1);
 const UDP_CAPTURE_READINESS_POLL: Duration = Duration::from_millis(250);
+/// Bounded Node GET used to publish and revalidate this node's Kubernetes UID.
+/// Matches the privileged preflight's lookup window so both authorities fail in
+/// the same outage rather than one masking the other.
+const NODE_UID_LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
 const UDP_HANDSHAKE_ORPHAN_GRACE: Duration = Duration::from_secs(30);
 // Verified handshakes need longer than the ordinary orphan grace for producer
 // polling, bounded responder batches, and process restarts, but cannot live
@@ -1712,6 +1717,9 @@ async fn run_with_backend(
     // publication before it can fail, so a failure leaves the proxy with NO
     // node identity — not with a predecessor Node object's UID — and the
     // proxy's own guard treats an absent identity as a fail-closed refusal.
+    // Adoption stays fail-closed until a later maintenance-lane retry can read
+    // this Node object; a same-name Node recreation that resolves to a
+    // different UID never keeps using the old one.
     //
     // The resolved UID also BINDS this incarnation's registry-synchronization
     // publications: the marker lives on a persistent registry path, so one left
@@ -2025,8 +2033,11 @@ async fn run_with_pod_stream<S, I>(
     // This node-agent incarnation's AUTHORITATIVELY resolved
     // `Node.metadata.uid`, or `None` when it could not prove one. It binds every
     // registry-synchronization publication this loop makes to the machine whose
-    // pod inventory it enumerates (issue #3809).
-    udp_node_uid: Option<String>,
+    // pod inventory it enumerates (issue #3809). Revalidated on the existing
+    // enrollment-retry cadence so a transient API/RBAC/publication failure does
+    // not leave this None forever, and a same-name Node recreation cannot keep
+    // using the predecessor UID.
+    mut udp_node_uid: Option<String>,
     mut pod_stream: S,
     seed_pods: I,
 ) -> Result<(), anyhow::Error>
@@ -2513,6 +2524,74 @@ where
                 }
             }
             _ = retry_interval.tick() => {
+                // Revalidate / retry this node's Kubernetes UID on the existing
+                // enrollment-retry cadence (issue #3809). A transient API, RBAC,
+                // or publication failure must not leave identity unresolved
+                // forever, and a same-name Node recreation must not keep using
+                // the predecessor UID. Registry-sync is retracted before any
+                // identity lookup/change; capture mutations stay fenced while
+                // that retraction is outstanding.
+                if let (Some(registry_dir), Some(client)) = (
+                    config.node_waypoint_pod_registry_dir.as_deref(),
+                    kube_client.as_ref(),
+                ) {
+                    let refresh = refresh_node_identity_binding(
+                        udp_node_uid.as_deref(),
+                        &mut shutdown_rx,
+                        || lookup_this_node_uid(client, config.node_name.as_str()),
+                        || {
+                            match crate::proxy::udp_placement_migration::clear_registry_sync_marker(
+                                registry_dir,
+                            ) {
+                                Ok(()) => {
+                                    udp_registry_sync_published = false;
+                                    udp_registry_sync_retraction_pending = false;
+                                    Ok(())
+                                }
+                                Err(error) => {
+                                    udp_registry_sync_published = false;
+                                    udp_registry_sync_retraction_pending = true;
+                                    Err(error)
+                                }
+                            }
+                        },
+                        || {
+                            crate::proxy::udp_placement_migration::retract_node_identity(
+                                registry_dir,
+                            )
+                        },
+                        |uid| {
+                            crate::proxy::udp_placement_migration::publish_node_identity(
+                                registry_dir,
+                                uid,
+                            )
+                        },
+                    )
+                    .await;
+                    match refresh {
+                        NodeIdentityRefresh::Interrupted { uid } => {
+                            udp_node_uid = uid;
+                            if *shutdown_rx.borrow() {
+                                break PodWatcherLoopExit::ShutdownRequested;
+                            }
+                        }
+                        refresh => {
+                            let retracted = refresh.registry_sync_was_retracted();
+                            udp_node_uid = refresh.uid().map(str::to_string);
+                            if retracted {
+                                startup_ready.store(false, Ordering::Release);
+                            }
+                            if matches!(refresh, NodeIdentityRefresh::Fenced { .. })
+                                && udp_registry_sync_retraction_pending
+                            {
+                                warn!(
+                                    "Deferring capture retry tick until node identity and Ambient UDP registry proof retraction recover"
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                }
                 // Re-drive any pod whose transient enrollment failure has aged
                 // past the backoff window, and retry stale detach/map cleanup
                 // that would otherwise keep capture partially attached. Cheap
@@ -2853,6 +2932,49 @@ fn has_pending_capture_failures(pod_states: &DashMap<String, PodAttachmentState>
         .any(|entry| entry.key().starts_with(&key_prefix))
 }
 
+/// Outcome of one bounded node-identity retry/revalidation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum NodeIdentityRefresh {
+    /// Authoritative lookup returned the same UID already in use. Registry-sync
+    /// was not retracted.
+    Unchanged { uid: String },
+    /// A UID was published after the retract-then-lookup ordering. Registry-sync
+    /// was retracted; the caller republishes a marker bound to this UID only
+    /// after the current pod inventory is converged.
+    Established { uid: String },
+    /// No UID can be vouched for. Identity was retracted. Registry-sync was
+    /// retracted when that step ran.
+    Unresolved,
+    /// A required retraction or publication failed. Readiness and capture
+    /// mutation stay fenced. `uid` is `None` whenever the previous UID must not
+    /// keep being used.
+    Fenced { uid: Option<String> },
+    /// Shutdown arrived during the bounded GET. `uid` is the last value this
+    /// incarnation may still vouch for.
+    Interrupted { uid: Option<String> },
+}
+
+impl NodeIdentityRefresh {
+    /// The UID this incarnation may still vouch for, if any.
+    pub fn uid(&self) -> Option<&str> {
+        match self {
+            Self::Unchanged { uid } | Self::Established { uid } => Some(uid.as_str()),
+            Self::Fenced { uid } | Self::Interrupted { uid } => uid.as_deref(),
+            Self::Unresolved => None,
+        }
+    }
+
+    /// Whether this outcome retracted the registry-synchronization marker and
+    /// the caller must republish only after inventory converges.
+    pub fn registry_sync_was_retracted(&self) -> bool {
+        !matches!(
+            self,
+            Self::Unchanged { .. } | Self::Interrupted { .. }
+        )
+    }
+}
+
 /// Resolve this node's `Node.metadata.uid` with one bounded GET and publish it
 /// into the shared pod-registry directory for the Ambient proxy's UDP placement
 /// proof. Returns the resolved UID only when this incarnation both proved it
@@ -2874,50 +2996,31 @@ fn has_pending_capture_failures(pod_states: &DashMap<String, PodAttachmentState>
 /// the privileged preflight refuses. This is a strictly narrower posture than
 /// the identity file alone, because the preflight resolves its own identity from
 /// the API server and never reads this publication as an authority.
+///
+/// A transient failure here is retried on the existing enrollment-retry cadence
+/// inside the pod-watcher loop; adoption stays fail-closed until that retry can
+/// read this Node object.
 async fn publish_node_identity(
     client: &Client,
     node_name: &str,
     registry_dir: &std::path::Path,
 ) -> Option<String> {
-    if let Err(error) = crate::proxy::udp_placement_migration::retract_node_identity(registry_dir) {
-        error!(
-            %error,
-            "could not retract the previously published node identity before resolving this \
-             node's Kubernetes UID; refusing to publish a node identity or a node-bound Ambient \
-             UDP registry proof on this incarnation, because a surviving stale publication names \
-             a node UID this agent cannot vouch for"
-        );
-        return None;
-    }
-    match resolve_and_publish_node_identity(client, node_name, registry_dir).await {
-        Ok(node_uid) => Some(node_uid),
-        Err(error) => {
-            warn!(
-                %error,
-                "could not publish this node's Kubernetes UID; Ambient UDP host-placement adoption \
-                 will stay fail-closed until the node-agent can read its own Node object"
-            );
-            if let Err(error) =
-                crate::proxy::udp_placement_migration::retract_node_identity(registry_dir)
-            {
-                error!(
-                    %error,
-                    "could not remove the published Ambient UDP node identity after a failed \
-                     lookup; remove it manually before relying on node-specific placement proof"
-                );
-            }
-            None
-        }
-    }
+    let (_unused_shutdown, mut shutdown) = tokio::sync::watch::channel(false);
+    let refresh = refresh_node_identity_binding(
+        None,
+        &mut shutdown,
+        || lookup_this_node_uid(client, node_name),
+        || crate::proxy::udp_placement_migration::clear_registry_sync_marker(registry_dir),
+        || crate::proxy::udp_placement_migration::retract_node_identity(registry_dir),
+        |uid| crate::proxy::udp_placement_migration::publish_node_identity(registry_dir, uid),
+    )
+    .await;
+    refresh.uid().map(str::to_string)
 }
 
-async fn resolve_and_publish_node_identity(
-    client: &Client,
-    node_name: &str,
-    registry_dir: &std::path::Path,
-) -> Result<String, String> {
+async fn lookup_this_node_uid(client: &Client, node_name: &str) -> Result<String, String> {
     let nodes: Api<Node> = Api::all(client.clone());
-    let node = match tokio::time::timeout(Duration::from_secs(10), nodes.get(node_name)).await {
+    let node = match tokio::time::timeout(NODE_UID_LOOKUP_TIMEOUT, nodes.get(node_name)).await {
         Ok(Ok(node)) => node,
         Ok(Err(error)) => {
             return Err(format!(
@@ -2926,14 +3029,159 @@ async fn resolve_and_publish_node_identity(
         }
         Err(_) => return Err("timed out reading this node's Kubernetes object".to_string()),
     };
-    let uid = node
-        .metadata
+    node.metadata
         .uid
         .as_deref()
-        .ok_or_else(|| "this node's Kubernetes object carries no UID".to_string())?
-        .to_string();
-    crate::proxy::udp_placement_migration::publish_node_identity(registry_dir, &uid)?;
-    Ok(uid)
+        .filter(|uid| !uid.trim().is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "this node's Kubernetes object carries no UID".to_string())
+}
+
+async fn lookup_until_shutdown<Fut>(
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+    lookup: Fut,
+    keep_uid: Option<String>,
+) -> Result<Result<String, String>, NodeIdentityRefresh>
+where
+    Fut: Future<Output = Result<String, String>>,
+{
+    if *shutdown.borrow() {
+        return Err(NodeIdentityRefresh::Interrupted { uid: keep_uid });
+    }
+    tokio::pin!(lookup);
+    loop {
+        tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return Err(NodeIdentityRefresh::Interrupted { uid: keep_uid });
+                }
+            }
+            result = &mut lookup => return Ok(result),
+        }
+    }
+}
+
+/// Retry or revalidate the published node identity.
+///
+/// Hard ordering:
+/// 1. retract the registry-sync proof before any identity lookup that can
+///    change what this incarnation vouches for (the unresolved retry path) or
+///    before applying a detected UID change;
+/// 2. retract stale node identity before that lookup (retry) or before
+///    publishing a replacement UID;
+/// 3. publish the new UID only after authoritative resolution;
+/// 4. the caller republishes a registry-sync marker bound to exactly that UID
+///    only after the current pod inventory is converged.
+///
+/// A stable UID is revalidated with a probe lookup first so a healthy node does
+/// not fence capture on every cadence. Shutdown aborts the bounded GET.
+pub(crate) async fn refresh_node_identity_binding<L, Fut, RS, RI, P>(
+    current_uid: Option<&str>,
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+    lookup: L,
+    retract_registry_sync: RS,
+    retract_identity: RI,
+    publish_identity: P,
+) -> NodeIdentityRefresh
+where
+    L: FnOnce() -> Fut,
+    Fut: Future<Output = Result<String, String>>,
+    RS: FnOnce() -> Result<(), String>,
+    RI: FnMut() -> Result<(), String>,
+    P: FnOnce(&str) -> Result<(), String>,
+{
+    if *shutdown.borrow() {
+        return NodeIdentityRefresh::Interrupted {
+            uid: current_uid.map(str::to_string),
+        };
+    }
+
+    let mut lookup = Some(lookup);
+    let mut retract_identity = retract_identity;
+    let resolved = if let Some(current) = current_uid {
+        let Some(lookup) = lookup.take() else {
+            return NodeIdentityRefresh::Unresolved;
+        };
+        match lookup_until_shutdown(shutdown, lookup(), Some(current.to_string())).await {
+            Err(interrupted) => return interrupted,
+            Ok(Ok(uid)) if uid == current => {
+                return NodeIdentityRefresh::Unchanged { uid };
+            }
+            Ok(Ok(uid)) => Some(uid),
+            Ok(Err(error)) => {
+                warn!(
+                    %error,
+                    "could not revalidate this node's Kubernetes object; retracting identity and remaining fail-closed until the node-agent can read its own Node object"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let need_lookup_after_retract = current_uid.is_none();
+
+    if let Err(error) = retract_registry_sync() {
+        warn!(
+            %error,
+            "could not retract the Ambient UDP registry proof before a node identity lookup or change; keeping capture mutations and readiness fenced"
+        );
+        return NodeIdentityRefresh::Fenced { uid: None };
+    }
+    if let Err(error) = retract_identity() {
+        error!(
+            %error,
+            "could not retract the previously published node identity before resolving this \
+             node's Kubernetes UID; refusing to publish a node identity or a node-bound Ambient \
+             UDP registry proof on this incarnation, because a surviving stale publication names \
+             a node UID this agent cannot vouch for"
+        );
+        return NodeIdentityRefresh::Fenced { uid: None };
+    }
+
+    let uid = if let Some(uid) = resolved {
+        Some(uid)
+    } else if need_lookup_after_retract {
+        let Some(lookup) = lookup.take() else {
+            return NodeIdentityRefresh::Unresolved;
+        };
+        match lookup_until_shutdown(shutdown, lookup(), None).await {
+            Err(interrupted) => return interrupted,
+            Ok(Ok(uid)) => Some(uid),
+            Ok(Err(error)) => {
+                warn!(
+                    %error,
+                    "could not publish this node's Kubernetes UID; Ambient UDP host-placement adoption \
+                     will stay fail-closed until the node-agent can read its own Node object"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let Some(uid) = uid else {
+        return NodeIdentityRefresh::Unresolved;
+    };
+    if let Err(error) = publish_identity(&uid) {
+        warn!(
+            %error,
+            "could not publish this node's Kubernetes UID; Ambient UDP host-placement adoption \
+             will stay fail-closed until the node-agent can read its own Node object"
+        );
+        if let Err(error) = retract_identity() {
+            error!(
+                %error,
+                "could not remove the published Ambient UDP node identity after a failed \
+                 publication; remove it manually before relying on node-specific placement proof"
+            );
+            return NodeIdentityRefresh::Fenced { uid: None };
+        }
+        return NodeIdentityRefresh::Unresolved;
+    }
+    NodeIdentityRefresh::Established { uid }
 }
 
 fn publish_udp_migration_registry_sync_if_ready(

@@ -2079,7 +2079,7 @@ pub(crate) async fn recover_and_reap_until(
                 HostUdpRecoverOnce::Reaped
             }
         }
-        Err(OwnedShellError::DeadlineElapsed) => HostUdpRecoverOnce::DeadlineElapsed,
+        Err(error) if error.is_deadline_elapsed() => HostUdpRecoverOnce::DeadlineElapsed,
         Err(error) => {
             // A reap that cannot complete is retried, not logged once: leaving a
             // `PREROUTING` jump into a socketless chain black-holes every

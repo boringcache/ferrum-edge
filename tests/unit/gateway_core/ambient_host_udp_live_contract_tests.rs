@@ -970,10 +970,12 @@ fn ambient_udp_production_entry_points_are_scheduled_by_the_trusted_classifier()
     );
     let node_agent = read("src/modes/node_agent.rs");
     assert!(
-        node_agent.contains("udp_placement_migration::publish_node_identity(registry_dir, &uid)")
-            && node_agent.contains("udp_placement_migration::retract_node_identity(registry_dir)"),
-        "src/modes/node_agent.rs must still publish node identity and retract it \
-         before a lookup can fail"
+        node_agent.contains("udp_placement_migration::publish_node_identity(registry_dir, uid)")
+            && node_agent.contains("udp_placement_migration::retract_node_identity(registry_dir)")
+            && node_agent.contains("refresh_node_identity_binding")
+            && node_agent.contains("POD_ENROLLMENT_RETRY_BACKOFF"),
+        "src/modes/node_agent.rs must still publish node identity, retract it \
+         before a lookup can fail, and retry/revalidate on the existing enrollment cadence"
     );
     // The preflight's own provenance is the API server, not that publication:
     // a `.node-identity-v1.json` written by a PREVIOUS Kubernetes Node object on
@@ -1021,6 +1023,20 @@ fn ambient_udp_production_entry_points_are_scheduled_by_the_trusted_classifier()
         mesh.contains("run_udp_placement_cleanup(\n        context,\n        source,\n        shutdown.clone(),\n        None,")
             || mesh.contains("shutdown.clone(),\n        None,"),
         "ordinary migration cleanup must keep an unbounded supervisor (deadline None)"
+    );
+
+    let cleanup = read("src/proxy/udp_placement_cleanup.rs");
+    assert!(
+        cleanup.contains("withhold_node_cleanup_proof_after_deadline")
+            && cleanup.contains("fail_closed_on_deadline"),
+        "a deadline result must withhold any raced cleanup attestation rather than ignoring retract failure"
+    );
+    let owned_shell = read("src/proxy/owned_shell.rs");
+    assert!(
+        owned_shell.contains("drain_stderr_until")
+            && owned_shell.contains("terminate_owned_tree")
+            && owned_shell.contains("DeadlineCleanupFailed"),
+        "deadline-owned shells must bound stderr collection and report process-group cleanup failure"
     );
 
     let migration = read("src/proxy/udp_placement_migration.rs");
