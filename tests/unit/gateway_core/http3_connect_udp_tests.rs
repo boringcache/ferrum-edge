@@ -559,7 +559,9 @@ fn refuses_a_connect_udp_request_without_an_authority() {
     // absolute URI cannot be represented without an authority. Keep the
     // validator's fixed diagnostic covered directly as defense in depth.
     assert!(
-        "https:///udp/dns.example/853/".parse::<http::Uri>().is_err(),
+        "https:///udp/dns.example/853/"
+            .parse::<http::Uri>()
+            .is_err(),
         "the HTTP URI type must reject an HTTPS URI without authority"
     );
     assert_eq!(
