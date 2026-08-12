@@ -26,14 +26,25 @@ use crate::identity::{JwtAuthority as IdentityJwtAuthority, TrustBundle as Ident
 ///
 /// Mirrors Istio's `appProtocol` field on `Service` ports + endpoints. Phase
 /// A serialises lowercase ("http", "http2", "grpc", "tcp", "tls", "udp",
-/// "mongo", "redis", "mysql", "postgres", "unknown").
+/// "dtls", "mongo", "redis", "mysql", "postgres", "unknown").
 ///
 /// `Udp` is a distinct L4 transport: it is NOT HTTP-family (no HTTP route
 /// materialization) and NOT part of the raw-TCP stream lane (REDIRECT /
 /// `SO_ORIGINAL_DST` capture does not apply to UDP). It partitions out of both
 /// the HTTP-family and TCP-stream port predicates so a Service `protocol: UDP`
-/// port is never mis-classified as HTTP (its prior fate as `Unknown`). UDP
-/// capture/egress arrives in a later F3 §3.3 stage; this variant is inert today.
+/// port is never mis-classified as HTTP (its prior fate as `Unknown`).
+///
+/// `Dtls` is the SAME L4 transport as `Udp` — every UDP-family predicate
+/// (`is_udp_mesh_protocol`, `service_udp_stream_ports`, the mesh-DNS carve-out)
+/// treats the two identically, so DTLS ports partition out of the HTTP-family
+/// and raw-TCP lanes exactly like plain UDP. The variant exists so a NodeWaypoint
+/// UDP listener knows to TERMINATE frontend DTLS on that port instead of
+/// relaying opaque datagrams (issue #3286). It is sourced from an
+/// `appProtocol: dtls` / port-name hint on a `protocol: UDP` Kubernetes Service
+/// port (or the equivalent Istio `ServiceEntry`/`Sidecar` port protocol); a
+/// `protocol: TCP` port can never become `Dtls`. Datagram-over-mesh egress
+/// (Ambient/Sidecar capture) keeps relaying DTLS OPAQUELY — the mesh never
+/// terminates the inner DTLS on that path.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AppProtocol {
@@ -43,6 +54,7 @@ pub enum AppProtocol {
     Tcp,
     Tls,
     Udp,
+    Dtls,
     Mongo,
     Redis,
     Mysql,

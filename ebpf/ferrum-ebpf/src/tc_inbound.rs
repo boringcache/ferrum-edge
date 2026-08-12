@@ -105,10 +105,25 @@ fn guard_ipv4(ctx: &TcContext) -> Result<i32, i64> {
             }
             guard_enrolled_destination(ctx, source_is_node)
         }
-        IPPROTO_UDP => match udp_ports4(ctx) {
-            Ok((src_port, dst_port)) if dns_response_allowed(src_port, dst_port) => Ok(TC_ACT_OK),
-            _ => drop_unsupported_enrolled_destination(),
-        },
+        IPPROTO_UDP => {
+            // The NodeWaypoint's own UDP relay (issue #3286) is authorized by
+            // the SAME node-source + socket-mark proof the TCP arm uses: its
+            // frontend listener socket and its per-session backend socket both
+            // carry `node_waypoint_inbound_auth_mark`, so the forward datagram
+            // to an enrolled backend pod and the reply to the enrolled source
+            // pod are admitted while every unmarked datagram to an enrolled pod
+            // stays dropped. Checked BEFORE the DNS carve-out so a marked relay
+            // never depends on port heuristics.
+            if enrolled_destination_authorized(ctx, source_is_node) {
+                return Ok(TC_ACT_PIPE);
+            }
+            match udp_ports4(ctx) {
+                Ok((src_port, dst_port)) if dns_response_allowed(src_port, dst_port) => {
+                    Ok(TC_ACT_OK)
+                }
+                _ => drop_unsupported_enrolled_destination(),
+            }
+        }
         _ => Ok(TC_ACT_OK),
     }
 }
@@ -172,10 +187,19 @@ fn guard_ipv6(ctx: &TcContext) -> Result<i32, i64> {
             }
             guard_enrolled_destination(ctx, source_is_node)
         }
-        IPPROTO_UDP => match udp_ports6(ctx) {
-            Ok((src_port, dst_port)) if dns_response_allowed(src_port, dst_port) => Ok(TC_ACT_OK),
-            _ => drop_unsupported_enrolled_destination(),
-        },
+        IPPROTO_UDP => {
+            // IPv6 mirror of the v4 arm: the NodeWaypoint's own marked UDP
+            // relay is authorized on the same node-source + socket-mark proof.
+            if enrolled_destination_authorized(ctx, source_is_node) {
+                return Ok(TC_ACT_PIPE);
+            }
+            match udp_ports6(ctx) {
+                Ok((src_port, dst_port)) if dns_response_allowed(src_port, dst_port) => {
+                    Ok(TC_ACT_OK)
+                }
+                _ => drop_unsupported_enrolled_destination(),
+            }
+        }
         header if ipv6_extension_header(header) => drop_unsupported_enrolled_destination(),
         _ => Ok(TC_ACT_OK),
     }

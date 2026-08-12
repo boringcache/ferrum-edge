@@ -6120,6 +6120,11 @@ fn app_protocol(value: Option<&str>) -> AppProtocol {
         "tcp" => AppProtocol::Tcp,
         "tls" => AppProtocol::Tls,
         "udp" => AppProtocol::Udp,
+        // Same L4 transport as `udp`; selects frontend DTLS termination on a
+        // NodeWaypoint UDP listener (issue #3286). Every UDP-family predicate
+        // (including `service_entry_port_protocol_is_udp` below) treats it as
+        // UDP.
+        "dtls" => AppProtocol::Dtls,
         "mongo" => AppProtocol::Mongo,
         "redis" => AppProtocol::Redis,
         "mysql" => AppProtocol::Mysql,
@@ -6142,7 +6147,9 @@ fn app_protocol(value: Option<&str>) -> AppProtocol {
 /// the predicate lives in one place and translation/materialization and the
 /// status report stay in lock-step.
 pub(crate) fn service_entry_port_protocol_is_udp(protocol: Option<&str>) -> bool {
-    matches!(app_protocol(protocol), AppProtocol::Udp)
+    // `Dtls` is the same L4 transport, so it must report as a UDP port here or
+    // the status writer's deferral report would diverge from the materializer.
+    matches!(app_protocol(protocol), AppProtocol::Udp | AppProtocol::Dtls)
 }
 
 /// Map a Sidecar `ingress[].port.protocol` string to the `AppProtocol` carried on

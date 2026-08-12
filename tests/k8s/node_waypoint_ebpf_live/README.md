@@ -80,6 +80,47 @@ Kubernetes node UID in
 `k8s:node-name:<node>` so each NodeWaypoint DaemonSet pod receives the SVID
 that discovery later pins for that node.
 
+## NodeWaypoint UDP listener datapath (issue #3286)
+
+`run_node_waypoint_udp_datapath_checks` drives **real datagrams** through the
+UDP listener the NodeWaypoint materializes for the in-mesh `udp-echo` Service's
+`protocol: UDP` port (`materialize_node_waypoint_udp_listeners`, enabled by
+`ambient.env.FERRUM_MESH_NODE_WAYPOINT_UDP_LISTENERS_ENABLED=true` in the Helm
+install). The listener binds that port number in the node's network namespace,
+so a co-located enrolled pod reaches it at `<node IP>:$FERRUM_LIVE_UDP_LISTENER_PORT`
+(default `15353`) and its source pod is attributed from the kernel-reported
+ingress interface — its veth — before `mesh_authz` evaluates scoped policy.
+
+The two UDP senders reuse the `src-a` / `src-b` ServiceAccounts, so the same
+principal-keyed `AuthorizationPolicy` objects that govern the HTTP checks govern
+these datagrams. Assertions, all observed from the datagram outcome:
+
+- `node_waypoint.udp.listener_allow_attributed_source` — the admitted enrolled
+  source reaches the backend and receives its echo.
+- `node_waypoint.udp.listener_deny_scoped_policy` — the source the
+  namespace-scoped `deny-src-b` policy names gets nothing.
+- `node_waypoint.udp.listener_deny_unattributed_source` — an unenrolled pod
+  (`udp-unmanaged`, outside the mesh namespace) has no registry binding for its
+  veth and is refused.
+- `node_waypoint.udp.listener_deny_spoofed_source` — the same unenrolled pod
+  FORGES the admitted pod's source address over a raw socket and is still
+  refused, because attribution is the ingress interface rather than the
+  address. When the sandbox denies a raw socket the assertion records that the
+  forged datagram could not be emitted instead of claiming a refusal; the
+  unenrolled-source case above remains the required attribution proof, and the
+  address-forging property itself is pinned by
+  `one_pod_cannot_obtain_another_pods_scope_by_forging_its_source_address` in
+  `tests/integration/mesh_node_waypoint_udp_scope_tests.rs`.
+- `node_waypoint.udp.policy_change_denies_live` /
+  `node_waypoint.udp.policy_withdrawal_recovers_live` — applying then deleting a
+  DENY for the admitted principal converges both ways with the ambient
+  DaemonSet's total container restart count unchanged, so recovery is a live
+  reload rather than a data-plane restart.
+
+DTLS listeners are **not** exercised here: `AppProtocol::Dtls` materialization,
+its frontend-termination posture, and its bind-failure visibility are covered at
+unit/integration level only.
+
 Each run writes `target/node-waypoint-ebpf-live/live-assertions.json` using the
 shared live-assertion schema from `tests/k8s/lib/live_assertions.sh`. The current
 assertions are H2 evidence only; they do not promote NodeWaypoint or make it a

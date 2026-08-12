@@ -861,6 +861,7 @@ async fn connect_udp_backend_candidates(
     port: u16,
     connect_timeout: Duration,
     dtls_params: Option<crate::dtls::BackendDtlsParams>,
+    socket_mark: Option<u32>,
 ) -> Result<(ConnectedUdpBackend, SocketAddr), anyhow::Error> {
     crate::dns::connect_candidates(candidates, port, connect_timeout, |addr| {
         let dtls_params = dtls_params.clone();
@@ -871,6 +872,22 @@ async fn connect_udp_backend_candidates(
                 "0.0.0.0:0"
             };
             let socket = UdpSocket::bind(bind_addr).await?;
+            // NodeWaypoint UDP relay (issue #3286): the backend is an enrolled
+            // pod, and the pod-veth tc guard drops UDP to an enrolled pod IP
+            // unless the datagram carries the NodeWaypoint inbound auth mark —
+            // the same proof the TCP inbound relay dial uses. Fail the
+            // candidate rather than dialing unmarked into a guaranteed drop.
+            if let Some(mark) = socket_mark.filter(|mark| *mark != 0) {
+                #[cfg(unix)]
+                {
+                    use std::os::fd::AsRawFd;
+                    crate::socket_opts::set_socket_mark(socket.as_raw_fd(), mark)?;
+                }
+                // Socket marks are a Linux concept; NodeWaypoint scoping never
+                // runs on a non-unix target, so there is nothing to apply.
+                #[cfg(not(unix))]
+                let _ = mark;
+            }
             socket.connect(addr).await?;
             match dtls_params {
                 Some(params) => crate::dtls::DtlsConnection::connect(socket, params)
@@ -1890,6 +1907,31 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
 
     let addr = SocketAddr::new(bind_addr, port);
     let frontend_socket = Arc::new(UdpSocket::bind(addr).await?);
+
+    // NodeWaypoint UDP relay (issue #3286): replies leave THIS socket toward
+    // the enrolled source pod, and the pod-veth tc guard drops UDP to an
+    // enrolled pod IP unless it carries the NodeWaypoint inbound auth mark.
+    // Marking the frontend socket is therefore a startup precondition for a
+    // scoped listener, not an optimization — without it every admitted session
+    // would relay to the backend and have its reply silently dropped. Ordinary
+    // (non-scoped) UDP listeners are untouched.
+    if node_waypoint_udp_source.is_some() {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            crate::socket_opts::set_socket_mark(
+                frontend_socket.as_raw_fd(),
+                crate::ebpf::NODE_WAYPOINT_INBOUND_AUTH_MARK,
+            )
+            .map_err(|error| {
+                std::io::Error::other(format!(
+                    "NodeWaypoint scoped UDP listener on port {port} could not set the inbound \
+                     auth socket mark, so every reply to an enrolled source pod would be dropped \
+                     by the pod-veth guard: {error}"
+                ))
+            })?;
+        }
+    }
 
     // A NodeWaypoint scoped listener has no datapath at all without the
     // kernel's ingress-interface cmsg: every session would resolve to "no
@@ -4227,6 +4269,9 @@ async fn handle_dtls_client_inner(
         backend_port,
         connect_timeout,
         dtls_params,
+        node_waypoint_source
+            .as_ref()
+            .map(|_| crate::ebpf::NODE_WAYPOINT_INBOUND_AUTH_MARK),
     )
     .await
     {
@@ -4804,6 +4849,9 @@ async fn create_session(
         backend_port,
         connect_timeout,
         dtls_params,
+        node_waypoint_source
+            .as_ref()
+            .map(|_| crate::ebpf::NODE_WAYPOINT_INBOUND_AUTH_MARK),
     )
     .await
     {

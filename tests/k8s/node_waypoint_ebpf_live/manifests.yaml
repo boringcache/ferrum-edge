@@ -303,3 +303,123 @@ spec:
         - source:
             principals:
               - __TRUST_DOMAIN__/ns/__NAMESPACE__/sa/src-a
+---
+# ── NodeWaypoint UDP/DTLS listener datapath (issue #3286) ────────────────────
+#
+# `udp-echo` is an ordinary in-mesh Service whose port declares `protocol: UDP`.
+# With FERRUM_MESH_NODE_WAYPOINT_UDP_LISTENERS_ENABLED=true the NodeWaypoint
+# materializes ONE datagram listener on that port number in the host network
+# namespace and forwards to the Service's backing pods. A co-located enrolled
+# pod that sends to <node IP>:__UDP_LISTENER_PORT__ therefore reaches the production UDP
+# listener, and its source pod is attributed from the kernel-reported ingress
+# interface (its veth) before `mesh_authz` evaluates scoped policy.
+#
+# The two UDP senders deliberately REUSE the src-a / src-b ServiceAccounts, so
+# the same principal-keyed AuthorizationPolicies that govern the HTTP checks
+# also govern these datagrams: `deny-src-b` is namespace-scoped and matches the
+# src-b principal, so it applies to the src-b source scope and not to src-a's.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: udp-echo
+  namespace: __NAMESPACE__
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: udp-echo
+  template:
+    metadata:
+      labels:
+        app: udp-echo
+        ferrum.io/mesh: enabled
+    spec:
+      serviceAccountName: dst-a
+      nodeSelector:
+        ferrum.io/live-node: a
+      containers:
+        - name: udp
+          image: python:3.12-alpine
+          ports:
+            - containerPort: __UDP_LISTENER_PORT__
+              protocol: UDP
+          command:
+            - python
+            - -u
+            - -c
+            - |
+              import socket
+
+              s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+              s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+              s.bind(("0.0.0.0", __UDP_LISTENER_PORT__))
+              while True:
+                  data, peer = s.recvfrom(2048)
+                  # Logged so the live gate can prove a REFUSED datagram never
+                  # reached the backend, not merely that no reply came back
+                  # (a spoofed datagram's reply would be sent to the forged
+                  # address, so reply-absence alone would be vacuous).
+                  print("recv:" + data.decode("utf-8", "replace"), flush=True)
+                  s.sendto(b"udp-ok:" + data, peer)
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: udp-echo
+  namespace: __NAMESPACE__
+spec:
+  selector:
+    app: udp-echo
+  ports:
+    - name: udp
+      port: __UDP_LISTENER_PORT__
+      targetPort: __UDP_LISTENER_PORT__
+      protocol: UDP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: udp-src-a
+  namespace: __NAMESPACE__
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: udp-src-a
+  template:
+    metadata:
+      labels:
+        app: udp-src-a
+        ferrum.io/mesh: enabled
+    spec:
+      serviceAccountName: src-a
+      nodeSelector:
+        ferrum.io/live-node: a
+      containers:
+        - name: udp
+          image: python:3.12-alpine
+          command: ["sh", "-c", "sleep 365d"]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: udp-src-b
+  namespace: __NAMESPACE__
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: udp-src-b
+  template:
+    metadata:
+      labels:
+        app: udp-src-b
+        ferrum.io/mesh: enabled
+    spec:
+      serviceAccountName: src-b
+      nodeSelector:
+        ferrum.io/live-node: a
+      containers:
+        - name: udp
+          image: python:3.12-alpine
+          command: ["sh", "-c", "sleep 365d"]

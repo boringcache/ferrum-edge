@@ -233,22 +233,59 @@ need them, or because they are blocked upstream / architecturally:
   UDP/DTLS policy is unchanged.
 
 
-  **What is and is not proven, precisely.** What the lifted suppression restores
-  *today* is the UDP/DTLS half of the mesh service metadata and its mesh-DNS
-  visibility, plus the per-datagram attribution the listener path consumes. A
-  NodeWaypoint mesh data plane still has no configuration surface that
-  materializes a UDP/DTLS **listener**: `start_udp_listener` is reached only
-  from `StreamListenerManager` over `GatewayConfig.proxies`; in mesh mode those
-  proxies come only from `decode_virtual_service_l4_proxies`, whose CP-side
-  candidate filter requires a non-empty `stream_match`, and `Proxy::validate`
-  rejects `stream_match` on `udp`/`dtls` schemes; the localized file source
-  rejects a `proxies:` section outright. So the attribution channel, the
-  fail-closed listener startup, and the per-datagram revalidation are exercised
-  at unit and integration level and by the compiled NodeWaypoint runtime in the
-  `node-waypoint-ebpf-live` gate, but **there is no live UDP or DTLS traffic
-  assertion through a NodeWaypoint listener, because no supported configuration
-  can create one.** Issue #3286 is therefore not fully closed: adding such a
-  configuration surface, and a live gate over it, is follow-up work.
+  **The listener configuration surface.** The attribution channel is reachable
+  because a NodeWaypoint materializes real UDP/DTLS **service listeners** from
+  the mesh service inventory (`materialize_node_waypoint_udp_listeners`, opt-in
+  via `FERRUM_MESH_NODE_WAYPOINT_UDP_LISTENERS_ENABLED`). Each in-mesh
+  `MeshService` port whose protocol is `udp` (opaque datagram relay) or `dtls`
+  (frontend DTLS termination — the same L4 transport, selected by an
+  `appProtocol: dtls` / port-name hint on a `protocol: UDP` Service port, or by
+  a `dtls` Istio `ServiceEntry`/port protocol) materializes ONE datagram
+  listener on that port number, forwarding to the service's backing pods at
+  their resolved `targetPort`. Materialization runs DP-side in
+  `prepare_normalized_gateway_config_for_mesh`, exactly like the east-west and
+  egress-gateway stream listeners, so it needs neither a `stream_match` (which
+  `Proxy::validate` rejects on `udp`/`dtls`) nor a CP-side carrier. It is
+  default-OFF because a NodeWaypoint runs on the host network and enabling it
+  claims node-wide port numbers. Fail-closed refusals, each with a
+  field-specific log line and no inert leftovers: a port already claimed by a
+  mesh runtime listener or another stream proxy, a port claimed by two
+  different services (BOTH refused — a datagram carries no host or SNI), a
+  service port with no reachable local-cluster endpoint, and port `0`. A
+  `dtls` port with no usable frontend DTLS material, or a scoped listener whose
+  socket cannot report ingress interfaces, fails the BIND and is reported as a
+  `StreamBindFailure` in readiness/status rather than starting a black-hole
+  listener. A `dtls` port stays unrepresentable at the EgressGateway
+  (terminate-and-re-originate has no DTLS origination path) and is refused
+  there with its own diagnostic.
+
+  **What is and is not proven, precisely.** The `node-waypoint-ebpf-live` gate
+  sends REAL datagrams through this production listener on a multi-pod kind
+  cluster (`tests/k8s/node_waypoint_ebpf_live/run.sh`,
+  `run_node_waypoint_udp_datapath_checks`): an admitted enrolled source reaches
+  the backend and gets its echo, a source denied by a scoped
+  `AuthorizationPolicy` gets nothing, an unenrolled source (and the same pod
+  FORGING an enrolled pod's source address over a raw socket) is refused
+  because attribution is the kernel-reported ingress interface, and a policy
+  change then withdrawal denies and restores that datapath with the ambient
+  DaemonSet's restart count unchanged. The relay itself is authorized past the pod-veth tc guard the same way the TCP
+  inbound relay is: the scoped listener's frontend socket and its per-session
+  backend socket carry `NODE_WAYPOINT_INBOUND_AUTH_MARK`, and `tc_inbound`'s
+  UDP arms (IPv4 and IPv6) admit a node-sourced datagram carrying that mark
+  before falling through to the existing DNS-response carve-out; unmarked UDP
+  to an enrolled pod stays dropped. A scoped listener that cannot set that
+  mark does not start.
+
+  UDP is what the live gate carries;
+  **DTLS listener materialization, its frontend-termination posture, and its
+  bind-failure visibility are covered at unit/integration level only** — there
+  is no live DTLS handshake assertion, and the DTLS server socket does not yet
+  carry the inbound auth mark, so a NodeWaypoint DTLS listener whose backend or
+  source pod is eBPF-enrolled is not yet an end-to-end path (it fails closed —
+  the guard drops, nothing leaks). The spoof probe needs a raw socket; when
+  the sandbox denies one the assertion records that the forged datagram could
+  not be emitted rather than claiming a refusal, and the unenrolled-source
+  refusal remains the required attribution proof.
 - **DR `connectionPool.http.maxRequestsPerConnection`** — parsed and validated
   but **Deferred** in status; backend close-after-N-requests is unsupported, so
   it is not projected as effective policy. Use `http2MaxRequests`.

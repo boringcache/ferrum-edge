@@ -674,3 +674,418 @@ async fn manager_task_abort_retracts_the_published_generation() {
         NodeWaypointUdpSourceRefusal::IndexUnavailable
     );
 }
+
+// ── NodeWaypoint UDP/DTLS listener materialization (issue #3286) ──────────
+//
+// The attribution channel above is only reachable if a NodeWaypoint can
+// actually CREATE a UDP/DTLS listener. `materialize_node_waypoint_udp_listeners`
+// is that surface: it turns each in-mesh service's UDP-family port into a real
+// stream listener proxy + upstream in the prepared `GatewayConfig`, which is
+// exactly what `StreamListenerManager` binds and what
+// `NodeWaypointUdpSourceScoping` then scopes. These tests pin first
+// construction, reload/update/withdrawal, the fail-closed refusals, and the
+// UDP-vs-DTLS split.
+
+use ferrum_edge::config::types::{DispatchKind, GatewayConfig};
+use ferrum_edge::modes::mesh::config::{AppProtocol, MeshService, ServicePort, WorkloadRef};
+use ferrum_edge::modes::mesh::{
+    MESH_NODE_WAYPOINT_UDP_PROXY_ID_PREFIX, MESH_NODE_WAYPOINT_UDP_UPSTREAM_ID_PREFIX,
+    MeshRuntimeConfig, MeshTopology, node_waypoint_udp_proxy_id, node_waypoint_udp_upstream_id,
+    prepare_gateway_config_for_mesh,
+};
+
+use super::mesh_test_support::{
+    DEFAULT_NAMESPACE, gateway_config_with_mesh, mesh_config_with, runtime_for_topology,
+    workload_for,
+};
+
+const UDP_LISTENERS_ENV: &str = "FERRUM_MESH_NODE_WAYPOINT_UDP_LISTENERS_ENABLED";
+
+/// Serializes the `FERRUM_MESH_NODE_WAYPOINT_UDP_LISTENERS_ENABLED` mutations
+/// in this test binary and restores the previous value on drop.
+static UDP_LISTENER_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+struct UdpListenerEnvGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    saved: Option<String>,
+}
+
+impl UdpListenerEnvGuard {
+    fn set(value: Option<&str>) -> Self {
+        let lock = UDP_LISTENER_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let saved = std::env::var(UDP_LISTENERS_ENV).ok();
+        // SAFETY: `_lock` serializes every mutation of this variable in this
+        // test binary, and the guard restores the snapshot on drop.
+        unsafe {
+            match value {
+                Some(value) => std::env::set_var(UDP_LISTENERS_ENV, value),
+                None => std::env::remove_var(UDP_LISTENERS_ENV),
+            }
+        }
+        Self { _lock: lock, saved }
+    }
+}
+
+impl Drop for UdpListenerEnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: the guard still holds `UDP_LISTENER_ENV_LOCK`.
+        unsafe {
+            match self.saved.as_deref() {
+                Some(value) => std::env::set_var(UDP_LISTENERS_ENV, value),
+                None => std::env::remove_var(UDP_LISTENERS_ENV),
+            }
+        }
+    }
+}
+
+fn udp_service(
+    name: &str,
+    port: u16,
+    protocol: AppProtocol,
+    workloads: &[&Workload],
+) -> MeshService {
+    MeshService {
+        cluster_ips: vec!["10.96.0.10".to_string()],
+        name: name.to_string(),
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        ports: vec![ServicePort {
+            port,
+            protocol,
+            name: Some(name.to_string()),
+            target_port: None,
+        }],
+        workloads: workloads
+            .iter()
+            .map(|w| WorkloadRef {
+                spiffe_id: w.spiffe_id.clone(),
+            })
+            .collect(),
+        protocol_overrides: HashMap::new(),
+        uid: None,
+    }
+}
+
+fn node_waypoint_runtime() -> MeshRuntimeConfig {
+    runtime_for_topology(MeshTopology::NodeWaypoint)
+}
+
+fn prepare(
+    runtime: &MeshRuntimeConfig,
+    services: Vec<MeshService>,
+    workloads: Vec<Workload>,
+) -> GatewayConfig {
+    let mesh = mesh_config_with(workloads, services, Vec::new());
+    let config = gateway_config_with_mesh(Vec::new(), Vec::new(), mesh);
+    prepare_gateway_config_for_mesh(config, runtime).expect("mesh config preparation must succeed")
+}
+
+fn udp_listeners(config: &GatewayConfig) -> Vec<&ferrum_edge::config::types::Proxy> {
+    config
+        .proxies
+        .iter()
+        .filter(|proxy| proxy.id.starts_with(MESH_NODE_WAYPOINT_UDP_PROXY_ID_PREFIX))
+        .collect()
+}
+
+#[test]
+fn a_udp_service_port_materializes_a_node_waypoint_datagram_listener() {
+    let _env = UdpListenerEnvGuard::set(Some("true"));
+    let runtime = node_waypoint_runtime();
+    let backend = workload_for("dns", DEFAULT_NAMESPACE, [("app", "udp")], ["10.244.3.11"]);
+    let config = prepare(
+        &runtime,
+        vec![udp_service("dns", 5353, AppProtocol::Udp, &[&backend])],
+        vec![backend],
+    );
+
+    let listeners = udp_listeners(&config);
+    assert_eq!(
+        listeners.len(),
+        1,
+        "exactly one NodeWaypoint UDP listener must materialize"
+    );
+    let proxy = listeners[0];
+    assert_eq!(
+        proxy.id,
+        node_waypoint_udp_proxy_id(DEFAULT_NAMESPACE, "dns", 5353)
+    );
+    assert_eq!(proxy.listen_port, Some(5353));
+    assert_eq!(
+        proxy.dispatch_kind,
+        DispatchKind::UdpRaw,
+        "a `udp` service port relays opaque datagrams"
+    );
+    assert!(
+        !proxy.frontend_tls,
+        "a `udp` port must not terminate frontend DTLS"
+    );
+    assert!(
+        !proxy.passthrough,
+        "the listener must run the on_stream_connect chain so mesh_authz evaluates the \
+         attributed source pod"
+    );
+    assert!(
+        proxy.hosts.is_empty() && proxy.stream_match.is_none(),
+        "a datagram listener carries neither SNI hosts nor an L4 matcher"
+    );
+
+    let upstream_id = node_waypoint_udp_upstream_id(DEFAULT_NAMESPACE, "dns", 5353);
+    assert_eq!(proxy.upstream_id.as_deref(), Some(upstream_id.as_str()));
+    let upstream = config
+        .upstreams
+        .iter()
+        .find(|upstream| upstream.id == upstream_id)
+        .expect("the listener's upstream must be materialized");
+    assert!(upstream.id.starts_with(MESH_NODE_WAYPOINT_UDP_UPSTREAM_ID_PREFIX));
+    assert_eq!(
+        upstream
+            .targets
+            .iter()
+            .map(|target| (target.host.as_str(), target.port))
+            .collect::<Vec<_>>(),
+        vec![("10.244.3.11", 5353)],
+        "the listener forwards to the service's backing pod on its resolved target port"
+    );
+
+    // The whole point of the surface: the prepared config passes the same
+    // stream-proxy validation the runtime applies before binding.
+    config
+        .validate_stream_proxies()
+        .expect("a materialized NodeWaypoint UDP listener must be a valid stream proxy");
+}
+
+#[test]
+fn a_dtls_service_port_materializes_a_frontend_dtls_terminating_listener() {
+    let _env = UdpListenerEnvGuard::set(Some("true"));
+    let runtime = node_waypoint_runtime();
+    let backend = workload_for("coap", DEFAULT_NAMESPACE, [("app", "udp")], ["10.244.3.12"]);
+    let config = prepare(
+        &runtime,
+        vec![udp_service("coap", 5684, AppProtocol::Dtls, &[&backend])],
+        vec![backend],
+    );
+
+    let listeners = udp_listeners(&config);
+    assert_eq!(listeners.len(), 1);
+    let proxy = listeners[0];
+    assert_eq!(proxy.listen_port, Some(5684));
+    assert!(
+        proxy.frontend_tls,
+        "a `dtls` service port must terminate frontend DTLS on the listener"
+    );
+    assert_eq!(
+        proxy.dispatch_kind,
+        DispatchKind::UdpRaw,
+        "the BACKEND leg stays plaintext UDP; only the frontend terminates DTLS"
+    );
+    config
+        .validate_stream_proxies()
+        .expect("a DTLS listener must also be a valid stream proxy");
+}
+
+#[test]
+fn node_waypoint_udp_listeners_are_off_by_default() {
+    let _env = UdpListenerEnvGuard::set(None);
+    let runtime = node_waypoint_runtime();
+    let backend = workload_for("dns", DEFAULT_NAMESPACE, [("app", "udp")], ["10.244.3.11"]);
+    let config = prepare(
+        &runtime,
+        vec![udp_service("dns", 5353, AppProtocol::Udp, &[&backend])],
+        vec![backend],
+    );
+    assert!(
+        udp_listeners(&config).is_empty(),
+        "a NodeWaypoint runs on the host network, so claiming node-wide UDP ports is opt-in"
+    );
+}
+
+#[test]
+fn a_malformed_listener_switch_is_rejected_rather_than_silently_disabling_listeners() {
+    let _env = UdpListenerEnvGuard::set(Some("yes-please"));
+    let runtime = node_waypoint_runtime();
+    assert!(
+        runtime
+            .validate_node_waypoint_udp_listener_settings()
+            .is_err(),
+        "an unparseable switch must abort mesh startup instead of serving no listeners"
+    );
+    // Non-NodeWaypoint topologies never consume the switch, so a stray value
+    // there is inert rather than a startup error.
+    assert!(
+        runtime_for_topology(MeshTopology::Ambient)
+            .validate_node_waypoint_udp_listener_settings()
+            .is_ok()
+    );
+}
+
+#[test]
+fn only_the_node_waypoint_topology_materializes_udp_listeners() {
+    let _env = UdpListenerEnvGuard::set(Some("true"));
+    let backend = workload_for("dns", DEFAULT_NAMESPACE, [("app", "udp")], ["10.244.3.11"]);
+    for topology in [
+        MeshTopology::Ambient,
+        MeshTopology::Sidecar,
+        MeshTopology::ServiceWaypoint,
+    ] {
+        let runtime = runtime_for_topology(topology);
+        let config = prepare(
+            &runtime,
+            vec![udp_service("dns", 5353, AppProtocol::Udp, &[&backend])],
+            vec![backend.clone()],
+        );
+        assert!(
+            udp_listeners(&config).is_empty(),
+            "{topology:?} has no per-datagram source-attribution channel and must not bind \
+             a NodeWaypoint UDP listener"
+        );
+    }
+}
+
+#[test]
+fn two_services_claiming_one_udp_port_materialize_no_listener() {
+    let _env = UdpListenerEnvGuard::set(Some("true"));
+    let runtime = node_waypoint_runtime();
+    let a = workload_for("dns-a", DEFAULT_NAMESPACE, [("app", "udp")], ["10.244.3.11"]);
+    let b = workload_for("dns-b", DEFAULT_NAMESPACE, [("app", "udp")], ["10.244.3.12"]);
+    let config = prepare(
+        &runtime,
+        vec![
+            udp_service("dns-a", 5353, AppProtocol::Udp, &[&a]),
+            udp_service("dns-b", 5353, AppProtocol::Udp, &[&b]),
+        ],
+        vec![a, b],
+    );
+    assert!(
+        udp_listeners(&config).is_empty(),
+        "a datagram carries no host or SNI, so a contested port must refuse BOTH claimants \
+         rather than let materialization order pick a winner"
+    );
+}
+
+#[test]
+fn a_udp_service_port_with_no_reachable_endpoint_materializes_no_listener() {
+    let _env = UdpListenerEnvGuard::set(Some("true"));
+    let runtime = node_waypoint_runtime();
+    let orphan = workload_for("dns", DEFAULT_NAMESPACE, [("app", "udp")], ["10.244.3.11"]);
+    // The service references the workload, but the slice carries no workloads.
+    let config = prepare(
+        &runtime,
+        vec![udp_service("dns", 5353, AppProtocol::Udp, &[&orphan])],
+        Vec::new(),
+    );
+    assert!(
+        udp_listeners(&config).is_empty(),
+        "a listener with no backend would be a black hole; refuse it instead"
+    );
+}
+
+#[test]
+fn ipv6_workload_addresses_materialize_listener_targets() {
+    let _env = UdpListenerEnvGuard::set(Some("true"));
+    let runtime = node_waypoint_runtime();
+    let backend = workload_for("dns", DEFAULT_NAMESPACE, [("app", "udp")], ["fd00::1234"]);
+    let config = prepare(
+        &runtime,
+        vec![udp_service("dns", 5353, AppProtocol::Udp, &[&backend])],
+        vec![backend],
+    );
+    let upstream_id = node_waypoint_udp_upstream_id(DEFAULT_NAMESPACE, "dns", 5353);
+    let upstream = config
+        .upstreams
+        .iter()
+        .find(|upstream| upstream.id == upstream_id)
+        .expect("an IPv6-only service must still materialize its upstream");
+    assert_eq!(
+        upstream
+            .targets
+            .iter()
+            .map(|target| target.host.as_str())
+            .collect::<Vec<_>>(),
+        vec!["fd00::1234"]
+    );
+}
+
+#[test]
+fn a_reload_updates_endpoints_and_withdraws_a_removed_service() {
+    let _env = UdpListenerEnvGuard::set(Some("true"));
+    let runtime = node_waypoint_runtime();
+
+    let first_backend = workload_for("dns", DEFAULT_NAMESPACE, [("app", "udp")], ["10.244.3.11"]);
+    let first = prepare(
+        &runtime,
+        vec![udp_service("dns", 5353, AppProtocol::Udp, &[&first_backend])],
+        vec![first_backend],
+    );
+    assert_eq!(udp_listeners(&first).len(), 1);
+
+    // Source pod recreation / endpoint change: same service, new pod address.
+    let replaced_backend = workload_for("dns", DEFAULT_NAMESPACE, [("app", "udp")], ["10.244.3.99"]);
+    let updated = prepare(
+        &runtime,
+        vec![udp_service(
+            "dns",
+            5353,
+            AppProtocol::Udp,
+            &[&replaced_backend],
+        )],
+        vec![replaced_backend],
+    );
+    let upstream_id = node_waypoint_udp_upstream_id(DEFAULT_NAMESPACE, "dns", 5353);
+    assert_eq!(
+        updated
+            .upstreams
+            .iter()
+            .find(|upstream| upstream.id == upstream_id)
+            .expect("upstream")
+            .targets
+            .iter()
+            .map(|target| target.host.as_str())
+            .collect::<Vec<_>>(),
+        vec!["10.244.3.99"],
+        "an endpoint change must be reflected in the next prepared generation"
+    );
+
+    // Withdrawal: the service leaves the slice entirely.
+    let withdrawn = prepare(&runtime, Vec::new(), Vec::new());
+    assert!(
+        udp_listeners(&withdrawn).is_empty(),
+        "withdrawing the service must withdraw its listener"
+    );
+    assert!(
+        !withdrawn
+            .upstreams
+            .iter()
+            .any(|upstream| upstream.id == upstream_id),
+        "withdrawing the service must withdraw its upstream too"
+    );
+}
+
+#[test]
+fn a_udp_port_already_claimed_by_a_stream_proxy_is_refused() {
+    let _env = UdpListenerEnvGuard::set(Some("true"));
+    let runtime = node_waypoint_runtime();
+    let backend = workload_for("dns", DEFAULT_NAMESPACE, [("app", "udp")], ["10.244.3.11"]);
+
+    // An operator TCP stream proxy already owns 5353 in this generation.
+    let mut existing = super::mesh_test_support::http_proxy("operator-tcp", "example.test", 9000);
+    existing.backend_scheme = Some(ferrum_edge::config::types::BackendScheme::Tcp);
+    existing.hosts = Vec::new();
+    existing.listen_path = None;
+    existing.listen_port = Some(5353);
+
+    let mesh = mesh_config_with(
+        vec![backend.clone()],
+        vec![udp_service("dns", 5353, AppProtocol::Udp, &[&backend])],
+        Vec::new(),
+    );
+    let config = gateway_config_with_mesh(vec![existing], Vec::new(), mesh);
+    let prepared = prepare_gateway_config_for_mesh(config, &runtime)
+        .expect("mesh config preparation must succeed");
+
+    assert!(
+        udp_listeners(&prepared).is_empty(),
+        "a port already claimed by a stream proxy must not be re-claimed by a datagram listener"
+    );
+}

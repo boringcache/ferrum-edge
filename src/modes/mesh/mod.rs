@@ -1107,6 +1107,26 @@ impl MeshRuntimeConfig {
         validate_ingress_capture_addr(addr)
     }
 
+    /// Fail-closed validation of the NodeWaypoint UDP/DTLS listener switch
+    /// (issue #3286), for the SERVING path only.
+    ///
+    /// `materialize_node_waypoint_udp_listeners` must stay infallible (read-only
+    /// predicates and tests reach it), so a malformed
+    /// `FERRUM_MESH_NODE_WAYPOINT_UDP_LISTENERS_ENABLED` would there simply
+    /// materialize nothing — an operator who asked for UDP listeners would get a
+    /// proxy that reports healthy and serves none of them. The serving path
+    /// calls this with `?` and aborts startup with a field-specific error
+    /// instead.
+    ///
+    /// Topology-scoped: only `NodeWaypoint` consumes the switch, so a stray
+    /// value on any other topology is inert and is not a startup error.
+    pub fn validate_node_waypoint_udp_listener_settings(&self) -> Result<(), String> {
+        if self.topology != MeshTopology::NodeWaypoint {
+            return Ok(());
+        }
+        node_waypoint_udp_listeners_enabled_from_env().map(|_| ())
+    }
+
     /// The optional UDP TPROXY capture listener (F3 §3.3), emitted on the two
     /// topologies that actually **relay** captured UDP — **Ambient** (datagram
     /// over HBONE `:15008`) and **Sidecar** (datagram over mesh-mTLS `:15006`).
@@ -1352,6 +1372,11 @@ fn prepare_normalized_gateway_config_for_mesh(
     // Runs beside the in-mesh UDP materializer and shares its route index, so a
     // captured datagram resolves through one table regardless of destination.
     materialize_mesh_external_udp_egress_upstreams(&mut config, runtime, mesh_slice);
+    // NodeWaypoint UDP/DTLS SERVICE LISTENERS (issue #3286). Runs BEFORE the
+    // fail-closed suppression below so a build that cannot attribute a datagram
+    // to a source pod (non-Linux) strips these listeners through the exact same
+    // path as every other NodeWaypoint UDP/DTLS surface.
+    materialize_node_waypoint_udp_listeners(&mut config, runtime, mesh_slice);
     fail_closed_node_waypoint_udp_dtls_scoped_policies(&mut config, runtime);
     apply_destination_rules(&mut config, runtime, mesh_slice)?;
     project_mesh_source_locality(&mut config, runtime, mesh_slice);
@@ -1524,6 +1549,422 @@ fn prepare_normalized_gateway_config_for_mesh(
     Ok(config)
 }
 
+/// Env switch that opts a NodeWaypoint into materializing UDP/DTLS service
+/// listeners (issue #3286).
+///
+/// Default OFF. A NodeWaypoint runs on the host network, so materializing a
+/// listener for every UDP service port the slice carries would claim node-wide
+/// ports (`53`, `123`, …) the moment a NodeWaypoint is installed. The listener
+/// surface is therefore an explicit operator decision, exactly like
+/// `FERRUM_MESH_EGRESS_STREAM_ENABLED` for the stream-family egress listeners.
+///
+/// Returns the parse error rather than defaulting, so the serving path can
+/// abort startup with a field-specific message instead of silently serving no
+/// UDP listeners on a typo (see
+/// [`MeshRuntimeConfig::validate_node_waypoint_udp_listener_settings`]).
+pub(crate) fn node_waypoint_udp_listeners_enabled_from_env() -> Result<bool, String> {
+    const VAR: &str = "FERRUM_MESH_NODE_WAYPOINT_UDP_LISTENERS_ENABLED";
+    match std::env::var(VAR)
+        .ok()
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        None => Ok(false),
+        // Same accepted forms as every other `FERRUM_MESH_*` bool
+        // (`EnvValue for bool`): case-insensitive `true`/`false` plus `1`/`0`.
+        Some(value) => match value.to_ascii_lowercase().as_str() {
+            "true" | "1" => Ok(true),
+            "false" | "0" => Ok(false),
+            _ => Err(format!(
+                "Invalid {VAR} '{value}'. Expected true, false, 1, or 0"
+            )),
+        },
+    }
+}
+
+/// Reserved id prefix for NodeWaypoint UDP/DTLS service listener proxies
+/// (issue #3286). A DISTINCT id space from the egress relay proxies: these are
+/// LISTENERS with a `listen_port`, not route-only relay proxies.
+pub const MESH_NODE_WAYPOINT_UDP_PROXY_ID_PREFIX: &str = "__mesh-nw-udp-";
+
+/// Reserved id prefix for the upstreams backing those listeners.
+pub const MESH_NODE_WAYPOINT_UDP_UPSTREAM_ID_PREFIX: &str = "__mesh-nw-udp-upstream-";
+
+/// Forward-derived listener proxy id. Never parsed back.
+pub fn node_waypoint_udp_proxy_id(namespace: &str, name: &str, port: u16) -> String {
+    format!("{MESH_NODE_WAYPOINT_UDP_PROXY_ID_PREFIX}{namespace}-{name}-{port}")
+        .replace(['/', '.'], "-")
+}
+
+/// Forward-derived listener upstream id. Never parsed back.
+pub fn node_waypoint_udp_upstream_id(namespace: &str, name: &str, port: u16) -> String {
+    format!("{MESH_NODE_WAYPOINT_UDP_UPSTREAM_ID_PREFIX}{namespace}-{name}-{port}")
+        .replace(['/', '.'], "-")
+}
+
+/// Materialize NodeWaypoint UDP and DTLS **service listeners** from the mesh
+/// service inventory (issue #3286).
+///
+/// This is the configuration surface that makes the per-datagram source
+/// attribution in [`crate::proxy::node_waypoint_udp_identity`] reachable. Before
+/// it, a NodeWaypoint mesh data plane could not create a UDP/DTLS listener at
+/// all: `start_udp_listener` is only reached from `StreamListenerManager` over
+/// `GatewayConfig.proxies`, and the only mesh-mode source of proxies was
+/// `decode_virtual_service_l4_proxies`, whose candidates must carry a non-empty
+/// `stream_match` — which `Proxy::validate` rejects on `udp`/`dtls`. This
+/// materializer takes the same DP-side path every other mesh listener uses
+/// (`materialize_egress_gateway_proxies` materializes stream listeners the same
+/// way), so it needs no `stream_match` and no CP-side carrier.
+///
+/// **Source shape.** One listener per in-mesh `MeshService` UDP-family port
+/// (`service_udp_stream_ports`, which covers both `udp` and `dtls` because they
+/// are the same L4 transport). `udp` relays opaque datagrams; `dtls` terminates
+/// frontend DTLS on the listener (`frontend_tls: true`) and forwards plaintext
+/// datagrams to the backend. The listener binds the SERVICE port number on the
+/// node, and its upstream targets are the service's local-cluster backing pods
+/// at their resolved `targetPort` — the same fail-closed named-`targetPort`
+/// resolution the east-west materializer uses, so an unresolvable named target
+/// port skips that endpoint rather than publishing it on the wrong port.
+///
+/// **Why the datagrams are attributable.** A co-located pod's datagram reaches
+/// this host-netns socket over that pod's veth, so the kernel-reported ingress
+/// interface identifies the source pod exactly (and unforgeably) —
+/// `NodeWaypointUdpSourceScoping` joins it against the node-agent registry and
+/// stamps the pod's `PolicyScopeCache` before `mesh_authz` runs. Off-node
+/// senders arrive on the node uplink, which no enrolled pod owns, so they are
+/// unattributable and denied whenever any enforcing scoped policy is loaded.
+///
+/// **Fail-closed admission.** Every rejection drops the listener and logs a
+/// field-specific reason; nothing is silently inert:
+/// - a port already claimed by a mesh runtime listener (`listener_plan()`),
+/// - a port already claimed by another stream proxy in this generation,
+/// - a port claimed by two different services (BOTH are dropped — a datagram
+///   carries no host, so a shared datagram port is unresolvable),
+/// - a service port with no reachable local-cluster endpoint,
+/// - a port number of `0`.
+///
+/// Listener BIND failures (including a `dtls` port with no usable frontend DTLS
+/// material, and a scoped listener whose socket cannot report ingress
+/// interfaces) are reported by `StreamListenerManager` as `StreamBindFailure`
+/// entries and surface in readiness/status; no black-hole listener is started.
+fn materialize_node_waypoint_udp_listeners(
+    config: &mut GatewayConfig,
+    runtime: &MeshRuntimeConfig,
+    mesh_slice: &MeshSlice,
+) {
+    if runtime.topology != MeshTopology::NodeWaypoint {
+        return;
+    }
+    // A parse error is reported (and made fatal) by
+    // `validate_node_waypoint_udp_listener_settings` on the serving path; this
+    // cold materialization path must stay infallible for read-only callers, so
+    // an unparseable value materializes nothing.
+    if !node_waypoint_udp_listeners_enabled_from_env().unwrap_or(false) {
+        return;
+    }
+
+    // Ports the mesh runtime itself binds (HBONE, transparent inbound capture,
+    // …). Claiming one would take the node's mesh datapath down.
+    let mut reserved_ports: HashSet<u16> = runtime
+        .listener_plan()
+        .iter()
+        .map(|listener| listener.addr.port())
+        .filter(|port| *port != 0)
+        .collect();
+    // Ports already claimed by a stream proxy in THIS generation (VirtualService
+    // L4 routes, sidecar ingress binds, …). Those were materialized earlier and
+    // win; a datagram listener never shares a port with them.
+    for proxy in &config.proxies {
+        if proxy.dispatch_kind.is_stream()
+            && let Some(port) = proxy.listen_port
+            && port != 0
+        {
+            reserved_ports.insert(port);
+        }
+    }
+
+    // (port) -> candidate. A port claimed by two services is unresolvable for a
+    // datagram (no host header, no SNI on a plain UDP port), so BOTH claimants
+    // are dropped rather than letting materialization order pick a winner.
+    struct Candidate {
+        proxy: Proxy,
+        upstream: Upstream,
+        service: String,
+        namespace: String,
+        terminates_dtls: bool,
+    }
+    let mut by_port: BTreeMap<u16, Vec<Candidate>> = BTreeMap::new();
+    let now = chrono::Utc::now();
+
+    for service in &mesh_slice.services {
+        for service_port in service_udp_stream_ports(service) {
+            let protocol = service
+                .protocol_overrides
+                .get(&service_port.port)
+                .copied()
+                .unwrap_or(service_port.protocol);
+            let Some(terminates_dtls) = node_waypoint_udp_listener_terminates_dtls(protocol) else {
+                continue;
+            };
+            if service_port.port == 0 {
+                warn!(
+                    service = %service.name,
+                    namespace = %service.namespace,
+                    "Skipping NodeWaypoint UDP/DTLS listener: service port 0 is not bindable"
+                );
+                continue;
+            }
+            if reserved_ports.contains(&service_port.port) {
+                warn!(
+                    service = %service.name,
+                    namespace = %service.namespace,
+                    service_port = service_port.port,
+                    "Skipping NodeWaypoint UDP/DTLS listener: the port is already claimed by a \
+                     mesh runtime listener or another stream proxy in this generation"
+                );
+                continue;
+            }
+            let targets = build_east_west_service_targets(
+                service,
+                service_port,
+                &mesh_slice.workloads,
+                mesh_slice.multi_cluster.as_ref(),
+            );
+            if targets.is_empty() {
+                debug!(
+                    service = %service.name,
+                    namespace = %service.namespace,
+                    service_port = service_port.port,
+                    "Skipping NodeWaypoint UDP/DTLS listener: no reachable local-cluster \
+                     endpoint for this service port"
+                );
+                continue;
+            }
+
+            let upstream_id =
+                node_waypoint_udp_upstream_id(&service.namespace, &service.name, service_port.port);
+            let proxy_id =
+                node_waypoint_udp_proxy_id(&service.namespace, &service.name, service_port.port);
+            by_port
+                .entry(service_port.port)
+                .or_default()
+                .push(Candidate {
+                    proxy: node_waypoint_udp_listener_proxy(
+                        &proxy_id,
+                        &runtime.namespace,
+                        &upstream_id,
+                        service_port.port,
+                        terminates_dtls,
+                        egress_app_protocol_label(protocol),
+                        now,
+                    ),
+                    upstream: node_waypoint_udp_listener_upstream(
+                        &upstream_id,
+                        &runtime.namespace,
+                        targets,
+                        service.uid.clone(),
+                        now,
+                    ),
+                    service: service.name.clone(),
+                    namespace: service.namespace.clone(),
+                    terminates_dtls,
+                });
+        }
+    }
+
+    let mut materialized = 0usize;
+    let mut dtls_listeners = 0usize;
+    for (port, candidates) in by_port {
+        if candidates.len() > 1 {
+            let claimants = candidates
+                .iter()
+                .map(|candidate| format!("{}/{}", candidate.namespace, candidate.service))
+                .collect::<Vec<_>>();
+            warn!(
+                listen_port = port,
+                services = %capped_join(&claimants, 8),
+                "Refusing every NodeWaypoint UDP/DTLS listener on this port: two or more mesh \
+                 services declare it and a datagram carries no host or SNI to disambiguate \
+                 them. Give the services distinct UDP port numbers."
+            );
+            continue;
+        }
+        let Some(candidate) = candidates.into_iter().next() else {
+            continue;
+        };
+        if candidate.terminates_dtls {
+            dtls_listeners += 1;
+        }
+        materialized += 1;
+        let upstream = candidate.upstream;
+        if let Some(existing) = config
+            .upstreams
+            .iter_mut()
+            .find(|existing| existing.namespace == upstream.namespace && existing.id == upstream.id)
+        {
+            *existing = upstream;
+        } else {
+            config.upstreams.push(upstream);
+        }
+        let proxy = candidate.proxy;
+        if let Some(existing) = config
+            .proxies
+            .iter_mut()
+            .find(|existing| existing.namespace == proxy.namespace && existing.id == proxy.id)
+        {
+            *existing = proxy;
+        } else {
+            config.proxies.push(proxy);
+        }
+    }
+
+    if materialized > 0 {
+        info!(
+            udp_listeners = materialized - dtls_listeners,
+            dtls_listeners,
+            "Materialized NodeWaypoint UDP/DTLS service listeners; each session's source pod is \
+             attributed from the kernel-reported ingress interface and its scoped \
+             AuthorizationPolicies are enforced before any datagram reaches a backend"
+        );
+    }
+}
+
+/// Construct one NodeWaypoint UDP/DTLS listener proxy.
+///
+/// `terminates_dtls` selects the frontend posture: `false` relays opaque
+/// datagrams, `true` terminates frontend DTLS. The backend leg is plaintext UDP
+/// in both cases — the NodeWaypoint dials the backing pod's app port directly,
+/// exactly like the NodeWaypoint captured-service TCP path.
+#[allow(clippy::too_many_arguments)]
+fn node_waypoint_udp_listener_proxy(
+    id: &str,
+    namespace: &str,
+    upstream_id: &str,
+    listen_port: u16,
+    terminates_dtls: bool,
+    protocol_label: &'static str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Proxy {
+    Proxy {
+        id: id.to_string(),
+        name: Some(format!(
+            "mesh node-waypoint {protocol_label} listener :{listen_port}"
+        )),
+        namespace: namespace.to_string(),
+        // Stream-family proxies MUST NOT set `hosts` (route key is
+        // `listen_port`). See `validate_stream_proxies()` in
+        // `src/config/types.rs`.
+        hosts: Vec::new(),
+        listen_path: None,
+        backend_scheme: Some(BackendScheme::Udp),
+        dispatch_kind: Default::default(),
+        backend_host: String::new(),
+        backend_port: 0,
+        backend_path: None,
+        strip_listen_path: false,
+        preserve_host_header: false,
+        backend_connect_timeout_ms: 30_000,
+        backend_read_timeout_ms: 30_000,
+        backend_write_timeout_ms: 30_000,
+        backend_tls_client_cert_path: None,
+        backend_tls_client_key_path: None,
+        backend_tls_verify_server_cert: true,
+        backend_tls_server_ca_cert_path: None,
+        resolved_tls: BackendTlsConfig::default(),
+        dispatch_port_overrides: None,
+        dispatch_port_override_fallback: None,
+        dns_override: None,
+        dns_cache_ttl_seconds: None,
+        auth_mode: Default::default(),
+        plugins: Vec::<PluginAssociation>::new(),
+        pool_idle_timeout_seconds: None,
+        pool_enable_http_keep_alive: None,
+        pool_enable_http2: None,
+        pool_tcp_keepalive_seconds: None,
+        pool_http2_keep_alive_interval_seconds: None,
+        pool_http2_keep_alive_timeout_seconds: None,
+        pool_http2_initial_stream_window_size: None,
+        pool_http2_initial_connection_window_size: None,
+        pool_http2_adaptive_window: None,
+        pool_http2_max_frame_size: None,
+        pool_http2_max_concurrent_streams: None,
+        pool_http3_connections_per_backend: None,
+        h2_upgrade_policy: None,
+        pool_max_requests_per_connection: None,
+        pool_http1_max_pending_requests: None,
+        upstream_id: Some(upstream_id.to_string()),
+        upstream_subset: None,
+        api_spec_id: None,
+        circuit_breaker: None,
+        retry: None,
+        response_body_mode: ResponseBodyMode::Stream,
+        listen_port: Some(listen_port),
+        // Frontend DTLS termination is the ONLY difference between the two
+        // flavors; `passthrough` stays false so the listener runs the ordinary
+        // `on_stream_connect` chain (that is where `mesh_authz` evaluates the
+        // attributed source pod's scoped policies).
+        frontend_tls: terminates_dtls,
+        passthrough: false,
+        udp_idle_timeout_seconds: 60,
+        udp_max_response_amplification_factor: None,
+        stream_proxy_protocol: None,
+        backend_proxy_protocol: None,
+        stream_match: None,
+        compiled_stream_match: None,
+        tcp_idle_timeout_seconds: None,
+        websocket_idle_timeout_seconds: None,
+        allowed_methods: None,
+        allowed_ws_origins: Vec::new(),
+        created_at: now,
+        updated_at: now,
+        pending_limit_scope: None,
+    }
+}
+
+/// Construct the upstream backing one NodeWaypoint UDP/DTLS listener.
+fn node_waypoint_udp_listener_upstream(
+    id: &str,
+    namespace: &str,
+    targets: Vec<UpstreamTarget>,
+    k8s_service_uid: Option<String>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Upstream {
+    Upstream {
+        id: id.to_string(),
+        name: Some(id.to_string()),
+        namespace: namespace.to_string(),
+        targets,
+        algorithm: LoadBalancerAlgorithm::RoundRobin,
+        hash_on: None,
+        hash_on_cookie_config: None,
+        health_checks: Some(HealthCheckConfig {
+            active: None,
+            passive: Some(PassiveHealthCheck::default()),
+        }),
+        service_discovery: None,
+        subsets: None,
+        port_overrides: HashMap::new(),
+        source_locality: None,
+        source_labels: Default::default(),
+        locality_lb_strict: false,
+        locality_lb_setting: None,
+        backend_tls_client_cert_path: None,
+        backend_tls_client_key_path: None,
+        backend_tls_verify_server_cert: true,
+        backend_tls_server_ca_cert_path: None,
+        backend_tls_sni: None,
+        backend_tls_san_allow_list: Vec::new(),
+        resolved_subset_tls: HashMap::new(),
+        dispatch_port_override_fallback: None,
+        api_spec_id: None,
+        created_at: now,
+        updated_at: now,
+        k8s_service_uid,
+        pending_limit_scope: None,
+    }
+}
+
 /// Fail-closed suppression of NodeWaypoint UDP/DTLS under scoped policy.
 ///
 /// Historically this ALWAYS ran: a NodeWaypoint UDP/DTLS session had no
@@ -1583,14 +2024,14 @@ fn fail_closed_node_waypoint_udp_dtls_scoped_policies(
         .collect();
     let udp_services = strip_node_waypoint_udp_dtls_mesh_service_ports(config.mesh.as_deref_mut());
 
+    // Both UDP upstream families: the egress relay upstreams and — since issue
+    // #3286 — the NodeWaypoint UDP/DTLS LISTENER upstreams. Their proxies are
+    // removed above, so leaving the upstreams behind would keep dead endpoint
+    // state in the applied generation.
     let udp_upstreams: Vec<String> = config
         .upstreams
         .iter()
-        .filter(|upstream| {
-            upstream
-                .id
-                .starts_with(MESH_OUTBOUND_UDP_UPSTREAM_ID_PREFIX)
-        })
+        .filter(|upstream| is_node_waypoint_suppressible_udp_upstream_id(&upstream.id))
         .map(|upstream| upstream.id.clone())
         .collect();
 
@@ -1613,11 +2054,9 @@ fn fail_closed_node_waypoint_udp_dtls_scoped_policies(
         });
     }
     if !udp_upstreams.is_empty() {
-        config.upstreams.retain(|upstream| {
-            !upstream
-                .id
-                .starts_with(MESH_OUTBOUND_UDP_UPSTREAM_ID_PREFIX)
-        });
+        config
+            .upstreams
+            .retain(|upstream| !is_node_waypoint_suppressible_udp_upstream_id(&upstream.id));
     }
 
     warn!(
@@ -1633,6 +2072,15 @@ fn fail_closed_node_waypoint_udp_dtls_scoped_policies(
          closed in this topology. Use Sidecar for workload-scoped UDP/DTLS authorization or \
          keep NodeWaypoint UDP/DTLS policy MeshWide."
     );
+}
+
+/// Upstream ids the NodeWaypoint UDP/DTLS suppression removes alongside the
+/// UDP proxies it strips: the datagram-over-mesh egress upstreams and the
+/// NodeWaypoint UDP/DTLS listener upstreams (issue #3286). Forward-derived from
+/// the two reserved prefixes, never parsed.
+fn is_node_waypoint_suppressible_udp_upstream_id(id: &str) -> bool {
+    id.starts_with(MESH_OUTBOUND_UDP_UPSTREAM_ID_PREFIX)
+        || id.starts_with(MESH_NODE_WAYPOINT_UDP_UPSTREAM_ID_PREFIX)
 }
 
 fn effective_node_waypoint_scoped_authz_policy_labels(config: &GatewayConfig) -> Vec<String> {
@@ -3824,7 +4272,27 @@ pub(crate) fn mesh_outbound_service_groups(
 /// today this only keeps UDP ports out of the other two lanes (they were
 /// previously mis-classified as HTTP via `Unknown`).
 fn is_udp_mesh_protocol(protocol: AppProtocol) -> bool {
-    matches!(protocol, AppProtocol::Udp)
+    // `Dtls` is the SAME L4 transport as `Udp`; only the NodeWaypoint listener
+    // materializer distinguishes them (it terminates frontend DTLS on a `Dtls`
+    // port). Every other UDP-family predicate — egress port selection, the
+    // mesh-DNS carve-out, the HTTP/raw-TCP/UDP three-way partition — must treat
+    // them identically, or a DTLS port would silently fall into the HTTP-family
+    // default.
+    matches!(protocol, AppProtocol::Udp | AppProtocol::Dtls)
+}
+
+/// The frontend posture a NodeWaypoint UDP-family listener serves for one mesh
+/// service port (issue #3286): `false` relays opaque datagrams, `true`
+/// terminates frontend DTLS before the datagrams reach the backend.
+///
+/// Returns `None` for every non-UDP-family protocol so callers cannot
+/// accidentally materialize a datagram listener for a TCP/HTTP port.
+fn node_waypoint_udp_listener_terminates_dtls(protocol: AppProtocol) -> Option<bool> {
+    match protocol {
+        AppProtocol::Udp => Some(false),
+        AppProtocol::Dtls => Some(true),
+        _ => None,
+    }
 }
 
 /// Stream-family service ports of an in-mesh service — raw TCP, opaque TLS,
@@ -10144,16 +10612,21 @@ fn build_egress_proxies_and_upstreams(
             }
 
             let Some(backend_scheme) = egress_backend_scheme(port_spec.protocol) else {
-                // Defensive: every AppProtocol variant maps to a concrete
-                // scheme today (HTTP-family or stream-family). Future
-                // protocol additions that haven't been classified land
-                // here and get skipped with a warning instead of panicking.
+                // `Dtls` lands here deliberately: the EgressGateway terminates
+                // in-mesh mTLS and RE-ORIGINATES to the external backend, and
+                // it has no DTLS origination path, so a `dtls` ServiceEntry port
+                // is unrepresentable here and is refused rather than downgraded
+                // to an opaque UDP relay. Any future unclassified protocol is
+                // skipped the same way instead of panicking.
                 warn!(
                     service_entry = %entry.name,
                     namespace = %entry.namespace,
                     port = port_spec.port,
                     protocol = ?port_spec.protocol,
-                    "Skipping ServiceEntry port for egress gateway: unknown protocol classification"
+                    "Skipping ServiceEntry port for egress gateway: this port protocol has no \
+                     egress-gateway backend scheme (a `dtls` port is unrepresentable at the \
+                     terminate-and-re-originate egress boundary; declare it `udp` for opaque \
+                     datagram egress, or serve it from a NodeWaypoint UDP/DTLS listener)"
                 );
                 continue;
             };
@@ -10867,6 +11340,13 @@ fn egress_backend_scheme(protocol: AppProtocol) -> Option<BackendScheme> {
         AppProtocol::Tls | AppProtocol::Http2 | AppProtocol::Grpc => Some(BackendScheme::Https),
         AppProtocol::Http | AppProtocol::Unknown => Some(BackendScheme::Http),
         AppProtocol::Udp => Some(BackendScheme::Udp),
+        // The EgressGateway is a terminate-and-re-originate boundary and has no
+        // DTLS origination path to an external backend, so a `Dtls` ServiceEntry
+        // port materializes NO egress proxy rather than being silently
+        // downgraded to an opaque UDP relay (which would strip the operator's
+        // declared transport expectation). NodeWaypoint is the only topology
+        // that serves `Dtls` today (issue #3286).
+        AppProtocol::Dtls => None,
         AppProtocol::Tcp
         | AppProtocol::Mongo
         | AppProtocol::Redis
@@ -10904,6 +11384,7 @@ fn egress_app_protocol_label(protocol: AppProtocol) -> &'static str {
         AppProtocol::Tls => "tls",
         AppProtocol::Tcp => "tcp",
         AppProtocol::Udp => "udp",
+        AppProtocol::Dtls => "dtls",
         AppProtocol::Mongo => "mongo",
         AppProtocol::Redis => "redis",
         AppProtocol::Mysql => "mysql",
@@ -12389,6 +12870,14 @@ fn prepare_mesh_runtime_before_owner(
         .map_err(|e| {
             anyhow::anyhow!("Invalid NodeWaypoint inbound capture listener settings: {e}")
         })?;
+
+    // Same contract again for the NodeWaypoint UDP/DTLS service listener switch
+    // (issue #3286): the materializer is infallible, so an unparseable value
+    // would otherwise leave the proxy ready while serving none of the UDP/DTLS
+    // listeners the operator asked for.
+    runtime
+        .validate_node_waypoint_udp_listener_settings()
+        .map_err(|e| anyhow::anyhow!("Invalid NodeWaypoint UDP/DTLS listener settings: {e}"))?;
 
     if peek_mesh_startup_fault_inject() == MeshStartupFaultInject::BeforeOwner {
         let _ = take_mesh_startup_fault_inject();
@@ -20612,7 +21101,7 @@ mod tests {
         // (previously folded into HTTP via `Unknown`).
         use crate::modes::mesh::config::AppProtocol::*;
         for protocol in [
-            Http, Http2, Grpc, Tcp, Tls, Udp, Mongo, Redis, Mysql, Postgres, Unknown,
+            Http, Http2, Grpc, Tcp, Tls, Udp, Dtls, Mongo, Redis, Mysql, Postgres, Unknown,
         ] {
             let mut svc = http_mesh_service(
                 "partition",

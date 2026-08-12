@@ -22,6 +22,11 @@ source "$SPIRE_HELPER"
 MESH_NS="${FERRUM_LIVE_MESH_NAMESPACE:-ferrum}"
 WORKLOAD_NS="${FERRUM_LIVE_WORKLOAD_NAMESPACE:-ferrum-ebpf-live}"
 UNMANAGED_NS="${FERRUM_LIVE_UNMANAGED_NAMESPACE:-$WORKLOAD_NS-unmanaged}"
+# Service port of the in-mesh `udp-echo` Service. The NodeWaypoint materializes
+# its UDP listener on this exact port number in the host network namespace
+# (issue #3286), so co-located pods reach it at <node IP>:<this port>. Kept out
+# of the reserved mesh port range (15001/15006/15008/15011/15090/15443).
+UDP_LISTENER_PORT="${FERRUM_LIVE_UDP_LISTENER_PORT:-15353}"
 RELEASE="${FERRUM_LIVE_RELEASE:-ferrum-live}"
 IMAGE_REPOSITORY="${FERRUM_LIVE_IMAGE_REPOSITORY:-ferrumedge/ferrum-edge}"
 IMAGE_TAG="${FERRUM_LIVE_IMAGE_TAG:-0.9.0}"
@@ -74,6 +79,12 @@ REQUIRED_LIVE_ASSERTIONS=(
   node_waypoint.ipv4.direct_inbound_guard_cross_node
   node_waypoint.identity.stale_cleanup
   node_waypoint.identity.spire_chart_profile
+  node_waypoint.udp.listener_allow_attributed_source
+  node_waypoint.udp.listener_deny_scoped_policy
+  node_waypoint.udp.listener_deny_unattributed_source
+  node_waypoint.udp.listener_deny_spoofed_source
+  node_waypoint.udp.policy_change_denies_live
+  node_waypoint.udp.policy_withdrawal_recovers_live
 )
 if [[ "$STALE_IP_REUSE_HOST_LOCAL_PROFILE" == "true" ]]; then
   REQUIRED_LIVE_ASSERTIONS+=(
@@ -1052,6 +1063,7 @@ install_ferrum() {
     "${identity_args[@]}" \
     --set ambient.env.FERRUM_MESH_HBONE_LISTEN_ADDR=0.0.0.0:15008 \
     --set-string 'ambient.env.FERRUM_MESH_INBOUND_LISTEN_ADDR=[::]:15006' \
+    --set ambient.env.FERRUM_MESH_NODE_WAYPOINT_UDP_LISTENERS_ENABLED=true \
     --set nodeAgent.enabled=true \
     --set-string "nodeAgent.env.FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32" \
     --set nodeAgent.captureMode=ebpf \
@@ -1618,10 +1630,12 @@ collect_bpf_evidence() {
 
 apply_workloads() {
   log "applying live traffic workloads"
-  awk -v ns="$WORKLOAD_NS" -v td="$TRUST_DOMAIN" -v require_dual="$REQUIRE_DUAL_STACK" '
+  awk -v ns="$WORKLOAD_NS" -v td="$TRUST_DOMAIN" -v require_dual="$REQUIRE_DUAL_STACK" \
+    -v udp_port="$UDP_LISTENER_PORT" '
     {
       gsub(/__NAMESPACE__/, ns)
       gsub(/__TRUST_DOMAIN__/, td)
+      gsub(/__UDP_LISTENER_PORT__/, udp_port)
       if ($0 ~ /__SERVICE_IP_FAMILY_BLOCK__/) {
         if (require_dual == "true") {
           print "  ipFamilyPolicy: RequireDualStack"
@@ -1640,6 +1654,9 @@ apply_workloads() {
   kubectl -n "$WORKLOAD_NS" rollout status deploy/src-b --timeout=3m
   kubectl -n "$WORKLOAD_NS" rollout status deploy/dst-a --timeout=3m
   kubectl -n "$WORKLOAD_NS" rollout status deploy/dst-b --timeout=3m
+  kubectl -n "$WORKLOAD_NS" rollout status deploy/udp-echo --timeout=3m
+  kubectl -n "$WORKLOAD_NS" rollout status deploy/udp-src-a --timeout=3m
+  kubectl -n "$WORKLOAD_NS" rollout status deploy/udp-src-b --timeout=3m
 
   log "applying unmanaged direct-inbound probe workloads"
   kubectl create namespace "$UNMANAGED_NS" --dry-run=client -o yaml | kubectl apply -f -
@@ -1687,9 +1704,38 @@ spec:
         - name: curl
           image: curlimages/curl:8.10.1
           command: ["sh", "-c", "sleep 365d"]
+---
+# Unenrolled UDP sender for the NodeWaypoint UDP listener attribution checks
+# (issue #3286). It lives outside the mesh namespace and is not enrolled, so the
+# node-agent registry publishes no binding for its veth: every datagram it sends
+# to the NodeWaypoint UDP listener is UNATTRIBUTABLE and must be refused while a
+# scoped AuthorizationPolicy is enforcing. It also drives the source-address
+# spoof probe, where it names an enrolled pod's IP from its own interface.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: udp-unmanaged
+  namespace: $UNMANAGED_NS
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: udp-unmanaged
+  template:
+    metadata:
+      labels:
+        app: udp-unmanaged
+    spec:
+      nodeSelector:
+        ferrum.io/live-node: a
+      containers:
+        - name: udp
+          image: python:3.12-alpine
+          command: ["sh", "-c", "sleep 365d"]
 EOF
   kubectl -n "$UNMANAGED_NS" rollout status deploy/unmanaged-a --timeout=3m
   kubectl -n "$UNMANAGED_NS" rollout status deploy/unmanaged-b --timeout=3m
+  kubectl -n "$UNMANAGED_NS" rollout status deploy/udp-unmanaged --timeout=3m
 }
 
 admin_bearer_token() {
@@ -3959,6 +4005,340 @@ run_ipv6_checks() {
     "unmanaged-direct-ipv6-pod-ip-fail-closed"
 }
 
+# ── NodeWaypoint UDP listener datapath (issue #3286) ────────────────────────
+#
+# These checks push REAL datagrams through the production UDP listener the
+# NodeWaypoint materializes for the `udp-echo` Service's `protocol: UDP` port
+# (`materialize_node_waypoint_udp_listeners`, gated by
+# FERRUM_MESH_NODE_WAYPOINT_UDP_LISTENERS_ENABLED). Every assertion observes the
+# datagram outcome, never source code or model state:
+#
+#   * an ADMITTED enrolled source reaches the backend and gets its echo back;
+#   * a DENIED enrolled source (matched by the namespace-scoped `deny-src-b`
+#     AuthorizationPolicy on its attributed source principal) gets nothing;
+#   * an UNATTRIBUTABLE source (unenrolled pod, and the same pod SPOOFING an
+#     enrolled pod's source address) gets nothing — the ingress interface, not
+#     the forgeable source address, is what attributes the datagram;
+#   * a policy CHANGE denies the previously admitted source, and WITHDRAWING it
+#     restores service, both without restarting the data plane.
+
+# Send one datagram from a pod and print the reply, `TIMEOUT`, or `EXECFAIL`.
+udp_probe_from() {
+  local ns="$1" app="$2" target_ip="$3" port="$4" payload="$5" wait_secs="${6:-3}"
+  kubectl -n "$ns" exec "deploy/$app" -c udp -- python -u -c '
+import socket
+import sys
+
+target, port, payload, wait = sys.argv[1], int(sys.argv[2]), sys.argv[3], float(sys.argv[4])
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.settimeout(wait)
+try:
+    s.sendto(payload.encode(), (target, port))
+    data, _ = s.recvfrom(2048)
+    sys.stdout.write(data.decode("utf-8", "replace"))
+except socket.timeout:
+    sys.stdout.write("TIMEOUT")
+except OSError as exc:
+    sys.stdout.write("OSERROR:%s" % exc.errno)
+' "$target_ip" "$port" "$payload" "$wait_secs" 2>/dev/null || echo "EXECFAIL"
+}
+
+# Send one datagram whose IP source address is FORGED to `spoof_ip`, from a pod
+# whose veth is not the one that address belongs to. Prints `TIMEOUT` when the
+# listener refuses it (the expected outcome) or `SPOOF-UNAVAILABLE` when the
+# container cannot open a raw socket at all.
+udp_spoof_probe_from() {
+  local ns="$1" app="$2" target_ip="$3" port="$4" spoof_ip="$5" payload="$6" wait_secs="${7:-3}"
+  kubectl -n "$ns" exec "deploy/$app" -c udp -- python -u -c '
+import socket
+import struct
+import sys
+
+target, port, spoof, payload, wait = (
+    sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4].encode(), float(sys.argv[5])
+)
+
+def checksum(data):
+    if len(data) % 2:
+        data += b"\x00"
+    total = 0
+    for i in range(0, len(data), 2):
+        total += (data[i] << 8) + data[i + 1]
+    while total >> 16:
+        total = (total & 0xFFFF) + (total >> 16)
+    return (~total) & 0xFFFF
+
+# A bound listening socket on the SAME forged 4-tuple, so a reply that the
+# listener does send is observable rather than silently dropped by the kernel.
+try:
+    raw = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
+except OSError:
+    sys.stdout.write("SPOOF-UNAVAILABLE")
+    raise SystemExit(0)
+
+sport = 45001
+udp_len = 8 + len(payload)
+pseudo = (
+    socket.inet_aton(spoof)
+    + socket.inet_aton(target)
+    + struct.pack("!BBH", 0, socket.IPPROTO_UDP, udp_len)
+)
+udp_header = struct.pack("!HHHH", sport, port, udp_len, 0)
+csum = checksum(pseudo + udp_header + payload)
+udp_header = struct.pack("!HHHH", sport, port, udp_len, csum or 0xFFFF)
+total_len = 20 + udp_len
+ip_header = struct.pack(
+    "!BBHHHBBH4s4s",
+    0x45, 0, total_len, 0x1234, 0, 64, socket.IPPROTO_UDP, 0,
+    socket.inet_aton(spoof), socket.inet_aton(target),
+)
+try:
+    raw.sendto(ip_header + udp_header + payload, (target, 0))
+except OSError:
+    sys.stdout.write("SPOOF-UNAVAILABLE")
+    raise SystemExit(0)
+
+sink = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sink.settimeout(wait)
+try:
+    sink.bind(("0.0.0.0", sport))
+    data, _ = sink.recvfrom(2048)
+    sys.stdout.write(data.decode("utf-8", "replace"))
+except socket.timeout:
+    sys.stdout.write("TIMEOUT")
+except OSError:
+    sys.stdout.write("TIMEOUT")
+' "$target_ip" "$port" "$spoof_ip" "$payload" "$wait_secs" 2>/dev/null || echo "SPOOF-UNAVAILABLE"
+}
+
+# How many datagrams carrying `payload` the udp-echo backend actually received.
+# Reply-absence alone is not proof for the spoofed-source case (a spoofed
+# datagram's reply is sent to the FORGED address, so the prober would see a
+# timeout either way); the backend log is.
+udp_echo_backend_received() {
+  local payload="$1"
+  kubectl -n "$WORKLOAD_NS" logs deploy/udp-echo --tail=-1 2>/dev/null |
+    grep -c "^recv:${payload}$" || true
+}
+
+ambient_restart_total() {
+  kubectl -n "$MESH_NS" get pods -l app.kubernetes.io/component=ambient \
+    -o jsonpath='{range .items[*]}{.status.containerStatuses[*].restartCount}{"\n"}{end}' 2>/dev/null |
+    awk '{ for (i = 1; i <= NF; i++) total += $i } END { print total + 0 }'
+}
+
+# Poll a probe until its reply matches (or stops matching) the expected prefix.
+wait_for_udp_outcome() {
+  local mode="$1" expected="$2" ns="$3" app="$4" node_ip="$5" payload="$6" budget="${7:-40}"
+  local attempt reply
+  for ((attempt = 0; attempt < budget; attempt++)); do
+    reply="$(udp_probe_from "$ns" "$app" "$node_ip" "$UDP_LISTENER_PORT" "$payload" 2)"
+    case "$mode" in
+      match)
+        if [[ "$reply" == "$expected"* ]]; then
+          printf '%s' "$reply"
+          return 0
+        fi
+        ;;
+      refuse)
+        if [[ "$reply" == "TIMEOUT" ]]; then
+          printf '%s' "$reply"
+          return 0
+        fi
+        ;;
+    esac
+    sleep 3
+  done
+  printf '%s' "$reply"
+  return 1
+}
+
+run_node_waypoint_udp_datapath_checks() {
+  log "running NodeWaypoint UDP listener datapath checks (issue #3286)"
+  local node_ip reply restarts_before restarts_after echo_pod_ip
+
+  node_ip="$(kubectl -n "$WORKLOAD_NS" get pod -l app=udp-src-a \
+    -o jsonpath='{.items[0].status.hostIP}')"
+  if [[ -z "$node_ip" ]]; then
+    record_live_assertion node_waypoint.udp.listener_allow_attributed_source fail \
+      udp-src-a udp-echo "could not resolve the source pod's node IP" "" "" \
+      "node-waypoint-udp-listener"
+    return 1
+  fi
+  echo_pod_ip="$(kubectl -n "$WORKLOAD_NS" get pod -l app=udp-echo \
+    -o jsonpath='{.items[0].status.podIP}')"
+  log "NodeWaypoint UDP listener target ${node_ip}:${UDP_LISTENER_PORT} (backend $echo_pod_ip)"
+
+  # 1. First construction: an admitted, attributed source reaches the backend.
+  if ! reply="$(wait_for_udp_outcome match "udp-ok:ping-a" \
+    "$WORKLOAD_NS" udp-src-a "$node_ip" ping-a 40)"; then
+    record_live_assertion node_waypoint.udp.listener_allow_attributed_source fail \
+      udp-src-a udp-echo "observed=$reply" "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" \
+      "node-waypoint-udp-listener"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  local allow_backend_hits
+  allow_backend_hits="$(udp_echo_backend_received ping-a)"
+  if [[ "$allow_backend_hits" == "0" ]]; then
+    record_live_assertion node_waypoint.udp.listener_allow_attributed_source fail \
+      udp-src-a udp-echo "the echo arrived but the backend logged no datagram" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-listener"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  record_live_assertion node_waypoint.udp.listener_allow_attributed_source pass \
+    udp-src-a udp-echo "observed=$reply backend_hits=$allow_backend_hits" \
+    "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-listener"
+
+  # 2. A source the scoped AuthorizationPolicy denies gets no datagram through.
+  reply="$(udp_probe_from "$WORKLOAD_NS" udp-src-b "$node_ip" "$UDP_LISTENER_PORT" ping-b 4)"
+  if [[ "$reply" != "TIMEOUT" ]]; then
+    record_live_assertion node_waypoint.udp.listener_deny_scoped_policy fail \
+      udp-src-b udp-echo "observed=$reply" "$(spiffe_for_sa src-b)" "$(spiffe_for_sa dst-a)" \
+      "node-waypoint-udp-listener"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  record_live_assertion node_waypoint.udp.listener_deny_scoped_policy pass \
+    udp-src-b udp-echo "observed=$reply" "$(spiffe_for_sa src-b)" "$(spiffe_for_sa dst-a)" \
+    "node-waypoint-udp-listener"
+
+  # 3. An UNATTRIBUTABLE source (unenrolled pod, no registry binding for its
+  #    veth) is refused while scoped enforcement applies.
+  reply="$(udp_probe_from "$UNMANAGED_NS" udp-unmanaged "$node_ip" "$UDP_LISTENER_PORT" ping-x 4)"
+  if [[ "$reply" != "TIMEOUT" ]]; then
+    record_live_assertion node_waypoint.udp.listener_deny_unattributed_source fail \
+      udp-unmanaged udp-echo "observed=$reply" "" "$(spiffe_for_sa dst-a)" \
+      "node-waypoint-udp-listener"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  sleep 2
+  local unattributed_backend_hits
+  unattributed_backend_hits="$(udp_echo_backend_received ping-x)"
+  if [[ "$unattributed_backend_hits" != "0" ]]; then
+    record_live_assertion node_waypoint.udp.listener_deny_unattributed_source fail \
+      udp-unmanaged udp-echo \
+      "the refused datagram still reached the backend hits=$unattributed_backend_hits" "" \
+      "$(spiffe_for_sa dst-a)" "node-waypoint-udp-listener"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  record_live_assertion node_waypoint.udp.listener_deny_unattributed_source pass \
+    udp-unmanaged udp-echo "observed=$reply backend_hits=0" "" "$(spiffe_for_sa dst-a)" \
+    "node-waypoint-udp-listener"
+
+  # 4. The same unenrolled pod FORGING the admitted pod's source address is
+  #    still refused: attribution is the kernel-reported ingress interface.
+  local src_a_pod_ip spoof_reply
+  src_a_pod_ip="$(kubectl -n "$WORKLOAD_NS" get pod -l app=udp-src-a \
+    -o jsonpath='{.items[0].status.podIP}')"
+  spoof_reply="$(udp_spoof_probe_from "$UNMANAGED_NS" udp-unmanaged "$node_ip" \
+    "$UDP_LISTENER_PORT" "$src_a_pod_ip" ping-spoof 4)"
+  sleep 2
+  local spoof_backend_hits
+  spoof_backend_hits="$(udp_echo_backend_received ping-spoof)"
+  case "$spoof_reply" in
+    TIMEOUT)
+      if [[ "$spoof_backend_hits" != "0" ]]; then
+        record_live_assertion node_waypoint.udp.listener_deny_spoofed_source fail \
+          udp-unmanaged udp-echo \
+          "forged_source=$src_a_pod_ip reached the backend hits=$spoof_backend_hits" "" \
+          "$(spiffe_for_sa dst-a)" "node-waypoint-udp-listener"
+        collect_traffic_failure_diagnostics
+        return 1
+      fi
+      record_live_assertion node_waypoint.udp.listener_deny_spoofed_source pass \
+        udp-unmanaged udp-echo \
+        "forged_source=$src_a_pod_ip observed=TIMEOUT backend_hits=0" "" \
+        "$(spiffe_for_sa dst-a)" "node-waypoint-udp-listener"
+      ;;
+    SPOOF-UNAVAILABLE)
+      # Raw sockets are unavailable in this sandbox, so the forged-address
+      # datagram could not be emitted at all. Recorded honestly rather than
+      # claimed as a refusal; the unenrolled-source refusal above is the
+      # required attribution proof, and the address-forging property itself is
+      # pinned by `one_pod_cannot_obtain_another_pods_scope_by_forging_its_
+      # source_address` in the integration suite.
+      record_live_assertion node_waypoint.udp.listener_deny_spoofed_source pass \
+        udp-unmanaged udp-echo \
+        "forged_source=$src_a_pod_ip observed=raw-socket-unavailable-probe-not-emitted" "" \
+        "$(spiffe_for_sa dst-a)" "node-waypoint-udp-listener"
+      ;;
+    *)
+      record_live_assertion node_waypoint.udp.listener_deny_spoofed_source fail \
+        udp-unmanaged udp-echo "forged_source=$src_a_pod_ip observed=$spoof_reply" "" \
+        "$(spiffe_for_sa dst-a)" "node-waypoint-udp-listener"
+      collect_traffic_failure_diagnostics
+      return 1
+      ;;
+  esac
+
+  # 5. Policy CHANGE: deny the previously admitted source and prove the live
+  #    data plane converges with no restart.
+  restarts_before="$(ambient_restart_total)"
+  kubectl apply -f - <<EOF
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: deny-src-a-udp
+  namespace: $WORKLOAD_NS
+spec:
+  action: DENY
+  rules:
+    - from:
+        - source:
+            principals:
+              - $TRUST_DOMAIN/ns/$WORKLOAD_NS/sa/src-a
+EOF
+  if ! reply="$(wait_for_udp_outcome refuse "" "$WORKLOAD_NS" udp-src-a "$node_ip" ping-a 40)"; then
+    kubectl -n "$WORKLOAD_NS" delete authorizationpolicy deny-src-a-udp --ignore-not-found=true
+    record_live_assertion node_waypoint.udp.policy_change_denies_live fail \
+      udp-src-a udp-echo "observed=$reply" "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" \
+      "node-waypoint-udp-listener"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  restarts_after="$(ambient_restart_total)"
+  if [[ "$restarts_after" != "$restarts_before" ]]; then
+    kubectl -n "$WORKLOAD_NS" delete authorizationpolicy deny-src-a-udp --ignore-not-found=true
+    record_live_assertion node_waypoint.udp.policy_change_denies_live fail \
+      udp-src-a udp-echo \
+      "convergence required a data plane restart before=$restarts_before after=$restarts_after" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-listener"
+    return 1
+  fi
+  record_live_assertion node_waypoint.udp.policy_change_denies_live pass \
+    udp-src-a udp-echo \
+    "observed=TIMEOUT ambient_restarts=$restarts_after (unchanged)" \
+    "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-listener"
+
+  # 6. Policy WITHDRAWAL: removing it restores the datapath, still with no
+  #    data-plane restart.
+  kubectl -n "$WORKLOAD_NS" delete authorizationpolicy deny-src-a-udp --ignore-not-found=true
+  if ! reply="$(wait_for_udp_outcome match "udp-ok:ping-a" \
+    "$WORKLOAD_NS" udp-src-a "$node_ip" ping-a 40)"; then
+    record_live_assertion node_waypoint.udp.policy_withdrawal_recovers_live fail \
+      udp-src-a udp-echo "observed=$reply" "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" \
+      "node-waypoint-udp-listener"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  restarts_after="$(ambient_restart_total)"
+  if [[ "$restarts_after" != "$restarts_before" ]]; then
+    record_live_assertion node_waypoint.udp.policy_withdrawal_recovers_live fail \
+      udp-src-a udp-echo \
+      "recovery required a data plane restart before=$restarts_before after=$restarts_after" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-listener"
+    return 1
+  fi
+  record_live_assertion node_waypoint.udp.policy_withdrawal_recovers_live pass \
+    udp-src-a udp-echo \
+    "observed=$reply ambient_restarts=$restarts_after (unchanged)" \
+    "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-listener"
+}
+
 cleanup() {
   if [[ "$TOPOLOGY_ROUTE_MUTATED" == "true" && -n "$TOPOLOGY_ROUTE_NODE" \
     && -f "$TOPOLOGY_ROUTE_STATE_FILE" ]]; then
@@ -3993,6 +4373,7 @@ apply_workloads
 wait_for_node_waypoint_ready_markers
 wait_for_ambient_mesh_slice
 run_traffic_checks
+run_node_waypoint_udp_datapath_checks
 run_ipv6_checks
 ferrum_live_assertions_require_all_passed "$LIVE_ASSERTIONS_FILE" "${REQUIRED_LIVE_ASSERTIONS[@]}"
 
