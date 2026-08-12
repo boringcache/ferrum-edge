@@ -905,6 +905,164 @@ fn overflow_partial_recovery_counts_only_absent_identities() {
     assert_eq!(survivor.first_observed_unix_ms, 1_000);
 }
 
+/// Remaining ledger slots must not stay reserved for brand-new keys that
+/// arrived first. A previously tracked identity that appears late in the stream
+/// reclaims its slot; the earlier new keys overflow instead of false-recovering
+/// the prior identity.
+///
+/// A first-N-distinct or encounter-order cap would keep the new keys, drop the
+/// late prior identities, and count those drops as recoveries.
+#[test]
+fn late_prior_identities_reclaim_slots_from_earlier_new_keys() {
+    let status = GatewayListenerStatus::new();
+    let prior_count = MAX_ACTIVE_TRACKED_FAILURES - 6;
+    let prior: Vec<u16> = (1..=prior_count as u16).collect();
+    assert!(status.publish(
+        1,
+        prior.len(),
+        0,
+        oversubscribed_failures(prior.clone()),
+        1_000,
+    ));
+    assert_eq!(tcp_bind_failures_total(&status), prior_count as u64);
+
+    let mut observations = oversubscribed_failures((60_000..60_100).collect::<Vec<_>>());
+    observations.extend(oversubscribed_failures(prior.clone()));
+    assert!(status.publish(1, observations.len(), 0, observations, 2_000));
+
+    let snapshot = status.snapshot();
+    assert!(snapshot.overflowed);
+    assert_eq!(
+        snapshot.active_failures, prior_count,
+        "late prior identities must reclaim every ledger slot from earlier new keys"
+    );
+    assert_eq!(
+        tcp_bind_failures_total(&status),
+        prior_count as u64,
+        "new keys that arrived first must not count as onsets"
+    );
+    assert_eq!(
+        tcp_bind_recoveries_total(&status),
+        0,
+        "a late prior identity must not be false-recovered"
+    );
+    let entry = snapshot
+        .failures
+        .iter()
+        .find(|entry| entry.port == prior[0])
+        .expect("a late prior identity must remain active");
+    assert_eq!(entry.observations, 2);
+    assert_eq!(entry.first_observed_unix_ms, 1_000);
+}
+
+/// Brand-new identities compete for remaining slots in deterministic key order,
+/// not encounter order. High-keyed new identities first vs low-keyed first must
+/// select the same six lowest new ports.
+#[test]
+fn new_identities_compete_for_remaining_slots_in_key_order_not_encounter_order() {
+    let prior_count = MAX_ACTIVE_TRACKED_FAILURES - 6;
+    let prior: Vec<u16> = (1..=prior_count as u16).collect();
+    let low_new: Vec<u16> = (50_000..50_006).collect();
+    let high_new: Vec<u16> = (60_000..61_000).collect();
+
+    let publish_with_order = |new_first: Vec<u16>, new_second: Vec<u16>| {
+        let status = GatewayListenerStatus::new();
+        assert!(status.publish(
+            1,
+            prior.len(),
+            0,
+            oversubscribed_failures(prior.clone()),
+            1_000,
+        ));
+        let mut observations = oversubscribed_failures(new_first);
+        observations.extend(oversubscribed_failures(new_second));
+        observations.extend(oversubscribed_failures(prior.clone()));
+        assert!(status.publish(1, observations.len(), 0, observations, 2_000));
+        status
+    };
+
+    let high_then_low = publish_with_order(high_new.clone(), low_new.clone());
+    let low_then_high = publish_with_order(low_new.clone(), high_new);
+
+    for (label, status) in [
+        ("high-then-low", &high_then_low),
+        ("low-then-high", &low_then_high),
+    ] {
+        let snapshot = status.snapshot();
+        assert!(snapshot.overflowed, "{label}");
+        assert_eq!(
+            snapshot.active_failures,
+            MAX_ACTIVE_TRACKED_FAILURES,
+            "{label}"
+        );
+        assert_eq!(
+            tcp_bind_failures_total(status),
+            MAX_ACTIVE_TRACKED_FAILURES as u64,
+            "{label}: six lowest new keys onset once, independent of encounter order"
+        );
+        assert_eq!(tcp_bind_recoveries_total(status), 0, "{label}");
+    }
+
+    // Prove the six selected new keys were 50000..50005, not the high keys that
+    // were encountered first: a follow-up pass of prior + low_new must age,
+    // not recover-and-reonset.
+    let mut next = oversubscribed_failures(prior.clone());
+    next.extend(oversubscribed_failures(low_new.clone()));
+    assert!(high_then_low.publish(1, next.len(), 0, next, 3_000));
+    assert_eq!(
+        tcp_bind_recoveries_total(&high_then_low),
+        0,
+        "encounter-order selection would have recovered the high keys and counted the low keys as new onsets"
+    );
+    assert_eq!(
+        tcp_bind_failures_total(&high_then_low),
+        MAX_ACTIVE_TRACKED_FAILURES as u64
+    );
+
+    assert!(high_then_low.publish(
+        1,
+        prior.len(),
+        0,
+        oversubscribed_failures(prior),
+        4_000,
+    ));
+    assert_eq!(
+        tcp_bind_recoveries_total(&high_then_low),
+        6,
+        "clearing the six lowest new keys recovers exactly those selected identities"
+    );
+}
+
+/// Duplicate sightings of an unretained new identity must not be stored or
+/// counted as onsets, but overflow stays true.
+#[test]
+fn duplicate_unretained_new_identities_overflow_without_double_counting() {
+    let status = GatewayListenerStatus::new();
+    let tracked: Vec<u16> = (1..=MAX_ACTIVE_TRACKED_FAILURES as u16).collect();
+    assert!(status.publish(
+        1,
+        tracked.len(),
+        0,
+        oversubscribed_failures(tracked.clone()),
+        1_000,
+    ));
+
+    let mut observations = oversubscribed_failures((60_000..60_500).collect::<Vec<_>>());
+    observations.push(tcp_bind_failure(60_000));
+    observations.push(tcp_bind_failure(60_000));
+    observations.extend(oversubscribed_failures(tracked));
+    assert!(status.publish(1, observations.len(), 0, observations, 2_000));
+
+    let snapshot = status.snapshot();
+    assert!(snapshot.overflowed);
+    assert_eq!(snapshot.active_failures, MAX_ACTIVE_TRACKED_FAILURES);
+    assert_eq!(
+        tcp_bind_failures_total(&status),
+        MAX_ACTIVE_TRACKED_FAILURES as u64
+    );
+    assert_eq!(tcp_bind_recoveries_total(&status), 0);
+}
+
 /// A same-pass listener-task death that rebinds before publication is transient:
 /// cumulative counters move once, but nothing stays active.
 #[test]
@@ -957,7 +1115,8 @@ fn a_transient_listener_task_death_does_not_enter_the_active_ledger() {
 }
 
 /// Generation `0` and `u64::MAX` are exact published values with no sentinel
-/// encoding.
+/// encoding. Readers Acquire-load the advertised generation, so both extremes
+/// remain real values while still synchronizing with the snapshot store.
 #[test]
 fn generation_boundaries_publish_and_read_back_exactly() {
     let status = GatewayListenerStatus::new();
@@ -1019,8 +1178,8 @@ impl Iterator for StallingObservations {
 }
 
 /// While a publication is in flight, no generation may be advertised: the
-/// lock-free `published_generation` mirror is written only after the snapshot
-/// it describes is visible.
+/// lock-free `published_generation` mirror is a Release store written only
+/// after the snapshot it describes is visible, and readers Acquire-load it.
 ///
 /// This is the invariant the pre-repair design broke, and the seam makes the
 /// breach hold for a test-controlled window rather than a race window: that
@@ -1089,6 +1248,64 @@ fn no_generation_is_advertised_before_its_snapshot_is_published() {
         !snapshot.degraded(),
         "the newer generation's clean status is the one that stands"
     );
+}
+
+/// After the initialized flag is already true, a later publication must still
+/// not advertise its generation until its snapshot is visible. A Release store
+/// of `initialized = true` does not synchronize readers that already observed
+/// that flag; every advertised generation therefore carries its own
+/// Release/Acquire ordering, including generation `0` and `u64::MAX`.
+#[test]
+fn a_later_generation_is_not_advertised_before_its_snapshot() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let status = Arc::new(GatewayListenerStatus::new());
+    assert!(status.publish(10, 2, 2, Vec::new(), 1_000));
+    assert_eq!(status.published_generation(), Some(10));
+    assert_eq!(status.snapshot().config_generation, 10);
+
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let stalled = {
+        let status = Arc::clone(&status);
+        std::thread::spawn(move || {
+            status.publish(
+                11,
+                2,
+                1,
+                StallingObservations {
+                    items: vec![tcp_bind_failure(8443)].into_iter(),
+                    entered: Some(entered_tx),
+                    release: Some(release_rx),
+                },
+                2_000,
+            )
+        })
+    };
+
+    entered_rx
+        .recv()
+        .expect("the later publisher must reach its critical section");
+    for _ in 0..100 {
+        assert_eq!(
+            status.published_generation(),
+            Some(10),
+            "a later generation was advertised before its snapshot was published"
+        );
+        assert_eq!(status.snapshot().config_generation, 10);
+        assert!(
+            !status.snapshot().degraded(),
+            "the in-flight generation must not replace the committed snapshot"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    release_tx.send(()).expect("release the stalled publisher");
+    assert!(stalled.join().expect("stalled publisher"));
+    assert_eq!(status.published_generation(), Some(11));
+    assert_eq!(status.snapshot().config_generation, 11);
+    assert!(status.snapshot().degraded());
 }
 
 /// Two publishers racing an older and a newer generation: the newer one always

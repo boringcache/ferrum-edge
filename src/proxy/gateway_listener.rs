@@ -477,8 +477,10 @@ impl GatewayListenerBindFailure {
 struct ReconcileOutcome {
     failures: Vec<GatewayListenerBindFailure>,
     /// Active failures for the bounded status snapshot. Listener-task deaths
-    /// that rebind in the same pass are omitted here and published as transient
-    /// events instead.
+    /// that successfully rebind in the same pass are omitted here and published
+    /// as transient events instead. A death whose same-pass replacement failed
+    /// is not treated as recovered: the replacement error remains an active
+    /// observation, and no transient recovery is claimed.
     status_observations: Vec<GatewayListenerFailureObservation>,
     transient_events: Vec<GatewayListenerTransientEvent>,
     refused_route_ports: BTreeSet<u16>,
@@ -875,6 +877,9 @@ impl GatewayListenerManager {
                     );
                 }
                 error!(port, "Gateway API listener ended unexpectedly: {error}");
+                // Raw `bind_failures()` always records the death. A transient
+                // recovery is published only if the TCP half is live again at
+                // the end of this pass; a failed replacement stays fail-closed.
                 listener_task_ended_tcp.insert(port);
                 failures.push(GatewayListenerBindFailure::tcp(
                     port,
@@ -895,10 +900,10 @@ impl GatewayListenerManager {
                 "Gateway API HTTP/3 listener ended unexpectedly: {error}"
             );
             // Recorded in the raw reconcile result for logs and `bind_failures()`.
-            // The bounded status snapshot publishes the death as a transient
-            // same-pass event when this half rebinds below; only a failed
-            // rebind leaves a durable active failure (the bind/retirement
-            // error), not `listener_task_ended`.
+            // A transient failure+recovery pair is published only when this half
+            // is live again by the end of the pass. A failed rebind leaves the
+            // bind/retirement error as the durable active failure instead of
+            // claiming a recovery that did not occur.
             listener_task_ended_quic.insert(port);
             failures.push(GatewayListenerBindFailure::quic(
                 port,
@@ -1147,21 +1152,33 @@ impl GatewayListenerManager {
             })
             .map(GatewayListenerBindFailure::observation)
             .collect();
-        let mut transient_events: Vec<GatewayListenerTransientEvent> = listener_task_ended_tcp
-            .iter()
-            .map(|port| GatewayListenerTransientEvent {
-                port: *port,
-                protocol: GatewayListenerProtocolHalf::Tcp,
-                category: GatewayListenerFailureCategory::ListenerTaskEnded,
-            })
-            .chain(listener_task_ended_quic.iter().map(|port| {
-                GatewayListenerTransientEvent {
-                    port: *port,
+        // A transient pair is valid only when that exact protocol half is live
+        // again by publication. Failed TCP replacement and failed QUIC rebind
+        // keep their replacement error as the active failure (already in
+        // `status_observations`) and must not count a recovery. Raw
+        // `ListenerTaskEnded` rows stay in `failures` for logs/`bind_failures()`.
+        let mut transient_events: Vec<GatewayListenerTransientEvent> = Vec::new();
+        for port in listener_task_ended_tcp {
+            if live.contains_key(&port) {
+                transient_events.push(GatewayListenerTransientEvent {
+                    port,
+                    protocol: GatewayListenerProtocolHalf::Tcp,
+                    category: GatewayListenerFailureCategory::ListenerTaskEnded,
+                });
+            }
+        }
+        for port in listener_task_ended_quic {
+            if live
+                .get(&port)
+                .is_some_and(|listener| listener.quic.is_some())
+            {
+                transient_events.push(GatewayListenerTransientEvent {
+                    port,
                     protocol: GatewayListenerProtocolHalf::Quic,
                     category: GatewayListenerFailureCategory::ListenerTaskEnded,
-                }
-            }))
-            .collect();
+                });
+            }
+        }
 
         drop(live);
 
@@ -1638,6 +1655,24 @@ mod tests {
         port
     }
 
+    fn cumulative_series(
+        status: &crate::proxy::gateway_listener_status::GatewayListenerStatus,
+        protocol: GatewayListenerProtocolHalf,
+        category: GatewayListenerFailureCategory,
+        recoveries: bool,
+    ) -> u64 {
+        let cumulative = status.cumulative();
+        let series = if recoveries {
+            &cumulative.recoveries_total
+        } else {
+            &cumulative.failures_total
+        };
+        series
+            .iter()
+            .find(|entry| entry.protocol == protocol && entry.category == category)
+            .map_or(0, |entry| entry.value)
+    }
+
     /// A started listener whose accept-loop task later dies must be reaped,
     /// surfaced as a failure, and rebound — never left in the live map where
     /// the next reconcile would read the port as healthy.
@@ -1759,6 +1794,117 @@ mod tests {
                 .map(|series| series.value),
             Some(1)
         );
+        manager.shutdown_all().await;
+    }
+
+    /// A reaped TCP accept loop whose same-pass replacement fails must not be
+    /// published as a transient recovery. The death stays in raw
+    /// `bind_failures()`, and the failed bind is the durable active failure.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dead_listener_task_failed_rebind_is_not_published_as_recovered() {
+        let port = free_port().await;
+        let status = Arc::new(crate::proxy::gateway_listener_status::GatewayListenerStatus::new());
+        let manager = GatewayListenerManager::new(
+            test_state(port_scoped_config(port)),
+            std::net::IpAddr::from([127, 0, 0, 1]),
+            GatewayListenerTls::default(),
+        )
+        .with_status(status.clone());
+        assert!(manager.reconcile().await.is_empty());
+        assert_eq!(manager.active_ports().await, vec![port]);
+
+        {
+            let live = manager.listeners.lock().await;
+            live.get(&port).expect("listener").tcp.abort();
+        }
+        while !manager
+            .listeners
+            .lock()
+            .await
+            .get(&port)
+            .expect("listener")
+            .tcp_ended()
+        {
+            tokio::task::yield_now().await;
+        }
+
+        let occupied = {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+                    Ok(listener) => break listener,
+                    Err(_) => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "the reaped listener never released {port}"
+                        );
+                        tokio::task::yield_now().await;
+                    }
+                }
+            }
+        };
+
+        let failures = manager.reconcile().await;
+        assert!(
+            failures.iter().any(|failure| {
+                failure.port == port
+                    && failure.protocol == GatewayListenerProtocolHalf::Tcp
+                    && failure.category == GatewayListenerFailureCategory::ListenerTaskEnded
+            }),
+            "raw bind_failures must still report the death: {failures:?}"
+        );
+        assert!(
+            failures.iter().any(|failure| {
+                failure.port == port
+                    && failure.protocol == GatewayListenerProtocolHalf::Tcp
+                    && failure.category == GatewayListenerFailureCategory::BindFailed
+            }),
+            "raw bind_failures must still report the failed replacement: {failures:?}"
+        );
+        assert!(
+            manager.active_ports().await.is_empty(),
+            "the occupied port must not be rebound"
+        );
+
+        let snapshot = status.snapshot();
+        assert!(snapshot.degraded(), "{snapshot:?}");
+        assert_eq!(snapshot.active_failures, 1, "{snapshot:?}");
+        assert_eq!(snapshot.failures[0].port, port);
+        assert_eq!(
+            snapshot.failures[0].category,
+            GatewayListenerFailureCategory::BindFailed
+        );
+        assert_eq!(
+            cumulative_series(
+                &status,
+                GatewayListenerProtocolHalf::Tcp,
+                GatewayListenerFailureCategory::ListenerTaskEnded,
+                false,
+            ),
+            0,
+            "a failed replacement must not count a transient ListenerTaskEnded onset"
+        );
+        assert_eq!(
+            cumulative_series(
+                &status,
+                GatewayListenerProtocolHalf::Tcp,
+                GatewayListenerFailureCategory::ListenerTaskEnded,
+                true,
+            ),
+            0,
+            "a failed replacement must not claim a ListenerTaskEnded recovery"
+        );
+        assert_eq!(
+            cumulative_series(
+                &status,
+                GatewayListenerProtocolHalf::Tcp,
+                GatewayListenerFailureCategory::BindFailed,
+                false,
+            ),
+            1
+        );
+
+        drop(occupied);
         manager.shutdown_all().await;
     }
 
@@ -2080,6 +2226,137 @@ mod tests {
                 .map(|series| series.value),
             Some(1)
         );
+        manager.shutdown_all().await;
+    }
+
+    /// A reaped QUIC task whose same-pass rebind fails must not be published as
+    /// a transient recovery. TCP stays up; the failed QUIC bind is the durable
+    /// active failure, and raw `bind_failures()` still reports the death.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dead_quic_task_failed_rebind_is_not_published_as_recovered() {
+        let _ = rustls::crypto::CryptoProvider::install_default(
+            rustls::crypto::ring::default_provider(),
+        );
+        let port = free_port().await;
+        let mut config = port_scoped_config(port);
+        config
+            .http_tls_listen_ports
+            .insert((crate::config::types::default_namespace(), port));
+        let status = Arc::new(crate::proxy::gateway_listener_status::GatewayListenerStatus::new());
+        let manager = tls_h3_manager(test_state(config)).with_status(status.clone());
+        assert!(manager.reconcile().await.is_empty());
+        assert_eq!(manager.active_ports().await, vec![port]);
+        assert_eq!(manager.active_http3_ports().await, vec![port]);
+
+        let tcp_id = {
+            let live = manager.listeners.lock().await;
+            let listener = live.get(&port).expect("listener");
+            listener.quic.as_ref().expect("quic task").abort();
+            listener.tcp.id()
+        };
+        while !manager
+            .listeners
+            .lock()
+            .await
+            .get(&port)
+            .expect("listener")
+            .quic_ended()
+        {
+            tokio::task::yield_now().await;
+        }
+
+        let occupied = {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                match std::net::UdpSocket::bind(("127.0.0.1", port)) {
+                    Ok(socket) => break socket,
+                    Err(_) => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "the reaped QUIC listener never released {port}"
+                        );
+                        tokio::task::yield_now().await;
+                    }
+                }
+            }
+        };
+
+        let failures = manager.reconcile().await;
+        assert!(
+            failures.iter().any(|failure| {
+                failure.port == port
+                    && failure.protocol == GatewayListenerProtocolHalf::Quic
+                    && failure.category == GatewayListenerFailureCategory::ListenerTaskEnded
+            }),
+            "raw bind_failures must still report the QUIC death: {failures:?}"
+        );
+        assert!(
+            failures.iter().any(|failure| {
+                failure.port == port
+                    && failure.protocol == GatewayListenerProtocolHalf::Quic
+                    && failure.category == GatewayListenerFailureCategory::BindFailed
+            }),
+            "raw bind_failures must still report the failed QUIC rebind: {failures:?}"
+        );
+        assert!(
+            failures
+                .iter()
+                .all(|failure| failure.protocol == GatewayListenerProtocolHalf::Quic),
+            "the healthy TCP half must not be reported as failed: {failures:?}"
+        );
+        assert_eq!(manager.active_ports().await, vec![port]);
+        assert!(manager.active_http3_ports().await.is_empty());
+
+        let live = manager.listeners.lock().await;
+        let listener = live.get(&port).expect("listener must not be retired");
+        assert!(!listener.tcp_ended());
+        assert_eq!(listener.tcp.id(), tcp_id);
+        assert!(listener.quic.is_none());
+        drop(live);
+
+        let snapshot = status.snapshot();
+        assert!(snapshot.degraded(), "{snapshot:?}");
+        assert_eq!(snapshot.active_failures, 1, "{snapshot:?}");
+        assert_eq!(snapshot.failures[0].port, port);
+        assert_eq!(
+            snapshot.failures[0].protocol,
+            GatewayListenerProtocolHalf::Quic
+        );
+        assert_eq!(
+            snapshot.failures[0].category,
+            GatewayListenerFailureCategory::BindFailed
+        );
+        assert_eq!(
+            cumulative_series(
+                &status,
+                GatewayListenerProtocolHalf::Quic,
+                GatewayListenerFailureCategory::ListenerTaskEnded,
+                false,
+            ),
+            0,
+            "a failed QUIC rebind must not count a transient ListenerTaskEnded onset"
+        );
+        assert_eq!(
+            cumulative_series(
+                &status,
+                GatewayListenerProtocolHalf::Quic,
+                GatewayListenerFailureCategory::ListenerTaskEnded,
+                true,
+            ),
+            0,
+            "a failed QUIC rebind must not claim a ListenerTaskEnded recovery"
+        );
+        assert_eq!(
+            cumulative_series(
+                &status,
+                GatewayListenerProtocolHalf::Quic,
+                GatewayListenerFailureCategory::BindFailed,
+                false,
+            ),
+            1
+        );
+
+        drop(occupied);
         manager.shutdown_all().await;
     }
 

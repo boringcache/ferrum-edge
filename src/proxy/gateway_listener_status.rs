@@ -70,7 +70,7 @@
 //! closed sets and an alert on `reason="bind_failed"` covers both halves.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use arc_swap::ArcSwap;
@@ -97,7 +97,10 @@ pub const MAX_TRACKED_FAILURES: usize = 64;
 /// reached, further distinct identities in the same pass are dropped and
 /// [`GatewayListenerStatusSnapshot::overflowed`] is set: previously tracked
 /// identities that still appear anywhere in the stream keep their ledger slots,
-/// and only brand-new identities are evicted in deterministic key order.
+/// and only brand-new identities compete for remaining slots in deterministic
+/// key order. The publication scan itself is bounded the same way: it never
+/// materializes the full distinct stream, so hostile configuration cardinality
+/// cannot drive unbounded temporary allocation.
 pub const MAX_ACTIVE_TRACKED_FAILURES: usize = 4096;
 
 /// Hard cap on the sanitized `detail` retained for one entry.
@@ -452,13 +455,18 @@ struct PublishLedger {
 pub struct GatewayListenerStatus {
     snapshot: ArcSwap<GatewayListenerStatusSnapshot>,
     /// Lock-free mirror of [`PublishLedger::published_generation`], stored
-    /// **after** the snapshot it belongs to is visible. It therefore never
-    /// advertises a generation whose status has not been published yet.
+    /// **after** the snapshot it belongs to is visible. Each store is Release
+    /// so an Acquire load of this generation synchronizes-with that publication
+    /// and therefore cannot advertise a generation whose snapshot is not yet
+    /// visible — including after `published_generation_initialized` is already
+    /// true.
     published_generation: AtomicU64,
     /// Whether [`Self::published_generation`] has been initialized by an
     /// accepted publication. Separated so generation `0` and `u64::MAX` are
-    /// exact values with no sentinel encoding.
-    published_generation_initialized: std::sync::atomic::AtomicBool,
+    /// exact values with no sentinel encoding. This flag is not itself the
+    /// generation fence after the first publication: every later advertised
+    /// generation is a Release store on [`Self::published_generation`].
+    published_generation_initialized: AtomicBool,
     /// Serializes generation acceptance together with the read-modify-write of
     /// the snapshot, the active ledger, and the cumulative counters. Never held
     /// by a reader.
@@ -478,7 +486,7 @@ impl GatewayListenerStatus {
         Self {
             snapshot: ArcSwap::from_pointee(GatewayListenerStatusSnapshot::default()),
             published_generation: AtomicU64::new(0),
-            published_generation_initialized: std::sync::atomic::AtomicBool::new(false),
+            published_generation_initialized: AtomicBool::new(false),
             ledger: Mutex::new(PublishLedger::default()),
             failures_total: Default::default(),
             recoveries_total: Default::default(),
@@ -493,8 +501,10 @@ impl GatewayListenerStatus {
     /// The last config generation whose status was accepted, lock-free.
     ///
     /// `None` before the first accepted publication. This never runs ahead of
-    /// [`Self::snapshot`]: it is stored inside the publication's critical
-    /// section, after the snapshot it describes is already visible.
+    /// [`Self::snapshot`]: each advertised generation is an Acquire load of a
+    /// Release store that happens after the snapshot it describes is visible.
+    /// Generation `0` and `u64::MAX` are exact values; the initialized flag
+    /// exists only so those are not sentinels.
     // The binary target re-declares these modules, so a `pub` item consumed
     // only by `tests/` reads as dead code there.
     #[allow(dead_code)]
@@ -503,7 +513,10 @@ impl GatewayListenerStatus {
             .published_generation_initialized
             .load(Ordering::Acquire)
         {
-            Some(self.published_generation.load(Ordering::Relaxed))
+            // Acquire on the generation itself: after the first publication
+            // `initialized` stays `true`, so a later Release of that same
+            // boolean would not synchronize a reader that already observed it.
+            Some(self.published_generation.load(Ordering::Acquire))
         } else {
             None
         }
@@ -604,58 +617,25 @@ impl GatewayListenerStatus {
             return false;
         }
 
-        // Pass 1: the full distinct identity set for this generation, plus the
-        // sanitized detail for identities that may be retained in the public
-        // vector. Detail is kept only for the lowest-keyed
-        // `MAX_TRACKED_FAILURES` selected identities.
-        let mut stream_keys: BTreeSet<FailureKey> = BTreeSet::new();
-        let mut stream_details: BTreeMap<FailureKey, String> = BTreeMap::new();
+        let mut scan = BoundedStreamScan::new();
         for observation in observations {
-            let key = observation.key();
-            if !stream_keys.insert(key) {
-                // One pass can legitimately record the same port twice (for
-                // example a dead-task reap followed by a rebind failure). Keep
-                // the first detail and do not double-count the occurrence.
-                continue;
-            }
-            retain_detail(&mut stream_details, key, &observation.detail);
+            scan.observe(&ledger.active, observation);
         }
+        let overflowed = scan.overflowed;
+        let details = scan.public_details();
 
-        // Pass 2: select a hard-bounded active set. Every previously tracked
-        // identity present anywhere in the stream keeps its ledger slot; only
-        // then are new identities admitted in deterministic key order. Recovery
-        // is decided against the full stream, never the capped selection.
-        let mut selected: BTreeSet<FailureKey> = BTreeSet::new();
-        for key in ledger.active.keys() {
-            if stream_keys.contains(key) {
-                selected.insert(*key);
-            }
-        }
-        for key in stream_keys.iter().copied() {
-            if selected.contains(&key) {
-                continue;
-            }
-            if selected.len() >= MAX_ACTIVE_TRACKED_FAILURES {
-                break;
-            }
-            selected.insert(key);
-        }
-        let overflowed = stream_keys.len() > MAX_ACTIVE_TRACKED_FAILURES;
-
-        let mut details: BTreeMap<FailureKey, String> = BTreeMap::new();
-        for key in selected.iter().copied() {
-            if let Some(detail) = stream_details.get(&key) {
-                retain_detail(&mut details, key, detail);
-            }
-        }
-
-        // Pass 3: age every selected identity that was already active, count an
-        // onset for every selected identity that was not. The previous state
-        // comes from the private ledger, never from the truncated public
-        // vector: an identity the detail cap dropped is still a known, aged
-        // identity when it remains selected.
+        // Age every selected identity that was already active, count an onset
+        // for every selected identity that was not. The previous state comes
+        // from the private ledger, never from the truncated public vector: an
+        // identity the detail cap dropped is still a known, aged identity when
+        // it remains selected.
         let mut next_active: BTreeMap<FailureKey, ActiveFailureHistory> = BTreeMap::new();
-        for key in selected.iter().copied() {
+        for key in scan
+            .prior_seen
+            .iter()
+            .copied()
+            .chain(scan.new_candidates.iter().copied())
+        {
             let (_, protocol, category) = key;
             let history = match ledger.active.get(&key) {
                 Some(previous) => ActiveFailureHistory {
@@ -673,11 +653,11 @@ impl GatewayListenerStatus {
             next_active.insert(key, history);
         }
 
-        // Anything that was failing and is absent from the full stream has
-        // recovered — including identities that were never published in
-        // `failures` and identities dropped from the bounded selection.
+        // Recovery is decided only from the bounded prior ledger's seen flags.
+        // A previously tracked identity encountered anywhere in the stream was
+        // marked seen and kept; only genuinely absent prior identities recover.
         for key in ledger.active.keys() {
-            if stream_keys.contains(key) {
+            if scan.prior_seen.contains(key) {
                 continue;
             }
             let (_, protocol, category) = *key;
@@ -761,13 +741,139 @@ impl GatewayListenerStatus {
             active_by_category,
             failures,
         }));
-        // Published last, so a lock-free reader can never see this generation
-        // advertised before the snapshot that belongs to it.
+        // Snapshot first, then advertise this generation with Release so a
+        // lock-free Acquire load cannot observe the generation before the
+        // snapshot it names. Every publication uses Release on the generation
+        // itself: a Release store of `initialized = true` only synchronizes
+        // readers that observe *that* store, and after the first publication
+        // the flag is already true.
         self.published_generation
-            .store(config_generation, Ordering::Relaxed);
+            .store(config_generation, Ordering::Release);
         self.published_generation_initialized
             .store(true, Ordering::Release);
         true
+    }
+}
+
+/// One-pass bounded selection over a failure-observation stream.
+///
+/// Temporary identity storage is rigorously O(MAX_ACTIVE_TRACKED_FAILURES):
+/// `prior_seen` has one slot per already-tracked identity (≤ 4096) and
+/// `new_candidates` holds at most the remaining ledger slots (≤ 4096). Distinct
+/// unretained new identities set `overflowed` without being stored, so hostile
+/// configuration cardinality cannot grow this pass's working set. Duplicate
+/// unretained new keys are not distinguished: they never enter the ledger, so
+/// they cannot double-count onsets, but any such sighting still leaves
+/// `overflowed` true.
+///
+/// Recovery is decided only from `prior_seen`. A prior identity that appears
+/// anywhere in the stream is marked seen and kept — even if it arrives after a
+/// burst of brand-new keys that would have filled an encounter-order cap.
+/// Brand-new identities then compete for whatever slots remain, in
+/// deterministic key order, independent of encounter order.
+///
+/// Detail strings never track the full stream. Each population (seen prior, new
+/// candidates) keeps at most [`MAX_TRACKED_FAILURES`] sanitized strings so a
+/// late prior identity can still claim a public-detail slot after small new
+/// keys are evicted. The published vector is the 64 lowest selected keys.
+struct BoundedStreamScan {
+    prior_seen: BTreeSet<FailureKey>,
+    new_candidates: BTreeSet<FailureKey>,
+    overflowed: bool,
+    prior_details: BTreeMap<FailureKey, String>,
+    new_details: BTreeMap<FailureKey, String>,
+}
+
+impl BoundedStreamScan {
+    fn new() -> Self {
+        Self {
+            prior_seen: BTreeSet::new(),
+            new_candidates: BTreeSet::new(),
+            overflowed: false,
+            prior_details: BTreeMap::new(),
+            new_details: BTreeMap::new(),
+        }
+    }
+
+    fn remaining(&self) -> usize {
+        MAX_ACTIVE_TRACKED_FAILURES.saturating_sub(self.prior_seen.len())
+    }
+
+    fn evict_excess_new(&mut self) {
+        let remaining = self.remaining();
+        while self.new_candidates.len() > remaining {
+            if let Some(largest) = self.new_candidates.pop_last() {
+                self.new_details.remove(&largest);
+            }
+            self.overflowed = true;
+        }
+    }
+
+    fn observe(
+        &mut self,
+        prior: &BTreeMap<FailureKey, ActiveFailureHistory>,
+        observation: GatewayListenerFailureObservation,
+    ) {
+        let key = observation.key();
+        if prior.contains_key(&key) {
+            if !self.prior_seen.insert(key) {
+                // Duplicate prior identity in this pass: keep the first detail
+                // and do not double-count the occurrence.
+                return;
+            }
+            self.evict_excess_new();
+            retain_detail(&mut self.prior_details, key, &observation.detail);
+            return;
+        }
+        if self.new_candidates.contains(&key) {
+            return;
+        }
+        let remaining = self.remaining();
+        if remaining == 0 {
+            // Unretained new identity: remember overflow, store nothing.
+            self.overflowed = true;
+            return;
+        }
+        if self.new_candidates.len() < remaining {
+            self.new_candidates.insert(key);
+            retain_detail(&mut self.new_details, key, &observation.detail);
+            return;
+        }
+        if let Some(largest) = self.new_candidates.last().copied() {
+            if key < largest {
+                self.new_candidates.remove(&largest);
+                self.new_details.remove(&largest);
+                self.new_candidates.insert(key);
+                retain_detail(&mut self.new_details, key, &observation.detail);
+            }
+            self.overflowed = true;
+        }
+    }
+
+    fn public_details(&mut self) -> BTreeMap<FailureKey, String> {
+        let mut details = BTreeMap::new();
+        let mut prior = self.prior_seen.iter().peekable();
+        let mut new = self.new_candidates.iter().peekable();
+        while details.len() < MAX_TRACKED_FAILURES {
+            let next = match (prior.peek(), new.peek()) {
+                (Some(prior_key), Some(new_key)) if **prior_key <= **new_key => prior.next(),
+                (Some(_), Some(_)) => new.next(),
+                (Some(_), None) => prior.next(),
+                (None, Some(_)) => new.next(),
+                (None, None) => break,
+            };
+            let Some(&key) = next else {
+                break;
+            };
+            if let Some(detail) = self
+                .prior_details
+                .remove(&key)
+                .or_else(|| self.new_details.remove(&key))
+            {
+                details.insert(key, detail);
+            }
+        }
+        details
     }
 }
 
