@@ -364,7 +364,8 @@ Three properties are load-bearing:
 | Point | Behavior |
 |-------|----------|
 | Before the credential is accepted | Ordinary authentication rejection — a fixed `401`. An expired JWT/JWKS/OIDC/introspection credential fails at validation; an `mtls_auth` leaf outside its validity interval fails the per-request temporal check, including on a reused H1 keep-alive connection and on new H2/H3 streams over an existing transport connection |
-| After acceptance, before any response DATA | Native gRPC receives `grpc-status: 16` (`UNAUTHENTICATED`) trailers; gRPC-Web receives the equivalent bounded trailer frame in DATA |
+| After acceptance, before the downstream response head is committed | A fixed terminal chosen once, at the single point where every H1/H2 dispatch path converges: plain HTTP, SSE, and chunked responses get a fixed `401` with the compiled-in `{"error":"Unauthorized"}` body; native gRPC gets HTTP 200 with trailers-only `grpc-status: 16` (`UNAUTHENTICATED`); gRPC-Web gets the equivalent bounded terminal through the shared translation. This is the terminal a **request-upload** expiry produces, because the upload seam fires while the backend is still withholding response headers |
+| After the response head is committed, before any response DATA | Native gRPC receives `grpc-status: 16` (`UNAUTHENTICATED`) trailers; gRPC-Web receives the equivalent bounded trailer frame in DATA. Ordinary HTTP and SSE have **no** terminal status metadata, so the body ends with a transport error instead — a `grpc-status` trailer is never synthesized for a client that did not speak gRPC, and the body never ends cleanly, which would be indistinguishable from a complete response |
 | After response DATA is committed | The body ends with a transport error, which resets the HTTP/2 or HTTP/3 stream and terminates an HTTP/1.1 or SSE body deterministically. A complete gRPC message boundary cannot be proven at that point, so a terminal status is **never fabricated** |
 
 When the deadline fires, the wrapper drops the inner backend body immediately —
@@ -398,6 +399,7 @@ The `grpc-message` and the internal termination text are compiled-in literals.
 | Surface | Enforced |
 |---------|----------|
 | Generic HTTP/1.1 and HTTP/2 streaming responses, including SSE | Yes |
+| HTTP/1.1 and HTTP/2 streaming and bidirectional request **uploads** | Yes — the client body adapter every streaming dispatch path already installs (reqwest, direct-H2, mesh mTLS, HBONE, Unix socket) carries the same absolute plan, so an upload whose backend withholds response headers is bounded even though no response body exists yet |
 | Native gRPC server-, client-, and bidirectional streaming | Yes |
 | gRPC-Web streaming, binary and text | Yes |
 | HTTP/3 backend responses relayed to an H1/H2 downstream (`StreamingH3`) | Yes |
@@ -406,7 +408,7 @@ The `grpc-message` and the internal termination text are compiled-in literals.
 | H3 cross-protocol relays to HTTP/1.1, HTTP/2, and gRPC backends, gRPC-Web translation included | Yes, in both directions: the request-upload bridge terminates with a fixed `401` before response headers are committed, and the response relay resets or emits the bounded terminal after commitment |
 | Inspected / latency-tracked streaming bodies | Yes |
 | WebSocket over H1, H2 Extended CONNECT, and H3 Extended CONNECT | Yes, through the pre-existing WebSocket deadline arbiter, which uses the same `credential_deadline_at` |
-| TCP+TLS stream sessions on the userspace relay | Yes |
+| TCP+TLS stream sessions on the userspace relay | Yes — armed at `on_stream_connect` admission and enforced across every post-admission setup stage (DNS resolution, retry backoff, backend connect and TLS handshake, the outbound PROXY v2 header, and the inspected first-bytes forward) as well as the relay itself, so no backend or application byte is written on an expired credential |
 | UDP+DTLS stream sessions | Yes — raced against relay completion, the idle watchdog, and drain; both directions are closed and the backend connection is torn down |
 | CP/DP configuration streams | Yes, through the separate control-plane lifetime enforcement |
 
@@ -432,6 +434,12 @@ Deliberate scope notes:
   [Kernel TLS and the stream authorization deadline](frontend_tls.md#kernel-tls-and-the-stream-authorization-deadline).
 - **Plaintext TCP** stream sessions carry no gateway-verified credential from a
   built-in mechanism, so no deadline is derived for them.
+- A TCP setup-phase expiry is a **client-side, health-neutral** refusal
+  (`StreamSetupKind::AuthorizationExpired`): the half-open circuit-breaker probe
+  slot and the per-target backend-inflight slot are released without recording a
+  backend outcome, so the breaker, passive health, and the adaptive buffer
+  tracker are untouched. Retries and backoff sleeps cannot refresh the absolute
+  deadline — it is re-checked at the top of every connect attempt.
 - An H3 request body that is **buffered before dispatch** composes the
   authorization deadline into the existing early-upload ceiling
   (`backend_read_timeout_ms` and the optional client RPC deadline) through

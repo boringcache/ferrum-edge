@@ -9,7 +9,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ferrum_edge::_test_support::{
-    request_received_at_for_test, set_request_credential_deadline_for_test,
+    authorization_expired_pre_commitment_response_for_test, request_received_at_for_test,
+    request_upload_auth_deadline_for_test, set_request_credential_deadline_for_test,
+    within_stream_auth_deadline_for_test,
 };
 use ferrum_edge::config::types::Consumer;
 use ferrum_edge::plugins::RequestContext;
@@ -586,4 +588,234 @@ async fn attribution_reports_authorization_only_once_its_own_instant_has_passed(
     );
     // Still nothing to attribute for an unauthenticated stream.
     assert_eq!(expired_authorization(None), None);
+}
+
+// --- The H1/H2 request-upload seam (#3815) ---------------------------------
+
+#[tokio::test]
+async fn an_unauthenticated_upload_installs_no_authorization_bound() {
+    // No principal was admitted, so there is no authorization lifetime to
+    // enforce and no timer is registered on the upload at all.
+    assert!(request_upload_auth_deadline_for_test(&anonymous_ctx(), DEFAULT_MAX).is_none());
+}
+
+#[tokio::test]
+async fn an_authenticated_upload_is_bounded_by_the_same_plan_as_its_response() {
+    let mut ctx = authenticated_ctx();
+    let credential_at = tokio::time::Instant::now() + Duration::from_secs(30);
+    set_request_credential_deadline_for_test(&mut ctx, Some(credential_at));
+
+    let (upload_plan, family, _latch) =
+        request_upload_auth_deadline_for_test(&ctx, DEFAULT_MAX).expect("authenticated upload");
+    let response_plan =
+        effective_request_auth_deadline(&ctx, DEFAULT_MAX).expect("authenticated response");
+
+    // ONE plan for both directions: the upload cannot outlive the response
+    // bound, and neither can outlive the credential.
+    assert_eq!(upload_plan.at, credential_at);
+    assert_eq!(upload_plan, response_plan);
+    assert_eq!(
+        upload_plan.termination,
+        StreamAuthTermination::CredentialExpired
+    );
+    // A plain request is bounded, and reported, as HTTP.
+    assert_eq!(family, StreamAuthProtocolFamily::Http);
+}
+
+#[tokio::test]
+async fn an_upload_family_follows_the_request_flavor() {
+    let mut ctx = authenticated_ctx();
+    ctx.headers
+        .insert("content-type".to_string(), "application/grpc".to_string());
+    let (_, family, _) = request_upload_auth_deadline_for_test(&ctx, DEFAULT_MAX).unwrap();
+    assert_eq!(family, StreamAuthProtocolFamily::Grpc);
+
+    let mut ctx = authenticated_ctx();
+    ctx.headers.insert(
+        "content-type".to_string(),
+        "application/grpc-web+proto".to_string(),
+    );
+    let (_, family, _) = request_upload_auth_deadline_for_test(&ctx, DEFAULT_MAX).unwrap();
+    assert_eq!(family, StreamAuthProtocolFamily::GrpcWeb);
+
+    let mut ctx = authenticated_ctx();
+    ctx.headers
+        .insert("content-type".to_string(), "text/event-stream".to_string());
+    let (_, family, _) = request_upload_auth_deadline_for_test(&ctx, DEFAULT_MAX).unwrap();
+    assert_eq!(family, StreamAuthProtocolFamily::Http);
+}
+
+#[tokio::test]
+async fn an_upload_shares_one_latch_with_the_response_direction() {
+    let ctx = authenticated_ctx();
+    let (_, _, upload_latch) = request_upload_auth_deadline_for_test(&ctx, DEFAULT_MAX).unwrap();
+    let (_, _, second_handle) = request_upload_auth_deadline_for_test(&ctx, DEFAULT_MAX).unwrap();
+
+    assert!(upload_latch.record_once(
+        StreamAuthTermination::CredentialExpired,
+        StreamAuthProtocolFamily::Http
+    ));
+    assert!(
+        !second_handle.record_once(
+            StreamAuthTermination::CredentialExpired,
+            StreamAuthProtocolFamily::Http
+        ),
+        "both directions of one request share a single termination"
+    );
+    assert_eq!(
+        second_handle.observed(),
+        Some(StreamAuthTermination::CredentialExpired)
+    );
+}
+
+// --- The fixed pre-commitment terminal (#3815) -----------------------------
+
+#[tokio::test]
+async fn a_pre_commitment_expiry_is_a_fixed_redacted_401_for_plain_http() {
+    let ctx = authenticated_ctx();
+    let (status, headers, body) = authorization_expired_pre_commitment_response_for_test(
+        &ctx,
+        StreamAuthTermination::CredentialExpired,
+        false,
+    );
+    assert_eq!(status, 401);
+    assert_eq!(
+        headers.get("content-type").map(String::as_str),
+        Some("application/json")
+    );
+    assert_eq!(body, br#"{"error":"Unauthorized"}"#.to_vec());
+    // Redaction: no expiry instant, claim, subject, or provider detail.
+    let rendered = String::from_utf8(body).unwrap();
+    assert!(!rendered.chars().any(|c| c.is_ascii_digit()));
+    assert!(!headers.contains_key("grpc-status"));
+}
+
+#[tokio::test]
+async fn a_pre_commitment_expiry_is_unauthenticated_trailers_for_native_grpc() {
+    let ctx = authenticated_ctx();
+    let (status, headers, body) = authorization_expired_pre_commitment_response_for_test(
+        &ctx,
+        StreamAuthTermination::CredentialExpired,
+        true,
+    );
+    // gRPC errors ride HTTP 200 with the status in trailing metadata.
+    assert_eq!(status, 200);
+    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("16"));
+    assert_eq!(
+        headers.get("grpc-message").map(String::as_str),
+        Some("credential expired")
+    );
+    assert!(body.is_empty(), "no gRPC message may be fabricated");
+}
+
+#[tokio::test]
+async fn the_pre_commitment_terminal_class_is_a_closed_bounded_vocabulary() {
+    let ctx = authenticated_ctx();
+    let (_, headers, _) = authorization_expired_pre_commitment_response_for_test(
+        &ctx,
+        StreamAuthTermination::AuthenticatedStreamMaxLifetime,
+        true,
+    );
+    assert_eq!(
+        headers.get("grpc-message").map(String::as_str),
+        Some("authenticated stream lifetime reached")
+    );
+}
+
+// --- Post-admission TCP setup enforcement (#3816) --------------------------
+
+#[tokio::test(start_paused = true)]
+async fn an_unauthenticated_stream_setup_stage_runs_unbounded() {
+    let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = Arc::clone(&ran);
+    let result = within_stream_auth_deadline_for_test(None, async move {
+        tokio::time::sleep(Duration::from_secs(600)).await;
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        7u8
+    })
+    .await;
+    assert_eq!(result, Ok(7));
+    assert!(ran.load(std::sync::atomic::Ordering::SeqCst));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_setup_stage_inside_the_authorization_lifetime_completes() {
+    let plan = plan_at(
+        tokio::time::Instant::now() + Duration::from_secs(60),
+        StreamAuthTermination::CredentialExpired,
+    );
+    let result = within_stream_auth_deadline_for_test(Some(plan), async {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        "connected"
+    })
+    .await;
+    assert_eq!(result, Ok("connected"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_setup_stage_is_cancelled_at_the_authorization_deadline() {
+    // The stage models a backend dial (or an outbound PROXY/prefix write) that
+    // would otherwise complete AFTER the credential expired. Cancelling it is
+    // what guarantees no backend byte is written on an expired credential.
+    let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = Arc::clone(&completed);
+    let plan = plan_at(
+        tokio::time::Instant::now() + Duration::from_secs(10),
+        StreamAuthTermination::AuthenticatedStreamMaxLifetime,
+    );
+    let result = within_stream_auth_deadline_for_test(Some(plan), async move {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    })
+    .await;
+    assert_eq!(
+        result,
+        Err(StreamAuthTermination::AuthenticatedStreamMaxLifetime)
+    );
+    assert!(
+        !completed.load(std::sync::atomic::Ordering::SeqCst),
+        "the setup stage must be dropped at the deadline, not allowed to finish"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_already_elapsed_lifetime_refuses_a_setup_stage_outright() {
+    let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = Arc::clone(&started);
+    let plan = plan_at(
+        tokio::time::Instant::now(),
+        StreamAuthTermination::CredentialExpired,
+    );
+    tokio::time::advance(Duration::from_secs(1)).await;
+    let result = within_stream_auth_deadline_for_test(Some(plan), async move {
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    })
+    .await;
+    assert_eq!(result, Err(StreamAuthTermination::CredentialExpired));
+    assert!(
+        !started.load(std::sync::atomic::Ordering::SeqCst),
+        "a stage entered after the deadline must never run"
+    );
+}
+
+#[tokio::test]
+async fn the_setup_expiry_kind_is_client_side_and_health_neutral() {
+    use ferrum_edge::proxy::stream_error::{StreamSetupError, StreamSetupKind};
+
+    let kind = StreamSetupKind::AuthorizationExpired;
+    // Client-side: the gateway applied a policy to the client's own credential,
+    // so the disconnect cause and direction are client-attributed and no
+    // backend health signal is derived from it.
+    assert!(kind.is_client_side());
+    assert_eq!(kind.tls_side(), None);
+    assert_eq!(
+        kind.direction(),
+        ferrum_edge::plugins::Direction::ClientToBackend
+    );
+    let rendered = StreamSetupError::new(kind, "before any backend byte was written".to_string())
+        .to_string();
+    // Redacted: the contract, never the credential, its subject, or its expiry.
+    assert!(rendered.contains("authorization lifetime"), "{rendered}");
+    assert!(!rendered.chars().any(|c| c.is_ascii_digit()), "{rendered}");
 }

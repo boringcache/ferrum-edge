@@ -31127,6 +31127,10 @@ async fn handle_proxy_request_inner(
                         auth_deadline,
                         grpc_web_streaming_content_type,
                         auth_family,
+                        // Shared with the request-upload seam: on a
+                        // bidirectional stream both directions race the same
+                        // absolute plan, and exactly one termination is counted.
+                        Some(ctx.authorization_termination_latch()),
                     );
                 }
                 if let Some(content_type) = grpc_web_streaming_content_type {
@@ -32444,7 +32448,9 @@ async fn handle_proxy_request_inner(
     // backend served this response, so the sticky-affinity reissue below must
     // not pin the client to it.
     let mut sticky_dispatch_refused = false;
-    let (backend_resp, final_cb_target_key, final_upstream_target) = if let Some(retry_config) =
+    // `mut`: the pre-commitment authorization terminal below neutralizes the
+    // health inputs of a dispatch the gateway itself cancelled (#3815).
+    let (mut backend_resp, final_cb_target_key, final_upstream_target) = if let Some(retry_config) =
         retry_config
     {
         let mut attempt = 0u32;
@@ -33270,6 +33276,58 @@ async fn handle_proxy_request_inner(
     let mut response_status = backend_resp.status_code;
     let mut response_body = backend_resp.body;
     let mut response_headers = backend_resp.headers;
+    // Pre-commitment authorization terminal (#3815). The H1/H2 request-upload
+    // seam bounds a streaming/bidirectional upload by the accepted credential's
+    // absolute deadline; when it fires it errors the upload, which resets the
+    // backend stream and aborts the dispatch. That aborted dispatch surfaces
+    // here as an ordinary transport failure, and NOTHING has been written
+    // downstream yet — so this is the last point at which the fixed
+    // pre-commitment terminal is still possible, and the first at which every
+    // H1/H2 dispatch path (reqwest, direct-H2, mesh mTLS, HBONE, Unix socket)
+    // has converged.
+    //
+    // The whole outcome is health-neutral: the rewritten status is the one
+    // `recorded_backend_status` feeds to the circuit breaker, passive health,
+    // and the adaptive limiter, and the connection-error/error-class inputs are
+    // neutralized alongside it, so the gateway's own security decision can
+    // never be charged to the upstream.
+    //
+    // Two ways to get here: the upload seam already latched a termination, or
+    // the credential elapsed while the backend was still withholding its
+    // response head (a request with no body to bound). Both are pre-commitment,
+    // so both take the same fixed terminal; the second case is the response-head
+    // race, resolved at the point the head actually becomes available.
+    let precommit_authorization_termination =
+        ctx.authorization_termination_latch.observed().or_else(|| {
+            let elapsed = crate::proxy::auth_lifetime::expired_authorization(
+                crate::proxy::auth_lifetime::effective_request_auth_deadline(
+                    &ctx,
+                    state.env_config.authenticated_stream_max_lifetime_seconds,
+                ),
+            )?;
+            // Record through the shared latch so this counts exactly once for
+            // the request even though no body wrapper fired.
+            ctx.authorization_termination_latch
+                .record_once(elapsed, request_upload_auth_family(&ctx));
+            Some(elapsed)
+        });
+    if let Some(termination) = precommit_authorization_termination {
+        let (terminal_status, terminal_headers, terminal_body) =
+            authorization_expired_pre_commitment_response(
+                &ctx,
+                termination,
+                request_uses_grpc_content_type,
+            );
+        response_status = terminal_status;
+        response_headers = terminal_headers;
+        response_body = terminal_body;
+        backend_resp.connection_error = false;
+        backend_resp.error_class = Some(retry::ErrorClass::ClientDisconnect);
+        // Bounded class into the transaction summary through the ordinary
+        // latch. First writer wins, so a relay that already classified this
+        // request keeps its classification.
+        ctx.latch_authorization_termination(termination);
+    }
     // Authoritative gRPC response messages for a buffered backend body are
     // counted here, from the backend's native length-prefixed representation and
     // before the response-body pipeline can re-frame it (a gRPC-Web transform
@@ -35005,6 +35063,10 @@ async fn handle_proxy_request_inner(
             auth_deadline,
             grpc_web_response_content_type,
             auth_family,
+            // Shared with the request-upload seam: on a bidirectional stream
+            // both directions race the same absolute plan, and exactly one
+            // termination is counted.
+            Some(ctx.authorization_termination_latch()),
         );
     }
     let body = if let Some((content_type, initial_terminal_metadata)) = grpc_web_streaming_adapter {
@@ -38714,6 +38776,16 @@ async fn proxy_to_backend(
                 // body adapter writes byte counts directly into the context that
                 // summary builders read — no separate handle-capture needed.
                 let incoming = (*original_req).into_body();
+                // Authorization lifetime for the UPLOAD direction (#3815). A
+                // client-streaming or bidirectional upload whose backend
+                // withholds response headers has no response body to bound, so
+                // this is the only seam that can stop it from outliving the
+                // credential that admitted it. Absolute and armed once:
+                // relayed request DATA never refreshes it.
+                let upload_auth_deadline = request_upload_auth_deadline(
+                    Some(request_ctx),
+                    state.env_config.authenticated_stream_max_lifetime_seconds,
+                );
                 if effective_max_request_body_size_bytes > 0 {
                     let limited = body::SizeLimitedIncoming::new_with_counter(
                         incoming,
@@ -38721,6 +38793,12 @@ async fn proxy_to_backend(
                         Arc::clone(&body_size_exceeded),
                         Arc::clone(ctx_bytes_sent_observed),
                     );
+                    let limited = match upload_auth_deadline {
+                        Some((plan, family, latch)) => {
+                            limited.with_authorization_deadline(plan, family, latch)
+                        }
+                        None => limited,
+                    };
                     let limited =
                         if crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
                             &request_ctx.metadata,
@@ -38742,6 +38820,12 @@ async fn proxy_to_backend(
                         incoming,
                         Arc::clone(ctx_bytes_sent_observed),
                     );
+                    let counting = match upload_auth_deadline {
+                        Some((plan, family, latch)) => {
+                            counting.with_authorization_deadline(plan, family, latch)
+                        }
+                        None => counting,
+                    };
                     let counting =
                         if crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
                             &request_ctx.metadata,
@@ -41170,6 +41254,149 @@ fn client_grpc_deadline_exceeded_response_for_optional_request(
     }
 }
 
+/// Authorization-lifetime plan for a CLIENT REQUEST BODY upload, together with
+/// the request's shared once-only termination latch (issue #3815).
+///
+/// `None` for an unauthenticated request (no principal was admitted, so there
+/// is no authorization lifetime to bound) and for dispatch paths that carry no
+/// request context. Every H1/H2 streaming-upload adapter installs the result,
+/// so the seam is protocol-neutral: reqwest H1/H2, direct-H2, mesh mTLS, HBONE,
+/// and Unix-socket dispatch all bound the upload direction from one place, in
+/// parity with the response-body funnels and the H3 relays.
+pub(crate) fn request_upload_auth_deadline(
+    ctx: Option<&RequestContext>,
+    max_lifetime_seconds: u64,
+) -> Option<(
+    crate::proxy::auth_lifetime::StreamAuthDeadline,
+    crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
+    crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+)> {
+    let ctx = ctx?;
+    let plan =
+        crate::proxy::auth_lifetime::effective_request_auth_deadline(ctx, max_lifetime_seconds)?;
+    Some((
+        plan,
+        request_upload_auth_family(ctx),
+        ctx.authorization_termination_latch(),
+    ))
+}
+
+/// Bounded protocol family for a request-upload termination counter. Derived
+/// from the request's own declared flavor, so an upload and its response body
+/// report the same closed-set family.
+fn request_upload_auth_family(
+    ctx: &RequestContext,
+) -> crate::proxy::auth_lifetime::StreamAuthProtocolFamily {
+    use crate::proxy::auth_lifetime::StreamAuthProtocolFamily;
+    if crate::plugins::grpc_web::request_is_grpc_web_translated(ctx) {
+        return StreamAuthProtocolFamily::GrpcWeb;
+    }
+    match ctx.headers.get("content-type") {
+        Some(content_type)
+            if crate::plugins::grpc_web::is_grpc_web_content_type(content_type) =>
+        {
+            StreamAuthProtocolFamily::GrpcWeb
+        }
+        Some(content_type) if content_type.trim_start().starts_with("application/grpc") => {
+            StreamAuthProtocolFamily::Grpc
+        }
+        _ => StreamAuthProtocolFamily::Http,
+    }
+}
+
+/// Fixed, redacted PRE-COMMITMENT terminal for a request whose authorization
+/// lifetime elapsed before any response head reached the client (issue #3815).
+///
+/// Reached when the H1/H2 request-upload seam terminated a streaming upload:
+/// the backend dispatch was cancelled, so whatever transport error it produced
+/// describes the gateway's own cancellation, not a backend fault. Nothing has
+/// been committed downstream yet, so the client-visible terminal is a fixed
+/// one:
+///
+/// * native gRPC — HTTP 200 with trailers-only `grpc-status: 16`
+///   (`UNAUTHENTICATED`), the legal terminal for that flavor;
+/// * gRPC-Web — the equivalent bounded terminal through the shared
+///   `grpc_web` translation;
+/// * everything else (plain HTTP, SSE, chunked) — a fixed `401` with the
+///   compiled-in `{"error":"Unauthorized"}` body.
+///
+/// Every client-visible string is a compiled-in literal. No token, claim,
+/// subject, certificate field, provider detail, or absolute expiry reaches the
+/// status line, the headers, or the body.
+pub(crate) fn authorization_expired_pre_commitment_response(
+    request_ctx: &RequestContext,
+    termination: crate::proxy::auth_lifetime::StreamAuthTermination,
+    request_is_native_grpc: bool,
+) -> (u16, HashMap<String, String>, ResponseBody) {
+    if request_is_native_grpc {
+        let mut headers = HashMap::with_capacity(3);
+        headers.insert("content-type".to_string(), "application/grpc".to_string());
+        headers.insert(
+            "grpc-status".to_string(),
+            crate::proxy::auth_lifetime::AUTHORIZATION_EXPIRED_GRPC_STATUS_HEADER.to_string(),
+        );
+        headers.insert(
+            "grpc-message".to_string(),
+            termination.grpc_message().to_string(),
+        );
+        // gRPC errors ride HTTP 200 with the status in trailing metadata.
+        return (
+            StatusCode::OK.as_u16(),
+            headers,
+            ResponseBody::buffered(Vec::new()),
+        );
+    }
+    // A translated gRPC-Web request keeps its internal response native so the
+    // `grpc_web` response hook performs exactly one encoding pass; a
+    // pass-through gRPC-Web request has no translation marker, so its client
+    // wire shape is synthesized here. Mirrors
+    // `client_grpc_deadline_exceeded_response_for_request`.
+    if crate::plugins::grpc_web::request_is_grpc_web_translated(request_ctx) {
+        let mut headers = HashMap::with_capacity(3);
+        headers.insert("content-type".to_string(), "application/grpc".to_string());
+        headers.insert(
+            "grpc-status".to_string(),
+            crate::proxy::auth_lifetime::AUTHORIZATION_EXPIRED_GRPC_STATUS_HEADER.to_string(),
+        );
+        headers.insert(
+            "grpc-message".to_string(),
+            termination.grpc_message().to_string(),
+        );
+        return (
+            StatusCode::OK.as_u16(),
+            headers,
+            ResponseBody::buffered(Vec::new()),
+        );
+    }
+    if let Some(content_type) = request_ctx
+        .headers
+        .get("content-type")
+        .filter(|content_type| crate::plugins::grpc_web::is_grpc_web_content_type(content_type))
+    {
+        let response_content_type =
+            crate::plugins::grpc_web::retained_response_content_type(request_ctx)
+                .map(str::to_owned)
+                .unwrap_or_else(|| crate::plugins::grpc_web::response_content_type(content_type));
+        let translated = crate::plugins::grpc_web::error_response_for_content_type(
+            &response_content_type,
+            grpc_proxy::grpc_status::UNAUTHENTICATED,
+            termination.grpc_message(),
+        );
+        return (
+            StatusCode::OK.as_u16(),
+            translated.headers,
+            ResponseBody::buffered(translated.body),
+        );
+    }
+    let mut headers = HashMap::with_capacity(1);
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    (
+        StatusCode::UNAUTHORIZED.as_u16(),
+        headers,
+        ResponseBody::buffered(r#"{"error":"Unauthorized"}"#.as_bytes().to_vec()),
+    )
+}
+
 fn mesh_grpc_response_body_too_large_response(
     proxy: &Proxy,
     resolved_ip: Option<String>,
@@ -41631,6 +41858,17 @@ async fn proxy_to_backend_hbone(
                 Arc::clone(&body_size_exceeded),
                 Arc::clone(ctx_bytes_sent_observed),
             );
+            // Authorization lifetime for the UPLOAD direction (#3815); see
+            // `request_upload_auth_deadline`.
+            let body = match request_upload_auth_deadline(
+                ctx,
+                state.env_config.authenticated_stream_max_lifetime_seconds,
+            ) {
+                Some((plan, family, latch)) => {
+                    body.with_authorization_deadline(plan, family, latch)
+                }
+                None => body,
+            };
             let body = match ctx {
                 Some(c)
                     if crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
@@ -42274,6 +42512,17 @@ async fn proxy_to_backend_unix(
                 Arc::clone(&body_size_exceeded),
                 Arc::clone(ctx_bytes_sent_observed),
             );
+            // Authorization lifetime for the UPLOAD direction (#3815); see
+            // `request_upload_auth_deadline`.
+            let body = match request_upload_auth_deadline(
+                ctx,
+                state.env_config.authenticated_stream_max_lifetime_seconds,
+            ) {
+                Some((plan, family, latch)) => {
+                    body.with_authorization_deadline(plan, family, latch)
+                }
+                None => body,
+            };
             let body = match ctx {
                 Some(c)
                     if crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
@@ -43537,6 +43786,17 @@ async fn proxy_to_backend_mesh_mtls(
                 Arc::clone(&body_size_exceeded),
                 Arc::clone(ctx_bytes_sent_observed),
             );
+            // Authorization lifetime for the UPLOAD direction (#3815); see
+            // `request_upload_auth_deadline`.
+            let body = match request_upload_auth_deadline(
+                Some(request_ctx),
+                state.env_config.authenticated_stream_max_lifetime_seconds,
+            ) {
+                Some((plan, family, latch)) => {
+                    body.with_authorization_deadline(plan, family, latch)
+                }
+                None => body,
+            };
             let body = if crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
                 &request_ctx.metadata,
             ) {
@@ -44179,6 +44439,14 @@ async fn proxy_to_backend_http2(
         crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(&c.metadata)
             .then(|| Arc::clone(&c.grpc_request_messages_observed))
     });
+    // Authorization lifetime for the UPLOAD direction (#3815); see
+    // `request_upload_auth_deadline`. Direct-H2 hands the body to hyper's
+    // detached pipe task, so an expiry error from the adapter is also what
+    // resets the backend stream and releases that task.
+    let upload_auth_deadline = request_upload_auth_deadline(
+        ctx,
+        state.env_config.authenticated_stream_max_lifetime_seconds,
+    );
     let (body, body_completion_rx) = if effective_max_request_body_size_bytes > 0 {
         let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
         let mut body = body::SizeLimitedIncoming::new_with_counter_and_completion(
@@ -44189,6 +44457,9 @@ async fn proxy_to_backend_http2(
             completion_tx,
             cancel_rx,
         );
+        if let Some((plan, family, latch)) = upload_auth_deadline {
+            body = body.with_authorization_deadline(plan, family, latch);
+        }
         if let Some(messages) = observe_grpc.clone() {
             body = body.with_grpc_message_counter(messages);
         }
@@ -44201,6 +44472,9 @@ async fn proxy_to_backend_http2(
             Arc::clone(ctx_bytes_sent_observed),
         )
         .with_cancel(cancel_rx);
+        if let Some((plan, family, latch)) = upload_auth_deadline {
+            body = body.with_authorization_deadline(plan, family, latch);
+        }
         if let Some(messages) = observe_grpc {
             body = body.with_grpc_message_counter(messages);
         }

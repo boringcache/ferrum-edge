@@ -31,7 +31,8 @@
 //! identity, subject, token, claim, certificate field, provider name, or
 //! absolute expiry can reach either surface.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use crate::plugins::RequestContext;
 
@@ -63,6 +64,24 @@ impl StreamAuthTermination {
         match self {
             Self::CredentialExpired => "credential expired",
             Self::AuthenticatedStreamMaxLifetime => "authenticated stream lifetime reached",
+        }
+    }
+
+    /// Fixed message used when the deadline fires on an ordinary HTTP or SSE
+    /// response — a flavor that has no terminal status metadata at all — and
+    /// the response head has already been committed downstream.
+    ///
+    /// The body ends with this as a transport error, which resets an HTTP/2 or
+    /// HTTP/3 stream and terminates an HTTP/1.1 chunked or SSE body without a
+    /// terminating chunk. It is deliberately NOT a clean end of body: a client
+    /// must be able to tell an authorization termination from a complete
+    /// response. gRPC terminal metadata is never fabricated for these flavors.
+    pub const fn http_termination_message(self) -> &'static str {
+        match self {
+            Self::CredentialExpired => "authenticated stream terminated: credential expired",
+            Self::AuthenticatedStreamMaxLifetime => {
+                "authenticated stream terminated: maximum lifetime reached"
+            }
         }
     }
 
@@ -178,6 +197,58 @@ pub fn record_termination(termination: StreamAuthTermination, family: StreamAuth
         StreamAuthTermination::AuthenticatedStreamMaxLifetime => &MAX_LIFETIME,
     };
     table[family.index()].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Shared, once-only authorization-lifetime termination latch for ONE request.
+///
+/// A request can be bounded in two directions at the same time: the client
+/// request-body upload (H1/H2 streaming and bidirectional uploads) and the
+/// client-visible response body. Both are armed from the same absolute plan, so
+/// both can become ready at the same instant on a bidirectional stream. This
+/// latch makes the pair record exactly one termination for the stream: the
+/// first direction to fire wins, and the loser observes the class instead of
+/// counting a second one.
+///
+/// It carries no credential material — only the bounded class, encoded as a
+/// small integer.
+#[derive(Debug, Clone, Default)]
+pub struct StreamAuthTerminationLatch(Arc<AtomicU8>);
+
+const LATCH_NONE: u8 = 0;
+const LATCH_CREDENTIAL_EXPIRED: u8 = 1;
+const LATCH_MAX_LIFETIME: u8 = 2;
+
+impl StreamAuthTerminationLatch {
+    /// Latch this termination and record the fixed-cardinality counter, but
+    /// only for the FIRST caller. Returns `true` when this call owned the
+    /// termination (and therefore performed the single counter increment).
+    pub fn record_once(
+        &self,
+        termination: StreamAuthTermination,
+        family: StreamAuthProtocolFamily,
+    ) -> bool {
+        let code = match termination {
+            StreamAuthTermination::CredentialExpired => LATCH_CREDENTIAL_EXPIRED,
+            StreamAuthTermination::AuthenticatedStreamMaxLifetime => LATCH_MAX_LIFETIME,
+        };
+        let won = self
+            .0
+            .compare_exchange(LATCH_NONE, code, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
+        if won {
+            record_termination(termination, family);
+        }
+        won
+    }
+
+    /// The latched class, if this request's stream was ended by this contract.
+    pub fn observed(&self) -> Option<StreamAuthTermination> {
+        match self.0.load(Ordering::Acquire) {
+            LATCH_CREDENTIAL_EXPIRED => Some(StreamAuthTermination::CredentialExpired),
+            LATCH_MAX_LIFETIME => Some(StreamAuthTermination::AuthenticatedStreamMaxLifetime),
+            _ => None,
+        }
+    }
 }
 
 /// Snapshot of the authorization-lifetime termination counters for the runtime

@@ -357,6 +357,76 @@ pub(crate) const STREAM_ERR_NO_HEALTHY_TARGETS: &str = "No healthy targets";
 pub(crate) const STREAM_ERR_CIRCUIT_BREAKER_OPEN: &str = "circuit breaker open";
 pub(crate) const STREAM_ERR_BACKEND_MAX_CONNECTIONS: &str = "Backend maxConnections reached";
 pub(crate) const STREAM_ERR_UNSUPPORTED_STREAM_POLICY: &str = "Unsupported stream policy";
+/// The authorization lifetime of the credential that admitted this stream
+/// elapsed during post-admission setup, before any backend or application byte
+/// was written. A compiled-in literal: it names the contract, never the
+/// credential, its subject, or its expiry instant.
+pub(crate) const STREAM_ERR_AUTHORIZATION_EXPIRED: &str =
+    "Authenticated stream authorization lifetime elapsed during setup";
+
+/// Run one post-admission setup stage under the admitted stream's absolute
+/// authorization deadline (issue #3816).
+///
+/// The deadline is anchored at admission and never refreshed, so wrapping a
+/// stage cannot extend it: a stage that started before the deadline is
+/// cancelled at the deadline, and a stage entered after it never runs. Dropping
+/// the stage future is what guarantees no backend or application byte is
+/// written on behalf of an expired credential — a partially completed connect,
+/// handshake, or write is abandoned rather than finished.
+///
+/// `None` (an unauthenticated stream session) runs the stage unbounded, with no
+/// timer registered at all.
+pub(crate) async fn within_stream_auth_deadline<F>(
+    plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+    stage: F,
+) -> Result<F::Output, crate::proxy::auth_lifetime::StreamAuthTermination>
+where
+    F: std::future::Future,
+{
+    match plan {
+        Some(plan) => tokio::time::timeout_at(plan.at, stage)
+            .await
+            .map_err(|_| plan.termination),
+        None => Ok(stage.await),
+    }
+}
+
+/// Settle a post-admission setup-phase authorization expiry.
+///
+/// Records the fixed-cardinality termination counter exactly once for this
+/// session (the shared flag is the same one the relay-phase wrapper latches, so
+/// a session can only be counted once no matter which phase terminated it),
+/// stamps the bounded class into the stream metadata so `on_stream_disconnect`
+/// and the stream transaction summary observe it through the ordinary
+/// lifecycle, and returns the typed client-side setup error.
+///
+/// The returned kind is health-neutral: `StreamSetupKind::AuthorizationExpired`
+/// is client-side, so no circuit-breaker or passive-health failure is recorded
+/// against the upstream. Callers that hold a claimed HALF_OPEN probe slot must
+/// still release it neutrally before returning this error.
+fn settle_stream_auth_setup_expiry(
+    termination: crate::proxy::auth_lifetime::StreamAuthTermination,
+    stream_ctx: &mut StreamConnectionContext,
+    expired: &AtomicBool,
+) -> anyhow::Error {
+    if !expired.swap(true, Ordering::AcqRel) {
+        crate::proxy::auth_lifetime::record_termination(
+            termination,
+            crate::proxy::auth_lifetime::StreamAuthProtocolFamily::StreamTcp,
+        );
+        stream_ctx.insert_metadata(
+            crate::proxy::auth_lifetime::STREAM_AUTH_TERMINATION_METADATA_KEY.to_string(),
+            termination.as_str().to_string(),
+        );
+    }
+    StreamSetupError::new(
+        StreamSetupKind::AuthorizationExpired,
+        // Fixed suffix: the contract, never the credential, its subject, or
+        // its absolute expiry.
+        "before any backend byte was written".to_string(),
+    )
+    .into()
+}
 
 /// Sentinel prefix used by the Linux splice paths
 /// (`io_uring_splice_direction`, `libc_splice_loop`) to signal that the
@@ -3641,6 +3711,31 @@ async fn handle_tcp_connection_inner(
         ClientRelayStream::Tls(Box::new(tls_stream))
     };
 
+    // Authorization lifetime for the admitted stream session (issue #3816).
+    //
+    // Computed HERE — immediately after `on_stream_connect` admission, before
+    // any post-admission async work — rather than just before the relay. Every
+    // stage between admission and the first relayed byte (DNS resolution, retry
+    // backoff, backend connect, backend TLS handshake, outbound PROXY framing,
+    // and forwarding the inspected client prefix) is asynchronous and can
+    // outlast the credential; computing the plan late would let those stages
+    // write application bytes to a backend on behalf of an expired credential.
+    //
+    // `on_stream_connect` ran once at admission and is never repeated, so
+    // without this the session would outlive the certificate that admitted it.
+    // The bound is the EARLIEST of the accepted credential's own deadline (for
+    // `mtls_auth`, the leaf `notAfter`) and the finite authenticated-stream
+    // maximum, anchored at admission and never refreshed by relayed bytes,
+    // retries, or backoff sleeps.
+    // Unauthenticated stream connections get `None` and are unaffected.
+    let stream_auth_deadline = crate::proxy::auth_lifetime::effective_stream_auth_deadline(
+        stream_ctx.is_authenticated(),
+        stream_ctx.credential_deadline_at(),
+        tokio::time::Instant::from_std(start),
+        crate::proxy::auth_lifetime::authenticated_stream_max_lifetime_seconds(),
+    );
+    let stream_auth_expired = Arc::new(AtomicBool::new(false));
+
     // Helper: record circuit breaker failure for the current target.
     let record_cb_failure =
         |cb_cache: &CircuitBreakerCache, proxy_id: &str, cb_info: &TcpConnCbInfo| {
@@ -3698,6 +3793,23 @@ async fn handle_tcp_connection_inner(
 
     let mut attempt = 0u32;
     let backend_addr = loop {
+        // Authorization lifetime (#3816): re-check at the top of EVERY attempt.
+        // Retries, backoff sleeps, and target rotation must not buy an admitted
+        // stream any additional authorized lifetime, so a credential that
+        // elapsed during the previous attempt refuses the next one before a
+        // circuit-breaker probe slot is claimed, a target is selected, or a
+        // socket is dialed. No probe slot is outstanding at this point (each
+        // attempt settles its own before `continue`), so nothing has to be
+        // released here.
+        if let Some(termination) =
+            crate::proxy::auth_lifetime::expired_authorization(stream_auth_deadline)
+        {
+            return Err(settle_stream_auth_setup_expiry(
+                termination,
+                stream_ctx,
+                &stream_auth_expired,
+            ));
+        }
         // Circuit breaker check — reject before attempting backend connection if open.
         // When admitted, capture whether this is a half-open probe so downstream
         // record_failure/record_success calls only decrement the in-flight counter
@@ -3763,17 +3875,36 @@ async fn handle_tcp_connection_inner(
             }
         }
 
-        // Resolve backend IP via DNS
-        let candidates = match dns_cache
-            .resolve_candidates(
+        // Resolve backend IP via DNS, bounded by the admitted stream's
+        // authorization lifetime: a resolver that stalls (or a chain of
+        // resolver retries) must not carry an expired credential into a
+        // backend dial.
+        // Awaited in its own statement so the resolver future (which borrows the
+        // current target) is dropped before the retry arms below rotate it.
+        let resolved_candidates = within_stream_auth_deadline(
+            stream_auth_deadline,
+            dns_cache.resolve_candidates(
                 &current_host,
                 params.dns_override.as_deref(),
                 params.dns_cache_ttl_seconds,
-            )
-            .await
-        {
-            Ok(addresses) => addresses,
-            Err(e) => {
+            ),
+        )
+        .await;
+        let candidates = match resolved_candidates {
+            Err(termination) => {
+                // A HALF_OPEN probe slot claimed by `can_execute` above is
+                // released NEUTRALLY: an expired client credential is not a
+                // backend outcome, and leaking the slot would wedge the
+                // breaker in HALF_OPEN.
+                record_cb_neutral(circuit_breaker_cache, proxy_id, &current_cb_info);
+                return Err(settle_stream_auth_setup_expiry(
+                    termination,
+                    stream_ctx,
+                    &stream_auth_expired,
+                ));
+            }
+            Ok(Ok(addresses)) => addresses,
+            Ok(Err(e)) => {
                 // A backend-egress-policy denial means no backend was dialed, so
                 // keep circuit-breaker accounting neutral (a denied literal/rebound
                 // target must not trip the breaker as a connect failure). Genuine
@@ -3926,7 +4057,7 @@ async fn handle_tcp_connection_inner(
         let current_host_ref = current_host.as_str();
         let params_ref = &params;
         let outbound_pp = outbound_proxy_v2_header.as_deref();
-        let connect_result = crate::dns::connect_candidates(
+        let connect_attempt = crate::dns::connect_candidates(
             &candidates,
             current_port,
             connect_timeout,
@@ -3966,16 +4097,38 @@ async fn handle_tcp_connection_inner(
                     Ok(BackendStream::Plain(stream))
                 }
             },
-        )
-        .await
-        .map_err(|error| match error {
-            crate::dns::CandidateConnectError::TimedOut { last_addr } => anyhow::anyhow!(
-                "Backend TCP connect budget exhausted after {}ms (last={})",
-                params.backend_connect_timeout_ms,
-                last_addr
-            ),
-            crate::dns::CandidateConnectError::Failed { source, .. } => source,
-        });
+        );
+        // Bound the whole dial — TCP connect across every candidate, the
+        // backend TLS handshake, and the outbound PROXY v2 header write — by
+        // the admitted stream's authorization lifetime. Cancelling the future
+        // at the deadline is what keeps the outbound PROXY header (the first
+        // backend-visible byte on a plain backend) from being written on behalf
+        // of an expired credential; a half-completed dial is dropped, closing
+        // the socket, rather than finished.
+        let bounded_connect =
+            within_stream_auth_deadline(stream_auth_deadline, connect_attempt).await;
+        let connect_result = match bounded_connect {
+            Err(termination) => {
+                // Health-neutral: release the HALF_OPEN probe slot without
+                // recording a backend outcome. `backend_inflight_guard_attempt`
+                // is dropped by this return, so the per-target inflight slot is
+                // released too.
+                record_cb_neutral(circuit_breaker_cache, proxy_id, &current_cb_info);
+                return Err(settle_stream_auth_setup_expiry(
+                    termination,
+                    stream_ctx,
+                    &stream_auth_expired,
+                ));
+            }
+            Ok(result) => result.map_err(|error| match error {
+                crate::dns::CandidateConnectError::TimedOut { last_addr } => anyhow::anyhow!(
+                    "Backend TCP connect budget exhausted after {}ms (last={})",
+                    params.backend_connect_timeout_ms,
+                    last_addr
+                ),
+                crate::dns::CandidateConnectError::Failed { source, .. } => source,
+            }),
+        };
 
         match connect_result {
             Ok((_stream, addr)) => {
@@ -4048,9 +4201,33 @@ async fn handle_tcp_connection_inner(
     let forwarded_prefix_len = match client_first_bytes_forward.as_deref() {
         Some(prefix) if !prefix.is_empty() => {
             use tokio::io::AsyncWriteExt;
-            let write_res = match &mut backend_stream {
-                BackendStream::Tls(bs) => bs.write_all(prefix).await,
-                BackendStream::Plain(bs) => bs.write_all(prefix).await,
+            // These are APPLICATION bytes from the client. They are the last
+            // thing written before the relay starts, so the authorization
+            // lifetime is enforced around the write itself: an already-elapsed
+            // credential never forwards them, and a write that parks on a
+            // non-reading backend is cancelled at the deadline.
+            let write_res = match within_stream_auth_deadline(stream_auth_deadline, async {
+                match &mut backend_stream {
+                    BackendStream::Tls(bs) => bs.write_all(prefix).await,
+                    BackendStream::Plain(bs) => bs.write_all(prefix).await,
+                }
+            })
+            .await
+            {
+                Err(termination) => {
+                    // Settle the HALF_OPEN probe slot claimed for the connect
+                    // that succeeded above. Neutral: an expired client
+                    // credential is not a backend outcome, so the breaker,
+                    // passive health, and the adaptive buffer tracker are all
+                    // left untouched.
+                    record_cb_neutral(circuit_breaker_cache, proxy_id, &current_cb_info);
+                    return Err(settle_stream_auth_setup_expiry(
+                        termination,
+                        stream_ctx,
+                        &stream_auth_expired,
+                    ));
+                }
+                Ok(write_res) => write_res,
             };
             write_res.map_err(|e| {
                 anyhow::anyhow!("failed forwarding inspected first bytes to backend: {e}")
@@ -4060,20 +4237,20 @@ async fn handle_tcp_connection_inner(
         _ => 0,
     };
 
-    // Authorization lifetime for the admitted stream session (issue #3816).
-    // `on_stream_connect` ran once at admission and is never repeated, so
-    // without this the session would outlive the certificate that admitted it.
-    // The bound is the EARLIEST of the accepted credential's own deadline (for
-    // `mtls_auth`, the leaf `notAfter`) and the finite authenticated-stream
-    // maximum, anchored at admission and never refreshed by relayed bytes.
-    // Unauthenticated stream connections get `None` and are unaffected.
-    let stream_auth_deadline = crate::proxy::auth_lifetime::effective_stream_auth_deadline(
-        stream_ctx.is_authenticated(),
-        stream_ctx.credential_deadline_at(),
-        tokio::time::Instant::from_std(start),
-        crate::proxy::auth_lifetime::authenticated_stream_max_lifetime_seconds(),
-    );
-    let stream_auth_expired = Arc::new(AtomicBool::new(false));
+    // Final pre-relay gate. The dial, handshake, and prefix forward are each
+    // bounded above; this catches an authorization lifetime that elapsed in the
+    // gap between them (or one that was already elapsed when a stream with no
+    // inspected prefix reached here) before the relay moves a single byte.
+    if let Some(termination) =
+        crate::proxy::auth_lifetime::expired_authorization(stream_auth_deadline)
+    {
+        record_cb_neutral(circuit_breaker_cache, proxy_id, &current_cb_info);
+        return Err(settle_stream_auth_setup_expiry(
+            termination,
+            stream_ctx,
+            &stream_auth_expired,
+        ));
+    }
 
     // Start bidirectional copy. From here, no retries — bytes may be exchanged.
     let mut used_splice = false;

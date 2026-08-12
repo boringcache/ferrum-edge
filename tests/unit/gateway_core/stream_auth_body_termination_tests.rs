@@ -20,6 +20,7 @@ use ferrum_edge::_test_support::{
 };
 use ferrum_edge::proxy::auth_lifetime::{
     StreamAuthDeadline, StreamAuthProtocolFamily, StreamAuthTermination,
+    StreamAuthTerminationLatch,
 };
 use ferrum_edge::proxy::body::ProxyBodyError;
 use futures_util::stream;
@@ -88,6 +89,7 @@ async fn expiry_before_response_data_emits_unauthenticated_grpc_trailers() {
         elapsed_deadline(StreamAuthTermination::CredentialExpired),
         None,
         StreamAuthProtocolFamily::Grpc,
+        None,
     );
 
     let frame = body
@@ -113,7 +115,10 @@ async fn the_max_lifetime_class_carries_its_own_bounded_message() {
         pending_body(),
         elapsed_deadline(StreamAuthTermination::AuthenticatedStreamMaxLifetime),
         None,
-        StreamAuthProtocolFamily::Http,
+        // Native gRPC: the only flavor for which `grpc-status` trailers are a
+        // legal terminal.
+        StreamAuthProtocolFamily::Grpc,
+        None,
     );
 
     let frame = body.frame().await.unwrap().unwrap();
@@ -132,6 +137,7 @@ async fn grpc_web_expiry_emits_the_equivalent_bounded_trailer_frame() {
         elapsed_deadline(StreamAuthTermination::CredentialExpired),
         Some("application/grpc-web+proto"),
         StreamAuthProtocolFamily::GrpcWeb,
+        None,
     );
     let mut body =
         proxy_body_into_grpc_web_streaming_for_test(body, "application/grpc-web+proto", 200, None);
@@ -149,6 +155,103 @@ async fn grpc_web_expiry_emits_the_equivalent_bounded_trailer_frame() {
         "expected UNAUTHENTICATED, got {rendered:?}"
     );
     assert!(Body::is_end_stream(&body));
+}
+
+#[tokio::test]
+async fn plain_http_expiry_before_data_never_fabricates_grpc_trailers() {
+    // The generic H1/H2/H3-downstream funnel carries chunked HTTP and SSE, not
+    // just gRPC. An ordinary HTTP response has NO terminal status metadata, so
+    // the only protocol-correct termination is a deterministic end of the body
+    // as an error (resetting H2/H3, terminating an H1 chunked/SSE body) — never
+    // synthesized `grpc-status` trailers for a client that never spoke gRPC,
+    // and never a clean EOF that would look like a complete response.
+    let mut body = proxy_body_with_authorization_deadline_for_test(
+        pending_body(),
+        elapsed_deadline(StreamAuthTermination::CredentialExpired),
+        None,
+        StreamAuthProtocolFamily::Http,
+        None,
+    );
+
+    let message = match body
+        .frame()
+        .await
+        .expect("the deadline must terminate the body")
+    {
+        Ok(frame) => panic!(
+            "plain HTTP must not fabricate gRPC terminal metadata; got trailers={:?} data={:?}",
+            frame.trailers_ref(),
+            frame.data_ref()
+        ),
+        Err(error) => error.to_string(),
+    };
+    assert!(
+        message.contains("authenticated stream terminated"),
+        "unexpected terminal message: {message}"
+    );
+    // Redacted: no expiry value, identity, claim, or provider detail.
+    assert!(!message.chars().any(|c| c.is_ascii_digit()));
+    assert!(Body::is_end_stream(&body));
+    assert!(body.frame().await.is_none(), "no second completion");
+}
+
+#[tokio::test]
+async fn a_grpc_web_stream_without_a_content_type_does_not_fall_back_to_native_trailers() {
+    // Defensive: gRPC-Web's only legal terminal is the bounded body-framed
+    // trailer frame. With no content type to build one, terminate the stream
+    // rather than emitting native trailers a gRPC-Web client cannot read.
+    let mut body = proxy_body_with_authorization_deadline_for_test(
+        pending_body(),
+        elapsed_deadline(StreamAuthTermination::CredentialExpired),
+        None,
+        StreamAuthProtocolFamily::GrpcWeb,
+        None,
+    );
+
+    assert!(
+        body.frame()
+            .await
+            .expect("the deadline must terminate the body")
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn the_shared_latch_records_exactly_one_termination_per_request() {
+    // The request-upload body and the response body race the same absolute
+    // plan on a bidirectional stream. The latch is what makes the pair record
+    // one termination for the stream instead of two.
+    let latch = StreamAuthTerminationLatch::default();
+    assert_eq!(latch.observed(), None);
+    assert!(
+        latch.record_once(
+            StreamAuthTermination::CredentialExpired,
+            StreamAuthProtocolFamily::Http
+        ),
+        "the first direction to fire owns the termination"
+    );
+    assert!(
+        !latch.record_once(
+            StreamAuthTermination::CredentialExpired,
+            StreamAuthProtocolFamily::Http
+        ),
+        "the opposite direction must not count a second termination"
+    );
+    assert_eq!(
+        latch.observed(),
+        Some(StreamAuthTermination::CredentialExpired)
+    );
+    // A cloned handle is the same latch.
+    let cloned = latch.clone();
+    assert!(!cloned.record_once(
+        StreamAuthTermination::AuthenticatedStreamMaxLifetime,
+        StreamAuthProtocolFamily::Grpc
+    ));
+    assert_eq!(
+        cloned.observed(),
+        Some(StreamAuthTermination::CredentialExpired),
+        "the first class wins; a later firing cannot restate it"
+    );
 }
 
 // --- After response commitment ---------------------------------------------
@@ -170,6 +273,7 @@ async fn expiry_after_response_data_resets_instead_of_fabricating_a_status() {
         ),
         None,
         StreamAuthProtocolFamily::Http,
+        None,
     );
 
     // One SSE event is committed downstream.
@@ -219,6 +323,7 @@ async fn the_upstream_body_is_dropped_exactly_once_at_expiry() {
         elapsed_deadline(StreamAuthTermination::CredentialExpired),
         None,
         StreamAuthProtocolFamily::Grpc,
+        None,
     );
 
     let _terminal = body.frame().await.unwrap().unwrap();
@@ -256,6 +361,7 @@ async fn continuous_activity_never_extends_the_authorization_deadline() {
         ),
         None,
         StreamAuthProtocolFamily::Http,
+        None,
     );
 
     for _ in 0..5 {
@@ -286,6 +392,7 @@ async fn an_unexpired_deadline_passes_frames_through_untouched() {
         ),
         None,
         StreamAuthProtocolFamily::Http,
+        None,
     );
 
     assert_eq!(
@@ -331,6 +438,7 @@ async fn an_earlier_client_grpc_timeout_wins_over_a_later_credential_deadline() 
         ),
         None,
         StreamAuthProtocolFamily::Grpc,
+        None,
     );
 
     let frame = body.frame().await.unwrap().unwrap();
@@ -355,6 +463,7 @@ async fn an_earlier_credential_deadline_wins_over_a_later_client_grpc_timeout() 
         elapsed_deadline(StreamAuthTermination::CredentialExpired),
         None,
         StreamAuthProtocolFamily::Grpc,
+        None,
     );
 
     let frame = body.frame().await.unwrap().unwrap();
@@ -374,6 +483,7 @@ async fn a_buffered_body_is_already_committed_and_is_returned_unchanged() {
         elapsed_deadline(StreamAuthTermination::CredentialExpired),
         None,
         StreamAuthProtocolFamily::Http,
+        None,
     );
 
     let frame = body.frame().await.unwrap().unwrap();

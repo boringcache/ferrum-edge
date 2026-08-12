@@ -1019,11 +1019,24 @@ impl ProxyBody {
         deadline: crate::proxy::auth_lifetime::StreamAuthDeadline,
         grpc_web_response_content_type: Option<&str>,
         family: crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
+        auth_latch: Option<crate::proxy::auth_lifetime::StreamAuthTerminationLatch>,
     ) -> Self {
         let terminal = DeadlineTerminal {
             grpc_status_header: AUTHORIZATION_EXPIRED_GRPC_STATUS_HEADER,
             grpc_message_header: deadline.termination.grpc_message(),
             post_data_message: deadline.termination.post_commit_message(),
+            // Native `grpc-status: 16` trailers are legal ONLY for native gRPC.
+            // Ordinary HTTP/SSE has no terminal metadata, and gRPC-Web's legal
+            // terminal is the bounded body-framed `deadline_frame` built below,
+            // which takes precedence over both branches. This is what keeps the
+            // shared H1/H2/H3-downstream funnel — which carries chunked HTTP
+            // and SSE, not just gRPC — from fabricating gRPC terminal metadata
+            // on a response that is not gRPC.
+            native_grpc_trailers: matches!(
+                family,
+                crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Grpc
+            ),
+            pre_data_message: deadline.termination.http_termination_message(),
             auth_termination: Some((deadline.termination, family)),
         };
         let deadline_frame = grpc_web_response_content_type.map(|content_type| {
@@ -1045,6 +1058,7 @@ impl ProxyBody {
                     deadline_frame,
                     Arc::clone(&fired),
                     terminal,
+                    auth_latch,
                 );
                 ProxyBodyKind::Stream(Box::pin(bounded))
             }
@@ -1055,6 +1069,7 @@ impl ProxyBody {
                     deadline_frame,
                     Arc::clone(&fired),
                     terminal,
+                    auth_latch,
                 );
                 ProxyBodyKind::Stream(Box::pin(bounded))
             }
@@ -1810,6 +1825,77 @@ where
     }
 }
 
+// -- Request-upload authorization lifetime ------------------------------------
+
+/// Absolute authorization bound armed on a CLIENT REQUEST BODY (issue #3815).
+///
+/// The response-side `TotalDeadlineBody` can only bound bytes that flow after a
+/// backend response head exists. A client-streaming or bidirectional upload
+/// whose backend withholds response headers has no response body to bound at
+/// all, so without this seam an admitted stream could keep uploading past the
+/// expiry of the credential that admitted it.
+///
+/// This is the protocol-neutral H1/H2 counterpart: it wraps the client
+/// `Incoming` where every streaming dispatch path already wraps it
+/// ([`SizeLimitedIncoming`] / [`CountingIncoming`]), so reqwest H1/H2,
+/// direct-H2, mesh mTLS, HBONE, and Unix-socket dispatch all inherit it from
+/// the same two adapters.
+///
+/// Contract:
+/// * The timer is armed ONCE from the absolute plan. Relayed request DATA,
+///   gRPC request messages, and trailers never refresh it.
+/// * On expiry the upload yields a redacted error. Hyper resets the backend
+///   stream (`on_user_err` → `RST_STREAM`) and reqwest aborts the request, so
+///   the backend work and the opposite relay direction are cancelled rather
+///   than left detached.
+/// * The fixed-cardinality counter is recorded through the request's shared
+///   latch, so an upload and a response body racing the same plan on a
+///   bidirectional stream still count exactly one termination.
+struct UploadAuthDeadline {
+    sleep: Pin<Box<tokio::time::Sleep>>,
+    termination: crate::proxy::auth_lifetime::StreamAuthTermination,
+    family: crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
+    latch: crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+    fired: bool,
+}
+
+impl UploadAuthDeadline {
+    fn new(
+        deadline: crate::proxy::auth_lifetime::StreamAuthDeadline,
+        family: crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
+        latch: crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+    ) -> Self {
+        Self {
+            sleep: Box::pin(tokio::time::sleep_until(deadline.at)),
+            termination: deadline.termination,
+            family,
+            latch,
+            fired: false,
+        }
+    }
+
+    /// Poll the absolute bound. `true` once the authorization lifetime has
+    /// elapsed; latched, so every later poll of an already-terminated upload
+    /// keeps reporting expiry without registering a second termination.
+    fn expired(&mut self, cx: &mut Context<'_>) -> bool {
+        if self.fired {
+            return true;
+        }
+        if std::future::Future::poll(self.sleep.as_mut(), cx).is_pending() {
+            return false;
+        }
+        self.fired = true;
+        self.latch.record_once(self.termination, self.family);
+        true
+    }
+
+    /// Fixed, redacted upload-termination message. A compiled-in literal: no
+    /// expiry instant, claim, subject, certificate field, or provider detail.
+    const fn message(&self) -> &'static str {
+        "request upload terminated: authenticated stream authorization lifetime elapsed"
+    }
+}
+
 // -- SizeLimitedIncoming ------------------------------------------------------
 
 /// Terminal state of a client request body as observed by
@@ -1872,6 +1958,9 @@ pub struct SizeLimitedIncoming {
     /// `RequestContext.grpc_request_messages_observed`.
     grpc_messages: Option<Arc<AtomicU64>>,
     grpc_scanner: Option<crate::plugins::mesh::prometheus_helpers::GrpcLengthPrefixedScanner>,
+    /// Absolute authorization lifetime of the admitted stream, or `None` for an
+    /// unauthenticated request (no timer is registered at all).
+    auth_deadline: Option<UploadAuthDeadline>,
 }
 
 /// Outcome to report when the adapter is dropped without having reached a
@@ -1946,6 +2035,7 @@ impl SizeLimitedIncoming {
             cancel: None,
             grpc_messages: None,
             grpc_scanner: None,
+            auth_deadline: None,
         }
     }
 
@@ -1974,6 +2064,7 @@ impl SizeLimitedIncoming {
             cancel: Some(cancel),
             grpc_messages: None,
             grpc_scanner: None,
+            auth_deadline: None,
         }
     }
 
@@ -1988,6 +2079,25 @@ impl SizeLimitedIncoming {
     #[must_use]
     pub fn with_cancel(mut self, cancel: tokio::sync::oneshot::Receiver<()>) -> Self {
         self.cancel = Some(cancel);
+        self
+    }
+
+    /// Bound this client request-body upload by the accepted credential's
+    /// authorization lifetime (issue #3815).
+    ///
+    /// Absolute and armed once: relayed request DATA, gRPC request messages,
+    /// and trailers never reset it. On expiry the adapter yields a redacted
+    /// error, which makes hyper reset the backend stream (and reqwest abort the
+    /// request), cancelling the backend work and the opposite relay direction.
+    /// The termination is reported once per REQUEST through the shared latch.
+    #[must_use]
+    pub(crate) fn with_authorization_deadline(
+        mut self,
+        deadline: crate::proxy::auth_lifetime::StreamAuthDeadline,
+        family: crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
+        latch: crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+    ) -> Self {
+        self.auth_deadline = Some(UploadAuthDeadline::new(deadline, family, latch));
         self
     }
 
@@ -2123,6 +2233,20 @@ impl http_body::Body for SizeLimitedIncoming {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let this = self.get_mut();
+        // Authorization lifetime FIRST and on EVERY poll (issue #3815). The
+        // bound is absolute and never re-armed, so it must fire even for a
+        // client that uploads continuously and therefore never yields a
+        // `Pending` inner poll. `Abandoned` is the honest outcome: the upload
+        // did not complete, so a response-side gate that depends on a final
+        // size decision fails closed rather than forwarding an unvetted backend
+        // response.
+        if let Some(deadline) = this.auth_deadline.as_mut()
+            && deadline.expired(cx)
+        {
+            let message = deadline.message();
+            this.signal_completion(RequestBodyOutcome::Abandoned);
+            return Poll::Ready(Some(Err(message.into())));
+        }
         if poll_upload_cancel(&mut this.cancel, cx) == UploadCancelSignal::Cancelled {
             this.signal_completion(RequestBodyOutcome::Abandoned);
             return Poll::Ready(Some(Err(
@@ -2198,6 +2322,9 @@ pub struct CountingIncoming {
     bytes_seen: Arc<std::sync::atomic::AtomicU64>,
     grpc_messages: Option<Arc<std::sync::atomic::AtomicU64>>,
     grpc_scanner: Option<crate::plugins::mesh::prometheus_helpers::GrpcLengthPrefixedScanner>,
+    /// Absolute authorization lifetime of the admitted stream, or `None` for an
+    /// unauthenticated request (no timer is registered at all).
+    auth_deadline: Option<UploadAuthDeadline>,
 }
 
 impl CountingIncoming {
@@ -2230,7 +2357,23 @@ impl CountingIncoming {
             bytes_seen,
             grpc_messages: None,
             grpc_scanner: None,
+            auth_deadline: None,
         }
+    }
+
+    /// Bound this client request-body upload by the accepted credential's
+    /// authorization lifetime (issue #3815). See
+    /// [`SizeLimitedIncoming::with_authorization_deadline`] — identical
+    /// contract, for the unlimited-size streaming upload path.
+    #[must_use]
+    pub(crate) fn with_authorization_deadline(
+        mut self,
+        deadline: crate::proxy::auth_lifetime::StreamAuthDeadline,
+        family: crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
+        latch: crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+    ) -> Self {
+        self.auth_deadline = Some(UploadAuthDeadline::new(deadline, family, latch));
+        self
     }
 
     /// Enable authoritative gRPC length-prefixed message counting while
@@ -2281,6 +2424,14 @@ impl http_body::Body for CountingIncoming {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let this = self.get_mut();
+        // Absolute authorization lifetime, checked first and on every poll. See
+        // `SizeLimitedIncoming::poll_frame` for why this cannot wait for a
+        // `Pending` inner poll.
+        if let Some(deadline) = this.auth_deadline.as_mut()
+            && deadline.expired(cx)
+        {
+            return Poll::Ready(Some(Err(deadline.message().into())));
+        }
         match http_body::Body::poll_frame(Pin::new(&mut this.inner), cx) {
             Poll::Ready(Some(Ok(frame))) => {
                 if let Some(data) = frame.data_ref() {
@@ -3464,6 +3615,10 @@ struct TotalDeadlineBody<B> {
     deadline_frame: Option<Frame<Bytes>>,
     deadline_fired: Arc<AtomicBool>,
     terminal: DeadlineTerminal,
+    /// Shared once-only termination latch for this request. Present only for
+    /// the authorization-lifetime regime, where the request-upload body may be
+    /// racing the same absolute plan in the opposite direction.
+    auth_latch: Option<crate::proxy::auth_lifetime::StreamAuthTerminationLatch>,
     saw_data: bool,
     done: bool,
 }
@@ -3483,6 +3638,22 @@ struct DeadlineTerminal {
     /// AFTER response DATA, where a clean gRPC message boundary cannot be
     /// proven and the stream must be reset instead.
     post_data_message: &'static str,
+    /// Whether native `grpc-status`/`grpc-message` trailers are a LEGAL
+    /// terminal for this response.
+    ///
+    /// True only for native gRPC. An ordinary HTTP or SSE response carries no
+    /// gRPC terminal metadata, so synthesizing trailers there would fabricate a
+    /// protocol the client never spoke (and, on HTTP/1.1, trailers the client
+    /// never advertised support for). Those flavors terminate with
+    /// `pre_data_message` instead — a transport error that resets H2/H3 and
+    /// deterministically ends an H1/SSE body. gRPC-Web is also `false`: its
+    /// legal terminal is the bounded body-framed `deadline_frame`, which is
+    /// preferred over both branches when present.
+    native_grpc_trailers: bool,
+    /// Message carried by the boxed `TimedOut` error when the deadline fires
+    /// BEFORE any response DATA on a flavor with no legal terminal metadata
+    /// (`native_grpc_trailers == false` and no `deadline_frame`).
+    pre_data_message: &'static str,
     /// Fixed-cardinality authorization-lifetime termination recorded exactly
     /// once when this deadline fires. `None` for the client `grpc-timeout`
     /// deadline, which is a client-chosen RPC bound rather than an
@@ -3499,6 +3670,11 @@ impl DeadlineTerminal {
         grpc_status_header: GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER,
         grpc_message_header: GATEWAY_DEADLINE_EXCEEDED_MESSAGE_HEADER,
         post_data_message: "gRPC streaming response exceeded the client grpc-timeout deadline after response data",
+        // A `grpc-timeout` deadline is established only for gRPC-flavored
+        // requests, so native trailers are the correct terminal here.
+        native_grpc_trailers: true,
+        pre_data_message:
+            "gRPC streaming response exceeded the client grpc-timeout deadline",
         auth_termination: None,
     };
 }
@@ -3520,6 +3696,7 @@ impl<B> TotalDeadlineBody<B> {
             deadline_frame,
             deadline_fired,
             DeadlineTerminal::CLIENT_GRPC_TIMEOUT,
+            None,
         )
     }
 
@@ -3529,6 +3706,7 @@ impl<B> TotalDeadlineBody<B> {
         deadline_frame: Option<Frame<Bytes>>,
         deadline_fired: Arc<AtomicBool>,
         terminal: DeadlineTerminal,
+        auth_latch: Option<crate::proxy::auth_lifetime::StreamAuthTerminationLatch>,
     ) -> Self {
         Self {
             inner: Some(inner),
@@ -3536,6 +3714,7 @@ impl<B> TotalDeadlineBody<B> {
             deadline_frame,
             deadline_fired,
             terminal,
+            auth_latch,
             saw_data: false,
             done: false,
         }
@@ -3581,10 +3760,18 @@ where
             this.deadline = None;
             this.deadline_fired.store(true, Ordering::Release);
             // The `done` guard above makes this branch reachable at most once
-            // per body, so the fixed-cardinality counter is incremented exactly
-            // once per terminated stream.
+            // per body. The shared latch additionally makes it at most once per
+            // REQUEST: a bidirectional stream whose request-upload body is
+            // racing the same absolute plan records the class from whichever
+            // direction fires first, so the fixed-cardinality counter is
+            // incremented exactly once per terminated stream.
             if let Some((termination, family)) = this.terminal.auth_termination {
-                crate::proxy::auth_lifetime::record_termination(termination, family);
+                match this.auth_latch.as_ref() {
+                    Some(latch) => {
+                        latch.record_once(termination, family);
+                    }
+                    None => crate::proxy::auth_lifetime::record_termination(termination, family),
+                }
             }
             // Cancel upstream work and release its stream/accounting guards as
             // soon as the deadline fires, before the downstream polls again.
@@ -3592,6 +3779,20 @@ where
             if !this.saw_data {
                 if let Some(frame) = this.deadline_frame.take() {
                     return Poll::Ready(Some(Ok(frame)));
+                }
+                if !this.terminal.native_grpc_trailers {
+                    // Ordinary HTTP or SSE: the response head is already
+                    // committed and there is no legal terminal metadata for
+                    // this flavor. End with a transport error — which resets
+                    // H2/H3 and terminates an H1 chunked/SSE body — rather than
+                    // fabricating `grpc-status` trailers for a client that
+                    // never spoke gRPC, and rather than a clean EOF that would
+                    // be indistinguishable from a complete response.
+                    return Poll::Ready(Some(Err(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        this.terminal.pre_data_message,
+                    ))
+                        as BoxError)));
                 }
                 let mut trailers = http::HeaderMap::new();
                 trailers.insert(

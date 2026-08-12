@@ -2215,6 +2215,18 @@ pub struct RequestContext {
     /// site cannot restate or overwrite it. A compiled-in literal from a closed
     /// set — never a token, claim, identity, provider name, or absolute expiry.
     authorization_termination: Option<crate::proxy::auth_lifetime::StreamAuthTermination>,
+    /// Shared once-only authorization-lifetime termination latch for this
+    /// request (issue #3815).
+    ///
+    /// Unlike `authorization_termination` (which the request path owns and
+    /// mutates), this handle is cloned into detached body adapters — the
+    /// client request-body upload and the client-visible response body — that
+    /// can both be racing the same absolute plan on a bidirectional stream.
+    /// The first to fire records the single fixed-cardinality termination; the
+    /// request path reads it back to decide the pre-commitment terminal.
+    /// Carries the bounded class only, never credential material.
+    pub(crate) authorization_termination_latch:
+        crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
     /// Listener-scoped shutdown signal captured with the accepted connection.
     /// WebSocket takeover retains it so listener replacement/drain terminates
     /// upgraded sessions instead of only stopping new accepts.
@@ -3249,6 +3261,8 @@ impl RequestContext {
             auth_method: None,
             credential_deadline_at: None,
             authorization_termination: None,
+            authorization_termination_latch:
+                crate::proxy::auth_lifetime::StreamAuthTerminationLatch::default(),
             websocket_shutdown_rx: None,
             soap_ws_security_authenticated_body_digest: None,
             timestamp_received: Utc::now(),
@@ -3519,6 +3533,14 @@ impl RequestContext {
                 termination.as_str().to_string(),
             );
         }
+    }
+
+    /// Clone this request's shared authorization-lifetime termination latch for
+    /// a detached body adapter (request upload or response body).
+    pub(crate) fn authorization_termination_latch(
+        &self,
+    ) -> crate::proxy::auth_lifetime::StreamAuthTerminationLatch {
+        self.authorization_termination_latch.clone()
     }
 
     /// The latched authorization-lifetime termination class, if this request's
@@ -4339,6 +4361,9 @@ impl RequestContext {
             auth_method: self.auth_method,
             credential_deadline_at: self.credential_deadline_at,
             authorization_termination: self.authorization_termination,
+            // Same request, same latch: a cloned context must not be able to
+            // record a second termination for the stream it describes.
+            authorization_termination_latch: self.authorization_termination_latch.clone(),
             websocket_shutdown_rx: self.websocket_shutdown_rx.clone(),
             soap_ws_security_authenticated_body_digest: self
                 .soap_ws_security_authenticated_body_digest,

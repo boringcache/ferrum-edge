@@ -7086,8 +7086,64 @@ pub mod _test_support {
         deadline: crate::proxy::auth_lifetime::StreamAuthDeadline,
         grpc_web_response_content_type: Option<&str>,
         family: crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
+        auth_latch: Option<crate::proxy::auth_lifetime::StreamAuthTerminationLatch>,
     ) -> crate::proxy::ProxyBody {
-        body.with_authorization_deadline(deadline, grpc_web_response_content_type, family)
+        body.with_authorization_deadline(
+            deadline,
+            grpc_web_response_content_type,
+            family,
+            auth_latch,
+        )
+    }
+
+    /// Run one post-admission TCP setup stage under the admitted stream's
+    /// absolute authorization deadline, exactly as `handle_tcp_connection_inner`
+    /// bounds DNS resolution, the backend dial/handshake, and the inspected
+    /// first-bytes forward (issue #3816).
+    pub async fn within_stream_auth_deadline_for_test<F>(
+        plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+        stage: F,
+    ) -> Result<F::Output, crate::proxy::auth_lifetime::StreamAuthTermination>
+    where
+        F: std::future::Future,
+    {
+        crate::proxy::tcp_proxy::within_stream_auth_deadline(plan, stage).await
+    }
+
+    /// The fixed PRE-COMMITMENT terminal the H1/H2 dispatch funnel substitutes
+    /// when a request-upload authorization expiry cancelled the backend
+    /// dispatch before any response head reached the client (issue #3815).
+    /// Returns `(status, headers, body_bytes)`.
+    pub fn authorization_expired_pre_commitment_response_for_test(
+        ctx: &crate::plugins::RequestContext,
+        termination: crate::proxy::auth_lifetime::StreamAuthTermination,
+        request_is_native_grpc: bool,
+    ) -> (u16, std::collections::HashMap<String, String>, Vec<u8>) {
+        let (status, headers, body) = crate::proxy::authorization_expired_pre_commitment_response(
+            ctx,
+            termination,
+            request_is_native_grpc,
+        );
+        let bytes = match body {
+            crate::retry::ResponseBody::Buffered(bytes) => bytes.to_vec(),
+            _ => panic!("the pre-commitment terminal is always a buffered body"),
+        };
+        (status, headers, bytes)
+    }
+
+    /// The authorization-lifetime plan and bounded protocol family every H1/H2
+    /// streaming request-upload adapter installs (issue #3815), plus the shared
+    /// once-only termination latch it records through. `None` for an
+    /// unauthenticated request, which this contract does not bound.
+    pub fn request_upload_auth_deadline_for_test(
+        ctx: &crate::plugins::RequestContext,
+        max_lifetime_seconds: u64,
+    ) -> Option<(
+        crate::proxy::auth_lifetime::StreamAuthDeadline,
+        crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
+        crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+    )> {
+        crate::proxy::request_upload_auth_deadline(Some(ctx), max_lifetime_seconds)
     }
 
     /// Whether a TLS-terminating TCP listener may hand its socket to kernel
