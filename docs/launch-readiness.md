@@ -80,14 +80,18 @@ that relied on it would receive `403`. Both workflows therefore omit it.
 
 Two supported sources, in order:
 
-1. **Live API (preferred).** Provision a read-only credential that can list this
-   repository's security advisories and store it as the repository secret
-   `LAUNCH_ADVISORY_READ_TOKEN`. It is exposed **only** to trusted executions
-   (`push` to `main`, tags, `schedule`, `workflow_dispatch`, and the release
-   workflow). Pull-request and merge-group runs are given an empty value by
-   construction, so untrusted code never sees a privileged advisory token. Any
-   live failure — denial, rate limit, transport, pagination, or schema — is
+1. **Live API (preferred), from trusted code only.** Provision a read-only
+   credential that can list this repository's security advisories and store it
+   as an **environment** secret named `LAUNCH_ADVISORY_READ_TOKEN` inside the
+   protected `launch-advisory` environment. It is referenced by exactly one
+   workflow, `.github/workflows/launch-advisory-trust.yml`, and only after that
+   workflow's secretless job has established the candidate commit's provenance.
+   Any live failure — denial, rate limit, transport, pagination, or schema — is
    `UNKNOWN`; it never falls back to a weaker source.
+
+   A tag event is **not** a trusted execution. See "Trusted execution boundary"
+   below: this used to be modelled the other way round, and that was the defect
+   in issue #3802.
 2. **Externally maintained redacted variables.** When no advisory token is
    configured, the checker reads the repository *variables*
    `LAUNCH_PRIVATE_BLOCKER_COUNT` (a non-negative decimal count) and
@@ -103,19 +107,120 @@ Two supported sources, in order:
 
 No credential is stored in this repository, and none is printed.
 
+## Trusted execution boundary
+
+A `v*` tag can be created at **any** commit. For a `push` event GitHub loads the
+workflow definition *and* every file the workflow executes from that tag target,
+so a tag-triggered job is candidate-controlled code. A tag name is therefore
+never evidence that its target came through protected `main`, and a job that
+both runs tag code and holds the advisory credential hands the credential to an
+arbitrary commit before any provenance exists (issue #3802).
+
+The boundary is drawn by *which code executes*, not by which event fired:
+
+| Surface | Code source | Credential |
+|---------|-------------|------------|
+| `launch-readiness.yml` (PR, `merge_group`, `main` push, `v*` tag, schedule, dispatch) | the ref under test — untrusted | **never**, on any event |
+| `release.yml` (`v*` tag push) | the tag target — untrusted | **never** |
+| `launch-advisory-trust.yml` (`workflow_run`, `schedule`, `workflow_dispatch`) | protected default branch, always | yes, after provenance |
+
+`workflow_run`, `schedule`, and `workflow_dispatch` are the only events whose
+definition GitHub resolves from the default branch, which is what makes
+`launch-advisory-trust.yml` an immutable trust anchor a tag cannot rewrite.
+
+### How a release obtains a private-advisory verdict
+
+1. A `v*` tag push starts `Release`. That run holds no credential.
+2. The `Release` run's `requested` event triggers `launch-advisory-trust.yml`
+   from protected `main`.
+3. `establish-trust` holds no secret. It checks out the literal `refs/heads/main`,
+   pins the resolved trusted anchor commit, then treats the candidate purely as
+   data: normalized tag format, exactly one unambiguous remote tag ref, tag
+   resolution to exactly one commit, agreement with the triggering event's head
+   (a tag moved after the event is refused as stale), reachability from
+   protected `main`, and successful **push** `ci.yml` + `coverage.yml` runs for
+   that exact SHA. Anything missing, ambiguous, or stale fails closed.
+4. `advisory-verdict` re-checks out `refs/heads/main`, detaches onto the same
+   pinned anchor commit, and runs the default-branch checker with
+   `--trusted-execution --trusted-tree-sha <anchor>`. The checker re-asserts the
+   pin itself and **refuses the credential outright** in any invocation that did
+   not declare a trusted execution, so the tag's own copy of the checker cannot
+   use a credential even if one were somehow present. The candidate reaches this
+   job only as `LAUNCH_TARGET_SHA`; no candidate byte is fetched, imported, or
+   run. The credential comes from the protected `launch-advisory` environment.
+5. `publish-verdict` holds no secret and posts a fixed-text
+   `trusted-launch-advisory-gate` commit status on the candidate SHA. Neither
+   the credential nor any advisory identifier appears in the status, the logs,
+   or any artifact.
+6. `release.yml`'s `validate-launch-readiness` job waits for that status on the
+   commit its tag resolves to and fails closed if it is absent, `failure`, or
+   `error`. The release still cannot proceed without a computed `PASS`; the
+   decision simply moved to code a tag cannot rewrite.
+
+Every one of those preconditions fails closed. If the triggering payload does
+not carry a usable tag name, if the tag is ambiguous, if it moved after the
+event, or if it is not reachable from protected `main`, no credential is
+released and no verdict is published, so the release times out red rather than
+proceeding. The recovery lane is a maintainer `workflow_dispatch` of
+`launch-advisory-trust.yml` with an explicit `release_tag` input, which runs the
+identical trusted checks — it is a re-trigger, not a bypass.
+
+Because the policy, the exemptions, and `PRODUCTION_READINESS.md` are all read
+from the trusted anchor, the reviewed snapshot compared against the live verdict
+is protected `main`'s — never the candidate's copy of it.
+
+`.github/scripts/verify_launch_advisory_trust.py --self-test` is the checked-in
+proof. It runs an adversarial fixture table — a malicious tagged workflow that
+claims the credential, a newly added tag-triggered consumer, a credential-bearing
+job redirected at a candidate checker, a candidate-tree checkout, a tag-reachable
+trust workflow, a dropped environment binding, a dropped provenance edge, an
+unpinned action, and a release gate that stops requiring the trusted verdict —
+and then applies the same contract to the real `.github/workflows` tree. It runs
+on every pull request from `launch-readiness.yml`.
+
+### Required repository settings (root/admin only, not code)
+
+The code above removes the credential from every candidate-reachable job, but
+repository *settings* decide whether an attacker-authored workflow could still
+name the secret. These are administrator actions and are deliberately not
+automated here:
+
+1. **Move the credential out of repository-secret scope.** Delete the repository
+   secret `LAUNCH_ADVISORY_READ_TOKEN` and create it as an environment secret in
+   a new `launch-advisory` environment. Restrict that environment's deployment
+   branch/tag policy to the default branch only, so a tag-triggered workflow
+   naming the environment is refused before any step runs. Add required
+   reviewers if manual release approval is wanted.
+2. **Rotate the credential.** The previous design cannot prove the token was
+   never exposed to an arbitrary tag target, so treat it as disclosed and
+   reissue it. Prefer a short-lived GitHub App installation token or a
+   fine-grained credential scoped to repository advisory read on this repository
+   only.
+3. **Protect release tags.** Create an active ruleset targeting `refs/tags/v*`
+   that restricts creation to a narrow release principal, blocks update and
+   deletion, and audits any bypass. Consider requiring signed annotated tags.
+   Tag protection is defense in depth: trusted-code execution is still required
+   because a privileged release actor can be compromised.
+4. **Keep `main` protected.** The whole boundary rests on `refs/heads/main`
+   being a protected default branch whose required checks cannot be bypassed.
+
 ## Hosted enforcement
 
 - `.github/workflows/launch-readiness.yml` — pull requests, `merge_group`,
   `main` pushes, `v*` tags, a daily schedule, and `workflow_dispatch`. It runs
-  the deterministic self-tests, then verifies the live verdict for the exact
-  commit under test (PR head, merge-group head, or pushed SHA) and asserts that
-  the checkout is that commit.
+  the deterministic self-tests and the trust-boundary self-test, then verifies
+  the live verdict for the exact commit under test (PR head, merge-group head,
+  or pushed SHA) and asserts that the checkout is that commit. It holds no
+  advisory credential on any event and reads only the redacted variables.
+- `.github/workflows/launch-advisory-trust.yml` — the sole credential holder,
+  reachable only from `workflow_run`, `schedule`, and `workflow_dispatch`. Its
+  daily schedule is the live private-advisory re-audit of protected `main`.
 - `.github/workflows/release.yml` — the `validate-launch-readiness` job gates
-  every tag release on a computed `PASS` for the tagged commit resolved from the
-  checked-out tag ref.
-- Both keep `persist-credentials: false` and least permissions.
+  every tag release on the trusted `trusted-launch-advisory-gate` verdict for
+  the commit its tag resolves to, and holds no credential.
+- All keep `persist-credentials: false` and least permissions.
 - `.github/CODEOWNERS` covers the policy, the exemptions, the checker, the
-  workflow, and `PRODUCTION_READINESS.md`.
+  workflows, the trust-boundary verifier, and `PRODUCTION_READINESS.md`.
 
 ## Determinism
 
@@ -131,9 +236,17 @@ Hosted CI is the execution gate; the deterministic self-test is offline.
 ```bash
 python3 scripts/check_launch_readiness.py --self-test
 python3 scripts/check_launch_readiness.py --verify --launch-tier ga --target-sha "$GITHUB_SHA"
+python3 .github/scripts/verify_launch_advisory_trust.py --self-test
 ```
 
 `--verify` requires a computed `PASS`; `--require-pass` is accepted for release
 wiring and is implied. `--verify-checkout` additionally asserts that the working
 tree HEAD is the supplied target commit. With no target supplied, the checked-out
 HEAD is the target.
+
+`--trusted-execution --trusted-tree-sha <sha>` is the credential contract. It
+declares that the invocation is executing protected default-branch code and
+requires the evaluation target to be supplied explicitly, so the commit under
+evaluation is data and the executing tree is the pinned anchor. Without it an
+advisory credential in the environment is refused before any advisory request is
+made, and the refusal never echoes the credential.
