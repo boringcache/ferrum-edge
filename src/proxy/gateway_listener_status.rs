@@ -54,6 +54,20 @@
 //! name, hostname, config generation, and error text are per-entry status
 //! detail on the **authenticated** `/health` tier — never a metric label and
 //! never part of an unauthenticated response body.
+//!
+//! # One classification model
+//!
+//! [`GatewayListenerProtocolHalf`] and [`GatewayListenerFailureCategory`] are
+//! the *only* classification of a Gateway listener failure in the tree.
+//! `gateway_listener::GatewayListenerRefusal`,
+//! `gateway_listener::GatewayListenerProtocolFailure`, and
+//! `gateway_listener::GatewayListenerBindFailure` all carry these two types
+//! directly rather than a parallel enum that would have to be mapped — a
+//! mapping layer is exactly how an operator-facing reason and a metric label
+//! drift apart. The two axes are orthogonal: a QUIC socket that fails to bind
+//! beside a healthy TCP listener is `(Quic, BindFailed)`, not a distinct
+//! "quic_bind_failed" reason, so the label space stays the product of two
+//! closed sets and an alert on `reason="bind_failed"` covers both halves.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -114,7 +128,6 @@ impl GatewayListenerProtocolHalf {
         }
     }
 }
-
 /// Bounded reason a Gateway listener port (or one protocol half of it) is not
 /// serving.
 ///
@@ -135,14 +148,26 @@ pub enum GatewayListenerFailureCategory {
     UdpStreamCollision,
     /// Two HTTP-family proxies claim the port with different TLS classes.
     ClassConflict,
-    /// A TLS-terminating listener was declared without frontend TLS material.
+    /// A dedicated Sidecar ingress bind cannot be absorbed by the process-global
+    /// socket that already owns the port; widening a loopback-only claim onto a
+    /// shared frontend would violate bind isolation (#3266).
+    DedicatedBindConflict,
+    /// A dedicated Sidecar ingress bind was declared on a frontend-TLS listener;
+    /// Sidecar bind materialization supports plaintext HTTP-family listeners
+    /// only.
+    DedicatedBindTlsUnsupported,
+    /// A TLS-terminating listener (or its QUIC half) was declared without
+    /// frontend TLS material.
     FrontendTlsMissing,
     /// The OS refused the bind (address in use, missing `CAP_NET_BIND_SERVICE`,
-    /// unavailable address).
+    /// unavailable address), or the listener task failed to start.
     BindFailed,
     /// A listener task that had bound successfully later exited — cleanly, with
     /// an error, or by panic — and the port is being rebound.
     ListenerTaskEnded,
+    /// A frontend class flip did not finish retiring the previous socket within
+    /// the retire budget, so the replacement bind is deferred fail-closed.
+    ClassFlipDeferred,
     /// A previous generation of this port has not finished closing its accept
     /// sockets, so the replacement bind is deferred fail-closed.
     RetirementPending,
@@ -150,15 +175,18 @@ pub enum GatewayListenerFailureCategory {
 
 impl GatewayListenerFailureCategory {
     /// Every category, in metric-label order.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 12] = [
         Self::PortReserved,
         Self::ProcessGlobalClassMismatch,
         Self::StreamPortCollision,
         Self::UdpStreamCollision,
         Self::ClassConflict,
+        Self::DedicatedBindConflict,
+        Self::DedicatedBindTlsUnsupported,
         Self::FrontendTlsMissing,
         Self::BindFailed,
         Self::ListenerTaskEnded,
+        Self::ClassFlipDeferred,
         Self::RetirementPending,
     ];
 
@@ -170,9 +198,12 @@ impl GatewayListenerFailureCategory {
             Self::StreamPortCollision => "stream_port_collision",
             Self::UdpStreamCollision => "udp_stream_collision",
             Self::ClassConflict => "class_conflict",
+            Self::DedicatedBindConflict => "dedicated_bind_conflict",
+            Self::DedicatedBindTlsUnsupported => "dedicated_bind_tls_unsupported",
             Self::FrontendTlsMissing => "frontend_tls_missing",
             Self::BindFailed => "bind_failed",
             Self::ListenerTaskEnded => "listener_task_ended",
+            Self::ClassFlipDeferred => "class_flip_deferred",
             Self::RetirementPending => "retirement_pending",
         }
     }
@@ -189,10 +220,13 @@ impl GatewayListenerFailureCategory {
             | Self::StreamPortCollision
             | Self::UdpStreamCollision
             | Self::ClassConflict
+            | Self::DedicatedBindConflict
+            | Self::DedicatedBindTlsUnsupported
             | Self::FrontendTlsMissing => GatewayListenerFailureOrigin::Admission,
-            Self::BindFailed | Self::ListenerTaskEnded | Self::RetirementPending => {
-                GatewayListenerFailureOrigin::Runtime
-            }
+            Self::BindFailed
+            | Self::ListenerTaskEnded
+            | Self::ClassFlipDeferred
+            | Self::RetirementPending => GatewayListenerFailureOrigin::Runtime,
         }
     }
 
@@ -203,10 +237,13 @@ impl GatewayListenerFailureCategory {
             Self::StreamPortCollision => 2,
             Self::UdpStreamCollision => 3,
             Self::ClassConflict => 4,
-            Self::FrontendTlsMissing => 5,
-            Self::BindFailed => 6,
-            Self::ListenerTaskEnded => 7,
-            Self::RetirementPending => 8,
+            Self::DedicatedBindConflict => 5,
+            Self::DedicatedBindTlsUnsupported => 6,
+            Self::FrontendTlsMissing => 7,
+            Self::BindFailed => 8,
+            Self::ListenerTaskEnded => 9,
+            Self::ClassFlipDeferred => 10,
+            Self::RetirementPending => 11,
         }
     }
 }
@@ -763,7 +800,7 @@ fn render_classified(
 /// [`GatewayListenerFailureCategory::as_str`] — both closed sets — plus the
 /// process namespace. Port, listener name, host, config generation, and error
 /// text are deliberately absent: they are authenticated `/health` detail. The
-/// complete series count is therefore `3 + 3 * 2 * 9` regardless of how many
+/// complete series count is therefore `3 + 3 * 2 * 12` regardless of how many
 /// Gateway listeners a configuration declares.
 ///
 /// Emits nothing when the process has no dynamic Gateway listener status, so a

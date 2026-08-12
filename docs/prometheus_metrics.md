@@ -116,9 +116,11 @@ part of the configuration is not realized.
 
 `reason` is a closed set: `port_reserved`, `process_global_class_mismatch`,
 `stream_port_collision`, `udp_stream_collision`, `class_conflict`,
+`dedicated_bind_conflict`, `dedicated_bind_tls_unsupported`,
 `frontend_tls_missing`, `bind_failed`, `listener_task_ended`,
-`retirement_pending`. The first six are admission refusals repaired in the
-configuration; the last three are runtime failures repaired in the environment.
+`class_flip_deferred`, `retirement_pending`. The first eight are admission
+refusals repaired in the configuration; the last four are runtime failures
+repaired in the environment.
 Port, listener name, host, config generation, and error text are **never**
 labels — they are authenticated `/health` detail only, so listener cardinality
 can never reach the time-series store.
@@ -134,11 +136,14 @@ sustained.
 port already owned by another process; `port_reserved`,
 `stream_port_collision`, `udp_stream_collision`, `class_conflict`, and
 `process_global_class_mismatch` are configuration conflicts inside Ferrum's own
-port map; `listener_task_ended` means the accept loop died after a successful
-bind and is being rebound; `retirement_pending` means a previous generation of
-that port has not finished closing its accept sockets and the replacement bind
-is deliberately deferred. No action clears these manually — the supervisor
-retries on its own, and the metrics clear when it succeeds.
+port map; `dedicated_bind_conflict` and `dedicated_bind_tls_unsupported` identify
+Sidecar ingress bind declarations that cannot be realized without widening or
+misclassifying the listener; `listener_task_ended` means the accept loop died
+after a successful bind and is being rebound; `class_flip_deferred` means a
+frontend TLS-class change is waiting for the previous accept sockets to close;
+`retirement_pending` is the same fail-closed wait for another bind-identity
+change. No action clears these manually — the supervisor retries on its own,
+and the metrics clear when it succeeds.
 
 ## Complete family inventory
 
@@ -310,6 +315,8 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_mesh_config_revision_rejections_total` | counter | `reason`, `gateway_namespace` | `mesh` | `documented_only` | `conditional` | Mesh slices quarantined by the config-revision freshness gate before replacing live state, by reason. |
 | `ferrum_mesh_config_update_rejections_total` | counter | `consumer`, `reason`, `gateway_namespace` | `mesh` | `documented_only` | `conditional` | MeshSubscribe responses refused before apply, by consumer and reason. |
 | `ferrum_mesh_dns_upstream_id_exhaustions_total` | counter | `namespace` | `mesh` | `documented_only` | `always` | Mesh DNS upstream transaction ID exhaustion events. |
+| `ferrum_mesh_ext_authz_check_failures_total` | counter | `disposition`, `gateway_namespace` | `mesh` | `documented_only` | `conditional` | Failed CUSTOM external authorization checks by how the failure was resolved. |
+| `ferrum_mesh_ext_authz_checks_total` | counter | `outcome`, `gateway_namespace` | `mesh` | `documented_only` | `conditional` | Istio AuthorizationPolicy CUSTOM external authorization check outcomes. |
 | `ferrum_mesh_federation_bundle_age_seconds` | gauge | `trust_domain`, `gateway_namespace` | `mesh_federation` | `alert_and_dashboard` | `conditional` | Age of the cached federated trust bundle, in seconds. |
 | `ferrum_mesh_federation_last_success_timestamp_seconds` | gauge | `trust_domain`, `gateway_namespace` | `mesh_federation` | `documented_only` | `conditional` | Unix timestamp of last successful SPIFFE federation poll. |
 | `ferrum_mesh_federation_poll_failures_total` | counter | `trust_domain`, `endpoint`, `gateway_namespace` | `mesh_federation` | `alert_and_dashboard` | `conditional` | SPIFFE federation trust-bundle poll failures. |
