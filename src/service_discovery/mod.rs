@@ -1564,7 +1564,7 @@ async fn prepare_publication_under_deadline(
             () = &mut prepare => return PreparationOutcome::Ready,
             _ = wait_for_cancel(cancel_rx.clone()) => return PreparationOutcome::Aborted,
             _ = async {
-                if let Some(ref rx) = shutdown_rx {
+                if let Some(rx) = shutdown_rx {
                     wait_for_shutdown(rx.clone()).await;
                 } else {
                     std::future::pending::<()>().await;

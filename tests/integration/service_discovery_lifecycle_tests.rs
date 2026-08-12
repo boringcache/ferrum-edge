@@ -2035,7 +2035,10 @@ async fn cancellation_stops_a_task_parked_in_publication_preparation() {
     let _ = task.cancel_tx.send(true);
     let stopped = tokio::time::timeout(std::time::Duration::from_secs(30), task.handle).await;
     let joined = stopped.expect("a task parked in preparation must stop promptly on cancel");
-    assert!(joined.is_ok(), "the supervisor must exit cleanly, not panic");
+    assert!(
+        joined.is_ok(),
+        "the supervisor must exit cleanly, not panic"
+    );
 
     assert!(
         !lb_has_host(&lb_cache, "canceled-warmup", "discovered.local"),
