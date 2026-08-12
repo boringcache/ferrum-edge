@@ -36,6 +36,14 @@ ARG IPROUTE2_VERSION=6.15.0-1
 # is honored (and install rust-src on that pinned toolchain). core-only
 # build-std matches the crate's `#![no_std]` + `panic = "abort"`.
 FROM rust:latest AS ebpf-builder
+# bpf-linker 0.11 is built against LLVM 19 and discovers llvm-config through
+# LLVM_PREFIX. The rust:latest Debian 13 image does not guarantee an
+# unversioned llvm-config on PATH, so install the matching development package
+# explicitly rather than inheriting a mutable base-image accident.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        llvm-19-dev \
+    && rm -rf /var/lib/apt/lists/*
+ENV LLVM_PREFIX=/usr/lib/llvm-19
 RUN rustup toolchain install nightly --component rust-src \
     && cargo +nightly install bpf-linker --locked
 COPY ebpf/ /build/ebpf/
