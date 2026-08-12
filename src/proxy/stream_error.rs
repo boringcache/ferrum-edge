@@ -197,9 +197,7 @@ impl StreamSetupKind {
             Self::UnsupportedStreamPolicy => {
                 crate::proxy::tcp_proxy::STREAM_ERR_UNSUPPORTED_STREAM_POLICY
             }
-            Self::AuthorizationExpired => {
-                crate::proxy::tcp_proxy::STREAM_ERR_AUTHORIZATION_EXPIRED
-            }
+            Self::AuthorizationExpired => crate::proxy::tcp_proxy::STREAM_ERR_AUTHORIZATION_EXPIRED,
         }
     }
 }

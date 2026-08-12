@@ -1988,8 +1988,7 @@ impl UploadSource {
     ) -> Option<crate::proxy::upload_pump::UploadPumpJoin> {
         match std::mem::replace(self, UploadSource::Exhausted) {
             UploadSource::Direct(incoming) if !http_body::Body::is_end_stream(&incoming) => {
-                let (source, join) =
-                    crate::proxy::upload_pump::spawn_upload_pump(incoming, plan);
+                let (source, join) = crate::proxy::upload_pump::spawn_upload_pump(incoming, plan);
                 *self = UploadSource::Pumped(source);
                 Some(join)
             }
@@ -3817,8 +3816,7 @@ impl DeadlineTerminal {
         // A `grpc-timeout` deadline is established only for gRPC-flavored
         // requests, so native trailers are the correct terminal here.
         native_grpc_trailers: true,
-        pre_data_message:
-            "gRPC streaming response exceeded the client grpc-timeout deadline",
+        pre_data_message: "gRPC streaming response exceeded the client grpc-timeout deadline",
         auth_termination: None,
     };
 }
@@ -3935,8 +3933,7 @@ where
                     return Poll::Ready(Some(Err(Box::new(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
                         this.terminal.pre_data_message,
-                    ))
-                        as BoxError)));
+                    )) as BoxError)));
                 }
                 let mut trailers = http::HeaderMap::new();
                 trailers.insert(

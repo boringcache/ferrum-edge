@@ -7467,9 +7467,10 @@ pub mod _test_support {
 
         /// Hand the client body one DATA frame.
         pub fn feed(&self, data: &'static str) -> bool {
-            self.feed
-                .as_ref()
-                .is_some_and(|feed| feed.send(bytes::Bytes::from_static(data.as_bytes())).is_ok())
+            self.feed.as_ref().is_some_and(|feed| {
+                feed.send(bytes::Bytes::from_static(data.as_bytes()))
+                    .is_ok()
+            })
         }
 
         /// The bounded bridge's in-flight frame budget.

@@ -19,8 +19,7 @@ use ferrum_edge::_test_support::{
     proxy_body_with_client_grpc_deadline_for_test,
 };
 use ferrum_edge::proxy::auth_lifetime::{
-    StreamAuthDeadline, StreamAuthProtocolFamily, StreamAuthTermination,
-    StreamAuthTerminationLatch,
+    StreamAuthDeadline, StreamAuthProtocolFamily, StreamAuthTermination, StreamAuthTerminationLatch,
 };
 use ferrum_edge::proxy::body::ProxyBodyError;
 use futures_util::stream;

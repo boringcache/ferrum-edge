@@ -41710,7 +41710,10 @@ pub(crate) fn request_upload_auth_deadline(
 pub(crate) fn install_streaming_upload_authorization(
     body: body::SizeLimitedIncoming,
     auth: Option<&RequestAuthLifetimePlan>,
-) -> (body::SizeLimitedIncoming, Option<upload_pump::UploadPumpJoin>) {
+) -> (
+    body::SizeLimitedIncoming,
+    Option<upload_pump::UploadPumpJoin>,
+) {
     let Some(plan) = auth else {
         return (body, None);
     };
@@ -41879,9 +41882,7 @@ fn request_upload_auth_family(
         return StreamAuthProtocolFamily::GrpcWeb;
     }
     match ctx.headers.get("content-type") {
-        Some(content_type)
-            if crate::plugins::grpc_web::is_grpc_web_content_type(content_type) =>
-        {
+        Some(content_type) if crate::plugins::grpc_web::is_grpc_web_content_type(content_type) => {
             StreamAuthProtocolFamily::GrpcWeb
         }
         Some(content_type) if content_type.trim_start().starts_with("application/grpc") => {
@@ -45064,7 +45065,10 @@ pub(crate) fn authorization_bounded_header_deadline(
     };
     match header_deadline {
         Some((existing, _)) if existing < authorization_at => header_deadline,
-        _ => Some((authorization_at, ResponseHeaderDeadlineSource::Authorization)),
+        _ => Some((
+            authorization_at,
+            ResponseHeaderDeadlineSource::Authorization,
+        )),
     }
 }
 

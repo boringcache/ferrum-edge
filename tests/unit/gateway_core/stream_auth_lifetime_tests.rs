@@ -823,8 +823,8 @@ async fn the_setup_expiry_kind_is_client_side_and_health_neutral() {
         kind.direction(),
         ferrum_edge::plugins::Direction::ClientToBackend
     );
-    let rendered = StreamSetupError::new(kind, "before any backend byte was written".to_string())
-        .to_string();
+    let rendered =
+        StreamSetupError::new(kind, "before any backend byte was written".to_string()).to_string();
     // Redacted: the contract, never the credential, its subject, or its expiry.
     assert!(rendered.contains("authorization lifetime"), "{rendered}");
     assert!(!rendered.chars().any(|c| c.is_ascii_digit()), "{rendered}");
@@ -982,13 +982,8 @@ async fn an_earlier_operator_stall_timeout_still_wins_a_buffered_collect() {
 
 #[tokio::test(start_paused = true)]
 async fn an_unauthenticated_buffered_collect_is_completely_unaffected() {
-    let outcome = collect_buffered_upload_under_authorization_for_test(
-        async { Ok(()) },
-        None,
-        0,
-        None,
-    )
-    .await;
+    let outcome =
+        collect_buffered_upload_under_authorization_for_test(async { Ok(()) }, None, 0, None).await;
     assert_eq!(outcome, BufferedUploadWaitOutcomeForTest::Collected);
 }
 
@@ -1186,7 +1181,10 @@ async fn a_composed_rpc_deadline_keeps_its_attribution_across_the_gap() {
         "a client-chosen expiry stays an RPC deadline, never an operator timeout"
     );
     assert_eq!(latch.observed(), None);
-    assert_eq!(tokio::time::Instant::now(), start + Duration::from_millis(120));
+    assert_eq!(
+        tokio::time::Instant::now(),
+        start + Duration::from_millis(120)
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -1751,7 +1749,10 @@ async fn an_earlier_protocol_bound_keeps_its_attribution_under_delayed_observati
     // after the LATER one. Re-deriving attribution from the clock here would
     // misreport the protocol's own timeout as an authorization expiry.
     tokio::time::advance(Duration::from_secs(5)).await;
-    assert_eq!(attribute_dispatch_phase_bound_for_test(&bound, Some(&plan)), None);
+    assert_eq!(
+        attribute_dispatch_phase_bound_for_test(&bound, Some(&plan)),
+        None
+    );
     assert_eq!(latch.observed(), None);
 }
 
@@ -1882,7 +1883,9 @@ fn the_direct_h2_handler_joins_its_upload_before_returning() {
     // Every bounded direct-H2 exit, plus the normal completion path, joins the
     // pump; the residual error exits are covered by `cancel_on_drop`.
     assert_eq!(
-        PROXY_SOURCE.matches("pump.cancel_and_join().await;").count(),
+        PROXY_SOURCE
+            .matches("pump.cancel_and_join().await;")
+            .count(),
         3,
         "a direct-H2 exit stopped joining the gateway-owned upload"
     );
