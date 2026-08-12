@@ -693,9 +693,10 @@ async fn a_config_publication_before_the_supervisor_starts_is_not_missed() {
 
 /// Listener routing admission is part of the exact request/config generation:
 /// publication starts fail-closed, an admission refusal stays unreachable, and
-/// only the matching reconcile may enable the intentional Service remap for an
-/// ordinary OS bind failure. The held socket makes the bind failure
-/// deterministic; no timing sleep gates any assertion.
+/// only the matching reconcile may enable intentional Service remapping for a
+/// live listener. An ordinary OS bind failure remains fail-closed. The held
+/// socket makes the bind failure deterministic; no timing sleep gates any
+/// assertion.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn listener_admission_is_generation_bound_before_reconcile_acknowledgement() {
     use ferrum_edge::dns::{DnsCache, DnsConfig};
@@ -791,10 +792,17 @@ async fn listener_admission_is_generation_bound_before_reconcile_acknowledgement
             .any(|failure| failure.port == busy_port),
         "the held socket must force an ordinary OS bind failure"
     );
-    let remapped = state
-        .find_proxy_on_frontend_for_test(Some(HOST), "/api/window", Some(global_proxy_port), false)
-        .expect("matching-generation acknowledgement enables Service remap");
-    assert_eq!(remapped.proxy.id, "ordinary-bind-failure");
+    assert!(
+        state
+            .find_proxy_on_frontend_for_test(
+                Some(HOST),
+                "/api/window",
+                Some(global_proxy_port),
+                false,
+            )
+            .is_none(),
+        "an OS bind failure must not expose the route through Service remap"
+    );
 
     drop(global_proxy_listener);
     drop(admin_listener);
