@@ -14,14 +14,21 @@ name: Trusted Launch Advisory Gate
 # code no matter what the candidate contains. The
 # candidate commit is carried only as an inert 40-hex SHA:
 #
-#   1. `establish-trust` holds no secret. It pins the trusted anchor, resolves
-#      the tag to exactly one commit, requires that commit to be reachable from
-#      protected `main`, and requires successful push CI/coverage runs for that
-#      exact SHA. Anything missing, ambiguous, or stale fails closed.
-#   2. `advisory-verdict` re-checks out the SAME trusted anchor commit, runs the
-#      default-branch checker, and only then reads the advisory credential from
-#      the protected `launch-advisory` environment. It never checks out, fetches,
-#      imports, or executes a single byte of the candidate tree.
+#   1. `establish-trust` holds no secret. It pins the trusted anchor from the
+#      literal protected-branch checkout, runs the checker/verifier self-tests,
+#      resolves the tag to exactly one commit, requires that commit to be
+#      reachable from protected `main`, and requires successful push CI/coverage
+#      runs for that exact SHA. Anything missing, ambiguous, or stale fails
+#      closed.
+#   2. `advisory-verdict` is a CLOSED two-step job: a pinned `actions/checkout`
+#      directly at that same trusted anchor commit, immediately followed by the
+#      one credential-bearing checker invocation. There is deliberately no other
+#      step — no pin script, no self-test, no setup — because any executable step
+#      running before the credential step shares its workspace and could replace
+#      `scripts/check_launch_readiness.py` (or derive the candidate indirectly
+#      from the event payload, the API, or the environment) before the checker
+#      runs with the credential bound. It never checks out, fetches, imports, or
+#      executes a single byte of the candidate tree.
 #   3. `publish-verdict` holds no secret and publishes a fixed-text commit
 #      status on the candidate SHA, under a context bound to the exact Release
 #      run and run attempt that asked for it. `release.yml` consumes only its
@@ -77,14 +84,21 @@ jobs:
       status_context: ${{ steps.candidate.outputs.status_context }}
     steps:
       # `refs/heads/main` is the protected default branch. It is written as a
-      # literal so no event payload field can redirect the checkout, and the
-      # resolved commit is exported so the secret-bearing job pins the identical
-      # tree even if `main` advances mid-run.
+      # literal so no event payload field can redirect the checkout. The commit
+      # it resolves to is validated and exported as `trusted_sha`, and the
+      # secret-bearing job checks that exact commit out directly, so it evaluates
+      # the identical tree even if `main` advances mid-run.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           ref: refs/heads/main
           fetch-depth: 0
           persist-credentials: false
+
+      # Secretless by construction, and deliberately hosted here rather than in
+      # the credential-bearing job: an executable step in that job could mutate
+      # its workspace before the credential is used.
+      - name: Synthetic policy/checker self-tests
+        run: python3 -I scripts/check_launch_readiness.py --self-test
 
       - name: Resolve the trusted anchor and the candidate commit
         id: candidate
@@ -288,31 +302,25 @@ jobs:
       contents: read
       issues: read
       pull-requests: read
+    # EXACTLY TWO STEPS, IN THIS ORDER. `verify_launch_advisory_trust.py`
+    # enforces the whole sequence structurally. The workspace this job hands to
+    # the credential step must be a fresh checkout of the trusted anchor and
+    # nothing else: an arbitrary step here needs no secret and no literal
+    # candidate expression to be dangerous, because it could read
+    # `.workflow_run.head_sha` out of `$GITHUB_EVENT_PATH`, ask the API, or read
+    # `printenv`, then fetch candidate bytes or simply overwrite
+    # `scripts/check_launch_readiness.py` — and the exact credential command
+    # below would then execute the replaced file with the credential bound.
     steps:
+      # Checked out directly AT the trusted anchor commit resolved by the
+      # literal `refs/heads/main` checkout in `establish-trust`, so no in-job
+      # command is needed to move HEAD onto it. `fetch-depth: 1` fetches that
+      # one commit; the checker resolves HEAD from `.git` and re-asserts the pin.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
-          ref: refs/heads/main
-          fetch-depth: 0
+          ref: ${{ needs.establish-trust.outputs.trusted_sha }}
+          fetch-depth: 1
           persist-credentials: false
-
-      - name: Pin the trusted execution anchor
-        env:
-          TRUSTED_SHA: ${{ needs.establish-trust.outputs.trusted_sha }}
-        run: |
-          set -euo pipefail
-
-          if [[ ! "$TRUSTED_SHA" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "::error title=Launch advisory trust::trusted anchor is missing" >&2
-            exit 1
-          fi
-          git checkout --detach "$TRUSTED_SHA"
-          if [ "$(git rev-parse HEAD)" != "$TRUSTED_SHA" ]; then
-            echo "::error title=Launch advisory trust::tree is not the trusted anchor" >&2
-            exit 1
-          fi
-
-      - name: Synthetic policy/checker self-tests
-        run: python3 -I scripts/check_launch_readiness.py --self-test
 
       - name: Evaluate the candidate commit as data
         env:

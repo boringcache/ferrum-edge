@@ -139,20 +139,26 @@ branch or tag ref, so a manual dispatch is not intrinsically trusted code.
    that `requested` does not fire when a run is re-run, so a re-run Release
    attempt would never obtain its own verdict and would fail closed forever.
 3. `establish-trust` holds no secret. It checks out the literal `refs/heads/main`,
-   pins the resolved trusted anchor commit, then treats the candidate purely as
-   data: normalized tag format, exactly one unambiguous remote tag ref, tag
-   resolution to exactly one commit, agreement with the triggering event's head
-   (a tag moved after the event is refused as stale), reachability from
-   protected `main`, and successful **push** `ci.yml` + `coverage.yml` runs for
-   that exact SHA. Anything missing, ambiguous, or stale fails closed.
-4. `advisory-verdict` re-checks out `refs/heads/main`, detaches onto the same
-   pinned anchor commit, and runs the default-branch checker with
-   `--trusted-execution --trusted-tree-sha <anchor>`. The checker re-asserts the
-   pin itself and **refuses the credential outright** in any invocation that did
-   not declare a trusted execution, so the tag's own copy of the checker cannot
-   use a credential even if one were somehow present. The candidate reaches this
-   job only as `LAUNCH_TARGET_SHA`; no candidate byte is fetched, imported, or
-   run. The credential comes from the protected `launch-advisory` environment.
+   resolves that checkout's `HEAD` to the trusted anchor commit, validates it as
+   a 40-hex commit, requires it to be reachable from protected `main`, and
+   exports it as `trusted_sha`. It also runs every secretless prerequisite —
+   the checker self-tests — because the credential job may not run one. It then
+   treats the candidate purely as data: normalized tag format, exactly one
+   unambiguous remote tag ref, tag resolution to exactly one commit, agreement
+   with the triggering event's head (a tag moved after the event is refused as
+   stale), reachability from protected `main`, and successful **push** `ci.yml` +
+   `coverage.yml` runs for that exact SHA. Anything missing, ambiguous, or stale
+   fails closed.
+4. `advisory-verdict` is a closed two-step job: a pinned `actions/checkout`
+   **directly at `trusted_sha`**, immediately followed by the single
+   credential-bearing invocation of the default-branch checker with
+   `--trusted-execution --trusted-tree-sha <anchor>`. No command of its own moves
+   HEAD, and there is deliberately no third step. The checker re-asserts the pin
+   itself and **refuses the credential outright** in any invocation that did not
+   declare a trusted execution, so the tag's own copy of the checker cannot use a
+   credential even if one were somehow present. The candidate reaches this job
+   only as `LAUNCH_TARGET_SHA`; no candidate byte is fetched, imported, or run.
+   The credential comes from the protected `launch-advisory` environment.
 5. `publish-verdict` holds no secret and posts a fixed-text commit status on the
    candidate SHA under the context
    `trusted-launch-advisory-gate/release-<run id>-attempt-<attempt>`. Neither
@@ -203,18 +209,57 @@ Because the policy, the exemptions, and `PRODUCTION_READINESS.md` are all read
 from the trusted anchor, the reviewed snapshot compared against the live verdict
 is protected `main`'s — never the candidate's copy of it.
 
-### The credential is scoped to one step, and the verifier checks that step
+### The credential job is a closed step sequence, and the verifier checks the whole sequence
 
-The advisory credential is bound by the `env:` of a single step, so only that
-step's command can read it. Job membership is therefore not the unit of trust:
-the secretless anchor-pin and checker self-test steps share the job but never
-receive the secret, while the one step that does receive it is the entire
-attack surface.
+Step scoping bounds who can **read** the credential. It does not bound who can
+change what the credential step **executes**. Every step of a job shares one
+workspace, so a secretless step placed before the credential step needs no
+secret and no candidate expression to break the boundary: it can read
+`.workflow_run.head_sha` out of `$GITHUB_EVENT_PATH`, ask the API, or read
+`printenv`, then fetch candidate bytes, check them out, or simply overwrite
+`scripts/check_launch_readiness.py` — and the exact, fully anchored credential
+command would then execute the replaced file with the credential bound. Closing
+only the credential step's own command is therefore not a workspace boundary.
 
-`.github/scripts/verify_launch_advisory_trust.py` parses the credential-bearing
-job's `steps:` list by indentation, locates the exact step carrying
-`secrets.LAUNCH_ADVISORY_READ_TOKEN`, and holds that step — and only that step —
-to a closed contract:
+So `advisory-verdict` has **exactly two steps and no others**:
+
+1. `actions/checkout` at the pinned action SHA, with `ref` set to the
+   `trusted_sha` output `establish-trust` already resolved from the literal
+   `refs/heads/main` checkout, `fetch-depth: 1`, and
+   `persist-credentials: false`. This replaces the earlier in-job pin block: the
+   workspace arrives already at the trusted anchor, so no executable step is
+   needed to put it there.
+2. The credential-bearing checker invocation.
+
+Every secretless prerequisite — the checker self-tests — lives in
+`establish-trust` instead, where it cannot touch this workspace.
+
+`.github/scripts/verify_launch_advisory_trust.py` parses that job's `steps:`
+list by indentation and enforces the sequence structurally:
+
+- the job declares only `name`/`needs`/`runs-on`/`timeout-minutes`/
+  `environment`/`permissions`/`steps`, so no job-level `env:`, `defaults:`
+  working directory, `container:`, `services:`, `strategy:`, or reusable
+  `uses:` can add a surface outside the two steps;
+- there are exactly two steps. Any third step — before, between, or after — is
+  rejected on sight, whatever it claims to do;
+- the first step declares only `name`/`uses`/`with`; its `uses` is the exact
+  pinned `actions/checkout` SHA (a coordinated action-pin bump must update the
+  `CHECKOUT_ACTION_PIN` constant too); and its `with:` mapping is exactly
+  `ref: ${{ needs.establish-trust.outputs.trusted_sha }}`, `fetch-depth: 1`,
+  `persist-credentials: false` — no `path`, `repository`, `token`,
+  `submodules`, `sparse-checkout`, or `clean`, and no `run`, `env`, or `if`
+  that could execute in or skip past that checkout;
+- the second step is the one carrying `secrets.LAUNCH_ADVISORY_READ_TOKEN`, and
+  it must be both the second step and the last;
+- `establish-trust` must prove the anchor it exports: `trusted_sha` comes from
+  `git rev-parse HEAD` of the literal protected-branch checkout, is validated as
+  a 40-hex commit, is required to be an ancestor of protected `main`, and is
+  exported from that step's own output. Dropping any of those proofs is
+  rejected, because the credential job executes whatever that value names.
+
+The credential-bearing step is then held — as before — to a closed contract of
+its own:
 
 - it must be a plain `run:` step declaring only `name`/`id`/`if`/`env`/`run`, so
   no `uses:`, `shell:`, or `working-directory:` can add or redirect an execution
@@ -229,11 +274,15 @@ to a closed contract:
   `;`, a pipe, a command substitution in the pin, an alternate interpreter, or an
   alternate path to the checker all fail the match.
 
-Separately, **no** step of that job — secretless ones included, and inside
-multiline blocks — may expand a candidate-derived variable such as
-`$LAUNCH_TARGET_SHA` on an executable line. The candidate SHA is read from the
-process environment by the trusted checker and by nothing else, so any shell
-expansion of it is a new execution path over candidate-controlled data.
+Separately, and as defence in depth, **no** step of that job — inside multiline
+blocks included — may expand a candidate-derived variable such as
+`$LAUNCH_TARGET_SHA` on an executable line, and no candidate expression may
+appear anywhere in the job outside the inert `LAUNCH_TARGET_SHA` environment
+binding. The candidate SHA is read from the process environment by the trusted
+checker and by nothing else. That rule alone is *not* the boundary, though: it
+only sees a candidate named directly. The closed sequence above is what refuses
+an indirectly derived candidate — and a step that ignores the candidate entirely
+and just replaces the checker.
 
 Comments are stripped before every structural and contract decision, so prose can
 neither satisfy a requirement nor stand in for a rejected command.
@@ -247,14 +296,26 @@ before calling the checker, a second command chained onto the credential
 invocation, a command substitution in the trusted-tree pin, an action added as a
 second execution surface on the credential step, a credential widened from the
 step to the whole job, candidate expansion inside a secretless step of that job,
-a commented-out credential binding, a self-test surviving only as a comment, a
-tag-reachable trust workflow, a dropped environment binding, a dropped provenance
-edge, an unpinned action, a constant commit-wide status context, an omitted
-run-attempt binding, a `requested`-only trigger, a default-branch audit sharing
-the release context namespace, a release gate that accepts another run's status,
-and a release gate that stops requiring the trusted verdict — and then applies
-the same contract to the real `.github/workflows` tree. It runs on every pull
-request from `launch-readiness.yml`.
+a pre-credential step that derives the candidate from `$GITHUB_EVENT_PATH` and
+overwrites the checker while naming no candidate expression at all (asserted
+both to be rejected *and* to be invisible to the candidate-expansion rule, so
+the closed sequence is proved to be what catches it), an extra step appended
+after the credential step, the credential step and the checkout in swapped
+order, a block-scalar body line beginning with `- ` that must not hide an extra
+step, the self-test moved back into the credential job, a redirected checkout
+ref, a dropped or extra checkout input, a swapped checkout action, a checkout
+step that also runs a command or carries an `if:`, a job-level `defaults:`
+working directory, a trusted anchor exported without its protected-main
+ancestry proof or without coming from the protected-branch checkout, a
+commented-out credential binding, a self-test surviving only as a comment, a
+tag-reachable trust workflow, a tag checkout in the secretless trust job, a
+dropped environment binding, a dropped provenance edge, an unpinned action, a
+constant commit-wide status context, an omitted run-attempt binding, a
+`requested`-only trigger, a default-branch audit sharing the release context
+namespace, a release gate that accepts another run's status, and a release gate
+that stops requiring the trusted verdict — and then applies the same contract to
+the real `.github/workflows` tree. It runs on every pull request from
+`launch-readiness.yml`.
 
 ### Required repository settings (root/admin only, not code)
 
@@ -316,7 +377,9 @@ future provisioning safe rather than exploitable.
   the commit its tag resolves to, accepting no other context, and holds no
   credential.
 - Every checkout on this trust boundary — both checkouts in
-  `launch-advisory-trust.yml` (`publish-verdict` checks out nothing at all), the
+  `launch-advisory-trust.yml` (`establish-trust` at the literal
+  `refs/heads/main`, `advisory-verdict` at the `trusted_sha` that checkout
+  resolved; `publish-verdict` checks out nothing at all), the
   `launch-readiness.yml` checkout, and
   `release.yml`'s `validate-launch-readiness` job — uses
   `persist-credentials: false` and least permissions. This is a claim about the

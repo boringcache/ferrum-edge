@@ -13,16 +13,28 @@ workflow definitions as text — it executes nothing — and asserts:
 * the credential is referenced in exactly one workflow, and that workflow is
   reachable only from events whose definition GitHub loads from the protected
   default branch (`workflow_run`, `schedule`);
-* the secret-bearing job is gated behind the secretless trust job, is bound to
-  the protected deployment environment, and checks out only the literal trusted
-  ref;
+* the secret-bearing job is gated behind the secretless trust job and is bound to
+  the protected deployment environment;
+* that job is a *closed step sequence*: exactly two steps, the first being the
+  pinned `actions/checkout` at the trusted anchor commit the secretless job
+  already established (with a closed set of inputs), the second being the one
+  credential-bearing checker invocation. Step scoping alone is not enough. A
+  secretless step needs no credential and no candidate expression to be
+  dangerous: it shares the credential job's workspace, so it can read the
+  candidate from `$GITHUB_EVENT_PATH`, the API, or `printenv`, fetch candidate
+  bytes, or simply overwrite `scripts/check_launch_readiness.py` — and the exact
+  credential command would then execute the replaced file with the credential
+  bound. So no arbitrary executable step may exist in that job at all, before or
+  after the credential step;
 * the credential is delivered to exactly one *step*, identified structurally by
-  parsing the job's `steps:` list, and that step is a plain single-line `run:`
-  step whose whole command is the default-branch checker with its
-  trusted-execution pins. Job membership is not the unit of trust: a step that
-  merely lives in the same job never receives the step-scoped secret, and a
-  `run: |` block on the credential step would let arbitrary shell run beside the
-  checker with the credential already in the environment;
+  parsing the job's `steps:` list, that step is the second and final one, and it
+  is a plain single-line `run:` step whose whole command is the default-branch
+  checker with its trusted-execution pins. A `run: |` block on the credential
+  step would let arbitrary shell run beside the checker with the credential
+  already in the environment;
+* the trusted anchor is proved fail-closed in the secretless job: derived from
+  the literal protected-branch checkout, validated as a 40-hex commit, and
+  required to be reachable from protected `main` before it is exported;
 * the candidate commit reaches the secret-bearing job only as an inert SHA in an
   environment mapping, never as a checkout ref, and no candidate-derived
   environment variable is ever expanded on an executable line anywhere in that
@@ -46,11 +58,18 @@ step turned into a `run: |` block that checks out or sources candidate material
 before calling the checker, a second command chained onto the credential
 invocation, a command substitution in the trusted-tree pin, an action added as a
 second execution surface on the credential step, a job-level credential binding,
-candidate environment expansion in a secretless step, a missing environment
-binding, a dropped trust edge, a constant commit-wide status context, an omitted
-run-attempt binding, a `requested`-only trigger, a release gate that reuses
-another run's status, and a release job that stops requiring the trusted verdict
-— and then applies the same contract to the real `.github/workflows` tree.
+candidate environment expansion in a secretless step, an *indirect* pre-credential
+step that extracts the candidate from `$GITHUB_EVENT_PATH` and replaces the
+checker without naming any candidate expression, an extra step appended after the
+credential step, a swapped or unpinned checkout action, a redirected checkout
+ref, a dropped or altered checkout input, a checkout step that also runs a
+command, a swapped step order, a job-level `defaults:` working directory, the
+self-test moved back into the credential job, a dropped trusted-anchor ancestry
+proof, a missing environment binding, a dropped trust edge, a constant
+commit-wide status context, an omitted run-attempt binding, a `requested`-only
+trigger, a release gate that reuses another run's status, and a release job that
+stops requiring the trusted verdict — and then applies the same contract to the
+real `.github/workflows` tree.
 Comments are stripped before every contract decision, so prose can neither
 satisfy a requirement nor stand in for a rejected command.
 """
@@ -82,6 +101,17 @@ STATUS_CONTEXT_PREFIX = "trusted-launch-advisory-gate"
 AUDIT_STATUS_CONTEXT = f"{STATUS_CONTEXT_PREFIX}/main-audit"
 TRUSTED_CHECKER = "python3 -I scripts/check_launch_readiness.py"
 SELF_TEST_STEP = "python3 -I .github/scripts/verify_launch_advisory_trust.py --self-test"
+# The secretless checker self-test. It belongs to the trust job: hosted in the
+# credential-bearing job it would be an executable step sharing that job's
+# workspace with the credential step.
+CHECKER_SELF_TEST_STEP = f"{TRUSTED_CHECKER} --self-test"
+
+# The credential-bearing job checks out the anchor commit the secretless job
+# already established from the literal protected branch, so no in-job command is
+# needed to move HEAD onto it. Bumping the checkout pin means bumping this
+# constant; see docs/dependency-policy.md on coordinated action-pin bumps.
+CHECKOUT_ACTION_PIN = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
+TRUSTED_SHA_REF_EXPRESSION = "${{ needs.establish-trust.outputs.trusted_sha }}"
 
 # Events whose workflow definition and checked-out code GitHub resolves from the
 # protected default branch. Every other event can be reached from a ref whose
@@ -153,6 +183,62 @@ BLOCK_SCALAR = re.compile(r"^[|>][+-]?[0-9]*[+-]?$")
 # `working-directory` are each a way to redirect or duplicate the execution
 # surface while the credential is already bound to the step.
 CREDENTIAL_STEP_ALLOWED_KEYS = frozenset({"name", "id", "if", "env", "run"})
+
+# The credential-bearing job is a closed sequence: the trusted-anchor checkout
+# and then the credential step. Nothing else may run in that workspace.
+CREDENTIAL_JOB_STEP_COUNT = 2
+# The checkout step is declarative only: no `run`, no `env`, no `if` that could
+# skip it, no `id` another step could consume.
+CREDENTIAL_CHECKOUT_ALLOWED_KEYS = frozenset({"name", "uses", "with"})
+# Exactly these inputs, exactly these values. `path`/`repository`/`token`/
+# `submodules`/`sparse-checkout`/`clean` would each change what lands in the
+# workspace the credential step then executes.
+CREDENTIAL_CHECKOUT_INPUTS = {
+    "ref": TRUSTED_SHA_REF_EXPRESSION,
+    "fetch-depth": "1",
+    "persist-credentials": "false",
+}
+# Job-level keys admitted on the credential job. `defaults:`, `container:`,
+# `services:`, `strategy:`, `env:`, and `uses:` would each add a surface — a
+# working-directory rewrite, a foreign image, a matrix, a job-wide credential, or
+# a whole reusable workflow — outside the two verified steps.
+CREDENTIAL_JOB_ALLOWED_KEYS = frozenset(
+    {
+        "name",
+        "needs",
+        "runs-on",
+        "timeout-minutes",
+        "environment",
+        "permissions",
+        "steps",
+    }
+)
+JOB_KEY = re.compile(r"^    (?P<key>[A-Za-z_][A-Za-z0-9_-]*):")
+MAPPING_ENTRY = re.compile(
+    r"^\s*(?P<key>[A-Za-z_][A-Za-z0-9_-]*):\s*(?P<value>.*?)\s*$"
+)
+
+# The trusted anchor must be proved, not asserted: taken from the literal
+# protected-branch checkout, validated as a commit, and required to be reachable
+# from protected `main` before it is exported to the credential job.
+TRUST_ANCHOR_PROOFS = (
+    (
+        re.compile(r'trusted_sha="\$\(git rev-parse HEAD\)"'),
+        "derive the trusted anchor from the literal protected-branch checkout "
+        '(`trusted_sha="$(git rev-parse HEAD)"`)',
+    ),
+    (
+        re.compile(r'\[\[\s*"\$trusted_sha"\s*=~\s*\^\[0-9a-f\]\{40\}\$\s*\]\]'),
+        "validate the trusted anchor as a 40-hex commit",
+    ),
+    (
+        re.compile(r'git merge-base --is-ancestor "\$trusted_sha" "\$main_tip"'),
+        "require the trusted anchor to be reachable from protected `main`",
+    ),
+)
+TRUSTED_SHA_OUTPUT_BINDING = re.compile(
+    r"^\s*trusted_sha:\s*\$\{\{\s*steps\.[A-Za-z0-9_-]+\.outputs\.trusted_sha\s*\}\}\s*$"
+)
 
 # The complete command the credential-bearing step may execute, anchored at both
 # ends. Anchoring is the contract: no leading `cd`, no trailing `&& …`, no `;`,
@@ -361,14 +447,83 @@ def step_run_text(step_lines: list[str]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def check_credential_steps(steps: list[list[str]]) -> list[str]:
-    """The step-scoped contract for the advisory credential.
+def inline_value(value: str) -> str:
+    """A step/mapping scalar with a trailing comment and quotes removed."""
 
-    Job membership is not the unit of trust. A secret bound by one step's `env:`
-    is visible only to that step's command, so the whole contract below is
-    applied to the step that actually receives it — and every *other* step in
-    the job is held only to the weaker rule that it may not expand a
-    candidate-derived variable on an executable line.
+    text = value.split(" #", 1)[0].strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+        text = text[1:-1]
+    return text.strip()
+
+
+def check_trusted_checkout_step(step_lines: list[str]) -> list[str]:
+    """The first step of the credential job: the trusted-anchor checkout.
+
+    This step is what makes the credential job's workspace trustworthy without
+    any in-job command. It is held to an exact action pin, an exact ref
+    expression, and a closed input set, and it may declare nothing executable.
+    """
+
+    where = f"{TRUSTED_WORKFLOW} job `{SECRET_JOB}`"
+    entries = step_entries(step_lines)
+    if not entries:
+        return [f"{where} first step is not parseable as a step"]
+
+    errors: list[str] = []
+    disallowed = sorted(
+        {key for key, _, _ in entries if key not in CREDENTIAL_CHECKOUT_ALLOWED_KEYS}
+    )
+    if disallowed:
+        errors.append(
+            f"{where} trusted-anchor checkout step declares {', '.join(disallowed)}; "
+            "only name/uses/with are admitted, so it can neither run a command in "
+            "this workspace nor be conditionally skipped"
+        )
+
+    uses = [inline_value(value) for key, value, _ in entries if key == "uses"]
+    if uses != [CHECKOUT_ACTION_PIN]:
+        errors.append(
+            f"{where} must begin with exactly one `uses: {CHECKOUT_ACTION_PIN}` "
+            f"step (found {uses}); the credential job's workspace must come from "
+            "the pinned checkout action and nothing else"
+        )
+
+    with_bodies = [body for key, _, body in entries if key == "with"]
+    if len(with_bodies) != 1:
+        errors.append(
+            f"{where} trusted-anchor checkout must declare exactly one `with:` "
+            f"input mapping (found {len(with_bodies)})"
+        )
+        return errors
+
+    inputs: dict[str, str] = {}
+    for line in with_bodies[0]:
+        entry = MAPPING_ENTRY.match(line)
+        if entry:
+            inputs[entry.group("key")] = inline_value(entry.group("value"))
+    if inputs != CREDENTIAL_CHECKOUT_INPUTS:
+        errors.append(
+            f"{where} trusted-anchor checkout declares inputs {inputs!r}; it must "
+            f"declare exactly {CREDENTIAL_CHECKOUT_INPUTS!r} — the established "
+            "anchor commit, a single-commit fetch, and no persisted credential — "
+            "so no other ref, repository, path, or credential can reach the "
+            "workspace the credential step executes"
+        )
+    return errors
+
+
+def check_credential_job_steps(steps: list[list[str]]) -> list[str]:
+    """The closed step-sequence contract for the credential-bearing job.
+
+    Step scoping bounds who can *read* the credential; it does not bound who can
+    change what the credential step *executes*. Any additional step in this job
+    shares its workspace, needs no secret, and needs no candidate expression: it
+    can read `.workflow_run.head_sha` from `$GITHUB_EVENT_PATH`, ask the API, or
+    read `printenv`, then fetch candidate bytes or overwrite
+    `scripts/check_launch_readiness.py`, and the exact credential command would
+    execute the replaced file with the credential bound. So the sequence itself
+    is verified: a pinned trusted-anchor checkout, then the credential step, and
+    nothing before, between, or after.
     """
 
     errors: list[str] = []
@@ -377,6 +532,8 @@ def check_credential_steps(steps: list[list[str]]) -> list[str]:
     # Executable candidate data anywhere in the job, block scalars included. The
     # checker receives the candidate SHA through the process environment and
     # never through the shell, so any expansion here is a new execution path.
+    # This survives as defence in depth; the closed sequence below is what makes
+    # an *indirectly* derived candidate unreachable too.
     for step in steps:
         run_text = step_run_text(step)
         match = CANDIDATE_ENV_EXPANSION.search(run_text)
@@ -386,6 +543,50 @@ def check_credential_steps(steps: list[list[str]]) -> list[str]:
                 "executable line; the candidate commit may only be read from the "
                 "process environment by the trusted checker, never by shell"
             )
+
+    if len(steps) != CREDENTIAL_JOB_STEP_COUNT:
+        errors.append(
+            f"{where} must consist of exactly {CREDENTIAL_JOB_STEP_COUNT} steps — "
+            f"the pinned `{CHECKOUT_ACTION_PIN}` checkout of the established "
+            "trusted anchor, immediately followed by the one credential-bearing "
+            f"checker invocation — but declares {len(steps)}. Any other step "
+            "shares this job's workspace and can replace the checker (or derive "
+            "the candidate from $GITHUB_EVENT_PATH, the API, or printenv) before "
+            "the credential is used, with no secret and no candidate expression "
+            "of its own"
+        )
+    if not steps:
+        return errors
+
+    errors.extend(check_trusted_checkout_step(steps[0]))
+
+    positions = [
+        index
+        for index, step in enumerate(steps)
+        if any(TOKEN_REFERENCE in line for line in step)
+    ]
+    if positions and (
+        positions != [CREDENTIAL_JOB_STEP_COUNT - 1] or positions[0] != len(steps) - 1
+    ):
+        errors.append(
+            f"{where} credential-bearing step must be step "
+            f"{CREDENTIAL_JOB_STEP_COUNT} of {CREDENTIAL_JOB_STEP_COUNT} — "
+            "immediately after the trusted-anchor checkout and the last step of "
+            f"the job (found at step {positions[0] + 1} of {len(steps)})"
+        )
+    errors.extend(check_credential_step(steps))
+    return errors
+
+
+def check_credential_step(steps: list[list[str]]) -> list[str]:
+    """The step-scoped contract for the step that receives the credential.
+
+    A secret bound by one step's `env:` is visible only to that step's command,
+    so this contract is applied to the step that actually receives it.
+    """
+
+    errors: list[str] = []
+    where = f"{TRUSTED_WORKFLOW} job `{SECRET_JOB}`"
 
     bearing = [step for step in steps if any(TOKEN_REFERENCE in line for line in step)]
     if len(bearing) != 1:
@@ -480,18 +681,44 @@ def check_trusted_workflow(text: str) -> list[str]:
         )
 
     for line in lines:
-        ref = REF_FIELD.match(line)
-        if ref and ref.group("value").strip("\"'") != TRUSTED_REF:
-            errors.append(
-                f"{TRUSTED_WORKFLOW} checks out {ref.group('value')!r}; every ref "
-                f"must be the literal trusted ref {TRUSTED_REF!r}"
-            )
         uses = USES_FIELD.match(line)
         if uses and not PINNED_ACTION.match(uses.group("value")):
             errors.append(
                 f"{TRUSTED_WORKFLOW} uses unpinned or local action "
                 f"{uses.group('value')!r}"
             )
+
+    # Checkout refs are judged per job. Every secretless job may check out only
+    # the literal protected branch; the credential-bearing job checks out the
+    # anchor commit that literal checkout already established, so its workspace
+    # is trusted without running any command of its own.
+    declared_refs = sum(1 for line in lines if REF_FIELD.match(line))
+    scanned_refs = 0
+    for job_name in sorted(jobs):
+        for line in code_lines(jobs[job_name]):
+            ref = REF_FIELD.match(line)
+            if not ref:
+                continue
+            scanned_refs += 1
+            value = inline_value(ref.group("value"))
+            if job_name == SECRET_JOB:
+                if value != TRUSTED_SHA_REF_EXPRESSION:
+                    errors.append(
+                        f"{TRUSTED_WORKFLOW} job `{SECRET_JOB}` checks out "
+                        f"{value!r}; it must check out exactly "
+                        f"{TRUSTED_SHA_REF_EXPRESSION!r}, the anchor commit the "
+                        "literal protected-branch checkout already established"
+                    )
+            elif value != TRUSTED_REF:
+                errors.append(
+                    f"{TRUSTED_WORKFLOW} job `{job_name}` checks out {value!r}; "
+                    f"every secretless ref must be the literal trusted ref "
+                    f"{TRUSTED_REF!r}"
+                )
+    if scanned_refs != declared_refs:
+        errors.append(
+            f"{TRUSTED_WORKFLOW} declares a checkout ref outside any job block"
+        )
 
     for job_name in (TRUST_JOB, SECRET_JOB, PUBLISH_JOB):
         if job_name not in jobs:
@@ -505,6 +732,33 @@ def check_trusted_workflow(text: str) -> list[str]:
         errors.append(
             f"{TRUSTED_WORKFLOW} job `{TRUST_JOB}` must establish provenance "
             "without any credential"
+        )
+
+    # The credential job executes whatever the trusted anchor names, so the
+    # anchor itself must be proved here: taken from the literal protected-branch
+    # checkout, validated as a commit, reachable from protected `main`, and
+    # exported from that step's own output.
+    for pattern, detail in TRUST_ANCHOR_PROOFS:
+        if not pattern.search(trust_text):
+            errors.append(
+                f"{TRUSTED_WORKFLOW} job `{TRUST_JOB}` must {detail}; the "
+                f"`{SECRET_JOB}` job checks that anchor out directly and executes "
+                "it with the credential bound"
+            )
+    if not any(TRUSTED_SHA_OUTPUT_BINDING.match(line) for line in trust_lines):
+        errors.append(
+            f"{TRUSTED_WORKFLOW} job `{TRUST_JOB}` must export `trusted_sha` from "
+            "the step that resolved and validated it"
+        )
+
+    # Secretless prerequisites belong here, not in the credential job, whose
+    # workspace must reach the credential step untouched by any other step.
+    if CHECKER_SELF_TEST_STEP not in trust_text:
+        errors.append(
+            f"{TRUSTED_WORKFLOW} job `{TRUST_JOB}` must run the secretless checker "
+            f"self-test `{CHECKER_SELF_TEST_STEP}`; it cannot live in "
+            f"`{SECRET_JOB}`, where it would be an executable step sharing the "
+            "credential step's workspace"
         )
 
     # The verdict must be bound to the exact Release run AND run attempt that
@@ -574,7 +828,24 @@ def check_trusted_workflow(text: str) -> list[str]:
                 "other than the default-branch checker"
             )
 
-    errors.extend(check_credential_steps(job_steps(jobs[SECRET_JOB])))
+    declared_job_keys = sorted(
+        {
+            match.group("key")
+            for match in (JOB_KEY.match(line) for line in secret_lines)
+            if match
+        }
+        - CREDENTIAL_JOB_ALLOWED_KEYS
+    )
+    if declared_job_keys:
+        errors.append(
+            f"{TRUSTED_WORKFLOW} job `{SECRET_JOB}` declares "
+            f"{', '.join(declared_job_keys)}; only "
+            f"{'/'.join(sorted(CREDENTIAL_JOB_ALLOWED_KEYS))} are admitted, so no "
+            "job-wide credential, working-directory rewrite, container, matrix, "
+            "or reusable workflow can add a surface outside the two verified steps"
+        )
+
+    errors.extend(check_credential_job_steps(job_steps(jobs[SECRET_JOB])))
 
     if PUBLISH_JOB in jobs:
         publish_lines = code_lines(jobs[PUBLISH_JOB])
@@ -723,14 +994,20 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           ref: refs/heads/main
+      - name: Synthetic policy/checker self-tests
+        run: python3 -I scripts/check_launch_readiness.py --self-test
       - name: Resolve
         id: candidate
         env:
           WORKFLOW_RUN_ID: ${{ github.event.workflow_run.id }}
           WORKFLOW_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
         run: |
+          trusted_sha="$(git rev-parse HEAD)"
+          [[ "$trusted_sha" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          git merge-base --is-ancestor "$trusted_sha" "$main_tip" || exit 1
           status_context="trusted-launch-advisory-gate/main-audit"
           status_context="trusted-launch-advisory-gate/release-${release_run_id}-attempt-${release_run_attempt}"
+          echo "trusted_sha=${trusted_sha}" >> "$GITHUB_OUTPUT"
           echo "status_context=${status_context}" >> "$GITHUB_OUTPUT"
 
   advisory-verdict:
@@ -741,7 +1018,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
-          ref: refs/heads/main
+          ref: ${{ needs.establish-trust.outputs.trusted_sha }}
+          fetch-depth: 1
+          persist-credentials: false
       - name: Evaluate
         env:
           LAUNCH_TARGET_SHA: ${{ needs.establish-trust.outputs.candidate_sha }}
@@ -978,9 +1257,25 @@ def run_self_test() -> int:  # noqa: C901 — a flat fixture table stays readabl
         ),
     )
 
+    # ---- Closed step sequence for the credential-bearing job -----------------
+    #
+    # Step scoping bounds who can *read* the credential. It does not bound who
+    # can change what the credential step *executes*: every fixture below is a
+    # secretless step sharing that job's workspace, and each one was accepted by
+    # a verifier that only closed the credential step's own command.
+
+    before_evaluate = "          persist-credentials: false\n      - name: Evaluate"
+    checkout_block = (
+        "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6\n"
+        "        with:\n"
+        "          ref: ${{ needs.establish-trust.outputs.trusted_sha }}\n"
+        "          fetch-depth: 1\n"
+        "          persist-credentials: false\n"
+    )
+
     candidate_in_secretless_step = FIXTURE_TRUSTED.replace(
-        "          ref: refs/heads/main\n      - name: Evaluate",
-        "          ref: refs/heads/main\n"
+        before_evaluate,
+        "          persist-credentials: false\n"
         "      - name: Pin\n"
         "        env:\n"
         "          LAUNCH_TARGET_SHA: "
@@ -994,6 +1289,227 @@ def run_self_test() -> int:  # noqa: C901 — a flat fixture table stays readabl
         any(
             "on an executable line" in err
             for err in evaluate(mutated(TRUSTED_WORKFLOW, candidate_in_secretless_step))
+        ),
+    )
+
+    # The accepted bypass this contract exists for: a secretless step that names
+    # no candidate expression at all, derives the candidate indirectly from the
+    # event payload, and replaces the checker the credential step then executes.
+    indirect_replacement = FIXTURE_TRUSTED.replace(
+        before_evaluate,
+        "          persist-credentials: false\n"
+        "      - name: Prepare the workspace\n"
+        "        run: |\n"
+        "          head=$(jq -r '.workflow_run.head_sha' \"$GITHUB_EVENT_PATH\")\n"
+        '          git fetch --depth 1 origin "$head"\n'
+        '          git show "$head:scripts/check_launch_readiness.py" '
+        "> scripts/check_launch_readiness.py\n"
+        "      - name: Evaluate",
+    )
+    indirect_errors = evaluate(mutated(TRUSTED_WORKFLOW, indirect_replacement))
+    check(
+        "a pre-credential step that rebuilds the checker from $GITHUB_EVENT_PATH is "
+        "rejected",
+        any("must consist of exactly 2 steps" in err for err in indirect_errors),
+        str(indirect_errors),
+    )
+    check(
+        "that bypass expands no candidate variable and names no candidate "
+        "expression, so only the closed sequence catches it",
+        not any(
+            "on an executable line" in err or "exposes candidate input" in err
+            for err in indirect_errors
+        ),
+        str(indirect_errors),
+    )
+
+    trailing_step = FIXTURE_TRUSTED.replace(
+        credential_run,
+        credential_run + "\n"
+        "      - name: Post\n"
+        "        run: sh ./candidate/postscript.sh",
+    )
+    trailing_errors = evaluate(mutated(TRUSTED_WORKFLOW, trailing_step))
+    check(
+        "a step appended after the credential step is rejected",
+        any("must consist of exactly 2 steps" in err for err in trailing_errors),
+        str(trailing_errors),
+    )
+    check(
+        "the credential step must be the last step of its job",
+        any("must be step 2 of 2" in err for err in trailing_errors),
+        str(trailing_errors),
+    )
+
+    swapped_order = FIXTURE_TRUSTED.replace(checkout_block, "").replace(
+        credential_run, credential_run + "\n" + checkout_block.rstrip("\n")
+    )
+    check(
+        "running the credential step before the trusted-anchor checkout is rejected",
+        any(
+            "must be step 2 of 2" in err
+            for err in evaluate(mutated(TRUSTED_WORKFLOW, swapped_order))
+        ),
+    )
+
+    # A block-scalar body line that begins with `- ` must not fragment the step
+    # list; the extra step still has to be visible to the sequence contract.
+    dash_body_step = FIXTURE_TRUSTED.replace(
+        before_evaluate,
+        "          persist-credentials: false\n"
+        "      - name: Prepare\n"
+        "        run: |\n"
+        "          printf '%s\\n' \\\n"
+        "            - one \\\n"
+        "            - two > scripts/check_launch_readiness.py\n"
+        "      - name: Evaluate",
+    )
+    check(
+        "a block-scalar line starting with `- ` does not hide an extra step",
+        any(
+            "must consist of exactly 2 steps" in err and "declares 3" in err
+            for err in evaluate(mutated(TRUSTED_WORKFLOW, dash_body_step))
+        ),
+        str(evaluate(mutated(TRUSTED_WORKFLOW, dash_body_step))),
+    )
+
+    self_test_in_credential_job = FIXTURE_TRUSTED.replace(
+        "      - name: Synthetic policy/checker self-tests\n"
+        f"        run: {CHECKER_SELF_TEST_STEP}\n",
+        "",
+    ).replace(
+        "      - name: Evaluate",
+        "      - name: Synthetic policy/checker self-tests\n"
+        f"        run: {CHECKER_SELF_TEST_STEP}\n"
+        "      - name: Evaluate",
+    )
+    self_test_errors = evaluate(mutated(TRUSTED_WORKFLOW, self_test_in_credential_job))
+    check(
+        "hosting the secretless self-test inside the credential job is rejected",
+        any("must consist of exactly 2 steps" in err for err in self_test_errors),
+        str(self_test_errors),
+    )
+    check(
+        "dropping the self-test from the secretless trust job is rejected",
+        any(
+            "must run the secretless checker self-test" in err
+            for err in self_test_errors
+        ),
+        str(self_test_errors),
+    )
+
+    # ---- The trusted-anchor checkout itself ----------------------------------
+
+    redirected_checkout = FIXTURE_TRUSTED.replace(
+        checkout_block,
+        checkout_block.replace(
+            TRUSTED_SHA_REF_EXPRESSION,
+            "${{ needs.establish-trust.outputs.candidate_sha }}",
+        ),
+    )
+    check(
+        "redirecting the credential job's checkout at the candidate is rejected",
+        any(
+            "it must check out exactly" in err
+            for err in evaluate(mutated(TRUSTED_WORKFLOW, redirected_checkout))
+        ),
+    )
+
+    dropped_input = FIXTURE_TRUSTED.replace(
+        checkout_block, checkout_block.replace("          persist-credentials: false\n", "")
+    )
+    check(
+        "dropping a trusted-anchor checkout input is rejected",
+        any(
+            "it must declare exactly" in err
+            for err in evaluate(mutated(TRUSTED_WORKFLOW, dropped_input))
+        ),
+    )
+
+    extra_input = FIXTURE_TRUSTED.replace(
+        checkout_block, checkout_block + "          path: candidate\n"
+    )
+    check(
+        "an extra trusted-anchor checkout input is rejected",
+        any(
+            "it must declare exactly" in err
+            for err in evaluate(mutated(TRUSTED_WORKFLOW, extra_input))
+        ),
+    )
+
+    swapped_action = FIXTURE_TRUSTED.replace(
+        checkout_block,
+        checkout_block.replace(
+            CHECKOUT_ACTION_PIN,
+            "actions/github-script@3d3c42e5aac5ba805825da76410c181273ba90b1",
+        ),
+    )
+    check(
+        "swapping the credential job's checkout for another action is rejected",
+        any(
+            "must begin with exactly one `uses:" in err
+            for err in evaluate(mutated(TRUSTED_WORKFLOW, swapped_action))
+        ),
+    )
+
+    executable_checkout = FIXTURE_TRUSTED.replace(
+        checkout_block, checkout_block + "        run: sh ./candidate/pre.sh\n"
+    )
+    check(
+        "a trusted-anchor checkout step that also runs a command is rejected",
+        any(
+            "only name/uses/with are admitted" in err
+            for err in evaluate(mutated(TRUSTED_WORKFLOW, executable_checkout))
+        ),
+    )
+
+    skippable_checkout = FIXTURE_TRUSTED.replace(
+        checkout_block, checkout_block + "        if: ${{ false }}\n"
+    )
+    check(
+        "a conditionally skippable trusted-anchor checkout is rejected",
+        any(
+            "only name/uses/with are admitted" in err
+            for err in evaluate(mutated(TRUSTED_WORKFLOW, skippable_checkout))
+        ),
+    )
+
+    job_defaults = FIXTURE_TRUSTED.replace(
+        "    environment: launch-advisory\n    steps:\n",
+        "    environment: launch-advisory\n"
+        "    defaults:\n"
+        "      run:\n"
+        "        working-directory: ./candidate\n"
+        "    steps:\n",
+    )
+    check(
+        "a job-level working-directory rewrite on the credential job is rejected",
+        any(
+            "declares defaults" in err
+            for err in evaluate(mutated(TRUSTED_WORKFLOW, job_defaults))
+        ),
+    )
+
+    unproven_anchor = FIXTURE_TRUSTED.replace(
+        '          git merge-base --is-ancestor "$trusted_sha" "$main_tip" || exit 1\n',
+        "",
+    )
+    check(
+        "an exported trusted anchor with no protected-main ancestry proof is rejected",
+        any(
+            "reachable from protected `main`" in err
+            for err in evaluate(mutated(TRUSTED_WORKFLOW, unproven_anchor))
+        ),
+    )
+
+    unvalidated_anchor = FIXTURE_TRUSTED.replace(
+        '          trusted_sha="$(git rev-parse HEAD)"\n', "          trusted_sha=x\n"
+    )
+    check(
+        "a trusted anchor not taken from the protected-branch checkout is rejected",
+        any(
+            "literal protected-branch checkout" in err
+            for err in evaluate(mutated(TRUSTED_WORKFLOW, unvalidated_anchor))
         ),
     )
 
@@ -1023,17 +1539,16 @@ def run_self_test() -> int:  # noqa: C901 — a flat fixture table stays readabl
         ),
     )
 
-    # The candidate tree checked out into the credential-bearing job.
-    hostile_checkout = FIXTURE_TRUSTED.replace(
-        "          ref: refs/heads/main\n      - name: Evaluate",
-        "          ref: ${{ needs.establish-trust.outputs.candidate_sha }}\n"
-        "      - name: Evaluate",
+    # The candidate tree checked out into a secretless job of the trusted
+    # workflow, whose refs must stay the literal protected branch.
+    hostile_trust_checkout = FIXTURE_TRUSTED.replace(
+        "          ref: refs/heads/main\n", "          ref: refs/tags/v9.9.9\n"
     )
     check(
-        "checking out the candidate in the credential-bearing job is rejected",
+        "checking out a tag in the secretless trust job is rejected",
         any(
             "must be the literal trusted ref" in err
-            for err in evaluate(mutated(TRUSTED_WORKFLOW, hostile_checkout))
+            for err in evaluate(mutated(TRUSTED_WORKFLOW, hostile_trust_checkout))
         ),
     )
 
