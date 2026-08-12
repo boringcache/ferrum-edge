@@ -264,15 +264,47 @@ already use — there is no second representation that can drift.
   carries or the expectation a `PUT` body carries. If that re-read fails, the
   request is reported as failed — no fabricated revision, no cached fallback.
 - **Standalone MongoDB contract.** Standalone MongoDB has no multi-document
-  transaction, so for this resource the poll signal is written **first** and the
-  document mutation second. If the change record fails, nothing was mutated at
-  all. If the document write then fails, a redundant change row costs one extra
-  full reload and nothing else. The reverse order — the trade-off other
-  resources can afford — is what must not happen here: a committed rotation or
-  revocation with no change row is invisible to a poller that already consumed
-  the cursor, and no later poll cycle repairs it. Standalone MongoDB therefore
-  guarantees "never invisible", not "never redundant"; a deployment that needs
-  full multi-document atomicity must set `FERRUM_MONGO_REPLICA_SET`.
+  transaction, so for this resource the poll signal and the document mutation
+  are two separate commits. The signal is written **first**, for two reasons —
+  neither of which is a visibility guarantee. First, failure containment: if the
+  change record fails, nothing was mutated at all, and if the document write
+  then fails, a redundant change row costs one extra full reload and nothing
+  else. Second, the revision source: the change sequence that write returns *is*
+  the stored revision, so the monotonic, incarnation-safe revision and the poll
+  signal are the same durable write.
+
+  Ordering alone does **not** make a committed mutation visible to a running
+  poller, and Ferrum does not claim it does. A poller can read sequence `N`,
+  escalate to a full reload that still reads the *old* document, advance its
+  cursor past `N`, and only then does the document commit — with no later signal
+  to announce it. Reversing the order trades that for a crash between the
+  document and the signal, and adding a second trailing signal still loses to a
+  crash after the document commit. Every ordering has a boundary at which a
+  committed trust mutation carries no unconsumed signal.
+
+  Visibility on this topology is therefore established on the **read** side. A
+  backend reports whether its trust write and change-log signal commit
+  atomically (`true` for every SQL backend and for replica-set MongoDB, `false`
+  for standalone mongod). When it reports `false`, every database-mode and CP
+  poll tick performs an authoritative drift check: a projected, identity-only
+  read of the namespace's stored trust document — `id`, `trust_domain`,
+  `revision`, never the material — compared against the trust state the running
+  configuration was actually built from. Any difference in either direction —
+  a create or rotation that is stored but not published, or a **revocation**
+  whose document is gone while the roots are still published — escalates that
+  namespace to an authoritative full reload, which is the single path that
+  republishes trust and its `trust_bundles_json` side channel from one read.
+  Because the check reads the document rather than the change log, it depends on
+  neither write ordering nor on the writing process surviving.
+
+  Cost and blast radius are bounded by construction: zero additional queries on
+  transactional backends, at most one projected single-document read per polled
+  namespace per tick on standalone mongod, every read predicated on its own
+  namespace, and a failed read reported and skipped rather than converted into a
+  reload or a withdrawal, so the last known good publication stands. Standalone
+  MongoDB therefore guarantees "never invisible", not "never redundant"; a
+  deployment that needs full multi-document atomicity for the *write* must still
+  set `FERRUM_MONGO_REPLICA_SET`.
 - **Backup/restore.** Database-backed exports always carry a
   `gateway_trust_bundles` section (possibly empty). Restore treats an **absent**
   section as "this backup says nothing about trust" and leaves existing roots
@@ -407,13 +439,27 @@ Live, backend-by-backend acceptance runs in the hosted `Functional Tests
 | A restart reconstructs the identical generation, revision, and material from the database alone | the same acceptance cells, plus the CP restart in the HA cells |
 | Two CP replicas observe and publish the same committed revision **without a restart** | `test_two_control_plane_replicas_converge_{postgres,mongodb}` |
 | Concurrent writers racing from one read leave exactly one winner | the same HA cells |
-| MongoDB never commits a trust mutation no poller can see, including through an interrupted write | `test_mongodb_{standalone,replica_set}_never_commits_an_invisible_trust_mutation` |
+| An interrupted MongoDB write never leaves a committed document whose revision no change row records | `test_mongodb_{standalone,replica_set}_leaves_no_unrecorded_trust_revision` |
+| A committed create / rotation / revocation whose signal was already consumed is still detected by the next poll | `tests/unit/config/gateway_trust_bundle_tests.rs` drift-detection cells |
 
-The MongoDB invisibility cells `SIGKILL` the control plane mid-rotation and then
+The MongoDB interruption cells `SIGKILL` the control plane mid-rotation and then
 read the collection directly: the committed document's `revision` must still be
-a `config_changes` sequence that exists, which is exactly the property the
-standalone signal-first ordering buys. A redundant change row is allowed by
-contract and costs one wasted full reload.
+a `config_changes` sequence that exists. That is a *crash-consistency* property
+of the signal-first ordering, and it is deliberately narrower than visibility —
+it proves a matching change row exists, not that the row was still unconsumed
+when the document committed. A live poller can consume that row before the
+document lands, which is why standalone visibility is proved on the read side
+instead. A redundant change row is allowed by contract and costs one wasted full
+reload.
+
+The live suite cannot reproduce that interleaving deterministically, so the
+poll-side repair is asserted against a store simulator that commits the change
+signal and the document as two explicit, separately ordered steps: signal
+committed → cursor advanced by a full reload against the old document →
+document commits with no unconsumed signal left → the next poll's drift check
+still escalates. Rotation, first-incarnation create, revocation, and
+delete-then-recreate each have their own cell, alongside the bounded-cost,
+namespace-isolation, and read-failure cells.
 
 Two gaps remain, and are not claimed as covered: the CP still publishes a
 rotation as a FULL_SNAPSHOT rather than a trust-carrying DELTA (deliberate — the

@@ -434,6 +434,173 @@ pub struct PublishedGatewayTrustState {
     pub bundle: GatewayTrustBundleSummary,
 }
 
+// ─── Authoritative drift detection ──────────────────────────────────────────
+//
+// Why a reader-side check exists at all.
+//
+// Every backend except standalone MongoDB commits a trust document mutation
+// and its `config_changes` poll signal in ONE transaction, so a poller that
+// consumed a sequence has, by construction, already been able to read the
+// document that sequence describes. Standalone MongoDB has no multi-document
+// transaction, and NO ordering of the two writes closes the hole on its own:
+//
+// - Signal first, document second. A live poller can read the signal at
+//   sequence N, escalate to a full reload that still reads the OLD document,
+//   advance its cursor past N, and only then does the document commit. There
+//   is no later signal, so that running poller never learns about the
+//   mutation until it restarts or an unrelated change forces another reload.
+// - Document first, signal second. A crash between the two commits a mutation
+//   with no signal at all, which is the same invisibility with a wider window.
+// - Both (signal, document, signal). The crash boundary between the document
+//   commit and the trailing signal reproduces the first case exactly: the
+//   leading signal may already have been consumed, and the trailing one never
+//   lands.
+//
+// So the WRITE side cannot prove visibility on this topology, and this module
+// deliberately does not claim it does. The READ side can: the stored document
+// is authoritative, and comparing its material-free identity against the trust
+// state the running configuration was actually built from detects every one of
+// the cases above with no dependence on signals, ordering, or process
+// survival. That comparison is what [`detect_gateway_trust_drift`] performs,
+// on the cold poll path only, and only for backends that report their trust
+// writes are not atomic with the change log.
+
+/// Material-free identity of one namespace's stored trust document.
+///
+/// Deliberately carries no bundle material: it is read with a field projection
+/// so PEM/DER bytes never cross the store boundary for a drift check, and it
+/// can be logged in full. `revision` is the backend-assigned durable change
+/// sequence, which every physical write (including a delete-then-recreate)
+/// advances, so identity equality is exactly "the same committed trust
+/// incarnation".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayTrustBundleIdentity {
+    pub id: String,
+    pub trust_domain: String,
+    pub revision: u64,
+}
+
+impl GatewayTrustBundleIdentity {
+    /// The identity of an already-loaded record.
+    pub fn of(record: &GatewayTrustBundleRecord) -> Self {
+        Self {
+            id: record.id.clone(),
+            trust_domain: record.trust_domain.clone(),
+            revision: record.revision,
+        }
+    }
+}
+
+/// Whether the trust state a running configuration was built from disagrees
+/// with what the store currently holds for that namespace.
+///
+/// Both directions matter and are distinct outcomes upstream, so both are
+/// drift here:
+///
+/// - `held = None`, `stored = Some(_)` — a create or a rotation whose signal
+///   was consumed before the document landed.
+/// - `held = Some(_)`, `stored = None` — a **revocation** whose delete landed
+///   after its signal was consumed. This is the security-critical direction:
+///   without it a data plane keeps validating with roots an operator revoked.
+/// - Both `Some(_)` with different identities — a rotation, including one that
+///   deleted and recreated the namespace singleton.
+pub fn gateway_trust_state_drifted(
+    held: Option<&GatewayTrustBundleRecord>,
+    stored: Option<&GatewayTrustBundleIdentity>,
+) -> bool {
+    match (held, stored) {
+        (None, None) => false,
+        (Some(held), Some(stored)) => GatewayTrustBundleIdentity::of(held) != *stored,
+        _ => true,
+    }
+}
+
+/// The minimal store surface authoritative drift detection needs.
+///
+/// Deliberately narrower than `DatabaseBackend`: the check must be provable
+/// against a deterministic fake that can interleave a consumed signal with a
+/// later document commit, and it must be impossible for this path to reach any
+/// mutating or material-bearing store method. `dyn DatabaseBackend` implements
+/// it directly (see `db_backend.rs`); a blanket implementation is deliberately
+/// avoided so an external test crate can still implement this trait for its own
+/// simulator.
+#[async_trait::async_trait]
+pub trait GatewayTrustDriftSource: Send + Sync {
+    /// `true` when a trust document mutation and its `config_changes` signal
+    /// commit as one atomic unit, which makes the signal alone sufficient and
+    /// this whole check unnecessary. SQL and replica-set MongoDB report `true`;
+    /// standalone MongoDB reports `false`.
+    fn gateway_trust_writes_are_atomic_with_change_log(&self) -> bool;
+
+    /// Read the namespace's stored trust identity from the authoritative
+    /// primary, without decoding trust material.
+    async fn gateway_trust_bundle_identity(
+        &self,
+        namespace: &str,
+    ) -> Result<Option<GatewayTrustBundleIdentity>, anyhow::Error>;
+}
+
+/// Cold-path authoritative drift sweep for one poll tick.
+///
+/// Returns the namespaces whose stored trust document no longer matches the
+/// trust state `held` was built from; the caller escalates those to a full
+/// reload, which is the only path that republishes trust from one authoritative
+/// read.
+///
+/// Cost and safety properties this deliberately preserves:
+///
+/// - **Zero cost on transactional backends.** A source whose trust writes are
+///   atomic with the change log returns immediately, so SQL and replica-set
+///   MongoDB add no query and keep their existing signal-driven behaviour.
+/// - **Bounded.** At most ONE projected single-document read per polled
+///   namespace per tick, and the projection excludes the bundle, so neither the
+///   query count nor the bytes read scale with trust material.
+/// - **Namespace isolation.** Every read is predicated on its own namespace and
+///   compared only against that namespace's held record; one tenant's drift can
+///   never be inferred from, or attributed to, another's.
+/// - **Last known good.** A read failure is reported and skipped, never
+///   converted into a reload or a withdrawal — an unreadable stored document
+///   could not be published by a full reload either, so forcing one would only
+///   spin while the running configuration is already the last known good state.
+/// - **Redaction.** Only the namespace and the two revisions are logged.
+pub async fn detect_gateway_trust_drift<S: GatewayTrustDriftSource + ?Sized>(
+    source: &S,
+    namespaces: &[String],
+    held: &crate::config::types::GatewayConfig,
+) -> Vec<String> {
+    if source.gateway_trust_writes_are_atomic_with_change_log() {
+        return Vec::new();
+    }
+    let mut drifted = Vec::new();
+    for namespace in namespaces {
+        let stored = match source.gateway_trust_bundle_identity(namespace).await {
+            Ok(stored) => stored,
+            Err(error) => {
+                tracing::warn!(
+                    namespace = %namespace,
+                    error = %error,
+                    "Gateway trust drift check could not read the stored trust identity; \
+                     keeping the running trust state and retrying on the next poll"
+                );
+                continue;
+            }
+        };
+        let held_record = held.gateway_trust_bundle_for(namespace);
+        if gateway_trust_state_drifted(held_record, stored.as_ref()) {
+            tracing::info!(
+                namespace = %namespace,
+                published_revision = held_record.map(|record| record.revision).unwrap_or(0),
+                stored_revision = stored.as_ref().map(|stored| stored.revision).unwrap_or(0),
+                "Stored gateway trust bundle differs from the published trust state on a \
+                 backend whose trust writes are not atomic with the change log; escalating to \
+                 an authoritative full reload"
+            );
+            drifted.push(namespace.clone());
+        }
+    }
+    drifted
+}
+
 /// Publication semantics for one namespace's gateway trust state.
 ///
 /// This is the CP-side mirror of the DP's `GatewayTrustBundleUpdate` and the

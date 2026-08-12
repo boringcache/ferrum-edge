@@ -63,7 +63,7 @@ mod inner {
         GATEWAY_TRUST_BUNDLE_RESOURCE_TYPE, credential_value_hash, mark_row_decode_rejection,
         proxy_route_key_hash,
     };
-    use crate::config::gateway_trust::GatewayTrustBundleRecord;
+    use crate::config::gateway_trust::{GatewayTrustBundleIdentity, GatewayTrustBundleRecord};
     use crate::config::types::{
         ApiSpec, Consumer, GatewayConfig, PluginAssociation, PluginConfig, PluginScope, Proxy,
         Upstream,
@@ -9210,6 +9210,50 @@ mod inner {
             doc.map(doc_to_gateway_trust_bundle).transpose()
         }
 
+        /// Standalone mongod has no multi-document transaction, so a trust
+        /// document mutation and its `config_changes` signal are two separate
+        /// commits and NO ordering of them proves visibility to a live poller
+        /// (see `create_gateway_trust_bundle`). Report that honestly so the
+        /// poll path runs the authoritative reader-side drift check. A
+        /// replica set commits both in one transaction and needs nothing.
+        fn gateway_trust_writes_are_atomic_with_change_log(&self) -> bool {
+            self.replica_set_configured()
+        }
+
+        /// Identity-only read for the poll-path drift check.
+        ///
+        /// Projected to the three identity fields, so a visibility check never
+        /// pulls the bundle out of the store; the `_id` is suppressed because
+        /// it duplicates the namespace this call already carries. The
+        /// namespace is in the filter, so the read cannot observe another
+        /// tenant's document even if the collection held one under a
+        /// mismatched `_id`.
+        async fn gateway_trust_bundle_identity(
+            &self,
+            namespace: &str,
+        ) -> Result<Option<GatewayTrustBundleIdentity>, anyhow::Error> {
+            let start = std::time::Instant::now();
+            let doc = self
+                .gateway_trust_bundles()
+                .find_one(doc! { "_id": namespace, "namespace": namespace })
+                .projection(doc! { "_id": 0, "id": 1, "trust_domain": 1, "revision": 1 })
+                .await?;
+            self.check_slow_query("gateway_trust_bundle_identity", start);
+            let Some(doc) = doc else {
+                return Ok(None);
+            };
+            // Same strictness as a full load: a revision that is missing or
+            // non-positive is corrupt security metadata, and treating it as a
+            // usable identity would let a corrupt document masquerade as the
+            // published one and suppress the reload that reports it.
+            let revision = strict_stored_revision(&doc)?;
+            Ok(Some(GatewayTrustBundleIdentity {
+                id: doc.get_str("id").unwrap_or_default().to_string(),
+                trust_domain: doc.get_str("trust_domain").unwrap_or_default().to_string(),
+                revision,
+            }))
+        }
+
         async fn list_gateway_trust_bundles_paginated(
             &self,
             namespace: &str,
@@ -9287,24 +9331,35 @@ mod inner {
                     .await;
             } else {
                 // Standalone MongoDB has no multi-document transaction, so the
-                // ORDER is the safety property: the poll signal is written
-                // FIRST and the trust document second.
+                // signal and the document are two separate commits.
                 //
-                // - change record fails  → nothing was mutated at all; the
-                //   caller sees the failure and no trust state moved.
-                // - document write fails → a change record exists for a
-                //   mutation that did not happen. The next poll escalates to a
-                //   full reload and reads the unchanged document, which is
-                //   correct, just one wasted reload.
+                // The signal is written FIRST for two reasons, and NEITHER of
+                // them is a visibility proof:
                 //
-                // The reverse order (the one every other resource can afford)
-                // is exactly what must not happen here: a committed rotation or
-                // revocation with no change row is invisible to a poller that
-                // already consumed the cursor, and no later poll repairs it.
+                // 1. Failure containment. If the change record fails, nothing
+                //    was mutated at all. If the document write then fails, a
+                //    redundant change row costs one wasted full reload that
+                //    re-reads unchanged state.
+                // 2. The revision source. The change sequence this write
+                //    returns IS the stored revision, so the monotonic,
+                //    incarnation-safe revision and the poll signal are the
+                //    same durable write.
                 //
-                // The signal-first order also supplies the revision: the change
-                // sequence it returns IS the stored revision, so the invariant
-                // and the monotonic revision source are the same write.
+                // Ordering ALONE does not make a committed mutation visible to
+                // a running poller, and this code does not claim it does. A
+                // poller can read sequence N, escalate to a full reload that
+                // still reads the OLD document, advance its cursor past N, and
+                // only then does the document below commit — with no later
+                // signal to announce it. Reversing the order trades that for a
+                // crash between the document and the signal, and writing a
+                // second trailing signal still loses to a crash after the
+                // document. Visibility on this topology is therefore
+                // established by the authoritative reader-side drift check
+                // (`gateway_trust_writes_are_atomic_with_change_log` +
+                // `crate::config::gateway_trust::detect_gateway_trust_drift`),
+                // which compares the stored document against the published
+                // trust state on every poll and depends on neither ordering nor
+                // process survival.
                 let revision = self
                     .record_config_change_returning_sequence(
                         &record.namespace,
@@ -9434,13 +9489,13 @@ mod inner {
                 }
                 matched
             } else {
-                // Standalone: poll signal first, mutation second (see
-                // `create_gateway_trust_bundle`). A change record for a
-                // compare-and-set that then loses its race costs one redundant
-                // full reload; the reverse order could commit a rotation no
-                // poller ever learns about. That same signal supplies the
-                // backend-assigned revision, so the invariant and the monotonic
-                // source remain one write.
+                // Standalone: signal first, mutation second (see
+                // `create_gateway_trust_bundle` for why that order is about
+                // failure containment and the revision source, NOT visibility).
+                // A change record for a compare-and-set that then loses its
+                // race costs one redundant full reload. A rotation that commits
+                // after a poller already consumed this signal is caught by the
+                // poll-path drift check, not by this ordering.
                 let next_revision = self
                     .record_config_change_returning_sequence(
                         &record.namespace,
@@ -9552,14 +9607,19 @@ mod inner {
                 }
                 deleted
             } else {
-                // Standalone: the revocation's poll signal is written BEFORE
-                // the document is removed. A revocation that commits without a
-                // change row would be invisible to a poller that already
-                // consumed the cursor — subscribers would keep validating with
-                // roots the operator revoked, and no later poll cycle repairs
-                // that. A change row for a delete that then fails (or matched
-                // nothing) is harmless: the next poll escalates to a full
-                // reload and reads the document that is still there.
+                // Standalone: the revocation's signal is written BEFORE the
+                // document is removed, for the same failure-containment reason
+                // as create/update. A change row for a delete that then fails
+                // (or matched nothing) is harmless: the next poll escalates to
+                // a full reload and reads the document that is still there.
+                //
+                // Revocation carries the same interleaving exposure as a
+                // rotation and is the more dangerous direction — a delete that
+                // lands after a poller consumed this signal would leave
+                // subscribers validating with roots the operator revoked. That
+                // case is closed by the poll-path drift check, which treats a
+                // published record with no stored document as drift; ordering
+                // alone does not close it.
                 self.record_config_change(
                     namespace,
                     GATEWAY_TRUST_BUNDLE_RESOURCE_TYPE,

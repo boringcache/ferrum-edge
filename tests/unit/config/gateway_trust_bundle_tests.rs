@@ -11,20 +11,32 @@
 //!    "revoke" is precisely the defect this resource had to fix.
 //! 3. **Authority precedence.** Two simultaneous authorities must fail closed
 //!    identically on every replica rather than each replica picking one.
+//! 4. **Visibility on a store without multi-document transactions.** A
+//!    committed create, rotation, or revocation must reach a *running* poller
+//!    even when the change-log signal that would have announced it was already
+//!    consumed before the document commit. Write ordering cannot prove that, so
+//!    the authoritative reader-side drift check is asserted against a
+//!    deterministic simulator that reproduces the interleaving exactly.
 
 use ferrum_edge::config::gateway_trust::{
-    AMBIGUOUS_TRUST_AUTHORITY_MESSAGE, GatewayTrustBundleRecord, GatewayTrustFailureReason,
-    GatewayTrustPublication, MAX_FEDERATED_BUNDLES, MAX_JWT_AUTHORITIES_PER_BUNDLE,
-    MAX_TRUST_BUNDLE_JSON_BYTES, MAX_X509_AUTHORITIES_PER_BUNDLE, NamespaceTrustProjection,
-    TrustAuthorityResolution, observability_snapshot, project_namespace_trust,
-    published_namespace_generation, published_namespace_state, record_ambiguous_authority,
-    record_trust_generation_published, record_trust_load_rejection, reset_observability_for_tests,
-    resolve_trust_authority, trust_generation_fingerprint,
+    AMBIGUOUS_TRUST_AUTHORITY_MESSAGE, GatewayTrustBundleIdentity, GatewayTrustBundleRecord,
+    GatewayTrustDriftSource, GatewayTrustFailureReason, GatewayTrustPublication,
+    MAX_FEDERATED_BUNDLES, MAX_JWT_AUTHORITIES_PER_BUNDLE, MAX_TRUST_BUNDLE_JSON_BYTES,
+    MAX_X509_AUTHORITIES_PER_BUNDLE, NamespaceTrustProjection, TrustAuthorityResolution,
+    detect_gateway_trust_drift, gateway_trust_state_drifted, observability_snapshot,
+    project_namespace_trust, published_namespace_generation, published_namespace_state,
+    record_ambiguous_authority, record_trust_generation_published, record_trust_load_rejection,
+    reset_observability_for_tests, resolve_trust_authority, trust_generation_fingerprint,
 };
+use ferrum_edge::config::types::GatewayConfig;
 use ferrum_edge::identity::TrustDomain;
 use ferrum_edge::modes::mesh::config::{JwtAuthority, TrustBundle, TrustBundleSet};
 
+use async_trait::async_trait;
 use base64::Engine;
+use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// A real self-signed X.509 root, base64-encoded DER. Admission parses the DER,
 /// so a fixture of arbitrary bytes would be rejected for the wrong reason and
@@ -900,5 +912,438 @@ fn a_single_authority_publishes_and_an_absent_one_clears() {
     assert_eq!(
         project_namespace_trust(None, None, true),
         NamespaceTrustProjection::Clear
+    );
+}
+
+// ── Authoritative drift detection (standalone-MongoDB interleaving) ─────────
+//
+// The write-side ordering on a store without multi-document transactions
+// cannot prove a committed mutation is visible to a *running* poller, and the
+// cases below encode exactly why. A signal-first write can have its signal
+// consumed — cursor advanced, full reload completed against the OLD document —
+// before the document commits, and no later signal is ever written. A
+// document-first write, or a trailing second signal, moves the same
+// invisibility behind a crash boundary instead of removing it.
+//
+// `detect_gateway_trust_drift` is the reader-side proof: it compares the
+// authoritative stored identity with the trust state the running configuration
+// was actually built from, so it depends on neither ordering nor on the writer
+// surviving. These cells drive it through a deterministic store simulator that
+// can interleave those two commits explicitly, which a live MongoDB cell
+// cannot do reproducibly.
+
+/// Deterministic stand-in for a configuration store whose trust document and
+/// change-log signal are two separate commits.
+///
+/// Both halves are mutated independently and explicitly by each test, so the
+/// exact interleaving under test is written out in the test body rather than
+/// raced for.
+struct StoreSimulator {
+    documents: Mutex<HashMap<String, GatewayTrustBundleIdentity>>,
+    signals: Mutex<Vec<u64>>,
+    unreadable: Mutex<HashSet<String>>,
+    identity_reads: AtomicUsize,
+    atomic_trust_writes: bool,
+}
+
+impl StoreSimulator {
+    /// A store with no multi-document transaction (standalone MongoDB).
+    fn standalone() -> Self {
+        Self {
+            documents: Mutex::new(HashMap::new()),
+            signals: Mutex::new(Vec::new()),
+            unreadable: Mutex::new(HashSet::new()),
+            identity_reads: AtomicUsize::new(0),
+            atomic_trust_writes: false,
+        }
+    }
+
+    /// A store that commits the document and its signal in one transaction
+    /// (every SQL backend, and replica-set MongoDB).
+    fn transactional() -> Self {
+        Self {
+            atomic_trust_writes: true,
+            ..Self::standalone()
+        }
+    }
+
+    /// The change-log half of a write commits.
+    fn commit_signal(&self, sequence: u64) {
+        self.signals.lock().expect("signal log").push(sequence);
+    }
+
+    /// The document half of a write commits.
+    fn commit_document(&self, namespace: &str, stored: GatewayTrustBundleIdentity) {
+        self.documents
+            .lock()
+            .expect("documents")
+            .insert(namespace.to_string(), stored);
+    }
+
+    /// The document half of a revocation commits.
+    fn remove_document(&self, namespace: &str) {
+        self.documents.lock().expect("documents").remove(namespace);
+    }
+
+    /// What a full reload would read for this namespace right now.
+    fn stored(&self, namespace: &str) -> Option<GatewayTrustBundleIdentity> {
+        self.documents
+            .lock()
+            .expect("documents")
+            .get(namespace)
+            .cloned()
+    }
+
+    /// The highest committed change sequence — what a poller's cursor tracks.
+    fn latest_signal(&self) -> u64 {
+        self.signals
+            .lock()
+            .expect("signal log")
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn make_unreadable(&self, namespace: &str) {
+        self.unreadable
+            .lock()
+            .expect("unreadable set")
+            .insert(namespace.to_string());
+    }
+
+    fn identity_reads(&self) -> usize {
+        self.identity_reads.load(Ordering::Relaxed)
+    }
+}
+
+#[async_trait]
+impl GatewayTrustDriftSource for StoreSimulator {
+    fn gateway_trust_writes_are_atomic_with_change_log(&self) -> bool {
+        self.atomic_trust_writes
+    }
+
+    async fn gateway_trust_bundle_identity(
+        &self,
+        namespace: &str,
+    ) -> Result<Option<GatewayTrustBundleIdentity>, anyhow::Error> {
+        self.identity_reads.fetch_add(1, Ordering::Relaxed);
+        let unreadable = self
+            .unreadable
+            .lock()
+            .expect("unreadable set")
+            .contains(namespace);
+        if unreadable {
+            anyhow::bail!("simulated authoritative read failure");
+        }
+        Ok(self.stored(namespace))
+    }
+}
+
+fn stored_identity(id: &str, domain: &str, revision: u64) -> GatewayTrustBundleIdentity {
+    GatewayTrustBundleIdentity {
+        id: id.to_string(),
+        trust_domain: domain.to_string(),
+        revision,
+    }
+}
+
+/// Build the record a full reload of `stored` would put in the running
+/// configuration. Only the identity fields decide drift, so the material is a
+/// valid fixture bundle.
+fn published_record(
+    namespace: &str,
+    stored: &GatewayTrustBundleIdentity,
+) -> GatewayTrustBundleRecord {
+    let mut record = GatewayTrustBundleRecord::new(
+        namespace,
+        &stored.id,
+        bundle_with(vec![root_ca_der_base64("published-root")]),
+    );
+    record.trust_domain = stored.trust_domain.clone();
+    record.revision = stored.revision;
+    record
+}
+
+/// Publish what a full reload just read, the way the loaders do: the
+/// namespace's record is replaced wholesale, or removed.
+fn publish_loaded(
+    config: &mut GatewayConfig,
+    namespace: &str,
+    loaded: Option<&GatewayTrustBundleIdentity>,
+) {
+    config
+        .gateway_trust_bundles
+        .retain(|record| record.namespace != namespace);
+    if let Some(loaded) = loaded {
+        config
+            .gateway_trust_bundles
+            .push(published_record(namespace, loaded));
+    }
+    config.sort_gateway_trust_bundles();
+}
+
+/// One authoritative full reload: read the store *now* and publish exactly
+/// what it returned.
+fn full_reload(config: &mut GatewayConfig, store: &StoreSimulator, namespace: &str) {
+    publish_loaded(config, namespace, store.stored(namespace).as_ref());
+}
+
+fn published_revision(config: &GatewayConfig, namespace: &str) -> Option<u64> {
+    config
+        .gateway_trust_bundle_for(namespace)
+        .map(|record| record.revision)
+}
+
+#[tokio::test]
+async fn a_rotation_that_commits_after_its_signal_was_consumed_is_caught_by_the_next_poll() {
+    let store = StoreSimulator::standalone();
+    let mut published = GatewayConfig::default();
+    let namespaces = vec!["ferrum".to_string()];
+
+    // The store already holds an incarnation the poller published.
+    store.commit_signal(4);
+    store.commit_document("ferrum", stored_identity("ferrum", "cluster.local", 4));
+    full_reload(&mut published, &store, "ferrum");
+    let mut cursor = store.latest_signal();
+
+    // ── The interleaving ────────────────────────────────────────────────────
+    // 1. A rotation writes its poll signal first; sequence 5 becomes the
+    //    revision the document will carry.
+    store.commit_signal(5);
+
+    // 2. The poller consumes sequence 5 and escalates to a full reload. The
+    //    document has NOT committed yet, so the reload reads the OLD material
+    //    and the cursor advances past 5 anyway.
+    full_reload(&mut published, &store, "ferrum");
+    cursor = cursor.max(store.latest_signal());
+    assert_eq!(
+        published_revision(&published, "ferrum"),
+        Some(4),
+        "the reload that consumed the signal legitimately read the pre-rotation document"
+    );
+
+    // 3. Only now does the rotation's document commit, carrying revision 5.
+    store.commit_document("ferrum", stored_identity("ferrum", "cluster.local", 5));
+    assert_eq!(
+        store.latest_signal(),
+        cursor,
+        "the interleaving leaves NO unconsumed signal: a signal-driven poller is done"
+    );
+
+    // ── The repair ──────────────────────────────────────────────────────────
+    let drifted = detect_gateway_trust_drift(&store, &namespaces, &published).await;
+    assert_eq!(
+        drifted,
+        vec!["ferrum".to_string()],
+        "the drift check must see a committed rotation the change log never announced"
+    );
+
+    // The escalation republishes from one authoritative read, and the next
+    // poll is quiet again — the check converges instead of spinning.
+    full_reload(&mut published, &store, "ferrum");
+    assert_eq!(published_revision(&published, "ferrum"), Some(5));
+    let settled = detect_gateway_trust_drift(&store, &namespaces, &published).await;
+    assert!(
+        settled.is_empty(),
+        "a converged namespace must not force a reload on every subsequent tick"
+    );
+}
+
+#[tokio::test]
+async fn a_revocation_that_commits_after_its_signal_was_consumed_is_caught_by_the_next_poll() {
+    let store = StoreSimulator::standalone();
+    let mut published = GatewayConfig::default();
+    let namespaces = vec!["ferrum".to_string()];
+
+    store.commit_signal(9);
+    store.commit_document("ferrum", stored_identity("ferrum", "cluster.local", 9));
+    full_reload(&mut published, &store, "ferrum");
+
+    // The revocation's signal commits, the poller consumes it and reloads
+    // against a document that is still present, and its cursor advances.
+    store.commit_signal(10);
+    full_reload(&mut published, &store, "ferrum");
+    let cursor = store.latest_signal();
+    assert!(
+        published.gateway_trust_bundle_for("ferrum").is_some(),
+        "the consumed-signal reload still published the roots being revoked"
+    );
+
+    // Only now does the delete commit. Nothing else will ever announce it, and
+    // this is the dangerous direction: every subscriber is still validating
+    // with revoked roots.
+    store.remove_document("ferrum");
+    assert_eq!(store.latest_signal(), cursor);
+
+    let drifted = detect_gateway_trust_drift(&store, &namespaces, &published).await;
+    assert_eq!(
+        drifted,
+        vec!["ferrum".to_string()],
+        "a committed revocation with no unconsumed signal must still force a reload"
+    );
+
+    full_reload(&mut published, &store, "ferrum");
+    assert!(
+        published.gateway_trust_bundle_for("ferrum").is_none(),
+        "the escalated full reload withdraws the revoked roots"
+    );
+    let settled = detect_gateway_trust_drift(&store, &namespaces, &published).await;
+    assert!(settled.is_empty());
+}
+
+#[tokio::test]
+async fn a_create_that_commits_after_its_signal_was_consumed_is_caught_by_the_next_poll() {
+    let store = StoreSimulator::standalone();
+    let mut published = GatewayConfig::default();
+    let namespaces = vec!["ferrum".to_string()];
+
+    // First incarnation of the namespace singleton: signal first, then the
+    // poller consumes it and reloads an empty trust state, then the document
+    // commits with the sequence the poller already passed.
+    store.commit_signal(1);
+    full_reload(&mut published, &store, "ferrum");
+    let cursor = store.latest_signal();
+    store.commit_document("ferrum", stored_identity("ferrum", "cluster.local", 1));
+    assert_eq!(store.latest_signal(), cursor);
+
+    let drifted = detect_gateway_trust_drift(&store, &namespaces, &published).await;
+    assert_eq!(
+        drifted,
+        vec!["ferrum".to_string()],
+        "a first-incarnation create is invisible to the change log after the same race"
+    );
+}
+
+#[tokio::test]
+async fn a_delete_and_recreate_is_drift_even_though_the_namespace_still_holds_a_record() {
+    let store = StoreSimulator::standalone();
+    let mut published = GatewayConfig::default();
+    let namespaces = vec!["ferrum".to_string()];
+
+    store.commit_document("ferrum", stored_identity("ferrum", "cluster.local", 7));
+    full_reload(&mut published, &store, "ferrum");
+
+    // A revocation and a recreate both land between two polls. The namespace
+    // still has "a" record, so only the incarnation-safe revision distinguishes
+    // it from the one that was published.
+    store.remove_document("ferrum");
+    store.commit_document("ferrum", stored_identity("ferrum", "cluster.local", 12));
+
+    let drifted = detect_gateway_trust_drift(&store, &namespaces, &published).await;
+    assert_eq!(
+        drifted,
+        vec!["ferrum".to_string()],
+        "a new incarnation under the same id must not read as the published one"
+    );
+}
+
+#[tokio::test]
+async fn a_transactional_backend_pays_nothing_for_the_check() {
+    let store = StoreSimulator::transactional();
+    let mut published = GatewayConfig::default();
+
+    // Drift that WOULD be reported on a non-transactional store.
+    store.commit_document("ferrum", stored_identity("ferrum", "cluster.local", 3));
+    publish_loaded(&mut published, "ferrum", None);
+
+    let namespaces = vec!["ferrum".to_string(), "tenant-b".to_string()];
+    let drifted = detect_gateway_trust_drift(&store, &namespaces, &published).await;
+    assert!(
+        drifted.is_empty(),
+        "a backend whose trust write and signal are one transaction needs no check"
+    );
+    assert_eq!(
+        store.identity_reads(),
+        0,
+        "SQL and replica-set MongoDB must not gain a per-poll query"
+    );
+}
+
+#[tokio::test]
+async fn the_sweep_is_one_bounded_read_per_polled_namespace_and_stays_namespace_scoped() {
+    let store = StoreSimulator::standalone();
+    let mut published = GatewayConfig::default();
+
+    // tenant-a is converged; tenant-b drifted; tenant-c has no trust at all.
+    store.commit_document("tenant-a", stored_identity("tenant-a", "a.local", 2));
+    store.commit_document("tenant-b", stored_identity("tenant-b", "b.local", 5));
+    full_reload(&mut published, &store, "tenant-a");
+    publish_loaded(
+        &mut published,
+        "tenant-b",
+        Some(&stored_identity("tenant-b", "b.local", 4)),
+    );
+
+    let namespaces = vec![
+        "tenant-a".to_string(),
+        "tenant-b".to_string(),
+        "tenant-c".to_string(),
+    ];
+    let drifted = detect_gateway_trust_drift(&store, &namespaces, &published).await;
+    assert_eq!(
+        drifted,
+        vec!["tenant-b".to_string()],
+        "only the tenant whose own document moved may be escalated"
+    );
+    assert_eq!(
+        store.identity_reads(),
+        3,
+        "exactly one identity read per polled namespace per tick"
+    );
+}
+
+#[tokio::test]
+async fn an_unreadable_stored_document_keeps_the_last_known_good_publication() {
+    let store = StoreSimulator::standalone();
+    let mut published = GatewayConfig::default();
+    let namespaces = vec!["ferrum".to_string()];
+
+    store.commit_document("ferrum", stored_identity("ferrum", "cluster.local", 6));
+    full_reload(&mut published, &store, "ferrum");
+    store.make_unreadable("ferrum");
+
+    let drifted = detect_gateway_trust_drift(&store, &namespaces, &published).await;
+    assert!(
+        drifted.is_empty(),
+        "a failed authoritative read must not withdraw or churn the trust state"
+    );
+    assert_eq!(
+        published_revision(&published, "ferrum"),
+        Some(6),
+        "the last known good publication stands"
+    );
+}
+
+#[test]
+fn drift_is_decided_by_identity_alone_in_both_directions() {
+    let mut held = valid_record();
+    held.revision = 3;
+    let same = stored_identity(&held.id, &held.trust_domain, 3);
+    let rotated = stored_identity(&held.id, &held.trust_domain, 4);
+    let other_id = stored_identity("other", &held.trust_domain, 3);
+    let other_domain = stored_identity(&held.id, "other.local", 3);
+
+    assert!(!gateway_trust_state_drifted(None, None));
+    assert!(!gateway_trust_state_drifted(Some(&held), Some(&same)));
+    assert!(
+        gateway_trust_state_drifted(Some(&held), None),
+        "a published record with no stored document is a revocation, not a no-op"
+    );
+    assert!(
+        gateway_trust_state_drifted(None, Some(&same)),
+        "a stored document with nothing published is an unannounced create"
+    );
+    assert!(
+        gateway_trust_state_drifted(Some(&held), Some(&rotated)),
+        "a newer revision under the same id is a rotation"
+    );
+    assert!(
+        gateway_trust_state_drifted(Some(&held), Some(&other_id)),
+        "a different resource id is a different record"
+    );
+    assert!(
+        gateway_trust_state_drifted(Some(&held), Some(&other_domain)),
+        "a different trust domain is different material"
     );
 }

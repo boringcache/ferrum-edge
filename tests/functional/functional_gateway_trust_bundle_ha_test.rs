@@ -19,11 +19,18 @@
 //! - two control-plane replicas sharing one database converge on the same
 //!   committed revision **without a restart**, and concurrent writers racing
 //!   from the same read leave exactly one winner;
-//! - MongoDB never commits a trust mutation no poller can see. On standalone
-//!   the ordering is the only safety property available, so the assertion is
-//!   made against a genuinely interrupted write: the gateway is `SIGKILL`ed
-//!   mid-rotation and the committed document's `revision` must still be a
-//!   `config_changes` sequence that exists.
+//! - an interrupted MongoDB write leaves the database crash-consistent: the
+//!   gateway is `SIGKILL`ed mid-rotation and the committed document's
+//!   `revision` must still be a `config_changes` sequence that exists.
+//!
+//! That last cell is deliberately scoped to crash consistency and is NOT a
+//! visibility proof. It shows a matching change row exists; it cannot show the
+//! row was still unconsumed when the document committed, and on standalone
+//! mongod a live poller can consume it first. Visibility there is established
+//! on the read side by the authoritative poll-path drift check, whose exact
+//! interleaving is asserted deterministically in
+//! `tests/unit/config/gateway_trust_bundle_tests.rs` — a live server cannot
+//! stage that interleaving reproducibly.
 //!
 //! Hosted CI sets `FERRUM_DB_BACKENDS_REQUIRED=1` plus explicit
 //! `FERRUM_TEST_POSTGRES_URL` / `FERRUM_TEST_MYSQL_URL` / `FERRUM_TEST_MONGO_URL`
@@ -900,18 +907,26 @@ async fn test_gateway_trust_bundle_acceptance_mongodb_replica_set() {
     assert_explicit_revocation(&client, &restarted, "mongodb-replica-set").await;
 }
 
-// ── MongoDB: a committed trust mutation is never invisible ──────────────────
+// ── MongoDB: an interrupted write leaves no unrecorded trust revision ───────
 
 /// Kill a control plane in the middle of a rotation and prove the database is
-/// left in a state a poller can still act on.
+/// left crash-consistent: the stored `revision` **is** a `config_changes`
+/// sequence that exists, because the signal is written first and supplies it.
+/// A redundant change row (a signal for a mutation that did not land) is
+/// explicitly allowed — it costs one wasted full reload.
 ///
-/// The invariant is the one the standalone ordering exists to guarantee: the
-/// stored `revision` **is** the `config_changes` sequence that was written
-/// first, so a committed document always has a change row a poller will read.
-/// The reverse ordering could commit a rotation that no later poll cycle ever
-/// repairs. A redundant change row (a signal for a mutation that did not land)
-/// is explicitly allowed — it costs one wasted full reload.
-async fn assert_interrupted_rotation_is_never_invisible(
+/// This is deliberately NOT a visibility proof, and must not be read as one.
+/// It shows a matching change row *exists*; it cannot show the row was still
+/// unconsumed when the document committed. On standalone mongod a live poller
+/// can read that sequence, complete a full reload against the pre-rotation
+/// document, and advance its cursor past it before the document lands — after
+/// which no signal announces the committed mutation at all. That interleaving
+/// cannot be staged deterministically against a live server, so the repair
+/// that closes it (the authoritative poll-path drift check, see
+/// `crate::config::gateway_trust::detect_gateway_trust_drift`) is proved in
+/// `tests/unit/config/gateway_trust_bundle_tests.rs`, which commits the signal
+/// and the document as two explicitly ordered steps.
+async fn assert_interrupted_write_records_every_committed_revision(
     client: &Client,
     mongo_url: &str,
     replica_set: Option<&str>,
@@ -1013,7 +1028,7 @@ async fn assert_interrupted_rotation_is_never_invisible(
 
 #[tokio::test]
 #[ignore]
-async fn test_mongodb_standalone_never_commits_an_invisible_trust_mutation() {
+async fn test_mongodb_standalone_leaves_no_unrecorded_trust_revision() {
     let Some(mongo_url) = standalone_mongo_url().await else {
         return;
     };
@@ -1021,7 +1036,7 @@ async fn test_mongodb_standalone_never_commits_an_invisible_trust_mutation() {
     // Two interruption points: one likely inside admission/validation, one
     // likely inside the two-write sequence itself.
     for kill_after in [Duration::from_millis(40), Duration::from_millis(120)] {
-        assert_interrupted_rotation_is_never_invisible(
+        assert_interrupted_write_records_every_committed_revision(
             &client,
             &mongo_url,
             None,
@@ -1034,12 +1049,12 @@ async fn test_mongodb_standalone_never_commits_an_invisible_trust_mutation() {
 
 #[tokio::test]
 #[ignore]
-async fn test_mongodb_replica_set_never_commits_an_invisible_trust_mutation() {
+async fn test_mongodb_replica_set_leaves_no_unrecorded_trust_revision() {
     let Some((mongo_url, replica_set)) = replica_set_mongo_url().await else {
         return;
     };
     let client = Client::new();
-    assert_interrupted_rotation_is_never_invisible(
+    assert_interrupted_write_records_every_committed_revision(
         &client,
         &mongo_url,
         Some(&replica_set),

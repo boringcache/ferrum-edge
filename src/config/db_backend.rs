@@ -13,7 +13,7 @@ pub use crate::config::batch_atomicity::{
     BATCH_ADMISSION_LEASE_LOST_MESSAGE, BatchAdmissionLeaseLost, NamespaceConfigAdmissionLeaseRef,
     atomic_batch_unsupported, is_batch_admission_lease_lost,
 };
-use crate::config::gateway_trust::GatewayTrustBundleRecord;
+use crate::config::gateway_trust::{GatewayTrustBundleIdentity, GatewayTrustBundleRecord};
 use crate::config::types::{
     ApiSpec, Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, Upstream,
 };
@@ -2350,6 +2350,46 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
         namespace: &str,
     ) -> Result<Option<GatewayTrustBundleRecord>, anyhow::Error>;
 
+    /// Whether a trust document mutation and its `config_changes` poll signal
+    /// commit as ONE atomic unit on this backend's connected topology.
+    ///
+    /// `true` (the default, and the answer for every SQL backend) means a
+    /// poller that consumed a change sequence could already read the mutation
+    /// that sequence describes, so the signal alone is a complete visibility
+    /// proof and the poll path performs no extra work.
+    ///
+    /// A backend that cannot make that guarantee — standalone MongoDB, which
+    /// has no multi-document transaction — MUST return `false`. No ordering of
+    /// the two writes repairs it: signal-first loses to a live poller that
+    /// consumes the signal, completes a full reload against the old document,
+    /// and advances its cursor before the document commits; document-first
+    /// loses to a crash before the signal. Returning `false` enables the
+    /// authoritative reader-side drift check
+    /// ([`crate::config::gateway_trust::detect_gateway_trust_drift`]), which
+    /// depends on neither ordering nor process survival.
+    fn gateway_trust_writes_are_atomic_with_change_log(&self) -> bool {
+        true
+    }
+
+    /// Material-free identity of the namespace's stored trust document, read
+    /// from the authoritative primary.
+    ///
+    /// This is the cold-path drift-detection read. Implementations SHOULD
+    /// project only the identity fields so trust material never crosses the
+    /// store boundary for a visibility check; the default derives it from the
+    /// full record, which is correct but reads more than it needs and is only
+    /// ever exercised by backends that report atomic trust writes.
+    async fn gateway_trust_bundle_identity(
+        &self,
+        namespace: &str,
+    ) -> Result<Option<GatewayTrustBundleIdentity>, anyhow::Error> {
+        Ok(self
+            .get_namespace_gateway_trust_bundle(namespace)
+            .await?
+            .as_ref()
+            .map(GatewayTrustBundleIdentity::of))
+    }
+
     /// Page the namespace's trust-bundle records (0 or 1 items — the resource
     /// is a singleton, but the paginated shape keeps the admin surface uniform
     /// with every other resource list).
@@ -2435,6 +2475,27 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
     /// Namespace-scoped, bounded audit retention prune. No-op when retention
     /// policy is unset. Must never delete rows belonging to another namespace.
     async fn prune_audit_events(&self, namespace: &str) -> Result<u64, anyhow::Error>;
+}
+
+/// The poll path holds `Arc<dyn DatabaseBackend>`, so the narrow drift surface
+/// is implemented for exactly that trait object rather than as a blanket impl
+/// over every backend. A blanket impl would make it impossible for an external
+/// test crate to implement `GatewayTrustDriftSource` for its own deterministic
+/// fake (coherence cannot rule out that the fake also implements
+/// `DatabaseBackend`), and a fake that can interleave a consumed signal with a
+/// later document commit is the only way to prove this detector.
+#[async_trait]
+impl crate::config::gateway_trust::GatewayTrustDriftSource for dyn DatabaseBackend {
+    fn gateway_trust_writes_are_atomic_with_change_log(&self) -> bool {
+        DatabaseBackend::gateway_trust_writes_are_atomic_with_change_log(self)
+    }
+
+    async fn gateway_trust_bundle_identity(
+        &self,
+        namespace: &str,
+    ) -> Result<Option<GatewayTrustBundleIdentity>, anyhow::Error> {
+        DatabaseBackend::gateway_trust_bundle_identity(self, namespace).await
+    }
 }
 
 /// Extract resource IDs from a full config.

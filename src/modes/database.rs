@@ -35,6 +35,7 @@ use crate::config::config_change_watch::{
 };
 use crate::config::db_backend::{self, DatabaseBackend};
 use crate::config::db_loader::{DatabaseStore, DbPoolConfig};
+use crate::config::gateway_trust::detect_gateway_trust_drift;
 use crate::config::types::GatewayConfig;
 use crate::dns::{DnsCache, DnsConfig};
 use crate::modes::file::{
@@ -2292,6 +2293,34 @@ pub async fn run(
                                 }
                             } else {
                                 last_db_ips = Some(ips);
+                            }
+                        }
+
+                        // Authoritative gateway trust drift check (issue #3727).
+                        //
+                        // No-op on every backend whose trust document mutation
+                        // and `config_changes` signal commit atomically (all
+                        // SQL, replica-set MongoDB). On standalone MongoDB the
+                        // two are separate commits, so a signal this poller
+                        // already consumed can describe a document that had not
+                        // landed yet — and a revocation is the same race with
+                        // the roots left installed. Comparing the stored
+                        // identity with the trust state the RUNNING config was
+                        // built from detects both without depending on write
+                        // ordering or on the writer surviving. Cost is one
+                        // projected single-document read per tick, and it runs
+                        // before the reload decision so the repair happens in
+                        // this tick rather than the next.
+                        if !force_full_reload {
+                            let running_config = proxy_state_poll.current_config();
+                            let drifted = detect_gateway_trust_drift(
+                                db_poll.as_ref(),
+                                std::slice::from_ref(&poll_namespace),
+                                running_config.as_ref(),
+                            )
+                            .await;
+                            if !drifted.is_empty() {
+                                force_full_reload = true;
                             }
                         }
 

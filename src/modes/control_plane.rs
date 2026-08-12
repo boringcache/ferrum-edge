@@ -32,6 +32,7 @@ use crate::admin::{self, AdminState};
 use crate::config::EnvConfig;
 use crate::config::db_backend::{self, DatabaseBackend, FullConfigLoadPurpose, IncrementalResult};
 use crate::config::db_loader::{DatabaseStore, DbPoolConfig};
+use crate::config::gateway_trust::detect_gateway_trust_drift;
 use crate::config::incremental_apply::apply_incremental_to_config_snapshot as apply_incremental_to_config;
 use crate::config::types::GatewayConfig;
 use crate::config::validation_pipeline::{
@@ -3096,6 +3097,35 @@ pub async fn run(
                             Some(&last_polled_namespaces),
                         )
                         .await;
+
+                        // Authoritative gateway trust drift check (issue
+                        // #3727). A no-op on every backend whose trust document
+                        // mutation and `config_changes` signal commit
+                        // atomically (all SQL, replica-set MongoDB). On
+                        // standalone MongoDB they are separate commits, so this
+                        // poller can consume a signal, complete a full reload
+                        // that still reads the old document, advance its
+                        // cursor, and only then see the document commit with no
+                        // later signal — and a revocation is the same race with
+                        // the revoked roots left installed on every subscriber.
+                        // Comparing the stored identity against the trust state
+                        // the CURRENT published snapshot was built from detects
+                        // both, per namespace, without depending on write
+                        // ordering or on the writer surviving. Escalating
+                        // rather than repairing inline keeps trust publication
+                        // on the single authoritative full-reload path.
+                        let trust_drifted = detect_gateway_trust_drift(
+                            db_poll.as_ref(),
+                            &nslist,
+                            current_snapshot.as_ref(),
+                        )
+                        .await;
+                        if !trust_drifted.is_empty() {
+                            force_full_reload = true;
+                            database_delta_poll_metrics_for_poll.record_poll_completed();
+                            continue;
+                        }
+
                         // Incremental poll — only fetch changes since last poll
                         match load_incremental_config_multi(
                             db_poll.as_ref(),
