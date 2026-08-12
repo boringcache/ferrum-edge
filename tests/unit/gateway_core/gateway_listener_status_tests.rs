@@ -369,9 +369,9 @@ fn render(status: &GatewayListenerStatus) -> String {
     out
 }
 
-/// The Prometheus surface is fixed-cardinality: two protocol halves times nine
-/// bounded reasons, plus three unlabeled process gauges — regardless of how
-/// many listener ports the configuration declares or how many of them fail.
+/// The Prometheus surface is fixed-cardinality: two protocol halves times
+/// twelve bounded reasons, plus three unlabeled process gauges — regardless of
+/// how many listener ports the configuration declares or how many of them fail.
 #[test]
 fn the_metric_surface_has_fixed_cardinality_and_leaks_no_listener_identity() {
     let status = GatewayListenerStatus::new();
@@ -394,10 +394,10 @@ fn the_metric_surface_has_fixed_cardinality_and_leaks_no_listener_identity() {
     assert_eq!(count("ferrum_gateway_listeners_desired"), 1);
     assert_eq!(count("ferrum_gateway_listeners_active"), 1);
     assert_eq!(count("ferrum_gateway_listener_failed_ports"), 1);
-    assert_eq!(count("ferrum_gateway_listener_failures_active"), 18);
-    assert_eq!(count("ferrum_gateway_listener_failures_total"), 18);
-    assert_eq!(count("ferrum_gateway_listener_recoveries_total"), 18);
-    assert_eq!(sample_lines.len(), 3 + 18 * 3);
+    assert_eq!(count("ferrum_gateway_listener_failures_active"), 24);
+    assert_eq!(count("ferrum_gateway_listener_failures_total"), 24);
+    assert_eq!(count("ferrum_gateway_listener_recoveries_total"), 24);
+    assert_eq!(sample_lines.len(), 3 + 24 * 3);
 
     // No port, config generation, or error text may reach a label.
     for forbidden in [
@@ -457,11 +457,20 @@ fn every_category_has_a_stable_label_and_origin() {
         ),
         ("class_conflict", GatewayListenerFailureOrigin::Admission),
         (
+            "dedicated_bind_conflict",
+            GatewayListenerFailureOrigin::Admission,
+        ),
+        (
+            "dedicated_bind_tls_unsupported",
+            GatewayListenerFailureOrigin::Admission,
+        ),
+        (
             "frontend_tls_missing",
             GatewayListenerFailureOrigin::Admission,
         ),
         ("bind_failed", GatewayListenerFailureOrigin::Runtime),
         ("listener_task_ended", GatewayListenerFailureOrigin::Runtime),
+        ("class_flip_deferred", GatewayListenerFailureOrigin::Runtime),
         ("retirement_pending", GatewayListenerFailureOrigin::Runtime),
     ];
     let categories = GatewayListenerFailureCategory::ALL;
