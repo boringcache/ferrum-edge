@@ -699,9 +699,10 @@ async fn assert_restart_reconstructs(
 /// `DELETE` is authoritative on the store, and the live configuration follows on
 /// the next database poll / full-snapshot publication. So the status view is
 /// waited on with the same bounded style the install and rotation cells use,
-/// and the wait requires a *new* publication — the counter captured before the
-/// `DELETE` must have advanced — so it cannot be satisfied by the generation
-/// that was already live.
+/// and the wait requires the namespace's material-free generation digest to
+/// change. `published_generations_total` deliberately counts only NONEMPTY
+/// database trust generations, so an explicit empty-generation revocation must
+/// leave that process counter unchanged.
 async fn assert_explicit_revocation(client: &Client, gateway: &TestGateway, backend: &str) {
     let (status, before) = trust_status(client, gateway, PRIMARY_NAMESPACE).await;
     assert_eq!(
@@ -713,6 +714,10 @@ async fn assert_explicit_revocation(client: &Client, gateway: &TestGateway, back
         "[{backend}] the namespace must start configured: {before}"
     );
     let published_before = published_generations(&before);
+    let generation_before = before["generation"]
+        .as_str()
+        .expect("a configured trust status carries its generation")
+        .to_string();
 
     assert_eq!(
         trust_delete(client, gateway, PRIMARY_NAMESPACE, PRIMARY_NAMESPACE).await,
@@ -724,24 +729,32 @@ async fn assert_explicit_revocation(client: &Client, gateway: &TestGateway, back
 
     let timeout = Duration::from_secs(45);
     let deadline = Instant::now() + timeout;
-    loop {
+    let after = loop {
         let (status, after) = trust_status(client, gateway, PRIMARY_NAMESPACE).await;
         if status == 200
             && after["configured"] == false
             && after["bundle"].is_null()
-            && published_generations(&after) > published_before
+            && after["generation"]
+                .as_str()
+                .is_some_and(|generation| generation != generation_before.as_str())
         {
-            break;
+            break after;
         }
         if Instant::now() >= deadline {
             panic!(
                 "[{backend}] the revocation never reached the live publication boundary \
-                 within {timeout:?} (published_generations_total was {published_before} \
-                 before the DELETE); last status: {after}"
+                 within {timeout:?} (the prior generation was {generation_before}); \
+                 last status: {after}"
             );
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
-    }
+    };
+    assert_eq!(
+        published_generations(&after),
+        published_before,
+        "[{backend}] an empty revocation publication must not increment the \
+         nonempty database-generation counter: {after}"
+    );
 
     assert_eq!(
         trust_delete(client, gateway, PRIMARY_NAMESPACE, PRIMARY_NAMESPACE).await,
