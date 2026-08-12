@@ -1023,15 +1023,18 @@ install_spire_production_identity() {
 # Mint the DTLS server certificate the NodeWaypoint's `dtls` listener terminates
 # with, and publish it as a TLS Secret mounted into the ambient DaemonSet.
 #
-# Deliberately a throwaway self-signed leaf minted per run: the property under
-# test is the DTLS DATAPATH and its scoped source authorization, not PKI trust,
-# and the live client does not verify the server certificate. No key material
-# leaves the cluster or the run's temp dir, and nothing is echoed to the log.
+# Deliberately a throwaway self-signed P-256 leaf minted per run: Ferrum's DTLS
+# admission accepts only ECDSA P-256/P-384 server leaves, and using an RSA leaf
+# here would leave the listener deferred before the datapath under test exists.
+# The property under test is the DTLS datapath and scoped source authorization,
+# not PKI trust, and the live client does not verify the server certificate. No
+# key material leaves the cluster or the run's temp dir, and nothing is echoed
+# to the log.
 create_dtls_listener_secret() {
   log "minting the NodeWaypoint frontend DTLS material"
   local dir
   dir="$(mktemp -d)"
-  if ! openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
+  if ! openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 \
     -subj "/CN=ferrum-node-waypoint-dtls" \
     -keyout "$dir/tls.key" -out "$dir/tls.crt" >/dev/null 2>&1; then
     rm -rf "$dir"
