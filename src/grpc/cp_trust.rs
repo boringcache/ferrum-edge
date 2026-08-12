@@ -52,6 +52,47 @@
 //! every data plane already holds that value, so any of them could name the
 //! credential's `kid` and reach its namespaces.
 //!
+//! # One coherent source generation
+//!
+//! The bundle document and every file it references must be read from **one**
+//! filesystem generation. Reading the document and then independently
+//! re-resolving each `secret_path` / `public_key_path` let a Kubernetes
+//! projected mount hand back a *mixed* bundle: the old document's namespace
+//! ceiling paired with the new generation's key material (or the inverse).
+//! Both halves are individually valid and the mixed result is internally
+//! self-consistent, so neither a semantic fingerprint nor last-known-good
+//! retention can detect it — the CP simply publishes a namespace binding that
+//! existed in no operator configuration.
+//!
+//! Loading therefore has two phases:
+//!
+//! 1. [`PinnedTrustBundleSource::pin`] opens the mount's `..data` symlink
+//!    **once**. One `open(2)` follows it atomically, so the resulting
+//!    descriptor names exactly one generation directory forever after; a later
+//!    `..data` swap — including an A→B→A sequence that recreates the original
+//!    name — cannot redirect anything. The document itself is read through that
+//!    descriptor, so the pin is only ever claimed when the document provably
+//!    came from it.
+//! 2. [`CpDpTrustBundle::from_pinned_source`] resolves every referenced source
+//!    through the pinned descriptor with `openat(…, O_NOFOLLOW)` before any
+//!    [`TrustedKey`] is constructed. Material that does not live in the pinned
+//!    generation — an arbitrary external path, an ordinary filesystem, a
+//!    non-Unix host — has no generation to be pinned to and must instead carry
+//!    a manifest-bound `material_sha256`, which binds the bytes to the document
+//!    that named them. Absence and mismatch are both fail-closed. Each file and
+//!    the aggregate path-backed material retained for one candidate are bounded
+//!    to 1 MiB.
+//!
+//! Inline `public_key_pem`, inline `secret`, and `secret_env` are read
+//! atomically from the document or the process environment and keep their
+//! documented behavior unchanged.
+//!
+//! Startup and the periodic reload worker share this one loader, so a mixed
+//! candidate can become neither the initial authorization root nor a live
+//! replacement. Rejections are classified by the closed
+//! [`TrustBundleRejectReason`] set and never replace the last accepted
+//! verifier.
+//!
 //! # Disclosure discipline
 //!
 //! Nothing in this module renders key material, token bytes, or claim values.
@@ -63,6 +104,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use arc_swap::ArcSwap;
@@ -83,6 +125,12 @@ const TRUST_BUNDLE_MAX_BYTES: u64 = 1024 * 1024;
 /// the periodic reload worker into an unbounded file reader.
 const TRUST_MATERIAL_MAX_BYTES: u64 = TRUST_BUNDLE_MAX_BYTES;
 
+/// Maximum total path-backed material retained while one coherent candidate is
+/// assembled. Phase one intentionally resolves every source before semantic
+/// construction, so the per-file ceiling alone would permit a small manifest
+/// containing thousands of references to retain gigabytes at once.
+const TRUST_MATERIAL_TOTAL_MAX_BYTES: u64 = TRUST_BUNDLE_MAX_BYTES;
+
 /// A stalled network filesystem must not silently stop trust-bundle reloads
 /// forever. The blocking read itself runs on a detached OS thread because a
 /// timed-out `spawn_blocking` task cannot be cancelled.
@@ -97,9 +145,104 @@ pub(crate) fn trust_bundle_reload_read_limit() -> Arc<Semaphore> {
     Arc::clone(TRUST_BUNDLE_RELOAD_READ_LIMIT.get_or_init(|| Arc::new(Semaphore::new(1))))
 }
 
+/// The symlink a Kubernetes projected ConfigMap/Secret volume replaces
+/// atomically when it rotates. Every user-visible entry in the mount is a
+/// stable symlink of the shape `<name> -> ..data/<name>`, so pinning this one
+/// link pins the whole generation.
+const PROJECTED_GENERATION_LINK: &str = "..data";
+
+/// Why a trust-bundle load was refused.
+///
+/// A closed, fixed-cardinality set. It is what the reload worker logs and the
+/// seam the follow-up reload-health work (#3813) consumes; this module
+/// deliberately implements no stale-verifier health or maximum-retention policy
+/// on top of it. No variant carries a path, a digest, a namespace inventory, a
+/// credential identifier, or any document or key bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustBundleRejectReason {
+    /// The bundle document itself is not a readable, bounded, regular UTF-8
+    /// file.
+    DocumentUnreadable,
+    /// The document was read but is not a valid trust-bundle configuration.
+    DocumentInvalid,
+    /// Path-backed material could not be read as a bounded regular file.
+    MaterialUnreadable,
+    /// Path-backed material lies outside a provably pinned source generation
+    /// and the document binds it to no `material_sha256`, so nothing proves it
+    /// belongs to the generation the document came from.
+    MaterialIntegrityUnbound,
+    /// A declared `material_sha256` is not exactly 64 lowercase hex digits.
+    MaterialIntegrityMalformed,
+    /// Resolved material does not match the digest the document binds it to.
+    MaterialIntegrityMismatch,
+    /// A reference that claims to live in the pinned generation traverses out
+    /// of it, is a symlink inside it, or does not name a file.
+    SourceGenerationEscape,
+    /// The pinned generation could not be established or was reclaimed while
+    /// it was being read — the ordinary shape of a rotation that landed
+    /// mid-load.
+    SourceGenerationUnstable,
+    /// A projected generation was detected but this platform offers no way to
+    /// pin it. Refused rather than downgraded to independent re-resolution.
+    #[allow(dead_code)]
+    // Constructed on non-Unix; external tests assert the closed reason on Unix.
+    SourceGenerationUnsupported,
+}
+
+impl TrustBundleRejectReason {
+    /// Fixed-cardinality label for logs, metrics, and audit records.
+    pub const fn as_metric_label(self) -> &'static str {
+        match self {
+            Self::DocumentUnreadable => "document_unreadable",
+            Self::DocumentInvalid => "document_invalid",
+            Self::MaterialUnreadable => "material_unreadable",
+            Self::MaterialIntegrityUnbound => "material_integrity_unbound",
+            Self::MaterialIntegrityMalformed => "material_integrity_malformed",
+            Self::MaterialIntegrityMismatch => "material_integrity_mismatch",
+            Self::SourceGenerationEscape => "source_generation_escape",
+            Self::SourceGenerationUnstable => "source_generation_unstable",
+            Self::SourceGenerationUnsupported => "source_generation_unsupported",
+        }
+    }
+}
+
+/// A refused trust-bundle load: one closed classification plus an
+/// operator-facing detail.
+///
+/// The detail names only operator-authored identifiers the operator already
+/// wrote into their own configuration (the bundle path, a `kid`). It never
+/// carries document bytes, key bytes, a referenced material path, a namespace
+/// inventory, or either side of a digest comparison. Only the closed
+/// [`TrustBundleRejectReason`] is ever logged.
+#[derive(Debug, Clone)]
+pub struct TrustBundleLoadError {
+    reason: TrustBundleRejectReason,
+    detail: String,
+}
+
+impl TrustBundleLoadError {
+    fn new(reason: TrustBundleRejectReason, detail: impl Into<String>) -> Self {
+        Self {
+            reason,
+            detail: detail.into(),
+        }
+    }
+
+    /// The closed classification, for audit/metric sinks and for #3813.
+    pub fn reason(&self) -> TrustBundleRejectReason {
+        self.reason
+    }
+}
+
+impl std::fmt::Display for TrustBundleLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TrustBundleReloadError {
-    ReadOrValidationFailed,
+    Rejected(TrustBundleRejectReason),
     ReaderUnavailable,
     ReaderFailed,
     ReadTimedOut,
@@ -108,7 +251,7 @@ enum TrustBundleReloadError {
 impl TrustBundleReloadError {
     fn audit_reason(self) -> &'static str {
         match self {
-            Self::ReadOrValidationFailed => "read_or_validation_failed",
+            Self::Rejected(reason) => reason.as_metric_label(),
             Self::ReaderUnavailable => "reader_unavailable",
             Self::ReaderFailed => "reload_reader_failed",
             Self::ReadTimedOut => "reload_read_timed_out",
@@ -126,14 +269,21 @@ impl TrustBundleReloadError {
 /// plain blocking `open(2)` parks the caller *before* any regular-file check can
 /// run — which would hang CP startup outright, and would wedge the trust-bundle
 /// reload worker's `spawn_blocking` thread forever so accepted-credential
-/// removals could never be published again. Symlinked pathnames (Kubernetes
-/// projected ConfigMap/Secret mounts) are deliberately left to `open` so the
-/// opened target stays authoritative against a swap race.
-fn open_trust_material_file(path: &str, description: &str) -> Result<std::fs::File, String> {
-    let metadata = std::fs::symlink_metadata(path)
-        .map_err(|e| format!("failed to inspect {description} '{path}': {e}"))?;
+/// removals could never be published again.
+///
+/// Symlinked pathnames are still followed here: this is the *unpinned* opener,
+/// reached only for the bundle document itself and for material the document
+/// binds by `material_sha256`. Material inside a pinned projected generation
+/// goes through [`open_at_nofollow`] instead, which refuses symlinks outright.
+///
+/// `subject` is the complete operator-facing phrase for diagnostics. Callers
+/// deliberately omit referenced material paths from it: a `secret_path` names
+/// where a tenant's signing secret lives.
+fn open_regular_file_nonblocking(path: &str, subject: &str) -> Result<std::fs::File, String> {
+    let metadata =
+        std::fs::symlink_metadata(path).map_err(|e| format!("failed to inspect {subject}: {e}"))?;
     if !metadata.file_type().is_symlink() && !metadata.is_file() {
-        return Err(format!("{description} '{path}' is not a regular file"));
+        return Err(format!("{subject} is not a regular file"));
     }
 
     #[cfg(unix)]
@@ -141,30 +291,34 @@ fn open_trust_material_file(path: &str, description: &str) -> Result<std::fs::Fi
         use std::os::unix::fs::OpenOptionsExt;
         std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NONBLOCK)
+            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
             .open(path)
     };
     #[cfg(not(unix))]
     let opened = std::fs::File::open(path);
 
-    opened.map_err(|e| format!("failed to open {description} '{path}': {e}"))
+    opened.map_err(|e| format!("failed to open {subject}: {e}"))
 }
 
-fn read_regular_utf8_file_bounded(
-    path: &str,
-    description: &str,
+/// Read an already-open descriptor as a bounded regular file.
+///
+/// Split out from the path-based readers so material opened through a pinned
+/// generation descriptor shares one bounding contract with material opened by
+/// pathname. The descriptor — not the pathname — is authoritative for both.
+fn read_open_file_bounded(
+    mut file: std::fs::File,
+    subject: &str,
     max_bytes: u64,
-) -> Result<String, String> {
-    let mut file = open_trust_material_file(path, description)?;
+) -> Result<Vec<u8>, String> {
     let metadata = file
         .metadata()
-        .map_err(|e| format!("failed to inspect {description} '{path}': {e}"))?;
+        .map_err(|e| format!("failed to inspect {subject}: {e}"))?;
     if !metadata.is_file() {
-        return Err(format!("{description} '{path}' is not a regular file"));
+        return Err(format!("{subject} is not a regular file"));
     }
     if metadata.len() > max_bytes {
         return Err(format!(
-            "{description} '{path}' is {} bytes, above the {max_bytes}-byte limit",
+            "{subject} is {} bytes, above the {max_bytes}-byte limit",
             metadata.len()
         ));
     }
@@ -176,13 +330,480 @@ fn read_regular_utf8_file_bounded(
     (&mut file)
         .take(max_bytes.saturating_add(1))
         .read_to_end(&mut raw)
-        .map_err(|e| format!("failed to read {description} '{path}': {e}"))?;
+        .map_err(|e| format!("failed to read {subject}: {e}"))?;
     if raw.len() as u64 > max_bytes {
         return Err(format!(
-            "{description} '{path}' grew above the {max_bytes}-byte limit while it was read"
+            "{subject} grew above the {max_bytes}-byte limit while it was read"
         ));
     }
-    String::from_utf8(raw).map_err(|_| format!("{description} '{path}' is not valid UTF-8"))
+    Ok(raw)
+}
+
+fn read_regular_file_bytes_bounded(
+    path: &str,
+    subject: &str,
+    max_bytes: u64,
+) -> Result<Vec<u8>, String> {
+    read_open_file_bounded(
+        open_regular_file_nonblocking(path, subject)?,
+        subject,
+        max_bytes,
+    )
+}
+
+fn decode_trust_utf8(raw: Vec<u8>, subject: &str) -> Result<String, String> {
+    String::from_utf8(raw).map_err(|_| format!("{subject} is not valid UTF-8"))
+}
+
+/// `openat(dirfd, name, O_RDONLY|O_NOFOLLOW|…)`.
+///
+/// The `O_NOFOLLOW` is the escape guard: a symlink planted inside a projected
+/// generation directory would otherwise resolve against the *live* filesystem
+/// and reintroduce exactly the cross-generation reference this module exists to
+/// forbid.
+#[cfg(unix)]
+fn open_at_nofollow(dir: &std::fs::File, name: &std::ffi::OsStr) -> std::io::Result<std::fs::File> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+
+    let name = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "material name contains an interior NUL",
+        )
+    })?;
+    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
+    // SAFETY: `dir` owns a valid open directory descriptor for the whole call,
+    // and `name` is a NUL-terminated C string that outlives it.
+    let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `openat` returned a fresh descriptor that this call now solely
+    // owns, so wrapping it in a `File` transfers that ownership exactly once.
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+/// The filesystem generation a trust-bundle document was read from.
+enum PinnedSourceGeneration {
+    /// A Kubernetes-style projected mount. `dir` is an open descriptor for the
+    /// exact `..data` generation directory the document was read from, so every
+    /// same-mount reference resolves against that one inode no matter how
+    /// `..data` moves afterwards.
+    #[cfg(unix)]
+    Projected {
+        dir: std::fs::File,
+        mount_dir: std::path::PathBuf,
+    },
+    /// No generation could be pinned: an ordinary filesystem, a document
+    /// outside the projection, or a platform without `openat`. Every
+    /// path-backed reference must then carry a manifest-bound digest.
+    Unpinned,
+}
+
+/// A trust-bundle document plus the filesystem generation it was read from,
+/// pinned before the document's own bytes were read.
+///
+/// Holding this value is what makes coherence provable: the generation every
+/// later reference resolves against is already fixed, so no `..data` swap
+/// between here and [`CpDpTrustBundle::from_pinned_source`] can mix the
+/// document's namespace policy with another generation's key material.
+pub struct PinnedTrustBundleSource {
+    generation: PinnedSourceGeneration,
+    document: String,
+    origin: String,
+}
+
+impl std::fmt::Debug for PinnedTrustBundleSource {
+    /// The document is configuration that may carry inline symmetric material,
+    /// so it is never rendered.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PinnedTrustBundleSource")
+            .field("origin", &self.origin)
+            .field(
+                "pinned_generation",
+                &!matches!(self.generation, PinnedSourceGeneration::Unpinned),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl PinnedTrustBundleSource {
+    /// Pin the document's filesystem generation and read the document through
+    /// it.
+    ///
+    /// A projected mount is detected by `<dir>/..data` being a symlink. One
+    /// `open(2)` on that link follows it atomically, so the returned descriptor
+    /// names one generation directory even if `..data` is replaced in the very
+    /// next instant. The pin is claimed only when the document itself can be
+    /// opened inside it: a document living elsewhere proves nothing about a
+    /// mount, so it falls back to the unpinned contract where every referenced
+    /// file needs its own `material_sha256`.
+    pub fn pin(path: &str) -> Result<Self, TrustBundleLoadError> {
+        let subject = format!("CP/DP trust bundle '{path}'");
+        let bundle_path = Path::new(path);
+
+        if let Some(mount_dir) = bundle_path.parent() {
+            let data_link = mount_dir.join(PROJECTED_GENERATION_LINK);
+            let projected = std::fs::symlink_metadata(&data_link)
+                .map(|metadata| metadata.file_type().is_symlink())
+                .unwrap_or(false);
+            if projected {
+                #[cfg(unix)]
+                {
+                    if let Some(file_name) = bundle_path.file_name() {
+                        let dir = open_projected_generation_dir(&data_link)?;
+                        if let Ok(file) = open_at_nofollow(&dir, file_name) {
+                            let raw =
+                                read_open_file_bounded(file, &subject, TRUST_BUNDLE_MAX_BYTES)
+                                    .and_then(|raw| decode_trust_utf8(raw, &subject))
+                                    .map_err(|detail| {
+                                        TrustBundleLoadError::new(
+                                            TrustBundleRejectReason::DocumentUnreadable,
+                                            detail,
+                                        )
+                                    })?;
+                            return Ok(Self {
+                                generation: PinnedSourceGeneration::Projected {
+                                    dir,
+                                    mount_dir: mount_dir.to_path_buf(),
+                                },
+                                document: raw,
+                                origin: path.to_string(),
+                            });
+                        }
+                        // The document is not an entry of this projection. Drop
+                        // the pin entirely rather than claim a generation the
+                        // document did not come from.
+                    }
+                }
+                #[cfg(not(unix))]
+                return Err(TrustBundleLoadError::new(
+                    TrustBundleRejectReason::SourceGenerationUnsupported,
+                    format!(
+                        "{subject} is served from a projected '{PROJECTED_GENERATION_LINK}' \
+                         generation, which this platform cannot pin. Ferrum refuses to fall back \
+                         to re-resolving the live symlink per file, because that is exactly how a \
+                         rotation can pair one generation's namespace policy with another \
+                         generation's key material. Place the bundle on an ordinary filesystem \
+                         and bind each referenced file with `material_sha256`, or inline public \
+                         material with `public_key_pem`."
+                    ),
+                ));
+            }
+        }
+
+        let document = read_regular_file_bytes_bounded(path, &subject, TRUST_BUNDLE_MAX_BYTES)
+            .and_then(|raw| decode_trust_utf8(raw, &subject))
+            .map_err(|detail| {
+                TrustBundleLoadError::new(TrustBundleRejectReason::DocumentUnreadable, detail)
+            })?;
+        Ok(Self {
+            generation: PinnedSourceGeneration::Unpinned,
+            document,
+            origin: path.to_string(),
+        })
+    }
+}
+
+#[cfg(unix)]
+fn open_projected_generation_dir(data_link: &Path) -> Result<std::fs::File, TrustBundleLoadError> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    // Deliberately one `open(2)` on the symlink rather than readlink-then-open:
+    // resolving the name first would leave a window in which `..data` moves
+    // between the two syscalls.
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(data_link)
+        .map_err(|e| {
+            TrustBundleLoadError::new(
+                TrustBundleRejectReason::SourceGenerationUnstable,
+                format!("CP/DP trust bundle projected generation could not be pinned: {e}"),
+            )
+        })
+}
+
+/// Bound an operator-authored `kid` before it reaches a diagnostic.
+///
+/// Source resolution runs *before* the semantic `kid` length and control-character
+/// checks, so a hostile document must not be able to smuggle an unbounded or
+/// control-laden string into a startup error through this earlier phase.
+fn diagnostic_kid(kid: &str) -> String {
+    kid.trim()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_KEY_ID_LEN)
+        .collect()
+}
+
+/// Strictly parse a manifest-bound SHA-256: exactly 64 lowercase hex digits,
+/// nothing else. No trimming, no uppercase, no `sha256:` prefix — an integrity
+/// binding that quietly accepts near-misses is not one.
+fn parse_material_sha256(raw: &str) -> Option<[u8; 32]> {
+    let bytes = raw.as_bytes();
+    if bytes.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (index, slot) in out.iter_mut().enumerate() {
+        let high = lower_hex_value(bytes[index * 2])?;
+        let low = lower_hex_value(bytes[index * 2 + 1])?;
+        *slot = (high << 4) | low;
+    }
+    Some(out)
+}
+
+const fn lower_hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
+}
+
+/// Read one entry's material through the pinned generation, or `Ok(None)` when
+/// the reference does not live in it.
+#[cfg(unix)]
+fn read_pinned_material(
+    generation: &PinnedSourceGeneration,
+    candidate: &Path,
+    origin: &str,
+    kid: &str,
+    subject: &str,
+) -> Result<Option<Vec<u8>>, TrustBundleLoadError> {
+    let PinnedSourceGeneration::Projected { dir, mount_dir } = generation else {
+        return Ok(None);
+    };
+    if candidate.parent() != Some(mount_dir.as_path()) {
+        // A different directory is a different mount as far as this load is
+        // concerned. It gets the external contract: bind it by digest.
+        return Ok(None);
+    }
+    let Some(name) = candidate.file_name() else {
+        return Err(TrustBundleLoadError::new(
+            TrustBundleRejectReason::SourceGenerationEscape,
+            format!(
+                "CP/DP trust bundle '{origin}': key '{kid}' names no file inside the pinned \
+                 projected generation"
+            ),
+        ));
+    };
+    let file = match open_at_nofollow(dir, name) {
+        Ok(file) => file,
+        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
+            use std::os::unix::fs::MetadataExt;
+
+            // ENOENT has two materially different meanings. If kubelet
+            // reclaimed the directory behind our pinned fd, the generation is
+            // transiently unstable. If the pinned directory still exists, the
+            // reference simply is not one of its entries: let it use the same
+            // digest-bound external-file contract as a path in another
+            // directory. This makes a typo fail permanently as unbound instead
+            // of masquerading as a rotation race, and lets an explicit digest
+            // bind a legitimate regular file beside the projected entries.
+            let generation_reclaimed = dir
+                .metadata()
+                .map_or(true, |metadata| metadata.nlink() == 0);
+            if !generation_reclaimed {
+                return Ok(None);
+            }
+            return Err(TrustBundleLoadError::new(
+                TrustBundleRejectReason::SourceGenerationUnstable,
+                format!(
+                    "CP/DP trust bundle '{origin}': key '{kid}' could not be resolved inside the \
+                     pinned projected generation: {e}"
+                ),
+            ));
+        }
+        Err(e) => {
+            // Linux reports ELOOP for O_NOFOLLOW against a symlink; Darwin and
+            // FreeBSD report EMLINK. Both are a deliberate in-generation escape
+            // attempt, not a retryable projection race.
+            let reason = if matches!(e.raw_os_error(), Some(libc::ELOOP) | Some(libc::EMLINK)) {
+                TrustBundleRejectReason::SourceGenerationEscape
+            } else {
+                TrustBundleRejectReason::SourceGenerationUnstable
+            };
+            return Err(TrustBundleLoadError::new(
+                reason,
+                format!(
+                    "CP/DP trust bundle '{origin}': key '{kid}' could not be resolved inside the \
+                     pinned projected generation: {e}"
+                ),
+            ));
+        }
+    };
+    read_open_file_bounded(file, subject, TRUST_MATERIAL_MAX_BYTES)
+        .map(Some)
+        .map_err(|detail| {
+            TrustBundleLoadError::new(TrustBundleRejectReason::MaterialUnreadable, detail)
+        })
+}
+
+/// Non-Unix hosts have no `openat`, so no generation is ever pinned and every
+/// path-backed reference falls to the digest-bound contract.
+#[cfg(not(unix))]
+fn read_pinned_material(
+    generation: &PinnedSourceGeneration,
+    candidate: &Path,
+    origin: &str,
+    kid: &str,
+    subject: &str,
+) -> Result<Option<Vec<u8>>, TrustBundleLoadError> {
+    let _ = (generation, candidate, origin, kid, subject);
+    Ok(None)
+}
+
+/// Resolve one entry's path-backed material from the pinned generation, or from
+/// an external path bound by `material_sha256`.
+///
+/// Returns `Ok(None)` for inline and environment-backed sources, which are read
+/// atomically and keep their documented behavior.
+fn resolve_entry_material(
+    entry: &TrustBundleKeyDocument,
+    origin: &str,
+    generation: &PinnedSourceGeneration,
+) -> Result<Option<Vec<u8>>, TrustBundleLoadError> {
+    let kid = diagnostic_kid(&entry.kid);
+
+    let source_count = [
+        entry.secret.is_some(),
+        entry.secret_env.is_some(),
+        entry.secret_path.is_some(),
+        entry.public_key_pem.is_some(),
+        entry.public_key_path.is_some(),
+    ]
+    .into_iter()
+    .filter(|present| *present)
+    .count();
+    if source_count != 1 {
+        return Err(TrustBundleLoadError::new(
+            TrustBundleRejectReason::DocumentInvalid,
+            format!(
+                "CP/DP trust bundle '{origin}': key '{kid}' must declare exactly one of \
+                 `secret`, `secret_env`, `secret_path`, `public_key_pem`, or \
+                 `public_key_path` (found {source_count})"
+            ),
+        ));
+    }
+
+    let expected = match entry.material_sha256.as_deref() {
+        Some(raw) => Some(parse_material_sha256(raw).ok_or_else(|| {
+            TrustBundleLoadError::new(
+                TrustBundleRejectReason::MaterialIntegrityMalformed,
+                format!(
+                    "CP/DP trust bundle '{origin}': key '{kid}' declares a `material_sha256` \
+                     that is not exactly 64 lowercase hexadecimal digits"
+                ),
+            )
+        })?),
+        None => None,
+    };
+
+    let path = match entry
+        .secret_path
+        .as_deref()
+        .or(entry.public_key_path.as_deref())
+    {
+        Some(path) => path,
+        None => {
+            if expected.is_some() {
+                return Err(TrustBundleLoadError::new(
+                    TrustBundleRejectReason::DocumentInvalid,
+                    format!(
+                        "CP/DP trust bundle '{origin}': key '{kid}' declares `material_sha256` \
+                         without `secret_path` or `public_key_path`. Inline and \
+                         environment-backed material is read atomically with the document and \
+                         carries no separate integrity binding."
+                    ),
+                ));
+            }
+            return Ok(None);
+        }
+    };
+
+    let subject = format!(
+        "CP/DP trust bundle '{origin}' key '{kid}' {} file",
+        if entry.secret_path.is_some() {
+            "secret"
+        } else {
+            "public key"
+        }
+    );
+
+    let candidate = Path::new(path);
+    if candidate
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        // A `..` component can climb out of the pinned generation between the
+        // parent-directory comparison and the open, so it is refused outright
+        // rather than normalized.
+        return Err(TrustBundleLoadError::new(
+            TrustBundleRejectReason::SourceGenerationEscape,
+            format!(
+                "CP/DP trust bundle '{origin}': key '{kid}' references material through a `..` \
+                 path component"
+            ),
+        ));
+    }
+
+    let bytes = match read_pinned_material(generation, candidate, origin, &kid, &subject)? {
+        Some(bytes) => bytes,
+        None => {
+            if expected.is_none() {
+                return Err(TrustBundleLoadError::new(
+                    TrustBundleRejectReason::MaterialIntegrityUnbound,
+                    format!(
+                        "CP/DP trust bundle '{origin}': key '{kid}' resolves material outside a \
+                         pinned projected generation, so nothing proves the bytes read belong to \
+                         the generation the document itself was read from — a rotation can pair \
+                         one generation's namespace ceiling with another's key material. Declare \
+                         this key's `material_sha256`, move the material into the same projected \
+                         mount as the bundle document, or inline public material with \
+                         `public_key_pem`."
+                    ),
+                ));
+            }
+            read_regular_file_bytes_bounded(path, &subject, TRUST_MATERIAL_MAX_BYTES).map_err(
+                |detail| {
+                    TrustBundleLoadError::new(TrustBundleRejectReason::MaterialUnreadable, detail)
+                },
+            )?
+        }
+    };
+
+    if let Some(expected) = expected
+        && Sha256::digest(&bytes) != expected
+    {
+        // Neither digest is rendered: a digest over a symmetric secret is an
+        // offline verification oracle for that secret.
+        return Err(TrustBundleLoadError::new(
+            TrustBundleRejectReason::MaterialIntegrityMismatch,
+            format!(
+                "CP/DP trust bundle '{origin}': key '{kid}' material does not match the \
+                 `material_sha256` the document binds it to"
+            ),
+        ));
+    }
+
+    Ok(Some(bytes))
+}
+
+/// One immutable trust-bundle load candidate.
+///
+/// The document exactly as it was read, plus every referenced source resolved
+/// from one coherent filesystem generation. The whole value exists before a
+/// single [`TrustedKey`] is constructed, so a candidate assembled from two
+/// projected generations can never reach semantic construction — let alone
+/// publication.
+struct CoherentBundleSources {
+    document: TrustBundleDocument,
+    /// Parallel to `document.keys`; `None` for inline and environment-backed
+    /// entries.
+    materials: Vec<Option<Vec<u8>>>,
 }
 
 async fn load_trust_bundle_reload_candidate_detached(
@@ -198,9 +819,13 @@ async fn load_trust_bundle_reload_candidate_detached(
             // times out or shuts down, no replacement reader can start until
             // this detached read actually exits.
             let _permit = permit;
-            let candidate = CpDpTrustBundle::load_from_path(&path, fleet_secret.as_deref())
+            // The same coherent-generation loader startup uses. A reload that
+            // cannot prove one source generation is classified and dropped;
+            // the active verifier is retained in full.
+            let loaded = CpDpTrustBundle::load_coherent_from_path(&path, fleet_secret.as_deref());
+            let candidate = loaded
                 .map(CpDpVerifier::TrustBundle)
-                .map_err(|_| TrustBundleReloadError::ReadOrValidationFailed);
+                .map_err(|e| TrustBundleReloadError::Rejected(e.reason()));
             let _ = sender.send(candidate);
         })
         .map_err(|_| TrustBundleReloadError::ReaderFailed)?;
@@ -536,50 +1161,145 @@ impl CpDpTrustBundle {
     /// operator configured one. It is used only to *refuse* a bound credential
     /// backed by that value; it is never rendered.
     pub fn load_from_path(path: &str, fleet_secret: Option<&str>) -> Result<Self, String> {
-        let raw =
-            read_regular_utf8_file_bounded(path, "CP/DP trust bundle", TRUST_BUNDLE_MAX_BYTES)?;
-        Self::from_document_str(&raw, path, fleet_secret)
+        Self::load_coherent_from_path(path, fleet_secret).map_err(|e| e.to_string())
+    }
+
+    /// [`Self::load_from_path`] with the closed [`TrustBundleRejectReason`]
+    /// classification preserved.
+    ///
+    /// This is the one loader both CP startup and the periodic reload worker
+    /// go through, so a mixed-generation candidate can become neither the
+    /// initial authorization root nor a live replacement.
+    pub fn load_coherent_from_path(
+        path: &str,
+        fleet_secret: Option<&str>,
+    ) -> Result<Self, TrustBundleLoadError> {
+        Self::from_pinned_source(PinnedTrustBundleSource::pin(path)?, fleet_secret)
+    }
+
+    /// Resolve every referenced source through an already-pinned generation and
+    /// build the verifier.
+    ///
+    /// Separate from [`PinnedTrustBundleSource::pin`] so the coherence boundary
+    /// is an explicit value rather than an implicit ordering: by the time this
+    /// runs, the generation each reference will resolve against is already
+    /// fixed, and no `..data` swap can change it.
+    pub fn from_pinned_source(
+        source: PinnedTrustBundleSource,
+        fleet_secret: Option<&str>,
+    ) -> Result<Self, TrustBundleLoadError> {
+        let PinnedTrustBundleSource {
+            generation,
+            document,
+            origin,
+        } = source;
+        let bundle =
+            Self::from_document_with_generation(&document, &origin, fleet_secret, &generation);
+        // The pinned descriptor is released only once every referenced source
+        // has been resolved through it.
+        drop(generation);
+        bundle
     }
 
     /// Parse and validate a trust-bundle document. `origin` is used only in
     /// error text so an operator can tell which file failed. `fleet_secret` is
     /// the effective `FERRUM_CP_DP_GRPC_JWT_SECRET`, used only to refuse a
     /// credential backed by it.
+    ///
+    /// The document carries no pinned generation here, so every `secret_path` /
+    /// `public_key_path` it names must be bound by `material_sha256`.
+    #[allow(dead_code)] // Public library API exercised by the external integration-test crate.
     pub fn from_document_str(
         raw: &str,
         origin: &str,
         fleet_secret: Option<&str>,
     ) -> Result<Self, String> {
-        let document: TrustBundleDocument = serde_json::from_str(raw)
-            .map_err(|e| format!("CP/DP trust bundle '{origin}' is not valid JSON: {e}"))?;
+        Self::from_document_with_generation(
+            raw,
+            origin,
+            fleet_secret,
+            &PinnedSourceGeneration::Unpinned,
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    fn from_document_with_generation(
+        raw: &str,
+        origin: &str,
+        fleet_secret: Option<&str>,
+        generation: &PinnedSourceGeneration,
+    ) -> Result<Self, TrustBundleLoadError> {
+        let invalid = |detail: String| {
+            TrustBundleLoadError::new(TrustBundleRejectReason::DocumentInvalid, detail)
+        };
+
+        let document: TrustBundleDocument = serde_json::from_str(raw).map_err(|e| {
+            invalid(format!(
+                "CP/DP trust bundle '{origin}' is not valid JSON: {e}"
+            ))
+        })?;
         if let Some(version) = document.version
             && version != 1
         {
-            return Err(format!(
+            return Err(invalid(format!(
                 "CP/DP trust bundle '{origin}' declares unsupported version {version}; only \
                  version 1 is understood"
-            ));
+            )));
         }
         if document.keys.is_empty() {
-            return Err(format!(
+            return Err(invalid(format!(
                 "CP/DP trust bundle '{origin}' declares no keys; a control plane with no \
                  verification credential can authorize nothing"
-            ));
+            )));
         }
 
-        let mut keys: HashMap<String, TrustedKey> = HashMap::with_capacity(document.keys.len());
-        for entry in document.keys {
-            let key = entry.into_trusted_key(origin, fleet_secret)?;
+        // Phase one: resolve every referenced source from the pinned
+        // generation. Nothing semantic is constructed until the whole immutable
+        // candidate exists, so an incoherent bundle is refused before a single
+        // `TrustedKey` — or the fingerprint that would publish it — comes into
+        // being.
+        let mut materials = Vec::with_capacity(document.keys.len());
+        let mut material_bytes = 0_u64;
+        for entry in &document.keys {
+            let material = resolve_entry_material(entry, origin, generation)?;
+            if let Some(bytes) = material.as_ref() {
+                material_bytes = material_bytes.saturating_add(bytes.len() as u64);
+                if material_bytes > TRUST_MATERIAL_TOTAL_MAX_BYTES {
+                    return Err(TrustBundleLoadError::new(
+                        TrustBundleRejectReason::MaterialUnreadable,
+                        format!(
+                            "CP/DP trust bundle '{origin}' resolves more than \
+                             {TRUST_MATERIAL_TOTAL_MAX_BYTES} bytes of path-backed key material \
+                             in one candidate"
+                        ),
+                    ));
+                }
+            }
+            materials.push(material);
+        }
+        let candidate = CoherentBundleSources {
+            document,
+            materials,
+        };
+
+        // Phase two: semantic construction, from the immutable candidate only.
+        let mut keys: HashMap<String, TrustedKey> =
+            HashMap::with_capacity(candidate.document.keys.len());
+        let materials = candidate.materials;
+        for (entry, material) in candidate.document.keys.into_iter().zip(materials) {
+            let key = entry
+                .into_trusted_key(origin, fleet_secret, material)
+                .map_err(invalid)?;
             if keys.contains_key(&key.kid) {
                 // Ambiguous key selection is a configuration error, not a
                 // runtime tie-break: two credentials answering to one `kid`
                 // would make which namespaces a token can reach depend on map
                 // ordering.
-                return Err(format!(
+                return Err(invalid(format!(
                     "CP/DP trust bundle '{origin}' declares duplicate kid '{}'; key selection \
                      must be unambiguous",
                     key.kid
-                ));
+                )));
             }
             keys.insert(key.kid.clone(), key);
         }
@@ -955,7 +1675,7 @@ pub fn spawn_trust_bundle_reload(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut accepted_fingerprint = verifier.load().verifier().configuration_fingerprint();
-        let mut last_failed = false;
+        let mut last_failed: Option<&'static str> = None;
         let mut ticker = tokio::time::interval(interval.max(std::time::Duration::from_secs(1)));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         ticker.tick().await;
@@ -990,36 +1710,38 @@ pub fn spawn_trust_bundle_reload(
             } {
                 Ok(candidate) => candidate,
                 Err(error) => {
-                    if !last_failed {
+                    let reason = error.audit_reason();
+                    if last_failed != Some(reason) {
                         tracing::warn!(
                             audit.event = "cp_dp_trust_bundle_reload_rejected",
-                            reason = error.audit_reason(),
+                            reason,
                             "CP/DP trust-bundle reload rejected; retaining the active verifier"
                         );
                     }
-                    last_failed = true;
+                    last_failed = Some(reason);
                     continue;
                 }
             };
             if candidate.validate_for_scope(multi_namespace).is_err() {
-                if !last_failed {
+                const REASON: &str = "scope_validation_failed";
+                if last_failed != Some(REASON) {
                     tracing::warn!(
                         audit.event = "cp_dp_trust_bundle_reload_rejected",
-                        reason = "scope_validation_failed",
+                        reason = REASON,
                         "CP/DP trust-bundle reload rejected; retaining the active verifier"
                     );
                 }
-                last_failed = true;
+                last_failed = Some(REASON);
                 continue;
             }
             let fingerprint = candidate.configuration_fingerprint();
             if accepted_fingerprint == fingerprint {
-                last_failed = false;
+                last_failed = None;
                 continue;
             }
             verifier.replace(candidate);
             accepted_fingerprint = fingerprint;
-            last_failed = false;
+            last_failed = None;
             tracing::info!(
                 audit.event = "cp_dp_trust_bundle_reloaded",
                 "CP/DP trust bundle reloaded; streams whose accepted credential was removed are closing"
@@ -1114,6 +1836,18 @@ struct TrustBundleKeyDocument {
     /// Path to a PEM-encoded public key.
     #[serde(default)]
     public_key_path: Option<String>,
+    /// Lowercase hex SHA-256 of the exact bytes of this key's `secret_path` /
+    /// `public_key_path` file, as `sha256sum` prints them.
+    ///
+    /// This is the manifest→material binding. Without it, a `secret_path` or
+    /// `public_key_path` outside a pinned projected generation is just a name
+    /// resolved at some later instant, and a rotation can hand back a different
+    /// generation's bytes than the document was read from. Required whenever no
+    /// generation could be pinned; verified in addition to the pin when both
+    /// are present. Rejected on inline and environment-backed sources, which
+    /// are read atomically and have nothing to bind.
+    #[serde(default)]
+    material_sha256: Option<String>,
 }
 
 /// Renders only operator-authored identifiers. The `secret` field carries raw
@@ -1131,6 +1865,9 @@ impl std::fmt::Debug for TrustBundleKeyDocument {
             .field("secret_path", &self.secret_path)
             .field("public_key_pem", &self.public_key_pem)
             .field("public_key_path", &self.public_key_path)
+            // A digest over a symmetric secret is an offline verification
+            // oracle for that secret, so it is never rendered either.
+            .field("material_sha256", &"<omitted>")
             .finish()
     }
 }
@@ -1150,10 +1887,16 @@ fn fleet_secret_reuse_error(origin: &str, kid: &str) -> String {
 }
 
 impl TrustBundleKeyDocument {
+    /// Build the credential. `material` is this entry's path-backed bytes, already
+    /// resolved from one coherent source generation by
+    /// [`resolve_entry_material`] — this function performs no filesystem access
+    /// of its own, which is what keeps semantic construction strictly after the
+    /// coherence proof.
     fn into_trusted_key(
         self,
         origin: &str,
         fleet_secret: Option<&str>,
+        material: Option<Vec<u8>>,
     ) -> Result<TrustedKey, String> {
         let kid = self.kid.trim().to_string();
         if kid.is_empty() {
@@ -1261,11 +2004,15 @@ impl TrustBundleKeyDocument {
                          variable '{var}', which is unset or not valid UTF-8"
                     )
                 })?
-            } else if let Some(path) = self.secret_path.as_deref() {
-                read_regular_utf8_file_bounded(
-                    path,
+            } else if self.secret_path.is_some() {
+                let raw = material.ok_or_else(|| {
+                    format!(
+                        "CP/DP trust bundle '{origin}': key '{kid}' has no readable secret source"
+                    )
+                })?;
+                decode_trust_utf8(
+                    raw,
                     &format!("CP/DP trust bundle '{origin}' key '{kid}' secret file"),
-                    TRUST_MATERIAL_MAX_BYTES,
                 )?
                 .trim()
                 .to_string()
@@ -1296,11 +2043,16 @@ impl TrustBundleKeyDocument {
         } else {
             let pem = if let Some(inline) = self.public_key_pem {
                 inline
-            } else if let Some(path) = self.public_key_path.as_deref() {
-                read_regular_utf8_file_bounded(
-                    path,
+            } else if self.public_key_path.is_some() {
+                let raw = material.ok_or_else(|| {
+                    format!(
+                        "CP/DP trust bundle '{origin}': key '{kid}' has no readable public key \
+                         source"
+                    )
+                })?;
+                decode_trust_utf8(
+                    raw,
                     &format!("CP/DP trust bundle '{origin}' key '{kid}' public key file"),
-                    TRUST_MATERIAL_MAX_BYTES,
                 )?
             } else {
                 return Err(format!(

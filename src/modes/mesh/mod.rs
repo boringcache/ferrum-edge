@@ -11943,23 +11943,31 @@ pub async fn run(
         foreign_authority_adopt_secs: env_config.mesh_config_revision_adopt_secs,
     });
     let federation_activation = FederationActivation::from_env_config(&env_config);
+    // Localized mesh file / stock-xDS policy reload rejection signal (issue
+    // #3776). Shared recovery handshake clears sticky health only after the
+    // exact current recovery is accepted by the proxy apply lifecycle.
+    // AdminState still receives the authenticated-only `Arc<AtomicBool>`.
+    let config_rejected = Arc::new(AtomicBool::new(false));
+    let local_source_recovery =
+        config_consumer::file_source::MeshLocalSourceRecovery::new(config_rejected.clone());
 
     let mut background_handles = Vec::new();
     if runtime.config_protocol == MeshConfigProtocol::File {
         // Localized file source: no control plane, so no CP/DP JWT secret and
-        // no DP gRPC TLS machinery. The initial load is synchronous and
-        // fail-closed — an unreadable or invalid mesh document refuses
+        // no DP gRPC TLS machinery. The initial load is fail-closed on a
+        // blocking worker — an unreadable or invalid mesh document refuses
         // startup, matching file-mode validation semantics. Subsequent SIGHUP
-        // reloads keep the last good slice on error.
+        // reloads keep the last good slice on error and raise config_rejected.
         let file_path = runtime.file_config_path.clone().ok_or_else(|| {
             anyhow::anyhow!(
                 "FERRUM_MESH_FILE_CONFIG_PATH is required when FERRUM_MESH_CONFIG_PROTOCOL=file"
             )
         })?;
-        let initial_slice = config_consumer::file_source::load_mesh_slice_from_file(
-            std::path::Path::new(&file_path),
+        let initial_slice = config_consumer::file_source::load_mesh_slice_from_file_off_thread(
+            std::path::PathBuf::from(&file_path),
             runtime.mesh_slice_request(),
         )
+        .await
         .with_context(|| format!("failed to load localized mesh config from '{file_path}'"))?;
         // Fail-closed beyond mesh-field validity: run the full slice→config
         // preparation (plugin injection, materialization, DestinationRule
@@ -11986,6 +11994,7 @@ pub async fn run(
                 file_path.clone(),
                 runtime.mesh_slice_request(),
                 mesh_state.clone(),
+                local_source_recovery.clone(),
                 shutdown_tx.subscribe(),
             ),
         );
@@ -12009,14 +12018,17 @@ pub async fn run(
                  FERRUM_MESH_CONFIG_PROTOCOL=stock_xds"
             )
         })?;
-        let baseline = config_consumer::stock_xds_client::load_stock_policy_baseline(
-            std::path::Path::new(&policy_path),
+        let baseline = config_consumer::stock_xds_client::load_stock_policy_baseline_off_thread(
+            std::path::PathBuf::from(&policy_path),
         )
+        .await
         .with_context(|| {
             format!("failed to load the stock xDS mesh policy document from '{policy_path}'")
         })?;
         let baseline = Arc::new(baseline);
-        let (policy_tx, policy_rx) = tokio::sync::watch::channel(baseline.clone());
+        let (policy_tx, policy_rx) = tokio::sync::watch::channel(
+            config_consumer::stock_xds_client::StockPolicySnapshot::initial(baseline.clone()),
+        );
 
         // The stock server is a third party: reuse only the transport TLS
         // material, never the Ferrum CP/DP JWT machinery.
@@ -12042,6 +12054,7 @@ pub async fn run(
             config_consumer::stock_xds_client::start_stock_policy_watcher_with_shutdown(
                 policy_path.clone(),
                 policy_tx,
+                local_source_recovery.clone(),
                 shutdown_tx.subscribe(),
             ),
         ));
@@ -12054,6 +12067,7 @@ pub async fn run(
                 grpc_tls,
                 grpc_tls_reload,
                 policy_rx,
+                local_source_recovery.clone(),
             ),
         ));
         info!(
@@ -12172,6 +12186,11 @@ pub async fn run(
         mesh_slice_version = %initial_applied_mesh_slice.version,
         "Mesh global plugin chain prepared from initial mesh slice"
     );
+    let local_source_recovery = matches!(
+        runtime.config_protocol,
+        MeshConfigProtocol::File | MeshConfigProtocol::StockXds
+    )
+    .then_some(local_source_recovery);
 
     serve_mesh_runtime(
         env_config,
@@ -12183,6 +12202,7 @@ pub async fn run(
         MeshRuntimeBackgroundOwnership {
             handles: background_handles,
             finalize_global_plugins_on_shutdown: true,
+            local_source_recovery,
         },
     )
     .await
@@ -12205,6 +12225,10 @@ struct MeshRuntimeBackgroundOwnership {
     // must not stop process-global delivery generations. Production always
     // passes true.
     finalize_global_plugins_on_shutdown: bool,
+    // Shared only by the localized file / stock-policy recovery path. Keeping
+    // it with the already-running source tasks preserves one handshake through
+    // startup ownership transfer; test probes that do not run a source omit it.
+    local_source_recovery: Option<Arc<config_consumer::file_source::MeshLocalSourceRecovery>>,
 }
 
 async fn serve_mesh_runtime(
@@ -12219,6 +12243,7 @@ async fn serve_mesh_runtime(
     let MeshRuntimeBackgroundOwnership {
         handles: mesh_background_handles,
         finalize_global_plugins_on_shutdown,
+        local_source_recovery,
     } = background_ownership;
     // Prep before MeshStartupOwner exists. Incoming `mesh_background_handles`
     // already hold config-consumer / gRPC TLS watcher tasks from `run()`, so
@@ -12269,6 +12294,7 @@ async fn serve_mesh_runtime(
         tls_policy,
         crls,
         bpf_metrics_state,
+        local_source_recovery,
     )
     .await
     {
@@ -12625,6 +12651,7 @@ async fn arm_mesh_runtime_startup(
     tls_policy: TlsPolicy,
     crls: tls::CrlList,
     bpf_metrics_state: Option<Arc<crate::ebpf::bpf_metrics::BpfMetricsState>>,
+    local_source_recovery: Option<Arc<config_consumer::file_source::MeshLocalSourceRecovery>>,
 ) -> Result<(), anyhow::Error> {
     let shutdown_tx = owner.shutdown_tx.clone();
     let proxy_state = owner.proxy_state.clone();
@@ -13091,6 +13118,10 @@ async fn arm_mesh_runtime_startup(
     let startup_ready = Arc::new(AtomicBool::new(false));
     let serving_degraded = Arc::new(AtomicBool::new(false));
     let serving_listener_failures = Arc::new(crate::startup::ServingListenerFailures::default());
+    let config_rejected = local_source_recovery
+        .as_ref()
+        .map(|recovery| recovery.config_rejected_flag())
+        .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
     let MeshAdminListeners {
         handles: admin_handles,
         startup_signals: admin_startup_signals,
@@ -13099,6 +13130,7 @@ async fn arm_mesh_runtime_startup(
         &shutdown_tx,
         proxy_state.clone(),
         mesh_state.clone(),
+        config_rejected.clone(),
         MeshServingSignals {
             startup_ready: startup_ready.clone(),
             serving_degraded: serving_degraded.clone(),
@@ -13655,6 +13687,7 @@ async fn arm_mesh_runtime_startup(
         },
         shutdown_tx.subscribe(),
         dns_proxy_handle,
+        local_source_recovery,
     ));
 
     info!(
@@ -13827,11 +13860,13 @@ struct MeshServingSignals {
     listener_failures: Arc<crate::startup::ServingListenerFailures>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn start_mesh_admin_listeners(
     env_config: &EnvConfig,
     shutdown_tx: &tokio::sync::watch::Sender<bool>,
     proxy_state: ProxyState,
     mesh_state: MeshRuntimeState,
+    config_rejected: Arc<AtomicBool>,
     serving_signals: MeshServingSignals,
     tls_policy: &TlsPolicy,
     crls: &tls::CrlList,
@@ -13874,7 +13909,7 @@ fn start_mesh_admin_listeners(
         serving_degraded: Some(serving_degraded.clone()),
         serving_listener_failures: Some(serving_listener_failures.clone()),
         db_available: None,
-        config_rejected: None,
+        config_rejected: Some(config_rejected.clone()),
         admin_restore_max_body_size_mib: env_config.admin_restore_max_body_size_mib,
         admin_spec_max_body_size_mib: env_config.admin_spec_max_body_size_mib,
         reserved_ports: env_config.reserved_gateway_ports(),
@@ -17122,6 +17157,7 @@ async fn apply_mesh_slice_generation(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn start_mesh_slice_apply_task(
     mesh_state: MeshRuntimeState,
     proxy_state: ProxyState,
@@ -17130,6 +17166,7 @@ fn start_mesh_slice_apply_task(
     mut inbound_tls_reload: MeshInboundTlsReloadState,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     dns_proxy: Option<Arc<MeshDnsProxy>>,
+    local_source_recovery: Option<Arc<config_consumer::file_source::MeshLocalSourceRecovery>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         // Topology is process-fixed, so whether this data plane has an inbound
@@ -17171,6 +17208,9 @@ fn start_mesh_slice_apply_task(
                         true,
                         revision_apply_token,
                     );
+                    if let Some(recovery) = local_source_recovery.as_ref() {
+                        recovery.note_proxy_apply_success(slice);
+                    }
                     debug!(
                         mesh_slice_version = %slice.version,
                         "Skipping no-op mesh slice update"
@@ -17209,8 +17249,15 @@ fn start_mesh_slice_apply_task(
                     // revision beneath it and block recovery. Roll back to the
                     // last APPLIED revision, keyed to this exact received
                     // candidate so a newer one received mid-apply is untouched.
-                    if !received_accepted {
+                    if received_accepted {
+                        if let Some(recovery) = local_source_recovery.as_ref() {
+                            recovery.note_proxy_apply_success(slice);
+                        }
+                    } else {
                         mesh_state.record_rejected_slice(&snapshot);
+                        if let Some(recovery) = local_source_recovery.as_ref() {
+                            recovery.note_proxy_apply_rejection(slice);
+                        }
                     }
                     // Finding 3 (accepted-remote/federation update vs rejected
                     // received slice): the discovery + federation pollers are
@@ -17239,7 +17286,7 @@ fn start_mesh_slice_apply_task(
                             last_accepted_slice_version = %base.version,
                             "Received mesh slice rejected; re-applying federation/remote overlay against last-accepted slice"
                         );
-                        apply_mesh_slice_generation(
+                        let overlay_accepted = apply_mesh_slice_generation(
                             &mesh_state,
                             &proxy_state,
                             &runtime,
@@ -17253,6 +17300,12 @@ fn start_mesh_slice_apply_task(
                             &dns_proxy,
                         )
                         .await;
+                        // Overlay re-apply of last-accepted must NOT clear a
+                        // sticky local-source failure unless that base is the
+                        // exact pending recovery identity.
+                        if overlay_accepted && let Some(recovery) = local_source_recovery.as_ref() {
+                            recovery.note_proxy_apply_success(base.as_ref());
+                        }
                     }
                 }
                 // Federation / remote-endpoint revisions are consumed after
@@ -17853,6 +17906,7 @@ pub mod startup_rollback_test_seams {
             MeshRuntimeBackgroundOwnership {
                 handles: vec![sentinel],
                 finalize_global_plugins_on_shutdown: false,
+                local_source_recovery: None,
             },
         )
         .await;
@@ -19278,6 +19332,7 @@ mod tests {
                 MeshRuntimeBackgroundOwnership {
                     handles: Vec::new(),
                     finalize_global_plugins_on_shutdown: true,
+                    local_source_recovery: None,
                 },
             )
             .await
@@ -24891,6 +24946,8 @@ mod tests {
                 topology: Default::default(),
             }),
             default_weight: 1,
+            max_stale_seconds: None,
+            stale_policy: None,
         });
         upstream.backend_tls_client_cert_path = Some("/existing/client.pem".to_string());
         upstream.backend_tls_client_key_path = Some("/existing/client.key".to_string());
@@ -24944,6 +25001,8 @@ mod tests {
                 topology: Default::default(),
             }),
             default_weight: 1,
+            max_stale_seconds: None,
+            stale_policy: None,
         });
 
         let runtime = MeshRuntimeConfig {
@@ -24991,6 +25050,8 @@ mod tests {
             consul: None,
             mesh: None,
             default_weight: 1,
+            max_stale_seconds: None,
+            stale_policy: None,
         });
 
         let runtime = MeshRuntimeConfig {
@@ -30042,6 +30103,7 @@ mod tests {
             },
             shutdown_rx,
             None,
+            None,
         );
 
         mesh_state.install_slice(MeshSlice {
@@ -30091,6 +30153,7 @@ mod tests {
                 production: false,
             },
             shutdown_rx,
+            None,
             None,
         );
 
@@ -30260,6 +30323,7 @@ mod tests {
             },
             shutdown_rx,
             None,
+            None,
         );
 
         mesh_state.install_slice(MeshSlice {
@@ -30339,6 +30403,7 @@ mod tests {
                 production: false,
             },
             shutdown_rx,
+            None,
             None,
         );
 
@@ -30452,6 +30517,7 @@ mod tests {
                 production: false,
             },
             shutdown_rx,
+            None,
             None,
         );
 
@@ -31631,6 +31697,7 @@ mod tests {
                 production: false,
             },
             shutdown_rx,
+            None,
             None,
         );
 
@@ -35934,6 +36001,8 @@ mod tests {
                 topology: Default::default(),
             }),
             default_weight: 1,
+            max_stale_seconds: None,
+            stale_policy: None,
         });
         let mut config = GatewayConfig {
             upstreams: vec![upstream],
@@ -36009,6 +36078,8 @@ mod tests {
                 topology: Default::default(),
             }),
             default_weight: 1,
+            max_stale_seconds: None,
+            stale_policy: None,
         });
         let mut config = GatewayConfig {
             upstreams: vec![upstream],
