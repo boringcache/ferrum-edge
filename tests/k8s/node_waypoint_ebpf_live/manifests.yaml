@@ -499,6 +499,11 @@ spec:
 # so the namespace-scoped `deny-src-b` AuthorizationPolicy that governs the HTTP
 # and UDP checks governs these DTLS sessions too. `openssl s_client -dtls1_2` is
 # the client: a real DTLS handshake, not a datagram shaped like one.
+#
+# openssl is baked into `__DTLS_CLIENT_IMAGE__` on the runner (see
+# `dtls-client.Dockerfile`) and loaded into kind. These pods are mesh-enrolled,
+# so a runtime `apk add` would have its TCP connect() rewritten to the capture
+# listener and could never reach Alpine mirrors.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -520,17 +525,9 @@ spec:
         ferrum.io/live-node: a
       containers:
         - name: dtls
-          image: python:3.12-alpine
-          # Fail closed: if the openssl CLI cannot be installed there is no DTLS
-          # client, and the pod must crash rather than let the required
-          # assertions be evaluated against a missing tool.
-          command:
-            - sh
-            - -c
-            - >-
-              for i in 1 2 3 4 5; do apk add --no-cache openssl && break; sleep 5; done;
-              command -v openssl >/dev/null || exit 1;
-              sleep 365d
+          image: __DTLS_CLIENT_IMAGE__
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c", "sleep 365d"]
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -553,11 +550,6 @@ spec:
         ferrum.io/live-node: a
       containers:
         - name: dtls
-          image: python:3.12-alpine
-          command:
-            - sh
-            - -c
-            - >-
-              for i in 1 2 3 4 5; do apk add --no-cache openssl && break; sleep 5; done;
-              command -v openssl >/dev/null || exit 1;
-              sleep 365d
+          image: __DTLS_CLIENT_IMAGE__
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c", "sleep 365d"]

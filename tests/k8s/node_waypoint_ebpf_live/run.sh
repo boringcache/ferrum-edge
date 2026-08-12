@@ -40,6 +40,10 @@ DTLS_LISTENER_PORT="${FERRUM_LIVE_DTLS_LISTENER_PORT:-15354}"
 # never binds.
 DTLS_SECRET_NAME="${FERRUM_LIVE_DTLS_SECRET:-ferrum-live-node-waypoint-dtls}"
 DTLS_MOUNT_PATH=/etc/ferrum/dtls
+# openssl CLI image for the enrolled DTLS probe pods. Built on the runner and
+# loaded into kind: those pods are mesh-captured, so they cannot `apk add`.
+DTLS_CLIENT_IMAGE="${FERRUM_LIVE_DTLS_CLIENT_IMAGE:-ferrum-live-dtls-client:local}"
+DTLS_CLIENT_DOCKERFILE="$ROOT_DIR/tests/k8s/node_waypoint_ebpf_live/dtls-client.Dockerfile"
 RELEASE="${FERRUM_LIVE_RELEASE:-ferrum-live}"
 IMAGE_REPOSITORY="${FERRUM_LIVE_IMAGE_REPOSITORY:-ferrumedge/ferrum-edge}"
 IMAGE_TAG="${FERRUM_LIVE_IMAGE_TAG:-0.9.0}"
@@ -1680,15 +1684,31 @@ collect_bpf_evidence() {
     "bpftool-$NODE_A.txt,bpftool-$NODE_B.txt"
 }
 
+prepare_dtls_client_image() {
+  log "building the NodeWaypoint DTLS client image with openssl preinstalled"
+  require_cmd docker
+  require_cmd kind
+  if [[ ! -f "$DTLS_CLIENT_DOCKERFILE" ]]; then
+    echo "missing DTLS client Dockerfile: $DTLS_CLIENT_DOCKERFILE" >&2
+    exit 1
+  fi
+  local cluster="${FERRUM_LIVE_KIND_CLUSTER:-${KIND_CLUSTER:-ferrum-ebpf-live}}"
+  docker build -t "$DTLS_CLIENT_IMAGE" -f "$DTLS_CLIENT_DOCKERFILE" \
+    "$(dirname "$DTLS_CLIENT_DOCKERFILE")"
+  kind load docker-image "$DTLS_CLIENT_IMAGE" --name "$cluster"
+}
+
 apply_workloads() {
   log "applying live traffic workloads"
   awk -v ns="$WORKLOAD_NS" -v td="$TRUST_DOMAIN" -v require_dual="$REQUIRE_DUAL_STACK" \
-    -v udp_port="$UDP_LISTENER_PORT" -v dtls_port="$DTLS_LISTENER_PORT" '
+    -v udp_port="$UDP_LISTENER_PORT" -v dtls_port="$DTLS_LISTENER_PORT" \
+    -v dtls_image="$DTLS_CLIENT_IMAGE" '
     {
       gsub(/__NAMESPACE__/, ns)
       gsub(/__TRUST_DOMAIN__/, td)
       gsub(/__UDP_LISTENER_PORT__/, udp_port)
       gsub(/__DTLS_LISTENER_PORT__/, dtls_port)
+      gsub(/__DTLS_CLIENT_IMAGE__/, dtls_image)
       if ($0 ~ /__SERVICE_IP_FAMILY_BLOCK__/) {
         if (require_dual == "true") {
           print "  ipFamilyPolicy: RequireDualStack"
@@ -1711,10 +1731,15 @@ apply_workloads() {
   kubectl -n "$WORKLOAD_NS" rollout status deploy/udp-src-a --timeout=3m
   kubectl -n "$WORKLOAD_NS" rollout status deploy/udp-src-b --timeout=3m
   kubectl -n "$WORKLOAD_NS" rollout status deploy/dtls-echo --timeout=3m
-  # The DTLS senders install the openssl CLI on start, so they need a longer
-  # window than the dependency-free pods.
-  kubectl -n "$WORKLOAD_NS" rollout status deploy/dtls-src-a --timeout=5m
-  kubectl -n "$WORKLOAD_NS" rollout status deploy/dtls-src-b --timeout=5m
+  kubectl -n "$WORKLOAD_NS" rollout status deploy/dtls-src-a --timeout=3m
+  kubectl -n "$WORKLOAD_NS" rollout status deploy/dtls-src-b --timeout=3m
+  local dtls_app
+  for dtls_app in dtls-src-a dtls-src-b; do
+    if ! kubectl -n "$WORKLOAD_NS" exec "deploy/$dtls_app" -c dtls -- openssl version >/dev/null; then
+      echo "$dtls_app is missing the openssl CLI; the DTLS live client image did not load" >&2
+      exit 1
+    fi
+  done
 
   log "applying unmanaged direct-inbound probe workloads"
   kubectl create namespace "$UNMANAGED_NS" --dry-run=client -o yaml | kubectl apply -f -
@@ -4559,10 +4584,11 @@ run_node_waypoint_dtls_datapath_checks() {
     sleep 4
   done
   if [[ "$report" != *ferrum-node-waypoint-dtls* ]]; then
+    local snippet
+    snippet="$(printf '%s' "$report" | sed '/-----BEGIN/,/-----END/d' | tr '\n' ' ' | cut -c1-240)"
     record_live_assertion node_waypoint.dtls.listener_bound fail \
       dtls-src-a dtls-echo \
-      "no DTLS handshake completed on ${listener_ip}:${DTLS_LISTENER_PORT}; the materialized dtls \
-listener did not bind or presented no server certificate" \
+      "no DTLS handshake completed on ${listener_ip}:${DTLS_LISTENER_PORT}; last probe=${snippet}" \
       "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-listener"
     collect_traffic_failure_diagnostics
     return 1
@@ -4642,6 +4668,7 @@ verify_ambient_spire_identity
 assert_node_agent_ready_metric
 run_ingress_topology_negative_and_drift_checks
 collect_bpf_evidence
+prepare_dtls_client_image
 apply_workloads
 wait_for_node_waypoint_ready_markers
 wait_for_ambient_mesh_slice

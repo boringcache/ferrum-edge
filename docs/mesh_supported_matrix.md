@@ -293,7 +293,11 @@ need them, or because they are blocked upstream / architecturally:
   materializes a `frontend_tls: true` listener that TERMINATES DTLS on the
   host-netns socket and forwards plaintext datagrams to the backing pod.
   `run_node_waypoint_dtls_datapath_checks` drives a real
-  `openssl s_client -dtls1_2` handshake through it and records
+  `openssl s_client -dtls1_2` handshake through it from a prebuilt
+  `ferrum-live-dtls-client` image (openssl cannot be `apk add`'d from a
+  mesh-enrolled pod: `connect4` rewrites that TCP `connect()` to the capture
+  listener; UDP `connect()` is left unrewritten so the DTLS client keeps the
+  host-netns destination) and records
   `node_waypoint.dtls.listener_bound` (the handshake completes and the listener
   presents the operator DTLS material — proof it bound, not that it was
   configured), `node_waypoint.dtls.listener_allow_attributed_source` (the

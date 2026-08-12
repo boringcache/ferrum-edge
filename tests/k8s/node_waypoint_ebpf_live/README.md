@@ -143,7 +143,13 @@ true`: the NodeWaypoint TERMINATES DTLS on the host-netns socket and forwards
 PLAINTEXT datagrams to the backing pod, which stays an ordinary UDP echo. The
 client is `openssl s_client -dtls1_2` from `dtls-src-a` / `dtls-src-b`, which
 reuse the `src-a` / `src-b` ServiceAccounts so the same principal-keyed
-`AuthorizationPolicy` objects govern these sessions.
+`AuthorizationPolicy` objects govern these sessions. Those pods are
+mesh-enrolled, so the harness cannot `apk add openssl` at runtime: `connect4`
+rewrites their TCP `connect()` to the capture listener. openssl is therefore
+baked into `ferrum-live-dtls-client:local` (`dtls-client.Dockerfile`) on the
+runner and loaded into kind before the workloads start. `connect4`/`connect6`
+also leave UDP `connect()` unrewritten so the DTLS client's connected socket
+keeps the original host-netns destination.
 
 The listener terminates with material the harness mints per run and publishes as
 a TLS Secret mounted through `ambient.extraVolumes` /

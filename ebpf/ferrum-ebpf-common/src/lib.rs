@@ -598,6 +598,24 @@ pub struct CidrKey6 {
 /// Outbound capture port. Connect hooks rewrite destinations here.
 pub const OUTBOUND_CAPTURE_PORT: u16 = 15001;
 
+/// Linux `SOCK_STREAM`. `cgroup/connect4` and `cgroup/connect6` fire for every
+/// inet `connect()`, including UDP; the outbound capture listener on
+/// [`OUTBOUND_CAPTURE_PORT`] is TCP-only, so those programs rewrite only this
+/// socket type. UDP/DTLS `connect()` must stay unrewritten so NodeWaypoint
+/// host-netns listeners and Ambient TPROXY can observe the original destination.
+pub const SOCK_STREAM: u32 = 1;
+
+/// Linux `SOCK_DGRAM`. Pinned so tests can prove the TCP-only capture gate
+/// rejects the socket type a DTLS/`connect()`ed-UDP client uses.
+pub const SOCK_DGRAM: u32 = 2;
+
+/// True when a `bpf_sock_addr.type` value is the TCP stream the connect hooks
+/// are allowed to rewrite to loopback capture.
+#[inline(always)]
+pub const fn is_tcp_stream_connect(sock_type: u32) -> bool {
+    sock_type == SOCK_STREAM
+}
+
 /// Inbound HBONE port carried in the capture config for sidecarless topologies.
 pub const INBOUND_HBONE_PORT: u16 = 15008;
 
@@ -1257,6 +1275,17 @@ mod tests {
         // The previous bug (`remote_port as u16` first) read the zero low half
         // and returned 0 for both of these.
         assert_ne!(sock_ops_peer_port_host_order(0x901F_0000), 0);
+    }
+
+    #[test]
+    fn connect_capture_rewrites_tcp_stream_only() {
+        // cgroup/connect{4,6} also fire for UDP connect(). Rewriting SOCK_DGRAM
+        // to the TCP capture listener would black-hole DTLS from enrolled pods.
+        assert_eq!(SOCK_STREAM, 1);
+        assert_eq!(SOCK_DGRAM, 2);
+        assert!(is_tcp_stream_connect(SOCK_STREAM));
+        assert!(!is_tcp_stream_connect(SOCK_DGRAM));
+        assert!(!is_tcp_stream_connect(0));
     }
 
     #[test]
