@@ -1127,6 +1127,127 @@
     "emission": "conditional"
   },
   {
+    "name": "ferrum_cp_dp_trust_active_generation_age_seconds",
+    "type": "gauge",
+    "help": "Seconds since the CP last accepted (replaced or confirmed) its trust generation, on a monotonic clock.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "cp_dp_trust",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_cp_dp_trust_degraded",
+    "type": "gauge",
+    "help": "Whether the CP is authorizing with a trust generation it could not revalidate (1) or not (0).",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "cp_dp_trust",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_cp_dp_trust_max_stale_seconds",
+    "type": "gauge",
+    "help": "Configured maximum unrevalidated trust-generation age before admission fails closed (0 = unbounded, explicit opt-in).",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "cp_dp_trust",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_cp_dp_trust_reload_acceptances_total",
+    "type": "counter",
+    "help": "Reload attempts that produced a usable trust generation (replaced or confirmed unchanged).",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "cp_dp_trust",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_cp_dp_trust_reload_attempts_total",
+    "type": "counter",
+    "help": "CP/DP trust-bundle reload attempts that produced a verdict since process start.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "cp_dp_trust",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_cp_dp_trust_reload_consecutive_failures",
+    "type": "gauge",
+    "help": "Consecutive refused reload attempts since the last accepted generation.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "cp_dp_trust",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_cp_dp_trust_reload_recoveries_total",
+    "type": "counter",
+    "help": "Failure episodes ended by a later valid candidate.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "cp_dp_trust",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_cp_dp_trust_reload_rejections_total",
+    "type": "counter",
+    "help": "Reload attempts refused, by closed reason. The previous verifier was retained.",
+    "labels": [
+      "reason",
+      "namespace"
+    ],
+    "subsystem": "cp_dp_trust",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_cp_dp_trust_reload_worker_running",
+    "type": "gauge",
+    "help": "Whether the trust-bundle reload worker is alive (1) or stopped/failed (0).",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "cp_dp_trust",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_cp_dp_trust_stale",
+    "type": "gauge",
+    "help": "Whether the active trust generation has aged past its bound, refusing new configuration streams (1) or not (0).",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "cp_dp_trust",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
     "name": "ferrum_cp_grpc_active_connections",
     "type": "gauge",
     "help": "CP gRPC listener connections currently admitted (pre-handshake through served HTTP/2 session).",

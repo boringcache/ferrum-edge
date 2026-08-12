@@ -33,13 +33,14 @@ use tonic::transport::Server;
 use ferrum_edge::config::types::GatewayConfig;
 use ferrum_edge::grpc::auth::{
     AuthorizedResponseStream, MESH_LOCAL_SUBSCRIBE_AUDIENCE, StreamAuthSurface,
-    remote_discovery_audience,
+    StreamAuthorizationLease, remote_discovery_audience,
 };
 use ferrum_edge::grpc::cp_server::{CpGrpcServer, CpScope, DpNodeRegistry};
 use ferrum_edge::grpc::cp_trust::{
     CpDpTrustBundle, CpDpVerifier, CpDpVerifierStore, CpGrpcConnectInfo, PeerNamespaceScope,
     PinnedTrustBundleSource, TrustBundleRejectReason,
 };
+use ferrum_edge::grpc::cp_trust_health::{CpDpTrustReloadStatus, TrustReloadFailure};
 use ferrum_edge::grpc::mesh_registry::MeshNodeRegistry;
 use ferrum_edge::grpc::mesh_server::MeshGrpcServer;
 use ferrum_edge::identity::TrustDomain;
@@ -2859,6 +2860,7 @@ mod projected_generation {
             store.clone(),
             true,
             Duration::from_secs(1),
+            Arc::new(CpDpTrustReloadStatus::disabled()),
             shutdown_rx,
         );
 
@@ -3022,4 +3024,269 @@ fn non_unix_hosts_fail_closed_instead_of_re_resolving_live_symlinks() {
     );
     CpDpTrustBundle::load_coherent_from_path(&bound, None)
         .expect("digest-bound material must load on any platform");
+}
+
+// ── Stale-trust boundary across every configuration surface (issue #3813) ──
+
+/// A verifier store whose trust source has already aged past its bound.
+///
+/// The bound is the boundary and nothing else: no failure needs to be recorded
+/// for the age to grow, because only an *accepted* reload resets it.
+fn stale_trust_store() -> Arc<CpDpVerifierStore> {
+    let status = CpDpTrustReloadStatus::watching_at(
+        // A millisecond bound keeps this test on real time without a sleep
+        // long enough to slow the suite; the boundary semantics are identical
+        // and are pinned exactly in `cp_trust_reload_health_tests.rs`.
+        Duration::from_millis(1),
+        false,
+        Duration::from_secs(30),
+        "0000000000000000".to_string(),
+        tokio::time::Instant::now(),
+    );
+    let status = Arc::new(status);
+    status.record_rejected(TrustReloadFailure::DocumentUnreadable);
+    Arc::new(CpDpVerifierStore::from_arc(two_tenant_bundle()).with_trust_status(status))
+}
+
+async fn admission_outcome<T>(
+    result: Result<tonic::Response<tonic::Streaming<T>>, tonic::Status>,
+) -> tonic::Code {
+    match result {
+        Ok(response) => wait_for_terminal_status(&mut response.into_inner()).await,
+        Err(status) => status.code(),
+    }
+}
+
+/// Past the bound, a credential the operator tried to remove must not be able
+/// to open a *new* stream on any configuration surface — the retained verifier
+/// is no longer an admission authority.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_trust_refuses_new_streams_on_every_configuration_surface() {
+    let verifier = stale_trust_store();
+    let (addr, handle) = start_all_stream_surfaces(verifier, Duration::from_secs(300)).await;
+    // Cross the bound. Only an accepted reload could have moved it.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let config_token = mint(
+        TENANT_A_SECRET,
+        Some(TENANT_A),
+        "stale-config-node",
+        Some(json!(TENANT_A)),
+        None,
+    );
+    let mut config_client = configsync_client!(addr, config_token);
+    assert_eq!(
+        admission_outcome(
+            config_client
+                .subscribe(tonic::Request::new(subscribe_request(
+                    "stale-config-node",
+                    TENANT_A,
+                )))
+                .await
+        )
+        .await,
+        tonic::Code::Unavailable
+    );
+
+    for (node_id, remote, audience) in [
+        (
+            "stale-mesh-local",
+            false,
+            MESH_LOCAL_SUBSCRIBE_AUDIENCE.to_string(),
+        ),
+        (
+            "stale-mesh-remote",
+            true,
+            remote_discovery_audience("test-cluster"),
+        ),
+    ] {
+        let mesh_token = mint(
+            TENANT_A_SECRET,
+            Some(TENANT_A),
+            node_id,
+            Some(json!(TENANT_A)),
+            Some(&audience),
+        );
+        let mut mesh_client = mesh_client!(addr, mesh_token);
+        assert_eq!(
+            admission_outcome(
+                mesh_client
+                    .mesh_subscribe(tonic::Request::new(mesh_subscribe_request(
+                        node_id, TENANT_A, remote,
+                    )))
+                    .await
+            )
+            .await,
+            tonic::Code::Unavailable,
+            "MeshSubscribe (remote_discovery={remote}) must refuse under stale trust"
+        );
+    }
+
+    let sotw_token = mint(
+        TENANT_A_SECRET,
+        Some(TENANT_A),
+        "stale-xds-sotw",
+        Some(json!(TENANT_A)),
+        None,
+    );
+    let mut sotw_client = AggregatedDiscoveryServiceClient::new(xds_channel(addr).await);
+    let (sotw_tx, sotw_rx) = mpsc::channel(2);
+    sotw_tx
+        .send(DiscoveryRequest {
+            node: Some(Node {
+                id: "stale-xds-sotw".to_string(),
+                ..Node::default()
+            }),
+            resource_names: vec!["*".to_string()],
+            type_url: LDS_TYPE_URL.to_string(),
+            ..DiscoveryRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        admission_outcome(
+            sotw_client
+                .stream_aggregated_resources(authorize(
+                    tonic::Request::new(ReceiverStream::new(sotw_rx)),
+                    &sotw_token,
+                ))
+                .await
+        )
+        .await,
+        tonic::Code::Unavailable
+    );
+    drop(sotw_tx);
+
+    let delta_token = mint(
+        TENANT_A_SECRET,
+        Some(TENANT_A),
+        "stale-xds-delta",
+        Some(json!(TENANT_A)),
+        None,
+    );
+    let mut delta_client = AggregatedDiscoveryServiceClient::new(xds_channel(addr).await);
+    let (delta_tx, delta_rx) = mpsc::channel(2);
+    delta_tx
+        .send(DeltaDiscoveryRequest {
+            node: Some(Node {
+                id: "stale-xds-delta".to_string(),
+                ..Node::default()
+            }),
+            resource_names_subscribe: vec!["*".to_string()],
+            type_url: LDS_TYPE_URL.to_string(),
+            ..DeltaDiscoveryRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        admission_outcome(
+            delta_client
+                .delta_aggregated_resources(authorize(
+                    tonic::Request::new(ReceiverStream::new(delta_rx)),
+                    &delta_token,
+                ))
+                .await
+        )
+        .await,
+        tonic::Code::Unavailable
+    );
+    drop(delta_tx);
+
+    handle.abort();
+}
+
+/// Refusing only new streams would leave the longest-lived sessions as the ones
+/// the bound never reaches. Established streams on every surface must end at
+/// the boundary through the shared authorization lifecycle.
+#[tokio::test(start_paused = true)]
+async fn stale_trust_terminates_established_streams_on_every_surface() {
+    for surface in [
+        StreamAuthSurface::ConfigSync,
+        StreamAuthSurface::MeshSubscribeLocal,
+        StreamAuthSurface::MeshSubscribeRemote,
+        StreamAuthSurface::XdsSotw,
+        StreamAuthSurface::XdsDelta,
+    ] {
+        let bound = Duration::from_secs(60);
+        let status = Arc::new(CpDpTrustReloadStatus::watching_at(
+            bound,
+            false,
+            Duration::from_secs(30),
+            "0000000000000000".to_string(),
+            tokio::time::Instant::now(),
+        ));
+        let verifier =
+            Arc::new(CpDpVerifierStore::from_arc(two_tenant_bundle()).with_trust_status(status));
+        let snapshot = verifier.load();
+        let token = mint(
+            TENANT_A_SECRET,
+            Some(TENANT_A),
+            "stale-established-node",
+            Some(json!(TENANT_A)),
+            None,
+        );
+        let request = authorize(tonic::Request::new(()), &token);
+        let identity = snapshot
+            .verify_and_bind_grpc_identity(request.metadata(), TEST_ISSUER, None, verifier.as_ref())
+            .expect("admission inside the bound must still succeed");
+        let (_tx, rx) = mpsc::channel::<Result<(), tonic::Status>>(1);
+        let mut stream = AuthorizedResponseStream::new(
+            ReceiverStream::new(rx),
+            &identity,
+            verifier.clone(),
+            // Far beyond the trust bound, so this proves the trust boundary
+            // rather than the independent server lifetime.
+            Duration::from_secs(86_400),
+            surface,
+        );
+        let waiter = tokio::spawn(async move { stream.next().await });
+        tokio::task::yield_now().await;
+        tokio::time::advance(bound).await;
+
+        let status = waiter
+            .await
+            .expect("stale-trust waiter must not panic")
+            .expect("the stale boundary must emit one terminal item")
+            .expect_err("the stale boundary must terminate the stream");
+        assert_eq!(status.code(), tonic::Code::Unavailable, "surface {surface:?}");
+        assert_eq!(
+            status.message(),
+            "This control plane cannot currently revalidate its verification trust source"
+        );
+    }
+}
+
+/// The task-owned ADS loops wait on the shared lease rather than the response
+/// stream, so the boundary has to hold there too.
+#[tokio::test(start_paused = true)]
+async fn stale_trust_ends_the_shared_authorization_lease() {
+    let bound = Duration::from_secs(120);
+    let status = Arc::new(CpDpTrustReloadStatus::watching_at(
+        bound,
+        false,
+        Duration::from_secs(30),
+        "0000000000000000".to_string(),
+        tokio::time::Instant::now(),
+    ));
+    let verifier =
+        Arc::new(CpDpVerifierStore::from_arc(two_tenant_bundle()).with_trust_status(status));
+    let snapshot = verifier.load();
+    let token = mint(
+        TENANT_A_SECRET,
+        Some(TENANT_A),
+        "stale-lease-node",
+        Some(json!(TENANT_A)),
+        None,
+    );
+    let request = authorize(tonic::Request::new(()), &token);
+    let identity = snapshot
+        .verify_and_bind_grpc_identity(request.metadata(), TEST_ISSUER, None, verifier.as_ref())
+        .expect("admission inside the bound must still succeed");
+    let lease = StreamAuthorizationLease::new(&identity, verifier, Duration::from_secs(86_400));
+    let waiter = tokio::spawn(async move { lease.wait_for_end().await });
+    tokio::task::yield_now().await;
+    tokio::time::advance(bound).await;
+
+    let reason = waiter.await.expect("lease waiter must not panic");
+    assert_eq!(reason.label(), "trust_stale");
 }

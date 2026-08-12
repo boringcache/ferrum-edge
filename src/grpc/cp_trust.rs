@@ -111,6 +111,7 @@ use serde::Deserialize;
 use tokio::sync::{Semaphore, watch};
 
 use crate::fips::approved::Sha256;
+use crate::grpc::cp_trust_health::{CpDpTrustReloadStatus, TrustReloadFailure};
 
 /// Upper bound on the trust-bundle document size. The file is operator-owned,
 /// but a bounded read keeps a mistyped path (a device node, a huge log) from
@@ -145,10 +146,9 @@ const PROJECTED_GENERATION_LINK: &str = "..data";
 
 /// Why a trust-bundle load was refused.
 ///
-/// A closed, fixed-cardinality set. It is what the reload worker logs and the
-/// seam the follow-up reload-health work (#3813) consumes; this module
-/// deliberately implements no stale-verifier health or maximum-retention policy
-/// on top of it. No variant carries a path, a digest, a namespace inventory, a
+/// A closed, fixed-cardinality set. It is what the reload worker logs and what
+/// [`crate::grpc::cp_trust_health`] projects onto its published failure reason
+/// (#3813). No variant carries a path, a digest, a namespace inventory, a
 /// credential identifier, or any document or key bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrustBundleRejectReason {
@@ -181,23 +181,6 @@ pub enum TrustBundleRejectReason {
     SourceGenerationUnsupported,
 }
 
-impl TrustBundleRejectReason {
-    /// Fixed-cardinality label for logs, metrics, and audit records.
-    pub const fn as_metric_label(self) -> &'static str {
-        match self {
-            Self::DocumentUnreadable => "document_unreadable",
-            Self::DocumentInvalid => "document_invalid",
-            Self::MaterialUnreadable => "material_unreadable",
-            Self::MaterialIntegrityUnbound => "material_integrity_unbound",
-            Self::MaterialIntegrityMalformed => "material_integrity_malformed",
-            Self::MaterialIntegrityMismatch => "material_integrity_mismatch",
-            Self::SourceGenerationEscape => "source_generation_escape",
-            Self::SourceGenerationUnstable => "source_generation_unstable",
-            Self::SourceGenerationUnsupported => "source_generation_unsupported",
-        }
-    }
-}
-
 /// A refused trust-bundle load: one closed classification plus an
 /// operator-facing detail.
 ///
@@ -220,7 +203,8 @@ impl TrustBundleLoadError {
         }
     }
 
-    /// The closed classification, for audit/metric sinks and for #3813.
+    /// The closed classification, for audit/metric sinks and for the published
+    /// reload-health reason.
     pub fn reason(&self) -> TrustBundleRejectReason {
         self.reason
     }
@@ -241,12 +225,14 @@ enum TrustBundleReloadError {
 }
 
 impl TrustBundleReloadError {
-    fn audit_reason(self) -> &'static str {
+    /// Project onto the published closed reload-failure set (#3813), so logs,
+    /// authenticated health, and metrics all name the same fixed label.
+    fn health_failure(self) -> TrustReloadFailure {
         match self {
-            Self::Rejected(reason) => reason.as_metric_label(),
-            Self::ReaderUnavailable => "reader_unavailable",
-            Self::ReaderFailed => "reload_reader_failed",
-            Self::ReadTimedOut => "reload_read_timed_out",
+            Self::Rejected(reason) => TrustReloadFailure::from_reject_reason(reason),
+            Self::ReaderUnavailable => TrustReloadFailure::ReaderUnavailable,
+            Self::ReaderFailed => TrustReloadFailure::ReaderFailed,
+            Self::ReadTimedOut => TrustReloadFailure::ReadTimedOut,
         }
     }
 }
@@ -829,7 +815,7 @@ pub(crate) async fn load_trust_bundle_reload_candidate_for_test(
     load_trust_bundle_reload_candidate_with_timeout(path, None, timeout)
         .await
         .map(|_| ())
-        .map_err(TrustBundleReloadError::audit_reason)
+        .map_err(|error| error.health_failure().as_str())
 }
 
 /// Upper bound on an operator-authored identifier (`kid`). Bounded so a
@@ -1341,6 +1327,21 @@ impl CpDpVerifier {
         }
     }
 
+    /// Redacted, replica-comparable identifier of this verifier's generation.
+    ///
+    /// The raw fingerprint digests each credential's key material and namespace
+    /// ceiling, so it is never published directly; the redaction re-hashes it
+    /// under a display-only domain and truncates it (see
+    /// [`crate::grpc::cp_trust_health::redact_generation_fingerprint`]). Two CP
+    /// replicas holding the same configuration produce the same value, which is
+    /// what makes fleet convergence checkable without revealing anything about
+    /// the credentials themselves.
+    pub fn redacted_generation(&self) -> String {
+        crate::grpc::cp_trust_health::redact_generation_fingerprint(
+            &self.configuration_fingerprint(),
+        )
+    }
+
     /// True when this verifier provides server-derived namespace binding.
     pub fn has_namespace_binding(&self) -> bool {
         matches!(self, Self::TrustBundle(_))
@@ -1493,6 +1494,13 @@ pub struct CpDpVerifierStore {
     revision: watch::Sender<u64>,
     replace_lock: Mutex<()>,
     store_identity: Arc<()>,
+    /// Published reload health for the source this verifier is loaded from
+    /// (#3813). Hanging it on the store — rather than threading it through
+    /// every gRPC server builder — is what gives ConfigSync, both MeshSubscribe
+    /// surfaces, and both ADS surfaces one shared stale-trust boundary: they
+    /// all already hold this store. Stores built outside CP mode get the shared
+    /// disabled status, which can never block admission.
+    trust_status: Arc<CpDpTrustReloadStatus>,
 }
 
 impl std::fmt::Debug for CpDpVerifierStore {
@@ -1532,7 +1540,23 @@ impl CpDpVerifierStore {
             revision,
             replace_lock: Mutex::new(()),
             store_identity,
+            trust_status: crate::grpc::cp_trust_health::disabled_status(),
         }
+    }
+
+    /// Bind this store to the published trust-reload health for its source.
+    ///
+    /// CP mode calls this once with the installed status; every other builder
+    /// keeps the shared disabled status, so no other mode gains a stale-trust
+    /// admission gate it has no watcher to clear.
+    pub fn with_trust_status(mut self, status: Arc<CpDpTrustReloadStatus>) -> Self {
+        self.trust_status = status;
+        self
+    }
+
+    /// The published trust-reload health this store's admission gates read.
+    pub fn trust_status(&self) -> &Arc<CpDpTrustReloadStatus> {
+        &self.trust_status
     }
 
     /// Capture the verifier and its credential generations as one immutable
@@ -1602,87 +1626,113 @@ impl CpDpVerifierStore {
 /// accepted verifier. Semantic fingerprints include resolved referenced key
 /// material, so quiet sources do not wake streams while a rotated key file is
 /// still detected even when the bundle document itself is unchanged.
+///
+/// Every attempt, acceptance, and refusal is published to `status` (#3813), so
+/// the retained-verifier policy is observable and bounded instead of being a
+/// silent local boolean. The returned handle is a **supervisor**: it owns the
+/// worker task and converts its disappearance — a panic, or any exit that was
+/// not shutdown-signalled — into a visible failure. A clean shutdown is never
+/// reported as one.
 pub fn spawn_trust_bundle_reload(
     path: String,
     fleet_secret: Option<String>,
     verifier: Arc<CpDpVerifierStore>,
     multi_namespace: bool,
     interval: std::time::Duration,
-    mut shutdown: watch::Receiver<bool>,
+    status: Arc<CpDpTrustReloadStatus>,
+    shutdown: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
+    let worker = tokio::spawn(trust_bundle_reload_worker(
+        path,
+        fleet_secret,
+        verifier,
+        multi_namespace,
+        interval,
+        Arc::clone(&status),
+        shutdown,
+    ));
     tokio::spawn(async move {
-        let mut accepted_fingerprint = verifier.load().verifier().configuration_fingerprint();
-        let mut last_failed = false;
-        let mut ticker = tokio::time::interval(interval.max(std::time::Duration::from_secs(1)));
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        ticker.tick().await;
+        // A panicking worker resolves the join handle with a `JoinError`, and a
+        // worker that ever returns `false` left the loop without being asked
+        // to. Both are the same operator-visible condition: nothing in this
+        // process will publish a credential removal again.
+        let clean = matches!(worker.await, Ok(true));
+        status.record_worker_stopped(clean);
+    })
+}
 
-        loop {
-            tokio::select! {
-                _ = ticker.tick() => {}
-                changed = shutdown.changed() => {
-                    if changed.is_err() || *shutdown.borrow() {
-                        return;
-                    }
-                    continue;
-                }
-            }
+/// Returns `true` when the loop ended because shutdown was signalled.
+async fn trust_bundle_reload_worker(
+    path: String,
+    fleet_secret: Option<String>,
+    verifier: Arc<CpDpVerifierStore>,
+    multi_namespace: bool,
+    interval: std::time::Duration,
+    status: Arc<CpDpTrustReloadStatus>,
+    mut shutdown: watch::Receiver<bool>,
+) -> bool {
+    let mut accepted_fingerprint = verifier.load().verifier().configuration_fingerprint();
+    let mut ticker = tokio::time::interval(interval.max(std::time::Duration::from_secs(1)));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    ticker.tick().await;
 
-            // Bundle parsing resolves file-backed key material. The detached
-            // reader plus timeout keeps a stalled mount from pinning Tokio's
-            // blocking pool or silently ending credential revocation. A
-            // process-wide permit remains with any abandoned OS thread so a
-            // persistent outage cannot accumulate blocked readers.
-            let read = load_trust_bundle_reload_candidate(path.clone(), fleet_secret.clone());
-            tokio::pin!(read);
-            let candidate = match tokio::select! {
-                biased;
-                changed = shutdown.changed() => {
-                    if changed.is_err() || *shutdown.borrow() {
-                        return;
-                    }
-                    continue;
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {}
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return true;
                 }
-                candidate = &mut read => candidate,
-            } {
-                Ok(candidate) => candidate,
-                Err(error) => {
-                    if !last_failed {
-                        tracing::warn!(
-                            audit.event = "cp_dp_trust_bundle_reload_rejected",
-                            reason = error.audit_reason(),
-                            "CP/DP trust-bundle reload rejected; retaining the active verifier"
-                        );
-                    }
-                    last_failed = true;
-                    continue;
-                }
-            };
-            if candidate.validate_for_scope(multi_namespace).is_err() {
-                if !last_failed {
-                    tracing::warn!(
-                        audit.event = "cp_dp_trust_bundle_reload_rejected",
-                        reason = "scope_validation_failed",
-                        "CP/DP trust-bundle reload rejected; retaining the active verifier"
-                    );
-                }
-                last_failed = true;
                 continue;
             }
-            let fingerprint = candidate.configuration_fingerprint();
-            if accepted_fingerprint == fingerprint {
-                last_failed = false;
+        }
+
+        status.record_attempt();
+        // Bundle parsing resolves file-backed key material. The detached
+        // reader plus timeout keeps a stalled mount from pinning Tokio's
+        // blocking pool or silently ending credential revocation. A
+        // process-wide permit remains with any abandoned OS thread so a
+        // persistent outage cannot accumulate blocked readers.
+        let read = load_trust_bundle_reload_candidate(path.clone(), fleet_secret.clone());
+        tokio::pin!(read);
+        let candidate = match tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return true;
+                }
                 continue;
             }
+            candidate = &mut read => candidate,
+        } {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                status.record_rejected(error.health_failure());
+                continue;
+            }
+        };
+        if candidate.validate_for_scope(multi_namespace).is_err() {
+            status.record_rejected(TrustReloadFailure::ScopeValidationFailed);
+            continue;
+        }
+        let fingerprint = candidate.configuration_fingerprint();
+        let changed = accepted_fingerprint != fingerprint;
+        let redacted = candidate.redacted_generation();
+        if changed {
             verifier.replace(candidate);
             accepted_fingerprint = fingerprint;
-            last_failed = false;
             tracing::info!(
                 audit.event = "cp_dp_trust_bundle_reloaded",
                 "CP/DP trust bundle reloaded; streams whose accepted credential was removed are closing"
             );
         }
-    })
+        // A semantically unchanged candidate is still an acceptance: the source
+        // was read coherently and re-validated, which is exactly what the stale
+        // bound asks about. Recording it is what lets an outage that ends
+        // without any configuration change clear degraded state and count one
+        // recovery.
+        status.record_accepted(redacted, changed);
+    }
 }
 
 /// Intersect the credential's namespace ceiling with the bearer's `ns` claim

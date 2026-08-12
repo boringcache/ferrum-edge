@@ -2044,13 +2044,39 @@ async fn handle_admin_request_inner(
         let dp_config_stale = dp_config_freshness
             .as_ref()
             .is_some_and(|freshness| freshness.stale);
-        let ready = startup_ready && !serving_degraded && jwks_ready && !dp_config_stale;
+        // Bounded CP/DP trust-reload health (issue #3813). `None` outside a CP
+        // that watches a trust bundle. Evaluating here keeps the probe exact at
+        // the boundary; it is a handful of atomic loads with no allocation, no
+        // lock, and no I/O, so an unauthenticated probe flood drives no work.
+        // Readiness fails once the CP is authorizing under a trust generation
+        // it could not revalidate within the bound, or once the reload worker
+        // has died and no revocation can ever be published again.
+        let cp_trust_reload = crate::grpc::cp_trust_health::snapshot();
+        let cp_trust_blocked = cp_trust_reload
+            .as_ref()
+            .is_some_and(|trust| trust.readiness_blocked);
+        let ready = startup_ready
+            && !serving_degraded
+            && jwks_ready
+            && !dp_config_stale
+            && !cp_trust_blocked;
         health_status["ready"] = json!(ready);
         if detailed && let Some(freshness) = dp_config_freshness.as_ref() {
             // Fixed-cardinality only: booleans, seconds, counters, and
             // closed-set reason/action labels. Never a CP URL, token,
             // namespace, node id, or config content.
             health_status["dp_config"] = serde_json::to_value(freshness).unwrap_or_default();
+        }
+        if let Some(trust) = cp_trust_reload.as_ref() {
+            if detailed {
+                // Same discipline: booleans, seconds, counters, a closed-set
+                // reason, and a redacted generation identifier. Never a bundle
+                // path, key material, `kid`, namespace, or token.
+                health_status["cp_dp_trust"] = serde_json::to_value(trust).unwrap_or_default();
+            }
+            if trust.degraded && !cp_trust_blocked {
+                health_status["status"] = json!("degraded");
+            }
         }
         if jwks_degraded && jwks_ready {
             health_status["status"] = json!("degraded");
@@ -2250,12 +2276,16 @@ async fn handle_admin_request_inner(
             // previously-ready dependency, so it shares `unavailable`. So does
             // a DP whose applied configuration aged past its bound (#3726): it
             // started ready and lost its authority, which is not "starting".
-            health_status["status"] =
-                json!(if serving_degraded || !jwks_ready || dp_config_stale {
-                    "unavailable"
-                } else {
-                    "starting"
-                });
+            // A CP that can no longer revalidate its verification trust source
+            // within the bound — or whose reload worker died — is the same
+            // shape (#3813).
+            let lost_authority =
+                serving_degraded || !jwks_ready || dp_config_stale || cp_trust_blocked;
+            health_status["status"] = json!(if lost_authority {
+                "unavailable"
+            } else {
+                "starting"
+            });
             StatusCode::SERVICE_UNAVAILABLE
         } else {
             StatusCode::OK

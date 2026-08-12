@@ -193,8 +193,9 @@ paths:
         `cached_config` proxy/consumer counts,
         `database_polling` degradation, `config_rejected`, mesh state,
         `logging`, `kafka_logging`, and `ai_transcript_audit` admitted capture
-        ceilings, fixed-cardinality `jwks_trust` aggregates, and the DP
-        `dp_config` staleness diagnostic — are
+        ceilings, fixed-cardinality `jwks_trust` aggregates, the DP
+        `dp_config` staleness diagnostic, and the CP `cp_dp_trust` reload
+        diagnostic — are
         returned only when the caller presents a valid admin JWT, a matching
         `FERRUM_METRICS_BEARER_TOKEN`, or originates from
         `FERRUM_METRICS_ALLOWED_CIDRS`.
@@ -235,6 +236,19 @@ paths:
         the boundary itself; no grace period is added to it. Readiness is
         restored only by a snapshot that passes validation and applies, never by
         a reconnect alone.
+
+        In **control-plane mode with a watched CP/DP trust bundle**, readiness is
+        additionally bounded by how long the control plane has been unable to
+        revalidate its verification trust source (issue #3813). A rejected
+        reload retains the whole previous verifier and marks trust reload
+        degraded immediately; once the active generation reaches
+        `FERRUM_CP_DP_TRUST_MAX_STALE_SECONDS`, `/health` returns `503` with
+        `status: "unavailable"`, `ready: false`, and the CP refuses to admit new
+        ConfigSync, MeshSubscribe, and xDS streams while terminating established
+        ones. A reload worker that exits unexpectedly fails readiness
+        immediately, because no revocation can be published again in that
+        process. Recovery requires an accepted candidate — including a
+        semantically unchanged one — never the passage of time.
       tags: [Health]
       security: []
       responses:
@@ -11694,8 +11708,8 @@ components:
         `admin_writes_enabled`, `fips`, `cached_config`, `database_polling`,
         `config_rejected`, `mesh`, `listener_failures`, `logging`,
         `kafka_logging`, `ai_transcript_audit`, `audit_pipeline`, `jwks_trust`,
-        `dp_config`) are present only when the caller is authenticated (admin
-        JWT, metrics bearer token, or allowlisted CIDR).
+        `dp_config`, `cp_dp_trust`) are present only when the caller is
+        authenticated (admin JWT, metrics bearer token, or allowlisted CIDR).
       required: [status, ready]
       properties:
         status:
@@ -11984,6 +11998,168 @@ components:
           $ref: "#/components/schemas/JwksTrustHealthSnapshot"
         dp_config:
           $ref: "#/components/schemas/DpConfigFreshnessSnapshot"
+        cp_dp_trust:
+          $ref: "#/components/schemas/CpDpTrustReloadSnapshot"
+
+    CpDpTrustReloadSnapshot:
+      type: object
+      description: |
+        Control-plane mode only, authenticated detail. Published health of the
+        CP/DP verification trust-bundle reload worker and the bounded window in
+        which an unrevalidatable verifier may keep authorizing (issue #3813).
+
+        Every field is fixed-cardinality — booleans, seconds, counters, a closed
+        reason label, and a redacted generation identifier. Nothing here carries
+        a bundle path, key material, a JWT, a `kid`, a namespace inventory, or
+        any credential identifier. `active_generation` is a domain-separated
+        re-hash of the internal configuration fingerprint truncated to 16 hex
+        characters: two replicas holding the same configuration publish the same
+        value, so fleet convergence after a rotation is checkable without
+        revealing anything about the credentials themselves.
+
+        Ages are measured on a monotonic clock, so a wall-clock/NTP step can
+        neither extend nor shorten the window. Only an accepted reload resets
+        `active_generation_age_seconds`; attempts, refusals, and the passage of
+        time do not. Once that age reaches `max_stale_seconds`, `stale` latches,
+        `admission_blocked` turns true for every configuration stream family,
+        and `/health` reports `ready: false` with `status: "unavailable"`. The
+        configured maximum is the boundary: no grace period is added to it.
+      required:
+        [
+          configured,
+          worker_state,
+          worker_running,
+          degraded,
+          stale,
+          admission_blocked,
+          readiness_blocked,
+          reason,
+          active_generation_age_seconds,
+          max_stale_seconds,
+          unbounded_stale_allowed,
+          consecutive_failures,
+          recoveries_total,
+          attempts_total,
+          acceptances_total,
+          rejections_total,
+          rejections_by_reason,
+        ]
+      properties:
+        configured:
+          type: boolean
+          description: Whether a file-backed CP/DP trust bundle is watched.
+        worker_state:
+          type: string
+          enum: [disabled, running, stalled, stopped, failed]
+          description: >
+            Closed-set supervision state. `stalled` is alive but with no
+            completed attempt in three poll intervals (a read parked in the
+            kernel); `stopped` is a clean shutdown and is never a failure;
+            `failed` is an unexpected exit or panic and fails readiness
+            immediately.
+        worker_running:
+          type: boolean
+          description: Whether the reload worker is still alive.
+        degraded:
+          type: boolean
+          description: >
+            Whether the control plane is authorizing with a trust generation it
+            could not revalidate. True from the first refused attempt.
+        stale:
+          type: boolean
+          description: >
+            Whether the active generation has aged past `max_stale_seconds`.
+            Sticky until a valid candidate is accepted.
+        admission_blocked:
+          type: boolean
+          description: >
+            Whether new ConfigSync, local/remote MeshSubscribe, SotW ADS, and
+            Delta ADS streams are currently refused. Established streams are
+            terminated at the same boundary.
+        readiness_blocked:
+          type: boolean
+          description: >
+            Whether this replica reports `ready: false` because of trust state —
+            `stale`, or a reload worker that exited unexpectedly.
+        reason:
+          type: string
+          enum:
+            [
+              ok,
+              document_unreadable,
+              document_invalid,
+              material_unreadable,
+              material_integrity_unbound,
+              material_integrity_malformed,
+              material_integrity_mismatch,
+              source_generation_escape,
+              source_generation_unstable,
+              source_generation_unsupported,
+              reader_unavailable,
+              reload_reader_failed,
+              reload_read_timed_out,
+              scope_validation_failed,
+              worker_exited,
+            ]
+          description: Closed-set reason currently blocking rotation.
+        active_generation:
+          type: string
+          nullable: true
+          description: >
+            Redacted, replica-comparable identifier of the active trust
+            generation. 16 lowercase hex characters; never the internal
+            fingerprint, a `kid`, or any key material.
+        active_generation_age_seconds:
+          type: integer
+          format: uint64
+          description: Seconds since the last accepted generation, monotonic.
+        last_attempt_age_seconds:
+          type: integer
+          format: uint64
+          nullable: true
+          description: Seconds since the last completed reload attempt.
+        last_acceptance_age_seconds:
+          type: integer
+          format: uint64
+          nullable: true
+          description: Seconds since the last accepted reload.
+        max_stale_seconds:
+          type: integer
+          format: uint64
+          description: >
+            Configured `FERRUM_CP_DP_TRUST_MAX_STALE_SECONDS`. `0` means
+            unbounded retention, which requires the explicit unsafe opt-in.
+        unbounded_stale_allowed:
+          type: boolean
+          description: Whether unbounded retention was explicitly opted into.
+        consecutive_failures:
+          type: integer
+          format: uint64
+          description: Consecutive refused attempts since the last acceptance.
+        recoveries_total:
+          type: integer
+          format: uint64
+          description: Failure episodes ended by a later valid candidate.
+        attempts_total:
+          type: integer
+          format: uint64
+          description: Reload attempts that produced a verdict.
+        acceptances_total:
+          type: integer
+          format: uint64
+          description: Attempts that replaced or confirmed the generation.
+        rejections_total:
+          type: integer
+          format: uint64
+          description: Attempts refused across every closed reason.
+        rejections_by_reason:
+          type: object
+          additionalProperties:
+            type: integer
+            format: uint64
+          description: >
+            Refusals per closed reason. Exactly the `reason` enum minus `ok`;
+            no key is derived from operator or attacker input.
 
     DpConfigFreshnessSnapshot:
       type: object

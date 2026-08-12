@@ -337,6 +337,59 @@ Between the two steps the old document's digest no longer matches, so the
 candidate is refused and the CP keeps the last accepted verifier — the window is
 fail-closed rather than mixed.
 
+### Retention of an unrevalidatable verifier is bounded (issue #3813)
+
+Retaining the entire last accepted verifier through a transient failure is the
+right availability policy. Left unbounded it is also a silent one: a credential
+an operator removed from the bundle keeps authorizing for as long as every
+reload keeps failing, and the hourly maximum stream lifetime does not help —
+the reconnect re-verifies under the same retained key.
+
+The reload worker therefore publishes its own health, and the retention window
+has a finite default.
+
+**What is published.** Authenticated `/health` and `/status` carry a
+`cp_dp_trust` object, and `/metrics` carries the `ferrum_cp_dp_trust_*`
+families. Both are fixed-cardinality: booleans, counters, seconds, the closed
+reason set above (plus `reader_unavailable`, `reload_reader_failed`,
+`reload_read_timed_out`, `scope_validation_failed`, and `worker_exited`), and a
+**redacted generation identifier**. That identifier is a domain-separated
+re-hash of the internal configuration fingerprint truncated to 16 hex
+characters, so two replicas holding the same configuration publish the same
+value — fleet convergence after a rotation is checkable — while it is not a
+digest anyone can verify candidate key material against. No path, `kid`,
+namespace, token, or key byte appears in any of it. Unauthenticated probes
+still receive only the documented coarse `status` / `ready` pair.
+
+**What the states mean.**
+
+| State | Trigger | Effect |
+|---|---|---|
+| degraded | The first refused attempt in an episode | `status: degraded`; `ferrum_cp_dp_trust_degraded 1`. Streams and admission are unaffected — the retained verifier is still serving. |
+| stale | The active generation reaches `FERRUM_CP_DP_TRUST_MAX_STALE_SECONDS` | `ready: false`, `status: unavailable`; new ConfigSync, local/remote MeshSubscribe, SotW ADS, and Delta ADS streams are refused with `UNAVAILABLE`, and established streams end at the same boundary through the shared authorization lease. |
+| worker failed | The reload task exited or panicked without being asked to | `ready: false` immediately, independent of the bound: nothing in that process can publish a revocation again. A shutdown-signalled exit is `stopped` and is never reported as a failure. |
+| recovered | A valid candidate is accepted | Degraded and stale clear, admission and readiness return, and `ferrum_cp_dp_trust_reload_recoveries_total` increments exactly once for the episode. |
+
+The age is measured on a monotonic clock from the last **accepted** reload, so
+an NTP step cannot extend or shorten it, and attempts, refusals, and reconnects
+never reset it. A semantically *unchanged* candidate is an acceptance: no
+verifier swap is needed, but the source was read coherently and revalidated,
+which is exactly what the bound asks about.
+
+The configured maximum is the boundary; no grace period is added to it. It must
+be at least three poll intervals (`FERRUM_SECRET_REFRESH_INTERVAL_SECONDS`) or
+startup fails closed, because a shorter bound would latch between two healthy
+polls. `FERRUM_CP_DP_TRUST_MAX_STALE_SECONDS=0` means unbounded retention and is
+refused unless `FERRUM_CP_DP_TRUST_ALLOW_UNBOUNDED_STALE=true` — "retain a
+verifier nobody can revalidate, forever, while ready" is never an implicit
+default.
+
+Suggested alerts: `ferrum_cp_dp_trust_degraded == 1` for longer than one poll
+interval (a rotation is not landing), `ferrum_cp_dp_trust_stale == 1` (this
+replica is refusing its data planes), `ferrum_cp_dp_trust_reload_worker_running
+== 0` (supervision failure), and a `count(count by (active_generation) (...))`
+style comparison of the redacted generation across replicas after a rotation.
+
 ### mTLS / SPIFFE intersection
 
 When the CP gRPC listener terminates mTLS and the peer's leaf certificate
