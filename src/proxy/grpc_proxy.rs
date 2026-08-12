@@ -2746,8 +2746,7 @@ impl GrpcTransportDiagnostic {
 ///
 /// Fixed and metadata-free like every other transport refusal: it names
 /// neither the gateway's SPIFFE ID nor the target's identity metadata.
-pub(crate) const GATEWAY_MESH_IDENTITY_NOT_LIVE: &str =
-    "mesh transport is unavailable: the gateway has no live mesh identity for this configuration \
+pub(crate) const GATEWAY_MESH_IDENTITY_NOT_LIVE: &str = "mesh transport is unavailable: the gateway has no live mesh identity for this configuration \
      generation";
 
 /// Why a gRPC dispatch could not materialize a transport for its selected

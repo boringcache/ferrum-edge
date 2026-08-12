@@ -7515,17 +7515,19 @@ impl ProxyState {
         let authority = resolve_trust_authority(record, candidate.trust_bundles.as_deref());
         match (authority, record) {
             (TrustAuthorityResolution::Ambiguous, _) => Ok(GatewayTrustCommit::Unchanged),
-            (TrustAuthorityResolution::Database, Some(record)) => match record.bundle.to_runtime() {
-                Ok(runtime) => Ok(GatewayTrustCommit::Replace(runtime)),
-                Err(error) => {
-                    record_trust_load_rejection(GatewayTrustFailureReason::InvalidMaterial);
-                    Err(format!(
-                        "stored gateway trust bundle for namespace '{namespace}' revision {} did \
-                         not convert to runtime trust material: {error}",
-                        record.revision
-                    ))
+            (TrustAuthorityResolution::Database, Some(record)) => {
+                match record.bundle.to_runtime() {
+                    Ok(runtime) => Ok(GatewayTrustCommit::Replace(runtime)),
+                    Err(error) => {
+                        record_trust_load_rejection(GatewayTrustFailureReason::InvalidMaterial);
+                        Err(format!(
+                            "stored gateway trust bundle for namespace '{namespace}' revision {} did \
+                             not convert to runtime trust material: {error}",
+                            record.revision
+                        ))
+                    }
                 }
-            },
+            }
             // Database authority with no record (explicit revocation), or file
             // authority: either way no database override may remain installed.
             _ => Ok(if self.gateway_trust_bundles.load().is_some() {
@@ -11919,7 +11921,8 @@ impl ProxyState {
         &self,
         result: crate::config::db_loader::IncrementalResult,
     ) -> ConfigApplyOutcome {
-        self.apply_incremental_with_gateway_trust(result, None).await
+        self.apply_incremental_with_gateway_trust(result, None)
+            .await
     }
 
     /// [`Self::apply_incremental`] carrying an out-of-band gateway trust

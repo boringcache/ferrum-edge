@@ -757,8 +757,7 @@ async fn dp_state_with_gateway_svid(gateway: SvidBundle) -> (ProxyState, Vec<Joi
         ..Default::default()
     };
     assert_eq!(
-        env_config.mesh_svid_rotation_drain_seconds,
-        0,
+        env_config.mesh_svid_rotation_drain_seconds, 0,
         "these tests exist for the DEFAULT drain window; a non-zero default would \
          let the rotation consumer's delayed force-drain do the work instead"
     );

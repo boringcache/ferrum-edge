@@ -543,7 +543,10 @@ async fn dp_snapshot_publishes_cp_trust_with_its_own_configuration_generation() 
     ));
 
     let (config_after, trust_after, live_after) = published_generations(&state);
-    assert!(live_after, "the accepted snapshot must end up authenticating");
+    assert!(
+        live_after,
+        "the accepted snapshot must end up authenticating"
+    );
     assert!(mesh_admission_open(&state));
     assert!(
         trust_after > trust_before,
@@ -863,7 +866,10 @@ async fn a_cp_trust_only_delta_rotates_the_backend_pools_once() {
         .await;
 
     assert_eq!(outcome, ConfigApplyOutcome::Unchanged);
-    assert_eq!(active_svid_domain(&state).as_deref(), Some("cp-delta.local"));
+    assert_eq!(
+        active_svid_domain(&state).as_deref(),
+        Some("cp-delta.local")
+    );
     assert!(mesh_admission_open(&state));
     assert_eq!(
         backend_security_generation(&state),
