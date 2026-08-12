@@ -6997,7 +6997,7 @@ impl ProxyState {
         Ok(())
     }
 
-    fn reload_frontend_dtls_material(&self) -> Result<(), anyhow::Error> {
+    async fn reload_frontend_dtls_material(&self) -> Result<(), anyhow::Error> {
         let (Some(cert_path), Some(key_path)) = (
             self.env_config.dtls_cert_path.clone(),
             self.env_config.dtls_key_path.clone(),
@@ -7005,31 +7005,41 @@ impl ProxyState {
             return Ok(());
         };
         let client_ca_cert_path = self.env_config.dtls_client_ca_cert_path.clone();
-        let active_crls = crate::tls::load_crls(self.env_config.tls_crl_file_path.as_deref())?;
-        crate::dtls::build_frontend_dtls_config(
+        // Validate the complete candidate (cert/key/optional client-CA/CRLs)
+        // as one generation BEFORE publishing anything. A failure keeps the
+        // last accepted generation on every listener.
+        let active_crls = match crate::tls::load_crls(self.env_config.tls_crl_file_path.as_deref())
+        {
+            Ok(crls) => crls,
+            Err(err) => {
+                self.stream_listener_manager
+                    .record_frontend_dtls_candidate_failure();
+                return Err(err);
+            }
+        };
+        let config = match crate::dtls::build_frontend_dtls_config(
             &cert_path,
             &key_path,
             client_ca_cert_path.as_deref(),
             active_crls.as_ref().as_slice(),
-        )?;
+        ) {
+            Ok(config) => config,
+            Err(err) => {
+                self.stream_listener_manager
+                    .record_frontend_dtls_candidate_failure();
+                return Err(err);
+            }
+        };
 
-        let manager = self.stream_listener_manager.clone();
-        tokio::spawn(async move {
-            let swapped = manager
-                .swap_active_dtls_frontend_configs(|| {
-                    crate::dtls::build_frontend_dtls_config(
-                        &cert_path,
-                        &key_path,
-                        client_ca_cert_path.as_deref(),
-                        active_crls.as_ref().as_slice(),
-                    )
-                })
-                .await;
-            info!(
-                swapped_dtls_listeners = swapped,
-                "Frontend DTLS material reloaded; new DTLS sessions will use rotated material"
-            );
-        });
+        let (published, swapped) = self
+            .stream_listener_manager
+            .publish_frontend_dtls_generation(config)
+            .await;
+        info!(
+            dtls_generation = published.generation,
+            swapped_dtls_listeners = swapped,
+            "Frontend DTLS material reloaded; new DTLS sessions will use the accepted generation"
+        );
         Ok(())
     }
 
@@ -7061,15 +7071,18 @@ impl ProxyState {
         let (revision_tx, _revision_rx) = tokio::sync::watch::channel(0u64);
         let state = self.clone();
         Some(
-            crate::tls::source::subscription::spawn_material_set_reload_task(
-                crate::tls::source::subscription::MaterialSetReloadConfig {
+            crate::tls::source::subscription::spawn_async_material_set_reload_task(
+                crate::tls::source::subscription::AsyncMaterialSetReloadConfig {
                     surface: "dtls",
                     sources: watched_sources,
                     interval,
                     revision_tx,
                     max_material_bytes: self.env_config.tls_max_material_size_bytes,
-                    rebuild: Box::new(move || state.reload_frontend_dtls_material()),
                     ready_tx: None,
+                    rebuild: Box::new(move || {
+                        let state = state.clone();
+                        Box::pin(async move { state.reload_frontend_dtls_material().await })
+                    }),
                 },
                 shutdown_rx,
             ),
