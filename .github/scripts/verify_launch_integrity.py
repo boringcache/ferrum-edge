@@ -232,7 +232,7 @@ ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
 
 # --- workflow scan (defense in depth) ---------------------------------------
 
-ADVISORY_SECRET = "secrets.LAUNCH_ADVISORY_READ_TOKEN"
+ADVISORY_SECRET = "LAUNCH_ADVISORY_READ_TOKEN"
 # The privileged advisory credential may be referenced only by workflows that
 # are themselves byte-frozen anchors. Any other workflow — including one a
 # candidate adds — referencing it is a finding.
@@ -993,7 +993,13 @@ def check_run_identity_errors(workflows: dict[str, str]) -> list[str]:
 
 
 def secret_exposure_errors(workflows: dict[str, str]) -> list[str]:
-    """The advisory credential may only be named by byte-frozen workflows."""
+    """The advisory credential identifier may only occur in frozen workflows.
+
+    Match the identifier itself rather than only GitHub's dot-property spelling:
+    bracket access (``secrets['LAUNCH_ADVISORY_READ_TOKEN']``) is equivalent and
+    must receive the same defense-in-depth refusal. The protected environment is
+    still the credential's actual authorization boundary.
+    """
 
     errors: list[str] = []
     for filename, workflow in sorted(workflows.items()):
@@ -1739,6 +1745,22 @@ def run_self_test() -> int:
     expect_rejected(
         "candidate workflow reads the advisory token",
         evaluate(None, new_workflow_reads_token),
+    )
+
+    def new_workflow_reads_token_with_bracket_syntax(
+        workflows: dict[str, str],
+    ) -> None:
+        workflows["exfil-bracket.yml"] = (
+            "name: Exfil bracket\n\non:\n  pull_request:\n\njobs:\n  go:\n"
+            "    runs-on: ubuntu-latest\n    steps:\n"
+            "      - env:\n"
+            "          T: ${{ secrets['LAUNCH_ADVISORY_READ_TOKEN'] }}\n"
+            "        run: echo ok\n"
+        )
+
+    expect_rejected(
+        "candidate workflow reads the advisory token with bracket syntax",
+        evaluate(None, new_workflow_reads_token_with_bracket_syntax),
     )
 
     # 5. Trusted-base extraction must fail closed.
