@@ -7146,6 +7146,182 @@ pub mod _test_support {
         crate::proxy::request_upload_auth_deadline(Some(ctx), max_lifetime_seconds)
     }
 
+    /// Which bound ended a BUFFERED client request-body collect (issue #3815).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum BufferedUploadWaitOutcomeForTest {
+        Collected,
+        ClientError,
+        TimedOut,
+        DeadlineExceeded,
+        AuthorizationExpired(crate::proxy::auth_lifetime::StreamAuthTermination),
+    }
+
+    /// Run one buffered client request-body collect under the earliest of the
+    /// client RPC deadline, the operator whole-upload stall timeout, and the
+    /// admitted stream's authorization lifetime, exactly as every post-admission
+    /// buffered upload arm does (issue #3815).
+    pub async fn collect_buffered_upload_under_authorization_for_test<F>(
+        collect: F,
+        deadline: Option<tokio::time::Instant>,
+        request_body_read_timeout_ms: u64,
+        auth: Option<(
+            crate::proxy::auth_lifetime::StreamAuthDeadline,
+            crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
+            crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+        )>,
+    ) -> BufferedUploadWaitOutcomeForTest
+    where
+        F: std::future::Future<Output = Result<(), ()>>,
+    {
+        match crate::proxy::collect_request_body_under_authorization(
+            collect,
+            deadline,
+            request_body_read_timeout_ms,
+            auth.as_ref(),
+        )
+        .await
+        {
+            Ok(Ok(())) => BufferedUploadWaitOutcomeForTest::Collected,
+            Ok(Err(())) => BufferedUploadWaitOutcomeForTest::ClientError,
+            Err(crate::proxy::AuthorizedUploadWaitError::Wait(
+                crate::proxy::RequestBodyWaitError::TimedOut,
+            )) => BufferedUploadWaitOutcomeForTest::TimedOut,
+            Err(crate::proxy::AuthorizedUploadWaitError::Wait(
+                crate::proxy::RequestBodyWaitError::DeadlineExceeded,
+            )) => BufferedUploadWaitOutcomeForTest::DeadlineExceeded,
+            Err(crate::proxy::AuthorizedUploadWaitError::AuthorizationExpired(termination)) => {
+                BufferedUploadWaitOutcomeForTest::AuthorizationExpired(termination)
+            }
+        }
+    }
+
+    /// Attribute an already-fired composed dispatch-phase bound and latch the
+    /// bounded class exactly once for the request (issue #3815).
+    pub fn dispatch_phase_authorization_expiry_for_test(
+        auth: Option<&(
+            crate::proxy::auth_lifetime::StreamAuthDeadline,
+            crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
+            crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+        )>,
+    ) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
+        crate::proxy::dispatch_phase_authorization_expiry(auth)
+    }
+
+    /// A fixed authorization-lifetime plan for a dispatch-phase test. The class
+    /// and family are incidental to the composition being proven.
+    fn header_wait_authorization_plan_for_test(
+        at: tokio::time::Instant,
+    ) -> (
+        crate::proxy::auth_lifetime::StreamAuthDeadline,
+        crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
+        crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+    ) {
+        use crate::proxy::auth_lifetime::{
+            StreamAuthDeadline, StreamAuthProtocolFamily, StreamAuthTermination,
+            StreamAuthTerminationLatch,
+        };
+        (
+            StreamAuthDeadline {
+                at,
+                termination: StreamAuthTermination::CredentialExpired,
+            },
+            StreamAuthProtocolFamily::Http,
+            StreamAuthTerminationLatch::default(),
+        )
+    }
+
+    /// Which bound wins the direct-H2 response-header wait once the admitted
+    /// stream's authorization lifetime composes over the client/operator bounds
+    /// (issue #3815). Returns `(millis_from_now, source_label)`.
+    pub fn authorization_bounded_header_deadline_for_test(
+        client_deadline_after_ms: Option<u64>,
+        backend_read_timeout_ms: u64,
+        authorization_after_ms: Option<u64>,
+    ) -> Option<(u128, &'static str)> {
+        let read_started_at = tokio::time::Instant::now();
+        let client_deadline = client_deadline_after_ms.and_then(|millis| {
+            read_started_at.checked_add(std::time::Duration::from_millis(millis))
+        });
+        let authorization = authorization_after_ms.and_then(|millis| {
+            read_started_at
+                .checked_add(std::time::Duration::from_millis(millis))
+                .map(header_wait_authorization_plan_for_test)
+        });
+        crate::proxy::authorization_bounded_header_deadline(
+            crate::proxy::response_header_deadline(
+                client_deadline,
+                backend_read_timeout_ms,
+                read_started_at,
+            ),
+            authorization.as_ref(),
+        )
+        .map(|(deadline, source)| {
+            let label = match source {
+                crate::proxy::ResponseHeaderDeadlineSource::Client => "client",
+                crate::proxy::ResponseHeaderDeadlineSource::Operator => "operator",
+                crate::proxy::ResponseHeaderDeadlineSource::Authorization => "authorization",
+            };
+            (
+                deadline
+                    .saturating_duration_since(read_started_at)
+                    .as_millis(),
+                label,
+            )
+        })
+    }
+
+    /// Which bound wins the direct-H2 early-response upload join once the
+    /// admitted stream's authorization lifetime composes over the client RPC
+    /// deadline and the operator whole-upload stall timeout (issue #3815).
+    /// Returns `(millis_from_now, source_label)`.
+    pub fn direct_h2_upload_join_bound_for_test(
+        rpc_deadline_after_ms: Option<u64>,
+        operator_timeout_ms: u64,
+        authorization_after_ms: Option<u64>,
+    ) -> Option<(u128, &'static str)> {
+        let now = tokio::time::Instant::now();
+        let rpc_deadline = rpc_deadline_after_ms
+            .and_then(|millis| now.checked_add(std::time::Duration::from_millis(millis)));
+        let authorization = authorization_after_ms
+            .and_then(|millis| now.checked_add(std::time::Duration::from_millis(millis)));
+        crate::proxy::direct_h2_upload_join_bound(
+            crate::proxy::compose_early_upload_bound(rpc_deadline, operator_timeout_ms),
+            authorization,
+        )
+        .map(|(deadline, bound)| {
+            let label = match bound {
+                crate::proxy::DirectH2UploadJoinBound::Authorization => "authorization",
+                crate::proxy::DirectH2UploadJoinBound::Protocol(
+                    crate::proxy::EarlyUploadBoundKind::RpcDeadline,
+                ) => "rpc_deadline",
+                crate::proxy::DirectH2UploadJoinBound::Protocol(
+                    crate::proxy::EarlyUploadBoundKind::OperatorTimeout,
+                ) => "operator_timeout",
+            };
+            (deadline.saturating_duration_since(now).as_millis(), label)
+        })
+    }
+
+    /// The health-neutral dispatch outcome every H1/H2 dispatch phase returns
+    /// when the admitted stream's authorization lifetime cancelled it
+    /// (issue #3815). Returns
+    /// `(status, body_bytes, connection_error, error_class_label)`.
+    pub fn authorization_expired_dispatch_placeholder_for_test()
+    -> (u16, Vec<u8>, bool, Option<&'static str>) {
+        let response =
+            crate::proxy::authorization_expired_dispatch_placeholder(Some("10.0.0.9".to_string()));
+        let bytes = match &response.body {
+            crate::retry::ResponseBody::Buffered(bytes) => bytes.to_vec(),
+            _ => panic!("the authorization placeholder is always a buffered body"),
+        };
+        (
+            response.status_code,
+            bytes,
+            response.connection_error,
+            response.error_class.map(crate::retry::error_class_log_kind),
+        )
+    }
+
     /// Whether a TLS-terminating TCP listener may hand its socket to kernel
     /// TLS, exactly as `handle_tcp_connection_inner` decides it before the
     /// frontend handshake. Exposed so external tests can prove that a listener

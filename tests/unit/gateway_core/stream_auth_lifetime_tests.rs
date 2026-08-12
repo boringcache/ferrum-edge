@@ -9,7 +9,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ferrum_edge::_test_support::{
-    authorization_expired_pre_commitment_response_for_test, request_received_at_for_test,
+    BufferedUploadWaitOutcomeForTest, authorization_bounded_header_deadline_for_test,
+    authorization_expired_dispatch_placeholder_for_test,
+    authorization_expired_pre_commitment_response_for_test,
+    collect_buffered_upload_under_authorization_for_test, direct_h2_upload_join_bound_for_test,
+    dispatch_phase_authorization_expiry_for_test, request_received_at_for_test,
     request_upload_auth_deadline_for_test, set_request_credential_deadline_for_test,
     within_stream_auth_deadline_for_test,
 };
@@ -820,4 +824,550 @@ async fn the_setup_expiry_kind_is_client_side_and_health_neutral() {
     // Redacted: the contract, never the credential, its subject, or its expiry.
     assert!(rendered.contains("authorization lifetime"), "{rendered}");
     assert!(!rendered.chars().any(|c| c.is_ascii_digit()), "{rendered}");
+}
+
+// --- Buffered H1/H2 uploads (#3815) ----------------------------------------
+//
+// A request body that a request-body plugin, a gRPC-Web translation, or retry
+// replay forces into memory never reaches the streaming upload adapters, so the
+// collect itself must carry the absolute plan. A continuously active upload
+// makes progress on every poll, so neither the (often absent) client RPC
+// deadline nor the progress-refreshed operator stall timeout bounds it.
+
+fn upload_plan(
+    after: Duration,
+    termination: StreamAuthTermination,
+) -> (
+    StreamAuthDeadline,
+    StreamAuthProtocolFamily,
+    ferrum_edge::proxy::auth_lifetime::StreamAuthTerminationLatch,
+) {
+    (
+        plan_at(tokio::time::Instant::now() + after, termination),
+        StreamAuthProtocolFamily::WebSocket,
+        ferrum_edge::proxy::auth_lifetime::StreamAuthTerminationLatch::default(),
+    )
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_continuously_active_buffered_upload_stops_at_the_authorization_deadline() {
+    // No client RPC deadline and `backend_read_timeout_ms = 0`: without the
+    // authorization arm this collect is completely unbounded.
+    let plan = upload_plan(
+        Duration::from_secs(30),
+        StreamAuthTermination::CredentialExpired,
+    );
+    let latch = plan.2.clone();
+    let outcome = collect_buffered_upload_under_authorization_for_test(
+        async {
+            // A client that keeps sending: the collect makes progress on every
+            // poll, so it never stalls and never resolves either.
+            for _ in 0..600 {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            Ok(())
+        },
+        None,
+        0,
+        Some(plan),
+    )
+    .await;
+    assert_eq!(
+        outcome,
+        BufferedUploadWaitOutcomeForTest::AuthorizationExpired(
+            StreamAuthTermination::CredentialExpired
+        )
+    );
+    assert_eq!(
+        latch.observed(),
+        Some(StreamAuthTermination::CredentialExpired),
+        "the collect must latch the bounded class for the request"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_buffered_upload_reports_the_fallback_maximum_class_when_that_bound_wins() {
+    let plan = upload_plan(
+        Duration::from_secs(5),
+        StreamAuthTermination::AuthenticatedStreamMaxLifetime,
+    );
+    let outcome = collect_buffered_upload_under_authorization_for_test(
+        std::future::pending::<Result<(), ()>>(),
+        None,
+        0,
+        Some(plan),
+    )
+    .await;
+    assert_eq!(
+        outcome,
+        BufferedUploadWaitOutcomeForTest::AuthorizationExpired(
+            StreamAuthTermination::AuthenticatedStreamMaxLifetime
+        )
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_already_elapsed_plan_fails_a_buffered_collect_closed_without_polling_it() {
+    let polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = Arc::clone(&polled);
+    let plan = upload_plan(
+        Duration::from_secs(0),
+        StreamAuthTermination::CredentialExpired,
+    );
+    tokio::time::advance(Duration::from_secs(1)).await;
+    let outcome = collect_buffered_upload_under_authorization_for_test(
+        async move {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        },
+        None,
+        0,
+        Some(plan),
+    )
+    .await;
+    assert_eq!(
+        outcome,
+        BufferedUploadWaitOutcomeForTest::AuthorizationExpired(
+            StreamAuthTermination::CredentialExpired
+        )
+    );
+    assert!(
+        !polled.load(std::sync::atomic::Ordering::SeqCst),
+        "the authorization arm is biased first, so an elapsed plan never reads client bytes"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_earlier_client_rpc_deadline_still_wins_a_buffered_collect() {
+    let plan = upload_plan(
+        Duration::from_secs(30),
+        StreamAuthTermination::CredentialExpired,
+    );
+    let latch = plan.2.clone();
+    let rpc_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    let outcome = collect_buffered_upload_under_authorization_for_test(
+        std::future::pending::<Result<(), ()>>(),
+        Some(rpc_deadline),
+        0,
+        Some(plan),
+    )
+    .await;
+    assert_eq!(outcome, BufferedUploadWaitOutcomeForTest::DeadlineExceeded);
+    assert_eq!(
+        latch.observed(),
+        None,
+        "a client-chosen RPC expiry is not an authorization termination"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_earlier_operator_stall_timeout_still_wins_a_buffered_collect() {
+    let plan = upload_plan(
+        Duration::from_secs(30),
+        StreamAuthTermination::CredentialExpired,
+    );
+    let outcome = collect_buffered_upload_under_authorization_for_test(
+        std::future::pending::<Result<(), ()>>(),
+        None,
+        1_000,
+        Some(plan),
+    )
+    .await;
+    assert_eq!(outcome, BufferedUploadWaitOutcomeForTest::TimedOut);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unauthenticated_buffered_collect_is_completely_unaffected() {
+    let outcome = collect_buffered_upload_under_authorization_for_test(
+        async { Ok(()) },
+        None,
+        0,
+        None,
+    )
+    .await;
+    assert_eq!(outcome, BufferedUploadWaitOutcomeForTest::Collected);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_buffered_collect_that_completes_before_expiry_is_forwarded() {
+    let plan = upload_plan(
+        Duration::from_secs(30),
+        StreamAuthTermination::CredentialExpired,
+    );
+    let latch = plan.2.clone();
+    let outcome = collect_buffered_upload_under_authorization_for_test(
+        async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            Ok(())
+        },
+        None,
+        0,
+        Some(plan),
+    )
+    .await;
+    assert_eq!(outcome, BufferedUploadWaitOutcomeForTest::Collected);
+    assert_eq!(latch.observed(), None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_client_disconnect_during_a_buffered_collect_keeps_its_own_outcome() {
+    let plan = upload_plan(
+        Duration::from_secs(30),
+        StreamAuthTermination::CredentialExpired,
+    );
+    let outcome = collect_buffered_upload_under_authorization_for_test(
+        async { Err(()) },
+        None,
+        0,
+        Some(plan),
+    )
+    .await;
+    assert_eq!(outcome, BufferedUploadWaitOutcomeForTest::ClientError);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_buffered_collect_and_a_second_direction_record_one_termination() {
+    let plan = upload_plan(
+        Duration::from_secs(2),
+        StreamAuthTermination::CredentialExpired,
+    );
+    let latch = plan.2.clone();
+    let outcome = collect_buffered_upload_under_authorization_for_test(
+        std::future::pending::<Result<(), ()>>(),
+        None,
+        0,
+        Some(plan),
+    )
+    .await;
+    assert!(matches!(
+        outcome,
+        BufferedUploadWaitOutcomeForTest::AuthorizationExpired(_)
+    ));
+    assert!(
+        !latch.record_once(
+            StreamAuthTermination::CredentialExpired,
+            StreamAuthProtocolFamily::WebSocket
+        ),
+        "the opposite direction must not count a second termination"
+    );
+}
+
+// --- Dispatch-phase attribution (#3815) ------------------------------------
+
+#[tokio::test(start_paused = true)]
+async fn a_dispatch_phase_attributes_an_elapsed_authorization_bound_once() {
+    let plan = upload_plan(
+        Duration::from_secs(1),
+        StreamAuthTermination::CredentialExpired,
+    );
+    assert_eq!(
+        dispatch_phase_authorization_expiry_for_test(Some(&plan)),
+        None,
+        "a bound that has not elapsed is the protocol's own, not authorization's"
+    );
+    tokio::time::advance(Duration::from_secs(2)).await;
+    assert_eq!(
+        dispatch_phase_authorization_expiry_for_test(Some(&plan)),
+        Some(StreamAuthTermination::CredentialExpired)
+    );
+    assert_eq!(
+        plan.2.observed(),
+        Some(StreamAuthTermination::CredentialExpired)
+    );
+    // Idempotent: a second phase observing the same elapsed plan cannot count
+    // a second termination.
+    assert_eq!(
+        dispatch_phase_authorization_expiry_for_test(Some(&plan)),
+        Some(StreamAuthTermination::CredentialExpired)
+    );
+    assert!(!plan.2.record_once(
+        StreamAuthTermination::CredentialExpired,
+        StreamAuthProtocolFamily::WebSocket
+    ));
+}
+
+#[tokio::test]
+async fn an_unauthenticated_dispatch_phase_never_attributes_authorization() {
+    assert_eq!(dispatch_phase_authorization_expiry_for_test(None), None);
+}
+
+#[tokio::test]
+async fn the_dispatch_placeholder_is_health_neutral_and_redacted() {
+    let (status, body, connection_error, error_class) =
+        authorization_expired_dispatch_placeholder_for_test();
+    assert_eq!(status, 401);
+    assert_eq!(body, br#"{"error":"Unauthorized"}"#.to_vec());
+    assert!(
+        !connection_error,
+        "the gateway cancelled the dispatch; no connect failure occurred"
+    );
+    // `client_disconnect` is never retried and is backend-health neutral, so the
+    // gateway's own security decision cannot be charged to the upstream.
+    assert_eq!(error_class, Some("client_disconnect"));
+    let rendered = String::from_utf8(body).unwrap();
+    assert!(!rendered.chars().any(|c| c.is_ascii_digit()), "{rendered}");
+}
+
+// --- The response-header wait (#3815) --------------------------------------
+
+#[tokio::test(start_paused = true)]
+async fn the_authorization_lifetime_bounds_an_otherwise_unbounded_header_wait() {
+    // No client `grpc-timeout` and `backend_read_timeout_ms = 0`: the wait had
+    // no bound at all, and a bodyless request gives the upload adapter nothing
+    // to fire on.
+    assert_eq!(
+        authorization_bounded_header_deadline_for_test(None, 0, None),
+        None
+    );
+    assert_eq!(
+        authorization_bounded_header_deadline_for_test(None, 0, Some(5_000)),
+        Some((5_000, "authorization"))
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_earlier_protocol_header_bound_still_wins() {
+    assert_eq!(
+        authorization_bounded_header_deadline_for_test(None, 1_000, Some(5_000)),
+        Some((1_000, "operator"))
+    );
+    assert_eq!(
+        authorization_bounded_header_deadline_for_test(Some(800), 0, Some(5_000)),
+        Some((800, "client"))
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_later_protocol_header_bound_loses_to_the_authorization_lifetime() {
+    assert_eq!(
+        authorization_bounded_header_deadline_for_test(Some(60_000), 30_000, Some(5_000)),
+        Some((5_000, "authorization"))
+    );
+    // A tie is attributed to the security decision.
+    assert_eq!(
+        authorization_bounded_header_deadline_for_test(None, 5_000, Some(5_000)),
+        Some((5_000, "authorization"))
+    );
+}
+
+// --- The direct-H2 early-response upload join (#3815) ----------------------
+
+#[tokio::test(start_paused = true)]
+async fn the_authorization_lifetime_bounds_an_otherwise_unbounded_upload_join() {
+    // `backend_read_timeout_ms = 0` with no RPC deadline is the documented
+    // "0 = no timeout" contract: an early backend response would otherwise wait
+    // on the detached upload indefinitely.
+    assert_eq!(direct_h2_upload_join_bound_for_test(None, 0, None), None);
+    assert_eq!(
+        direct_h2_upload_join_bound_for_test(None, 0, Some(4_000)),
+        Some((4_000, "authorization"))
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_earlier_protocol_upload_join_bound_still_wins() {
+    assert_eq!(
+        direct_h2_upload_join_bound_for_test(None, 1_000, Some(9_000)),
+        Some((1_000, "operator_timeout"))
+    );
+    assert_eq!(
+        direct_h2_upload_join_bound_for_test(Some(700), 0, Some(9_000)),
+        Some((700, "rpc_deadline"))
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_later_protocol_upload_join_bound_loses_to_the_authorization_lifetime() {
+    assert_eq!(
+        direct_h2_upload_join_bound_for_test(Some(60_000), 30_000, Some(2_500)),
+        Some((2_500, "authorization"))
+    );
+    assert_eq!(
+        direct_h2_upload_join_bound_for_test(None, 2_500, Some(2_500)),
+        Some((2_500, "authorization")),
+        "a tie is attributed to the security decision"
+    );
+}
+
+// --- Source contracts for the dispatch seams (#3815) -----------------------
+//
+// These seams live inside `handle_proxy_request_inner` / `proxy_to_backend*`,
+// which need a live listener, a pooled backend, and a real hyper transport to
+// drive. The behavior each one composes is unit-tested above; these assertions
+// keep the WIRING from silently regressing — a buffered arm reverting to the
+// unbounded collect, or the direct-H2 upload join losing its gate.
+
+const PROXY_SOURCE: &str = include_str!("../../../src/proxy/mod.rs");
+const GRPC_PROXY_SOURCE: &str = include_str!("../../../src/proxy/grpc_proxy.rs");
+
+#[test]
+fn every_post_admission_buffered_upload_collect_carries_the_authorization_plan() {
+    // reqwest buffered (limited + unlimited) and the H3-backend bridge's
+    // buffered arms (limited + unlimited).
+    assert_eq!(
+        PROXY_SOURCE
+            .matches("collect_request_body_under_authorization(")
+            .count(),
+        4,
+        "a post-admission buffered upload arm reverted to the unbounded collect"
+    );
+    // Both buffered native-gRPC collects.
+    assert_eq!(
+        GRPC_PROXY_SOURCE
+            .matches("collect_request_body_under_authorization(")
+            .count(),
+        2,
+        "a buffered gRPC upload arm reverted to the unbounded collect"
+    );
+    // Every authorization arm returns the health-neutral placeholder, so the
+    // single pre-commitment terminal decides the client-visible shape.
+    assert_eq!(
+        PROXY_SOURCE
+            .matches("Err(AuthorizedUploadWaitError::AuthorizationExpired(_)) => {")
+            .count(),
+        4
+    );
+}
+
+#[test]
+fn the_pre_authentication_prebuffer_stays_on_the_unbounded_collect() {
+    // `buffer_request_body_for_before_proxy` runs BEFORE any principal is
+    // admitted, so there is no authorization lifetime to enforce there and no
+    // credential deadline to read. Widening it would be a false bound.
+    let prebuffer = PROXY_SOURCE
+        .split("async fn buffer_request_body_for_before_proxy(")
+        .nth(1)
+        .expect("pre-authentication prebuffer")
+        .split("pub(crate) fn request_may_have_body")
+        .next()
+        .expect("bounded prebuffer body");
+    assert!(!prebuffer.contains("collect_request_body_under_authorization"));
+}
+
+#[test]
+fn the_direct_h2_upload_completion_gate_is_installed_for_authenticated_requests() {
+    let gate = PROXY_SOURCE
+        .split("let needs_upload_completion_gate =")
+        .nth(1)
+        .expect("direct-H2 upload-completion gate decision")
+        .split(';')
+        .next()
+        .expect("bounded gate decision");
+    assert!(
+        gate.contains("effective_max_request_body_size_bytes > 0"),
+        "the size-limit reason must stay: {gate}"
+    );
+    assert!(
+        gate.contains("upload_auth_deadline.is_some()"),
+        "an authenticated direct-H2 request needs the upload join even with limits off: {gate}"
+    );
+    assert!(
+        PROXY_SOURCE.contains("if needs_upload_completion_gate {"),
+        "the gate decision must drive the completion-channel installation"
+    );
+}
+
+#[test]
+fn the_direct_h2_upload_join_reports_authorization_rather_than_an_indeterminate_size() {
+    // An authorization-terminated upload also reports `Abandoned`, which the
+    // size gate classifies as FailClosed. That must not surface as a 502
+    // backend fault.
+    let fail_closed = PROXY_SOURCE
+        .split("DirectH2UploadGate::FailClosed => {")
+        .nth(1)
+        .expect("direct-H2 fail-closed arm")
+        .split("\"HTTP/2 request upload did not establish an authoritative size decision")
+        .next()
+        .expect("bounded fail-closed arm");
+    assert!(fail_closed.contains("upload_auth_deadline"));
+    assert!(fail_closed.contains("latch.observed()"));
+    assert!(fail_closed.contains("authorization_expired_dispatch_placeholder("));
+}
+
+#[test]
+fn every_h1h2_response_header_wait_composes_the_authorization_lifetime() {
+    // The definition plus five composed waits: the reqwest initial attempt, the
+    // reqwest retry attempt, mesh mTLS, HBONE, and the Unix-socket pool.
+    // Direct-H2 composes through `authorization_bounded_header_deadline` instead,
+    // because it carries a typed bound source.
+    assert_eq!(
+        PROXY_SOURCE
+            .matches("compose_dispatch_phase_auth_bound(")
+            .count(),
+        6,
+        "an H1/H2 response-header wait lost its authorization bound"
+    );
+    assert!(PROXY_SOURCE.contains("authorization_bounded_header_deadline("));
+    assert!(PROXY_SOURCE.contains("ResponseHeaderDeadlineSource::Authorization => {"));
+    // The definition plus seven attributions: those five waits, the direct-H2
+    // header wait, and the direct-H2 early-response upload join. Each attributes
+    // the fired bound, so an authorization expiry is never reported as a backend
+    // timeout or a client RPC deadline.
+    assert_eq!(
+        PROXY_SOURCE
+            .matches("dispatch_phase_authorization_expiry(")
+            .count(),
+        8,
+        "an H1/H2 dispatch phase lost its authorization attribution"
+    );
+    // Every one of those exits returns the health-neutral placeholder: the
+    // definition plus twelve call sites (four buffered collects, five header
+    // waits, the direct-H2 header wait, the direct-H2 upload join, and the
+    // direct-H2 fail-closed guard).
+    assert_eq!(
+        PROXY_SOURCE
+            .matches("authorization_expired_dispatch_placeholder(")
+            .count(),
+        13,
+        "an H1/H2 authorization exit stopped being health-neutral"
+    );
+}
+
+#[test]
+fn both_buffered_grpc_authorization_exits_release_their_admission_state() {
+    let branches: Vec<&str> = PROXY_SOURCE
+        .split("Err(grpc_proxy::GrpcRequestBodyCollectError::AuthorizationExpired(")
+        .skip(1)
+        .map(|branch| {
+            branch
+                .split("Err(grpc_proxy::GrpcRequestBodyCollectError::Proxy")
+                .next()
+                .expect("bounded buffered gRPC authorization branch")
+        })
+        .collect();
+    assert_eq!(branches.len(), 2, "split and mixed buffered gRPC arms");
+    for branch in branches {
+        assert!(branch.contains("grpc_probe_guard.disarm()"));
+        assert!(branch.contains("release_circuit_breaker_probe_on_admission_reject("));
+        assert!(branch.contains("preacquired_backend_admission.take_if_acquired()"));
+        assert!(branch.contains("finalize_authorization_expired_rejection("));
+        assert!(branch.contains("authorization_expired_buffered_grpc_upload"));
+    }
+}
+
+#[test]
+fn the_buffered_grpc_authorization_terminal_is_unauthenticated_and_latched() {
+    // `grpc-status: 16` (`UNAUTHENTICATED`), never a fabricated DEADLINE_EXCEEDED.
+    let normalized = PROXY_SOURCE
+        .split("fn normalized_authorization_expired(")
+        .nth(1)
+        .expect("buffered gRPC authorization terminal")
+        .split("\n}\n")
+        .next()
+        .expect("bounded terminal builder");
+    assert!(normalized.contains("AUTHORIZATION_EXPIRED_GRPC_STATUS_HEADER"));
+    assert!(normalized.contains("termination.grpc_message()"));
+    assert!(
+        !normalized.contains("GATEWAY_DEADLINE_EXCEEDED"),
+        "an expired credential is never reported as a client-chosen RPC deadline"
+    );
+    // The bounded class reaches the transaction summary through the ordinary latch.
+    let finalize = PROXY_SOURCE
+        .split("async fn finalize_authorization_expired_rejection(")
+        .nth(1)
+        .expect("buffered gRPC authorization finalizer")
+        .split("\n}\n")
+        .next()
+        .expect("bounded finalizer");
+    assert!(finalize.contains("ctx.latch_authorization_termination(termination);"));
 }

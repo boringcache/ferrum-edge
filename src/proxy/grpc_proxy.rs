@@ -1495,13 +1495,25 @@ pub(crate) enum GrpcRequestBodyCollectError {
     Proxy(GrpcProxyError),
     TimedOut,
     DeadlineExceeded,
+    /// The admitted stream's authorization lifetime elapsed while the gateway was
+    /// still collecting the buffered client upload (issue #3815). Already latched
+    /// and counted exactly once for the request; the caller emits the fixed
+    /// pre-commitment gRPC terminal.
+    AuthorizationExpired(crate::proxy::auth_lifetime::StreamAuthTermination),
 }
 
-fn map_request_body_wait_error(error: super::RequestBodyWaitError) -> GrpcRequestBodyCollectError {
+fn map_authorized_upload_wait_error(
+    error: super::AuthorizedUploadWaitError,
+) -> GrpcRequestBodyCollectError {
     match error {
-        super::RequestBodyWaitError::TimedOut => GrpcRequestBodyCollectError::TimedOut,
-        super::RequestBodyWaitError::DeadlineExceeded => {
+        super::AuthorizedUploadWaitError::Wait(super::RequestBodyWaitError::TimedOut) => {
+            GrpcRequestBodyCollectError::TimedOut
+        }
+        super::AuthorizedUploadWaitError::Wait(super::RequestBodyWaitError::DeadlineExceeded) => {
             GrpcRequestBodyCollectError::DeadlineExceeded
+        }
+        super::AuthorizedUploadWaitError::AuthorizationExpired(termination) => {
+            GrpcRequestBodyCollectError::AuthorizationExpired(termination)
         }
     }
 }
@@ -3994,22 +4006,29 @@ async fn proxy_grpc_streaming_dispatch(
 /// This is used when plugins or retry replay require request body buffering for
 /// gRPC proxies. The body bytes, method, and headers are returned so the caller
 /// can run plugin hooks before dispatching via `proxy_grpc_request_core`.
+///
+/// `auth` is the admitted stream's authorization-lifetime plan (issue #3815).
+/// A buffered gRPC upload never reaches the streaming upload adapters, so this
+/// collect is the only seam that can stop a continuously active client-streaming
+/// RPC on a buffering route from outliving the credential that admitted it.
 pub(crate) async fn collect_grpc_request_body(
     req: Request<Incoming>,
     max_grpc_recv_size_bytes: usize,
     request_body_read_timeout_ms: u64,
     grpc_deadline_at: Option<tokio::time::Instant>,
+    auth: Option<&crate::proxy::RequestAuthLifetimePlan>,
 ) -> Result<(hyper::Method, hyper::HeaderMap, Bytes), GrpcRequestBodyCollectError> {
     let (parts, body) = req.into_parts();
     let body_bytes = if max_grpc_recv_size_bytes > 0 {
         let limited = http_body_util::Limited::new(body, max_grpc_recv_size_bytes);
-        let collected = super::collect_request_body_with_deadline(
+        let collected = super::collect_request_body_under_authorization(
             BodyExt::collect(limited),
             grpc_deadline_at,
             request_body_read_timeout_ms,
+            auth,
         )
         .await
-        .map_err(map_request_body_wait_error)?;
+        .map_err(map_authorized_upload_wait_error)?;
         match collected {
             Ok(collected) => collected.to_bytes(),
             Err(e) => {
@@ -4027,13 +4046,14 @@ pub(crate) async fn collect_grpc_request_body(
             }
         }
     } else {
-        super::collect_request_body_with_deadline(
+        super::collect_request_body_under_authorization(
             BodyExt::collect(body),
             grpc_deadline_at,
             request_body_read_timeout_ms,
+            auth,
         )
         .await
-        .map_err(map_request_body_wait_error)?
+        .map_err(map_authorized_upload_wait_error)?
         .map_err(|e| {
             GrpcRequestBodyCollectError::Proxy(GrpcProxyError::Internal(format!(
                 "Failed to read request body: {}",

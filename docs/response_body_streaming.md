@@ -400,6 +400,9 @@ The `grpc-message` and the internal termination text are compiled-in literals.
 |---------|----------|
 | Generic HTTP/1.1 and HTTP/2 streaming responses, including SSE | Yes |
 | HTTP/1.1 and HTTP/2 streaming and bidirectional request **uploads** | Yes — the client body adapter every streaming dispatch path already installs (reqwest, direct-H2, mesh mTLS, HBONE, Unix socket) carries the same absolute plan, so an upload whose backend withholds response headers is bounded even though no response body exists yet |
+| HTTP/1.1 and HTTP/2 request uploads the gateway **buffers** before dispatch | Yes — a body a request-body plugin, a gRPC-Web translation, or retry replay forces into memory never reaches those adapters, so the collect itself carries the plan (`collect_request_body_under_authorization`). Covers the reqwest buffered arms, the H3-backend bridge's buffered arms, and both buffered native-gRPC arms |
+| The response-**header** wait on every H1/H2 dispatch path | Yes — reqwest (initial attempt and retry), direct-H2, mesh mTLS, HBONE, and Unix socket compose the plan over the client RPC deadline and `backend_read_timeout_ms`, so a backend that withholds its response head cannot hold an authenticated request open past expiry even when both of those bounds are disabled |
+| The direct-H2 **early-response** upload join | Yes — the upload-completion gate is installed whenever a request-size limit is configured **or** the request carries an authorization lifetime, and the join waits under the composed plan, so an early backend response is never committed while an authenticated upload is still running past expiry |
 | Native gRPC server-, client-, and bidirectional streaming | Yes |
 | gRPC-Web streaming, binary and text | Yes |
 | HTTP/3 backend responses relayed to an H1/H2 downstream (`StreamingH3`) | Yes |
@@ -440,6 +443,32 @@ Deliberate scope notes:
   backend outcome, so the breaker, passive health, and the adaptive buffer
   tracker are untouched. Retries and backoff sleeps cannot refresh the absolute
   deadline — it is re-checked at the top of every connect attempt.
+- A **buffered H1/H2 upload** is bounded by the collect, not by a body adapter:
+  the plan composes over the client RPC deadline and the operator whole-upload
+  stall timeout, and the authorization arm is biased first, so a plan that has
+  already elapsed fails closed without polling the collect at all. When the
+  authorization bound is the one that elapsed, the dispatch returns a
+  health-neutral outcome and the single pre-commitment terminal decides the
+  client-visible shape; a buffered **native-gRPC** upload takes the equivalent
+  trailers-only `grpc-status: 16` terminal through the shared reject pipeline,
+  which releases the half-open circuit-breaker probe slot and any body-phase
+  admission preacquisition first.
+- **Direct-H2 early responses and hyper's detached upload pipe.** When
+  `send_request` yields a response head, hyper moves the client body into a
+  detached HTTP/2 pipe task, and h2 resets a stream only once *every* reference
+  to it is dropped — the pipe holds one, and hyper closes its own cancellation
+  channel as soon as the response head resolves. So the gateway cannot force an
+  immediate `RST_STREAM` from outside without tearing down the whole pooled
+  multiplexed connection and its sibling requests. What is guaranteed instead:
+  the upload adapter evaluates the authorization bound **before** its inner
+  poll, so no client byte is forwarded to the backend after expiry; and the
+  dispatch returns the pre-commitment terminal rather than the backend response,
+  so no response byte is delivered under an expired credential. What is not
+  guaranteed is prompt teardown of a pipe *parked on backend send capacity* —
+  that pipe is not polling, so it observes the cancellation only when credit, a
+  reset, or a connection close arrives. No data crosses the gateway in either
+  direction in the meantime, and the counters/summary classification are already
+  recorded at the deadline.
 - An H3 request body that is **buffered before dispatch** composes the
   authorization deadline into the existing early-upload ceiling
   (`backend_read_timeout_ms` and the optional client RPC deadline) through
