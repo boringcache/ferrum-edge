@@ -5488,12 +5488,15 @@ mod inner {
         })
     }
 
-    /// Strictly decode a stored gateway trust-bundle `revision`.
+    /// Strictly decode a stored gateway trust-bundle string identity field.
     ///
-    /// Missing, non-integer, or non-positive values are corrupt security
-    /// metadata and are refused rather than defaulted; the diagnostic names the
-    /// field only and drives the bounded `undecodable` failure reason.
-    fn strict_stored_str_field(doc: &Document, field: &'static str) -> Result<String, anyhow::Error> {
+    /// Missing or non-string values are corrupt security metadata and are
+    /// refused rather than defaulted; the diagnostic names the field only and
+    /// drives the bounded `undecodable` failure reason.
+    fn strict_stored_str_field(
+        doc: &Document,
+        field: &'static str,
+    ) -> Result<String, anyhow::Error> {
         match doc.get_str(field) {
             Ok(value) => Ok(value.to_string()),
             Err(_) => {
