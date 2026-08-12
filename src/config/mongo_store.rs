@@ -14305,6 +14305,7 @@ mod inner {
                 compiled_stream_match: None,
                 created_at: now,
                 updated_at: now,
+                pending_limit_scope: None,
             };
 
             let doc = proxy_to_doc(&proxy).expect("proxy_to_doc should succeed");
@@ -14423,6 +14424,8 @@ mod inner {
                 api_spec_id: None,
                 created_at: now,
                 updated_at: now,
+                k8s_service_uid: None,
+                pending_limit_scope: None,
             };
 
             let doc = upstream_to_doc(&upstream).expect("upstream_to_doc should succeed");
@@ -14516,6 +14519,7 @@ mod inner {
                 compiled_stream_match: None,
                 created_at: now,
                 updated_at: now,
+                pending_limit_scope: None,
             };
             let doc = proxy_to_doc(&proxy).unwrap();
             // The _id should be set to the proxy id
@@ -14627,6 +14631,7 @@ mod inner {
                 compiled_stream_match: None,
                 created_at: now,
                 updated_at: now,
+                pending_limit_scope: None,
             };
             let doc = proxy_to_doc(&proxy).unwrap();
             assert!(
@@ -14728,6 +14733,8 @@ mod inner {
                 api_spec_id: None,
                 created_at: now,
                 updated_at: now,
+                k8s_service_uid: None,
+                pending_limit_scope: None,
             };
             let doc = upstream_to_doc(&upstream).unwrap();
             assert!(
@@ -14842,6 +14849,7 @@ mod inner {
                 compiled_stream_match: None,
                 created_at: now,
                 updated_at: now,
+                pending_limit_scope: None,
             };
 
             let doc = proxy_to_doc(&proxy).unwrap();
