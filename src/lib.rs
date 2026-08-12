@@ -7185,7 +7185,100 @@ pub mod _test_support {
             grpc_web_response_content_type,
             family,
             auth_latch,
+            None,
         )
+    }
+
+    /// [`proxy_body_with_authorization_deadline_for_test`] WITH the
+    /// transport-level close signal the connection handlers install, so an
+    /// external test can prove the gateway-owned watchdog releases the upstream
+    /// and then closes a downstream that never polls the body (issue #3815).
+    pub fn proxy_body_with_authorization_deadline_and_closer_for_test(
+        body: crate::proxy::ProxyBody,
+        deadline: crate::proxy::auth_lifetime::StreamAuthDeadline,
+        family: crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
+        auth_latch: Option<crate::proxy::auth_lifetime::StreamAuthTerminationLatch>,
+        closer: crate::proxy::auth_lifetime::AuthorizationConnectionCloser,
+    ) -> crate::proxy::ProxyBody {
+        body.with_authorization_deadline(deadline, None, family, auth_latch, Some(closer))
+    }
+
+    /// The bounded grace the response watchdog waits after the authorization
+    /// deadline before asking the connection task to close the client
+    /// connection.
+    #[must_use]
+    pub fn authorization_transport_close_grace() -> std::time::Duration {
+        crate::proxy::response_watchdog::TRANSPORT_CLOSE_GRACE
+    }
+
+    /// Install the gateway-owned response watchdog directly over one body, as
+    /// `ProxyBody::with_authorization_deadline` does, so an external test can
+    /// observe the upstream release without going through `ProxyBody`
+    /// (issue #3815).
+    pub fn authorization_cancellable_body_for_test(
+        inner: crate::proxy::ProxyBody,
+        deadline: crate::proxy::auth_lifetime::StreamAuthDeadline,
+        family: crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
+        latch: crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+        fired: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        closer: Option<crate::proxy::auth_lifetime::AuthorizationConnectionCloser>,
+    ) -> crate::proxy::response_watchdog::AuthorizationCancellableBody<crate::proxy::ProxyBody> {
+        crate::proxy::response_watchdog::AuthorizationCancellableBody::new(
+            inner, deadline, family, latch, fired, closer,
+        )
+    }
+
+    /// Which bound ended a buffered response-body collection, as
+    /// [`collect_response_under_authorization_for_test`] reports it.
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum ResponseCollectBoundForTest {
+        Completed,
+        RpcDeadline,
+        AuthorizationExpired,
+    }
+
+    /// Collect a buffered RESPONSE body under the composed bound every buffered
+    /// dispatch arm now installs — the earliest of the client RPC deadline and
+    /// the admitted stream's authorization deadline (issue #3815).
+    pub async fn collect_response_under_authorization_for_test<F>(
+        collect: F,
+        grpc_deadline_at: Option<tokio::time::Instant>,
+        auth: Option<&(
+            crate::proxy::auth_lifetime::StreamAuthDeadline,
+            crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
+            crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+        )>,
+    ) -> ResponseCollectBoundForTest
+    where
+        F: std::future::Future,
+    {
+        match crate::proxy::collect_response_under_authorization(grpc_deadline_at, auth, collect)
+            .await
+        {
+            Ok(_) => ResponseCollectBoundForTest::Completed,
+            Err(crate::proxy::ResponseCollectBound::RpcDeadline) => {
+                ResponseCollectBoundForTest::RpcDeadline
+            }
+            Err(crate::proxy::ResponseCollectBound::AuthorizationExpired) => {
+                ResponseCollectBoundForTest::AuthorizationExpired
+            }
+        }
+    }
+
+    /// The absolute bound every awaited PRE-COMMITMENT response phase runs
+    /// under (`after_proxy`, the buffered body hooks, the final client-visible
+    /// body/header policies, and the response-committed hook).
+    pub fn precommit_response_phase_deadline_for_test(
+        ctx: &crate::plugins::RequestContext,
+    ) -> Option<tokio::time::Instant> {
+        ctx.precommit_response_phase_deadline_at()
+    }
+
+    /// Publish the validated authenticated-stream maximum, as
+    /// `EnvConfig::validate` does, so a test can control the process-wide value
+    /// [`precommit_response_phase_deadline_for_test`] reads.
+    pub fn publish_authenticated_stream_max_lifetime_seconds_for_test(seconds: u64) {
+        crate::proxy::auth_lifetime::publish_authenticated_stream_max_lifetime_seconds(seconds);
     }
 
     /// Run one post-admission TCP setup stage under the admitted stream's
@@ -7859,6 +7952,17 @@ pub mod _test_support {
         expired: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> crate::proxy::tcp_proxy::AuthorizationDeadlineStream<S> {
         crate::proxy::tcp_proxy::AuthorizationDeadlineStream::new(inner, deadline_at, expired)
+    }
+
+    /// Wait out one connect-retry backoff exactly as the TCP setup loop does,
+    /// so an external test can prove the backoff is bounded by the admitted
+    /// stream's authorization deadline (issue #3816). Returns the bounded
+    /// termination class on expiry.
+    pub async fn tcp_retry_backoff_under_authorization_for_test(
+        plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+        delay: std::time::Duration,
+    ) -> Result<(), crate::proxy::auth_lifetime::StreamAuthTermination> {
+        crate::proxy::tcp_proxy::retry_backoff_within_stream_auth_deadline(plan, delay).await
     }
 
     pub fn proxy_body_with_client_grpc_deadline_for_test(

@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use ferrum_edge::_test_support::{
     BufferedUploadWaitOutcomeForTest, DtlsAuthorizationExpiryForTest, EarlyUploadBoundKind,
-    ProbePumpOutcome, ProbeTransportPoll, UploadPumpProbe, attribute_dispatch_phase_bound_for_test,
-    authorization_bounded_header_deadline_for_test,
+    ProbePumpOutcome, ProbeTransportPoll, ResponseCollectBoundForTest, UploadPumpProbe,
+    attribute_dispatch_phase_bound_for_test, authorization_bounded_header_deadline_for_test,
     authorization_expired_dispatch_placeholder_for_test,
     authorization_expired_pre_commitment_response_for_test,
     collect_buffered_upload_under_authorization_for_test,
@@ -281,35 +281,20 @@ fn protocol_families_are_a_fixed_closed_inventory() {
         StreamAuthProtocolFamily::Http,
         StreamAuthProtocolFamily::Grpc,
         StreamAuthProtocolFamily::GrpcWeb,
-        StreamAuthProtocolFamily::WebSocket,
         StreamAuthProtocolFamily::StreamTcp,
         StreamAuthProtocolFamily::StreamUdp,
     ];
     let names: Vec<&str> = families.iter().map(|f| f.as_str()).collect();
     assert_eq!(
         names,
-        vec![
-            "http",
-            "grpc",
-            "grpc_web",
-            "websocket",
-            "stream_tcp",
-            "stream_udp"
-        ]
+        vec!["http", "grpc", "grpc_web", "stream_tcp", "stream_udp"]
     );
 }
 
 #[test]
 fn counters_expose_every_family_and_only_those_families() {
     let snapshot = counters();
-    let expected = [
-        "http",
-        "grpc",
-        "grpc_web",
-        "websocket",
-        "stream_tcp",
-        "stream_udp",
-    ];
+    let expected = ["http", "grpc", "grpc_web", "stream_tcp", "stream_udp"];
     assert_eq!(snapshot.credential_expired.len(), expected.len());
     assert_eq!(
         snapshot.authenticated_stream_max_lifetime.len(),
@@ -543,6 +528,99 @@ fn plan_at(at: tokio::time::Instant, termination: StreamAuthTermination) -> Stre
     StreamAuthDeadline { at, termination }
 }
 
+// ── TCP connect-retry backoff is authorization-bounded (issue #3816) ────────
+//
+// `retry_delay` grows with the attempt number, so a chain of failing
+// candidates can hold an admitted authenticated session open for far longer
+// than the credential that admitted it. Unlike DNS, connect, and the
+// handshake, a raw `sleep` has no bound of its own at all.
+
+#[tokio::test(start_paused = true)]
+async fn a_retry_backoff_shorter_than_the_authorization_deadline_completes_normally() {
+    let plan = plan_at(
+        tokio::time::Instant::now() + Duration::from_secs(30),
+        StreamAuthTermination::CredentialExpired,
+    );
+    let started = tokio::time::Instant::now();
+    ferrum_edge::_test_support::tcp_retry_backoff_under_authorization_for_test(
+        Some(plan),
+        Duration::from_secs(2),
+    )
+    .await
+    .expect("a backoff inside the authorization lifetime is an ordinary wait");
+    assert_eq!(tokio::time::Instant::now() - started, Duration::from_secs(2));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_retry_backoff_is_cancelled_at_the_authorization_deadline() {
+    // The operator's retry policy would wait five minutes; the credential has
+    // three seconds left. The backoff must end at the credential's deadline,
+    // not at the retry policy's.
+    let plan = plan_at(
+        tokio::time::Instant::now() + Duration::from_secs(3),
+        StreamAuthTermination::CredentialExpired,
+    );
+    let started = tokio::time::Instant::now();
+    let termination = ferrum_edge::_test_support::tcp_retry_backoff_under_authorization_for_test(
+        Some(plan),
+        Duration::from_secs(300),
+    )
+    .await
+    .expect_err("the backoff must be cancelled at the absolute deadline");
+    assert_eq!(termination, StreamAuthTermination::CredentialExpired);
+    assert_eq!(tokio::time::Instant::now() - started, Duration::from_secs(3));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_retry_backoff_entered_exactly_at_the_deadline_never_waits() {
+    // Exact-deadline equality settles as expiry: a credential whose deadline is
+    // exactly now no longer authorizes this session.
+    let at = tokio::time::Instant::now();
+    let termination = ferrum_edge::_test_support::tcp_retry_backoff_under_authorization_for_test(
+        Some(plan_at(
+            at,
+            StreamAuthTermination::AuthenticatedStreamMaxLifetime,
+        )),
+        Duration::from_secs(30),
+    )
+    .await
+    .expect_err("an already-elapsed plan must not enter the backoff at all");
+    assert_eq!(
+        termination,
+        StreamAuthTermination::AuthenticatedStreamMaxLifetime
+    );
+    assert_eq!(tokio::time::Instant::now(), at, "no time may pass");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_zero_length_backoff_at_the_deadline_still_settles_as_expiry() {
+    // A zero delay resolves on its first poll, before any timer arm could be
+    // consulted, so the elapsed-plan check has to precede the wait.
+    let at = tokio::time::Instant::now();
+    let termination = ferrum_edge::_test_support::tcp_retry_backoff_under_authorization_for_test(
+        Some(plan_at(at, StreamAuthTermination::CredentialExpired)),
+        Duration::ZERO,
+    )
+    .await
+    .expect_err("an elapsed plan wins over a zero-length wait");
+    assert_eq!(termination, StreamAuthTermination::CredentialExpired);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unauthenticated_retry_backoff_is_unbounded() {
+    let started = tokio::time::Instant::now();
+    ferrum_edge::_test_support::tcp_retry_backoff_under_authorization_for_test(
+        None,
+        Duration::from_secs(300),
+    )
+    .await
+    .expect("an unauthenticated session carries no authorization lifetime");
+    assert_eq!(
+        tokio::time::Instant::now() - started,
+        Duration::from_secs(300)
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn the_composed_bound_is_the_earliest_of_the_two_absolute_plans() {
     let now = tokio::time::Instant::now();
@@ -676,16 +754,16 @@ async fn an_upload_shares_one_latch_with_the_response_direction() {
     let (_, _, upload_latch) = request_upload_auth_deadline_for_test(&ctx, DEFAULT_MAX).unwrap();
     let (_, _, second_handle) = request_upload_auth_deadline_for_test(&ctx, DEFAULT_MAX).unwrap();
 
-    // `WebSocket` keeps this test's increments clear of the `http` /
+    // `GrpcWeb` keeps this test's increments clear of the `http` /
     // `stream_udp` delta assertions elsewhere in this binary.
     assert!(upload_latch.record_once(
         StreamAuthTermination::CredentialExpired,
-        StreamAuthProtocolFamily::WebSocket
+        StreamAuthProtocolFamily::GrpcWeb
     ));
     assert!(
         !second_handle.record_once(
             StreamAuthTermination::CredentialExpired,
-            StreamAuthProtocolFamily::WebSocket
+            StreamAuthProtocolFamily::GrpcWeb
         ),
         "both directions of one request share a single termination"
     );
@@ -865,7 +943,7 @@ fn upload_plan(
 ) {
     (
         plan_at(tokio::time::Instant::now() + after, termination),
-        StreamAuthProtocolFamily::WebSocket,
+        StreamAuthProtocolFamily::GrpcWeb,
         ferrum_edge::proxy::auth_lifetime::StreamAuthTerminationLatch::default(),
     )
 }
@@ -1062,7 +1140,7 @@ async fn a_buffered_collect_and_a_second_direction_record_one_termination() {
     assert!(
         !latch.record_once(
             StreamAuthTermination::CredentialExpired,
-            StreamAuthProtocolFamily::WebSocket
+            StreamAuthProtocolFamily::GrpcWeb
         ),
         "the opposite direction must not count a second termination"
     );
@@ -1295,7 +1373,7 @@ async fn a_dispatch_phase_attributes_an_elapsed_authorization_bound_once() {
     );
     assert!(!plan.2.record_once(
         StreamAuthTermination::CredentialExpired,
-        StreamAuthProtocolFamily::WebSocket
+        StreamAuthProtocolFamily::GrpcWeb
     ));
 }
 
@@ -1412,6 +1490,7 @@ async fn a_later_protocol_upload_join_bound_loses_to_the_authorization_lifetime(
 
 const PROXY_SOURCE: &str = include_str!("../../../src/proxy/mod.rs");
 const GRPC_PROXY_SOURCE: &str = include_str!("../../../src/proxy/grpc_proxy.rs");
+const H3_SERVER_SOURCE: &str = include_str!("../../../src/http3/server.rs");
 
 #[test]
 fn every_post_admission_buffered_upload_collect_carries_the_authorization_plan() {
@@ -1524,40 +1603,128 @@ fn the_direct_h2_upload_join_reports_authorization_rather_than_an_indeterminate_
 
 #[test]
 fn every_h1h2_response_header_wait_composes_the_authorization_lifetime() {
-    // The definition plus five composed waits: the reqwest initial attempt, the
-    // reqwest retry attempt, mesh mTLS, HBONE, and the Unix-socket pool.
-    // Direct-H2 composes through `authorization_bounded_header_deadline` instead,
-    // because it carries a typed bound source.
+    // The definition, five composed header waits (the reqwest initial attempt,
+    // the reqwest retry attempt, mesh mTLS, HBONE, and the Unix-socket pool),
+    // and the shared buffered-RESPONSE collect composer. Direct-H2 composes
+    // through `authorization_bounded_header_deadline` instead, because it
+    // carries a typed bound source.
     assert_eq!(
         PROXY_SOURCE
             .matches("compose_dispatch_phase_auth_bound(")
             .count(),
-        6,
+        7,
         "an H1/H2 response-header wait lost its authorization bound"
     );
     assert!(PROXY_SOURCE.contains("authorization_bounded_header_deadline("));
     assert!(PROXY_SOURCE.contains("ResponseHeaderDeadlineSource::Authorization => {"));
-    // The definition plus seven attributions: those five waits, the direct-H2
-    // header wait, and the direct-H2 early-response upload join. Each attributes
-    // the fired bound, so an authorization expiry is never reported as a backend
-    // timeout or a client RPC deadline.
+    // The definition plus eight attributions: those five waits, the direct-H2
+    // header wait, the direct-H2 early-response upload join, and the shared
+    // buffered-response collect composer. Each attributes the fired bound, so an
+    // authorization expiry is never reported as a backend timeout or a client
+    // RPC deadline.
     assert_eq!(
         PROXY_SOURCE
             .matches("dispatch_phase_authorization_expiry(")
             .count(),
-        8,
+        9,
         "an H1/H2 dispatch phase lost its authorization attribution"
     );
     // Every one of those exits returns the health-neutral placeholder: the
-    // definition plus twelve call sites (four buffered collects, five header
-    // waits, the direct-H2 header wait, the direct-H2 upload join, and the
-    // direct-H2 fail-closed guard).
+    // definition plus twenty-two call sites — the twelve that already existed
+    // (buffered request-body collects, the five header waits, the direct-H2
+    // header wait, the direct-H2 upload join, and the direct-H2 fail-closed
+    // guard) plus the ten buffered RESPONSE collects.
     assert_eq!(
         PROXY_SOURCE
             .matches("authorization_expired_dispatch_placeholder(")
             .count(),
-        13,
+        23,
         "an H1/H2 authorization exit stopped being health-neutral"
+    );
+}
+
+/// Every buffered RESPONSE collection goes through the shared composer, and
+/// every one of them settles an authorization expiry health-neutrally.
+///
+/// A buffered collect is the one response phase with no downstream body adapter
+/// to fall back on, and its only other bound is the PER-FRAME
+/// `backend_read_timeout_ms`, which `0` disables outright.
+#[test]
+fn every_buffered_response_collect_is_authorization_bounded() {
+    // Ten call sites, one per buffered response arm: two reqwest retry arms,
+    // four reqwest first-attempt arms, direct-H2, HBONE, the Unix-socket pool,
+    // and the mesh-mTLS gRPC-Web arm. (The generic definition itself carries a
+    // `<F>` and is not counted.)
+    assert_eq!(
+        PROXY_SOURCE
+            .matches("collect_response_under_authorization(")
+            .count(),
+        10,
+        "a buffered response collect lost its authorization bound"
+    );
+    for arm in PROXY_SOURCE
+        .split("Err(ResponseCollectBound::AuthorizationExpired) => {")
+        .skip(1)
+    {
+        let branch = arm
+            .split("\n        };")
+            .next()
+            .expect("bounded authorization arm");
+        assert!(
+            branch.contains("authorization_expired_dispatch_placeholder("),
+            "a buffered response collect expiry stopped being health-neutral: {branch}"
+        );
+    }
+}
+
+/// The final authoritative gate immediately before response-head commitment.
+///
+/// The earlier pre-commitment check runs where backend dispatch converges;
+/// every awaited response phase after it can still consume time up to the
+/// deadline, so a protected head must not be committed without one last check.
+#[test]
+fn a_final_authorization_gate_precedes_response_head_commitment() {
+    let gate = PROXY_SOURCE
+        .split("let final_precommit_authorization_termination =")
+        .nth(1)
+        .expect("the final pre-commitment authorization gate");
+    let gate = gate
+        .split("let total_ms =")
+        .next()
+        .expect("bounded final gate");
+    assert!(gate.contains("expired_authorization("));
+    assert!(gate.contains("authorization_expired_pre_commitment_response("));
+    assert!(gate.contains("ctx.latch_authorization_termination(termination);"));
+    assert!(
+        gate.contains("is_streaming_response = false;"),
+        "the fixed terminal is buffered, so the summary must not describe it as streamed"
+    );
+    // The gate must precede the response builder, not follow it.
+    let gate_at = PROXY_SOURCE
+        .find("let final_precommit_authorization_termination =")
+        .expect("gate present");
+    let builder_at = PROXY_SOURCE
+        .find("    // Build final response\n    let mut resp_builder = Response::builder()")
+        .expect("response builder present");
+    assert!(
+        gate_at < builder_at,
+        "the authorization gate must run BEFORE the response head is built"
+    );
+}
+
+/// Every awaited pre-commitment RESPONSE phase runs under the composed bound.
+///
+/// `grpc_deadline_at()` alone is `None` for an ordinary HTTP request, which left
+/// `after_proxy`, the buffered body hooks, the final client-visible body and
+/// header policies, and the response-committed hook completely unbounded.
+#[test]
+fn every_precommit_response_phase_composes_the_authorization_lifetime() {
+    assert_eq!(
+        PROXY_SOURCE
+            .matches("ctx.precommit_response_phase_deadline_at()")
+            .count(),
+        7,
+        "a pre-commitment response phase lost its authorization bound"
     );
 }
 
@@ -1832,7 +1999,7 @@ async fn a_buffered_collect_reports_the_earlier_protocol_bound_even_when_both_ha
             start + Duration::from_secs(2),
             StreamAuthTermination::CredentialExpired,
         ),
-        StreamAuthProtocolFamily::WebSocket,
+        StreamAuthProtocolFamily::GrpcWeb,
         ferrum_edge::proxy::auth_lifetime::StreamAuthTerminationLatch::default(),
     );
     let latch = plan.2.clone();
@@ -2208,5 +2375,200 @@ fn the_dtls_and_upload_pump_authorization_paths_carry_no_production_panic() {
         UPLOAD_PUMP_SOURCE
             .contains("match std::future::pending::<std::convert::Infallible>().await {}"),
         "the disarmed cancellation arm must stay a panic-free never-type match"
+    );
+}
+
+// ── Buffered RESPONSE collection and the pre-commitment response phases ─────
+//
+// A buffered collect is the one response phase with no downstream body adapter:
+// the bytes are retained, not relayed, so there is nothing yet for a `ProxyBody`
+// deadline to cancel. Its only other bound is the PER-FRAME
+// `backend_read_timeout_ms`, which `0` disables outright — a backend that
+// trickles frames then keeps an authenticated request collecting forever.
+
+fn response_plan(
+    after: Duration,
+    termination: StreamAuthTermination,
+) -> (
+    StreamAuthDeadline,
+    StreamAuthProtocolFamily,
+    ferrum_edge::proxy::auth_lifetime::StreamAuthTerminationLatch,
+) {
+    (
+        plan_at(tokio::time::Instant::now() + after, termination),
+        StreamAuthProtocolFamily::Http,
+        ferrum_edge::proxy::auth_lifetime::StreamAuthTerminationLatch::default(),
+    )
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stalled_buffered_response_collect_is_cancelled_at_the_authorization_deadline() {
+    // No client RPC deadline and `backend_read_timeout_ms = 0`: without the
+    // authorization arm this collect is completely unbounded.
+    let plan = response_plan(
+        Duration::from_secs(30),
+        StreamAuthTermination::CredentialExpired,
+    );
+    let latch = plan.2.clone();
+    let started = tokio::time::Instant::now();
+    let outcome = ferrum_edge::_test_support::collect_response_under_authorization_for_test(
+        std::future::pending::<()>(),
+        None,
+        Some(&plan),
+    )
+    .await;
+    assert_eq!(outcome, ResponseCollectBoundForTest::AuthorizationExpired);
+    assert_eq!(
+        tokio::time::Instant::now() - started,
+        Duration::from_secs(30),
+        "the collect must end AT the credential deadline, not later"
+    );
+    assert_eq!(
+        latch.observed(),
+        Some(StreamAuthTermination::CredentialExpired)
+    );
+    assert!(
+        !latch.record_once(
+            StreamAuthTermination::CredentialExpired,
+            StreamAuthProtocolFamily::Http
+        ),
+        "the expiry is counted exactly once for the request"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_earlier_client_rpc_deadline_still_owns_a_buffered_response_collect() {
+    let plan = response_plan(
+        Duration::from_secs(30),
+        StreamAuthTermination::CredentialExpired,
+    );
+    let latch = plan.2.clone();
+    let rpc_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let outcome = ferrum_edge::_test_support::collect_response_under_authorization_for_test(
+        std::future::pending::<()>(),
+        Some(rpc_deadline),
+        Some(&plan),
+    )
+    .await;
+    assert_eq!(outcome, ResponseCollectBoundForTest::RpcDeadline);
+    assert_eq!(
+        latch.observed(),
+        None,
+        "a client-chosen RPC deadline is not an authorization termination"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unauthenticated_buffered_response_collect_keeps_its_own_bounds() {
+    let outcome = ferrum_edge::_test_support::collect_response_under_authorization_for_test(
+        std::future::ready(()),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(outcome, ResponseCollectBoundForTest::Completed);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_response_phase_is_bounded_by_the_authorization_deadline_alone() {
+    // A slow response hook (`after_proxy`, a body transform, the final
+    // client-visible policies, the committed hook) on an ordinary HTTP request
+    // has no `grpc-timeout` at all, so before this composition every one of
+    // them could run past the credential that admitted the stream and then
+    // commit a protected response head.
+    ferrum_edge::_test_support::publish_authenticated_stream_max_lifetime_seconds_for_test(120);
+    let ctx = authenticated_ctx();
+    let bound = ferrum_edge::_test_support::precommit_response_phase_deadline_for_test(&ctx)
+        .expect("an admitted authenticated request must bound every pre-commitment phase");
+    assert!(
+        bound <= tokio::time::Instant::now() + Duration::from_secs(120),
+        "the phase bound must never exceed the finite authenticated-stream maximum"
+    );
+
+    // An unauthenticated request with no RPC deadline is untouched.
+    assert_eq!(
+        ferrum_edge::_test_support::precommit_response_phase_deadline_for_test(&anonymous_ctx()),
+        None
+    );
+
+    // Restore the documented default: this value is process-wide.
+    ferrum_edge::_test_support::publish_authenticated_stream_max_lifetime_seconds_for_test(3_600);
+}
+
+/// Native-H3 gRPC dispatch composes the authorization deadline over BOTH
+/// pre-commitment phases (issue #3815).
+///
+/// `dispatch_grpc_native_h3` opens the backend stream and then races the
+/// request-upload pump against the backend's response head. Both of that race's
+/// protocol bounds can be absent at once — no client `grpc-timeout` and
+/// `backend_read_timeout_ms: 0` — and a continuously active upload keeps the
+/// pump making progress forever, so without the composed bound an admitted
+/// credential stayed authorized while NO response head existed.
+#[test]
+fn native_h3_grpc_dispatch_phases_compose_the_authorization_lifetime() {
+    let dispatch = H3_SERVER_SOURCE
+        .split("async fn dispatch_grpc_native_h3(")
+        .nth(1)
+        .expect("native-H3 gRPC dispatch");
+    // The plan is hoisted AHEAD of the backend open, and the dispatch bound is
+    // the composition rather than the raw protocol bound.
+    let precommit = dispatch
+        .split("// ── Phase 2:")
+        .next()
+        .expect("bounded pre-commitment section");
+    assert!(precommit.contains("let protocol_dispatch_deadline_at ="));
+    assert!(
+        precommit.contains("compose_absolute_bound(\n        protocol_dispatch_deadline_at,"),
+        "the dispatch deadline must be the composition, not the protocol bound alone"
+    );
+    // Both phases check authorization FIRST, so a policy expiry is never
+    // reported as a backend timeout and never downgrades the H3 capability.
+    assert_eq!(
+        dispatch.matches("Some(termination) => Err(termination),").count(),
+        2,
+        "a native-H3 gRPC dispatch phase lost its authorization attribution"
+    );
+    assert_eq!(
+        dispatch
+            .matches("send_h3_grpc_authorization_expired_terminal(")
+            .count(),
+        2,
+        "both pre-commitment phases must emit the fixed trailers-only terminal"
+    );
+    // The relay loop reuses the SAME hoisted plan rather than re-anchoring: one
+    // arbiter call for the whole dispatch.
+    assert_eq!(
+        dispatch.matches("effective_request_auth_deadline(").count(),
+        1,
+        "the relay must not recompute its own authorization plan"
+    );
+    // The header-race arm cancels and JOINS the gateway-owned upload pump.
+    assert!(dispatch.contains("pump_guard.retire().await;"));
+}
+
+/// The pre-commitment native-H3 gRPC terminal is `UNAUTHENTICATED`, redacted,
+/// and health-neutral.
+#[test]
+fn the_native_h3_grpc_precommit_terminal_is_unauthenticated_and_health_neutral() {
+    let terminal = H3_SERVER_SOURCE
+        .split("async fn send_h3_grpc_authorization_expired_terminal<S>(")
+        .nth(1)
+        .expect("native-H3 gRPC pre-commitment terminal")
+        .split("\n/// ")
+        .next()
+        .expect("bounded terminal builder");
+    assert!(terminal.contains("grpc_status::UNAUTHENTICATED"));
+    assert!(terminal.contains("termination.grpc_message()"));
+    assert!(terminal.contains("record_once("));
+    assert!(terminal.contains("ctx.latch_authorization_termination(termination);"));
+    assert!(terminal.contains("outcome_connection_error: false,"));
+    assert!(terminal.contains("crate::retry::ErrorClass::ClientDisconnect"));
+    assert!(
+        !terminal.contains("mark_h3_unsupported"),
+        "a gateway policy expiry must never downgrade a proven backend capability"
+    );
+    assert!(
+        !terminal.contains("DEADLINE_EXCEEDED"),
+        "an expired credential is never reported as a client-chosen RPC deadline"
     );
 }

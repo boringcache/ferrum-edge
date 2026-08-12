@@ -100,6 +100,15 @@ fn mint_short_lived_token() -> String {
 /// TTL so the authorization deadline — not a backend watchdog — is provably
 /// the bound that terminates each stream.
 fn protected_proxy_yaml(backend_port: u16) -> String {
+    protected_proxy_yaml_with_read_timeout(backend_port, 60000)
+}
+
+/// [`protected_proxy_yaml`] with an explicit `backend_read_timeout_ms`.
+///
+/// `0` disables the operator fallback entirely, which — combined with a client
+/// that sends no `grpc-timeout` — leaves the authorization deadline as the only
+/// bound on a dispatch phase.
+fn protected_proxy_yaml_with_read_timeout(backend_port: u16, read_timeout_ms: u64) -> String {
     let config = json!({
         "version": "1",
         "proxies": [{
@@ -110,7 +119,7 @@ fn protected_proxy_yaml(backend_port: u16) -> String {
             "backend_port": backend_port,
             "strip_listen_path": true,
             "backend_connect_timeout_ms": 5000,
-            "backend_read_timeout_ms": 60000,
+            "backend_read_timeout_ms": read_timeout_ms,
             "backend_write_timeout_ms": 60000,
             "backend_tls_verify_server_cert": false,
             "plugins": [{"plugin_config_id": "h3-auth-lifetime-jwt"}],
@@ -1119,4 +1128,141 @@ async fn h3_auth_lifetime_continuously_active_upload_is_a_fixed_401() {
     );
 
     assert_credential_expired_exactly(&harness, "http", 1).await;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// 10. NATIVE HTTP/3 gRPC, PRE-COMMITMENT. `dispatch_grpc_native_h3` opens the
+//     backend stream and then races the request-upload pump against the
+//     backend's response head. Both of that race's protocol bounds can be
+//     absent at once — the client sets no `grpc-timeout` and the operator sets
+//     `backend_read_timeout_ms: 0` — and a continuously active upload keeps the
+//     pump making progress forever, so before the authorization deadline was
+//     composed into the dispatch bound an admitted credential could stay
+//     authorized indefinitely while NO response head existed.
+//
+//     Nothing is client-visible at expiry, so the terminal is the fixed
+//     pre-commitment trailers-only `grpc-status: 16`, the backend's proven H3
+//     capability is not downgraded, and the termination is counted exactly once
+//     for the `grpc` family.
+//
+//     Production path: `http3::server::dispatch_grpc_native_h3` phases 1–3.
+// ────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn h3_auth_lifetime_native_h3_grpc_withheld_head_is_a_precommit_unauthenticated_terminal() {
+    let ca = TestCa::new("h3-auth-lifetime-native-grpc").expect("ca");
+    let (cert, key) = ca.valid().expect("leaf");
+    let (tcp_res, udp_res) = reserve_colocated_tcp_udp()
+        .await
+        .expect("colocated tcp/udp");
+    let backend_port = tcp_res.port;
+
+    // The capability probe uses the colocated TCP+TLS side; once the registry
+    // classifies the target `h3=supported`, the gRPC request itself takes the
+    // native-H3 gRPC dispatch rather than the cross-protocol H2 bridge.
+    let _tcp_backend = ScriptedTlsBackend::builder(
+        tcp_res.into_listener(),
+        TlsConfig::new(cert.clone(), key.clone())
+            .with_alpn(vec![b"h2".to_vec(), b"http/1.1".to_vec()]),
+    )
+    .step(TcpStep::ReadUntil(b"\r\n\r\n".to_vec()))
+    .step(TcpStep::Write(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec(),
+    ))
+    .step(TcpStep::Drop)
+    .spawn()
+    .expect("spawn tls probe backend");
+
+    // The H3 backend accepts the request stream and keeps CONSUMING request
+    // DATA — proving the upload is live and the backend is healthy — while
+    // never sending a response head, for far longer than the credential lives.
+    let mut steps = vec![H3Step::AcceptStream];
+    for _ in 0..40 {
+        steps.push(H3Step::ReadRequestData);
+    }
+    steps.push(H3Step::StallFor(Duration::from_secs(45)));
+    let _h3_backend = ScriptedH3Backend::builder(
+        udp_res.into_socket(),
+        H3TlsConfig::new(cert.clone(), key.clone()),
+    )
+    .steps(steps)
+    .spawn()
+    .expect("spawn head-withholding h3 backend");
+
+    // `backend_read_timeout_ms: 0` removes the operator fallback, and the
+    // client sends no `grpc-timeout`, so the authorization deadline is the ONLY
+    // bound in existence for the open + header race.
+    let (harness, https_port) =
+        spawn_h3_gateway(protected_proxy_yaml_with_read_timeout(backend_port, 0), false).await;
+    let entry = wait_for_h3_supported(&harness, Duration::from_secs(20)).await;
+    assert!(
+        entry.is_some(),
+        "capability registry must classify the backend h3=supported so the gRPC request takes \
+         the native-H3 dispatch; logs:\n{}",
+        harness.captured_combined().unwrap_or_default()
+    );
+
+    let client = Http3Client::insecure().expect("H3 client");
+    let token = mint_short_lived_token();
+    let mut stream = client
+        .open_grpc_stream_with_headers(
+            &proxy_url(https_port, "/api/pkg.Svc/Upload"),
+            &[("authorization", &format!("Bearer {token}"))],
+        )
+        .await
+        .expect("open H3 native gRPC stream");
+
+    // Usable BEFORE the deadline: the first request message is accepted and
+    // relayed while the credential is valid.
+    stream
+        .send_message(b"hello")
+        .await
+        .expect("the RPC must accept a request message while the credential is valid");
+
+    // Then keep the upload CONTINUOUSLY active across the deadline. Relayed
+    // request messages must never buy extra authorized lifetime, and the client
+    // never half-closes.
+    let started = std::time::Instant::now();
+    let pump = async {
+        loop {
+            if stream.send_message(b"more").await.is_err() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    };
+    let _ = tokio::time::timeout(TERMINATION_GRACE * 2, pump).await;
+
+    let (status, headers) = tokio::time::timeout(TERMINATION_GRACE, stream.recv_response())
+        .await
+        .expect("the native-H3 gRPC dispatch must terminate inside the bounded grace")
+        .expect("terminal response headers");
+    assert_eq!(status.as_u16(), 200, "gRPC terminals ride on HTTP 200");
+    assert_eq!(
+        headers.get("grpc-status").and_then(|v| v.to_str().ok()),
+        Some("16"),
+        "a pre-commitment authorization expiry must be a trailers-only UNAUTHENTICATED terminal, \
+         never a backend UNAVAILABLE or DEADLINE_EXCEEDED; elapsed {:?}; logs:\n{}",
+        started.elapsed(),
+        harness.captured_combined().unwrap_or_default()
+    );
+    assert_eq!(
+        headers.get("grpc-message").and_then(|v| v.to_str().ok()),
+        Some("credential expired"),
+        "the grpc-message must be the compiled-in literal with no credential or expiry detail"
+    );
+
+    // The backend never failed, so its proven H3 capability must survive: an
+    // authorization expiry is a gateway policy decision, not a transport fault.
+    let after = fetch_capability_entry(&harness).await;
+    assert_eq!(
+        after
+            .as_ref()
+            .and_then(|entry| entry["plain_http"]["h3"].as_str()),
+        Some("supported"),
+        "an authorization expiry must not downgrade the backend's proven H3 capability; entry: \
+         {after:#?}"
+    );
+
+    assert_credential_expired_exactly(&harness, "grpc", 1).await;
 }

@@ -10827,6 +10827,70 @@ where
     }
 }
 
+/// Emit the fixed PRE-COMMITMENT authorization terminal for a native-H3 gRPC
+/// dispatch and classify it health-neutrally (issue #3815).
+///
+/// Reached when the admitted credential's absolute authorization deadline
+/// elapsed while the gateway was still opening the backend stream, or while it
+/// was racing the request upload against the backend's response head. Neither
+/// phase has committed a client-visible response, so `grpc-status: 16`
+/// (`UNAUTHENTICATED`) trailers are the legal terminal — the exact shape the
+/// H1/H2 pre-commitment terminal uses.
+///
+/// The classification is deliberately neutral: an expired client credential is
+/// a gateway policy decision, never a backend fault, so the circuit breaker,
+/// passive health, and the adaptive limiter must not record a failure. The
+/// fixed-cardinality counter is recorded through the request's shared latch, so
+/// this arm and the relay-phase arm together count exactly once per stream.
+///
+/// Every client-visible string here is a compiled-in literal: no expiry
+/// instant, claim, subject, certificate field, provider, or backend target can
+/// reach the wire or the transaction summary.
+async fn send_h3_grpc_authorization_expired_terminal<S>(
+    env: &H3GrpcDispatchEnv<'_>,
+    stream: &mut RequestStream<S, Bytes>,
+    ctx: &mut RequestContext,
+    termination: crate::proxy::auth_lifetime::StreamAuthTermination,
+) -> H3GrpcDispatchFailure
+where
+    S: SendStream<Bytes>,
+{
+    ctx.authorization_termination_latch().record_once(
+        termination,
+        crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Grpc,
+    );
+    ctx.latch_authorization_termination(termination);
+    let grpc_message = termination.grpc_message();
+    let error_sent = await_h3_grpc_terminal_write_with_grace(send_h3_grpc_error_send(
+        stream,
+        crate::proxy::grpc_proxy::grpc_status::UNAUTHENTICATED,
+        grpc_message,
+        env.initial_response_header_policy_plugins,
+    ))
+    .await;
+    if !error_sent {
+        crate::http3::stream_util::abort_response_stream(stream);
+    }
+    H3GrpcDispatchFailure {
+        grpc_status: crate::proxy::grpc_proxy::grpc_status::UNAUTHENTICATED,
+        grpc_message,
+        // Summary class only. `ClientDisconnect` is the neutral class every
+        // client-caused pre-commitment terminal on this path already uses.
+        h3_error_class: crate::retry::ErrorClass::ClientDisconnect,
+        // HTTP-equivalent health status for a rejected credential. Paired with
+        // `ClientDisconnect` it is skipped by CB / passive health / adaptive
+        // concurrency, so the upstream is never charged for this decision.
+        health_status: 401,
+        outcome_error_class: Some(crate::retry::ErrorClass::ClientDisconnect),
+        // The request DID reach the backend wire on the header-race arm and did
+        // NOT on the open arm, but neither is a backend connect fault, so this
+        // is false in both cases: a connect-class failure would downgrade the
+        // proven H3 capability for a gateway policy decision.
+        outcome_connection_error: false,
+        error_sent,
+    }
+}
+
 /// Record a pre-headers native-H3 gRPC dispatch failure: backend / admission
 /// outcome, observability metadata, and the `TransactionSummary`.
 ///
@@ -11153,12 +11217,25 @@ async fn dispatch_grpc_native_h3(
     let grpc_deadline_at = ctx.grpc_deadline_at();
     let client_deadline_present = grpc_deadline_at.is_some();
 
+    // Absolute AUTHORIZATION deadline for this admitted native-H3 gRPC stream
+    // (issue #3815), hoisted AHEAD of dispatch so the pre-commitment phases
+    // below are bounded by it too. Anchored once from the accepted credential
+    // at request receipt, so computing it here rather than at the relay loop
+    // yields the identical instant; hoisting only widens where it applies.
+    //
+    // `None` for an unauthenticated request, which this contract does not bound
+    // at all.
+    let auth_deadline_plan = crate::proxy::auth_lifetime::effective_request_auth_deadline(
+        ctx,
+        state.env_config.authenticated_stream_max_lifetime_seconds,
+    );
+
     // Bound the request upload + response-header wait. WITH a parseable client
     // deadline that is the absolute deadline; WITHOUT one (absent or malformed —
     // see the grammar check above), fall back to `backend_read_timeout_ms` so a
     // stalled upload can't pin admission / LB / QUIC state indefinitely (matching
     // the H2 path's fallback around `send_request`).
-    let dispatch_deadline_at = if client_deadline_present {
+    let protocol_dispatch_deadline_at = if client_deadline_present {
         grpc_deadline_at
     } else if proxy.backend_read_timeout_ms > 0 {
         tokio::time::Instant::now()
@@ -11166,6 +11243,17 @@ async fn dispatch_grpc_native_h3(
     } else {
         None
     };
+    // ...composed with the authorization deadline, because neither protocol
+    // bound is an authorization bound and BOTH can be absent. A client that
+    // sets no `grpc-timeout` on a proxy with `backend_read_timeout_ms = 0`
+    // previously left the backend open and the header wait completely
+    // unbounded, so a continuously active upload plus a backend that withholds
+    // its response head kept an admitted credential authorized indefinitely.
+    // Earliest-wins, and a tie is attributed to authorization.
+    let dispatch_deadline_at = crate::proxy::auth_lifetime::compose_absolute_bound(
+        protocol_dispatch_deadline_at,
+        auth_deadline_plan,
+    );
 
     // Everything the failure/reject bookkeeping needs, bundled once so the
     // pre-split (backend open) and post-split (response header) failure paths
@@ -11220,37 +11308,70 @@ async fn dispatch_grpc_native_h3(
     };
     let opened = match dispatch_deadline_at {
         Some(at) => match tokio::time::timeout_at(at, open_fut).await {
-            Ok(result) => result,
-            Err(_) => {
+            Ok(result) => Ok(result),
+            // Authorization is checked FIRST: when the composed bound fired
+            // because the admitted credential elapsed, the terminal is the
+            // fixed pre-commitment one, not a backend timeout — and the
+            // capability downgrade below must not run for a gateway policy
+            // decision. A tie between the two bounds is attributed here,
+            // matching every other composed seam.
+            Err(_) => match crate::proxy::auth_lifetime::expired_authorization(auth_deadline_plan) {
+                Some(termination) => Err(termination),
                 // The COLD connect (QUIC/TLS/H3) was still in flight. Under the
                 // operator `backend_read_timeout_ms` FALLBACK that is a genuine
                 // PRE-WIRE connect failure (`connection_error=true` + capability
                 // downgrade); when the CLIENT's own `grpc-timeout` drove the
                 // expiry the client merely chose a deadline too tight to connect,
                 // which is not a backend capability/health signal.
-                if client_deadline_present {
-                    Err(crate::http3::client::H3PoolError::read_timeout(
-                        anyhow::anyhow!(
-                            "client grpc-timeout deadline exceeded before the backend stream opened"
-                        ),
-                    ))
-                } else {
+                None if client_deadline_present => Ok(Err(
+                    crate::http3::client::H3PoolError::read_timeout(anyhow::anyhow!(
+                        "client grpc-timeout deadline exceeded before the backend stream opened"
+                    )),
+                )),
+                None => {
                     state
                         .backend_capabilities
                         .mark_h3_unsupported(proxy, upstream_target);
-                    Err(crate::http3::client::H3PoolError::pre_wire(
+                    Ok(Err(crate::http3::client::H3PoolError::pre_wire(
                         anyhow::anyhow!(
                             "gRPC backend connect/dispatch timed out before the request reached the wire"
                         ),
-                    ))
+                    )))
                 }
-            }
+            },
         },
-        None => open_fut.await,
+        None => Ok(open_fut.await),
     };
     let backend = match opened {
-        Ok(backend) => backend,
-        Err(error) => {
+        Err(termination) => {
+            // PRE-SPLIT and pre-wire for the frontend: no response byte is
+            // client-visible and the receive half has never been polled, so the
+            // fixed `grpc-status: 16` terminal is still the legal shape. Same
+            // ordering as the failure branch below: response, then the graceful
+            // receive halt, then the health-neutral bookkeeping. No upload pump
+            // exists yet on this arm, so there is nothing to join.
+            let failure = send_h3_grpc_authorization_expired_terminal(
+                &dispatch_env,
+                &mut stream,
+                ctx,
+                termination,
+            )
+            .await;
+            crate::http3::stream_util::halt_request_body(&mut stream);
+            record_failed_h3_grpc_dispatch(
+                &dispatch_env,
+                ctx,
+                &mut backend_admission_permits,
+                backend_admission_start,
+                *plugin_execution_ns,
+                failure,
+                0,
+            )
+            .await;
+            return Ok(());
+        }
+        Ok(Ok(backend)) => backend,
+        Ok(Err(error)) => {
             // PRE-SPLIT: the stream is still whole and its receive half has never
             // been polled — the opener writes only request HEADERS. Response
             // first, then the graceful STOP_SENDING(H3_NO_ERROR), then the
@@ -11314,34 +11435,71 @@ async fn dispatch_grpc_native_h3(
     };
     let head_result = match dispatch_deadline_at {
         Some(at) => match tokio::time::timeout_at(at, header_fut).await {
-            Ok(result) => result,
-            Err(_) => {
-                // Attribute the expiry to whoever the gateway was actually
-                // waiting on. `BackendStalled` is a real post-wire read timeout
-                // (504 + `ReadWriteTimeout`, no capability downgrade), so CB /
-                // passive health / adaptive concurrency / LB fallback all see a
-                // dead backend; `ClientStalled` means the incomplete upload is
-                // currently waiting on the client and stays health-neutral. See
-                // `classify_h3_grpc_header_wait_expiry`.
-                let expiry = classify_h3_grpc_header_wait_expiry(&upload);
-                if expiry == H3GrpcHeaderWaitExpiry::BackendStalled {
-                    Err(crate::http3::client::H3PoolError::read_timeout(
-                        anyhow::anyhow!(
-                            "gRPC backend dispatch timed out before response headers (grpc-timeout / backend_read_timeout)"
-                        ),
-                    ))
-                } else {
-                    Err(crate::http3::client::H3PoolError::read_timeout(
-                        anyhow::anyhow!("client request upload stalled past the dispatch deadline"),
-                    ))
+            Ok(result) => Ok(result),
+            // Authorization first, exactly as on the open arm. A continuously
+            // active upload keeps the pump making progress forever and a
+            // backend that simply withholds its response head keeps this race
+            // parked, so this is the arm that would otherwise let an admitted
+            // credential outlive itself before ANY response head existed.
+            Err(_) => match crate::proxy::auth_lifetime::expired_authorization(auth_deadline_plan) {
+                Some(termination) => Err(termination),
+                None => {
+                    // Attribute the expiry to whoever the gateway was actually
+                    // waiting on. `BackendStalled` is a real post-wire read timeout
+                    // (504 + `ReadWriteTimeout`, no capability downgrade), so CB /
+                    // passive health / adaptive concurrency / LB fallback all see a
+                    // dead backend; `ClientStalled` means the incomplete upload is
+                    // currently waiting on the client and stays health-neutral. See
+                    // `classify_h3_grpc_header_wait_expiry`.
+                    let expiry = classify_h3_grpc_header_wait_expiry(&upload);
+                    if expiry == H3GrpcHeaderWaitExpiry::BackendStalled {
+                        Ok(Err(crate::http3::client::H3PoolError::read_timeout(
+                            anyhow::anyhow!(
+                                "gRPC backend dispatch timed out before response headers (grpc-timeout / backend_read_timeout)"
+                            ),
+                        )))
+                    } else {
+                        Ok(Err(crate::http3::client::H3PoolError::read_timeout(
+                            anyhow::anyhow!(
+                                "client request upload stalled past the dispatch deadline"
+                            ),
+                        )))
+                    }
                 }
-            }
+            },
         },
-        None => header_fut.await,
+        None => Ok(header_fut.await),
     };
     let h3_resp = match head_result {
-        Ok(head) => head,
-        Err(error) => {
+        Err(termination) => {
+            // Nothing is client-visible yet, so the fixed pre-commitment
+            // terminal still applies. Response first, then RETIRE the
+            // gateway-owned upload pump — `retire()` cancels AND joins, so once
+            // it returns the pump owns no frontend receive half and no backend
+            // send half, and the forwarded-byte count below is final. Only then
+            // does the health-neutral bookkeeping run.
+            let failure = send_h3_grpc_authorization_expired_terminal(
+                &dispatch_env,
+                &mut send_half,
+                ctx,
+                termination,
+            )
+            .await;
+            pump_guard.retire().await;
+            record_failed_h3_grpc_dispatch(
+                &dispatch_env,
+                ctx,
+                &mut backend_admission_permits,
+                backend_admission_start,
+                *plugin_execution_ns,
+                failure,
+                upload.bytes(),
+            )
+            .await;
+            return Ok(());
+        }
+        Ok(Ok(head)) => head,
+        Ok(Err(error)) => {
             // Response first, then retire the pump (which finalizes the forwarded
             // byte count and closes/resets the backend request direction), then
             // record.
@@ -11831,10 +11989,10 @@ async fn dispatch_grpc_native_h3(
     // Placed BEFORE the client `grpc-timeout` arm below so that when both are
     // ready the security bound is the one attributed; `break 'outer` then makes
     // either arm reachable at most once, so there is no double completion.
-    let auth_deadline_plan = crate::proxy::auth_lifetime::effective_request_auth_deadline(
-        ctx,
-        state.env_config.authenticated_stream_max_lifetime_seconds,
-    );
+    //
+    // `auth_deadline_plan` is the SAME binding the pre-commitment dispatch
+    // phases above were bounded by — computed once, before backend open, so the
+    // two phases cannot drift apart and the relay cannot silently re-anchor.
     let auth_deadline_active = auth_deadline_plan.is_some();
     let auth_deadline_sleep = tokio::time::sleep_until(
         auth_deadline_plan

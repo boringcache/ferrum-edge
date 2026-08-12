@@ -2227,6 +2227,21 @@ pub struct RequestContext {
     /// Carries the bounded class only, never credential material.
     pub(crate) authorization_termination_latch:
         crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+    /// Transport-level close signal for the client connection this request
+    /// arrived on (issue #3815).
+    ///
+    /// Captured with the accepted connection, exactly like
+    /// `websocket_shutdown_rx`. The response-body watchdog uses it as the last
+    /// resort when the downstream refuses to drain the authorization terminal:
+    /// hyper does not poll a response body while its HTTP/2 pipe is parked on
+    /// send capacity or its HTTP/1.1 connection is parked on socket
+    /// writability, so without a lever on the transport the request/session
+    /// accounting `ProxyBody` holds could not be released at all.
+    ///
+    /// `None` on frontends that own their own downstream writes and bound each
+    /// one directly (the native HTTP/3 relays). Carries no credential material.
+    pub(crate) authorization_connection_closer:
+        Option<crate::proxy::auth_lifetime::AuthorizationConnectionCloser>,
     /// Listener-scoped shutdown signal captured with the accepted connection.
     /// WebSocket takeover retains it so listener replacement/drain terminates
     /// upgraded sessions instead of only stopping new accepts.
@@ -3263,6 +3278,7 @@ impl RequestContext {
             authorization_termination: None,
             authorization_termination_latch:
                 crate::proxy::auth_lifetime::StreamAuthTerminationLatch::default(),
+            authorization_connection_closer: None,
             websocket_shutdown_rx: None,
             soap_ws_security_authenticated_body_digest: None,
             timestamp_received: Utc::now(),
@@ -3533,6 +3549,37 @@ impl RequestContext {
                 termination.as_str().to_string(),
             );
         }
+    }
+
+    /// Absolute bound for a PRE-COMMITMENT response phase: the earliest of the
+    /// client RPC deadline and the admitted credential's authorization deadline
+    /// (issue #3815).
+    ///
+    /// Every awaited response phase between backend convergence and the
+    /// client-visible response head — `after_proxy`, the buffered
+    /// normalize/inspect/transform hooks, the final client-visible body and
+    /// header policies, and the response-committed hook — runs while nothing has
+    /// been written downstream. Bounding them only by `grpc_deadline_at()` left
+    /// them completely unbounded for an ordinary HTTP request, so a slow hook
+    /// could carry an admitted credential past its own expiry and then commit a
+    /// PROTECTED response head. Composing the authorization deadline here means
+    /// the phase is cancelled instead, and the authoritative gate immediately
+    /// before head commitment turns that into the fixed pre-commitment terminal.
+    ///
+    /// The maximum comes from the process-wide value `EnvConfig::validate`
+    /// publishes after its `1..=86400` range check, so this needs no config
+    /// handle and cannot read an unvalidated number.
+    ///
+    /// `None` for an unauthenticated request with no RPC deadline — byte for
+    /// byte the previous behavior.
+    pub(crate) fn precommit_response_phase_deadline_at(&self) -> Option<tokio::time::Instant> {
+        crate::proxy::auth_lifetime::compose_absolute_bound(
+            self.grpc_deadline_at(),
+            crate::proxy::auth_lifetime::effective_request_auth_deadline(
+                self,
+                crate::proxy::auth_lifetime::authenticated_stream_max_lifetime_seconds(),
+            ),
+        )
     }
 
     /// Clone this request's shared authorization-lifetime termination latch for
@@ -4364,6 +4411,7 @@ impl RequestContext {
             // Same request, same latch: a cloned context must not be able to
             // record a second termination for the stream it describes.
             authorization_termination_latch: self.authorization_termination_latch.clone(),
+            authorization_connection_closer: self.authorization_connection_closer.clone(),
             websocket_shutdown_rx: self.websocket_shutdown_rx.clone(),
             soap_ws_security_authenticated_body_digest: self
                 .soap_ws_security_authenticated_body_digest,

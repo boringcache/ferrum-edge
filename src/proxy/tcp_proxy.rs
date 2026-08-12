@@ -391,6 +391,39 @@ where
     }
 }
 
+/// Wait out one connect-retry backoff under the admitted stream's absolute
+/// authorization deadline (issue #3816).
+///
+/// A retry backoff is a post-admission setup wait like any other: `retry_delay`
+/// grows with the attempt number, so a chain of failing candidates can hold an
+/// admitted authenticated session for far longer than the credential that
+/// admitted it — and unlike DNS, connect, or the handshake, a raw
+/// `tokio::time::sleep` has no bound of its own at all.
+///
+/// Exact-deadline equality settles as EXPIRY rather than as a completed wait:
+/// a credential whose deadline is exactly now is no longer authorizing this
+/// session, so the backoff is never entered. That also makes the check correct
+/// for a zero-length delay, which would otherwise resolve on its first poll
+/// before any timer arm could be consulted.
+///
+/// `None` (an unauthenticated stream session) sleeps unbounded, with no timer
+/// registered beyond the backoff itself — the previous behavior byte for byte.
+pub(crate) async fn retry_backoff_within_stream_auth_deadline(
+    plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+    delay: std::time::Duration,
+) -> Result<(), crate::proxy::auth_lifetime::StreamAuthTermination> {
+    let Some(plan) = plan else {
+        tokio::time::sleep(delay).await;
+        return Ok(());
+    };
+    if tokio::time::Instant::now() >= plan.at {
+        return Err(plan.termination);
+    }
+    tokio::time::timeout_at(plan.at, tokio::time::sleep(delay))
+        .await
+        .map_err(|_| plan.termination)
+}
+
 /// Settle a post-admission setup-phase authorization expiry.
 ///
 /// Records the fixed-cardinality termination counter exactly once for this
@@ -3958,8 +3991,26 @@ async fn handle_tcp_connection_inner(
                     backend_info.backend_resolved_ip = None;
                     last_connect_err = Some(anyhow::anyhow!(err_msg));
                     attempt += 1;
+                    // The backoff is part of the admitted session's setup, so
+                    // it is bounded by the same absolute plan every other setup
+                    // stage uses. No circuit-breaker settlement is owed here:
+                    // this attempt's outcome was already recorded above and
+                    // `current_cb_info.is_half_open_probe` was cleared for the
+                    // next target, so no HALF_OPEN probe slot is held across
+                    // the wait. Nothing has been written to a backend, so the
+                    // expiry is settled exactly once and returned.
                     if let Some(ref retry_config) = params.retry {
-                        tokio::time::sleep(crate::retry::retry_delay(retry_config, attempt)).await;
+                        let backoff = crate::retry::retry_delay(retry_config, attempt);
+                        if let Err(termination) =
+                            retry_backoff_within_stream_auth_deadline(stream_auth_deadline, backoff)
+                                .await
+                        {
+                            return Err(settle_stream_auth_setup_expiry(
+                                termination,
+                                stream_ctx,
+                                &stream_auth_expired,
+                            ));
+                        }
                     }
                     continue;
                 }
@@ -4039,8 +4090,26 @@ async fn handle_tcp_connection_inner(
                         .into(),
                     );
                     attempt += 1;
+                    // The backoff is part of the admitted session's setup, so
+                    // it is bounded by the same absolute plan every other setup
+                    // stage uses. No circuit-breaker settlement is owed here:
+                    // this attempt's outcome was already recorded above and
+                    // `current_cb_info.is_half_open_probe` was cleared for the
+                    // next target, so no HALF_OPEN probe slot is held across
+                    // the wait. Nothing has been written to a backend, so the
+                    // expiry is settled exactly once and returned.
                     if let Some(ref retry_config) = params.retry {
-                        tokio::time::sleep(crate::retry::retry_delay(retry_config, attempt)).await;
+                        let backoff = crate::retry::retry_delay(retry_config, attempt);
+                        if let Err(termination) =
+                            retry_backoff_within_stream_auth_deadline(stream_auth_deadline, backoff)
+                                .await
+                        {
+                            return Err(settle_stream_auth_setup_expiry(
+                                termination,
+                                stream_ctx,
+                                &stream_auth_expired,
+                            ));
+                        }
                     }
                     continue;
                 }
@@ -4180,8 +4249,26 @@ async fn handle_tcp_connection_inner(
                     backend_info.backend_resolved_ip = None;
                     last_connect_err = Some(e);
                     attempt += 1;
+                    // The backoff is part of the admitted session's setup, so
+                    // it is bounded by the same absolute plan every other setup
+                    // stage uses. No circuit-breaker settlement is owed here:
+                    // this attempt's outcome was already recorded above and
+                    // `current_cb_info.is_half_open_probe` was cleared for the
+                    // next target, so no HALF_OPEN probe slot is held across
+                    // the wait. Nothing has been written to a backend, so the
+                    // expiry is settled exactly once and returned.
                     if let Some(ref retry_config) = params.retry {
-                        tokio::time::sleep(crate::retry::retry_delay(retry_config, attempt)).await;
+                        let backoff = crate::retry::retry_delay(retry_config, attempt);
+                        if let Err(termination) =
+                            retry_backoff_within_stream_auth_deadline(stream_auth_deadline, backoff)
+                                .await
+                        {
+                            return Err(settle_stream_auth_setup_expiry(
+                                termination,
+                                stream_ctx,
+                                &stream_auth_expired,
+                            ));
+                        }
                     }
                     continue;
                 }

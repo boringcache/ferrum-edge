@@ -14,9 +14,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   accepted credential's own deadline and the finite
   `FERRUM_AUTHENTICATED_STREAM_MAX_LIFETIME_SECONDS` fallback; application
   activity never extends it, and unauthenticated traffic is unaffected.
-  Enforcement covers H1/H2/H3 response bodies, WebSocket, TCP/TLS and UDP/DTLS
-  stream sessions, buffered uploads, and every dispatch-phase wait between
-  admission and the client-visible response head. Streaming H1/H2 request
+  Enforcement covers H1/H2/H3 response bodies, TCP/TLS and UDP/DTLS stream
+  sessions, buffered uploads, buffered response collections, every awaited
+  pre-commitment response phase, and every dispatch-phase wait between admission
+  and the client-visible response head — including the native-HTTP/3 gRPC
+  backend open and its upload-versus-response-head race, where both protocol
+  bounds can be absent at once. (WebSocket keeps its own pre-existing
+  `FERRUM_WEBSOCKET_MAX_LIFETIME_SECONDS` policy and its own
+  `websocket.termination_reason` reporting, and is deliberately not a family of
+  the new counters.) Streaming H1/H2 request
   uploads additionally get a **gateway-owned upload pump**: the inbound client
   body moves into a task the gateway schedules, so the deadline fires — and the
   body is released — even while the backend transport is parked on flow control
@@ -31,6 +37,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   counted through one per-request latch on a fixed-cardinality
   (class × protocol family) counter that carries no route, identity, or expiry
   detail.
+
+  Client-visible response bodies additionally get a **gateway-owned response
+  watchdog**, for the same reason the upload direction needs a pump: hyper does
+  not poll a response body while its HTTP/2 pipe is parked on stream send
+  capacity (a client advertising `SETTINGS_INITIAL_WINDOW_SIZE: 0`) or its
+  HTTP/1.1 connection is parked flushing a socket the client stopped reading, so
+  a body-only deadline is not enforceable. At the deadline a gateway-scheduled
+  task releases the backend body — cancelling the upstream stream, its pooled
+  connection, and every guard rooted in it — and, if the downstream still has
+  not drained the protocol-correct terminal a bounded grace later, closes that
+  client connection so the request guard, per-IP guard, admission permits, and
+  load-balancer accounting the response body holds are released exactly once.
+  HTTP/2 gives a server no way to reset one stream from outside hyper, so that
+  close is connection-scoped and is preceded by `GOAWAY` plus a bounded settle
+  window; it is only ever reached for a connection that is demonstrably refusing
+  to drain an already-expired authenticated stream.
+
+  A final authoritative gate immediately before response-head commitment turns a
+  credential that expired while the response phases were running into the fixed
+  pre-commitment terminal, rather than committing a protected head (or
+  committing a streaming head only to terminal-error it immediately afterwards).
+
+- TCP/TLS stream connect-**retry backoff** is bounded by the admitted session's
+  authorization lifetime (issue #3816). `retry_delay` grows with the attempt
+  number, so a chain of failing candidates could hold an admitted authenticated
+  session far past the credential that admitted it; unlike DNS, connect, and the
+  handshake, a raw sleep had no bound of its own. Expiry is settled exactly once,
+  no HALF_OPEN probe slot or in-flight state is leaked, no byte is forwarded, and
+  unauthenticated sessions are unaffected.
 
 - Istio `AuthorizationPolicy` `action: CUSTOM` external authorization (issue
   #3235). A matching policy delegates the decision to a root-namespace

@@ -19,7 +19,8 @@ use ferrum_edge::_test_support::{
     proxy_body_with_client_grpc_deadline_for_test,
 };
 use ferrum_edge::proxy::auth_lifetime::{
-    StreamAuthDeadline, StreamAuthProtocolFamily, StreamAuthTermination, StreamAuthTerminationLatch,
+    AuthorizationConnectionCloser, StreamAuthDeadline, StreamAuthProtocolFamily,
+    StreamAuthTermination, StreamAuthTerminationLatch,
 };
 use ferrum_edge::proxy::body::ProxyBodyError;
 use futures_util::stream;
@@ -220,7 +221,7 @@ async fn the_shared_latch_records_exactly_one_termination_per_request() {
     // The request-upload body and the response body race the same absolute
     // plan on a bidirectional stream. The latch is what makes the pair record
     // one termination for the stream instead of two.
-    // The family here is incidental to the latch contract; `WebSocket` keeps
+    // The family here is incidental to the latch contract; `GrpcWeb` keeps
     // this test's counter increments clear of the delta assertions other tests
     // in this binary make on the `http` / `stream_udp` families.
     let latch = StreamAuthTerminationLatch::default();
@@ -228,14 +229,14 @@ async fn the_shared_latch_records_exactly_one_termination_per_request() {
     assert!(
         latch.record_once(
             StreamAuthTermination::CredentialExpired,
-            StreamAuthProtocolFamily::WebSocket
+            StreamAuthProtocolFamily::GrpcWeb
         ),
         "the first direction to fire owns the termination"
     );
     assert!(
         !latch.record_once(
             StreamAuthTermination::CredentialExpired,
-            StreamAuthProtocolFamily::WebSocket
+            StreamAuthProtocolFamily::GrpcWeb
         ),
         "the opposite direction must not count a second termination"
     );
@@ -511,4 +512,162 @@ async fn a_body_with_no_authorization_deadline_streams_to_completion() {
         b"public".as_slice()
     );
     assert!(body.frame().await.is_none());
+}
+
+// --- The gateway-owned response watchdog (issue #3815) ----------------------
+//
+// `TotalDeadlineBody` fires only when hyper POLLS the response body, and hyper
+// does not poll it while its HTTP/2 pipe is parked on `poll_capacity` (a client
+// advertising a zero initial window, or simply withholding `WINDOW_UPDATE`) or
+// its HTTP/1.1 connection is parked flushing a socket the client stopped
+// reading. Both are client-controlled. These cover the two gateway-owned
+// mechanisms that make the deadline enforceable anyway.
+
+fn probe_body(
+    polls: &Arc<AtomicUsize>,
+    dropped: &Arc<AtomicBool>,
+) -> ferrum_edge::proxy::ProxyBody {
+    proxy_body_streaming_for_test(Box::pin(ProbeBody {
+        frames: VecDeque::new(),
+        polls: Arc::clone(polls),
+        dropped: Arc::clone(dropped),
+    }))
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_watchdog_releases_the_upstream_while_the_transport_polls_nothing() {
+    let polls = Arc::new(AtomicUsize::new(0));
+    let dropped = Arc::new(AtomicBool::new(false));
+    let fired = Arc::new(AtomicBool::new(false));
+    let latch = StreamAuthTerminationLatch::default();
+    let body = ferrum_edge::_test_support::authorization_cancellable_body_for_test(
+        probe_body(&polls, &dropped),
+        future_deadline(
+            Duration::from_secs(5),
+            StreamAuthTermination::CredentialExpired,
+        ),
+        StreamAuthProtocolFamily::GrpcWeb,
+        latch.clone(),
+        Arc::clone(&fired),
+        None,
+    );
+    assert!(!body.upstream_released());
+
+    // Nothing polls the body — the whole point of the watchdog.
+    tokio::time::sleep(Duration::from_secs(6)).await;
+
+    assert_eq!(
+        polls.load(Ordering::SeqCst),
+        0,
+        "the transport polled nothing, exactly as a zero-credit HTTP/2 client forces"
+    );
+    assert!(
+        body.upstream_released(),
+        "the gateway must release the backend body from its own task"
+    );
+    assert!(
+        dropped.load(Ordering::SeqCst),
+        "the backend body must be DROPPED — releasing the upstream stream, its pooled \
+         connection, and every guard rooted in it — not merely detached"
+    );
+    assert!(
+        fired.load(Ordering::Acquire),
+        "the shared flag is what classifies the eventual ProxyBody drop as a health-neutral \
+         authorization termination rather than a client disconnect"
+    );
+    assert_eq!(
+        latch.observed(),
+        Some(StreamAuthTermination::CredentialExpired)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_downstream_that_never_drains_the_terminal_is_closed_at_the_transport() {
+    let polls = Arc::new(AtomicUsize::new(0));
+    let dropped = Arc::new(AtomicBool::new(false));
+    let latch = StreamAuthTerminationLatch::default();
+    let closer = AuthorizationConnectionCloser::new();
+    let grace = ferrum_edge::_test_support::authorization_transport_close_grace();
+    let _body =
+        ferrum_edge::_test_support::proxy_body_with_authorization_deadline_and_closer_for_test(
+            probe_body(&polls, &dropped),
+            future_deadline(
+                Duration::from_secs(5),
+                StreamAuthTermination::CredentialExpired,
+            ),
+            StreamAuthProtocolFamily::Http,
+            Some(latch.clone()),
+            closer.clone(),
+        );
+
+    // Upstream release happens AT the deadline, before any grace.
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    assert!(
+        dropped.load(Ordering::SeqCst),
+        "the backend body must be released at the deadline, not at the end of the grace"
+    );
+    assert!(
+        !closer.close_requested(),
+        "the downstream still has its bounded grace to drain the terminal"
+    );
+
+    tokio::time::sleep(grace + Duration::from_secs(1)).await;
+    assert!(
+        closer.close_requested(),
+        "a downstream that never drains the terminal must have its connection closed, or the \
+         request guard, per-IP guard, admission permits, and load-balancer accounting held by \
+         the response body are retained at the client's discretion"
+    );
+
+    // Exactly one termination for the stream, whichever mechanism settled it.
+    assert_eq!(
+        latch.observed(),
+        Some(StreamAuthTermination::CredentialExpired)
+    );
+    assert!(!latch.record_once(
+        StreamAuthTermination::CredentialExpired,
+        StreamAuthProtocolFamily::Http
+    ));
+    assert_eq!(
+        polls.load(Ordering::SeqCst),
+        0,
+        "no poll of the response body was needed to reach either outcome"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_drained_terminal_never_costs_the_client_its_connection() {
+    let latch = StreamAuthTerminationLatch::default();
+    let closer = AuthorizationConnectionCloser::new();
+    let grace = ferrum_edge::_test_support::authorization_transport_close_grace();
+    let mut body =
+        ferrum_edge::_test_support::proxy_body_with_authorization_deadline_and_closer_for_test(
+            pending_body(),
+            future_deadline(
+                Duration::from_secs(2),
+                StreamAuthTermination::CredentialExpired,
+            ),
+            StreamAuthProtocolFamily::Http,
+            Some(latch.clone()),
+            closer.clone(),
+        );
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let terminal = body
+        .frame()
+        .await
+        .expect("the elapsed deadline must produce a terminal");
+    assert!(
+        terminal.is_err(),
+        "an ordinary HTTP/SSE response has no terminal metadata, so it ends with a transport \
+         error rather than a clean, complete-looking end of body"
+    );
+    drop(body);
+
+    tokio::time::sleep(grace * 2 + Duration::from_secs(1)).await;
+    assert!(
+        !closer.close_requested(),
+        "a client that drained the terminal must keep its connection: the transport close is a \
+         last resort, not the normal path"
+    );
 }

@@ -375,6 +375,67 @@ request guard, per-IP guard, circuit-breaker and load-balancer accounting,
 backend-admission permits, and body-buffer budget are released exactly once
 through the same deferred machinery every other terminal path uses.
 
+### The gateway-owned response watchdog
+
+The response-body adapter only acts when the transport **polls** it, and hyper
+does not always poll a response body:
+
+- **HTTP/2.** `PipeToSendStream` reserves stream send capacity and awaits
+  `SendStream::poll_capacity` *before* it polls the body. A client that
+  advertises `SETTINGS_INITIAL_WINDOW_SIZE: 0` — or that simply stops issuing
+  `WINDOW_UPDATE` — parks that pipe for as long as it likes.
+- **HTTP/1.1.** the dispatcher flushes a connection that can no longer buffer
+  before it polls the body, so a client that stops reading parks the write.
+
+Both are client-controlled, so a body-only bound is not an enforceable
+authorization lifetime. Authenticated streaming responses therefore also carry a
+watchdog (`src/proxy/response_watchdog.rs`), which mirrors what
+[the upload pump](#the-gateway-owned-upload-pump) does for the request
+direction:
+
+1. **Upstream cancellation.** The backend body lives in a shared slot. At the
+   deadline a task the *gateway* schedules takes it out and drops it. From that
+   instant the gateway reads no further protected byte, and the backend stream,
+   its pooled connection, and every guard rooted in that body are released —
+   whatever the transport is parked on.
+2. **Transport close.** Dropping the upstream does not release what the response
+   body itself owns: the request guard, the per-IP guard, circuit-breaker and
+   load-balancer accounting, backend-admission permits, and the deferred
+   transaction logger all live in `ProxyBody`, which hyper owns. If the
+   downstream still has not drained the terminal a bounded grace after the
+   deadline, the watchdog asks the connection task to close the client
+   connection. hyper then drops the response body, releasing all of the above
+   exactly once through the ordinary `Drop` path, and the client observes a
+   protocol-visible termination — a `GOAWAY` then a close on HTTP/2, and a
+   chunked or SSE body that ends **without** its terminating chunk on HTTP/1.1.
+
+A client that *is* draining never reaches step 2: the adapter's own terminal is
+delivered on the next poll, the body is dropped, and the watchdog is aborted
+with it. The steady-state cost is one `Sleep` and one uncontended lock per
+polled frame, on authenticated streaming responses only.
+
+**Deliberate trade-off.** HTTP/2 gives a server no way to reset one stream from
+outside hyper — the `SendStream` is owned by the parked pipe — so the transport
+close is connection-scoped and sibling streams end with it. It is preceded by
+`graceful_shutdown` (a `GOAWAY`, then a bounded settle window in which siblings
+can still complete), and it is only ever reached for a connection that is
+demonstrably refusing to drain an already-expired authenticated stream. Leaving
+that stream parked instead would let a hostile client retain a request slot, a
+per-IP slot, an admission permit, and a load-balancer connection indefinitely.
+
+### The final pre-commitment gate
+
+Buffered response collection, every awaited pre-commitment response phase
+(`after_proxy`, the buffered normalize / inspect / transform hooks, the final
+client-visible body and header policies, and the response-committed hook), and
+one last authoritative check immediately before the response head is committed
+are all bounded by the same absolute plan. Before that composition those phases
+were bounded only by the client RPC deadline, which is absent for an ordinary
+HTTP request — so a slow hook could carry an admitted credential past its own
+expiry and then commit a **protected** response head, or commit a streaming head
+only to terminal-error it immediately afterwards when the fixed pre-commitment
+terminal was still available.
+
 ### Observability
 
 Expiry is classified as a **policy** termination, not a backend fault, so error
@@ -388,7 +449,12 @@ rate alerts stay meaningful:
   single-fire deferred logger.
 - `GET /metrics/runtime` exposes `authorization_lifetime`, a fixed-cardinality
   counter pair whose only label dimension is a closed protocol family (`http`,
-  `grpc`, `grpc_web`, `websocket`, `stream_tcp`, `stream_udp`).
+  `grpc`, `grpc_web`, `stream_tcp`, `stream_udp`). WebSocket is deliberately
+  **not** a family here: WebSocket sessions are bounded by their own
+  `FERRUM_WEBSOCKET_MAX_LIFETIME_SECONDS` policy (issue #3738) and reported
+  through `websocket.termination_reason`, so publishing a `websocket` series
+  under `authenticated_stream_max_lifetime` would name a different operator
+  knob and could only ever read zero.
 
 No token, claim, subject identifier, certificate field, provider response, or
 absolute expiry value reaches a log, a metric, a trailer, or a response body.
@@ -398,7 +464,7 @@ The `grpc-message` and the internal termination text are compiled-in literals.
 
 | Surface | Enforced |
 |---------|----------|
-| Generic HTTP/1.1 and HTTP/2 streaming responses, including SSE | Yes |
+| Generic HTTP/1.1 and HTTP/2 streaming responses, including SSE | Yes — two mechanisms, armed from the same absolute plan. The body adapter emits the protocol-correct terminal when the transport polls it, and a **gateway-owned response watchdog** releases the backend body — and, after a bounded grace, closes the client connection — when it does not. See [The gateway-owned response watchdog](#the-gateway-owned-response-watchdog) |
 | HTTP/1.1 and HTTP/2 streaming and bidirectional request **uploads** | Yes — two mechanisms, armed from the same absolute plan. The client body adapter every streaming dispatch path installs (reqwest, direct-H2, mesh mTLS, HBONE, Unix socket, and the fully-streamed native-gRPC body) refuses to hand the transport another client byte after expiry, and a **gateway-owned upload pump** owns the inbound body in a task the gateway schedules, so the bound fires — and the client body is released — even while the backend transport is parked on flow control and is polling nothing. See [The gateway-owned upload pump](#the-gateway-owned-upload-pump) |
 | HTTP/1.1 and HTTP/2 request uploads the gateway **buffers** before dispatch | Yes — a body a request-body plugin, a gRPC-Web translation, or retry replay forces into memory never reaches those adapters, so the collect itself carries the plan (`collect_request_body_under_authorization`). Covers the reqwest buffered arms, the H3-backend bridge's buffered arms, and both buffered native-gRPC arms |
 | The response-**header** wait on every H1/H2 dispatch path | Yes — reqwest (initial attempt and retry), direct-H2, mesh mTLS, HBONE, and Unix socket compose the plan over the client RPC deadline and `backend_read_timeout_ms`, so a backend that withholds its response head cannot hold an authenticated request open past expiry even when both of those bounds are disabled |
@@ -410,7 +476,7 @@ The `grpc-message` and the internal termination text are compiled-in literals.
 | Native HTTP/3 gRPC server-, client-, and bidirectional streaming | Yes — clean `grpc-status: 16` trailers while no response byte is client-visible, otherwise a stream reset; the request-upload pump is retired by its guard in the same step |
 | H3 cross-protocol relays to HTTP/1.1, HTTP/2, and gRPC backends, gRPC-Web translation included | Yes, in both directions: the request-upload bridge terminates with a fixed `401` before response headers are committed, and the response relay resets or emits the bounded terminal after commitment |
 | Inspected / latency-tracked streaming bodies | Yes |
-| WebSocket over H1, H2 Extended CONNECT, and H3 Extended CONNECT | Yes, through the pre-existing WebSocket deadline arbiter, which uses the same `credential_deadline_at` |
+| WebSocket over H1, H2 Extended CONNECT, and H3 Extended CONNECT | Yes, through the pre-existing WebSocket deadline arbiter (issue #3738), which uses the same `credential_deadline_at`. Its absolute maximum is `FERRUM_WEBSOCKET_MAX_LIFETIME_SECONDS`, a different knob from `FERRUM_AUTHENTICATED_STREAM_MAX_LIFETIME_SECONDS`, and it reports through `websocket.termination_reason` — so it is deliberately **not** a family of the `authorization_lifetime` counters |
 | TCP+TLS stream sessions on the userspace relay | Yes — armed at `on_stream_connect` admission and enforced across every post-admission setup stage (DNS resolution, retry backoff, backend connect and TLS handshake, the outbound PROXY v2 header, and the inspected first-bytes forward) as well as the relay itself, so no backend or application byte is written on an expired credential |
 | UDP+DTLS stream sessions | Yes — raced against relay completion, the idle watchdog, and drain; both directions are closed and the backend connection is torn down |
 | CP/DP configuration streams | Yes, through the separate control-plane lifetime enforcement |

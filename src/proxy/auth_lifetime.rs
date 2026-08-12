@@ -117,6 +117,19 @@ pub struct StreamAuthDeadline {
 /// This is the ONLY dimension the counters carry. It is a closed compile-time
 /// set, so the exported series count is fixed no matter how many routes,
 /// consumers, or credentials exist.
+///
+/// # Why WebSocket is deliberately absent
+///
+/// WebSocket sessions are bounded by their OWN policy — the `WsSessionDeadline`
+/// arbiter and `FERRUM_WEBSOCKET_MAX_LIFETIME_SECONDS` — which predates this
+/// contract (issue #3738 / PR #3744) and has its own documented configuration
+/// surface and its own `websocket.termination_reason` observability. Publishing
+/// a `websocket` family here would name a series that this module's
+/// `authenticated_stream_max_lifetime` counter can never describe: the
+/// WebSocket maximum is a different operator knob. A family with no production
+/// recorder is a false contract, so WebSocket is out of this inventory. If the
+/// two policies are ever unified, add the family and the recorder in the same
+/// change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamAuthProtocolFamily {
     /// Generic HTTP/1.1, HTTP/2, and HTTP/3 response or request bodies,
@@ -126,8 +139,6 @@ pub enum StreamAuthProtocolFamily {
     Grpc,
     /// gRPC-Web, binary and text.
     GrpcWeb,
-    /// WebSocket over H1 Upgrade, H2 Extended CONNECT, or H3 Extended CONNECT.
-    WebSocket,
     /// Raw TCP / TCP+TLS stream proxying.
     StreamTcp,
     /// UDP / DTLS stream proxying.
@@ -140,7 +151,6 @@ impl StreamAuthProtocolFamily {
             Self::Http => "http",
             Self::Grpc => "grpc",
             Self::GrpcWeb => "grpc_web",
-            Self::WebSocket => "websocket",
             Self::StreamTcp => "stream_tcp",
             Self::StreamUdp => "stream_udp",
         }
@@ -151,34 +161,30 @@ impl StreamAuthProtocolFamily {
             Self::Http => 0,
             Self::Grpc => 1,
             Self::GrpcWeb => 2,
-            Self::WebSocket => 3,
-            Self::StreamTcp => 4,
-            Self::StreamUdp => 5,
+            Self::StreamTcp => 3,
+            Self::StreamUdp => 4,
         }
     }
 
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 5] = [
         Self::Http,
         Self::Grpc,
         Self::GrpcWeb,
-        Self::WebSocket,
         Self::StreamTcp,
         Self::StreamUdp,
     ];
 }
 
-/// One monotonic counter per (termination class, protocol family). Six families
+/// One monotonic counter per (termination class, protocol family). Five families
 /// times two classes is the complete, fixed series inventory.
-static CREDENTIAL_EXPIRED: [AtomicU64; 6] = [
-    AtomicU64::new(0),
+static CREDENTIAL_EXPIRED: [AtomicU64; 5] = [
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
 ];
-static MAX_LIFETIME: [AtomicU64; 6] = [
-    AtomicU64::new(0),
+static MAX_LIFETIME: [AtomicU64; 5] = [
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
@@ -249,6 +255,84 @@ impl StreamAuthTerminationLatch {
             _ => None,
         }
     }
+}
+
+/// Transport-level authorization close signal for ONE accepted downstream
+/// client connection (issue #3815).
+///
+/// A response-body adapter can only act when the transport polls it, and hyper
+/// does not poll a response body while its HTTP/2 pipe is parked on stream send
+/// capacity or its HTTP/1.1 connection is parked on socket writability. Both are
+/// client-controlled. This signal is the gateway's own lever over that
+/// transport: the connection task selects on it beside the connection future, so
+/// a stream whose authorization lifetime elapsed can be settled even when the
+/// client is refusing to make progress.
+///
+/// Carries no credential material, no class, and no identity — it is a single
+/// edge-triggered boolean. The bounded termination class travels through
+/// [`StreamAuthTerminationLatch`] and the transaction summary as usual.
+///
+/// Cloning is cheap and every clone signals the same connection.
+#[derive(Clone, Debug)]
+pub struct AuthorizationConnectionCloser(Arc<tokio::sync::watch::Sender<bool>>);
+
+impl AuthorizationConnectionCloser {
+    /// Create one signal for one accepted connection.
+    #[must_use]
+    pub fn new() -> Self {
+        // The initial receiver is dropped immediately; `subscribe()` mints the
+        // connection task's receiver, and `send` on a receiver-less channel is a
+        // deliberate no-op rather than an error worth reporting.
+        let (sender, _initial) = tokio::sync::watch::channel(false);
+        Self(Arc::new(sender))
+    }
+
+    /// A receiver for the connection task's `select!`.
+    #[must_use]
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.0.subscribe()
+    }
+
+    /// Ask the connection task to close this client connection.
+    ///
+    /// Level-triggered and idempotent: a receiver created after this call still
+    /// observes the closed state, and repeated calls are indistinguishable from
+    /// one.
+    pub fn request_close(&self) {
+        let _ = self.0.send(true);
+    }
+
+    /// Whether a close has already been requested.
+    #[must_use]
+    pub fn close_requested(&self) -> bool {
+        *self.0.borrow()
+    }
+}
+
+impl Default for AuthorizationConnectionCloser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Resolve when [`AuthorizationConnectionCloser::request_close`] has been called
+/// on the connection this receiver watches.
+///
+/// Stays pending forever once the signal can no longer arrive (every sender
+/// gone), so it is safe as a permanently-armed `select!` arm: a dropped sender
+/// must never be mistaken for a close request.
+pub async fn authorization_close_requested(receiver: &mut tokio::sync::watch::Receiver<bool>) {
+    if *receiver.borrow_and_update() {
+        return;
+    }
+    while receiver.changed().await.is_ok() {
+        if *receiver.borrow_and_update() {
+            return;
+        }
+    }
+    // `pending::<Infallible>()` has an uninhabited output, so the empty match
+    // expresses "this await never resolves" as a type rather than as a panic.
+    match std::future::pending::<std::convert::Infallible>().await {}
 }
 
 /// Snapshot of the authorization-lifetime termination counters for the runtime

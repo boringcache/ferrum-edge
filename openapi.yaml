@@ -13057,10 +13057,13 @@ components:
       description: |
         Fixed-cardinality counters for authenticated streams terminated by the
         authorization-lifetime contract. Each map is keyed by a closed
-        compile-time protocol family (`http`, `grpc`, `grpc_web`, `websocket`,
-        `stream_tcp`, `stream_udp`) and every family is always present. No
-        route, consumer, identity, token, claim, certificate field, provider,
-        or absolute expiry is ever recorded. Monotonic for the process lifetime.
+        compile-time protocol family (`http`, `grpc`, `grpc_web`, `stream_tcp`,
+        `stream_udp`) and every family is always present. WebSocket is
+        deliberately absent: WebSocket sessions are bounded by their own
+        `FERRUM_WEBSOCKET_MAX_LIFETIME_SECONDS` policy and reported through
+        `websocket.termination_reason`, not by this contract. No route,
+        consumer, identity, token, claim, certificate field, provider, or
+        absolute expiry is ever recorded. Monotonic for the process lifetime.
       required: [credential_expired, authenticated_stream_max_lifetime]
       properties:
         credential_expired:

@@ -1014,12 +1014,36 @@ impl ProxyBody {
     ///
     /// A buffered (`Full`) body is already committed in its entirety and is
     /// returned unchanged: there is no relay left to bound.
+    ///
+    /// # The adapter is not sufficient on its own
+    ///
+    /// Everything above only happens when the transport POLLS this body, and
+    /// hyper does not poll a response body while its HTTP/2 pipe is parked on
+    /// stream send capacity (`PipeToSendStream` awaits `poll_capacity` first) or
+    /// its HTTP/1.1 connection is parked flushing a socket the client stopped
+    /// reading. Both are client-controlled, so the adapter alone is not an
+    /// enforceable authorization lifetime.
+    ///
+    /// The inner body is therefore ALSO placed under a gateway-owned watchdog
+    /// (`response_watchdog::AuthorizationCancellableBody`), armed from the same
+    /// absolute plan and settling through the same once-only latch. It runs in a
+    /// task the gateway schedules, so at the deadline it releases the backend
+    /// body — and with it the upstream stream, its pooled connection, and every
+    /// guard rooted in that body — regardless of what the transport is doing,
+    /// and then, after a bounded grace in which the downstream may still drain
+    /// the terminal above, asks `closer` to close the client connection so the
+    /// request/session accounting held by `ProxyBody` itself is released too.
+    ///
+    /// `closer` is `None` for frontends that own their own downstream writes and
+    /// already bound every one of them (the native HTTP/3 relays), where a
+    /// transport close would be both unnecessary and wrong.
     pub(crate) fn with_authorization_deadline(
         mut self,
         deadline: crate::proxy::auth_lifetime::StreamAuthDeadline,
         grpc_web_response_content_type: Option<&str>,
         family: crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
         auth_latch: Option<crate::proxy::auth_lifetime::StreamAuthTerminationLatch>,
+        closer: Option<crate::proxy::auth_lifetime::AuthorizationConnectionCloser>,
     ) -> Self {
         let terminal = DeadlineTerminal {
             grpc_status_header: AUTHORIZATION_EXPIRED_GRPC_STATUS_HEADER,
@@ -1048,28 +1072,49 @@ impl ProxyBody {
             Frame::data(Bytes::from(response.body))
         });
         let fired = Arc::new(AtomicBool::new(false));
+        // The adapter and the gateway-owned watchdog settle through ONE latch,
+        // so the pair records exactly one fixed-cardinality termination for this
+        // stream whichever of them fires first — including when the caller
+        // supplied no request-level latch to share with the upload direction.
+        let auth_latch = auth_latch.unwrap_or_default();
         let placeholder = ProxyBodyKind::Full(Full::default());
         let previous = std::mem::replace(&mut self.kind, placeholder);
         self.kind = match previous {
             ProxyBodyKind::Stream(body) => {
-                let bounded = TotalDeadlineBody::with_terminal(
+                let guarded = crate::proxy::response_watchdog::AuthorizationCancellableBody::new(
                     body,
+                    deadline,
+                    family,
+                    auth_latch.clone(),
+                    Arc::clone(&fired),
+                    closer,
+                );
+                let bounded = TotalDeadlineBody::with_terminal(
+                    guarded,
                     Some(deadline.at),
                     deadline_frame,
                     Arc::clone(&fired),
                     terminal,
-                    auth_latch,
+                    Some(auth_latch),
                 );
                 ProxyBodyKind::Stream(Box::pin(bounded))
             }
             ProxyBodyKind::Tracked(body) => {
-                let bounded = TotalDeadlineBody::with_terminal(
+                let guarded = crate::proxy::response_watchdog::AuthorizationCancellableBody::new(
                     body,
+                    deadline,
+                    family,
+                    auth_latch.clone(),
+                    Arc::clone(&fired),
+                    closer,
+                );
+                let bounded = TotalDeadlineBody::with_terminal(
+                    guarded,
                     Some(deadline.at),
                     deadline_frame,
                     Arc::clone(&fired),
                     terminal,
-                    auth_latch,
+                    Some(auth_latch),
                 );
                 ProxyBodyKind::Stream(Box::pin(bounded))
             }
