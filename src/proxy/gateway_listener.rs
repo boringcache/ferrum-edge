@@ -879,7 +879,10 @@ impl GatewayListenerManager {
             let Some(error) = Self::reap_ended_quic(listener).await else {
                 continue;
             };
-            error!(port, "Gateway API HTTP/3 listener ended unexpectedly: {error}");
+            error!(
+                port,
+                "Gateway API HTTP/3 listener ended unexpectedly: {error}"
+            );
             // Reported for this pass even when `ensure_quic` rebinds QUIC
             // further down the same pass, exactly as a dead TCP accept loop is:
             // a healthy-to-dead transition that recovered immediately must
