@@ -608,6 +608,10 @@ pub fn prepare_placement(
                 && state.pending.is_none()
                 && state.completed.as_ref() == Some(&transition)
             {
+                // Finalize is idempotent, including its quarantine cleanup. A
+                // crash or transient filesystem error after the durable state
+                // write must not make a later retry skip the tombstone removal.
+                clear_ownership_quarantine(registry_dir);
                 set_phase(UdpMigrationStatusPhase::Stable, 0);
                 clear_failure();
                 return Ok(UdpPlacementDecision::RunStable);
@@ -662,7 +666,13 @@ fn ownership_is_quarantined(registry_dir: &Path) -> Result<bool, std::io::Error>
 
 fn clear_ownership_quarantine(registry_dir: &Path) {
     let path = registry_dir.join(QUARANTINE_FILE);
-    match std::fs::remove_file(&path) {
+    let removal = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_dir() => std::fs::remove_dir(&path),
+        Ok(_) => std::fs::remove_file(&path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => Err(error),
+    };
+    match removal {
         Ok(()) => {
             if let Err(error) = sync_directory(registry_dir) {
                 tracing::warn!(
@@ -671,6 +681,7 @@ fn clear_ownership_quarantine(registry_dir: &Path) {
                 );
             }
         }
+        // A concurrent operator cleanup already achieved the desired state.
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
             tracing::warn!(

@@ -254,6 +254,28 @@ fn quarantine_tombstone_refuses_attested_adoption_until_finalize_clears_it() {
         !registry.path().join(".udp-placement-quarantined").exists(),
         "finalize proof must clear the quarantine tombstone"
     );
+
+    // Model a crash or transient removal failure after the durable finalize
+    // state was written. An idempotent finalize retry must retry its cleanup
+    // side effect instead of returning early and stranding the marker.
+    std::fs::create_dir(registry.path().join(".udp-placement-quarantined"))
+        .expect("empty directory tombstone");
+    assert!(matches!(
+        prepare_placement(
+            registry.path(),
+            &transition(
+                UdpMigrationPhase::Finalize,
+                "repair-1",
+                UdpPlacement::PodNetns,
+                UdpPlacement::HostNetns,
+            ),
+        ),
+        Ok(UdpPlacementDecision::RunStable)
+    ));
+    assert!(
+        !registry.path().join(".udp-placement-quarantined").exists(),
+        "idempotent finalize must retry safe tombstone removal"
+    );
 }
 
 #[test]
