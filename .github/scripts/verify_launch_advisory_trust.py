@@ -14,10 +14,19 @@ workflow definitions as text — it executes nothing — and asserts:
   reachable only from events whose definition GitHub loads from the protected
   default branch (`workflow_run`, `schedule`);
 * the secret-bearing job is gated behind the secretless trust job, is bound to
-  the protected deployment environment, checks out only the literal trusted ref,
-  and runs only the default-branch checker with its trusted-execution pins;
+  the protected deployment environment, and checks out only the literal trusted
+  ref;
+* the credential is delivered to exactly one *step*, identified structurally by
+  parsing the job's `steps:` list, and that step is a plain single-line `run:`
+  step whose whole command is the default-branch checker with its
+  trusted-execution pins. Job membership is not the unit of trust: a step that
+  merely lives in the same job never receives the step-scoped secret, and a
+  `run: |` block on the credential step would let arbitrary shell run beside the
+  checker with the credential already in the environment;
 * the candidate commit reaches the secret-bearing job only as an inert SHA in an
-  environment mapping, never as a checkout ref or a shell operand;
+  environment mapping, never as a checkout ref, and no candidate-derived
+  environment variable is ever expanded on an executable line anywhere in that
+  job — including inside a multiline block of a secretless step;
 * the tag-triggered release job consumes the trusted verdict as a published
   commit status instead of evaluating advisories itself;
 * that verdict is bound to the exact Release run ID and run attempt on both
@@ -32,12 +41,18 @@ workflow definitions as text — it executes nothing — and asserts:
 * the untrusted standalone gate holds no credential on any event.
 
 `--self-test` runs an adversarial fixture table — a malicious tagged workflow, a
-malicious tagged checker invocation, a candidate-tree checkout, a missing
-environment binding, a dropped trust edge, a constant commit-wide status
-context, an omitted run-attempt binding, a `requested`-only trigger, a release
-gate that reuses another run's status, and a release job that stops requiring
-the trusted verdict — and then applies the same contract to the real
-`.github/workflows` tree.
+malicious tagged checker invocation, a candidate-tree checkout, a credential
+step turned into a `run: |` block that checks out or sources candidate material
+before calling the checker, a second command chained onto the credential
+invocation, a command substitution in the trusted-tree pin, an action added as a
+second execution surface on the credential step, a job-level credential binding,
+candidate environment expansion in a secretless step, a missing environment
+binding, a dropped trust edge, a constant commit-wide status context, an omitted
+run-attempt binding, a `requested`-only trigger, a release gate that reuses
+another run's status, and a release job that stops requiring the trusted verdict
+— and then applies the same contract to the real `.github/workflows` tree.
+Comments are stripped before every contract decision, so prose can neither
+satisfy a requirement nor stand in for a rejected command.
 """
 
 from __future__ import annotations
@@ -122,6 +137,51 @@ RELEASE_CONTEXT_SHAPE = re.compile(
 # release gate that is a commit-wide, replayable context.
 COMMIT_WIDE_CONTEXT = re.compile(re.escape(STATUS_CONTEXT_PREFIX) + r"(?!/release-)")
 
+# ---------------------------------------------------------------------------
+# Step-level structure for the credential-bearing job
+# ---------------------------------------------------------------------------
+
+STEPS_KEY = re.compile(r"^(?P<indent> *)steps:\s*$")
+STEP_ITEM = re.compile(r"^(?P<lead> *)-(?P<gap> +)(?=\S)")
+KEY_LINE = re.compile(r"^(?P<indent> *)(?P<key>[A-Za-z_][A-Za-z0-9_-]*):(?P<rest>.*)$")
+# `|`, `>`, `|-`, `>+`, `|2` … every YAML block-scalar indicator. A credential
+# step written as a block can carry any number of extra shell commands, which is
+# exactly the bypass this module must refuse.
+BLOCK_SCALAR = re.compile(r"^[|>][+-]?[0-9]*[+-]?$")
+
+# The only keys the credential-bearing step may declare. `uses`, `shell`, and
+# `working-directory` are each a way to redirect or duplicate the execution
+# surface while the credential is already bound to the step.
+CREDENTIAL_STEP_ALLOWED_KEYS = frozenset({"name", "id", "if", "env", "run"})
+
+# The complete command the credential-bearing step may execute, anchored at both
+# ends. Anchoring is the contract: no leading `cd`, no trailing `&& …`, no `;`,
+# no pipe, no command substitution, no alternate interpreter, and no alternate
+# path to the checker can survive it, and the trusted-tree pin must be the
+# literal environment reference the anchor-pin step already validated.
+CREDENTIAL_RUN_COMMAND = re.compile(
+    r"^python3 -I scripts/check_launch_readiness\.py"
+    r"(?: --(?:verify|require-pass|trusted-execution))+"
+    r' --trusted-tree-sha "\$TRUSTED_SHA"$'
+)
+CREDENTIAL_REQUIRED_FLAGS = ("--verify", "--trusted-execution")
+
+# Environment variables in the credential-bearing job that carry the candidate
+# commit. The checker reads them from the process environment; any *shell*
+# expansion of one puts candidate-derived bytes on an executable line, so it is
+# refused in every step of that job, block scalars included.
+CANDIDATE_ENV_NAMES = ("LAUNCH_TARGET_SHA", "CANDIDATE_SHA")
+_CANDIDATE_ENV_ALTERNATION = "|".join(CANDIDATE_ENV_NAMES)
+CANDIDATE_ENV_EXPANSION = re.compile(
+    r"\$(?:\{\{\s*env\.(?:"
+    + _CANDIDATE_ENV_ALTERNATION
+    + r")\s*\}\}|\{(?:"
+    + _CANDIDATE_ENV_ALTERNATION
+    + r")[:\-\}]|(?:"
+    + _CANDIDATE_ENV_ALTERNATION
+    + r")\b)"
+)
+
 WORKFLOW_RUN_TYPE_ITEM = re.compile(r"^\s*-\s*(?P<value>[a-z_]+)\s*$")
 # `requested` does not fire for a re-run, so a re-run Release attempt would
 # never obtain its own verdict and would fail closed permanently.
@@ -150,7 +210,11 @@ def split_blocks(lines: list[str], pattern: re.Pattern[str]) -> dict[str, list[s
 
 
 def top_level_blocks(text: str) -> dict[str, list[str]]:
-    return split_blocks(text.splitlines(), TOP_LEVEL_KEY)
+    # Comments are removed before any structure is derived, so a commented-out
+    # key can neither introduce nor terminate a block.
+    return split_blocks(
+        [strip_comment(line) for line in text.splitlines()], TOP_LEVEL_KEY
+    )
 
 
 def job_blocks(text: str) -> dict[str, list[str]]:
@@ -213,9 +277,175 @@ def code_lines(lines: list[str]) -> list[str]:
     return [line for line in (strip_comment(item) for item in lines) if line.strip()]
 
 
+def job_steps(job_lines: list[str]) -> list[list[str]]:
+    """Split a job block into its `steps:` items by indentation.
+
+    Each returned step is the list of its code lines, starting with the `- `
+    item line. This is what makes the credential's *step* scope visible: a
+    secret bound by a step's `env:` is readable only by that step's command, so
+    the contract has to be applied to the step, not to the job.
+    """
+
+    lines = code_lines(job_lines)
+    start: int | None = None
+    steps_indent = 0
+    for index, line in enumerate(lines):
+        match = STEPS_KEY.match(line)
+        if match:
+            start = index
+            steps_indent = len(match.group("indent"))
+            break
+    if start is None:
+        return []
+
+    steps: list[list[str]] = []
+    item_indent: int | None = None
+    for line in lines[start + 1 :]:
+        indent = len(line) - len(line.lstrip())
+        if indent <= steps_indent:
+            break
+        item = STEP_ITEM.match(line)
+        # A `- ` at the item indent opens a new step. Anything deeper — including
+        # a shell line inside a block scalar that happens to start with `-` —
+        # belongs to the step already open.
+        if item and (item_indent is None or len(item.group("lead")) == item_indent):
+            item_indent = len(item.group("lead"))
+            steps.append([line])
+            continue
+        if steps:
+            steps[-1].append(line)
+    return steps
+
+
+def step_entries(step_lines: list[str]) -> list[tuple[str, str, list[str]]]:
+    """Return `(key, inline value, body lines)` for each top-level step key."""
+
+    if not step_lines:
+        return []
+    item = STEP_ITEM.match(step_lines[0])
+    if item is None:
+        return []
+    key_indent = len(item.group(0))
+    # Rewrite the `- ` marker as plain indentation so the first key is read the
+    # same way as every later one.
+    normalized = [" " * key_indent + step_lines[0][key_indent:], *step_lines[1:]]
+
+    entries: list[tuple[str, str, list[str]]] = []
+    current: tuple[str, str, list[str]] | None = None
+    for line in normalized:
+        match = KEY_LINE.match(line)
+        if match and len(match.group("indent")) == key_indent:
+            current = (match.group("key"), match.group("rest").strip(), [])
+            entries.append(current)
+            continue
+        if current is not None:
+            current[2].append(line)
+    return entries
+
+
+def step_run_text(step_lines: list[str]) -> str:
+    """Every executable line of every `run:` in a step, inline value and body."""
+
+    parts: list[str] = []
+    for key, value, body in step_entries(step_lines):
+        if key != "run":
+            continue
+        if not BLOCK_SCALAR.match(value):
+            parts.append(value)
+        parts.extend(body)
+    return "\n".join(parts)
+
+
 # ---------------------------------------------------------------------------
 # Contract
 # ---------------------------------------------------------------------------
+
+
+def check_credential_steps(steps: list[list[str]]) -> list[str]:
+    """The step-scoped contract for the advisory credential.
+
+    Job membership is not the unit of trust. A secret bound by one step's `env:`
+    is visible only to that step's command, so the whole contract below is
+    applied to the step that actually receives it — and every *other* step in
+    the job is held only to the weaker rule that it may not expand a
+    candidate-derived variable on an executable line.
+    """
+
+    errors: list[str] = []
+    where = f"{TRUSTED_WORKFLOW} job `{SECRET_JOB}`"
+
+    # Executable candidate data anywhere in the job, block scalars included. The
+    # checker receives the candidate SHA through the process environment and
+    # never through the shell, so any expansion here is a new execution path.
+    for step in steps:
+        run_text = step_run_text(step)
+        match = CANDIDATE_ENV_EXPANSION.search(run_text)
+        if match:
+            errors.append(
+                f"{where} expands candidate-derived {match.group(0)!r} on an "
+                "executable line; the candidate commit may only be read from the "
+                "process environment by the trusted checker, never by shell"
+            )
+
+    bearing = [step for step in steps if any(TOKEN_REFERENCE in line for line in step)]
+    if len(bearing) != 1:
+        errors.append(
+            f"{where} must deliver the advisory credential to exactly one step "
+            f"(found {len(bearing)}); a job-level or workflow-level binding would "
+            "hand the credential to every command in the job"
+        )
+        return errors
+
+    entries = step_entries(bearing[0])
+    if not entries:
+        errors.append(f"{where} credential-bearing step is not parseable as a step")
+        return errors
+
+    disallowed = sorted(
+        {key for key, _, _ in entries if key not in CREDENTIAL_STEP_ALLOWED_KEYS}
+    )
+    if disallowed:
+        errors.append(
+            f"{where} credential-bearing step declares {', '.join(disallowed)}; "
+            "only name/id/if/env/run are admitted, so no action, shell override, "
+            "or working directory can add or redirect an execution surface while "
+            "the credential is bound"
+        )
+
+    runs = [(value, body) for key, value, body in entries if key == "run"]
+    if len(runs) != 1:
+        errors.append(
+            f"{where} credential-bearing step must have exactly one `run:` "
+            f"execution surface (found {len(runs)})"
+        )
+        return errors
+
+    value, body = runs[0]
+    if BLOCK_SCALAR.match(value) or body or not value:
+        errors.append(
+            f"{where} credential-bearing step uses a multiline `run:` block; it "
+            "must be a single-line invocation of the default-branch checker so "
+            "no other shell command — a candidate checkout, a `source`, or any "
+            "other statement — can run beside it with the credential already in "
+            "the environment"
+        )
+        return errors
+
+    if not CREDENTIAL_RUN_COMMAND.match(value):
+        errors.append(
+            f"{where} credential-bearing step runs {value!r}; it may run only "
+            f'`{TRUSTED_CHECKER} [--verify] [--require-pass] --trusted-execution '
+            '--trusted-tree-sha "$TRUSTED_SHA"` with no other command, operator, '
+            "substitution, interpreter, or path"
+        )
+    missing = [flag for flag in CREDENTIAL_REQUIRED_FLAGS if flag not in value]
+    if missing:
+        errors.append(
+            f"{where} credential-bearing step omits {', '.join(missing)}; without "
+            "the trusted-execution pins the checker will not prove the executing "
+            "tree is the trusted anchor before using the credential"
+        )
+    return errors
 
 
 def check_trusted_workflow(text: str) -> list[str]:
@@ -324,12 +554,6 @@ def check_trusted_workflow(text: str) -> list[str]:
             f"{TRUSTED_WORKFLOW} job `{SECRET_JOB}` must require `{TRUST_JOB}` so "
             "provenance is established before the credential is released"
         )
-    if "--trusted-execution" not in secret_text or "--trusted-tree-sha" not in secret_text:
-        errors.append(
-            f"{TRUSTED_WORKFLOW} job `{SECRET_JOB}` must pin the checker to the "
-            "trusted anchor with --trusted-execution and --trusted-tree-sha"
-        )
-
     # The candidate may reach the secret-bearing job only as an inert SHA in an
     # environment mapping. A checkout ref, a fetch, or any shell operand would
     # make candidate-controlled bytes executable here.
@@ -344,18 +568,13 @@ def check_trusted_workflow(text: str) -> list[str]:
 
     for line in secret_lines:
         stripped = line.strip()
-        if stripped.startswith("run:"):
-            command = stripped[len("run:") :].strip()
-            if command and command != "|" and not command.startswith(TRUSTED_CHECKER):
-                errors.append(
-                    f"{TRUSTED_WORKFLOW} job `{SECRET_JOB}` runs {command!r}; the "
-                    "credential-bearing job may only run the default-branch checker"
-                )
         if "python" in stripped and TRUSTED_CHECKER not in stripped:
             errors.append(
                 f"{TRUSTED_WORKFLOW} job `{SECRET_JOB}` invokes an interpreter "
                 "other than the default-branch checker"
             )
+
+    errors.extend(check_credential_steps(job_steps(jobs[SECRET_JOB])))
 
     if PUBLISH_JOB in jobs:
         publish_lines = code_lines(jobs[PUBLISH_JOB])
@@ -428,7 +647,9 @@ def check_release_workflow(text: str) -> list[str]:
 
 def check_standalone_workflow(text: str) -> list[str]:
     errors: list[str] = []
-    if SELF_TEST_STEP not in text:
+    # Comment-stripped: a commented-out or merely documented invocation must not
+    # satisfy the requirement that the self-test actually runs.
+    if not any(SELF_TEST_STEP in line for line in code_lines(text.splitlines())):
         errors.append(
             f"{STANDALONE_WORKFLOW} must run the advisory trust-boundary "
             "self-test on every pull request"
@@ -645,9 +866,160 @@ def run_self_test() -> int:  # noqa: C901 — a flat fixture table stays readabl
     check(
         "a credential-bearing job running candidate code is rejected",
         any(
-            "may only run the default-branch checker" in err
+            "credential-bearing step runs" in err
             or "invokes an interpreter other than" in err
             for err in evaluate(mutated(TRUSTED_WORKFLOW, hostile_checker))
+        ),
+    )
+
+    # ---- Step-scoped credential contract -------------------------------------
+    #
+    # Every fixture below is accepted by a verifier that inspects only the first
+    # line of a `run:`, which is precisely why each one is here: with the
+    # credential already bound to the step, the extra shell runs beside the
+    # checker and can check out, source, or otherwise execute candidate material.
+
+    credential_run = (
+        "run: python3 -I scripts/check_launch_readiness.py --verify "
+        '--trusted-execution --trusted-tree-sha "$TRUSTED_SHA"'
+    )
+
+    block_checkout = FIXTURE_TRUSTED.replace(
+        credential_run,
+        "run: |\n"
+        '          git checkout "$LAUNCH_TARGET_SHA"\n'
+        "          python3 -I scripts/check_launch_readiness.py --verify "
+        '--trusted-execution --trusted-tree-sha "$TRUSTED_SHA"',
+    )
+    block_checkout_errors = evaluate(mutated(TRUSTED_WORKFLOW, block_checkout))
+    check(
+        "a credential-bearing `run: |` block that checks out the candidate is rejected",
+        any("must be a single-line invocation" in err for err in block_checkout_errors),
+        str(block_checkout_errors),
+    )
+    check(
+        "the candidate checkout in that block is itself reported",
+        any(
+            "on an executable line" in err and "LAUNCH_TARGET_SHA" in err
+            for err in block_checkout_errors
+        ),
+        str(block_checkout_errors),
+    )
+
+    block_source = FIXTURE_TRUSTED.replace(
+        credential_run,
+        "run: |\n"
+        '          . "./candidate/${LAUNCH_TARGET_SHA}.env"\n'
+        "          python3 -I scripts/check_launch_readiness.py --verify "
+        '--trusted-execution --trusted-tree-sha "$TRUSTED_SHA"',
+    )
+    check(
+        "a credential-bearing block that sources candidate material is rejected",
+        any(
+            "must be a single-line invocation" in err or "on an executable line" in err
+            for err in evaluate(mutated(TRUSTED_WORKFLOW, block_source))
+        ),
+    )
+
+    chained_command = FIXTURE_TRUSTED.replace(
+        credential_run, credential_run + " && sh ./candidate/postscript.sh"
+    )
+    check(
+        "a second command chained onto the credential invocation is rejected",
+        any(
+            "credential-bearing step runs" in err
+            for err in evaluate(mutated(TRUSTED_WORKFLOW, chained_command))
+        ),
+    )
+
+    substituted_pin = FIXTURE_TRUSTED.replace(
+        '--trusted-tree-sha "$TRUSTED_SHA"',
+        '--trusted-tree-sha "$(git rev-parse HEAD)"',
+    )
+    check(
+        "a command substitution in the trusted-tree pin is rejected",
+        any(
+            "credential-bearing step runs" in err
+            for err in evaluate(mutated(TRUSTED_WORKFLOW, substituted_pin))
+        ),
+    )
+
+    second_surface = FIXTURE_TRUSTED.replace(
+        "      - name: Evaluate\n        env:\n",
+        "      - name: Evaluate\n"
+        "        uses: actions/github-script@3d3c42e5aac5ba805825da76410c181273ba90b1\n"
+        "        env:\n",
+    )
+    check(
+        "an action added as a second execution surface on the credential step is "
+        "rejected",
+        any(
+            "only name/id/if/env/run are admitted" in err
+            for err in evaluate(mutated(TRUSTED_WORKFLOW, second_surface))
+        ),
+    )
+
+    job_level_credential = FIXTURE_TRUSTED.replace(
+        "    environment: launch-advisory\n    steps:\n",
+        "    environment: launch-advisory\n"
+        "    env:\n"
+        "      LAUNCH_ADVISORY_READ_TOKEN: ${{ secrets.LAUNCH_ADVISORY_READ_TOKEN }}\n"
+        "    steps:\n",
+    ).replace(
+        "          LAUNCH_ADVISORY_READ_TOKEN: "
+        "${{ secrets.LAUNCH_ADVISORY_READ_TOKEN }}\n",
+        "",
+    )
+    check(
+        "widening the credential from the step to the whole job is rejected",
+        any(
+            "exactly one step (found 0)" in err
+            for err in evaluate(mutated(TRUSTED_WORKFLOW, job_level_credential))
+        ),
+    )
+
+    candidate_in_secretless_step = FIXTURE_TRUSTED.replace(
+        "          ref: refs/heads/main\n      - name: Evaluate",
+        "          ref: refs/heads/main\n"
+        "      - name: Pin\n"
+        "        env:\n"
+        "          LAUNCH_TARGET_SHA: "
+        "${{ needs.establish-trust.outputs.candidate_sha }}\n"
+        "        run: |\n"
+        '          git checkout --detach "$LAUNCH_TARGET_SHA"\n'
+        "      - name: Evaluate",
+    )
+    check(
+        "candidate execution in a secretless step of the credential job is rejected",
+        any(
+            "on an executable line" in err
+            for err in evaluate(mutated(TRUSTED_WORKFLOW, candidate_in_secretless_step))
+        ),
+    )
+
+    commented_credential = FIXTURE_TRUSTED.replace(
+        "          LAUNCH_ADVISORY_READ_TOKEN: "
+        "${{ secrets.LAUNCH_ADVISORY_READ_TOKEN }}\n",
+        "          # LAUNCH_ADVISORY_READ_TOKEN: "
+        "${{ secrets.LAUNCH_ADVISORY_READ_TOKEN }}\n",
+    )
+    check(
+        "a commented-out credential binding does not satisfy the contract",
+        any(
+            "exactly once (found 0)" in err
+            for err in evaluate(mutated(TRUSTED_WORKFLOW, commented_credential))
+        ),
+    )
+
+    commented_self_test = FIXTURE_STANDALONE.replace(
+        f"        run: {SELF_TEST_STEP}",
+        f"        # run: {SELF_TEST_STEP}\n        run: true",
+    )
+    check(
+        "a self-test that survives only as a comment is rejected",
+        any(
+            "must run the advisory trust-boundary" in err
+            for err in evaluate(mutated(STANDALONE_WORKFLOW, commented_self_test))
         ),
     )
 

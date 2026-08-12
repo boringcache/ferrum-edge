@@ -203,16 +203,57 @@ Because the policy, the exemptions, and `PRODUCTION_READINESS.md` are all read
 from the trusted anchor, the reviewed snapshot compared against the live verdict
 is protected `main`'s — never the candidate's copy of it.
 
+### The credential is scoped to one step, and the verifier checks that step
+
+The advisory credential is bound by the `env:` of a single step, so only that
+step's command can read it. Job membership is therefore not the unit of trust:
+the secretless anchor-pin and checker self-test steps share the job but never
+receive the secret, while the one step that does receive it is the entire
+attack surface.
+
+`.github/scripts/verify_launch_advisory_trust.py` parses the credential-bearing
+job's `steps:` list by indentation, locates the exact step carrying
+`secrets.LAUNCH_ADVISORY_READ_TOKEN`, and holds that step — and only that step —
+to a closed contract:
+
+- it must be a plain `run:` step declaring only `name`/`id`/`if`/`env`/`run`, so
+  no `uses:`, `shell:`, or `working-directory:` can add or redirect an execution
+  surface;
+- it must have exactly one `run:`, and that `run:` must be a **single-line**
+  scalar. A `run: |` or `run: >` block is refused outright, because a block can
+  carry any number of extra commands that run with the credential already in the
+  environment;
+- the whole command is matched end to end against
+  `python3 -I scripts/check_launch_readiness.py [--verify] [--require-pass]
+  --trusted-execution --trusted-tree-sha "$TRUSTED_SHA"`. An appended `&& …`, a
+  `;`, a pipe, a command substitution in the pin, an alternate interpreter, or an
+  alternate path to the checker all fail the match.
+
+Separately, **no** step of that job — secretless ones included, and inside
+multiline blocks — may expand a candidate-derived variable such as
+`$LAUNCH_TARGET_SHA` on an executable line. The candidate SHA is read from the
+process environment by the trusted checker and by nothing else, so any shell
+expansion of it is a new execution path over candidate-controlled data.
+
+Comments are stripped before every structural and contract decision, so prose can
+neither satisfy a requirement nor stand in for a rejected command.
+
 `.github/scripts/verify_launch_advisory_trust.py --self-test` is the checked-in
 proof. It runs an adversarial fixture table — a malicious tagged workflow that
 claims the credential, a newly added tag-triggered consumer, a credential-bearing
-job redirected at a candidate checker, a candidate-tree checkout, a tag-reachable
-trust workflow, a dropped environment binding, a dropped provenance edge, an
-unpinned action, a constant commit-wide status context, an omitted run-attempt
-binding, a `requested`-only trigger, a default-branch audit sharing the release
-context namespace, a release gate that accepts another run's status, and a
-release gate that stops requiring the trusted verdict — and then applies the
-same contract to the real `.github/workflows` tree. It runs on every pull
+job redirected at a candidate checker, a candidate-tree checkout, a
+credential-bearing `run: |` block that checks out or sources candidate material
+before calling the checker, a second command chained onto the credential
+invocation, a command substitution in the trusted-tree pin, an action added as a
+second execution surface on the credential step, a credential widened from the
+step to the whole job, candidate expansion inside a secretless step of that job,
+a commented-out credential binding, a self-test surviving only as a comment, a
+tag-reachable trust workflow, a dropped environment binding, a dropped provenance
+edge, an unpinned action, a constant commit-wide status context, an omitted
+run-attempt binding, a `requested`-only trigger, a default-branch audit sharing
+the release context namespace, a release gate that accepts another run's status,
+and a release gate that stops requiring the trusted verdict — and then applies
+the same contract to the real `.github/workflows` tree. It runs on every pull
 request from `launch-readiness.yml`.
 
 ### Required repository settings (root/admin only, not code)
@@ -274,7 +315,14 @@ future provisioning safe rather than exploitable.
   `trusted-launch-advisory-gate/release-<run id>-attempt-<attempt>` verdict for
   the commit its tag resolves to, accepting no other context, and holds no
   credential.
-- All keep `persist-credentials: false` and least permissions.
+- Every checkout on this trust boundary — both checkouts in
+  `launch-advisory-trust.yml` (`publish-verdict` checks out nothing at all), the
+  `launch-readiness.yml` checkout, and
+  `release.yml`'s `validate-launch-readiness` job — uses
+  `persist-credentials: false` and least permissions. This is a claim about the
+  trust-boundary jobs only: `release.yml` also contains build, packaging, and
+  publishing jobs that check out with the default persisted credential, and
+  those are outside this boundary and unchanged by #3802.
 - `.github/CODEOWNERS` covers the policy, the exemptions, the checker, the
   workflows, the trust-boundary verifier, and `PRODUCTION_READINESS.md`.
 
