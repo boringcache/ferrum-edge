@@ -83,6 +83,12 @@
 //! panic included) so a dead reconcile loop cannot leave marked-but-unserved
 //! destinations installed.
 //!
+//! Destination and interface updates share one cold-path mutex: each event
+//! mutates only its component, then the backend reconcile derives from the
+//! latest combined desired state inside that same critical section. A stale
+//! cloned plan must never install after a newer event has already published.
+//! The datagram hot path does not take this lock.
+//!
 //! Linux-only. Everywhere else [`NodeWaypointUdpSteering`] is inert and
 //! `steering_supported()` is false, which is also why the mesh startup path
 //! keeps its fail-closed UDP/DTLS suppression off Linux.
@@ -267,20 +273,26 @@ struct SteeringState {
     /// The generation this process installed, or `None` when nothing is (or is
     /// known to be) installed.
     applied: Option<AppliedSteering>,
+    /// Latest bound destination set. Source of truth for reconcile; the
+    /// lock-free [`NodeWaypointUdpSteering::bound_destinations`] snapshot is
+    /// only a diagnostic copy written while this mutex is held.
+    desired_destinations: Vec<NodeWaypointUdpSteerDestination>,
+    /// Latest published attribution interfaces. Paired with
+    /// [`Self::desired_destinations`] inside the same critical section.
+    desired_ifaces: Vec<String>,
 }
 
 /// Reconciles the NodeWaypoint Service-steering datapath.
 pub struct NodeWaypointUdpSteering {
     backend: Arc<dyn NodeWaypointUdpSteerBackend>,
     /// Guarded by a plain `Mutex` because it is touched once per registry poll
-    /// (seconds), never on a datagram path.
+    /// (seconds), never on a datagram path. Desired destinations, desired
+    /// interfaces, and the applied generation all live here so a stale cloned
+    /// plan cannot install after a newer event has already published.
     state: Mutex<SteeringState>,
-    /// Destinations whose corresponding UDP/DTLS listeners are currently bound
-    /// and serving on the accepted generation. Empty means steer nothing.
+    /// Lock-free diagnostic snapshot of the desired destination set. Written
+    /// only while `state` is held; never the reconcile source of truth.
     bound_destinations: ArcSwap<Vec<NodeWaypointUdpSteerDestination>>,
-    /// Last published attribution interfaces, so a destination-plan change can
-    /// apply immediately without waiting for the next registry poll.
-    last_ifaces: ArcSwap<Vec<String>>,
 }
 
 impl NodeWaypointUdpSteering {
@@ -289,7 +301,6 @@ impl NodeWaypointUdpSteering {
             backend,
             state: Mutex::new(SteeringState::default()),
             bound_destinations: ArcSwap::from_pointee(Vec::new()),
-            last_ifaces: ArcSwap::from_pointee(Vec::new()),
         }
     }
 
@@ -299,12 +310,37 @@ impl NodeWaypointUdpSteering {
         self.bound_destinations.load_full().as_ref().clone()
     }
 
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, SteeringState> {
+        match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                // A poisoned lock is treated as "nothing is KNOWN about the
+                // node": forget the applied generation AND drop the reaped
+                // proof, so the pass below runs a teardown rather than
+                // short-circuiting on this process's own stale memory.
+                let mut guard = poisoned.into_inner();
+                *guard = SteeringState::default();
+                self.bound_destinations.store(Arc::new(Vec::new()));
+                guard
+            }
+        }
+    }
+
+    fn publish_desired_snapshot(&self, state: &SteeringState) {
+        self.bound_destinations
+            .store(Arc::new(state.desired_destinations.clone()));
+    }
+
     /// Replace the bound destination set and apply it immediately against the
     /// last published attribution interfaces (or `ifaces` when supplied).
     ///
     /// Whole-plan replacement: a generation is applied or it is not. An empty
     /// set tears the datapath down. Callers must pass only destinations whose
     /// listeners are actually bound on the accepted serving generation.
+    ///
+    /// The destination (and optional interface) update and the backend
+    /// reconcile share one critical section so a concurrent later event cannot
+    /// be overwritten by this call's stale clone.
     pub fn set_bound_destinations(
         &self,
         destinations: Vec<NodeWaypointUdpSteerDestination>,
@@ -313,27 +349,29 @@ impl NodeWaypointUdpSteering {
         let mut destinations = destinations;
         destinations.sort_unstable();
         destinations.dedup();
-        self.bound_destinations
-            .store(Arc::new(destinations.clone()));
+        let mut state = self.lock_state();
+        state.desired_destinations = destinations;
         if let Some(ifaces) = ifaces {
-            self.last_ifaces.store(Arc::new(ifaces.to_vec()));
+            state.desired_ifaces = ifaces.to_vec();
         }
-        let ifaces = self.last_ifaces.load_full();
-        self.reconcile_with(&ifaces, &destinations)
+        self.publish_desired_snapshot(&state);
+        self.reconcile_locked(&mut state)
     }
 
     /// Drop every destination served on `port` and apply immediately. Used when
     /// a bound listener fails asynchronously so the destination cannot remain
     /// marked without a serving socket until the next full reconcile.
+    ///
+    /// Filters the latest desired set while holding the same mutex the full
+    /// plan update uses, so a concurrent `set_bound_destinations` cannot be
+    /// lost to a stale load/filter/store.
     pub fn retract_port(&self, port: u16) -> SteerReconcileOutcome {
-        let remaining: Vec<NodeWaypointUdpSteerDestination> = self
-            .bound_destinations
-            .load()
-            .iter()
-            .copied()
-            .filter(|destination| destination.port != port)
-            .collect();
-        self.set_bound_destinations(remaining, None)
+        let mut state = self.lock_state();
+        state
+            .desired_destinations
+            .retain(|destination| destination.port != port);
+        self.publish_desired_snapshot(&state);
+        self.reconcile_locked(&mut state)
     }
 
     /// Reconcile the datapath against `ifaces` — the interfaces the source
@@ -346,9 +384,9 @@ impl NodeWaypointUdpSteering {
     /// the previous generation is still installed is the one answer that could
     /// leave marked-but-unserved destinations behind.
     pub fn reconcile(&self, ifaces: &[String]) -> SteerReconcileOutcome {
-        self.last_ifaces.store(Arc::new(ifaces.to_vec()));
-        let destinations = self.bound_destinations.load_full();
-        self.reconcile_with(ifaces, destinations.as_slice())
+        let mut state = self.lock_state();
+        state.desired_ifaces = ifaces.to_vec();
+        self.reconcile_locked(&mut state)
     }
 
     /// [`Self::reconcile`] against an explicit destination set. Tests drive this
@@ -358,22 +396,23 @@ impl NodeWaypointUdpSteering {
         ifaces: &[String],
         destinations: &[NodeWaypointUdpSteerDestination],
     ) -> SteerReconcileOutcome {
-        let desired = AppliedSteering {
-            ifaces: ifaces.to_vec(),
-            destinations: destinations.to_vec(),
-        };
+        let mut destinations = destinations.to_vec();
+        destinations.sort_unstable();
+        destinations.dedup();
+        let mut state = self.lock_state();
+        state.desired_ifaces = ifaces.to_vec();
+        state.desired_destinations = destinations;
+        self.publish_desired_snapshot(&state);
+        self.reconcile_locked(&mut state)
+    }
 
-        let mut state = match self.state.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => {
-                // A poisoned lock is treated as "nothing is KNOWN about the
-                // node": forget the applied generation AND drop the reaped
-                // proof, so the pass below runs a teardown rather than
-                // short-circuiting on this process's own stale memory.
-                let mut guard = poisoned.into_inner();
-                *guard = SteeringState::default();
-                guard
-            }
+    /// Apply the latest combined desired state. Must be called while `state` is
+    /// held so the backend never installs a plan that a later event has already
+    /// superseded.
+    fn reconcile_locked(&self, state: &mut SteeringState) -> SteerReconcileOutcome {
+        let desired = AppliedSteering {
+            ifaces: state.desired_ifaces.clone(),
+            destinations: state.desired_destinations.clone(),
         };
 
         if desired.ifaces.is_empty() || desired.destinations.is_empty() {
@@ -385,7 +424,7 @@ impl NodeWaypointUdpSteering {
             if state.reaped && state.applied.is_none() {
                 return SteerReconcileOutcome::Unchanged;
             }
-            self.tear_down(&mut state);
+            self.tear_down(state);
             return SteerReconcileOutcome::Removed;
         }
 
@@ -399,7 +438,7 @@ impl NodeWaypointUdpSteering {
         ) {
             Ok(Some(script)) => script,
             Ok(None) => {
-                self.tear_down(&mut state);
+                self.tear_down(state);
                 return SteerReconcileOutcome::Removed;
             }
             Err(error) => {
@@ -411,7 +450,7 @@ impl NodeWaypointUdpSteering {
                      unsteered (and therefore fails closed at the pod-veth guard) rather than \
                      installing a partial ruleset"
                 );
-                self.tear_down(&mut state);
+                self.tear_down(state);
                 return SteerReconcileOutcome::Failed;
             }
         };
@@ -421,7 +460,7 @@ impl NodeWaypointUdpSteering {
         // first pass — a crashed predecessor's objects, which may name an
         // address family or a destination this generation does not.
         if !state.reaped || state.applied.is_some() {
-            self.tear_down(&mut state);
+            self.tear_down(state);
         }
 
         match self.backend.run_script(&script) {
@@ -447,7 +486,7 @@ impl NodeWaypointUdpSteering {
                      Ferrum-owned steering object so no destination is marked without a serving \
                      socket, and retrying the whole plan on the next reconcile"
                 );
-                self.tear_down(&mut state);
+                self.tear_down(state);
                 SteerReconcileOutcome::Failed
             }
         }
@@ -485,11 +524,9 @@ impl NodeWaypointUdpSteering {
     /// it. Also forgets the bound destination set so a later reconcile cannot
     /// reinstall destinations whose listeners are already gone.
     pub fn shutdown(&self) {
-        self.bound_destinations.store(Arc::new(Vec::new()));
-        let mut state = match self.state.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let mut state = self.lock_state();
+        state.desired_destinations.clear();
+        self.publish_desired_snapshot(&state);
         self.tear_down(&mut state);
     }
 }
@@ -505,4 +542,5 @@ impl Drop for NodeWaypointUdpSteering {
 
 // Contract coverage for this module lives in
 // `tests/unit/gateway_core/node_waypoint_udp_steering_tests.rs` (first-pass
-// reaping, later-empty idempotence, command order, and failure cleanup).
+// reaping, later-empty idempotence, command order, failure cleanup, and
+// serialized latest-state B/C and retract-vs-full-plan ordering).

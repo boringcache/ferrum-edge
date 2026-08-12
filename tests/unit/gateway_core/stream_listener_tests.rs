@@ -14,7 +14,9 @@ use ferrum_edge::load_balancer::LoadBalancerCache;
 use ferrum_edge::modes::mesh::config::MeshConfig;
 use ferrum_edge::plugin_cache::PluginCache;
 use ferrum_edge::proxy::client_ip::TrustedProxies;
-use ferrum_edge::proxy::stream_listener::{StreamListenerDegradation, StreamListenerManager};
+use ferrum_edge::proxy::stream_listener::{
+    NodeWaypointUdpSteerHold, StreamListenerDegradation, StreamListenerManager,
+};
 use ferrum_edge::proxy::stream_match::{StreamMatchArm, StreamMatchCriteria};
 use ferrum_edge::proxy::node_waypoint_udp_steering::{
     NodeWaypointUdpSteerBackend, NodeWaypointUdpSteering,
@@ -22,6 +24,7 @@ use ferrum_edge::proxy::node_waypoint_udp_steering::{
 use ferrum_edge::request_epoch::RequestEpochStore;
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 
@@ -2449,4 +2452,283 @@ async fn node_waypoint_udp_withdrawal_retracts_steering() {
         "withdrawing the listener must retract its destination before the socket is gone"
     );
     manager.shutdown_all().await;
+}
+
+async fn start_steered_nw_udp() -> (
+    Arc<StreamListenerManager>,
+    Arc<NodeWaypointUdpSteering>,
+    Vec<ferrum_edge::capture::NodeWaypointUdpSteerDestination>,
+) {
+    let dest_ip = "10.96.0.10";
+    let mut last_failures = Vec::new();
+    for _ in 0..8 {
+        let probe = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("udp probe");
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let dest = vec![steer_destination(dest_ip, port)];
+        let config = config_with_nw_udp(port, dest.clone());
+        let manager = Arc::new(create_manager(config));
+        let steering = attach_steering(&manager);
+        let failures = manager.reconcile().await;
+        if failures.is_empty()
+            && manager
+                .wait_until_started(Duration::from_secs(5))
+                .await
+                .is_ok()
+            && !steering.bound_destinations().is_empty()
+        {
+            return (manager, steering, dest);
+        }
+        last_failures = failures;
+        manager.shutdown_all().await;
+    }
+    panic!("NodeWaypoint UDP listener did not start: {last_failures:?}");
+}
+
+/// A listener-task failure between eligibility and plan install must not leave
+/// the dead port marked. The last event is the non-serving mark: publication
+/// re-reads serving flags after the fence.
+#[tokio::test]
+async fn node_waypoint_udp_failure_between_eligibility_and_publish_does_not_install() {
+    let (manager, steering, dest) = start_steered_nw_udp().await;
+    assert_eq!(steering.bound_destinations(), dest);
+
+    let owners = manager.node_waypoint_udp_listener_owners_for_test().await;
+    assert_eq!(owners.len(), 1, "one generated NodeWaypoint UDP owner");
+    let (_key, _generation, started) = &owners[0];
+
+    let hold = NodeWaypointUdpSteerHold::new();
+    manager.set_node_waypoint_udp_steer_holds_for_test(None, Some(hold.clone()));
+
+    let sync_manager = manager.clone();
+    let sync = tokio::spawn(async move {
+        sync_manager.sync_node_waypoint_udp_steering().await;
+    });
+    hold.wait_entered().await;
+    started.store(false, Ordering::Release);
+    hold.wait_release().await;
+    sync.await.expect("sync task");
+
+    assert!(
+        steering.bound_destinations().is_empty(),
+        "a failure between eligibility and publish must not install the dead port"
+    );
+    manager.shutdown_all().await;
+}
+
+/// A failed older generation must not retract a successfully bound replacement
+/// on the same key.
+#[tokio::test]
+async fn node_waypoint_udp_old_generation_failure_does_not_retract_replacement() {
+    let (manager, steering, dest) = start_steered_nw_udp().await;
+    let owners = manager.node_waypoint_udp_listener_owners_for_test().await;
+    let (key, generation, _) = owners
+        .into_iter()
+        .next()
+        .expect("bound NodeWaypoint UDP owner");
+
+    manager
+        .retract_node_waypoint_udp_listener_generation_for_test(&key, generation.wrapping_sub(1))
+        .await;
+    assert_eq!(
+        steering.bound_destinations(),
+        dest,
+        "a stale generation must not retract the serving replacement"
+    );
+
+    manager
+        .retract_node_waypoint_udp_listener_generation_for_test(&key, generation)
+        .await;
+    assert!(
+        steering.bound_destinations().is_empty(),
+    manager.shutdown_all().await;
+}
+
+/// A failed older generation after a same-key replacement must not retract the
+/// successor's serving plan.
+#[tokio::test]
+async fn node_waypoint_udp_old_generation_failure_after_replacement_keeps_successor() {
+    let dest_ip = "10.96.0.10";
+    let mut last_failures = Vec::new();
+    for _ in 0..8 {
+        let probe = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("udp probe");
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let dest = vec![steer_destination(dest_ip, port)];
+        let config = config_with_nw_udp(port, dest.clone());
+        let config_arc = Arc::new(ArcSwap::from_pointee(config.clone()));
+        let manager = Arc::new(create_manager_with_config_arc(config_arc.clone(), &config));
+        let steering = attach_steering(&manager);
+        let failures = manager.reconcile().await;
+        if !(failures.is_empty()
+            && manager
+                .wait_until_started(Duration::from_secs(5))
+                .await
+                .is_ok()
+            && !steering.bound_destinations().is_empty())
+        {
+            last_failures = failures;
+            manager.shutdown_all().await;
+            continue;
+        }
+
+        let owners = manager.node_waypoint_udp_listener_owners_for_test().await;
+        let (key, generation, _) = owners
+            .into_iter()
+            .next()
+            .expect("bound NodeWaypoint UDP owner");
+
+        let mut replacement = config_with_nw_udp(port, dest.clone());
+        replacement.proxies[0].passthrough = true;
+        config_arc.store(Arc::new(replacement));
+        let _ = manager.reconcile().await;
+        if manager
+            .wait_until_started(Duration::from_secs(5))
+            .await
+            .is_err()
+        {
+            last_failures = manager
+                .stream_bind_failures()
+                .iter()
+                .map(|failure| {
+                    (
+                        failure.proxy_id.clone(),
+                        failure.listen_port,
+                        failure.error.clone(),
+                    )
+                })
+                .collect();
+            manager.shutdown_all().await;
+            continue;
+        }
+
+        let owners = manager.node_waypoint_udp_listener_owners_for_test().await;
+        let successor = owners
+            .iter()
+            .find(|(owner_key, _, _)| owner_key == &key)
+            .map(|(_, generation, _)| *generation);
+        let Some(successor_generation) = successor else {
+            last_failures = vec![("missing-successor".into(), port, "no owner".into())];
+            manager.shutdown_all().await;
+            continue;
+        };
+        assert_ne!(
+            successor_generation, generation,
+            "passthrough flip must spawn a new listener generation on the same key"
+        );
+        assert_eq!(
+            steering.bound_destinations(),
+            dest,
+            "the replacement must be steered before the old generation fails"
+        );
+
+        manager
+            .retract_node_waypoint_udp_listener_generation_for_test(&key, generation)
+            .await;
+        assert_eq!(
+            steering.bound_destinations(),
+            dest,
+            "a failed old generation must not retract a successfully bound replacement"
+        );
+        manager.shutdown_all().await;
+        return;
+    }
+    panic!("NodeWaypoint UDP replacement did not start: {last_failures:?}");
+}
+
+/// Shutdown fences bind-success watchers, retracts, then closes sockets. A
+/// watcher that observed `started` before teardown must not republish after it.
+#[tokio::test]
+async fn node_waypoint_udp_shutdown_is_the_final_datapath_operation() {
+    let dest_ip = "10.96.0.10";
+    let mut last_failures = Vec::new();
+    for _ in 0..8 {
+        let probe = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("udp probe");
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let dest = vec![steer_destination(dest_ip, port)];
+        let config = config_with_nw_udp(port, dest);
+        let manager = Arc::new(create_manager(config));
+        let steering = attach_steering(&manager);
+        let hold = NodeWaypointUdpSteerHold::new();
+        manager.set_node_waypoint_udp_steer_holds_for_test(Some(hold.clone()), None);
+
+        let reconcile_manager = manager.clone();
+        let reconcile = tokio::spawn(async move { reconcile_manager.reconcile().await });
+
+        let entered = tokio::time::timeout(Duration::from_secs(5), hold.wait_entered()).await;
+        if entered.is_err() {
+            last_failures = reconcile.await.unwrap_or_default();
+            manager.shutdown_all().await;
+            continue;
+        }
+
+        manager.shutdown_all().await;
+        hold.wait_release().await;
+        let _ = reconcile.await;
+        assert!(
+            steering.bound_destinations().is_empty(),
+            "teardown must be the final datapath operation; a bind-watch must not republish"
+        );
+        return;
+    }
+    panic!("NodeWaypoint UDP listener did not reach the bind-watch fence: {last_failures:?}");
+}
+
+/// A tenant namespace that happens to contain the reserved listener prefix
+/// must not steal NodeWaypoint UDP steering ownership. Ownership is the
+/// generated proxy id, not a substring of the runtime key.
+#[tokio::test]
+async fn node_waypoint_udp_steering_ignores_runtime_key_substring() {
+    let dest_ip = "10.96.0.10";
+    let mut last_failures = Vec::new();
+    for _ in 0..8 {
+        let probe = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("udp probe");
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let mut proxy = create_stream_proxy("ordinary-udp", BackendScheme::Udp, port);
+        proxy.namespace = format!(
+            "tenant{}trap",
+            ferrum_edge::modes::mesh::MESH_NODE_WAYPOINT_UDP_PROXY_ID_PREFIX
+        );
+        let config = GatewayConfig {
+            proxies: vec![proxy],
+            node_waypoint_udp_steer_destinations: vec![steer_destination(dest_ip, port)],
+            ..empty_config()
+        };
+        let manager = create_manager(config);
+        let steering = attach_steering(&manager);
+        let failures = manager.reconcile().await;
+        if failures.is_empty()
+            && manager
+                .wait_until_started(Duration::from_secs(5))
+                .await
+                .is_ok()
+        {
+            assert!(
+                steering.bound_destinations().is_empty(),
+                "a namespace-qualified runtime key containing the reserved prefix must not own steering"
+            );
+            assert!(
+                manager
+                    .node_waypoint_udp_listener_owners_for_test()
+                    .await
+                    .is_empty(),
+                "ordinary UDP listeners must not be marked as generated NodeWaypoint owners"
+            );
+            manager.shutdown_all().await;
+            return;
+        }
+        last_failures = failures;
+        manager.shutdown_all().await;
+    }
+    panic!("ordinary UDP listener did not start: {last_failures:?}");
 }

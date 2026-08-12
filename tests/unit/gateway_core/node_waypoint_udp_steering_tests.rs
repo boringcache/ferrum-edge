@@ -402,3 +402,185 @@ fn retract_port_drops_only_that_destination() {
     );
     forget(steering);
 }
+
+// ── Serialized latest-state machine (issue #3286 exact-head review) ────────
+
+/// Blocks the next non-teardown script so a later event can be queued behind
+/// the in-flight reconcile. Destination/interface updates hold the same mutex
+/// across the component write and this backend call, so the queued event
+/// always observes the latest combined state.
+struct ArmedBarrierBackend {
+    scripts: Mutex<Vec<String>>,
+    arm: Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
+}
+
+impl ArmedBarrierBackend {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            scripts: Mutex::new(Vec::new()),
+            arm: Mutex::new(None),
+        })
+    }
+
+    fn arm(&self) -> (Arc<std::sync::Barrier>, Arc<std::sync::Barrier>) {
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        *self.arm.lock().expect("arm lock") = Some((entered.clone(), release.clone()));
+        (entered, release)
+    }
+}
+
+impl NodeWaypointUdpSteerBackend for ArmedBarrierBackend {
+    fn run_script(&self, script: &str) -> Result<(), String> {
+        self.scripts
+            .lock()
+            .expect("recording backend lock")
+            .push(script.to_string());
+        if is_teardown(script) {
+            return Ok(());
+        }
+        if let Some((entered, release)) = self.arm.lock().expect("arm lock").take() {
+            entered.wait();
+            release.wait();
+        }
+        Ok(())
+    }
+}
+
+/// Plan B is in-flight (component stored, backend blocked). Plan C is the
+/// later logical event. C must own the installed plan; B must not install
+/// after C has already been published.
+#[test]
+fn later_bound_destination_update_owns_the_installed_plan() {
+    let backend = ArmedBarrierBackend::new();
+    let steering = Arc::new(NodeWaypointUdpSteering::new(backend.clone()));
+    let ifaces = vec!["veth0".to_string()];
+    let plan_b = vec![destination("10.96.0.10", 5300)];
+    let plan_c = vec![destination("10.96.0.11", 5301)];
+
+    let (entered, release) = backend.arm();
+    let steering_b = steering.clone();
+    let ifaces_b = ifaces.clone();
+    let plan_b_thread = plan_b.clone();
+    let handle_b = std::thread::spawn(move || {
+        steering_b.set_bound_destinations(plan_b_thread, Some(&ifaces_b))
+    });
+    entered.wait();
+
+    let steering_c = steering.clone();
+    let ifaces_c = ifaces.clone();
+    let plan_c_thread = plan_c.clone();
+    let handle_c = std::thread::spawn(move || {
+        steering_c.set_bound_destinations(plan_c_thread, Some(&ifaces_c))
+    });
+
+    release.wait();
+    handle_b.join().expect("plan B thread");
+    handle_c.join().expect("plan C thread");
+
+    assert_eq!(
+        steering.bound_destinations(),
+        plan_c,
+        "the later logical event must own the installed plan"
+    );
+    std::mem::forget(steering);
+}
+
+/// A retract that races a later full-plan update must filter the LATEST
+/// desired set, not a stale snapshot taken before the full plan was stored.
+/// Full plan adds 5302 while 5300+5301 are already applied; retract drops
+/// 5300. Legal finals: the full plan (retract ran first) or 5301+5302
+/// (retract ran last). `[5301]` alone is the stale-load bug.
+#[test]
+fn retract_filters_the_latest_desired_set_not_a_stale_snapshot() {
+    let backend = ArmedBarrierBackend::new();
+    let steering = Arc::new(NodeWaypointUdpSteering::new(backend.clone()));
+    let ifaces = vec!["veth0".to_string()];
+    let initial = vec![
+        destination("10.96.0.10", 5300),
+        destination("10.96.0.11", 5301),
+    ];
+    let full = vec![
+        destination("10.96.0.10", 5300),
+        destination("10.96.0.11", 5301),
+        destination("10.96.0.12", 5302),
+    ];
+    let retract_after_full = vec![
+        destination("10.96.0.11", 5301),
+        destination("10.96.0.12", 5302),
+    ];
+
+    assert_eq!(
+        steering.set_bound_destinations(initial, Some(&ifaces)),
+        SteerReconcileOutcome::Applied
+    );
+
+    let (entered, release) = backend.arm();
+    let steering_full = steering.clone();
+    let ifaces_full = ifaces.clone();
+    let full_thread = full.clone();
+    let handle_full = std::thread::spawn(move || {
+        steering_full.set_bound_destinations(full_thread, Some(&ifaces_full))
+    });
+    entered.wait();
+
+    let steering_retract = steering.clone();
+    let handle_retract = std::thread::spawn(move || steering_retract.retract_port(5300));
+
+    release.wait();
+    handle_full.join().expect("full-plan thread");
+    handle_retract.join().expect("retract thread");
+
+    assert_eq!(
+        steering.bound_destinations(),
+        retract_after_full,
+        "retract queued behind the full plan must drop 5300 from the latest set, keeping 5302"
+    );
+    std::mem::forget(steering);
+}
+
+/// The other retract/full order: retract is in-flight, then the full plan is
+/// the later event and must own the installed plan (including 5300).
+#[test]
+fn later_full_plan_owns_the_installed_plan_over_an_in_flight_retract() {
+    let backend = ArmedBarrierBackend::new();
+    let steering = Arc::new(NodeWaypointUdpSteering::new(backend.clone()));
+    let ifaces = vec!["veth0".to_string()];
+    let initial = vec![
+        destination("10.96.0.10", 5300),
+        destination("10.96.0.11", 5301),
+    ];
+    let full = vec![
+        destination("10.96.0.10", 5300),
+        destination("10.96.0.11", 5301),
+        destination("10.96.0.12", 5302),
+    ];
+
+    assert_eq!(
+        steering.set_bound_destinations(initial, Some(&ifaces)),
+        SteerReconcileOutcome::Applied
+    );
+
+    let (entered, release) = backend.arm();
+    let steering_retract = steering.clone();
+    let handle_retract = std::thread::spawn(move || steering_retract.retract_port(5300));
+    entered.wait();
+
+    let steering_full = steering.clone();
+    let ifaces_full = ifaces.clone();
+    let full_thread = full.clone();
+    let handle_full = std::thread::spawn(move || {
+        steering_full.set_bound_destinations(full_thread, Some(&ifaces_full))
+    });
+
+    release.wait();
+    handle_retract.join().expect("retract thread");
+    handle_full.join().expect("full-plan thread");
+
+    assert_eq!(
+        steering.bound_destinations(),
+        full,
+        "the later full-plan event must own the installed plan"
+    );
+    std::mem::forget(steering);
+}

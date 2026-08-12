@@ -1621,6 +1621,14 @@ pub fn node_waypoint_udp_proxy_id(namespace: &str, name: &str, port: u16) -> Str
         .replace(['/', '.'], "-")
 }
 
+/// True when `id` is a Ferrum-generated NodeWaypoint UDP/DTLS **listener**
+/// proxy id. Exact prefix on the proxy id itself — never a substring of a
+/// namespace-qualified runtime key, which a tenant namespace can contain.
+#[inline]
+pub fn is_node_waypoint_udp_listener_id(id: &str) -> bool {
+    id.starts_with(MESH_NODE_WAYPOINT_UDP_PROXY_ID_PREFIX)
+}
+
 /// Forward-derived listener upstream id. Never parsed back.
 pub fn node_waypoint_udp_upstream_id(namespace: &str, name: &str, port: u16) -> String {
     format!("{MESH_NODE_WAYPOINT_UDP_UPSTREAM_ID_PREFIX}{namespace}-{name}-{port}")
