@@ -94,8 +94,12 @@ In mesh mode, authenticated health detail includes
 asserted-identity decisions, destination-policy rejections, missing destination
 metadata, and blocked plaintext fallback attempts; `enabled` is true only for
 `node_waypoint` topology), and `mesh.udp_placement_migration` (bounded phase,
-outstanding count, and closed-set failure reason for the node-local Ambient UDP
-placement guard; no generation or pod UID is exposed). The authenticated `/overload`
+outstanding count, closed-set failure reason, and an `established_adoption` flag
+for the node-local Ambient UDP placement guard; no generation or pod UID is
+exposed). `established_adoption` is true when the node had no durable placement
+record and started from the release-attested established placement
+(`FERRUM_MESH_CAPTURE_UDP_PLACEMENT_ESTABLISHED`) — expected for a fresh node or
+one whose registry directory was recreated by a reboot. The authenticated `/overload`
 snapshot also includes `node_waypoint_drops`, with monotonic counters for
 missing/unknown socket-cookie metadata, missing pod/workload identity data,
 unknown pods, and workload-hash mismatches. These fields are omitted from the
@@ -157,7 +161,7 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
   "http://localhost:9000/admin/tls/rotate/proxy_https"
 ```
 
-Supported force-reload surfaces are `proxy_https`, `backend_tls`, `admin_https`, `dtls`, `database_tls`, `cp_grpc`, `dp_grpc`, `svid`, and `all` for every registered watcher plus the configured gateway SVID. Aliases `frontend`, `backend`, `admin`, `frontend_dtls`, `db`, `database`, `cp_grpc_tls`, `dp_grpc_tls`, and `gateway_svid` are accepted. Watcher-backed TLS reloads are enqueued and report success or failure asynchronously through `/admin/tls/events` and `/metrics`; `svid` reloads are validated synchronously and publish a backend SVID generation bump on success.
+Supported force-reload surfaces are `proxy_https`, `backend_tls`, `admin_https`, `dtls`, `database_tls`, `cp_grpc`, `dp_grpc`, `svid`, and `all` for every registered watcher plus the configured gateway SVID. Aliases `frontend`, `backend`, `admin`, `frontend_dtls`, `db`, `database`, `cp_grpc_tls`, `dp_grpc_tls`, and `gateway_svid` are accepted. Watcher-backed TLS reloads are enqueued and report success or failure asynchronously through `/admin/tls/events` and `/metrics`; `svid` reloads are validated synchronously and publish a backend SVID generation bump on success. The `dtls` / `frontend_dtls` surface validates one immutable generation (server cert/key, optional client CA, CRLs) before publishing it into every active DTLS server; a rejected candidate retains the previous generation and is recorded as a rebuild failure without secret paths or PEM material. Authenticated `GET /overload` includes the bounded `stream_listeners.frontend_dtls_reload` generation, last publish count, timestamps, and fixed-cardinality outcome.
 
 ## TLS Validation
 

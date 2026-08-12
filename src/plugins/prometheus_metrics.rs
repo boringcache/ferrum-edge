@@ -2564,6 +2564,7 @@ impl MetricsRegistry {
         };
         self.append_mesh_observability_prometheus(&mut output);
         self.append_node_waypoint_observability_prometheus(&mut output);
+        self.append_grpc_stream_auth_prometheus(&mut output);
         self.append_udp_placement_migration_prometheus(&mut output);
         self.append_dp_config_freshness_prometheus(&mut output);
         output
@@ -2622,6 +2623,22 @@ impl MetricsRegistry {
             output,
             &gateway_ns_label,
         );
+        // Issue #3235: CUSTOM external-authorization outcomes. Rendered here,
+        // outside the render cache, for the same reason as the series above —
+        // the counters are process-static and a fail-closed spike must be
+        // visible on the next scrape. Labels are a closed outcome enum plus the
+        // gateway namespace; never provider, policy, route, host, or principal.
+        crate::plugins::mesh::ext_authz::render_prometheus(output, &gateway_ns_label);
+    }
+
+    fn append_grpc_stream_auth_prometheus(&self, output: &mut String) {
+        let ns_label = self
+            .namespace_label
+            .read()
+            .map(|label| label.clone())
+            .unwrap_or_default();
+        let gateway_ns_label = gateway_namespace_label(&ns_label);
+        crate::grpc::auth::render_stream_auth_metrics(output, &gateway_ns_label);
     }
 
     /// Append the bounded Ambient UDP placement migration state outside the
@@ -2651,6 +2668,7 @@ impl MetricsRegistry {
         let mut output = self.render_cacheable_body();
         self.append_mesh_observability_prometheus(&mut output);
         self.append_node_waypoint_observability_prometheus(&mut output);
+        self.append_grpc_stream_auth_prometheus(&mut output);
         self.append_udp_placement_migration_prometheus(&mut output);
         self.append_dp_config_freshness_prometheus(&mut output);
         output
