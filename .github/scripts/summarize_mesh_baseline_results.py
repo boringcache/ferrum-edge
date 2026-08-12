@@ -21,6 +21,7 @@ import sys
 import tempfile
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 
 AUTHZ_SIZES = (10, 100, 1_000, 10_000)
@@ -55,7 +56,7 @@ MAX_CPU_STEAL_PERCENT = 5.0
 SUPPORTED_SUITES = frozenset({"all", "mesh", "hbone", "dns"})
 DNS_GATEWAY_TARGET_MARKER = ":15053"
 DNS_DIRECT_TARGET_MARKER = ":17053"
-HBONE_GATEWAY_TARGET_MARKER = ":18000"
+HBONE_GATEWAY_PORT = 18_000
 
 
 def parse_args() -> argparse.Namespace:
@@ -345,17 +346,38 @@ def hbone_blob_looks_relevant(blob: dict[str, Any]) -> bool:
 
 
 def classify_hbone_blob(blob: dict[str, Any]) -> str | None:
-    """Map a relevant HBONE blob to gateway/direct via known identity.
+    """Map an actual hbone_loadgen blob to gateway/direct by exact target shape.
 
-    Gateway identity requires the fixed harness port (:18000). Direct baseline
-    uses an ephemeral backend port, so it is identified by the direct label.
-    Ambiguous or unexpected targets fail closed (return None).
+    The harness emits the fixed ``hbone_e2e`` label for BOTH phases. Gateway
+    identity is the exact loopback HTTP ``/echo`` target on port 18000; the
+    direct phase uses the same shape with the backend's non-18000 ephemeral
+    port. Synthetic semantic labels are not evidence of what the harness ran,
+    and ambiguous or unexpected targets fail closed (return None).
     """
-    target = str(blob.get("target", ""))
-    label = str(blob.get("label", "")).lower()
-    if HBONE_GATEWAY_TARGET_MARKER in target:
+    if blob.get("label") != "hbone_e2e":
+        return None
+    target = blob.get("target")
+    if not isinstance(target, str):
+        return None
+    try:
+        parsed = urlsplit(target)
+        port = parsed.port
+    except ValueError:
+        return None
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname != "127.0.0.1"
+        or parsed.username is not None
+        or parsed.password is not None
+        or port is None
+        or parsed.path != "/echo"
+        or parsed.query
+        or parsed.fragment
+    ):
+        return None
+    if port == HBONE_GATEWAY_PORT:
         return "gateway"
-    if "direct" in label and HBONE_GATEWAY_TARGET_MARKER not in target:
+    if 1 <= port <= 65_535:
         return "direct"
     return None
 
@@ -377,7 +399,9 @@ def parse_hbone_sample(blob: dict[str, Any], source: str) -> dict[str, Any] | No
     p50 = parse_finite_number(blob.get("p50_us"), non_negative=True)
     p95 = parse_finite_number(blob.get("p95_us"), non_negative=True)
     p99 = parse_finite_number(blob.get("p99_us"), non_negative=True)
-    errors = parse_non_negative_int(blob.get("total_errors", 0))
+    if "total_errors" not in blob:
+        return None
+    errors = parse_non_negative_int(blob.get("total_errors"))
     if None in (rps, p50, p95, p99, errors):
         return None
     kind = classify_hbone_blob(blob)
@@ -406,7 +430,9 @@ def parse_dns_report(report: dict[str, Any], source: str) -> dict[str, Any] | No
     p50 = parse_finite_number(report.get("p50_us"), non_negative=True)
     p90 = parse_finite_number(report.get("p90_us"), non_negative=True)
     p99 = parse_finite_number(report.get("p99_us"), non_negative=True)
-    errors = parse_non_negative_int(report.get("total_errors", 0))
+    if "total_errors" not in report:
+        return None
+    errors = parse_non_negative_int(report.get("total_errors"))
     if None in (qps, p50, p90, p99, errors):
         return None
     return {
@@ -1035,8 +1061,8 @@ def write_draft_markdown(
 
 def _write_hbone_run(path: Path, *, gateway_rps: float, direct_rps: float, errors: int = 0) -> None:
     gateway = {
-        "label": "gateway-hbone",
-        "target": "127.0.0.1:18000",
+        "label": "hbone_e2e",
+        "target": "http://127.0.0.1:18000/echo",
         "rps": gateway_rps,
         "p50_us": 100,
         "p95_us": 200,
@@ -1044,8 +1070,8 @@ def _write_hbone_run(path: Path, *, gateway_rps: float, direct_rps: float, error
         "total_errors": errors,
     }
     direct = {
-        "label": "direct",
-        "target": "127.0.0.1:19000",
+        "label": "hbone_e2e",
+        "target": "http://127.0.0.1:19000/echo",
         "rps": direct_rps,
         "p50_us": 80,
         "p95_us": 160,
@@ -1204,8 +1230,8 @@ def self_test() -> int:
         dup = root / "dup_blobs" / "hbone" / "1kib_c50_30s"
         dup.mkdir(parents=True)
         gateway = {
-            "label": "gateway-hbone",
-            "target": "127.0.0.1:18000",
+            "label": "hbone_e2e",
+            "target": "http://127.0.0.1:18000/echo",
             "rps": 80.0,
             "p50_us": 100,
             "p95_us": 200,
@@ -1213,8 +1239,8 @@ def self_test() -> int:
             "total_errors": 0,
         }
         direct = {
-            "label": "direct",
-            "target": "127.0.0.1:19000",
+            "label": "hbone_e2e",
+            "target": "http://127.0.0.1:19000/echo",
             "rps": 100.0,
             "p50_us": 80,
             "p95_us": 160,
@@ -1254,8 +1280,8 @@ def self_test() -> int:
         malformed = root / "malformed_mixed" / "hbone" / "1kib_c50_30s"
         malformed.mkdir(parents=True)
         bad_mixed = {
-            "label": "gateway-hbone",
-            "target": "127.0.0.1:18000",
+            "label": "hbone_e2e",
+            "target": "http://127.0.0.1:18000/echo",
             "rps": "not-a-number",
             "p50_us": 1,
             "p95_us": 2,
@@ -1294,18 +1320,25 @@ def self_test() -> int:
         ) is None
         assert classify_hbone_blob(
             {
-                "label": "Gateway → HBONE → Backend",
+                "label": "hbone_e2e",
                 "target": "http://127.0.0.1:18000/echo",
                 "rps": 1.0,
             }
         ) == "gateway"
         assert classify_hbone_blob(
             {
-                "label": "Direct baseline",
+                "label": "hbone_e2e",
                 "target": "http://127.0.0.1:54321/echo",
                 "rps": 1.0,
             }
         ) == "direct"
+        assert classify_hbone_blob(
+            {
+                "label": "Direct baseline",
+                "target": "http://127.0.0.1:54321/echo",
+                "rps": 1.0,
+            }
+        ) is None
 
         # --- missing DNS rows / incomplete per-run shape ---
         dns_missing = root / "dns_missing"
@@ -1368,8 +1401,8 @@ def self_test() -> int:
         bad = root / "bad_metrics" / "hbone" / "1kib_c50_30s"
         bad.mkdir(parents=True)
         bad_blob = {
-            "label": "gateway-hbone",
-            "target": "127.0.0.1:18000",
+            "label": "hbone_e2e",
+            "target": "http://127.0.0.1:18000/echo",
             "rps": "not-a-number",
             "p50_us": 1,
             "p95_us": 2,
@@ -1377,8 +1410,8 @@ def self_test() -> int:
             "total_errors": 0,
         }
         nan_blob = {
-            "label": "direct",
-            "target": "127.0.0.1:19000",
+            "label": "hbone_e2e",
+            "target": "http://127.0.0.1:19000/echo",
             "rps": float("nan"),
             "p50_us": 1,
             "p95_us": 2,
@@ -1386,8 +1419,8 @@ def self_test() -> int:
             "total_errors": 0,
         }
         zero_blob = {
-            "label": "direct",
-            "target": "127.0.0.1:19000",
+            "label": "hbone_e2e",
+            "target": "http://127.0.0.1:19000/echo",
             "rps": 0.0,
             "p50_us": 1,
             "p95_us": 2,
@@ -1401,6 +1434,15 @@ def self_test() -> int:
         assert parse_hbone_sample(bad_blob, "x") is None
         assert parse_hbone_sample(nan_blob, "x") is None
         assert parse_hbone_sample(zero_blob, "x") is None
+        missing_hbone_errors = {
+            "label": "hbone_e2e",
+            "target": "http://127.0.0.1:18000/echo",
+            "rps": 1.0,
+            "p50_us": 1,
+            "p95_us": 2,
+            "p99_us": 3,
+        }
+        assert parse_hbone_sample(missing_hbone_errors, "x") is None
         assert parse_dns_report(
             {
                 "name_class": "mesh-internal",
@@ -1410,6 +1452,17 @@ def self_test() -> int:
                 "p90_us": 2,
                 "p99_us": 3,
                 "total_errors": 0,
+            },
+            "x",
+        ) is None
+        assert parse_dns_report(
+            {
+                "name_class": "mesh-internal",
+                "transport": "udp",
+                "qps": 1,
+                "p50_us": 1,
+                "p90_us": 2,
+                "p99_us": 3,
             },
             "x",
         ) is None
