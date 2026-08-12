@@ -46,6 +46,22 @@ workflow definitions as text — it executes nothing — and asserts:
   without appearing in either validated step — is refused, as is any unparseable
   top-level or `jobs:`-level entry and any YAML anchor, alias, or merge key in
   the credential job;
+* the whole document is unambiguous, because a text contract that reads a
+  workflow one way while GitHub's YAML parser reads it another has verified a
+  workflow that does not exist. A duplicate mapping key is not an error GitHub
+  reports — one occurrence wins, and *which* one is a property of the consumer —
+  so a workflow could keep the safe block-form `on:` this contract derives events
+  from and append a duplicate `on: [push]` that makes it tag-reachable. Every
+  duplicate key is therefore refused: top-level keys (including the admitted
+  `on`, `jobs`, `permissions`, `concurrency`), event keys under `on:`, job IDs,
+  the credential job's own keys (`needs`, `environment`, `permissions`, `steps`,
+  …), top-level step keys, the credential step's `env:` entries, and the
+  trusted-anchor checkout's `with:` inputs. An inline flow value written where
+  this contract reads a block is the other half of the family — `on: [push]`,
+  `jobs: {…}`, `steps: [{run: …}]`, `with: {ref: …}` are not "an empty block" but
+  a whole structure the block reader never sees — so it is reported rather than
+  discarded, and every other top-level/job-level value must be a plain scalar or
+  an explicit block;
 * `establish-trust` runs both secretless preflights as real executable steps
   before the protected environment can release the credential: the launch
   readiness checker's own self-test and *this* verifier's `--self-test`, so the
@@ -89,9 +105,15 @@ anchor/alias/merge-key bypass, either secretless self-test dropped, commented
 out, or relocated into the credential job, a dropped trusted-anchor ancestry
 proof, a missing environment binding, a dropped trust edge, a constant
 commit-wide status context, an omitted run-attempt binding, a `requested`-only
-trigger, a release gate that reuses another run's status, and a release job that
-stops requiring the trusted verdict — and then applies the same contract to the
-real `.github/workflows` tree.
+trigger, a release gate that reuses another run's status, a release job that
+stops requiring the trusted verdict, a safe block-form `on:` followed by a
+duplicate `on: [push]` (and the reversed ordering), a duplicate `jobs:`,
+`advisory-verdict`, `needs`, `environment`, `steps`, step key, or checkout input,
+and an `on:`/`steps:`/`with:` written as an inline flow collection — and then
+applies the same contract to the real `.github/workflows` tree. Each duplicate
+and flow fixture asserts the structural rejection AND, where it matters, that the
+corresponding value-level check did not fire: that absence is the proof the
+structural refusal is what catches the bypass.
 Comments are stripped before every contract decision, so prose can neither
 satisfy a requirement nor stand in for a rejected command.
 """
@@ -102,6 +124,7 @@ import argparse
 import re
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_WORKFLOWS_DIR = ROOT / ".github" / "workflows"
@@ -150,8 +173,8 @@ CANDIDATE_EXPRESSIONS = (
     "needs.establish-trust.outputs.candidate_sha",
 )
 
-TOP_LEVEL_KEY = re.compile(r"^(?P<key>[A-Za-z_][A-Za-z0-9_-]*):")
-NESTED_KEY = re.compile(r"^  (?P<key>[A-Za-z_][A-Za-z0-9_-]*):")
+TOP_LEVEL_KEY = re.compile(r"^(?P<key>[A-Za-z_][A-Za-z0-9_-]*):(?P<rest>.*)$")
+NESTED_KEY = re.compile(r"^  (?P<key>[A-Za-z_][A-Za-z0-9_-]*):(?P<rest>.*)$")
 REF_FIELD = re.compile(r"^\s*ref:\s*(?P<value>\S.*?)\s*$")
 USES_FIELD = re.compile(r"^\s*(?:-\s+)?uses:\s*(?P<value>\S+)")
 PINNED_ACTION = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._/-]+@[0-9a-f]{40}$")
@@ -284,7 +307,17 @@ CREDENTIAL_JOB_ALLOWED_KEYS = frozenset(
         "steps",
     }
 )
-JOB_KEY = re.compile(r"^    (?P<key>[A-Za-z_][A-Za-z0-9_-]*):")
+JOB_KEY = re.compile(r"^    (?P<key>[A-Za-z_][A-Za-z0-9_-]*):(?P<rest>.*)$")
+# Job-level keys whose body this contract parses as a block mapping/sequence. An
+# inline (flow) value there is not "an empty block": it is a whole structure the
+# block reader never sees, so it must be refused rather than silently dropped.
+CREDENTIAL_JOB_BLOCK_KEYS = frozenset({"steps"})
+# Top-level keys the trusted workflow's structure is derived from. Same reason.
+TRUSTED_WORKFLOW_BLOCK_TOP_LEVEL_KEYS = frozenset({"on", "jobs"})
+# A value that opens a flow collection or an aliasing node. `on: [push]`,
+# `jobs: {…}`, `permissions: &a …`, `concurrency: *a` all put structure where the
+# block reader looks for none.
+FLOW_OR_ALIASED_VALUE = re.compile(r"^[\[{&*]")
 MAPPING_ENTRY = re.compile(
     r"^\s*(?P<key>[A-Za-z_][A-Za-z0-9_-]*):\s*(?P<value>.*?)\s*$"
 )
@@ -350,23 +383,63 @@ REQUIRED_WORKFLOW_RUN_TYPE = "in_progress"
 # ---------------------------------------------------------------------------
 
 
-def split_blocks(lines: list[str], pattern: re.Pattern[str]) -> dict[str, list[str]]:
-    """Split lines into blocks introduced by `pattern`, keyed by the match."""
+class BlockMapping(NamedTuple):
+    """A YAML mapping read as text, with its ambiguities kept rather than lost.
+
+    A text reader that keeps one entry per key silently resolves a duplicate for
+    the whole contract, and GitHub's YAML parser may resolve it the other way. So
+    every ambiguity is carried out of the reader instead of being decided by it:
+
+    * `blocks` — the union of every occurrence's body lines, so nothing a
+      duplicate introduced can hide from a body-level check;
+    * `duplicates` — every key introduced more than once, in order;
+    * `inline` — every inline (same-line) value each key was introduced with, so
+      a flow collection written where a block is expected (`on: [push]`,
+      `steps: [{run: …}]`) is visible instead of being discarded as "no body".
+    """
+
+    blocks: dict[str, list[str]]
+    duplicates: tuple[str, ...]
+    inline: dict[str, list[str]]
+
+
+EMPTY_BLOCK_MAPPING = BlockMapping({}, (), {})
+
+
+def split_blocks(lines: list[str], pattern: re.Pattern[str]) -> BlockMapping:
+    """Split lines into blocks introduced by `pattern`, keyed by the match.
+
+    Duplicate keys are recorded, never merged away, and the value written on the
+    introducing line is recorded too. Both are how a workflow can read one way to
+    this contract and another way to GitHub.
+    """
 
     blocks: dict[str, list[str]] = {}
+    inline: dict[str, list[str]] = {}
+    duplicates: list[str] = []
     current: str | None = None
     for line in lines:
         match = pattern.match(line)
         if match:
             current = match.group("key")
-            blocks.setdefault(current, [])
+            if current in blocks:
+                duplicates.append(current)
+            else:
+                blocks[current] = []
+                inline[current] = []
+            rest = match.groupdict().get("rest") or ""
+            inline[current].append(inline_value(rest))
             continue
         if current is not None:
             blocks[current].append(line)
-    return blocks
+    return BlockMapping(blocks, tuple(duplicates), inline)
 
 
-def top_level_blocks(text: str) -> dict[str, list[str]]:
+def duplicate_keys(mapping: BlockMapping) -> list[str]:
+    return sorted(set(mapping.duplicates))
+
+
+def top_level_blocks(text: str) -> BlockMapping:
     # Comments are removed before any structure is derived, so a commented-out
     # key can neither introduce nor terminate a block.
     return split_blocks(
@@ -374,27 +447,27 @@ def top_level_blocks(text: str) -> dict[str, list[str]]:
     )
 
 
-def job_blocks(text: str) -> dict[str, list[str]]:
-    jobs = top_level_blocks(text).get("jobs")
+def job_blocks(text: str) -> BlockMapping:
+    jobs = top_level_blocks(text).blocks.get("jobs")
     if jobs is None:
-        return {}
+        return EMPTY_BLOCK_MAPPING
     return split_blocks(jobs, NESTED_KEY)
 
 
 def event_names(text: str) -> set[str]:
-    block = top_level_blocks(text).get("on")
+    block = top_level_blocks(text).blocks.get("on")
     if block is None:
         return set()
-    return set(split_blocks(block, NESTED_KEY))
+    return set(split_blocks(block, NESTED_KEY).blocks)
 
 
 def workflow_run_types(text: str) -> set[str]:
     """Return the declared `on.workflow_run.types` entries."""
 
-    block = top_level_blocks(text).get("on")
+    block = top_level_blocks(text).blocks.get("on")
     if block is None:
         return set()
-    run_block = split_blocks(block, NESTED_KEY).get("workflow_run")
+    run_block = split_blocks(block, NESTED_KEY).blocks.get("workflow_run")
     if run_block is None:
         return set()
 
@@ -527,6 +600,32 @@ def inline_value(value: str) -> str:
     return text.strip()
 
 
+def duplicate_step_key_errors(
+    where: str, label: str, entries: list[tuple[str, str, list[str]]]
+) -> list[str]:
+    """Refuse any repeated top-level key inside one step mapping.
+
+    A step written with two `name:`, `if:`, `uses:`, or `with:` keys is not a
+    YAML error GitHub reports: one of them wins. Which one is an implementation
+    detail of the consumer, so a contract that reads a different occurrence than
+    the runner applies has verified a workflow that does not exist.
+    """
+
+    seen: set[str] = set()
+    repeated: list[str] = []
+    for key, _, _ in entries:
+        if key in seen:
+            repeated.append(key)
+        seen.add(key)
+    if not repeated:
+        return []
+    return [
+        f"{where} {label} step declares duplicate step key(s) "
+        f"{', '.join(sorted(set(repeated)))}; a duplicated mapping key is ambiguous "
+        "— this contract reads one occurrence while GitHub may apply the other"
+    ]
+
+
 def check_trusted_checkout_step(step_lines: list[str]) -> list[str]:
     """The first step of the credential job: the trusted-anchor checkout.
 
@@ -541,6 +640,7 @@ def check_trusted_checkout_step(step_lines: list[str]) -> list[str]:
         return [f"{where} first step is not parseable as a step"]
 
     errors: list[str] = []
+    errors.extend(duplicate_step_key_errors(where, "trusted-anchor checkout", entries))
     disallowed = sorted(
         {key for key, _, _ in entries if key not in CREDENTIAL_CHECKOUT_ALLOWED_KEYS}
     )
@@ -559,19 +659,53 @@ def check_trusted_checkout_step(step_lines: list[str]) -> list[str]:
             "the pinned checkout action and nothing else"
         )
 
-    with_bodies = [body for key, _, body in entries if key == "with"]
-    if len(with_bodies) != 1:
+    with_entries = [(value, body) for key, value, body in entries if key == "with"]
+    if len(with_entries) != 1:
         errors.append(
             f"{where} trusted-anchor checkout must declare exactly one `with:` "
-            f"input mapping (found {len(with_bodies)})"
+            f"input mapping (found {len(with_entries)})"
+        )
+        return errors
+
+    # `step_entries` has already stripped the value, so re-pad it before dropping
+    # a trailing comment: a bare `with:  # note` must still read as "no value".
+    with_inline = inline_value(f" {with_entries[0][0]}")
+    with_body = with_entries[0][1]
+    if with_inline:
+        # A flow mapping is not "an empty `with:`". The block reader below sees no
+        # body at all, so every input inside the braces would vanish from the
+        # exact-input comparison while GitHub still applies it.
+        errors.append(
+            f"{where} trusted-anchor checkout declares an inline or flow `with:` "
+            f"value {with_inline!r}; the checkout inputs must be an explicit block "
+            "mapping so every input is individually compared against the admitted set"
         )
         return errors
 
     inputs: dict[str, str] = {}
-    for line in with_bodies[0]:
+    duplicate_inputs: list[str] = []
+    for line in with_body:
         entry = MAPPING_ENTRY.match(line)
-        if entry:
-            inputs[entry.group("key")] = inline_value(entry.group("value"))
+        if entry is None:
+            errors.append(
+                f"{where} trusted-anchor checkout declares a `with:` entry this "
+                f"contract cannot parse ({line.strip()!r}); an unreadable input is "
+                "exactly how a redirected ref or an extra input would slip past the "
+                "exact-input comparison"
+            )
+            continue
+        key = entry.group("key")
+        if key in inputs:
+            duplicate_inputs.append(key)
+        inputs[key] = inline_value(entry.group("value"))
+    if duplicate_inputs:
+        errors.append(
+            f"{where} trusted-anchor checkout declares duplicate `with:` input(s) "
+            f"{', '.join(sorted(set(duplicate_inputs)))}; a duplicated input is "
+            "ambiguous — this contract compares one of them while GitHub may apply "
+            "the other, so the workspace the credential step executes would not be "
+            "the one verified here"
+        )
     if inputs != CREDENTIAL_CHECKOUT_INPUTS:
         errors.append(
             f"{where} trusted-anchor checkout declares inputs {inputs!r}; it must "
@@ -767,6 +901,7 @@ def check_credential_step(steps: list[list[str]]) -> list[str]:
         errors.append(f"{where} credential-bearing step is not parseable as a step")
         return errors
 
+    errors.extend(duplicate_step_key_errors(where, "credential-bearing", entries))
     disallowed = sorted(
         {key for key, _, _ in entries if key not in CREDENTIAL_STEP_ALLOWED_KEYS}
     )
@@ -845,7 +980,66 @@ def check_trusted_workflow_structure(text: str) -> list[str]:
     """
 
     errors: list[str] = []
-    blocks = top_level_blocks(text)
+    mapping = top_level_blocks(text)
+    blocks = mapping.blocks
+
+    # A duplicate mapping key is the whole ambiguity: a workflow can keep the
+    # safe block-form `on:` first and append `on: [push]`, and a reader that
+    # derives events from the first occurrence still sees only trusted events
+    # while a consumer applying the last duplicate sees a tag-reachable push
+    # trigger. Every duplicate is refused, including the admitted keys.
+    for key in duplicate_keys(mapping):
+        errors.append(
+            f"{TRUSTED_WORKFLOW} declares top-level key `{key}` more than once; a "
+            "duplicated mapping key makes this contract's single structural reading "
+            "and GitHub's YAML reading disagree, so a safe first occurrence could "
+            "stand in front of an untrusted last one"
+        )
+
+    for key, values in sorted(mapping.inline.items()):
+        for value in values:
+            if key in TRUSTED_WORKFLOW_BLOCK_TOP_LEVEL_KEYS:
+                if value:
+                    errors.append(
+                        f"{TRUSTED_WORKFLOW} declares top-level `{key}:` with the "
+                        f"inline value {value!r}; `{key}` must be an explicit block "
+                        "mapping, because a flow collection written here carries "
+                        "whole entries — `on: [push]`, `jobs: {…}` — that this "
+                        "contract's block reader would never see"
+                    )
+            elif FLOW_OR_ALIASED_VALUE.match(value) or BLOCK_SCALAR.match(value):
+                errors.append(
+                    f"{TRUSTED_WORKFLOW} declares top-level `{key}:` with the flow, "
+                    f"aliased, or block-scalar value {value!r}; every top-level "
+                    "value must be a plain scalar or an explicit block, so nothing "
+                    "structural can hide from this contract"
+                )
+
+    on_block = blocks.get("on")
+    if on_block is not None:
+        for key in duplicate_keys(split_blocks(on_block, NESTED_KEY)):
+            errors.append(
+                f"{TRUSTED_WORKFLOW} declares the `{key}` trigger more than once "
+                "under `on:`; a duplicated event key is ambiguous, so the events "
+                "this contract reads need not be the events GitHub applies"
+            )
+
+    jobs_mapping = job_blocks(text)
+    for key in duplicate_keys(jobs_mapping):
+        errors.append(
+            f"{TRUSTED_WORKFLOW} declares job `{key}` more than once; a duplicated "
+            "job ID is ambiguous — this contract would hold one definition to the "
+            "credential contract while GitHub runs the other"
+        )
+    for key, values in sorted(jobs_mapping.inline.items()):
+        for value in values:
+            if value:
+                errors.append(
+                    f"{TRUSTED_WORKFLOW} declares job `{key}` with the inline value "
+                    f"{value!r}; every job must be an explicit block mapping, "
+                    "because a flow mapping carries steps, environment, and "
+                    "permissions this contract's block reader never sees"
+                )
 
     extra = sorted(set(blocks) - TRUSTED_WORKFLOW_ALLOWED_TOP_LEVEL_KEYS)
     if extra:
@@ -881,7 +1075,7 @@ def check_trusted_workflow_structure(text: str) -> list[str]:
 def check_trusted_workflow(text: str) -> list[str]:
     errors: list[str] = []
     lines = code_lines(text.splitlines())
-    jobs = job_blocks(text)
+    jobs = job_blocks(text).blocks
 
     errors.extend(check_trusted_workflow_structure(text))
 
@@ -1082,14 +1276,49 @@ def check_trusted_workflow(text: str) -> list[str]:
                 "other than the default-branch checker"
             )
 
-    declared_job_keys = sorted(
-        {
-            match.group("key")
-            for match in (JOB_KEY.match(line) for line in secret_lines)
-            if match
-        }
-        - CREDENTIAL_JOB_ALLOWED_KEYS
-    )
+    # The credential job's own mapping, read in source order. A duplicated key
+    # here is decided by whichever consumer reads it: `environment:` twice keeps
+    # the protected binding this contract matches while GitHub may apply the
+    # second, and a second `steps:` is invisible to the block reader that stops
+    # at the first one.
+    job_key_entries = [
+        (match.group("key"), inline_value(match.group("rest")))
+        for match in (JOB_KEY.match(line) for line in secret_lines)
+        if match
+    ]
+    seen_job_keys: set[str] = set()
+    repeated_job_keys: list[str] = []
+    for key, _ in job_key_entries:
+        if key in seen_job_keys:
+            repeated_job_keys.append(key)
+        seen_job_keys.add(key)
+    if repeated_job_keys:
+        errors.append(
+            f"{TRUSTED_WORKFLOW} job `{SECRET_JOB}` declares duplicate job key(s) "
+            f"{', '.join(sorted(set(repeated_job_keys)))}; a duplicated mapping key "
+            "is ambiguous — this contract verifies one occurrence (the protected "
+            "environment, the trust edge, the closed two-step sequence) while "
+            "GitHub may apply the other"
+        )
+    for key, value in job_key_entries:
+        if key in CREDENTIAL_JOB_BLOCK_KEYS:
+            if value:
+                errors.append(
+                    f"{TRUSTED_WORKFLOW} job `{SECRET_JOB}` declares `{key}:` with "
+                    f"the inline value {value!r}; it must be an explicit block, "
+                    "because a flow sequence there carries steps the closed "
+                    "two-step contract would never see"
+                )
+        elif value and (
+            FLOW_OR_ALIASED_VALUE.match(value) or BLOCK_SCALAR.match(value)
+        ):
+            errors.append(
+                f"{TRUSTED_WORKFLOW} job `{SECRET_JOB}` declares `{key}:` with the "
+                f"flow, aliased, or block-scalar value {value!r}; every job-level "
+                "value must be a plain scalar or an explicit block"
+            )
+
+    declared_job_keys = sorted(seen_job_keys - CREDENTIAL_JOB_ALLOWED_KEYS)
     if declared_job_keys:
         errors.append(
             f"{TRUSTED_WORKFLOW} job `{SECRET_JOB}` declares "
@@ -1136,7 +1365,7 @@ def check_trusted_workflow(text: str) -> list[str]:
 
 def check_release_workflow(text: str) -> list[str]:
     errors: list[str] = []
-    jobs = job_blocks(text)
+    jobs = job_blocks(text).blocks
     if RELEASE_GATE_JOB not in jobs:
         errors.append(f"{RELEASE_WORKFLOW} is missing job `{RELEASE_GATE_JOB}`")
         return errors
@@ -1947,6 +2176,344 @@ def run_self_test() -> int:  # noqa: C901 — a flat fixture table stays readabl
             for err in evaluate(mutated(TRUSTED_WORKFLOW, jobs_level_merge))
         ),
         str(evaluate(mutated(TRUSTED_WORKFLOW, jobs_level_merge))),
+    )
+
+    # ---- Duplicate and inline/flow mapping keys ------------------------------
+    #
+    # A duplicate mapping key is not an error GitHub reports: one occurrence
+    # wins, and *which* one is a property of the consumer. So a workflow can keep
+    # the safe block-form `on:` this contract reads and append a duplicate
+    # `on: [push]` that a last-key-wins consumer applies — every event-derived
+    # check still sees only `workflow_run`/`schedule` while the workflow is
+    # actually tag-reachable. The same ambiguity reaches job IDs, the credential
+    # job's own keys, step keys, and checkout inputs. An inline flow value is the
+    # other half of the family: written where this contract reads a block, its
+    # entries are not "an empty block" but a whole structure the block reader
+    # never sees.
+    #
+    # Where the difference is load-bearing, each fixture also asserts that the
+    # corresponding value-level check did NOT fire. That absence is the proof the
+    # structural rejection is what catches the bypass, not an incidental
+    # downstream error.
+
+    on_block_form = (
+        "on:\n"
+        "  workflow_run:\n"
+        "    workflows:\n"
+        "      - Release\n"
+        "    types:\n"
+        "      - in_progress\n"
+        "  schedule:\n"
+        '    - cron: "45 6 * * *"\n'
+    )
+    check(
+        "the fixture's `on:` block is the block form this contract reads",
+        on_block_form in FIXTURE_TRUSTED,
+    )
+
+    # The root finding: safe block `on:` first, untrusted `on: [push]` appended.
+    duplicate_on_appended = FIXTURE_TRUSTED.replace(
+        on_block_form, on_block_form + "on: [push]\n"
+    )
+    duplicate_on_appended_errors = evaluate(
+        mutated(TRUSTED_WORKFLOW, duplicate_on_appended)
+    )
+    check(
+        "a duplicate `on: [push]` appended after the safe block form is rejected",
+        any(
+            "declares top-level key `on` more than once" in err
+            for err in duplicate_on_appended_errors
+        ),
+        str(duplicate_on_appended_errors),
+    )
+    check(
+        "and the appended flow value is itself reported, not discarded",
+        any(
+            "declares top-level `on:` with the inline value" in err
+            for err in duplicate_on_appended_errors
+        ),
+        str(duplicate_on_appended_errors),
+    )
+    check(
+        "the derived events still look trusted, so only the structural rejection "
+        "catches that bypass",
+        event_names(duplicate_on_appended) == {"workflow_run", "schedule"}
+        and not any(
+            "candidate-controlled events" in err
+            for err in duplicate_on_appended_errors
+        ),
+        str(duplicate_on_appended_errors),
+    )
+
+    # The reversed ordering: the untrusted trigger introduces the key and the
+    # safe block form follows it.
+    duplicate_on_prepended = FIXTURE_TRUSTED.replace(
+        on_block_form, "on: push\n" + on_block_form
+    )
+    duplicate_on_prepended_errors = evaluate(
+        mutated(TRUSTED_WORKFLOW, duplicate_on_prepended)
+    )
+    check(
+        "a duplicate `on:` in the reversed order is rejected",
+        any(
+            "declares top-level key `on` more than once" in err
+            for err in duplicate_on_prepended_errors
+        ),
+        str(duplicate_on_prepended_errors),
+    )
+    check(
+        "the reversed ordering also derives only trusted events",
+        event_names(duplicate_on_prepended) == {"workflow_run", "schedule"}
+        and not any(
+            "candidate-controlled events" in err
+            for err in duplicate_on_prepended_errors
+        ),
+        str(duplicate_on_prepended_errors),
+    )
+
+    # No duplicate at all: a single `on:` whose whole value is a flow sequence.
+    # The block reader sees an empty body, so the trigger list would simply
+    # disappear from the contract.
+    flow_on_sequence = FIXTURE_TRUSTED.replace(
+        on_block_form, "on: [push, workflow_run]\n"
+    )
+    check(
+        "a single `on:` written as a flow sequence is rejected",
+        any(
+            "declares top-level `on:` with the inline value" in err
+            for err in evaluate(mutated(TRUSTED_WORKFLOW, flow_on_sequence))
+        ),
+        str(evaluate(mutated(TRUSTED_WORKFLOW, flow_on_sequence))),
+    )
+
+    scalar_on_value = FIXTURE_TRUSTED.replace(on_block_form, "on: push\n")
+    check(
+        "a single `on:` written as an inline scalar is rejected",
+        any(
+            "declares top-level `on:` with the inline value" in err
+            for err in evaluate(mutated(TRUSTED_WORKFLOW, scalar_on_value))
+        ),
+        str(evaluate(mutated(TRUSTED_WORKFLOW, scalar_on_value))),
+    )
+
+    duplicate_jobs_key = FIXTURE_TRUSTED.replace(
+        "jobs:\n",
+        "jobs:\n"
+        "  hostile:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - run: sh ./candidate/postscript.sh\n"
+        "jobs:\n",
+        1,
+    )
+    check(
+        "a duplicate top-level `jobs:` mapping is rejected",
+        any(
+            "declares top-level key `jobs` more than once" in err
+            for err in evaluate(mutated(TRUSTED_WORKFLOW, duplicate_jobs_key))
+        ),
+        str(evaluate(mutated(TRUSTED_WORKFLOW, duplicate_jobs_key))),
+    )
+
+    duplicate_event_key = FIXTURE_TRUSTED.replace(
+        "  schedule:\n", "  workflow_run:\n    types:\n      - completed\n  schedule:\n"
+    )
+    check(
+        "a duplicated event key under `on:` is rejected",
+        any(
+            "declares the `workflow_run` trigger more than once" in err
+            for err in evaluate(mutated(TRUSTED_WORKFLOW, duplicate_event_key))
+        ),
+        str(evaluate(mutated(TRUSTED_WORKFLOW, duplicate_event_key))),
+    )
+
+    duplicate_secret_job = FIXTURE_TRUSTED.replace(
+        "  publish-verdict:\n",
+        "  advisory-verdict:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - run: sh ./candidate/postscript.sh\n"
+        "  publish-verdict:\n",
+    )
+    check(
+        "a duplicate `advisory-verdict` job ID is rejected",
+        any(
+            "declares job `advisory-verdict` more than once" in err
+            for err in evaluate(mutated(TRUSTED_WORKFLOW, duplicate_secret_job))
+        ),
+        str(evaluate(mutated(TRUSTED_WORKFLOW, duplicate_secret_job))),
+    )
+
+    flow_job_mapping = FIXTURE_TRUSTED.replace(
+        "  publish-verdict:\n    name: Publish trusted advisory verdict\n",
+        "  publish-verdict: { runs-on: ubuntu-latest }\n"
+        "    name: Publish trusted advisory verdict\n",
+    )
+    check(
+        "a job written as an inline flow mapping is rejected",
+        any(
+            "declares job `publish-verdict` with the inline value" in err
+            for err in evaluate(mutated(TRUSTED_WORKFLOW, flow_job_mapping))
+        ),
+        str(evaluate(mutated(TRUSTED_WORKFLOW, flow_job_mapping))),
+    )
+
+    duplicate_needs = FIXTURE_TRUSTED.replace(
+        "    needs: establish-trust\n",
+        "    needs: establish-trust\n    needs: publish-verdict\n",
+    )
+    duplicate_needs_errors = evaluate(mutated(TRUSTED_WORKFLOW, duplicate_needs))
+    check(
+        "a duplicated `needs:` on the credential job is rejected",
+        any(
+            "declares duplicate job key(s) needs" in err
+            for err in duplicate_needs_errors
+        ),
+        str(duplicate_needs_errors),
+    )
+    check(
+        "the trust edge still reads as present, so only the duplicate check "
+        "catches a second `needs:`",
+        not any(
+            "must require `establish-trust`" in err for err in duplicate_needs_errors
+        ),
+        str(duplicate_needs_errors),
+    )
+
+    duplicate_environment = FIXTURE_TRUSTED.replace(
+        "    environment: launch-advisory\n",
+        "    environment: launch-advisory\n    environment: candidate-controlled\n",
+    )
+    duplicate_environment_errors = evaluate(
+        mutated(TRUSTED_WORKFLOW, duplicate_environment)
+    )
+    check(
+        "a duplicated `environment:` on the credential job is rejected",
+        any(
+            "declares duplicate job key(s) environment" in err
+            for err in duplicate_environment_errors
+        ),
+        str(duplicate_environment_errors),
+    )
+    check(
+        "the protected environment binding still reads as present, so only the "
+        "duplicate check catches a second `environment:`",
+        not any(
+            "protected `launch-advisory` environment" in err
+            for err in duplicate_environment_errors
+        ),
+        str(duplicate_environment_errors),
+    )
+
+    # The second `steps:` is at the job's own indentation, so the block reader
+    # stops at the first one and the closed two-step contract is fully satisfied
+    # by a job that may actually run a third step.
+    duplicate_steps = FIXTURE_TRUSTED.replace(
+        credential_run + "\n\n  publish-verdict:",
+        credential_run + "\n"
+        "    steps:\n"
+        "      - run: sh ./candidate/postscript.sh\n"
+        "\n  publish-verdict:",
+    )
+    duplicate_steps_errors = evaluate(mutated(TRUSTED_WORKFLOW, duplicate_steps))
+    check(
+        "a duplicated `steps:` on the credential job is rejected",
+        any(
+            "declares duplicate job key(s) steps" in err
+            for err in duplicate_steps_errors
+        ),
+        str(duplicate_steps_errors),
+    )
+    check(
+        "the closed two-step sequence still reads as satisfied, so only the "
+        "duplicate check catches a second `steps:`",
+        not any(
+            "must consist of exactly 2 steps" in err for err in duplicate_steps_errors
+        ),
+        str(duplicate_steps_errors),
+    )
+
+    flow_steps_sequence = FIXTURE_TRUSTED.replace(
+        "    environment: launch-advisory\n    steps:\n",
+        "    environment: launch-advisory\n"
+        "    steps: [{ run: sh ./candidate/postscript.sh }]\n",
+    )
+    check(
+        "a `steps:` written as an inline flow sequence is rejected",
+        any(
+            "declares `steps:` with the inline value" in err
+            for err in evaluate(mutated(TRUSTED_WORKFLOW, flow_steps_sequence))
+        ),
+        str(evaluate(mutated(TRUSTED_WORKFLOW, flow_steps_sequence))),
+    )
+
+    duplicate_step_key = FIXTURE_TRUSTED.replace(
+        "      - name: Evaluate\n        env:\n",
+        "      - name: Evaluate\n        name: Evaluate again\n        env:\n",
+    )
+    duplicate_step_key_errors_seen = evaluate(
+        mutated(TRUSTED_WORKFLOW, duplicate_step_key)
+    )
+    check(
+        "a duplicated top-level step key on the credential step is rejected",
+        any(
+            "declares duplicate step key(s) name" in err
+            for err in duplicate_step_key_errors_seen
+        ),
+        str(duplicate_step_key_errors_seen),
+    )
+    check(
+        "the step's admitted-key set still reads as satisfied, so only the "
+        "duplicate check catches it",
+        not any(
+            "only name/id/if/env/run are admitted" in err
+            for err in duplicate_step_key_errors_seen
+        ),
+        str(duplicate_step_key_errors_seen),
+    )
+
+    duplicate_checkout_input = FIXTURE_TRUSTED.replace(
+        before_evaluate,
+        "          persist-credentials: false\n"
+        "          persist-credentials: true\n"
+        "      - name: Evaluate",
+    )
+    check(
+        "a duplicated trusted-anchor checkout input is rejected",
+        any(
+            "duplicate `with:` input(s) persist-credentials" in err
+            for err in evaluate(mutated(TRUSTED_WORKFLOW, duplicate_checkout_input))
+        ),
+        str(evaluate(mutated(TRUSTED_WORKFLOW, duplicate_checkout_input))),
+    )
+
+    # The proof that an inline flow mapping cannot simply disappear: written this
+    # way the redirected `ref:` matches no line-oriented check in this module at
+    # all, so without the structural refusal the candidate ref would be invisible.
+    flow_checkout_with = FIXTURE_TRUSTED.replace(
+        "        with:\n"
+        "          ref: ${{ needs.establish-trust.outputs.trusted_sha }}\n"
+        "          fetch-depth: 1\n"
+        "          persist-credentials: false\n",
+        "        with: { ref: refs/tags/v9.9.9, fetch-depth: 1, "
+        "persist-credentials: false }\n",
+    )
+    flow_checkout_errors = evaluate(mutated(TRUSTED_WORKFLOW, flow_checkout_with))
+    check(
+        "an inline flow `with:` on the trusted-anchor checkout is rejected",
+        any(
+            "inline or flow `with:` value" in err for err in flow_checkout_errors
+        ),
+        str(flow_checkout_errors),
+    )
+    check(
+        "the redirected ref inside that flow mapping reaches no value-level check, "
+        "so only the structural refusal catches it",
+        not any(
+            "it must check out exactly" in err or "it must declare exactly" in err
+            for err in flow_checkout_errors
+        ),
+        str(flow_checkout_errors),
     )
 
     # ---- The trusted-anchor checkout itself ----------------------------------

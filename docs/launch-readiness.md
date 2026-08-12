@@ -405,6 +405,45 @@ The job-level closed-key contract is unchanged and still applies:
 `advisory-verdict` may declare only
 `name`/`needs`/`runs-on`/`timeout-minutes`/`environment`/`permissions`/`steps`.
 
+### The document must be unambiguous: no duplicate keys, no inline block values
+
+Every contract above is a *single structural reading* of the workflow text. That
+reading is only a proof if GitHub's YAML parser cannot read the same file
+differently — and a duplicate mapping key is exactly where the two can diverge.
+A duplicate key is not an error GitHub reports: one occurrence wins, and *which*
+one is a property of the consumer. So a workflow could keep the safe block-form
+`on:` the verifier derives its events from, append a duplicate `on: [push]`, and
+a last-key-wins consumer would make the trusted workflow tag-reachable while
+every event-derived check still saw only `workflow_run`/`schedule`.
+
+The contract therefore refuses the whole family outright, rather than picking a
+winner:
+
+- **Duplicate top-level keys** in `launch-advisory-trust.yml` — including the
+  admitted `on`, `jobs`, `permissions`, and `concurrency`. Order does not matter:
+  a safe occurrence first and an untrusted one last is rejected, and so is the
+  reverse.
+- **Duplicate event keys** under `on:`, and **duplicate job IDs** under `jobs:`.
+  A second `advisory-verdict:` would let the contract hold one definition to the
+  closed credential contract while GitHub ran the other.
+- **Duplicate keys in the `advisory-verdict` job mapping** — `needs`,
+  `environment`, `permissions`, `steps`, and anything else. A second
+  `environment:` leaves the protected binding the contract matches in place while
+  GitHub may apply the second, and a second `steps:` at the job's own
+  indentation is entirely invisible to a block reader that stops at the first.
+- **Duplicate top-level step keys** in either validated step, **duplicate `env:`
+  entries** on the credential step, and **duplicate `with:` inputs** on the
+  trusted-anchor checkout.
+
+The mirror-image ambiguity is an **inline (flow) value written where the contract
+reads a block**. `on: [push]`, `jobs: {…}`, `steps: [{run: …}]`, and
+`with: {ref: …}` are not "an empty block": they carry whole entries that a
+block reader never sees, so a redirected checkout ref inside `with: {…}` would
+reach no value-level check at all. Those values are reported, never discarded:
+top-level `on:` and `jobs:` and the job's `steps:` must be explicit block
+mappings, and every other top-level and job-level value must be a plain scalar or
+an explicit block — never a flow collection, anchor, alias, or block scalar.
+
 Separately, and as defence in depth, **no** step of that job — inside multiline
 blocks included — may expand a candidate-derived variable such as
 `$LAUNCH_TARGET_SHA` on an executable line, and no candidate expression may
@@ -451,10 +490,24 @@ tag-reachable trust workflow, a tag checkout in the secretless trust job, a
 dropped environment binding, a dropped provenance edge, an unpinned action, a
 constant commit-wide status context, an omitted run-attempt binding, a
 `requested`-only trigger, a default-branch audit sharing the release context
-namespace, a release gate that accepts another run's status, and a release gate
-that stops requiring the trusted verdict — and then applies the same contract to
-the real `.github/workflows` tree. It runs on every pull request from
-`launch-readiness.yml`.
+namespace, a release gate that accepts another run's status, a release gate
+that stops requiring the trusted verdict, a safe block-form `on:` followed by a
+duplicate `on: [push]` and the reversed ordering, a duplicate `jobs:`, a
+duplicate `workflow_run` trigger, a duplicate `advisory-verdict` job ID, a
+duplicate `needs`, `environment`, or `steps` on the credential job, a duplicate
+top-level step key, a duplicate checkout `with:` input, and an `on:`, `steps:`,
+`with:`, or whole job written as an inline flow collection — and then applies the
+same contract to the real `.github/workflows` tree. It runs on every pull request
+from `launch-readiness.yml`.
+
+Each duplicate/flow fixture asserts the intended **structural** rejection, and
+where the ambiguity is load-bearing it also asserts that the corresponding
+value-level check did *not* fire — the duplicated `on:` still derives only
+trusted events, the duplicated `needs:`/`environment:` still read as present, the
+duplicated `steps:` still satisfies the closed two-step sequence, and the
+redirected ref inside a flow `with:` reaches no ref check. That absence is the
+proof the structural refusal is what catches the bypass, not an incidental
+downstream error.
 
 ### Required repository settings (root/admin only, not code)
 
