@@ -236,7 +236,10 @@ async fn the_configured_bound_is_the_boundary_with_no_grace_period() {
 
     advance(Duration::from_secs(1)).await;
     let outside = status.snapshot();
-    assert!(outside.stale, "the bound itself is the boundary: {outside:?}");
+    assert!(
+        outside.stale,
+        "the bound itself is the boundary: {outside:?}"
+    );
     assert!(outside.admission_blocked);
     assert!(outside.readiness_blocked);
     assert_eq!(outside.reason, "material_unreadable");
@@ -328,7 +331,10 @@ async fn a_clean_shutdown_is_not_reported_as_a_reload_failure() {
 
     let snapshot = status.snapshot();
     assert_eq!(snapshot.worker_state, "stopped");
-    assert!(!snapshot.degraded, "shutdown is not a failure: {snapshot:?}");
+    assert!(
+        !snapshot.degraded,
+        "shutdown is not a failure: {snapshot:?}"
+    );
     assert_eq!(snapshot.reason, "ok");
     assert!(!snapshot.readiness_blocked);
     assert_eq!(snapshot.rejections_total, 0);
@@ -359,7 +365,8 @@ async fn replicas_sharing_one_configuration_expose_the_same_redacted_generation(
     assert_eq!(left, right, "replica convergence must be checkable");
     assert_eq!(left.len(), 16);
     assert!(
-        left.chars().all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
+        left.chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
         "generation identifier must be lowercase hex: {left}"
     );
 
@@ -613,7 +620,11 @@ async fn a_rotated_bundle_publishes_a_new_redacted_generation() {
 
     std::fs::write(
         &path,
-        bundle_document("tenant-a-v2", NAMESPACE, "rotated-tenant-a-secret-2026-ferrum"),
+        bundle_document(
+            "tenant-a-v2",
+            NAMESPACE,
+            "rotated-tenant-a-secret-2026-ferrum",
+        ),
     )
     .expect("rotate bundle");
     wait_for_status(&status, "a rotated generation", |snapshot| {

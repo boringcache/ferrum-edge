@@ -3248,7 +3248,11 @@ async fn stale_trust_terminates_established_streams_on_every_surface() {
             .expect("stale-trust waiter must not panic")
             .expect("the stale boundary must emit one terminal item")
             .expect_err("the stale boundary must terminate the stream");
-        assert_eq!(status.code(), tonic::Code::Unavailable, "surface {surface:?}");
+        assert_eq!(
+            status.code(),
+            tonic::Code::Unavailable,
+            "surface {surface:?}"
+        );
         assert_eq!(
             status.message(),
             "This control plane cannot currently revalidate its verification trust source"
