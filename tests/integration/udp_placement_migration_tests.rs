@@ -2515,6 +2515,6 @@ fn deadline_withhold_reports_retract_failure_and_leaves_no_usable_proof() {
     );
     assert!(
         !matches!(decision, Ok(UdpPlacementDecision::RunStable)),
-        "deadline withhold must not leave a usable attestation, got {decision:?}"
+        "deadline withhold must not leave a usable attestation"
     );
 }
