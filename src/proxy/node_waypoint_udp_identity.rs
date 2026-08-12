@@ -554,6 +554,7 @@ impl NodeWaypointUdpSourceScoping {
 
     /// Attribute a datagram and resolve its per-pod policy scope from the same
     /// live-slice read that vouches the pod.
+    #[allow(dead_code)] // Exercised through the external integration-test API.
     pub fn resolve(
         &self,
         ingress_ifindex: Option<u32>,
@@ -574,6 +575,7 @@ impl NodeWaypointUdpSourceScoping {
     /// interface a packet entered on, but it CAN name an established session —
     /// so the datagram is dropped and the session continues under its own,
     /// still-vouched-for evidence. The datagram is never forwarded either way.
+    #[allow(dead_code)] // Exercised through the external integration-test API.
     pub fn revalidate_datagram(
         &self,
         pinned: &NodeWaypointUdpSourceBinding,
@@ -636,6 +638,7 @@ impl NodeWaypointUdpSourceScoping {
 
     /// Re-authorize a live session against both current attribution evidence
     /// and the current slice's coherent pod-identity/scope generation.
+    #[allow(dead_code)] // Exercised through the external integration-test API.
     pub fn revalidate(
         &self,
         pinned: &NodeWaypointUdpSourceBinding,
