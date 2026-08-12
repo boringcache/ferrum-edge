@@ -320,7 +320,12 @@ fn a_transport_constrained_target_is_refused_even_when_a_sibling_is_directly_dia
         "a directly dialable sibling must not make an HBONE target tunnelable"
     );
     // And the boolean projection the live re-check uses agrees.
-    assert!(!destination_is_configured(&proxy, lb, "hbone.internal", 5353));
+    assert!(!destination_is_configured(
+        &proxy,
+        lb,
+        "hbone.internal",
+        5353
+    ));
 }
 
 #[test]
