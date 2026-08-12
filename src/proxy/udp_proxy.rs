@@ -2894,8 +2894,7 @@ async fn process_new_session_datagram(
                 // Same canonical principal the session identity and rate-limit
                 // keys use, so a dropped datagram is attributable to the client
                 // those keys name (GHSA-vjwj-657f-5w9g).
-                let peer_ip =
-                    crate::util::client_identity::canonical_ip(identity.resolved().ip());
+                let peer_ip = crate::util::client_identity::canonical_ip(identity.resolved().ip());
                 warn!(
                     proxy_id = %view.proxy.id,
                     client = %peer_ip,
@@ -6601,8 +6600,8 @@ backend_tls_verify_server_cert: false
         let first = test_client_addr();
         let second: SocketAddr = "127.0.0.1:40001".parse().expect("valid addr");
 
-        assert!(super::try_insert_pending_session_gate(&pending, first, 1).unwrap());
-        let err = super::try_insert_pending_session_gate(&pending, second, 1)
+        assert!(super::try_insert_pending_session_gate(&pending, first, 1, None).unwrap());
+        let err = super::try_insert_pending_session_gate(&pending, second, 1, None)
             .expect_err("second pending gate should hit pending limit");
 
         assert!(

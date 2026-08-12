@@ -408,7 +408,11 @@ async fn authenticated_envelope_drives_the_live_dtls_demux_and_binds_identity() 
         rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
 
     let frontend_config = FrontendDtlsConfig {
-        dimpl_config: Arc::new(dimpl::Config::builder().build().expect("DTLS server config")),
+        dimpl_config: Arc::new(
+            dimpl::Config::builder()
+                .build()
+                .expect("DTLS server config"),
+        ),
         certificate: dimpl::certificate::generate_self_signed_certificate()
             .expect("DTLS server certificate")
             .into(),
@@ -483,7 +487,9 @@ async fn authenticated_envelope_drives_the_live_dtls_demux_and_binds_identity() 
     }
     // Nothing may come back, and nothing may be allocated for the sender.
     assert!(
-        recv_within(&hostile, DROP_OBSERVATION_WINDOW).await.is_none(),
+        recv_within(&hostile, DROP_OBSERVATION_WINDOW)
+            .await
+            .is_none(),
         "a refused datagram must not be answered"
     );
     assert_eq!(
@@ -506,7 +512,11 @@ async fn authenticated_envelope_drives_the_live_dtls_demux_and_binds_identity() 
         .await
         .expect("connect DTLS client to relay");
     let client_params = BackendDtlsParams {
-        config: Arc::new(dimpl::Config::builder().build().expect("DTLS client config")),
+        config: Arc::new(
+            dimpl::Config::builder()
+                .build()
+                .expect("DTLS client config"),
+        ),
         certificate: dimpl::certificate::generate_self_signed_certificate()
             .expect("DTLS client certificate")
             .into(),
@@ -526,7 +536,10 @@ async fn authenticated_envelope_drives_the_live_dtls_demux_and_binds_identity() 
         .await
         .expect("DTLS accept timed out")
         .expect("DTLS accept failed");
-    assert_eq!(direct_peer, relay_addr, "the socket peer must remain the relay");
+    assert_eq!(
+        direct_peer, relay_addr,
+        "the socket peer must remain the relay"
+    );
     assert_eq!(
         server_conn.forwarded_client_addr,
         Some(forwarded_client),
@@ -538,7 +551,10 @@ async fn authenticated_envelope_drives_the_live_dtls_demux_and_binds_identity() 
         "the deliberately bare first ClientHello must be refused before association allocation"
     );
 
-    client.send(b"dtls-through-envelope").await.expect("DTLS send");
+    client
+        .send(b"dtls-through-envelope")
+        .await
+        .expect("DTLS send");
     assert_eq!(
         tokio::time::timeout(RECV_TIMEOUT, server_conn.recv())
             .await
@@ -654,7 +670,9 @@ async fn unauthenticated_and_malformed_datagrams_are_dropped_before_the_backend(
             .await
             .expect("send refused datagram");
         assert!(
-            recv_within(&sender, DROP_OBSERVATION_WINDOW).await.is_none(),
+            recv_within(&sender, DROP_OBSERVATION_WINDOW)
+                .await
+                .is_none(),
             "{label} must be dropped, not forwarded"
         );
     }
