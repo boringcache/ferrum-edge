@@ -266,9 +266,7 @@ impl HbonePoolError {
             | Self::NoLeafCert
             | Self::InvalidServerName { .. }
             | Self::TlsConfig(_) => true,
-            Self::TlsHandshake { source, .. } => {
-                tls_handshake_is_capability_failure(source)
-            }
+            Self::TlsHandshake { source, .. } => tls_handshake_is_capability_failure(source),
             _ => false,
         }
     }
@@ -1780,12 +1778,13 @@ pub(crate) async fn dial_h2_connect_sender(
                 pool_config.tcp_keepalive_seconds,
             );
 
-            let tls_stream = connector.connect(server_name, tcp).await.map_err(|source| {
-                HbonePoolError::TlsHandshake {
+            let tls_stream = connector
+                .connect(server_name, tcp)
+                .await
+                .map_err(|source| HbonePoolError::TlsHandshake {
                     host: target_host.to_string(),
                     source,
-                }
-            })?;
+                })?;
             if !matches!(tls_stream.get_ref().1.alpn_protocol(), Some(b"h2")) {
                 return Err(HbonePoolError::TlsHandshake {
                     host: target_host.to_string(),
