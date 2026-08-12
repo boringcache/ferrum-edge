@@ -523,7 +523,7 @@ fn the_preflight_binds_its_node_lookup_to_this_pods_node_name() {
         "the grant must bind the ambient DaemonSet's own service account"
     );
     assert!(
-        rbac.contains("a `get` without `resourceNames` as a single-object restriction")
+        rbac.contains("`get` without `resourceNames` as a single-object restriction")
             && rbac.contains("runtime request is what binds the lookup"),
         "the Role comment must not claim an enforcement boundary Kubernetes RBAC \
          does not provide"
