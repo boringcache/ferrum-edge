@@ -491,7 +491,11 @@ fn parse_datagram_header(datagram: &[u8]) -> Result<ParsedDatagramHeader, Datagr
         header_len,
         // A LOCAL envelope never sets a client identity even if it carried
         // addresses; the balancer is speaking for itself.
-        forwarded: if is_local { None } else { forwarded },
+        forwarded: if is_local {
+            None
+        } else {
+            forwarded.map(crate::util::client_identity::canonical_socket_addr)
+        },
         auth_tag,
     })
 }

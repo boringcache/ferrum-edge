@@ -109,6 +109,30 @@ fn ipv6_envelope_round_trips() {
 }
 
 #[test]
+fn ipv4_mapped_forwarded_client_is_canonicalized_for_session_identity() {
+    let gate = address_trust_gate();
+    let source = "::ffff:203.0.113.9"
+        .parse::<std::net::Ipv6Addr>()
+        .expect("mapped source");
+    let destination = "2001:db8::1"
+        .parse::<std::net::Ipv6Addr>()
+        .expect("IPv6 destination");
+    let mut block = Vec::new();
+    block.extend_from_slice(&source.octets());
+    block.extend_from_slice(&destination.octets());
+    block.extend_from_slice(&41234u16.to_be_bytes());
+    block.extend_from_slice(&5353u16.to_be_bytes());
+    let datagram = header(0x21, 0x22, &block, b"mapped");
+
+    let decoded = gate
+        .decode(&datagram, &addr("10.0.0.1:60000"))
+        .expect("mapped IPv4 envelope is admitted");
+
+    assert_eq!(decoded.forwarded, Some(addr("203.0.113.9:41234")));
+    assert_eq!(decoded.payload, b"mapped");
+}
+
+#[test]
 fn untrusted_peer_is_refused_before_the_envelope_is_parsed() {
     let gate = address_trust_gate();
     let datagram = encode_datagram_with_metadata(
