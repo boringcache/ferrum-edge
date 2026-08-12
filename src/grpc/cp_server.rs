@@ -1833,10 +1833,19 @@ impl CpGrpcServer {
         crate::fips::policy::check_gateway_config(config)
             .map_err(|error| format!("FIPS policy rejected the configuration: {error}"))?;
         let mut snapshot = config.clone();
-        // Trust bundles travel exclusively through `ConfigUpdate.trust_bundles_json`.
-        // Keeping them out of the regular GatewayConfig JSON preserves compatibility
-        // with older DPs whose `GatewayConfig` deserializer denies unknown fields.
+        // Trust material travels exclusively through
+        // `ConfigUpdate.trust_bundles_json`. BOTH trust slots are cleared here:
+        // the unpartitioned `trust_bundles` set and the authoritative
+        // per-namespace `gateway_trust_bundles` resource vector, whose records
+        // carry raw authority material plus server-assigned metadata
+        // (revision, actor, timestamps). Keeping them out of the regular
+        // GatewayConfig JSON preserves compatibility with older DPs whose
+        // `GatewayConfig` deserializer denies unknown fields, and makes the
+        // wire boundary fail closed at the single publication funnel rather
+        // than depending on `gateway_trust_bundles` keeping its `#[serde(skip)]`
+        // attribute.
         snapshot.trust_bundles = None;
+        snapshot.gateway_trust_bundles.clear();
         serde_json::to_string(&snapshot).map_err(|error| error.to_string())
     }
 }
@@ -2271,6 +2280,31 @@ mod tests {
         }
     }
 
+    /// A fully populated namespace trust record: raw authority material plus
+    /// the server-assigned metadata (revision, actor) a DP must never see on
+    /// the ordinary `config_json` wire. The material is deliberately distinct
+    /// from [`test_trust_bundles`] so an assertion can tell the two apart.
+    fn test_gateway_trust_record(
+        namespace: &str,
+    ) -> crate::config::gateway_trust::GatewayTrustBundleRecord {
+        let bundle = crate::modes::mesh::config::TrustBundleSet {
+            local: crate::modes::mesh::config::TrustBundle {
+                trust_domain: crate::identity::TrustDomain::new("record.internal")
+                    .expect("test trust domain should be valid"),
+                x509_authorities: vec!["BQYHCA==".to_string()],
+                jwt_authorities: Vec::new(),
+                refresh_hint_seconds: None,
+            },
+            federated: Vec::new(),
+        };
+        let mut record = crate::config::gateway_trust::GatewayTrustBundleRecord::new(
+            namespace, namespace, bundle,
+        );
+        record.revision = 4242;
+        record.updated_by = Some("trust-actor@example.test".to_string());
+        record
+    }
+
     fn registry_info(node_id: &str, version: &str, connected_at: DateTime<Utc>) -> DpNodeInfo {
         DpNodeInfo {
             node_id: node_id.to_string(),
@@ -2300,8 +2334,11 @@ mod tests {
     fn config_json_for_dp_strips_gateway_trust_bundles() {
         let mut config = GatewayConfig {
             version: crate::config::types::CURRENT_CONFIG_VERSION.to_string(),
-            loaded_at: Utc::now(),
+            // Fixed so the numeric metadata assertion below cannot collide with
+            // digits from a wall-clock timestamp.
+            loaded_at: Utc.with_ymd_and_hms(2026, 5, 5, 12, 0, 0).unwrap(),
             trust_bundles: Some(Box::new(test_trust_bundles())),
+            gateway_trust_bundles: vec![test_gateway_trust_record("ferrum")],
             ..Default::default()
         };
         config.known_namespaces.push("ferrum".to_string());
@@ -2310,10 +2347,20 @@ mod tests {
         let value: serde_json::Value =
             serde_json::from_str(&json).expect("DP config JSON should parse");
         assert!(value.get("trust_bundles").is_none());
+        assert!(value.get("gateway_trust_bundles").is_none());
+        // Neither trust slot's authority material may appear anywhere in the
+        // ordinary DP document, nor the record's server-assigned metadata.
+        assert!(!json.contains("AQIDBA=="));
+        assert!(!json.contains("BQYHCA=="));
+        assert!(!json.contains("cluster.local"));
+        assert!(!json.contains("record.internal"));
+        assert!(!json.contains("trust-actor@example.test"));
+        assert!(!json.contains("4242"));
 
         let parsed: GatewayConfig =
             serde_json::from_str(&json).expect("stripped DP config should deserialize");
         assert!(parsed.trust_bundles.is_none());
+        assert!(parsed.gateway_trust_bundles.is_empty());
         assert_eq!(parsed.known_namespaces, vec!["ferrum"]);
     }
 
@@ -2323,6 +2370,7 @@ mod tests {
             version: crate::config::types::CURRENT_CONFIG_VERSION.to_string(),
             loaded_at: Utc::now(),
             trust_bundles: Some(Box::new(test_trust_bundles())),
+            gateway_trust_bundles: vec![test_gateway_trust_record("ferrum")],
             ..Default::default()
         };
         let (tx, mut rx) = broadcast::channel(1);
@@ -2333,6 +2381,11 @@ mod tests {
         let value: serde_json::Value =
             serde_json::from_str(&update.config_json).expect("config JSON should parse");
         assert!(value.get("trust_bundles").is_none());
+        assert!(value.get("gateway_trust_bundles").is_none());
+        assert!(!update.config_json.contains("record.internal"));
+        assert!(!update.config_json.contains("BQYHCA=="));
+        assert!(!update.config_json.contains("trust-actor@example.test"));
+        // The side channel is unaffected by the wire-boundary strip.
         assert_ne!(update.trust_bundles_json, "null");
         assert!(update.trust_bundles_json.contains("cluster.local"));
     }
