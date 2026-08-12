@@ -906,6 +906,46 @@ fn test_passthrough_port_sharing_uniform_stream_proxy_protocol_accepted() {
 }
 
 #[test]
+fn test_udp_and_dtls_proxies_accept_stream_proxy_protocol() {
+    // Issue #3289: full-config validation (the reload path) must admit the
+    // per-datagram client-address envelope on udp/dtls, not just the
+    // connection header on tcp/tcps.
+    let mut udp = make_stream_proxy("udp-dgram-meta", BackendScheme::Udp, 8553);
+    udp.stream_proxy_protocol = Some(true);
+    let mut dtls = make_stream_proxy("dtls-dgram-meta", BackendScheme::Dtls, 8554);
+    dtls.stream_proxy_protocol = Some(true);
+
+    let config = test_config(vec![udp, dtls]);
+    assert!(
+        config.validate_stream_proxies().is_ok(),
+        "udp/dtls must accept stream_proxy_protocol: {:?}",
+        config.validate_stream_proxies()
+    );
+}
+
+#[test]
+fn test_http_proxy_still_rejects_stream_proxy_protocol() {
+    // The HTTP family resolves the client IP from X-Forwarded-For; neither
+    // PROXY framing applies there, so the field must stay a validation error
+    // rather than becoming silently inert.
+    let mut http = make_stream_proxy("http-pp", BackendScheme::Https, 8555);
+    http.listen_port = None;
+    http.listen_path = Some("/api".to_string());
+    http.hosts = vec!["api.example.com".to_string()];
+    http.dispatch_kind = DispatchKind::HttpsPool;
+    http.stream_proxy_protocol = Some(true);
+
+    let config = test_config(vec![http]);
+    let errors = config
+        .validate_stream_proxies()
+        .expect_err("HTTP-family proxies must reject stream_proxy_protocol");
+    assert!(
+        errors.iter().any(|e| e.contains("stream_proxy_protocol")),
+        "expected a stream_proxy_protocol rejection, got: {errors:?}"
+    );
+}
+
+#[test]
 fn test_passthrough_port_sharing_wildcard_hosts() {
     let mut p1 = make_stream_proxy("pt-wild", BackendScheme::Tcp, 8444);
     p1.passthrough = true;

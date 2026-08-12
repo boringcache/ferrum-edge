@@ -74,7 +74,7 @@ proxies:
 | `backend_scheme` | `string` | (required) | One of: `tcp`, `tcps`, `udp`, `dtls` |
 | `frontend_tls` | `bool` | `false` | Terminate TLS (TCP) or DTLS (UDP) on incoming connections |
 | `tcp_idle_timeout_seconds` | `u64` | (global) | TCP idle timeout override. When omitted, uses `FERRUM_TCP_IDLE_TIMEOUT_SECONDS` (default 300s). 0 = disabled |
-| `stream_proxy_protocol` | `bool` | `false` | Enable inbound PROXY protocol (v1 or v2) on this `tcp`/`tcp_tls` listener. See [Inbound PROXY Protocol](#inbound-proxy-protocol) below. |
+| `stream_proxy_protocol` | `bool` | `false` | Enable inbound PROXY protocol: the v1/v2 connection header on `tcp`/`tcp_tls` (see [Inbound PROXY Protocol](#inbound-proxy-protocol)), or the per-datagram v2 DGRAM envelope on `udp`/`dtls` (see [Datagram Client-Address Metadata](#datagram-client-address-metadata-udp--dtls)). |
 | `udp_idle_timeout_seconds` | `u64` | `60` | UDP session idle timeout before cleanup |
 | `udp_max_response_amplification_factor` | `f32` | unset | Drop backend response datagrams larger than `request_payload_size × factor`. A zero-length request receives only a one-byte response allowance; nonempty requests retain the exact configured payload ratio. |
 
@@ -937,7 +937,7 @@ These Linux-specific options auto-detect kernel support at startup when set to `
 
 ## Inbound PROXY Protocol
 
-Ferrum supports inbound [PROXY protocol](https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt) (v1 text and v2 binary, auto-detected by prefix) on TCP and TCP+TLS stream listeners. This lets a front-end load balancer (AWS NLB, HAProxy, etc.) prepend the real client address to each accepted connection so the gateway sees the originating source IP instead of the LB's own IP.
+Ferrum supports inbound [PROXY protocol](https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt) (v1 text and v2 binary, auto-detected by prefix) on TCP and TCP+TLS stream listeners. The UDP/DTLS equivalent is [Datagram Client-Address Metadata](#datagram-client-address-metadata-udp--dtls). This lets a front-end load balancer (AWS NLB, HAProxy, etc.) prepend the real client address to each accepted connection so the gateway sees the originating source IP instead of the LB's own IP.
 
 ### Enabling PROXY Protocol
 
@@ -992,9 +992,86 @@ This mirrors the HTTP-path semantics of `X-Forwarded-For` + `FERRUM_TRUSTED_PROX
 
 ### Limitations
 
-- **TCP and TCP+TLS only.** PROXY protocol is a TCP-borne framing; it cannot be used on `udp` or `dtls` proxies. Setting `stream_proxy_protocol: true` on a non-TCP proxy produces a validation error.
+- **Connection framing is TCP-only.** The v1/v2 header described above is read once at the head of a connection. UDP and DTLS use the datagram envelope described in [Datagram Client-Address Metadata](#datagram-client-address-metadata-udp--dtls) instead — the same `stream_proxy_protocol` field, a different wire framing.
 - **Shared (SNI-passthrough) ports must agree.** The PROXY header is read from the raw stream before the TLS ClientHello, so SNI-based proxy resolution has not happened yet — the accept loop applies one per-listener decision. Every passthrough proxy sharing a `listen_port` must set the same `stream_proxy_protocol` value; mixing is a validation error.
 - **Not supported on mesh inbound relay paths.** Mesh tunnel peers (Sidecar mTLS, Ambient HBONE) carry cryptographic peer identity rather than PROXY headers; mesh inbound TCP relay never reads PROXY protocol headers.
+
+## Datagram Client-Address Metadata (UDP / DTLS)
+
+Behind a datagram load balancer, a `udp` or `dtls` listener would otherwise only ever see the balancer's address. Setting `stream_proxy_protocol: true` on a `udp` / `dtls` proxy turns on the datagram equivalent of the connection header: a **PROXY protocol v2 envelope carrying the `DGRAM` transport byte, prepended to every datagram** (issue #3289).
+
+```yaml
+proxies:
+  - id: dns-proxy
+    name: DNS
+    backend_scheme: udp
+    listen_port: 5353
+    targets:
+      - host: resolver.internal
+        port: 53
+    stream_proxy_protocol: true   # expect the DGRAM envelope on every datagram
+```
+
+### Wire format
+
+```text
+ 0                12      13      14          16
+ +----------------+-------+-------+-----------+----------------+---------+
+ | v2 signature   |ver_cmd|fam_tp | addr_len  |  address block | payload |
+ |   (12 bytes)   |  1 B  |  1 B  |  u16 BE   |  addr_len B    |    …    |
+ +----------------+-------+-------+-----------+----------------+---------+
+```
+
+- `ver_cmd` is `0x21` (version 2, `PROXY`) or `0x20` (version 2, `LOCAL`).
+- `fam_tp` is `0x12` (`AF_INET` + `DGRAM`) or `0x22` (`AF_INET6` + `DGRAM`). `AF_UNSPEC` (`0x0*`) carries no address.
+- The address block holds the fixed source/destination addresses and ports, optionally followed by TLVs. `addr_len` covers both; the payload begins immediately after.
+- Everything after the address block is the application payload, forwarded to the backend verbatim.
+
+**Every** datagram must carry the envelope. A first-datagram-only contract would let any later datagram from the same 4-tuple inherit an identity it never proved, and datagram delivery is unordered and lossy, so there is no dependable "first" datagram.
+
+### Authentication
+
+Source addresses are trivially spoofable on UDP. Set `FERRUM_DATAGRAM_PROXY_PROTOCOL_SECRET` (at least 32 bytes) to require an HMAC-SHA-256 tag on every datagram:
+
+- TLV type `0xE0` (the PROXY v2 application-reserved range), value length 32.
+- The tag is computed over the complete datagram with the 32 tag bytes elided — so the command, family, transport, addresses, every other TLV, and the payload are all bound to it.
+- A datagram with a missing, malformed, duplicated, or non-verifying tag is dropped.
+
+The tag binds metadata to payload; it is **not** an anti-replay mechanism. A verbatim replay of a captured datagram remains possible, exactly as it is for plain UDP.
+
+With no secret configured, trust rests on `FERRUM_TRUSTED_PROXIES` alone. That is sufficient only where the network path between the balancer and the gateway cannot carry spoofed source addresses; the listener logs a warning at startup so the weaker posture is visible.
+
+### Fail-closed behavior
+
+| Scenario | Result |
+|----------|--------|
+| Trusted peer + valid envelope (+ valid tag when a secret is set) | `client_ip` = forwarded address; `direct_client_ip` = balancer socket peer |
+| Untrusted peer (not in `FERRUM_TRUSTED_PROXIES`) | Datagram **dropped** |
+| Missing / truncated / oversized / malformed envelope | Datagram **dropped** |
+| `STREAM` transport (a TCP PROXY header replayed onto the datagram path) | Datagram **dropped** |
+| Unsupported address family (including `AF_UNIX`) | Datagram **dropped** |
+| Missing, duplicated, wrong-length, or invalid authentication tag | Datagram **dropped** |
+| Forwarded client differs from the established session's | Datagram **dropped** |
+| `LOCAL` command or `AF_UNSPEC` (balancer health probe) | `client_ip` = `direct_client_ip` = balancer socket peer |
+
+A drop is silent on the wire (UDP has no reset). Each one increments the listener's client-address-metadata drop counter and emits a rate-limited structured warning naming the failing field; payload bytes, tag material, and rejected forwarded addresses are never logged.
+
+### Session and reply semantics
+
+- Ferrum keys UDP sessions by the **socket peer**, so a balancer must allocate a distinct source port per client flow (ordinary per-flow NAT). All datagrams on one socket peer must therefore carry the same forwarded client; one that does not is dropped rather than attributed to the established session's identity.
+- **Replies are sent to the socket peer unwrapped.** Ferrum does not emit the envelope on the return path — the balancer demultiplexes by its own 4-tuple.
+- The envelope is stripped before anything else runs: before session lookup, before `on_stream_connect` / `on_udp_datagram` plugins, before the DTLS record layer on a `dtls` listener, and before any backend send. The backend never sees envelope bytes.
+- Backend load-balancer stickiness (`hash_on` ip-hash lanes) follows the resolved client, so one real client keeps one backend across the balancer's ports.
+
+### Client IP resolution
+
+Identical to the TCP path: `client_ip` (mesh authz `remote.ip` / `remoteIpBlocks`, stream logs, rate-limit keys) is the authenticated forwarded address, while `direct_client_ip` (`source.ip` / `ipBlocks`) always stays the socket peer. With the feature disabled both remain the socket peer, which is the historical UDP/DTLS behavior.
+
+### Limitations (datagram)
+
+- **Inbound only.** Ferrum never emits the datagram envelope toward a backend; `backend_proxy_protocol` remains TCP-only.
+- **No anti-replay.** See above.
+- **Not supported on mesh capture paths.** Ambient/sidecar UDP capture carries its own metadata; the envelope applies to configured `udp` / `dtls` stream listeners.
 
 ## Outbound PROXY Protocol
 
@@ -1042,7 +1119,7 @@ Outbound PROXY can be combined with inbound `stream_proxy_protocol: true`: Ferru
 - `listen_port` must not conflict with gateway reserved ports — the proxy HTTP/HTTPS ports (`FERRUM_PROXY_HTTP_PORT`, `FERRUM_PROXY_HTTPS_PORT`), admin HTTP/HTTPS ports (`FERRUM_ADMIN_HTTP_PORT`, `FERRUM_ADMIN_HTTPS_PORT`), or CP gRPC port (`FERRUM_CP_GRPC_LISTEN_ADDR`)
 - `listen_port` is optional for HTTP-family proxies; when present it scopes the route to that frontend port and does not join stream-port sharing
 - A TCP/TLS stream `listen_port` still collides with an HTTP-family Gateway listener on that port (whole-listener refusal). A UDP/DTLS stream may share the numeric port with an HTTP-family listener: plaintext is unaffected, and a TLS-class listener with HTTP/3 enabled keeps TCP/H1/H2 while refusing only QUIC/H3 for that port (see [gateway_api_conformance.md](gateway_api_conformance.md) and [http3.md](http3.md))
-- `stream_proxy_protocol` may only be set on `tcp` / `tcp_tls` proxies; setting it on `udp`, `dtls`, or HTTP proxies is a validation error
+- `stream_proxy_protocol` may only be set on stream proxies (`tcp` / `tcp_tls` use the connection header, `udp` / `dtls` use the per-datagram envelope); setting it on an HTTP-family proxy is a validation error
 - `backend_proxy_protocol` may only be set on `tcp` / `tcps` proxies; setting it on `udp`, `dtls`, or HTTP proxies is a validation error
 - Stream proxies are excluded from the HTTP router (routed by port, not path)
 

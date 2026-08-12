@@ -3032,6 +3032,16 @@ pub struct EnvConfig {
     #[allow(dead_code)]
     pub basic_auth_hmac_secret: Option<String>,
 
+    /// Shared secret authenticating the datagram client-address envelope on
+    /// `udp` / `dtls` listeners that set `stream_proxy_protocol: true`.
+    ///
+    /// When set, every such datagram must carry a valid HMAC-SHA-256 tag over
+    /// the complete envelope and payload; unauthenticated datagrams are
+    /// dropped. When unset, trust rests on the socket peer being inside
+    /// `FERRUM_TRUSTED_PROXIES` alone — sufficient only on a network path where
+    /// source addresses cannot be spoofed. Must be at least 32 bytes.
+    pub datagram_proxy_protocol_secret: Option<String>,
+
     /// Threshold in milliseconds for logging slow plugin outbound HTTP calls.
     /// When a plugin HTTP request (e.g. http_logging, JWKS fetch,
     /// OIDC discovery, OTLP export) exceeds this duration, a warning is logged.
@@ -3749,6 +3759,7 @@ impl Default for EnvConfig {
             add_forwarded_header: false,
             real_ip_header: None,
             basic_auth_hmac_secret: None,
+            datagram_proxy_protocol_secret: None,
             plugin_http_slow_threshold_ms: 1000,
             plugin_http_max_retries: 0,
             plugin_http_retry_delay_ms: 100,
@@ -4384,6 +4395,7 @@ impl EnvConfig {
             via_pseudonym: String = "FERRUM_VIA_PSEUDONYM" => "ferrum-edge".to_string();
             add_forwarded_header: bool = "FERRUM_ADD_FORWARDED_HEADER" => false;
             basic_auth_hmac_secret: Option<String> = "FERRUM_BASIC_AUTH_HMAC_SECRET";
+            datagram_proxy_protocol_secret: Option<String> = "FERRUM_DATAGRAM_PROXY_PROTOCOL_SECRET";
             plugin_http_slow_threshold_ms: u64 = "FERRUM_PLUGIN_HTTP_SLOW_THRESHOLD_MS" => 1000u64;
             plugin_http_max_retries: u32 = "FERRUM_PLUGIN_HTTP_MAX_RETRIES" => 0u32;
             plugin_http_retry_delay_ms: u64 = "FERRUM_PLUGIN_HTTP_RETRY_DELAY_MS" => 100u64;
@@ -5121,6 +5133,7 @@ impl EnvConfig {
             add_forwarded_header,
             real_ip_header,
             basic_auth_hmac_secret,
+            datagram_proxy_protocol_secret,
             plugin_http_slow_threshold_ms,
             plugin_http_max_retries,
             plugin_http_retry_delay_ms,
@@ -7061,6 +7074,36 @@ impl EnvConfig {
         // rather than quietly shrinking the trust set at runtime.
         self.validate_trusted_proxies()?;
 
+        // The datagram client-address envelope's MAC key (issue #3289).
+        self.validate_datagram_proxy_protocol_secret()?;
+
+        Ok(())
+    }
+
+    /// Reject a `FERRUM_DATAGRAM_PROXY_PROTOCOL_SECRET` that is too short to be
+    /// an HMAC-SHA-256 key.
+    ///
+    /// This key is what makes a datagram client-address envelope trustworthy on
+    /// a path where the source address can be spoofed, so a weak value is a
+    /// startup error rather than a warning. The diagnostic reports the
+    /// requirement only — never the configured value, and never its length,
+    /// which is a property of the secret itself.
+    fn validate_datagram_proxy_protocol_secret(&self) -> Result<(), String> {
+        let Some(secret) = self
+            .datagram_proxy_protocol_secret
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(());
+        };
+        if secret.len() < crate::proxy::datagram_client_address::MIN_DATAGRAM_SECRET_BYTES {
+            return Err(format!(
+                "FERRUM_DATAGRAM_PROXY_PROTOCOL_SECRET must be at least {} bytes — it is the \
+                 HMAC-SHA-256 key authenticating datagram client-address metadata on udp/dtls \
+                 listeners.",
+                crate::proxy::datagram_client_address::MIN_DATAGRAM_SECRET_BYTES
+            ));
+        }
         Ok(())
     }
 

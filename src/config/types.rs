@@ -5015,22 +5015,19 @@ impl GatewayConfig {
                     proxy.id, port
                 ));
             }
-            // stream_proxy_protocol is only valid for TCP/TCP-TLS stream
-            // proxies. UDP/DTLS cannot carry a PROXY protocol header (it is
-            // TCP-borne), and HTTP proxies use XFF instead.
-            if proxy.stream_proxy_protocol == Some(true) {
-                let is_tcp_stream = matches!(
-                    proxy.dispatch_kind,
-                    DispatchKind::TcpRaw | DispatchKind::TcpTls
-                );
-                if !is_tcp_stream {
-                    errors.push(format!(
-                        "Proxy '{}' (scheme {}) sets stream_proxy_protocol but PROXY protocol \
-                         is only valid for tcp/tcp_tls stream proxies",
-                        proxy.id,
-                        proxy.scheme_display()
-                    ));
-                }
+            // `stream_proxy_protocol` is valid on every stream family, with two
+            // different framings: the connection-borne PROXY header on
+            // tcp/tcp_tls, and the per-datagram PROXY v2 DGRAM envelope on
+            // udp/dtls (issue #3289). HTTP proxies use XFF instead and are
+            // still rejected.
+            if proxy.stream_proxy_protocol == Some(true) && !proxy.dispatch_kind.is_stream() {
+                errors.push(format!(
+                    "Proxy '{}' (scheme {}) sets stream_proxy_protocol but PROXY protocol is only \
+                     valid for tcp/tcp_tls/udp/dtls stream proxies — HTTP-family proxies resolve \
+                     the client IP from X-Forwarded-For",
+                    proxy.id,
+                    proxy.scheme_display()
+                ));
             }
             // Outbound PROXY is likewise TCP-borne only.
             if proxy.backend_proxy_protocol.is_some() {
@@ -7308,16 +7305,16 @@ impl Proxy {
         let effective_scheme = self.effective_scheme();
         let is_stream_proxy = effective_scheme.is_stream();
 
-        // Inbound PROXY protocol is TCP-borne: valid only on tcp/tcps stream
-        // proxies. Enforced here (single-proxy admin writes: POST/PUT
+        // Inbound PROXY protocol is a stream-family control: the connection
+        // header on tcp/tcps, the per-datagram DGRAM envelope on udp/dtls
+        // (issue #3289). Enforced here (single-proxy admin writes: POST/PUT
         // /proxies and the API-spec proxy path) in addition to
         // `GatewayConfig::validate_stream_proxies`, so a bad row can never
         // persist and then wedge the next full-config load/reconcile.
-        if self.stream_proxy_protocol == Some(true)
-            && !matches!(effective_scheme, BackendScheme::Tcp | BackendScheme::Tcps)
-        {
+        if self.stream_proxy_protocol == Some(true) && !is_stream_proxy {
             errors.push(
-                "stream_proxy_protocol is only valid for tcp/tcps stream proxies                  (PROXY protocol is TCP-borne)"
+                "stream_proxy_protocol is only valid for tcp/tcps/udp/dtls stream proxies \
+                 (HTTP-family proxies resolve the client IP from X-Forwarded-For)"
                     .to_string(),
             );
         }

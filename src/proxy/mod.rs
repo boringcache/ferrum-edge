@@ -38,6 +38,7 @@ pub mod backend_capabilities;
 pub mod backend_dispatch;
 pub mod body;
 pub mod client_ip;
+pub mod datagram_client_address;
 pub mod deferred_log;
 pub mod gateway_listener;
 pub mod grpc_proxy;
@@ -7826,6 +7827,13 @@ impl ProxyState {
         // stays fail-closed, which is the intended default.
         stream_listener_manager
             .set_stream_sni_plaintext_fallback(env_config_arc.stream_sni_plaintext_fallback);
+        // Publish the datagram client-address envelope's MAC key before the
+        // first `reconcile()` so a udp/dtls listener with
+        // `stream_proxy_protocol: true` never binds in the weaker
+        // address-trust-only posture when a secret is configured (issue #3289).
+        stream_listener_manager.set_datagram_client_address_secret(
+            env_config_arc.datagram_proxy_protocol_secret.clone(),
+        );
 
         let state = Self {
             config: config_arc,

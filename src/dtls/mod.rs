@@ -152,6 +152,19 @@ pub struct DtlsServerLimits {
     /// is eventually consistent with `active_sessions` and is not used for
     /// admission control.
     pub active_session_mirror: Option<Arc<AtomicU64>>,
+    /// Datagram client-address metadata gate (issue #3289). `Some` only when
+    /// the `dtls` proxy sets `stream_proxy_protocol: true`; then every datagram
+    /// reaching the demuxer must carry a trusted, well-formed (and, when a
+    /// secret is configured, authenticated) PROXY v2 DGRAM envelope. The
+    /// envelope is stripped before the DTLS record layer sees a byte, and the
+    /// forwarded address becomes the accepted connection's client identity.
+    /// `None` keeps ordinary DTLS behavior.
+    pub datagram_client_address:
+        Option<Arc<crate::proxy::datagram_client_address::DatagramClientAddressGate>>,
+    /// Counter incremented for every datagram the gate refuses. Shared with the
+    /// owning UDP listener's metrics so plain-UDP and DTLS refusals are one
+    /// number. `None` outside the proxy listener path.
+    pub datagram_client_address_drops: Option<Arc<AtomicU64>>,
 }
 
 impl Default for DtlsServerLimits {
@@ -161,6 +174,8 @@ impl Default for DtlsServerLimits {
             handshake_timeout: Some(DEFAULT_DTLS_HANDSHAKE_TIMEOUT),
             allow_new_session: None,
             active_session_mirror: None,
+            datagram_client_address: None,
+            datagram_client_address_drops: None,
         }
     }
 }
@@ -871,6 +886,11 @@ struct DtlsSessionState {
     /// [`DtlsServer::next_session_generation`]). Both removal sites must match
     /// this token before deleting the map entry.
     generation: u64,
+    /// Authenticated forwarded client this peer entry was admitted with, when
+    /// the datagram client-address gate is enabled. A later datagram from the
+    /// same peer address asserting a different client is dropped rather than
+    /// fed into a DTLS association admitted under another identity.
+    forwarded_client: Option<SocketAddr>,
 }
 
 /// Remove the demux entry for `peer_addr` only when it still belongs to
@@ -939,6 +959,11 @@ pub struct DtlsServerConn {
     pub tls_client_cert_chain_der: Option<Arc<Vec<Vec<u8>>>>,
     /// SNI hostname extracted from the initial DTLS ClientHello, if supplied.
     pub sni_hostname: Option<String>,
+    /// Authenticated original client from the datagram client-address envelope
+    /// (issue #3289). `None` when the listener does not run that gate, or when
+    /// the envelope carried no address (`LOCAL` / `AF_UNSPEC`); the caller then
+    /// keeps the socket peer as the only identity.
+    pub forwarded_client_addr: Option<SocketAddr>,
 }
 
 /// A cloneable sender half of a `DtlsServerConn`, used to send data back to
@@ -1168,7 +1193,31 @@ impl DtlsServer {
                 return Ok(());
             }
 
-            let data = buf[..len].to_vec();
+            // Datagram client-address boundary (issue #3289). When the gate is
+            // configured, the envelope is validated and stripped here — before
+            // demux, before any per-peer state is allocated, and before the
+            // DTLS record layer sees a byte — so an untrusted or
+            // unauthenticated datagram can neither start an association nor
+            // reach an existing one. With no gate this is the untouched
+            // historical path.
+            let (payload, forwarded_client) = match self.limits.datagram_client_address.as_ref() {
+                None => (&buf[..len], None),
+                Some(gate) => match gate.decode(&buf[..len], &peer_addr) {
+                    Ok(decoded) => (decoded.payload, decoded.forwarded),
+                    Err(error) => {
+                        if let Some(drops) = self.limits.datagram_client_address_drops.as_deref() {
+                            drops.fetch_add(1, Ordering::Relaxed);
+                        }
+                        trace!(
+                            client = %peer_addr,
+                            reason = error.reason(),
+                            "DTLS: dropping datagram with refused client-address metadata"
+                        );
+                        continue;
+                    }
+                },
+            };
+            let data = payload.to_vec();
 
             // Clone the sender (and demux identity) out of the DashMap guard
             // before sending. The `Ref` from `sessions.get()` holds a read lock
@@ -1179,8 +1228,21 @@ impl DtlsServer {
             let session = self
                 .sessions
                 .get(&peer_addr)
-                .map(|s| (s.incoming_tx.clone(), s.generation));
-            if let Some((tx, generation)) = session {
+                .map(|s| (s.incoming_tx.clone(), s.generation, s.forwarded_client));
+            if let Some((tx, generation, session_forwarded)) = session {
+                // The association was admitted for one authenticated client;
+                // a datagram asserting another is refused rather than decrypted
+                // under the first client's identity.
+                if session_forwarded != forwarded_client {
+                    if let Some(drops) = self.limits.datagram_client_address_drops.as_deref() {
+                        drops.fetch_add(1, Ordering::Relaxed);
+                    }
+                    trace!(
+                        client = %peer_addr,
+                        "DTLS: dropping datagram whose forwarded client differs from the session"
+                    );
+                    continue;
+                }
                 // Existing session — forward packet to its driver. Never
                 // `.send().await`: one session whose driver has stalled (its
                 // proxy-side consumer stopped draining `app_out`) would fill
@@ -1208,18 +1270,18 @@ impl DtlsServer {
                         );
                     }
                 }
-            } else if len >= 13 && data[0] == 0x16 {
+            } else if data.len() >= 13 && data[0] == 0x16 {
                 // New client — spawn a session driver. Only for datagrams that
                 // plausibly start a DTLS handshake (content-type 0x16 with a
                 // full 13-byte record header): spawning reserves a
                 // `max_sessions` slot, allocates four channels, and holds the
                 // slot for the handshake timeout, so arbitrary garbage from
                 // scanners or spoofed floods must not reach it.
-                self.spawn_session(peer_addr, data);
+                self.spawn_session(peer_addr, data, forwarded_client);
             } else {
                 trace!(
                     client = %peer_addr,
-                    len,
+                    len = data.len(),
                     "DTLS: dropping non-handshake datagram from unknown source"
                 );
             }
@@ -1237,7 +1299,12 @@ impl DtlsServer {
     ///   2. `max_sessions` is the *hard* cap, enforced via a CAS loop on
     ///      `active_sessions`. This is the authoritative bound — even if the
     ///      soft gate races, the hard cap cannot be exceeded.
-    fn spawn_session(&self, peer_addr: SocketAddr, initial_packet: Vec<u8>) {
+    fn spawn_session(
+        &self,
+        peer_addr: SocketAddr,
+        initial_packet: Vec<u8>,
+        forwarded_client: Option<SocketAddr>,
+    ) {
         if let Some(ref allow) = self.limits.allow_new_session
             && !allow()
         {
@@ -1296,6 +1363,7 @@ impl DtlsServer {
                 incoming_tx: incoming_tx.clone(),
                 shutdown_tx: shutdown_tx.clone(),
                 generation,
+                forwarded_client,
             },
         );
 
@@ -1501,6 +1569,7 @@ impl DtlsServer {
                                 tls_client_cert_der: peer_cert_der.clone(),
                                 tls_client_cert_chain_der: peer_cert_chain_der.clone(),
                                 sni_hostname: sni_hostname.clone(),
+                                forwarded_client_addr: forwarded_client,
                             };
                             if accept_tx.send((conn, peer_addr)).await.is_err() {
                                 return;
@@ -2164,7 +2233,7 @@ mod tests {
         })
         .await;
 
-        server.spawn_session("127.0.0.1:12345".parse().unwrap(), vec![0x16; 32]);
+        server.spawn_session("127.0.0.1:12345".parse().unwrap(), vec![0x16; 32], None);
 
         assert_eq!(server.active_session_count(), 0);
         assert!(server.sessions.is_empty());
@@ -2178,7 +2247,7 @@ mod tests {
         })
         .await;
 
-        server.spawn_session("127.0.0.1:12346".parse().unwrap(), vec![0x16; 32]);
+        server.spawn_session("127.0.0.1:12346".parse().unwrap(), vec![0x16; 32], None);
 
         assert_eq!(server.active_session_count(), 0);
         assert!(server.sessions.is_empty());
@@ -2195,11 +2264,19 @@ mod tests {
         })
         .await;
 
-        server.spawn_session("127.0.0.1:12347".parse().unwrap(), client_hello_packet());
+        server.spawn_session(
+            "127.0.0.1:12347".parse().unwrap(),
+            client_hello_packet(),
+            None,
+        );
         assert_eq!(server.active_session_count(), 1);
         assert_eq!(mirror.load(Ordering::Relaxed), 1);
 
-        server.spawn_session("127.0.0.1:12348".parse().unwrap(), client_hello_packet());
+        server.spawn_session(
+            "127.0.0.1:12348".parse().unwrap(),
+            client_hello_packet(),
+            None,
+        );
         assert_eq!(server.active_session_count(), 1);
         assert_eq!(mirror.load(Ordering::Relaxed), 1);
 
@@ -2306,7 +2383,11 @@ mod tests {
         // single session to validate the snapshot path: `spawn_session`
         // captures the swapped `certificate` value rather than the
         // original.
-        server.spawn_session("127.0.0.1:43210".parse().unwrap(), client_hello_packet());
+        server.spawn_session(
+            "127.0.0.1:43210".parse().unwrap(),
+            client_hello_packet(),
+            None,
+        );
         assert!(
             server.active_session_count() <= 1,
             "spawn_session honored admission limits after a live-reload swap"

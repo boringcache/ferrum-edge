@@ -7686,22 +7686,34 @@ components:
         stream_proxy_protocol:
           type: [boolean, "null"]
           description: |
-            Enable inbound PROXY protocol (v1 text or v2 binary, auto-detected) on this
-            stream proxy listener. When true, every inbound TCP connection must begin with a
-            valid PROXY header; connections that do not are closed immediately (fail closed).
+            Enable inbound PROXY protocol on this stream proxy listener. The framing
+            depends on the scheme:
+
+            * tcp / tcp_tls: PROXY protocol v1 text or v2 binary (auto-detected), read once
+              at the head of each accepted connection. A connection that does not begin with
+              a valid header is closed immediately (fail closed).
+            * udp / dtls: the PROXY protocol v2 DGRAM envelope, present on EVERY datagram
+              (a session-scoped header cannot be trusted on an unordered, lossy transport).
+              A datagram that does not decode is dropped; nothing is forwarded and no
+              session is created. Ferrum never emits the envelope toward the backend, and
+              replies are sent back to the socket peer unwrapped.
 
             Trust requirement: the forwarded address is honoured only when the socket peer
             (the load balancer's own IP) belongs to the FERRUM_TRUSTED_PROXIES CIDR set. A
             connection from an untrusted peer on a PROXY-protocol-enabled listener is also
-            closed to prevent direct-connect clients from spoofing their source IP.
+            closed (TCP) or dropped (UDP/DTLS) to prevent direct-connect clients from
+            spoofing their source IP. On udp / dtls, set
+            FERRUM_DATAGRAM_PROXY_PROTOCOL_SECRET to additionally require an HMAC-SHA-256
+            tag over every envelope and payload; source addresses are spoofable on UDP, so
+            that secret is what makes datagram metadata trustworthy off a protected path.
 
             After a trusted parse, client_ip in the stream context (and in stream logs and
-            authz plugins) is the forwarded source IP from the PROXY header; direct_client_ip
-            retains the raw socket peer (the LB's own IP). This mirrors XFF + FERRUM_TRUSTED_PROXIES
+            authz plugins) is the forwarded source IP; direct_client_ip retains the raw
+            socket peer (the LB's own IP). This mirrors XFF + FERRUM_TRUSTED_PROXIES
             on the HTTP path.
 
-            Only valid for tcp / tcp_tls stream proxies. Setting it on UDP, DTLS, or HTTP
-            proxies produces a validation error (PROXY protocol is TCP-borne).
+            Only valid for tcp / tcp_tls / udp / dtls stream proxies. Setting it on an
+            HTTP-family proxy produces a validation error (use X-Forwarded-For there).
 
             Default: null / false (disabled; socket peer is always used as client_ip).
         backend_proxy_protocol:
