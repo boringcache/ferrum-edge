@@ -234,7 +234,7 @@ fn setup_script(ifaces: &[&str], destinations: &[NodeWaypointUdpSteerDestination
 fn line_index(script: &str, predicate: impl Fn(&str) -> bool) -> usize {
     script
         .lines()
-        .position(|line| predicate(line))
+        .position(predicate)
         .unwrap_or_else(|| panic!("expected line not found in script:\n{script}"))
 }
 
