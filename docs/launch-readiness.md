@@ -221,13 +221,30 @@ have enforced anything. Every later revision takes the enforcing path.
   are all rejected on bytes alone.
 - **Deletion/rename:** every protected gate path is still present and non-empty.
 - **Policy downgrade:** frozen state machine and reason sets; GA blocking every
-  severity; no tier dropping a severity the trusted base blocked; the label
-  contract unchanged (a rename silently empties the blocker set); private
-  advisories enabled, redacted-count-only, unpublished states blocking, the
-  never-emit set intact, the freshness window never widened, and no
+  severity; no tier dropping a severity the trusted base blocked; only
+  severities the checker knows; a `default_launch_tier` the policy actually
+  defines; the exact label schema, with distinct severity labels and the label
+  contract unchanged (a rename silently empties the blocker set); non-empty
+  policy/classification versions; the repository identity format-checked and
+  pinned to the trusted base; every tracked blocker carrying a note; and no
   checked-in count/as-of key anywhere in the file.
-- **Exemption schema:** required fields, ISO timestamps, unique ids, at least
-  one launch tier, and an expiry strictly after approval.
+- **Private-advisory downgrade:** enabled, redacted-count-only, unpublished
+  states blocking, blocking and closed state sets disjoint and jointly covering
+  every known advisory state, per-tier advisory severities covering exactly the
+  policy tiers with only known severities, GA still blocking
+  critical/high/medium, no tier dropping a severity the trusted base blocked,
+  the never-emit set intact, the freshness window never widened, and the
+  credential (`live_api.token_env`) and fallback evidence variables
+  format-checked, mutually distinct, and pinned to the trusted-base names so a
+  pull request cannot point the checker at a source it controls.
+- **Exemption schema:** required fields; a positive issue number; owner and
+  approver matching the checker's principal grammar; non-empty rationale and
+  compensating control; unique non-empty ids; at least one launch tier and no
+  tier the candidate policy does not define; ISO-8601 timestamps compared as
+  *instants*, so an expiry strictly after approval cannot be faked with a
+  timezone offset whose lexical order is the reverse of its chronological order.
+  The candidate policy's tier set is passed into this check as inert parsed
+  data; no candidate code is imported or executed.
 - **Document markers:** exactly one begin/end/historical marker, in order, with
   the marker contract itself unchanged from the trusted base.
 - **Secret exposure:** the privileged advisory token may be named only by a
@@ -247,6 +264,14 @@ The last three run over the *whole* extracted workflow directory, including
 workflows the candidate adds. They are defense in depth against a bypass built
 beside the gate; they are explicitly **not** the permission model for changing
 an anchored file — that is the byte anchor and nothing else.
+
+The policy and exemption checks are held to the frozen production checker's own
+schema (`scripts/check_launch_readiness.py`). The checker's bytes are anchored,
+but the data it consumes is candidate-editable and is consumed from `main` the
+moment a data-only edit lands, so anything the checker would reject — or any
+narrowing of what it will block — has to be refused here, at pull-request time.
+A trusted-base policy copy that cannot be read fails closed rather than
+silently disabling every base comparison.
 
 What it deliberately does **not** judge: live issue/advisory state, and the
 *content* of the tracked-blocker inventory or the exemption list. Those are

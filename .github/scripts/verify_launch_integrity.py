@@ -69,6 +69,7 @@ import json
 import re
 import sys
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -210,6 +211,24 @@ REQUIRED_NEVER_EMIT_FIELDS = (
 
 # A ceiling, not a tunable: the policy may tighten it and never loosen it.
 MAX_FALLBACK_AGE_SECONDS_CEILING = 30 * 24 * 60 * 60
+
+# Mirrors of the frozen production checker's vocabulary
+# (`scripts/check_launch_readiness.py`). The checker is byte-frozen, but the
+# policy it consumes is candidate-editable data, so a policy that the checker
+# would reject — or that quietly narrows what the checker will block — must be
+# refused here, at pull-request time, before it can reach the trusted checker on
+# `main`.
+SEVERITIES = ("critical", "high", "medium")
+ADVISORY_STATES = ("triage", "draft", "published", "closed", "withdrawn")
+ADVISORY_SEVERITIES = ("critical", "high", "medium", "low")
+# GA is the launch tier the release gate runs at: it must keep blocking every
+# non-`low` private-advisory severity. Tiers may tighten, never loosen.
+REQUIRED_GA_ADVISORY_SEVERITIES = frozenset({"critical", "high", "medium"})
+
+OWNER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+REPO_RE = re.compile(r"^[\w.-]+/[\w.-]+$")
+LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:._/-]{0,63}$")
+ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
 
 # --- workflow scan (defense in depth) ---------------------------------------
 
@@ -366,6 +385,35 @@ def load_json(text: str | None, path: str, errors: list[str]) -> Any:
         return None
 
 
+def str_list(value: Any) -> list[str] | None:
+    """A non-empty JSON array of non-empty strings, or `None` if it is not one."""
+
+    if not isinstance(value, list) or not value:
+        return None
+    if not all(isinstance(item, str) and item for item in value):
+        return None
+    return list(value)
+
+
+def parse_instant(value: Any) -> datetime | None:
+    """Parse an ISO-8601 timestamp to a UTC instant, mirroring the checker.
+
+    Comparing these lexically is wrong across offsets: `2026-08-02T00:00:00+09:00`
+    sorts after `2026-08-01T23:00:00Z` but happens eight hours *before* it. The
+    exemption window is therefore compared as instants.
+    """
+
+    if not isinstance(value, str) or not ISO_Z_RE.fullmatch(value):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
 def contains_key(value: Any, keys: Iterable[str]) -> str | None:
     stack = [value]
     wanted = set(keys)
@@ -388,14 +436,32 @@ def policy_errors(candidate_text: str | None, base_text: str | None) -> list[str
         if policy is not None:
             errors.append(f"{POLICY_PATH} is not a JSON object")
         return errors
+    # Several policy checks are *comparisons* against the trusted base (the
+    # label contract, tier tightening, the credential and evidence-source
+    # names). Silently degrading to "no base" when the base copy cannot be read
+    # would turn every one of them off, so an unusable base fails closed.
     base: dict[str, Any] = {}
-    if base_text is not None and base_text.strip():
+    if base_text is None or not base_text.strip():
+        errors.append(
+            f"{POLICY_PATH} is missing from the trusted base; refusing to certify "
+            "a policy edit against an incomplete base"
+        )
+    else:
         try:
             loaded = json.loads(base_text)
-        except json.JSONDecodeError:
-            loaded = None
-        if isinstance(loaded, dict):
-            base = loaded
+        except json.JSONDecodeError as exc:
+            errors.append(
+                f"{POLICY_PATH} on the trusted base is not valid JSON "
+                f"({exc.msg}); refusing to certify a policy edit against it"
+            )
+        else:
+            if isinstance(loaded, dict):
+                base = loaded
+            else:
+                errors.append(
+                    f"{POLICY_PATH} on the trusted base is not a JSON object; "
+                    "refusing to certify a policy edit against it"
+                )
 
     forbidden = contains_key(policy, FORBIDDEN_POLICY_KEYS)
     if forbidden is not None:
@@ -403,6 +469,28 @@ def policy_errors(candidate_text: str | None, base_text: str | None) -> list[str
             f"{POLICY_PATH} carries pull-request-controlled advisory evidence "
             f"`{forbidden}`"
         )
+
+    # Repository identity decides which issues and advisories the checker reads.
+    # It is a format-checked constant, not a tunable, so it is pinned.
+    repository = policy.get("repository")
+    if not isinstance(repository, str) or not REPO_RE.fullmatch(repository):
+        errors.append(f"{POLICY_PATH} repository is not an `owner/name` identity")
+    else:
+        base_repository = base.get("repository")
+        if isinstance(base_repository, str) and base_repository:
+            if repository != base_repository:
+                errors.append(
+                    f"{POLICY_PATH} repository identity differs from the trusted "
+                    "base; the evaluated repository is not a pull-request choice"
+                )
+
+    # The versions label the contract the readiness snapshot was produced under.
+    # A bump is a legitimate part of a policy edit, so they are required to stay
+    # present and non-empty rather than pinned.
+    for key in ("policy_version", "classification_version"):
+        value = policy.get(key)
+        if not isinstance(value, str) or not value.strip():
+            errors.append(f"{POLICY_PATH} {key} is missing or empty")
 
     if normalized(policy.get("state_machine")) != normalized(REQUIRED_STATE_MACHINE):
         errors.append(f"{POLICY_PATH} state machine differs from the frozen contract")
@@ -419,16 +507,24 @@ def policy_errors(candidate_text: str | None, base_text: str | None) -> list[str
     if not isinstance(tiers, dict) or not tiers:
         errors.append(f"{POLICY_PATH} has no tier table")
         tiers = {}
+    if any(not isinstance(name, str) or not name for name in tiers):
+        errors.append(f"{POLICY_PATH} tier table holds a malformed tier name")
     ga = tiers.get("ga")
     ga_severities = ga.get("blocking_severities") if isinstance(ga, dict) else None
     if normalized(ga_severities) != ("critical", "high", "medium"):
         errors.append(f"{POLICY_PATH} GA tier no longer blocks every severity")
     base_tiers = base.get("tiers") if isinstance(base.get("tiers"), dict) else {}
     for tier, entry in tiers.items():
-        severities = entry.get("blocking_severities") if isinstance(entry, dict) else None
-        if not isinstance(severities, list) or not severities:
+        severities = str_list(entry.get("blocking_severities")) if isinstance(entry, dict) else None
+        if severities is None:
             errors.append(f"{POLICY_PATH} tier `{tier}` has no blocking severities")
             continue
+        unknown = sorted(set(severities) - set(SEVERITIES))
+        if unknown:
+            errors.append(
+                f"{POLICY_PATH} tier `{tier}` lists severities the checker does "
+                f"not know: {unknown}"
+            )
         base_entry = base_tiers.get(tier)
         base_severities = (
             base_entry.get("blocking_severities") if isinstance(base_entry, dict) else None
@@ -439,15 +535,48 @@ def policy_errors(candidate_text: str | None, base_text: str | None) -> list[str
                 "trusted base enforced"
             )
 
+    default_tier = policy.get("default_launch_tier")
+    if not isinstance(default_tier, str) or not default_tier:
+        errors.append(f"{POLICY_PATH} default_launch_tier is missing")
+    elif tiers and default_tier not in tiers:
+        errors.append(
+            f"{POLICY_PATH} default_launch_tier `{default_tier}` is not a defined tier"
+        )
+
     labels = policy.get("labels")
     base_labels = base.get("labels")
     if not isinstance(labels, dict):
         errors.append(f"{POLICY_PATH} has no label table")
-    elif isinstance(base_labels, dict) and normalized(labels) != normalized(base_labels):
-        errors.append(
-            f"{POLICY_PATH} label contract differs from the trusted base; a label "
-            "rename silently empties the blocker set"
-        )
+    else:
+        for key in ("launch_blocker", "launch_exempted"):
+            value = labels.get(key)
+            if not isinstance(value, str) or not LABEL_RE.fullmatch(value):
+                errors.append(f"{POLICY_PATH} label `{key}` is missing or malformed")
+        severity_labels = labels.get("severity")
+        if not isinstance(severity_labels, dict) or set(severity_labels) != set(SEVERITIES):
+            errors.append(
+                f"{POLICY_PATH} labels.severity must cover exactly "
+                f"{sorted(SEVERITIES)}"
+            )
+        else:
+            # Two severities sharing one label collapses their issue sets.
+            seen_labels: set[str] = set()
+            for severity in SEVERITIES:
+                value = severity_labels.get(severity)
+                if not isinstance(value, str) or not LABEL_RE.fullmatch(value):
+                    errors.append(
+                        f"{POLICY_PATH} labels.severity.{severity} is missing or "
+                        "malformed"
+                    )
+                    continue
+                if value in seen_labels:
+                    errors.append(f"{POLICY_PATH} labels.severity entries must be distinct")
+                seen_labels.add(value)
+        if isinstance(base_labels, dict) and normalized(labels) != normalized(base_labels):
+            errors.append(
+                f"{POLICY_PATH} label contract differs from the trusted base; a label "
+                "rename silently empties the blocker set"
+            )
 
     advisories = policy.get("private_advisories")
     base_advisories = base.get("private_advisories")
@@ -458,23 +587,117 @@ def policy_errors(candidate_text: str | None, base_text: str | None) -> list[str
         errors.append(f"{POLICY_PATH} disables the private-advisory contract")
     if advisories.get("representation") != "redacted_count_only":
         errors.append(f"{POLICY_PATH} private advisories are no longer redacted-count-only")
-    blocking_states = advisories.get("blocking_states")
-    if not isinstance(blocking_states, list) or not {"triage", "draft"} <= set(
-        blocking_states
-    ):
+    blocking_states = str_list(advisories.get("blocking_states"))
+    closed_states = str_list(advisories.get("closed_states"))
+    if blocking_states is None or not {"triage", "draft"} <= set(blocking_states):
         errors.append(f"{POLICY_PATH} unpublished advisory states no longer block")
+    if closed_states is None:
+        errors.append(f"{POLICY_PATH} private advisory closed_states is missing")
+    if blocking_states is not None and closed_states is not None:
+        # The checker partitions advisory states: a state in neither set (or in
+        # both) is an unclassified advisory, which is how a blocking state gets
+        # quietly demoted.
+        blocking_set = set(blocking_states)
+        closed_set = set(closed_states)
+        if blocking_set & closed_set:
+            errors.append(
+                f"{POLICY_PATH} advisory blocking and closed state sets overlap"
+            )
+        if blocking_set | closed_set != set(ADVISORY_STATES):
+            errors.append(
+                f"{POLICY_PATH} advisory state sets must cover exactly "
+                f"{sorted(ADVISORY_STATES)}"
+            )
+
+    by_tier = advisories.get("blocking_severities_by_tier")
+    base_by_tier = (
+        base_advisories.get("blocking_severities_by_tier")
+        if isinstance(base_advisories, dict)
+        else None
+    )
+    if not isinstance(by_tier, dict) or not by_tier:
+        errors.append(
+            f"{POLICY_PATH} has no private-advisory blocking_severities_by_tier table"
+        )
+    else:
+        if tiers and set(by_tier) != set(tiers):
+            errors.append(
+                f"{POLICY_PATH} private-advisory severities must cover exactly the "
+                "policy tiers"
+            )
+        for tier, value in by_tier.items():
+            severities = str_list(value)
+            if severities is None:
+                errors.append(
+                    f"{POLICY_PATH} private-advisory tier `{tier}` has no blocking "
+                    "severities"
+                )
+                continue
+            unknown = sorted(set(severities) - set(ADVISORY_SEVERITIES))
+            if unknown:
+                errors.append(
+                    f"{POLICY_PATH} private-advisory tier `{tier}` lists severities "
+                    f"the checker does not know: {unknown}"
+                )
+            base_severities = (
+                str_list(base_by_tier.get(tier))
+                if isinstance(base_by_tier, dict)
+                else None
+            )
+            if base_severities is not None and not set(base_severities) <= set(severities):
+                errors.append(
+                    f"{POLICY_PATH} private-advisory tier `{tier}` dropped a blocking "
+                    "severity the trusted base enforced"
+                )
+        ga_advisory = str_list(by_tier.get("ga"))
+        if ga_advisory is None or not REQUIRED_GA_ADVISORY_SEVERITIES <= set(ga_advisory):
+            errors.append(
+                f"{POLICY_PATH} GA tier no longer blocks every private-advisory "
+                "severity"
+            )
+
     never_emit = advisories.get("never_emit_fields")
     required_never_emit = set(REQUIRED_NEVER_EMIT_FIELDS)
     if not isinstance(never_emit, list) or not required_never_emit <= set(never_emit):
         errors.append(f"{POLICY_PATH} never_emit_fields dropped a confidential field")
     live_api = advisories.get("live_api")
-    if not isinstance(live_api, dict) or live_api.get(
-        "actions_security_events_permission_is_insufficient"
-    ) is not True:
-        errors.append(
-            f"{POLICY_PATH} claims the Actions token can list private advisories"
-        )
+    if not isinstance(live_api, dict):
+        errors.append(f"{POLICY_PATH} has no private-advisory live_api contract")
+    else:
+        if live_api.get("actions_security_events_permission_is_insufficient") is not True:
+            errors.append(
+                f"{POLICY_PATH} claims the Actions token can list private advisories"
+            )
+        token_env = live_api.get("token_env")
+        if not isinstance(token_env, str) or not ENV_NAME_RE.fullmatch(token_env):
+            errors.append(
+                f"{POLICY_PATH} live_api.token_env is not a valid environment-variable "
+                "name"
+            )
+        else:
+            # The credential the trusted lanes supply is named by the workflow,
+            # not by the candidate: redirecting this name points the live listing
+            # at an attacker-chosen (and therefore empty) variable.
+            base_live_api = (
+                base_advisories.get("live_api")
+                if isinstance(base_advisories, dict)
+                else None
+            )
+            base_token_env = (
+                base_live_api.get("token_env") if isinstance(base_live_api, dict) else None
+            )
+            if isinstance(base_token_env, str) and base_token_env:
+                if token_env != base_token_env:
+                    errors.append(
+                        f"{POLICY_PATH} live_api.token_env was redirected away from "
+                        "the trusted-base advisory credential"
+                    )
     fallback = advisories.get("trusted_fallback")
+    base_fallback = (
+        base_advisories.get("trusted_fallback")
+        if isinstance(base_advisories, dict)
+        else None
+    )
     if not isinstance(fallback, dict):
         errors.append(f"{POLICY_PATH} has no trusted advisory fallback contract")
     else:
@@ -486,11 +709,6 @@ def policy_errors(candidate_text: str | None, base_text: str | None) -> list[str
                 errors.append(
                     f"{POLICY_PATH} fallback max_age_seconds exceeds the frozen ceiling"
                 )
-            base_fallback = (
-                base_advisories.get("trusted_fallback")
-                if isinstance(base_advisories, dict)
-                else None
-            )
             base_age = (
                 base_fallback.get("max_age_seconds")
                 if isinstance(base_fallback, dict)
@@ -501,9 +719,30 @@ def policy_errors(candidate_text: str | None, base_text: str | None) -> list[str
                     errors.append(
                         f"{POLICY_PATH} widened the private-advisory freshness window"
                     )
+        # The fallback evidence lives in repository Actions variables a pull
+        # request can read but not write. Renaming either one redirects the
+        # checker at a variable a candidate *can* influence, or at an unrelated
+        # repository variable that happens to read as "zero blockers".
+        variable_names: dict[str, str] = {}
         for key in ("count_variable", "as_of_variable"):
-            if not isinstance(fallback.get(key), str) or not fallback.get(key):
-                errors.append(f"{POLICY_PATH} fallback `{key}` is missing")
+            name = fallback.get(key)
+            if not isinstance(name, str) or not ENV_NAME_RE.fullmatch(name):
+                errors.append(
+                    f"{POLICY_PATH} fallback `{key}` is not a valid "
+                    "environment-variable name"
+                )
+                continue
+            variable_names[key] = name
+            base_name = base_fallback.get(key) if isinstance(base_fallback, dict) else None
+            if isinstance(base_name, str) and base_name and name != base_name:
+                errors.append(
+                    f"{POLICY_PATH} fallback `{key}` was redirected away from the "
+                    "trusted-base evidence source"
+                )
+        if len(variable_names) == 2 and len(set(variable_names.values())) != 2:
+            errors.append(
+                f"{POLICY_PATH} fallback count and as-of variables must be distinct"
+            )
 
     tracked = policy.get("tracked_blockers")
     if not isinstance(tracked, list):
@@ -526,6 +765,11 @@ def policy_errors(candidate_text: str | None, base_text: str | None) -> list[str
                 errors.append(
                     f"{POLICY_PATH} tracked blocker {issue} has an unusable severity"
                 )
+            # Schema only: the inventory's *content* stays a CODEOWNER decision,
+            # but an entry the checker would reject must not reach `main`.
+            note = entry.get("note")
+            if not isinstance(note, str) or not note.strip():
+                errors.append(f"{POLICY_PATH} tracked blocker {issue} has no note")
 
     document = policy.get("document")
     base_document = base.get("document")
@@ -561,14 +805,29 @@ EXEMPTION_REQUIRED_KEYS = (
 )
 
 
-def exemption_errors(candidate_text: str | None) -> list[str]:
+def exemption_errors(
+    candidate_text: str | None, tier_names: set[str] | None = None
+) -> list[str]:
+    """Mirror `check_launch_readiness.py::validate_exemptions` on inert data.
+
+    An exemption is the one mechanism that clears a real blocker, so its schema
+    is enforced to the same strength as the production checker's: a positive
+    issue number, principals matching the checker's owner grammar, non-empty
+    rationale and compensating control, tiers the candidate policy actually
+    defines, and a validity window compared as instants.
+
+    `tier_names` is the candidate policy's tier set, passed in as parsed data.
+    Nothing from the candidate is imported or executed.
+    """
+
     errors: list[str] = []
     data = load_json(candidate_text, EXEMPTIONS_PATH, errors)
     if data is None:
         return errors
     if not isinstance(data, dict):
         return [f"{EXEMPTIONS_PATH} is not a JSON object"]
-    if not isinstance(data.get("exemptions_version"), str):
+    version = data.get("exemptions_version")
+    if not isinstance(version, str) or not version.strip():
         errors.append(f"{EXEMPTIONS_PATH} has no exemptions_version")
     entries = data.get("exemptions")
     if not isinstance(entries, list):
@@ -586,37 +845,82 @@ def exemption_errors(candidate_text: str | None) -> list[str]:
             continue
         identifier = entry["id"]
         if not isinstance(identifier, str) or not identifier:
-            errors.append(f"{EXEMPTIONS_PATH} exemption id is not a string")
+            errors.append(f"{EXEMPTIONS_PATH} exemption id is not a non-empty string")
             continue
         if identifier in identifiers:
             errors.append(f"{EXEMPTIONS_PATH} exemption `{identifier}` is duplicated")
         identifiers.add(identifier)
-        for key in ("approved_at", "expires_at"):
+
+        issue = entry["issue"]
+        if not isinstance(issue, int) or isinstance(issue, bool) or issue <= 0:
+            errors.append(
+                f"{EXEMPTIONS_PATH} exemption `{identifier}` has no positive issue "
+                "number"
+            )
+
+        for key in ("owner", "approver", "rationale", "compensating_control"):
             value = entry[key]
-            if not isinstance(value, str) or not ISO_Z_RE.match(value):
+            if not isinstance(value, str) or not value.strip():
+                errors.append(
+                    f"{EXEMPTIONS_PATH} exemption `{identifier}` has an empty {key}"
+                )
+                continue
+            if key in ("owner", "approver") and not OWNER_RE.fullmatch(value):
+                errors.append(
+                    f"{EXEMPTIONS_PATH} exemption `{identifier}` {key} is not an "
+                    "accountable principal"
+                )
+
+        instants: dict[str, datetime] = {}
+        for key in ("approved_at", "expires_at"):
+            parsed = parse_instant(entry[key])
+            if parsed is None:
                 errors.append(
                     f"{EXEMPTIONS_PATH} exemption `{identifier}` has a malformed {key}"
                 )
-        approved = entry["approved_at"]
-        expires = entry["expires_at"]
-        if (
-            isinstance(approved, str)
-            and isinstance(expires, str)
-            and ISO_Z_RE.match(approved)
-            and ISO_Z_RE.match(expires)
-            and expires <= approved
-        ):
+                continue
+            instants[key] = parsed
+        if len(instants) == 2 and instants["expires_at"] <= instants["approved_at"]:
             errors.append(
                 f"{EXEMPTIONS_PATH} exemption `{identifier}` never expires after approval"
             )
-        tiers = entry["launch_tiers"]
-        if not isinstance(tiers, list) or not tiers or not all(
-            isinstance(tier, str) and tier for tier in tiers
-        ):
+
+        tiers = str_list(entry["launch_tiers"])
+        if tiers is None:
             errors.append(
                 f"{EXEMPTIONS_PATH} exemption `{identifier}` has no launch tiers"
             )
+        elif tier_names:
+            unknown = sorted(set(tiers) - tier_names)
+            if unknown:
+                errors.append(
+                    f"{EXEMPTIONS_PATH} exemption `{identifier}` names launch tiers "
+                    f"the policy does not define: {unknown}"
+                )
     return errors
+
+
+def candidate_tier_names(policy_text: str | None) -> set[str] | None:
+    """The candidate policy's tier names, as inert parsed data.
+
+    `None` means "not determinable" — the policy is missing or malformed, which
+    `policy_errors` already reports; the tier-membership check is skipped rather
+    than reported a second time as an exemption fault.
+    """
+
+    if policy_text is None:
+        return None
+    try:
+        policy = json.loads(policy_text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(policy, dict):
+        return None
+    tiers = policy.get("tiers")
+    if not isinstance(tiers, dict):
+        return None
+    names = {name for name in tiers if isinstance(name, str) and name}
+    return names or None
 
 
 def document_errors(candidate_text: str | None, policy_text: str | None) -> list[str]:
@@ -836,7 +1140,11 @@ def verify(base: Root, candidate: Root) -> list[str]:
     errors.extend(presence_errors(candidate))
     errors.extend(anchor_errors(candidate, base))
     errors.extend(policy_errors(candidate.text("policy"), base.text("policy")))
-    errors.extend(exemption_errors(candidate.text("exemptions")))
+    errors.extend(
+        exemption_errors(
+            candidate.text("exemptions"), candidate_tier_names(candidate.text("policy"))
+        )
+    )
     errors.extend(document_errors(candidate.text("document"), candidate.text("policy")))
     errors.extend(check_run_identity_errors(candidate.workflows))
     errors.extend(secret_exposure_errors(candidate.workflows))
@@ -1133,6 +1441,52 @@ def _adopt_advisory(files: dict[str, str], workflows: dict[str, str]) -> None:
 
     files[SLOT_FILENAMES["advisory_verifier"]] = _FIXTURE_ADVISORY_VERIFIER
     workflows["launch-advisory-trust.yml"] = _FIXTURE_ADVISORY_WORKFLOW
+
+
+_FIXTURE_EXEMPTION = {
+    "id": "ex-1",
+    "issue": 4242,
+    "launch_tiers": ["ga"],
+    "owner": "fixture-owner",
+    "approver": "fixture-approver",
+    "rationale": "fixture rationale",
+    "compensating_control": "fixture compensating control",
+    "approved_at": "2026-08-01T00:00:00Z",
+    "expires_at": "2026-09-01T00:00:00Z",
+}
+
+
+def _exemption(**overrides: Any) -> dict[str, Any]:
+    entry = dict(_FIXTURE_EXEMPTION)
+    entry.update(overrides)
+    return entry
+
+
+def _exemptions_document(*entries: dict[str, Any]) -> str:
+    return (
+        json.dumps(
+            {"exemptions_version": "1", "exemptions": list(entries)}, indent=2
+        )
+        + "\n"
+    )
+
+
+def _with_exemptions(*entries: dict[str, Any]) -> Any:
+    def mutate(files: dict[str, str]) -> None:
+        files[SLOT_FILENAMES["exemptions"]] = _exemptions_document(*entries)
+
+    return mutate
+
+
+def _with_policy(apply: Any) -> Any:
+    """Build a fixture mutator that edits the policy as parsed JSON."""
+
+    def mutate(files: dict[str, str]) -> None:
+        policy = json.loads(files[SLOT_FILENAMES["policy"]])
+        apply(policy)
+        files[SLOT_FILENAMES["policy"]] = json.dumps(policy, indent=2) + "\n"
+
+    return mutate
 
 
 def run_self_test() -> int:
@@ -1538,6 +1892,253 @@ def run_self_test() -> int:
         )
 
     expect_rejected("exemption never expires", evaluate(open_ended_exemption))
+
+    # 7a. Private-advisory policy weakening. The checker is byte-frozen, but the
+    #     policy it consumes is candidate-editable, so every narrowing of what it
+    #     will block — and every redirection of where it reads evidence — has to
+    #     be refused here.
+    expect_rejected(
+        "GA private-advisory severities narrowed",
+        evaluate(
+            _with_policy(
+                lambda policy: policy["private_advisories"][
+                    "blocking_severities_by_tier"
+                ].__setitem__("ga", ["critical", "high"])
+            )
+        ),
+    )
+    expect_rejected(
+        "private-advisory tier set no longer matches the policy tiers",
+        evaluate(
+            _with_policy(
+                lambda policy: policy["private_advisories"][
+                    "blocking_severities_by_tier"
+                ].__setitem__("nightly", ["critical"])
+            )
+        ),
+    )
+    expect_rejected(
+        "unknown private-advisory severity",
+        evaluate(
+            _with_policy(
+                lambda policy: policy["private_advisories"][
+                    "blocking_severities_by_tier"
+                ].__setitem__("beta", ["critical", "high", "catastrophic"])
+            )
+        ),
+    )
+    expect_rejected(
+        "advisory blocking and closed states overlap",
+        evaluate(
+            _with_policy(
+                lambda policy: policy["private_advisories"]["closed_states"].append(
+                    "draft"
+                )
+            )
+        ),
+    )
+    expect_rejected(
+        "advisory state sets no longer cover every known state",
+        evaluate(
+            _with_policy(
+                lambda policy: policy["private_advisories"].__setitem__(
+                    "closed_states", ["published", "closed"]
+                )
+            )
+        ),
+    )
+    expect_rejected(
+        "advisory credential lookup redirected",
+        evaluate(
+            _with_policy(
+                lambda policy: policy["private_advisories"]["live_api"].__setitem__(
+                    "token_env", "ATTACKER_SUPPLIED_TOKEN"
+                )
+            )
+        ),
+    )
+    expect_rejected(
+        "advisory credential name is not an environment variable",
+        evaluate(
+            _with_policy(
+                lambda policy: policy["private_advisories"]["live_api"].__setitem__(
+                    "token_env", "launch advisory token"
+                )
+            )
+        ),
+    )
+    expect_rejected(
+        "fallback count variable redirected",
+        evaluate(
+            _with_policy(
+                lambda policy: policy["private_advisories"][
+                    "trusted_fallback"
+                ].__setitem__("count_variable", "SOME_UNRELATED_REPO_VARIABLE")
+            )
+        ),
+    )
+    expect_rejected(
+        "fallback as-of variable redirected",
+        evaluate(
+            _with_policy(
+                lambda policy: policy["private_advisories"][
+                    "trusted_fallback"
+                ].__setitem__("as_of_variable", "SOME_UNRELATED_REPO_VARIABLE")
+            )
+        ),
+    )
+    expect_rejected(
+        "fallback count and as-of variables collapsed onto one name",
+        evaluate(
+            _with_policy(
+                lambda policy: policy["private_advisories"][
+                    "trusted_fallback"
+                ].__setitem__("as_of_variable", "LAUNCH_PRIVATE_BLOCKER_COUNT")
+            )
+        ),
+    )
+    expect_rejected(
+        "fallback variable name is not an environment variable",
+        evaluate(
+            _with_policy(
+                lambda policy: policy["private_advisories"][
+                    "trusted_fallback"
+                ].__setitem__("as_of_variable", "launch.private.advisory.as-of")
+            )
+        ),
+    )
+
+    # 7b. Remaining policy schema parity with the frozen production checker.
+    expect_rejected(
+        "evaluated repository redirected",
+        evaluate(_with_policy(lambda policy: policy.__setitem__("repository", "attacker/fork"))),
+    )
+    expect_rejected(
+        "repository is not an owner/name identity",
+        evaluate(_with_policy(lambda policy: policy.__setitem__("repository", "ferrum-edge"))),
+    )
+    expect_rejected(
+        "policy version emptied",
+        evaluate(_with_policy(lambda policy: policy.__setitem__("policy_version", "  "))),
+    )
+    expect_rejected(
+        "classification version emptied",
+        evaluate(
+            _with_policy(lambda policy: policy.__setitem__("classification_version", ""))
+        ),
+    )
+    expect_rejected(
+        "default launch tier is not a defined tier",
+        evaluate(
+            _with_policy(lambda policy: policy.__setitem__("default_launch_tier", "nightly"))
+        ),
+    )
+    expect_rejected(
+        "unknown severity in a policy tier",
+        evaluate(
+            _with_policy(
+                lambda policy: policy["tiers"]["beta"].__setitem__(
+                    "blocking_severities", ["critical", "high", "catastrophic"]
+                )
+            )
+        ),
+    )
+    expect_rejected(
+        "severity label table dropped a severity",
+        evaluate(
+            _with_policy(lambda policy: policy["labels"]["severity"].pop("medium"))
+        ),
+    )
+    expect_rejected(
+        "two severities collapsed onto one label",
+        evaluate(
+            _with_policy(
+                lambda policy: policy["labels"]["severity"].__setitem__(
+                    "medium", "severity:high"
+                )
+            )
+        ),
+    )
+    expect_rejected(
+        "tracked blocker loses its note",
+        evaluate(_with_policy(lambda policy: policy["tracked_blockers"][0].pop("note"))),
+    )
+
+    def base_policy_unparsable(files: dict[str, str]) -> None:
+        files[SLOT_FILENAMES["policy"]] = "{ not json\n"
+
+    expect_rejected(
+        "trusted base policy is unreadable",
+        evaluate(mutate_base_files=base_policy_unparsable),
+    )
+
+    # 7c. Exemption schema parity. An exemption is the one mechanism that clears
+    #     a real blocker, so it is held to the production checker's schema.
+    expect_clean(
+        "well-formed exemption", evaluate(_with_exemptions(_exemption()))
+    )
+    expect_rejected(
+        "exemption owner is not an accountable principal",
+        evaluate(_with_exemptions(_exemption(owner="not a github login!"))),
+    )
+    expect_rejected(
+        "exemption approver is not an accountable principal",
+        evaluate(_with_exemptions(_exemption(approver="team/security"))),
+    )
+    expect_rejected(
+        "exemption issue is not positive",
+        evaluate(_with_exemptions(_exemption(issue=0))),
+    )
+    expect_rejected(
+        "exemption issue is a boolean",
+        evaluate(_with_exemptions(_exemption(issue=True))),
+    )
+    expect_rejected(
+        "exemption names an undefined launch tier",
+        evaluate(_with_exemptions(_exemption(launch_tiers=["nightly"]))),
+    )
+    expect_rejected(
+        "exemption rationale is blank",
+        evaluate(_with_exemptions(_exemption(rationale="   "))),
+    )
+    expect_rejected(
+        "exemption compensating control is empty",
+        evaluate(_with_exemptions(_exemption(compensating_control=""))),
+    )
+    expect_rejected(
+        "exemption ids are duplicated",
+        evaluate(_with_exemptions(_exemption(), _exemption(issue=4243))),
+    )
+
+    # An offset-bearing window whose lexical order is the reverse of its
+    # chronological order. `+09:00` sorts last but happens first: comparing the
+    # strings accepts an exemption that expired eight hours before it was
+    # approved, so the comparison is made on instants.
+    expect_rejected(
+        "exemption expiry precedes approval across timezone offsets",
+        evaluate(
+            _with_exemptions(
+                _exemption(
+                    approved_at="2026-08-01T23:00:00Z",
+                    expires_at="2026-08-02T00:00:00+09:00",
+                )
+            )
+        ),
+    )
+    # The mirror image: lexically inverted but chronologically valid (approved
+    # 2026-07-31T23:30Z, expires 2026-08-01T00:00Z). A lexical comparison would
+    # reject this legitimate exemption.
+    expect_clean(
+        "exemption window valid across timezone offsets",
+        evaluate(
+            _with_exemptions(
+                _exemption(
+                    approved_at="2026-08-01T00:30:00+01:00",
+                    expires_at="2026-08-01T00:00:00Z",
+                )
+            )
+        ),
+    )
 
     def marker_removed(files: dict[str, str]) -> None:
         files[SLOT_FILENAMES["document"]] = files[SLOT_FILENAMES["document"]].replace(
