@@ -321,8 +321,8 @@ pub fn read_stable_file(
             let (first_identity, first_bytes) = read_snapshot(path, options.max_bytes)?;
             // The first probe already proved the path exists, so a second-probe
             // absence is a replacement window, not a terminal `NotFound`.
-            let (second_identity, second_bytes) = read_snapshot(path, options.max_bytes)
-                .map_err(classify_error_after_first_probe)?;
+            let (second_identity, second_bytes) =
+                read_snapshot(path, options.max_bytes).map_err(classify_error_after_first_probe)?;
             if second_identity != first_identity {
                 return Err(StableFileError::Unstable(
                     "file identity changed between consecutive stable-read probes",
