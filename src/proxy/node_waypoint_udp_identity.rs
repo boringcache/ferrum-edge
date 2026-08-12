@@ -58,8 +58,12 @@
 //! churn safe: a veth index recycled onto a different pod, a pod restarted under
 //! a new UID at the same address, or a workload removed from the registry all
 //! change the attribution, so the in-flight session stops being served instead
-//! of continuing under evidence this generation no longer vouches for. An
-//! unchanged republish compares equal and disturbs nothing.
+//! of continuing under evidence this generation no longer vouches for. Sessions
+//! also pin the coherent accepted mesh-slice generation that supplied their
+//! plugin chain and policy scope; every later accepted slice retires the old
+//! authorization lifetime, including for a session admitted unattributable under
+//! mesh-wide-only policy. An unchanged registry republish compares equal and
+//! disturbs nothing.
 //!
 //! # Bounds
 //!
@@ -189,10 +193,15 @@ pub enum NodeWaypointUdpSourceRefusal {
     /// A live session's attribution changed under it (pod churn, interface
     /// reuse, or registry removal).
     AttributionChanged,
+    /// The accepted mesh-slice generation changed after this session's stream
+    /// admission. The old plugin chain and per-pod scope are no longer a valid
+    /// authorization lifetime, even when the workload's registry attribution
+    /// itself is unchanged.
+    PolicyGenerationChanged,
 }
 
 impl NodeWaypointUdpSourceRefusal {
-    pub const COUNT: usize = 6;
+    pub const COUNT: usize = 7;
 
     pub fn as_str(self) -> &'static str {
         match self {
@@ -202,6 +211,7 @@ impl NodeWaypointUdpSourceRefusal {
             Self::SourceAddressMismatch => "source_address_mismatch",
             Self::PodNotInSlice => "pod_not_in_slice",
             Self::AttributionChanged => "attribution_changed",
+            Self::PolicyGenerationChanged => "policy_generation_changed",
         }
     }
 
@@ -213,6 +223,7 @@ impl NodeWaypointUdpSourceRefusal {
             Self::SourceAddressMismatch => 3,
             Self::PodNotInSlice => 4,
             Self::AttributionChanged => 5,
+            Self::PolicyGenerationChanged => 6,
         }
     }
 
@@ -225,6 +236,7 @@ impl NodeWaypointUdpSourceRefusal {
             Self::SourceAddressMismatch,
             Self::PodNotInSlice,
             Self::AttributionChanged,
+            Self::PolicyGenerationChanged,
         ]
     }
 }
@@ -457,6 +469,11 @@ pub struct NodeWaypointUdpSourceScoping {
 pub struct ResolvedUdpSource {
     pub binding: Arc<NodeWaypointUdpSourceBinding>,
     pub scope: Arc<PolicyScopeCache>,
+    /// Coherent accepted mesh-slice generation that supplied `scope`. Sessions
+    /// pin this alongside the binding and close when it changes, so policy-only
+    /// updates cannot leave an established datagram flow on an old plugin/scope
+    /// generation.
+    pub policy_generation: u64,
 }
 
 /// How an admitted session must react to one of its datagrams failing
@@ -498,6 +515,46 @@ impl NodeWaypointUdpDatagramVerdict {
 }
 
 impl NodeWaypointUdpSourceScoping {
+    /// Resolve while also returning the coherent policy generation observed on
+    /// a miss. The plain `resolve` API remains for callers that only need an
+    /// admission verdict; UDP/DTLS session creation uses this richer form so an
+    /// unattributable-but-mesh-wide-only admission is still fenced by later
+    /// policy updates.
+    pub fn resolve_observed(
+        &self,
+        ingress_ifindex: Option<u32>,
+        source: IpAddr,
+    ) -> (
+        u64,
+        Result<ResolvedUdpSource, NodeWaypointUdpSourceRefusal>,
+    ) {
+        let binding = match self.index.authorize(ingress_ifindex, source) {
+            Ok(binding) => binding,
+            Err(refusal) => {
+                return (self.resolver.policy_scope_generation(), Err(refusal));
+            }
+        };
+        let (policy_generation, scope) = self
+            .resolver
+            .policy_scope_observation_for_pod_identity(&binding.pod_uid, &binding.principal);
+        let Some(scope) = scope else {
+            return (
+                policy_generation,
+                Err(self
+                    .index
+                    .record(NodeWaypointUdpSourceRefusal::PodNotInSlice)),
+            );
+        };
+        (
+            policy_generation,
+            Ok(ResolvedUdpSource {
+                binding,
+                scope,
+                policy_generation,
+            }),
+        )
+    }
+
     /// Attribute a datagram and resolve its per-pod policy scope from the same
     /// live-slice read that vouches the pod.
     pub fn resolve(
@@ -505,16 +562,7 @@ impl NodeWaypointUdpSourceScoping {
         ingress_ifindex: Option<u32>,
         source: IpAddr,
     ) -> Result<ResolvedUdpSource, NodeWaypointUdpSourceRefusal> {
-        let binding = self.index.authorize(ingress_ifindex, source)?;
-        let Some(scope) = self
-            .resolver
-            .policy_scope_for_pod_identity(&binding.pod_uid, &binding.principal)
-        else {
-            return Err(self
-                .index
-                .record(NodeWaypointUdpSourceRefusal::PodNotInSlice));
-        };
-        Ok(ResolvedUdpSource { binding, scope })
+        self.resolve_observed(ingress_ifindex, source).1
     }
 
     /// Re-authorize ONE datagram of an admitted session and classify what its
@@ -551,6 +599,44 @@ impl NodeWaypointUdpSourceScoping {
         }
     }
 
+    /// Generation-fenced form of [`Self::revalidate_datagram`] used by live
+    /// UDP/DTLS sessions. A policy-generation change is always a session
+    /// property and therefore closes the session, even when the triggering
+    /// datagram arrived on a different interface.
+    pub fn revalidate_datagram_at_policy_generation(
+        &self,
+        pinned: &NodeWaypointUdpSourceBinding,
+        pinned_policy_generation: u64,
+        pinned_ingress_ifindex: Option<u32>,
+        ingress_ifindex: Option<u32>,
+        source: IpAddr,
+    ) -> Result<(), NodeWaypointUdpDatagramVerdict> {
+        let Err(refusal) = self.revalidate_at_policy_generation(
+            pinned,
+            pinned_policy_generation,
+            ingress_ifindex,
+            source,
+        ) else {
+            return Ok(());
+        };
+        if refusal == NodeWaypointUdpSourceRefusal::PolicyGenerationChanged
+            || ingress_ifindex == pinned_ingress_ifindex
+        {
+            return Err(NodeWaypointUdpDatagramVerdict::CloseSession(refusal));
+        }
+        match self.revalidate_at_policy_generation(
+            pinned,
+            pinned_policy_generation,
+            pinned_ingress_ifindex,
+            source,
+        ) {
+            Ok(()) => Err(NodeWaypointUdpDatagramVerdict::DropDatagram(refusal)),
+            Err(pinned_refusal) => Err(NodeWaypointUdpDatagramVerdict::CloseSession(
+                pinned_refusal,
+            )),
+        }
+    }
+
     /// Re-authorize a live session against both current attribution evidence
     /// and the current slice's coherent pod-identity/scope generation.
     pub fn revalidate(
@@ -570,6 +656,67 @@ impl NodeWaypointUdpSourceScoping {
                 .record(NodeWaypointUdpSourceRefusal::PodNotInSlice));
         }
         Ok(())
+    }
+
+    /// Re-authorize an attributed session and require the exact accepted mesh
+    /// policy generation that ran its stream-admission plugin chain. A later
+    /// generation may change policy without changing workload identity or
+    /// labels, so presence of a current scope alone is insufficient.
+    pub fn revalidate_at_policy_generation(
+        &self,
+        pinned: &NodeWaypointUdpSourceBinding,
+        pinned_policy_generation: u64,
+        ingress_ifindex: Option<u32>,
+        source: IpAddr,
+    ) -> Result<(), NodeWaypointUdpSourceRefusal> {
+        self.index.revalidate(pinned, ingress_ifindex, source)?;
+        let (current_generation, scope) = self
+            .resolver
+            .policy_scope_observation_for_pod_identity(&pinned.pod_uid, &pinned.principal);
+        if current_generation != pinned_policy_generation {
+            return Err(self
+                .index
+                .record(NodeWaypointUdpSourceRefusal::PolicyGenerationChanged));
+        }
+        if scope.is_none() {
+            return Err(self
+                .index
+                .record(NodeWaypointUdpSourceRefusal::PodNotInSlice));
+        }
+        Ok(())
+    }
+
+    /// Revalidate a session that was deliberately admitted without an
+    /// attributable pod while the then-current mesh policy generation had no
+    /// enforcing scoped policy. The same miss must still be observed in the
+    /// same generation; any accepted slice update or newly attributable source
+    /// ends the old authorization lifetime.
+    pub fn revalidate_unattributed(
+        &self,
+        pinned_policy_generation: u64,
+        pinned_refusal: NodeWaypointUdpSourceRefusal,
+        ingress_ifindex: Option<u32>,
+        source: IpAddr,
+    ) -> Result<(), NodeWaypointUdpSourceRefusal> {
+        let (current_generation, current) = self.resolve_observed(ingress_ifindex, source);
+        if current_generation != pinned_policy_generation {
+            return Err(self
+                .index
+                .record(NodeWaypointUdpSourceRefusal::PolicyGenerationChanged));
+        }
+        match current {
+            Err(refusal) if refusal == pinned_refusal => Ok(()),
+            _ => Err(self
+                .index
+                .record(NodeWaypointUdpSourceRefusal::AttributionChanged)),
+        }
+    }
+
+    /// Record the closed-set refusal used when a datagram arrives on an
+    /// interface other than the one an unattributable session pinned.
+    pub(crate) fn record_attribution_changed(&self) -> NodeWaypointUdpSourceRefusal {
+        self.index
+            .record(NodeWaypointUdpSourceRefusal::AttributionChanged)
     }
 }
 

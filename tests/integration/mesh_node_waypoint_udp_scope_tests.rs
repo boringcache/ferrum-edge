@@ -410,6 +410,78 @@ fn a_policy_relevant_label_change_takes_effect_on_the_next_admission() {
     );
 }
 
+/// Established UDP/DTLS sessions carry the plugin chain and workload scope
+/// from admission. Even an accepted slice whose workload projection is
+/// unchanged may add or revoke AuthorizationPolicy, so the coherent slice
+/// generation must fence that old authorization lifetime.
+#[test]
+fn an_attributed_session_stops_revalidating_after_any_accepted_slice_generation() {
+    let fixture = Fixture::new();
+    fixture.manager.reconcile_once();
+    let scoping = fixture.scoping();
+    let admitted = scoping
+        .resolve(Some(IFINDEX_A), ip(IP_A))
+        .expect("pod A resolves in the admitted generation");
+
+    fixture
+        .resolver
+        .install_policy_scopes_from_workloads(&[
+            workload(SPIFFE_A, "team-a", labels(&[("app", "api")]), POD_A),
+            workload(SPIFFE_B, "team-b", labels(&[("app", "api")]), POD_B),
+        ]);
+
+    assert_eq!(
+        scoping
+            .revalidate_at_policy_generation(
+                &admitted.binding,
+                admitted.policy_generation,
+                Some(IFINDEX_A),
+                ip(IP_A),
+            )
+            .expect_err("the old stream-admission generation must be retired"),
+        NodeWaypointUdpSourceRefusal::PolicyGenerationChanged
+    );
+}
+
+/// A mesh-wide-only generation may admit an unattributable source, but that
+/// miss must still be pinned. Otherwise adding the first scoped policy would
+/// leave the established session on the old plugin generation forever because
+/// it has no workload binding to revalidate.
+#[test]
+fn an_unattributable_session_is_also_fenced_by_policy_generation() {
+    let fixture = Fixture::new();
+    fixture.manager.reconcile_once();
+    let scoping = fixture.scoping();
+    let (policy_generation, admission) =
+        scoping.resolve_observed(Some(999), ip("192.0.2.10"));
+    let refusal = admission
+        .err()
+        .expect("off-node interface is not attributable");
+    assert_eq!(
+        refusal,
+        NodeWaypointUdpSourceRefusal::UnenrolledInterface
+    );
+
+    fixture
+        .resolver
+        .install_policy_scopes_from_workloads(&[
+            workload(SPIFFE_A, "team-a", labels(&[("app", "api")]), POD_A),
+            workload(SPIFFE_B, "team-b", labels(&[("app", "api")]), POD_B),
+        ]);
+
+    assert_eq!(
+        scoping
+            .revalidate_unattributed(
+                policy_generation,
+                refusal,
+                Some(999),
+                ip("192.0.2.10"),
+            )
+            .expect_err("the old mesh-wide-only admission must be retired"),
+        NodeWaypointUdpSourceRefusal::PolicyGenerationChanged
+    );
+}
+
 /// Delete: a pod removed from the registry stops being attributable on the very
 /// next reconcile, and sessions pinned to its old binding stop revalidating.
 #[test]

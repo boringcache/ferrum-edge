@@ -138,12 +138,13 @@ struct UdpSession {
     /// (e.g., it came through tokio's cmsg-less `recv_from`).
     local_addr: std::sync::OnceLock<crate::socket_opts::PktinfoLocal>,
     /// NodeWaypoint source-workload attribution pinned at admission (issue
-    /// #3286). `None` for every non-NodeWaypoint listener and for sessions
-    /// admitted without an attributable source. When present, every subsequent
-    /// datagram of the session is re-authorized against the CURRENT published
-    /// generation and must still resolve to an attribution-identical binding,
-    /// so pod churn / interface reuse / registry removal ends the session
-    /// instead of letting it keep relaying under stale evidence.
+    /// #3286). `None` only for non-NodeWaypoint listeners. NodeWaypoint sessions
+    /// retain state even when mesh-wide-only policy admits an unattributable
+    /// source, so every subsequent datagram is fenced by the exact accepted
+    /// mesh-slice policy generation and either still resolves to the pinned
+    /// binding/miss or ends the session. Pod churn, interface reuse, registry
+    /// removal, and policy-only updates therefore cannot keep relaying under
+    /// stale evidence.
     node_waypoint_source: Option<NodeWaypointUdpSessionSource>,
     /// Identified consumer username (gateway Consumer or external identity) resolved
     /// during `on_stream_connect`. Carried to `on_stream_disconnect` for logging.
@@ -224,8 +225,15 @@ struct UdpSession {
 #[derive(Clone)]
 struct NodeWaypointUdpSessionSource {
     scoping: crate::proxy::node_waypoint_udp_identity::NodeWaypointUdpSourceScoping,
-    binding: Arc<crate::proxy::node_waypoint_udp_identity::NodeWaypointUdpSourceBinding>,
+    /// Present when admission attributed the source to an enrolled pod. `None`
+    /// is still stateful: mesh-wide-only policy may admit an unattributable
+    /// source, but the miss and policy generation below remain pinned so a
+    /// later scoped-policy update cannot leave that session on the old chain.
+    binding: Option<Arc<crate::proxy::node_waypoint_udp_identity::NodeWaypointUdpSourceBinding>>,
     ingress_ifindex: Option<u32>,
+    policy_generation: u64,
+    unresolved_refusal:
+        Option<crate::proxy::node_waypoint_udp_identity::NodeWaypointUdpSourceRefusal>,
 }
 
 impl NodeWaypointUdpSessionSource {
@@ -234,8 +242,23 @@ impl NodeWaypointUdpSessionSource {
         ingress_ifindex: Option<u32>,
         source: IpAddr,
     ) -> Result<(), crate::proxy::node_waypoint_udp_identity::NodeWaypointUdpSourceRefusal> {
-        self.scoping
-            .revalidate(&self.binding, ingress_ifindex, source)
+        if let Some(binding) = self.binding.as_deref() {
+            self.scoping.revalidate_at_policy_generation(
+                binding,
+                self.policy_generation,
+                ingress_ifindex,
+                source,
+            )
+        } else {
+            self.scoping.revalidate_unattributed(
+                self.policy_generation,
+                self.unresolved_refusal.unwrap_or(
+                    crate::proxy::node_waypoint_udp_identity::NodeWaypointUdpSourceRefusal::AttributionChanged,
+                ),
+                ingress_ifindex,
+                source,
+            )
+        }
     }
 
     /// Re-authorize a datagram whose ingress interface is the DATAGRAM's, not
@@ -249,8 +272,37 @@ impl NodeWaypointUdpSessionSource {
         source: IpAddr,
     ) -> Result<(), crate::proxy::node_waypoint_udp_identity::NodeWaypointUdpDatagramVerdict> {
         let pinned_iface = self.ingress_ifindex;
-        self.scoping
-            .revalidate_datagram(&self.binding, pinned_iface, ingress_ifindex, source)
+        if let Some(binding) = self.binding.as_deref() {
+            return self.scoping.revalidate_datagram_at_policy_generation(
+                binding,
+                self.policy_generation,
+                pinned_iface,
+                ingress_ifindex,
+                source,
+            );
+        }
+
+        // For an unattributable session the ingress interface is still exact
+        // kernel evidence. A forged tuple arriving on a different interface is
+        // dropped alone when the session's own pinned miss remains current; it
+        // must not become a cross-workload teardown primitive.
+        if ingress_ifindex != pinned_iface {
+            return match self.revalidate(pinned_iface, source) {
+                Ok(()) => Err(
+                    crate::proxy::node_waypoint_udp_identity::NodeWaypointUdpDatagramVerdict::DropDatagram(
+                        self.scoping.record_attribution_changed(),
+                    ),
+                ),
+                Err(refusal) => Err(
+                    crate::proxy::node_waypoint_udp_identity::NodeWaypointUdpDatagramVerdict::CloseSession(
+                        refusal,
+                    ),
+                ),
+            };
+        }
+        self.revalidate(ingress_ifindex, source).map_err(
+            crate::proxy::node_waypoint_udp_identity::NodeWaypointUdpDatagramVerdict::CloseSession,
+        )
     }
 }
 
@@ -2984,7 +3036,7 @@ async fn process_new_session_datagram(
     // unauthenticated clients must not be able to consume that bounded work
     // budget or remain in the pending-session map while stream policy will
     // ultimately reject them.
-    let (stream_ctx, node_waypoint_source_binding) = admit_plain_udp_stream(
+    let (stream_ctx, node_waypoint_session_source) = admit_plain_udp_stream(
         &epoch,
         &view,
         client_addr,
@@ -2993,15 +3045,6 @@ async fn process_new_session_datagram(
         local_addr.map(|local| local.ifindex),
     )
     .await?;
-    let node_waypoint_session_source = node_waypoint_source_binding.and_then(|binding| {
-        node_waypoint_udp_source
-            .cloned()
-            .map(|scoping| NodeWaypointUdpSessionSource {
-                scoping,
-                binding,
-                ingress_ifindex: local_addr.map(|local| local.ifindex),
-            })
-    });
 
     // Bind the flow's datagram hooks to the decisions the admission chain just
     // memoized. Evaluated once here; every datagram of this session — starting
@@ -3666,9 +3709,9 @@ async fn start_dtls_frontend_listener(
                     // unchanged. See docs/mesh.md.
                     let mut handler_node_waypoint_session_source = None;
                     if let Some(scoping) = handler_node_waypoint_source.as_ref() {
-                        match scoping
-                            .resolve(client_conn.ingress_ifindex, client_addr.ip())
-                        {
+                        let (policy_generation, resolution) = scoping
+                            .resolve_observed(client_conn.ingress_ifindex, client_addr.ip());
+                        match resolution {
                             Ok(resolved) => {
                                 stream_ctx.node_waypoint_policy_scope = Some(resolved.scope);
                                 stream_ctx.insert_metadata(
@@ -3678,8 +3721,10 @@ async fn start_dtls_frontend_listener(
                                 handler_node_waypoint_session_source =
                                     Some(NodeWaypointUdpSessionSource {
                                         scoping: scoping.clone(),
-                                        binding: resolved.binding,
+                                        binding: Some(resolved.binding),
                                         ingress_ifindex: client_conn.ingress_ifindex,
+                                        policy_generation: resolved.policy_generation,
+                                        unresolved_refusal: None,
                                     });
                             }
                             Err(refusal) => {
@@ -3688,6 +3733,18 @@ async fn start_dtls_frontend_listener(
                                     &client_ip,
                                     refusal,
                                 );
+                                // Mesh-wide-only policy may deliberately admit
+                                // this missing scope. Keep the miss state and
+                                // exact policy generation so a later accepted
+                                // scoped-policy slice terminates the session.
+                                handler_node_waypoint_session_source =
+                                    Some(NodeWaypointUdpSessionSource {
+                                        scoping: scoping.clone(),
+                                        binding: None,
+                                        ingress_ifindex: client_conn.ingress_ifindex,
+                                        policy_generation,
+                                        unresolved_refusal: Some(refusal),
+                                    });
                             }
                         }
                     }
@@ -4636,7 +4693,7 @@ async fn admit_plain_udp_stream(
 ) -> Result<
     (
         StreamConnectionContext,
-        Option<Arc<crate::proxy::node_waypoint_udp_identity::NodeWaypointUdpSourceBinding>>,
+        Option<NodeWaypointUdpSessionSource>,
     ),
     anyhow::Error,
 > {
@@ -4663,9 +4720,11 @@ async fn admit_plain_udp_stream(
     // unchanged. Both the identity and the scope come from ONE resolve, so a
     // vouched pod can never be paired with a scope from a different slice
     // generation — the same "never partial" rule the TCP path follows.
-    let mut node_waypoint_source_binding = None;
+    let mut node_waypoint_session_source = None;
     if let Some(scoping) = node_waypoint_udp_source {
-        match scoping.resolve(ingress_ifindex, client_addr.ip()) {
+        let (policy_generation, resolution) =
+            scoping.resolve_observed(ingress_ifindex, client_addr.ip());
+        match resolution {
             Ok(resolved) => {
                 stream_ctx.node_waypoint_policy_scope = Some(resolved.scope);
                 // The resolved pod's SPIFFE ID is this session's authenticated
@@ -4676,7 +4735,13 @@ async fn admit_plain_udp_stream(
                     "peer_spiffe_id".to_string(),
                     resolved.binding.principal.as_str().to_string(),
                 );
-                node_waypoint_source_binding = Some(resolved.binding);
+                node_waypoint_session_source = Some(NodeWaypointUdpSessionSource {
+                    scoping: scoping.clone(),
+                    binding: Some(resolved.binding),
+                    ingress_ifindex,
+                    policy_generation: resolved.policy_generation,
+                    unresolved_refusal: None,
+                });
             }
             Err(refusal) => {
                 // Leave the scope absent: `mesh_authz` denies the session when
@@ -4688,6 +4753,16 @@ async fn admit_plain_udp_stream(
                     &udp_session_client_ip(client_addr),
                     refusal,
                 );
+                // Mesh-wide-only policy may admit the absent scope. Preserve
+                // both the miss and this exact accepted slice generation so a
+                // later scoped-policy update cannot inherit the old admission.
+                node_waypoint_session_source = Some(NodeWaypointUdpSessionSource {
+                    scoping: scoping.clone(),
+                    binding: None,
+                    ingress_ifindex,
+                    policy_generation,
+                    unresolved_refusal: Some(refusal),
+                });
             }
         }
     }
@@ -4698,12 +4773,10 @@ async fn admit_plain_udp_stream(
             );
         }
     }
-    if let (Some(scoping), Some(binding)) = (
-        node_waypoint_udp_source,
-        node_waypoint_source_binding.as_ref(),
-    ) && let Err(refusal) = scoping.revalidate(binding, ingress_ifindex, client_addr.ip())
+    if let Some(source) = node_waypoint_session_source.as_ref()
+        && let Err(refusal) = source.revalidate(ingress_ifindex, client_addr.ip())
     {
-        scoping.index.warn_refusal(
+        source.scoping.index.warn_refusal(
             view.proxy.id.as_str(),
             &udp_session_client_ip(client_addr),
             refusal,
@@ -4713,7 +4786,7 @@ async fn admit_plain_udp_stream(
             refusal.as_str()
         ));
     }
-    Ok((stream_ctx, node_waypoint_source_binding))
+    Ok((stream_ctx, node_waypoint_session_source))
 }
 
 /// Create a new UDP session after stream admission and first-datagram policy.
