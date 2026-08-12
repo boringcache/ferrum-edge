@@ -24,6 +24,7 @@ Concepts map directly to the Istio service mesh model: `Workload` corresponds to
   - [PolicyScope Filtering](#policyscope-filtering)
   - [AuthorizationPolicy targetRefs](#authorizationpolicy-targetrefs-issue-3226)
   - [Evaluation Semantics](#evaluation-semantics)
+  - [AuthorizationPolicy action: CUSTOM](#authorizationpolicy-action-custom-issue-3235)
   - [Rule Matching](#rule-matching)
   - [SPIFFE Identity](#spiffe-identity)
   - [HBONE Protocol](#hbone-protocol)
@@ -1120,14 +1121,291 @@ DP slices reconstruct `MeshConfig` without `waypoint_bindings`, so Gateway prese
 
 ### Evaluation Semantics
 
-`evaluate_mesh_authorization()` processes policies in order:
+`evaluate_mesh_authorization_full()` processes policies in Istio's action order:
 
-1. **DENY rules checked first** -- first match returns `Deny`.
-2. **ALLOW rules** -- if any ALLOW rule exists in the policy set but none matched, the result is **implicit deny** (Istio semantics).
-3. **AUDIT rules** -- matched audit policies are returned for logging.
-4. If no DENY or ALLOW rules exist, the result is `Allow`.
+1. **CUSTOM rules checked first** -- a matching CUSTOM rule delegates the decision to its `meshConfig.extensionProviders` external authorizer *before* any DENY or ALLOW tier can settle the request. See [AuthorizationPolicy `action: CUSTOM`](#authorizationpolicy-action-custom-issue-3235).
+2. **DENY rules** -- first match returns `Deny`. A DENY still refuses a request an external authorizer was willing to admit.
+3. **ALLOW rules** -- if any ALLOW rule exists in the policy set but none matched, the result is **implicit deny** (Istio semantics). A CUSTOM rule does **not** contribute to that implicit-deny floor: it delegates rather than grants.
+4. **AUDIT rules** -- matched audit policies are returned for logging.
+5. If no CUSTOM, DENY, or ALLOW rules exist, the result is `Allow`.
 
-**Istio empty-rule semantics**: `ALLOW` with no rules is allow-nothing (emits a `never_matches` rule so the implicit deny applies). `DENY`/`AUDIT` with no rules are no-ops.
+**Istio empty-rule semantics**: `ALLOW` with no rules is allow-nothing (emits a `never_matches` rule so the implicit deny applies). `DENY`/`AUDIT` with no rules are no-ops. `CUSTOM` with no rules is **rejected** at translation: a ruleless delegation has no matching surface, so admitting it would produce an accepted-but-inert policy.
+
+### AuthorizationPolicy `action: CUSTOM` (issue #3235)
+
+An `AuthorizationPolicy` with `action: CUSTOM` delegates matching requests to an
+external authorization service declared in the **root-namespace**
+`meshConfig.extensionProviders` list:
+
+```yaml
+# istio-system/istio ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: istio
+  namespace: istio-system
+data:
+  mesh: |
+    extensionProviders:
+    - name: sample-ext-authz
+      envoyExtAuthzHttp:
+        service: ext-authz.istio-system.svc.cluster.local
+        port: 8000
+        scheme: https           # Ferrum extension, see "Provider transport"
+        timeout: 0.5s
+        pathPrefix: /check
+        failOpen: false
+        statusOnError: "403"
+        includeRequestHeadersInCheck:
+        - x-request-id
+        includeAdditionalHeadersInCheck:
+          x-ext-authz-caller: "ferrum-mesh"
+        headersToDownstreamOnDeny:
+        - www-authenticate
+---
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: delegate-admin
+  namespace: default
+spec:
+  action: CUSTOM
+  provider:
+    name: sample-ext-authz
+  selector:
+    matchLabels: { app: reviews }
+  rules:
+  - to:
+    - operation:
+        paths: ["/admin/*"]
+```
+
+**Provider resolution is root-namespace only.** `spec.provider.name` is resolved
+against `meshConfig.extensionProviders` in `FERRUM_K8S_ISTIO_ROOT_NAMESPACE`.
+A tenant namespace cannot introduce or shadow a provider, so cross-namespace
+provider resolution is structurally impossible rather than filtered. Each
+failure mode has its own field-shaped diagnostic and **rejects the resource**
+(it is never accepted-but-inert):
+
+| Condition | Outcome |
+| --- | --- |
+| `provider` absent / not an object / unknown field | rejected |
+| `provider.name` empty, non-string, or over 253 bytes | rejected |
+| name not declared in the root-namespace meshConfig | rejected, naming the root namespace |
+| name declared as a tracing (or other non-ext-auth) provider | rejected, "is not an external authorization provider" |
+| name declared as `envoyExtAuthzGrpc` | rejected, "a variant Ferrum does not implement" |
+| `action: CUSTOM` with no `rules` | rejected |
+| `provider` on a non-CUSTOM action | rejected |
+
+**Supported provider shape.** Only `envoyExtAuthzHttp` is implemented: the
+check is a bounded HTTP request. `envoyExtAuthzGrpc` is refused at admission
+rather than approximated — the Envoy gRPC check API carries attributes Ferrum
+does not model, and an approximation would silently change what a policy
+authorizes. The `envoyExtAuthzHttp` key set is **closed**: an unmodelled field
+(including the deprecated `includeHeadersInCheck`) is rejected rather than
+ignored, so an operator can never believe a field is in force when it is not.
+The enclosing extension-provider oneof is closed too: an entry carrying an
+HTTP ext-authz block plus any sibling provider variant or unknown field is
+rejected instead of choosing whichever recognized field appears first.
+
+**Provider transport.** Istio derives the ext-auth transport from the
+destination's own mesh configuration; Ferrum's provider dial does not go
+through that path, so the operator states it with a `scheme: http|https` field
+on the provider block. A **non-loopback** provider must use `https`: an
+unencrypted off-box check (which may carry a forwarded credential) is refused
+at admission. Loopback providers (`127.0.0.1`, `::1`, `localhost`) may use
+plaintext.
+
+**`service` must be a real bare URL host** — a DNS name, an IPv4 literal, or an
+IPv6 literal (bracketed or bare). Userinfo (`@`), an embedded port, a path,
+query, fragment, backslash, percent-encoding, or a bracket imbalance is
+rejected at admission rather than deferred to a per-request URL parse.
+`pathPrefix` is validated as a real path: it must start with a single `/` and
+may not carry `?`, `#`, `\`, percent-encoding, a `.` / `..` segment, or a
+leading `//` — those forms can be normalized or can move the request path into
+a different URL component. The composed base URL is re-parsed at config
+publication and must still carry only scheme, host, port, and path.
+
+> **Deliberate narrowing:** Istio's namespace-qualified
+> `[<namespace>/]<hostname>` service syntax is **not supported** and is
+> rejected with a diagnostic naming it. Ferrum dials the provider directly
+> rather than resolving it through the mesh service registry, so the namespace
+> qualifier has no meaning here — and silently dropping it would dial a
+> different service than the operator named. Declare the fully qualified
+> hostname instead.
+
+**`statusOnError` is an HTTP status.** Upstream Istio documents it as a status
+**string**, so `statusOnError: "403"` is the real operator input shape; a JSON
+integer (`403`) is also accepted for hand-authored Ferrum mesh documents. The
+internal representation is numeric. A value outside 4xx/5xx, an Envoy enum
+*name*, a float, or a non-numeric string is rejected rather than defaulted.
+
+**At most ONE extension provider may apply to a request.** Istio permits one
+extension provider per workload. Several CUSTOM policies naming the **same**
+provider coalesce into one check. Two CUSTOM policies naming **different**
+providers are refused: a workload-scoped conflict is rejected at plugin
+construction (the previous valid generation keeps serving), and a request that
+can see two distinct applicable providers across relay/waypoint destination
+scopes is denied with the stable reason `custom:provider-conflict`. Ferrum
+never picks the first match — that would let policy iteration order choose
+which operator's authorizer enforces. Different providers on **disjoint**
+workloads or destination scopes remain fully supported: the construction-time
+refusal applies only where the generation's policy set really is one workload's,
+so a node-waypoint generation (which serves every enrolled pod on the node from
+one listener) and a waypoint generation (whose `targetRefs` retention spans
+every fronted Service) may each carry one provider per pod / per destination,
+and only a request that can genuinely see two is refused.
+
+**CUSTOM runs before DENY across destination scopes too.** A request that spans
+several destination scopes (a node-waypoint relay serving many backends)
+evaluates **every** applicable scope before applying a decision: a DENY in an
+earlier scope is recorded and the scan continues, so a delegation carried by a
+later scope is still executed and still counted. The first DENY in scope order
+remains the reported policy, and it still refuses the request once the check has
+run — stopping the scan at that DENY would have let scope order decide whether
+an operator's authorizer ever saw a request the scope it protects applied to
+(and would have hidden a two-provider conflict living in a later scope).
+
+**Bounds.** `timeout` is capped at 30s (default 1s), `includeRequestBodyInCheck.maxRequestBytes`
+at 1 MiB, provider response reads at 64 KiB, each header list at 32 exact
+entries (case-insensitively unique), and the admitted provider set at 16 per
+mesh generation. In-flight checks are capped process-wide and are **refused
+immediately** at the ceiling rather than queued, so provider slowness cannot
+become unbounded gateway latency or memory growth.
+
+**Nothing is retried.** The check is dispatched through a dedicated
+single-attempt seam on the shared plugin HTTP client, so it keeps that client's
+no-proxy, redirect-disabled, DNS/egress-policy, TLS posture, redacted logging,
+latency accounting, and typed failure classification while performing **exactly
+one attempt** — `FERRUM_PLUGIN_HTTP_MAX_RETRIES` does not apply. A check is a
+decision, not a report: replaying it would turn one client request into several
+authorization decisions and amplify load onto a struggling authorizer.
+
+**What the check carries.** The HTTP ext-auth protocol's automatic fields are
+all present: the original request **method**, the (prefixed) **path**, the
+original **Host** authority, and **Content-Length** when a body is sent.
+Carrying the original authority is a header only — the connection is always
+dialled at the provider's own configured `service`/`port`, so a client-supplied
+authority can never route the provider connection. The query string is **not**
+forwarded (a credential in it must not reach the provider).
+`includeAdditionalHeadersInCheck` values are **authoritative**: a fixed
+operator header replaces any same-named client header or
+`includeRequestHeadersInCheck` value rather than being appended beside it, and
+case-variant duplicate fixed names are rejected at admission so the winner is
+never iteration-order dependent.
+
+**Outcome classification** follows the Istio/Envoy HTTP ext-auth protocol
+exactly:
+
+| Provider response | Outcome |
+| --- | --- |
+| HTTP `200` | **allow** |
+| HTTP `5xx` | **failed check** — follows `failOpen`; `statusOnError` when fail-closed |
+| communication failure (connect / TLS / timeout, or an unreadable / oversize `200` response) | **failed check** — follows `failOpen`; `statusOnError` when fail-closed |
+| any other status (3xx, 4xx, and any non-`200` 2xx such as `204`) | **explicit denial**, carrying the provider's own status |
+
+The denial Ferrum emits is gateway-authored and carries a fixed JSON error
+body, so a denial status that cannot frame content — `1xx`, a non-`200` `2xx`
+such as `204`/`205`, and `304` — is replaced by a plain `403`. Forwarding one
+verbatim would put `Content-Length` on a response the client is required not to
+read a body for, leaving those bytes to be misparsed as the head of the next
+response on an HTTP/1.1 keep-alive connection. `3xx` (except `304`) and `4xx`
+pass through unchanged, so a redirect-to-login denial paired with
+`headersToDownstreamOnDeny: [location]` still works. Only the unrepresentable
+status is replaced: the decision is still a denial and is still counted as
+`denied_by_provider`.
+
+Ferrum never uses or forwards the provider response body. Once an explicit
+denial status has arrived, that status remains authoritative even if its
+discarded body is oversized or cannot be drained; `failOpen` therefore cannot
+convert a provider denial into an allow through a body-framing failure.
+
+A provider name this generation does not carry, a generation with no executor,
+an unavailable request body for a body-inspecting provider, a concurrency
+refusal, and task cancellation are all failed checks and therefore also honour
+`failOpen`. **Three** refusals are decided **without** contacting a provider and
+are therefore **not** subject to `failOpen`: a provider conflict (above), a
+matched delegation on a connection with no HTTP request to check, and a request
+body over the selected provider's `maxRequestBytes` (below).
+
+**Request body.** `includeRequestBodyInCheck.maxRequestBytes` is folded into
+the proxy's pre-`authorize` body ceiling, so an over-cap request is refused with
+**413 before the check is dispatched**. That shared ceiling is the **maximum**
+`maxRequestBytes` across the generation's providers, because one prebuffer
+serves whichever provider the matched CUSTOM rule selects — it is **not**
+necessarily the selected provider's own cap, so a generation that also carries a
+higher-cap provider lets a body over a lower-cap provider's `maxRequestBytes`
+reach the check. The per-provider cap is re-enforced there as an
+**unconditional client-facing 413**, before any provider I/O and before a
+concurrency permit is taken, and it is **never** subject to `failOpen`: with
+`allowPartialMessage` refused at admission there is no truncated body a strict
+provider could have decided on, so an unrelated provider's larger cap can never
+admit a request the selected provider's cap excluded. (A body that is *missing*
+rather than too large stays an ordinary failed check and still honours
+`failOpen`.) That ceiling and the buffering it implies apply **only** to
+requests a body-inspecting CUSTOM rule could actually reach: the per-request
+predicate is precise on method, path, and host, so an unrelated request on the
+same workload keeps its ordinary accepted body size.
+
+> **Deliberate narrowing:** `includeRequestBodyInCheck.allowPartialMessage:
+> true` is **rejected at every admission boundary** (Kubernetes translation,
+> the native/file mesh document, and the xDS carrier). Envoy's partial-message
+> mode checks a bounded prefix and still forwards the complete original body
+> upstream; Ferrum's authorize-phase buffer *is* the body the proxy forwards, so
+> honouring the flag would mean either truncating the backend-visible request or
+> retaining an unbounded body behind a cap the operator asked for. An
+> accepted-but-unreachable flag would be worse than a visible refusal.
+
+**Mutation is deliberately narrow.** `headersToDownstreamOnDeny` is honoured:
+those headers land on the gateway-authored denial this plugin itself produces.
+`headersToUpstreamOnAllow` and `headersToDownstreamOnAllow` are **rejected at
+admission**. Ferrum runs the check in the `authorize` phase, before route
+dispatch and before every request/response transformer, so a header written
+there would order differently against operator-authored rules on each ingress
+path; a protocol-dependent mutation of an authenticated request is exactly the
+gap this feature must not introduce. Wildcard header entries are refused for
+the same reason a prefix rule cannot be shown to exclude hop-by-hop, routing,
+mesh-identity, or gateway-reserved names. The provider's own response **body**
+is never echoed to the client. Credentials (`authorization`, `cookie`) reach a
+provider only by being named explicitly in `includeRequestHeadersInCheck`; the
+full client header map and the request query string are never forwarded.
+
+**Protocol coverage.** The check runs on every HTTP-family ingress path
+identically — HTTP/1.1, HTTP/2, native gRPC, HTTP/3, and HTTP relayed inside a
+mesh/HBONE CONNECT — because they share one `authorize` ladder. Layer-4
+sessions (raw TCP, TLS passthrough, UDP, DTLS) carry no HTTP request and cannot
+be checked: a CUSTOM rule that **matches** an L4 connection **denies** it rather
+than serving it unchecked. Following Istio, HTTP-only fields are treated as
+**always matched** on a non-HTTP port for `DENY` **and `CUSTOM`** alike, so a
+CUSTOM rule carrying `paths` / `methods` / `headers` / `when: request.auth.*`
+still matches an L4 connection and still closes it — it does not quietly become
+inert. Scope a CUSTOM policy with `to.operation.ports` when the selected
+workload also serves non-HTTP ports.
+
+**Reload and withdrawal.** Providers ride the mesh slice (and their own
+`ExtAuthzProvidersCarrier` ECDS carrier over xDS, re-validated at the ACK
+boundary), and `MeshSlice::content_eq` compares them, so editing only
+`meshConfig.extensionProviders` still republishes. Each slice carries only the
+providers its retained policies actually bind. Deleting a CUSTOM policy retires
+its executor with the generation — there is no background task or detached
+queue to leak. A provider that cannot be prepared rejects the whole plugin
+generation, so the previous valid one keeps serving.
+
+**Observability.** `ferrum_mesh_ext_authz_checks_total{outcome}` and
+`ferrum_mesh_ext_authz_check_failures_total{disposition}` are fixed-cardinality:
+the labels are closed enums plus the gateway namespace, never a provider,
+policy, route, host, principal, or status string. `mesh_authz.ext_authz_outcome`
+request metadata carries the same closed reason token. Every matched
+delegation is counted **exactly once**, including the outcomes decided without
+contacting a provider (`provider_unbound` when no executor or no binding,
+`provider_conflict`, `unexecutable` for an L4 session), so a fail-closed
+denial is never invisible. `outcome` values are `allowed`, `denied_by_provider`,
+`provider_unbound`, `provider_error`, `provider_conflict`, `unexecutable`,
+`timeout`, `transport_error`, `response_refused`, `body_unavailable`,
+`body_too_large`, and `concurrency_exhausted`. `body_unavailable` (a failed
+check `failOpen` may admit) and `body_too_large` (the unconditional over-cap
+refusal) are deliberately separate series. No request body, credential header
+value, provider secret, or resolved provider URL is ever logged.
 
 ### Rule Matching
 
@@ -2175,10 +2453,10 @@ A listener that is edited, replaced, or deleted takes effect on the next slice a
 
 **Fail-closed transport gate.** The socket path rides the reserved `mesh.unix_socket` tag on the materialized upstream's single target — the same mechanism `mesh.hbone` / `mesh.mtls` use, and the same reserved `mesh.` namespace that is stripped from every operator/workload label copy, so a pod label can never forge it. Operator-provided upstream targets are also forbidden from setting any `mesh.*` tag through admin create/update, API-spec import, restore, or file configuration; only Ferrum's trusted mesh projection may stamp those transport markers. A target carrying the tag is dialed over a Unix stream **or the request is refused**; it is never downgraded to the target's placeholder `host:port` (which nothing listens on).
 
-### `bind` and `captureMode` limitations
+### `bind` and `captureMode`
 
-- **`bind`** — Ferrum's capture model funnels all inbound through the shared `:15006` listener (matched by captured original destination = the dialed listener port), so a custom `bind` address does **not** open a separate OS listener; it is preserved on the parsed model for observability. Unix-socket `bind` values are invalid (Istio rejects them too). **Issue #3266** tracks dedicated bind-address socket materialization separately; stream-ingress modeling (#3260) intentionally keeps this capture-listener contract and does not absorb custom-bind behavior.
-- **`captureMode`** — Ferrum assumes `IPTABLES`/`DEFAULT` capture (the sidecar redirect model). `captureMode: NONE` (the app handles capture itself) is not separately honored; the listener-port disambiguation relies on the captured original destination or the request authority port being present.
+- **`bind` (issue #3266)** — Omitted, empty, or unspecified (`0.0.0.0` / `::`) keeps the shared capture-listener contract: inbound traffic still enters through `:15006` and is disambiguated by captured original destination / authority port. A supported **dedicated** bind (`127.0.0.1` / `::1`) is conflict-checked against Gateway/stream/mesh listener ownership and materialized as a real OS listener on `bind:port` (HTTP via `GatewayListenerManager`, stream via `StreamListenerManager`) while the shared capture path remains for mesh peers. The dedicated HTTP accept loop is stamped as mesh inbound, and its configured/accepted listener port is the authoritative AuthorizationPolicy destination port; it never widens onto an ordinary process-global frontend or falls back to the `defaultEndpoint` port for authorization. Dedicated-bind HTTP routes are exact-listener only: they do **not** participate in single-listener Service remap, so a lone loopback bind cannot steal `:15006` / process-global matches from the port-agnostic capture sibling. Unsupported or unrepresentable values (Unix-domain sockets, hostnames, `ip:port`, non-loopback addresses) fail closed with field-specific `deferred_fields` / resolve diagnostics rather than being accepted as inert metadata. A dedicated bind that collides with an already-owned port, or that pairs with a `unix://` `defaultEndpoint`, fails closed for that **whole** ingress entry: it is removed from the prepared `local_ingress_listeners` set as well as bind-proxy / capture-route materialization, so there is no silent shared-capture or authenticated-CONNECT fallback. `sidecar_ingress_declared` and `declared_ingress_http_ports` stay independent of that admission so all-rejected / empty cases still fail closed without restoring default inbound behavior or incorrectly lowering the operator-declared HTTP port count.
+- **`captureMode`** — Ferrum assumes `IPTABLES`/`DEFAULT` capture (the sidecar redirect model). `captureMode: NONE` (the app handles capture itself) is not separately honored; the listener-port disambiguation relies on the captured original destination or the request authority port being present. Dedicated loopback binds still provide direct `bind:port` exposure for local dialers that bypass capture.
 
 ### xDS / file / native parity
 
