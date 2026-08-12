@@ -1894,3 +1894,39 @@ fn the_direct_h2_handler_joins_its_upload_before_returning() {
         "direct-H2 must arm cancel-on-drop so residual early returns still release the upload"
     );
 }
+
+#[test]
+fn the_authorization_expired_rejection_future_is_built_out_of_line() {
+    // Stack-budget invariant, not style (the one issue #3764 established for
+    // `boxed_proxy_to_backend_unix`). `handle_proxy_request_inner` is the
+    // generic request future every HTTP request is polled through, and in an
+    // unoptimized build every future awaited inline there is a fixed frame slot
+    // charged to EVERY request — including ones that can never take the branch.
+    // The rejection pipeline this arm awaits (after-proxy hooks, commit policy,
+    // gRPC-Web translation, rejection logging) is large enough that two inline
+    // copies overflowed a tokio worker stack on the coverage profile.
+    assert_eq!(
+        PROXY_SOURCE
+            .matches("Ok(finalize_authorization_expired_rejection(")
+            .count(),
+        0,
+        "the authorization-expired rejection future must not be materialized in \
+         the generic request future's frame"
+    );
+    assert_eq!(
+        PROXY_SOURCE
+            .matches("Ok(boxed_finalize_authorization_expired_rejection(")
+            .count(),
+        2,
+        "both buffered-gRPC authorization arms must use the out-of-line factory"
+    );
+    let factory = PROXY_SOURCE
+        .split("fn boxed_finalize_authorization_expired_rejection<'a>(")
+        .next()
+        .expect("the out-of-line rejection factory must remain present");
+    assert!(
+        factory.ends_with("#[allow(clippy::too_many_arguments)]\n#[inline(never)]\n"),
+        "the factory must stay `#[inline(never)]`: inlining it back into the \
+         caller restores the frame slot it exists to remove"
+    );
+}

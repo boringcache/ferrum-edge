@@ -24681,6 +24681,57 @@ async fn finalize_authorization_expired_rejection(
     response
 }
 
+/// One rejection-pipeline future, heap-allocated so it is not a frame slot in
+/// the caller. See [`boxed_finalize_authorization_expired_rejection`].
+type BoxedRejectionResponseFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Response<ProxyBody>> + Send + 'a>>;
+
+/// The authorization-expired rejection future, CONSTRUCTED OUT OF LINE and
+/// returned boxed.
+///
+/// This indirection is a stack-budget invariant, not a style choice (the same
+/// one issue #3764 established for `boxed_proxy_to_backend_unix`).
+/// `handle_proxy_request_inner` is THE generic request future every HTTP request
+/// the gateway serves is polled through, and in an unoptimized build (the
+/// coverage profile) every future it awaits inline is a FIXED `alloca` in that
+/// one poll frame — charged to every request, including ones that can never
+/// reach the branch. `finalize_authorization_expired_rejection` awaits the whole
+/// rejection pipeline (after-proxy hooks, the commit-policy pass, the gRPC-Web
+/// translation, and the rejection logger), so materializing it inline at the two
+/// buffered-gRPC upload arms added a large permanent slot twice over, on a path
+/// only an expired credential during a buffered gRPC upload ever executes.
+///
+/// Building the future in a separate, `#[inline(never)]` frame that RETURNS
+/// before anything is awaited keeps that temporary off the deep poll stack
+/// entirely: the caller stores only a pointer. The cost is one allocation, and
+/// only when a credential has actually expired mid-upload. Do not fold this back
+/// into the call sites without re-measuring the generic future's stack frame.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn boxed_finalize_authorization_expired_rejection<'a>(
+    plugins: &'a [Arc<dyn Plugin>],
+    ctx: &'a mut RequestContext,
+    state: &'a ProxyState,
+    start_time: Instant,
+    rejection_phase: &'a str,
+    plugin_execution_ns: u64,
+    original_request_path: Option<&'a str>,
+    grpc_web_response_content_type: Option<&'a str>,
+    termination: crate::proxy::auth_lifetime::StreamAuthTermination,
+) -> BoxedRejectionResponseFuture<'a> {
+    Box::pin(finalize_authorization_expired_rejection(
+        plugins,
+        ctx,
+        state,
+        start_time,
+        rejection_phase,
+        plugin_execution_ns,
+        original_request_path,
+        grpc_web_response_content_type,
+        termination,
+    ))
+}
+
 pub fn request_is_authenticated(ctx: &RequestContext) -> bool {
     ctx.effective_identity().is_some()
 }
@@ -29454,7 +29505,11 @@ async fn handle_proxy_request_inner(
                                 grpc_cb_probe_slot,
                             );
                             drop(preacquired_backend_admission.take_if_acquired());
-                            return Ok(finalize_authorization_expired_rejection(
+                            // Constructed out of line and boxed so this cold arm
+                            // is not a permanent frame slot in the generic
+                            // request future; see
+                            // `boxed_finalize_authorization_expired_rejection`.
+                            return Ok(boxed_finalize_authorization_expired_rejection(
                                 &plugins,
                                 &mut ctx,
                                 &state,
@@ -30084,7 +30139,9 @@ async fn handle_proxy_request_inner(
                             grpc_cb_probe_slot,
                         );
                         drop(preacquired_backend_admission.take_if_acquired());
-                        return Ok(finalize_authorization_expired_rejection(
+                        // Boxed out of line for the same stack-budget reason as
+                        // the split-path arm above.
+                        return Ok(boxed_finalize_authorization_expired_rejection(
                             &plugins,
                             &mut ctx,
                             &state,
