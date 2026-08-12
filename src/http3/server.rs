@@ -5331,6 +5331,7 @@ async fn handle_h3_request(
                 bytes_streamed: outcome.bytes_streamed,
                 client_disconnected: outcome.client_disconnected,
                 grpc_status: None,
+                authorization_termination: None,
             };
             run_response_stream_termination_hooks(
                 &plugins,
@@ -6406,6 +6407,7 @@ async fn handle_h3_request(
             bytes_streamed,
             client_disconnected,
             grpc_status: None,
+            authorization_termination: None,
         };
         run_response_stream_termination_hooks(&plugins, &mut ctx, response_status, &stream_outcome)
             .await;
@@ -7012,6 +7014,7 @@ async fn handle_h3_request(
             bytes_streamed: h3_stream_result.bytes_streamed,
             client_disconnected: h3_stream_result.client_disconnected,
             grpc_status: None,
+            authorization_termination: None,
         };
         run_response_stream_termination_hooks(&plugins, &mut ctx, response_status, &stream_outcome)
             .await;

@@ -6839,6 +6839,24 @@ pub mod _test_support {
             .map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()))
     }
 
+    /// Set a request's credential deadline directly so external tests can drive
+    /// the protocol-neutral authorization-lifetime arbiter without minting a
+    /// real token. Carries no credential material.
+    pub fn set_request_credential_deadline_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        deadline: Option<tokio::time::Instant>,
+    ) {
+        ctx.credential_deadline_at = deadline;
+    }
+
+    /// Monotonic instant the request was received. The authenticated-stream
+    /// maximum is anchored here, not at response-build time.
+    pub fn request_received_at_for_test(
+        ctx: &crate::plugins::RequestContext,
+    ) -> tokio::time::Instant {
+        ctx.grpc_deadline_received_at
+    }
+
     /// Construct a streaming `ProxyBody` for use in unit/integration tests.
     /// Delegates to the crate-private `ProxyBody::streaming` constructor,
     /// keeping that constructor internal while still letting tests exercise
@@ -6853,6 +6871,18 @@ pub mod _test_support {
         >,
     ) -> crate::proxy::ProxyBody {
         crate::proxy::body::ProxyBody::streaming(body)
+    }
+
+    /// Apply the protocol-neutral authorization-lifetime bound to a
+    /// `ProxyBody`, exactly as the H1/H2 and native-gRPC response funnels do.
+    /// Inputs are fixed test controls and carry no credential material.
+    pub fn proxy_body_with_authorization_deadline_for_test(
+        body: crate::proxy::ProxyBody,
+        deadline: crate::proxy::auth_lifetime::StreamAuthDeadline,
+        grpc_web_response_content_type: Option<&str>,
+        family: crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
+    ) -> crate::proxy::ProxyBody {
+        body.with_authorization_deadline(deadline, grpc_web_response_content_type, family)
     }
 
     pub fn proxy_body_with_client_grpc_deadline_for_test(

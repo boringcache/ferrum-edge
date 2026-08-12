@@ -2422,6 +2422,23 @@ pub struct EnvConfig {
     /// Absolute lifetime for every accepted WebSocket session, independent of
     /// traffic and idle activity. Must be 1..=86400 seconds. Default: 3600.
     pub websocket_max_lifetime_seconds: u64,
+    /// Finite fallback maximum authorization lifetime for an AUTHENTICATED
+    /// non-WebSocket stream — generic HTTP/SSE bodies, native gRPC, gRPC-Web,
+    /// and TCP/TLS or UDP/DTLS stream sessions — anchored when the request or
+    /// connection was admitted and never refreshed by traffic.
+    ///
+    /// The effective bound is the EARLIEST of this value and the accepted
+    /// credential's own authoritative expiry, so a credential with a short TTL
+    /// always wins. A credential accepted WITHOUT an authoritative expiry
+    /// (`key_auth`, `basic_auth`, `hmac_auth`, LDAP, an `mtls_auth` leaf with an
+    /// unusable validity horizon) is bounded by this value alone — there is no
+    /// indefinite authenticated-stream bypass and no "unbounded" setting.
+    ///
+    /// Unauthenticated streams are not bounded by this value; they carry no
+    /// authorization lifetime to enforce.
+    ///
+    /// Must be 1..=86400 seconds, validated in every mode. Default: 3600.
+    pub authenticated_stream_max_lifetime_seconds: u64,
     /// Maximum physical WebSocket frames a single fragmented message may consume
     /// before the connection is closed with RFC 6455 code `1008`. Counts the
     /// initial non-final Text/Binary frame plus every continuation frame that
@@ -3491,6 +3508,7 @@ impl Default for EnvConfig {
             websocket_tunnel_mode: false,
             websocket_idle_timeout_seconds: 300,
             websocket_max_lifetime_seconds: 3_600,
+            authenticated_stream_max_lifetime_seconds: 3_600,
             websocket_max_incomplete_message_frames: 1_024,
             websocket_max_incomplete_message_seconds: 60,
             max_credentials_per_type: 2,
@@ -4059,6 +4077,7 @@ impl EnvConfig {
             websocket_tunnel_mode: bool = "FERRUM_WEBSOCKET_TUNNEL_MODE" => false;
             websocket_idle_timeout_seconds: u64 = "FERRUM_WEBSOCKET_IDLE_TIMEOUT_SECONDS" => 300u64;
             websocket_max_lifetime_seconds: u64 = "FERRUM_WEBSOCKET_MAX_LIFETIME_SECONDS" => 3_600u64;
+            authenticated_stream_max_lifetime_seconds: u64 = "FERRUM_AUTHENTICATED_STREAM_MAX_LIFETIME_SECONDS" => 3_600u64;
             websocket_max_incomplete_message_frames: usize = "FERRUM_WEBSOCKET_MAX_INCOMPLETE_MESSAGE_FRAMES" => 1_024usize;
             websocket_max_incomplete_message_seconds: u64 = "FERRUM_WEBSOCKET_MAX_INCOMPLETE_MESSAGE_SECONDS" => 60u64;
             max_credentials_per_type: usize = "FERRUM_MAX_CREDENTIALS_PER_TYPE" => 2usize;
@@ -4846,6 +4865,7 @@ impl EnvConfig {
             websocket_tunnel_mode,
             websocket_idle_timeout_seconds,
             websocket_max_lifetime_seconds,
+            authenticated_stream_max_lifetime_seconds,
             websocket_max_incomplete_message_frames,
             websocket_max_incomplete_message_seconds,
             max_credentials_per_type,
@@ -5884,6 +5904,23 @@ impl EnvConfig {
                 "FERRUM_WEBSOCKET_MAX_LIFETIME_SECONDS must be between 1 and 86400 seconds".into(),
             );
         }
+        // A credential accepted without an authoritative expiry must still get a
+        // finite authorization lifetime, so `0`/unbounded is deliberately not a
+        // representable value in any mode.
+        if !(1..=86_400).contains(&self.authenticated_stream_max_lifetime_seconds) {
+            return Err(
+                "FERRUM_AUTHENTICATED_STREAM_MAX_LIFETIME_SECONDS must be between 1 and 86400 \
+                 seconds"
+                    .into(),
+            );
+        }
+        // Stream listeners accept connections far from any `EnvConfig`
+        // reference. Publish the validated value once so the TCP/TLS and
+        // UDP/DTLS session lifecycles can read it without threading a scalar
+        // through every accept-loop signature.
+        crate::proxy::auth_lifetime::publish_authenticated_stream_max_lifetime_seconds(
+            self.authenticated_stream_max_lifetime_seconds,
+        );
         if let Some(gateway_ref) = self.stream_gateway_ref.as_deref() {
             crate::proxy::stream_match::validate_canonical_gateway_ref(gateway_ref)
                 .map_err(|e| format!("FERRUM_STREAM_GATEWAY_REF: {e}"))?;

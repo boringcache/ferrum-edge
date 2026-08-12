@@ -8,6 +8,7 @@ Ferrum Edge supports two modes for handling backend response bodies: **streaming
 - [Configuration](#configuration)
 - [How Streaming Works](#how-streaming-works)
 - [Plugin Buffering Override](#plugin-buffering-override)
+- [Authorization Lifetime of an Admitted Stream](#authorization-lifetime-of-an-admitted-stream)
 - [Interaction with Retry Logic](#interaction-with-retry-logic)
 - [Interaction with Response Size Limits](#interaction-with-response-size-limits)
 - [Protocol-Specific Behavior](#protocol-specific-behavior)
@@ -317,6 +318,108 @@ buffering decision and may narrow that decision by request or response
 | `http_logging` | No | No |
 | `tcp_logging` | No | No |
 | `transaction_debugger` | No | Only with `log_response_body: true`, the `transaction_debug` DEBUG target enabled, and only for an identity-encoded, capturable textual response whose `Content-Length` fits the configured cap. gRPC (typed flavor), WebSocket including H2/H3 Extended CONNECT (typed flavor), SSE, chunked/unknown-length, encoded, oversized, and non-textual responses are released to stream. |
+
+## Authorization Lifetime of an Admitted Stream
+
+Idle timeouts, per-frame read timeouts, and RPC deadlines answer "is this stream
+still making progress". They are **independent** of the question this section
+answers: "is the credential that admitted this stream still valid".
+
+Ferrum streams SSE, chunked HTTP, native gRPC, and gRPC-Web bodies without
+buffering, and authentication runs once, at request admission. Without an
+explicit bound, a client could present a token with seconds of validity left,
+open a long-lived stream, and keep receiving protected data long after a *new*
+request with the same credential would be rejected. Issue #3815 tracks that gap;
+issue #3816 tracks the same gap for client certificates.
+
+### The contract
+
+Every authenticated stream carries one **absolute, monotonic authorization
+deadline**, anchored when the request was admitted. It is the **earliest** of:
+
+| Bound | Source |
+|-------|--------|
+| The accepted credential's authoritative expiry | JWT / JWKS `exp` plus that provider's configured leeway; OIDC session expiry; OAuth2 introspection `exp` / `active_until` / `expires_in`, converted once at validation so a cache hit cannot slide it; the `mtls_auth` leaf certificate's `notAfter` |
+| The finite fallback maximum | `FERRUM_AUTHENTICATED_STREAM_MAX_LIFETIME_SECONDS` (default `3600`, valid `1`–`86400`) |
+
+That deadline then composes with every other bound the protocol already
+enforces — the client `grpc-timeout`, listener replacement / route drain,
+process shutdown, and idle/read timeouts — on the same earliest-wins basis.
+
+Three properties are load-bearing:
+
+- **Activity never extends it.** DATA frames, SSE events, gRPC messages, and
+  keep-alives do not reset the timer. It is armed once and checked on every
+  poll, so a backend that streams continuously (and therefore never yields a
+  `Pending` poll to drive an idle check) is still bounded.
+- **There is no unbounded configuration.** A credential admitted without an
+  authoritative expiry — `key_auth`, `basic_auth`, `hmac_auth`, LDAP — is
+  bounded by the fallback maximum alone. `0` is rejected in every mode.
+- **Unauthenticated streams are untouched.** No principal was admitted, so
+  there is no authorization lifetime to enforce. A public SSE endpoint behaves
+  exactly as before.
+
+### Termination semantics
+
+| Point | Behavior |
+|-------|----------|
+| Before the credential is accepted | Ordinary authentication rejection — a fixed `401`. An expired JWT/JWKS/OIDC/introspection credential fails at validation; an `mtls_auth` leaf outside its validity interval fails the per-request temporal check, including on a reused H1 keep-alive connection and on new H2/H3 streams over an existing transport connection |
+| After acceptance, before any response DATA | Native gRPC receives `grpc-status: 16` (`UNAUTHENTICATED`) trailers; gRPC-Web receives the equivalent bounded trailer frame in DATA |
+| After response DATA is committed | The body ends with a transport error, which resets the HTTP/2 or HTTP/3 stream and terminates an HTTP/1.1 or SSE body deterministically. A complete gRPC message boundary cannot be proven at that point, so a terminal status is **never fabricated** |
+
+When the deadline fires, the wrapper drops the inner backend body immediately —
+before the downstream is polled again — so upstream work is cancelled, the
+opposite relay direction is torn down, and no detached producer remains. The
+request guard, per-IP guard, circuit-breaker and load-balancer accounting,
+backend-admission permits, and body-buffer budget are released exactly once
+through the same deferred machinery every other terminal path uses.
+
+### Observability
+
+Expiry is classified as a **policy** termination, not a backend fault, so error
+rate alerts stay meaningful:
+
+- Deferred backend accounting records it health-neutral (the backend did nothing
+  wrong), exactly like a client-chosen `grpc-timeout` expiry.
+- The transaction summary carries a bounded
+  `authorization.termination_reason` metadata value — `credential_expired` or
+  `authenticated_stream_max_lifetime` — stamped exactly once inside the
+  single-fire deferred logger.
+- `GET /metrics/runtime` exposes `authorization_lifetime`, a fixed-cardinality
+  counter pair whose only label dimension is a closed protocol family (`http`,
+  `grpc`, `grpc_web`, `websocket`, `stream_tcp`, `stream_udp`).
+
+No token, claim, subject identifier, certificate field, provider response, or
+absolute expiry value reaches a log, a metric, a trailer, or a response body.
+The `grpc-message` and the internal termination text are compiled-in literals.
+
+### Coverage
+
+| Surface | Enforced |
+|---------|----------|
+| Generic HTTP/1.1 and HTTP/2 streaming responses, including SSE | Yes |
+| Native gRPC server-, client-, and bidirectional streaming | Yes |
+| gRPC-Web streaming, binary and text | Yes |
+| HTTP/3 backend responses relayed to an H1/H2 downstream (`StreamingH3`) | Yes |
+| Inspected / latency-tracked streaming bodies | Yes |
+| WebSocket over H1, H2 Extended CONNECT, and H3 Extended CONNECT | Yes, through the pre-existing WebSocket deadline arbiter, which uses the same `credential_deadline_at` |
+| TCP+TLS stream sessions on the userspace relay | Yes |
+| UDP+DTLS stream sessions | Yes — raced against relay completion, the idle watchdog, and drain; both directions are closed and the backend connection is torn down |
+| CP/DP configuration streams | Yes, through the separate control-plane lifetime enforcement |
+
+Known gaps, tracked as follow-ups rather than silently implied:
+
+- The **native HTTP/3 frontend** response path (`src/http3/server.rs`) and the
+  **H3 cross-protocol** relay loops (`src/http3/cross_protocol.rs`) write frames
+  directly rather than through `ProxyBody`, and are not yet bounded by this
+  contract. They already enforce the client `grpc-timeout` and transport
+  deadlines. An H3 request whose credential is *already* expired is still
+  rejected at authentication.
+- The Linux **kTLS splice** frontend leg cannot be wrapped by the relay-side
+  deadline, so a stream session that would carry one is refused outright rather
+  than relayed unbounded.
+- **Plaintext TCP** stream sessions carry no gateway-verified credential from a
+  built-in mechanism, so no deadline is derived for them.
 
 ## Interaction with Retry Logic
 

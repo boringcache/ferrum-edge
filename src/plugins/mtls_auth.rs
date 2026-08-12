@@ -48,9 +48,57 @@ enum CertField {
 
 static NEXT_MTLS_AUTH_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Certificate-invariant temporal window retained beside a cached identity.
+///
+/// Only the two canonical Unix timestamps are kept. No DER, DN, SAN, serial, or
+/// fingerprint reaches this type, and neither value is ever logged, exported as
+/// a metric label, or echoed to a client.
+#[derive(Debug, Clone, Copy)]
+struct CertValidityWindow {
+    not_before_unix: i64,
+    not_after_unix: i64,
+}
+
+impl CertValidityWindow {
+    /// Parse the leaf's validity interval, failing closed on anything that
+    /// cannot be represented as a coherent window.
+    ///
+    /// `x509_parser` returns `i64` seconds, so an out-of-range or malformed
+    /// ASN.1 time surfaces as a nonsensical value rather than a panic. An
+    /// inverted interval (`not_after < not_before`) is rejected outright: such
+    /// a certificate can never be valid, and admitting it would make the
+    /// per-request check depend on which bound is compared first.
+    fn from_certificate(cert: &X509Certificate<'_>) -> Option<Self> {
+        let validity = cert.validity();
+        let not_before_unix = validity.not_before.timestamp();
+        let not_after_unix = validity.not_after.timestamp();
+        if not_after_unix < not_before_unix {
+            return None;
+        }
+        Some(Self {
+            not_before_unix,
+            not_after_unix,
+        })
+    }
+
+    /// Whether `now_unix` lies inside the closed interval. Both boundaries are
+    /// inclusive, matching RFC 5280's "valid at" semantics and
+    /// `x509_parser`'s own `Validity::is_valid_at`.
+    fn contains(&self, now_unix: i64) -> bool {
+        now_unix >= self.not_before_unix && now_unix <= self.not_after_unix
+    }
+}
+
 #[derive(Debug, Clone)]
 enum CertificateEvaluation {
-    Identity(String),
+    /// Certificate-invariant result: the extracted identity plus the leaf's
+    /// authoritative validity window. Deliberately does NOT record "was valid
+    /// when evaluated" — that is a time-dependent fact and is re-decided on
+    /// every request from the retained window.
+    Identity {
+        identity: String,
+        validity: CertValidityWindow,
+    },
     InvalidCertificate,
     Forbidden(String),
 }
@@ -657,6 +705,20 @@ impl MtlsAuth {
             }
         };
 
+        // Retain the leaf's authoritative validity window UNCONDITIONALLY,
+        // independently of whether optional issuer/CA constraints are
+        // configured (issue #3816). The default configuration previously
+        // reached identity extraction without ever consulting the leaf's
+        // temporal bounds, so a certificate that crossed `notAfter` after its
+        // TLS handshake kept authorizing requests on the same connection.
+        //
+        // A malformed or inverted interval is not representable as a window and
+        // fails closed here, before any identity is extracted.
+        let Some(validity) = CertValidityWindow::from_certificate(&parsed_cert) else {
+            debug!("mtls_auth: certificate validity interval is not usable");
+            return CertificateEvaluation::InvalidCertificate;
+        };
+
         if self.has_issuer_constraints()
             && let Err(reason) = self.verify_issuer_constraints(&parsed_cert, cert_der, chain_der)
         {
@@ -674,7 +736,7 @@ impl MtlsAuth {
             }
         };
 
-        CertificateEvaluation::Identity(identity)
+        CertificateEvaluation::Identity { identity, validity }
     }
 
     fn evaluation_outcome(
@@ -682,8 +744,8 @@ impl MtlsAuth {
         evaluation: &CertificateEvaluation,
         consumer_index: &ConsumerIndex,
     ) -> VerifyOutcome {
-        let identity = match evaluation {
-            CertificateEvaluation::Identity(identity) => identity,
+        let (identity, validity) = match evaluation {
+            CertificateEvaluation::Identity { identity, validity } => (identity, validity),
             CertificateEvaluation::InvalidCertificate => {
                 return VerifyOutcome::Invalid(r#"{"error":"Invalid client certificate"}"#.into());
             }
@@ -692,13 +754,44 @@ impl MtlsAuth {
             }
         };
 
+        // Cheap per-request temporal check (issue #3816). The expensive X.509
+        // parse, path verification, and identity extraction stay memoized per
+        // plugin instance and transport connection, but "is this certificate
+        // valid RIGHT NOW" is time-dependent and must never be cached: an H2 or
+        // H3 connection multiplexes new request streams for a long time without
+        // repeating the TLS handshake, and an H1 connection is reused for
+        // keep-alive requests. Two integer comparisons per request.
+        //
+        // X.509 validity is defined against wall-clock time, so the comparison
+        // has to read wall clock. The monotonic deadline attached below is what
+        // bounds an ALREADY-ADMITTED stream, so a wall-clock rollback cannot
+        // extend a running relay even though it can make a fresh request look
+        // in-window again.
+        let now_unix = x509_parser::time::ASN1Time::now().timestamp();
+        if !validity.contains(now_unix) {
+            // Fixed body. `notBefore`, `notAfter`, the observed time, the
+            // identity, and the certificate are all withheld from the client.
+            debug!("mtls_auth: client certificate is outside its validity interval");
+            return VerifyOutcome::Invalid(
+                r#"{"error":"Client certificate is not currently valid"}"#.into(),
+            );
+        }
+
         let consumer = if matches!(self.cert_field, CertField::SanDns) {
             consumer_index.find_by_mtls_dns_identity(identity)
         } else {
             consumer_index.find_by_mtls_identity(identity)
         };
         match consumer {
-            Some(consumer) => VerifyOutcome::consumer(consumer),
+            // The authoritative certificate bound published on the shared
+            // protocol-neutral contract. `credential_deadline_from_unix_seconds`
+            // converts it to a monotonic instant with zero leeway (mTLS has no
+            // configurable clock skew allowance) and saturates rather than
+            // overflowing, so a pathological `notAfter` cannot panic the
+            // authentication path.
+            Some(consumer) => VerifyOutcome::consumer(consumer).with_credential_deadline(Some(
+                auth_flow::credential_deadline_from_unix_seconds(validity.not_after_unix, 0),
+            )),
             None => VerifyOutcome::ConsumerNotFound(
                 r#"{"error":"No consumer found for client certificate"}"#.into(),
             ),
@@ -912,6 +1005,7 @@ auth_flow::impl_auth_plugin!(
         ) {
             VerifyOutcome::Success {
                 consumer: Some(consumer),
+                credential_deadline,
                 ..
             } => {
                 if ctx.identified_consumer.is_none() {
@@ -925,6 +1019,12 @@ auth_flow::impl_auth_plugin!(
                 if ctx.auth_method.is_none() {
                     ctx.auth_method = Some("mtls_auth");
                 }
+                // Carry the accepted certificate's authoritative monotonic
+                // deadline into the stream session lifecycle (issue #3816).
+                // `on_stream_connect` runs once at admission, so without this
+                // the raw TCP/TLS and DTLS relays would have no bound at all.
+                // Earliest wins across every admitting mechanism.
+                ctx.observe_credential_deadline(credential_deadline);
                 PluginResult::Continue
             }
             VerifyOutcome::NotApplicable => PluginResult::Continue,

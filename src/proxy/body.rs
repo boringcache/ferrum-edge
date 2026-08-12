@@ -28,6 +28,21 @@ use crate::retry::ErrorClass;
 
 pub type ProxyBodyError = Box<dyn std::error::Error + Send + Sync>;
 
+/// Wire value of `grpc-status: 16` (`UNAUTHENTICATED`), emitted when an
+/// admitted stream outlives the authorization lifetime of the credential that
+/// admitted it. A compiled-in literal so no expiry value can reach the wire.
+const AUTHORIZATION_EXPIRED_GRPC_STATUS_HEADER: &str = "16";
+
+/// Authorization-lifetime state carried on a client-visible response body.
+///
+/// `fired` is shared with the wrapper that owns the timer; `termination` is the
+/// bounded class that wrapper will publish. Neither carries credential material.
+#[derive(Clone)]
+struct StreamAuthDeadlineState {
+    fired: Arc<AtomicBool>,
+    termination: crate::proxy::auth_lifetime::StreamAuthTermination,
+}
+
 pub(crate) type BoxError = ProxyBodyError;
 
 /// A response body that is either fully buffered or streamed from the backend.
@@ -67,6 +82,13 @@ pub struct ProxyBody {
     /// terminal deadline frame (or abort after partial DATA). Deferred backend
     /// accounting uses this signal to keep a client-chosen expiry neutral.
     client_grpc_deadline_fired: Option<Arc<AtomicBool>>,
+    /// Set by the authorization-lifetime wrapper when the accepted credential's
+    /// deadline (or the finite authenticated-stream maximum) fired. Deferred
+    /// backend accounting treats it exactly like a client-chosen expiry —
+    /// health-neutral, never a backend fault — and the deferred logger records
+    /// the bounded termination class instead of a generic transport timeout.
+    /// Carries no token, claim, identity, or absolute expiry.
+    stream_auth_deadline: Option<StreamAuthDeadlineState>,
     /// Set by the streaming gRPC-Web adapter immediately before it yields the
     /// terminal body-framed trailer. The outer body uses this to finish
     /// deferred logging and backend outcome classification with the real gRPC
@@ -442,20 +464,32 @@ impl http_body::Body for GrpcWebStreamingBody {
                         )))));
                     }
                 };
-                // An outer client-deadline wrapper may already have produced a
-                // body-framed gRPC-Web terminal status. Preserve it verbatim
-                // (especially text mode, which is already base64-encoded) and
-                // expose its status to the outer deferred logger.
-                let inner_deadline_fired = this
+                // An inner client-deadline or authorization-lifetime wrapper may
+                // already have produced a body-framed gRPC-Web terminal status.
+                // Preserve it verbatim (especially text mode, which is already
+                // base64-encoded) and expose its status to the outer deferred
+                // logger. The authorization deadline is checked first so an
+                // expired credential is reported as `UNAUTHENTICATED` rather
+                // than a client-chosen `DEADLINE_EXCEEDED`.
+                let inner_auth_deadline_fired = this
                     .inner
-                    .client_grpc_deadline_fired
+                    .stream_auth_deadline
                     .as_ref()
-                    .is_some_and(|flag| flag.load(Ordering::Acquire));
+                    .is_some_and(|state| state.fired.load(Ordering::Acquire));
+                let inner_deadline_fired = inner_auth_deadline_fired
+                    || this
+                        .inner
+                        .client_grpc_deadline_fired
+                        .as_ref()
+                        .is_some_and(|flag| flag.load(Ordering::Acquire));
                 if inner_deadline_fired {
-                    this.terminal_status.store(
-                        u64::from(crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED),
-                        Ordering::Release,
-                    );
+                    let terminal_status = if inner_auth_deadline_fired {
+                        crate::proxy::grpc_proxy::grpc_status::UNAUTHENTICATED
+                    } else {
+                        crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED
+                    };
+                    this.terminal_status
+                        .store(u64::from(terminal_status), Ordering::Release);
                     this.terminal_emitted = true;
                     return Poll::Ready(Some(Ok(Frame::data(data))));
                 }
@@ -543,6 +577,7 @@ impl ProxyBody {
             backend_admission_outcome: None,
             backend_dispatch_outcome: None,
             client_grpc_deadline_fired: None,
+            stream_auth_deadline: None,
             grpc_web_terminal_status: None,
             logger: None,
             bytes_streamed: AtomicU64::new(0),
@@ -571,6 +606,7 @@ impl ProxyBody {
             backend_admission_outcome: None,
             backend_dispatch_outcome: None,
             client_grpc_deadline_fired: None,
+            stream_auth_deadline: None,
             grpc_web_terminal_status: None,
             logger: None,
             bytes_streamed: AtomicU64::new(0),
@@ -621,6 +657,7 @@ impl ProxyBody {
     ) -> Self {
         let mut inner = self;
         let client_grpc_deadline_fired = inner.client_grpc_deadline_fired.clone();
+        let stream_auth_deadline = inner.stream_auth_deadline.clone();
         let logger = inner.logger.take();
         let backend_admission_permits = inner._backend_admission_permits.take();
         let backend_admission_outcome = inner.backend_admission_outcome.take();
@@ -640,6 +677,7 @@ impl ProxyBody {
         body.backend_admission_outcome = backend_admission_outcome;
         body.backend_dispatch_outcome = backend_dispatch_outcome;
         body.client_grpc_deadline_fired = client_grpc_deadline_fired;
+        body.stream_auth_deadline = stream_auth_deadline;
         body.grpc_web_terminal_status = Some(terminal_status);
         body.logger = logger;
         body
@@ -874,6 +912,82 @@ impl ProxyBody {
         self
     }
 
+    /// Bound this client-visible response body by the accepted credential's
+    /// authorization lifetime (issue #3815).
+    ///
+    /// The deadline is absolute and armed once: response DATA, gRPC messages,
+    /// and SSE events never reset it. Stacking is intentional — a client
+    /// `grpc-timeout` wrapper may already be installed inside or outside this
+    /// one, and whichever deadline is earlier fires first, cancels the inner
+    /// body, and marks the stream done, so the later one can never produce a
+    /// second completion.
+    ///
+    /// Termination is protocol-correct:
+    /// * before any response DATA, native gRPC gets `grpc-status: 16`
+    ///   (`UNAUTHENTICATED`) trailers and gRPC-Web gets the equivalent bounded
+    ///   trailer frame in DATA;
+    /// * after response DATA — where a complete gRPC message boundary cannot be
+    ///   proven — the body ends with a boxed `TimedOut` error, which resets the
+    ///   HTTP/2 or HTTP/3 stream and ends an HTTP/1.1 or SSE body deterministically
+    ///   rather than fabricating a successful terminal status.
+    ///
+    /// A buffered (`Full`) body is already committed in its entirety and is
+    /// returned unchanged: there is no relay left to bound.
+    pub(crate) fn with_authorization_deadline(
+        mut self,
+        deadline: crate::proxy::auth_lifetime::StreamAuthDeadline,
+        grpc_web_response_content_type: Option<&str>,
+        family: crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
+    ) -> Self {
+        let terminal = DeadlineTerminal {
+            grpc_status_header: AUTHORIZATION_EXPIRED_GRPC_STATUS_HEADER,
+            grpc_message_header: deadline.termination.grpc_message(),
+            post_data_message: deadline.termination.post_commit_message(),
+            auth_termination: Some((deadline.termination, family)),
+        };
+        let deadline_frame = grpc_web_response_content_type.map(|content_type| {
+            let response = crate::plugins::grpc_web::error_response_for_content_type(
+                content_type,
+                crate::proxy::grpc_proxy::grpc_status::UNAUTHENTICATED,
+                deadline.termination.grpc_message(),
+            );
+            Frame::data(Bytes::from(response.body))
+        });
+        let fired = Arc::new(AtomicBool::new(false));
+        let placeholder = ProxyBodyKind::Full(Full::default());
+        let previous = std::mem::replace(&mut self.kind, placeholder);
+        self.kind = match previous {
+            ProxyBodyKind::Stream(body) => {
+                let bounded = TotalDeadlineBody::with_terminal(
+                    body,
+                    Some(deadline.at),
+                    deadline_frame,
+                    Arc::clone(&fired),
+                    terminal,
+                );
+                ProxyBodyKind::Stream(Box::pin(bounded))
+            }
+            ProxyBodyKind::Tracked(body) => {
+                let bounded = TotalDeadlineBody::with_terminal(
+                    body,
+                    Some(deadline.at),
+                    deadline_frame,
+                    Arc::clone(&fired),
+                    terminal,
+                );
+                ProxyBodyKind::Stream(Box::pin(bounded))
+            }
+            full @ ProxyBodyKind::Full(_) => full,
+        };
+        if matches!(self.kind, ProxyBodyKind::Stream(_)) {
+            self.stream_auth_deadline = Some(StreamAuthDeadlineState {
+                fired,
+                termination: deadline.termination,
+            });
+        }
+        self
+    }
+
     /// Attach the gRPC streaming request-body-overflow flag to an already-set
     /// deferred backend-admission outcome. When the flag has tripped by the time
     /// the body terminates, the recorded outcome is forced to `RequestBodyTooLarge`
@@ -944,6 +1058,7 @@ impl ProxyBody {
             backend_admission_outcome: None,
             backend_dispatch_outcome: None,
             client_grpc_deadline_fired: None,
+            stream_auth_deadline: None,
             grpc_web_terminal_status: None,
             logger: None,
             bytes_streamed: AtomicU64::new(0),
@@ -1160,10 +1275,19 @@ impl http_body::Body for ProxyBody {
             ProxyBodyKind::Stream(body) => body.as_mut().poll_frame(cx),
             ProxyBodyKind::Tracked(body) => Pin::new(body).poll_frame(cx),
         };
+        // The authorization-lifetime wrapper is classified exactly like the
+        // client-chosen gRPC deadline: health-neutral for backend accounting
+        // (the backend did nothing wrong) and terminal for this body.
+        let auth_deadline_termination = this
+            .stream_auth_deadline
+            .as_ref()
+            .filter(|state| state.fired.load(Ordering::Acquire))
+            .map(|state| state.termination);
         let client_deadline_fired = this
             .client_grpc_deadline_fired
             .as_ref()
-            .is_some_and(|flag| flag.load(Ordering::Acquire));
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+            || auth_deadline_termination.is_some();
         let grpc_web_terminal_status = this
             .grpc_web_terminal_status
             .as_ref()
@@ -1235,14 +1359,17 @@ impl http_body::Body for ProxyBody {
                 if is_trailers || is_grpc_web_deadline_terminal || is_grpc_web_streaming_terminal {
                     if let Some(logger) = this.logger.take() {
                         let bytes = this.bytes_streamed.load(Ordering::Relaxed);
-                        let terminal_grpc_status = if is_grpc_web_deadline_terminal {
+                        let terminal_grpc_status = if auth_deadline_termination.is_some() {
+                            Some(crate::proxy::grpc_proxy::grpc_status::UNAUTHENTICATED)
+                        } else if is_grpc_web_deadline_terminal {
                             Some(crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED)
                         } else {
                             grpc_status
                         };
                         logger.fire(
                             crate::proxy::deferred_log::BodyOutcome::success(bytes)
-                                .with_grpc_status(terminal_grpc_status),
+                                .with_grpc_status(terminal_grpc_status)
+                                .with_authorization_termination(auth_deadline_termination),
                         );
                     }
                     let terminal_class =
@@ -1259,11 +1386,16 @@ impl http_body::Body for ProxyBody {
                 };
                 if let Some(logger) = this.logger.take() {
                     let bytes = this.bytes_streamed.load(Ordering::Relaxed);
-                    let grpc_status = client_deadline_fired
-                        .then_some(crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED);
+                    let grpc_status = if auth_deadline_termination.is_some() {
+                        Some(crate::proxy::grpc_proxy::grpc_status::UNAUTHENTICATED)
+                    } else {
+                        client_deadline_fired
+                            .then_some(crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED)
+                    };
                     logger.fire(
                         crate::proxy::deferred_log::BodyOutcome::error(class, bytes, disconnected)
-                            .with_grpc_status(grpc_status),
+                            .with_grpc_status(grpc_status)
+                            .with_authorization_termination(auth_deadline_termination),
                     );
                 }
                 this.record_deferred_backend_admission(Some(class), disconnected);
@@ -1272,7 +1404,10 @@ impl http_body::Body for ProxyBody {
             Poll::Ready(None) => {
                 if let Some(logger) = this.logger.take() {
                     let bytes = this.bytes_streamed.load(Ordering::Relaxed);
-                    logger.fire(crate::proxy::deferred_log::BodyOutcome::success(bytes));
+                    logger.fire(
+                        crate::proxy::deferred_log::BodyOutcome::success(bytes)
+                            .with_authorization_termination(auth_deadline_termination),
+                    );
                 }
                 let terminal_class = client_deadline_fired.then_some(ErrorClass::ClientDisconnect);
                 this.record_deferred_backend_admission(terminal_class, client_deadline_fired);
@@ -1305,10 +1440,16 @@ impl Drop for ProxyBody {
     fn drop(&mut self) {
         let mut deferred_admission_error_class = None;
         let mut deferred_admission_client_disconnected = false;
+        let auth_deadline_termination = self
+            .stream_auth_deadline
+            .as_ref()
+            .filter(|state| state.fired.load(Ordering::Acquire))
+            .map(|state| state.termination);
         let client_deadline_fired = self
             .client_grpc_deadline_fired
             .as_ref()
-            .is_some_and(|flag| flag.load(Ordering::Acquire));
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+            || auth_deadline_termination.is_some();
         if let Some(logger) = self.logger.take() {
             let bytes = self.bytes_streamed.load(Ordering::Relaxed);
 
@@ -1379,7 +1520,10 @@ impl Drop for ProxyBody {
                 deferred_admission_error_class = outcome.body_error_class;
                 deferred_admission_client_disconnected = outcome.client_disconnected;
             }
-            logger.fire(outcome);
+            // `fire` is single-fire, so a body whose terminal poll already
+            // recorded the class cannot record it twice. This branch only
+            // covers the Drop safety net.
+            logger.fire(outcome.with_authorization_termination(auth_deadline_termination));
         } else if (self._backend_admission_permits.is_some()
             && self.backend_admission_outcome.is_some()
             || self.backend_dispatch_outcome.is_some())
@@ -3200,8 +3344,44 @@ struct TotalDeadlineBody<B> {
     deadline: Option<Pin<Box<tokio::time::Sleep>>>,
     deadline_frame: Option<Frame<Bytes>>,
     deadline_fired: Arc<AtomicBool>,
+    terminal: DeadlineTerminal,
     saw_data: bool,
     done: bool,
+}
+
+/// Protocol-correct terminal an absolute-deadline wrapper emits when it fires.
+///
+/// Every field is a compiled-in literal. No expiry value, claim, subject,
+/// certificate field, or provider detail can reach the wire through this type.
+#[derive(Debug, Clone, Copy)]
+struct DeadlineTerminal {
+    /// `grpc-status` value emitted as native trailers before any response DATA.
+    grpc_status_header: &'static str,
+    /// `grpc-message` emitted alongside `grpc_status_header`. Already in the
+    /// percent-encoded-safe ASCII subset.
+    grpc_message_header: &'static str,
+    /// Message carried by the boxed `TimedOut` error when the deadline fires
+    /// AFTER response DATA, where a clean gRPC message boundary cannot be
+    /// proven and the stream must be reset instead.
+    post_data_message: &'static str,
+    /// Fixed-cardinality authorization-lifetime termination recorded exactly
+    /// once when this deadline fires. `None` for the client `grpc-timeout`
+    /// deadline, which is a client-chosen RPC bound rather than an
+    /// authorization decision.
+    auth_termination: Option<(
+        crate::proxy::auth_lifetime::StreamAuthTermination,
+        crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
+    )>,
+}
+
+impl DeadlineTerminal {
+    /// The client `grpc-timeout` terminal (`DEADLINE_EXCEEDED`).
+    const CLIENT_GRPC_TIMEOUT: Self = Self {
+        grpc_status_header: GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER,
+        grpc_message_header: GATEWAY_DEADLINE_EXCEEDED_MESSAGE_HEADER,
+        post_data_message: "gRPC streaming response exceeded the client grpc-timeout deadline after response data",
+        auth_termination: None,
+    };
 }
 
 impl<B> TotalDeadlineBody<B> {
@@ -3215,11 +3395,28 @@ impl<B> TotalDeadlineBody<B> {
         deadline_frame: Option<Frame<Bytes>>,
         deadline_fired: Arc<AtomicBool>,
     ) -> Self {
+        Self::with_terminal(
+            inner,
+            deadline,
+            deadline_frame,
+            deadline_fired,
+            DeadlineTerminal::CLIENT_GRPC_TIMEOUT,
+        )
+    }
+
+    fn with_terminal(
+        inner: B,
+        deadline: Option<tokio::time::Instant>,
+        deadline_frame: Option<Frame<Bytes>>,
+        deadline_fired: Arc<AtomicBool>,
+        terminal: DeadlineTerminal,
+    ) -> Self {
         Self {
             inner: Some(inner),
             deadline: deadline.map(tokio::time::sleep_until).map(Box::pin),
             deadline_frame,
             deadline_fired,
+            terminal,
             saw_data: false,
             done: false,
         }
@@ -3264,6 +3461,12 @@ where
             this.done = true;
             this.deadline = None;
             this.deadline_fired.store(true, Ordering::Release);
+            // The `done` guard above makes this branch reachable at most once
+            // per body, so the fixed-cardinality counter is incremented exactly
+            // once per terminated stream.
+            if let Some((termination, family)) = this.terminal.auth_termination {
+                crate::proxy::auth_lifetime::record_termination(termination, family);
+            }
             // Cancel upstream work and release its stream/accounting guards as
             // soon as the deadline fires, before the downstream polls again.
             this.inner.take();
@@ -3274,17 +3477,17 @@ where
                 let mut trailers = http::HeaderMap::new();
                 trailers.insert(
                     "grpc-status",
-                    http::HeaderValue::from_static(GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER),
+                    http::HeaderValue::from_static(this.terminal.grpc_status_header),
                 );
                 trailers.insert(
                     "grpc-message",
-                    http::HeaderValue::from_static(GATEWAY_DEADLINE_EXCEEDED_MESSAGE_HEADER),
+                    http::HeaderValue::from_static(this.terminal.grpc_message_header),
                 );
                 return Poll::Ready(Some(Ok(Frame::trailers(trailers))));
             }
             return Poll::Ready(Some(Err(Box::new(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
-                "gRPC streaming response exceeded the client grpc-timeout deadline after response data",
+                this.terminal.post_data_message,
             )) as BoxError)));
         }
         let Some(inner) = this.inner.as_mut() else {

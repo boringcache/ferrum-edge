@@ -34,6 +34,7 @@
 //! - **Streaming by default**: Response bodies are streamed unless a plugin requires buffering
 //! - **Atomic config reload**: `update_config()` and `apply_incremental()` swap config atomically
 
+pub mod auth_lifetime;
 pub mod backend_capabilities;
 pub mod backend_dispatch;
 pub mod body;
@@ -30677,6 +30678,32 @@ async fn handle_proxy_request_inner(
                         &ctx.grpc_response_messages_observed,
                     ));
                 }
+                // Authorization lifetime (#3815) for native gRPC server-,
+                // client-, and bidirectional streaming. Bounded by the EARLIEST
+                // of the accepted credential's authoritative deadline and the
+                // finite authenticated-stream maximum, and stacked outside the
+                // client `grpc-timeout` deadline already installed inside the
+                // streaming body above, so whichever is earlier wins without a
+                // second completion. Attached before the gRPC-Web adapter so a
+                // translated stream terminates with the equivalent bounded
+                // trailer frame rather than native trailers.
+                if let Some(auth_deadline) =
+                    crate::proxy::auth_lifetime::effective_request_auth_deadline(
+                        &ctx,
+                        state.env_config.authenticated_stream_max_lifetime_seconds,
+                    )
+                {
+                    let auth_family = if grpc_web_streaming_content_type.is_some() {
+                        crate::proxy::auth_lifetime::StreamAuthProtocolFamily::GrpcWeb
+                    } else {
+                        crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Grpc
+                    };
+                    body = body.with_authorization_deadline(
+                        auth_deadline,
+                        grpc_web_streaming_content_type,
+                        auth_family,
+                    );
+                }
                 if let Some(content_type) = grpc_web_streaming_content_type {
                     body = body.into_grpc_web_streaming(
                         content_type,
@@ -34486,6 +34513,36 @@ async fn handle_proxy_request_inner(
         && crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(&ctx.metadata)
     {
         body = body.with_grpc_message_counter(Arc::clone(&ctx.grpc_response_messages_observed));
+    }
+    // Authorization lifetime (#3815). Bound this admitted stream by the
+    // EARLIEST of the accepted credential's authoritative deadline and the
+    // finite `FERRUM_AUTHENTICATED_STREAM_MAX_LIFETIME_SECONDS` fallback. This
+    // is the shared H1/H2/H3-downstream funnel, so generic chunked responses,
+    // SSE, translated gRPC-Web streams, and the inspected/tracked streaming
+    // bodies all inherit it from one place.
+    //
+    // Attached AFTER the client `grpc-timeout` wrapper and BEFORE the gRPC-Web
+    // adapter, exactly like that wrapper: whichever deadline is earlier fires
+    // first, cancels the inner body, and marks the stream done, so the two can
+    // never both complete. Unauthenticated requests get `None` here and are
+    // completely unaffected. A buffered body is already fully committed and is
+    // returned unchanged.
+    if let Some(auth_deadline) = crate::proxy::auth_lifetime::effective_request_auth_deadline(
+        &ctx,
+        state.env_config.authenticated_stream_max_lifetime_seconds,
+    ) {
+        let auth_family = if grpc_web_response_content_type.is_some() {
+            crate::proxy::auth_lifetime::StreamAuthProtocolFamily::GrpcWeb
+        } else if flavor == HttpFlavor::Grpc {
+            crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Grpc
+        } else {
+            crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http
+        };
+        body = body.with_authorization_deadline(
+            auth_deadline,
+            grpc_web_response_content_type,
+            auth_family,
+        );
     }
     let body = if let Some((content_type, initial_terminal_metadata)) = grpc_web_streaming_adapter {
         body.into_grpc_web_streaming(

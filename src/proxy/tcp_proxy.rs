@@ -641,6 +641,126 @@ fn pre_copy_disconnect_direction(error: &anyhow::Error, class: &ErrorClass) -> D
     }
 }
 
+/// Frontend leg handed to the userspace relay, with or without an
+/// authorization-lifetime bound. A concrete enum rather than a boxed trait
+/// object so the unbounded (and overwhelmingly common) case keeps the exact
+/// monomorphised `bidirectional_copy` it had before.
+enum StreamClientLeg<S> {
+    Plain(S),
+    Deadline(AuthorizationDeadlineStream<S>),
+}
+
+/// Frontend stream wrapper that terminates an admitted session at the accepted
+/// credential's authorization deadline (issue #3816).
+///
+/// The deadline is absolute and armed once at admission: relayed bytes in
+/// either direction never reset it. When it fires, both the read and the write
+/// half of the client leg start reporting `TimedOut`, which the relay's own
+/// Phase 1 / Phase 2 machinery treats exactly like any other client-side
+/// transport failure — so byte counters, first-failure attribution, adaptive
+/// buffer sampling, circuit-breaker classification, `on_stream_disconnect`, and
+/// the `StreamTransactionSummary` all complete exactly once through their
+/// existing paths, and the opposite direction is torn down with a bounded grace
+/// window rather than being left as a detached producer.
+///
+/// Wrapping the frontend leg (rather than racing the whole relay future in a
+/// `select!`) is what preserves that accounting: cancelling the relay future
+/// would drop its stack-local byte counters.
+///
+/// Carries no credential material — only a monotonic instant.
+pub(crate) struct AuthorizationDeadlineStream<S> {
+    inner: S,
+    deadline: Pin<Box<tokio::time::Sleep>>,
+    expired: Arc<AtomicBool>,
+}
+
+impl<S> AuthorizationDeadlineStream<S> {
+    pub(crate) fn new(
+        inner: S,
+        deadline_at: tokio::time::Instant,
+        expired: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            inner,
+            deadline: Box::pin(tokio::time::sleep_until(deadline_at)),
+            expired,
+        }
+    }
+
+    /// Poll the absolute deadline. Returns `true` once it has elapsed. Latches:
+    /// after the first `true` the timer is not consulted again.
+    fn expired(&mut self, cx: &mut std::task::Context<'_>) -> bool {
+        if self.expired.load(Ordering::Acquire) {
+            return true;
+        }
+        if std::future::Future::poll(self.deadline.as_mut(), cx).is_ready() {
+            self.expired.store(true, Ordering::Release);
+            return true;
+        }
+        false
+    }
+}
+
+fn authorization_expired_io_error() -> std::io::Error {
+    // Fixed message: no expiry value, identity, certificate field, or provider
+    // detail. This never reaches the client as a payload — a raw stream has no
+    // error channel — but it does reach the relay's error classifier and the
+    // connection-scoped debug log.
+    std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "authenticated stream terminated: authorization lifetime reached",
+    )
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for AuthorizationDeadlineStream<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if this.expired(cx) {
+            return Poll::Ready(Err(authorization_expired_io_error()));
+        }
+        Pin::new(&mut this.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for AuthorizationDeadlineStream<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        if this.expired(cx) {
+            return Poll::Ready(Err(authorization_expired_io_error()));
+        }
+        Pin::new(&mut this.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if this.expired(cx) {
+            return Poll::Ready(Err(authorization_expired_io_error()));
+        }
+        Pin::new(&mut this.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        // Shutdown must always be allowed through: it is the teardown the
+        // deadline itself is trying to reach, and refusing it would leave the
+        // socket half-open after expiry.
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
 /// Crate-visible bounded bidirectional relay used by TCP-family paths that
 /// need the same idle and half-close watchdogs as the dedicated TCP proxy.
 #[allow(clippy::too_many_arguments)]
@@ -3899,9 +4019,49 @@ async fn handle_tcp_connection_inner(
         _ => 0,
     };
 
+    // Authorization lifetime for the admitted stream session (issue #3816).
+    // `on_stream_connect` ran once at admission and is never repeated, so
+    // without this the session would outlive the certificate that admitted it.
+    // The bound is the EARLIEST of the accepted credential's own deadline (for
+    // `mtls_auth`, the leaf `notAfter`) and the finite authenticated-stream
+    // maximum, anchored at admission and never refreshed by relayed bytes.
+    // Unauthenticated stream connections get `None` and are unaffected.
+    let stream_auth_deadline = crate::proxy::auth_lifetime::effective_stream_auth_deadline(
+        stream_ctx.is_authenticated(),
+        stream_ctx.credential_deadline_at(),
+        tokio::time::Instant::from_std(start),
+        crate::proxy::auth_lifetime::authenticated_stream_max_lifetime_seconds(),
+    );
+    let stream_auth_expired = Arc::new(AtomicBool::new(false));
+
     // Start bidirectional copy. From here, no retries — bytes may be exchanged.
     let mut used_splice = false;
     let copy_result = match client_stream {
+        // A kernel-TLS frontend leg is relayed by `splice(2)`, which owns the
+        // sockets and cannot be wrapped by the authorization-deadline stream.
+        // Rather than silently relay an authenticated session with no
+        // authorization bound, fail closed. The combination is narrow: kTLS is
+        // Linux-only, opt-in, TLS 1.2 ChaCha20-Poly1305 only, plain-backend
+        // only, and only reachable at all when the listener also verifies a
+        // client certificate that a stream auth plugin mapped to a principal.
+        #[cfg(target_os = "linux")]
+        ClientRelayStream::Ktls(..) if stream_auth_deadline.is_some() => {
+            used_splice = false;
+            let error = anyhow::anyhow!(
+                "kTLS client leg cannot carry an authenticated stream authorization deadline: \
+                 the kernel splice relay cannot be bounded by the accepted credential's lifetime"
+            );
+            StreamCopyResult {
+                bytes_client_to_backend: 0,
+                bytes_backend_to_client: 0,
+                first_failure: Some((
+                    Direction::Unknown,
+                    classify_stream_error(&error),
+                    None,
+                    error.to_string(),
+                )),
+            }
+        }
         ClientRelayStream::Tls(tls_stream) => {
             // Userspace rustls relay. This is the fallback for every kTLS
             // refusal (non-Linux, TLS 1.3, unsupported/unprobed cipher, kernel
@@ -3910,10 +4070,25 @@ async fn handle_tcp_connection_inner(
             // kernel does not own.
             let tls_stream = *tls_stream;
             let buf_size = adaptive_buffer.get_buffer_size(&proxy.namespace, proxy_id);
-            match backend_stream {
-                BackendStream::Tls(bs) => {
+            // Wrap the frontend leg when the session carries an authorization
+            // deadline. Expiry surfaces to the relay as an ordinary client-side
+            // transport failure, so byte counters, first-failure attribution,
+            // circuit-breaker classification, `on_stream_disconnect`, and the
+            // stream transaction summary all run exactly once through their
+            // existing paths and the backend direction is drained under the
+            // relay's own bounded grace window.
+            let client_leg = match stream_auth_deadline {
+                Some(plan) => StreamClientLeg::Deadline(AuthorizationDeadlineStream::new(
+                    tls_stream,
+                    plan.at,
+                    Arc::clone(&stream_auth_expired),
+                )),
+                None => StreamClientLeg::Plain(tls_stream),
+            };
+            match (client_leg, backend_stream) {
+                (StreamClientLeg::Plain(cs), BackendStream::Tls(bs)) => {
                     bidirectional_copy(
-                        tls_stream,
+                        cs,
                         bs,
                         idle_timeout,
                         half_close_cap,
@@ -3923,9 +4098,33 @@ async fn handle_tcp_connection_inner(
                     )
                     .await
                 }
-                BackendStream::Plain(bs) => {
+                (StreamClientLeg::Plain(cs), BackendStream::Plain(bs)) => {
                     bidirectional_copy(
-                        tls_stream,
+                        cs,
+                        bs,
+                        idle_timeout,
+                        half_close_cap,
+                        backend_read_timeout,
+                        backend_write_timeout,
+                        buf_size,
+                    )
+                    .await
+                }
+                (StreamClientLeg::Deadline(cs), BackendStream::Tls(bs)) => {
+                    bidirectional_copy(
+                        cs,
+                        bs,
+                        idle_timeout,
+                        half_close_cap,
+                        backend_read_timeout,
+                        backend_write_timeout,
+                        buf_size,
+                    )
+                    .await
+                }
+                (StreamClientLeg::Deadline(cs), BackendStream::Plain(bs)) => {
+                    bidirectional_copy(
+                        cs,
                         bs,
                         idle_timeout,
                         half_close_cap,
@@ -4053,6 +4252,25 @@ async fn handle_tcp_connection_inner(
             }
         }
     };
+
+    // Publish the bounded authorization-lifetime termination class exactly once
+    // for this session. The relay has already returned, so this runs on every
+    // exit path (expiry, peer close, error) and the metadata reaches
+    // `on_stream_disconnect` and `StreamTransactionSummary` through the normal
+    // stream lifecycle. Fixed-cardinality: one class plus one protocol family,
+    // never an identity, certificate field, or absolute expiry.
+    if let Some(plan) = stream_auth_deadline
+        && stream_auth_expired.load(Ordering::Acquire)
+    {
+        crate::proxy::auth_lifetime::record_termination(
+            plan.termination,
+            crate::proxy::auth_lifetime::StreamAuthProtocolFamily::StreamTcp,
+        );
+        stream_ctx.insert_metadata(
+            crate::proxy::auth_lifetime::STREAM_AUTH_TERMINATION_METADATA_KEY.to_string(),
+            plan.termination.as_str().to_string(),
+        );
+    }
 
     // Record adaptive buffer stats for the TLS/non-passthrough path.
     // Only feed SUCCESSFUL relay sizes into the adaptive buffer tracker — see

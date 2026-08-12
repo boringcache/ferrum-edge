@@ -7393,6 +7393,16 @@ pub struct StreamConnectionContext {
     /// Authentication mechanism that succeeded for this stream connection.
     /// Mirrors `RequestContext::auth_method`.
     pub auth_method: Option<&'static str>,
+    /// Monotonic authorization deadline supplied by the accepted stream
+    /// credential — for `mtls_auth`, the leaf certificate's `notAfter`.
+    /// Mirrors `RequestContext::credential_deadline_at`.
+    ///
+    /// Private so a later hook cannot LENGTHEN a bound an earlier admitting
+    /// mechanism already established; use [`Self::observe_credential_deadline`]
+    /// (earliest wins) to contribute one and
+    /// [`Self::credential_deadline_at`] to read it. Contains no certificate,
+    /// DN, SAN, serial, fingerprint, or absolute expiry.
+    credential_deadline_at: Option<tokio::time::Instant>,
     /// Plugin metadata. Lazily allocated on first write to avoid a HashMap allocation
     /// for stream connections that have no metadata-writing plugins configured.
     pub metadata: Option<HashMap<String, String>>,
@@ -7512,6 +7522,7 @@ impl StreamConnectionContext {
             identified_consumer: None,
             authenticated_identity: None,
             auth_method: None,
+            credential_deadline_at: None,
             metadata: None,
             admission_permits: Vec::new(),
             tls_client_cert_der: None,
@@ -7596,6 +7607,35 @@ impl StreamConnectionContext {
             .as_ref()
             .map(|consumer| consumer.username.as_str())
             .or_else(|| meaningful_identity(self.authenticated_identity.as_deref()))
+    }
+
+    /// Contribute an authorization deadline observed by an admitting stream
+    /// authentication mechanism (issue #3816).
+    ///
+    /// Earliest wins and the bound is monotonic: a later hook can only tighten
+    /// it, never lengthen it, and `None` is a no-op rather than a reset. That
+    /// makes the field safe to expose to the plugin chain while keeping a
+    /// second, longer-lived credential from widening a bound already
+    /// established by a short-lived one.
+    pub fn observe_credential_deadline(&mut self, deadline: Option<tokio::time::Instant>) {
+        let Some(deadline) = deadline else {
+            return;
+        };
+        self.credential_deadline_at = Some(match self.credential_deadline_at {
+            Some(existing) => existing.min(deadline),
+            None => deadline,
+        });
+    }
+
+    /// The accepted stream credential's authorization deadline, if any.
+    pub fn credential_deadline_at(&self) -> Option<tokio::time::Instant> {
+        self.credential_deadline_at
+    }
+
+    /// Whether this connection admitted an authenticated principal. Mirrors the
+    /// HTTP-side predicate in `proxy::auth_lifetime::request_is_authenticated`.
+    pub fn is_authenticated(&self) -> bool {
+        self.identified_consumer.is_some() || self.authenticated_identity.is_some()
     }
 
     /// Insert a metadata value, lazily allocating the map on first write.

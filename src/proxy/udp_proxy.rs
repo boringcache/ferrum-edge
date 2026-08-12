@@ -3342,6 +3342,24 @@ async fn start_dtls_frontend_listener(
                         Default::default()
                     };
 
+                    // Authorization lifetime for the admitted DTLS session
+                    // (issue #3816). `on_stream_connect` ran once at admission
+                    // and is never repeated, so the session would otherwise
+                    // outlive the certificate that admitted it. Earliest of the
+                    // accepted credential's own deadline and the finite
+                    // authenticated-stream maximum, anchored here and never
+                    // refreshed by relayed datagrams. `None` for an
+                    // unauthenticated session.
+                    let handler_auth_max_lifetime =
+                        crate::proxy::auth_lifetime::authenticated_stream_max_lifetime_seconds();
+                    let handler_auth_deadline =
+                        crate::proxy::auth_lifetime::effective_stream_auth_deadline(
+                            stream_ctx.is_authenticated(),
+                            stream_ctx.credential_deadline_at(),
+                            tokio::time::Instant::now(),
+                            handler_auth_max_lifetime,
+                        );
+
                     let result = handle_dtls_client(
                         client_conn,
                         client_addr,
@@ -3359,6 +3377,7 @@ async fn start_dtls_frontend_listener(
                         port,
                         &handler_crls,
                         &handler_dtls_cache,
+                        handler_auth_deadline,
                     )
                     .await;
                     let (err_msg, error_class, disconnect_cause, disconnect_direction) =
@@ -3524,6 +3543,7 @@ async fn handle_dtls_client(
     listen_port: u16,
     crls: &crate::tls::CrlList,
     backend_dtls_config_cache: &BackendDtlsConfigCache,
+    auth_deadline: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
 ) -> DtlsHandlerResult {
     let mut backend_info = DtlsBackendInfo {
         backend_target: String::new(),
@@ -3558,6 +3578,7 @@ async fn handle_dtls_client(
         listen_port,
         crls,
         backend_dtls_config_cache,
+        auth_deadline,
     )
     .await;
     DtlsHandlerResult {
@@ -3700,6 +3721,7 @@ async fn handle_dtls_client_inner(
     listen_port: u16,
     crls: &crate::tls::CrlList,
     backend_dtls_config_cache: &BackendDtlsConfigCache,
+    auth_deadline: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
 ) -> Result<(), anyhow::Error> {
     // Look up proxy config
     let proxy = epoch
@@ -4041,11 +4063,38 @@ async fn handle_dtls_client_inner(
     let mut client_to_backend = client_to_backend;
     let mut backend_to_client = backend_to_client;
     let mut idle_watchdog = Box::pin(dtls_shared_idle_watchdog(shared_activity_ms, idle_timeout));
+    // Absolute authorization deadline for the admitted session. Armed once and
+    // never refreshed by relayed datagrams, unlike the idle watchdog beside it.
+    // An unauthenticated session (or one whose plan is absent) leaves the arm
+    // permanently pending, so the relay behaves exactly as before.
+    let authorization_deadline_active = auth_deadline.is_some();
+    let mut authorization_deadline = Box::pin(tokio::time::sleep_until(
+        auth_deadline
+            .map(|plan| plan.at)
+            .unwrap_or_else(tokio::time::Instant::now),
+    ));
     let outcome = tokio::select! {
         _ = &mut client_to_backend => Ok(()),
         _ = &mut backend_to_client => Ok(()),
         result = &mut idle_watchdog => result,
+        _ = &mut authorization_deadline, if authorization_deadline_active => {
+            // Fixed-cardinality termination class, recorded once on the single
+            // path that can reach this arm.
+            if let Some(plan) = auth_deadline {
+                crate::proxy::auth_lifetime::record_termination(
+                    plan.termination,
+                    crate::proxy::auth_lifetime::StreamAuthProtocolFamily::StreamUdp,
+                );
+            }
+            // Fixed message: no expiry value, identity, or certificate detail.
+            Err(anyhow::anyhow!(
+                "authenticated DTLS session terminated: authorization lifetime reached"
+            ))
+        }
     };
+    // Both relay directions and the backend connection are torn down on every
+    // exit path below, including the authorization deadline, so no detached
+    // producer remains and the disconnect/accounting runs exactly once.
     client_to_backend.abort();
     backend_to_client.abort();
 
