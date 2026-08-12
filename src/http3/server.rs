@@ -1136,8 +1136,8 @@ async fn handle_h3_connection(
     // depth. SETTINGS_H3_DATAGRAM is deliberately left unnegotiated: the
     // CONNECT-UDP profile carries HTTP Datagrams as RFC 9297 DATAGRAM capsules
     // on the CONNECT stream (see `crate::http3::connect_udp`).
-    let extended_connect_enabled = state.env_config.http3_websocket_enabled
-        || state.env_config.http3_connect_udp_enabled;
+    let extended_connect_enabled =
+        state.env_config.http3_websocket_enabled || state.env_config.http3_connect_udp_enabled;
     let mut h3_conn = h3::server::builder()
         .enable_extended_connect(extended_connect_enabled)
         .build(h3_quinn::Connection::new(connection))

@@ -629,12 +629,10 @@ impl Http3Client {
         let port = parsed.port_u16().unwrap_or(443);
         let addr = resolve_loopback(&host, port)?;
 
-        let conn = tokio::time::timeout(
-            Duration::from_secs(15),
-            self.endpoint.connect(addr, &host)?,
-        )
-        .await
-        .map_err(|_| "QUIC handshake timed out")??;
+        let conn =
+            tokio::time::timeout(Duration::from_secs(15), self.endpoint.connect(addr, &host)?)
+                .await
+                .map_err(|_| "QUIC handshake timed out")??;
         let h3_conn = h3_quinn::Connection::new(conn);
         let (mut driver, mut send_request) = h3::client::new(h3_conn)
             .await

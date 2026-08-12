@@ -201,7 +201,12 @@ fn admits_only_the_configured_direct_backend() {
     // Case-insensitive on the host, exact on the port.
     assert!(destination_is_configured(&proxy, lb, "DNS.example", 853));
     assert!(!destination_is_configured(&proxy, lb, "dns.example", 53));
-    assert!(!destination_is_configured(&proxy, lb, "attacker.example", 853));
+    assert!(!destination_is_configured(
+        &proxy,
+        lb,
+        "attacker.example",
+        853
+    ));
 }
 
 #[test]
@@ -214,11 +219,26 @@ fn admits_any_target_of_the_referenced_upstream_and_nothing_else() {
     let lb: &LoadBalancerCacheInner = &guard;
     let proxy = upstream_proxy("udp-pool");
 
-    assert!(destination_is_configured(&proxy, lb, "relay-a.internal", 5353));
-    assert!(destination_is_configured(&proxy, lb, "relay-b.internal", 5353));
+    assert!(destination_is_configured(
+        &proxy,
+        lb,
+        "relay-a.internal",
+        5353
+    ));
+    assert!(destination_is_configured(
+        &proxy,
+        lb,
+        "relay-b.internal",
+        5353
+    ));
     // The proxy's own backend_host is NOT admitted once an upstream governs it.
     assert!(!destination_is_configured(&proxy, lb, "unused.example", 1));
-    assert!(!destination_is_configured(&proxy, lb, "relay-a.internal", 53));
+    assert!(!destination_is_configured(
+        &proxy,
+        lb,
+        "relay-a.internal",
+        53
+    ));
 }
 
 #[test]
@@ -230,7 +250,12 @@ fn a_withdrawn_upstream_admits_nothing() {
     let lb: &LoadBalancerCacheInner = &guard;
     let proxy = upstream_proxy("udp-pool");
 
-    assert!(!destination_is_configured(&proxy, lb, "relay-a.internal", 5353));
+    assert!(!destination_is_configured(
+        &proxy,
+        lb,
+        "relay-a.internal",
+        5353
+    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -267,7 +292,9 @@ fn decodes_a_context_zero_datagram_capsule() {
         .expect("push must succeed");
     assert_eq!(
         drain(&mut decoder),
-        vec![CapsuleEvent::UdpPayload(bytes::Bytes::from_static(b"hello"))]
+        vec![CapsuleEvent::UdpPayload(bytes::Bytes::from_static(
+            b"hello"
+        ))]
     );
 }
 
@@ -360,7 +387,9 @@ fn refuses_a_datagram_capsule_with_no_context_id() {
 fn refuses_a_capsule_declaring_a_length_above_the_ceiling() {
     let mut decoder = CapsuleDecoder::new(64);
     // Type 0x00, 2-byte varint length 0x4400 = 1024, far above 64 + slack.
-    decoder.push(&[0x00, 0x44, 0x00]).expect("push must succeed");
+    decoder
+        .push(&[0x00, 0x44, 0x00])
+        .expect("push must succeed");
     assert_eq!(decoder.next(), Err(CapsuleDecodeError::CapsuleTooLarge));
 }
 
@@ -388,7 +417,10 @@ fn refuses_a_push_that_would_exceed_the_transient_buffer_bound() {
 fn encodes_a_context_zero_datagram_capsule_on_the_wire() {
     let mut out = bytes::BytesMut::new();
     let capsule = encode_udp_datagram_capsule(&mut out, b"pong");
-    assert_eq!(capsule.as_ref(), &[0x00, 0x05, 0x00, b'p', b'o', b'n', b'g']);
+    assert_eq!(
+        capsule.as_ref(),
+        &[0x00, 0x05, 0x00, b'p', b'o', b'n', b'g']
+    );
 }
 
 #[test]

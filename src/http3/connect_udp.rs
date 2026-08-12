@@ -247,9 +247,7 @@ const MAX_TARGET_HOST_LEN: usize = 253;
 /// segment split unambiguous here — the RFC 9298 requirement that IPv6 colons
 /// be percent-encoded is satisfied by clients and undone by canonicalization,
 /// so both `2001:db8::1` and `2001%3Adb8%3A%3A1` arrive as the same literal.
-pub fn parse_connect_udp_target(
-    path: &str,
-) -> Result<ConnectUdpTarget, ConnectUdpTargetRejection> {
+pub fn parse_connect_udp_target(path: &str) -> Result<ConnectUdpTarget, ConnectUdpTargetRejection> {
     if !path.ends_with('/') {
         return Err(ConnectUdpTargetRejection::TrailingSlashMissing);
     }
@@ -1052,8 +1050,10 @@ async fn relay(
                     );
                 }
                 Ok(len) => {
-                    from_target_activity
-                        .store(session_start.elapsed().as_millis() as u64, Ordering::Relaxed);
+                    from_target_activity.store(
+                        session_start.elapsed().as_millis() as u64,
+                        Ordering::Relaxed,
+                    );
                     let capsule = encode_udp_datagram_capsule(&mut out, &buf[..len]);
                     if let Err(error) = h3_send.send_data(capsule).await {
                         debug!(

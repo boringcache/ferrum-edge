@@ -79,7 +79,9 @@ async fn start_masque_gateway(config: String, extra_env: &[(&str, &str)]) -> (Te
     // harness's own port retry, so every attempt needs a fresh one.
     let mut last_error = None;
     for attempt in 1..=3 {
-        let reservation = TcpListener::bind("127.0.0.1:0").await.expect("reserve port");
+        let reservation = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("reserve port");
         let https_port = reservation.local_addr().expect("reserved addr").port();
         drop(reservation);
 
