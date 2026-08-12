@@ -78,7 +78,7 @@
 //! The reconcile logic is platform-independent and unit-tested with a mock
 //! interface resolver; the procfs/sysfs resolution is Linux-only.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -284,12 +284,38 @@ impl NodeWaypointUdpSourceIndex {
 
     /// Publish a complete new generation. Returns the generation number.
     ///
-    /// Bindings whose registry pod UID does not parse are dropped: the parsed
-    /// `[u8; 16]` is the scope-index key, and an unparseable UID could not be
-    /// scoped anyway, so admitting it would only produce an unscoped session.
+    /// Publication is the FINAL authorization boundary for UDP/DTLS source
+    /// attribution — everything downstream reads only this index — so it applies
+    /// its own fail-closed rules rather than trusting the planner to have
+    /// applied them:
+    ///
+    /// * Bindings whose registry pod UID does not parse are dropped: the parsed
+    ///   `[u8; 16]` is the scope-index key, and an unparseable UID could not be
+    ///   scoped anyway, so admitting it would only produce an unscoped session.
+    /// * A binding whose registry pod UID disagrees with the UID the attested
+    ///   identity was issued for is dropped.
+    /// * An **ingress interface claimed by more than one binding refuses BOTH
+    ///   claimants.** The ingress interface is the whole source-evidence
+    ///   channel: two claimants mean the kernel fact no longer identifies one
+    ///   pod, so admitting either would run one pod's datagrams under the
+    ///   other's policy scope and attested principal. `plan_host_udp_bindings`
+    ///   normally rejects the conflict first, but a last-writer-wins insert here
+    ///   would silently pick a winner if it ever did not.
+    /// * The published cardinality stays bounded by
+    ///   [`crate::capture::MAX_HOST_UDP_CAPTURE_INTERFACES`]. An input that
+    ///   exceeds it publishes an EMPTY generation (every datagram then refuses
+    ///   `unenrolled_interface`) rather than an arbitrary truncation of which
+    ///   pods keep their identity.
+    ///
+    /// Diagnostics are counts only — no interface name, pod UID, or principal is
+    /// logged, so nothing registry-supplied is echoed.
     pub fn publish(&self, bindings: &[HostUdpPodBinding]) -> u64 {
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
         let mut by_ifindex: HashMap<u32, Arc<NodeWaypointUdpSourceBinding>> = HashMap::new();
+        // Interfaces withdrawn because two bindings claimed them. Kept so a
+        // third claimant cannot re-add an interface a conflict already retired.
+        let mut contested_ifindexes: HashSet<u32> = HashSet::new();
+        let mut malformed = 0usize;
         for binding in bindings {
             // `pod_uid` is the registry/interface owner while
             // `identity.pod_uid` is the UID bound to the attested principal.
@@ -298,11 +324,28 @@ impl NodeWaypointUdpSourceIndex {
             // pair must never let pod A's interface/address run under pod B's
             // policy scope or asserted identity.
             if binding.pod_uid != binding.identity.pod_uid {
+                malformed += 1;
                 continue;
             }
             let Ok(pod_uid) = parse_pod_uid(&binding.pod_uid) else {
+                malformed += 1;
                 continue;
             };
+            if contested_ifindexes.contains(&binding.ifindex) {
+                continue;
+            }
+            if let Some(existing) = by_ifindex.get(&binding.ifindex) {
+                // Two attributable pods claim one ingress interface. Refuse BOTH
+                // — never keep the first-seen one, which would make attribution
+                // depend on registry read order.
+                if existing.pod_uid != pod_uid || existing.principal != binding.identity.principal {
+                    by_ifindex.remove(&binding.ifindex);
+                    contested_ifindexes.insert(binding.ifindex);
+                }
+                // An exactly-identical duplicate record is not a conflict; the
+                // already-inserted binding stands.
+                continue;
+            }
             by_ifindex.insert(
                 binding.ifindex,
                 Arc::new(NodeWaypointUdpSourceBinding {
@@ -317,6 +360,30 @@ impl NodeWaypointUdpSourceIndex {
                 }),
             );
         }
+
+        if by_ifindex.len() > crate::capture::MAX_HOST_UDP_CAPTURE_INTERFACES {
+            warn!(
+                generation,
+                attributable = by_ifindex.len(),
+                bound = crate::capture::MAX_HOST_UDP_CAPTURE_INTERFACES,
+                "NodeWaypoint UDP source attribution exceeds the supported interface bound; \
+                 publishing an empty generation so no datagram is attributed under a truncated \
+                 index"
+            );
+            by_ifindex.clear();
+        }
+        if !contested_ifindexes.is_empty() || malformed > 0 {
+            warn!(
+                generation,
+                contested_interfaces = contested_ifindexes.len(),
+                malformed_bindings = malformed,
+                published = by_ifindex.len(),
+                "NodeWaypoint UDP source attribution refused bindings at publication; a contested \
+                 ingress interface refuses every claimant because the kernel fact no longer names \
+                 one pod"
+            );
+        }
+
         self.current.store(Arc::new(SourceGeneration {
             generation,
             published: true,
@@ -790,6 +857,13 @@ pub struct NodeWaypointUdpSourceIndexManager<R: NodeWaypointUdpInterfaceResolver
     resolver: R,
     index: Arc<NodeWaypointUdpSourceIndex>,
     poll_interval: Duration,
+    /// Service-path steering (issue #3286), reconciled from the SAME pass that
+    /// publishes attribution so the two can never disagree about which pods
+    /// exist: a pod whose interface is not attributable this pass is also not an
+    /// interface whose traffic is steered. `None` disables steering entirely
+    /// (non-Linux, or an operator who has not enabled the listeners), which
+    /// leaves the Service path unsteered and therefore fail-closed.
+    steering: Option<Arc<super::node_waypoint_udp_steering::NodeWaypointUdpSteering>>,
 }
 
 /// Retract attribution evidence whenever the manager future leaves scope — not
@@ -818,7 +892,17 @@ impl<R: NodeWaypointUdpInterfaceResolver> NodeWaypointUdpSourceIndexManager<R> {
             resolver,
             index,
             poll_interval,
+            steering: None,
         }
+    }
+
+    /// Attach the Service-path steering datapath to this reconcile loop.
+    pub fn with_steering(
+        mut self,
+        steering: Arc<super::node_waypoint_udp_steering::NodeWaypointUdpSteering>,
+    ) -> Self {
+        self.steering = Some(steering);
+        self
     }
 
     /// One reconcile pass. Returns the published bindings so tests can assert
@@ -859,6 +943,20 @@ impl<R: NodeWaypointUdpInterfaceResolver> NodeWaypointUdpSourceIndexManager<R> {
             );
         }
         self.index.publish(&desired.bindings);
+        // Steering follows publication, never precedes it: a datagram may only
+        // be diverted to the waypoint once the interface it arrives on can be
+        // attributed to a source workload. The interface set is exactly the
+        // attributable one, so a pod that lost attribution this pass also loses
+        // steering and its Service traffic fails closed at the pod-veth guard
+        // instead of reaching a listener that could only deny it.
+        if let Some(steering) = self.steering.as_ref() {
+            let ifaces: Vec<String> = desired
+                .bindings
+                .iter()
+                .map(|binding| binding.iface.clone())
+                .collect();
+            steering.reconcile(&ifaces);
+        }
         desired.bindings
     }
 

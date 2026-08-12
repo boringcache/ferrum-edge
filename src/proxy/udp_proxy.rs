@@ -1983,6 +1983,31 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                 ))
             })?;
         }
+
+        // Transparent socket (issue #3286 Service path). A steered datagram is
+        // delivered with its ORIGINAL destination — the Service ClusterIP — in
+        // the IP header, and the session sources its replies from exactly that
+        // address (pinned per session from the `IP_PKTINFO` / `IPV6_PKTINFO`
+        // cmsg). A ClusterIP is not configured on this host, so the kernel
+        // refuses that source unless the socket carries `FLOWI_FLAG_ANYSRC`.
+        // Without it every steered session would be one-way: the workload's
+        // datagram reaches the backend and the reply is dropped at the sender,
+        // or arrives from the wrong address and is discarded by the workload's
+        // connected socket. Fail the listener rather than serve that.
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            let local = frontend_socket.local_addr().unwrap_or(addr);
+            crate::socket_opts::set_ip_transparent(frontend_socket.as_raw_fd(), local.is_ipv6())
+                .map_err(|error| {
+                    std::io::Error::other(format!(
+                        "NodeWaypoint scoped UDP listener on port {port} could not become a \
+                         transparent socket, so it could not source replies from the Service \
+                         address a steered workload addressed. NET_ADMIN (or NET_RAW on newer \
+                         kernels) is required: {error}"
+                    ))
+                })?;
+        }
     }
 
     // A NodeWaypoint scoped listener has no datapath at all without the

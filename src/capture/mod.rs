@@ -175,6 +175,318 @@ const MAX_INTERFACE_NAME_LEN: usize = 15;
 /// fails closed rather than installing a partial ruleset.
 pub const MAX_HOST_UDP_CAPTURE_INTERFACES: usize = 512;
 
+// ── NodeWaypoint UDP/DTLS Service steering (issue #3286) ────────────────────
+//
+// A NodeWaypoint materializes one host-netns wildcard UDP/DTLS listener per
+// in-mesh Service port. Nothing steers ordinary Service traffic there: an
+// enrolled workload sends to `<ClusterIP>:<port>`, kube-proxy's `nat
+// PREROUTING` DNATs that to a backing pod, and the datagram is forwarded to the
+// pod — where the pod-veth `ferrum_tc_inbound` guard drops it because it does
+// not carry the relay's auth mark. So the Service path is not merely a bypass,
+// it is a black hole, and only a direct dial to a NODE address reaches the
+// listener at all.
+//
+// These rules close that gap without rewriting a single packet field:
+//
+//   raw    PREROUTING -i <pod veth> -p udp -d <ClusterIP> --dport <port>
+//              -j CT --notrack
+//   mangle PREROUTING -i <pod veth> -p udp -d <ClusterIP> --dport <port>
+//              -j MARK --set-xmark <mark>/<mask>
+//   ip rule add priority <prio> fwmark <mark>/<mask> lookup <table>
+//   ip route add local <default> dev lo table <table>
+//
+// * `--notrack` runs in `raw` (priority -300), BEFORE conntrack (-200), so the
+//   `nat` table is never consulted for these flows and kube-proxy cannot DNAT
+//   them out from under the waypoint. It also makes the steering independent of
+//   which endpoint kube-proxy would have chosen: the waypoint does its own
+//   authorized endpoint selection.
+// * `MARK` + the `local` route make the datagram LOCALLY DELIVERED while its IP
+//   header still carries the ClusterIP. The listener's wildcard socket receives
+//   it by the ordinary UDP lookup, and `IP_PKTINFO`/`IPV6_PKTINFO` reports the
+//   original destination (`fib_compute_spec_dst` returns `iph->daddr` for an
+//   `RTCF_LOCAL` route) together with the pod's ingress interface — the exact
+//   evidence NodeWaypoint source attribution already consumes. Replies are
+//   sourced back from the ClusterIP through the listener's transparent socket.
+// * `-i <pod veth>` is the direction discriminator, identical to the Ambient
+//   host capture path: only a pod's own egress enters the host namespace on
+//   that pod's interface. Node-local traffic is locally generated and traverses
+//   `OUTPUT`, which is deliberately never hooked, so the waypoint's own relay
+//   dials and replies can never be re-steered into itself.
+// * `-d <ClusterIP> --dport <port>` is the service identity. Port-only scoping
+//   would capture a workload's traffic to an unrelated off-cluster host that
+//   happens to use the same port number and relay it to a mesh service's
+//   endpoints, so the destination address is always part of the match.
+
+/// `raw`-table chain holding the NodeWaypoint Service-steering conntrack
+/// exemptions.
+pub(crate) const NODE_WAYPOINT_UDP_STEER_NOTRACK_CHAIN: &str = "FERRUM_NW_UDP_NOTRACK";
+
+/// `mangle`-table chain holding the NodeWaypoint Service-steering marks.
+pub(crate) const NODE_WAYPOINT_UDP_STEER_CHAIN: &str = "FERRUM_NW_UDP_STEER";
+
+/// Firewall mark stamped on a steered datagram. Ferrum-owned and distinct from
+/// every other mark this datapath uses, because each selects a different
+/// routing outcome and an alias would cross them.
+pub const NODE_WAYPOINT_UDP_STEER_MARK: u32 = 0x736;
+
+/// Full-width mask, matching the UDP TPROXY convention, so the steering mark
+/// cannot alias onto a co-resident CNI's mark bits.
+pub(crate) const NODE_WAYPOINT_UDP_STEER_MARK_MASK: u32 = 0xffff_ffff;
+
+/// Ferrum-owned routing table for steered local delivery. Distinct from the
+/// pod-netns TPROXY table (`33133`), the tc ingress-redirect table (`33134`),
+/// and the host UDP capture table (`33135`), so tearing one down can never reap
+/// another.
+pub(crate) const NODE_WAYPOINT_UDP_STEER_TABLE: u16 = 33136;
+
+/// RPDB priority for the steering fwmark rule. Must sort BELOW the kernel
+/// `main` rule at 32766 (lower number = evaluated first) or the marked datagram
+/// resolves as forwardable and is never delivered locally.
+pub(crate) const NODE_WAYPOINT_UDP_STEER_RULE_PRIORITY: u32 = 102;
+
+const _: () = assert!(
+    NODE_WAYPOINT_UDP_STEER_MARK != DEFAULT_TPROXY_MARK,
+    "the NodeWaypoint UDP steering mark must not alias the UDP TPROXY mark"
+);
+const _: () = assert!(
+    NODE_WAYPOINT_UDP_STEER_MARK != 0x734 && NODE_WAYPOINT_UDP_STEER_MARK != 0x735,
+    "the NodeWaypoint UDP steering mark must not alias the relay auth mark (0x734) or the tc \
+     ingress-redirect mark (0x735); a steered datagram would then be routed as a relayed one"
+);
+const _: () = assert!(
+    NODE_WAYPOINT_UDP_STEER_RULE_PRIORITY < 32766,
+    "the NodeWaypoint UDP steering fwmark rule must sort below the kernel `main` table rule"
+);
+const _: () = assert!(
+    NODE_WAYPOINT_UDP_STEER_TABLE != TPROXY_ROUTE_TABLE
+        && NODE_WAYPOINT_UDP_STEER_TABLE != TPROXY_HOST_ROUTE_TABLE,
+    "the NodeWaypoint UDP steering table must be distinct from every other Ferrum-owned table"
+);
+
+/// Upper bound on steered `(ClusterIP, port)` destinations in one plan. Each
+/// destination is multiplied by the enrolled-interface count in BOTH emitted
+/// chains, so an unbounded set would turn a large slice into an unbounded
+/// `iptables` workload on every reconcile. Exceeding it fails the plan closed
+/// rather than installing a partial (and therefore silently service-losing)
+/// ruleset.
+pub const MAX_NODE_WAYPOINT_UDP_STEER_DESTINATIONS: usize = 128;
+
+/// One steered Service destination: the address a workload actually addresses
+/// and the port the materialized listener serves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NodeWaypointUdpSteerDestination {
+    pub ip: std::net::IpAddr,
+    pub port: u16,
+}
+
+impl NodeWaypointUdpSteerDestination {
+    /// Render the `-d <ip>/<prefix> --dport <port>` match. The address is
+    /// re-rendered from the parsed `IpAddr`, never from operator text, so
+    /// nothing that reaches the `sh -c` script can carry shell metacharacters.
+    fn selector(&self) -> String {
+        let prefix = if self.ip.is_ipv4() { 32 } else { 128 };
+        format!("-p udp -d {}/{} --dport {}", self.ip, prefix, self.port)
+    }
+}
+
+/// Per-family NodeWaypoint UDP steering commands.
+///
+/// Ordering is load-bearing and fail-closed:
+///
+/// 1. `ip rule` / `ip route local` first. Marking without local delivery is a
+///    black hole, so the routing goes in before anything can be marked.
+/// 2. The `raw` `--notrack` chain and its `PREROUTING` jump next, so no steered
+///    flow can be conntracked (and therefore DNAT-ed) while the mark exists.
+/// 3. The `mangle` mark chain and its jump LAST — the moment steering becomes
+///    observable.
+///
+/// Both chains are flushed and repopulated behind a STABLE `PREROUTING` jump,
+/// so a reconcile changes chain CONTENTS only and a crash mid-reconcile can
+/// leave at worst a subset of the intended rules, never an orphaned jump.
+fn node_waypoint_udp_steer_commands_for_family(
+    binary: &str,
+    ipv6: bool,
+    ifaces: &[String],
+    destinations: &[NodeWaypointUdpSteerDestination],
+) -> Vec<String> {
+    let family_destinations: Vec<&NodeWaypointUdpSteerDestination> = destinations
+        .iter()
+        .filter(|destination| destination.ip.is_ipv6() == ipv6)
+        .collect();
+    if family_destinations.is_empty() {
+        // No steered destination in this family: emit NOTHING rather than an
+        // inert chain plus routing, mirroring the host capture path.
+        return Vec::new();
+    }
+
+    let mark_arg = format!(
+        "0x{NODE_WAYPOINT_UDP_STEER_MARK:x}/0x{NODE_WAYPOINT_UDP_STEER_MARK_MASK:x}"
+    );
+    let (ip, local_route) = if ipv6 {
+        ("ip -6", "local ::/0 dev lo")
+    } else {
+        ("ip", "local 0.0.0.0/0 dev lo")
+    };
+    let priority = NODE_WAYPOINT_UDP_STEER_RULE_PRIORITY;
+    let table = NODE_WAYPOINT_UDP_STEER_TABLE;
+    let notrack = NODE_WAYPOINT_UDP_STEER_NOTRACK_CHAIN;
+    let steer = NODE_WAYPOINT_UDP_STEER_CHAIN;
+    let wait = XTABLES_LOCK_WAIT_SECONDS;
+
+    let mut commands = vec![
+        // FAIL CLOSED before any rule: without iproute2 the local-delivery rule
+        // cannot be installed, and a mark with no local route is a black hole.
+        "command -v ip >/dev/null 2>&1 || { echo \"iproute2 (ip) is required for NodeWaypoint UDP Service steering\" >&2; exit 1; }"
+            .to_string(),
+        ip_delete_best_effort(&format!("{ip} rule del priority {priority} lookup {table}")),
+        format!("{ip} rule add priority {priority} fwmark {mark_arg} lookup {table}"),
+        ip_delete_best_effort(&format!("{ip} route del {local_route} table {table}")),
+        format!("{ip} route add {local_route} table {table}"),
+        // `raw` conntrack exemption chain.
+        format!("{binary} -t raw -w {wait} -N {notrack} 2>/dev/null || {binary} -t raw -w {wait} -F {notrack}"),
+        format!("{binary} -t raw -w {wait} -F {notrack}"),
+    ];
+    for iface in ifaces {
+        for destination in &family_destinations {
+            commands.push(format!(
+                "{binary} -t raw -w {wait} -A {notrack} -i {iface} {} -j CT --notrack",
+                destination.selector()
+            ));
+        }
+    }
+    commands.push(format!(
+        "{binary} -t raw -w {wait} -C PREROUTING -p udp -j {notrack} 2>/dev/null || \
+         {binary} -t raw -w {wait} -A PREROUTING -p udp -j {notrack}"
+    ));
+
+    // `mangle` mark chain.
+    commands.push(format!(
+        "{binary} -t mangle -w {wait} -N {steer} 2>/dev/null || {binary} -t mangle -w {wait} -F {steer}"
+    ));
+    commands.push(format!("{binary} -t mangle -w {wait} -F {steer}"));
+    for iface in ifaces {
+        for destination in &family_destinations {
+            commands.push(format!(
+                "{binary} -t mangle -w {wait} -A {steer} -i {iface} {} -j MARK --set-xmark {mark_arg}",
+                destination.selector()
+            ));
+        }
+    }
+    commands.push(format!(
+        "{binary} -t mangle -w {wait} -C PREROUTING -p udp -j {steer} 2>/dev/null || \
+         {binary} -t mangle -w {wait} -A PREROUTING -p udp -j {steer}"
+    ));
+
+    commands
+}
+
+/// Per-family removal of EXACTLY the Ferrum-owned steering objects.
+///
+/// Removal order is the reverse of installation: the mark jump goes first so
+/// nothing new can be steered, then the conntrack exemption, then the routing.
+/// Every target is named exactly, so this is a no-op when no steering state
+/// exists and it can never disturb the pod-netns TPROXY objects, the tc
+/// ingress-redirect routing, or a co-resident CNI's policy routing.
+fn node_waypoint_udp_steer_teardown_for_family(binary: &str, ipv6: bool) -> Vec<String> {
+    let (ip, local_route) = if ipv6 {
+        ("ip -6", "local ::/0 dev lo")
+    } else {
+        ("ip", "local 0.0.0.0/0 dev lo")
+    };
+    let priority = NODE_WAYPOINT_UDP_STEER_RULE_PRIORITY;
+    let table = NODE_WAYPOINT_UDP_STEER_TABLE;
+    let notrack = NODE_WAYPOINT_UDP_STEER_NOTRACK_CHAIN;
+    let steer = NODE_WAYPOINT_UDP_STEER_CHAIN;
+    let wait = XTABLES_LOCK_WAIT_SECONDS;
+    vec![
+        format!("{binary} -t mangle -w {wait} -D PREROUTING -p udp -j {steer} 2>/dev/null || true"),
+        format!("{binary} -t mangle -w {wait} -F {steer} 2>/dev/null || true"),
+        format!("{binary} -t mangle -w {wait} -X {steer} 2>/dev/null || true"),
+        format!("{binary} -t raw -w {wait} -D PREROUTING -p udp -j {notrack} 2>/dev/null || true"),
+        format!("{binary} -t raw -w {wait} -F {notrack} 2>/dev/null || true"),
+        format!("{binary} -t raw -w {wait} -X {notrack} 2>/dev/null || true"),
+        format!("{ip} rule del priority {priority} lookup {table} 2>/dev/null || true"),
+        format!("{ip} route del {local_route} table {table} 2>/dev/null || true"),
+    ]
+}
+
+/// The `set -e` NodeWaypoint UDP Service-steering setup script.
+///
+/// Returns `Ok(None)` when there is nothing to steer (no enrolled interface or
+/// no materialized Service destination) — the caller then runs the teardown so
+/// the datapath holds no half-state.
+///
+/// Every interface name is validated before a command is rendered (it is
+/// interpolated into an `iptables -i` argument inside a `sh -c` script and
+/// originates from kernel/procfs discovery), and every destination address is
+/// re-rendered from a parsed `IpAddr`. A rejected input fails the WHOLE plan
+/// rather than being skipped, so a corrupt entry can never yield a
+/// partially-scoped ruleset that steers the wrong traffic.
+pub fn node_waypoint_udp_steer_setup_script(
+    ifaces: &[String],
+    destinations: &[NodeWaypointUdpSteerDestination],
+) -> Result<Option<String>, String> {
+    validate_host_capture_interfaces(ifaces)?;
+    if destinations.len() > MAX_NODE_WAYPOINT_UDP_STEER_DESTINATIONS {
+        return Err(format!(
+            "NodeWaypoint UDP Service steering is scoped to {} destinations, above the supported \
+             maximum of {MAX_NODE_WAYPOINT_UDP_STEER_DESTINATIONS}",
+            destinations.len()
+        ));
+    }
+    for destination in destinations {
+        if destination.port == 0 {
+            return Err("NodeWaypoint UDP Service steering destination port 0 is not a service \
+                        port"
+                .to_string());
+        }
+        if destination.ip.is_unspecified() || destination.ip.is_loopback() {
+            return Err("NodeWaypoint UDP Service steering refuses an unspecified or loopback \
+                        destination address: it would steer traffic that never belonged to a \
+                        Service"
+                .to_string());
+        }
+    }
+    if ifaces.is_empty() || destinations.is_empty() {
+        return Ok(None);
+    }
+    let v4 = node_waypoint_udp_steer_commands_for_family("iptables", false, ifaces, destinations);
+    let v6 = node_waypoint_udp_steer_commands_for_family("ip6tables", true, ifaces, destinations);
+    if v4.is_empty() && v6.is_empty() {
+        return Ok(None);
+    }
+    let mut chunks = Vec::new();
+    if !v4.is_empty() {
+        chunks.push(v4.join("\n"));
+    }
+    if !v6.is_empty() {
+        // IPv6 steering is best-effort at the TABLE level only: a node without
+        // `ip6tables` (or without its `mangle`/`raw` tables) keeps the IPv4
+        // datapath instead of failing the whole plan. The IPv6 Service path is
+        // then simply not steered — fail-closed for those datagrams, which are
+        // still dropped by the pod-veth guard rather than bypassing the
+        // waypoint. This is reported by the caller, never silent.
+        chunks.push(format!(
+            "if command -v ip6tables >/dev/null 2>&1; then\n  {}\nelse\n  echo \"ip6tables not found; NodeWaypoint IPv6 UDP Service steering not installed\" >&2\nfi",
+            v6.join("\n  ")
+        ));
+    }
+    Ok(Some(format!("set -e\n{}", chunks.join("\n"))))
+}
+
+/// The NodeWaypoint UDP Service-steering teardown script. Best-effort
+/// throughout: it runs on shutdown, on every unsuccessful setup, and before the
+/// first setup to reap a previous generation, where a missing object is the
+/// expected outcome.
+pub fn node_waypoint_udp_steer_teardown_script() -> String {
+    let mut chunks = vec![node_waypoint_udp_steer_teardown_for_family("iptables", false).join("\n")];
+    chunks.push(format!(
+        "if command -v ip6tables >/dev/null 2>&1; then\n  {}\nfi",
+        node_waypoint_udp_steer_teardown_for_family("ip6tables", true).join("\n  ")
+    ));
+    chunks.join("\n")
+}
+
 /// Istio-compatible `includeOutboundPorts` annotation. The injector and the
 /// node-agent eBPF backend both read this key — keep the spelling exactly
 /// in sync with Istio so existing operator annotations apply unchanged.

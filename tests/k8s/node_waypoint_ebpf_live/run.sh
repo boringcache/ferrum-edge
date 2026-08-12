@@ -97,6 +97,7 @@ REQUIRED_LIVE_ASSERTIONS=(
   node_waypoint.identity.stale_cleanup
   node_waypoint.identity.spire_chart_profile
   node_waypoint.udp.listener_allow_attributed_source
+  node_waypoint.udp.service_path_allow_attributed_source
   node_waypoint.udp.listener_deny_scoped_policy
   node_waypoint.udp.listener_deny_unattributed_source
   node_waypoint.udp.listener_deny_spoofed_source
@@ -4336,6 +4337,46 @@ run_node_waypoint_udp_datapath_checks() {
   fi
   record_live_assertion node_waypoint.udp.listener_allow_attributed_source pass \
     udp-src-a udp-echo "observed=$reply backend_hits=$allow_backend_hits" \
+    "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-listener"
+
+  # 1b. The ORDINARY user path (issue #3286 root review): an enrolled workload
+  #     addressing its Service's ClusterIP — not a node address. Without the
+  #     Service-path steering this cannot work at all: kube-proxy DNATs the
+  #     ClusterIP to a backing pod and the pod-veth guard drops the unmarked
+  #     datagram, so the workload sees a timeout. Passing therefore proves the
+  #     steering rules diverted the datagram to the materialized listener with
+  #     its original destination intact AND that the reply came back sourced
+  #     from the ClusterIP (an unmarked or wrongly-sourced reply is dropped
+  #     before the workload ever sees it). The check above stays as the distinct
+  #     direct-node-address boundary.
+  local service_ip service_reply service_backend_hits
+  service_ip="$(kubectl -n "$WORKLOAD_NS" get svc udp-echo -o jsonpath='{.spec.clusterIP}')"
+  if [[ -z "$service_ip" || "$service_ip" == "None" ]]; then
+    record_live_assertion node_waypoint.udp.service_path_allow_attributed_source fail \
+      udp-src-a udp-echo "the udp-echo Service publishes no ClusterIP to steer" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-listener"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  log "NodeWaypoint UDP Service path target ${service_ip}:${UDP_LISTENER_PORT} (udp-echo ClusterIP)"
+  if ! service_reply="$(wait_for_udp_outcome match "udp-ok:svc-a" \
+    "$WORKLOAD_NS" udp-src-a "$service_ip" svc-a 40)"; then
+    record_live_assertion node_waypoint.udp.service_path_allow_attributed_source fail \
+      udp-src-a udp-echo "service_ip=$service_ip observed=$service_reply" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-listener"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  service_backend_hits="$(udp_echo_backend_received svc-a)"
+  if [[ "$service_backend_hits" == "0" ]]; then
+    record_live_assertion node_waypoint.udp.service_path_allow_attributed_source fail \
+      udp-src-a udp-echo "the echo arrived but the backend logged no Service-path datagram" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-listener"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  record_live_assertion node_waypoint.udp.service_path_allow_attributed_source pass \
+    udp-src-a udp-echo "service_ip=$service_ip observed=$service_reply backend_hits=$service_backend_hits" \
     "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-listener"
 
   # 2. A source the scoped AuthorizationPolicy denies gets no datagram through.

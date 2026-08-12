@@ -1682,14 +1682,21 @@ fn materialize_node_waypoint_udp_listeners(
     if runtime.topology != MeshTopology::NodeWaypoint {
         return;
     }
+    // Every early return below is also a RETRACTION of the Service-steering
+    // plan: leaving the previous generation's destinations published would keep
+    // enrolled workloads' Service datagrams diverted to listeners this
+    // generation no longer materializes. Retracting steers nothing, which
+    // fails closed at the pod-veth guard.
     // A parse error is reported (and made fatal) by
     // `validate_node_waypoint_udp_listener_settings` on the serving path; this
     // cold materialization path must stay infallible for read-only callers, so
     // an unparseable value materializes nothing.
     if !node_waypoint_udp_listeners_enabled_from_env().unwrap_or(false) {
+        crate::proxy::node_waypoint_udp_steering::retract_plan();
         return;
     }
     let Some(local_node_name) = node_waypoint_udp_local_node_name_from_env() else {
+        crate::proxy::node_waypoint_udp_steering::retract_plan();
         warn!(
             "Skipping NodeWaypoint UDP/DTLS listener materialization: \
              FERRUM_K8S_NODE_NAME is missing or empty"
@@ -1726,6 +1733,12 @@ fn materialize_node_waypoint_udp_listeners(
         service: String,
         namespace: String,
         terminates_dtls: bool,
+        /// The Service's own virtual IPs. These are the addresses an enrolled
+        /// workload actually sends to, so they are what the Service-path
+        /// steering rules match on; a VIP-less (headless) Service port has no
+        /// steerable address and is served only over the documented
+        /// direct-address boundary.
+        cluster_ips: Vec<std::net::IpAddr>,
     }
     let mut by_port: BTreeMap<u16, Vec<Candidate>> = BTreeMap::new();
     let now = chrono::Utc::now();
@@ -1803,12 +1816,20 @@ fn materialize_node_waypoint_udp_listeners(
                     service: service.name.clone(),
                     namespace: service.namespace.clone(),
                     terminates_dtls,
+                    cluster_ips: service
+                        .cluster_ips
+                        .iter()
+                        .filter_map(|raw| raw.parse::<std::net::IpAddr>().ok())
+                        .filter(|ip| !ip.is_unspecified() && !ip.is_loopback())
+                        .collect(),
                 });
         }
     }
 
     let mut materialized = 0usize;
     let mut dtls_listeners = 0usize;
+    let mut steer_destinations: Vec<crate::capture::NodeWaypointUdpSteerDestination> = Vec::new();
+    let mut vip_less_ports: Vec<String> = Vec::new();
     for (port, candidates) in by_port {
         if candidates.len() > 1 {
             let claimants = candidates
@@ -1831,6 +1852,33 @@ fn materialize_node_waypoint_udp_listeners(
             dtls_listeners += 1;
         }
         materialized += 1;
+        // Service-path steering is published only for the listener that
+        // actually won this port, AFTER every fail-closed refusal above. A port
+        // two services contested, a port a mesh runtime listener owns, and a
+        // port with no reachable endpoint therefore never appear here — steering
+        // a destination with no serving listener would black-hole it.
+        //
+        // DTLS listeners are deliberately NOT steered yet. A `DtlsServer` owns
+        // the socket every record leaves from and replies with `send_to`, so a
+        // steered DTLS session's records would leave with a NODE source address
+        // and the workload's connected socket would discard them — the
+        // handshake would never complete. Publishing a destination we cannot
+        // serve correctly would replace a working direct-address boundary with
+        // a black hole, so DTLS keeps that boundary until per-peer reply-source
+        // pinning lands. See `docs/mesh_supported_matrix.md`.
+        if candidate.terminates_dtls {
+            continue;
+        }
+        if candidate.cluster_ips.is_empty() {
+            vip_less_ports.push(format!(
+                "{}/{}:{port}",
+                candidate.namespace, candidate.service
+            ));
+        }
+        for ip in &candidate.cluster_ips {
+            steer_destinations
+                .push(crate::capture::NodeWaypointUdpSteerDestination { ip: *ip, port });
+        }
         let upstream = candidate.upstream;
         if let Some(existing) = config
             .upstreams
@@ -1852,6 +1900,21 @@ fn materialize_node_waypoint_udp_listeners(
             config.proxies.push(proxy);
         }
     }
+
+    if !vip_less_ports.is_empty() {
+        warn!(
+            services = %capped_join(&vip_less_ports, 8),
+            "NodeWaypoint UDP/DTLS listeners were materialized for services that publish no \
+             ClusterIP; their Service DNS name resolves to pod addresses, so the transparent \
+             Service-path steering has no address to match and those ports are reachable only \
+             over the documented direct-node-address boundary"
+        );
+    }
+    // Publish the steering plan for EVERY generation, including the empty one:
+    // a generation that materializes nothing must retract the previous
+    // generation's steering rather than leave workloads diverted to listeners
+    // that no longer exist.
+    crate::proxy::node_waypoint_udp_steering::publish_plan(steer_destinations);
 
     if materialized > 0 {
         info!(
@@ -13324,13 +13387,31 @@ async fn arm_mesh_runtime_startup(
             let source = Arc::new(crate::proxy::netns_capture::DirectoryCaptureSource::new(
                 env_config.mesh_node_waypoint_pod_registry_dir.clone(),
             ));
-            let manager =
+            let mut manager =
                 crate::proxy::node_waypoint_udp_identity::NodeWaypointUdpSourceIndexManager::new(
                     source,
                     crate::proxy::node_waypoint_udp_identity::VethInterfaceResolver::new(),
                     udp_source_index.clone(),
                     std::time::Duration::from_secs(2),
                 );
+            // Service-path steering (issue #3286). Without it the materialized
+            // listeners are reachable only over a direct node address: an
+            // enrolled workload addressing its Service DNS name / ClusterIP has
+            // its datagram DNAT-ed to a backing pod by kube-proxy and then
+            // dropped by the pod-veth guard. Steering rides the SAME reconcile
+            // pass as attribution so the two never disagree about which pods
+            // exist. It needs `iptables`/`ip` in the NodeWaypoint image; a node
+            // without them fails the plan closed and logs it, leaving the
+            // Service path unsteered rather than unauthorized.
+            if crate::proxy::node_waypoint_udp_steering::steering_supported() {
+                manager = manager.with_steering(std::sync::Arc::new(
+                    crate::proxy::node_waypoint_udp_steering::NodeWaypointUdpSteering::new(
+                        std::sync::Arc::new(
+                            crate::proxy::node_waypoint_udp_steering::HostNamespaceSteerBackend,
+                        ),
+                    ),
+                ));
+            }
             let manager_shutdown = shutdown_tx.subscribe();
             info!(
                 registry_dir = %env_config.mesh_node_waypoint_pod_registry_dir,

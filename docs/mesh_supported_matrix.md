@@ -231,6 +231,35 @@ need them, or because they are blocked upstream / architecturally:
   deny. The blanket config-preparation suppression of NodeWaypoint UDP/DTLS
   remains only on builds where the channel cannot exist (non-Linux). Mesh-wide
   UDP/DTLS policy is unchanged.
+- **NodeWaypoint UDP Service-path reachability — supported on Linux for plain
+  `udp` only** (issue #3286 root review). Materializing a listener does not make
+  it reachable: a workload addressing its Service ClusterIP has that datagram
+  DNAT-ed by kube-proxy to a backing pod and then DROPPED by the pod-veth guard,
+  so the Service path was a black hole and only a direct dial to a trusted node
+  address worked. Transparent steering (`raw` `--notrack` + `mangle` mark +
+  Ferrum-owned `fwmark`/`local` route, scoped `-i <pod veth> -d <ClusterIP>
+  --dport <port>`) now delivers that datagram to the materialized listener
+  **without rewriting it**, so the source address, the ingress interface, and
+  the original destination all survive and the reply is sourced back from the
+  ClusterIP through a transparent socket. What is and is not covered:
+  - **Proven live** (`node-waypoint-ebpf-live`,
+    `node_waypoint.udp.service_path_allow_attributed_source`): an enrolled pod
+    sending to a `protocol: UDP` Service's ClusterIP reaches the production
+    listener, the backend logs the datagram, and the echo returns — under
+    kube-proxy **iptables** mode, IPv4, on kind.
+  - **Not steered, by decision**: `dtls` listeners. A `DtlsServer` owns its
+    socket and replies with `send_to`, so a steered DTLS handshake's records
+    would carry a node source address and the client's connected socket would
+    discard them. DTLS keeps the direct-node-address contract until per-peer
+    reply-source pinning lands; publishing a destination that cannot be served
+    correctly would trade a working boundary for a black hole.
+  - **Not exercised, not claimed**: IPv6 Service steering, kube-proxy `ipvs` and
+    `nftables` modes, and headless (ClusterIP-less) services, which have no
+    address to steer and remain direct-address only.
+  - **Requires** `iptables` and `ip` in the NodeWaypoint image (the
+    `-ebpf-tools` image) plus `NET_ADMIN`. A node without them fails the plan
+    closed and logs it: the Service path stays unsteered, which is a lost
+    service, never an unauthorized one.
 
 
   **The listener configuration surface.** The attribution channel is reachable
