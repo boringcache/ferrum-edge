@@ -707,7 +707,10 @@ async fn a_full_export_audits_the_released_trust_count_without_material() {
     assert_eq!(event["diff"]["data_source"], "database");
     let audited = event["diff"]["counts"]["gateway_trust_bundles"].clone();
     assert_eq!(audited, backup["counts"]["gateway_trust_bundles"]);
-    assert_eq!(audited, 1, "the audit must record the exported rows: {event}");
+    assert_eq!(
+        audited, 1,
+        "the audit must record the exported rows: {event}"
+    );
 
     // Count only: no certificate bytes, PEM, subjects, or revisions.
     let rendered = serde_json::to_string(&event).expect("event serializes");
