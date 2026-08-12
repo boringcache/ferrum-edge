@@ -37,10 +37,10 @@
 //! 3. A structurally invalid response is NACKed with a field-specific
 //!    `error_detail` re-asserting the last accepted version, and the last-good
 //!    view keeps serving real traffic.
-//! 4.–5. EDS endpoint withdrawal removes reachability; a replacement assignment
-//!    restores it.
-//! 6.–7. A state-of-the-world CDS withdrawal removes reachability; re-publishing
-//!    the cluster restores it.
+//! 4. EDS endpoint withdrawal removes reachability.
+//! 5. A replacement EDS assignment restores it.
+//! 6. A state-of-the-world CDS withdrawal removes reachability.
+//! 7. Re-publishing the cluster restores it.
 //! 8. A listener carrying an enforcement HTTP filter (`envoy.filters.http.rbac`)
 //!    and a route using `weighted_clusters` are ACKed-but-refused: they widen
 //!    nothing (the cluster they name stays unreachable) and the good service is
@@ -715,17 +715,15 @@ async fn probe(outbound_port: u16, host: &str) -> Probe {
 /// Poll until the host is routed all the way to the backend, or fail.
 async fn wait_until_reachable(outbound_port: u16, host: &str) -> Result<Probe, String> {
     let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
-    let mut last = None;
     loop {
         let observed = probe(outbound_port, host).await;
         if observed.reached_backend() {
             return Ok(observed);
         }
-        last = Some(observed.describe("last non-routed response"));
+        let last = observed.describe("last non-routed response");
         if Instant::now() >= deadline {
             return Err(format!(
-                "'{host}' never became reachable within {CONVERGENCE_TIMEOUT:?}; {}",
-                last.unwrap_or_else(|| "no observation".to_string())
+                "'{host}' never became reachable within {CONVERGENCE_TIMEOUT:?}; {last}"
             ));
         }
         tokio::time::sleep(CONVERGENCE_POLL_INTERVAL).await;
