@@ -392,10 +392,7 @@ fn retract_port_drops_only_that_destination() {
     );
     backend.take();
 
-    assert_eq!(
-        steering.retract_port(5300),
-        SteerReconcileOutcome::Applied
-    );
+    assert_eq!(steering.retract_port(5300), SteerReconcileOutcome::Applied);
     assert_eq!(
         steering.bound_destinations(),
         vec![destination("10.96.0.11", 5301)]

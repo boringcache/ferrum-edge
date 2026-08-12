@@ -14,13 +14,13 @@ use ferrum_edge::load_balancer::LoadBalancerCache;
 use ferrum_edge::modes::mesh::config::MeshConfig;
 use ferrum_edge::plugin_cache::PluginCache;
 use ferrum_edge::proxy::client_ip::TrustedProxies;
+use ferrum_edge::proxy::node_waypoint_udp_steering::{
+    NodeWaypointUdpSteerBackend, NodeWaypointUdpSteering,
+};
 use ferrum_edge::proxy::stream_listener::{
     NodeWaypointUdpSteerHold, StreamListenerDegradation, StreamListenerManager,
 };
 use ferrum_edge::proxy::stream_match::{StreamMatchArm, StreamMatchCriteria};
-use ferrum_edge::proxy::node_waypoint_udp_steering::{
-    NodeWaypointUdpSteerBackend, NodeWaypointUdpSteering,
-};
 use ferrum_edge::request_epoch::RequestEpochStore;
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -2280,10 +2280,7 @@ fn node_waypoint_udp_proxy(port: u16) -> Proxy {
     create_stream_proxy(&id, BackendScheme::Udp, port)
 }
 
-fn steer_destination(
-    ip: &str,
-    port: u16,
-) -> ferrum_edge::capture::NodeWaypointUdpSteerDestination {
+fn steer_destination(ip: &str, port: u16) -> ferrum_edge::capture::NodeWaypointUdpSteerDestination {
     ferrum_edge::capture::NodeWaypointUdpSteerDestination {
         ip: ip.parse().expect("destination ip"),
         port,
@@ -2387,9 +2384,8 @@ async fn node_waypoint_udp_successful_bind_publishes_and_shutdown_retracts() {
         last_failures = failures;
         manager.shutdown_all().await;
     }
-    let (manager, steering, dest) = started.unwrap_or_else(|| {
-        panic!("NodeWaypoint UDP listener did not start: {last_failures:?}")
-    });
+    let (manager, steering, dest) = started
+        .unwrap_or_else(|| panic!("NodeWaypoint UDP listener did not start: {last_failures:?}"));
 
     assert_eq!(
         steering.bound_destinations(),
@@ -2435,9 +2431,8 @@ async fn node_waypoint_udp_withdrawal_retracts_steering() {
         last_failures = failures;
         manager.shutdown_all().await;
     }
-    let (manager, steering) = started.unwrap_or_else(|| {
-        panic!("NodeWaypoint UDP listener did not start: {last_failures:?}")
-    });
+    let (manager, steering) = started
+        .unwrap_or_else(|| panic!("NodeWaypoint UDP listener did not start: {last_failures:?}"));
     assert!(
         !steering.bound_destinations().is_empty(),
         "the bound listener must be steered before withdrawal"
