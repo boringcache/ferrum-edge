@@ -1,13 +1,13 @@
 ---
 name: grok-agents
-description: Dispatch and orchestrate local Cursor Grok 4.5 subagents via the standalone cursor-agent CLI for ferrum-edge issue/PR work — implementer, fix-round, and shepherd modes, with worktree isolation and the review loop. Use when the user asks Claude to spawn Grok/Cursor Grok agents on issues, PRs, review findings, or red CI.
+description: Dispatch and orchestrate local Cursor Grok 4.6 subagents via the standalone cursor-agent CLI for ferrum-edge issue/PR work — implementer, fix-round, and shepherd modes, with worktree isolation and the review loop. Use when the user asks Claude to spawn Grok/Cursor Grok agents on issues, PRs, review findings, or red CI.
 ---
 
-# grok-agents: Cursor Grok 4.5 subagent orchestration
+# grok-agents: Cursor Grok 4.6 subagent orchestration
 
 You are the ORCHESTRATOR. Grok agents implement/fix; you verify their diffs, drive/merge
 decisions, and never let an unreviewed PR merge. This skill drives the operator's own standalone
-`cursor-agent` CLI in print mode, pinned to a non-Fast Cursor Grok 4.5 SKU. It never uses
+`cursor-agent` CLI in print mode, pinned to a non-Fast Cursor Grok 4.6 SKU. It never uses
 Conductor's bundled Cursor harness, whose copies lag the standalone releases.
 
 **Guard: do NOT use this skill when you are yourself a dispatched worker.** If your session prompt
@@ -27,10 +27,10 @@ prompt file outside the repo, then launch:
 ```
 
 `--effort low|medium|high|xhigh|max` selects the Grok reasoning SKU (default `high`). Cursor
-publishes three tiers, so `xhigh`/`max` clamp to `high` — do not claim a tier above `high`.
+publishes four tiers, so `max` clamps to `xhigh` — do not claim a tier above `xhigh`.
 
 Non-negotiables:
-- The launcher pins a **non-Fast** SKU (`cursor-grok-4.5-{low,medium,high}`) so runs bill at the
+- The launcher pins a **non-Fast** SKU (`cursor-grok-4.6-{low,medium,high,xhigh}`) so runs bill at the
   standard rate instead of consuming fast credits. The `-fast` variants are never used.
 - The `cursor-agent` binary is resolved from `CURSOR_AGENT_BIN`, then `~/.local/bin/cursor-agent`
   / `/opt/homebrew/bin/cursor-agent` / `/usr/local/bin/cursor-agent`, then `PATH`. Any candidate
