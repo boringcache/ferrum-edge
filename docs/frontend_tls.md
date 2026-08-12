@@ -580,6 +580,27 @@ The deadline is converted to a **monotonic** instant at validation time, so a
 wall-clock rollback cannot lengthen an already-admitted stream. Relayed traffic
 never refreshes it.
 
+#### Kernel TLS and the stream authorization deadline
+
+The optional Linux kernel-TLS (kTLS) fast path for terminating `tcp_tls`
+listeners hands the socket to the kernel and relays with `splice(2)`. The
+gateway no longer owns the byte stream at that point, so the userspace
+authorization-deadline wrapper that bounds an admitted TCP+TLS session cannot be
+installed — and once `dangerous_into_kernel_connection` has run there is no safe
+conversion back to a userspace rustls session.
+
+Eligibility is therefore decided **before the frontend handshake starts**, while
+the socket is still pristine. A TLS-terminating TCP listener whose plugin chain
+can admit an authenticated stream principal — today that means `mtls_auth` —
+does not take the kTLS handoff at all. Such a connection stays on the ordinary
+buffered rustls path, is relayed normally, and is bounded by the certificate
+deadline exactly as described above. Nothing is refused and no authentication is
+skipped; only the optional fast path is declined.
+
+Listeners that cannot admit such a principal keep kTLS unchanged, alongside the
+pre-existing refusals (opt-in off, TLS backend, decrypted first-bytes
+inspection, TLS 1.3, and the cipher/kernel probes inside the handoff itself).
+
 #### Expiry is not revocation
 
 These are two different mechanisms and this document does not conflate them:

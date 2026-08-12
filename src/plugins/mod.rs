@@ -2203,6 +2203,18 @@ pub struct RequestContext {
     /// Monotonic validity deadline supplied by the accepted authentication
     /// attempt. Contains no token, claim set, subject, or issuer material.
     pub(crate) credential_deadline_at: Option<tokio::time::Instant>,
+    /// Bounded authorization-lifetime termination class latched by the relay
+    /// that actually terminated this request's stream because the accepted
+    /// credential's deadline (or the finite authenticated-stream maximum)
+    /// elapsed (issue #3815).
+    ///
+    /// Used by the native-H3 and H3 cross-protocol relays, which own the QUIC
+    /// request/response halves directly and therefore cannot go through the
+    /// `ProxyBody` wrapper that carries this class on the H1/H2 funnel. Private
+    /// and latch-once: the first terminating relay wins, so a later completion
+    /// site cannot restate or overwrite it. A compiled-in literal from a closed
+    /// set — never a token, claim, identity, provider name, or absolute expiry.
+    authorization_termination: Option<crate::proxy::auth_lifetime::StreamAuthTermination>,
     /// Listener-scoped shutdown signal captured with the accepted connection.
     /// WebSocket takeover retains it so listener replacement/drain terminates
     /// upgraded sessions instead of only stopping new accepts.
@@ -3236,6 +3248,7 @@ impl RequestContext {
             backend_geo_country: None,
             auth_method: None,
             credential_deadline_at: None,
+            authorization_termination: None,
             websocket_shutdown_rx: None,
             soap_ws_security_authenticated_body_digest: None,
             timestamp_received: Utc::now(),
@@ -3490,6 +3503,30 @@ impl RequestContext {
     /// from the relative `grpc-timeout` header on later backend attempts.
     pub fn grpc_deadline_at(&self) -> Option<tokio::time::Instant> {
         self.grpc_deadline_at
+    }
+
+    /// Latch the bounded authorization-lifetime termination class for this
+    /// request. First writer wins, so exactly one relay owns the classification
+    /// even when several completion sites run afterwards.
+    pub(crate) fn latch_authorization_termination(
+        &mut self,
+        termination: crate::proxy::auth_lifetime::StreamAuthTermination,
+    ) {
+        if self.authorization_termination.is_none() {
+            self.authorization_termination = Some(termination);
+            self.metadata.insert(
+                crate::proxy::auth_lifetime::STREAM_AUTH_TERMINATION_METADATA_KEY.to_string(),
+                termination.as_str().to_string(),
+            );
+        }
+    }
+
+    /// The latched authorization-lifetime termination class, if this request's
+    /// stream was ended by that contract.
+    pub(crate) fn authorization_termination(
+        &self,
+    ) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
+        self.authorization_termination
     }
 
     pub(crate) fn mark_gateway_deadline_response_selected(&mut self) {
@@ -4301,6 +4338,7 @@ impl RequestContext {
             backend_geo_country: self.backend_geo_country,
             auth_method: self.auth_method,
             credential_deadline_at: self.credential_deadline_at,
+            authorization_termination: self.authorization_termination,
             websocket_shutdown_rx: self.websocket_shutdown_rx.clone(),
             soap_ws_security_authenticated_body_digest: self
                 .soap_ws_security_authenticated_body_digest,
@@ -10105,6 +10143,30 @@ pub trait Plugin: Send + Sync {
     /// which is carried through to `on_stream_disconnect`.
     async fn on_stream_connect(&self, _ctx: &mut StreamConnectionContext) -> PluginResult {
         PluginResult::Continue
+    }
+
+    /// Whether this plugin's [`Plugin::on_stream_connect`] hook can admit an
+    /// authenticated principal — a mapped consumer, a permitted external
+    /// identity, or an authorization deadline contributed through
+    /// [`StreamConnectionContext::observe_credential_deadline`] (issue #3816).
+    ///
+    /// Read BEFORE the frontend TLS handshake starts, to decide whether a
+    /// TLS-terminating TCP listener may hand its socket to kernel TLS. A kTLS
+    /// leg is relayed by `splice(2)`: the kernel owns both sockets and the relay
+    /// cannot be wrapped by the authorization-deadline stream that bounds an
+    /// admitted session. A listener that can admit such a principal therefore
+    /// has to stay on the buffered userspace rustls path, and that decision must
+    /// be taken while the socket is still pristine — after
+    /// `dangerous_into_kernel_connection` there is no safe reverse conversion.
+    ///
+    /// Defaults to `false`. A plugin that populates
+    /// `StreamConnectionContext::identified_consumer`,
+    /// `StreamConnectionContext::authenticated_identity`, or
+    /// `StreamConnectionContext::observe_credential_deadline` MUST override it
+    /// to `true`; `tests/unit/plugins/mtls_auth_certificate_lifetime_tests.rs`
+    /// pins the built-in inventory of such plugins so the two cannot drift.
+    fn admits_authenticated_stream_principal(&self) -> bool {
+        false
     }
 
     /// Called when a stream connection (TCP/UDP session) is completed.

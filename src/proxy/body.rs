@@ -28,10 +28,7 @@ use crate::retry::ErrorClass;
 
 pub type ProxyBodyError = Box<dyn std::error::Error + Send + Sync>;
 
-/// Wire value of `grpc-status: 16` (`UNAUTHENTICATED`), emitted when an
-/// admitted stream outlives the authorization lifetime of the credential that
-/// admitted it. A compiled-in literal so no expiry value can reach the wire.
-const AUTHORIZATION_EXPIRED_GRPC_STATUS_HEADER: &str = "16";
+use crate::proxy::auth_lifetime::AUTHORIZATION_EXPIRED_GRPC_STATUS_HEADER;
 
 /// Authorization-lifetime state carried on a client-visible response body.
 ///

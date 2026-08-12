@@ -641,6 +641,46 @@ fn pre_copy_disconnect_direction(error: &anyhow::Error, class: &ErrorClass) -> D
     }
 }
 
+/// Whether this TLS-terminating TCP listener may hand its socket to kernel TLS.
+///
+/// Decided BEFORE `accept_frontend_tls`, while the socket is still pristine:
+/// once `dangerous_into_kernel_connection` has installed kTLS there is no safe
+/// reverse conversion back to a userspace rustls session, so a connection that
+/// turns out to need an authorization deadline could only be refused outright.
+///
+/// The four terms:
+///
+/// * `ktls_enabled` — the operator opt-in.
+/// * `!is_backend_tls` — `splice(2)` needs both ends raw.
+/// * `!scan_first_bytes_decrypted` — a decrypted first-bytes read has already
+///   taken plaintext out of the TLS session.
+/// * no configured stream plugin declares
+///   [`Plugin::admits_authenticated_stream_principal`] — a kTLS leg is relayed
+///   by the kernel and cannot be wrapped by [`AuthorizationDeadlineStream`], so
+///   a listener that can admit a principal whose session must be bounded by an
+///   authorization deadline (issue #3816) stays on the buffered userspace path
+///   and keeps a usable, deadline-aware relay. This is the conservative
+///   direction: the cost of a false positive is losing an optional fast path,
+///   whereas a false negative would relay an authenticated session with no
+///   authorization bound at all.
+///
+/// Everything else that can refuse — kernel/cipher probes, TLS 1.3,
+/// confidentiality policy — is decided inside `try_ktls_accept`, which falls
+/// back to the buffered accept with the socket untouched.
+pub(crate) fn ktls_handoff_eligible(
+    ktls_enabled: bool,
+    is_backend_tls: bool,
+    scan_first_bytes_decrypted: bool,
+    plugins: &[Arc<dyn Plugin>],
+) -> bool {
+    ktls_enabled
+        && !is_backend_tls
+        && !scan_first_bytes_decrypted
+        && !plugins
+            .iter()
+            .any(|plugin| plugin.admits_authenticated_stream_principal())
+}
+
 /// Frontend leg handed to the userspace relay, with or without an
 /// authorization-lifetime bound. A concrete enum rather than a boxed trait
 /// object so the unbounded (and overwhelmingly common) case keeps the exact
@@ -668,14 +708,14 @@ enum StreamClientLeg<S> {
 /// would drop its stack-local byte counters.
 ///
 /// Carries no credential material — only a monotonic instant.
-pub(crate) struct AuthorizationDeadlineStream<S> {
+pub struct AuthorizationDeadlineStream<S> {
     inner: S,
     deadline: Pin<Box<tokio::time::Sleep>>,
     expired: Arc<AtomicBool>,
 }
 
 impl<S> AuthorizationDeadlineStream<S> {
-    pub(crate) fn new(
+    pub fn new(
         inner: S,
         deadline_at: tokio::time::Instant,
         expired: Arc<AtomicBool>,
@@ -3452,7 +3492,12 @@ async fn handle_tcp_connection_inner(
         // refuse — kernel/cipher probes, TLS 1.3, secret-extraction opt-in —
         // is decided inside `try_ktls_accept` while the socket is still
         // pristine, so a refusal costs nothing but a ClientHello peek.
-        let ktls_eligible = ktls_enabled && !is_backend_tls && !scan_first_bytes_decrypted;
+        let ktls_eligible = ktls_handoff_eligible(
+            ktls_enabled,
+            is_backend_tls,
+            scan_first_bytes_decrypted,
+            plugins.as_ref(),
+        );
 
         // Frontend TLS failures return before any backend dispatch — no backend
         // circuit-breaker, pool, or socket interaction.
@@ -4037,16 +4082,27 @@ async fn handle_tcp_connection_inner(
     // Start bidirectional copy. From here, no retries — bytes may be exchanged.
     let mut used_splice = false;
     let copy_result = match client_stream {
-        // A kernel-TLS frontend leg is relayed by `splice(2)`, which owns the
-        // sockets and cannot be wrapped by the authorization-deadline stream.
-        // Rather than silently relay an authenticated session with no
-        // authorization bound, fail closed. The combination is narrow: kTLS is
-        // Linux-only, opt-in, TLS 1.2 ChaCha20-Poly1305 only, plain-backend
-        // only, and only reachable at all when the listener also verifies a
-        // client certificate that a stream auth plugin mapped to a principal.
+        // Defensive invariant, not a live path. A kernel-TLS frontend leg is
+        // relayed by `splice(2)`, which owns the sockets and cannot be wrapped
+        // by `AuthorizationDeadlineStream`. `ktls_handoff_eligible` therefore
+        // refuses the handoff BEFORE the handshake for any listener carrying a
+        // plugin that can admit an authenticated principal, so such a
+        // connection reaches the `ClientRelayStream::Tls` arm below on the
+        // buffered userspace path and is relayed normally with its deadline.
+        //
+        // Reaching here would mean a plugin admitted a principal without
+        // declaring `admits_authenticated_stream_principal`. That is a
+        // composition bug, and the only safe response is to fail closed rather
+        // than relay an authenticated session with no authorization bound: the
+        // session cannot be converted back to userspace TLS at this point.
         #[cfg(target_os = "linux")]
         ClientRelayStream::Ktls(..) if stream_auth_deadline.is_some() => {
             used_splice = false;
+            debug_assert!(
+                false,
+                "kTLS handoff must be refused before the handshake for a listener that can \
+                 admit an authenticated stream principal"
+            );
             let error = anyhow::anyhow!(
                 "kTLS client leg cannot carry an authenticated stream authorization deadline: \
                  the kernel splice relay cannot be bounded by the accepted credential's lifetime"

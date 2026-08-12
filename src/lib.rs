@@ -6885,6 +6885,38 @@ pub mod _test_support {
         body.with_authorization_deadline(deadline, grpc_web_response_content_type, family)
     }
 
+    /// Whether a TLS-terminating TCP listener may hand its socket to kernel
+    /// TLS, exactly as `handle_tcp_connection_inner` decides it before the
+    /// frontend handshake. Exposed so external tests can prove that a listener
+    /// carrying a stream-authenticating plugin (`mtls_auth`) stays on the
+    /// buffered userspace path where the authorization deadline can be
+    /// enforced (issue #3816).
+    pub fn ktls_handoff_eligible_for_test(
+        ktls_enabled: bool,
+        is_backend_tls: bool,
+        scan_first_bytes_decrypted: bool,
+        plugins: &[std::sync::Arc<dyn crate::plugins::Plugin>],
+    ) -> bool {
+        crate::proxy::tcp_proxy::ktls_handoff_eligible(
+            ktls_enabled,
+            is_backend_tls,
+            scan_first_bytes_decrypted,
+            plugins,
+        )
+    }
+
+    /// Wrap a frontend stream leg with the authorization-lifetime bound the
+    /// TCP/TLS relay installs, so external tests can prove that the deadline
+    /// terminates BOTH directions under continuous traffic without refreshing
+    /// on relayed bytes.
+    pub fn authorization_deadline_stream_for_test<S>(
+        inner: S,
+        deadline_at: tokio::time::Instant,
+        expired: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> crate::proxy::tcp_proxy::AuthorizationDeadlineStream<S> {
+        crate::proxy::tcp_proxy::AuthorizationDeadlineStream::new(inner, deadline_at, expired)
+    }
+
     pub fn proxy_body_with_client_grpc_deadline_for_test(
         body: crate::proxy::ProxyBody,
         deadline: tokio::time::Instant,

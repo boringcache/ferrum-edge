@@ -401,25 +401,42 @@ The `grpc-message` and the internal termination text are compiled-in literals.
 | Native gRPC server-, client-, and bidirectional streaming | Yes |
 | gRPC-Web streaming, binary and text | Yes |
 | HTTP/3 backend responses relayed to an H1/H2 downstream (`StreamingH3`) | Yes |
+| Native HTTP/3 frontend streaming responses, including SSE and inspected streams | Yes — the relay resets the H3 stream at the deadline rather than fabricating a clean finish |
+| Native HTTP/3 gRPC server-, client-, and bidirectional streaming | Yes — clean `grpc-status: 16` trailers while no response byte is client-visible, otherwise a stream reset; the request-upload pump is retired by its guard in the same step |
+| H3 cross-protocol relays to HTTP/1.1, HTTP/2, and gRPC backends, gRPC-Web translation included | Yes, in both directions: the request-upload bridge terminates with a fixed `401` before response headers are committed, and the response relay resets or emits the bounded terminal after commitment |
 | Inspected / latency-tracked streaming bodies | Yes |
 | WebSocket over H1, H2 Extended CONNECT, and H3 Extended CONNECT | Yes, through the pre-existing WebSocket deadline arbiter, which uses the same `credential_deadline_at` |
 | TCP+TLS stream sessions on the userspace relay | Yes |
 | UDP+DTLS stream sessions | Yes — raced against relay completion, the idle watchdog, and drain; both directions are closed and the backend connection is torn down |
 | CP/DP configuration streams | Yes, through the separate control-plane lifetime enforcement |
 
-Known gaps, tracked as follow-ups rather than silently implied:
+The native HTTP/3 frontend and the H3 cross-protocol bridge own the QUIC
+request and response halves directly rather than going through `ProxyBody`, so
+each relay loop races its own copy of the same absolute deadline. The deadline
+is captured once from the accepted request context before the relay takes
+ownership and is never recomputed from relay activity; the arm is placed ahead
+of the client `grpc-timeout` arm so the security bound is the one attributed
+when both are ready, and each arm breaks its relay loop, so exactly one
+completion and one counter increment occur per terminated stream. The bounded
+termination class is latched on the request and reaches the H3
+`BodyOutcome` / response-stream termination hooks and the transaction summary
+through the ordinary path.
 
-- The **native HTTP/3 frontend** response path (`src/http3/server.rs`) and the
-  **H3 cross-protocol** relay loops (`src/http3/cross_protocol.rs`) write frames
-  directly rather than through `ProxyBody`, and are not yet bounded by this
-  contract. They already enforce the client `grpc-timeout` and transport
-  deadlines. An H3 request whose credential is *already* expired is still
-  rejected at authentication.
+Deliberate scope notes:
+
 - The Linux **kTLS splice** frontend leg cannot be wrapped by the relay-side
-  deadline, so a stream session that would carry one is refused outright rather
-  than relayed unbounded.
+  deadline. Eligibility is therefore decided before the frontend handshake: a
+  TLS-terminating TCP listener that can admit an authenticated stream principal
+  declines the kTLS handoff and is relayed on the buffered userspace path, where
+  the deadline is enforced. See
+  [Kernel TLS and the stream authorization deadline](frontend_tls.md#kernel-tls-and-the-stream-authorization-deadline).
 - **Plaintext TCP** stream sessions carry no gateway-verified credential from a
   built-in mechanism, so no deadline is derived for them.
+- An H3 request body that is **buffered before dispatch** is bounded by the
+  existing early-upload ceiling (`backend_read_timeout_ms` composed with the
+  client RPC deadline) and by the request-body size ceiling; the authorization
+  deadline governs the **streaming** upload bridge, which is the path that can
+  otherwise stay continuously active.
 
 ## Interaction with Retry Logic
 

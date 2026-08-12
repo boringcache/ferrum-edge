@@ -80,6 +80,12 @@ impl StreamAuthTermination {
     }
 }
 
+/// Wire value of `grpc-status: 16` (`UNAUTHENTICATED`), emitted when an
+/// admitted stream outlives the authorization lifetime of the credential that
+/// admitted it. A compiled-in literal shared by every relay so no expiry value
+/// can reach the wire and the frontends cannot drift.
+pub const AUTHORIZATION_EXPIRED_GRPC_STATUS_HEADER: &str = "16";
+
 /// The effective authorization bound for one admitted stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamAuthDeadline {

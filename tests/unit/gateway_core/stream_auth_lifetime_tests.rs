@@ -12,7 +12,7 @@ use ferrum_edge::_test_support::{
     request_received_at_for_test, set_request_credential_deadline_for_test,
 };
 use ferrum_edge::config::types::Consumer;
-use ferrum_edge::plugins::RequestContext;
+use ferrum_edge::plugins::{Plugin, RequestContext};
 use ferrum_edge::proxy::auth_lifetime::{
     StreamAuthProtocolFamily, StreamAuthTermination, counters, effective_request_auth_deadline,
     effective_stream_auth_deadline, record_termination, request_is_authenticated,
@@ -336,4 +336,146 @@ fn the_runtime_metrics_snapshot_serializes_without_any_unbounded_label() {
             &"credential_expired".to_string()
         ]
     );
+}
+
+// --- kTLS fallback for deadline-bearing stream sessions (issue #3816) -------
+//
+// A kernel-TLS frontend leg is relayed by `splice(2)`: the kernel owns both
+// sockets, so the relay cannot be wrapped by `AuthorizationDeadlineStream`, and
+// after `dangerous_into_kernel_connection` there is no safe conversion back to a
+// userspace rustls session. The handoff is therefore refused BEFORE the
+// handshake for any listener whose plugin chain can admit an authenticated
+// principal, and such a connection is relayed normally on the buffered
+// userspace path where the deadline IS enforceable.
+
+fn mtls_auth_plugin() -> Arc<dyn ferrum_edge::plugins::Plugin> {
+    Arc::new(
+        ferrum_edge::plugins::mtls_auth::MtlsAuth::new(&serde_json::json!({
+            "cert_field": "subject_cn"
+        }))
+        .expect("valid mtls_auth config"),
+    )
+}
+
+fn observability_plugin() -> Arc<dyn ferrum_edge::plugins::Plugin> {
+    Arc::new(
+        ferrum_edge::plugins::correlation_id::CorrelationId::new(&serde_json::json!({}))
+            .expect("valid correlation_id config"),
+    )
+}
+
+#[test]
+fn mtls_auth_declares_that_it_admits_an_authenticated_stream_principal() {
+    assert!(
+        mtls_auth_plugin().admits_authenticated_stream_principal(),
+        "mtls_auth maps a client certificate to a consumer and contributes the leaf notAfter \
+         as the session authorization deadline, so it must keep a listener off the kTLS path"
+    );
+}
+
+#[test]
+fn an_ordinary_stream_plugin_does_not_declare_a_stream_principal() {
+    assert!(!observability_plugin().admits_authenticated_stream_principal());
+}
+
+#[test]
+fn a_listener_with_mtls_auth_is_kept_off_the_ktls_handoff() {
+    let plugins = vec![observability_plugin(), mtls_auth_plugin()];
+    assert!(
+        !ferrum_edge::_test_support::ktls_handoff_eligible_for_test(true, false, false, &plugins),
+        "an mTLS-authenticated TCP+TLS listener must stay on the buffered userspace path so its \
+         admitted session can be bounded by the certificate deadline"
+    );
+}
+
+#[test]
+fn the_ktls_fast_path_survives_for_listeners_that_cannot_admit_a_principal() {
+    let plugins = vec![observability_plugin()];
+    assert!(ferrum_edge::_test_support::ktls_handoff_eligible_for_test(
+        true, false, false, &plugins
+    ));
+    assert!(ferrum_edge::_test_support::ktls_handoff_eligible_for_test(
+        true,
+        false,
+        false,
+        &[] as &[Arc<dyn ferrum_edge::plugins::Plugin>]
+    ));
+}
+
+#[test]
+fn the_pre_existing_ktls_refusals_are_unchanged() {
+    let plugins: Vec<Arc<dyn ferrum_edge::plugins::Plugin>> = Vec::new();
+    // opt-in off
+    assert!(!ferrum_edge::_test_support::ktls_handoff_eligible_for_test(
+        false, false, false, &plugins
+    ));
+    // TLS backend: splice needs both ends raw
+    assert!(!ferrum_edge::_test_support::ktls_handoff_eligible_for_test(
+        true, true, false, &plugins
+    ));
+    // decrypted first-bytes inspection already took plaintext out of the session
+    assert!(!ferrum_edge::_test_support::ktls_handoff_eligible_for_test(
+        true, false, true, &plugins
+    ));
+}
+
+// --- The deadline-aware userspace frontend leg -----------------------------
+
+/// The relay wrapper terminates BOTH directions of a continuously active
+/// session at the absolute deadline, and relayed bytes never push it out.
+#[tokio::test(start_paused = true)]
+async fn the_userspace_frontend_leg_terminates_both_directions_at_the_deadline() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (client, mut peer) = tokio::io::duplex(64 * 1024);
+    let expired = Arc::new(AtomicBool::new(false));
+    let deadline_at = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut leg =
+        ferrum_edge::_test_support::authorization_deadline_stream_for_test(client, deadline_at, Arc::clone(&expired));
+
+    // Continuous traffic BEFORE the deadline keeps working in both directions.
+    for _ in 0..8 {
+        leg.write_all(b"ping").await.expect("write before deadline");
+        let mut buf = [0u8; 4];
+        peer.read_exact(&mut buf).await.expect("peer read");
+        peer.write_all(b"pong").await.expect("peer write");
+        let mut back = [0u8; 4];
+        leg.read_exact(&mut back).await.expect("read before deadline");
+        assert_eq!(&back, b"pong");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+    }
+    assert!(
+        !expired.load(Ordering::Acquire),
+        "relayed bytes must never refresh an absolute authorization deadline, but they also \
+         must not trip it early"
+    );
+
+    // Cross the deadline. Both halves now fail, deterministically and with a
+    // fixed, credential-free `TimedOut` classification.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let read_err = leg.read(&mut [0u8; 4]).await.expect_err("read after deadline");
+    assert_eq!(read_err.kind(), std::io::ErrorKind::TimedOut);
+    let write_err = leg.write(b"ping").await.expect_err("write after deadline");
+    assert_eq!(write_err.kind(), std::io::ErrorKind::TimedOut);
+    assert!(expired.load(Ordering::Acquire));
+
+    // Nothing credential-bearing reaches the classifier or the debug log.
+    let message = read_err.to_string();
+    assert!(!message.contains("alice"));
+    assert!(!message.contains("notAfter"));
+    assert!(!message.to_ascii_lowercase().contains("cert"));
+
+    // Shutdown is always allowed through: it is the teardown the deadline is
+    // trying to reach, so refusing it would leave the socket half-open.
+    leg.shutdown().await.expect("shutdown after deadline");
+}
+
+/// A session with no authorization deadline is untouched: the wrapper is only
+/// installed when the arbiter produced a plan.
+#[tokio::test(start_paused = true)]
+async fn an_unauthenticated_stream_session_gets_no_deadline_plan() {
+    let anchor = tokio::time::Instant::now();
+    assert!(effective_stream_auth_deadline(false, None, anchor, DEFAULT_MAX).is_none());
 }

@@ -985,6 +985,14 @@ auth_flow::impl_auth_plugin!(
     super::priority::MTLS_AUTH,
     crate::plugins::HTTP_FAMILY_AND_STREAM_PROTOCOLS,
     auth_flow::run_auth;
+    /// `on_stream_connect` below maps a client certificate to a consumer and
+    /// contributes the leaf's `notAfter` as the session authorization deadline,
+    /// so a listener carrying this plugin can never be handed to kernel TLS:
+    /// the `splice(2)` relay cannot be bounded by that deadline (issue #3816).
+    fn admits_authenticated_stream_principal(&self) -> bool {
+        true
+    }
+
     async fn on_stream_connect(&self, ctx: &mut StreamConnectionContext) -> PluginResult {
         let cert_der = match &ctx.tls_client_cert_der {
             Some(der) => der,

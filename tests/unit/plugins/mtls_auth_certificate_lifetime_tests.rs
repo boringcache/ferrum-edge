@@ -382,3 +382,91 @@ async fn a_validity_rejection_never_echoes_certificate_or_time_material() {
         other => panic!("expected a rejection, got {other:?}"),
     }
 }
+
+/// Drift guard for the kTLS handoff decision (issue #3816).
+///
+/// `Plugin::admits_authenticated_stream_principal` defaults to `false`, and the
+/// TCP/TLS listener uses it to decide — before the frontend handshake — whether
+/// the socket may be handed to kernel TLS. A plugin that admits a stream
+/// principal without overriding it would be relayed by `splice(2)` with no
+/// enforceable authorization deadline, so the built-in inventory of such
+/// plugins is pinned here: any new `on_stream_connect` hook that populates
+/// `identified_consumer`, `authenticated_identity`, or a credential deadline
+/// must both override the declaration and be listed below.
+#[test]
+fn the_stream_principal_admitting_plugin_inventory_is_pinned() {
+    use std::path::Path;
+
+    const DECLARED: &[&str] = &["mtls_auth"];
+
+    fn scan(dir: &Path, found: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).expect("readable plugin directory") {
+            let entry = entry.expect("readable directory entry");
+            let path = entry.path();
+            if path.is_dir() {
+                scan(&path, found);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            // `src/plugins/mod.rs` holds the trait DEFINITION (and this
+            // declaration's own doc comment), not a plugin implementation.
+            if path == dir.join("mod.rs") && dir.ends_with("plugins") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).expect("readable plugin source");
+            let Some(hook_start) = source.find("fn on_stream_connect(") else {
+                continue;
+            };
+            // Bound the scan to the hook body: other phases legitimately assign
+            // request-scoped identity and are irrelevant to a stream session.
+            // Comment lines are stripped so prose about the contract cannot be
+            // mistaken for an implementation of it.
+            let body: String = source[hook_start..]
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let assigns_identity = body.contains("ctx.identified_consumer = Some")
+                || body.contains("ctx.authenticated_identity = Some")
+                || body.contains("observe_credential_deadline");
+            if assigns_identity {
+                found.push(
+                    path.file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                );
+            }
+        }
+    }
+
+    let mut found = Vec::new();
+    scan(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("src/plugins"),
+        &mut found,
+    );
+    found.sort();
+    found.dedup();
+
+    assert_eq!(
+        found, DECLARED,
+        "a plugin whose on_stream_connect admits an authenticated principal must override \
+         Plugin::admits_authenticated_stream_principal and be listed here; otherwise a \
+         TLS-terminating TCP listener carrying it can still take the kTLS splice path, where \
+         the session's authorization deadline cannot be enforced"
+    );
+}
+
+#[test]
+fn mtls_auth_keeps_a_tcp_tls_listener_on_the_deadline_aware_userspace_relay() {
+    let plugin: std::sync::Arc<dyn Plugin> = std::sync::Arc::new(default_plugin());
+    assert!(plugin.admits_authenticated_stream_principal());
+    assert!(!ferrum_edge::_test_support::ktls_handoff_eligible_for_test(
+        true,
+        false,
+        false,
+        &[plugin]
+    ));
+}
