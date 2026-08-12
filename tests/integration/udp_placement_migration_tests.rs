@@ -8,7 +8,8 @@ use ferrum_edge::proxy::netns_udp_capture::{NetnsUdpCleanupBackend, NetnsUdpClea
 use ferrum_edge::proxy::udp_placement_migration::{
     UdpAdoptionProof, UdpCleanupProofWindow, UdpMigrationFailureReason, UdpMigrationPhase,
     UdpNodeIdentity, UdpPlacement, UdpPlacementDecision, UdpPlacementRequest, UdpRegistrySyncProof,
-    clear_registry_sync_marker, prepare_placement, publish_registry_sync_marker_for_pods,
+    clear_registry_sync_marker, prepare_placement, publish_node_identity_for,
+    publish_registry_sync_marker_for_pods, retract_node_identity,
 };
 
 /// Node identity is supplied EXPLICITLY in these tests rather than resolved
@@ -492,35 +493,243 @@ fn an_identity_bound_record_fails_closed_when_current_node_identity_is_unknown()
 }
 
 #[test]
-fn a_pre_identity_record_keeps_its_identity_free_handling_and_is_restamped() {
-    // A record written before the node-identity binding existed asserts NO
-    // ownership claim, so refusing it when identity is unresolvable would be a
-    // gratuitous upgrade outage rather than a security boundary. It keeps the
-    // legacy handling, and the first stable start that CAN resolve an identity
-    // stamps one so the boundary applies from then on.
+fn an_unbound_durable_record_never_adopts_a_producer_placement() {
+    // A durable record naming NO owning node UID proves nothing about which
+    // machine established the placement it describes. That is the shape a
+    // pre-#3809 record has, and also the shape a registry directory copied
+    // between machines or reattached under a recycled node name presents — so
+    // it must not start a producer merely by existing, with or without a
+    // resolvable current identity (a missing identity is not a way past it).
+    for node in [None, Some(identity(NODE_A, BOOT_1))] {
+        let registry = tempfile::tempdir().expect("registry");
+        write_unbound_state(registry.path(), UdpPlacement::PodNetns);
+        let request = UdpPlacementRequest {
+            node: node.clone(),
+            node_proof_generation: node.as_ref().map(|_| PROOF_GENERATION.to_string()),
+            ..stable(UdpPlacement::PodNetns)
+        };
+        let error = prepare_placement(registry.path(), &request)
+            .err()
+            .expect("unbound durable ownership must not adopt a producer");
+        assert!(error.contains("names no owning Kubernetes node UID"), "{error}");
+        assert!(error.contains("cleanup then finalize"), "{error}");
+    }
+
+    // `disabled` owns no producer and carries no traffic, so it is the one
+    // placement an unbound record may still carry — and the first start that
+    // CAN resolve an identity binds it, so the boundary applies from then on.
     let registry = tempfile::tempdir().expect("registry");
-    prepare_placement(registry.path(), &stable(UdpPlacement::PodNetns))
-        .expect("legacy identity-free bootstrap");
+    write_unbound_state(registry.path(), UdpPlacement::Disabled);
     assert!(matches!(
-        prepare_placement(registry.path(), &stable(UdpPlacement::PodNetns)),
+        prepare_placement(registry.path(), &stable(UdpPlacement::Disabled)),
         Ok(UdpPlacementDecision::RunStable)
     ));
-
     let node = identity(NODE_A, BOOT_1);
     assert!(matches!(
         prepare_placement(
             registry.path(),
-            &stable_on_node(UdpPlacement::PodNetns, &node)
+            &stable_on_node(UdpPlacement::Disabled, &node)
         ),
         Ok(UdpPlacementDecision::RunStable)
     ));
-    let error = prepare_placement(registry.path(), &stable(UdpPlacement::PodNetns))
+    let error = prepare_placement(registry.path(), &stable(UdpPlacement::Disabled))
         .err()
-        .expect("the re-stamped record is identity-bound from here on");
+        .expect("the bound record is identity-bound from here on");
     assert!(
         error.contains("current identity could not be resolved"),
         "{error}"
     );
+}
+
+#[test]
+fn unbound_durable_ownership_recovers_only_through_cleanup_and_finalize() {
+    // The supported recovery: an explicit cleanup migration retires the exact
+    // Ferrum-owned predecessor state on this node, and finalize binds this
+    // node's identity to the record it leaves behind. Only then does the
+    // placement start.
+    let registry = tempfile::tempdir().expect("registry");
+    write_unbound_state(registry.path(), UdpPlacement::PodNetns);
+    let node = identity(NODE_A, BOOT_1);
+
+    let cleanup = on_node(
+        transition(
+            UdpMigrationPhase::Cleanup,
+            "unbound-recovery",
+            UdpPlacement::PodNetns,
+            UdpPlacement::HostNetns,
+        ),
+        &node,
+    );
+    let context = cleanup_context(registry.path(), &cleanup);
+    complete_cleanup(&context);
+    assert!(matches!(
+        prepare_placement(
+            registry.path(),
+            &on_node(
+                transition(
+                    UdpMigrationPhase::Finalize,
+                    "unbound-recovery",
+                    UdpPlacement::PodNetns,
+                    UdpPlacement::HostNetns,
+                ),
+                &node,
+            ),
+        ),
+        Ok(UdpPlacementDecision::RunStable)
+    ));
+
+    // The recovered record is this node's own ownership from here on: it starts
+    // without any node attestation, and it is refused for any other node.
+    assert!(matches!(
+        prepare_placement(
+            registry.path(),
+            &stable_on_node(UdpPlacement::HostNetns, &node)
+        ),
+        Ok(UdpPlacementDecision::RunStable)
+    ));
+    let error = prepare_placement(
+        registry.path(),
+        &stable_on_node(UdpPlacement::HostNetns, &identity(NODE_B, BOOT_1)),
+    )
+    .err()
+    .expect("the recovered record is bound to the node that proved the cleanup");
+    assert!(error.contains("different Kubernetes node UID"), "{error}");
+}
+
+/// The exact on-disk shape of ownership that names no node: a pre-#3809 record,
+/// a restored backup, or a registry directory reattached under a reused node
+/// name. Written directly so the refusal is decided by the record's CONTENT and
+/// never by how this process happened to create it.
+fn write_unbound_state(registry: &std::path::Path, active: UdpPlacement) {
+    let document = serde_json::json!({
+        "version": 1,
+        "active": active.as_str(),
+        "pending": null,
+        "completed": null,
+    });
+    std::fs::write(
+        registry.join(".udp-placement-state-v1.json"),
+        serde_json::to_vec(&document).expect("encode durable state"),
+    )
+    .expect("write unbound durable state");
+}
+
+#[test]
+fn a_stale_same_boot_node_identity_publication_would_inherit_the_predecessor_proof() {
+    // The hazard the retraction closes, stated as a live fact: a publication
+    // left by a PREVIOUS Kubernetes Node object on this same boot resolves —
+    // its boot id IS the current incarnation's — and its UID matches the
+    // predecessor's node-cleanup proof, so the host producer starts.
+    let registry = tempfile::tempdir().expect("registry");
+    let predecessor = identity(NODE_A, BOOT_1);
+    publish_node_identity_for(registry.path(), &predecessor).expect("predecessor publication");
+    write_node_attestation(
+        registry.path(),
+        ".udp-node-cleanup-proof-v1.json",
+        &predecessor,
+        UdpPlacement::HostNetns,
+        PROOF_GENERATION,
+    );
+
+    let resolved = UdpNodeIdentity::resolve_published(registry.path(), BOOT_1);
+    assert_eq!(resolved.as_ref(), Some(&predecessor));
+    let request = UdpPlacementRequest {
+        node: resolved,
+        node_proof_generation: Some(PROOF_GENERATION.to_string()),
+        ..stable_attested(UdpPlacement::HostNetns, UdpPlacement::HostNetns)
+    };
+    assert!(matches!(
+        prepare_placement(registry.path(), &request),
+        Ok(UdpPlacementDecision::RunStable)
+    ));
+}
+
+#[test]
+fn retracting_the_publication_leaves_no_stale_identity_authorizing_adoption() {
+    // The publisher retracts BEFORE anything that can fail, and again after a
+    // failure, so a lookup/publication failure leaves NO identity rather than
+    // the predecessor Node object's UID.
+    let registry = tempfile::tempdir().expect("registry");
+    let predecessor = identity(NODE_A, BOOT_1);
+    let identity_file = registry.path().join(".node-identity-v1.json");
+    publish_node_identity_for(registry.path(), &predecessor).expect("predecessor publication");
+    write_node_attestation(
+        registry.path(),
+        ".udp-node-cleanup-proof-v1.json",
+        &predecessor,
+        UdpPlacement::HostNetns,
+        PROOF_GENERATION,
+    );
+
+    retract_node_identity(registry.path()).expect("retraction");
+    assert!(
+        !identity_file.exists(),
+        "the exact publication must be gone, not merely superseded"
+    );
+    assert_eq!(
+        UdpNodeIdentity::resolve_published(registry.path(), BOOT_1),
+        None
+    );
+    // Retraction is idempotent, so the post-failure re-assertion is safe.
+    retract_node_identity(registry.path()).expect("idempotent retraction");
+
+    // With no identity resolved, the predecessor's proof authorizes nothing.
+    let error = prepare_placement(
+        registry.path(),
+        &stable_attested(UdpPlacement::HostNetns, UdpPlacement::HostNetns),
+    )
+    .err()
+    .expect("a retracted identity must not adopt the host producer");
+    assert!(error.contains("no node identity"), "{error}");
+
+    // The replacement Node object publishes its OWN UID, which the predecessor
+    // proof cannot satisfy.
+    let replacement = identity(NODE_B, BOOT_1);
+    publish_node_identity_for(registry.path(), &replacement).expect("replacement publication");
+    let resolved = UdpNodeIdentity::resolve_published(registry.path(), BOOT_1);
+    assert_eq!(resolved.as_ref(), Some(&replacement));
+    let request = UdpPlacementRequest {
+        node: resolved,
+        node_proof_generation: Some(PROOF_GENERATION.to_string()),
+        ..stable_attested(UdpPlacement::HostNetns, UdpPlacement::HostNetns)
+    };
+    let error = prepare_placement(registry.path(), &request)
+        .err()
+        .expect("a recreated node must not inherit the predecessor's proof");
+    assert!(error.contains("different Kubernetes node UID"), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
+fn identity_retraction_is_narrow_and_does_not_follow_symlinks() {
+    use std::os::unix::fs::symlink;
+
+    let registry = tempfile::tempdir().expect("registry");
+    let published = registry.path().join(".node-identity-v1.json");
+    let outside = registry.path().join("outside-target");
+    std::fs::write(&outside, b"must survive").expect("symlink target");
+    symlink(&outside, &published).expect("symlinked identity");
+    let neighbour = registry.path().join(".udp-node-cleanup-proof-v1.json");
+    std::fs::write(&neighbour, b"neighbour").expect("neighbouring artifact");
+
+    retract_node_identity(registry.path()).expect("symlinked publication is retracted");
+    assert!(
+        published.symlink_metadata().is_err(),
+        "the link itself must be unlinked"
+    );
+    assert_eq!(
+        std::fs::read(&outside).expect("symlink target survives"),
+        b"must survive"
+    );
+    assert!(
+        neighbour.exists(),
+        "retraction must touch only the identity publication"
+    );
+
+    // A crash-left or hostile entry of another type is retracted, not skipped.
+    std::fs::create_dir(&published).expect("directory at the publication path");
+    retract_node_identity(registry.path()).expect("directory publication is retracted");
+    assert!(!published.exists());
 }
 
 #[test]
@@ -807,23 +1016,35 @@ fn quarantine_tombstone_refuses_attested_adoption_until_finalize_clears_it() {
 #[test]
 fn pod_to_host_cleanup_resumes_and_finalize_requires_durable_completion() {
     let registry = tempfile::tempdir().expect("registry");
-    prepare_placement(registry.path(), &stable(UdpPlacement::PodNetns))
-        .expect("pod placement bootstrap");
-    let cleanup = transition(
-        UdpMigrationPhase::Cleanup,
-        "rollout-42",
-        UdpPlacement::PodNetns,
-        UdpPlacement::HostNetns,
+    // Ownership of a producer placement is identity-bound end to end, so every
+    // phase of this rollout carries the same node identity.
+    let node = identity(NODE_A, BOOT_1);
+    prepare_placement(
+        registry.path(),
+        &stable_on_node(UdpPlacement::PodNetns, &node),
+    )
+    .expect("pod placement bootstrap");
+    let cleanup = on_node(
+        transition(
+            UdpMigrationPhase::Cleanup,
+            "rollout-42",
+            UdpPlacement::PodNetns,
+            UdpPlacement::HostNetns,
+        ),
+        &node,
     );
     let first = cleanup_context(registry.path(), &cleanup);
     let resumed = cleanup_context(registry.path(), &cleanup);
     assert_eq!(first.generation(), resumed.generation());
 
-    let finalize = transition(
-        UdpMigrationPhase::Finalize,
-        "rollout-42",
-        UdpPlacement::PodNetns,
-        UdpPlacement::HostNetns,
+    let finalize = on_node(
+        transition(
+            UdpMigrationPhase::Finalize,
+            "rollout-42",
+            UdpPlacement::PodNetns,
+            UdpPlacement::HostNetns,
+        ),
+        &node,
     );
     assert!(prepare_placement(registry.path(), &finalize).is_err());
     complete_cleanup(&resumed);
@@ -838,7 +1059,10 @@ fn pod_to_host_cleanup_resumes_and_finalize_requires_durable_completion() {
         Ok(UdpPlacementDecision::RunStable)
     ));
     assert!(matches!(
-        prepare_placement(registry.path(), &stable(UdpPlacement::HostNetns)),
+        prepare_placement(
+            registry.path(),
+            &stable_on_node(UdpPlacement::HostNetns, &node)
+        ),
         Ok(UdpPlacementDecision::RunStable)
     ));
 }
@@ -1058,43 +1282,59 @@ fn enabled_disabled_transitions_also_require_cleanup_and_finalize() {
         (UdpPlacement::Disabled, UdpPlacement::PodNetns, "enable-pod"),
     ] {
         let registry = tempfile::tempdir().expect("registry");
+        // Ownership of a producer placement is identity-bound end to end, so
+        // every phase in this rollout carries the same node identity.
+        let node = identity(NODE_A, BOOT_1);
         if from == UdpPlacement::HostNetns {
             let bootstrap = cleanup_context(
                 registry.path(),
-                &transition(
-                    UdpMigrationPhase::Cleanup,
-                    "bootstrap-host",
-                    UdpPlacement::PodNetns,
-                    UdpPlacement::HostNetns,
+                &on_node(
+                    transition(
+                        UdpMigrationPhase::Cleanup,
+                        "bootstrap-host",
+                        UdpPlacement::PodNetns,
+                        UdpPlacement::HostNetns,
+                    ),
+                    &node,
                 ),
             );
             complete_cleanup(&bootstrap);
             prepare_placement(
                 registry.path(),
-                &transition(
-                    UdpMigrationPhase::Finalize,
-                    "bootstrap-host",
-                    UdpPlacement::PodNetns,
-                    UdpPlacement::HostNetns,
+                &on_node(
+                    transition(
+                        UdpMigrationPhase::Finalize,
+                        "bootstrap-host",
+                        UdpPlacement::PodNetns,
+                        UdpPlacement::HostNetns,
+                    ),
+                    &node,
                 ),
             )
             .expect("bootstrap finalize");
         } else {
-            prepare_placement(registry.path(), &stable(from)).expect("bootstrap placement");
+            prepare_placement(registry.path(), &stable_on_node(from, &node))
+                .expect("bootstrap placement");
         }
-        assert!(prepare_placement(registry.path(), &stable(to)).is_err());
+        assert!(prepare_placement(registry.path(), &stable_on_node(to, &node)).is_err());
         let context = cleanup_context(
             registry.path(),
-            &transition(UdpMigrationPhase::Cleanup, generation, from, to),
+            &on_node(
+                transition(UdpMigrationPhase::Cleanup, generation, from, to),
+                &node,
+            ),
         );
         complete_cleanup(&context);
         prepare_placement(
             registry.path(),
-            &transition(UdpMigrationPhase::Finalize, generation, from, to),
+            &on_node(
+                transition(UdpMigrationPhase::Finalize, generation, from, to),
+                &node,
+            ),
         )
         .expect("finalize transition");
         assert!(matches!(
-            prepare_placement(registry.path(), &stable(to)),
+            prepare_placement(registry.path(), &stable_on_node(to, &node)),
             Ok(UdpPlacementDecision::RunStable)
         ));
     }

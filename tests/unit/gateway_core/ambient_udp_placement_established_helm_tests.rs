@@ -142,9 +142,36 @@ fn a_settled_host_placement_renders_the_privileged_node_preflight() {
             "the preflight init stage needs {privilege} to enter pod netns"
         );
     }
+    // The one-shot stage's privilege surface is exactly the four declared
+    // capabilities: it drops the runtime's ambient/default set FIRST and cannot
+    // gain more, so the elevated init stage is narrower than the pod default
+    // rather than merely additive.
+    assert!(
+        init_block.contains("allowPrivilegeEscalation: false"),
+        "the preflight init stage must forbid privilege escalation"
+    );
+    let (init_drop, init_add) = init_block
+        .split_once("              add:")
+        .expect("the preflight capability add list");
+    assert!(
+        init_drop.contains("              drop:\n                - ALL\n"),
+        "the preflight init stage must drop ALL capabilities before adding its own"
+    );
+    for privilege in ["NET_ADMIN", "NET_RAW", "SYS_ADMIN", "SYS_PTRACE"] {
+        assert!(
+            init_add.contains(privilege),
+            "the preflight init stage must re-add {privilege} explicitly after the drop"
+        );
+    }
+
     assert!(
         steady_state.contains("{{- if $ambientSetnsCapture }}"),
         "the steady-state container must keep its own narrow setns gate"
+    );
+    assert!(
+        !steady_state.contains("allowPrivilegeEscalation") && !steady_state.contains("drop:"),
+        "narrowing the one-shot stage must not silently rewrite the steady-state \
+         container's capability contract"
     );
     assert!(
         !steady_state.contains("$ambientUdpRunNodePreflight"),

@@ -924,6 +924,59 @@ fn image_surfaces_are_scheduled_by_the_trusted_relevance_classifier() {
     );
 }
 
+/// The required gate decides its own relevance from a TRUSTED-BASE copy of the
+/// classifier, so any production surface the classifier omits can ship a defect
+/// with the live suite silently skipped. The Ambient UDP lifecycle's entry
+/// points are the `ambient-udp-preflight` subcommand (definition and dispatch)
+/// and the node-agent that publishes the node identity every placement proof is
+/// bound to — none of which live under `src/proxy/`.
+#[test]
+fn ambient_udp_production_entry_points_are_scheduled_by_the_trusted_classifier() {
+    let filter = read(".github/scripts/live_suite_path_filter.py");
+    assert!(
+        filter.contains(r#"r"^src/(cli|main)\.rs$""#),
+        "a preflight subcommand or dispatch edit must schedule this gate"
+    );
+    assert!(
+        filter.contains(r#"r"^src/modes/node_agent\.rs$""#),
+        "a node-identity publisher edit must schedule this gate"
+    );
+    for pin in [
+        r#"("ambient-host-udp", ["src/cli.rs"], True)"#,
+        r#"("ambient-host-udp", ["src/main.rs"], True)"#,
+        r#"("ambient-host-udp", ["src/modes/node_agent.rs"], True)"#,
+        r#"("ambient-host-udp", ["src/proxy/udp_placement_migration.rs"], True)"#,
+        r#"("ambient-host-udp", ["src/proxy/udp_placement_cleanup.rs"], True)"#,
+    ] {
+        assert!(
+            filter.contains(pin),
+            "the trusted classifier self-test must pin `{pin}`"
+        );
+    }
+
+    // The scheduled paths are the ones that really carry the lifecycle, so a
+    // rename cannot leave the patterns pointing at nothing.
+    let cli = read("src/cli.rs");
+    assert!(
+        cli.contains("pub fn execute_ambient_udp_preflight")
+            && cli.contains("AmbientUdpPreflight("),
+        "src/cli.rs must still define and dispatch the preflight subcommand"
+    );
+    let main = read("src/main.rs");
+    assert!(
+        main.contains("cli::Command::AmbientUdpPreflight(args)")
+            && main.contains("cli::execute_ambient_udp_preflight(args)"),
+        "src/main.rs must still route the preflight subcommand"
+    );
+    let node_agent = read("src/modes/node_agent.rs");
+    assert!(
+        node_agent.contains("udp_placement_migration::publish_node_identity(registry_dir, uid)")
+            && node_agent.contains("udp_placement_migration::retract_node_identity(registry_dir)"),
+        "src/modes/node_agent.rs must still publish node identity and retract it \
+         before a lookup can fail"
+    );
+}
+
 #[test]
 fn pr_ci_plan_schedules_ebpf_live_for_host_udp_surfaces() {
     let plan = read(".github/scripts/pr_ci_plan.py");

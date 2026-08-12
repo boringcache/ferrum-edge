@@ -192,7 +192,11 @@ host-placement capability set still applies to the running container — but a
 settled host-netns pod now also renders a one-shot `ferrum-udp-node-preflight`
 **init container** that holds `hostPID`/`SYS_ADMIN`/`SYS_PTRACE` long enough to
 retire both predecessor placements ownership-safely and publish that proof, then
-exits. The privilege is bounded to an init stage that cannot serve traffic,
+exits. That stage sets `allowPrivilegeEscalation: false` and drops `ALL`
+capabilities before adding back exactly `NET_ADMIN`, `NET_RAW`, `SYS_ADMIN`, and
+`SYS_PTRACE`, so its declared four are its complete privilege surface rather
+than an addition on top of whatever the runtime's ambient/default set carries.
+The privilege is bounded to an init stage that cannot serve traffic,
 which is strictly narrower than granting the producer setns for its whole
 lifetime, and clusters that will not grant it at all can set
 `ambient.udpNodePreflight.enabled=false` and adopt nodes with explicit

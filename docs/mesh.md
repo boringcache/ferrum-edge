@@ -4223,10 +4223,25 @@ node name would have its record trusted verbatim, because there is nothing left
 to compare it against. Every phase therefore refuses such a record BEFORE
 reading it, with failure reason `node_identity_unresolved`, and the operator
 recovers by restoring the node-agent's `nodes: get` permission (or supplying
-`FERRUM_K8S_NODE_UID` directly). A record written by a release that PREDATES
-this binding carries no incarnation and asserts no ownership claim, so it keeps
-its previous identity-free handling; it is re-stamped with this node's identity
-on the next stable start that can resolve one.
+`FERRUM_K8S_NODE_UID` directly).
+
+**Durable ownership that names no node is never adopted.** A record carrying no
+incarnation — one written before this binding existed, or one written by a
+process that could not resolve an identity — asserts no ownership claim at all,
+so it cannot prove which machine established the placement it describes. A
+registry directory restored from a backup, copied between machines, or
+reattached under a recycled node name presents exactly that shape. Ferrum
+therefore refuses it for every placement that runs a producer (`pod-netns` and
+`host-netns` alike), with failure reason `migration_required`, whether or not a
+current identity is resolvable — a missing identity is not a way past it.
+`disabled` runs no producer and carries no traffic, so it is the one placement
+an unbound record may still carry, and it is bound as soon as an identity is
+resolvable. The supported recovery is the explicit cleanup/finalize pair, which
+retires the exact Ferrum-owned predecessor state on this node and binds this
+node's identity to the record it leaves behind; from then on the ordinary
+node-UID boundary applies. Node identity is therefore a **requirement** for
+running an Ambient UDP producer across a restart, not merely an input to the
+`host-netns` proof.
 
 The proof is visible on authenticated `/health` as
 `mesh.udp_placement_migration.adoption_proof` (with `established_adoption` true
@@ -4266,7 +4281,12 @@ It exits non-zero without publishing anything on any failure or on its
 container never starts on a node whose retirement could not be proven. Only the
 init stage receives `hostPID`, `SYS_ADMIN`, and `SYS_PTRACE`; it has exited
 before the producer starts, so the host placement keeps its narrow
-`NET_ADMIN`/`NET_RAW` steady-state posture — the property that makes it usable
+`NET_ADMIN`/`NET_RAW` steady-state posture. The elevated stage is also narrower
+than the pod default rather than merely additive: it sets
+`allowPrivilegeEscalation: false` and drops `ALL` capabilities before adding
+back exactly `NET_ADMIN`, `NET_RAW`, `SYS_ADMIN`, and `SYS_PTRACE`, so those
+four are its complete, declared privilege surface and it inherits nothing from
+the runtime's ambient or default set — the property that makes it usable
 on clusters that will not grant setns privileges at all.
 
 On such a cluster, set `ambient.udpNodePreflight.enabled=false` and adopt each
@@ -4292,12 +4312,24 @@ value may set `FERRUM_K8S_NODE_UID` directly, which takes precedence. If neither
 is available the node has no identity, and every recordless host adoption stays
 fail-closed.
 
+The node-agent **retracts** that publication before it consults Kubernetes, and
+again after any failure, so a failed lookup leaves NO identity rather than a
+predecessor's. Without that, a Node object deleted and recreated under the same
+name would be dangerous in exactly the case the guard exists for: the old
+`.node-identity-v1.json` names a UID this incarnation cannot vouch for, but the
+boot id it records IS the current one, so the resolver accepts it and the old
+UID's durable ownership and `.udp-node-cleanup-proof-v1.json` are inherited by
+the replacement. A lookup, RBAC, API-server, or publication failure therefore
+withholds identity — it can never carry a stale one forward.
+
 **Coverage.** The deterministic external suites cover the whole proof boundary
 (pre-contract same-boot refusal, explicit cleanup proof, same-node-UID reboot
 adoption, node-name reuse under a different UID, an identity-bound record with
-no resolvable current identity, the cleanup-complete/finalize-missed
-resumption, stale/malformed/release-only evidence, and the dual-stack
-both-domains retirement plan).
+no resolvable current identity, unbound durable ownership and its
+cleanup/finalize recovery, a stale same-boot identity publication and its
+retraction, the cleanup-complete/finalize-missed resumption,
+stale/malformed/release-only evidence, and the dual-stack both-domains
+retirement plan).
 
 The **missed-rollout/rejoin scenario itself is proven on the hosted live
 kernel** by the required `ambient-host-udp-live` gate

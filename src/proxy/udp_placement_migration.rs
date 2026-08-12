@@ -131,6 +131,11 @@ impl UdpNodeIdentity {
     /// An unresolvable identity is not an error here: it leaves the caller with
     /// NO node-specific evidence, which every proof-requiring branch treats as
     /// a fail-closed refusal.
+    ///
+    /// A publication surviving from a PREVIOUS Kubernetes Node object on this
+    /// same boot would pass the boot-id check, so the publisher retracts its
+    /// file before it can fail (`retract_node_identity`) rather than relying on
+    /// this reader to detect staleness it cannot see.
     pub fn resolve(registry_dir: &Path) -> Option<Self> {
         let boot_id = current_boot_id()?;
         if let Some(node_uid) =
@@ -139,8 +144,15 @@ impl UdpNodeIdentity {
         {
             return Some(identity);
         }
+        Self::resolve_published(registry_dir, &boot_id)
+    }
+
+    /// The published-file half of `resolve`, taking this incarnation's boot id
+    /// explicitly so the publication boundary is decidable without a
+    /// process-wide environment read or a `/proc` lookup.
+    pub fn resolve_published(registry_dir: &Path, boot_id: &str) -> Option<Self> {
         let published = read_node_identity_file(registry_dir)?;
-        (published.boot_id == boot_id).then_some(published)
+        (published.boot_id.as_str() == boot_id.trim()).then_some(published)
     }
 
     fn validate(&self) -> Result<(), String> {
@@ -189,7 +201,19 @@ fn read_node_identity_file(registry_dir: &Path) -> Option<UdpNodeIdentity> {
 pub fn publish_node_identity(registry_dir: &Path, node_uid: &str) -> Result<(), String> {
     let boot_id =
         current_boot_id().ok_or_else(|| "could not read this node's boot id".to_string())?;
-    let identity = UdpNodeIdentity::new(node_uid, &boot_id)?;
+    publish_node_identity_for(registry_dir, &UdpNodeIdentity::new(node_uid, &boot_id)?)
+}
+
+/// Publish an ALREADY-RESOLVED node identity. `publish_node_identity` is the
+/// production entry point (it pairs a Kubernetes UID with this incarnation's
+/// boot id); this is the incarnation-explicit form, so the retract/publish
+/// boundary can be decided without reading `/proc`.
+pub fn publish_node_identity_for(
+    registry_dir: &Path,
+    identity: &UdpNodeIdentity,
+) -> Result<(), String> {
+    identity.validate()?;
+    let identity = identity.clone();
     if read_node_identity_file(registry_dir).as_ref() == Some(&identity) {
         return Ok(());
     }
@@ -208,6 +232,44 @@ pub fn publish_node_identity(registry_dir: &Path, node_uid: &str) -> Result<(), 
         &bytes,
         "node identity record",
     )
+}
+
+/// Retract this node's published identity so NO node-identity file remains.
+///
+/// The publisher calls this BEFORE it consults Kubernetes, and again after any
+/// failure. A file left by a PREVIOUS Kubernetes Node object on this same boot
+/// names a UID this incarnation cannot vouch for, and `resolve` accepts it
+/// because the boot id it records IS the current one — so a Node deleted and
+/// recreated under the same name could otherwise inherit its predecessor's
+/// durable ownership and node-cleanup proof whenever the replacement
+/// node-agent failed to read or publish its own UID.
+///
+/// The removal is narrowly scoped to the exact publication file, never follows
+/// a symlink (`remove_file` unlinks the link itself), handles a directory entry
+/// explicitly so a crash-left or hostile entry of any type is retracted rather
+/// than skipped, and is made durable with a directory sync before the caller
+/// can publish or fail.
+pub fn retract_node_identity(registry_dir: &Path) -> Result<(), String> {
+    let path = registry_dir.join(NODE_IDENTITY_FILE);
+    let removal = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_dir() => std::fs::remove_dir(&path),
+        Ok(_) => std::fs::remove_file(&path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => Err(error),
+    };
+    match removal {
+        Ok(()) => {}
+        // A concurrent publisher already achieved the desired state.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "could not retract the published Ambient UDP node identity: {error}"
+            ));
+        }
+    }
+    sync_directory(registry_dir).map_err(|error| {
+        format!("could not sync the Ambient UDP node identity retraction: {error}")
+    })
 }
 
 fn validate_node_identifier(value: &str, description: &str) -> Result<(), String> {
@@ -519,11 +581,18 @@ struct DurablePlacementState {
     active: UdpPlacement,
     pending: Option<PendingMigration>,
     completed: Option<UdpMigrationTransition>,
-    /// The node incarnation that last wrote this record. Absent only on a
-    /// record written before the node-proof contract; a PRESENT identity whose
-    /// node UID disagrees with this machine is a hard rejection, so a registry
-    /// directory restored from a backup or reused under a recycled node name
-    /// can never hand its ownership to a different machine.
+    /// The node incarnation that last wrote this record. A PRESENT identity
+    /// whose node UID disagrees with this machine is a hard rejection, so a
+    /// registry directory restored from a backup or reused under a recycled
+    /// node name can never hand its ownership to a different machine.
+    ///
+    /// ABSENT means the record asserts no owning node at all — a pre-#3809
+    /// record, or one written by a process that could not resolve an identity.
+    /// That is NOT a compatibility escape hatch: an already-present unbound
+    /// record can never be ADOPTED for a placement that runs a producer (see
+    /// `prepare_placement`'s stable arm). Only `disabled` — which owns no
+    /// producer and carries no traffic — stays adoptable, and it is bound as
+    /// soon as an identity is resolvable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     incarnation: Option<UdpNodeIdentity>,
 }
@@ -825,9 +894,12 @@ pub fn prepare_placement(
     // registry directory carrying another machine's record would be trusted
     // verbatim — exactly the node-name-reuse inheritance this binding exists to
     // refuse. Unresolvable identity is a closed refusal in every phase, before
-    // any phase reads the record. A record with NO recorded incarnation is the
-    // pre-identity legacy shape: it asserts no ownership claim to verify, so it
-    // keeps its previous handling.
+    // any phase reads the record. A record with NO recorded incarnation asserts
+    // no ownership claim to COMPARE, so it passes this block — and is then
+    // refused outright by the stable arm for every placement that runs a
+    // producer, recoverable only through the explicit cleanup/finalize pair
+    // that retires the exact Ferrum-owned predecessor state and binds this
+    // node's identity.
     let recorded_incarnation = state.as_ref().and_then(|state| state.incarnation.clone());
     let mut incarnation_changed = false;
     if let Some(recorded) = recorded_incarnation.as_ref() {
@@ -849,6 +921,11 @@ pub fn prepare_placement(
     }
     match request.phase {
         UdpMigrationPhase::Stable => {
+            // A record this call creates is ownership this process is
+            // establishing, not ownership it is adopting; only a record that
+            // was ALREADY on disk is subject to the unbound-ownership refusal
+            // below.
+            let record_was_absent = state.is_none();
             if state.is_none() {
                 // A node with no durable record is either genuinely new to this
                 // placement (fresh node, or a registry directory recreated by a
@@ -933,6 +1010,34 @@ pub fn prepare_placement(
                 return Err(format!(
                     "unsafe one-step Ambient UDP placement change {} -> {} rejected; run cleanup then finalize with an explicit generation",
                     state.active.as_str(),
+                    request.target.as_str()
+                ));
+            }
+            // Durable ownership that names NO node cannot prove which machine
+            // established the placement it describes. A registry directory
+            // restored from a backup, copied between machines, or reattached
+            // under a recycled node name presents exactly this shape, as does a
+            // record written before the node-identity binding existed. Adopting
+            // it would start a producer on ownership this node never earned,
+            // while the predecessor's interception rules may still be live in
+            // the workloads running here — the issue #3809 blackhole, reached
+            // through the record instead of through a release attestation.
+            //
+            // `disabled` runs no producer and carries no traffic, so it is the
+            // one placement an unbound record may still carry (and it is
+            // re-stamped below once an identity is resolvable). Every producer
+            // placement fails closed until the explicit cleanup/finalize pair
+            // has retired the exact Ferrum-owned predecessor state and bound
+            // this node's identity to the record. Note that a MISSING current
+            // identity is not a way past this: it cannot satisfy the refusal,
+            // and cleanup/finalize only bind an identity they can resolve.
+            if !record_was_absent
+                && state.incarnation.is_none()
+                && request.target != UdpPlacement::Disabled
+            {
+                set_failure(UdpMigrationFailureReason::MigrationRequired);
+                return Err(format!(
+                    "the durable Ambient UDP placement record on this registry directory names no owning Kubernetes node UID, so it cannot prove this node established the {} placement it describes; run an explicit cleanup migration (cleanup then finalize, with this node's identity resolvable) to retire the predecessor state before this node adopts it",
                     request.target.as_str()
                 ));
             }

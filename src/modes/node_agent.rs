@@ -1708,8 +1708,10 @@ async fn run_with_backend(
     // node-agent — which already holds a scoped client for this exact node — is
     // the only place that can bind node-local UDP placement proof to an
     // identifier a rebuilt machine cannot inherit. A missing RBAC grant or an
-    // unavailable API is NOT fatal here: it simply leaves the proxy without
-    // node identity, which its own guard treats as a fail-closed refusal.
+    // unavailable API is NOT fatal here: the publisher retracts the previous
+    // publication before it can fail, so a failure leaves the proxy with NO
+    // node identity — not with a predecessor Node object's UID — and the
+    // proxy's own guard treats an absent identity as a fail-closed refusal.
     if let Some(registry_dir) = config.node_waypoint_pod_registry_dir.as_deref() {
         publish_node_identity(&client, config.node_name.as_str(), registry_dir).await;
     }
@@ -2828,43 +2830,66 @@ fn has_pending_capture_failures(pod_states: &DashMap<String, PodAttachmentState>
 
 /// Resolve this node's `Node.metadata.uid` with one bounded GET and publish it
 /// into the shared pod-registry directory for the Ambient proxy's UDP placement
-/// proof. Every failure path warns and returns: the proxy fails closed on a
-/// missing identity, so a best-effort publication can only ever withhold an
-/// adoption, never authorize one.
+/// proof.
+///
+/// The previous publication is RETRACTED first, before anything that can fail.
+/// A failure is not merely "no new evidence": an identity file left by an
+/// EARLIER Kubernetes Node object on this same boot records a UID this
+/// incarnation cannot vouch for, and the proxy's resolver accepts it because
+/// the boot id it names is the current one. A Node deleted and recreated under
+/// the same name would then let its replacement inherit the predecessor's
+/// durable ownership and node-cleanup proof precisely when this agent could
+/// NOT read or publish its own UID. Retracting up front — and re-asserting the
+/// retraction after any failure — keeps that window closed, so every failure
+/// path here leaves NO published identity, which the placement guard treats as
+/// a fail-closed refusal.
 async fn publish_node_identity(client: &Client, node_name: &str, registry_dir: &std::path::Path) {
+    if let Err(error) = crate::proxy::udp_placement_migration::retract_node_identity(registry_dir) {
+        // Publication may still overwrite the stale file, so continue rather
+        // than guaranteeing it survives; the failure is loud either way.
+        error!(
+            %error,
+            "could not retract the previously published node identity before resolving this \
+             node's Kubernetes UID; a surviving stale publication could authorize Ambient UDP \
+             host-placement adoption for a node UID this agent cannot vouch for"
+        );
+    }
+    let Err(error) = resolve_and_publish_node_identity(client, node_name, registry_dir).await else {
+        return;
+    };
+    warn!(
+        %error,
+        "could not publish this node's Kubernetes UID; Ambient UDP host-placement adoption \
+         will stay fail-closed until the node-agent can read its own Node object"
+    );
+    if let Err(error) = crate::proxy::udp_placement_migration::retract_node_identity(registry_dir) {
+        error!(
+            %error,
+            "could not remove the published Ambient UDP node identity after a failed lookup; \
+             remove it manually before relying on node-specific placement proof"
+        );
+    }
+}
+
+async fn resolve_and_publish_node_identity(
+    client: &Client,
+    node_name: &str,
+    registry_dir: &std::path::Path,
+) -> Result<(), String> {
     let nodes: Api<Node> = Api::all(client.clone());
     let node = match tokio::time::timeout(Duration::from_secs(10), nodes.get(node_name)).await {
         Ok(Ok(node)) => node,
         Ok(Err(error)) => {
-            warn!(
-                %error,
-                "could not read this node's Kubernetes UID; Ambient UDP host-placement adoption \
-                 will stay fail-closed until the node-agent can read its own Node object"
-            );
-            return;
+            return Err(format!("could not read this node's Kubernetes object: {error}"));
         }
-        Err(_) => {
-            warn!(
-                "timed out reading this node's Kubernetes UID; Ambient UDP host-placement \
-                 adoption will stay fail-closed"
-            );
-            return;
-        }
+        Err(_) => return Err("timed out reading this node's Kubernetes object".to_string()),
     };
-    let Some(uid) = node.metadata.uid.as_deref() else {
-        warn!(
-            "this node's Kubernetes object carries no UID; Ambient UDP host-placement adoption will stay fail-closed"
-        );
-        return;
-    };
-    if let Err(error) =
-        crate::proxy::udp_placement_migration::publish_node_identity(registry_dir, uid)
-    {
-        warn!(
-            %error,
-            "could not publish this node's identity for the Ambient UDP placement proof"
-        );
-    }
+    let uid = node
+        .metadata
+        .uid
+        .as_deref()
+        .ok_or_else(|| "this node's Kubernetes object carries no UID".to_string())?;
+    crate::proxy::udp_placement_migration::publish_node_identity(registry_dir, uid)
 }
 
 fn publish_udp_migration_registry_sync_if_ready(

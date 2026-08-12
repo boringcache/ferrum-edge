@@ -248,6 +248,13 @@ SUITE_PATTERNS: dict[str, list[str]] = {
         r"^src/capture/",
         r"^src/modes/mesh/",
         r"^src/proxy/(host_udp_capture|host_udp_capture_live_tests|mesh_udp_capture|netns_capture|netns_udp_capture|udp_batch|udp_placement_cleanup|udp_placement_migration|mod)\.rs$",
+        # The production entry points for the Ambient UDP lifecycle: the
+        # `ambient-udp-preflight` subcommand definition and dispatch, and the
+        # node-agent that publishes the node identity every placement proof is
+        # bound to. A defect in any of them bypasses the proof this gate
+        # exercises live.
+        r"^src/(cli|main)\.rs$",
+        r"^src/modes/node_agent\.rs$",
         r"^src/socket_opts\.rs$",
         r"^src/ebpf/veth\.rs$",
         *exact_path_patterns(AMBIENT_HOST_UDP_DOCUMENTATION_PATHS),
@@ -366,6 +373,11 @@ def self_test() -> int:
             ["charts/ferrum-mesh/templates/ambient-daemonset.yaml"],
             True,
         ),
+        ("ambient-host-udp", ["src/proxy/udp_placement_migration.rs"], True),
+        ("ambient-host-udp", ["src/proxy/udp_placement_cleanup.rs"], True),
+        ("ambient-host-udp", ["src/cli.rs"], True),
+        ("ambient-host-udp", ["src/main.rs"], True),
+        ("ambient-host-udp", ["src/modes/node_agent.rs"], True),
         ("ambient-host-udp", ["src/modes/data_plane.rs"], False),
         ("ambient-host-udp", ["tests/k8s/mesh_e2e_sidecar/run.sh"], False),
     ]

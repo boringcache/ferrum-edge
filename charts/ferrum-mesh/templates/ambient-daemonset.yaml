@@ -307,7 +307,15 @@ spec:
           securityContext:
             runAsUser: 0
             runAsGroup: 0
+            {{- /* The one-shot stage runs as root with explicit capabilities, so
+                   it never needs to GAIN privileges, and it must not inherit the
+                   runtime's ambient/default set: dropping ALL first makes the
+                   four capabilities below the complete, declared privilege
+                   surface of this container. */}}
+            allowPrivilegeEscalation: false
             capabilities:
+              drop:
+                - ALL
               add:
                 - NET_ADMIN
                 - NET_RAW
