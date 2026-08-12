@@ -360,6 +360,34 @@ namespace partitioning clears the unpartitioned slot
 record-plus-file deployment look database-only on a claim-requiring scope, and
 the ambiguity would be silently resolved.
 
+##### Database serving mode applies its own record
+
+A `database`-mode gateway is both the store's reader and a proxy, so it has no
+side channel to deliver trust to itself. At the same publication boundary that
+makes a configuration generation live —
+`ProxyState::publish_gateway_trust_generation`, called from the request-epoch
+swap and once at startup for an already-persisted record — it installs its
+configured namespace's singleton record into the live gateway SVID verifier
+(`ProxyState::install_database_gateway_trust`). An accepted rotation replaces
+the live trust, and an explicit record deletion **withdraws** the database
+override so the ordinary source-loaded gateway SVID trust becomes live again —
+the same withdrawal the data plane performs on a `Clear`.
+
+Precedence is the shared `resolve_trust_authority` resolver, not a second
+model: an ambiguous namespace (record plus file-sourced `trust_bundles`) keeps
+the last-known-good verifier state, and a file-only namespace is left to the
+gateway SVID source loader. Only `database` mode does this; the CP→DP side
+channel and the mesh apply loop remain the single writers of that slot in their
+own modes, and a data plane's configuration never carries the resource at all.
+
+The runtime update happens **before** the generation is recorded as published,
+so status and `/metrics` can never report a database generation as live while
+peers are still validated against the previous one. Stored material that cannot
+be converted to runtime trust — an invariant admission validation is supposed to
+guarantee — fails closed without panicking: the previous generation stays live,
+`..._load_rejections_total` increments with the `invalid_material` reason, and
+the candidate is not published.
+
 ##### Observability
 
 `/metrics` exposes four process series, rendered with **no labels at all** —
@@ -428,6 +456,10 @@ the ConfigSync projection are asserted in-process by
 [`gateway_trust_bundle_store_tests.rs`](../tests/integration/gateway_trust_bundle_store_tests.rs),
 [`gateway_trust_bundle_admin_tests.rs`](../tests/integration/gateway_trust_bundle_admin_tests.rs),
 and [`gateway_trust_bundle_tests.rs`](../tests/unit/config/gateway_trust_bundle_tests.rs).
+Database serving mode's live-verifier installation (startup, rotation,
+revocation, ambiguous authority, unconvertible material, and the non-database
+no-op) is asserted in
+[`gateway_trust_runtime_publication_tests.rs`](../tests/unit/gateway_core/gateway_trust_runtime_publication_tests.rs).
 
 Live, backend-by-backend acceptance runs in the hosted `Functional Tests
 (data-plane)` job through

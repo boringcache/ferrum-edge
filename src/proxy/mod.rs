@@ -6229,6 +6229,31 @@ fn clone_svid_bundle_slot(slot: &SharedSvidBundle) -> SharedSvidBundle {
 pub type SharedGatewayTrustBundles = Arc<ArcSwap<Option<RuntimeTrustBundleSet>>>;
 pub type SharedMeshInboundTls = Arc<ArcSwap<Option<Arc<rustls::ServerConfig>>>>;
 
+/// What an accepted configuration generation did to the live gateway trust
+/// override in database serving mode.
+///
+/// Returned by [`ProxyState::install_database_gateway_trust`] so the caller
+/// (and status/observability) can distinguish "this generation is live" from
+/// "the previous generation is still what peers are validated against".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatabaseGatewayTrustInstall {
+    /// This mode does not own database trust publication. The CP→DP side
+    /// channel, the mesh apply loop, and file mode are untouched.
+    NotApplicable,
+    /// The namespace's database record is now the live gateway trust.
+    Installed,
+    /// A previously installed database override was withdrawn; the
+    /// source-loaded gateway SVID trust is live again.
+    Cleared,
+    /// No database override was installed and none is due — nothing changed.
+    Absent,
+    /// Ambiguous authority: the last-known-good trust stays live.
+    KeptPrevious,
+    /// Stored material could not be converted. Fail closed: last-known-good
+    /// trust stays live and the generation must not be advertised.
+    Failed,
+}
+
 pub struct MeshInboundTlsPolicy {
     pub default: Option<Arc<rustls::ServerConfig>>,
     pub by_port: HashMap<u16, Option<Arc<rustls::ServerConfig>>>,
@@ -6812,6 +6837,130 @@ impl ProxyState {
         self.gateway_trust_bundles.store(Arc::new(None));
         self.gateway_svid_bundle
             .store(self.gateway_file_svid_bundle.load_full());
+    }
+
+    /// Install the database-sourced gateway trust generation for this process's
+    /// configured namespace into the live gateway SVID verifier.
+    ///
+    /// Database serving mode is the only mode that owns this publication. The
+    /// CP→DP side channel (`update_gateway_trust_bundles` /
+    /// `clear_gateway_trust_bundles` from `dp_client`) and the mesh slice apply
+    /// loop already own the same slot for their modes, and a DP's config never
+    /// carries `gateway_trust_bundles` at all (the CP strips it), so the mode
+    /// gate is what keeps a single writer per deployment shape.
+    ///
+    /// Authority precedence is NOT re-decided here: it is
+    /// [`crate::config::gateway_trust::resolve_trust_authority`], the same
+    /// resolver the CP publication path uses.
+    /// - `Ambiguous` (database record AND an unpartitioned file/overlay value)
+    ///   keeps the last-known-good verifier state, matching the CP's
+    ///   `NamespaceTrustProjection::KeepPrevious` refusal.
+    /// - `File` leaves the file/overlay authority to the ordinary gateway SVID
+    ///   source loader — but a database override installed by an EARLIER
+    ///   generation is still withdrawn, because the database record that
+    ///   justified it is gone.
+    /// - `Database` installs the namespace singleton, or withdraws the override
+    ///   when the record was revoked.
+    ///
+    /// Conversion failure is fail-closed WITHOUT panicking: admission validates
+    /// the material before it can be stored, so a bundle that cannot convert
+    /// means that invariant was broken. The previous verifier state is retained
+    /// and the caller must not advertise this generation as live.
+    pub fn install_database_gateway_trust(
+        &self,
+        config: &GatewayConfig,
+    ) -> DatabaseGatewayTrustInstall {
+        use crate::config::gateway_trust::{
+            GatewayTrustFailureReason, TrustAuthorityResolution, record_trust_load_rejection,
+            resolve_trust_authority,
+        };
+
+        if !matches!(
+            self.env_config.mode,
+            crate::config::env_config::OperatingMode::Database
+        ) {
+            return DatabaseGatewayTrustInstall::NotApplicable;
+        }
+
+        // Namespace selection is the process's own configured namespace and the
+        // namespace singleton — never a scan that could pick another tenant's
+        // record.
+        let record = config.gateway_trust_bundle_for(&self.env_config.namespace);
+        let authority = resolve_trust_authority(record, config.trust_bundles.as_deref());
+        let install = match (authority, record) {
+            (TrustAuthorityResolution::Ambiguous, _) => {
+                return DatabaseGatewayTrustInstall::KeptPrevious;
+            }
+            (TrustAuthorityResolution::Database, Some(record)) => Some(record),
+            // Database authority with no record (explicit revocation), or file
+            // authority: either way no database override may remain installed.
+            _ => None,
+        };
+
+        match install {
+            Some(record) => match record.bundle.to_runtime() {
+                Ok(runtime) => {
+                    let trust_domain = runtime.local.trust_domain.clone();
+                    let federated_count = runtime.federated.len();
+                    self.update_gateway_trust_bundles(runtime);
+                    info!(
+                        %trust_domain,
+                        federated_count,
+                        namespace = %self.env_config.namespace,
+                        revision = record.revision,
+                        "Installed database gateway SPIFFE trust bundles into the live verifier"
+                    );
+                    DatabaseGatewayTrustInstall::Installed
+                }
+                Err(error) => {
+                    record_trust_load_rejection(GatewayTrustFailureReason::InvalidMaterial);
+                    warn!(
+                        %error,
+                        namespace = %self.env_config.namespace,
+                        revision = record.revision,
+                        "Stored gateway trust bundle did not convert to runtime trust material; \
+                         keeping the previously active gateway trust and refusing to publish \
+                         this generation"
+                    );
+                    DatabaseGatewayTrustInstall::Failed
+                }
+            },
+            None => {
+                if self.gateway_trust_bundles.load().is_some() {
+                    self.clear_gateway_trust_bundles();
+                    info!(
+                        namespace = %self.env_config.namespace,
+                        "Withdrew database gateway SPIFFE trust bundles; restored source-loaded \
+                         gateway trust"
+                    );
+                    DatabaseGatewayTrustInstall::Cleared
+                } else {
+                    DatabaseGatewayTrustInstall::Absent
+                }
+            }
+        }
+    }
+
+    /// Publish one accepted configuration generation's gateway trust state.
+    ///
+    /// The runtime verifier update comes FIRST so status/observability can
+    /// never report a database generation as live before the live verifier
+    /// actually validates peers with it. A conversion failure retains the last
+    /// known good generation on both surfaces.
+    pub fn publish_gateway_trust_generation(
+        &self,
+        config: &GatewayConfig,
+    ) -> DatabaseGatewayTrustInstall {
+        let outcome = self.install_database_gateway_trust(config);
+        if outcome == DatabaseGatewayTrustInstall::Failed {
+            return outcome;
+        }
+        crate::config::gateway_trust::record_trust_generation_published(
+            &config.gateway_trust_bundles,
+            config.trust_bundles.as_deref(),
+            chrono::Utc::now().timestamp().max(0) as u64,
+        );
+        outcome
     }
 
     pub(crate) fn install_gateway_runtime_svid_bundle(&self, bundle: SvidBundle) {
@@ -10295,17 +10444,17 @@ impl ProxyState {
             self.env_config.http3_idle_timeout,
         );
         self.config.store(Arc::clone(&published.config));
-        // Trust acceptance is counted at the swap that makes a generation live,
-        // not at load time (issue #3727). A publication carrying no
-        // database-sourced trust record is not counted at all, and neither is
-        // one that also carries an unpartitioned file/overlay trust value —
-        // that pair is the ambiguous-authority refusal, which keeps the
-        // previously accepted trust rather than publishing this generation's.
-        crate::config::gateway_trust::record_trust_generation_published(
-            &published.config.gateway_trust_bundles,
-            published.config.trust_bundles.as_deref(),
-            chrono::Utc::now().timestamp().max(0) as u64,
-        );
+        // Trust acceptance is applied and counted at the swap that makes a
+        // generation live, not at load time (issue #3727). In database serving
+        // mode this also rotates or withdraws the live gateway SVID verifier
+        // override, so an accepted trust-only reload takes effect and an
+        // explicit revocation restores the source-loaded fallback. A
+        // publication carrying no database-sourced trust record is not counted
+        // at all, and neither is one that also carries an unpartitioned
+        // file/overlay trust value — that pair is the ambiguous-authority
+        // refusal, which keeps the previously accepted trust rather than
+        // publishing this generation's.
+        self.publish_gateway_trust_generation(&published.config);
         // Config publications can add, remove, or repoint certificate-family
         // sources without producing a TLS source-watcher event. Invalidate the
         // metrics-safe snapshot only after the validated epoch is published so
