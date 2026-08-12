@@ -75,11 +75,11 @@ Only the upstream-forward class is meaningful here (mesh-internal / mesh-wildcar
 
 ## Rerun procedure
 
-1. Trigger **Mesh Performance Baselines** (`suites=dns` or `all`, `iterations≥3`).
+1. Trigger **Mesh Performance Baselines** (`suites=dns` or `all`, `iterations=3–5`).
 2. Download `mesh-performance-baselines-<sha>`.
 3. Require `summary.json` → `dns_complete` and `dns_errors_ok` with every
    documented gateway row (mesh-internal, mesh-wildcard, upstream-forward ×
-   UDP/TCP) and both direct upstream-forward UDP/TCP rows at ≥3 repetitions.
+   UDP/TCP) and both direct upstream-forward UDP/TCP rows at 3–5 repetitions.
 4. Require `runner_health_ok` (CPU steal ≤ 5.0% across pre-collection and
    per-run probes in `runner_health.json` / `runner_health_probes.jsonl`).
 5. Discard any repetition with unexplained non-zero `total_errors`.

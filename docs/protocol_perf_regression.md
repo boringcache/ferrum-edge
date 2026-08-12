@@ -134,6 +134,8 @@ under the `mesh-performance-baselines-<sha>` artifact. Selected-suite acceptance
 fails the job when required gates are false (undersampling, missing DNS rows,
 nonzero errors, or CPU steal > 5.0%); artifacts still upload. Stage 2 copies
 only zero-error hosted aggregates into the three `baseline.md` tables.
+Manual and reusable workflow callers are limited to 3–5 E2E repetitions so a
+misconfigured reusable caller cannot consume an unbounded hosted-runner budget.
 
 `tests/performance/mesh/README.md` is a **frozen Trusted Cross automation
 surface**: every path under `tests/performance/` is treated as protected

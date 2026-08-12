@@ -77,6 +77,12 @@ def check_workflow(text: str, failures: list[str]) -> None:
         "workflow suite allowlist must be all|mesh|hbone|dns",
         failures,
     )
+    require(
+        "BENCH_ITERATIONS must be an integer from 3 to 5" in text
+        and "ITERATIONS > 5" in text,
+        "workflow must reject E2E repetition counts outside 3..5",
+        failures,
+    )
     require("authz_match" in text and "ip_restriction" in text, "mesh benches incomplete", failures)
     require("slice_apply" in text and "xds_translation" in text, "mesh benches incomplete", failures)
     require("1kib_c50_30s" in text and "16kib_c50_30s" in text, "HBONE scenarios incomplete", failures)
@@ -217,6 +223,10 @@ jobs:
               exit 1
               ;;
           esac
+          if [[ ! "${ITERATIONS}" =~ ^[0-9]+$ ]] || ((ITERATIONS < 3 || ITERATIONS > 5)); then
+            echo "::error::BENCH_ITERATIONS must be an integer from 3 to 5"
+            exit 1
+          fi
       - name: Enforce selected-suite acceptance gates
         if: always()
         run: --check-acceptance

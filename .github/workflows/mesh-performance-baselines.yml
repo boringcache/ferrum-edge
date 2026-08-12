@@ -30,7 +30,7 @@ on:
           - hbone
           - dns
       iterations:
-        description: "Clean E2E repetitions (HBONE + DNS); minimum 3"
+        description: "Clean E2E repetitions (HBONE + DNS); 3 to 5"
         required: false
         default: "3"
         type: choice
@@ -47,7 +47,7 @@ on:
         default: "all"
         type: string
       iterations:
-        description: "Clean E2E repetitions (HBONE + DNS); minimum 3"
+        description: "Clean E2E repetitions (HBONE + DNS); 3 to 5"
         required: false
         default: "3"
         type: string
@@ -120,7 +120,12 @@ jobs:
           supported = {"all", "mesh", "hbone", "dns"}
           if suites not in supported:
               raise SystemExit(f"unsupported suites value: {suites!r}")
-          iterations = max(3, int(os.environ["BENCH_ITERATIONS"]))
+          try:
+              iterations = int(os.environ["BENCH_ITERATIONS"])
+          except ValueError as exc:
+              raise SystemExit("BENCH_ITERATIONS must be an integer from 3 to 5") from exc
+          if not 3 <= iterations <= 5:
+              raise SystemExit("BENCH_ITERATIONS must be an integer from 3 to 5")
           commands = []
           if suites in ("all", "mesh"):
               for bench in ("authz_match", "ip_restriction", "slice_apply", "xds_translation"):
@@ -265,8 +270,8 @@ jobs:
         run: |
           set -euo pipefail
           ITERATIONS="${BENCH_ITERATIONS}"
-          if [ "${ITERATIONS}" -lt 3 ]; then
-            echo "::error::BENCH_ITERATIONS must be >= 3 (got ${ITERATIONS})"
+          if [[ ! "${ITERATIONS}" =~ ^[0-9]+$ ]] || ((ITERATIONS < 3 || ITERATIONS > 5)); then
+            echo "::error::BENCH_ITERATIONS must be an integer from 3 to 5 (got ${ITERATIONS})"
             exit 1
           fi
           declare -a SCENARIOS=(
@@ -319,8 +324,8 @@ jobs:
         run: |
           set -euo pipefail
           ITERATIONS="${BENCH_ITERATIONS}"
-          if [ "${ITERATIONS}" -lt 3 ]; then
-            echo "::error::BENCH_ITERATIONS must be >= 3 (got ${ITERATIONS})"
+          if [[ ! "${ITERATIONS}" =~ ^[0-9]+$ ]] || ((ITERATIONS < 3 || ITERATIONS > 5)); then
+            echo "::error::BENCH_ITERATIONS must be an integer from 3 to 5 (got ${ITERATIONS})"
             exit 1
           fi
           mkdir -p mesh-baseline-results/dns
