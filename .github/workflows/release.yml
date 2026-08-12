@@ -56,6 +56,12 @@ jobs:
     # bound to the protected `launch-advisory` environment. This job only reads
     # the fixed-text commit status that trusted run publishes for the exact tag
     # commit, so nothing here can reach the credential or private advisory data.
+    #
+    # The status is accepted only under the context bound to THIS run and THIS
+    # run attempt. A commit-wide context would be replayable: the daily audit,
+    # an earlier tag release on the same commit, or an earlier attempt of this
+    # run would already have posted a success, and a blocker opened after it
+    # would let the release proceed on a stale verdict.
     permissions:
       contents: read
       statuses: read
@@ -74,6 +80,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG_NAME: ${{ github.ref_name }}
+          RELEASE_RUN_ID: ${{ github.run_id }}
+          RELEASE_RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           set -euo pipefail
 
@@ -89,6 +97,17 @@ jobs:
           fi
           echo "Release tag ${TAG_NAME} resolves to ${release_sha}"
 
+          # Strict positive decimals, matching the trusted publisher's own
+          # validation, so the context this job waits for is exactly the one it
+          # can derive and no other run's status can be mistaken for it.
+          if [[ ! "$RELEASE_RUN_ID" =~ ^[1-9][0-9]{0,17}$ ]] \
+            || [[ ! "$RELEASE_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,17}$ ]]; then
+            echo "::error title=Release validation failed::this run has no usable run ID or run attempt" >&2
+            exit 1
+          fi
+          expected_context="trusted-launch-advisory-gate/release-${RELEASE_RUN_ID}-attempt-${RELEASE_RUN_ATTEMPT}"
+          echo "Requiring the trusted verdict published for ${expected_context}"
+
           max_attempts=240
           for attempt in $(seq 1 "$max_attempts"); do
             statuses="$(gh api \
@@ -100,7 +119,7 @@ jobs:
               continue
             fi
 
-            state="$(jq -r '[.[] | select(.context == "trusted-launch-advisory-gate")] | sort_by(.created_at) | last | .state // empty' <<<"$statuses" 2>/dev/null || true)"
+            state="$(jq -r --arg ctx "$expected_context" '[.[] | select(.context == $ctx)] | sort_by(.created_at) | last | .state // empty' <<<"$statuses" 2>/dev/null || true)"
             case "$state" in
               success)
                 echo "Trusted launch advisory verdict is PASS for ${release_sha}"
@@ -109,21 +128,23 @@ jobs:
                   echo ""
                   echo "Validated ${release_sha} from protected \`main\` code."
                   echo ""
+                  echo "Verdict context: \`${expected_context}\`"
+                  echo ""
                 } >> "$GITHUB_STEP_SUMMARY"
                 exit 0
                 ;;
               failure|error)
-                echo "::error title=Release validation failed::trusted launch advisory gate did not pass for ${release_sha}" >&2
+                echo "::error title=Release validation failed::the trusted launch advisory verdict for this run attempt did not pass for ${release_sha}" >&2
                 exit 1
                 ;;
               *)
-                echo "No trusted launch advisory verdict for ${release_sha} yet (attempt ${attempt}/${max_attempts}); waiting"
+                echo "No trusted launch advisory verdict for this run attempt on ${release_sha} yet (attempt ${attempt}/${max_attempts}); waiting"
                 sleep 30
                 ;;
             esac
           done
 
-          echo "::error title=Missing release validation::no trusted launch advisory verdict was published for ${release_sha}" >&2
+          echo "::error title=Missing release validation::no trusted launch advisory verdict was published for this run attempt on ${release_sha}" >&2
           exit 1
 
   validate-release-sha:

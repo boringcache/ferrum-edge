@@ -122,7 +122,7 @@ The boundary is drawn by *which code executes*, not by which event fired:
 |---------|-------------|------------|
 | `launch-readiness.yml` (PR, `merge_group`, `main` push, `v*` tag, schedule, dispatch) | the ref under test — untrusted | **never**, on any event |
 | `release.yml` (`v*` tag push) | the tag target — untrusted | **never** |
-| `launch-advisory-trust.yml` (`workflow_run`, `schedule`, `workflow_dispatch`) | protected default branch, always | yes, after provenance |
+| `launch-advisory-trust.yml` (`workflow_run: in_progress`, `schedule`, `workflow_dispatch`) | protected default branch, always | yes, after provenance |
 
 `workflow_run`, `schedule`, and `workflow_dispatch` are the only events whose
 definition GitHub resolves from the default branch, which is what makes
@@ -131,8 +131,11 @@ definition GitHub resolves from the default branch, which is what makes
 ### How a release obtains a private-advisory verdict
 
 1. A `v*` tag push starts `Release`. That run holds no credential.
-2. The `Release` run's `requested` event triggers `launch-advisory-trust.yml`
-   from protected `main`.
+2. The `Release` run's `workflow_run: in_progress` event triggers
+   `launch-advisory-trust.yml` from protected `main`, carrying the Release run
+   ID and run attempt. `in_progress` rather than `requested`: GitHub documents
+   that `requested` does not fire when a run is re-run, so a re-run Release
+   attempt would never obtain its own verdict and would fail closed forever.
 3. `establish-trust` holds no secret. It checks out the literal `refs/heads/main`,
    pins the resolved trusted anchor commit, then treats the candidate purely as
    data: normalized tag format, exactly one unambiguous remote tag ref, tag
@@ -148,22 +151,56 @@ definition GitHub resolves from the default branch, which is what makes
    use a credential even if one were somehow present. The candidate reaches this
    job only as `LAUNCH_TARGET_SHA`; no candidate byte is fetched, imported, or
    run. The credential comes from the protected `launch-advisory` environment.
-5. `publish-verdict` holds no secret and posts a fixed-text
-   `trusted-launch-advisory-gate` commit status on the candidate SHA. Neither
+5. `publish-verdict` holds no secret and posts a fixed-text commit status on the
+   candidate SHA under the context
+   `trusted-launch-advisory-gate/release-<run id>-attempt-<attempt>`. Neither
    the credential nor any advisory identifier appears in the status, the logs,
    or any artifact.
-6. `release.yml`'s `validate-launch-readiness` job waits for that status on the
-   commit its tag resolves to and fails closed if it is absent, `failure`, or
-   `error`. The release still cannot proceed without a computed `PASS`; the
-   decision simply moved to code a tag cannot rewrite.
+6. `release.yml`'s `validate-launch-readiness` job derives the identical context
+   from its own `github.run_id` and `github.run_attempt`, waits for **only that
+   context** on the commit its tag resolves to, and fails closed if it is
+   absent, `failure`, or `error`. The release still cannot proceed without a
+   computed `PASS`; the decision simply moved to code a tag cannot rewrite.
+
+### Why the verdict is bound to a run attempt
+
+Commit statuses are commit-wide. A single constant
+`trusted-launch-advisory-gate` context would be replayable: the daily audit of
+protected `main`, an earlier tag release on the same commit, or an earlier
+attempt of the same Release run would already have posted a success, and a
+release started afterwards would consume it before its own trusted evaluation
+had run. A blocker opened in between would be invisible.
+
+So every release verdict carries a context unique to one Release run **and** one
+run attempt:
+
+| Lane | Context |
+|------|---------|
+| Release (`workflow_run: in_progress`, or the recovery dispatch) | `trusted-launch-advisory-gate/release-<run id>-attempt-<attempt>` |
+| Scheduled / dispatched default-branch audit | `trusted-launch-advisory-gate/main-audit` |
+
+Both operands are validated as strict positive decimals (`^[1-9][0-9]{0,17}$`)
+on both sides, and the whole derived context is re-checked against the admitted
+shape before it is published, so no payload or input value can lengthen or
+reshape it. The audit context is not of the release shape, so an audit verdict
+can never satisfy a release gate.
 
 Every one of those preconditions fails closed. If the triggering payload does
-not carry a usable tag name, if the tag is ambiguous, if it moved after the
-event, or if it is not reachable from protected `main`, no credential is
-released and no verdict is published, so the release times out red rather than
-proceeding. The recovery lane is a maintainer `workflow_dispatch` of
-`launch-advisory-trust.yml` with an explicit `release_tag` input, which runs the
-identical trusted checks — it is a re-trigger, not a bypass.
+not carry a usable tag name, run ID, or run attempt, if the tag is ambiguous, if
+it moved after the event, or if it is not reachable from protected `main`, no
+credential is released and no verdict is published, so the release times out red
+rather than proceeding.
+
+The recovery lane is a maintainer `workflow_dispatch` of
+`launch-advisory-trust.yml` with an explicit `release_tag`, `release_run_id`, and
+`release_run_attempt` — all three are required together, and it publishes only
+that one run-bound context, so it re-triggers a single stuck release rather than
+minting a verdict any release could consume. It runs the identical trusted
+checks, and additionally verifies through the API that the named run really is a
+push-triggered `Release` run for that same tag with at least that attempt,
+taking the head SHA from the run itself so the tag-moved-after-the-event check
+still applies. A dispatch with an empty `release_tag` is the default-branch
+audit lane and is refused if it also names a run ID or attempt.
 
 Because the policy, the exemptions, and `PRODUCTION_READINESS.md` are all read
 from the trusted anchor, the reviewed snapshot compared against the live verdict
@@ -174,34 +211,53 @@ proof. It runs an adversarial fixture table — a malicious tagged workflow that
 claims the credential, a newly added tag-triggered consumer, a credential-bearing
 job redirected at a candidate checker, a candidate-tree checkout, a tag-reachable
 trust workflow, a dropped environment binding, a dropped provenance edge, an
-unpinned action, and a release gate that stops requiring the trusted verdict —
-and then applies the same contract to the real `.github/workflows` tree. It runs
-on every pull request from `launch-readiness.yml`.
+unpinned action, a constant commit-wide status context, an omitted run-attempt
+binding, a `requested`-only trigger, a default-branch audit sharing the release
+context namespace, a release gate that accepts another run's status, and a
+release gate that stops requiring the trusted verdict — and then applies the
+same contract to the real `.github/workflows` tree. It runs on every pull
+request from `launch-readiness.yml`.
 
 ### Required repository settings (root/admin only, not code)
 
 The code above removes the credential from every candidate-reachable job, but
 repository *settings* decide whether an attacker-authored workflow could still
 name the secret. These are administrator actions and are deliberately not
-automated here:
+automated here.
 
-1. **Move the credential out of repository-secret scope.** Delete the repository
-   secret `LAUNCH_ADVISORY_READ_TOKEN` and create it as an environment secret in
-   a new `launch-advisory` environment. Restrict that environment's deployment
-   branch/tag policy to the default branch only, so a tag-triggered workflow
-   naming the environment is refused before any step runs. Add required
-   reviewers if manual release approval is wanted.
-2. **Rotate the credential.** The previous design cannot prove the token was
-   never exposed to an arbitrary tag target, so treat it as disclosed and
-   reissue it. Prefer a short-lived GitHub App installation token or a
-   fine-grained credential scoped to repository advisory read on this repository
-   only.
-3. **Protect release tags.** Create an active ruleset targeting `refs/tags/v*`
+**Verified live state at the time of writing:** no repository secret named
+`LAUNCH_ADVISORY_READ_TOKEN` is provisioned, and no `launch-advisory`
+environment exists. There is therefore nothing to delete and **no rotation is
+currently required** — the checker falls back to the redacted repository
+variables, and the trusted workflow's advisory read is inert until a credential
+is provisioned. The code boundary is still worth keeping: it is what makes a
+future provisioning safe rather than exploitable.
+
+1. **Create and protect the environment first.** Create a `launch-advisory`
+   environment and restrict its deployment branch/tag policy to the default
+   branch only, so a tag-triggered workflow naming the environment is refused
+   before any step runs. Add required reviewers if manual release approval is
+   wanted. Do this *before* step 2: referencing a not-yet-existing environment
+   auto-creates an **unprotected** one, and provisioning the secret into an
+   unprotected environment would reopen the hole.
+2. **Only then provision the credential as an environment secret.** Add a newly
+   issued, narrowly scoped advisory-read credential as
+   `LAUNCH_ADVISORY_READ_TOKEN` in that protected environment — never in
+   repository-secret scope, where any workflow, including one authored by a
+   `v*` tag, can name it. Prefer a short-lived GitHub App installation token or
+   a fine-grained credential scoped to repository advisory read on this
+   repository only.
+3. **If audit history later shows a credential was independently provisioned or
+   used**, treat that one as disclosed — the pre-#3802 design cannot prove it
+   was never handed to an arbitrary tag target — and revoke and reissue it under
+   step 2. Absent such evidence, the verified no-secret state means there is
+   nothing to rotate.
+4. **Protect release tags.** Create an active ruleset targeting `refs/tags/v*`
    that restricts creation to a narrow release principal, blocks update and
    deletion, and audits any bypass. Consider requiring signed annotated tags.
    Tag protection is defense in depth: trusted-code execution is still required
    because a privileged release actor can be compromised.
-4. **Keep `main` protected.** The whole boundary rests on `refs/heads/main`
+5. **Keep `main` protected.** The whole boundary rests on `refs/heads/main`
    being a protected default branch whose required checks cannot be bypassed.
 
 ## Hosted enforcement
@@ -213,11 +269,14 @@ automated here:
   or pushed SHA) and asserts that the checkout is that commit. It holds no
   advisory credential on any event and reads only the redacted variables.
 - `.github/workflows/launch-advisory-trust.yml` — the sole credential holder,
-  reachable only from `workflow_run`, `schedule`, and `workflow_dispatch`. Its
-  daily schedule is the live private-advisory re-audit of protected `main`.
+  reachable only from `workflow_run` (`in_progress`), `schedule`, and
+  `workflow_dispatch`. Its daily schedule is the live private-advisory re-audit
+  of protected `main`, published under the separate `.../main-audit` context.
 - `.github/workflows/release.yml` — the `validate-launch-readiness` job gates
-  every tag release on the trusted `trusted-launch-advisory-gate` verdict for
-  the commit its tag resolves to, and holds no credential.
+  every tag release on the trusted
+  `trusted-launch-advisory-gate/release-<run id>-attempt-<attempt>` verdict for
+  the commit its tag resolves to, accepting no other context, and holds no
+  credential.
 - All keep `persist-credentials: false` and least permissions.
 - `.github/CODEOWNERS` covers the policy, the exemptions, the checker, the
   workflows, the trust-boundary verifier, and `PRODUCTION_READINESS.md`.
