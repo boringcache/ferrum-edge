@@ -132,8 +132,21 @@ admitted stream.
 atomically. Adding an overlapping credential does not disrupt streams admitted
 by a retained credential with the same namespace policy. Removing that
 credential, or changing its trusted namespace ceiling, closes its existing
-streams. Invalid reloads retain the last accepted verifier. DPs and mesh/xDS
-clients use their existing bounded reconnect backoff and reread
+streams. Invalid reloads retain the last accepted verifier.
+
+Startup and that reload worker share one coherent-generation loader: the bundle
+document and every `secret_path` / `public_key_path` it names are read from a
+single filesystem generation, so a rotation can never pair one generation's
+namespace ceiling with another generation's key material. A Kubernetes projected
+mount is pinned by `..data` descriptor before the document is read; any path
+outside a pinned generation must carry a `material_sha256`. A candidate that
+cannot prove coherence is rejected with a closed reason label and retains the
+entire prior verifier — it is never partially applied. Each referenced file and
+the aggregate path-backed material retained for one candidate are limited to 1
+MiB. See
+[cp_namespace_tenancy.md](cp_namespace_tenancy.md#rotation-is-atomic-per-source-generation).
+
+DPs and mesh/xDS clients use their existing bounded reconnect backoff and reread
 `FERRUM_DP_CP_GRPC_TOKEN_FILE` (or mint a new short-lived token) on each attempt.
 The fixed-cardinality
 `ferrum_grpc_config_stream_terminations_total{surface,reason}` metric and
