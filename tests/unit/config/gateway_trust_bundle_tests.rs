@@ -546,6 +546,11 @@ fn observability_counters_are_bounded_and_material_free() {
         "an all-ambiguous generation must not count as a published trust generation"
     );
     assert_eq!(
+        after_ambiguous_publication.ambiguous_authority_total,
+        before_ambiguous_publication.ambiguous_authority_total + 1,
+        "an ambiguous generation must be counted once at the publication boundary"
+    );
+    assert_eq!(
         after_ambiguous_publication.last_published_unix_seconds,
         before_ambiguous_publication.last_published_unix_seconds,
         "a refused generation must not advance the last-published timestamp"
@@ -589,7 +594,9 @@ fn observability_counters_are_bounded_and_material_free() {
 
     // An accepted empty generation is an explicit live revocation. It does not
     // increment the database-record counter, but status must stop reporting
-    // either namespace's previously published revision.
+    // either namespace's previously published revision and must clear a
+    // standing failure just like an accepted nonempty generation.
+    record_trust_load_rejection(GatewayTrustFailureReason::InvalidMaterial);
     let before_revoke = observability_snapshot().published_generations_total;
     record_trust_generation_published(&[], None, 1_950_000_000);
     assert!(published_namespace_state("production").is_none());
@@ -598,12 +605,22 @@ fn observability_counters_are_bounded_and_material_free() {
         observability_snapshot().published_generations_total,
         before_revoke
     );
+    assert_eq!(
+        observability_snapshot().last_published_unix_seconds,
+        1_950_000_000,
+        "an explicit revocation is the most recent successful trust publication"
+    );
+    assert_eq!(observability_snapshot().last_failure_reason, "none");
 
     // Re-run the ambiguity refusal so the trailing snapshot assertions below
     // still observe the bounded reason they were written for.
+    let ambiguity_before_replay = observability_snapshot().ambiguous_authority_total;
     record_ambiguous_authority();
     let after_ambiguous = observability_snapshot();
-    assert_eq!(after_ambiguous.ambiguous_authority_total, 2);
+    assert_eq!(
+        after_ambiguous.ambiguous_authority_total,
+        ambiguity_before_replay + 1
+    );
     assert_eq!(after_ambiguous.last_failure_reason, "ambiguous_authority");
 
     // The whole snapshot is a fixed set of integers plus a bounded enum, so it
@@ -833,8 +850,18 @@ fn two_authorities_keep_the_previously_accepted_trust_rather_than_revoking_it() 
     );
     assert_eq!(
         observability_snapshot().ambiguous_authority_total,
+        0,
+        "per-subscriber projection must not inflate publication observability"
+    );
+    record_trust_generation_published(
+        std::slice::from_ref(&record),
+        Some(&file_value),
+        1_800_000_000,
+    );
+    assert_eq!(
+        observability_snapshot().ambiguous_authority_total,
         1,
-        "the refusal must be observable"
+        "the refusal must be observable even without an active subscriber"
     );
     reset_observability_for_tests();
 }

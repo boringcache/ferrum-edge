@@ -840,7 +840,8 @@ impl CpGrpcServer {
     ///   withdrawal so a reconnecting DP reconstructs the true state;
     /// - `KeepPrevious` — two authorities disagree. Trust is NOT revoked:
     ///   subscribers keep the last generation they accepted while the redacted
-    ///   diagnostic and the ambiguity counter surface the misconfiguration.
+    ///   diagnostic surfaces the misconfiguration. The process counter is
+    ///   recorded once at the live publication boundary, not per subscriber.
     ///   Converting the ambiguity into a clear would take a working fleet
     ///   offline over a leftover file value.
     fn resolve_namespace_trust_projection(

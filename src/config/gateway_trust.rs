@@ -489,9 +489,9 @@ impl<'a> GatewayTrustPublication<'a> {
 
     /// Encode to the `trust_bundles_json` wire value.
     ///
-    /// A serialization failure fails closed to `Clear`: publishing stale trust
-    /// the CP can no longer describe would be worse than withdrawing it, and a
-    /// bundle that cannot serialize never passed admission in the first place.
+    /// A serialization failure is returned to the caller. A bundle that passed
+    /// admission should always serialize, but the transport must still choose
+    /// the protocol-appropriate fail-closed response if that invariant breaks.
     pub fn to_side_channel_json(&self) -> Result<String, serde_json::Error> {
         match self {
             Self::Unchanged => Ok(String::new()),
@@ -566,10 +566,7 @@ pub fn project_namespace_trust(
     file_sourced_admissible: bool,
 ) -> NamespaceTrustProjection {
     match resolve_trust_authority(database_record, file_sourced) {
-        TrustAuthorityResolution::Ambiguous => {
-            record_ambiguous_authority();
-            NamespaceTrustProjection::KeepPrevious
-        }
+        TrustAuthorityResolution::Ambiguous => NamespaceTrustProjection::KeepPrevious,
         TrustAuthorityResolution::Database => match database_record {
             Some(record) => NamespaceTrustProjection::Replace(record.bundle.clone()),
             None => NamespaceTrustProjection::Clear,
@@ -671,8 +668,8 @@ impl GatewayTrustFailureReason {
 /// against every namespace's record by [`resolve_trust_authority`], so the
 /// outcome is all-or-nothing: when it is `Some`, every database record in this
 /// generation is ambiguous and nothing distributable is published (the
-/// refusal's own counter and bounded reason are recorded by
-/// [`record_ambiguous_authority`] at the projection); when it is `None`, no
+/// refusal's own counter and bounded reason are recorded here at the same
+/// publication boundary); when it is `None`, no
 /// record is ambiguous and a mixed generation — some namespaces accepted, some
 /// refused — cannot arise. Multi-namespace generations therefore still count
 /// exactly once, as one generation reaching the swap.
@@ -698,8 +695,24 @@ pub fn record_trust_generation_published(
             .map(|record| record.namespace.as_str())
             .collect();
         let mut retained = PUBLISHED_NAMESPACE_STATES.load().as_ref().clone();
+        let revoked_database_state = records.is_empty() && !retained.is_empty();
         retained.retain(|namespace, _| current_namespaces.contains(namespace.as_str()));
         PUBLISHED_NAMESPACE_STATES.store(Arc::new(retained));
+        if !records.is_empty() {
+            // Count the refused generation exactly once at the live swap. The
+            // later per-namespace projection can run zero times (no active
+            // subscriber) or many times (reconnects); neither may suppress or
+            // inflate process-level publication observability.
+            record_ambiguous_authority();
+        } else {
+            // File-only/empty state is a valid, unambiguous publication. It
+            // does not count as a database trust generation, but it does
+            // resolve any standing load/authority failure.
+            LAST_FAILURE_REASON.store(GatewayTrustFailureReason::None.code(), Ordering::Relaxed);
+            if revoked_database_state {
+                LAST_PUBLISHED_UNIX_SECONDS.store(now_unix_seconds, Ordering::Relaxed);
+            }
+        }
         return;
     }
 
@@ -708,6 +721,8 @@ pub fn record_trust_generation_published(
     // empty accepted generation clears every previously published database
     // record even though it deliberately does not increment the
     // database-record publication counter below.
+    let revoked_database_state =
+        records.is_empty() && !PUBLISHED_NAMESPACE_STATES.load().is_empty();
     let published = records
         .iter()
         .map(|record| {
@@ -721,13 +736,19 @@ pub fn record_trust_generation_published(
         })
         .collect();
     PUBLISHED_NAMESPACE_STATES.store(Arc::new(published));
+    // An accepted explicit revocation is still a successful trust publication:
+    // clear the standing failure even though an empty database generation does
+    // not advance the record-bearing generation counter or timestamp.
+    LAST_FAILURE_REASON.store(GatewayTrustFailureReason::None.code(), Ordering::Relaxed);
 
     if records.is_empty() {
+        if revoked_database_state {
+            LAST_PUBLISHED_UNIX_SECONDS.store(now_unix_seconds, Ordering::Relaxed);
+        }
         return;
     }
     PUBLISHED_GENERATIONS_TOTAL.fetch_add(1, Ordering::Relaxed);
     LAST_PUBLISHED_UNIX_SECONDS.store(now_unix_seconds, Ordering::Relaxed);
-    LAST_FAILURE_REASON.store(GatewayTrustFailureReason::None.code(), Ordering::Relaxed);
 }
 
 /// Return the material-free state that actually reached the live configuration
