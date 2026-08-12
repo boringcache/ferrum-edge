@@ -11381,8 +11381,13 @@ components:
         max_stale_seconds:
           type: [integer, "null"]
           format: uint64
-          minimum: 0
-          maximum: 86400
+          anyOf:
+            - type: "null"
+            - type: integer
+              const: 0
+            - type: integer
+              minimum: 5
+              maximum: 86400
           description: |
             Per-upstream override of the maximum age of the last successfully
             admitted **and published** discovery snapshot before the expiry
