@@ -92,11 +92,13 @@ mod mesh_grpc_transport_tests;
 mod mesh_hbone_tests;
 // Keep host UDP capture coverage on the existing trusted mesh-platform shard:
 // its filter matches this module-name prefix without changing CI workflow code.
+mod gateway_listener_quic_udp_collision_tests;
 mod mesh_k8s_pod_discovery_tests;
 #[path = "mesh_k8s_pod_discovery/host_udp_capture_tests.rs"]
 mod mesh_k8s_pod_discovery_tests_host_udp_capture;
 mod mesh_l4_weighted_routing_tests;
 mod mesh_l7_routing_tests;
+mod mesh_local_reload_observability_tests;
 mod mesh_multicluster_discovery_tests;
 mod mesh_node_waypoint_stream_scope_tests;
 mod mesh_node_waypoint_udp_scope_tests;
@@ -119,6 +121,7 @@ mod policy_path_canonicalization_tests;
 mod port_aware_route_traffic_tests;
 mod scripted_backend_smoke_tests;
 mod service_discovery_endpointslice_lifecycle_tests;
+mod service_discovery_lifecycle_tests;
 mod sidecar_ingress_bind_tests;
 mod spec_expose_integration_tests;
 mod tcp_fast_path_l4_plugins_tests;

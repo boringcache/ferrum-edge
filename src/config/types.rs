@@ -339,6 +339,11 @@ pub const MAX_BACKOFF_MS: u64 = 300_000;
 pub const MAX_TARGET_WEIGHT: u32 = 65_535;
 /// Maximum service discovery poll interval in seconds (1 hour).
 pub const MAX_SD_POLL_INTERVAL: u64 = 3600;
+/// Minimum non-zero service-discovery staleness window. `0` is the explicit
+/// unbounded sentinel and is separately gated by the process unsafe opt-in.
+pub const MIN_SD_MAX_STALE_SECONDS: u64 = 5;
+/// Hard maximum service-discovery staleness window (24 hours).
+pub const MAX_SD_MAX_STALE_SECONDS: u64 = 86_400;
 /// Maximum health check interval in seconds (1 hour).
 pub const MAX_HEALTH_CHECK_INTERVAL: u64 = 3600;
 /// Maximum UDP idle timeout in seconds (1 hour).
@@ -1059,7 +1064,7 @@ pub const UPSTREAM_TARGET_SERVICE_NAMESPACE_TAG: &str = "_ferrum_service_namespa
 pub const UPSTREAM_TARGET_SERVICE_NAME_TAG: &str = "_ferrum_service_name";
 pub const UPSTREAM_TARGET_SERVICE_PORT_TAG: &str = "_ferrum_service_port";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UpstreamTarget {
     pub host: String,
     pub port: u16,
@@ -1815,7 +1820,7 @@ pub enum SdProvider {
 }
 
 /// DNS-SD specific configuration (SRV record-based discovery).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DnsSdConfig {
     /// The DNS name to query for SRV records (e.g., "_http._tcp.my-service.example.com").
     pub service_name: String,
@@ -1825,7 +1830,7 @@ pub struct DnsSdConfig {
 }
 
 /// Kubernetes service discovery configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct KubernetesConfig {
     /// Kubernetes namespace. Default: "default".
     #[serde(default = "default_k8s_namespace")]
@@ -1844,7 +1849,7 @@ pub struct KubernetesConfig {
 }
 
 /// Consul service discovery configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConsulConfig {
     /// Consul HTTP API address (e.g., "http://consul:8500").
     pub address: String,
@@ -1868,7 +1873,7 @@ pub struct ConsulConfig {
 }
 
 /// Ferrum mesh service discovery configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MeshSdConfig {
     /// Mesh service name to resolve from the CP-delivered mesh model.
     pub service_name: String,
@@ -1915,13 +1920,71 @@ impl MeshSdTopology {
     }
 }
 
+/// What to do with the last-known discovered target set once it exceeds the
+/// configured maximum staleness (issue #3717).
+///
+/// Staleness is measured from the last *successfully admitted and published*
+/// snapshot (or from task start when no snapshot has ever been admitted), not
+/// from the last poll attempt: a registry that answers with a payload Ferrum
+/// refuses is exactly as stale as one that does not answer at all.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SdStalePolicy {
+    /// Keep routing to the expired discovered set. Coarse health reports
+    /// `degraded`; readiness is unaffected. Legacy (pre-#3717) behavior — safe
+    /// only where the registry is not the authority on endpoint identity.
+    Retain,
+    /// Withdraw the expired *discovered* targets while retaining every
+    /// statically configured target for the upstream. Coarse health reports
+    /// `degraded`; readiness is unaffected. Production default.
+    #[default]
+    Withdraw,
+    /// Withdraw the expired discovered targets (as [`SdStalePolicy::Withdraw`])
+    /// **and** fail gateway readiness while any task remains expired, so an
+    /// orchestrator takes the instance out of rotation.
+    FailReadiness,
+}
+
+impl SdStalePolicy {
+    /// Fixed-cardinality label for logs, `/health`, and status output.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Retain => "retain",
+            Self::Withdraw => "withdraw",
+            Self::FailReadiness => "fail_readiness",
+        }
+    }
+
+    /// Whether expiry withdraws discovered targets under this policy.
+    pub fn withdraws(self) -> bool {
+        matches!(self, Self::Withdraw | Self::FailReadiness)
+    }
+
+    /// Whether expiry fails gateway readiness under this policy.
+    pub fn fails_readiness(self) -> bool {
+        matches!(self, Self::FailReadiness)
+    }
+
+    /// Parse a policy token (env / config value). Case-insensitive.
+    pub fn parse_token(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "retain" => Some(Self::Retain),
+            "withdraw" => Some(Self::Withdraw),
+            "fail_readiness" => Some(Self::FailReadiness),
+            _ => None,
+        }
+    }
+}
+
 /// Service discovery configuration for an upstream.
 ///
 /// Attaches a dynamic service discovery source to an upstream. Discovered
 /// targets are merged with any statically configured targets and fed into
 /// the load balancer. If the discovery source becomes unavailable, the
-/// gateway continues serving with the last-known targets.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// gateway continues serving with the last-known targets **up to a bounded
+/// staleness window** (`max_stale_seconds` / `stale_policy`, issue #3717);
+/// past that window the configured expiry policy applies.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ServiceDiscoveryConfig {
     /// The service discovery provider to use.
     pub provider: SdProvider,
@@ -1940,6 +2003,23 @@ pub struct ServiceDiscoveryConfig {
     /// Default weight assigned to discovered targets. Default: 1.
     #[serde(default = "default_weight")]
     pub default_weight: u32,
+    /// Per-upstream override of the maximum age of the last successfully
+    /// admitted and published snapshot, in seconds (issue #3717).
+    ///
+    /// Omitted uses `FERRUM_SERVICE_DISCOVERY_MAX_STALE_SECONDS`. `0` means
+    /// unbounded last-known retention and is admitted only when
+    /// `FERRUM_SERVICE_DISCOVERY_ALLOW_UNBOUNDED_STALE=true`; otherwise the
+    /// gateway warns once and falls back to the bounded process default.
+    ///
+    /// The effective window is never shorter than three poll intervals for the
+    /// configured provider, so a long poll interval cannot make an upstream
+    /// permanently stale.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_stale_seconds: Option<u64>,
+    /// Per-upstream override of the staleness expiry action. Omitted uses
+    /// `FERRUM_SERVICE_DISCOVERY_STALE_POLICY` (default `withdraw`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_policy: Option<SdStalePolicy>,
 }
 
 fn default_sd_poll_interval() -> u64 {
@@ -9506,6 +9586,18 @@ impl ServiceDiscoveryConfig {
                 "default_weight must be between 1 and {} (got {})",
                 MAX_TARGET_WEIGHT, self.default_weight
             ));
+        }
+
+        if let Some(max_stale_seconds) = self.max_stale_seconds
+            && max_stale_seconds != 0
+            && let Err(error) = validate_u64_range(
+                "max_stale_seconds",
+                max_stale_seconds,
+                MIN_SD_MAX_STALE_SECONDS,
+                MAX_SD_MAX_STALE_SECONDS,
+            )
+        {
+            errors.push(error);
         }
 
         match self.provider {

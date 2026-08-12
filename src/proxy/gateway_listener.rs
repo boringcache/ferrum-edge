@@ -66,12 +66,22 @@
 //! socket. A **dedicated** Sidecar ingress bind override on that same port is
 //! never absorbed this way: widening a loopback-only ownership claim onto the
 //! global frontend would violate bind isolation (#3266), so the collision is
-//! refused fail-closed instead. Every other collision is skipped fail-closed:
+//! refused fail-closed instead. Every other **TCP** collision is skipped
+//! fail-closed:
 //!
 //! - an HTTP listener on the global HTTPS port (or the reverse),
 //! - admin HTTP/HTTPS ports and the CP gRPC port,
 //! - any port claimed by a TCP/TLS stream proxy in the same config, and
 //! - any port two HTTP-family proxies claim with different TLS classes.
+//!
+//! A UDP/DTLS stream claim on the same numeric port is different. TCP and UDP
+//! are independent socket namespaces, so the HTTPS TCP listener still binds and
+//! serves H1/H2. When HTTP/3 is enabled the optional QUIC half is refused for
+//! that port only (`quic_refused`), `ensure_quic` is not called while the
+//! collision exists, and `Alt-Svc` stays tied to a live QUIC task. Adding the
+//! UDP/DTLS claim live drains only QUIC; removing it starts QUIC on the already
+//! running TCP listener. A stale reconcile cannot leave QUIC up after a newer
+//! epoch reserved the UDP port.
 //!
 //! A refusal — and any bind failure, such as `:80` without
 //! `CAP_NET_BIND_SERVICE` — is recorded in
@@ -85,7 +95,8 @@
 //! become reachable through the process-global proxy or the single-listener
 //! Service remap. This includes dedicated Sidecar ingress binds, where
 //! remapping a loopback-only listener onto a process-global frontend would
-//! widen its exposure.
+//! widen its exposure. QUIC-only degradations do **not** enter the refused-route
+//! set, so an available H1/H2 half remains routable.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, SocketAddr};
@@ -113,6 +124,82 @@ impl GatewayListenerClass {
     }
 }
 
+/// Bounded reason a planned Gateway listener (or one of its protocol halves)
+/// cannot be realized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayListenerFailureReason {
+    /// Collides with an admin, control-plane, capture, or other reserved port.
+    Reserved,
+    /// Collides with a TCP/TLS raw-stream proxy in the same config.
+    TcpStreamCollision,
+    /// QUIC/H3 collides with a UDP/DTLS stream proxy; TCP/H1/H2 may still serve.
+    UdpStreamCollision,
+    /// Same port claimed as both plaintext and TLS by HTTP-family proxies.
+    ClassConflict,
+    /// Process-global frontend already owns the port under the opposite class.
+    ProcessGlobalClassMismatch,
+    /// A dedicated Sidecar bind cannot be absorbed by a process-global socket.
+    DedicatedBindConflict,
+    /// Dedicated Sidecar bind materialization does not support frontend TLS.
+    DedicatedBindTlsUnsupported,
+    /// TLS-class listener requested but frontend TLS material is absent.
+    FrontendTlsMissing,
+    /// OS bind / accept-loop start failed.
+    BindFailed,
+    /// A started accept loop ended unexpectedly and is being rebound.
+    EndedUnexpectedly,
+    /// Previous frontend class did not finish retiring in time.
+    ClassFlipDeferred,
+    /// A prior accept task may still own the port; rebind is deferred.
+    RebindDeferred,
+    /// Optional QUIC half failed to bind; TCP keeps serving.
+    QuicBindFailed,
+    /// Optional QUIC half lacks frontend TLS material.
+    QuicTlsMissing,
+}
+
+/// Which protocol half a Gateway listener failure applies to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayListenerFailureProtocol {
+    /// The HTTP-family TCP listener itself is unavailable.
+    Tcp,
+    /// Only the optional QUIC/HTTP/3 half is unavailable.
+    Quic,
+}
+
+/// Protocol-scoped QUIC admission failure for a TLS-class listener that still
+/// keeps its TCP half in [`GatewayListenerPlan::ports`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GatewayListenerProtocolFailure {
+    UdpStreamCollision,
+}
+
+impl GatewayListenerProtocolFailure {
+    pub fn message(self, port: u16) -> String {
+        match self {
+            Self::UdpStreamCollision => format!(
+                "port {port} is claimed by a UDP/DTLS stream proxy in the same config; \
+                 the TLS-class Gateway listener's HTTP/3 socket is not bound"
+            ),
+        }
+    }
+
+    pub fn reason(self) -> GatewayListenerFailureReason {
+        match self {
+            Self::UdpStreamCollision => GatewayListenerFailureReason::UdpStreamCollision,
+        }
+    }
+}
+
+/// Whole-listener (TCP) admission refusal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayListenerRefusal {
+    pub reason: GatewayListenerFailureReason,
+    pub message: String,
+}
+
 /// One Gateway API listener port a config wants bound, including the exact
 /// OS bind address for that generation (default proxy bind or a dedicated
 /// Sidecar ingress override).
@@ -133,9 +220,12 @@ pub struct GatewayListenerPlan {
     /// Desired ports already served by a process-global proxy frontend of the
     /// same class. No dynamic bind and no failure are needed for these.
     pub already_served: BTreeMap<u16, GatewayListenerClass>,
-    /// Ports the config asked for that this process refuses to bind, with the
-    /// reason. Surfaced rather than silently dropped.
-    pub refused: BTreeMap<u16, String>,
+    /// Ports the config asked for that this process refuses to bind at the TCP
+    /// half, with a bounded reason. Surfaced rather than silently dropped.
+    pub refused: BTreeMap<u16, GatewayListenerRefusal>,
+    /// TLS-class ports whose optional QUIC/HTTP/3 half cannot be realized while
+    /// the TCP listener remains desired in [`Self::ports`].
+    pub quic_refused: BTreeMap<u16, GatewayListenerProtocolFailure>,
 }
 
 fn sidecar_ingress_bind_for_port(config: &GatewayConfig, port: u16) -> Option<IpAddr> {
@@ -193,7 +283,8 @@ impl GatewayListenerPlan {
 
         let mut ports: BTreeMap<u16, DesiredGatewayListener> = BTreeMap::new();
         let mut already_served: BTreeMap<u16, GatewayListenerClass> = BTreeMap::new();
-        let mut refused: BTreeMap<u16, String> = BTreeMap::new();
+        let mut refused: BTreeMap<u16, GatewayListenerRefusal> = BTreeMap::new();
+        let mut quic_refused: BTreeMap<u16, GatewayListenerProtocolFailure> = BTreeMap::new();
         for proxy in &config.proxies {
             if proxy.dispatch_kind.is_stream() {
                 continue;
@@ -218,13 +309,16 @@ impl GatewayListenerPlan {
             let mesh_direction =
                 dedicated_bind.then_some(crate::modes::mesh::MeshTrafficDirection::Inbound);
             if dedicated_bind && class == GatewayListenerClass::Tls {
-                refused.entry(port).or_insert_with(|| {
-                    format!(
-                        "port {port} has a dedicated Sidecar ingress bind but is marked as a \
-                         frontend-TLS listener; Sidecar bind materialization supports plaintext \
-                         HTTP-family listeners only"
-                    )
-                });
+                refused
+                    .entry(port)
+                    .or_insert_with(|| GatewayListenerRefusal {
+                        reason: GatewayListenerFailureReason::DedicatedBindTlsUnsupported,
+                        message: format!(
+                            "port {port} has a dedicated Sidecar ingress bind but is marked as a \
+                             frontend-TLS listener; Sidecar bind materialization supports plaintext \
+                             HTTP-family listeners only"
+                        ),
+                    });
                 continue;
             }
             if let Some(existing) = existing_frontends.get(&port) {
@@ -233,26 +327,32 @@ impl GatewayListenerPlan {
                     // ownership. Absorbing it into the process-global
                     // same-class frontend would silently widen loopback-only
                     // traffic onto the shared socket (#3266).
-                    refused.entry(port).or_insert_with(|| {
-                        format!(
-                            "port {port} has a dedicated Sidecar ingress bind but is already \
-                             owned by a process-global {} proxy listener; the dedicated bind \
-                             is not served",
-                            existing.label()
-                        )
-                    });
+                    refused
+                        .entry(port)
+                        .or_insert_with(|| GatewayListenerRefusal {
+                            reason: GatewayListenerFailureReason::DedicatedBindConflict,
+                            message: format!(
+                                "port {port} has a dedicated Sidecar ingress bind but is already \
+                                 owned by a process-global {} proxy listener; the dedicated bind \
+                                 is not served",
+                                existing.label()
+                            ),
+                        });
                 } else if *existing == class {
                     already_served.insert(port, class);
                 } else {
-                    refused.entry(port).or_insert_with(|| {
-                        format!(
-                            "port {port} is already owned by a process-global {} proxy \
+                    refused
+                        .entry(port)
+                        .or_insert_with(|| GatewayListenerRefusal {
+                            reason: GatewayListenerFailureReason::ProcessGlobalClassMismatch,
+                            message: format!(
+                                "port {port} is already owned by a process-global {} proxy \
                              listener, but this Gateway listener requires {}; the Gateway \
                              listener is not served",
-                            existing.label(),
-                            class.label()
-                        )
-                    });
+                                existing.label(),
+                                class.label()
+                            ),
+                        });
                 }
                 continue;
             }
@@ -261,34 +361,38 @@ impl GatewayListenerPlan {
             // proxy ports this gateway did not adopt as a same-class frontend
             // above — name the set rather than guessing which member it was.
             if reserved.contains(&port) {
-                refused.entry(port).or_insert_with(|| {
-                    format!(
-                        "port {port} is reserved by another Ferrum listener \
+                refused
+                    .entry(port)
+                    .or_insert_with(|| GatewayListenerRefusal {
+                        reason: GatewayListenerFailureReason::Reserved,
+                        message: format!(
+                            "port {port} is reserved by another Ferrum listener \
                          (proxy/admin/control-plane/capture); the Gateway listener is not bound"
-                    )
-                });
+                        ),
+                    });
                 continue;
             }
             if tcp_stream_ports.contains(&port) {
-                refused.entry(port).or_insert_with(|| {
-                    format!(
-                        "port {port} is claimed by a TCP/TLS stream proxy in the same config; \
+                refused
+                    .entry(port)
+                    .or_insert_with(|| GatewayListenerRefusal {
+                        reason: GatewayListenerFailureReason::TcpStreamCollision,
+                        message: format!(
+                            "port {port} is claimed by a TCP/TLS stream proxy in the same config; \
                          the HTTP-family Gateway listener is not bound"
-                    )
-                });
+                        ),
+                    });
                 continue;
             }
+            // UDP/DTLS claims the UDP namespace only. Keep the TCP listener in
+            // `ports` and refuse the optional QUIC half when HTTP/3 is on.
             if http3_enabled
                 && class == GatewayListenerClass::Tls
                 && udp_stream_ports.contains(&port)
             {
-                refused.entry(port).or_insert_with(|| {
-                    format!(
-                        "port {port} is claimed by a UDP/DTLS stream proxy in the same config; \
-                         the TLS-class Gateway listener's HTTP/3 socket is not bound"
-                    )
-                });
-                continue;
+                quic_refused
+                    .entry(port)
+                    .or_insert(GatewayListenerProtocolFailure::UdpStreamCollision);
             }
             if let Some(existing) = ports.insert(
                 port,
@@ -304,30 +408,56 @@ impl GatewayListenerPlan {
                 // hand-authored config: refuse the port outright rather than
                 // letting whichever proxy happened to sort first decide the
                 // socket's protocol for the other.
-                refused.entry(port).or_insert_with(|| {
-                    format!(
+                refused.entry(port).or_insert_with(|| GatewayListenerRefusal {
+                    reason: GatewayListenerFailureReason::ClassConflict,
+                    message: format!(
                         "port {port} is claimed as both plaintext and TLS by HTTP-family proxies \
                          in this config; one socket cannot serve both, so the listener is not bound"
-                    )
+                    ),
                 });
             }
         }
-        // Every refusal reason wins over any class this port also resolved to.
+        // Every TCP refusal reason wins over any class this port also resolved to.
+        // QUIC-only refusals deliberately leave the port in `ports`.
         ports.retain(|port, _| !refused.contains_key(port));
         already_served.retain(|port, _| !refused.contains_key(port));
+        quic_refused.retain(|port, _| ports.contains_key(port));
         Self {
             ports,
             already_served,
             refused,
+            quic_refused,
         }
     }
 }
 
-/// A refusal or bind failure for one Gateway listener port.
+/// A refusal or bind failure for one Gateway listener port (or protocol half).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct GatewayListenerBindFailure {
     pub port: u16,
     pub error: String,
+    pub protocol: GatewayListenerFailureProtocol,
+    pub reason: GatewayListenerFailureReason,
+}
+
+impl GatewayListenerBindFailure {
+    fn tcp(port: u16, reason: GatewayListenerFailureReason, error: impl Into<String>) -> Self {
+        Self {
+            port,
+            error: error.into(),
+            protocol: GatewayListenerFailureProtocol::Tcp,
+            reason,
+        }
+    }
+
+    fn quic(port: u16, reason: GatewayListenerFailureReason, error: impl Into<String>) -> Self {
+        Self {
+            port,
+            error: error.into(),
+            protocol: GatewayListenerFailureProtocol::Quic,
+            reason,
+        }
+    }
 }
 
 type ListenerTask = tokio::task::JoinHandle<Result<(), anyhow::Error>>;
@@ -353,6 +483,10 @@ struct LiveListener {
     /// The QUIC listener task on the same port, when HTTP/3 is enabled and this
     /// is a TLS-class listener.
     quic: Option<ListenerTask>,
+    /// Independent of [`Self::shutdown_tx`] so a UDP/DTLS collision can drain
+    /// only QUIC without closing the TCP accept loop or existing H1/H2
+    /// connections.
+    quic_shutdown_tx: Option<watch::Sender<bool>>,
 }
 
 impl LiveListener {
@@ -360,6 +494,15 @@ impl LiveListener {
     /// exited is not a healthy port, however it exited.
     fn is_finished(&self) -> bool {
         self.tcp.is_finished() || self.quic.as_ref().is_some_and(ListenerTask::is_finished)
+    }
+
+    /// Signal both protocol halves to stop accepting. QUIC uses an independent
+    /// watch channel so UDP/DTLS collisions can drain it alone.
+    fn signal_shutdown(&self) {
+        let _ = self.shutdown_tx.send(true);
+        if let Some(tx) = self.quic_shutdown_tx.as_ref() {
+            let _ = tx.send(true);
+        }
     }
 
     fn tasks(self) -> Vec<ListenerTask> {
@@ -595,15 +738,24 @@ impl GatewayListenerManager {
         let mut failures: Vec<GatewayListenerBindFailure> = plan
             .refused
             .iter()
-            .map(|(port, error)| GatewayListenerBindFailure {
-                port: *port,
-                error: error.clone(),
+            .map(|(port, refusal)| {
+                GatewayListenerBindFailure::tcp(*port, refusal.reason, refusal.message.clone())
             })
             .collect();
+        for (port, quic_failure) in &plan.quic_refused {
+            failures.push(GatewayListenerBindFailure::quic(
+                *port,
+                quic_failure.reason(),
+                quic_failure.message(*port),
+            ));
+        }
         for failure in &failures {
             warn!(
                 port = failure.port,
-                "Gateway API listener refused: {}", failure.error
+                protocol = ?failure.protocol,
+                reason = ?failure.reason,
+                "Gateway API listener refused: {}",
+                failure.error
             );
         }
 
@@ -620,7 +772,7 @@ impl GatewayListenerManager {
             .collect();
         for port in dead {
             if let Some(listener) = live.remove(&port) {
-                let _ = listener.shutdown_tx.send(true);
+                listener.signal_shutdown();
                 let (error, pending) = Self::describe_ended_listener(listener).await;
                 if !pending.is_empty() {
                     self.draining.lock().await.extend(
@@ -630,7 +782,11 @@ impl GatewayListenerManager {
                     );
                 }
                 error!(port, "Gateway API listener ended unexpectedly: {error}");
-                failures.push(GatewayListenerBindFailure { port, error });
+                failures.push(GatewayListenerBindFailure::tcp(
+                    port,
+                    GatewayListenerFailureReason::EndedUnexpectedly,
+                    error,
+                ));
             }
         }
 
@@ -659,9 +815,13 @@ impl GatewayListenerManager {
                 continue;
             };
             let replacing = plan.ports.contains_key(&port);
+            let class_changed = plan
+                .ports
+                .get(&port)
+                .is_some_and(|desired| desired.class != listener.class);
             let retire_reason = match plan.ports.get(&port) {
                 Some(desired) if desired.class != listener.class => "its frontend class changed",
-                Some(_) => "its bind address changed",
+                Some(_) => "its bind address or mesh direction changed",
                 None => "no longer declared by config",
             };
             info!(
@@ -670,7 +830,7 @@ impl GatewayListenerManager {
                 listener.class.label(),
                 retire_reason
             );
-            let _ = listener.shutdown_tx.send(true);
+            listener.signal_shutdown();
             if replacing {
                 // The replacement binds the same port. With
                 // `FERRUM_ACCEPT_THREADS > 1` both generations use
@@ -698,8 +858,13 @@ impl GatewayListenerManager {
                          {}s; the replacement listener is deferred to the next reconcile",
                         CLASS_FLIP_RETIRE_TIMEOUT.as_secs()
                     );
+                    let reason = if class_changed {
+                        GatewayListenerFailureReason::ClassFlipDeferred
+                    } else {
+                        GatewayListenerFailureReason::RebindDeferred
+                    };
                     warn!(port, "Gateway API listener rebind deferred: {error}");
-                    failures.push(GatewayListenerBindFailure { port, error });
+                    failures.push(GatewayListenerBindFailure::tcp(port, reason, error));
                     defer_rebind.insert(port);
                     self.draining.lock().await.extend(
                         pending
@@ -740,6 +905,8 @@ impl GatewayListenerManager {
         // the process-global proxy. Every `spawn_listener` error is included;
         // in particular, a failed dedicated Sidecar ingress bind must not widen
         // its loopback-only route through single-listener remapping.
+        // QUIC-only collisions stay out of this set so H1/H2 routes remain
+        // reachable on the TCP half.
         let mut refused_route_ports: BTreeSet<u16> = plan.refused.keys().copied().collect();
         refused_route_ports.extend(stale_route_ports);
         refused_route_ports.extend(retiring_ports.iter().copied());
@@ -747,7 +914,15 @@ impl GatewayListenerManager {
         for (port, desired) in &plan.ports {
             if defer_rebind.contains(port) || retiring_ports.contains(port) {
                 refused_route_ports.insert(*port);
-                if !failures.iter().any(|failure| failure.port == *port) {
+                if !failures.iter().any(|failure| {
+                    failure.port == *port
+                        && failure.protocol == GatewayListenerFailureProtocol::Tcp
+                        && matches!(
+                            failure.reason,
+                            GatewayListenerFailureReason::ClassFlipDeferred
+                                | GatewayListenerFailureReason::RebindDeferred
+                        )
+                }) {
                     let error = format!(
                         "port {port} still has a retiring Gateway listener task; the replacement \
                          listener remains deferred until every previous accept socket closes"
@@ -756,14 +931,34 @@ impl GatewayListenerManager {
                         port = *port,
                         "Gateway API listener rebind deferred: {error}"
                     );
-                    failures.push(GatewayListenerBindFailure { port: *port, error });
+                    failures.push(GatewayListenerBindFailure::tcp(
+                        *port,
+                        GatewayListenerFailureReason::RebindDeferred,
+                        error,
+                    ));
                 }
                 continue;
             }
             if let Some(listener) = live.get_mut(port) {
-                // Retry a QUIC socket that did not come up with its TCP peer.
-                if let Some(error) = self.ensure_quic(*port, listener).await {
-                    failures.push(GatewayListenerBindFailure { port: *port, error });
+                if let Some(quic_failure) = plan.quic_refused.get(port) {
+                    // Live addition of a UDP/DTLS claim: drain only QUIC.
+                    self.stop_quic(*port, listener).await;
+                    if !failures.iter().any(|failure| {
+                        failure.port == *port
+                            && failure.protocol == GatewayListenerFailureProtocol::Quic
+                            && failure.reason == quic_failure.reason()
+                    }) {
+                        failures.push(GatewayListenerBindFailure::quic(
+                            *port,
+                            quic_failure.reason(),
+                            quic_failure.message(*port),
+                        ));
+                    }
+                } else if let Some(error) = self
+                    .ensure_quic(*port, listener, expected.config_generation)
+                    .await
+                {
+                    failures.push(error);
                 }
                 continue;
             }
@@ -773,20 +968,44 @@ impl GatewayListenerManager {
                      configured on this gateway; the listener is not bound"
                 );
                 warn!(port = *port, "Gateway API listener refused: {error}");
-                failures.push(GatewayListenerBindFailure { port: *port, error });
+                failures.push(GatewayListenerBindFailure::tcp(
+                    *port,
+                    GatewayListenerFailureReason::FrontendTlsMissing,
+                    error,
+                ));
                 refused_route_ports.insert(*port);
                 continue;
             }
             match self.spawn_listener(*port, *desired).await {
                 Ok(mut listener) => {
-                    if let Some(error) = self.ensure_quic(*port, &mut listener).await {
-                        failures.push(GatewayListenerBindFailure { port: *port, error });
+                    if let Some(quic_failure) = plan.quic_refused.get(port) {
+                        // Initial collision: bind TCP, never call ensure_quic.
+                        if !failures.iter().any(|failure| {
+                            failure.port == *port
+                                && failure.protocol == GatewayListenerFailureProtocol::Quic
+                                && failure.reason == quic_failure.reason()
+                        }) {
+                            failures.push(GatewayListenerBindFailure::quic(
+                                *port,
+                                quic_failure.reason(),
+                                quic_failure.message(*port),
+                            ));
+                        }
+                    } else if let Some(error) = self
+                        .ensure_quic(*port, &mut listener, expected.config_generation)
+                        .await
+                    {
+                        failures.push(error);
                     }
                     live.insert(*port, listener);
                 }
                 Err(error) => {
                     error!(port = *port, "Gateway API listener bind failed: {error}");
-                    failures.push(GatewayListenerBindFailure { port: *port, error });
+                    failures.push(GatewayListenerBindFailure::tcp(
+                        *port,
+                        GatewayListenerFailureReason::BindFailed,
+                        error,
+                    ));
                     refused_route_ports.insert(*port);
                 }
             }
@@ -875,26 +1094,40 @@ impl GatewayListenerManager {
 
     /// Bind the QUIC socket for a TLS-class listener when HTTP/3 is enabled.
     ///
-    /// Returns the failure reason when the QUIC listener could not be started.
-    /// The TCP listener keeps serving H1/H2 in that case and the QUIC bind is
-    /// retried on the next reconcile / retry tick; `Alt-Svc` does not advertise
-    /// HTTP/3 for the port until the socket exists, so no client is steered at
-    /// a socket that is not there.
-    async fn ensure_quic(&self, port: u16, listener: &mut LiveListener) -> Option<String> {
+    /// Returns the failure when the QUIC listener could not be started. The TCP
+    /// listener keeps serving H1/H2 in that case and the QUIC bind is retried on
+    /// the next reconcile / retry tick; `Alt-Svc` does not advertise HTTP/3 for
+    /// the port until the socket exists, so no client is steered at a socket
+    /// that is not there.
+    ///
+    /// `expected_generation` fences a stale reconcile: if a newer config epoch
+    /// published while the QUIC bind awaited, the freshly started QUIC task is
+    /// stopped immediately so it cannot restore H3 after a newer epoch reserved
+    /// the UDP port.
+    async fn ensure_quic(
+        &self,
+        port: u16,
+        listener: &mut LiveListener,
+        expected_generation: u64,
+    ) -> Option<GatewayListenerBindFailure> {
         let http3 = self.http3.as_ref()?;
         if listener.class != GatewayListenerClass::Tls || listener.quic.is_some() {
             return None;
         }
         let Some(tls_config) = self.tls.quic_initial_config() else {
-            return Some(format!(
-                "port {port} has no frontend TLS material for an HTTP/3 listener; HTTP/3 is not \
-                 served on this Gateway listener port"
+            return Some(GatewayListenerBindFailure::quic(
+                port,
+                GatewayListenerFailureReason::QuicTlsMissing,
+                format!(
+                    "port {port} has no frontend TLS material for an HTTP/3 listener; HTTP/3 is not \
+                     served on this Gateway listener port"
+                ),
             ));
         };
         let addr = SocketAddr::new(listener.bind_addr, port);
         let (started_tx, started_rx) = oneshot::channel();
+        let (quic_shutdown_tx, quic_shutdown_rx) = watch::channel(false);
         let state = self.state.clone();
-        let shutdown_rx = listener.shutdown_tx.subscribe();
         let h3_config = http3.config.clone();
         let tls_policy = http3.tls_policy.clone();
         let options = crate::http3::server::Http3ListenerOptions {
@@ -907,7 +1140,7 @@ impl GatewayListenerManager {
             crate::http3::server::start_http3_listener_with_signal(
                 addr,
                 state,
-                shutdown_rx,
+                quic_shutdown_rx,
                 tls_config,
                 h3_config,
                 &tls_policy,
@@ -917,8 +1150,22 @@ impl GatewayListenerManager {
         });
         match started_rx.await {
             Ok(()) => {
-                info!(port, "Gateway API HTTP/3 (QUIC) listener started on {addr}");
                 listener.quic = Some(task);
+                listener.quic_shutdown_tx = Some(quic_shutdown_tx);
+                if self.state.request_epoch.load().config_generation != expected_generation {
+                    // A newer epoch published while this bind awaited. Drop the
+                    // QUIC half now so a concurrent UDP/DTLS claim from that
+                    // epoch can own the port; the next loop iteration applies
+                    // the current plan (start again, or leave refused).
+                    warn!(
+                        port,
+                        expected_generation,
+                        "Discarding QUIC bind from a stale Gateway listener reconcile"
+                    );
+                    self.stop_quic(port, listener).await;
+                    return None;
+                }
+                info!(port, "Gateway API HTTP/3 (QUIC) listener started on {addr}");
                 None
             }
             Err(_) => {
@@ -928,7 +1175,40 @@ impl GatewayListenerManager {
                     Err(err) => format!("HTTP/3 listener task panicked: {err}"),
                 };
                 error!(port, "Gateway API HTTP/3 listener bind failed: {error}");
-                Some(error)
+                Some(GatewayListenerBindFailure::quic(
+                    port,
+                    GatewayListenerFailureReason::QuicBindFailed,
+                    error,
+                ))
+            }
+        }
+    }
+
+    /// Stop and drain only the QUIC half of a live listener.
+    ///
+    /// The TCP accept loop and already-accepted H1/H2 connections are left
+    /// intact. A wedged QUIC task is aborted after the retire budget so it
+    /// cannot retain the UDP port against a stream proxy or a later
+    /// `ensure_quic`.
+    async fn stop_quic(&self, port: u16, listener: &mut LiveListener) {
+        if let Some(tx) = listener.quic_shutdown_tx.take() {
+            let _ = tx.send(true);
+        }
+        let Some(mut task) = listener.quic.take() else {
+            return;
+        };
+        match tokio::time::timeout(CLASS_FLIP_RETIRE_TIMEOUT, &mut task).await {
+            Ok(outcome) => {
+                Self::log_listener_task_outcome(outcome);
+                info!(port, "Gateway API HTTP/3 (QUIC) listener stopped");
+            }
+            Err(_) => {
+                warn!(
+                    port,
+                    "Gateway API HTTP/3 listener did not stop within the retire budget; aborting"
+                );
+                task.abort();
+                Self::log_listener_task_outcome(task.await);
             }
         }
     }
@@ -1009,6 +1289,7 @@ impl GatewayListenerManager {
                     shutdown_tx,
                     tcp: task,
                     quic: None,
+                    quic_shutdown_tx: None,
                 })
             }
             Err(_) => Err(match task.await {
@@ -1027,7 +1308,7 @@ impl GatewayListenerManager {
         };
         let mut tasks: Vec<ListenerTask> = Vec::new();
         for listener in listeners {
-            let _ = listener.shutdown_tx.send(true);
+            listener.signal_shutdown();
             tasks.extend(listener.tasks());
         }
         tasks.extend(
@@ -1305,6 +1586,118 @@ mod tests {
         manager.shutdown_all().await;
     }
 
+    /// A QUIC bind that finishes after a newer config generation published must
+    /// not leave HTTP/3 up when that newer epoch reserved the UDP port.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_quic_bind_is_fenced_after_udp_claim() {
+        let _ = rustls::crypto::CryptoProvider::install_default(
+            rustls::crypto::ring::default_provider(),
+        );
+        let port = free_port().await;
+        let https = port_scoped_config(port);
+        let mut tls_https = https.clone();
+        tls_https
+            .http_tls_listen_ports
+            .insert((crate::config::types::default_namespace(), port));
+        let state = test_state(tls_https.clone());
+        let manager = GatewayListenerManager::new(
+            state.clone(),
+            std::net::IpAddr::from([127, 0, 0, 1]),
+            GatewayListenerTls {
+                static_config: Some(test_self_signed_server_config()),
+                reload_slot: None,
+            },
+        )
+        .with_http3(GatewayListenerHttp3 {
+            config: crate::http3::config::Http3ServerConfig::default(),
+            tls_policy: crate::tls::TlsPolicy {
+                protocol_versions: vec![&rustls::version::TLS13, &rustls::version::TLS12],
+                crypto_provider: std::sync::Arc::new(rustls::crypto::ring::default_provider()),
+                prefer_server_cipher_order: true,
+                session_cache_size: 1024,
+                early_data_max_size: 0,
+            },
+            client_ca_bundle_path: None,
+            client_crls: std::sync::Arc::new(Vec::new()),
+            tls_slot: None,
+            tls_revision_rx: None,
+        });
+        assert!(manager.reconcile().await.is_empty());
+        assert_eq!(manager.active_http3_ports().await, vec![port]);
+        let stale_generation = state.request_epoch.load().config_generation;
+
+        let mut with_udp = tls_https;
+        let udp: crate::config::types::Proxy = serde_json::from_value(serde_json::json!({
+            "id": "udp-stream",
+            "backend_scheme": "udp",
+            "backend_host": "127.0.0.1",
+            "backend_port": 1,
+            "listen_port": port,
+        }))
+        .expect("udp proxy");
+        with_udp.proxies.push(udp);
+        with_udp.resolve_dispatch_kind();
+        assert!(state.update_config(with_udp).applied());
+
+        // Simulate a late ensure_quic from the pre-UDP generation.
+        {
+            let mut live = manager.listeners.lock().await;
+            let listener = live.get_mut(&port).expect("listener");
+            if let Some(tx) = listener.quic_shutdown_tx.take() {
+                let _ = tx.send(true);
+            }
+            if let Some(task) = listener.quic.take() {
+                task.abort();
+                let _ = task.await;
+            }
+            let _ = manager.ensure_quic(port, listener, stale_generation).await;
+            assert!(
+                listener.quic.is_none(),
+                "stale generation must not restore QUIC after a newer UDP claim"
+            );
+        }
+
+        let failures = manager.reconcile().await;
+        assert!(
+            failures.iter().any(|failure| {
+                failure.port == port
+                    && failure.protocol == GatewayListenerFailureProtocol::Quic
+                    && failure.reason == GatewayListenerFailureReason::UdpStreamCollision
+            }),
+            "current epoch must keep QUIC refused: {failures:?}"
+        );
+        assert!(manager.active_http3_ports().await.is_empty());
+        manager.shutdown_all().await;
+    }
+
+    fn test_self_signed_server_config() -> std::sync::Arc<rustls::ServerConfig> {
+        let key_pair =
+            rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("generate key");
+        let params =
+            rcgen::CertificateParams::new(vec!["app.example.com".to_string()]).expect("params");
+        let cert = params.self_signed(&key_pair).expect("self-sign");
+        let cert_pem = cert.pem();
+        let mut cert_reader = cert_pem.as_bytes();
+        let certs: Vec<_> = rustls_pemfile::certs(&mut cert_reader)
+            .filter_map(Result::ok)
+            .collect();
+        let key_pem = key_pair.serialize_pem();
+        let mut key_reader = key_pem.as_bytes();
+        let private_key = rustls_pemfile::private_key(&mut key_reader)
+            .expect("read key")
+            .expect("key present");
+        std::sync::Arc::new(
+            rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .expect("versions")
+            .with_no_client_auth()
+            .with_single_cert(certs, private_key)
+            .expect("server config"),
+        )
+    }
+
     fn config_with_dedicated_bind(port: u16, bind: IpAddr) -> GatewayConfig {
         let mut config = port_scoped_config(port);
         let mut mesh = crate::modes::mesh::config::MeshConfig::default();
@@ -1493,9 +1886,14 @@ mod tests {
             plan.ports
         );
         let reason = plan.refused.get(&port).expect("refusal");
+        assert_eq!(
+            reason.reason,
+            GatewayListenerFailureReason::DedicatedBindConflict
+        );
         assert!(
-            reason.contains("dedicated Sidecar ingress bind"),
-            "refusal must name the dedicated-bind collision: {reason}"
+            reason.message.contains("dedicated Sidecar ingress bind"),
+            "refusal must name the dedicated-bind collision: {}",
+            reason.message
         );
     }
 }
