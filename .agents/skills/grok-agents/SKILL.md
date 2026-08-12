@@ -26,10 +26,11 @@ this session's model deliberately.
    - `~/.local/bin/cursor-agent`, `/opt/homebrew/bin/cursor-agent`, `/usr/local/bin/cursor-agent`,
    - `cursor-agent` on `PATH`.
 3. Authenticate every spawned worker either through an exported `CURSOR_API_KEY` (the launcher
-   leaves it in the environment for `cursor-agent` to read; it is never placed on argv, where `ps`
-   would expose it) or through the CLI's own stored login — check with `cursor-agent status`. Never
-   print the key or put it in prompts, files, arguments, or logs, and do not ask a worker to perform
-   an interactive login.
+   leaves it in the environment for `cursor-agent` to read and pins Cursor's process-local memory
+   credential store so the API-key path cannot fall through to macOS Keychain; the key is never
+   placed on argv, where `ps` would expose it) or through the CLI's own stored login — check with
+   `cursor-agent status`. Never print the key or put it in prompts, files, arguments, or logs, and
+   do not ask a worker to perform an interactive login.
 4. Use only the pinned non-Fast SKUs `cursor-grok-4.6-{low,medium,high,xhigh}`; confirm with
    `cursor-agent models`. Stop and report the exact error if authentication or model access is
    rejected. Do not silently substitute `composer-2.5`, `auto`, a `-fast` SKU, or another provider.
