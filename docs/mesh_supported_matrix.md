@@ -231,9 +231,9 @@ need them, or because they are blocked upstream / architecturally:
   deny. The blanket config-preparation suppression of NodeWaypoint UDP/DTLS
   remains only on builds where the channel cannot exist (non-Linux). Mesh-wide
   UDP/DTLS policy is unchanged.
-- **NodeWaypoint UDP Service-path reachability — supported on Linux for plain
-  `udp` only** (issue #3286 root review). Materializing a listener does not make
-  it reachable: a workload addressing its Service ClusterIP has that datagram
+- **NodeWaypoint UDP/DTLS Service-path reachability — supported on Linux**
+  (issue #3286 root review). Materializing a listener does not make it
+  reachable: a workload addressing its Service ClusterIP has that datagram
   DNAT-ed by kube-proxy to a backing pod and then DROPPED by the pod-veth guard,
   so the Service path was a black hole and only a direct dial to a trusted node
   address worked. Transparent steering (`raw` `--notrack` + `mangle` mark +
@@ -247,19 +247,52 @@ need them, or because they are blocked upstream / architecturally:
     sending to a `protocol: UDP` Service's ClusterIP reaches the production
     listener, the backend logs the datagram, and the echo returns — under
     kube-proxy **iptables** mode, IPv4, on kind.
-  - **Not steered, by decision**: `dtls` listeners. A `DtlsServer` owns its
-    socket and replies with `send_to`, so a steered DTLS handshake's records
-    would carry a node source address and the client's connected socket would
-    discard them. DTLS keeps the direct-node-address contract until per-peer
-    reply-source pinning lands; publishing a destination that cannot be served
-    correctly would trade a working boundary for a black hole.
+  - **Proven live for DTLS too**
+    (`node_waypoint.dtls.service_path_allow_attributed_source`,
+    `node_waypoint.dtls.service_path_deny_scoped_policy`, and
+    `node_waypoint.dtls.service_path_deny_unattributed_source`): an enrolled pod
+    resolves the `dtls-echo` Service DNS name, completes a real
+    `openssl s_client -dtls1_2` handshake against its ClusterIP through the
+    production listener, its decrypted datagram reaches the backend (which logs
+    it) and the echo returns; a namespace-scoped-denied source and an unenrolled
+    source both get no application data with the backend proving it saw nothing.
+    A steered DTLS session works because the `DtlsServer` PINS the captured
+    local destination per peer and sources every encrypted record from it —
+    initial handshake flight, ordinary output drain, retransmits, application
+    replies, and the final shutdown flush — over a transparent socket. A
+    datagram whose capture does not match the pinned one, or that carries no
+    capture at all on a scoped listener, is dropped before any session state is
+    allocated or delivered. The direct-node-address probes
+    (`node_waypoint.dtls.listener_bound`,
+    `node_waypoint.dtls.listener_allow_attributed_source`,
+    `node_waypoint.dtls.listener_deny_scoped_policy`) are retained as a
+    **distinct boundary**, not as substitute evidence for the Service path.
   - **Not exercised, not claimed**: IPv6 Service steering, kube-proxy `ipvs` and
     `nftables` modes, and headless (ClusterIP-less) services, which have no
     address to steer and remain direct-address only.
   - **Requires** `iptables` and `ip` in the NodeWaypoint image (the
-    `-ebpf-tools` image) plus `NET_ADMIN`. A node without them fails the plan
-    closed and logs it: the Service path stays unsteered, which is a lost
-    service, never an unauthorized one.
+    `-ebpf-tools` image) plus `NET_ADMIN`; a `dtls` listener additionally needs
+    `NET_ADMIN` (or `NET_RAW` on newer kernels) for its transparent socket, and
+    refuses to start without it. Every PUBLISHED address family must be
+    installable in full: a node missing `ip6tables` while an IPv6 destination is
+    published fails the WHOLE apply, tears every Ferrum-owned object down, and
+    retries on the next reconcile — there is no per-family best-effort arm,
+    because a published-but-uninstalled family is a silent black hole that
+    would never be retried. A node that cannot install the plan leaves the
+    Service path unsteered, which is a lost service, never an unauthorized one.
+  - **Stale-rule reaping**: the chains, `ip rule`, and route survive the process
+    that installed them, so the FIRST reconcile of every process runs the
+    exact-name teardown even when it steers nothing; later unchanged polls run
+    no command. A generation change empties the `mangle` mark chain BEFORE the
+    `raw` notrack chain is repopulated, so no datagram is ever marked under a
+    destination generation whose notrack / local-delivery prerequisites do not
+    match it. The resulting window is unsteered (fail-closed at the pod-veth
+    guard), never cross-generation admission.
+  - **Steered interfaces are the PUBLISHED ones.** The steering interface set is
+    taken from the source-attribution index's published generation, after its
+    own refusals — a contested ingress interface (refused for both claimants), a
+    malformed or UID-mismatched binding, a duplicate, and an over-bound
+    generation all contribute nothing to steering.
 
 
   **The listener configuration surface.** The attribution channel is reachable
@@ -334,12 +367,21 @@ need them, or because they are blocked upstream / architecturally:
   it, and the echo comes back), and
   `node_waypoint.dtls.listener_deny_scoped_policy` (a source the
   namespace-scoped `AuthorizationPolicy` denies gets no application data AND the
-  backend logs nothing from it). Because a `DtlsServer` owns the socket every
-  encrypted record leaves from, `DtlsServerLimits::socket_mark` stamps
-  `NODE_WAYPOINT_INBOUND_AUTH_MARK` on that socket before the server exists;
-  a scoped DTLS listener that cannot apply it — or cannot enable the ingress
-  cmsg — fails construction and is reported as a bind failure. The allow
-  assertion above is what proves the mark is really applied end to end.
+  backend logs nothing from it). Those three are the DIRECT-NODE-ADDRESS
+  boundary; the ordinary user path — the Service DNS name / ClusterIP — is
+  proven separately by the three `node_waypoint.dtls.service_path_*` assertions
+  and neither substitutes for the other.
+
+  Because a `DtlsServer` owns the socket every encrypted record leaves from,
+  three socket options are stamped on it BEFORE the server object exists:
+  `DtlsServerLimits::socket_mark` (`NODE_WAYPOINT_INBOUND_AUTH_MARK`),
+  `DtlsServerLimits::transparent_reply_source` (`IP_TRANSPARENT` /
+  `IPV6_TRANSPARENT`, so a steered session can source records from the Service
+  ClusterIP), and `DtlsServerLimits::capture_ingress_ifindex` (the
+  `IP_PKTINFO` / `IPV6_PKTINFO` capture). A scoped DTLS listener that cannot
+  apply any of them fails construction and is reported as a bind failure. The
+  allow assertions above are what prove the mark and the pinned reply source are
+  really applied end to end.
 
   The DTLS material itself comes from the DTLS-specific
   `FERRUM_DTLS_CERT_PATH` / `FERRUM_DTLS_KEY_PATH` (+ optional

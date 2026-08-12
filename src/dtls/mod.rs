@@ -197,6 +197,22 @@ pub struct DtlsServerLimits {
     /// `None` (and `Some(0)`) leave the socket untouched, which is every
     /// ordinary DTLS listener.
     pub socket_mark: Option<u32>,
+    /// Make the server's OWN bound socket transparent (`IP_TRANSPARENT` /
+    /// `IPV6_TRANSPARENT`) before it is published or used (issue #3286
+    /// Service path).
+    ///
+    /// Set only by the NodeWaypoint scoped DTLS path. A steered Service
+    /// datagram is delivered with its ORIGINAL destination — the Service
+    /// ClusterIP — still in the IP header, and every encrypted record this
+    /// server sends back is sourced from exactly that pinned address. A
+    /// ClusterIP is not configured on the node, so the kernel refuses it as a
+    /// source unless the socket carries `FLOWI_FLAG_ANYSRC`. Without this flag
+    /// a steered DTLS handshake could never complete: the client's connected
+    /// socket discards records arriving from a node address.
+    ///
+    /// `false` for every ordinary DTLS listener, which is byte-for-byte
+    /// unchanged.
+    pub transparent_reply_source: bool,
 }
 
 impl Default for DtlsServerLimits {
@@ -208,6 +224,7 @@ impl Default for DtlsServerLimits {
             active_session_mirror: None,
             capture_ingress_ifindex: false,
             socket_mark: None,
+            transparent_reply_source: false,
         }
     }
 }
@@ -230,7 +247,10 @@ fn apply_scoped_dtls_socket_options(
     socket: &UdpSocket,
     limits: &DtlsServerLimits,
 ) -> Result<(), anyhow::Error> {
-    if !limits.capture_ingress_ifindex && limits.socket_mark.is_none_or(|mark| mark == 0) {
+    if !limits.capture_ingress_ifindex
+        && !limits.transparent_reply_source
+        && limits.socket_mark.is_none_or(|mark| mark == 0)
+    {
         return Ok(());
     }
     let local = socket
@@ -260,6 +280,20 @@ fn apply_scoped_dtls_socket_options(
         // regardless, so there is nothing to apply.
         #[cfg(not(unix))]
         let _ = mark;
+    }
+
+    // Transparent next, still before any record can leave: a scoped session
+    // sources every encrypted record from the Service address the client
+    // targeted, which is not configured on this node.
+    if limits.transparent_reply_source {
+        crate::socket_opts::set_scoped_reply_transparent(fd, local.is_ipv6()).map_err(|error| {
+            anyhow::Error::new(error).context(format!(
+                "NodeWaypoint scoped DTLS listener on {local} could not apply \
+                 DtlsServerLimits::transparent_reply_source (IP_TRANSPARENT / IPV6_TRANSPARENT), \
+                 so it could not source its encrypted records from the Service address a steered \
+                 workload addressed; NET_ADMIN (or NET_RAW on newer kernels) is required"
+            ))
+        })?;
     }
 
     if limits.capture_ingress_ifindex {
@@ -499,7 +533,7 @@ pub(crate) fn dtls_stale_session_removal_preserves_newer_generation_for_test() -
             incoming_tx: gen2_tx,
             shutdown_tx: gen2_shutdown_tx,
             generation: 2,
-            ingress_ifindex: None,
+            reply_local: None,
         },
     );
     active_sessions.fetch_add(1, Ordering::Relaxed);
@@ -985,12 +1019,62 @@ struct DtlsSessionState {
     /// [`DtlsServer::next_session_generation`]). Both removal sites must match
     /// this token before deleting the map entry.
     generation: u64,
-    /// Kernel-reported ingress interface index of the datagram that opened this
-    /// peer entry, when `DtlsServerLimits::capture_ingress_ifindex` is on. The
-    /// NodeWaypoint source attribution is anchored on it, so a later datagram
-    /// for the same peer arriving on a DIFFERENT interface is dropped instead of
-    /// being folded into a session attributed to another interface's pod.
-    ingress_ifindex: Option<u32>,
+    /// The complete kernel-reported `IP_PKTINFO` / `IPV6_PKTINFO` local
+    /// destination of the datagram that opened this peer entry, when
+    /// `DtlsServerLimits::capture_ingress_ifindex` is on (`None` on every
+    /// ordinary listener). Two distinct facts ride in it and both are
+    /// load-bearing:
+    ///
+    /// * `ifindex` is the INGRESS interface, which is the whole NodeWaypoint
+    ///   source-attribution channel. A later datagram for the same peer
+    ///   arriving on a DIFFERENT interface is dropped instead of being folded
+    ///   into a session attributed to another interface's pod.
+    /// * `ip` is the local address the client actually addressed — the Service
+    ///   ClusterIP on the steered path, since steering rewrites nothing. Every
+    ///   encrypted record for this session is sourced from it, or the client's
+    ///   connected socket discards the reply. A later datagram naming a
+    ///   DIFFERENT local destination is a different service flow and is
+    ///   likewise dropped rather than silently re-pointing the reply source.
+    reply_local: Option<crate::socket_opts::PktinfoLocal>,
+}
+
+/// Whether a scoped DTLS listener may act on one datagram's kernel capture.
+///
+/// The whole NodeWaypoint DTLS security and reply story rides on the
+/// `IP_PKTINFO` / `IPV6_PKTINFO` capture, so the decision is pulled out here as
+/// a pure function: it is the one place that says what "this datagram belongs
+/// to this session" means, and it is exercised without a socket, a privileged
+/// host, or a live handshake.
+///
+/// * `capture_enabled` is [`DtlsServerLimits::capture_ingress_ifindex`]. When
+///   it is off — every ordinary DTLS listener — nothing is captured, nothing is
+///   compared, and every datagram is admitted exactly as before.
+/// * `pinned` is the session's captured local destination, or `None` when no
+///   session exists yet for this peer.
+/// * `observed` is this datagram's captured local destination.
+///
+/// A scoped listener admits a datagram only when the kernel actually reported a
+/// capture (otherwise it is neither attributable to a source workload nor
+/// answerable from the address the client addressed) and, for an established
+/// peer, only when that capture equals the pinned one. Both halves of
+/// [`crate::socket_opts::PktinfoLocal`] participate: a different ingress
+/// interface is a different source workload, and a different local destination
+/// is a different Service flow whose reply would leave from the wrong source.
+pub fn dtls_scoped_capture_admits(
+    capture_enabled: bool,
+    pinned: Option<crate::socket_opts::PktinfoLocal>,
+    observed: Option<crate::socket_opts::PktinfoLocal>,
+) -> bool {
+    if !capture_enabled {
+        return true;
+    }
+    if observed.is_none() {
+        return false;
+    }
+    match pinned {
+        Some(_) => pinned == observed,
+        None => true,
+    }
 }
 
 /// Remove the demux entry for `peer_addr` only when it still belongs to
@@ -1352,12 +1436,20 @@ impl DtlsServer {
                                 for i in 0..n {
                                     let (data, peer_addr) = batch.datagram(i);
                                     let data = data.to_vec();
-                                    let ingress_ifindex = batch
+                                    // The WHOLE captured local destination is
+                                    // carried forward, not just its interface
+                                    // index: the address half is this session's
+                                    // reply source (the Service ClusterIP on the
+                                    // steered path) and the interface half is
+                                    // its source attribution. An ifindex of 0 is
+                                    // "the kernel reported no interface", which
+                                    // is not usable evidence, so the whole
+                                    // capture is discarded and the datagram
+                                    // fails closed below.
+                                    let reply_local = batch
                                         .local_addr(i)
-                                        .map(|local| local.ifindex)
-                                        .filter(|index| *index != 0);
-                                    self.dispatch_datagram(peer_addr, data, ingress_ifindex)
-                                        .await;
+                                        .filter(|local| local.ifindex != 0);
+                                    self.dispatch_datagram(peer_addr, data, reply_local).await;
                                 }
                                 drained += n;
                             }
@@ -1427,16 +1519,30 @@ impl DtlsServer {
 
     /// Demux one received datagram onto its peer's session, or open a new one.
     ///
-    /// `ingress_ifindex` is the kernel-reported interface the datagram arrived
-    /// on when the listener enabled
-    /// [`DtlsServerLimits::capture_ingress_ifindex`], and `None` otherwise.
+    /// `reply_local` is the complete kernel-reported `IP_PKTINFO` /
+    /// `IPV6_PKTINFO` local destination (address + ingress interface) when the
+    /// listener enabled [`DtlsServerLimits::capture_ingress_ifindex`], and
+    /// `None` otherwise. On a scoped listener a datagram that carries no such
+    /// capture FAILS CLOSED here: it can neither be attributed to a source
+    /// workload nor answered from the address the client addressed, so it is
+    /// dropped before any session state is allocated or delivered.
     async fn dispatch_datagram(
         &self,
         peer_addr: SocketAddr,
         data: Vec<u8>,
-        ingress_ifindex: Option<u32>,
+        reply_local: Option<crate::socket_opts::PktinfoLocal>,
     ) {
         let len = data.len();
+        if !dtls_scoped_capture_admits(self.limits.capture_ingress_ifindex, None, reply_local) {
+            trace!(
+                client = %peer_addr,
+                len,
+                "DTLS: dropping datagram with no ingress pktinfo on a scoped listener; it is \
+                 neither attributable to a source workload nor answerable from the address it \
+                 was sent to"
+            );
+            return;
+        }
         // Clone the sender (and demux identity) out of the DashMap guard
         // before sending. The `Ref` from `sessions.get()` holds a read lock
         // on the shard; holding it while a `SessionGuard::Drop` on the same
@@ -1446,18 +1552,27 @@ impl DtlsServer {
         let session = self
             .sessions
             .get(&peer_addr)
-            .map(|s| (s.incoming_tx.clone(), s.generation, s.ingress_ifindex));
-        if let Some((tx, generation, session_ifindex)) = session {
-            // The peer's source ADDRESS is spoofable; the interface it entered
-            // the host namespace on is not. A datagram claiming an established
-            // peer address but arriving on a different interface belongs to a
-            // different workload, so it must never be folded into that session
-            // (issue #3286). Only enforced when the capture is enabled — every
-            // other listener carries `None` on both sides and compares equal.
-            if self.limits.capture_ingress_ifindex && session_ifindex != ingress_ifindex {
+            .map(|s| (s.incoming_tx.clone(), s.generation, s.reply_local));
+        if let Some((tx, generation, session_local)) = session {
+            // The peer's source ADDRESS is spoofable; neither the interface it
+            // entered the host namespace on nor the local destination the
+            // kernel delivered it to is. A datagram claiming an established peer
+            // address but arriving on a different interface belongs to a
+            // different workload, and one naming a different local destination
+            // belongs to a different Service flow; neither may be folded into
+            // this session (issue #3286), because doing so would either run it
+            // under another pod's policy scope or re-point this session's reply
+            // source. Only enforced when the capture is enabled — every other
+            // listener carries `None` on both sides and compares equal.
+            if !dtls_scoped_capture_admits(
+                self.limits.capture_ingress_ifindex,
+                session_local,
+                reply_local,
+            ) {
                 trace!(
                     client = %peer_addr,
-                    "DTLS: dropping datagram whose ingress interface does not match the session's"
+                    "DTLS: dropping datagram whose ingress interface or local destination does \
+                     not match the session's pinned capture"
                 );
                 return;
             }
@@ -1495,7 +1610,7 @@ impl DtlsServer {
             // `max_sessions` slot, allocates four channels, and holds the
             // slot for the handshake timeout, so arbitrary garbage from
             // scanners or spoofed floods must not reach it.
-            self.spawn_session(peer_addr, data, ingress_ifindex);
+            self.spawn_session(peer_addr, data, reply_local);
         } else {
             trace!(
                 client = %peer_addr,
@@ -1520,7 +1635,7 @@ impl DtlsServer {
         &self,
         peer_addr: SocketAddr,
         initial_packet: Vec<u8>,
-        ingress_ifindex: Option<u32>,
+        reply_local: Option<crate::socket_opts::PktinfoLocal>,
     ) {
         if let Some(ref allow) = self.limits.allow_new_session
             && !allow()
@@ -1574,13 +1689,17 @@ impl DtlsServer {
                 | crate::proxy::sni::DtlsSniResult::InvalidFragment => None,
             };
 
+        // The ingress interface half of the capture, for the source-attribution
+        // consumers that only need that scalar.
+        let ingress_ifindex = reply_local.map(|local| local.ifindex);
+
         self.sessions.insert(
             peer_addr,
             DtlsSessionState {
                 incoming_tx: incoming_tx.clone(),
                 shutdown_tx: shutdown_tx.clone(),
                 generation,
-                ingress_ifindex,
+                reply_local,
             },
         );
 
@@ -1651,6 +1770,7 @@ impl DtlsServer {
                 &mut out_buf,
                 &socket,
                 peer_addr,
+                reply_local,
                 &mut next_timeout,
             )
             .await
@@ -1749,7 +1869,11 @@ impl DtlsServer {
                 for _ in 0..MAX_OUTPUTS_PER_DRAIN {
                     match dtls.poll_output(&mut out_buf) {
                         Output::Packet(data) => {
-                            let _ = socket.send_to(data, peer_addr).await;
+                            // Ordinary output drain: handshake continuation,
+                            // retransmits, and every encrypted application
+                            // reply. All of them leave from this session's
+                            // pinned reply source on a scoped listener.
+                            let _ = send_dtls_record(&socket, data, peer_addr, reply_local).await;
                         }
                         Output::Timeout(t) => {
                             next_timeout = Some(t);
@@ -1824,11 +1948,12 @@ impl DtlsServer {
             }
 
             // Flush any DTLS-buffered data produced by the shutdown
-            // handler's reply drain so it reaches the wire.
+            // handler's reply drain so it reaches the wire — from the same
+            // pinned reply source, or the client discards the final flight.
             for _ in 0..MAX_OUTPUTS_PER_DRAIN {
                 match dtls.poll_output(&mut out_buf) {
                     Output::Packet(data) => {
-                        let _ = socket.send_to(data, peer_addr).await;
+                        let _ = send_dtls_record(&socket, data, peer_addr, reply_local).await;
                     }
                     _ => break,
                 }
@@ -2256,14 +2381,88 @@ async fn drain_handshake_outputs(
     Ok(connected)
 }
 
+/// Send one encrypted DTLS record to `peer`.
+///
+/// `reply_local` is the session's PINNED local destination — the address the
+/// client actually addressed, which on the NodeWaypoint steered Service path is
+/// the Service ClusterIP rather than any address configured on this node. When
+/// it is present the record is sourced from exactly that address (and, for a
+/// scoped IPv6 source, its zone) through `IP_PKTINFO` / `IPV6_PKTINFO`; letting
+/// the route table pick a source instead would make every record arrive from a
+/// node address, which the client's connected socket discards, so the handshake
+/// would never complete. `None` — every ordinary DTLS listener — keeps the
+/// original `send_to` behaviour byte for byte.
+///
+/// The pinned source is honored only when its family matches the destination:
+/// a cmsg of the wrong family is rejected by the kernel. A pinned source that
+/// does NOT match — the dual-stack `[::]` bind with an IPv4-mapped client — is
+/// an ERROR here rather than a fallback to `send_to`, because falling back
+/// would emit the record from a route-selected node address that the client's
+/// connected socket discards. That is the silent black hole this pinning
+/// exists to remove, so it fails closed instead and the session ends. (Ferrum's
+/// stream listeners bind `FERRUM_PROXY_BIND_ADDRESS`, `0.0.0.0` by default, so
+/// this arm is reachable only on an explicitly dual-stack scoped listener,
+/// which is not a claimed configuration.)
+///
+/// Nonblocking throughout. `try_io` performs the `sendmsg(2)` only when the
+/// socket is writable and clears readiness when the kernel says it is not, so a
+/// full send buffer parks THIS session's driver task on `writable()` instead of
+/// blocking a thread. The shared demux loop never calls this.
+async fn send_dtls_record(
+    socket: &UdpSocket,
+    data: &[u8],
+    peer: SocketAddr,
+    reply_local: Option<crate::socket_opts::PktinfoLocal>,
+) -> std::io::Result<usize> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        let effective_local = match (reply_local.map(|local| local.ip), peer) {
+            (Some(std::net::IpAddr::V4(_)), SocketAddr::V4(_))
+            | (Some(std::net::IpAddr::V6(_)), SocketAddr::V6(_)) => reply_local,
+            (Some(_), _) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "DTLS reply source pinned for a NodeWaypoint-scoped session does not match \
+                     the peer's address family; refusing to emit the record from a \
+                     route-selected source the client would discard",
+                ));
+            }
+            (None, _) => None,
+        };
+        if let Some(local) = effective_local {
+            let (dest, dest_len) = crate::proxy::udp_batch::std_to_sockaddr_storage(peer);
+            let fd = socket.as_raw_fd();
+            loop {
+                let sent = socket.try_io(tokio::io::Interest::WRITABLE, || {
+                    crate::socket_opts::send_with_pktinfo(fd, data, local, &dest, dest_len, None)
+                });
+                match sent {
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        socket.writable().await?;
+                    }
+                    other => return other,
+                }
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = reply_local;
+    socket.send_to(data, peer).await
+}
+
 /// Drain `poll_output()` and send packets to a specific peer address (for server-side).
 /// Captures the retransmit timeout. Returns `true` on `Connected`.
 /// Same Timeout-skipping logic as `drain_handshake_outputs` for post-Connected packets.
+///
+/// `reply_local` pins the source address of every record emitted here — the
+/// initial handshake flight — exactly as the per-session drain does.
 async fn drain_server_outputs(
     dtls: &mut Dtls,
     out_buf: &mut [u8],
     socket: &UdpSocket,
     peer: SocketAddr,
+    reply_local: Option<crate::socket_opts::PktinfoLocal>,
     next_timeout: &mut Option<Instant>,
 ) -> Result<bool, anyhow::Error> {
     let mut connected = false;
@@ -2271,8 +2470,7 @@ async fn drain_server_outputs(
     for _ in 0..MAX_OUTPUTS_PER_DRAIN {
         match dtls.poll_output(out_buf) {
             Output::Packet(data) => {
-                socket
-                    .send_to(data, peer)
+                send_dtls_record(socket, data, peer, reply_local)
                     .await
                     .map_err(|e| anyhow::anyhow!("UDP send_to: {}", e))?;
             }

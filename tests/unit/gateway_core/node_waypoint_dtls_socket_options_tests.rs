@@ -1,25 +1,35 @@
-//! NodeWaypoint scoped DTLS listener socket options (issue #3286).
+//! NodeWaypoint scoped DTLS listener socket options and reply-source pinning
+//! (issue #3286).
 //!
 //! A `DtlsServer` owns the UDP socket every encrypted record leaves from, so
-//! the two socket options a NodeWaypoint scoped listener depends on cannot be
+//! the three socket options a NodeWaypoint scoped listener depends on cannot be
 //! applied by the caller after the fact:
 //!
 //! - `IP_PKTINFO` / `IPV6_RECVPKTINFO`, whose kernel-reported ingress
-//!   interface IS the session's source-workload attribution;
+//!   interface IS the session's source-workload attribution — and whose
+//!   captured local ADDRESS is the session's reply source;
 //! - `SO_MARK = NODE_WAYPOINT_INBOUND_AUTH_MARK`, without which the pod-veth tc
-//!   guard drops every record heading back toward the enrolled source pod.
+//!   guard drops every record heading back toward the enrolled source pod;
+//! - `IP_TRANSPARENT` / `IPV6_TRANSPARENT`, without which the kernel refuses to
+//!   source those records from the Service ClusterIP a steered workload
+//!   addressed.
 //!
-//! Both are startup preconditions: a server that reports itself constructed
-//! while missing either is a black hole that looks healthy. These tests pin
-//! that construction fails instead, that ordinary DTLS listeners are untouched,
-//! and that the fail-closed family decision cannot be satisfied by a success on
-//! a family the socket does not actually serve.
+//! All three are startup preconditions: a server that reports itself
+//! constructed while missing any of them is a black hole that looks healthy.
+//! These tests pin that construction fails instead, that ordinary DTLS
+//! listeners are untouched, that the fail-closed family decision cannot be
+//! satisfied by a success on a family the socket does not actually serve, and
+//! that a scoped session admits only datagrams matching its pinned capture.
 
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 
-use ferrum_edge::dtls::{DtlsServer, DtlsServerLimits, FrontendDtlsConfig};
+use ferrum_edge::dtls::{
+    DtlsServer, DtlsServerLimits, FrontendDtlsConfig, dtls_scoped_capture_admits,
+};
 use ferrum_edge::socket_opts::{
-    IngressPktinfoFamilies, ingress_pktinfo_outcome, required_ingress_pktinfo_families,
+    IngressPktinfoFamilies, PktinfoLocal, ingress_pktinfo_outcome,
+    required_ingress_pktinfo_families,
 };
 use tokio::net::UdpSocket;
 
@@ -80,6 +90,10 @@ fn default_dtls_limits_leave_both_scoped_socket_options_off() {
     assert!(
         limits.socket_mark.is_none(),
         "the NodeWaypoint inbound auth mark is a NodeWaypoint-only opt-in"
+    );
+    assert!(
+        !limits.transparent_reply_source,
+        "a transparent socket is a NodeWaypoint Service-path-only opt-in"
     );
 }
 
@@ -295,3 +309,153 @@ fn the_family_shape_reports_exactly_which_options_are_required() {
     assert!(IngressPktinfoFamilies::V6.needs_v6() && !IngressPktinfoFamilies::V6.needs_v4());
     assert!(IngressPktinfoFamilies::Both.needs_v4() && IngressPktinfoFamilies::Both.needs_v6());
 }
+
+// ── Transparent reply source (Service path) ────────────────────────────────
+
+/// Whether this host lets an unprivileged process set `IP_TRANSPARENT`
+/// (Linux requires `CAP_NET_ADMIN`/`CAP_NET_RAW`). Probed through the same
+/// public primitive the DTLS path uses, so the expectation below is exact on
+/// privileged and unprivileged runners alike.
+async fn host_allows_transparent() -> bool {
+    let probe = bound_socket().await;
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        ferrum_edge::socket_opts::set_scoped_reply_transparent(probe.as_raw_fd(), false).is_ok()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = probe;
+        false
+    }
+}
+
+/// The wiring contract: a scoped listener's construction shares the fate of the
+/// underlying transparent-socket `setsockopt` exactly. Without it every steered
+/// session's records would leave with a node source address, the workload's
+/// connected socket would discard them, and the handshake would never complete
+/// — a black hole that looks like a bound listener.
+#[tokio::test]
+async fn a_scoped_transparent_socket_shares_the_fate_of_the_underlying_setsockopt() {
+    let can_transparent = host_allows_transparent().await;
+    let result = DtlsServer::from_socket_with_limits(
+        bound_socket().await,
+        frontend_config(),
+        DtlsServerLimits {
+            transparent_reply_source: true,
+            ..DtlsServerLimits::default()
+        },
+    );
+    match (can_transparent, result) {
+        (true, Ok(_)) => {}
+        (true, Err(error)) => panic!(
+            "the transparent socket option is permitted on this host, so construction must \
+             succeed: {error:#}"
+        ),
+        (false, Ok(_)) => panic!(
+            "the transparent socket option was refused, so no steered session could ever \
+             complete its handshake; the listener must not be constructed"
+        ),
+        (false, Err(error)) => {
+            let text = format!("{error:#}");
+            assert!(
+                text.contains("DtlsServerLimits::transparent_reply_source"),
+                "the diagnostic must name the field that could not be applied: {text}"
+            );
+            assert!(
+                text.contains("IP_TRANSPARENT"),
+                "the diagnostic must name the socket option: {text}"
+            );
+            assert!(
+                !text.contains("BEGIN") && !text.to_ascii_lowercase().contains("private key"),
+                "the diagnostic must not carry crypto material: {text}"
+            );
+        }
+    }
+}
+
+// ── Per-session reply-source / ingress pinning ─────────────────────────────
+
+fn local(ip: IpAddr, ifindex: u32) -> PktinfoLocal {
+    PktinfoLocal { ip, ifindex }
+}
+
+fn v4(octets: [u8; 4], ifindex: u32) -> PktinfoLocal {
+    local(IpAddr::V4(Ipv4Addr::from(octets)), ifindex)
+}
+
+/// An ordinary DTLS listener captures nothing and must be admitted exactly as
+/// before — no comparison, no fail-closed drop.
+#[test]
+fn an_unscoped_listener_admits_every_datagram_unchanged() {
+    assert!(dtls_scoped_capture_admits(false, None, None));
+    assert!(dtls_scoped_capture_admits(
+        false,
+        Some(v4([10, 96, 0, 10], 7)),
+        None
+    ));
+    assert!(dtls_scoped_capture_admits(
+        false,
+        None,
+        Some(v4([10, 96, 0, 10], 7))
+    ));
+}
+
+/// A scoped listener that receives a datagram with NO kernel capture cannot
+/// attribute it to a source workload and cannot answer it from the address the
+/// client addressed. It fails closed BEFORE any session state is allocated.
+#[test]
+fn a_scoped_listener_refuses_a_datagram_with_no_capture() {
+    assert!(
+        !dtls_scoped_capture_admits(true, None, None),
+        "a new peer with no pktinfo must not open a session"
+    );
+    assert!(
+        !dtls_scoped_capture_admits(true, Some(v4([10, 96, 0, 10], 7)), None),
+        "an established peer's datagram with no pktinfo must not be delivered"
+    );
+}
+
+/// The pinned capture is compared WHOLE. A different ingress interface is a
+/// different source workload wearing a forged source tuple; a different local
+/// destination is a different Service flow whose reply would leave from the
+/// wrong source. Neither may be folded into an established session.
+#[test]
+fn a_scoped_session_admits_only_its_exact_pinned_capture() {
+    let pinned = v4([10, 96, 0, 10], 7);
+    assert!(
+        dtls_scoped_capture_admits(true, Some(pinned), Some(pinned)),
+        "the identical capture is the session's own traffic"
+    );
+    assert!(
+        !dtls_scoped_capture_admits(true, Some(pinned), Some(v4([10, 96, 0, 10], 9))),
+        "a different ingress interface is a different source workload"
+    );
+    assert!(
+        !dtls_scoped_capture_admits(true, Some(pinned), Some(v4([10, 96, 0, 99], 7))),
+        "a different local destination is a different Service flow"
+    );
+    assert!(
+        !dtls_scoped_capture_admits(
+            true,
+            Some(pinned),
+            Some(local(IpAddr::V6(Ipv6Addr::LOCALHOST), 7))
+        ),
+        "a different address family is never the same flow"
+    );
+}
+
+/// A scoped listener with a capture but no pinned session is a NEW peer, which
+/// is admitted (the handshake gate and admission limits decide the rest).
+#[test]
+fn a_scoped_listener_admits_a_new_peer_that_carries_a_capture() {
+    assert!(dtls_scoped_capture_admits(
+        true,
+        None,
+        Some(v4([10, 96, 0, 10], 7))
+    ));
+}
+
+// The send-side interface derivation the pinned reply source feeds
+// (`PktinfoLocal::send_ifindex`) is pinned in
+// `tests/unit/gateway_core/socket_opts_tests.rs`.

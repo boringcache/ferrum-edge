@@ -672,3 +672,109 @@ impl Drop for RunningFlag {
         self.0.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 }
+
+// ───────────────────────────────────────────────────────────────────────────
+// The published interface set is what may be steered
+// ───────────────────────────────────────────────────────────────────────────
+//
+// `NodeWaypointUdpSourceIndexManager` hands `publish()`'s returned interface
+// set — never the planner's pre-publication wish list — to the Service-path
+// steering reconcile. Publication is where the fail-closed refusals actually
+// take effect, so an interface that appears in the input but not in the result
+// must not be steered: diverting its datagrams to a materialized listener that
+// could only deny them is strictly worse than leaving them on the unsteered
+// path, where the pod-veth guard drops them with no listener involved.
+
+#[test]
+fn the_published_generation_reports_exactly_the_attributable_interfaces() {
+    let index = NodeWaypointUdpSourceIndex::new();
+    let published = index.publish(&[
+        binding(UID_B, "reports", 8, Some("10.244.1.8"), None),
+        binding(UID_A, "ledger", 7, Some("10.244.1.7"), None),
+    ]);
+
+    assert_eq!(
+        published.ifaces,
+        vec!["veth7".to_string(), "veth8".to_string()],
+        "the steerable set is sorted so an unchanged registry renders an identical plan"
+    );
+    assert!(published.generation > 0);
+}
+
+#[test]
+fn a_contested_interface_is_never_steered_for_either_claimant() {
+    let index = NodeWaypointUdpSourceIndex::new();
+    let published = index.publish(&[
+        binding(UID_A, "ledger", 7, Some("10.244.1.7"), None),
+        binding(UID_B, "reports", 7, Some("10.244.1.8"), None),
+        binding(UID_B, "reports", 8, Some("10.244.1.8"), None),
+    ]);
+
+    assert_eq!(
+        published.ifaces,
+        vec!["veth8".to_string()],
+        "an ingress interface two pods claim identifies neither, so it is steered for neither"
+    );
+}
+
+#[test]
+fn a_malformed_or_mismatched_binding_is_never_steered() {
+    let index = NodeWaypointUdpSourceIndex::new();
+    let mut unparseable = binding(UID_A, "ledger", 7, Some("10.244.1.7"), None);
+    unparseable.pod_uid = "not-a-uuid".to_string();
+    let mut mismatched = binding(UID_B, "reports", 8, Some("10.244.1.8"), None);
+    mismatched.identity.pod_uid = UID_A.to_string();
+
+    let published = index.publish(&[unparseable, mismatched]);
+
+    assert!(
+        published.ifaces.is_empty(),
+        "neither an unscopeable UID nor a cross-pod UID mismatch may be steered: {:?}",
+        published.ifaces
+    );
+}
+
+#[test]
+fn an_exactly_duplicated_binding_is_steered_once() {
+    let index = NodeWaypointUdpSourceIndex::new();
+    let published = index.publish(&[
+        binding(UID_A, "ledger", 7, Some("10.244.1.7"), None),
+        binding(UID_A, "ledger", 7, Some("10.244.1.7"), None),
+    ]);
+
+    assert_eq!(
+        published.ifaces,
+        vec!["veth7".to_string()],
+        "a duplicate record is not a conflict, and must not duplicate a steering rule either"
+    );
+}
+
+/// Over the interface bound the whole generation collapses to empty rather than
+/// being truncated arbitrarily. The steering set must collapse with it — every
+/// datagram then refuses `unenrolled_interface`, so steering ANY interface
+/// would divert traffic to a listener that could only deny it.
+#[test]
+fn an_over_bound_generation_steers_nothing_at_all() {
+    let index = NodeWaypointUdpSourceIndex::new();
+    let bindings: Vec<HostUdpPodBinding> =
+        (0..(ferrum_edge::capture::MAX_HOST_UDP_CAPTURE_INTERFACES as u32 + 1))
+            .map(|i| {
+                let uid = format!("{:08x}-1111-1111-1111-111111111111", i + 1);
+                binding(&uid, "ledger", i + 1, Some("10.244.1.7"), None)
+            })
+            .collect();
+
+    let published = index.publish(&bindings);
+
+    assert!(
+        published.ifaces.is_empty(),
+        "an over-bound generation publishes nothing, so it steers nothing"
+    );
+}
+
+#[test]
+fn a_retracted_generation_is_reported_as_steering_nothing() {
+    let index = NodeWaypointUdpSourceIndex::new();
+    let published = index.publish(&[]);
+    assert!(published.ifaces.is_empty());
+}

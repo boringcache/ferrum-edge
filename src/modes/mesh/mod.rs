@@ -1858,17 +1858,14 @@ fn materialize_node_waypoint_udp_listeners(
         // port with no reachable endpoint therefore never appear here — steering
         // a destination with no serving listener would black-hole it.
         //
-        // DTLS listeners are deliberately NOT steered yet. A `DtlsServer` owns
-        // the socket every record leaves from and replies with `send_to`, so a
-        // steered DTLS session's records would leave with a NODE source address
-        // and the workload's connected socket would discard them — the
-        // handshake would never complete. Publishing a destination we cannot
-        // serve correctly would replace a working direct-address boundary with
-        // a black hole, so DTLS keeps that boundary until per-peer reply-source
-        // pinning lands. See `docs/mesh_supported_matrix.md`.
-        if candidate.terminates_dtls {
-            continue;
-        }
+        // `udp` and `dtls` listeners are steered identically. A `DtlsServer`
+        // pins each session's captured local destination (the ClusterIP a
+        // steered workload addressed) and sources EVERY encrypted record from
+        // it — handshake flights, retransmits, application replies, and the
+        // final shutdown flush — over a transparent socket, so a steered DTLS
+        // handshake completes exactly like a plain-UDP session. See
+        // `crate::dtls::DtlsSessionState::reply_local` and
+        // `docs/mesh_supported_matrix.md`.
         if candidate.cluster_ips.is_empty() {
             vip_less_ports.push(format!(
                 "{}/{}:{port}",
@@ -1914,15 +1911,20 @@ fn materialize_node_waypoint_udp_listeners(
     // a generation that materializes nothing must retract the previous
     // generation's steering rather than leave workloads diverted to listeners
     // that no longer exist.
+    let steer_destination_count = steer_destinations.len();
     crate::proxy::node_waypoint_udp_steering::publish_plan(steer_destinations);
 
     if materialized > 0 {
         info!(
             udp_listeners = materialized - dtls_listeners,
             dtls_listeners,
+            steered_destinations = steer_destination_count,
             "Materialized NodeWaypoint UDP/DTLS service listeners; each session's source pod is \
              attributed from the kernel-reported ingress interface and its scoped \
-             AuthorizationPolicies are enforced before any datagram reaches a backend"
+             AuthorizationPolicies are enforced before any datagram reaches a backend. Every \
+             ClusterIP-bearing listener, `udp` and `dtls` alike, is published for Service-path \
+             steering; the rules are installed by the source-attribution reconcile loop, so a \
+             published destination becomes reachable only once its steering apply succeeds"
         );
     }
 }

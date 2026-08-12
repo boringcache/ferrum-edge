@@ -1993,20 +1993,26 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
         // Without it every steered session would be one-way: the workload's
         // datagram reaches the backend and the reply is dropped at the sender,
         // or arrives from the wrong address and is discarded by the workload's
-        // connected socket. Fail the listener rather than serve that.
-        #[cfg(target_os = "linux")]
+        // connected socket. Fail the listener rather than serve that — including
+        // off Linux, where `set_scoped_reply_transparent` reports Unsupported.
         {
-            use std::os::fd::AsRawFd;
+            #[cfg(unix)]
+            let fd = {
+                use std::os::fd::AsRawFd;
+                frontend_socket.as_raw_fd()
+            };
+            #[cfg(not(unix))]
+            let fd = 0;
             let local = frontend_socket.local_addr().unwrap_or(addr);
-            crate::socket_opts::set_ip_transparent(frontend_socket.as_raw_fd(), local.is_ipv6())
-                .map_err(|error| {
-                    std::io::Error::other(format!(
-                        "NodeWaypoint scoped UDP listener on port {port} could not become a \
-                         transparent socket, so it could not source replies from the Service \
-                         address a steered workload addressed. NET_ADMIN (or NET_RAW on newer \
-                         kernels) is required: {error}"
-                    ))
-                })?;
+            let ipv6 = local.is_ipv6();
+            if let Err(error) = crate::socket_opts::set_scoped_reply_transparent(fd, ipv6) {
+                return Err(anyhow::anyhow!(
+                    "NodeWaypoint scoped UDP listener on port {port} could not become a \
+                     transparent socket, so it could not source replies from the Service address \
+                     a steered workload addressed. NET_ADMIN (or NET_RAW on newer kernels) is \
+                     required: {error}"
+                ));
+            }
         }
     }
 
@@ -3574,6 +3580,13 @@ async fn start_dtls_frontend_listener(
         socket_mark: node_waypoint_udp_source_scoping
             .as_ref()
             .map(|_| crate::ebpf::NODE_WAYPOINT_INBOUND_AUTH_MARK),
+        // Service-path steering delivers the datagram with the Service
+        // ClusterIP still in its IP header, and each session sources every
+        // encrypted record from exactly that pinned address. The ClusterIP is
+        // not configured on this node, so the socket has to be transparent or
+        // the kernel refuses the source. Applied before the server object
+        // exists, like the mark; off for every other DTLS listener.
+        transparent_reply_source: node_waypoint_udp_source_scoping.is_some(),
     };
     let server =
         Arc::new(crate::dtls::DtlsServer::bind_with_limits(addr, dtls_config, dtls_limits).await?);

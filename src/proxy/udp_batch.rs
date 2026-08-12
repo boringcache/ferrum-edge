@@ -672,10 +672,12 @@ mod sendmmsg_batch_tests {
 
 /// Convert a `std::net::SocketAddr` to `libc::sockaddr_storage` + length.
 ///
-/// `pub(super)` so `flush_gso_batch()` in `udp_proxy.rs` can call it directly
-/// without a wrapper.
+/// `pub(crate)` so `flush_gso_batch()` in `udp_proxy.rs` and the DTLS server's
+/// pinned reply-source send path (`crate::dtls`) can both call it directly
+/// without a wrapper — one conversion, so the two datagram frontends cannot
+/// disagree about destination encoding.
 #[cfg(target_os = "linux")]
-pub(super) fn std_to_sockaddr_storage(
+pub(crate) fn std_to_sockaddr_storage(
     addr: SocketAddr,
 ) -> (libc::sockaddr_storage, libc::socklen_t) {
     let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };

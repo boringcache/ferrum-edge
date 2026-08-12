@@ -291,18 +291,32 @@ impl NodeWaypointUdpSteerDestination {
 
 /// Per-family NodeWaypoint UDP steering commands.
 ///
-/// Ordering is load-bearing and fail-closed:
+/// Ordering is load-bearing and fail-closed, and the FIRST step is the one that
+/// makes a generation change safe:
 ///
-/// 1. `ip rule` / `ip route local` first. Marking without local delivery is a
-///    black hole, so the routing goes in before anything can be marked.
-/// 2. The `raw` `--notrack` chain and its `PREROUTING` jump next, so no steered
-///    flow can be conntracked (and therefore DNAT-ed) while the mark exists.
-/// 3. The `mangle` mark chain and its jump LAST — the moment steering becomes
-///    observable.
+/// 1. **Create-and-empty the `mangle` mark chain before anything else.** From
+///    this instant nothing is marked at all, so no datagram can be steered under
+///    a destination generation whose `--notrack` and local-delivery
+///    prerequisites have not been installed yet. This opens a brief window where
+///    the Service path is unsteered — which is exactly the pre-existing
+///    fail-closed posture (the pod-veth guard drops the datagram) — and closes
+///    the window where a previous generation's mark survived while its `raw`
+///    exemption had already been flushed. In that window `nat PREROUTING` would
+///    have DNAT-ed the flow to a backing pod and the still-live mark would then
+///    have delivered THAT rewritten datagram locally: cross-generation,
+///    wrong-destination admission. A short outage is acceptable; that is not.
+/// 2. `ip rule` / `ip route local` next. Marking without local delivery is a
+///    black hole, so the routing exists before anything can be marked.
+/// 3. The `raw` `--notrack` chain, its rules, and its `PREROUTING` jump, so no
+///    steered flow can be conntracked (and therefore DNAT-ed).
+/// 4. The `mangle` rules and the mangle `PREROUTING` jump LAST — the moment
+///    steering becomes observable again, and by then every prerequisite for
+///    exactly these destinations is already installed.
 ///
 /// Both chains are flushed and repopulated behind a STABLE `PREROUTING` jump,
 /// so a reconcile changes chain CONTENTS only and a crash mid-reconcile can
-/// leave at worst a subset of the intended rules, never an orphaned jump.
+/// leave at worst a subset of the intended rules behind an empty-or-partial
+/// chain, never an orphaned jump and never a mark without its prerequisites.
 fn node_waypoint_udp_steer_commands_for_family(
     binary: &str,
     ipv6: bool,
@@ -334,10 +348,19 @@ fn node_waypoint_udp_steer_commands_for_family(
     let wait = XTABLES_LOCK_WAIT_SECONDS;
 
     let mut commands = vec![
-        // FAIL CLOSED before any rule: without iproute2 the local-delivery rule
-        // cannot be installed, and a mark with no local route is a black hole.
+        // FAIL CLOSED before any rule: this family cannot be installed at all
+        // without its own `iptables`/`ip6tables` binary and without iproute2, and
+        // a partially installed family is a silent black hole rather than a
+        // fail-closed one.
+        format!(
+            "command -v {binary} >/dev/null 2>&1 || {{ echo \"{binary} is required for \
+             NodeWaypoint UDP Service steering of its address family\" >&2; exit 1; }}"
+        ),
         "command -v ip >/dev/null 2>&1 || { echo \"iproute2 (ip) is required for NodeWaypoint UDP Service steering\" >&2; exit 1; }"
             .to_string(),
+        // STOP MARKING FIRST (see the ordering note above).
+        format!("{binary} -t mangle -w {wait} -N {steer} 2>/dev/null || {binary} -t mangle -w {wait} -F {steer}"),
+        format!("{binary} -t mangle -w {wait} -F {steer}"),
         ip_delete_best_effort(&format!("{ip} rule del priority {priority} lookup {table}")),
         format!("{ip} rule add priority {priority} fwmark {mark_arg} lookup {table}"),
         ip_delete_best_effort(&format!("{ip} route del {local_route} table {table}")),
@@ -359,11 +382,8 @@ fn node_waypoint_udp_steer_commands_for_family(
          {binary} -t raw -w {wait} -A PREROUTING -p udp -j {notrack}"
     ));
 
-    // `mangle` mark chain.
-    commands.push(format!(
-        "{binary} -t mangle -w {wait} -N {steer} 2>/dev/null || {binary} -t mangle -w {wait} -F {steer}"
-    ));
-    commands.push(format!("{binary} -t mangle -w {wait} -F {steer}"));
+    // `mangle` mark rules, then the jump. Every destination marked below already
+    // has its notrack exemption and its local-delivery route installed above.
     for iface in ifaces {
         for destination in &family_destinations {
             commands.push(format!(
@@ -455,21 +475,20 @@ pub fn node_waypoint_udp_steer_setup_script(
     if v4.is_empty() && v6.is_empty() {
         return Ok(None);
     }
+    // A published family is installed COMPLETELY or the whole apply fails.
+    // There is deliberately no per-family best-effort arm: a family that is
+    // published but not installed is a black hole that looks configured — the
+    // reconcile would record the plan as applied and never retry it, while
+    // those datagrams silently take the unsteered path. Under `set -e` each
+    // family's own `command -v` guard (emitted first, above) exits non-zero, the
+    // reconcile tears every Ferrum-owned object down, and the next reconcile
+    // retries the whole plan.
     let mut chunks = Vec::new();
     if !v4.is_empty() {
         chunks.push(v4.join("\n"));
     }
     if !v6.is_empty() {
-        // IPv6 steering is best-effort at the TABLE level only: a node without
-        // `ip6tables` (or without its `mangle`/`raw` tables) keeps the IPv4
-        // datapath instead of failing the whole plan. The IPv6 Service path is
-        // then simply not steered — fail-closed for those datagrams, which are
-        // still dropped by the pod-veth guard rather than bypassing the
-        // waypoint. This is reported by the caller, never silent.
-        chunks.push(format!(
-            "if command -v ip6tables >/dev/null 2>&1; then\n  {}\nelse\n  echo \"ip6tables not found; NodeWaypoint IPv6 UDP Service steering not installed\" >&2\nfi",
-            v6.join("\n  ")
-        ));
+        chunks.push(v6.join("\n"));
     }
     Ok(Some(format!("set -e\n{}", chunks.join("\n"))))
 }

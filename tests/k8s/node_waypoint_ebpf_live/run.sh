@@ -106,6 +106,9 @@ REQUIRED_LIVE_ASSERTIONS=(
   node_waypoint.dtls.listener_bound
   node_waypoint.dtls.listener_allow_attributed_source
   node_waypoint.dtls.listener_deny_scoped_policy
+  node_waypoint.dtls.service_path_allow_attributed_source
+  node_waypoint.dtls.service_path_deny_scoped_policy
+  node_waypoint.dtls.service_path_deny_unattributed_source
 )
 if [[ "$STALE_IP_REUSE_HOST_LOCAL_PROFILE" == "true" ]]; then
   REQUIRED_LIVE_ASSERTIONS+=(
@@ -1824,10 +1827,45 @@ spec:
               # The harness fails that assertion closed rather than recording a
               # refusal for a datagram that was never emitted.
               add: ["NET_RAW"]
+---
+# Unenrolled DTLS sender for the Service-path refusal check (issue #3286 root
+# review). Same posture as udp-unmanaged — outside the mesh namespace, no
+# registry binding for its veth — but carrying openssl, so it can attempt a real
+# handshake against the dtls-echo Service DNS name. No steering rule names its
+# interface, so its datagram takes the ordinary path: kube-proxy DNATs the
+# ClusterIP to the backing pod and the pod-veth guard drops it. The backend log
+# is the authority that it arrived nowhere.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dtls-unmanaged
+  namespace: $UNMANAGED_NS
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dtls-unmanaged
+  template:
+    metadata:
+      labels:
+        app: dtls-unmanaged
+    spec:
+      nodeSelector:
+        ferrum.io/live-node: a
+      containers:
+        - name: dtls
+          image: $DTLS_CLIENT_IMAGE
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c", "sleep 365d"]
 EOF
   kubectl -n "$UNMANAGED_NS" rollout status deploy/unmanaged-a --timeout=3m
   kubectl -n "$UNMANAGED_NS" rollout status deploy/unmanaged-b --timeout=3m
   kubectl -n "$UNMANAGED_NS" rollout status deploy/udp-unmanaged --timeout=3m
+  kubectl -n "$UNMANAGED_NS" rollout status deploy/dtls-unmanaged --timeout=3m
+  if ! kubectl -n "$UNMANAGED_NS" exec deploy/dtls-unmanaged -c dtls -- openssl version >/dev/null; then
+    echo "dtls-unmanaged is missing the openssl CLI; the DTLS live client image did not load" >&2
+    exit 1
+  fi
 }
 
 admin_bearer_token() {
@@ -4550,6 +4588,11 @@ EOF
 # the DtlsServer owns the socket every encrypted record leaves from; an unmarked
 # one would be dropped by the pod-veth guard and the allow case below could not
 # pass.
+#
+# These three probe a trusted NODE address. That is a real but DISTINCT
+# boundary and is deliberately NOT substitute evidence for the ordinary user
+# path — the Service DNS name / ClusterIP — which
+# `run_node_waypoint_dtls_service_path_checks` proves separately.
 
 # Full `openssl s_client` handshake report (stdout+stderr), used to prove the
 # listener bound and which certificate it presented.
@@ -4597,6 +4640,98 @@ wait_for_dtls_echo() {
   done
   printf '%s' "$reply"
   return 1
+}
+
+# ── The ORDINARY user path for DTLS: the Service DNS name / ClusterIP ───────
+#
+# Everything above targets a trusted NODE address, which is a deliberate but
+# NARROW boundary — no workload dials a node IP to reach a Service. The checks
+# below drive the same production listener through the address a workload
+# actually uses, which only works when the Service-path steering diverted the
+# datagram with its original destination intact AND every encrypted record came
+# back sourced from that ClusterIP (a `connect()`ed DTLS client discards a
+# record arriving from any other source, so a wrong reply source is
+# indistinguishable from no listener at all).
+#
+# The DNS name is resolved BY THE CLIENT POD, so a passing check also proves the
+# ordinary discovery path reaches the steered address rather than a hardcoded
+# one.
+run_node_waypoint_dtls_service_path_checks() {
+  log "running NodeWaypoint DTLS Service-path datapath checks (issue #3286 root review)"
+  local service_dns service_ip reply hits
+
+  service_dns="dtls-echo.${WORKLOAD_NS}.svc.cluster.local"
+  service_ip="$(kubectl -n "$WORKLOAD_NS" get svc dtls-echo -o jsonpath='{.spec.clusterIP}')"
+  if [[ -z "$service_ip" || "$service_ip" == "None" ]]; then
+    record_live_assertion node_waypoint.dtls.service_path_allow_attributed_source fail \
+      dtls-src-a dtls-echo "the dtls-echo Service publishes no ClusterIP to steer" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-listener"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  log "NodeWaypoint DTLS Service path target ${service_dns} (${service_ip}:${DTLS_LISTENER_PORT})"
+
+  # 1. Admitted, attributed source addressing the Service DNS NAME. openssl
+  #    resolves it in the pod, handshakes through the steered listener, and the
+  #    backend logs the decrypted datagram it relayed.
+  if ! reply="$(wait_for_dtls_echo "$WORKLOAD_NS" dtls-src-a "$service_dns" dtls-svc-a 20)"; then
+    record_live_assertion node_waypoint.dtls.service_path_allow_attributed_source fail \
+      dtls-src-a dtls-echo "service_dns=$service_dns service_ip=$service_ip observed=$reply" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-listener"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  hits="$(dtls_echo_backend_received dtls-svc-a)"
+  if [[ "$hits" == "0" ]]; then
+    record_live_assertion node_waypoint.dtls.service_path_allow_attributed_source fail \
+      dtls-src-a dtls-echo \
+      "the echo arrived but the backend logged no Service-path decrypted datagram" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-listener"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  record_live_assertion node_waypoint.dtls.service_path_allow_attributed_source pass \
+    dtls-src-a dtls-echo \
+    "service_dns=$service_dns service_ip=$service_ip observed=dtls-ok backend_hits=$hits" \
+    "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-listener"
+
+  # 2. A source the namespace-scoped policy denies reaches the same steered
+  #    listener and is refused there. Reply-absence alone would be vacuous, so
+  #    the backend log is the authority.
+  reply="$(dtls_probe_from "$WORKLOAD_NS" dtls-src-b "$service_dns" "$DTLS_LISTENER_PORT" \
+    dtls-svc-b 8)"
+  sleep 2
+  hits="$(dtls_echo_backend_received dtls-svc-b)"
+  if [[ "$reply" == *"dtls-ok:dtls-svc-b"* || "$hits" != "0" ]]; then
+    record_live_assertion node_waypoint.dtls.service_path_deny_scoped_policy fail \
+      dtls-src-b dtls-echo "observed=$reply backend_hits=$hits" \
+      "$(spiffe_for_sa src-b)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-listener"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  record_live_assertion node_waypoint.dtls.service_path_deny_scoped_policy pass \
+    dtls-src-b dtls-echo "no application data returned and backend_hits=0" \
+    "$(spiffe_for_sa src-b)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-listener"
+
+  # 3. An UNENROLLED source. No steering rule names its interface, so its
+  #    datagram takes the pre-existing path: kube-proxy DNATs the ClusterIP to
+  #    the backing pod and the pod-veth guard drops it. Nothing reaches the
+  #    backend and no application data comes back — the fail-closed contract,
+  #    proven for the Service address rather than only for a node address.
+  reply="$(dtls_probe_from "$UNMANAGED_NS" dtls-unmanaged "$service_dns" "$DTLS_LISTENER_PORT" \
+    dtls-svc-x 8)"
+  sleep 2
+  hits="$(dtls_echo_backend_received dtls-svc-x)"
+  if [[ "$reply" == *"dtls-ok:dtls-svc-x"* || "$hits" != "0" ]]; then
+    record_live_assertion node_waypoint.dtls.service_path_deny_unattributed_source fail \
+      dtls-unmanaged dtls-echo "observed=$reply backend_hits=$hits" "" \
+      "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-listener"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  record_live_assertion node_waypoint.dtls.service_path_deny_unattributed_source pass \
+    dtls-unmanaged dtls-echo "no application data returned and backend_hits=0" "" \
+    "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-listener"
 }
 
 run_node_waypoint_dtls_datapath_checks() {
@@ -4716,6 +4851,7 @@ wait_for_ambient_mesh_slice
 run_traffic_checks
 run_node_waypoint_udp_datapath_checks
 run_node_waypoint_dtls_datapath_checks
+run_node_waypoint_dtls_service_path_checks
 run_ipv6_checks
 ferrum_live_assertions_require_all_passed "$LIVE_ASSERTIONS_FILE" "${REQUIRED_LIVE_ASSERTIONS[@]}"
 

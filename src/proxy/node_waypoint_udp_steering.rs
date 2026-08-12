@@ -61,13 +61,23 @@
 //! # Ownership and lifecycle
 //!
 //! The desired destination set is published by mesh config apply
-//! ([`publish_plan`], from `materialize_node_waypoint_udp_listeners`) and the
-//! interface set comes from the same registry reconcile that publishes source
-//! attribution, so steering and attribution can never disagree about which pods
-//! exist. [`NodeWaypointUdpSteering::reconcile`] applies the pair only when it
-//! CHANGED, tears the datapath down whenever either half is empty, and tears it
-//! down on drop (task abort or panic included) so a dead reconcile loop cannot
-//! leave marked-but-unserved destinations installed.
+//! ([`publish_plan`], from `materialize_node_waypoint_udp_listeners`). The
+//! interface set is the EXACT set of interfaces the source-attribution index
+//! successfully published this pass
+//! (`NodeWaypointUdpSourceIndex::publish` → `PublishedSourceGeneration::ifaces`),
+//! not the planner's pre-publication wish list: publication is where a
+//! contested interface refuses every claimant, a malformed or UID-mismatched
+//! binding is dropped, and an over-bound input collapses to an empty
+//! generation. Steering an interface publication refused would divert its
+//! datagrams to a listener that could only deny them.
+//!
+//! [`NodeWaypointUdpSteering::reconcile`] applies the pair only when it CHANGED,
+//! tears the datapath down whenever either half is empty, ALWAYS runs one
+//! exact-name teardown before this process trusts the datapath (so objects a
+//! crashed prior process left installed are reaped on the first pass rather than
+//! surviving until this process exits), and tears it down on drop (task abort or
+//! panic included) so a dead reconcile loop cannot leave marked-but-unserved
+//! destinations installed.
 //!
 //! Linux-only. Everywhere else [`NodeWaypointUdpSteering`] is inert and
 //! `steering_supported()` is false, which is also why the mesh startup path
@@ -138,6 +148,27 @@ pub const fn steering_supported() -> bool {
     cfg!(target_os = "linux")
 }
 
+/// Upper bound on the failed-script diagnostic carried into a `warn!`.
+const STEER_ERROR_DETAIL_MAX_CHARS: usize = 512;
+
+/// Withhold every interface name this generation named from a tool diagnostic.
+///
+/// `iptables` can echo the `-i <iface>` argument it rejected, and an enrolled
+/// pod's host-side interface name is discovered per pod rather than being ours
+/// to disclose. The failure CLASS is what an operator needs; the device name is
+/// not. The placeholder cannot contain an interface name (the shared
+/// `validate_host_capture_interfaces` charset admits no `<` or `>`), so this is
+/// a single non-amplifying pass, and the result is re-bounded afterwards.
+fn redact_steer_error_detail(detail: &str, ifaces: &[String]) -> String {
+    let mut out = detail.to_string();
+    for iface in ifaces {
+        if !iface.is_empty() {
+            out = out.replace(iface.as_str(), "<iface>");
+        }
+    }
+    out.chars().take(STEER_ERROR_DETAIL_MAX_CHARS).collect()
+}
+
 /// Effects the steering reconcile performs, behind a trait so the reconcile
 /// logic is testable without root, `iptables`, or a live node.
 pub trait NodeWaypointUdpSteerBackend: Send + Sync + 'static {
@@ -160,14 +191,29 @@ impl NodeWaypointUdpSteerBackend for HostNamespaceSteerBackend {
             .output()
             .map_err(|error| format!("failed to run the steering script: {error}"))?;
         if output.status.success() {
+            // A successful script installed every published family completely:
+            // the setup script is `set -e` and each family opens with its own
+            // `command -v` guard, so there is no "succeeded but skipped a
+            // family" outcome whose stderr would need reporting. Anything the
+            // tools wrote to stderr on success is therefore non-actionable
+            // noise and is deliberately not surfaced.
             return Ok(());
         }
         // stderr can only contain iptables/ip diagnostics about Ferrum-owned
         // objects; no secret, peer, or registry value reaches this script.
+        // Bounded so a pathological tool cannot turn one failed reconcile into
+        // an unbounded log record.
+        let detail = String::from_utf8_lossy(&output.stderr);
+        let detail = detail.trim();
+        let truncated: String = detail.chars().take(STEER_ERROR_DETAIL_MAX_CHARS).collect();
+        let ellipsis = if truncated.chars().count() < detail.chars().count() {
+            "…"
+        } else {
+            ""
+        };
         Err(format!(
-            "steering script exited with {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
+            "steering script exited with {}: {truncated}{ellipsis}",
+            output.status
         ))
     }
 
@@ -198,28 +244,50 @@ struct AppliedSteering {
     destinations: Vec<NodeWaypointUdpSteerDestination>,
 }
 
+/// What this PROCESS knows about the node's steering objects.
+#[derive(Debug, Default)]
+struct SteeringState {
+    /// Whether this process has completed one successful exact-name teardown,
+    /// i.e. whether "nothing is applied" is a PROVEN statement about the node
+    /// rather than merely about this process's memory.
+    ///
+    /// It starts `false` on purpose. Ferrum-owned chains, rules, and routes
+    /// survive the process that installed them, so a crashed or `SIGKILL`ed
+    /// predecessor leaves destinations marked and locally delivered to a socket
+    /// that no longer exists. Without this flag the first reconcile of an empty
+    /// plan short-circuits on `applied == None` and those objects stay installed
+    /// for the whole life of the new process.
+    reaped: bool,
+    /// The generation this process installed, or `None` when nothing is (or is
+    /// known to be) installed.
+    applied: Option<AppliedSteering>,
+}
+
 /// Reconciles the NodeWaypoint Service-steering datapath.
 pub struct NodeWaypointUdpSteering {
     backend: Arc<dyn NodeWaypointUdpSteerBackend>,
-    /// `None` = nothing installed. Guarded by a plain `Mutex` because it is
-    /// touched once per registry poll (seconds), never on a datagram path.
-    applied: Mutex<Option<AppliedSteering>>,
+    /// Guarded by a plain `Mutex` because it is touched once per registry poll
+    /// (seconds), never on a datagram path.
+    state: Mutex<SteeringState>,
 }
 
 impl NodeWaypointUdpSteering {
     pub fn new(backend: Arc<dyn NodeWaypointUdpSteerBackend>) -> Self {
         Self {
             backend,
-            applied: Mutex::new(None),
+            state: Mutex::new(SteeringState::default()),
         }
     }
 
-    /// Reconcile the datapath against `ifaces` (this pass's attributable
-    /// enrolled pods) and the published destination plan.
+    /// Reconcile the datapath against `ifaces` — the interfaces the source
+    /// attribution index actually PUBLISHED this pass, never the planner's
+    /// pre-publication list — and the published destination plan.
     ///
-    /// A poisoned lock is treated as "nothing known to be applied" and forces a
-    /// teardown: guessing that the previous generation is still installed is the
-    /// one answer that could leave marked-but-unserved destinations behind.
+    /// A poisoned lock is treated as "nothing known about the node": both the
+    /// applied generation and the teardown proof are dropped, so the pass runs
+    /// a teardown rather than trusting stale in-process memory. Guessing that
+    /// the previous generation is still installed is the one answer that could
+    /// leave marked-but-unserved destinations behind.
     pub fn reconcile(&self, ifaces: &[String]) -> SteerReconcileOutcome {
         let plan = published_plan();
         self.reconcile_with(ifaces, &plan.destinations)
@@ -238,24 +306,33 @@ impl NodeWaypointUdpSteering {
             destinations: destinations.to_vec(),
         };
 
-        let mut applied = match self.applied.lock() {
+        let mut state = match self.state.lock() {
             Ok(guard) => guard,
             Err(poisoned) => {
+                // A poisoned lock is treated as "nothing is KNOWN about the
+                // node": forget the applied generation AND drop the reaped
+                // proof, so the pass below runs a teardown rather than
+                // short-circuiting on this process's own stale memory.
                 let mut guard = poisoned.into_inner();
-                *guard = None;
+                *guard = SteeringState::default();
                 guard
             }
         };
 
         if desired.ifaces.is_empty() || desired.destinations.is_empty() {
-            if applied.is_none() {
+            // Nothing to steer. Run the exact-name teardown unless this process
+            // has already PROVEN the node holds no Ferrum-owned steering
+            // objects — which is exactly what makes the first pass reap a
+            // crashed predecessor's rules while every later quiet poll runs no
+            // command at all.
+            if state.reaped && state.applied.is_none() {
                 return SteerReconcileOutcome::Unchanged;
             }
-            self.tear_down(&mut applied);
+            self.tear_down(&mut state);
             return SteerReconcileOutcome::Removed;
         }
 
-        if applied.as_ref() == Some(&desired) {
+        if state.reaped && state.applied.as_ref() == Some(&desired) {
             return SteerReconcileOutcome::Unchanged;
         }
 
@@ -265,7 +342,7 @@ impl NodeWaypointUdpSteering {
         ) {
             Ok(Some(script)) => script,
             Ok(None) => {
-                self.tear_down(&mut applied);
+                self.tear_down(&mut state);
                 return SteerReconcileOutcome::Removed;
             }
             Err(error) => {
@@ -277,19 +354,17 @@ impl NodeWaypointUdpSteering {
                      unsteered (and therefore fails closed at the pod-veth guard) rather than \
                      installing a partial ruleset"
                 );
-                self.tear_down(&mut applied);
+                self.tear_down(&mut state);
                 return SteerReconcileOutcome::Failed;
             }
         };
 
-        // Reap the previous generation before installing the new one. Both
-        // chains are flushed and repopulated behind stable jumps, so this is
-        // belt-and-braces for the case where the previous generation used an
-        // address family the new one does not.
-        if applied.is_some() {
-            let _ = self
-                .backend
-                .run_script(&crate::capture::node_waypoint_udp_steer_teardown_script());
+        // Reap whatever may already be installed before installing the new
+        // generation: the previous generation this process applied, or — on the
+        // first pass — a crashed predecessor's objects, which may name an
+        // address family or a destination this generation does not.
+        if !state.reaped || state.applied.is_some() {
+            self.tear_down(&mut state);
         }
 
         match self.backend.run_script(&script) {
@@ -301,27 +376,35 @@ impl NodeWaypointUdpSteering {
                      their Service ClusterIP through the materialized listener with the original \
                      destination, source address, and ingress interface intact"
                 );
-                *applied = Some(desired);
+                // `reaped` is deliberately NOT set here — only a SUCCESSFUL
+                // teardown sets it. If the reap above failed we have proven
+                // nothing about a predecessor's objects, so the next reconcile
+                // must re-enter and retry it rather than settling on Unchanged.
+                state.applied = Some(desired);
                 SteerReconcileOutcome::Applied
             }
             Err(error) => {
                 warn!(
-                    error = %error,
+                    error = %redact_steer_error_detail(&error, &desired.ifaces),
                     "NodeWaypoint UDP Service steering could not be installed; removing every \
                      Ferrum-owned steering object so no destination is marked without a serving \
-                     socket"
+                     socket, and retrying the whole plan on the next reconcile"
                 );
-                self.tear_down(&mut applied);
+                self.tear_down(&mut state);
                 SteerReconcileOutcome::Failed
             }
         }
     }
 
     /// Remove every Ferrum-owned steering object and forget the applied
-    /// generation. Best-effort by construction: the teardown script tolerates
-    /// missing objects, and a failure is reported rather than retried inline
-    /// (the next reconcile retries).
-    fn tear_down(&self, applied: &mut Option<AppliedSteering>) {
+    /// generation. The teardown script tolerates missing objects, so it is a
+    /// no-op when nothing is installed.
+    ///
+    /// `reaped` is set ONLY when the script succeeded: a failed teardown has not
+    /// proven anything about the node, so the next reconcile must try again
+    /// rather than treat "nothing applied" as settled.
+    fn tear_down(&self, state: &mut SteeringState) {
+        state.applied = None;
         if let Err(error) = self
             .backend
             .run_script(&crate::capture::node_waypoint_udp_steer_teardown_script())
@@ -332,25 +415,23 @@ impl NodeWaypointUdpSteering {
                  on the next reconcile"
             );
         } else {
+            state.reaped = true;
             debug!("NodeWaypoint UDP Service steering datapath removed");
         }
-        *applied = None;
     }
 
     /// Unconditional teardown, for shutdown and for the retraction guard.
+    ///
+    /// Always runs the script, even when this process installed nothing: a
+    /// previous process generation's objects survive this process, and they are
+    /// exactly the marked-without-a-serving-socket state that must not outlive
+    /// it.
     pub fn shutdown(&self) {
-        let mut applied = match self.applied.lock() {
+        let mut state = match self.state.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        if applied.is_none() {
-            // Still run the teardown once: a previous process generation's
-            // objects survive this process, and they are exactly the
-            // marked-without-a-socket state that must not outlive it.
-            self.tear_down(&mut applied);
-            return;
-        }
-        self.tear_down(&mut applied);
+        self.tear_down(&mut state);
     }
 }
 
@@ -363,95 +444,6 @@ impl Drop for NodeWaypointUdpSteering {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::net::IpAddr;
-    use std::sync::Mutex as StdMutex;
-
-    struct RecordingBackend {
-        scripts: StdMutex<Vec<String>>,
-        fail: bool,
-    }
-
-    impl NodeWaypointUdpSteerBackend for RecordingBackend {
-        fn run_script(&self, script: &str) -> Result<(), String> {
-            self.scripts
-                .lock()
-                .expect("recording backend lock")
-                .push(script.to_string());
-            if self.fail {
-                Err("boom".to_string())
-            } else {
-                Ok(())
-            }
-        }
-    }
-
-    fn destination(ip: &str, port: u16) -> NodeWaypointUdpSteerDestination {
-        NodeWaypointUdpSteerDestination {
-            ip: ip.parse::<IpAddr>().expect("destination address"),
-            port,
-        }
-    }
-
-    /// The two postures that must never install a half-datapath:
-    ///
-    /// * either half of the pair empty (no enrolled pod, or no materialized
-    ///   Service) installs NOTHING — marking a destination with no attributable
-    ///   source, or with no serving socket, is a black hole that looks
-    ///   configured;
-    /// * a failed apply leaves the datapath TORN DOWN by exact name.
-    ///
-    /// Driven through `reconcile_with` so it never touches the process-wide
-    /// published plan that every mesh config-apply test also writes.
-    #[test]
-    fn steering_never_leaves_a_half_installed_datapath() {
-        let one = vec![destination("10.96.0.10", 5300)];
-        let quiet = Arc::new(RecordingBackend {
-            scripts: StdMutex::new(Vec::new()),
-            fail: false,
-        });
-        let steering = NodeWaypointUdpSteering::new(quiet.clone());
-        assert_eq!(
-            steering.reconcile_with(&["veth0".to_string()], &[]),
-            SteerReconcileOutcome::Unchanged,
-            "no materialized Service steers nothing"
-        );
-        assert_eq!(
-            steering.reconcile_with(&[], &one),
-            SteerReconcileOutcome::Unchanged,
-            "no enrolled interface steers nothing"
-        );
-        assert!(
-            quiet
-                .scripts
-                .lock()
-                .expect("recording backend lock")
-                .is_empty(),
-            "neither posture may run a command"
-        );
-        std::mem::forget(steering);
-
-        let failing = Arc::new(RecordingBackend {
-            scripts: StdMutex::new(Vec::new()),
-            fail: true,
-        });
-        let steering = NodeWaypointUdpSteering::new(failing.clone());
-        assert_eq!(
-            steering.reconcile_with(&["veth0".to_string()], &one),
-            SteerReconcileOutcome::Failed
-        );
-        {
-            let scripts = failing.scripts.lock().expect("recording backend lock");
-            assert!(
-                scripts
-                    .last()
-                    .expect("a teardown ran")
-                    .contains("-D PREROUTING"),
-                "a failed apply must be followed by the exact-name teardown"
-            );
-        }
-        std::mem::forget(steering);
-    }
-}
+// Contract coverage for this module lives in
+// `tests/unit/gateway_core/node_waypoint_udp_steering_tests.rs` (first-pass
+// reaping, later-empty idempotence, command order, and failure cleanup).

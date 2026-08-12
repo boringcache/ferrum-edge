@@ -102,68 +102,6 @@ pub fn set_socket_mark(_fd: i32, _mark: u32) -> std::io::Result<()> {
     Ok(())
 }
 
-// ── IP_TRANSPARENT / IPV6_TRANSPARENT ───────────────────────────────────────
-
-/// `IP_TRANSPARENT` and `IPV6_TRANSPARENT` option numbers.
-///
-/// Pinned here rather than taken from `libc` because the IPv6 constant is not
-/// exposed by every `libc` release Ferrum builds against, and a wrong number
-/// would silently be a different option. Both set the SAME kernel flag
-/// (`inet_sk(sk)->transparent`), so one successful call covers a dual-stack
-/// socket; the family-appropriate one is used so the error, if any, names an
-/// option that socket can actually carry.
-#[cfg(target_os = "linux")]
-const IP_TRANSPARENT: libc::c_int = 19;
-#[cfg(target_os = "linux")]
-const IPV6_TRANSPARENT: libc::c_int = 75;
-
-/// Mark a UDP socket transparent so it may SOURCE replies from an address that
-/// is not configured on this host.
-///
-/// The NodeWaypoint Service datapath needs exactly this: a workload addresses
-/// its Service's ClusterIP, the steering rules deliver that datagram locally
-/// **without rewriting it**, and the reply must therefore leave with the
-/// ClusterIP as its source or the workload's connected socket discards it. The
-/// kernel refuses a non-local `flowi4_saddr` unless the socket carries
-/// `FLOWI_FLAG_ANYSRC`, which is what this flag sets.
-///
-/// Requires `CAP_NET_ADMIN` (or `CAP_NET_RAW` on newer kernels). Failure is
-/// returned, never swallowed: a scoped listener that cannot source its replies
-/// correctly must fail to start rather than serve a one-way datapath.
-#[cfg(target_os = "linux")]
-pub fn set_ip_transparent(fd: std::os::unix::io::RawFd, ipv6: bool) -> std::io::Result<()> {
-    let (level, name) = if ipv6 {
-        (libc::IPPROTO_IPV6, IPV6_TRANSPARENT)
-    } else {
-        (libc::IPPROTO_IP, IP_TRANSPARENT)
-    };
-    let val: libc::c_int = 1;
-    let ret = unsafe {
-        libc::setsockopt(
-            fd,
-            level,
-            name,
-            &val as *const libc::c_int as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        )
-    };
-    if ret != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-/// Non-Linux builds have no transparent-socket concept; the NodeWaypoint
-/// steering datapath is Linux-only and its callers refuse to start there.
-#[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
-pub fn set_ip_transparent(_fd: i32, _ipv6: bool) -> std::io::Result<()> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "transparent sockets (IP_TRANSPARENT / IPV6_TRANSPARENT) are Linux-only",
-    ))
-}
-
 // ── SO_COOKIE ───────────────────────────────────────────────────────────────
 
 /// Read the kernel socket cookie for a TCP stream.
@@ -1325,6 +1263,55 @@ pub fn set_ip_transparent(_fd: i32) -> std::io::Result<()> {
 #[allow(dead_code)]
 pub fn set_ipv6_transparent(_fd: i32) -> std::io::Result<()> {
     Ok(())
+}
+
+/// Make a NodeWaypoint-scoped datagram listener socket transparent so it may
+/// SOURCE replies from an address that is not configured on this host.
+///
+/// This is a thin family dispatcher over the two established helpers above —
+/// [`set_ip_transparent`] and [`set_ipv6_transparent`] — deliberately NOT a
+/// third `setsockopt` implementation. Rust has no function overloading, so
+/// adding a second `set_ip_transparent` arity would not compile; the family
+/// decision belongs here, once, rather than being repeated at each scoped
+/// listener.
+///
+/// The NodeWaypoint Service datapath needs exactly this flag: a workload
+/// addresses its Service's ClusterIP, the steering rules deliver that datagram
+/// locally **without rewriting it**, and the reply must therefore leave with
+/// the ClusterIP as its source or the workload's connected socket discards it.
+/// The kernel refuses a non-local source address unless the socket carries
+/// `FLOWI_FLAG_ANYSRC`, which is what `IP_TRANSPARENT` / `IPV6_TRANSPARENT`
+/// sets. Both option numbers set the SAME kernel flag
+/// (`inet_sk(sk)->transparent`); the family-appropriate one is used so a
+/// failure names an option that socket can actually carry.
+///
+/// Requires `CAP_NET_ADMIN` (or `CAP_NET_RAW` on newer kernels). Unlike the
+/// per-family helpers — whose non-Linux stubs are historic no-ops for the
+/// TPROXY capture paths — this one FAILS CLOSED off Linux, because its only
+/// callers are scoped listeners that must not start when they cannot source
+/// their replies correctly.
+#[cfg(target_os = "linux")]
+pub fn set_scoped_reply_transparent(
+    fd: std::os::unix::io::RawFd,
+    ipv6: bool,
+) -> std::io::Result<()> {
+    if ipv6 {
+        set_ipv6_transparent(fd)
+    } else {
+        set_ip_transparent(fd)
+    }
+}
+
+/// Non-Linux builds have no transparent-socket concept, and the NodeWaypoint
+/// steering datapath is Linux-only, so a scoped listener refuses to start here
+/// rather than serving a one-way datapath.
+#[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
+pub fn set_scoped_reply_transparent(_fd: i32, _ipv6: bool) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "transparent sockets (IP_TRANSPARENT / IPV6_TRANSPARENT) are Linux-only",
+    ))
 }
 
 // ── IP_RECVORIGDSTADDR / IPV6_RECVORIGDSTADDR ──────────────────────────

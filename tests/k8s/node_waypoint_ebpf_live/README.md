@@ -174,9 +174,39 @@ trust.
   namespace-scoped `deny-src-b` policy names gets no application data back AND
   the backend logs nothing from it.
 
-Not exercised live: DTLS frontend client-certificate (mTLS) verification, IPv6
-DTLS, and DTLS across a PeerAuthentication live-reload swap. Those stay at
-unit/integration level.
+Those three probe a trusted **node** address. That is a real boundary, but it is
+not how a workload reaches a Service, so it is kept as a distinct check and is
+never substitute evidence for the path below.
+
+## NodeWaypoint DTLS Service path (issue #3286 root review)
+
+`run_node_waypoint_dtls_service_path_checks` drives the SAME production listener
+through the address a workload actually uses: the `dtls-echo` Service DNS name
+`dtls-echo.<workload ns>.svc.cluster.local`, resolved inside the client pod, so
+the ordinary discovery path is part of what is proven. Without the Service-path
+steering this cannot work at all — kube-proxy DNATs the ClusterIP to the backing
+pod and the pod-veth guard drops the unmarked datagram — and a steered DTLS
+session additionally requires the `DtlsServer` to source EVERY encrypted record
+from the pinned ClusterIP, because a `connect()`ed DTLS client discards a record
+arriving from any other address.
+
+- `node_waypoint.dtls.service_path_allow_attributed_source` — `dtls-src-a`
+  completes a real `openssl s_client -dtls1_2` handshake against the Service DNS
+  name, its decrypted datagram reaches the backend (which logs `recv:`), and the
+  echo returns under the attributed source.
+- `node_waypoint.dtls.service_path_deny_scoped_policy` — `dtls-src-b`, named by
+  the namespace-scoped `deny-src-b` policy, reaches the same steered listener and
+  gets no application data, with the backend proving it saw nothing.
+- `node_waypoint.dtls.service_path_deny_unattributed_source` — `dtls-unmanaged`
+  (outside the mesh namespace, no registry binding for its veth, so no steering
+  rule names its interface) gets no application data and the backend logs
+  nothing: its datagram takes the pre-existing path and dies at the pod-veth
+  guard.
+
+Not exercised live, and therefore not claimed: DTLS frontend
+client-certificate (mTLS) verification, IPv6 DTLS (and IPv6 Service steering),
+kube-proxy `ipvs` and `nftables` modes, headless services, and DTLS across a
+PeerAuthentication live-reload swap. Those stay at unit/integration level.
 
 Each run writes `target/node-waypoint-ebpf-live/live-assertions.json` using the
 shared live-assertion schema from `tests/k8s/lib/live_assertions.sh`. The current

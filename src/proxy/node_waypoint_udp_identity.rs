@@ -254,6 +254,20 @@ struct SourceGeneration {
     by_ifindex: HashMap<u32, Arc<NodeWaypointUdpSourceBinding>>,
 }
 
+/// The result of one [`NodeWaypointUdpSourceIndex::publish`] call: the
+/// generation number and the interfaces that actually survived publication.
+///
+/// `ifaces` is the AUTHORITATIVE "which interfaces are attributable this
+/// generation" answer — sorted and deduplicated, and empty whenever the
+/// generation published nothing (including the over-bound collapse). A
+/// contested interface appears in NEITHER claimant's entry, a malformed or
+/// UID-mismatched binding contributes nothing, and duplicates collapse.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PublishedSourceGeneration {
+    pub generation: u64,
+    pub ifaces: Vec<String>,
+}
+
 /// Lock-free ingress-interface-keyed source-evidence index consulted on every
 /// captured datagram.
 #[derive(Debug)]
@@ -282,7 +296,15 @@ impl NodeWaypointUdpSourceIndex {
         Self::default()
     }
 
-    /// Publish a complete new generation. Returns the generation number.
+    /// Publish a complete new generation. Returns the generation number **and
+    /// the exact interface set that survived publication**.
+    ///
+    /// Returning the surviving set is not a convenience: publication is where
+    /// the fail-closed rules below actually take effect, so the caller's
+    /// pre-publication wish list is NOT the set of interfaces whose datagrams
+    /// can be attributed. Anything that consumes "which interfaces are
+    /// attributable" — notably the Service-path steering — must consume this
+    /// value, or it would act on interfaces this generation refused.
     ///
     /// Publication is the FINAL authorization boundary for UDP/DTLS source
     /// attribution — everything downstream reads only this index — so it applies
@@ -309,7 +331,7 @@ impl NodeWaypointUdpSourceIndex {
     ///
     /// Diagnostics are counts only — no interface name, pod UID, or principal is
     /// logged, so nothing registry-supplied is echoed.
-    pub fn publish(&self, bindings: &[HostUdpPodBinding]) -> u64 {
+    pub fn publish(&self, bindings: &[HostUdpPodBinding]) -> PublishedSourceGeneration {
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
         let mut by_ifindex: HashMap<u32, Arc<NodeWaypointUdpSourceBinding>> = HashMap::new();
         // Interfaces withdrawn because two bindings claimed them. Kept so a
@@ -384,12 +406,23 @@ impl NodeWaypointUdpSourceIndex {
             );
         }
 
+        // Derived from the SAME map that is about to become the published
+        // generation, after every refusal above, so the two cannot disagree.
+        // Sorted and deduplicated so an unchanged registry yields a byte-equal
+        // steering plan and the reconcile runs no command.
+        let mut ifaces: Vec<String> = by_ifindex
+            .values()
+            .map(|binding| binding.iface.clone())
+            .collect();
+        ifaces.sort_unstable();
+        ifaces.dedup();
+
         self.current.store(Arc::new(SourceGeneration {
             generation,
             published: true,
             by_ifindex,
         }));
-        generation
+        PublishedSourceGeneration { generation, ifaces }
     }
 
     /// Retract every binding and mark the index unpublished, so a socket still
@@ -942,20 +975,23 @@ impl<R: NodeWaypointUdpInterfaceResolver> NodeWaypointUdpSourceIndexManager<R> {
                  interface; their UDP/DTLS sessions fail closed under scoped policy"
             );
         }
-        self.index.publish(&desired.bindings);
+        let published = self.index.publish(&desired.bindings);
         // Steering follows publication, never precedes it: a datagram may only
         // be diverted to the waypoint once the interface it arrives on can be
-        // attributed to a source workload. The interface set is exactly the
-        // attributable one, so a pod that lost attribution this pass also loses
-        // steering and its Service traffic fails closed at the pod-veth guard
-        // instead of reaching a listener that could only deny it.
+        // attributed to a source workload.
+        //
+        // The interface set is taken from `published`, NOT from
+        // `desired.bindings`. Publication is the final authorization boundary
+        // and applies its own refusals — a contested ingress interface refuses
+        // BOTH claimants, a malformed or UID-mismatched binding is dropped, and
+        // an input above the interface bound collapses the whole generation to
+        // empty. Steering a pre-publication interface would therefore divert a
+        // pod's Service datagrams to a listener that could only deny them:
+        // strictly worse than the unsteered path, which fails closed at the
+        // pod-veth guard with no listener state involved. A pod that lost
+        // attribution this pass loses steering in the same pass.
         if let Some(steering) = self.steering.as_ref() {
-            let ifaces: Vec<String> = desired
-                .bindings
-                .iter()
-                .map(|binding| binding.iface.clone())
-                .collect();
-            steering.reconcile(&ifaces);
+            steering.reconcile(&published.ifaces);
         }
         desired.bindings
     }
