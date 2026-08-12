@@ -129,7 +129,7 @@ Hosted collection (stage 1) lives in
 trusted workflow lands on `main`. Collection is pinned to GitHub-hosted
 `ubuntu-24.04` (no arbitrary/self-hosted runner
 input). It records provenance, Criterion trees, HBONE/DNS JSON (≥3 repetitions),
-`runner_health.json` + per-E2E steal probes, `summary.json`, and draft markdown
+`runner_health.json` + per-E2E workload-interval steal probes, `summary.json`, and draft markdown
 under the `mesh-performance-baselines-<sha>` artifact. Selected-suite acceptance
 fails the job when required gates are false (undersampling, missing DNS rows,
 nonzero errors, or CPU steal > 5.0%); artifacts still upload. Stage 2 copies

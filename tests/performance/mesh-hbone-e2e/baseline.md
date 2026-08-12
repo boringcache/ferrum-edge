@@ -79,8 +79,9 @@ cd tests/performance/mesh-hbone-e2e
 3. Require `summary.json` → `acceptance_gate.hbone_complete` and `hbone_errors_ok`.
 4. Require `repetition_evidence` showing 3–5 clean gateway and direct samples per
    scenario (matching the bounded workflow input).
-5. Require `runner_health_ok` (CPU steal ≤ 5.0% in `runner_health.json` and
-   per-run probes); reject the collection for publication when exceeded.
+5. Require `runner_health_ok` (CPU steal ≤ 5.0% in the pre-collection sample
+   and each per-run workload-interval `/proc/stat` steal delta); reject the
+   collection for publication when exceeded.
 6. Reject any repetition with non-zero `total_errors`; do not average failures away.
 7. Publish mean RPS / latency across remaining clean runs and the overhead percent
    from the formula above.

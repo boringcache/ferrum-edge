@@ -5,7 +5,8 @@ Reads Criterion estimates.json trees and E2E JSON blobs produced by the
 mesh-performance-baselines workflow. Never fabricates measurements: missing
 inputs become explicit null/incomplete entries. Publication gates fail closed
 on undersampling, missing DNS rows, malformed metrics, nonzero errors,
-unexpected target identities, unsupported suite filters, or excessive CPU steal.
+unexpected target identities, unsupported suite filters, missing or invalid
+workload-interval CPU-steal evidence, or excessive CPU steal.
 Repetition evidence counts distinct expected run_N.txt executions with exactly
 one valid gateway/direct identity each — duplicate or partial blobs in a single
 file do not satisfy the repetition gate.
@@ -1002,6 +1003,7 @@ def load_runner_health(
             or repetition < 1
             or not isinstance(phase, str)
             or not isinstance(scenario, str)
+            or probe.get("coverage") != "workload_interval"
         ):
             malformed_probe = True
             continue
@@ -1013,7 +1015,8 @@ def load_runner_health(
         steal_values.append(steal)
     max_steal = max(steal_values) if steal_values else None
     # Missing health evidence fails closed: publication requires machine-readable
-    # steal samples from the pre-collection probe and every selected E2E run.
+    # steal samples from the pre-collection probe and every selected E2E
+    # workload-interval /proc/stat delta.
     expected_probe_ids = expected_health_probe_ids(suites, required_reps)
     evidence_ok = (
         pre is not None
@@ -1481,6 +1484,7 @@ def _self_test_health_probes(required_reps: int) -> str:
             "scenario": scenario["key"],
             "repetition": repetition,
             "avg_steal_percent": 3.0,
+            "coverage": "workload_interval",
         }
         for scenario in HBONE_SCENARIOS
         for repetition in range(1, required_reps + 1)
@@ -1490,6 +1494,7 @@ def _self_test_health_probes(required_reps: int) -> str:
             "phase": "dns",
             "repetition": repetition,
             "avg_steal_percent": 2.0,
+            "coverage": "workload_interval",
         }
         for repetition in range(1, required_reps + 1)
     )
@@ -1917,6 +1922,135 @@ def self_test() -> int:
         )
         assert summary_bad_probe["acceptance_gate"]["runner_health_ok"] is False
         assert summary_bad_probe["ready_to_publish_baselines"] is False
+        probes_path.write_text(_self_test_health_probes(3), encoding="utf-8")
+
+        # successful exact-interval evidence with a real 0.0% steal is valid.
+        (valid / "runner_health.json").write_text(
+            json.dumps({"avg_steal_percent": 0.0, "runner_class": "ubuntu-24.04"}) + "\n",
+            encoding="utf-8",
+        )
+        zero_probes = [
+            {
+                "phase": "hbone",
+                "scenario": scenario["key"],
+                "repetition": repetition,
+                "avg_steal_percent": 0.0,
+                "coverage": "workload_interval",
+            }
+            for scenario in HBONE_SCENARIOS
+            for repetition in range(1, 4)
+        ]
+        zero_probes.extend(
+            {
+                "phase": "dns",
+                "repetition": repetition,
+                "avg_steal_percent": 0.0,
+                "coverage": "workload_interval",
+            }
+            for repetition in range(1, 4)
+        )
+        probes_path.write_text(
+            "".join(json.dumps(probe) + "\n" for probe in zero_probes),
+            encoding="utf-8",
+        )
+        summary_zero = build_summary(
+            valid,
+            load_json(valid / "provenance.json") or {},
+            required_repetitions(3),
+            suites="all",
+        )
+        assert summary_zero["acceptance_gate"]["runner_health_ok"] is True
+        assert summary_zero["ready_to_publish_baselines"] is True
+
+        # parse failure cannot become healthy evidence
+        (valid / "runner_health.json").write_text(
+            json.dumps({"avg_steal_percent": None, "runner_class": "ubuntu-24.04"}) + "\n",
+            encoding="utf-8",
+        )
+        probes_path.write_text(_self_test_health_probes(3), encoding="utf-8")
+        summary_null_pre = build_summary(
+            valid,
+            load_json(valid / "provenance.json") or {},
+            required_repetitions(3),
+            suites="all",
+        )
+        assert summary_null_pre["acceptance_gate"]["runner_health_ok"] is False
+        assert summary_null_pre["ready_to_publish_baselines"] is False
+
+        (valid / "runner_health.json").write_text(
+            json.dumps({"avg_steal_percent": 2.5, "runner_class": "ubuntu-24.04"}) + "\n",
+            encoding="utf-8",
+        )
+        probes_path.write_text("", encoding="utf-8")
+        summary_missing = build_summary(
+            valid,
+            load_json(valid / "provenance.json") or {},
+            required_repetitions(3),
+            suites="all",
+        )
+        assert summary_missing["acceptance_gate"]["runner_health_ok"] is False
+        assert summary_missing["ready_to_publish_baselines"] is False
+
+        # end-without-start evidence is not a healthy interval measurement.
+        probes_path.write_text(
+            json.dumps(
+                {
+                    "phase": "dns",
+                    "repetition": 1,
+                    "avg_steal_percent": None,
+                    "coverage": None,
+                    "error": "missing_begin",
+                }
+            )
+            + "\n"
+            + _self_test_health_probes(3),
+            encoding="utf-8",
+        )
+        summary_end_without_start = build_summary(
+            valid,
+            load_json(valid / "provenance.json") or {},
+            required_repetitions(3),
+            suites="all",
+        )
+        assert summary_end_without_start["acceptance_gate"]["runner_health_ok"] is False
+        assert summary_end_without_start["ready_to_publish_baselines"] is False
+
+        # A pre-run sample without workload_interval coverage is not exact-interval evidence.
+        uncovered = json.loads(_self_test_health_probes(3).splitlines()[0])
+        del uncovered["coverage"]
+        probes_path.write_text(
+            json.dumps(uncovered)
+            + "\n"
+            + _self_test_health_probes(3),
+            encoding="utf-8",
+        )
+        summary_uncovered = build_summary(
+            valid,
+            load_json(valid / "provenance.json") or {},
+            required_repetitions(3),
+            suites="all",
+        )
+        assert summary_uncovered["acceptance_gate"]["runner_health_ok"] is False
+        assert summary_uncovered["ready_to_publish_baselines"] is False
+        probes_path.write_text(_self_test_health_probes(3), encoding="utf-8")
+
+        # excessive steal on a workload-interval probe fails publication
+        probes_path.write_text(
+            _self_test_health_probes(3).replace(
+                '"avg_steal_percent": 3.0',
+                '"avg_steal_percent": 9.0',
+                1,
+            ),
+            encoding="utf-8",
+        )
+        summary_interval_steal = build_summary(
+            valid,
+            load_json(valid / "provenance.json") or {},
+            required_repetitions(3),
+            suites="all",
+        )
+        assert summary_interval_steal["acceptance_gate"]["runner_health_ok"] is False
+        assert summary_interval_steal["ready_to_publish_baselines"] is False
         probes_path.write_text(_self_test_health_probes(3), encoding="utf-8")
 
         # excessive steal fails publication even with complete metrics

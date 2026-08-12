@@ -113,8 +113,9 @@ are reported beside the overhead column and are not folded into it.
 2. Run Actions → **Mesh Performance Baselines** → `suites=mesh` or `all`.
 3. Download artifact `mesh-performance-baselines-<sha>`.
 4. Confirm `summary.json` → `acceptance_gate.mesh_complete == true` and
-   `runner_health_ok == true` (CPU steal ≤ 5.0% across pre-collection and any
-   recorded E2E probes; see `runner_health.json`).
+   `runner_health_ok == true` (CPU steal ≤ 5.0% across the pre-collection
+   vmstat sample and each selected E2E workload-interval `/proc/stat` steal
+   delta; see `runner_health.json` and `logs/runner_health_probes.jsonl`).
 5. Copy Criterion means (and σ / CI from `estimates.json`) into the tables above.
 6. Link the artifact (or commit a companion `summary.json` excerpt) from the
    reference-environment table.

@@ -80,8 +80,9 @@ Only the upstream-forward class is meaningful here (mesh-internal / mesh-wildcar
 3. Require `summary.json` → `dns_complete` and `dns_errors_ok` with every
    documented gateway row (mesh-internal, mesh-wildcard, upstream-forward ×
    UDP/TCP) and both direct upstream-forward UDP/TCP rows at 3–5 repetitions.
-4. Require `runner_health_ok` (CPU steal ≤ 5.0% across pre-collection and
-   per-run probes in `runner_health.json` / `runner_health_probes.jsonl`).
+4. Require `runner_health_ok` (CPU steal ≤ 5.0% across the pre-collection
+   sample and each per-run workload-interval `/proc/stat` steal delta in
+   `runner_health.json` / `runner_health_probes.jsonl`).
 5. Discard any repetition with unexplained non-zero `total_errors`.
 6. Publish mean qps/latency into the tables and record upstream-forward overhead
    with the formula above.

@@ -174,7 +174,8 @@ def main() -> int:
             "e2e_policy": (
                 "At least three clean repetitions (configured count, never below "
                 "three); discard/fail publication if any retained row has non-zero "
-                "unexplained errors or if CPU steal exceeds 5.0%"
+                "unexplained errors or if CPU steal exceeds 5.0% on the "
+                "pre-collection sample or any E2E workload-interval /proc/stat delta"
             ),
         },
         "suite_commands": suite_commands,

@@ -12,7 +12,8 @@
 # label input). Publication fails closed when selected-suite gates are false,
 # including undersampled E2E rows, missing DNS rows, malformed/duplicate
 # relevant blobs, unexpected DNS target identities, unsupported suite filters,
-# nonzero errors, or CPU steal above 5.0%. Artifacts still upload via if: always().
+# nonzero errors, missing/invalid workload-interval steal evidence, or CPU
+# steal above 5.0%. Artifacts still upload via if: always().
 #
 # Every computation that is not a literal command lives in an approved
 # automation root under .github/scripts/. Keep it that way: inline interpreter
@@ -88,6 +89,7 @@ jobs:
       - name: Verify summarizer contract (static)
         run: |
           python3 .github/scripts/summarize_mesh_baseline_results.py --self-test
+          python3 .github/scripts/mesh_baseline_runner_health.py --self-test
           python3 -m py_compile \
             .github/scripts/collect_mesh_baseline_provenance.py \
             .github/scripts/mesh_baseline_ledger.py \
@@ -207,7 +209,10 @@ jobs:
                 --results-root mesh-baseline-results \
                 --phase hbone \
                 --scenario "${KEY}" \
-                --repetition "${run}"
+                --repetition "${run}" \
+                --interval-begin
+              harness_status=1
+              set +e
               (
                 cd tests/performance/mesh-hbone-e2e
                 ./run.sh --skip-build --json \
@@ -215,6 +220,17 @@ jobs:
                   --concurrency "${CONCURRENCY}" \
                   --payload-size "${PAYLOAD}"
               ) 2>&1 | tee "mesh-baseline-results/hbone/${KEY}/run_${run}.txt"
+              harness_status=${PIPESTATUS[0]}
+              python3 .github/scripts/mesh_baseline_runner_health.py \
+                --results-root mesh-baseline-results \
+                --phase hbone \
+                --scenario "${KEY}" \
+                --repetition "${run}" \
+                --interval-end
+              set -euo pipefail
+              if (( harness_status != 0 )); then
+                exit "${harness_status}"
+              fi
             done
           done
 
@@ -240,11 +256,24 @@ jobs:
             python3 .github/scripts/mesh_baseline_runner_health.py \
               --results-root mesh-baseline-results \
               --phase dns \
-              --repetition "${run}"
+              --repetition "${run}" \
+              --interval-begin
+            harness_status=1
+            set +e
             (
               cd tests/performance/mesh-dns-e2e
               ./run.sh --skip-build --json --duration 60 --concurrency 100 --protocol both
             ) 2>&1 | tee "mesh-baseline-results/dns/run_${run}.txt"
+            harness_status=${PIPESTATUS[0]}
+            python3 .github/scripts/mesh_baseline_runner_health.py \
+              --results-root mesh-baseline-results \
+              --phase dns \
+              --repetition "${run}" \
+              --interval-end
+            set -euo pipefail
+            if (( harness_status != 0 )); then
+              exit "${harness_status}"
+            fi
           done
 
       - name: Summarize results + draft baseline markdown

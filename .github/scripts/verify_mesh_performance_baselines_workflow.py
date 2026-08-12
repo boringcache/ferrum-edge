@@ -73,6 +73,18 @@ def check_workflow(text: str, failures: list[str]) -> None:
         "runner health capture must be wired to the approved automation script",
         failures,
     )
+    require(
+        "mesh_baseline_runner_health.py --self-test" in text,
+        "workflow must run the runner health hosted self-test",
+        failures,
+    )
+    require("--interval-begin" in text, "E2E health probes must snapshot interval begin", failures)
+    require("--interval-end" in text, "E2E health probes must snapshot interval end", failures)
+    require(
+        "harness_status" in text and "PIPESTATUS" in text,
+        "E2E interval-end must preserve the original harness exit status",
+        failures,
+    )
     # The trusted Cross build policy refuses a new workflow that carries a
     # dynamic executable surface. Inline interpreter bodies are exactly that:
     # a heredoc program or an awk/bc one-liner is a command the static scan
@@ -140,6 +152,42 @@ def check_workflow(text: str, failures: list[str]) -> None:
         pass
     require("./.github/actions/setup-rust-ci" in text, "must use setup-rust-ci", failures)
 
+    hbone_step = _named_step(text, "Collect HBONE E2E baselines (3+ repetitions)")
+    dns_step = _named_step(text, "Collect DNS E2E baselines (3+ repetitions)")
+    require(bool(hbone_step), "HBONE E2E collection step required", failures)
+    require(bool(dns_step), "DNS E2E collection step required", failures)
+    for body, label in ((hbone_step, "HBONE"), (dns_step, "DNS")):
+        begin = body.find("--interval-begin")
+        run = body.find("./run.sh")
+        end = body.find("--interval-end")
+        require(
+            begin != -1 and run != -1 and end != -1 and begin < run < end,
+            f"{label} health probes must snapshot /proc/stat around the workload interval",
+            failures,
+        )
+        require(
+            "harness_status" in body and "PIPESTATUS" in body,
+            f"{label} must preserve harness exit status around interval-end",
+            failures,
+        )
+        require(
+            "set +e" in body,
+            f"{label} must attempt interval-end even when the harness exits nonzero",
+            failures,
+        )
+
+
+def _named_step(text: str, name: str) -> str:
+    """Return the workflow step body starting at `- name: {name}`."""
+    marker = f"- name: {name}"
+    start = text.find(marker)
+    if start == -1:
+        return ""
+    next_step = text.find("\n      - name:", start + len(marker))
+    if next_step == -1:
+        return text[start:]
+    return text[start:next_step]
+
 
 def _workflow_inputs_block(text: str) -> str:
     """Return concatenated workflow_dispatch + workflow_call inputs sections."""
@@ -198,8 +246,41 @@ def check_scripts(failures: list[str]) -> None:
         failures,
     )
     require(
-        '["vmstat", "1", "6"]' in health and '["vmstat", "1", "3"]' in health,
-        "runner health sampling must use literal command vectors",
+        '["vmstat", "1", "6"]' in health,
+        "pre-collection runner health sampling must use a literal vmstat command vector",
+        failures,
+    )
+    require(
+        '["vmstat", "1", "3"]' not in health,
+        "E2E probes must not use a short pre-run vmstat sample",
+        failures,
+    )
+    require("/proc/stat" in health, "E2E interval probes must snapshot /proc/stat", failures)
+    require(
+        "interval-begin" in health and "interval-end" in health,
+        "E2E interval probes must expose begin/end snapshots",
+        failures,
+    )
+    require("--self-test" in health, "runner health script must provide hosted self-tests", failures)
+    require(
+        "parse failure cannot become healthy evidence" in health,
+        "runner health self-test must prove parse failure cannot become healthy evidence",
+        failures,
+    )
+    require(
+        "successful exact-interval evidence" in health,
+        "runner health self-test must cover successful exact-interval evidence",
+        failures,
+    )
+    require(
+        "end-without-start" in health,
+        "runner health self-test must cover end-without-start evidence",
+        failures,
+    )
+    require("excessive steal" in health, "runner health self-test must cover excessive steal", failures)
+    require(
+        "return 0.0" not in health,
+        "runner health parse failure must not return 0.0 as a healthy steal sample",
         failures,
     )
 
@@ -222,6 +303,27 @@ def check_scripts(failures: list[str]) -> None:
     require("shape_failures" in summary, "summarizer must track per-run shape failures", failures)
     require("provenance_complete" in summary, "summarizer must gate incomplete provenance", failures)
     require("expected_health_probe_ids" in summary, "summarizer must gate every E2E health probe", failures)
+    require("workload_interval" in summary, "summarizer must require workload-interval probe coverage", failures)
+    require(
+        "successful exact-interval evidence" in summary,
+        "summarizer self-test must cover successful exact-interval evidence",
+        failures,
+    )
+    require(
+        "parse failure cannot become healthy evidence" in summary,
+        "summarizer self-test must prove parse failure cannot become healthy evidence",
+        failures,
+    )
+    require(
+        "end-without-start" in summary,
+        "summarizer self-test must cover end-without-start evidence",
+        failures,
+    )
+    require(
+        "excessive steal" in summary,
+        "summarizer self-test must cover excessive steal",
+        failures,
+    )
     require("payload_size" in summary, "summarizer must validate HBONE scenario parameters", failures)
     require("DNS_DURATION_SECS" in summary, "summarizer must validate DNS scenario parameters", failures)
 
@@ -230,6 +332,11 @@ def check_docs_and_baselines(failures: list[str]) -> None:
     require("mesh-performance-baselines.yml" in protocol, "protocol_perf_regression.md missing workflow pointer", failures)
     require("#3332" in protocol, "protocol_perf_regression.md must keep #3332 pointer", failures)
     require("ubuntu-24.04" in protocol, "protocol_perf_regression.md must document ubuntu-24.04 pin", failures)
+    require(
+        "workload-interval" in protocol,
+        "protocol_perf_regression.md must describe per-E2E workload-interval steal probes",
+        failures,
+    )
 
     ci_cd = CI_CD_DOC.read_text(encoding="utf-8")
     require("mesh-performance-baselines.yml" in ci_cd, "ci_cd.md inventory missing workflow row", failures)
@@ -244,6 +351,11 @@ def check_docs_and_baselines(failures: list[str]) -> None:
         require("ubuntu-24.04" in text, f"{path} must pin runner class ubuntu-24.04", failures)
         require("_TBD_" in text, f"{path} must keep stage-1 TBD cells (no fabricated numbers)", failures)
         require("5.0%" in text or "5%" in text, f"{path} must document CPU steal publication threshold", failures)
+        require(
+            "workload-interval" in text.lower() or "workload interval" in text.lower(),
+            f"{path} must document workload-interval steal coverage",
+            failures,
+        )
 
 
 def self_test() -> int:
@@ -282,6 +394,7 @@ jobs:
       - run: collect_mesh_baseline_provenance.py
       - run: summarize_mesh_baseline_results.py
       - run: runner_health.json runner_health_probes.jsonl
+      - run: python3 .github/scripts/mesh_baseline_runner_health.py --self-test
       - run: python3 .github/scripts/mesh_baseline_runner_health.py --phase pre_collection
       - run: |
           case "${SUITES}" in
@@ -295,6 +408,20 @@ jobs:
             echo "::error::BENCH_ITERATIONS must be an integer from 3 to 5"
             exit 1
           fi
+      - name: Collect HBONE E2E baselines (3+ repetitions)
+        run: |
+          python3 .github/scripts/mesh_baseline_runner_health.py --interval-begin
+          set +e
+          ./run.sh --duration 60 --concurrency 100
+          harness_status=${PIPESTATUS[0]}
+          python3 .github/scripts/mesh_baseline_runner_health.py --interval-end
+      - name: Collect DNS E2E baselines (3+ repetitions)
+        run: |
+          python3 .github/scripts/mesh_baseline_runner_health.py --interval-begin
+          set +e
+          ./run.sh --duration 60 --concurrency 100
+          harness_status=${PIPESTATUS[0]}
+          python3 .github/scripts/mesh_baseline_runner_health.py --interval-end
       - name: Enforce selected-suite acceptance gates
         if: always()
         run: --check-acceptance
