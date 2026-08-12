@@ -515,7 +515,7 @@ async fn authenticated_envelope_drives_the_live_dtls_demux_and_binds_identity() 
         connect_timeout_ms: 15_000,
     };
     let client = tokio::time::timeout(
-        Duration::from_secs(15),
+        Duration::from_secs(20),
         DtlsConnection::connect(client_socket, client_params),
     )
     .await

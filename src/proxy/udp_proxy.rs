@@ -2894,7 +2894,8 @@ async fn process_new_session_datagram(
                 // Same canonical principal the session identity and rate-limit
                 // keys use, so a dropped datagram is attributable to the client
                 // those keys name (GHSA-vjwj-657f-5w9g).
-                let peer_ip = crate::util::client_identity::canonical_ip(client_addr.ip());
+                let peer_ip =
+                    crate::util::client_identity::canonical_ip(identity.resolved().ip());
                 warn!(
                     proxy_id = %view.proxy.id,
                     client = %peer_ip,
