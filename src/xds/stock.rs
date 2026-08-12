@@ -1070,6 +1070,23 @@ fn cluster_peer_identities(
                     format!("{field}.validation_context.custom_validator_config"),
                 ));
             }
+            // Envoy's DEPRECATED `match_subject_alt_names` (field 9, a plain
+            // repeated StringMatcher with no SAN type). Peer identities are read
+            // only from `match_typed_subject_alt_names`, so accepting the cluster
+            // here would drop the control plane's peer constraint and then blame
+            // a field the operator never set ("no pinned peer identity" against
+            // the typed field). Refuse with the field that is actually in the
+            // way — the outcome is the same fail-closed narrowing, with an
+            // actionable diagnostic.
+            if !validation.match_subject_alt_names.is_empty() {
+                return Err((
+                    refusal::UNSUPPORTED_PEER_IDENTITY_MATCHER,
+                    format!(
+                        "{field}.validation_context.match_subject_alt_names (deprecated; use \
+                         match_typed_subject_alt_names with san_type URI)"
+                    ),
+                ));
+            }
             for matcher in &validation.match_typed_subject_alt_names {
                 // SanType URI = 3. Ferrum pins SPIFFE URIs only; a DNS or IP
                 // SAN constraint is a different assertion and is skipped

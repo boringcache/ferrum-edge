@@ -1268,6 +1268,50 @@ fn stock_regex_peer_identity_matcher_is_refused() {
     );
 }
 
+/// Envoy's DEPRECATED `match_subject_alt_names` carries no SAN type, so Ferrum
+/// cannot read a peer SPIFFE from it. Accepting the cluster anyway would silently
+/// drop the control plane's peer constraint and then report
+/// `no_pinned_peer_identity` against the TYPED field the operator never set, so
+/// the deprecated field is refused by name instead.
+#[test]
+fn stock_deprecated_subject_alt_name_matcher_is_refused_by_name() {
+    let deprecated = sp::UpstreamTlsContext {
+        common_tls_context: Some(sp::CommonTlsContext {
+            validation_context: Some(sp::CertificateValidationContext {
+                // One presence-only StringMatcher: `exact: "spiffe://…"`.
+                match_subject_alt_names: vec![vec![0x0a, 0x01, 0x61]],
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let mut cluster = eds_cluster(REVIEWS_CLUSTER, &[]);
+    cluster.transport_socket = Some(sp::TransportSocket {
+        name: "envoy.transport_sockets.tls".to_string(),
+        typed_config: Some(sp::Any {
+            type_url: UPSTREAM_TLS_TYPE_URL.to_string(),
+            value: deprecated.encode_to_vec(),
+        }),
+    });
+    let accumulator = cds_with(cluster);
+    assert_eq!(
+        refusal_reasons(&accumulator),
+        vec![refusal::UNSUPPORTED_PEER_IDENTITY_MATCHER]
+    );
+    assert!(
+        accumulator.refusals()[0]
+            .detail
+            .contains("match_subject_alt_names"),
+        "the diagnostic must name the deprecated field that is actually in the way, got: {}",
+        accumulator.refusals()[0].detail
+    );
+    assert!(
+        accumulator.clusters().is_empty(),
+        "a cluster whose peer constraint Ferrum cannot read must not become routable"
+    );
+}
+
 #[test]
 fn stock_filesystem_trusted_ca_and_inline_certificates_are_refused() {
     let filesystem = sp::UpstreamTlsContext {

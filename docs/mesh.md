@@ -84,7 +84,7 @@ Ferrum's mesh subsystem is in active build-out. The paths below ship in one bina
 | Native `MeshSubscribe` (Ferrum CP → Ferrum DP) | **Stable** | Default protocol. Full slice (authz, PeerAuth, JWT, ServiceEntry, trust bundles, ProxyConfig, workloads, telemetry, multi-cluster) is pushed directly. The most mature and recommended config path. Enrolled in the conformance GA contract as `mesh.config_transport.native_subscribe` (semantics: `tests/conformance/mesh_config_transport.rs`; live: `sidecar.config.native_subscribe_delivered` via the `mesh-e2e-sidecar` CP + native-subscribe leg). |
 | xDS ADS (Ferrum CP → Ferrum DP) | **Beta** | Functionally equivalent to native via Ferrum-specific ECDS carriers (`ferrum.config.extension.v3.*`), including `ProxyConfig` on `ProxyConfigsCarrier`. **NOT stock-Envoy / third-party-Istio interop** — a non-Ferrum CP emits only name-only CDS/EDS/LDS/RDS and no carriers, so it cannot drive a protected Ferrum mesh and may be NACKed. RTDS layers are authored by the operator's CP (Ferrum's xDS server does not originate Runtime resources). |
 | Localized file source (`FERRUM_MESH_CONFIG_PROTOCOL=file`) | **Beta** | No control plane: the DP builds its slice locally from `FERRUM_MESH_FILE_CONFIG_PATH` through the same materialization path as native/xDS, so enforcement parity is structural. Fail-closed initial load; SIGHUP reload (Unix) keeps the last good slice on error. Sharp edges: reload is signal-driven only (no file watching), and there is no CP heartbeat — `/mesh/config-drift` staleness reflects the last SIGHUP, not a sync failure. |
-| Stock Envoy / third-party Istio xDS interop (`FERRUM_MESH_CONFIG_PROTOCOL=stock_xds`) | **Beta** | Issue #3317. A **separate protocol** from `xds`: consumes standard v3 CDS/EDS/LDS/RDS from a stock Envoy / third-party Istio control plane and projects it onto `MeshService` / `Workload` for **discovery only**. Enforcement policy comes from the mandatory local `FERRUM_MESH_FILE_CONFIG_PATH` document, so a third-party CP can change reachability but never Ferrum's security posture. Everything Ferrum does not model is refused per-resource with a field-specific diagnostic and contributes no route, endpoint, or identity. See [Stock Envoy / third-party Istio xDS interoperability](#stock-envoy--third-party-istio-xds-interoperability). |
+| Stock Envoy / third-party Istio xDS interop (`FERRUM_MESH_CONFIG_PROTOCOL=stock_xds`) | **Beta** | Issue #3317. A **separate protocol** from `xds`: consumes standard v3 CDS/EDS/LDS/RDS from a stock Envoy / third-party Istio control plane and projects it onto `MeshService` / `Workload` for **discovery only**. Enforcement policy comes from the mandatory local `FERRUM_MESH_FILE_CONFIG_PATH` document, so a third-party CP can change reachability but never Ferrum's security posture. Everything Ferrum does not model is refused per-resource with a field-specific diagnostic and contributes no route, endpoint, or identity. Live data-path coverage (a scripted third-party ADS server driving a real sidecar through update / deletion / NACK / refusal) runs in the hosted `data-plane` functional shard. See [Stock Envoy / third-party Istio xDS interoperability](#stock-envoy--third-party-istio-xds-interoperability). |
 
 ### Topology maturity
 
@@ -507,7 +507,10 @@ delivery channel could enter is refused:
 - Any transport socket that is not `UpstreamTlsContext` or `RawBuffer`; inline
   `tls_certificates`; a `trusted_ca` `DataSource` naming a `filename` or
   `environment_variable`; `custom_validator_config`; `custom_handshaker`; a
-  non-`exact` (regex/prefix/suffix) peer-identity matcher.
+  non-`exact` (regex/prefix/suffix) peer-identity matcher; and Envoy's
+  deprecated `match_subject_alt_names` (it carries no SAN type, so a peer
+  constraint expressed there is refused **by that field name** rather than
+  silently dropped and reported against the typed field).
 - Listener `api_listener`, `filter_chain_matcher`, `additional_addresses`; any
   listener filter outside `original_dst` / `tls_inspector` / `http_inspector` /
   `workload_metadata` (notably `proxy_protocol` and `original_src`, which
@@ -555,12 +558,35 @@ decode surface is a field-exact **projection** of the upstream Envoy v3 messages
 every field number is taken from Envoy `v1.31.0` and a field that can change
 routing, trust, or identity is either consumed or refused.
 
+A `TcpProxy` filter chain does classify its port as `AppProtocol::Tcp`, but
+raw-TCP mesh egress matches captured **original destinations** against the
+service VIP (a raw stream carries no `Host`), so a stock-discovered TCP port is
+only routable where the platform actually redirects the connection — the same
+condition as native/file config. The live matrix below therefore drives HTTP;
+raw-TCP egress keeps its coverage in the capture-based mesh suites.
+
+**Live data-path coverage.** `tests/functional/functional_mesh_stock_xds_test.rs`
+drives the profile end to end against a **scripted third-party ADS server** (not
+Ferrum's own `XdsAdsServer`): the production `stock_xds` client feeds a real
+sidecar whose captured plaintext request traverses the materialized egress route
+and SVID-mTLS into a second real sidecar and its backend. The same live fixture
+proves, on that data path, that an endpoint withdrawal and a state-of-the-world
+cluster withdrawal each remove reachability (and a replacement restores it),
+that a structurally invalid response is NACKed with a field-specific
+`error_detail` while the last-good view keeps serving, that a listener carrying
+`envoy.filters.http.rbac` and a route using `weighted_clusters` are ACKed but
+refused without widening anything, that an unpinned / subset / foreign-namespace
+cluster with a genuinely reachable endpoint still cannot be dialed, and that
+re-pinning the peer identity to an impostor SPIFFE fails the dial closed. It runs
+in the hosted `data-plane` functional shard.
+
 **Where the code lives.** `src/xds/stock.rs` (decode, capability classification,
 projection onto the typed mesh model) and
 `src/modes/mesh/config_consumer/stock_xds_client.rs` (the ADS stream machine and
 the policy/discovery merge). Tests:
 `tests/unit/gateway_core/stock_xds_tests.rs`,
-`tests/integration/mesh_stock_xds_tests.rs`, and
+`tests/integration/mesh_stock_xds_tests.rs`,
+`tests/functional/functional_mesh_stock_xds_test.rs`, and
 `tests/conformance/stock_xds_interop.rs`.
 
 #### Ferrum mesh-slice ECDS carriers (full parity over xDS)

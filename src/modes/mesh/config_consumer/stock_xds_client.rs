@@ -883,7 +883,8 @@ async fn handle_stock_response(
             "Closing stock xDS stream after an unsolicited unsupported resource type"
         );
         return Err(anyhow::anyhow!(
-            "stock xDS control plane sent unsolicited unsupported type_url '{safe_url}'; +             closing the stream without subscribing to that type"
+            "stock xDS control plane sent unsolicited unsupported type_url '{safe_url}'; closing \
+             the stream without subscribing to that type"
         ));
     }
 

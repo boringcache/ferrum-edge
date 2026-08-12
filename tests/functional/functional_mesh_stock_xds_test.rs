@@ -1,0 +1,1370 @@
+//! Live data-path coverage for the stock Envoy / third-party Istio xDS
+//! interoperability profile (`FERRUM_MESH_CONFIG_PROTOCOL=stock_xds`, issue
+//! #3317).
+//!
+//! Everything here runs against a **scripted third-party ADS server** — a bare
+//! `envoy.service.discovery.v3.AggregatedDiscoveryService` implementation that
+//! puts standard v3 `Cluster` / `ClusterLoadAssignment` / `Listener` /
+//! `RouteConfiguration` resources on the wire. It is deliberately NOT Ferrum's
+//! own `XdsAdsServer`: nothing in this file can be satisfied by the
+//! Ferrum-private carrier protocol.
+//!
+//! The datapath is the real one:
+//!
+//! ```text
+//!   scripted stock ADS server ──(production stock_xds client)──▶ gateway A
+//!   plaintext app request ──▶ A's outbound capture listener
+//!                        ──▶ materialized egress route (discovered service)
+//!                        ──▶ SVID-mTLS to gateway B's inbound listener
+//!                        ──▶ B's materialized loopback route ──▶ echo backend
+//! ```
+//!
+//! Gateway A consumes **discovery only** from the stock server; its enforcement
+//! posture (STRICT PeerAuthentication) comes from the mandatory local policy
+//! document. Gateway B is an ordinary native-CP sidecar and is what proves the
+//! request really traversed mesh mTLS: it terminates the mTLS, verifies A's
+//! SVID, and only then relays to the labelled echo backend whose body the test
+//! asserts.
+//!
+//! Phases (one fixture, in order — each transition is proven by a *change* in
+//! observable reachability, so no fail-closed assertion can pass vacuously):
+//!
+//! 1. CDS+EDS+LDS+RDS converge and the discovered service routes live traffic.
+//! 2. Well-formed-but-unrepresentable clusters (subset cluster, unpinned peer
+//!    identity, foreign namespace) are refused/narrowed: each is unreachable
+//!    while the good service keeps serving, and the refusal diagnostics appear
+//!    with their stable reason code and field path.
+//! 3. A structurally invalid response is NACKed with a field-specific
+//!    `error_detail` re-asserting the last accepted version, and the last-good
+//!    view keeps serving real traffic.
+//! 4.–5. EDS endpoint withdrawal removes reachability; a replacement assignment
+//!    restores it.
+//! 6.–7. A state-of-the-world CDS withdrawal removes reachability; re-publishing
+//!    the cluster restores it.
+//! 8. A listener carrying an enforcement HTTP filter (`envoy.filters.http.rbac`)
+//!    and a route using `weighted_clusters` are ACKed-but-refused: they widen
+//!    nothing (the cluster they name stays unreachable) and the good service is
+//!    unaffected.
+//! 9. Re-pinning the cluster's peer identity to an impostor SPIFFE removes
+//!    reachability — the control plane's SAN pin is a real verification input,
+//!    not decoration.
+//!
+//! Run with:
+//!   cargo test --test functional_tests functional_mesh_stock_xds -- --ignored --nocapture
+
+use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use prost::Message;
+use tempfile::TempDir;
+use tokio::sync::{broadcast, mpsc};
+use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
+use tonic::transport::Server;
+use tonic::{Request, Response, Status, Streaming};
+
+use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain};
+use ferrum_edge::modes::mesh::config::{
+    AppProtocol, MeshConfig, MeshService, MtlsMode, PeerAuthentication, ServicePort, Workload,
+    WorkloadPort, WorkloadRef, WorkloadSelector,
+};
+use ferrum_edge::modes::mesh::slice::MeshSlice;
+use ferrum_edge::xds::proto::aggregated_discovery_service_server::{
+    AggregatedDiscoveryService, AggregatedDiscoveryServiceServer,
+};
+use ferrum_edge::xds::proto::{
+    Any, DeltaDiscoveryRequest, DeltaDiscoveryResponse, DiscoveryRequest, DiscoveryResponse,
+};
+use ferrum_edge::xds::stock_proto as sp;
+use ferrum_edge::xds::{CDS_TYPE_URL, EDS_TYPE_URL, LDS_TYPE_URL, RDS_TYPE_URL};
+
+use crate::common::ensure_gateway_built;
+use crate::functional::functional_mesh_mode_test::{
+    MeshGatewaySpawnOptions, RETRY_ATTEMPTS, STARTUP_TIMEOUT, bind_fixture_listener,
+    captured_output, exited_gateway_diagnostic, generate_two_gateway_svids, kill_child,
+    loopback_ephemeral, plaintext_http_get, reserve_mesh_ports, spawn_mesh_gateway,
+    start_static_mesh_cp, wait_for_gateway_listener,
+};
+
+const A_SPIFFE: &str = "spiffe://cluster.local/ns/ferrum/sa/client-app";
+const B_SPIFFE: &str = "spiffe://cluster.local/ns/ferrum/sa/svc-b";
+/// A SPIFFE identity nothing in the mesh actually holds. Used to prove the
+/// control plane's SAN pin is verified rather than decorative.
+const IMPOSTOR_SPIFFE: &str = "spiffe://cluster.local/ns/ferrum/sa/impostor";
+
+const BACKEND_LABEL: &str = "stock-xds-backend-ok";
+const SERVICE_HOST: &str = "svc-b.ferrum.svc.cluster.local";
+const NO_PIN_HOST: &str = "svc-nopin.ferrum.svc.cluster.local";
+const SUBSET_HOST: &str = "svc-subset.ferrum.svc.cluster.local";
+const FOREIGN_NAMESPACE_HOST: &str = "svc-other.other.svc.cluster.local";
+/// Named only by a refused `weighted_clusters` route action, so it must never
+/// become reachable.
+const GHOST_HOST: &str = "svc-ghost.ferrum.svc.cluster.local";
+
+const UPSTREAM_TLS_TYPE_URL: &str =
+    "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext";
+const HCM_TYPE_URL: &str = "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager";
+
+/// Bound for one discovery transition to show up on the data path.
+const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(20);
+const CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(400);
+/// Bound for the gateway's own ADS request (ACK / NACK) to reach the fixture.
+const ADS_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(20);
+
+// ── scripted third-party ADS server ──────────────────────────────────────
+
+#[derive(Clone, Default)]
+struct AdsRecorder {
+    requests: Arc<Mutex<Vec<DiscoveryRequest>>>,
+}
+
+impl AdsRecorder {
+    fn record(&self, request: DiscoveryRequest) {
+        self.requests
+            .lock()
+            .expect("ADS recorder mutex is never held across a panic")
+            .push(request);
+    }
+
+    fn snapshot(&self) -> Vec<DiscoveryRequest> {
+        self.requests
+            .lock()
+            .expect("ADS recorder mutex is never held across a panic")
+            .clone()
+    }
+}
+
+type SeedMap = Arc<Mutex<HashMap<String, DiscoveryResponse>>>;
+
+/// A stock control plane the test scripts directly.
+///
+/// Each type's CURRENT state-of-the-world response is held in `seeds` and sent
+/// when that type is first subscribed on a stream; pushing a new response both
+/// broadcasts it to live streams and replaces the seed, so a reconnect resumes
+/// from the newest state rather than rewinding to the first one.
+struct ScriptedThirdPartyAds {
+    recorder: AdsRecorder,
+    seeds: SeedMap,
+    pushes: broadcast::Sender<DiscoveryResponse>,
+}
+
+#[tonic::async_trait]
+impl AggregatedDiscoveryService for ScriptedThirdPartyAds {
+    type StreamAggregatedResourcesStream = std::pin::Pin<
+        Box<dyn tokio_stream::Stream<Item = Result<DiscoveryResponse, Status>> + Send>,
+    >;
+    type DeltaAggregatedResourcesStream = std::pin::Pin<
+        Box<dyn tokio_stream::Stream<Item = Result<DeltaDiscoveryResponse, Status>> + Send>,
+    >;
+
+    async fn stream_aggregated_resources(
+        &self,
+        request: Request<Streaming<DiscoveryRequest>>,
+    ) -> Result<Response<Self::StreamAggregatedResourcesStream>, Status> {
+        let mut inbound = request.into_inner();
+        let recorder = self.recorder.clone();
+        let seeds = Arc::clone(&self.seeds);
+        // Subscribed before the response stream is returned so no push made
+        // after the gateway connects can be missed.
+        let mut pushes = self.pushes.subscribe();
+        let (tx, rx) = mpsc::channel(64);
+
+        let push_tx = tx.clone();
+        tokio::spawn(async move {
+            while let Ok(response) = pushes.recv().await {
+                if push_tx.send(Ok(response)).await.is_err() {
+                    return;
+                }
+            }
+        });
+
+        tokio::spawn(async move {
+            let mut seeded: HashSet<String> = HashSet::new();
+            while let Ok(Some(discovery_request)) = inbound.message().await {
+                let type_url = discovery_request.type_url.clone();
+                recorder.record(discovery_request);
+                if !seeded.insert(type_url.clone()) {
+                    continue;
+                }
+                let seed = seeds
+                    .lock()
+                    .expect("ADS seed mutex is never held across a panic")
+                    .get(&type_url)
+                    .cloned();
+                if let Some(seed) = seed
+                    && tx.send(Ok(seed)).await.is_err()
+                {
+                    return;
+                }
+            }
+        });
+
+        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+    }
+
+    async fn delta_aggregated_resources(
+        &self,
+        _request: Request<Streaming<DeltaDiscoveryRequest>>,
+    ) -> Result<Response<Self::DeltaAggregatedResourcesStream>, Status> {
+        // Delta xDS is explicitly out of scope for the stock profile.
+        Err(Status::unimplemented(
+            "delta xDS is not part of the Ferrum stock xDS profile",
+        ))
+    }
+}
+
+struct StockAdsHandle {
+    addr: SocketAddr,
+    recorder: AdsRecorder,
+    seeds: SeedMap,
+    pushes: broadcast::Sender<DiscoveryResponse>,
+    task: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+}
+
+impl StockAdsHandle {
+    async fn start(seeds: HashMap<String, DiscoveryResponse>) -> Result<Self, String> {
+        let listener = bind_fixture_listener(loopback_ephemeral())
+            .await
+            .map_err(|e| format!("bind scripted ADS listener: {e}"))?;
+        let addr = listener
+            .local_addr()
+            .map_err(|e| format!("scripted ADS listener addr: {e}"))?;
+        let recorder = AdsRecorder::default();
+        let seeds: SeedMap = Arc::new(Mutex::new(seeds));
+        let (pushes, _) = broadcast::channel(64);
+        let server = ScriptedThirdPartyAds {
+            recorder: recorder.clone(),
+            seeds: Arc::clone(&seeds),
+            pushes: pushes.clone(),
+        };
+        let incoming = TcpListenerStream::new(listener);
+        let task = tokio::spawn(async move {
+            Server::builder()
+                .add_service(AggregatedDiscoveryServiceServer::new(server))
+                .serve_with_incoming(incoming)
+                .await
+        });
+        Ok(Self {
+            addr,
+            recorder,
+            seeds,
+            pushes,
+            task,
+        })
+    }
+
+    fn url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
+    /// Publish one state-of-the-world response, and make it the state a
+    /// reconnecting client would resume from.
+    fn push(&self, response: DiscoveryResponse) {
+        self.seeds
+            .lock()
+            .expect("ADS seed mutex is never held across a panic")
+            .insert(response.type_url.clone(), response.clone());
+        let _ = self.pushes.send(response);
+    }
+
+    /// Wait for the gateway to ACK `version` for `type_url` (an ACK carries the
+    /// accepted version, the response nonce, and no `error_detail`).
+    async fn wait_for_ack(&self, type_url: &str, version: &str) -> Result<(), String> {
+        let deadline = Instant::now() + ADS_EXCHANGE_TIMEOUT;
+        loop {
+            let acked = self.recorder.snapshot().into_iter().any(|request| {
+                request.type_url == type_url
+                    && request.version_info == version
+                    && request.error_detail.is_none()
+                    && !request.response_nonce.is_empty()
+            });
+            if acked {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "the gateway never ACKed '{type_url}' version '{version}'"
+                ));
+            }
+            tokio::time::sleep(CONVERGENCE_POLL_INTERVAL).await;
+        }
+    }
+
+    async fn wait_for_nack(&self, type_url: &str) -> Result<DiscoveryRequest, String> {
+        let deadline = Instant::now() + ADS_EXCHANGE_TIMEOUT;
+        loop {
+            if let Some(nack) = self
+                .recorder
+                .snapshot()
+                .into_iter()
+                .find(|request| request.type_url == type_url && request.error_detail.is_some())
+            {
+                return Ok(nack);
+            }
+            if Instant::now() >= deadline {
+                return Err(format!("the gateway never NACKed a '{type_url}' response"));
+            }
+            tokio::time::sleep(CONVERGENCE_POLL_INTERVAL).await;
+        }
+    }
+
+    /// True when the gateway ever sent a request for `type_url` carrying an
+    /// `error_detail` — i.e. NACKed it.
+    fn nacked(&self, type_url: &str) -> bool {
+        self.recorder
+            .snapshot()
+            .iter()
+            .any(|request| request.type_url == type_url && request.error_detail.is_some())
+    }
+
+    async fn shutdown(self) {
+        self.task.abort();
+        let _ = self.task.await;
+    }
+}
+
+// ── standard Envoy v3 resource fixtures ──────────────────────────────────
+
+fn any_resource(type_url: &str, message: &impl Message) -> Any {
+    Any {
+        type_url: type_url.to_string(),
+        value: message.encode_to_vec(),
+    }
+}
+
+fn response(type_url: &str, version: &str, nonce: &str, resources: Vec<Any>) -> DiscoveryResponse {
+    DiscoveryResponse {
+        version_info: version.to_string(),
+        resources,
+        canary: false,
+        type_url: type_url.to_string(),
+        nonce: nonce.to_string(),
+        control_plane: None,
+    }
+}
+
+fn ads_source() -> sp::ConfigSource {
+    sp::ConfigSource {
+        // `AggregatedConfigSource` is an empty upstream message, so presence is
+        // the whole signal.
+        ads: vec![Vec::new()],
+        ..Default::default()
+    }
+}
+
+/// The control plane's own statement of who may answer for a cluster: a URI SAN
+/// matcher on the cluster's `UpstreamTlsContext`.
+fn pinned_tls_socket(san: &str) -> sp::TransportSocket {
+    let context = sp::UpstreamTlsContext {
+        common_tls_context: Some(sp::CommonTlsContext {
+            combined_validation_context: Some(sp::CombinedCertificateValidationContext {
+                default_validation_context: Some(sp::CertificateValidationContext {
+                    match_typed_subject_alt_names: vec![sp::SubjectAltNameMatcher {
+                        // SanType::URI
+                        san_type: 3,
+                        matcher: Some(sp::StringMatcher {
+                            exact: san.to_string(),
+                            ..Default::default()
+                        }),
+                        oid: String::new(),
+                    }],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    sp::TransportSocket {
+        name: "envoy.transport_sockets.tls".to_string(),
+        typed_config: Some(sp::Any {
+            type_url: UPSTREAM_TLS_TYPE_URL.to_string(),
+            value: context.encode_to_vec(),
+        }),
+    }
+}
+
+fn cluster_name(port: u16, subset: &str, host: &str) -> String {
+    format!("outbound|{port}|{subset}|{host}")
+}
+
+/// A plain Istio outbound EDS cluster, optionally carrying the CP's SAN pin.
+fn eds_cluster(name: &str, san: Option<&str>) -> sp::Cluster {
+    sp::Cluster {
+        name: name.to_string(),
+        // DiscoveryType::EDS
+        r#type: 3,
+        eds_cluster_config: Some(sp::EdsClusterConfig {
+            eds_config: Some(ads_source()),
+            service_name: String::new(),
+        }),
+        transport_socket: san.map(pinned_tls_socket),
+        ..Default::default()
+    }
+}
+
+fn assignment(cluster: &str, endpoints: &[(&str, u16)]) -> sp::ClusterLoadAssignment {
+    sp::ClusterLoadAssignment {
+        cluster_name: cluster.to_string(),
+        endpoints: vec![sp::LocalityLbEndpoints {
+            lb_endpoints: endpoints
+                .iter()
+                .map(|(address, port)| sp::LbEndpoint {
+                    endpoint: Some(sp::Endpoint {
+                        address: Some(sp::Address {
+                            socket_address: Some(sp::SocketAddress {
+                                address: (*address).to_string(),
+                                port_value: u32::from(*port),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    // HealthStatus::HEALTHY
+                    health_status: 1,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }],
+    }
+}
+
+/// A wildcard-bind HCM listener whose only HTTP filter is the terminal router,
+/// plus the extra `filters` the caller wants in front of it. An enforcement
+/// filter here must refuse the whole listener.
+fn hcm_listener(name: &str, port: u16, route_config_name: &str, filters: &[&str]) -> sp::Listener {
+    let mut http_filters: Vec<sp::HttpFilter> = filters
+        .iter()
+        .map(|filter| sp::HttpFilter {
+            name: (*filter).to_string(),
+            ..Default::default()
+        })
+        .collect();
+    http_filters.push(sp::HttpFilter {
+        name: "envoy.filters.http.router".to_string(),
+        ..Default::default()
+    });
+    let hcm = sp::HttpConnectionManager {
+        stat_prefix: "outbound".to_string(),
+        rds: Some(sp::Rds {
+            config_source: Some(ads_source()),
+            route_config_name: route_config_name.to_string(),
+        }),
+        http_filters,
+        ..Default::default()
+    };
+    sp::Listener {
+        name: name.to_string(),
+        address: Some(sp::Address {
+            socket_address: Some(sp::SocketAddress {
+                address: "0.0.0.0".to_string(),
+                port_value: u32::from(port),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        filter_chains: vec![sp::FilterChain {
+            filters: vec![sp::NetworkFilter {
+                name: "envoy.filters.network.http_connection_manager".to_string(),
+                typed_config: Some(sp::Any {
+                    type_url: HCM_TYPE_URL.to_string(),
+                    value: hcm.encode_to_vec(),
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+        // TrafficDirection::OUTBOUND
+        traffic_direction: 2,
+        ..Default::default()
+    }
+}
+
+fn route_config(name: &str, domains: &[&str], cluster: &str) -> sp::RouteConfiguration {
+    sp::RouteConfiguration {
+        name: name.to_string(),
+        virtual_hosts: vec![sp::VirtualHost {
+            name: format!("{name}-vhost"),
+            domains: domains.iter().map(|d| (*d).to_string()).collect(),
+            routes: vec![sp::Route {
+                r#match: Some(sp::RouteMatch {
+                    prefix: "/".to_string(),
+                    ..Default::default()
+                }),
+                route: Some(sp::RouteAction {
+                    cluster: cluster.to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+}
+
+/// A route configuration whose action splits traffic with `weighted_clusters` —
+/// a traffic-shaping construct the stock profile refuses rather than
+/// approximating.
+fn weighted_route_config(name: &str, domains: &[&str]) -> sp::RouteConfiguration {
+    sp::RouteConfiguration {
+        name: name.to_string(),
+        virtual_hosts: vec![sp::VirtualHost {
+            name: format!("{name}-weighted-vhost"),
+            domains: domains.iter().map(|d| (*d).to_string()).collect(),
+            routes: vec![sp::Route {
+                r#match: Some(sp::RouteMatch {
+                    prefix: "/".to_string(),
+                    ..Default::default()
+                }),
+                route: Some(sp::RouteAction {
+                    // Presence-only in the decode projection; a non-empty
+                    // `weighted_clusters` is what must be refused.
+                    weighted_clusters: vec![Vec::new()],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+}
+
+// ── local fixtures (policy half, destination sidecar, backend) ───────────
+
+/// The MANDATORY local policy document for the stock profile. It carries the
+/// enforcement posture (STRICT mTLS) and deliberately declares no `services`
+/// and no `workloads` — those are the control plane's half.
+fn stock_policy_document() -> String {
+    let mesh = MeshConfig {
+        peer_authentications: vec![PeerAuthentication {
+            name: "stock-xds-strict".to_string(),
+            namespace: "ferrum".to_string(),
+            scope: None,
+            selector: None,
+            mtls_mode: MtlsMode::Strict,
+            port_overrides: HashMap::new(),
+        }],
+        ..MeshConfig::default()
+    };
+    serde_json::to_string(&serde_json::json!({ "mesh": mesh }))
+        .expect("mesh policy document serializes")
+}
+
+/// Gateway B's slice: the destination sidecar's own view of the one in-mesh
+/// service it backs. B is an ordinary native-CP sidecar — the stock control
+/// plane drives only gateway A.
+fn destination_slice(node_id: &str, backend_port: u16) -> MeshSlice {
+    let b_id = SpiffeId::new(B_SPIFFE).expect("destination SPIFFE id");
+    MeshSlice {
+        node_id: node_id.to_string(),
+        namespace: "ferrum".to_string(),
+        version: chrono::Utc::now().to_rfc3339(),
+        workloads: vec![Workload {
+            spiffe_id: b_id.clone(),
+            selector: WorkloadSelector {
+                labels: HashMap::from([("app".to_string(), "svc-b".to_string())]),
+                namespace: Some("ferrum".to_string()),
+            },
+            service_name: "svc-b".to_string(),
+            service_namespace: None,
+            addresses: vec!["127.0.0.1".to_string()],
+            ports: vec![WorkloadPort {
+                port: backend_port,
+                protocol: AppProtocol::Http,
+                name: Some("http".to_string()),
+            }],
+            trust_domain: TrustDomain::new("cluster.local").expect("trust domain"),
+            namespace: "ferrum".to_string(),
+            network: None,
+            cluster: None,
+            weight: None,
+            locality: None,
+            service_account: Some("svc-b".to_string()),
+            pod_uid: None,
+            node_waypoint: None,
+            remote_provenance: false,
+        }],
+        services: vec![MeshService {
+            cluster_ips: Vec::new(),
+            name: "svc-b".to_string(),
+            namespace: "ferrum".to_string(),
+            ports: vec![ServicePort {
+                port: backend_port,
+                protocol: AppProtocol::Http,
+                name: Some("http".to_string()),
+                target_port: None,
+            }],
+            workloads: vec![WorkloadRef { spiffe_id: b_id }],
+            protocol_overrides: HashMap::new(),
+            uid: None,
+        }],
+        peer_authentications: vec![PeerAuthentication {
+            name: "stock-xds-strict".to_string(),
+            namespace: "ferrum".to_string(),
+            scope: None,
+            selector: None,
+            mtls_mode: MtlsMode::Strict,
+            port_overrides: HashMap::new(),
+        }],
+        ..MeshSlice::default()
+    }
+}
+
+/// Echo backend behind gateway B. Its body is the only reliable "the request
+/// reached the application" signal: every fail-closed outcome in this file is
+/// asserted as "no 200 AND no backend body".
+async fn start_stock_echo_backend() -> Result<u16, String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = bind_fixture_listener(loopback_ephemeral())
+        .await
+        .map_err(|e| format!("bind stock echo backend: {e}"))?;
+    let port = listener
+        .local_addr()
+        .map_err(|e| format!("stock echo backend addr: {e}"))?
+        .port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    BACKEND_LABEL.len()
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(BACKEND_LABEL.as_bytes()).await;
+                let _ = sock.flush().await;
+            });
+        }
+    });
+    Ok(port)
+}
+
+// ── observed phase outcomes ──────────────────────────────────────────────
+
+/// One HTTP observation at gateway A's outbound capture listener.
+///
+/// A transport-level failure is a first-class outcome, not an error: when a
+/// discovered service is withdrawn or refused the client can legitimately see a
+/// reset instead of a status line, and either way no backend body reached it.
+#[derive(Debug)]
+enum Probe {
+    Answered { status: u16, body: String },
+    TransportFailure(String),
+}
+
+impl Probe {
+    fn reached_backend(&self) -> bool {
+        matches!(
+            self,
+            Probe::Answered { status: 200, body } if body.contains(BACKEND_LABEL)
+        )
+    }
+
+    fn describe(&self, what: &str) -> String {
+        match self {
+            Probe::Answered { status, body } => {
+                format!("{what}: status={status} body={body:?}")
+            }
+            Probe::TransportFailure(error) => format!("{what}: transport failure ({error})"),
+        }
+    }
+}
+
+/// Everything the driver observed, asserted by the test so a single fixture
+/// bring-up covers the whole live matrix.
+struct StockLiveObservations {
+    converged: Probe,
+    unpinned_peer: Probe,
+    subset_cluster: Probe,
+    foreign_namespace: Probe,
+    good_service_after_refusals: Probe,
+    nack_version_info: String,
+    nack_message: String,
+    good_service_after_nack: Probe,
+    endpoints_withdrawn: Probe,
+    endpoints_restored: Probe,
+    cluster_withdrawn: Probe,
+    cluster_restored: Probe,
+    lds_nacked: bool,
+    rds_nacked: bool,
+    ghost_cluster: Probe,
+    good_service_after_capability_refusal: Probe,
+    impostor_pin: Probe,
+    logs: String,
+}
+
+// ── the driver ───────────────────────────────────────────────────────────
+
+async fn probe(outbound_port: u16, host: &str) -> Probe {
+    match plaintext_http_get(outbound_port, host, "/").await {
+        Ok((status, body)) => Probe::Answered { status, body },
+        Err(e) => Probe::TransportFailure(format!("GET http://{host}/ : {e}")),
+    }
+}
+
+/// Poll until the host is routed all the way to the backend, or fail.
+async fn wait_until_reachable(outbound_port: u16, host: &str) -> Result<Probe, String> {
+    let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
+    let mut last = None;
+    loop {
+        let observed = probe(outbound_port, host).await;
+        if observed.reached_backend() {
+            return Ok(observed);
+        }
+        last = Some(observed.describe("last non-routed response"));
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "'{host}' never became reachable within {CONVERGENCE_TIMEOUT:?}; {}",
+                last.unwrap_or_else(|| "no observation".to_string())
+            ));
+        }
+        tokio::time::sleep(CONVERGENCE_POLL_INTERVAL).await;
+    }
+}
+
+/// Poll until the host stops reaching the backend, then make ONE authoritative
+/// confirming observation.
+///
+/// A withdrawal is a *transition*, so the poll bounds how long convergence may
+/// take; the returned probe is the single post-convergence observation the test
+/// asserts on. Polling never turns a reachable service into an unreachable
+/// verdict — it only waits for the state the control plane just published, and
+/// the confirming probe is issued exactly once afterwards.
+async fn wait_until_unreachable(outbound_port: u16, host: &str) -> Result<Probe, String> {
+    let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
+    loop {
+        if !probe(outbound_port, host).await.reached_backend() {
+            return Ok(probe(outbound_port, host).await);
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "'{host}' still reaches the backend {CONVERGENCE_TIMEOUT:?} after the control \
+                 plane withdrew it"
+            ));
+        }
+        tokio::time::sleep(CONVERGENCE_POLL_INTERVAL).await;
+    }
+}
+
+/// Bring up the scripted stock control plane, the stock-driven sidecar (A), the
+/// destination sidecar (B) and its backend, then walk the live phase matrix.
+///
+/// Bounded retries cover fixture bring-up races only: an attempt whose gateway
+/// died mid-run is VOID (its ports were never owned by the process the driver
+/// believed it was driving), so it is retried with fresh ports, temp dirs,
+/// control planes, and ADS server rather than reported as a datapath result.
+async fn drive_stock_xds_live_datapath() -> Result<StockLiveObservations, String> {
+    ensure_gateway_built().map_err(|e| format!("gateway build: {e}"))?;
+
+    let mut last_failure = String::new();
+    for attempt in 1..=RETRY_ATTEMPTS {
+        let node_a = format!("functional-stock-xds-a-{attempt}");
+        let node_b = format!("functional-stock-xds-b-{attempt}");
+        let temp_a = TempDir::new().map_err(|e| format!("temp dir a: {e}"))?;
+        let temp_b = TempDir::new().map_err(|e| format!("temp dir b: {e}"))?;
+        let svids = generate_two_gateway_svids(temp_b.path(), A_SPIFFE, B_SPIFFE);
+        let backend_port = start_stock_echo_backend().await?;
+
+        let good_cluster = cluster_name(backend_port, "", SERVICE_HOST);
+        let nopin_cluster = cluster_name(backend_port, "", NO_PIN_HOST);
+        let subset_cluster = cluster_name(backend_port, "v1", SUBSET_HOST);
+        let foreign_cluster = cluster_name(backend_port, "", FOREIGN_NAMESPACE_HOST);
+        // Istio names an outbound route configuration after the port.
+        let route_config_name = backend_port.to_string();
+
+        // The converged initial state a stock control plane would program:
+        // one outbound cluster, its endpoint assignment, the listener that
+        // classifies the port as HTTP, and the route configuration naming it.
+        let ads = StockAdsHandle::start(HashMap::from([
+            (
+                CDS_TYPE_URL.to_string(),
+                response(
+                    CDS_TYPE_URL,
+                    "cds-1",
+                    "cds-n1",
+                    vec![any_resource(
+                        CDS_TYPE_URL,
+                        &eds_cluster(&good_cluster, Some(B_SPIFFE)),
+                    )],
+                ),
+            ),
+            (
+                EDS_TYPE_URL.to_string(),
+                response(
+                    EDS_TYPE_URL,
+                    "eds-1",
+                    "eds-n1",
+                    vec![any_resource(
+                        EDS_TYPE_URL,
+                        &assignment(&good_cluster, &[("127.0.0.1", backend_port)]),
+                    )],
+                ),
+            ),
+            (
+                LDS_TYPE_URL.to_string(),
+                response(
+                    LDS_TYPE_URL,
+                    "lds-1",
+                    "lds-n1",
+                    vec![any_resource(
+                        LDS_TYPE_URL,
+                        &hcm_listener(
+                            &format!("0.0.0.0_{backend_port}"),
+                            backend_port,
+                            &route_config_name,
+                            &["istio.metadata_exchange"],
+                        ),
+                    )],
+                ),
+            ),
+            (
+                RDS_TYPE_URL.to_string(),
+                response(
+                    RDS_TYPE_URL,
+                    "rds-1",
+                    "rds-n1",
+                    vec![any_resource(
+                        RDS_TYPE_URL,
+                        &route_config(
+                            &route_config_name,
+                            &[SERVICE_HOST, &format!("{SERVICE_HOST}:{backend_port}")],
+                            &good_cluster,
+                        ),
+                    )],
+                ),
+            ),
+        ]))
+        .await?;
+
+        let policy_path = temp_a.path().join("stock-mesh-policy.json");
+        std::fs::write(&policy_path, stock_policy_document())
+            .map_err(|e| format!("write stock policy document: {e}"))?;
+        let policy_path = policy_path
+            .to_str()
+            .ok_or("stock policy path is not UTF-8")?
+            .to_string();
+
+        let cp_b = start_static_mesh_cp(destination_slice(&node_b, backend_port)).await;
+        let ports_a = reserve_mesh_ports().await;
+        let ports_b = reserve_mesh_ports().await;
+        let a_outbound_port = ports_a.outbound;
+        let b_inbound_port = ports_b.inbound;
+
+        // Gateway B: the destination sidecar. Its workload identity makes svc-b
+        // local, so its inbound materializer routes :inbound → the backend.
+        let mut child_b = spawn_mesh_gateway(
+            &temp_b,
+            MeshGatewaySpawnOptions {
+                cp_addr: cp_b.addr,
+                ports: ports_b,
+                node_id: &node_b,
+                config_protocol: "native",
+                topology: "sidecar",
+                waypoint_name: None,
+                env_overrides: vec![
+                    ("FERRUM_MESH_PRODUCTION_MODE", "true".to_string()),
+                    ("FERRUM_POOL_WARMUP_ENABLED", "false".to_string()),
+                    ("FERRUM_MESH_WORKLOAD_SPIFFE_ID", B_SPIFFE.to_string()),
+                    ("FERRUM_GATEWAY_SVID_CERT_PATH", svids.b.cert_path.clone()),
+                    ("FERRUM_GATEWAY_SVID_KEY_PATH", svids.b.key_path.clone()),
+                    (
+                        "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+                        svids.b.trust_bundle_path.clone(),
+                    ),
+                ],
+            },
+        );
+        let readiness =
+            wait_for_gateway_listener(&mut child_b, b_inbound_port, STARTUP_TIMEOUT).await;
+        if !readiness.is_ready() {
+            last_failure = format!(
+                "attempt {attempt}: {}\n{}",
+                readiness.describe("gateway B inbound listener", b_inbound_port),
+                captured_output(&temp_b)
+            );
+            kill_child(&mut child_b);
+            cp_b.shutdown().await;
+            ads.shutdown().await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
+
+        // Gateway A: the stock-xDS-driven sidecar. Discovery comes from the
+        // scripted third-party ADS server; the enforcement posture comes from
+        // the local policy document, which is mandatory for this profile.
+        let mut child_a = spawn_mesh_gateway(
+            &temp_a,
+            MeshGatewaySpawnOptions {
+                // A stock control plane is dialled through
+                // FERRUM_MESH_STOCK_XDS_URLS; the harness's Ferrum CP URL is
+                // deliberately unused by this profile.
+                cp_addr: cp_b.addr,
+                ports: ports_a,
+                node_id: &node_a,
+                config_protocol: "stock_xds",
+                topology: "sidecar",
+                waypoint_name: None,
+                env_overrides: vec![
+                    ("FERRUM_MESH_PRODUCTION_MODE", "true".to_string()),
+                    // Refusal diagnostics are warnings; debug level also keeps
+                    // the discovery/apply trail in the captured output.
+                    ("FERRUM_LOG_LEVEL", "debug".to_string()),
+                    ("FERRUM_POOL_WARMUP_ENABLED", "false".to_string()),
+                    ("FERRUM_MESH_STOCK_XDS_URLS", ads.url()),
+                    (
+                        "FERRUM_MESH_STOCK_XDS_NODE_ID",
+                        "sidecar~127.0.0.1~client-app.ferrum~ferrum.svc.cluster.local".to_string(),
+                    ),
+                    ("FERRUM_MESH_FILE_CONFIG_PATH", policy_path.clone()),
+                    ("FERRUM_MESH_WORKLOAD_SPIFFE_ID", A_SPIFFE.to_string()),
+                    ("FERRUM_MESH_EGRESS_MTLS_PORT", b_inbound_port.to_string()),
+                    ("FERRUM_GATEWAY_SVID_CERT_PATH", svids.a.cert_path.clone()),
+                    ("FERRUM_GATEWAY_SVID_KEY_PATH", svids.a.key_path.clone()),
+                    (
+                        "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+                        svids.a.trust_bundle_path.clone(),
+                    ),
+                ],
+            },
+        );
+        let readiness =
+            wait_for_gateway_listener(&mut child_a, a_outbound_port, STARTUP_TIMEOUT).await;
+        if !readiness.is_ready() {
+            last_failure = format!(
+                "attempt {attempt}: {}\n{}",
+                readiness.describe("gateway A outbound listener", a_outbound_port),
+                captured_output(&temp_a)
+            );
+            kill_child(&mut child_a);
+            kill_child(&mut child_b);
+            cp_b.shutdown().await;
+            ads.shutdown().await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
+
+        let outcome = run_stock_live_phases(
+            &ads,
+            a_outbound_port,
+            backend_port,
+            &good_cluster,
+            &nopin_cluster,
+            &subset_cluster,
+            &foreign_cluster,
+            &route_config_name,
+        )
+        .await;
+
+        // A gateway that exited during the run never owned the ports the driver
+        // drove, so every observation above proves nothing about the mesh
+        // datapath (issue #2132). Void the attempt and retry with fresh
+        // fixtures instead of reporting the resulting transport errors.
+        let exited = exited_gateway_diagnostic(&mut [
+            ("gateway A", &mut child_a),
+            ("gateway B", &mut child_b),
+        ]);
+        let logs = format!(
+            "--- gateway A (stock_xds) ---\n{}\n--- gateway B (destination) ---\n{}",
+            captured_output(&temp_a),
+            captured_output(&temp_b)
+        );
+        kill_child(&mut child_a);
+        kill_child(&mut child_b);
+        cp_b.shutdown().await;
+        ads.shutdown().await;
+
+        if let Some(exited) = exited {
+            last_failure = format!("attempt {attempt}: {exited}\n{logs}");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
+
+        return match outcome {
+            Ok(mut observations) => {
+                observations.logs = logs;
+                Ok(observations)
+            }
+            Err(e) => Err(format!("{e}\n{logs}")),
+        };
+    }
+
+    Err(format!(
+        "the stock xDS live fixture never came up after {RETRY_ATTEMPTS} attempts\n{last_failure}"
+    ))
+}
+
+/// The live phase matrix, run once against a healthy fixture.
+#[allow(clippy::too_many_arguments)]
+async fn run_stock_live_phases(
+    ads: &StockAdsHandle,
+    outbound_port: u16,
+    backend_port: u16,
+    good_cluster: &str,
+    nopin_cluster: &str,
+    subset_cluster: &str,
+    foreign_cluster: &str,
+    route_config_name: &str,
+) -> Result<StockLiveObservations, String> {
+    let endpoint = [("127.0.0.1", backend_port)];
+
+    // ── Phase 1: the converged stock resources route real traffic ──
+    let converged = wait_until_reachable(outbound_port, SERVICE_HOST).await?;
+
+    // ── Phase 2: unrepresentable / out-of-scope clusters narrow, never widen ──
+    // Every one of these carries a REACHABLE endpoint, so only Ferrum's own
+    // refusal / narrowing can keep them off the data path.
+    ads.push(response(
+        CDS_TYPE_URL,
+        "cds-2",
+        "cds-n2",
+        vec![
+            any_resource(CDS_TYPE_URL, &eds_cluster(good_cluster, Some(B_SPIFFE))),
+            // No `UpstreamTlsContext`: the CP asserted no peer identity, so
+            // Ferrum must publish the service shape with no dialable endpoint.
+            any_resource(CDS_TYPE_URL, &eds_cluster(nopin_cluster, None)),
+            // A DestinationRule subset cluster: refused, not approximated.
+            any_resource(CDS_TYPE_URL, &eds_cluster(subset_cluster, Some(B_SPIFFE))),
+            // A service in another namespace: existing mesh namespace narrowing
+            // must keep it out of this workload's slice.
+            any_resource(CDS_TYPE_URL, &eds_cluster(foreign_cluster, Some(B_SPIFFE))),
+        ],
+    ));
+    ads.push(response(
+        EDS_TYPE_URL,
+        "eds-2",
+        "eds-n2",
+        vec![
+            any_resource(EDS_TYPE_URL, &assignment(good_cluster, &endpoint)),
+            any_resource(EDS_TYPE_URL, &assignment(nopin_cluster, &endpoint)),
+            any_resource(EDS_TYPE_URL, &assignment(subset_cluster, &endpoint)),
+            any_resource(EDS_TYPE_URL, &assignment(foreign_cluster, &endpoint)),
+        ],
+    ));
+    ads.wait_for_ack(CDS_TYPE_URL, "cds-2").await?;
+    ads.wait_for_ack(EDS_TYPE_URL, "eds-2").await?;
+    // The good service still serving is the proof this state is LIVE, so the
+    // three fail-closed observations below cannot pass vacuously.
+    let good_service_after_refusals = wait_until_reachable(outbound_port, SERVICE_HOST).await?;
+    let unpinned_peer = probe(outbound_port, NO_PIN_HOST).await;
+    let subset_cluster_probe = probe(outbound_port, SUBSET_HOST).await;
+    let foreign_namespace = probe(outbound_port, FOREIGN_NAMESPACE_HOST).await;
+
+    // ── Phase 3: a structural error NACKs; the last-good view keeps serving ──
+    ads.push(response(
+        CDS_TYPE_URL,
+        "cds-3",
+        "cds-n3",
+        vec![
+            any_resource(CDS_TYPE_URL, &eds_cluster(good_cluster, Some(B_SPIFFE))),
+            any_resource(CDS_TYPE_URL, &eds_cluster(good_cluster, Some(B_SPIFFE))),
+        ],
+    ));
+    let nack = ads.wait_for_nack(CDS_TYPE_URL).await?;
+    let nack_message = nack
+        .error_detail
+        .as_ref()
+        .map(|status| status.message.clone())
+        .ok_or("the NACK request carried no error_detail")?;
+    let nack_version_info = nack.version_info.clone();
+    let good_service_after_nack = wait_until_reachable(outbound_port, SERVICE_HOST).await?;
+
+    // ── Phase 4: withdrawing the endpoints removes reachability ──
+    // The cluster stays, so this isolates endpoint deletion.
+    ads.push(response(
+        EDS_TYPE_URL,
+        "eds-3",
+        "eds-n3",
+        vec![any_resource(EDS_TYPE_URL, &assignment(good_cluster, &[]))],
+    ));
+    ads.wait_for_ack(EDS_TYPE_URL, "eds-3").await?;
+    let endpoints_withdrawn = wait_until_unreachable(outbound_port, SERVICE_HOST).await?;
+
+    // ── Phase 5: a replacement assignment restores it ──
+    ads.push(response(
+        EDS_TYPE_URL,
+        "eds-4",
+        "eds-n4",
+        vec![any_resource(EDS_TYPE_URL, &assignment(good_cluster, &endpoint))],
+    ));
+    ads.wait_for_ack(EDS_TYPE_URL, "eds-4").await?;
+    let endpoints_restored = wait_until_reachable(outbound_port, SERVICE_HOST).await?;
+
+    // ── Phase 6: state-of-the-world CDS withdrawal removes reachability ──
+    // `cds-4` no longer names the service's cluster. Under SotW that IS the
+    // deletion, and it must take the endpoints with it.
+    ads.push(response(
+        CDS_TYPE_URL,
+        "cds-4",
+        "cds-n4",
+        vec![any_resource(
+            CDS_TYPE_URL,
+            &eds_cluster(nopin_cluster, Some(B_SPIFFE)),
+        )],
+    ));
+    ads.wait_for_ack(CDS_TYPE_URL, "cds-4").await?;
+    let cluster_withdrawn = wait_until_unreachable(outbound_port, SERVICE_HOST).await?;
+
+    // ── Phase 7: re-publishing the cluster restores it ──
+    ads.push(response(
+        CDS_TYPE_URL,
+        "cds-5",
+        "cds-n5",
+        vec![any_resource(
+            CDS_TYPE_URL,
+            &eds_cluster(good_cluster, Some(B_SPIFFE)),
+        )],
+    ));
+    ads.wait_for_ack(CDS_TYPE_URL, "cds-5").await?;
+    ads.push(response(
+        EDS_TYPE_URL,
+        "eds-5",
+        "eds-n5",
+        vec![any_resource(EDS_TYPE_URL, &assignment(good_cluster, &endpoint))],
+    ));
+    ads.wait_for_ack(EDS_TYPE_URL, "eds-5").await?;
+    let cluster_restored = wait_until_reachable(outbound_port, SERVICE_HOST).await?;
+
+    // ── Phase 8: unsupported enforcement + routing constructs are refused ──
+    // An RBAC HTTP filter refuses the whole listener (reducing it to plain
+    // routing would turn the control plane's DENY into an ALLOW), and a
+    // `weighted_clusters` route action is refused rather than approximated.
+    // Both are CAPABILITY refusals: the response is ACKed, not NACKed, and the
+    // refusal narrows — the cluster the weighted route names must not become
+    // reachable, and the good service must be unaffected.
+    ads.push(response(
+        LDS_TYPE_URL,
+        "lds-2",
+        "lds-n2",
+        vec![any_resource(
+            LDS_TYPE_URL,
+            &hcm_listener(
+                &format!("0.0.0.0_{backend_port}"),
+                backend_port,
+                route_config_name,
+                &["envoy.filters.http.rbac"],
+            ),
+        )],
+    ));
+    ads.wait_for_ack(LDS_TYPE_URL, "lds-2").await?;
+    ads.push(response(
+        RDS_TYPE_URL,
+        "rds-2",
+        "rds-n2",
+        vec![any_resource(
+            RDS_TYPE_URL,
+            &weighted_route_config(route_config_name, &[GHOST_HOST, SERVICE_HOST]),
+        )],
+    ));
+    ads.wait_for_ack(RDS_TYPE_URL, "rds-2").await?;
+    let lds_nacked = ads.nacked(LDS_TYPE_URL);
+    let rds_nacked = ads.nacked(RDS_TYPE_URL);
+    let good_service_after_capability_refusal =
+        wait_until_reachable(outbound_port, SERVICE_HOST).await?;
+    let ghost_cluster_probe = probe(outbound_port, GHOST_HOST).await;
+
+    // ── Phase 9: the CP's SAN pin is a verification input ──
+    // Same cluster, same endpoint, only the pinned peer identity changes — so
+    // losing reachability here can only come from the mTLS peer check.
+    ads.push(response(
+        CDS_TYPE_URL,
+        "cds-6",
+        "cds-n6",
+        vec![any_resource(
+            CDS_TYPE_URL,
+            &eds_cluster(good_cluster, Some(IMPOSTOR_SPIFFE)),
+        )],
+    ));
+    ads.wait_for_ack(CDS_TYPE_URL, "cds-6").await?;
+    ads.push(response(
+        EDS_TYPE_URL,
+        "eds-6",
+        "eds-n6",
+        vec![any_resource(EDS_TYPE_URL, &assignment(good_cluster, &endpoint))],
+    ));
+    ads.wait_for_ack(EDS_TYPE_URL, "eds-6").await?;
+    let impostor_pin = wait_until_unreachable(outbound_port, SERVICE_HOST).await?;
+
+    Ok(StockLiveObservations {
+        converged,
+        unpinned_peer,
+        subset_cluster: subset_cluster_probe,
+        foreign_namespace,
+        good_service_after_refusals,
+        nack_version_info,
+        nack_message,
+        good_service_after_nack,
+        endpoints_withdrawn,
+        endpoints_restored,
+        cluster_withdrawn,
+        cluster_restored,
+        lds_nacked,
+        rds_nacked,
+        ghost_cluster: ghost_cluster_probe,
+        good_service_after_capability_refusal,
+        impostor_pin,
+        logs: String::new(),
+    })
+}
+
+// ── the test ─────────────────────────────────────────────────────────────
+
+/// Live keystone for issue #3317: standard v3 resources from a **third-party**
+/// ADS server, consumed by the production `stock_xds` client, routing real
+/// traffic through a real Ferrum proxy listener to a real backend — and every
+/// update, deletion, NACK, and refusal asserted on that same data path.
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_stock_xds_live_datapath_matrix() {
+    let observed = drive_stock_xds_live_datapath()
+        .await
+        .expect("stock xDS live datapath drive");
+    let logs = &observed.logs;
+
+    // Phase 1.
+    assert!(
+        observed.converged.reached_backend(),
+        "a service discovered from standard CDS/EDS/LDS/RDS must route captured traffic through \
+         the mesh transport to its backend — {}\n{logs}",
+        observed.converged.describe("converged probe")
+    );
+
+    // Phase 2 — refusals and narrowing remove reachability, never add it.
+    assert!(
+        observed.good_service_after_refusals.reached_backend(),
+        "the accepted service must keep serving while other resources are refused — {}\n{logs}",
+        observed
+            .good_service_after_refusals
+            .describe("good service")
+    );
+    for (probe, what, reason) in [
+        (
+            &observed.unpinned_peer,
+            "a cluster whose control plane pinned NO peer identity",
+            "no_pinned_peer_identity",
+        ),
+        (
+            &observed.subset_cluster,
+            "a DestinationRule subset cluster",
+            "subset_cluster_unsupported",
+        ),
+    ] {
+        assert!(
+            !probe.reached_backend(),
+            "{what} must not reach a backend even though its endpoint is reachable — {}\n{logs}",
+            probe.describe("refused probe")
+        );
+        assert!(
+            logs.contains(reason),
+            "the refusal diagnostic '{reason}' must appear for {what}\n{logs}"
+        );
+    }
+    assert!(
+        !observed.foreign_namespace.reached_backend(),
+        "a discovered service in another namespace must stay outside this workload's slice — \
+         {}\n{logs}",
+        observed
+            .foreign_namespace
+            .describe("foreign-namespace probe")
+    );
+
+    // Phase 3 — a structural error NACKs and the last-good view keeps serving.
+    assert!(
+        observed
+            .nack_message
+            .contains("duplicate Cluster resource name"),
+        "the NACK must carry a field-specific diagnostic, got: {:?}\n{logs}",
+        observed.nack_message
+    );
+    assert_eq!(
+        observed.nack_version_info, "cds-2",
+        "a NACK re-asserts the last version the client actually accepted\n{logs}"
+    );
+    assert!(
+        observed.good_service_after_nack.reached_backend(),
+        "a NACKed response must leave the last good slice serving live traffic — {}\n{logs}",
+        observed.good_service_after_nack.describe("post-NACK probe")
+    );
+
+    // Phases 4–7 — update / delete take effect on the live data path.
+    assert!(
+        !observed.endpoints_withdrawn.reached_backend(),
+        "withdrawing a cluster's endpoints must remove reachability — {}\n{logs}",
+        observed
+            .endpoints_withdrawn
+            .describe("withdrawn-endpoints probe")
+    );
+    assert!(
+        observed.endpoints_restored.reached_backend(),
+        "a replacement endpoint assignment must restore reachability — {}\n{logs}",
+        observed
+            .endpoints_restored
+            .describe("restored-endpoints probe")
+    );
+    assert!(
+        !observed.cluster_withdrawn.reached_backend(),
+        "a state-of-the-world CDS response that omits the cluster must remove reachability — \
+         {}\n{logs}",
+        observed
+            .cluster_withdrawn
+            .describe("withdrawn-cluster probe")
+    );
+    assert!(
+        observed.cluster_restored.reached_backend(),
+        "re-publishing the cluster must restore reachability — {}\n{logs}",
+        observed.cluster_restored.describe("restored-cluster probe")
+    );
+
+    // Phase 8 — capability refusals ACK, narrow, and never widen.
+    assert!(
+        !observed.lds_nacked,
+        "a well-formed listener carrying an unsupported enforcement filter is a CAPABILITY \
+         refusal, not a structural NACK\n{logs}"
+    );
+    assert!(
+        !observed.rds_nacked,
+        "a well-formed route using an unsupported action is a CAPABILITY refusal, not a \
+         structural NACK\n{logs}"
+    );
+    assert!(
+        logs.contains("unsupported_http_filter") && logs.contains("envoy.filters.http.rbac"),
+        "the enforcement-filter refusal must name the offending filter field\n{logs}"
+    );
+    assert!(
+        logs.contains("unsupported_route_action")
+            && logs.contains("routes[].route.weighted_clusters"),
+        "the traffic-shaping refusal must name the offending route field\n{logs}"
+    );
+    assert!(
+        !observed.ghost_cluster.reached_backend(),
+        "a cluster named only by a REFUSED weighted-cluster route must not become reachable — \
+         {}\n{logs}",
+        observed.ghost_cluster.describe("ghost-cluster probe")
+    );
+    assert!(
+        observed
+            .good_service_after_capability_refusal
+            .reached_backend(),
+        "refusing an unsupported listener/route must not disturb the accepted service — {}\n{logs}",
+        observed
+            .good_service_after_capability_refusal
+            .describe("post-refusal probe")
+    );
+
+    // Phase 9 — the control plane's SAN pin is enforced, not decorative.
+    assert!(
+        !observed.impostor_pin.reached_backend(),
+        "re-pinning the cluster's peer identity to an impostor SPIFFE must fail the mesh mTLS \
+         dial closed — {}\n{logs}",
+        observed.impostor_pin.describe("impostor-pin probe")
+    );
+}
