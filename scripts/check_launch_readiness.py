@@ -1651,6 +1651,65 @@ def resolve_checked_out_sha(root: Path) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Advisory-credential trust boundary
+# ---------------------------------------------------------------------------
+
+
+def advisory_token_present(env: Mapping[str, str]) -> bool:
+    """True when a privileged advisory credential is in this environment.
+
+    The value itself is never returned, stored, or logged — only its presence.
+    """
+
+    raw = env.get(ADVISORY_TOKEN_VAR, "")
+    return isinstance(raw, str) and bool(raw.strip())
+
+
+def advisory_execution_errors(
+    *,
+    trusted_execution: bool,
+    explicit_target: bool,
+    trusted_tree_sha: str,
+    checked_out_sha: str | None,
+    env: Mapping[str, str],
+) -> list[str]:
+    """Everything that disqualifies this invocation from using the credential.
+
+    Issue #3802: a `v*` tag can point at any commit, and a tag-triggered job
+    executes the tag's own copy of this checker. The credential therefore only
+    belongs to an invocation that declares itself trusted AND proves the tree it
+    is executing from is the pinned trusted anchor, with the commit under
+    evaluation supplied separately as inert data. Every failure below is
+    fail-closed and none of them interpolates the credential.
+    """
+
+    errors: list[str] = []
+    token_present = advisory_token_present(env)
+    if token_present and not trusted_execution:
+        errors.append(
+            "an advisory credential was supplied to an invocation that did not "
+            "declare --trusted-execution; refusing to use it"
+        )
+    if not trusted_execution:
+        return errors
+    if not explicit_target:
+        errors.append(
+            "--trusted-execution requires an explicit target SHA; the candidate "
+            "commit is data, never the executing tree"
+        )
+    if not SHA_RE.fullmatch(trusted_tree_sha or ""):
+        errors.append(
+            "--trusted-execution requires --trusted-tree-sha to name the trusted "
+            "anchor commit"
+        )
+    elif checked_out_sha is None:
+        errors.append("the executing tree could not be resolved to a commit")
+    elif checked_out_sha != trusted_tree_sha:
+        errors.append("the executing tree is not the pinned trusted anchor commit")
+    return errors
+
+
+# ---------------------------------------------------------------------------
 # Deterministic fixture self-tests
 # ---------------------------------------------------------------------------
 
@@ -3045,6 +3104,111 @@ def run_self_test() -> int:  # noqa: C901 — a flat fixture table stays readabl
     except GateError as exc:
         check("missing git dir fails closed", exc.code == "io", exc.message)
 
+    # ---- advisory-credential trust boundary (issue #3802) -------------------
+    trusted_anchor = "a" * 40
+    candidate_anchor = "b" * 40
+    token_env = {ADVISORY_TOKEN_VAR: "s3cret-advisory-credential"}
+
+    def boundary(
+        *,
+        trusted: bool,
+        explicit: bool,
+        tree: str = "",
+        head: str | None = trusted_anchor,
+        env: dict[str, str] | None = None,
+    ) -> list[str]:
+        return advisory_execution_errors(
+            trusted_execution=trusted,
+            explicit_target=explicit,
+            trusted_tree_sha=tree,
+            checked_out_sha=head,
+            env=env if env is not None else {},
+        )
+
+    # A malicious tagged checker/workflow: the tag target rewrote this script to
+    # exfiltrate whatever it is given, and the workflow handed it the credential.
+    # The credential is refused before a single advisory request is made.
+    malicious_tag = boundary(trusted=False, explicit=True, env=token_env)
+    check(
+        "credential outside a trusted execution is refused",
+        malicious_tag and any("did not declare" in err for err in malicious_tag),
+        str(malicious_tag),
+    )
+    check(
+        "the refusal never echoes the credential",
+        all("s3cret" not in err for err in malicious_tag),
+    )
+
+    # The same untrusted invocation with no credential is unaffected: the
+    # standalone tag/PR run still evaluates from the redacted variables.
+    check(
+        "an untrusted invocation without a credential is allowed",
+        boundary(trusted=False, explicit=True) == [],
+    )
+
+    # A trusted invocation must carry the candidate as data, not as the tree.
+    check(
+        "trusted execution requires an explicit target SHA",
+        any(
+            "explicit target SHA" in err
+            for err in boundary(trusted=True, explicit=False, tree=trusted_anchor)
+        ),
+    )
+    check(
+        "trusted execution requires a trusted anchor SHA",
+        any(
+            "--trusted-tree-sha" in err
+            for err in boundary(trusted=True, explicit=True, tree="")
+        ),
+    )
+    check(
+        "a malformed trusted anchor SHA is refused",
+        any(
+            "--trusted-tree-sha" in err
+            for err in boundary(trusted=True, explicit=True, tree="not-a-sha")
+        ),
+    )
+    # The candidate tree substituted for the trusted anchor — the exact swap the
+    # tag-triggered path used to perform implicitly.
+    check(
+        "executing from the candidate tree is refused",
+        any(
+            "not the pinned trusted anchor" in err
+            for err in boundary(
+                trusted=True,
+                explicit=True,
+                tree=trusted_anchor,
+                head=candidate_anchor,
+            )
+        ),
+    )
+    check(
+        "an unresolvable tree is refused",
+        any(
+            "could not be resolved" in err
+            for err in boundary(
+                trusted=True, explicit=True, tree=trusted_anchor, head=None
+            )
+        ),
+    )
+    check(
+        "a pinned trusted execution with an explicit candidate is allowed",
+        boundary(
+            trusted=True,
+            explicit=True,
+            tree=trusted_anchor,
+            head=trusted_anchor,
+            env=token_env,
+        )
+        == [],
+    )
+    check(
+        "credential presence is detected without returning it",
+        advisory_token_present(token_env)
+        and not advisory_token_present({ADVISORY_TOKEN_VAR: "   "})
+        and not advisory_token_present({}),
+    )
+
     # ---- checked-in policy / exemptions -------------------------------------
     try:
         repo_policy = require_dict(load_json_file(POLICY_PATH), "repo policy")
@@ -3096,6 +3260,22 @@ def verify_exit_code(claim: dict[str, Any], evaluation: Evaluation) -> int:
 def run_verify(args: argparse.Namespace, env: Mapping[str, str]) -> int:
     target_sha = (args.target_sha or env.get("LAUNCH_TARGET_SHA", "") or "").strip()
     explicit_target = bool(target_sha)
+    trusted_tree_sha = (args.trusted_tree_sha or "").strip()
+    try:
+        checked_out_for_trust: str | None = resolve_checked_out_sha(ROOT)
+    except GateError:
+        checked_out_for_trust = None
+    boundary_errors = advisory_execution_errors(
+        trusted_execution=args.trusted_execution,
+        explicit_target=explicit_target,
+        trusted_tree_sha=trusted_tree_sha,
+        checked_out_sha=checked_out_for_trust,
+        env=env,
+    )
+    if boundary_errors:
+        for err in boundary_errors:
+            print(f"error: trust_boundary: {sanitize_line(err)}", file=sys.stderr)
+        return 1
     if not explicit_target:
         # No caller-supplied target: evaluate the commit that is checked out,
         # which is what a tag/release job has already pinned via its ref.
@@ -3169,6 +3349,20 @@ def main(argv: list[str] | None = None) -> int:
         "--verify-checkout",
         action="store_true",
         help="assert the working tree HEAD is the evaluation target commit",
+    )
+    parser.add_argument(
+        "--trusted-execution",
+        action="store_true",
+        help=(
+            "declare that this invocation executes protected default-branch code "
+            "and may therefore use an advisory credential; requires an explicit "
+            "target SHA and --trusted-tree-sha"
+        ),
+    )
+    parser.add_argument(
+        "--trusted-tree-sha",
+        default="",
+        help="the trusted anchor commit this invocation must be executing from",
     )
     parser.add_argument("--launch-tier", default="")
     parser.add_argument("--target-sha", default="")
