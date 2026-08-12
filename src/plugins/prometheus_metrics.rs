@@ -2710,6 +2710,7 @@ impl MetricsRegistry {
         };
         self.append_mesh_observability_prometheus(&mut output);
         self.append_node_waypoint_observability_prometheus(&mut output);
+        self.append_grpc_stream_auth_prometheus(&mut output);
         self.append_udp_placement_migration_prometheus(&mut output);
         self.append_dp_config_freshness_prometheus(&mut output);
         output
@@ -2770,6 +2771,16 @@ impl MetricsRegistry {
         );
     }
 
+    fn append_grpc_stream_auth_prometheus(&self, output: &mut String) {
+        let ns_label = self
+            .namespace_label
+            .read()
+            .map(|label| label.clone())
+            .unwrap_or_default();
+        let gateway_ns_label = gateway_namespace_label(&ns_label);
+        crate::grpc::auth::render_stream_auth_metrics(output, &gateway_ns_label);
+    }
+
     /// Append the bounded Ambient UDP placement migration state outside the
     /// render cache so phase/outstanding changes are visible immediately.
     fn append_udp_placement_migration_prometheus(&self, output: &mut String) {
@@ -2797,6 +2808,7 @@ impl MetricsRegistry {
         let mut output = self.render_cacheable_body();
         self.append_mesh_observability_prometheus(&mut output);
         self.append_node_waypoint_observability_prometheus(&mut output);
+        self.append_grpc_stream_auth_prometheus(&mut output);
         self.append_udp_placement_migration_prometheus(&mut output);
         self.append_dp_config_freshness_prometheus(&mut output);
         output
