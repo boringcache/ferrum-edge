@@ -2854,7 +2854,8 @@ async fn publish_node_identity(client: &Client, node_name: &str, registry_dir: &
              host-placement adoption for a node UID this agent cannot vouch for"
         );
     }
-    let Err(error) = resolve_and_publish_node_identity(client, node_name, registry_dir).await else {
+    let Err(error) = resolve_and_publish_node_identity(client, node_name, registry_dir).await
+    else {
         return;
     };
     warn!(
@@ -2880,7 +2881,9 @@ async fn resolve_and_publish_node_identity(
     let node = match tokio::time::timeout(Duration::from_secs(10), nodes.get(node_name)).await {
         Ok(Ok(node)) => node,
         Ok(Err(error)) => {
-            return Err(format!("could not read this node's Kubernetes object: {error}"));
+            return Err(format!(
+                "could not read this node's Kubernetes object: {error}"
+            ));
         }
         Err(_) => return Err("timed out reading this node's Kubernetes object".to_string()),
     };

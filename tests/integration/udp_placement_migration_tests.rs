@@ -511,7 +511,10 @@ fn an_unbound_durable_record_never_adopts_a_producer_placement() {
         let error = prepare_placement(registry.path(), &request)
             .err()
             .expect("unbound durable ownership must not adopt a producer");
-        assert!(error.contains("names no owning Kubernetes node UID"), "{error}");
+        assert!(
+            error.contains("names no owning Kubernetes node UID"),
+            "{error}"
+        );
         assert!(error.contains("cleanup then finalize"), "{error}");
     }
 
