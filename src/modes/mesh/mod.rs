@@ -23777,6 +23777,116 @@ mod tests {
     }
 
     #[test]
+    fn sidecar_inbound_proxies_materialize_for_same_pod_selected_by_multiple_services() {
+        // One pod selected by two Services (same SPIFFE, same endpoint address,
+        // distinct service_name) is Kubernetes-normal. Inbound must emit a Host
+        // route per Service rather than treating the shared service-account
+        // SPIFFE as ambiguous and materializing nothing.
+        let shared = "spiffe://cluster.local/ns/default/sa/shared";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(shared.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let mut reviews = workload_with_address("reviews", "shared-app", "10.0.0.7");
+        reviews.spiffe_id = SpiffeId::new(shared).unwrap();
+        let mut ratings = workload_with_address("ratings", "shared-app", "10.0.0.7");
+        ratings.spiffe_id = SpiffeId::new(shared).unwrap();
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![reviews, ratings],
+            services: vec![
+                http_mesh_service("reviews", 8080, shared),
+                http_mesh_service("ratings", 8080, shared),
+            ],
+            ..MeshSlice::default()
+        };
+
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+        let mut inbound_ids: Vec<&str> = config
+            .proxies
+            .iter()
+            .filter(|p| p.id.starts_with("__mesh-inbound-"))
+            .map(|p| p.id.as_str())
+            .collect();
+        inbound_ids.sort_unstable();
+        assert_eq!(
+            inbound_ids,
+            vec![
+                "__mesh-inbound-default-ratings-8080",
+                "__mesh-inbound-default-reviews-8080",
+            ],
+            "same-pod multi-service inbound must materialize one Host route per \
+             Service, got {inbound_ids:?}"
+        );
+        let reviews = config
+            .proxies
+            .iter()
+            .find(|p| p.id == "__mesh-inbound-default-reviews-8080")
+            .expect("reviews inbound");
+        let ratings = config
+            .proxies
+            .iter()
+            .find(|p| p.id == "__mesh-inbound-default-ratings-8080")
+            .expect("ratings inbound");
+        assert!(
+            reviews
+                .hosts
+                .iter()
+                .any(|h| h == "reviews.default.svc.cluster.local"),
+            "reviews inbound hosts: {:?}",
+            reviews.hosts
+        );
+        assert!(
+            ratings
+                .hosts
+                .iter()
+                .any(|h| h == "ratings.default.svc.cluster.local"),
+            "ratings inbound hosts: {:?}",
+            ratings.hosts
+        );
+    }
+
+    #[test]
+    fn sidecar_inbound_proxies_skip_shared_spiffe_with_distinct_pod_addresses() {
+        // Same service-account SPIFFE backing two services on DIFFERENT
+        // addresses is two pods, not one pod selected by two Services. Fail
+        // closed rather than materialize inbound to the wrong loopback app.
+        let shared = "spiffe://cluster.local/ns/default/sa/shared";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(shared.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let mut reviews = workload_with_address("reviews", "shared-app", "10.0.0.7");
+        reviews.spiffe_id = SpiffeId::new(shared).unwrap();
+        let mut ratings = workload_with_address("ratings", "shared-app", "10.0.0.8");
+        ratings.spiffe_id = SpiffeId::new(shared).unwrap();
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![reviews, ratings],
+            services: vec![
+                http_mesh_service("reviews", 8080, shared),
+                http_mesh_service("ratings", 8080, shared),
+            ],
+            ..MeshSlice::default()
+        };
+
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+        assert!(
+            !config
+                .proxies
+                .iter()
+                .any(|p| p.id.starts_with("__mesh-inbound-")),
+            "distinct-pod shared-SPIFFE identities must not materialize inbound routes"
+        );
+    }
+
+    #[test]
     fn sidecar_inbound_proxies_skip_ambiguous_shared_spiffe_without_labels() {
         // Two workloads share the service-account SPIFFE but back different
         // services, and the sidecar carries no labels to disambiguate. The local

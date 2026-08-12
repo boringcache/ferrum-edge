@@ -602,54 +602,81 @@ fn stock_policy_document() -> String {
         .expect("mesh policy document serializes")
 }
 
-/// Gateway B's slice: the destination sidecar's own view of the one in-mesh
-/// service it backs. B is an ordinary native-CP sidecar — the stock control
-/// plane drives only gateway A.
+/// One local Service this destination pod backs, plus the per-service workload
+/// record stock xDS also emits for a shared endpoint (same SPIFFE, same
+/// address, distinct `service_name`).
+fn destination_local_service(
+    name: &str,
+    backend_port: u16,
+    b_id: &SpiffeId,
+    trust_domain: &TrustDomain,
+) -> (Workload, MeshService) {
+    let workload = Workload {
+        spiffe_id: b_id.clone(),
+        selector: WorkloadSelector {
+            labels: HashMap::from([("app".to_string(), "svc-b".to_string())]),
+            namespace: Some("ferrum".to_string()),
+        },
+        service_name: name.to_string(),
+        service_namespace: None,
+        addresses: vec!["127.0.0.1".to_string()],
+        ports: vec![WorkloadPort {
+            port: backend_port,
+            protocol: AppProtocol::Http,
+            name: Some("http".to_string()),
+        }],
+        trust_domain: trust_domain.clone(),
+        namespace: "ferrum".to_string(),
+        network: None,
+        cluster: None,
+        weight: None,
+        locality: None,
+        service_account: Some("svc-b".to_string()),
+        pod_uid: None,
+        node_waypoint: None,
+        remote_provenance: false,
+    };
+    let service = MeshService {
+        cluster_ips: Vec::new(),
+        name: name.to_string(),
+        namespace: "ferrum".to_string(),
+        ports: vec![ServicePort {
+            port: backend_port,
+            protocol: AppProtocol::Http,
+            name: Some("http".to_string()),
+            target_port: None,
+        }],
+        workloads: vec![WorkloadRef {
+            spiffe_id: b_id.clone(),
+        }],
+        protocol_overrides: HashMap::new(),
+        uid: None,
+    };
+    (workload, service)
+}
+
+/// Gateway B's slice: the destination sidecar's own view of the in-mesh
+/// services this pod backs. B is an ordinary native-CP sidecar — the stock
+/// control plane drives only gateway A.
+///
+/// Phase 2a publishes additional representable clusters (`svc-nopin`,
+/// `svc-subset`) that share this pod's endpoint and SAN pin. A's outbound
+/// preserves the client Host, so B must materialize inbound Host routes for
+/// those Services or the pre-state probe 404s at B after a successful mTLS hop.
 fn destination_slice(node_id: &str, backend_port: u16) -> MeshSlice {
     let b_id = SpiffeId::new(B_SPIFFE).expect("destination SPIFFE id");
+    let trust_domain = TrustDomain::new("cluster.local").expect("trust domain");
+    let (workloads, services): (Vec<Workload>, Vec<MeshService>) =
+        ["svc-b", "svc-nopin", "svc-subset"]
+            .into_iter()
+            .map(|name| destination_local_service(name, backend_port, &b_id, &trust_domain))
+            .unzip();
     MeshSlice {
         node_id: node_id.to_string(),
         namespace: "ferrum".to_string(),
         version: chrono::Utc::now().to_rfc3339(),
-        workloads: vec![Workload {
-            spiffe_id: b_id.clone(),
-            selector: WorkloadSelector {
-                labels: HashMap::from([("app".to_string(), "svc-b".to_string())]),
-                namespace: Some("ferrum".to_string()),
-            },
-            service_name: "svc-b".to_string(),
-            service_namespace: None,
-            addresses: vec!["127.0.0.1".to_string()],
-            ports: vec![WorkloadPort {
-                port: backend_port,
-                protocol: AppProtocol::Http,
-                name: Some("http".to_string()),
-            }],
-            trust_domain: TrustDomain::new("cluster.local").expect("trust domain"),
-            namespace: "ferrum".to_string(),
-            network: None,
-            cluster: None,
-            weight: None,
-            locality: None,
-            service_account: Some("svc-b".to_string()),
-            pod_uid: None,
-            node_waypoint: None,
-            remote_provenance: false,
-        }],
-        services: vec![MeshService {
-            cluster_ips: Vec::new(),
-            name: "svc-b".to_string(),
-            namespace: "ferrum".to_string(),
-            ports: vec![ServicePort {
-                port: backend_port,
-                protocol: AppProtocol::Http,
-                name: Some("http".to_string()),
-                target_port: None,
-            }],
-            workloads: vec![WorkloadRef { spiffe_id: b_id }],
-            protocol_overrides: HashMap::new(),
-            uid: None,
-        }],
+        workloads,
+        services,
         peer_authentications: vec![PeerAuthentication {
             name: "stock-xds-strict".to_string(),
             namespace: "ferrum".to_string(),
@@ -905,8 +932,10 @@ async fn drive_stock_xds_live_datapath() -> Result<StockLiveObservations, String
         let a_outbound_port = ports_a.outbound;
         let b_inbound_port = ports_b.inbound;
 
-        // Gateway B: the destination sidecar. Its workload identity makes svc-b
-        // local, so its inbound materializer routes :inbound → the backend.
+        // Gateway B: the destination sidecar. Its workload identity makes the
+        // local services this pod backs (svc-b plus the phase-2a representable
+        // extra hosts) inbound-routable, so :inbound Host matching reaches the
+        // backend.
         let mut child_b = spawn_mesh_gateway(
             &temp_b,
             MeshGatewaySpawnOptions {

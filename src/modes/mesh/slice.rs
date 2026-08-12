@@ -3787,12 +3787,17 @@ pub(crate) fn workload_is_local(
 /// and the inbound route materializer so the two cannot diverge.
 ///
 /// A SPIFFE id is a service-account identity, not pod-unique, and labels aren't
-/// necessarily pod-unique either. So after matching by SPIFFE + labels + cluster
-/// (`workload_is_local`), if the matched set still backs **more than one distinct
-/// service** we cannot tell which one the local pod serves and return empty
-/// rather than materialize inbound routes to the wrong loopback app. A single
-/// backed service (including replicas that share one `service_name`) is
-/// unambiguous.
+/// necessarily pod-unique either. After matching by SPIFFE + labels + cluster
+/// (`workload_is_local`), a matched set that backs **more than one distinct
+/// service** is the Kubernetes-normal "one pod, several Services" case when
+/// those records are the same pod (shared non-empty pod UID, or else the same
+/// non-empty endpoint address set). Keep every record so inbound can
+/// materialize a Host route per Service. Distinct pods that only share a
+/// service-account SPIFFE — different addresses, divergent pod UIDs, or no
+/// identity key that can prove sameness — stay ambiguous and return empty
+/// rather than materialize inbound routes to the wrong loopback app. Replicas
+/// of one service share its `service_name` and collapse to a single distinct
+/// entry.
 pub(crate) fn resolve_local_workloads<'a>(
     workloads: &'a [Workload],
     local_spiffe: &str,
@@ -3803,17 +3808,11 @@ pub(crate) fn resolve_local_workloads<'a>(
         .iter()
         .filter(|w| workload_is_local(w, local_spiffe, sidecar_labels, local_cluster))
         .collect();
-    // A single local pod backs exactly ONE service. If the matched set spans more
-    // than one distinct service the identity is ambiguous — a shared
-    // service-account SPIFFE that the labels (if any) don't disambiguate, since
-    // labels aren't necessarily pod-unique either — so fail closed rather than
-    // materialize inbound routes to the wrong loopback app. (Replicas of one
-    // service share its `service_name` and collapse to a single distinct entry.)
     let distinct_services: BTreeSet<(&str, &str)> = matched
         .iter()
         .map(|w| (w.service_name.as_str(), w.attached_service_namespace()))
         .collect();
-    if distinct_services.len() > 1 {
+    if distinct_services.len() > 1 && !matched_workloads_are_same_pod(&matched) {
         warn!(
             local_spiffe,
             distinct_services = distinct_services.len(),
@@ -3825,6 +3824,44 @@ pub(crate) fn resolve_local_workloads<'a>(
         return Vec::new();
     }
     matched
+}
+
+/// True when every matched workload is the same local pod.
+///
+/// A non-empty pod UID is the strongest key: all records must carry it, and
+/// they must agree. Divergent UIDs are distinct pods even when addresses
+/// collide (hostNetwork). When a UID is missing, the same non-empty address
+/// set is the remaining same-pod proof. Empty addresses cannot prove sameness,
+/// so two service-account copies without a UID or address stay ambiguous.
+fn matched_workloads_are_same_pod(matched: &[&Workload]) -> bool {
+    if matched.len() <= 1 {
+        return true;
+    }
+
+    let uids: Vec<Option<&str>> = matched
+        .iter()
+        .map(|workload| workload.pod_uid.as_deref().filter(|uid| !uid.is_empty()))
+        .collect();
+    if uids.iter().all(Option::is_some) {
+        let first = uids[0];
+        return uids.iter().all(|uid| *uid == first);
+    }
+
+    let address_sets: Vec<BTreeSet<&str>> = matched
+        .iter()
+        .map(|workload| {
+            workload
+                .addresses
+                .iter()
+                .map(String::as_str)
+                .filter(|address| !address.is_empty())
+                .collect()
+        })
+        .collect();
+    let Some(first) = address_sets.first() else {
+        return false;
+    };
+    !first.is_empty() && address_sets.iter().all(|set| set == first)
 }
 
 fn narrow_service_ports(

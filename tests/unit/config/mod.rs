@@ -52,6 +52,7 @@ mod pool_config_tests;
 mod separate_listeners_tests;
 mod sidecar_ingress_bind_tests;
 mod sidecar_ingress_stream_tests;
+mod sidecar_inbound_same_pod_multi_service_tests;
 mod sidecar_outbound_policy_tests;
 mod sql_dialect_tests;
 mod stable_file_tests;
