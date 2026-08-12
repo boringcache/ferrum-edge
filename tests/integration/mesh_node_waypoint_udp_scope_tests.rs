@@ -423,12 +423,10 @@ fn an_attributed_session_stops_revalidating_after_any_accepted_slice_generation(
         .resolve(Some(IFINDEX_A), ip(IP_A))
         .expect("pod A resolves in the admitted generation");
 
-    fixture
-        .resolver
-        .install_policy_scopes_from_workloads(&[
-            workload(SPIFFE_A, "team-a", labels(&[("app", "api")]), POD_A),
-            workload(SPIFFE_B, "team-b", labels(&[("app", "api")]), POD_B),
-        ]);
+    fixture.resolver.install_policy_scopes_from_workloads(&[
+        workload(SPIFFE_A, "team-a", labels(&[("app", "api")]), POD_A),
+        workload(SPIFFE_B, "team-b", labels(&[("app", "api")]), POD_B),
+    ]);
 
     assert_eq!(
         scoping
@@ -452,31 +450,20 @@ fn an_unattributable_session_is_also_fenced_by_policy_generation() {
     let fixture = Fixture::new();
     fixture.manager.reconcile_once();
     let scoping = fixture.scoping();
-    let (policy_generation, admission) =
-        scoping.resolve_observed(Some(999), ip("192.0.2.10"));
+    let (policy_generation, admission) = scoping.resolve_observed(Some(999), ip("192.0.2.10"));
     let refusal = admission
         .err()
         .expect("off-node interface is not attributable");
-    assert_eq!(
-        refusal,
-        NodeWaypointUdpSourceRefusal::UnenrolledInterface
-    );
+    assert_eq!(refusal, NodeWaypointUdpSourceRefusal::UnenrolledInterface);
 
-    fixture
-        .resolver
-        .install_policy_scopes_from_workloads(&[
-            workload(SPIFFE_A, "team-a", labels(&[("app", "api")]), POD_A),
-            workload(SPIFFE_B, "team-b", labels(&[("app", "api")]), POD_B),
-        ]);
+    fixture.resolver.install_policy_scopes_from_workloads(&[
+        workload(SPIFFE_A, "team-a", labels(&[("app", "api")]), POD_A),
+        workload(SPIFFE_B, "team-b", labels(&[("app", "api")]), POD_B),
+    ]);
 
     assert_eq!(
         scoping
-            .revalidate_unattributed(
-                policy_generation,
-                refusal,
-                Some(999),
-                ip("192.0.2.10"),
-            )
+            .revalidate_unattributed(policy_generation, refusal, Some(999), ip("192.0.2.10"),)
             .expect_err("the old mesh-wide-only admission must be retired"),
         NodeWaypointUdpSourceRefusal::PolicyGenerationChanged
     );

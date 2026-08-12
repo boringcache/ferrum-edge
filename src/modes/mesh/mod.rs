@@ -3889,13 +3889,7 @@ fn build_east_west_service_targets(
     workloads: &[crate::modes::mesh::config::Workload],
     multi_cluster: Option<&crate::modes::mesh::config::MultiClusterConfig>,
 ) -> Vec<UpstreamTarget> {
-    build_local_service_targets_where(
-        service,
-        service_port,
-        workloads,
-        multi_cluster,
-        |_| true,
-    )
+    build_local_service_targets_where(service, service_port, workloads, multi_cluster, |_| true)
 }
 
 /// Build the NodeWaypoint UDP/DTLS targets that are reachable through this

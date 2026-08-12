@@ -948,9 +948,7 @@ impl NodeWaypointIdentityResolver {
     /// it can never observe a new gate paired with an old/missing scope, which
     /// is the "never partial" reload invariant this resolver must hold.
     pub fn install_policy_scope_snapshot(&self, mut snapshot: NodeWaypointPolicyScopeSnapshot) {
-        snapshot.slice.generation = self
-            .next_slice_generation
-            .fetch_add(1, Ordering::Relaxed);
+        snapshot.slice.generation = self.next_slice_generation.fetch_add(1, Ordering::Relaxed);
         self.slice.store(std::sync::Arc::new(snapshot.slice));
     }
 

@@ -524,10 +524,7 @@ impl NodeWaypointUdpSourceScoping {
         &self,
         ingress_ifindex: Option<u32>,
         source: IpAddr,
-    ) -> (
-        u64,
-        Result<ResolvedUdpSource, NodeWaypointUdpSourceRefusal>,
-    ) {
+    ) -> (u64, Result<ResolvedUdpSource, NodeWaypointUdpSourceRefusal>) {
         let binding = match self.index.authorize(ingress_ifindex, source) {
             Ok(binding) => binding,
             Err(refusal) => {
@@ -631,9 +628,9 @@ impl NodeWaypointUdpSourceScoping {
             source,
         ) {
             Ok(()) => Err(NodeWaypointUdpDatagramVerdict::DropDatagram(refusal)),
-            Err(pinned_refusal) => Err(NodeWaypointUdpDatagramVerdict::CloseSession(
-                pinned_refusal,
-            )),
+            Err(pinned_refusal) => {
+                Err(NodeWaypointUdpDatagramVerdict::CloseSession(pinned_refusal))
+            }
         }
     }
 
