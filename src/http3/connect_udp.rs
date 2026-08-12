@@ -512,6 +512,21 @@ pub enum AdmittedConnectUdpDestination {
     UpstreamTarget(Box<UpstreamTarget>),
 }
 
+impl AdmittedConnectUdpDestination {
+    /// The exact upstream target the CLIENT named, when admission matched one.
+    ///
+    /// `None` for a route backend, which has no per-target metadata at all. This
+    /// is the ONLY target an admitted tunnel may be described by: it is the
+    /// member the client requested, never a load-balancer pick, so it is what
+    /// any later per-target reasoning must consult.
+    pub fn matched_upstream_target(&self) -> Option<&UpstreamTarget> {
+        match self {
+            Self::RouteBackend => None,
+            Self::UpstreamTarget(target) => Some(target.as_ref()),
+        }
+    }
+}
+
 /// Why a client-named CONNECT-UDP destination was refused.
 ///
 /// Both variants produce the same client-visible 403 with the same body: a
@@ -1271,7 +1286,7 @@ pub(crate) async fn handle_h3_connect_udp(
             .await;
         }
     };
-    let via_upstream_target = matches!(admitted, AdmittedConnectUdpDestination::UpstreamTarget(_));
+    let via_upstream_target = admitted.matched_upstream_target().is_some();
     debug!(
         proxy_id = %proxy.id,
         via_upstream_target,
