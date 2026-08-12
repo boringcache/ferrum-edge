@@ -4450,8 +4450,8 @@ EOF
 # listener bound and which certificate it presented.
 dtls_handshake_report_from() {
   local ns="$1" app="$2" target_ip="$3" port="$4" wait_secs="${5:-15}"
-  kubectl -n "$ns" exec "deploy/$app" -c dtls -- sh -c \
-    "timeout $wait_secs openssl s_client -dtls1_2 -connect $target_ip:$port </dev/null 2>&1" \
+  kubectl -n "$ns" exec "deploy/$app" -c dtls -- \
+    timeout "$wait_secs" openssl s_client -dtls1_2 -connect "$target_ip:$port" 2>&1 \
     || true
 }
 
@@ -4464,9 +4464,9 @@ dtls_handshake_report_from() {
 # authorization, not PKI trust, and the material is a per-run throwaway leaf.
 dtls_probe_from() {
   local ns="$1" app="$2" target_ip="$3" port="$4" payload="$5" wait_secs="${6:-8}"
-  kubectl -n "$ns" exec "deploy/$app" -c dtls -- sh -c \
-    "printf '%s\n' '$payload' | timeout $wait_secs openssl s_client -dtls1_2 \
-       -connect $target_ip:$port -quiet 2>/dev/null" \
+  printf '%s\n' "$payload" | kubectl -n "$ns" exec -i "deploy/$app" -c dtls -- \
+    timeout "$wait_secs" openssl s_client -dtls1_2 \
+      -connect "$target_ip:$port" -quiet 2>/dev/null \
     || true
 }
 
