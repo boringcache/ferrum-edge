@@ -215,7 +215,10 @@ need them, or because they are blocked upstream / architecturally:
   claim, a source address the interface's pod does not own, a registry entry with
   no attested identity or address, and a pod whose workload has left the live
   slice. Admitted sessions are re-authorized per datagram, so pod churn, veth
-  reuse, and registry removal terminate them. The blanket config-preparation
+  reuse, and registry removal terminate them; a datagram that merely names an
+  established session's (forgeable) source tuple from a different ingress
+  interface is refused on its own without ending that session. The blanket
+  config-preparation
   suppression of NodeWaypoint UDP/DTLS remains only on builds where the channel
   cannot exist (non-Linux). Mesh-wide UDP/DTLS policy is unchanged.
 - **DR `connectionPool.http.maxRequestsPerConnection`** — parsed and validated

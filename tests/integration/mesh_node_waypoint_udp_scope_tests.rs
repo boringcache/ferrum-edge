@@ -32,7 +32,7 @@ use ferrum_edge::modes::mesh::node_waypoint::NodeWaypointIdentityResolver;
 use ferrum_edge::proxy::host_udp_capture::ResolvedInterface;
 use ferrum_edge::proxy::netns_capture::{PodCaptureSource, PodCaptureSourceIps, PodCaptureTarget};
 use ferrum_edge::proxy::node_waypoint_udp_identity::{
-    NodeWaypointUdpInterfaceResolver, NodeWaypointUdpSourceIndex,
+    NodeWaypointUdpDatagramVerdict, NodeWaypointUdpInterfaceResolver, NodeWaypointUdpSourceIndex,
     NodeWaypointUdpSourceIndexManager, NodeWaypointUdpSourceRefusal, NodeWaypointUdpSourceScoping,
 };
 
@@ -505,6 +505,114 @@ fn a_shared_interface_refuses_every_claimant() {
     assert!(published.is_empty());
     assert!(fixture.index.authorize(Some(5), ip(IP_A)).is_err());
     assert!(fixture.index.authorize(Some(5), ip(IP_B)).is_err());
+}
+
+/// A UDP session is keyed by a source address and port that anything able to
+/// put a packet on the wire can forge — a neighbouring pod with `CAP_NET_RAW`,
+/// or an off-node sender. Such a datagram must be REFUSED (never forwarded),
+/// but it must not be able to tear down the session it names: the interface it
+/// actually arrived on proves it is somebody else's traffic, and the session's
+/// own pinned evidence is untouched by it. Otherwise one pod could keep killing
+/// a neighbour's UDP sessions at will.
+#[test]
+fn a_forged_datagram_from_another_interface_is_dropped_without_ending_the_session() {
+    let fixture = Fixture::new();
+    fixture.manager.reconcile_once();
+    let scoping = fixture.scoping();
+    let pinned = scoping
+        .resolve(Some(IFINDEX_A), ip(IP_A))
+        .expect("pod A's session is admitted")
+        .binding;
+
+    // Pod B forges pod A's source address, naming pod A's session.
+    assert_eq!(
+        scoping
+            .revalidate_datagram(&pinned, Some(IFINDEX_A), Some(IFINDEX_B), ip(IP_A))
+            .expect_err("a forged datagram must never be forwarded"),
+        NodeWaypointUdpDatagramVerdict::DropDatagram(
+            NodeWaypointUdpSourceRefusal::SourceAddressMismatch,
+        ),
+        "the forged datagram is dropped; pod A's session keeps its own still-vouched-for evidence"
+    );
+
+    // Off-node traffic on the node uplink, and a datagram that carried no
+    // ingress-interface cmsg at all, are the same shape.
+    assert_eq!(
+        scoping
+            .revalidate_datagram(&pinned, Some(IFINDEX_A), Some(9_999), ip(IP_A))
+            .expect_err("an unenrolled interface must never be forwarded"),
+        NodeWaypointUdpDatagramVerdict::DropDatagram(
+            NodeWaypointUdpSourceRefusal::UnenrolledInterface,
+        )
+    );
+    assert_eq!(
+        scoping
+            .revalidate_datagram(&pinned, Some(IFINDEX_A), None, ip(IP_A))
+            .expect_err("an unattributable datagram must never be forwarded"),
+        NodeWaypointUdpDatagramVerdict::DropDatagram(
+            NodeWaypointUdpSourceRefusal::NoIngressInterface,
+        )
+    );
+
+    // And the session itself is still serving.
+    scoping
+        .revalidate_datagram(&pinned, Some(IFINDEX_A), Some(IFINDEX_A), ip(IP_A))
+        .expect("pod A's own datagrams keep flowing");
+}
+
+/// The other half of the same split: when the refusal is a property of the
+/// SESSION rather than of one datagram, the session must end. Both directions
+/// are pinned here so a future change cannot collapse them back together.
+#[test]
+fn an_attribution_change_on_the_sessions_own_interface_ends_the_session() {
+    let fixture = Fixture::new();
+    fixture.manager.reconcile_once();
+    let pinned = fixture
+        .scoping()
+        .resolve(Some(IFINDEX_A), ip(IP_A))
+        .expect("pod A's session is admitted")
+        .binding;
+
+    // ABA: pod B reuses pod A's interface and address.
+    fixture
+        .registry
+        .set(vec![registry_target(POD_B, SPIFFE_B, IP_A)]);
+    fixture.interfaces.set(&[(POD_B, "vethA", IFINDEX_A)]);
+    fixture.manager.reconcile_once();
+
+    assert_eq!(
+        fixture
+            .scoping()
+            .revalidate_datagram(&pinned, Some(IFINDEX_A), Some(IFINDEX_A), ip(IP_A))
+            .expect_err("the replacement pod must not inherit the session"),
+        NodeWaypointUdpDatagramVerdict::CloseSession(
+            NodeWaypointUdpSourceRefusal::AttributionChanged,
+        )
+    );
+
+    // Registry removal is the same verdict, and stays so even when the datagram
+    // that observes it arrived on a different interface — the pinned evidence
+    // is gone either way, so there is nothing left to keep serving.
+    fixture.registry.set(Vec::new());
+    fixture.interfaces.set(&[]);
+    fixture.manager.reconcile_once();
+
+    assert_eq!(
+        fixture
+            .scoping()
+            .revalidate_datagram(&pinned, Some(IFINDEX_A), Some(IFINDEX_A), ip(IP_A))
+            .expect_err("a removed pod's session must stop")
+            .refusal(),
+        NodeWaypointUdpSourceRefusal::UnenrolledInterface
+    );
+    assert!(
+        fixture
+            .scoping()
+            .revalidate_datagram(&pinned, Some(IFINDEX_A), Some(IFINDEX_B), ip(IP_A))
+            .expect_err("a removed pod's session must stop")
+            .closes_session(),
+        "a datagram-specific mismatch must not mask the pinned evidence being gone"
+    );
 }
 
 /// Cleanup: shutting the manager down retracts the generation, so a listener

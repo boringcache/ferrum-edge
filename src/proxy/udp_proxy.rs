@@ -237,6 +237,21 @@ impl NodeWaypointUdpSessionSource {
         self.scoping
             .revalidate(&self.binding, ingress_ifindex, source)
     }
+
+    /// Re-authorize a datagram whose ingress interface is the DATAGRAM's, not
+    /// the session's. A UDP session is keyed by a forgeable source tuple, so a
+    /// refusal here must not be allowed to end a session whose own pinned
+    /// evidence is still current. The classification itself lives in
+    /// [`crate::proxy::node_waypoint_udp_identity`].
+    fn revalidate_datagram(
+        &self,
+        ingress_ifindex: Option<u32>,
+        source: IpAddr,
+    ) -> Result<(), crate::proxy::node_waypoint_udp_identity::NodeWaypointUdpDatagramVerdict> {
+        let pinned_iface = self.ingress_ifindex;
+        self.scoping
+            .revalidate_datagram(&self.binding, pinned_iface, ingress_ifindex, source)
+    }
 }
 
 impl UdpSession {
@@ -2610,18 +2625,34 @@ async fn process_datagram(
 
     // Re-authorize an established NodeWaypoint session on EVERY datagram
     // (issue #3286). The pinned binding must still be the current generation's
-    // attribution for this ingress interface and source address; a recycled
-    // veth, a pod restarted under a new UID at the same address, or a registry
-    // removal all fail here and terminate the session rather than letting it
-    // keep relaying under evidence that is no longer vouched for.
+    // attribution for this ingress interface and source address; nothing that
+    // fails here is ever forwarded. A recycled veth, a pod restarted under a new
+    // UID at the same address, or a registry removal invalidate the SESSION's
+    // own evidence and terminate it rather than letting it keep relaying under
+    // evidence that is no longer vouched for; a datagram that merely names this
+    // session's (forgeable) source tuple from a different ingress interface is
+    // refused on its own and leaves the session running.
     if let Some(source) = session.node_waypoint_source.as_ref()
-        && let Err(refusal) =
-            source.revalidate(local_addr.map(|local| local.ifindex), client_addr.ip())
+        && let Err(verdict) =
+            source.revalidate_datagram(local_addr.map(|local| local.ifindex), client_addr.ip())
     {
+        let refusal = verdict.refusal();
         source
             .scoping
             .index
             .warn_refusal(proxy_id, &udp_session_client_ip(client_addr), refusal);
+        if !verdict.closes_session() {
+            // This datagram entered on some other interface while the session's
+            // own evidence still resolves, so it is somebody else's traffic
+            // wearing a forged source tuple. Drop it — it is never forwarded —
+            // and leave the session alone: letting a neighbouring pod or an
+            // off-node sender tear down an established session by naming its
+            // 4-tuple would be a cross-workload denial of service, and refusing
+            // the datagram already gives the full security property. The
+            // refusal is counted and the warn is rate-limited, so a flood
+            // cannot become a log flood either.
+            return Ok(());
+        }
         session
             .expired
             .store(true, std::sync::atomic::Ordering::Release);
@@ -3023,15 +3054,22 @@ async fn process_new_session_datagram(
         for dgram in batch {
             // Pending entries are keyed only by the spoofable source tuple.
             // Re-authorize the actual ingress interface retained with every
-            // datagram before any plugin side effect.
+            // datagram before any plugin side effect. A queued datagram from a
+            // different interface is exactly the forged-tuple case, so it is
+            // dropped on its own rather than ending the admitted session.
             if let Some(source) = session.node_waypoint_source.as_ref()
-                && let Err(refusal) = source.revalidate(dgram.ingress_ifindex, client_addr.ip())
+                && let Err(verdict) =
+                    source.revalidate_datagram(dgram.ingress_ifindex, client_addr.ip())
             {
+                let refusal = verdict.refusal();
                 source.scoping.index.warn_refusal(
                     session.proxy_id.as_str(),
                     session.datagram_client_ip.as_ref(),
                     refusal,
                 );
+                if !verdict.closes_session() {
+                    continue;
+                }
                 session.expired.store(true, Ordering::Release);
                 signal_udp_reply_task_stop(&session.stop_reply_task, session.stop_notify.as_ref());
                 session.close_hook_ingress();
@@ -3060,13 +3098,18 @@ async fn process_new_session_datagram(
             // registry/slice change during it cannot produce a late backend
             // side effect under the opening workload's identity.
             if let Some(source) = session.node_waypoint_source.as_ref()
-                && let Err(refusal) = source.revalidate(dgram.ingress_ifindex, client_addr.ip())
+                && let Err(verdict) =
+                    source.revalidate_datagram(dgram.ingress_ifindex, client_addr.ip())
             {
+                let refusal = verdict.refusal();
                 source.scoping.index.warn_refusal(
                     session.proxy_id.as_str(),
                     session.datagram_client_ip.as_ref(),
                     refusal,
                 );
+                if !verdict.closes_session() {
+                    continue;
+                }
                 session.expired.store(true, Ordering::Release);
                 signal_udp_reply_task_stop(&session.stop_reply_task, session.stop_notify.as_ref());
                 session.close_hook_ingress();

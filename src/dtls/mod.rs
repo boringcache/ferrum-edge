@@ -124,6 +124,19 @@ pub struct FrontendDtlsConfig {
 #[cfg(target_os = "linux")]
 const DTLS_INGRESS_CAPTURE_BATCH: usize = 16;
 
+/// Datagrams drained per readiness wake-up before the capture loop returns to
+/// its `select!`.
+///
+/// `try_io` is a synchronous call that consumes no tokio cooperative budget and
+/// `dispatch_datagram` has no await point, so an unbounded inner drain would
+/// keep a runtime worker thread for exactly as long as a sender can keep the
+/// receive queue non-empty — never observing shutdown and never yielding. The
+/// plain-UDP listener bounds its own drain for the same reason; this is the
+/// DTLS equivalent. Re-entering the outer loop re-arms the shutdown branch and
+/// puts the readiness poll (which does consume coop budget) back in the path.
+#[cfg(target_os = "linux")]
+const DTLS_INGRESS_CAPTURE_DRAIN_LIMIT: usize = 256;
+
 /// Admission controls for the frontend DTLS demuxer.
 #[derive(Clone)]
 pub struct DtlsServerLimits {
@@ -1221,7 +1234,8 @@ impl DtlsServer {
                     let Some(batch) = recv_batch.as_mut() else {
                         return Ok(());
                     };
-                    loop {
+                    let mut drained: usize = 0;
+                    while drained < DTLS_INGRESS_CAPTURE_DRAIN_LIMIT {
                         let received = self.socket.try_io(tokio::io::Interest::READABLE, || {
                             batch.recv(fd, DTLS_INGRESS_CAPTURE_BATCH)
                         });
@@ -1237,6 +1251,7 @@ impl DtlsServer {
                                     self.dispatch_datagram(peer_addr, data, ingress_ifindex)
                                         .await;
                                 }
+                                drained += n;
                             }
                             Ok(_) => break,
                             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,

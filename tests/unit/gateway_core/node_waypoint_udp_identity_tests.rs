@@ -461,13 +461,22 @@ fn live_kernel_reports_an_ingress_interface_that_drives_attribution() {
         .send_to(b"ferrum", receiver_addr)
         .expect("send loopback datagram");
 
+    // `RecvMmsgBatch::recv` is `MSG_DONTWAIT`, so `SO_RCVTIMEO` would not apply
+    // and a `send_to` whose softirq delivery has been deferred to `ksoftirqd`
+    // would surface as `WouldBlock`. Poll for a bounded interval instead of
+    // asserting on the first non-blocking read.
     let mut batch = ferrum_edge::proxy::udp_batch::RecvMmsgBatch::new(4, false);
-    receiver
-        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-        .expect("set read timeout");
-    let received = batch
-        .recv(receiver.as_raw_fd(), 4)
-        .expect("recvmmsg returns the loopback datagram");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let received = loop {
+        match batch.recv(receiver.as_raw_fd(), 4) {
+            Ok(n) if n > 0 => break n,
+            _ if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Ok(n) => break n,
+            Err(error) => panic!("recvmmsg never returned the loopback datagram: {error}"),
+        }
+    };
     assert!(received >= 1, "the datagram must be received");
 
     let (payload, peer) = batch.datagram(0);

@@ -459,6 +459,44 @@ pub struct ResolvedUdpSource {
     pub scope: Arc<PolicyScopeCache>,
 }
 
+/// How an admitted session must react to one of its datagrams failing
+/// re-authorization.
+///
+/// A UDP session is keyed by the datagram's source address and port, and both
+/// are forgeable by anything that can put a packet on the wire — a neighbouring
+/// pod with `CAP_NET_RAW`, or an off-node sender. So "this datagram does not
+/// attribute to this session's workload" and "this session's own evidence is no
+/// longer vouched for" are DIFFERENT facts with different correct reactions,
+/// and collapsing them lets a third party end a session it has no relationship
+/// to. Neither verdict ever forwards the datagram.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeWaypointUdpDatagramVerdict {
+    /// This datagram entered the host namespace on an interface other than the
+    /// one the session pinned, while the pinned binding still resolves. It
+    /// belongs to some other sender, so it is DROPPED and the session is left
+    /// alone.
+    DropDatagram(NodeWaypointUdpSourceRefusal),
+    /// The session's own pinned evidence no longer resolves under the current
+    /// generation — veth reuse, a same-address restart under a new UID, a
+    /// re-attested identity, or a registry removal. The session must END.
+    CloseSession(NodeWaypointUdpSourceRefusal),
+}
+
+impl NodeWaypointUdpDatagramVerdict {
+    /// The closed-set refusal reason behind this verdict, for logging and
+    /// counting.
+    pub fn refusal(self) -> NodeWaypointUdpSourceRefusal {
+        match self {
+            Self::DropDatagram(refusal) | Self::CloseSession(refusal) => refusal,
+        }
+    }
+
+    /// Whether the session must be terminated.
+    pub fn closes_session(self) -> bool {
+        matches!(self, Self::CloseSession(_))
+    }
+}
+
 impl NodeWaypointUdpSourceScoping {
     /// Attribute a datagram and resolve its per-pod policy scope from the same
     /// live-slice read that vouches the pod.
@@ -477,6 +515,40 @@ impl NodeWaypointUdpSourceScoping {
                 .record(NodeWaypointUdpSourceRefusal::PodNotInSlice));
         };
         Ok(ResolvedUdpSource { binding, scope })
+    }
+
+    /// Re-authorize ONE datagram of an admitted session and classify what its
+    /// refusal actually proves.
+    ///
+    /// `pinned_ingress_ifindex` is the interface the session was admitted on;
+    /// `ingress_ifindex` is the interface THIS datagram arrived on. When the
+    /// two agree, the only inputs left are the pinned binding and the current
+    /// generation, so a refusal is a property of the session and ends it. When
+    /// they differ and the pinned evidence still resolves, the refusal is a
+    /// property of the datagram — a forged source tuple cannot change which
+    /// interface a packet entered on, but it CAN name an established session —
+    /// so the datagram is dropped and the session continues under its own,
+    /// still-vouched-for evidence. The datagram is never forwarded either way.
+    pub fn revalidate_datagram(
+        &self,
+        pinned: &NodeWaypointUdpSourceBinding,
+        pinned_ingress_ifindex: Option<u32>,
+        ingress_ifindex: Option<u32>,
+        source: IpAddr,
+    ) -> Result<(), NodeWaypointUdpDatagramVerdict> {
+        let Err(refusal) = self.revalidate(pinned, ingress_ifindex, source) else {
+            return Ok(());
+        };
+        if ingress_ifindex == pinned_ingress_ifindex {
+            // Same evidence the session pinned: nothing datagram-specific was
+            // consulted, so this is the session's own attribution changing.
+            // Short-circuited so the refusal is counted exactly once.
+            return Err(NodeWaypointUdpDatagramVerdict::CloseSession(refusal));
+        }
+        match self.revalidate(pinned, pinned_ingress_ifindex, source) {
+            Ok(()) => Err(NodeWaypointUdpDatagramVerdict::DropDatagram(refusal)),
+            Err(_) => Err(NodeWaypointUdpDatagramVerdict::CloseSession(refusal)),
+        }
     }
 
     /// Re-authorize a live session against both current attribution evidence
