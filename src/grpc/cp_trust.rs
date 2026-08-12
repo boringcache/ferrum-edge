@@ -176,7 +176,8 @@ pub enum TrustBundleRejectReason {
     SourceGenerationUnstable,
     /// A projected generation was detected but this platform offers no way to
     /// pin it. Refused rather than downgraded to independent re-resolution.
-    #[allow(dead_code)] // Constructed on non-Unix; external tests assert the closed reason on Unix.
+    #[allow(dead_code)]
+    // Constructed on non-Unix; external tests assert the closed reason on Unix.
     SourceGenerationUnsupported,
 }
 
