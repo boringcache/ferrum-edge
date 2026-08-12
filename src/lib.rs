@@ -7195,8 +7195,63 @@ pub mod _test_support {
         }
     }
 
-    /// Attribute an already-fired composed dispatch-phase bound and latch the
-    /// bounded class exactly once for the request (issue #3815).
+    /// A composed dispatch-phase wait bound, carried from composition time to
+    /// attribution time so a test can put arbitrary scheduling delay between
+    /// the two (issue #3815).
+    #[derive(Clone, Copy, Debug)]
+    pub struct ComposedDispatchPhaseBoundForTest(crate::proxy::DispatchPhaseBound);
+
+    impl ComposedDispatchPhaseBoundForTest {
+        /// Whether the admitted stream's authorization deadline is the bound
+        /// that won composition.
+        pub fn authorization_wins(&self) -> bool {
+            self.0.authorization_wins
+        }
+
+        /// Whether composition produced any bound at all.
+        pub fn is_bounded(&self) -> bool {
+            self.0.at.is_some()
+        }
+    }
+
+    /// Compose a dispatch-phase wait bound with the admitted stream's
+    /// authorization lifetime (issue #3815).
+    ///
+    /// `phase_bound_after_ms` is the phase's own client/operator absolute
+    /// bound, relative to now; `None` means it established none.
+    pub fn compose_dispatch_phase_bound_for_test(
+        phase_bound_after_ms: Option<u64>,
+        auth: Option<&(
+            crate::proxy::auth_lifetime::StreamAuthDeadline,
+            crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
+            crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+        )>,
+    ) -> ComposedDispatchPhaseBoundForTest {
+        let phase_bound = phase_bound_after_ms.and_then(|millis| {
+            tokio::time::Instant::now().checked_add(std::time::Duration::from_millis(millis))
+        });
+        ComposedDispatchPhaseBoundForTest(crate::proxy::compose_dispatch_phase_auth_bound(
+            phase_bound,
+            auth,
+        ))
+    }
+
+    /// Attribute an already-composed dispatch-phase bound (issue #3815).
+    pub fn attribute_dispatch_phase_bound_for_test(
+        bound: &ComposedDispatchPhaseBoundForTest,
+        auth: Option<&(
+            crate::proxy::auth_lifetime::StreamAuthDeadline,
+            crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
+            crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+        )>,
+    ) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
+        crate::proxy::dispatch_phase_authorization_expiry(bound.0, auth)
+    }
+
+    /// Attribute an ALREADY-COMPOSED dispatch-phase bound whose winning source
+    /// is the admitted stream's authorization lifetime (issue #3815). This is
+    /// the shape the typed composers (`authorization_bounded_header_deadline`,
+    /// `direct_h2_upload_join_bound`) hand to the shared helper.
     pub fn dispatch_phase_authorization_expiry_for_test(
         auth: Option<&(
             crate::proxy::auth_lifetime::StreamAuthDeadline,
@@ -7204,7 +7259,11 @@ pub mod _test_support {
             crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
         )>,
     ) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
-        crate::proxy::dispatch_phase_authorization_expiry(auth)
+        let bound = match auth {
+            Some((plan, _, _)) => crate::proxy::DispatchPhaseBound::authorization(plan.at),
+            None => crate::proxy::compose_dispatch_phase_auth_bound(None, None),
+        };
+        crate::proxy::dispatch_phase_authorization_expiry(bound, auth)
     }
 
     /// A fixed authorization-lifetime plan for a dispatch-phase test. The class
@@ -7228,6 +7287,167 @@ pub mod _test_support {
             StreamAuthProtocolFamily::Http,
             StreamAuthTerminationLatch::default(),
         )
+    }
+
+    /// What one poll of the transport side of an upload pump observed.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum ProbeTransportPoll {
+        Pending,
+        Data(usize),
+        Ended,
+        Errored(String),
+    }
+
+    /// Terminal state of a probed upload pump.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ProbePumpOutcome {
+        Completed,
+        SourceError,
+        Cancelled,
+        AuthorizationExpired,
+        ConsumerGone,
+        /// The join point resolved without an outcome (task aborted).
+        Aborted,
+    }
+
+    /// A client request body that yields only what the test feeds it and stays
+    /// `Pending` otherwise, recording the instant the gateway drops it.
+    pub struct ProbeClientBody {
+        receiver: tokio::sync::mpsc::UnboundedReceiver<bytes::Bytes>,
+        released: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Drop for ProbeClientBody {
+        fn drop(&mut self) {
+            self.released
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    impl http_body::Body for ProbeClientBody {
+        type Data = bytes::Bytes;
+        type Error = std::io::Error;
+
+        fn poll_frame(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<http_body::Frame<bytes::Bytes>, Self::Error>>> {
+            match self.receiver.poll_recv(cx) {
+                std::task::Poll::Ready(Some(data)) => {
+                    std::task::Poll::Ready(Some(Ok(http_body::Frame::data(data))))
+                }
+                // The feed channel is kept open by the probe, so this arm only
+                // fires once the probe itself is gone.
+                std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
+                std::task::Poll::Pending => std::task::Poll::Pending,
+            }
+        }
+    }
+
+    /// One gateway-owned upload pump under test, with its transport side held
+    /// and DELIBERATELY NOT POLLED — the shape of a hyper HTTP/2 pipe parked on
+    /// backend send capacity, which is exactly the state a body-adapter-only
+    /// bound cannot escape (issue #3815).
+    pub struct UploadPumpProbe {
+        feed: Option<tokio::sync::mpsc::UnboundedSender<bytes::Bytes>>,
+        source: Option<crate::proxy::upload_pump::UploadPumpSource>,
+        join: Option<crate::proxy::upload_pump::UploadPumpJoin>,
+        released: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl UploadPumpProbe {
+        /// Start a pump over a stalled client body under `plan`.
+        pub fn start(
+            plan: &(
+                crate::proxy::auth_lifetime::StreamAuthDeadline,
+                crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
+                crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+            ),
+        ) -> Self {
+            let (feed, receiver) = tokio::sync::mpsc::unbounded_channel();
+            let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let body = ProbeClientBody {
+                receiver,
+                released: std::sync::Arc::clone(&released),
+            };
+            let (source, join) = crate::proxy::upload_pump::spawn_upload_pump(body, plan);
+            Self {
+                feed: Some(feed),
+                source: Some(source),
+                join: Some(join),
+                released,
+            }
+        }
+
+        /// Whether the pump has dropped the inbound client body.
+        pub fn client_body_released(&self) -> bool {
+            self.released.load(std::sync::atomic::Ordering::Acquire)
+        }
+
+        /// Hand the client body one DATA frame.
+        pub fn feed(&self, data: &'static str) -> bool {
+            self.feed
+                .as_ref()
+                .is_some_and(|feed| feed.send(bytes::Bytes::from_static(data.as_bytes())).is_ok())
+        }
+
+        /// The bounded bridge's in-flight frame budget.
+        pub fn channel_capacity() -> usize {
+            crate::proxy::upload_pump::upload_pump_channel_capacity()
+        }
+
+        /// Poll the transport side exactly once with a no-op waker.
+        pub fn poll_transport_once(&mut self) -> ProbeTransportPoll {
+            let Some(source) = self.source.as_mut() else {
+                return ProbeTransportPoll::Ended;
+            };
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            match source.poll_frame(&mut cx) {
+                std::task::Poll::Pending => ProbeTransportPoll::Pending,
+                std::task::Poll::Ready(None) => ProbeTransportPoll::Ended,
+                std::task::Poll::Ready(Some(Ok(frame))) => {
+                    ProbeTransportPoll::Data(frame.data_ref().map_or(0, bytes::Bytes::len))
+                }
+                std::task::Poll::Ready(Some(Err(e))) => ProbeTransportPoll::Errored(e.to_string()),
+            }
+        }
+
+        /// Wait for the pump to finish on its own — no cancellation — which is
+        /// what an authorization expiry must produce even though the transport
+        /// side is never polled.
+        pub async fn join(&mut self) -> ProbePumpOutcome {
+            map_probe_outcome(match self.join.take() {
+                Some(join) => join.join().await,
+                None => None,
+            })
+        }
+
+        /// Cancel the pump and wait for it to finish.
+        pub async fn cancel_and_join(&mut self) -> ProbePumpOutcome {
+            map_probe_outcome(match self.join.take() {
+                Some(join) => join.cancel_and_join().await,
+                None => None,
+            })
+        }
+
+        /// Drop the transport side, modelling hyper releasing the request body.
+        pub fn drop_transport(&mut self) {
+            self.source = None;
+        }
+    }
+
+    fn map_probe_outcome(
+        outcome: Option<crate::proxy::upload_pump::UploadPumpOutcome>,
+    ) -> ProbePumpOutcome {
+        use crate::proxy::upload_pump::UploadPumpOutcome;
+        match outcome {
+            Some(UploadPumpOutcome::Completed) => ProbePumpOutcome::Completed,
+            Some(UploadPumpOutcome::SourceError) => ProbePumpOutcome::SourceError,
+            Some(UploadPumpOutcome::Cancelled) => ProbePumpOutcome::Cancelled,
+            Some(UploadPumpOutcome::AuthorizationExpired) => ProbePumpOutcome::AuthorizationExpired,
+            Some(UploadPumpOutcome::ConsumerGone) => ProbePumpOutcome::ConsumerGone,
+            None => ProbePumpOutcome::Aborted,
+        }
     }
 
     /// Which bound wins the direct-H2 response-header wait once the admitted

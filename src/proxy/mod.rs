@@ -112,6 +112,7 @@ pub mod udp_placement_migration;
 pub mod udp_proxy;
 pub mod unix_backend;
 pub mod unix_backend_pool;
+pub mod upload_pump;
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
@@ -3568,6 +3569,17 @@ pub(crate) enum AuthorizedUploadWaitError {
 /// fails closed without polling the collect at all, and a tie between the two
 /// bounds is attributed to the security decision — the same ordering every
 /// relay and every H3 write seam uses.
+///
+/// Attribution is decided from the COMPOSED BOUNDS, not from the biased arm
+/// alone (issue #3815). When the phase's own client RPC deadline / operator
+/// stall timeout resolves to an ABSOLUTE instant that is strictly earlier than
+/// the credential's, the authorization arm is not armed at all: otherwise a
+/// task that is not scheduled until after BOTH instants have passed would take
+/// the biased arm and report a security expiry for a phase the protocol bound
+/// actually ended. The arm is still armed whenever the protocol side resolves
+/// to NO absolute instant at all (`grpc-timeout` unset and
+/// `backend_read_timeout_ms = 0`), which is exactly the unbounded case this
+/// seam exists for.
 pub(crate) async fn collect_request_body_under_authorization<F, T, E>(
     collect: F,
     deadline: Option<tokio::time::Instant>,
@@ -3582,8 +3594,15 @@ where
             .await
             .map_err(AuthorizedUploadWaitError::Wait);
     };
+    let protocol_absolute =
+        compose_early_upload_bound(deadline, request_body_read_timeout_ms).map(|(at, _)| at);
     let bounded =
         collect_request_body_with_deadline(collect, deadline, request_body_read_timeout_ms);
+    if protocol_absolute.is_some_and(|protocol| protocol < plan.at) {
+        // The protocol's own absolute bound is strictly earlier, so it owns
+        // this phase's terminal no matter how late the wait is observed.
+        return bounded.await.map_err(AuthorizedUploadWaitError::Wait);
+    }
     tokio::select! {
         biased;
         () = tokio::time::sleep_until(plan.at) => {
@@ -29275,10 +29294,12 @@ async fn handle_proxy_request_inner(
         // only when a retry policy exists so the clone is never paid for
         // otherwise.
         let mut grpc_replay_headers = hyper::HeaderMap::new();
-        // Authorization lifetime for a BUFFERED native-gRPC / gRPC-Web upload
-        // (#3815). A client-streaming RPC on a buffering route makes progress on
-        // every poll, so neither the client `grpc-timeout` (often absent) nor the
-        // operator stall timeout bounds it; this plan does.
+        // Authorization lifetime for the native-gRPC / gRPC-Web upload (#3815).
+        // A client-streaming RPC makes progress on every poll, so neither the
+        // client `grpc-timeout` (often absent) nor the operator stall timeout
+        // bounds it; this plan does. The buffered arms apply it to their
+        // bounded collect; the fully-streamed arm hands it to the gateway-owned
+        // upload pump, which keeps bidirectional streaming intact.
         let grpc_buffered_upload_auth_deadline = request_upload_auth_deadline(
             Some(&ctx),
             state.env_config.authenticated_stream_max_lifetime_seconds,
@@ -29812,6 +29833,10 @@ async fn handle_proxy_request_inner(
                     ctx.grpc_deadline_at(),
                     &mut held_frontend_grpc_upload,
                     Some(Arc::clone(&ctx.grpc_request_messages_observed)),
+                    // Same absolute plan the buffered gRPC arms use (#3815);
+                    // the fully-streamed upload gets the gateway-owned pump
+                    // instead of a bounded collect.
+                    grpc_buffered_upload_auth_deadline.as_ref(),
                 )
                 .await;
                 (result, Bytes::new())
@@ -36417,18 +36442,17 @@ pub(crate) async fn proxy_to_backend_retry(
         Some(request_ctx),
         state.env_config.authenticated_stream_max_lifetime_seconds,
     );
-    let send_result = match crate::plugins::await_grpc_deadline(
-        compose_dispatch_phase_auth_bound(
-            request_ctx.grpc_deadline_at(),
-            send_auth_deadline.as_ref(),
-        ),
-        req_builder.send(),
-    )
-    .await
-    {
+    let send_bound = compose_dispatch_phase_auth_bound(
+        request_ctx.grpc_deadline_at(),
+        send_auth_deadline.as_ref(),
+    );
+    let send_future = crate::plugins::await_grpc_deadline(send_bound.at, req_builder.send());
+    let send_result = match send_future.await {
         Ok(result) => result,
         Err(()) => {
-            if dispatch_phase_authorization_expiry(send_auth_deadline.as_ref()).is_some() {
+            if dispatch_phase_authorization_expiry(send_bound, send_auth_deadline.as_ref())
+                .is_some()
+            {
                 return authorization_expired_dispatch_placeholder(resolved_ip);
             }
             return client_grpc_deadline_exceeded_response_for_request(
@@ -39025,12 +39049,20 @@ async fn proxy_to_backend(
                         Arc::clone(&body_size_exceeded),
                         Arc::clone(ctx_bytes_sent_observed),
                     );
-                    let limited = match upload_auth_deadline {
-                        Some((plan, family, latch)) => {
-                            limited.with_authorization_deadline(plan, family, latch)
-                        }
-                        None => limited,
-                    };
+                    // Adapter deadline PLUS a gateway-owned pump. Reqwest may
+                    // negotiate HTTP/2, in which case its connection task parks
+                    // on stream send capacity exactly like the direct-H2 pipe
+                    // and stops polling the body; the pump's deadline is not
+                    // subject to that. The join point is deliberately released
+                    // here rather than awaited: this dispatcher returns while
+                    // the response still streams, so the upload's lifetime is
+                    // the transport body's, and `UploadPumpSource`'s abort
+                    // guard ends the task when reqwest drops that body. The
+                    // pump self-terminates at the deadline regardless.
+                    let (limited, _upload_pump) = install_streaming_upload_authorization(
+                        limited,
+                        upload_auth_deadline.as_ref(),
+                    );
                     let limited =
                         if crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
                             &request_ctx.metadata,
@@ -39052,12 +39084,12 @@ async fn proxy_to_backend(
                         incoming,
                         Arc::clone(ctx_bytes_sent_observed),
                     );
-                    let counting = match upload_auth_deadline {
-                        Some((plan, family, latch)) => {
-                            counting.with_authorization_deadline(plan, family, latch)
-                        }
-                        None => counting,
-                    };
+                    // Same pairing as the size-limited arm above; see there for
+                    // why the join point is released rather than awaited.
+                    let (counting, _upload_pump) = install_counting_upload_authorization(
+                        counting,
+                        upload_auth_deadline.as_ref(),
+                    );
                     let counting =
                         if crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
                             &request_ctx.metadata,
@@ -39422,22 +39454,21 @@ async fn proxy_to_backend(
         Some(request_ctx),
         state.env_config.authenticated_stream_max_lifetime_seconds,
     );
-    let send_result = match crate::plugins::await_grpc_deadline(
-        compose_dispatch_phase_auth_bound(
-            request_ctx.grpc_deadline_at(),
-            send_auth_deadline.as_ref(),
-        ),
-        req_builder.send(),
-    )
-    .await
-    {
+    let send_bound = compose_dispatch_phase_auth_bound(
+        request_ctx.grpc_deadline_at(),
+        send_auth_deadline.as_ref(),
+    );
+    let send_future = crate::plugins::await_grpc_deadline(send_bound.at, req_builder.send());
+    let send_result = match send_future.await {
         Ok(result) => result,
         Err(()) => {
             // Attribute the fired bound. An authorization expiry cancels the
             // reqwest request (dropping the send future aborts it, releasing the
             // client upload it was reading) and is health-neutral; the
             // pre-commitment terminal decides the client-visible shape.
-            if dispatch_phase_authorization_expiry(send_auth_deadline.as_ref()).is_some() {
+            if dispatch_phase_authorization_expiry(send_bound, send_auth_deadline.as_ref())
+                .is_some()
+            {
                 return backend_dispatch_response(
                     authorization_expired_dispatch_placeholder(resolved_ip),
                     retained_body,
@@ -41577,6 +41608,56 @@ pub(crate) fn request_upload_auth_deadline(
     ))
 }
 
+/// Install the FULL upload lifecycle on a size-limited streaming client body
+/// (issue #3815 / #3816).
+///
+/// Two mechanisms, armed from the same absolute plan and recording through the
+/// same once-only latch, because neither is sufficient alone:
+///
+/// * The adapter's own deadline (`with_authorization_deadline`) refuses to hand
+///   the transport another client byte after expiry. It only runs when the
+///   transport polls the body.
+/// * The gateway-owned pump (`with_gateway_upload_pump`) owns the inbound
+///   `Incoming` in a task the GATEWAY schedules. Its deadline fires while
+///   hyper's HTTP/2 pipe is parked on send capacity — or an HTTP/1.1 connection
+///   task is parked on socket writability — which is precisely when the adapter
+///   cannot run. On expiry it drops the client body, discards anything still
+///   queued in the bounded bridge, and terminates the transport body with an
+///   error so the backend resets the stream instead of accepting a truncated
+///   upload as complete.
+///
+/// The returned join point is how a dispatcher proves the upload is over:
+/// `cancel_and_join()` resolves only after the pump published its outcome,
+/// which it does after dropping the client body.
+///
+/// Unauthenticated requests get neither (`auth` is `None`), so the no-auth-plan
+/// hot path is byte-for-byte the previous one: no task, no channel, no timer.
+pub(crate) fn install_streaming_upload_authorization(
+    body: body::SizeLimitedIncoming,
+    auth: Option<&RequestAuthLifetimePlan>,
+) -> (body::SizeLimitedIncoming, Option<upload_pump::UploadPumpJoin>) {
+    let Some(plan) = auth else {
+        return (body, None);
+    };
+    let (deadline, family, latch) = plan;
+    body.with_authorization_deadline(*deadline, *family, latch.clone())
+        .with_gateway_upload_pump(plan)
+}
+
+/// [`install_streaming_upload_authorization`] for the unlimited-size streaming
+/// upload adapter (reqwest with request-body limits disabled).
+pub(crate) fn install_counting_upload_authorization(
+    body: body::CountingIncoming,
+    auth: Option<&RequestAuthLifetimePlan>,
+) -> (body::CountingIncoming, Option<upload_pump::UploadPumpJoin>) {
+    let Some(plan) = auth else {
+        return (body, None);
+    };
+    let (deadline, family, latch) = plan;
+    body.with_authorization_deadline(*deadline, *family, latch.clone())
+        .with_gateway_upload_pump(plan)
+}
+
 /// Compose the admitted request's absolute authorization deadline over the
 /// bound a DISPATCH PHASE already had (issue #3815).
 ///
@@ -41590,13 +41671,73 @@ pub(crate) fn request_upload_auth_deadline(
 ///
 /// Returns the EARLIEST of the two, so the phase can never outlive the
 /// credential that admitted the stream and an earlier protocol bound still wins.
+///
+/// The WINNING SOURCE is part of the result, not re-derived after the fact.
+/// Deriving it later — "the timeout fired, is the authorization deadline in the
+/// past?" — is a scheduling race: a task that is not polled until after the
+/// LATER of the two deadlines sees both as elapsed and would report the
+/// security decision even though the client RPC deadline or the operator stall
+/// timeout is what actually bounded the phase. Attribution is decided here,
+/// where both instants are known, and survives arbitrary observation delay.
 #[inline]
 pub(crate) fn compose_dispatch_phase_auth_bound(
     phase_bound: Option<tokio::time::Instant>,
     auth: Option<&RequestAuthLifetimePlan>,
-) -> Option<tokio::time::Instant> {
-    let authorization = auth.map(|(plan, _, _)| *plan);
-    crate::proxy::auth_lifetime::compose_absolute_bound(phase_bound, authorization)
+) -> DispatchPhaseBound {
+    match (phase_bound, auth.map(|(plan, _, _)| plan.at)) {
+        // Authorization wins only when it is genuinely the earliest bound. A
+        // tie goes to authorization, matching the biased select-arm ordering
+        // every relay and H3 write seam uses.
+        (Some(protocol), Some(authorization)) if authorization <= protocol => DispatchPhaseBound {
+            at: Some(authorization),
+            authorization_wins: true,
+        },
+        (Some(protocol), _) => DispatchPhaseBound {
+            at: Some(protocol),
+            authorization_wins: false,
+        },
+        (None, Some(authorization)) => DispatchPhaseBound {
+            at: Some(authorization),
+            authorization_wins: true,
+        },
+        (None, None) => DispatchPhaseBound {
+            at: None,
+            authorization_wins: false,
+        },
+    }
+}
+
+/// A dispatch-phase wait bound together with the source that established it
+/// (issue #3815).
+///
+/// Produced by [`compose_dispatch_phase_auth_bound`]; consumed by
+/// [`dispatch_phase_authorization_expiry`]. Carrying the source is what makes
+/// attribution independent of WHEN the timeout is observed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DispatchPhaseBound {
+    /// The earliest absolute bound, or `None` when neither side established
+    /// one.
+    pub(crate) at: Option<tokio::time::Instant>,
+    /// Whether the admitted stream's authorization deadline is the bound `at`
+    /// came from.
+    pub(crate) authorization_wins: bool,
+}
+
+impl DispatchPhaseBound {
+    /// A bound whose winning source has ALREADY been decided as the admitted
+    /// stream's authorization lifetime by a typed composer
+    /// ([`authorization_bounded_header_deadline`],
+    /// [`direct_h2_upload_join_bound`]).
+    ///
+    /// Those composers keep the source in their own enum, so they do not need
+    /// to re-derive it either; this adapts their decision to the shared
+    /// attribution helper rather than letting the helper guess from the clock.
+    pub(crate) const fn authorization(at: tokio::time::Instant) -> Self {
+        Self {
+            at: Some(at),
+            authorization_wins: true,
+        }
+    }
 }
 
 /// Attribute an already-fired composed dispatch-phase bound (issue #3815).
@@ -41604,12 +41745,22 @@ pub(crate) fn compose_dispatch_phase_auth_bound(
 /// `Some` when the authorization deadline is the bound that elapsed, in which
 /// case the bounded class is latched for the request — first writer wins, so an
 /// upload adapter that already fired keeps its classification and the
-/// fixed-cardinality counter is still incremented exactly once. `None` when only
-/// the phase's own client/operator bound elapsed, which keeps its existing
-/// terminal.
+/// fixed-cardinality counter is still incremented exactly once. `None` when the
+/// phase's own client/operator bound is what bounded it, which keeps its
+/// existing terminal.
+///
+/// The decision comes from the COMPOSED BOUND, not from re-reading the clock:
+/// an earlier protocol bound stays attributed to the protocol even when the
+/// task was not scheduled until after the later authorization deadline had also
+/// elapsed. The clock is still consulted for the authorization case, so a
+/// composed bound that fired for some other reason cannot fabricate an expiry.
 pub(crate) fn dispatch_phase_authorization_expiry(
+    bound: DispatchPhaseBound,
     auth: Option<&RequestAuthLifetimePlan>,
 ) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
+    if !bound.authorization_wins {
+        return None;
+    }
     let (plan, family, latch) = auth?;
     let termination = crate::proxy::auth_lifetime::expired_authorization(Some(*plan))?;
     latch.record_once(termination, *family);
@@ -42219,17 +42370,21 @@ async fn proxy_to_backend_hbone(
                 Arc::clone(&body_size_exceeded),
                 Arc::clone(ctx_bytes_sent_observed),
             );
-            // Authorization lifetime for the UPLOAD direction (#3815); see
-            // `request_upload_auth_deadline`.
-            let body = match request_upload_auth_deadline(
-                ctx,
-                state.env_config.authenticated_stream_max_lifetime_seconds,
-            ) {
-                Some((plan, family, latch)) => {
-                    body.with_authorization_deadline(plan, family, latch)
-                }
-                None => body,
-            };
+            // Full upload lifecycle for the UPLOAD direction (#3815): the
+            // adapter deadline plus a gateway-owned pump, so the bound still
+            // fires while this pooled connection task is parked and not
+            // polling the body. The join point is released here — the response
+            // streams past this dispatcher, so the upload's lifetime is the
+            // transport body's, bounded by `UploadPumpSource`'s abort guard —
+            // and the pump self-terminates at the deadline regardless.
+            let (body, _upload_pump) = install_streaming_upload_authorization(
+                body,
+                request_upload_auth_deadline(
+                    ctx,
+                    state.env_config.authenticated_stream_max_lifetime_seconds,
+                )
+                .as_ref(),
+            );
             let body = match ctx {
                 Some(c)
                     if crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
@@ -42376,7 +42531,7 @@ async fn proxy_to_backend_hbone(
         None
     };
     let send_bound = compose_dispatch_phase_auth_bound(read_deadline, send_auth_deadline.as_ref());
-    let response = if let Some(send_deadline) = send_bound {
+    let response = if let Some(send_deadline) = send_bound.at {
         match tokio::time::timeout_at(send_deadline, send_fut).await {
             Ok(Ok(response)) => response,
             Ok(Err(err)) => {
@@ -42413,7 +42568,9 @@ async fn proxy_to_backend_hbone(
                 }
                 // The gateway's own security decision; health-neutral, and the
                 // pre-commitment terminal owns the client-visible shape.
-                if dispatch_phase_authorization_expiry(send_auth_deadline.as_ref()).is_some() {
+                if dispatch_phase_authorization_expiry(send_bound, send_auth_deadline.as_ref())
+                    .is_some()
+                {
                     return (
                         authorization_expired_dispatch_placeholder(resolved_ip),
                         None,
@@ -42896,17 +43053,21 @@ async fn proxy_to_backend_unix(
                 Arc::clone(&body_size_exceeded),
                 Arc::clone(ctx_bytes_sent_observed),
             );
-            // Authorization lifetime for the UPLOAD direction (#3815); see
-            // `request_upload_auth_deadline`.
-            let body = match request_upload_auth_deadline(
-                ctx,
-                state.env_config.authenticated_stream_max_lifetime_seconds,
-            ) {
-                Some((plan, family, latch)) => {
-                    body.with_authorization_deadline(plan, family, latch)
-                }
-                None => body,
-            };
+            // Full upload lifecycle for the UPLOAD direction (#3815): the
+            // adapter deadline plus a gateway-owned pump, so the bound still
+            // fires while this pooled connection task is parked and not
+            // polling the body. The join point is released here — the response
+            // streams past this dispatcher, so the upload's lifetime is the
+            // transport body's, bounded by `UploadPumpSource`'s abort guard —
+            // and the pump self-terminates at the deadline regardless.
+            let (body, _upload_pump) = install_streaming_upload_authorization(
+                body,
+                request_upload_auth_deadline(
+                    ctx,
+                    state.env_config.authenticated_stream_max_lifetime_seconds,
+                )
+                .as_ref(),
+            );
             let body = match ctx {
                 Some(c)
                     if crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
@@ -43063,7 +43224,7 @@ async fn proxy_to_backend_unix(
             };
             let send_bound =
                 compose_dispatch_phase_auth_bound(read_deadline, send_auth_deadline.as_ref());
-            if let Some(send_deadline) = send_bound {
+            if let Some(send_deadline) = send_bound.at {
                 match tokio::time::timeout_at(send_deadline, send_fut).await {
                     Ok(result) => result,
                     Err(_) => {
@@ -43081,8 +43242,11 @@ async fn proxy_to_backend_unix(
                         // The gateway's own security decision; health-neutral,
                         // and the lease is still dropped without check-in
                         // because the framing state is unknown.
-                        if dispatch_phase_authorization_expiry(send_auth_deadline.as_ref())
-                            .is_some()
+                        if dispatch_phase_authorization_expiry(
+                            send_bound,
+                            send_auth_deadline.as_ref(),
+                        )
+                        .is_some()
                         {
                             return (
                                 authorization_expired_dispatch_placeholder(resolved_ip),
@@ -44195,17 +44359,21 @@ async fn proxy_to_backend_mesh_mtls(
                 Arc::clone(&body_size_exceeded),
                 Arc::clone(ctx_bytes_sent_observed),
             );
-            // Authorization lifetime for the UPLOAD direction (#3815); see
-            // `request_upload_auth_deadline`.
-            let body = match request_upload_auth_deadline(
-                Some(request_ctx),
-                state.env_config.authenticated_stream_max_lifetime_seconds,
-            ) {
-                Some((plan, family, latch)) => {
-                    body.with_authorization_deadline(plan, family, latch)
-                }
-                None => body,
-            };
+            // Full upload lifecycle for the UPLOAD direction (#3815): the
+            // adapter deadline plus a gateway-owned pump, so the bound still
+            // fires while this pooled connection task is parked and not
+            // polling the body. The join point is released here — the response
+            // streams past this dispatcher, so the upload's lifetime is the
+            // transport body's, bounded by `UploadPumpSource`'s abort guard —
+            // and the pump self-terminates at the deadline regardless.
+            let (body, _upload_pump) = install_streaming_upload_authorization(
+                body,
+                request_upload_auth_deadline(
+                    Some(request_ctx),
+                    state.env_config.authenticated_stream_max_lifetime_seconds,
+                )
+                .as_ref(),
+            );
             let body = if crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
                 &request_ctx.metadata,
             ) {
@@ -44347,7 +44515,7 @@ async fn proxy_to_backend_mesh_mtls(
         Some(request_ctx),
         state.env_config.authenticated_stream_max_lifetime_seconds,
     );
-    let send_deadline = compose_dispatch_phase_auth_bound(
+    let send_bound = compose_dispatch_phase_auth_bound(
         if is_grpc_flavored {
             grpc_send_deadline
         } else {
@@ -44355,7 +44523,7 @@ async fn proxy_to_backend_mesh_mtls(
         },
         send_auth_deadline.as_ref(),
     );
-    let send_result = if let Some(deadline) = send_deadline {
+    let send_result = if let Some(deadline) = send_bound.at {
         match tokio::time::timeout_at(deadline, send_fut).await {
             Ok(result) => result,
             Err(_) => {
@@ -44375,7 +44543,9 @@ async fn proxy_to_backend_mesh_mtls(
                 // pre-commitment terminal owns the client-visible shape (native
                 // gRPC gets trailers-only `grpc-status: 16` there, not a
                 // DEADLINE_EXCEEDED).
-                if dispatch_phase_authorization_expiry(send_auth_deadline.as_ref()).is_some() {
+                if dispatch_phase_authorization_expiry(send_bound, send_auth_deadline.as_ref())
+                    .is_some()
+                {
                     return (
                         authorization_expired_dispatch_placeholder(resolved_ip),
                         None,
@@ -44384,7 +44554,8 @@ async fn proxy_to_backend_mesh_mtls(
                 }
                 warn!(
                     proxy_id = %proxy.id,
-                    timeout_ms = send_deadline
+                    timeout_ms = send_bound
+                        .at
                         .map(|deadline| {
                             deadline
                                 .saturating_duration_since(read_started_at)
@@ -44960,7 +45131,7 @@ async fn proxy_to_backend_http2(
     // bidirectional RPC streaming is unaffected.
     let needs_upload_completion_gate =
         effective_max_request_body_size_bytes > 0 || upload_auth_deadline.is_some();
-    let (body, body_completion_rx) = if needs_upload_completion_gate {
+    let (body, body_completion_rx, mut upload_pump) = if needs_upload_completion_gate {
         let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
         let mut body = body::SizeLimitedIncoming::new_with_counter_and_completion(
             body,
@@ -44970,13 +45141,24 @@ async fn proxy_to_backend_http2(
             completion_tx,
             cancel_rx,
         );
-        if let Some((plan, family, latch)) = upload_auth_deadline.clone() {
-            body = body.with_authorization_deadline(plan, family, latch);
-        }
         if let Some(messages) = observe_grpc.clone() {
             body = body.with_grpc_message_counter(messages);
         }
-        (body, Some(completion_rx))
+        // Full upload lifecycle (#3815). Direct-H2 is the one H1/H2 dispatcher
+        // whose upload is scoped to the handler — the completion gate below
+        // already waits for the upload's terminal state before any early
+        // backend response is exposed — so its join point is ARMED for
+        // cancel-on-drop and explicitly `cancel_and_join()`ed at every bounded
+        // exit. Once that join returns, the pump task has published its
+        // outcome, which it does after dropping the inbound client body: no
+        // gateway-owned upload survives this function.
+        let (body, upload_pump) =
+            install_streaming_upload_authorization(body, upload_auth_deadline.as_ref());
+        (
+            body,
+            Some(completion_rx),
+            upload_pump.map(crate::proxy::upload_pump::UploadPumpJoin::cancel_on_drop),
+        )
     } else {
         let mut body = body::SizeLimitedIncoming::new_with_counter(
             body,
@@ -44988,7 +45170,11 @@ async fn proxy_to_backend_http2(
         if let Some(messages) = observe_grpc {
             body = body.with_grpc_message_counter(messages);
         }
-        (body, None)
+        // Unreachable with an authorization plan present
+        // (`needs_upload_completion_gate` is true whenever
+        // `upload_auth_deadline.is_some()`), so this arm is the unauthenticated
+        // hot path and installs neither timer nor pump.
+        (body, None, None)
     };
 
     // Set the URI
@@ -45210,17 +45396,24 @@ async fn proxy_to_backend_http2(
             Err(_) => {
                 // The request body already moved into hyper's detached HTTP/2
                 // pipe task when `send_request` was called, so returning here
-                // does not stop the upload. Wake the adapter so it yields an
-                // error, resetting the backend stream and releasing the inbound
-                // client body instead of streaming it into a request whose
-                // response we have already abandoned. The signal only lands the
-                // next time hyper polls the body, so a pipe parked on backend
-                // send capacity tears down later (see the `cancel` field docs on
-                // `SizeLimitedIncoming`); an authorization expiry still forwards
-                // no client byte after the deadline, because the adapter checks
-                // that bound before its inner poll.
+                // does not by itself stop the upload. Two things do.
+                //
+                // The adapter cancel below makes hyper reset the backend stream
+                // the next time it polls the body — best-effort, because a pipe
+                // parked on backend send capacity is not polling at all.
+                //
+                // The pump join is the strong half: it drops the inbound client
+                // body and terminates the transport body with an error, and it
+                // resolves only after the pump task has actually finished. From
+                // that point the gateway neither owns nor polls any part of the
+                // client upload, whatever the backend's flow-control window is
+                // doing. Bytes already handed to hyper before this point may
+                // still be transport-buffered; those are not ours to recall.
                 if let Some(cancel_tx) = body_cancel_tx.take() {
                     let _ = cancel_tx.send(());
+                }
+                if let Some(pump) = upload_pump.take() {
+                    pump.cancel_and_join().await;
                 }
                 if body_size_exceeded.load(std::sync::atomic::Ordering::Acquire) {
                     return request_body_too_large();
@@ -45233,7 +45426,10 @@ async fn proxy_to_backend_http2(
                     // `handle_proxy_request_inner` owns the client-visible shape.
                     // Latched and counted exactly once for the request.
                     ResponseHeaderDeadlineSource::Authorization => {
-                        let _ = dispatch_phase_authorization_expiry(upload_auth_deadline.as_ref());
+                        let _ = dispatch_phase_authorization_expiry(
+                            DispatchPhaseBound::authorization(deadline),
+                            upload_auth_deadline.as_ref(),
+                        );
                         return (
                             authorization_expired_dispatch_placeholder(resolved_ip),
                             None,
@@ -45322,19 +45518,30 @@ async fn proxy_to_backend_http2(
                         // adapter explicitly; its terminal error resets the
                         // backend stream and releases the inbound client body.
                         //
-                        // What this guarantees exactly: the adapter checks the
-                        // authorization bound BEFORE its inner poll, so no client
-                        // byte is ever forwarded to the backend after expiry, and
+                        // The gateway-owned pump is what makes this a real
+                        // lifecycle join rather than a hint: `cancel_and_join`
+                        // resolves only after the pump task has dropped the
+                        // inbound client body and published its outcome, and the
+                        // pump's own waits are all `select!`ed with the
+                        // cancellation arm, so a backend that never grants
+                        // another byte of send capacity cannot delay it.
+                        //
+                        // What is guaranteed once this returns: the gateway owns
+                        // and polls no part of the client upload; nothing further
+                        // is handed to the transport; anything still queued in
+                        // the bounded bridge is discarded; the transport body
+                        // ends in an error, so the backend resets the stream
+                        // instead of reading a truncated upload as complete; and
                         // this handler returns without committing the backend
-                        // response, so no response byte is ever delivered under an
-                        // expired credential. What it does not guarantee: prompt
-                        // teardown of a pipe PARKED on backend send capacity —
-                        // that pipe is not polling, so it observes the signal only
-                        // once credit, a reset, or connection close arrives (see
-                        // `SizeLimitedIncoming::cancel`). No data crosses the
-                        // gateway in either direction in the meantime.
+                        // response, so no response byte reaches the client under
+                        // an expired credential. What is NOT claimed: bytes
+                        // handed to hyper BEFORE this point may already sit in
+                        // its transport buffers and may still reach the wire.
                         if let Some(cancel_tx) = body_cancel_tx.take() {
                             let _ = cancel_tx.send(());
+                        }
+                        if let Some(pump) = upload_pump.take() {
+                            pump.cancel_and_join().await;
                         }
                         if body_size_exceeded.load(std::sync::atomic::Ordering::Acquire) {
                             return request_body_too_large();
@@ -45348,6 +45555,7 @@ async fn proxy_to_backend_http2(
                             // the upstream, ended the exchange.
                             DirectH2UploadJoinBound::Authorization => {
                                 let _ = dispatch_phase_authorization_expiry(
+                                    DispatchPhaseBound::authorization(upload_deadline),
                                     upload_auth_deadline.as_ref(),
                                 );
                                 (
@@ -45392,6 +45600,15 @@ async fn proxy_to_backend_http2(
         // Normal completion: dropping the sender makes the adapter stop
         // polling the cancellation channel without changing its outcome.
         drop(body_cancel_tx.take());
+        // Join the upload before this handler proceeds to the response, so no
+        // gateway-owned upload task can outlive the request whose accounting it
+        // belongs to. A pump that already finished resolves immediately; one
+        // whose adapter reported a terminal state without the pump having
+        // observed it yet (an authorization expiry seen first on the adapter
+        // side) is stopped here.
+        if let Some(pump) = upload_pump.take() {
+            pump.cancel_and_join().await;
+        }
         match classify_direct_h2_upload_outcome(outcome) {
             DirectH2UploadGate::Forward => {}
             DirectH2UploadGate::RequestBodyTooLarge => return request_body_too_large(),

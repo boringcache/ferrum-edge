@@ -399,10 +399,10 @@ The `grpc-message` and the internal termination text are compiled-in literals.
 | Surface | Enforced |
 |---------|----------|
 | Generic HTTP/1.1 and HTTP/2 streaming responses, including SSE | Yes |
-| HTTP/1.1 and HTTP/2 streaming and bidirectional request **uploads** | Yes — the client body adapter every streaming dispatch path already installs (reqwest, direct-H2, mesh mTLS, HBONE, Unix socket) carries the same absolute plan, so an upload whose backend withholds response headers is bounded even though no response body exists yet |
+| HTTP/1.1 and HTTP/2 streaming and bidirectional request **uploads** | Yes — two mechanisms, armed from the same absolute plan. The client body adapter every streaming dispatch path installs (reqwest, direct-H2, mesh mTLS, HBONE, Unix socket, and the fully-streamed native-gRPC body) refuses to hand the transport another client byte after expiry, and a **gateway-owned upload pump** owns the inbound body in a task the gateway schedules, so the bound fires — and the client body is released — even while the backend transport is parked on flow control and is polling nothing. See [The gateway-owned upload pump](#the-gateway-owned-upload-pump) |
 | HTTP/1.1 and HTTP/2 request uploads the gateway **buffers** before dispatch | Yes — a body a request-body plugin, a gRPC-Web translation, or retry replay forces into memory never reaches those adapters, so the collect itself carries the plan (`collect_request_body_under_authorization`). Covers the reqwest buffered arms, the H3-backend bridge's buffered arms, and both buffered native-gRPC arms |
 | The response-**header** wait on every H1/H2 dispatch path | Yes — reqwest (initial attempt and retry), direct-H2, mesh mTLS, HBONE, and Unix socket compose the plan over the client RPC deadline and `backend_read_timeout_ms`, so a backend that withholds its response head cannot hold an authenticated request open past expiry even when both of those bounds are disabled |
-| The direct-H2 **early-response** upload join | Yes — the upload-completion gate is installed whenever a request-size limit is configured **or** the request carries an authorization lifetime, and the join waits under the composed plan, so an early backend response is never committed while an authenticated upload is still running past expiry |
+| The direct-H2 **early-response** upload join | Yes — the upload-completion gate is installed whenever a request-size limit is configured **or** the request carries an authorization lifetime, the join waits under the composed plan, and the handler then `cancel_and_join()`s the gateway-owned pump before returning, so no gateway-owned upload survives the handler and no early backend response is committed while an authenticated upload is still running past expiry |
 | Native gRPC server-, client-, and bidirectional streaming | Yes |
 | gRPC-Web streaming, binary and text | Yes |
 | HTTP/3 backend responses relayed to an H1/H2 downstream (`StreamingH3`) | Yes |
@@ -457,18 +457,13 @@ Deliberate scope notes:
   `send_request` yields a response head, hyper moves the client body into a
   detached HTTP/2 pipe task, and h2 resets a stream only once *every* reference
   to it is dropped — the pipe holds one, and hyper closes its own cancellation
-  channel as soon as the response head resolves. So the gateway cannot force an
-  immediate `RST_STREAM` from outside without tearing down the whole pooled
-  multiplexed connection and its sibling requests. What is guaranteed instead:
-  the upload adapter evaluates the authorization bound **before** its inner
-  poll, so no client byte is forwarded to the backend after expiry; and the
-  dispatch returns the pre-commitment terminal rather than the backend response,
-  so no response byte is delivered under an expired credential. What is not
-  guaranteed is prompt teardown of a pipe *parked on backend send capacity* —
-  that pipe is not polling, so it observes the cancellation only when credit, a
-  reset, or a connection close arrives. No data crosses the gateway in either
-  direction in the meantime, and the counters/summary classification are already
-  recorded at the deadline.
+  channel as soon as the response head resolves. The gateway therefore cannot
+  force an immediate `RST_STREAM` from outside without tearing down the whole
+  pooled multiplexed connection and its sibling requests. The upload pump is
+  what makes the lifecycle enforceable anyway: the gateway, not hyper, owns the
+  inbound body, so expiry releases it and terminates the transport body with an
+  error regardless of the pipe's state, and `cancel_and_join()` gives the
+  handler an actual join before it returns.
 - An H3 request body that is **buffered before dispatch** composes the
   authorization deadline into the existing early-upload ceiling
   (`backend_read_timeout_ms` and the optional client RPC deadline) through
@@ -476,6 +471,77 @@ Deliberate scope notes:
   upload cannot outlive the credential either. When the authorization bound is
   the one that elapsed, the terminal is the fixed redacted `401` (gRPC keeps
   `grpc-status: 16`) rather than the deadline contract.
+
+### The gateway-owned upload pump
+
+Every H1/H2 backend transport hands the client request body to a hyper client
+and lets that client's own connection task drive it. For HTTP/2 the task is
+`PipeToSendStream`, which **reserves and awaits stream send capacity before it
+polls the body**. Two consequences follow, and together they defeat any bound
+that lives only inside a body adapter:
+
+* A pipe parked in `poll_capacity` polls nothing, so a cancellation channel or
+  a `Sleep` armed *inside* the body cannot be observed until flow-control
+  credit, a reset, or a connection close arrives.
+* Once the response head resolves, hyper's own cancellation sender is gone, so
+  the detached pipe can keep owning the inbound body — and the request
+  accounting rooted in it — indefinitely.
+
+The same detachment exists on the HTTP/1.1 pooled clients (mesh mTLS, HBONE's
+inner client, the Unix-socket pool) and inside reqwest, whose connection task
+owns the body the same way and parks on socket writability, or on HTTP/2
+capacity when it negotiates HTTP/2.
+
+`proxy::upload_pump` closes that gap for **authenticated** streaming uploads.
+The inbound `hyper::body::Incoming` moves into a gateway-owned task, and the
+transport is handed a bounded bridge instead. The task selects, biased, over an
+explicit dispatcher cancellation, the admitted stream's absolute authorization
+deadline, and the next unit of work (bridge capacity, then one source frame).
+Arms one and two are polled by the gateway's own task, so they fire while the
+backend transport is parked and polling nothing.
+
+What this enforces, exactly:
+
+- After the deadline the gateway polls no further client body, hands the
+  transport no further client byte, and **discards** anything still queued in
+  the bridge.
+- The transport body ends in an **error**, never a clean end of stream, so the
+  backend resets rather than accepting a truncated upload as a complete request.
+- The inbound body is dropped **before** the pump publishes its outcome, so a
+  dispatcher that awaits `cancel_and_join()` has an actual join: once it
+  returns, no gateway-owned upload task or client-body ownership survives.
+- Direct-H2 — the one H1/H2 dispatcher whose upload is scoped to the handler,
+  because its completion gate already withholds an early backend response until
+  the upload terminates — joins at every bounded exit and arms cancel-on-drop so
+  residual early returns still release the upload promptly. The
+  streaming-response transports (reqwest, mesh mTLS, HBONE, Unix socket, native
+  gRPC) return while the response is still streaming, so their upload's lifetime
+  is the transport body's: the pump's abort guard ends the task when the
+  transport drops that body, and the pump self-terminates at the deadline
+  regardless.
+
+What this deliberately does **not** claim: bytes the pump handed to the
+transport *before* expiry may already sit in that transport's buffers and may
+still reach the wire afterwards. Those bytes are no longer the gateway's to
+recall, and the pump makes no statement about them.
+
+Cost and invariants:
+
+- The bridge holds **one** in-flight frame, and capacity is reserved before the
+  source is read, so the backpressure the transport used to apply directly to
+  `Incoming` is preserved rather than replaced by buffering. Native gRPC keeps
+  full-duplex semantics — this is not a buffer-first collect.
+- Frames move by `Bytes` handle; no per-chunk copy or allocation is introduced.
+- Byte counting, the request-size ceiling, and gRPC length-prefixed message
+  counting stay in the adapter above the bridge, so they remain authoritative
+  and unchanged. The client body's `size_hint` is snapshotted before the move
+  and decremented as frames cross, so `Content-Length` framing survives.
+- Unauthenticated requests construct no pump at all: no task, no channel, no
+  timer. That path is unchanged.
+- Termination messages are compiled-in literals from a closed set, and the
+  fixed-cardinality counter is recorded through the request's shared once-only
+  latch, so an upload and a response body racing the same plan still count
+  exactly one termination.
 
 ### A downstream that stops reading
 

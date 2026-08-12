@@ -9,13 +9,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ferrum_edge::_test_support::{
-    BufferedUploadWaitOutcomeForTest, authorization_bounded_header_deadline_for_test,
+    BufferedUploadWaitOutcomeForTest, ProbePumpOutcome, ProbeTransportPoll, UploadPumpProbe,
+    attribute_dispatch_phase_bound_for_test, authorization_bounded_header_deadline_for_test,
     authorization_expired_dispatch_placeholder_for_test,
     authorization_expired_pre_commitment_response_for_test,
-    collect_buffered_upload_under_authorization_for_test, direct_h2_upload_join_bound_for_test,
-    dispatch_phase_authorization_expiry_for_test, request_received_at_for_test,
-    request_upload_auth_deadline_for_test, set_request_credential_deadline_for_test,
-    within_stream_auth_deadline_for_test,
+    collect_buffered_upload_under_authorization_for_test, compose_dispatch_phase_bound_for_test,
+    direct_h2_upload_join_bound_for_test, dispatch_phase_authorization_expiry_for_test,
+    request_received_at_for_test, request_upload_auth_deadline_for_test,
+    set_request_credential_deadline_for_test, within_stream_auth_deadline_for_test,
 };
 use ferrum_edge::config::types::Consumer;
 use ferrum_edge::plugins::RequestContext;
@@ -1370,4 +1371,301 @@ fn the_buffered_grpc_authorization_terminal_is_unauthenticated_and_latched() {
         .next()
         .expect("bounded finalizer");
     assert!(finalize.contains("ctx.latch_authorization_termination(termination);"));
+}
+
+// --- Gateway-owned upload pump (#3815 / #3816) ------------------------------
+//
+// The pump exists because a body adapter alone cannot enforce the bound: hyper's
+// `PipeToSendStream` awaits backend send capacity BEFORE it polls the request
+// body, so a pipe parked on flow control polls nothing and observes no
+// body-side signal. Every test below therefore holds the transport side and
+// DELIBERATELY DOES NOT POLL IT while the bound fires.
+
+#[tokio::test(start_paused = true)]
+async fn the_authorization_deadline_releases_the_upload_while_the_backend_is_not_polling() {
+    let plan = upload_plan(
+        Duration::from_secs(2),
+        StreamAuthTermination::CredentialExpired,
+    );
+    let latch = plan.2.clone();
+    let mut probe = UploadPumpProbe::start(&plan);
+    assert!(
+        !probe.client_body_released(),
+        "the pump must still own the client body before the deadline"
+    );
+
+    // No consumer poll, ever. The only thing that can end this upload is the
+    // pump's own absolute bound.
+    tokio::time::advance(Duration::from_secs(3)).await;
+    assert_eq!(probe.join().await, ProbePumpOutcome::AuthorizationExpired);
+    assert!(
+        probe.client_body_released(),
+        "the pump must drop the inbound client body before it reports its outcome"
+    );
+    assert_eq!(
+        latch.observed(),
+        Some(StreamAuthTermination::CredentialExpired)
+    );
+    assert!(
+        !latch.record_once(
+            StreamAuthTermination::CredentialExpired,
+            StreamAuthProtocolFamily::Http
+        ),
+        "the pump must not count a second termination for the same request"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_expired_upload_ends_the_transport_body_with_an_error_not_a_clean_eof() {
+    let plan = upload_plan(
+        Duration::from_secs(1),
+        StreamAuthTermination::CredentialExpired,
+    );
+    let mut probe = UploadPumpProbe::start(&plan);
+    tokio::time::advance(Duration::from_secs(2)).await;
+    assert_eq!(probe.join().await, ProbePumpOutcome::AuthorizationExpired);
+
+    // A clean end of stream here would let the backend treat a truncated
+    // upload as a complete request.
+    match probe.poll_transport_once() {
+        ProbeTransportPoll::Errored(message) => {
+            assert!(
+                message.contains("authorization lifetime elapsed"),
+                "unexpected termination message: {message}"
+            );
+            // Fixed literal: no expiry instant, claim, subject, or route.
+            assert!(!message.contains(':') || message.starts_with("request upload terminated:"));
+        }
+        other => panic!("expected a transport error, got {other:?}"),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_frame_queued_before_expiry_is_discarded_rather_than_forwarded_after_it() {
+    let plan = upload_plan(
+        Duration::from_secs(1),
+        StreamAuthTermination::CredentialExpired,
+    );
+    let mut probe = UploadPumpProbe::start(&plan);
+    assert!(probe.feed("pre-expiry"));
+    // Let the pump pick the frame up into the bounded bridge without the
+    // transport ever draining it.
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(2)).await;
+    assert_eq!(probe.join().await, ProbePumpOutcome::AuthorizationExpired);
+
+    assert!(
+        matches!(probe.poll_transport_once(), ProbeTransportPoll::Errored(_)),
+        "a frame still queued inside the gateway must not cross to the backend after expiry"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancelling_the_pump_joins_it_while_the_backend_is_not_polling() {
+    // The deadline is far away: this proves the DISPATCHER's join point works
+    // on its own, which is what every bounded direct-H2 exit relies on.
+    let plan = upload_plan(
+        Duration::from_secs(3_600),
+        StreamAuthTermination::AuthenticatedStreamMaxLifetime,
+    );
+    let latch = plan.2.clone();
+    let mut probe = UploadPumpProbe::start(&plan);
+    assert_eq!(probe.cancel_and_join().await, ProbePumpOutcome::Cancelled);
+    assert!(
+        probe.client_body_released(),
+        "cancel_and_join must not return before the client body is released"
+    );
+    assert_eq!(
+        latch.observed(),
+        None,
+        "a dispatcher cancellation is not an authorization termination"
+    );
+    assert!(matches!(
+        probe.poll_transport_once(),
+        ProbeTransportPoll::Errored(_)
+    ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn releasing_the_transport_body_ends_the_pump() {
+    let plan = upload_plan(
+        Duration::from_secs(3_600),
+        StreamAuthTermination::AuthenticatedStreamMaxLifetime,
+    );
+    let mut probe = UploadPumpProbe::start(&plan);
+    probe.drop_transport();
+    assert_eq!(probe.join().await, ProbePumpOutcome::ConsumerGone);
+    assert!(
+        probe.client_body_released(),
+        "no pump may outlive the transport body it feeds"
+    );
+}
+
+#[test]
+fn the_upload_bridge_is_bounded_rather_than_a_buffer() {
+    assert_eq!(
+        UploadPumpProbe::channel_capacity(),
+        1,
+        "the pump must reserve capacity before reading, so it can never buffer the upload"
+    );
+}
+
+// --- Composed dispatch-phase attribution under delayed observation (#3815) ---
+
+#[tokio::test(start_paused = true)]
+async fn an_earlier_protocol_bound_keeps_its_attribution_under_delayed_observation() {
+    let plan = upload_plan(
+        Duration::from_secs(2),
+        StreamAuthTermination::CredentialExpired,
+    );
+    let latch = plan.2.clone();
+    let bound = compose_dispatch_phase_bound_for_test(Some(1_000), Some(&plan));
+    assert!(
+        !bound.authorization_wins(),
+        "a strictly earlier client/operator bound wins composition"
+    );
+
+    // Both instants are now in the past — the task was not scheduled until
+    // after the LATER one. Re-deriving attribution from the clock here would
+    // misreport the protocol's own timeout as an authorization expiry.
+    tokio::time::advance(Duration::from_secs(5)).await;
+    assert_eq!(attribute_dispatch_phase_bound_for_test(&bound, Some(&plan)), None);
+    assert_eq!(latch.observed(), None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_earlier_authorization_bound_is_still_reported_under_delayed_observation() {
+    let plan = upload_plan(
+        Duration::from_secs(1),
+        StreamAuthTermination::CredentialExpired,
+    );
+    let bound = compose_dispatch_phase_bound_for_test(Some(2_000), Some(&plan));
+    assert!(bound.authorization_wins());
+    tokio::time::advance(Duration::from_secs(5)).await;
+    assert_eq!(
+        attribute_dispatch_phase_bound_for_test(&bound, Some(&plan)),
+        Some(StreamAuthTermination::CredentialExpired)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_exact_tie_is_attributed_to_the_authorization_decision() {
+    let plan = upload_plan(
+        Duration::from_secs(1),
+        StreamAuthTermination::CredentialExpired,
+    );
+    let bound = compose_dispatch_phase_bound_for_test(Some(1_000), Some(&plan));
+    assert!(bound.authorization_wins());
+    tokio::time::advance(Duration::from_secs(2)).await;
+    assert_eq!(
+        attribute_dispatch_phase_bound_for_test(&bound, Some(&plan)),
+        Some(StreamAuthTermination::CredentialExpired)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unbounded_phase_is_bounded_by_the_authorization_deadline_alone() {
+    let plan = upload_plan(
+        Duration::from_secs(1),
+        StreamAuthTermination::CredentialExpired,
+    );
+    let bound = compose_dispatch_phase_bound_for_test(None, Some(&plan));
+    assert!(bound.is_bounded());
+    assert!(bound.authorization_wins());
+
+    // No plan at all leaves the phase exactly as it was.
+    let unauthenticated = compose_dispatch_phase_bound_for_test(None, None);
+    assert!(!unauthenticated.is_bounded());
+    assert!(!unauthenticated.authorization_wins());
+    assert_eq!(
+        attribute_dispatch_phase_bound_for_test(&unauthenticated, None),
+        None
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_buffered_collect_reports_the_earlier_protocol_bound_even_when_both_have_elapsed() {
+    let start = tokio::time::Instant::now();
+    let protocol_bound = start + Duration::from_secs(1);
+    let plan = (
+        plan_at(
+            start + Duration::from_secs(2),
+            StreamAuthTermination::CredentialExpired,
+        ),
+        StreamAuthProtocolFamily::WebSocket,
+        ferrum_edge::proxy::auth_lifetime::StreamAuthTerminationLatch::default(),
+    );
+    let latch = plan.2.clone();
+
+    // The collect is not entered until after BOTH bounds have elapsed.
+    tokio::time::advance(Duration::from_secs(5)).await;
+    let outcome = collect_buffered_upload_under_authorization_for_test(
+        std::future::pending::<Result<(), ()>>(),
+        Some(protocol_bound),
+        0,
+        Some(plan),
+    )
+    .await;
+    assert_eq!(outcome, BufferedUploadWaitOutcomeForTest::DeadlineExceeded);
+    assert_eq!(
+        latch.observed(),
+        None,
+        "the client RPC deadline bounded this collect, not the credential"
+    );
+}
+
+// --- Source/wiring contracts for transports with no in-process harness -------
+
+#[test]
+fn every_streaming_h1h2_upload_installs_the_gateway_owned_pump() {
+    // reqwest size-limited, reqwest unlimited, HBONE, Unix, mesh mTLS,
+    // direct-H2 — plus the two definitions.
+    assert_eq!(
+        PROXY_SOURCE
+            .matches("install_streaming_upload_authorization(")
+            .count(),
+        6,
+        "an H1/H2 streaming upload lost its gateway-owned lifecycle"
+    );
+    assert_eq!(
+        PROXY_SOURCE
+            .matches("install_counting_upload_authorization(")
+            .count(),
+        2,
+        "the unlimited-size reqwest upload lost its gateway-owned lifecycle"
+    );
+    // Native gRPC keeps its own body type, so it installs the pump directly on
+    // the shared upload source rather than through the H1/H2 adapters.
+    assert!(
+        GRPC_PROXY_SOURCE.contains("UploadSource::for_streaming_upload(body, auth)"),
+        "the fully-streamed native-gRPC upload lost its gateway-owned lifecycle"
+    );
+    // The adapter deadline and the pump are installed together from one place,
+    // so a transport cannot get one without the other.
+    let installer = PROXY_SOURCE
+        .split("pub(crate) fn install_streaming_upload_authorization(")
+        .nth(1)
+        .expect("streaming upload installer")
+        .split("\n}\n")
+        .next()
+        .expect("bounded installer body");
+    assert!(installer.contains("with_authorization_deadline("));
+    assert!(installer.contains("with_gateway_upload_pump("));
+    // Unauthenticated requests keep the previous zero-overhead path.
+    assert!(installer.contains("let Some(plan) = auth else {"));
+}
+
+#[test]
+fn the_direct_h2_handler_joins_its_upload_before_returning() {
+    // Every bounded direct-H2 exit, plus the normal completion path, joins the
+    // pump; the residual error exits are covered by `cancel_on_drop`.
+    assert_eq!(
+        PROXY_SOURCE.matches("pump.cancel_and_join().await;").count(),
+        3,
+        "a direct-H2 exit stopped joining the gateway-owned upload"
+    );
+    assert!(
+        PROXY_SOURCE.contains("UploadPumpJoin::cancel_on_drop"),
+        "direct-H2 must arm cancel-on-drop so residual early returns still release the upload"
+    );
 }

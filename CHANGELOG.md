@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Authorization lifetime for admitted streams and request uploads (issues
+  #3815, #3816). An authenticated stream is bounded by the earliest of the
+  accepted credential's own deadline and the finite
+  `FERRUM_AUTHENTICATED_STREAM_MAX_LIFETIME_SECONDS` fallback; application
+  activity never extends it, and unauthenticated traffic is unaffected.
+  Enforcement covers H1/H2/H3 response bodies, WebSocket, TCP/TLS and UDP/DTLS
+  stream sessions, buffered uploads, and every dispatch-phase wait between
+  admission and the client-visible response head. Streaming H1/H2 request
+  uploads additionally get a **gateway-owned upload pump**: the inbound client
+  body moves into a task the gateway schedules, so the deadline fires — and the
+  body is released — even while the backend transport is parked on flow control
+  and is polling nothing. On expiry the gateway polls no further client body,
+  discards anything still queued in its bounded one-frame bridge, and ends the
+  transport body with an error so the backend resets rather than accepting a
+  truncated upload as complete; bytes already handed to the transport before
+  expiry are not recalled. Direct-H2 joins the pump before returning. The
+  client-visible terminal is chosen once, before commitment: a fixed `401` for
+  plain HTTP/SSE, trailers-only `grpc-status: 16` for native gRPC, and the
+  equivalent bounded frame for gRPC-Web. Terminations are health-neutral and are
+  counted through one per-request latch on a fixed-cardinality
+  (class × protocol family) counter that carries no route, identity, or expiry
+  detail.
+
 - Istio `AuthorizationPolicy` `action: CUSTOM` external authorization (issue
   #3235). A matching policy delegates the decision to a root-namespace
   `meshConfig.extensionProviders` `envoyExtAuthzHttp` provider, evaluated in

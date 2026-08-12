@@ -1896,6 +1896,111 @@ impl UploadAuthDeadline {
     }
 }
 
+// -- Gateway-owned upload source ----------------------------------------------
+
+/// Where a streaming client request-body adapter reads its frames from.
+///
+/// Unauthenticated traffic keeps [`Direct`](UploadSource::Direct) — the client
+/// `Incoming` polled in place, exactly as before, with no task, channel, or
+/// extra allocation.
+///
+/// An AUTHENTICATED streaming upload is moved into a gateway-owned pump task
+/// ([`Pumped`](UploadSource::Pumped), see `crate::proxy::upload_pump`) and the
+/// adapter reads a bounded bridge instead. That is what makes the admitted
+/// stream's authorization lifetime enforceable end to end: the deadline is
+/// owned by a task the gateway schedules, so it fires — and releases the
+/// inbound client body — even while the backend transport is parked on flow
+/// control and is polling nothing at all.
+///
+/// The accounting stays exactly where it was: byte counting, the request-size
+/// ceiling, and gRPC length-prefixed message counting all run in the adapter
+/// above this enum, as frames are handed to the transport. The bridge changes
+/// who owns the socket-side read, not what is authoritative.
+pub enum UploadSource {
+    Direct(Incoming),
+    Pumped(crate::proxy::upload_pump::UploadPumpSource),
+    /// Transient placeholder used only while a pump is being installed. Never
+    /// observable by a consumer.
+    Exhausted,
+}
+
+impl UploadSource {
+    /// Build the source for one streaming client upload, installing a
+    /// gateway-owned pump when (and only when) the request carries an
+    /// authorization-lifetime plan.
+    ///
+    /// This is the entry the native-gRPC request body uses; the H1/H2 adapters
+    /// reach the same machinery through
+    /// `SizeLimitedIncoming::with_gateway_upload_pump`.
+    pub(crate) fn for_streaming_upload(
+        incoming: Incoming,
+        auth: Option<&crate::proxy::RequestAuthLifetimePlan>,
+    ) -> (Self, Option<crate::proxy::upload_pump::UploadPumpJoin>) {
+        let mut source = UploadSource::Direct(incoming);
+        let join = match auth {
+            Some(plan) => source.install_pump(plan),
+            None => None,
+        };
+        (source, join)
+    }
+
+    pub(crate) fn poll_frame(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+        match self {
+            UploadSource::Direct(incoming) => {
+                let frame = std::task::ready!(http_body::Body::poll_frame(Pin::new(incoming), cx));
+                Poll::Ready(frame.map(|result| result.map_err(|e| Box::new(e) as BoxError)))
+            }
+            UploadSource::Pumped(pump) => pump.poll_frame(cx),
+            UploadSource::Exhausted => Poll::Ready(None),
+        }
+    }
+
+    pub(crate) fn is_end_stream(&self) -> bool {
+        match self {
+            UploadSource::Direct(incoming) => http_body::Body::is_end_stream(incoming),
+            UploadSource::Pumped(pump) => pump.is_end_stream(),
+            UploadSource::Exhausted => true,
+        }
+    }
+
+    pub(crate) fn size_hint(&self) -> http_body::SizeHint {
+        match self {
+            UploadSource::Direct(incoming) => http_body::Body::size_hint(incoming),
+            UploadSource::Pumped(pump) => pump.size_hint(),
+            UploadSource::Exhausted => http_body::SizeHint::with_exact(0),
+        }
+    }
+
+    /// Move the client body into a gateway-owned pump, returning the join
+    /// point.
+    ///
+    /// Returns `None` — leaving the direct path untouched — when the body is
+    /// already at end of stream (an empty upload has nothing to bound, and
+    /// hyper relies on `is_end_stream()` being true up front to send
+    /// `END_STREAM` with the request headers) or when a pump is already
+    /// installed.
+    fn install_pump(
+        &mut self,
+        plan: &crate::proxy::RequestAuthLifetimePlan,
+    ) -> Option<crate::proxy::upload_pump::UploadPumpJoin> {
+        match std::mem::replace(self, UploadSource::Exhausted) {
+            UploadSource::Direct(incoming) if !http_body::Body::is_end_stream(&incoming) => {
+                let (source, join) =
+                    crate::proxy::upload_pump::spawn_upload_pump(incoming, plan);
+                *self = UploadSource::Pumped(source);
+                Some(join)
+            }
+            other => {
+                *self = other;
+                None
+            }
+        }
+    }
+}
+
 // -- SizeLimitedIncoming ------------------------------------------------------
 
 /// Terminal state of a client request body as observed by
@@ -1929,7 +2034,7 @@ pub enum RequestBodyOutcome {
 /// to distinguish a size-limit error from other request failures and
 /// return the correct HTTP 413 status.
 pub struct SizeLimitedIncoming {
-    inner: Incoming,
+    inner: UploadSource,
     max_bytes: usize,
     /// Running byte count, atomic so the caller can observe the final value
     /// after `into_reqwest_body()` has moved `self` into the outbound request.
@@ -2027,7 +2132,7 @@ impl SizeLimitedIncoming {
         bytes_seen: Arc<std::sync::atomic::AtomicU64>,
     ) -> Self {
         Self {
-            inner: incoming,
+            inner: UploadSource::Direct(incoming),
             max_bytes,
             bytes_seen,
             exceeded,
@@ -2056,7 +2161,7 @@ impl SizeLimitedIncoming {
         cancel: tokio::sync::oneshot::Receiver<()>,
     ) -> Self {
         Self {
-            inner: incoming,
+            inner: UploadSource::Direct(incoming),
             max_bytes,
             bytes_seen,
             exceeded,
@@ -2099,6 +2204,32 @@ impl SizeLimitedIncoming {
     ) -> Self {
         self.auth_deadline = Some(UploadAuthDeadline::new(deadline, family, latch));
         self
+    }
+
+    /// Move the inbound client body into a gateway-owned upload pump (issue
+    /// #3815), returning the dispatcher's join point.
+    ///
+    /// This is the half of the authorization-lifetime contract that a body
+    /// adapter alone cannot provide. The adapter's own deadline only fires when
+    /// the backend transport polls it, and an HTTP/2 pipe parked on send
+    /// capacity — or an HTTP/1.1 connection task parked on socket writability —
+    /// does not. The pump's deadline is owned by a task the gateway schedules,
+    /// so on expiry the client body is dropped and the transport body is
+    /// terminated with an error regardless of what the backend is doing.
+    ///
+    /// Both bounds are armed from the SAME absolute plan and record through the
+    /// same per-request latch, so whichever fires first counts the single
+    /// termination for the stream.
+    ///
+    /// `None` when the upload needs no pump: an already-ended (empty) client
+    /// body, which hyper must still see as `is_end_stream()` up front.
+    #[must_use]
+    pub(crate) fn with_gateway_upload_pump(
+        mut self,
+        plan: &crate::proxy::RequestAuthLifetimePlan,
+    ) -> (Self, Option<crate::proxy::upload_pump::UploadPumpJoin>) {
+        let join = self.inner.install_pump(plan);
+        (self, join)
     }
 
     /// Enable authoritative gRPC length-prefixed message counting while
@@ -2219,7 +2350,7 @@ impl Drop for SizeLimitedIncoming {
         if self.completion.is_none() {
             return;
         }
-        let outcome = request_body_drop_outcome(http_body::Body::is_end_stream(&self.inner));
+        let outcome = request_body_drop_outcome(self.inner.is_end_stream());
         self.signal_completion(outcome);
     }
 }
@@ -2253,7 +2384,7 @@ impl http_body::Body for SizeLimitedIncoming {
                 "request body forwarding cancelled after upload timeout".into(),
             )));
         }
-        match http_body::Body::poll_frame(Pin::new(&mut this.inner), cx) {
+        match this.inner.poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
                 if let Some(data) = frame.data_ref() {
                     // Single atomic RMW: fetch_add returns the pre-increment
@@ -2281,7 +2412,7 @@ impl http_body::Body for SizeLimitedIncoming {
             }
             Poll::Ready(Some(Err(e))) => {
                 this.signal_completion(RequestBodyOutcome::Errored);
-                Poll::Ready(Some(Err(Box::new(e))))
+                Poll::Ready(Some(Err(e)))
             }
             Poll::Ready(None) => {
                 this.signal_completion(RequestBodyOutcome::Completed);
@@ -2318,7 +2449,7 @@ impl http_body::Body for SizeLimitedIncoming {
 /// overhead beyond a single `fetch_add(Relaxed)` per frame. The increments
 /// use `Release` to pair with external `Acquire` loads on the cloned handle.
 pub struct CountingIncoming {
-    inner: Incoming,
+    inner: UploadSource,
     bytes_seen: Arc<std::sync::atomic::AtomicU64>,
     grpc_messages: Option<Arc<std::sync::atomic::AtomicU64>>,
     grpc_scanner: Option<crate::plugins::mesh::prometheus_helpers::GrpcLengthPrefixedScanner>,
@@ -2353,7 +2484,7 @@ impl CountingIncoming {
         bytes_seen: Arc<std::sync::atomic::AtomicU64>,
     ) -> Self {
         Self {
-            inner: incoming,
+            inner: UploadSource::Direct(incoming),
             bytes_seen,
             grpc_messages: None,
             grpc_scanner: None,
@@ -2374,6 +2505,19 @@ impl CountingIncoming {
     ) -> Self {
         self.auth_deadline = Some(UploadAuthDeadline::new(deadline, family, latch));
         self
+    }
+
+    /// Move the inbound client body into a gateway-owned upload pump (issue
+    /// #3815). Identical contract to
+    /// [`SizeLimitedIncoming::with_gateway_upload_pump`], for the
+    /// unlimited-size streaming upload path.
+    #[must_use]
+    pub(crate) fn with_gateway_upload_pump(
+        mut self,
+        plan: &crate::proxy::RequestAuthLifetimePlan,
+    ) -> (Self, Option<crate::proxy::upload_pump::UploadPumpJoin>) {
+        let join = self.inner.install_pump(plan);
+        (self, join)
     }
 
     /// Enable authoritative gRPC length-prefixed message counting while
@@ -2432,7 +2576,7 @@ impl http_body::Body for CountingIncoming {
         {
             return Poll::Ready(Some(Err(deadline.message().into())));
         }
-        match http_body::Body::poll_frame(Pin::new(&mut this.inner), cx) {
+        match this.inner.poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
                 if let Some(data) = frame.data_ref() {
                     // Release ordering pairs with Acquire on
@@ -2449,7 +2593,7 @@ impl http_body::Body for CountingIncoming {
                 }
                 Poll::Ready(Some(Ok(frame)))
             }
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(Box::new(e)))),
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,
         }

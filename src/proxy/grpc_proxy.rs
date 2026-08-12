@@ -127,7 +127,19 @@ pub enum GrpcBody {
     /// observe `bytes_seen` from another task after `into_reqwest_body()`
     /// moves ownership — `GrpcBody` has no such cross-task read path.
     Streaming {
-        incoming: Incoming,
+        /// The client body, or — for an AUTHENTICATED request — a bounded
+        /// bridge fed by a gateway-owned pump task (issue #3815).
+        ///
+        /// Native gRPC keeps its full-duplex semantics: the pump is a
+        /// capacity-1 bridge, not a buffer-first collect, so a bidirectional
+        /// RPC still commits each request message as it arrives. What it adds
+        /// is an absolute authorization bound owned by a task the GATEWAY
+        /// schedules, so it fires even while hyper's HTTP/2 pipe is parked on
+        /// backend send capacity and is polling nothing. On expiry the client
+        /// body is dropped and this body ends in an ERROR, so hyper emits
+        /// RST_STREAM — never a clean END_STREAM the backend could mistake for
+        /// a complete request stream.
+        incoming: crate::proxy::body::UploadSource,
         bytes_seen: usize,
         max_bytes: usize,
         exceeded: Arc<AtomicBool>,
@@ -233,7 +245,7 @@ impl http_body::Body for GrpcBody {
                 grpc_messages,
                 grpc_scanner,
                 ..
-            } => match Pin::new(incoming).poll_frame(cx) {
+            } => match incoming.poll_frame(cx) {
                 Poll::Ready(Some(Ok(frame))) => {
                     if let Some(data) = frame.data_ref() {
                         if *max_bytes > 0 {
@@ -258,7 +270,7 @@ impl http_body::Body for GrpcBody {
                     }
                     Poll::Ready(Some(Ok(frame)))
                 }
-                Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(Box::new(e)))),
+                Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
                 Poll::Ready(None) => Poll::Ready(None),
                 Poll::Pending => Poll::Pending,
             },
@@ -3626,6 +3638,7 @@ pub async fn proxy_grpc_request_streaming(
     grpc_deadline_at: Option<tokio::time::Instant>,
     held_frontend_upload: &mut Option<GrpcBody>,
     grpc_request_messages: Option<Arc<AtomicU64>>,
+    auth: Option<&crate::proxy::RequestAuthLifetimePlan>,
 ) -> Result<GrpcResponseKind, GrpcProxyError> {
     let (parts, body) = req.into_parts();
     let (grpc_messages, grpc_scanner) = match grpc_request_messages {
@@ -3635,6 +3648,13 @@ pub async fn proxy_grpc_request_streaming(
         ),
         None => (None, None),
     };
+    // Authorization lifetime for the fully-streamed native-gRPC upload (issue
+    // #3815). The join point is released rather than awaited: this dispatch
+    // returns while the RPC's response side is still streaming, so the upload's
+    // lifetime is the transport body's — `UploadPumpSource`'s abort guard ends
+    // the task when hyper drops that body, and the pump self-terminates at the
+    // deadline regardless of what the backend is doing.
+    let (body, _upload_pump) = crate::proxy::body::UploadSource::for_streaming_upload(body, auth);
     let grpc_body = GrpcBody::Streaming {
         incoming: body,
         bytes_seen: 0,
