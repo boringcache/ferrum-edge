@@ -41,7 +41,10 @@
 //! - **Supervision.** A started listener whose task later finishes — cleanly,
 //!   with an error, or by panic — is reaped on the next reconcile, surfaced on
 //!   [`GatewayListenerManager::bind_failures`], and rebound. A dead accept loop
-//!   is never mistaken for a healthy port.
+//!   is never mistaken for a healthy port. Reaping is per protocol half: a dead
+//!   TCP accept loop retires the whole listener, while a dead QUIC task is
+//!   joined and retried on its own, leaving the port's H1/H2 accept loop and
+//!   its admitted routes untouched.
 //! - **Shutdown.** The global shutdown signal closes every managed listener and
 //!   the manager awaits their drains, logging both listener errors
 //!   (`Ok(Err(..))`) and join failures (`Err(..)`), before returning.
@@ -511,10 +514,18 @@ struct LiveListener {
 }
 
 impl LiveListener {
-    /// Whether either task has ended. A started listener whose accept loop has
-    /// exited is not a healthy port, however it exited.
-    fn is_finished(&self) -> bool {
-        self.tcp.is_finished() || self.quic.as_ref().is_some_and(ListenerTask::is_finished)
+    /// Whether the TCP accept loop has ended. A started listener whose accept
+    /// loop has exited is not a healthy port, however it exited: the whole
+    /// listener must be retired and rebound.
+    fn tcp_ended(&self) -> bool {
+        self.tcp.is_finished()
+    }
+
+    /// Whether the QUIC task has ended. Scoped to HTTP/3 alone — the TCP accept
+    /// loop on the same port keeps serving H1/H2, so this half is reaped and
+    /// retried in place rather than tearing the listener down.
+    fn quic_ended(&self) -> bool {
+        self.quic.as_ref().is_some_and(ListenerTask::is_finished)
     }
 
     /// Signal both protocol halves to stop accepting. QUIC uses an independent
@@ -821,14 +832,28 @@ impl GatewayListenerManager {
 
         let mut live = self.listeners.lock().await;
 
-        // Reap listeners whose task ended after startup. A finished accept loop
-        // means the port is no longer served; leaving the entry in place would
-        // make every later reconcile treat it as healthy and never rebind.
-        let dead: Vec<u16> = live
+        // Reap listeners whose TCP accept loop ended after startup. A finished
+        // accept loop means the port is no longer served; leaving the entry in
+        // place would make every later reconcile treat it as healthy and never
+        // rebind. Both halves are retired together here because the QUIC task
+        // cannot outlive the TCP listener it shares a port identity with.
+        let dead_tcp: Vec<u16> = live
             .iter()
-            .filter_map(|(port, listener)| listener.is_finished().then_some(*port))
+            .filter_map(|(port, listener)| listener.tcp_ended().then_some(*port))
             .collect();
-        for port in dead {
+        // Ports whose QUIC task ended while the TCP accept loop is still
+        // serving. HTTP/3 alone is unavailable there: H1/H2 keep serving, the
+        // routes stay admitted, and `Alt-Svc` simply stops advertising the port
+        // until `ensure_quic` below rebinds it. Tearing the whole listener down
+        // for this would take a healthy TCP socket offline and misreport it as
+        // a TCP failure.
+        let dead_quic: Vec<u16> = live
+            .iter()
+            .filter_map(|(port, listener)| {
+                (!listener.tcp_ended() && listener.quic_ended()).then_some(*port)
+            })
+            .collect();
+        for port in dead_tcp {
             if let Some(listener) = live.remove(&port) {
                 listener.signal_shutdown();
                 let (error, pending) = Self::describe_ended_listener(listener).await;
@@ -846,6 +871,26 @@ impl GatewayListenerManager {
                     error,
                 ));
             }
+        }
+        for port in dead_quic {
+            let Some(listener) = live.get_mut(&port) else {
+                continue;
+            };
+            let Some(error) = Self::reap_ended_quic(listener).await else {
+                continue;
+            };
+            error!(port, "Gateway API HTTP/3 listener ended unexpectedly: {error}");
+            // Reported for this pass even when `ensure_quic` rebinds QUIC
+            // further down the same pass, exactly as a dead TCP accept loop is:
+            // a healthy-to-dead transition that recovered immediately must
+            // still be counted and visible once, and the next pass clears it as
+            // a recovery. Suppressing it on same-pass success would make the
+            // death invisible to metrics and health entirely.
+            failures.push(GatewayListenerBindFailure::quic(
+                port,
+                GatewayListenerFailureCategory::ListenerTaskEnded,
+                error,
+            ));
         }
 
         // Close listeners whose port left the config, and rebind ports whose
@@ -1130,6 +1175,32 @@ impl GatewayListenerManager {
             ),
             pending,
         )
+    }
+
+    /// Reap a QUIC task that has already ended, leaving the TCP accept loop and
+    /// its already-accepted H1/H2 connections untouched.
+    ///
+    /// Returns the rendered reason so the caller can report the failure against
+    /// the QUIC half alone, or `None` when there was nothing to reap. Clearing
+    /// the handle and its shutdown sender is what lets [`Self::ensure_quic`]
+    /// retry the port: a fresh watch channel is installed with the new task
+    /// rather than signalling one whose receiver is gone.
+    async fn reap_ended_quic(listener: &mut LiveListener) -> Option<String> {
+        // Only ever called for a task `quic_ended()` already observed finished,
+        // so this join returns immediately and cannot stall the reconcile pass.
+        // Joining rather than dropping the handle is how the task's error or
+        // panic payload is recovered instead of being discarded.
+        let task = listener.quic.take()?;
+        listener.quic_shutdown_tx = None;
+        let reason = match task.await {
+            Ok(Ok(())) => "the HTTP/3 listener exited without error".to_string(),
+            Ok(Err(err)) => format!("{err:#}"),
+            Err(err) => format!("the HTTP/3 listener task ended abnormally: {err}"),
+        };
+        Some(format!(
+            "HTTP/3 (QUIC) stopped serving and is being rebound ({reason}); HTTP/1.1 and HTTP/2 \
+             keep serving on this port"
+        ))
     }
 
     /// Await a retiring listener task under a bound. `Err(task)` hands the
@@ -1565,7 +1636,7 @@ mod tests {
             .await
             .get(&port)
             .expect("listener")
-            .is_finished()
+            .tcp_ended()
         {
             tokio::task::yield_now().await;
         }
@@ -1587,7 +1658,7 @@ mod tests {
                 .await
                 .get(&port)
                 .expect("listener")
-                .is_finished(),
+                .tcp_ended(),
             "the rebound listener must be live"
         );
         // The pass that reaped the dead task publishes it as a runtime
@@ -1711,28 +1782,7 @@ mod tests {
             .http_tls_listen_ports
             .insert((crate::config::types::default_namespace(), port));
         let state = test_state(tls_https.clone());
-        let manager = GatewayListenerManager::new(
-            state.clone(),
-            std::net::IpAddr::from([127, 0, 0, 1]),
-            GatewayListenerTls {
-                static_config: Some(test_self_signed_server_config()),
-                reload_slot: None,
-            },
-        )
-        .with_http3(GatewayListenerHttp3 {
-            config: crate::http3::config::Http3ServerConfig::default(),
-            tls_policy: crate::tls::TlsPolicy {
-                protocol_versions: vec![&rustls::version::TLS13, &rustls::version::TLS12],
-                crypto_provider: std::sync::Arc::new(rustls::crypto::ring::default_provider()),
-                prefer_server_cipher_order: true,
-                session_cache_size: 1024,
-                early_data_max_size: 0,
-            },
-            client_ca_bundle_path: None,
-            client_crls: std::sync::Arc::new(Vec::new()),
-            tls_slot: None,
-            tls_revision_rx: None,
-        });
+        let manager = tls_h3_manager(state.clone());
         assert!(manager.reconcile().await.is_empty());
         assert_eq!(manager.active_http3_ports().await, vec![port]);
         let stale_generation = state.request_epoch.load().config_generation;
@@ -1778,6 +1828,161 @@ mod tests {
             "current epoch must keep QUIC refused: {failures:?}"
         );
         assert!(manager.active_http3_ports().await.is_empty());
+        manager.shutdown_all().await;
+    }
+
+    /// A TLS-class Gateway listener manager with HTTP/3 enabled, so a port that
+    /// is in `http_tls_listen_ports` binds both a TCP accept loop and a QUIC
+    /// listener.
+    fn tls_h3_manager(state: ProxyState) -> GatewayListenerManager {
+        GatewayListenerManager::new(
+            state,
+            std::net::IpAddr::from([127, 0, 0, 1]),
+            GatewayListenerTls {
+                static_config: Some(test_self_signed_server_config()),
+                reload_slot: None,
+            },
+        )
+        .with_http3(GatewayListenerHttp3 {
+            config: crate::http3::config::Http3ServerConfig::default(),
+            tls_policy: crate::tls::TlsPolicy {
+                protocol_versions: vec![&rustls::version::TLS13, &rustls::version::TLS12],
+                crypto_provider: std::sync::Arc::new(rustls::crypto::ring::default_provider()),
+                prefer_server_cipher_order: true,
+                session_cache_size: 1024,
+                early_data_max_size: 0,
+            },
+            client_ca_bundle_path: None,
+            client_crls: std::sync::Arc::new(Vec::new()),
+            tls_slot: None,
+            tls_revision_rx: None,
+        })
+    }
+
+    /// A QUIC task that dies while the TCP accept loop is still healthy is a
+    /// HTTP/3-only outage. It must be joined, reported against the QUIC half,
+    /// and retried — never allowed to retire the healthy TCP listener, which
+    /// would take H1/H2 offline and falsely report the port's TCP half down.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dead_quic_task_is_reaped_on_its_own_half_without_stopping_tcp() {
+        let _ = rustls::crypto::CryptoProvider::install_default(
+            rustls::crypto::ring::default_provider(),
+        );
+        let port = free_port().await;
+        let mut config = port_scoped_config(port);
+        config
+            .http_tls_listen_ports
+            .insert((crate::config::types::default_namespace(), port));
+        let status = Arc::new(crate::proxy::gateway_listener_status::GatewayListenerStatus::new());
+        let manager = tls_h3_manager(test_state(config)).with_status(status.clone());
+        assert!(manager.reconcile().await.is_empty());
+        assert_eq!(manager.active_ports().await, vec![port]);
+        assert_eq!(manager.active_http3_ports().await, vec![port]);
+        assert!(!status.snapshot().degraded());
+
+        // Kill only the QUIC task behind the manager's back, exactly as a panic
+        // or an unexpected endpoint exit would. The TCP accept loop is
+        // untouched; its task id is the identity the rebind must preserve.
+        let tcp_id = {
+            let live = manager.listeners.lock().await;
+            let listener = live.get(&port).expect("listener");
+            listener.quic.as_ref().expect("quic task").abort();
+            listener.tcp.id()
+        };
+        while !manager
+            .listeners
+            .lock()
+            .await
+            .get(&port)
+            .expect("listener")
+            .quic_ended()
+        {
+            tokio::task::yield_now().await;
+        }
+
+        let failures = manager.reconcile().await;
+        assert!(
+            failures.iter().any(|failure| {
+                failure.port == port
+                    && failure.protocol == GatewayListenerProtocolHalf::Quic
+                    && failure.category == GatewayListenerFailureCategory::ListenerTaskEnded
+            }),
+            "the dead QUIC task must be surfaced on the QUIC half: {failures:?}"
+        );
+        assert!(
+            failures
+                .iter()
+                .all(|failure| failure.protocol == GatewayListenerProtocolHalf::Quic),
+            "a healthy TCP accept loop must never be reported as failed: {failures:?}"
+        );
+
+        let live = manager.listeners.lock().await;
+        let listener = live.get(&port).expect("listener must not be retired");
+        assert!(
+            !listener.tcp_ended(),
+            "the TCP accept loop must still be serving H1/H2"
+        );
+        assert_eq!(
+            listener.tcp.id(),
+            tcp_id,
+            "the healthy TCP accept loop must be the original task, not a rebind"
+        );
+        drop(live);
+
+        // The rebind does not hide the death: it is published for the pass that
+        // observed it, on the QUIC half only.
+        let snapshot = status.snapshot();
+        assert!(
+            snapshot.failures.iter().any(|entry| {
+                entry.port == port
+                    && entry.protocol == GatewayListenerProtocolHalf::Quic
+                    && entry.category == GatewayListenerFailureCategory::ListenerTaskEnded
+            }),
+            "{snapshot:?}"
+        );
+        assert!(
+            snapshot
+                .failures
+                .iter()
+                .all(|entry| entry.protocol == GatewayListenerProtocolHalf::Quic),
+            "the healthy TCP half must not appear in the published status: {snapshot:?}"
+        );
+
+        // Clearing the handle lets the existing `ensure_quic` path retry the
+        // port. That retry can lose a race with the aborted endpoint's socket
+        // close, so recovery is asserted across retry passes rather than
+        // pinned to the first one — what matters is that HTTP/3 comes back
+        // without a restart and the status clears itself.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            manager.reconcile().await;
+            if !status.snapshot().degraded() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the QUIC half never rebound: {:?}",
+                status.snapshot()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(manager.active_http3_ports().await, vec![port]);
+        assert_eq!(manager.active_ports().await, vec![port]);
+        // The death is counted exactly once however many retries the rebind
+        // took: a still-failing retry ages its entry instead of re-counting an
+        // onset, so its recovery is counted once too.
+        assert_eq!(
+            status
+                .cumulative()
+                .recoveries_total
+                .iter()
+                .find(|series| {
+                    series.protocol == GatewayListenerProtocolHalf::Quic
+                        && series.category == GatewayListenerFailureCategory::ListenerTaskEnded
+                })
+                .map(|series| series.value),
+            Some(1)
+        );
         manager.shutdown_all().await;
     }
 
