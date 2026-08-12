@@ -7143,12 +7143,19 @@ fn backup_audit_admit_failed_response() -> Response<Full<Bytes>> {
     )
 }
 
+/// Sanitized export counts for the backup success audit record.
+///
+/// `gateway_trust_bundles` is a count only: exported trust roots are
+/// unredacted material, so the audit trail must record that they left the
+/// gateway without ever carrying certificate bytes, PEM, subjects, or
+/// revisions into an audit field.
 fn backup_counts_audit_value(
     proxy_count: usize,
     consumer_count: usize,
     plugin_config_count: usize,
     upstream_count: usize,
     api_specs_count: usize,
+    gateway_trust_bundles_count: usize,
 ) -> Value {
     json!({
         "proxies": proxy_count,
@@ -7156,6 +7163,7 @@ fn backup_counts_audit_value(
         "plugin_configs": plugin_config_count,
         "upstreams": upstream_count,
         "api_specs": api_specs_count,
+        "gateway_trust_bundles": gateway_trust_bundles_count,
     })
 }
 
@@ -7168,6 +7176,7 @@ struct BackupExportPayload<'filter, 'value> {
     plugin_config_count: usize,
     upstream_count: usize,
     api_specs_count: usize,
+    gateway_trust_bundles_count: usize,
 }
 
 async fn finalize_backup_export(
@@ -7186,6 +7195,7 @@ async fn finalize_backup_export(
         plugin_config_count,
         upstream_count,
         api_specs_count,
+        gateway_trust_bundles_count,
     } = payload;
     let resources = audit::backup_resources_audit_value(resource_filter);
     let event = audit::AuditEvent::new(
@@ -7203,6 +7213,7 @@ async fn finalize_backup_export(
                 plugin_config_count,
                 upstream_count,
                 api_specs_count,
+                gateway_trust_bundles_count,
             ),
             body_bytes.len(),
         ),
@@ -7219,12 +7230,13 @@ async fn finalize_backup_export(
     {
         Ok(_) => {
             info!(
-                "Backup: {} proxies, {} consumers, {} plugin_configs, {} upstreams, {} api_specs ({} bytes)",
+                "Backup: {} proxies, {} consumers, {} plugin_configs, {} upstreams, {} api_specs, {} gateway_trust_bundles ({} bytes)",
                 proxy_count,
                 consumer_count,
                 plugin_config_count,
                 upstream_count,
                 api_specs_count,
+                gateway_trust_bundles_count,
                 body_bytes.len()
             );
             backup_attachment_response(body_bytes, source)
@@ -7303,6 +7315,7 @@ enum ConsistentApiSpecsBackup {
         plugin_config_count: usize,
         upstream_count: usize,
         api_specs_count: usize,
+        gateway_trust_bundles_count: usize,
     },
     /// Authoritative config load failed; caller may use labeled cached fallback.
     ConfigUnavailable,
@@ -7318,12 +7331,17 @@ fn backup_resource_includes(resource_filter: Option<&HashSet<&str>>, name: &str)
 ///
 /// `export_carries_api_specs` must be true only when `api_specs` is present and
 /// the caller proved a single generation (admission guard for database exports).
+///
+/// Returns `(body_bytes, proxies, consumers, plugin_configs, upstreams,
+/// api_specs, gateway_trust_bundles)`. The trailing counts are what the backup
+/// success audit record reports, so they must describe what this payload
+/// actually carries — an omitted trust section counts `0`.
 fn serialize_backup_payload(
     mut config: GatewayConfig,
     source: &'static str,
     resource_filter: Option<&HashSet<&str>>,
     api_specs_owned: Option<ApiSpecsBackupSection>,
-) -> (Vec<u8>, usize, usize, usize, usize, usize) {
+) -> (Vec<u8>, usize, usize, usize, usize, usize, usize) {
     let include_proxies = backup_resource_includes(resource_filter, "proxies");
     let include_consumers = backup_resource_includes(resource_filter, "consumers");
     let include_plugin_configs = backup_resource_includes(resource_filter, "plugin_configs");
@@ -7412,6 +7430,9 @@ fn serialize_backup_payload(
         } else {
             None
         };
+    // Omission counts as zero: the audit record must report what this payload
+    // actually released, never what the namespace happens to hold.
+    let gateway_trust_bundles_count = gateway_trust_bundles.map(<[_]>::len).unwrap_or(0);
 
     let backup = BackupPayload {
         version: &config.version,
@@ -7424,7 +7445,7 @@ fn serialize_backup_payload(
             plugin_configs: plugin_configs.len(),
             upstreams: upstreams.len(),
             api_specs: api_specs_count,
-            gateway_trust_bundles: gateway_trust_bundles.map(<[_]>::len).unwrap_or(0),
+            gateway_trust_bundles: gateway_trust_bundles_count,
         },
         proxies,
         consumers,
@@ -7442,6 +7463,7 @@ fn serialize_backup_payload(
         plugin_configs.len(),
         upstreams.len(),
         api_specs_count,
+        gateway_trust_bundles_count,
     )
 }
 
@@ -7498,6 +7520,7 @@ async fn build_consistent_api_specs_backup(
         plugin_config_count,
         upstream_count,
         api_specs_count,
+        gateway_trust_bundles_count,
     ) = serialize_backup_payload(
         config,
         "database",
@@ -7512,6 +7535,7 @@ async fn build_consistent_api_specs_backup(
         plugin_config_count,
         upstream_count,
         api_specs_count,
+        gateway_trust_bundles_count,
     }
 }
 
@@ -7666,6 +7690,7 @@ async fn handle_backup(
                 plugin_config_count,
                 upstream_count,
                 api_specs_count,
+                gateway_trust_bundles_count,
             } => {
                 return Ok(finalize_backup_export(
                     state,
@@ -7681,6 +7706,7 @@ async fn handle_backup(
                         plugin_config_count,
                         upstream_count,
                         api_specs_count,
+                        gateway_trust_bundles_count,
                     },
                 )
                 .await);
@@ -7796,6 +7822,7 @@ async fn handle_backup(
         plugin_config_count,
         upstream_count,
         api_specs_count,
+        gateway_trust_bundles_count,
     ) = serialize_backup_payload(config, source, resource_filter.as_ref(), None);
 
     Ok(finalize_backup_export(
@@ -7812,6 +7839,7 @@ async fn handle_backup(
             plugin_config_count,
             upstream_count,
             api_specs_count,
+            gateway_trust_bundles_count,
         },
     )
     .await)

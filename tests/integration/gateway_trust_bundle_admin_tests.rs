@@ -662,3 +662,98 @@ async fn more_than_one_record_is_refused_before_anything_is_deleted() {
         "and must not bump the revision either"
     );
 }
+
+// ── Backup audit evidence ───────────────────────────────────────────────────
+
+/// Newest successful `GET /backup` security audit record for `namespace`.
+async fn latest_backup_audit_event(base: &str, namespace: &str) -> Value {
+    let (status, body) = get_json(base, "/audit?action=backup&limit=20", namespace).await;
+    assert_eq!(status, 200, "audit list must succeed: {body}");
+    let listed = body["items"].clone();
+    let items = listed.as_array().expect("audit items array");
+    for item in items {
+        if item["action"] == "backup" && item["outcome"] == "success" {
+            return item.clone();
+        }
+    }
+    panic!("no successful backup audit event was recorded: {body}");
+}
+
+/// A full database export releases unredacted trust roots, so the success
+/// audit record must show that they left the gateway — as a count only.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_full_export_audits_the_released_trust_count_without_material() {
+    let dir = TempDir::new().expect("temp dir");
+    let (base, _shutdown) = start_admin(admin_state(make_store(&dir).await)).await;
+    let authority = root_ca_der_base64("root");
+
+    let (status, created) = post_json(
+        &base,
+        "/gateway-trust-bundles",
+        "ferrum",
+        json!({
+            "trust_domain": "cluster.local",
+            "bundle": bundle_body("cluster.local", &authority),
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "create must succeed: {created}");
+
+    let (status, backup) = get_json(&base, "/backup", "ferrum").await;
+    assert_eq!(status, 200);
+    assert_eq!(backup["counts"]["gateway_trust_bundles"], 1);
+
+    let event = latest_backup_audit_event(&base, "ferrum").await;
+    assert_eq!(event["diff"]["data_source"], "database");
+    let audited = event["diff"]["counts"]["gateway_trust_bundles"].clone();
+    assert_eq!(audited, backup["counts"]["gateway_trust_bundles"]);
+    assert_eq!(audited, 1, "the audit must record the exported rows: {event}");
+
+    // Count only: no certificate bytes, PEM, subjects, or revisions.
+    let rendered = serde_json::to_string(&event).expect("event serializes");
+    assert!(
+        !rendered.contains(&authority[..24]),
+        "trust material leaked into the backup audit record: {rendered}"
+    );
+    assert!(
+        !rendered.contains("x509_authorities") && !rendered.contains("cluster.local"),
+        "the audit record must not describe trust beyond a count: {rendered}"
+    );
+}
+
+/// An export that omits the trust section must audit `0` even while the
+/// namespace still holds a trust row: the count describes the payload that was
+/// released, never what the namespace happens to store.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_omitted_trust_section_audits_zero_while_the_row_survives() {
+    let dir = TempDir::new().expect("temp dir");
+    let (base, _shutdown) = start_admin(admin_state(make_store(&dir).await)).await;
+    let authority = root_ca_der_base64("root");
+
+    let (status, created) = post_json(
+        &base,
+        "/gateway-trust-bundles",
+        "ferrum",
+        json!({
+            "trust_domain": "cluster.local",
+            "bundle": bundle_body("cluster.local", &authority),
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "create must succeed: {created}");
+
+    let (status, partial) = get_json(&base, "/backup?resources=proxies", "ferrum").await;
+    assert_eq!(status, 200, "filtered backup must succeed: {partial}");
+    assert!(partial.get("gateway_trust_bundles").is_none());
+    assert_eq!(partial["counts"]["gateway_trust_bundles"], 0);
+
+    let event = latest_backup_audit_event(&base, "ferrum").await;
+    assert_eq!(event["diff"]["resources"], json!(["proxies"]));
+    let audited = event["diff"]["counts"]["gateway_trust_bundles"].clone();
+    assert_eq!(audited, 0, "an omitted section must audit zero: {event}");
+
+    // The stored row is untouched; the `0` describes the export only.
+    let (status, after) = get_json(&base, "/gateway-trust-bundles/ferrum", "ferrum").await;
+    assert_eq!(status, 200);
+    assert_eq!(after["bundle"]["local"]["x509_authorities"][0], authority);
+}
