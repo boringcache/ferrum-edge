@@ -7223,8 +7223,7 @@ impl EnvConfig {
         if self.http3_connect_udp_enabled
             && !crate::http3::connect_udp::CONNECT_UDP_NON_FRAGMENTATION_ENFORCEABLE
         {
-            const UNSUPPORTED_TARGET: &str =
-                "FERRUM_HTTP3_CONNECT_UDP_ENABLED=true is not supported on this build \
+            const UNSUPPORTED_TARGET: &str = "FERRUM_HTTP3_CONNECT_UDP_ENABLED=true is not supported on this build \
                  target: no do-not-fragment socket option is available, so RFC 9298 §3.1 \
                  (\"the proxy MUST NOT introduce IP fragmentation\") cannot be enforced. \
                  Disable the profile or run on Linux or macOS.";

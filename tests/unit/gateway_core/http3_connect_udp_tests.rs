@@ -613,7 +613,9 @@ fn an_unknown_capsule_larger_than_the_udp_ceiling_is_skipped_not_refused() {
     let mut events = Vec::new();
     let mut peak_buffered = 0usize;
     for chunk in wire.chunks(feed_limit) {
-        decoder.push(chunk).expect("a bounded feed must be accepted");
+        decoder
+            .push(chunk)
+            .expect("a bounded feed must be accepted");
         events.extend(drain(&mut decoder));
         peak_buffered = peak_buffered.max(decoder.buffered_len());
     }
@@ -1272,7 +1274,10 @@ async fn a_relay_join_failure_is_an_internal_failure_never_a_client_fin() {
     //
     // The failure is induced by cancelling a task, not by panicking one: this
     // asserts the classification without putting a panic on any code path.
-    for relay in [RelayDirection::ClientToTarget, RelayDirection::TargetToClient] {
+    for relay in [
+        RelayDirection::ClientToTarget,
+        RelayDirection::TargetToClient,
+    ] {
         let handle = tokio::spawn(async {
             tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
             SessionEnd::ClientClosed
