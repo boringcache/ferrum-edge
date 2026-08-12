@@ -279,14 +279,23 @@ impl NodeWaypointUdpSourceIndex {
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
         let mut by_ifindex: HashMap<u32, Arc<NodeWaypointUdpSourceBinding>> = HashMap::new();
         for binding in bindings {
-            let Ok(pod_uid) = parse_pod_uid(&binding.identity.pod_uid) else {
+            // `pod_uid` is the registry/interface owner while
+            // `identity.pod_uid` is the UID bound to the attested principal.
+            // They are constructed together on the production registry path,
+            // but publication is the final attribution boundary: a mismatched
+            // pair must never let pod A's interface/address run under pod B's
+            // policy scope or asserted identity.
+            if binding.pod_uid != binding.identity.pod_uid {
+                continue;
+            }
+            let Ok(pod_uid) = parse_pod_uid(&binding.pod_uid) else {
                 continue;
             };
             by_ifindex.insert(
                 binding.ifindex,
                 Arc::new(NodeWaypointUdpSourceBinding {
                     pod_uid,
-                    pod_uid_text: binding.identity.pod_uid.clone(),
+                    pod_uid_text: binding.pod_uid.clone(),
                     principal: binding.identity.principal.clone(),
                     iface: binding.iface.clone(),
                     ifindex: binding.ifindex,

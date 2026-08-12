@@ -368,6 +368,25 @@ fn a_binding_whose_pod_uid_does_not_parse_is_never_published() {
     );
 }
 
+/// Both redundant UIDs must identify the same pod. Otherwise a stale or
+/// malformed binding could attach pod A's kernel interface/address evidence to
+/// pod B's attested principal and policy scope.
+#[test]
+fn mismatched_registry_and_identity_pod_uids_are_never_published() {
+    let index = NodeWaypointUdpSourceIndex::new();
+    let mut mismatched = binding(UID_A, "ledger", 7, Some("10.244.1.7"), None);
+    mismatched.identity.pod_uid = UID_B.to_string();
+
+    index.publish(&[mismatched]);
+
+    assert_eq!(
+        index
+            .authorize(Some(7), ip("10.244.1.7"))
+            .expect_err("cross-pod UID mismatch must not become attributable"),
+        NodeWaypointUdpSourceRefusal::UnenrolledInterface
+    );
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // Bounded diagnostics
 // ───────────────────────────────────────────────────────────────────────────
