@@ -918,7 +918,11 @@ pub const UDP_DONT_FRAGMENT_SUPPORTED: bool =
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn set_udp_dont_fragment(fd: std::os::unix::io::RawFd, is_ipv4: bool) -> std::io::Result<()> {
     let (level, name, value) = if is_ipv4 {
-        (libc::IPPROTO_IP, libc::IP_MTU_DISCOVER, libc::IP_PMTUDISC_DO)
+        (
+            libc::IPPROTO_IP,
+            libc::IP_MTU_DISCOVER,
+            libc::IP_PMTUDISC_DO,
+        )
     } else {
         (
             libc::IPPROTO_IPV6,

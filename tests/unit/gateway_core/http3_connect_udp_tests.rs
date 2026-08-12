@@ -583,10 +583,22 @@ fn request_shape_diagnostics_are_field_specific_and_echo_nothing() {
 #[test]
 fn refuses_every_field_the_capsule_protocol_forbids() {
     for (name, expected) in [
-        ("content-length", ConnectUdpRequestRejection::ForbiddenContentLength),
-        ("Content-Length", ConnectUdpRequestRejection::ForbiddenContentLength),
-        ("content-type", ConnectUdpRequestRejection::ForbiddenContentType),
-        ("CONTENT-TYPE", ConnectUdpRequestRejection::ForbiddenContentType),
+        (
+            "content-length",
+            ConnectUdpRequestRejection::ForbiddenContentLength,
+        ),
+        (
+            "Content-Length",
+            ConnectUdpRequestRejection::ForbiddenContentLength,
+        ),
+        (
+            "content-type",
+            ConnectUdpRequestRejection::ForbiddenContentType,
+        ),
+        (
+            "CONTENT-TYPE",
+            ConnectUdpRequestRejection::ForbiddenContentType,
+        ),
         (
             "transfer-encoding",
             ConnectUdpRequestRejection::ForbiddenTransferEncoding,

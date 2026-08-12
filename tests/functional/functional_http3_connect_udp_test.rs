@@ -580,8 +580,10 @@ async fn functional_h3_connect_udp_refuses_a_non_https_scheme() {
     let client = Http3Client::insecure().expect("H3 client");
     // Same QUIC listener, same expansion — only `:scheme` differs. RFC 9298 §3
     // bootstraps over HTTPS; the handler must not assume it.
-    let http_scheme =
-        format!("http://localhost:{https_port}{MASQUE_PREFIX}/udp/127.0.0.1/{}/", echo.port);
+    let http_scheme = format!(
+        "http://localhost:{https_port}{MASQUE_PREFIX}/udp/127.0.0.1/{}/",
+        echo.port
+    );
     let mut tunnel = open_tunnel(&client, &http_scheme).await;
 
     assert_eq!(
@@ -620,7 +622,10 @@ async fn functional_h3_connect_udp_refuses_capsule_protocol_forbidden_fields() {
         let mut last_error = None;
         let deadline = std::time::Instant::now() + Duration::from_secs(40);
         let mut tunnel = loop {
-            match client.connect_udp_with_headers(&url, &[(name, value)]).await {
+            match client
+                .connect_udp_with_headers(&url, &[(name, value)])
+                .await
+            {
                 Ok(tunnel) => break tunnel,
                 Err(error) if std::time::Instant::now() < deadline => {
                     last_error = Some(error.to_string());

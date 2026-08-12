@@ -207,8 +207,6 @@ fn ipv4_and_ipv6_sources_are_accounted_separately() {
     );
     assert_eq!(limiter.tracked_source_ips(), 2);
 }
-
-
 // ============================================================================
 // RFC 9298 CONNECT-UDP session admission shares the same ceiling contract
 // ============================================================================
@@ -259,7 +257,10 @@ fn connect_udp_session_cap_above_the_ceiling_is_refused_not_clamped_or_unlimited
     let error = connect_udp_config(usize::MAX)
         .validate_h3_connect_udp_limits()
         .expect_err("usize::MAX is the obvious operator typo");
-    assert!(error.contains("FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS"), "{error}");
+    assert!(
+        error.contains("FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS"),
+        "{error}"
+    );
 }
 
 #[test]

@@ -297,9 +297,7 @@ pub fn forbidden_capsule_protocol_field(name: &str) -> Option<ConnectUdpRequestR
 /// the plugin/policy-finalized outbound map (immediately before a socket would
 /// be created), so neither a client nor a `request_transformer` can put a
 /// forbidden field on a Capsule Protocol message.
-pub fn first_forbidden_capsule_protocol_field<'a, I>(
-    names: I,
-) -> Option<ConnectUdpRequestRejection>
+pub fn first_forbidden_capsule_protocol_field<'a, I>(names: I) -> Option<ConnectUdpRequestRejection>
 where
     I: IntoIterator<Item = &'a str>,
 {
@@ -1401,7 +1399,10 @@ async fn relay_client_chunk(
         loop {
             match decoder.decode_next() {
                 Ok(Some(CapsuleEvent::UdpPayload(payload))) => {
-                    activity.store(session_start.elapsed().as_millis() as u64, Ordering::Relaxed);
+                    activity.store(
+                        session_start.elapsed().as_millis() as u64,
+                        Ordering::Relaxed,
+                    );
                     if let Err(error) = socket.send(&payload).await {
                         match classify_udp_send_error(&error) {
                             // Includes the `EMSGSIZE` that the RFC 9298 §3.1
