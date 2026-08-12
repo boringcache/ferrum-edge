@@ -226,14 +226,7 @@ already use — there is no second representation that can drift.
   Reads require `operator`, writes require `admin`. `PUT` takes the `revision`
   you read as an optimistic-concurrency expectation and returns `409` with
   `expected_revision` / `current_revision` on a lost race. `DELETE` is an
-  explicit revocation and is distinguishable on the wire from "no change".
-  It is also the one transition applied to the accepting process's own live
-  configuration before the response, so that process cannot keep serving — or
-  reporting on `GET /gateway-trust/status` — trust it has already revoked while
-  a poll tick elapses; the row is already gone from the store, so no later poll
-  can resurrect it, and other replicas converge on their own next cycle. Writes
-  stay poll-driven so a new generation still reaches the live swap only through
-  the authoritative snapshot load. A
+  explicit revocation and is distinguishable on the wire from "no change". A
   `POST` that omits `id` derives it from the authenticated
   `X-Ferrum-Namespace` value; neither the stored namespace nor the stored id
   can be influenced by the request body.

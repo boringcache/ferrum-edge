@@ -2127,15 +2127,6 @@ pub(crate) trait AdminResource:
     ) -> DbResult<()> {
         Ok(())
     }
-
-    /// Post-delete hook, run in the request task after the store confirmed the
-    /// row was removed and before the `204` is returned.
-    ///
-    /// Unlike [`AdminResource::after_write`] this cannot fail the response: the
-    /// authoritative removal has already committed. It exists so a resource can
-    /// reconcile process-local live state that must not wait for the next
-    /// configuration poll.
-    async fn after_delete(_state: &AdminState, _namespace: &str, _id: &str) {}
 }
 
 pub(crate) async fn handle_list<R: AdminResource>(
@@ -2313,10 +2304,7 @@ pub(crate) async fn handle_delete<R: AdminResource>(
                     )),
                 };
             return match persistence {
-                Ok(true) => {
-                    R::after_delete(state, namespace, id).await;
-                    Ok(super::empty_response(StatusCode::NO_CONTENT))
-                }
+                Ok(true) => Ok(super::empty_response(StatusCode::NO_CONTENT)),
                 Ok(false) => Ok(not_found_response::<R>()),
                 Err(error) => Ok(R::map_delete_db_error(&error)),
             };
@@ -2375,10 +2363,7 @@ pub(crate) async fn handle_delete<R: AdminResource>(
         )),
     };
     match persistence {
-        Ok(true) => {
-            R::after_delete(state, namespace, id).await;
-            Ok(super::empty_response(StatusCode::NO_CONTENT))
-        }
+        Ok(true) => Ok(super::empty_response(StatusCode::NO_CONTENT)),
         Ok(false) => Ok(not_found_response::<R>()),
         Err(error) => Ok(R::map_delete_db_error(&error)),
     }
@@ -3160,10 +3145,6 @@ impl AdminResource for GatewayTrustBundleRecord {
         db.delete_gateway_trust_bundle(namespace, id).await
     }
 
-    async fn after_delete(state: &AdminState, namespace: &str, id: &str) {
-        withdraw_revoked_gateway_trust_bundle(state, namespace, id).await;
-    }
-
     async fn check_uniqueness(
         db: &dyn DatabaseBackend,
         namespace: &str,
@@ -3176,61 +3157,6 @@ impl AdminResource for GatewayTrustBundleRecord {
             )),
             _ => Ok(None),
         }
-    }
-}
-
-/// Publish an accepted gateway trust-bundle revocation to this process's live
-/// configuration instead of waiting for the next database poll (issue #3727).
-///
-/// Revocation is the fail-closed direction and it is the one trust transition
-/// that must not sit behind a poll interval: until the withdrawal reaches the
-/// live swap, this process keeps serving — and keeps advertising on the
-/// authenticated status view — trust material an operator has already revoked,
-/// which is exactly the window the revocation exists to close.
-///
-/// Doing it here is safe precisely because the row is *already gone* from the
-/// authoritative store when this runs: no concurrent or later poll can
-/// resurrect it, so the early withdrawal can only converge with what the poller
-/// would compute. Installation and rotation stay poll-driven on purpose — a
-/// freshly written record must still reach the live swap through the
-/// authoritative single-transaction snapshot load, and publishing it from the
-/// admin task would let an in-flight poll load that predates the write flip it
-/// straight back out.
-///
-/// The candidate is the live configuration with exactly this record removed, so
-/// it carries no resource delta and takes the trust-only republish path through
-/// [`crate::proxy::ProxyState::update_config`] — the same chokepoint the poller
-/// uses, with the same validation, the same `ArcSwap` swap, and the same
-/// publication boundary that records trust observability. A mode with no local
-/// serving configuration (control plane) has nothing to withdraw here and
-/// converges through its own publication loop.
-async fn withdraw_revoked_gateway_trust_bundle(state: &AdminState, namespace: &str, id: &str) {
-    let Some(proxy_state) = state.proxy_state.as_ref() else {
-        return;
-    };
-    let live = proxy_state.config.load_full();
-    let mut candidate = live.as_ref().clone();
-    let before = candidate.gateway_trust_bundles.len();
-    candidate
-        .gateway_trust_bundles
-        .retain(|record| record.namespace != namespace || record.id != id);
-    if candidate.gateway_trust_bundles.len() == before {
-        // Nothing to withdraw: this process does not serve the revoked
-        // namespace, or the withdrawal already reached the live swap.
-        return;
-    }
-    if let crate::proxy::ConfigApplyOutcome::Rejected { errors } =
-        proxy_state.update_config_off_thread(candidate).await
-    {
-        // Operator-facing and material-free: the candidate differs from the
-        // live configuration only by the removed record. The poll loop reloads
-        // the same authoritative state and retries the withdrawal.
-        tracing::warn!(
-            surface = "gateway_trust_bundle_revocation",
-            "Revocation could not be published to the live configuration; the next \
-             database poll will retry: {}",
-            errors.join("; ")
-        );
     }
 }
 

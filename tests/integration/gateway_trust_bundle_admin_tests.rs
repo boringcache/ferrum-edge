@@ -25,11 +25,6 @@ use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig};
 use ferrum_edge::config::gateway_trust::{
     GatewayTrustBundleRecord, record_trust_generation_published, reset_observability_for_tests,
 };
-use ferrum_edge::config::types::GatewayConfig;
-use ferrum_edge::dns::{DnsCache, DnsConfig};
-use ferrum_edge::identity::TrustDomain;
-use ferrum_edge::modes::mesh::config::{TrustBundle, TrustBundleSet};
-use ferrum_edge::proxy::ProxyState;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::{Value, json};
 use std::net::SocketAddr;
@@ -666,103 +661,4 @@ async fn more_than_one_record_is_refused_before_anything_is_deleted() {
         after["revision"], 1,
         "and must not bump the revision either"
     );
-}
-
-// ── Explicit revocation reaches the live generation immediately ─────────────
-
-/// An accepted revocation must be off the live configuration — and off the
-/// authenticated status view — by the time the `204` lands.
-///
-/// The status view deliberately reports what reached the live publication
-/// boundary rather than what the database holds, so a revocation that only
-/// removes the row leaves this process serving and advertising trust material
-/// an operator has already revoked until the next poll tick. That window is
-/// exactly what the revocation exists to close, and it is safe to close from
-/// the admin task because the row is already gone from the authoritative store:
-/// no later poll can resurrect it.
-#[tokio::test(flavor = "multi_thread")]
-async fn an_explicit_revocation_withdraws_the_live_generation_without_waiting_for_a_poll() {
-    reset_observability_for_tests();
-    let dir = TempDir::new().expect("temp dir");
-    let store = make_store(&dir).await;
-    let authority = root_ca_der_base64("revocation-root");
-
-    let mut seed = GatewayTrustBundleRecord::new(
-        "ferrum",
-        "ferrum",
-        TrustBundleSet {
-            local: TrustBundle {
-                trust_domain: TrustDomain::new("cluster.local").expect("fixture trust domain"),
-                x509_authorities: vec![authority],
-                jwt_authorities: Vec::new(),
-                refresh_hint_seconds: None,
-            },
-            federated: Vec::new(),
-        },
-    );
-    seed.normalize_fields();
-    store
-        .create_gateway_trust_bundle(&seed)
-        .await
-        .expect("the fixture record persists");
-    let stored = store
-        .get_gateway_trust_bundle("ferrum", "ferrum")
-        .await
-        .expect("the fixture record reads back")
-        .expect("the fixture record exists");
-
-    // The state a converged database-mode process holds after one poll cycle:
-    // the same record in the live configuration and at the publication seam.
-    let live_config = GatewayConfig {
-        gateway_trust_bundles: vec![stored.clone()],
-        loaded_at: Utc::now(),
-        ..Default::default()
-    };
-    let (proxy_state, _health_check_handles) = ProxyState::new(
-        live_config,
-        DnsCache::new(DnsConfig::default()),
-        ferrum_edge::config::env_config::EnvConfig::default(),
-        None,
-        None,
-    )
-    .expect("proxy state");
-    record_trust_generation_published(
-        std::slice::from_ref(&stored),
-        None,
-        Utc::now().timestamp().max(0) as u64,
-    );
-
-    let (base, _shutdown) = start_admin(AdminState {
-        proxy_state: Some(proxy_state.clone()),
-        ..admin_state(store)
-    })
-    .await;
-
-    let (status, before) = get_json(&base, "/gateway-trust/status", "ferrum").await;
-    assert_eq!(status, 200);
-    assert_eq!(
-        before["configured"], true,
-        "the fixture generation must start live: {before}"
-    );
-
-    assert_eq!(
-        delete_resource(&base, "/gateway-trust-bundles/ferrum", "ferrum").await,
-        204,
-        "explicit revocation must succeed"
-    );
-
-    // No sleep and no poll tick between the 204 and these reads.
-    assert!(
-        proxy_state.config.load().gateway_trust_bundles.is_empty(),
-        "the revoked record must be withdrawn from the live configuration"
-    );
-    let (status, after) = get_json(&base, "/gateway-trust/status", "ferrum").await;
-    assert_eq!(status, 200);
-    assert_eq!(
-        after["configured"], false,
-        "revocation must clear the namespace on the status view: {after}"
-    );
-    assert!(after["bundle"].is_null());
-
-    reset_observability_for_tests();
 }

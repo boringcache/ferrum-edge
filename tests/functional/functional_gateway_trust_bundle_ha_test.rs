@@ -693,8 +693,27 @@ async fn assert_restart_reconstructs(
 }
 
 /// Explicit revocation is distinct from "no change": the record goes away, the
-/// namespace reports itself unconfigured, and the other tenant is untouched.
+/// withdrawal reaches the live generation, and the other tenant is untouched.
+///
+/// Like every other trust transition, the withdrawal is poll-driven: the
+/// `DELETE` is authoritative on the store, and the live configuration follows on
+/// the next database poll / full-snapshot publication. So the status view is
+/// waited on with the same bounded style the install and rotation cells use,
+/// and the wait requires a *new* publication — the counter captured before the
+/// `DELETE` must have advanced — so it cannot be satisfied by the generation
+/// that was already live.
 async fn assert_explicit_revocation(client: &Client, gateway: &TestGateway, backend: &str) {
+    let (status, before) = trust_status(client, gateway, PRIMARY_NAMESPACE).await;
+    assert_eq!(
+        status, 200,
+        "[{backend}] the status view must be readable before revoking: {before}"
+    );
+    assert_eq!(
+        before["configured"], true,
+        "[{backend}] the namespace must start configured: {before}"
+    );
+    let published_before = published_generations(&before);
+
     assert_eq!(
         trust_delete(client, gateway, PRIMARY_NAMESPACE, PRIMARY_NAMESPACE).await,
         204,
@@ -702,11 +721,28 @@ async fn assert_explicit_revocation(client: &Client, gateway: &TestGateway, back
     );
     let (status, gone) = trust_get(client, gateway, PRIMARY_NAMESPACE, PRIMARY_NAMESPACE).await;
     assert_eq!(status, 404, "[{backend}] the record is gone: {gone}");
-    let (_, after) = trust_status(client, gateway, PRIMARY_NAMESPACE).await;
-    assert_eq!(
-        after["configured"], false,
-        "[{backend}] revocation must clear the namespace: {after}"
-    );
+
+    let timeout = Duration::from_secs(45);
+    let deadline = Instant::now() + timeout;
+    loop {
+        let (status, after) = trust_status(client, gateway, PRIMARY_NAMESPACE).await;
+        if status == 200
+            && after["configured"] == false
+            && after["bundle"].is_null()
+            && published_generations(&after) > published_before
+        {
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "[{backend}] the revocation never reached the live publication boundary \
+                 within {timeout:?} (published_generations_total was {published_before} \
+                 before the DELETE); last status: {after}"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
     assert_eq!(
         trust_delete(client, gateway, PRIMARY_NAMESPACE, PRIMARY_NAMESPACE).await,
         404,
