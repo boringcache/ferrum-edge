@@ -1080,13 +1080,60 @@ pub fn enable_ingress_pktinfo(
 }
 
 /// Captured local (reply-source) address from an `IP_PKTINFO` / `IPV6_PKTINFO`
-/// cmsg. The interface index is preserved so scoped IPv6 replies (notably
-/// link-local `fe80::/10`) egress the correct interface zone on send; for IPv4
-/// it's informational and safe to leave at 0.
+/// cmsg. The interface index is the RECEIVE-side ingress interface the kernel
+/// reported for the datagram, which NodeWaypoint UDP source attribution treats
+/// as authoritative evidence. It is deliberately NOT the same quantity as the
+/// send-side egress interface — see [`PktinfoLocal::send_ifindex`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PktinfoLocal {
     pub ip: std::net::IpAddr,
     pub ifindex: u32,
+}
+
+impl PktinfoLocal {
+    /// Interface index to place in an OUTBOUND pktinfo cmsg for this reply
+    /// source.
+    ///
+    /// `ifindex` as captured is a receive-side fact ("the datagram arrived on
+    /// this interface"). In an outbound `in_pktinfo` / `in6_pktinfo` the same
+    /// field means something different — it constrains the egress route lookup
+    /// the way `SO_BINDTODEVICE` does, and on IPv4 it additionally makes the
+    /// kernel prefer the interface's primary address over `ipi_spec_dst`. Those
+    /// two meanings coincide only by accident, so the ingress interface must
+    /// never be reused blindly on send: replying to a same-node pod whose
+    /// datagram arrived on one device while the captured local address lives on
+    /// another would pin egress to a device the reply source does not belong
+    /// to, and the routing table would no longer be free to pick the path back
+    /// to the client.
+    ///
+    /// The one case where the field is genuinely REQUIRED on send is a scoped
+    /// IPv6 source address, whose zone is ambiguous without it: link-local
+    /// unicast (`fe80::/10`) and interface-local / link-local multicast
+    /// (`ff01::/16`, `ff02::/16`). Everything else — every IPv4 source and
+    /// every global IPv6 source — sends `0` and lets the route table choose the
+    /// egress device, while `ipi_spec_dst` / `ipi6_addr` still pins the source
+    /// address exactly to the local destination the client targeted.
+    ///
+    /// Both cmsg construction sites are Linux-only, so the binary target has no
+    /// caller for this on other platforms; the external unit tests still do.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn send_ifindex(self) -> u32 {
+        match self.ip {
+            std::net::IpAddr::V4(_) => 0,
+            std::net::IpAddr::V6(v6) => {
+                let octets = v6.octets();
+                // Link-local unicast: `fe80::/10`.
+                if octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80 {
+                    return self.ifindex;
+                }
+                // Interface-local / link-local multicast: `ff01::/16`, `ff02::/16`.
+                if octets[0] == 0xff && matches!(octets[1] & 0x0f, 0x01 | 0x02) {
+                    return self.ifindex;
+                }
+                0
+            }
+        }
+    }
 }
 
 /// Parse an `IP_PKTINFO` or `IPV6_PKTINFO` cmsg and return the captured local
@@ -1357,7 +1404,9 @@ pub fn send_with_pktinfo(
     gso_segment_size: Option<u16>,
 ) -> std::io::Result<usize> {
     let local_ip = local.ip;
-    let ifindex = local.ifindex;
+    // Send-side interface selection is derived, never the captured ingress
+    // interface: see `PktinfoLocal::send_ifindex`.
+    let send_ifindex = local.send_ifindex();
     const UDP_SEGMENT: libc::c_int = 103;
 
     let iov = libc::iovec {
@@ -1400,13 +1449,13 @@ pub fn send_with_pktinfo(
             (*cmsg).cmsg_type = libc::IP_PKTINFO;
             (*cmsg).cmsg_len =
                 libc::CMSG_LEN(std::mem::size_of::<libc::in_pktinfo>() as u32) as usize;
-            // ipi_ifindex intentionally 0 for IPv4: per ip(7), a nonzero
-            // ifindex makes the kernel prefer the interface's primary address
-            // over ipi_spec_dst on multi-IP interfaces, which would defeat the
+            // `send_ifindex` is always 0 on IPv4: per ip(7), a nonzero ifindex
+            // makes the kernel prefer the interface's primary address over
+            // ipi_spec_dst on multi-IP interfaces, which would defeat the
             // "reply from captured destination" semantics. ipi_spec_dst alone
             // is sufficient on IPv4; ifindex is only honored for IPv6 scopes.
             let pi = libc::in_pktinfo {
-                ipi_ifindex: 0,
+                ipi_ifindex: send_ifindex as libc::c_int,
                 ipi_spec_dst: libc::in_addr {
                     s_addr: u32::from(v4).to_be(),
                 },
@@ -1427,7 +1476,7 @@ pub fn send_with_pktinfo(
                 ipi6_addr: libc::in6_addr {
                     s6_addr: v6.octets(),
                 },
-                ipi6_ifindex: ifindex,
+                ipi6_ifindex: send_ifindex,
             };
             std::ptr::copy_nonoverlapping(
                 &pi as *const libc::in6_pktinfo as *const u8,

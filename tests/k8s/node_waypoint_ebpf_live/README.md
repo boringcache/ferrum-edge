@@ -86,10 +86,23 @@ that discovery later pins for that node.
 UDP listener the NodeWaypoint materializes for the in-mesh `udp-echo` Service's
 `protocol: UDP` port (`materialize_node_waypoint_udp_listeners`, enabled by
 `ambient.env.FERRUM_MESH_NODE_WAYPOINT_UDP_LISTENERS_ENABLED=true` in the Helm
-install). The listener binds that port number in the node's network namespace,
-so a co-located enrolled pod reaches it at `<node IP>:$FERRUM_LIVE_UDP_LISTENER_PORT`
-(default `15353`) and its source pod is attributed from the kernel-reported
-ingress interface — its veth — before `mesh_authz` evaluates scoped policy.
+install). The listener binds that port number (`0.0.0.0`) in the node's network
+namespace, so a co-located enrolled pod reaches it at
+`<trusted node source IP>:$FERRUM_LIVE_UDP_LISTENER_PORT` (default `15353`) and
+its source pod is attributed from the kernel-reported ingress interface — its
+veth — before `mesh_authz` evaluates scoped policy.
+
+**Probe address contract.** The probes address the listener at a *trusted node
+source IP* (`node_waypoint_listener_ip` derives the node's PodCIDR gateway, the
+same set `discover_trusted_kubelet_probe_ips` feeds to
+`FERRUM_NODE_AGENT_NODE_IPS`), never at the node's `status.hostIP`. Replies
+leave with their source pinned by IP(v6)\_PKTINFO to the exact local address the
+client targeted, and the node-agent's direct-pod guard admits a datagram to an
+enrolled pod only when it carries the relay's socket mark AND its source is a
+trusted node source IP. Probing an untrusted node address produces a reply the
+node's own guard drops — the documented fail-closed contract, not a datapath
+defect — and for DTLS a route-selected source would break the client's connected
+socket outright.
 
 The two UDP senders reuse the `src-a` / `src-b` ServiceAccounts, so the same
 principal-keyed `AuthorizationPolicy` objects that govern the HTTP checks govern
@@ -141,7 +154,8 @@ test is the datagram datapath and its scoped source authorization, not PKI
 trust.
 
 - `node_waypoint.dtls.listener_bound` — a DTLS 1.2 handshake completes against
-  `<node IP>:$FERRUM_LIVE_DTLS_LISTENER_PORT` and the listener presents the
+  `<trusted node source IP>:$FERRUM_LIVE_DTLS_LISTENER_PORT` (same probe address
+  contract as the UDP checks above) and the listener presents the
   operator DTLS material. A completed handshake can only come from a bound
   `DtlsServer`, so this is a datapath observation rather than a manifest one.
 - `node_waypoint.dtls.listener_allow_attributed_source` — the admitted enrolled

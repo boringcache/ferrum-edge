@@ -4210,12 +4210,52 @@ ambient_restart_total() {
     awk '{ for (i = 1; i <= NF; i++) total += $i } END { print total + 0 }'
 }
 
+# The node-local address the NodeWaypoint UDP/DTLS listeners are PROBED at.
+#
+# This is deliberately NOT the node's `status.hostIP`. Both listeners bind
+# `0.0.0.0`, and every reply leaves with its source pinned by IP(v6)_PKTINFO to
+# the exact local address the client targeted — that is the reply-source
+# invariant the wildcard bind depends on, and for the DTLS listener a
+# route-selected source would break the client's connected socket outright. The
+# node-agent's direct-pod guard then admits a datagram to an enrolled pod only
+# when it carries the relay's socket mark AND its source is one of the trusted
+# node source IPs (`FERRUM_NODE_AGENT_NODE_IPS`, derived here from the node
+# PodCIDR gateways by `discover_trusted_kubelet_probe_ips`). Probing the
+# listener at an untrusted node address therefore produces a reply the node's
+# own guard drops, which is the documented fail-closed contract, not a datapath
+# defect. Probe at a trusted node source address so the relay can answer.
+node_waypoint_listener_ip() {
+  kubectl get node "$NODE_A" -o json | python3 -c '
+import ipaddress
+import json
+import sys
+
+node = json.load(sys.stdin)
+spec = node.get("spec") or {}
+cidrs = spec.get("podCIDRs") or []
+if not cidrs and spec.get("podCIDR"):
+    cidrs = [spec["podCIDR"]]
+for raw in cidrs:
+    try:
+        network = ipaddress.ip_network(raw, strict=False)
+    except ValueError:
+        continue
+    if network.version != 4:
+        continue
+    try:
+        print(next(network.hosts()))
+    except StopIteration:
+        continue
+    break
+'
+}
+
 # Poll a probe until its reply matches (or stops matching) the expected prefix.
 wait_for_udp_outcome() {
-  local mode="$1" expected="$2" ns="$3" app="$4" node_ip="$5" payload="$6" budget="${7:-40}"
+  local mode="$1" expected="$2" ns="$3" app="$4" listener_ip="$5" payload="$6" budget="${7:-40}"
   local attempt reply
   for ((attempt = 0; attempt < budget; attempt++)); do
-    reply="$(udp_probe_from "$ns" "$app" "$node_ip" "$UDP_LISTENER_PORT" "$payload" 2)"
+    reply="$(udp_probe_from "$ns" "$app" "$listener_ip" "$UDP_LISTENER_PORT" "$payload" 2)"
     case "$mode" in
       match)
         if [[ "$reply" == "$expected"* ]]; then
@@ -4238,23 +4278,22 @@ wait_for_udp_outcome() {
 
 run_node_waypoint_udp_datapath_checks() {
   log "running NodeWaypoint UDP listener datapath checks (issue #3286)"
-  local node_ip reply restarts_before restarts_after echo_pod_ip
+  local listener_ip reply restarts_before restarts_after echo_pod_ip
 
-  node_ip="$(kubectl -n "$WORKLOAD_NS" get pod -l app=udp-src-a \
-    -o jsonpath='{.items[0].status.hostIP}')"
-  if [[ -z "$node_ip" ]]; then
+  listener_ip="$(node_waypoint_listener_ip)"
+  if [[ -z "$listener_ip" ]]; then
     record_live_assertion node_waypoint.udp.listener_allow_attributed_source fail \
-      udp-src-a udp-echo "could not resolve the source pod's node IP" "" "" \
-      "node-waypoint-udp-listener"
+      udp-src-a udp-echo "could not resolve a trusted node source address for the listener" \
+      "" "" "node-waypoint-udp-listener"
     return 1
   fi
   echo_pod_ip="$(kubectl -n "$WORKLOAD_NS" get pod -l app=udp-echo \
     -o jsonpath='{.items[0].status.podIP}')"
-  log "NodeWaypoint UDP listener target ${node_ip}:${UDP_LISTENER_PORT} (backend $echo_pod_ip)"
+  log "NodeWaypoint UDP listener target ${listener_ip}:${UDP_LISTENER_PORT} (backend $echo_pod_ip)"
 
   # 1. First construction: an admitted, attributed source reaches the backend.
   if ! reply="$(wait_for_udp_outcome match "udp-ok:ping-a" \
-    "$WORKLOAD_NS" udp-src-a "$node_ip" ping-a 40)"; then
+    "$WORKLOAD_NS" udp-src-a "$listener_ip" ping-a 40)"; then
     record_live_assertion node_waypoint.udp.listener_allow_attributed_source fail \
       udp-src-a udp-echo "observed=$reply" "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" \
       "node-waypoint-udp-listener"
@@ -4275,7 +4314,7 @@ run_node_waypoint_udp_datapath_checks() {
     "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-listener"
 
   # 2. A source the scoped AuthorizationPolicy denies gets no datagram through.
-  reply="$(udp_probe_from "$WORKLOAD_NS" udp-src-b "$node_ip" "$UDP_LISTENER_PORT" ping-b 4)"
+  reply="$(udp_probe_from "$WORKLOAD_NS" udp-src-b "$listener_ip" "$UDP_LISTENER_PORT" ping-b 4)"
   if [[ "$reply" != "TIMEOUT" ]]; then
     record_live_assertion node_waypoint.udp.listener_deny_scoped_policy fail \
       udp-src-b udp-echo "observed=$reply" "$(spiffe_for_sa src-b)" "$(spiffe_for_sa dst-a)" \
@@ -4289,7 +4328,7 @@ run_node_waypoint_udp_datapath_checks() {
 
   # 3. An UNATTRIBUTABLE source (unenrolled pod, no registry binding for its
   #    veth) is refused while scoped enforcement applies.
-  reply="$(udp_probe_from "$UNMANAGED_NS" udp-unmanaged "$node_ip" "$UDP_LISTENER_PORT" ping-x 4)"
+  reply="$(udp_probe_from "$UNMANAGED_NS" udp-unmanaged "$listener_ip" "$UDP_LISTENER_PORT" ping-x 4)"
   if [[ "$reply" != "TIMEOUT" ]]; then
     record_live_assertion node_waypoint.udp.listener_deny_unattributed_source fail \
       udp-unmanaged udp-echo "observed=$reply" "" "$(spiffe_for_sa dst-a)" \
@@ -4317,7 +4356,7 @@ run_node_waypoint_udp_datapath_checks() {
   local src_a_pod_ip spoof_reply
   src_a_pod_ip="$(kubectl -n "$WORKLOAD_NS" get pod -l app=udp-src-a \
     -o jsonpath='{.items[0].status.podIP}')"
-  spoof_reply="$(udp_spoof_probe_from "$UNMANAGED_NS" udp-unmanaged "$node_ip" \
+  spoof_reply="$(udp_spoof_probe_from "$UNMANAGED_NS" udp-unmanaged "$listener_ip" \
     "$UDP_LISTENER_PORT" "$src_a_pod_ip" ping-spoof 4)"
   sleep 2
   local spoof_backend_hits
@@ -4377,7 +4416,7 @@ spec:
             principals:
               - $TRUST_DOMAIN/ns/$WORKLOAD_NS/sa/src-a
 EOF
-  if ! reply="$(wait_for_udp_outcome refuse "" "$WORKLOAD_NS" udp-src-a "$node_ip" ping-a 40)"; then
+  if ! reply="$(wait_for_udp_outcome refuse "" "$WORKLOAD_NS" udp-src-a "$listener_ip" ping-a 40)"; then
     kubectl -n "$WORKLOAD_NS" delete authorizationpolicy deny-src-a-udp --ignore-not-found=true
     record_live_assertion node_waypoint.udp.policy_change_denies_live fail \
       udp-src-a udp-echo "observed=$reply" "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" \
@@ -4403,7 +4442,7 @@ EOF
   #    data-plane restart.
   kubectl -n "$WORKLOAD_NS" delete authorizationpolicy deny-src-a-udp --ignore-not-found=true
   if ! reply="$(wait_for_udp_outcome match "udp-ok:ping-a" \
-    "$WORKLOAD_NS" udp-src-a "$node_ip" ping-a 40)"; then
+    "$WORKLOAD_NS" udp-src-a "$listener_ip" ping-a 40)"; then
     record_live_assertion node_waypoint.udp.policy_withdrawal_recovers_live fail \
       udp-src-a udp-echo "observed=$reply" "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" \
       "node-waypoint-udp-listener"
@@ -4480,10 +4519,10 @@ dtls_echo_backend_received() {
 }
 
 wait_for_dtls_echo() {
-  local ns="$1" app="$2" node_ip="$3" payload="$4" budget="${5:-20}"
+  local ns="$1" app="$2" listener_ip="$3" payload="$4" budget="${5:-20}"
   local attempt reply
   for ((attempt = 0; attempt < budget; attempt++)); do
-    reply="$(dtls_probe_from "$ns" "$app" "$node_ip" "$DTLS_LISTENER_PORT" "$payload" 6)"
+    reply="$(dtls_probe_from "$ns" "$app" "$listener_ip" "$DTLS_LISTENER_PORT" "$payload" 6)"
     if [[ "$reply" == *"dtls-ok:$payload"* ]]; then
       printf '%s' "$reply"
       return 0
@@ -4496,24 +4535,23 @@ wait_for_dtls_echo() {
 
 run_node_waypoint_dtls_datapath_checks() {
   log "running NodeWaypoint DTLS listener datapath checks (issue #3286)"
-  local node_ip report reply attempt
+  local listener_ip report reply attempt
 
-  node_ip="$(kubectl -n "$WORKLOAD_NS" get pod -l app=dtls-src-a \
-    -o jsonpath='{.items[0].status.hostIP}')"
-  if [[ -z "$node_ip" ]]; then
+  listener_ip="$(node_waypoint_listener_ip)"
+  if [[ -z "$listener_ip" ]]; then
     record_live_assertion node_waypoint.dtls.listener_bound fail \
-      dtls-src-a dtls-echo "could not resolve the source pod's node IP" "" "" \
-      "node-waypoint-dtls-listener"
+      dtls-src-a dtls-echo "could not resolve a trusted node source address for the listener" \
+      "" "" "node-waypoint-dtls-listener"
     return 1
   fi
-  log "NodeWaypoint DTLS listener target ${node_ip}:${DTLS_LISTENER_PORT}"
+  log "NodeWaypoint DTLS listener target ${listener_ip}:${DTLS_LISTENER_PORT}"
 
   # 1. The materialized `dtls` listener really bound and terminates DTLS with
   #    the operator-supplied material. A handshake that reaches the server
   #    certificate can only come from a bound DtlsServer on that port.
   report=""
   for ((attempt = 0; attempt < 20; attempt++)); do
-    report="$(dtls_handshake_report_from "$WORKLOAD_NS" dtls-src-a "$node_ip" \
+    report="$(dtls_handshake_report_from "$WORKLOAD_NS" dtls-src-a "$listener_ip" \
       "$DTLS_LISTENER_PORT" 10)"
     if [[ "$report" == *ferrum-node-waypoint-dtls* ]]; then
       break
@@ -4523,7 +4561,7 @@ run_node_waypoint_dtls_datapath_checks() {
   if [[ "$report" != *ferrum-node-waypoint-dtls* ]]; then
     record_live_assertion node_waypoint.dtls.listener_bound fail \
       dtls-src-a dtls-echo \
-      "no DTLS handshake completed on ${node_ip}:${DTLS_LISTENER_PORT}; the materialized dtls \
+      "no DTLS handshake completed on ${listener_ip}:${DTLS_LISTENER_PORT}; the materialized dtls \
 listener did not bind or presented no server certificate" \
       "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-listener"
     collect_traffic_failure_diagnostics
@@ -4536,7 +4574,7 @@ material" "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-
 
   # 2. An admitted, attributed source: handshake, decrypt, relay, echo — and the
   #    backend logs the plaintext datagram it received.
-  if ! reply="$(wait_for_dtls_echo "$WORKLOAD_NS" dtls-src-a "$node_ip" dtls-a 20)"; then
+  if ! reply="$(wait_for_dtls_echo "$WORKLOAD_NS" dtls-src-a "$listener_ip" dtls-a 20)"; then
     record_live_assertion node_waypoint.dtls.listener_allow_attributed_source fail \
       dtls-src-a dtls-echo "observed=$reply" "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" \
       "node-waypoint-dtls-listener"
@@ -4558,7 +4596,7 @@ material" "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-
 
   # 3. A source the namespace-scoped policy denies gets nothing through, and —
   #    the load-bearing half — the backend never sees its datagram.
-  reply="$(dtls_probe_from "$WORKLOAD_NS" dtls-src-b "$node_ip" "$DTLS_LISTENER_PORT" dtls-b 8)"
+  reply="$(dtls_probe_from "$WORKLOAD_NS" dtls-src-b "$listener_ip" "$DTLS_LISTENER_PORT" dtls-b 8)"
   sleep 2
   local dtls_deny_hits
   dtls_deny_hits="$(dtls_echo_backend_received dtls-b)"
