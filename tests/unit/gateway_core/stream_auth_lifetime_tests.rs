@@ -9,14 +9,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ferrum_edge::_test_support::{
-    BufferedUploadWaitOutcomeForTest, ProbePumpOutcome, ProbeTransportPoll, UploadPumpProbe,
-    attribute_dispatch_phase_bound_for_test, authorization_bounded_header_deadline_for_test,
+    BufferedUploadWaitOutcomeForTest, EarlyUploadBoundKind, ProbePumpOutcome, ProbeTransportPoll,
+    UploadPumpProbe, attribute_dispatch_phase_bound_for_test,
+    authorization_bounded_header_deadline_for_test,
     authorization_expired_dispatch_placeholder_for_test,
     authorization_expired_pre_commitment_response_for_test,
-    collect_buffered_upload_under_authorization_for_test, compose_dispatch_phase_bound_for_test,
-    direct_h2_upload_join_bound_for_test, dispatch_phase_authorization_expiry_for_test,
-    request_received_at_for_test, request_upload_auth_deadline_for_test,
-    set_request_credential_deadline_for_test, within_stream_auth_deadline_for_test,
+    collect_buffered_upload_under_authorization_for_test,
+    collect_buffered_upload_under_composed_bound_for_test, compose_buffered_upload_bound_for_test,
+    compose_dispatch_phase_bound_for_test, direct_h2_upload_join_bound_for_test,
+    dispatch_phase_authorization_expiry_for_test, request_received_at_for_test,
+    request_upload_auth_deadline_for_test, set_request_credential_deadline_for_test,
+    within_stream_auth_deadline_for_test,
 };
 use ferrum_edge::config::types::Consumer;
 use ferrum_edge::plugins::RequestContext;
@@ -1053,6 +1056,200 @@ async fn a_buffered_collect_and_a_second_direction_record_one_termination() {
     );
 }
 
+// --- Single composition of the buffered upload bound (#3815) ---------------
+//
+// The protocol bound (client RPC deadline vs operator whole-upload stall
+// timeout) is composed ONCE per authorized collect, and that exact instant both
+// selects the arm and is awaited. Composing a second time at wait time would
+// rebase the fresh operator window onto a later `Instant::now()`, so a
+// credential deadline landing between the two could be judged "later than the
+// protocol bound" — disarming the security arm — while the instant actually
+// awaited lands after it.
+
+#[tokio::test(start_paused = true)]
+async fn a_composed_operator_window_is_never_rebased_past_the_credential() {
+    let start = tokio::time::Instant::now();
+    let bound = compose_buffered_upload_bound_for_test(None, 100);
+    assert_eq!(bound.kind(), Some(EarlyUploadBoundKind::OperatorTimeout));
+    assert_eq!(bound.at(), Some(start + Duration::from_millis(100)));
+
+    // The credential expires AFTER the composed operator window but BEFORE the
+    // window a second composition would open (120 + 100 = 220ms from start).
+    let plan = upload_plan(
+        Duration::from_millis(150),
+        StreamAuthTermination::CredentialExpired,
+    );
+    let plan_at = plan.0.at;
+    let latch = plan.2.clone();
+
+    // Arbitrary scheduling delay between composition and the wait.
+    tokio::time::advance(Duration::from_millis(120)).await;
+
+    let outcome = collect_buffered_upload_under_composed_bound_for_test(
+        std::future::pending::<Result<(), ()>>(),
+        bound,
+        100,
+        Some(plan),
+    )
+    .await;
+
+    assert_eq!(
+        outcome,
+        BufferedUploadWaitOutcomeForTest::TimedOut,
+        "the composed operator bound owns this phase's terminal"
+    );
+    assert_eq!(
+        latch.observed(),
+        None,
+        "an operator stall timeout is not an authorization termination"
+    );
+    assert_eq!(
+        tokio::time::Instant::now(),
+        start + Duration::from_millis(120),
+        "the wait must end at the ALREADY-ELAPSED composed bound, not at a \
+         freshly rebased operator window"
+    );
+    assert!(
+        tokio::time::Instant::now() <= plan_at,
+        "a rebased operator window would have kept the upload alive past the \
+         credential that admitted it"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_credential_earlier_than_the_composed_bound_still_arms_after_a_delay() {
+    let start = tokio::time::Instant::now();
+    // Operator window at +300ms; a second composition taken 120ms later would
+    // sit at +420ms, well past the credential either way.
+    let bound = compose_buffered_upload_bound_for_test(None, 300);
+    let plan = upload_plan(
+        Duration::from_millis(200),
+        StreamAuthTermination::CredentialExpired,
+    );
+    let latch = plan.2.clone();
+
+    tokio::time::advance(Duration::from_millis(120)).await;
+
+    let outcome = collect_buffered_upload_under_composed_bound_for_test(
+        std::future::pending::<Result<(), ()>>(),
+        bound,
+        300,
+        Some(plan),
+    )
+    .await;
+
+    assert_eq!(
+        outcome,
+        BufferedUploadWaitOutcomeForTest::AuthorizationExpired(
+            StreamAuthTermination::CredentialExpired
+        )
+    );
+    assert_eq!(
+        latch.observed(),
+        Some(StreamAuthTermination::CredentialExpired)
+    );
+    assert_eq!(
+        tokio::time::Instant::now(),
+        start + Duration::from_millis(200),
+        "the collect ends exactly at the credential deadline"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_composed_rpc_deadline_keeps_its_attribution_across_the_gap() {
+    let start = tokio::time::Instant::now();
+    // The client's RPC deadline is earlier than the operator window, so
+    // composition settles on it; only the operator side could ever be rebased.
+    let bound =
+        compose_buffered_upload_bound_for_test(Some(start + Duration::from_millis(100)), 5_000);
+    assert_eq!(bound.kind(), Some(EarlyUploadBoundKind::RpcDeadline));
+
+    let plan = upload_plan(
+        Duration::from_millis(150),
+        StreamAuthTermination::CredentialExpired,
+    );
+    let latch = plan.2.clone();
+
+    tokio::time::advance(Duration::from_millis(120)).await;
+
+    let outcome = collect_buffered_upload_under_composed_bound_for_test(
+        std::future::pending::<Result<(), ()>>(),
+        bound,
+        5_000,
+        Some(plan),
+    )
+    .await;
+
+    assert_eq!(
+        outcome,
+        BufferedUploadWaitOutcomeForTest::DeadlineExceeded,
+        "a client-chosen expiry stays an RPC deadline, never an operator timeout"
+    );
+    assert_eq!(latch.observed(), None);
+    assert_eq!(tokio::time::Instant::now(), start + Duration::from_millis(120));
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unauthenticated_collect_waits_on_the_same_composed_bound() {
+    let start = tokio::time::Instant::now();
+    let bound = compose_buffered_upload_bound_for_test(None, 100);
+
+    tokio::time::advance(Duration::from_millis(120)).await;
+
+    let outcome = collect_buffered_upload_under_composed_bound_for_test(
+        std::future::pending::<Result<(), ()>>(),
+        bound,
+        100,
+        None,
+    )
+    .await;
+
+    assert_eq!(outcome, BufferedUploadWaitOutcomeForTest::TimedOut);
+    assert_eq!(
+        tokio::time::Instant::now(),
+        start + Duration::from_millis(120),
+        "the unauthenticated arm waits on the composed bound too"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_disabled_operator_timeout_composes_no_bound_and_the_credential_owns_it() {
+    // `backend_read_timeout_ms = 0` with no client RPC deadline: composition
+    // yields NO absolute instant, which is exactly the unbounded case the
+    // authorization arm exists for. There is nothing to rebase, and the arm is
+    // armed regardless of how late the wait is observed.
+    let bound = compose_buffered_upload_bound_for_test(None, 0);
+    assert_eq!(bound.at(), None);
+    assert_eq!(bound.kind(), None);
+
+    let plan = upload_plan(
+        Duration::from_secs(30),
+        StreamAuthTermination::CredentialExpired,
+    );
+    let latch = plan.2.clone();
+
+    tokio::time::advance(Duration::from_secs(10)).await;
+
+    let outcome = collect_buffered_upload_under_composed_bound_for_test(
+        std::future::pending::<Result<(), ()>>(),
+        bound,
+        0,
+        Some(plan),
+    )
+    .await;
+
+    assert_eq!(
+        outcome,
+        BufferedUploadWaitOutcomeForTest::AuthorizationExpired(
+            StreamAuthTermination::CredentialExpired
+        )
+    );
+    assert_eq!(
+        latch.observed(),
+        Some(StreamAuthTermination::CredentialExpired)
+    );
+}
+
 // --- Dispatch-phase attribution (#3815) ------------------------------------
 
 #[tokio::test(start_paused = true)]
@@ -1228,6 +1425,31 @@ fn every_post_admission_buffered_upload_collect_carries_the_authorization_plan()
             .count(),
         4
     );
+}
+
+#[test]
+fn the_authorized_buffered_collect_composes_its_protocol_bound_exactly_once() {
+    let wait = PROXY_SOURCE
+        .split("pub(crate) async fn collect_request_body_under_authorization_with_bound<")
+        .nth(1)
+        .expect("the authorized buffered wait must remain present")
+        .split("\npub(crate) fn ")
+        .next()
+        .expect("the authorized buffered wait must remain bounded");
+    assert_eq!(
+        wait.matches("compose_early_upload_bound(").count(),
+        0,
+        "the wait takes an ALREADY-COMPOSED bound; recomposing here would rebase \
+         the fresh operator window onto a later now() than the arm selection used"
+    );
+    assert_eq!(
+        wait.matches("collect_request_body_with_deadline(").count(),
+        0,
+        "the deadline-composing entry point would compose a second time"
+    );
+    // The single parameter, threaded to the unauthenticated wait, the
+    // arm-selection comparison, and the authorized wait — never recomputed.
+    assert_eq!(wait.matches("protocol_bound").count(), 4);
 }
 
 #[test]

@@ -3508,19 +3508,30 @@ where
         .map_err(|_| RequestBodyWaitError::TimedOut)
 }
 
-pub(crate) async fn collect_request_body_with_deadline<F, T, E>(
+/// Wait for a buffered client request body against an ALREADY-COMPOSED early
+/// upload bound.
+///
+/// This is the single wait/attribution seam for buffered collects, so a caller
+/// that must also REASON about the bound (comparing it against the admitted
+/// stream's authorization deadline) composes exactly once and hands the same
+/// `(Instant, EarlyUploadBoundKind)` here. Recomposing at wait time would
+/// rebase the fresh operator window onto a later `Instant::now()`, so the
+/// instant that was compared and the instant that is actually awaited could
+/// differ (issue #3815).
+///
+/// `request_body_read_timeout_ms` is used only for the unbounded arm, where
+/// composition produced no absolute instant at all: it preserves the relative
+/// operator stall guard for the overflow case (`Instant::now() + timeout` is
+/// unrepresentable) and the plain "no bound configured" pass-through.
+pub(crate) async fn collect_request_body_with_composed_bound<F, T, E>(
     collect: F,
-    deadline: Option<tokio::time::Instant>,
+    composed_bound: Option<(tokio::time::Instant, EarlyUploadBoundKind)>,
     request_body_read_timeout_ms: u64,
 ) -> Result<Result<T, E>, RequestBodyWaitError>
 where
     F: std::future::Future<Output = Result<T, E>>,
 {
-    // The RPC deadline is an end-to-end ceiling, while the configured read
-    // timeout remains the operator's client-upload stall guard. Keep both by
-    // waiting only until the earlier instant; a very large grpc-timeout must
-    // not disable the operator bound.
-    match compose_early_upload_bound(deadline, request_body_read_timeout_ms) {
+    match composed_bound {
         Some((effective_deadline, EarlyUploadBoundKind::OperatorTimeout)) => {
             tokio::time::timeout_at(effective_deadline, collect)
                 .await
@@ -3533,6 +3544,31 @@ where
         }
         None => collect_request_body_with_timeout(collect, request_body_read_timeout_ms).await,
     }
+}
+
+pub(crate) async fn collect_request_body_with_deadline<F, T, E>(
+    collect: F,
+    deadline: Option<tokio::time::Instant>,
+    request_body_read_timeout_ms: u64,
+) -> Result<Result<T, E>, RequestBodyWaitError>
+where
+    F: std::future::Future<Output = Result<T, E>>,
+{
+    // The RPC deadline is an end-to-end ceiling, while the configured read
+    // timeout remains the operator's client-upload stall guard. Keep both by
+    // waiting only until the earlier instant; a very large grpc-timeout must
+    // not disable the operator bound.
+    //
+    // Composition happens exactly once, here, and the resulting instant is what
+    // is awaited — callers that need the composed bound for their own decision
+    // must call `collect_request_body_with_composed_bound` directly rather than
+    // composing a second time.
+    collect_request_body_with_composed_bound(
+        collect,
+        compose_early_upload_bound(deadline, request_body_read_timeout_ms),
+        request_body_read_timeout_ms,
+    )
+    .await
 }
 
 /// Outcome of waiting for a BUFFERED client request body under the admitted
@@ -3580,6 +3616,15 @@ pub(crate) enum AuthorizedUploadWaitError {
 /// to NO absolute instant at all (`grpc-timeout` unset and
 /// `backend_read_timeout_ms = 0`), which is exactly the unbounded case this
 /// seam exists for.
+///
+/// SINGLE-COMPOSITION INVARIANT: the protocol bound is composed exactly ONCE
+/// per authorized collect and the SAME `(Instant, EarlyUploadBoundKind)` drives
+/// both the arm-selection comparison and the actual wait/error attribution. A
+/// second composition would rebase the fresh operator window onto a later
+/// `Instant::now()`, so an authorization deadline falling in that gap could be
+/// judged "later than the protocol bound" (disarming the security arm) while
+/// the instant actually awaited lands AFTER it — a fail-closed race that also
+/// makes the reported terminal disagree with the instant that produced it.
 pub(crate) async fn collect_request_body_under_authorization<F, T, E>(
     collect: F,
     deadline: Option<tokio::time::Instant>,
@@ -3589,18 +3634,48 @@ pub(crate) async fn collect_request_body_under_authorization<F, T, E>(
 where
     F: std::future::Future<Output = Result<T, E>>,
 {
+    collect_request_body_under_authorization_with_bound(
+        collect,
+        compose_early_upload_bound(deadline, request_body_read_timeout_ms),
+        request_body_read_timeout_ms,
+        auth,
+    )
+    .await
+}
+
+/// [`collect_request_body_under_authorization`] over an ALREADY-COMPOSED
+/// protocol bound. Splitting composition from the wait is what makes the
+/// single-composition invariant testable: a caller (or a test) can compose,
+/// let arbitrary time pass, and still observe the arm selection and the wait
+/// agree on one instant.
+pub(crate) async fn collect_request_body_under_authorization_with_bound<F, T, E>(
+    collect: F,
+    protocol_bound: Option<(tokio::time::Instant, EarlyUploadBoundKind)>,
+    request_body_read_timeout_ms: u64,
+    auth: Option<&RequestAuthLifetimePlan>,
+) -> Result<Result<T, E>, AuthorizedUploadWaitError>
+where
+    F: std::future::Future<Output = Result<T, E>>,
+{
     let Some((plan, family, latch)) = auth else {
-        return collect_request_body_with_deadline(collect, deadline, request_body_read_timeout_ms)
-            .await
-            .map_err(AuthorizedUploadWaitError::Wait);
+        return collect_request_body_with_composed_bound(
+            collect,
+            protocol_bound,
+            request_body_read_timeout_ms,
+        )
+        .await
+        .map_err(AuthorizedUploadWaitError::Wait);
     };
-    let protocol_absolute =
-        compose_early_upload_bound(deadline, request_body_read_timeout_ms).map(|(at, _)| at);
-    let bounded =
-        collect_request_body_with_deadline(collect, deadline, request_body_read_timeout_ms);
+    let protocol_absolute = protocol_bound.map(|(at, _)| at);
+    let bounded = collect_request_body_with_composed_bound(
+        collect,
+        protocol_bound,
+        request_body_read_timeout_ms,
+    );
     if protocol_absolute.is_some_and(|protocol| protocol < plan.at) {
         // The protocol's own absolute bound is strictly earlier, so it owns
-        // this phase's terminal no matter how late the wait is observed.
+        // this phase's terminal no matter how late the wait is observed. This
+        // is the same instant `bounded` will await — never a recomposed one.
         return bounded.await.map_err(AuthorizedUploadWaitError::Wait);
     }
     tokio::select! {

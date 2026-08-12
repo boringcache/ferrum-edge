@@ -7195,6 +7195,87 @@ pub mod _test_support {
         }
     }
 
+    /// A composed early-upload protocol bound (client RPC deadline vs operator
+    /// whole-upload stall timeout), carried from composition time to wait time
+    /// so a test can put arbitrary scheduling delay between the two and prove
+    /// the buffered collect never recomposes it (issue #3815).
+    #[derive(Clone, Copy, Debug)]
+    pub struct ComposedEarlyUploadBoundForTest(
+        Option<(tokio::time::Instant, crate::proxy::EarlyUploadBoundKind)>,
+    );
+
+    impl ComposedEarlyUploadBoundForTest {
+        /// The absolute instant composition settled on, if any.
+        pub fn at(&self) -> Option<tokio::time::Instant> {
+            self.0.map(|(at, _)| at)
+        }
+
+        /// Which ceiling won composition.
+        pub fn kind(&self) -> Option<EarlyUploadBoundKind> {
+            self.0.map(|(_, kind)| match kind {
+                crate::proxy::EarlyUploadBoundKind::OperatorTimeout => {
+                    EarlyUploadBoundKind::OperatorTimeout
+                }
+                crate::proxy::EarlyUploadBoundKind::RpcDeadline => {
+                    EarlyUploadBoundKind::RpcDeadline
+                }
+            })
+        }
+    }
+
+    /// Compose the early-upload protocol bound exactly once, the way an
+    /// authorized buffered collect does (issue #3815).
+    pub fn compose_buffered_upload_bound_for_test(
+        deadline: Option<tokio::time::Instant>,
+        request_body_read_timeout_ms: u64,
+    ) -> ComposedEarlyUploadBoundForTest {
+        ComposedEarlyUploadBoundForTest(crate::proxy::compose_early_upload_bound(
+            deadline,
+            request_body_read_timeout_ms,
+        ))
+    }
+
+    /// Run one buffered client request-body collect against an ALREADY-COMPOSED
+    /// protocol bound (issue #3815).
+    ///
+    /// This is the seam the production entry point delegates to, so a test can
+    /// compose, advance time, and then observe that arm selection and the wait
+    /// itself agree on the SAME instant — no second, rebased operator window.
+    pub async fn collect_buffered_upload_under_composed_bound_for_test<F>(
+        collect: F,
+        bound: ComposedEarlyUploadBoundForTest,
+        request_body_read_timeout_ms: u64,
+        auth: Option<(
+            crate::proxy::auth_lifetime::StreamAuthDeadline,
+            crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
+            crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+        )>,
+    ) -> BufferedUploadWaitOutcomeForTest
+    where
+        F: std::future::Future<Output = Result<(), ()>>,
+    {
+        match crate::proxy::collect_request_body_under_authorization_with_bound(
+            collect,
+            bound.0,
+            request_body_read_timeout_ms,
+            auth.as_ref(),
+        )
+        .await
+        {
+            Ok(Ok(())) => BufferedUploadWaitOutcomeForTest::Collected,
+            Ok(Err(())) => BufferedUploadWaitOutcomeForTest::ClientError,
+            Err(crate::proxy::AuthorizedUploadWaitError::Wait(
+                crate::proxy::RequestBodyWaitError::TimedOut,
+            )) => BufferedUploadWaitOutcomeForTest::TimedOut,
+            Err(crate::proxy::AuthorizedUploadWaitError::Wait(
+                crate::proxy::RequestBodyWaitError::DeadlineExceeded,
+            )) => BufferedUploadWaitOutcomeForTest::DeadlineExceeded,
+            Err(crate::proxy::AuthorizedUploadWaitError::AuthorizationExpired(termination)) => {
+                BufferedUploadWaitOutcomeForTest::AuthorizationExpired(termination)
+            }
+        }
+    }
+
     /// A composed dispatch-phase wait bound, carried from composition time to
     /// attribution time so a test can put arbitrary scheduling delay between
     /// the two (issue #3815).
