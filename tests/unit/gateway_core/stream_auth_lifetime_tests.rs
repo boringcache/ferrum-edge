@@ -9,25 +9,28 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ferrum_edge::_test_support::{
-    BufferedUploadWaitOutcomeForTest, EarlyUploadBoundKind, ProbePumpOutcome, ProbeTransportPoll,
-    UploadPumpProbe, attribute_dispatch_phase_bound_for_test,
+    BufferedUploadWaitOutcomeForTest, DtlsAuthorizationExpiryForTest, EarlyUploadBoundKind,
+    ProbePumpOutcome, ProbeTransportPoll, UploadPumpProbe, attribute_dispatch_phase_bound_for_test,
     authorization_bounded_header_deadline_for_test,
     authorization_expired_dispatch_placeholder_for_test,
     authorization_expired_pre_commitment_response_for_test,
     collect_buffered_upload_under_authorization_for_test,
     collect_buffered_upload_under_composed_bound_for_test, compose_buffered_upload_bound_for_test,
     compose_dispatch_phase_bound_for_test, direct_h2_upload_join_bound_for_test,
-    dispatch_phase_authorization_expiry_for_test, request_received_at_for_test,
+    dispatch_phase_authorization_expiry_for_test, dtls_authorization_expired_before_relay_for_test,
+    dtls_setup_stage_under_authorization_for_test, request_received_at_for_test,
     request_upload_auth_deadline_for_test, set_request_credential_deadline_for_test,
-    within_stream_auth_deadline_for_test,
+    settle_dtls_relay_authorization_expiry_for_test, within_stream_auth_deadline_for_test,
 };
 use ferrum_edge::config::types::Consumer;
-use ferrum_edge::plugins::RequestContext;
+use ferrum_edge::plugins::{Direction, DisconnectCause, RequestContext};
 use ferrum_edge::proxy::auth_lifetime::{
     StreamAuthDeadline, StreamAuthProtocolFamily, StreamAuthTermination, compose_absolute_bound,
     counters, effective_request_auth_deadline, effective_stream_auth_deadline,
     expired_authorization, record_termination, request_is_authenticated,
 };
+use ferrum_edge::proxy::stream_error::StreamSetupKind;
+use ferrum_edge::retry::ErrorClass;
 
 const DEFAULT_MAX: u64 = 3_600;
 
@@ -322,8 +325,22 @@ fn counters_expose_every_family_and_only_those_families() {
     }
 }
 
+/// Serializes every test that asserts an EXACT delta on the process-global
+/// termination counters against every test that records one through a
+/// production path. The counters carry no test dimension (that is the point of
+/// their fixed cardinality), so without this the binary's default parallelism
+/// could interleave two `stream_udp` increments inside one before/after pair.
+static COUNTER_DELTA_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn counter_delta_guard() -> std::sync::MutexGuard<'static, ()> {
+    COUNTER_DELTA_GUARD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[test]
 fn recording_a_termination_increments_only_its_own_class_and_family() {
+    let _guard = counter_delta_guard();
     // Process-global monotonic counters: compare deltas, never absolutes, so
     // this stays correct alongside other tests in the same binary.
     let before = counters();
@@ -1928,5 +1945,268 @@ fn the_authorization_expired_rejection_future_is_built_out_of_line() {
         factory.ends_with("#[allow(clippy::too_many_arguments)]\n#[inline(never)]\n"),
         "the factory must stay `#[inline(never)]`: inlining it back into the \
          caller restores the frame slot it exists to remove"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// DTLS session authorization lifetime (issue #3816).
+//
+// `on_stream_connect` runs once, at admission, so a DTLS session would
+// otherwise outlive the certificate that admitted it. The absolute plan is
+// composed over EVERY awaitable post-admission setup stage — DNS resolution and
+// the backend UDP/DTLS connect + handshake — and re-checked immediately before
+// relay task creation, so slow setup cannot carry an expired credential into a
+// relay, a backend success, or a forwarded datagram.
+// ---------------------------------------------------------------------------
+
+const UDP_PROXY_SOURCE: &str = include_str!("../../../src/proxy/udp_proxy.rs");
+const UPLOAD_PUMP_SOURCE: &str = include_str!("../../../src/proxy/upload_pump.rs");
+
+const DTLS_SETUP_EXPIRED_ERROR: &str =
+    "Authenticated stream authorization lifetime elapsed during setup (DTLS session)";
+const DTLS_RELAY_EXPIRED_ERROR: &str =
+    "authenticated DTLS session terminated: authorization lifetime reached";
+const TERMINATION_REASON_KEY: &str = "authorization.termination_reason";
+
+fn dtls_plan(after: Duration, termination: StreamAuthTermination) -> StreamAuthDeadline {
+    StreamAuthDeadline {
+        at: tokio::time::Instant::now() + after,
+        termination,
+    }
+}
+
+/// Every DTLS authorization expiry is client-side, health-neutral, classified
+/// from the type rather than from message text, and publishes exactly one
+/// bounded class into the metadata the disconnect summary carries.
+fn assert_dtls_expiry_is_policy_neutral(expiry: &DtlsAuthorizationExpiryForTest) {
+    assert_eq!(
+        expiry.error_class, ErrorClass::RequestError,
+        "an authorization expiry must never read as a transport or backend fault"
+    );
+    assert_eq!(expiry.disconnect_cause, DisconnectCause::RecvError);
+    assert_eq!(expiry.disconnect_direction, Direction::ClientToBackend);
+    // Redaction: the wording is a compiled-in literal, so no expiry instant,
+    // identity, certificate field, provider detail, or client address can reach
+    // it. Any of those would have to print a digit.
+    assert!(
+        !expiry.error.chars().any(|c| c.is_ascii_digit()),
+        "unexpected value in a fixed termination message: {}",
+        expiry.error
+    );
+    let reason = expiry.metadata.get(TERMINATION_REASON_KEY).cloned();
+    assert_eq!(
+        reason.as_deref(), Some("credential_expired"),
+        "the bounded class must reach the stream transaction summary"
+    );
+    assert_eq!(expiry.metadata.len(), 1, "one class, nothing else");
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_already_elapsed_dtls_plan_never_starts_a_setup_stage() {
+    let _guard = counter_delta_guard();
+    let plan = dtls_plan(
+        Duration::from_secs(1),
+        StreamAuthTermination::CredentialExpired,
+    );
+    tokio::time::advance(Duration::from_secs(2)).await;
+
+    let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observed = Arc::clone(&started);
+    let stage = move || async move {
+        observed.store(true, std::sync::atomic::Ordering::SeqCst);
+        "resolved"
+    };
+    let before = counters();
+    let expiry = dtls_setup_stage_under_authorization_for_test(Some(plan), stage)
+        .await
+        .expect_err("an elapsed plan must not admit a post-admission setup stage");
+    let after = counters();
+
+    assert!(
+        !started.load(std::sync::atomic::Ordering::SeqCst),
+        "an expired credential must resolve no name and dial no backend"
+    );
+    assert_eq!(expiry.setup_kind, Some(StreamSetupKind::AuthorizationExpired));
+    assert!(
+        expiry.setup_kind.expect("typed kind").is_client_side(),
+        "a gateway policy decision about the client's credential is client-side"
+    );
+    assert_eq!(expiry.error, DTLS_SETUP_EXPIRED_ERROR);
+    assert_eq!(
+        expiry.probe_releases, 1,
+        "a claimed HALF_OPEN probe slot must be released exactly once, neutrally"
+    );
+    assert_eq!(
+        after.credential_expired["stream_udp"] - before.credential_expired["stream_udp"],
+        1
+    );
+    assert_eq!(
+        after.authenticated_stream_max_lifetime["stream_udp"],
+        before.authenticated_stream_max_lifetime["stream_udp"],
+        "only the class the plan carries may be counted"
+    );
+    assert_dtls_expiry_is_policy_neutral(&expiry);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_dtls_setup_stage_outliving_the_plan_is_cancelled_and_health_neutral() {
+    let _guard = counter_delta_guard();
+    let plan = dtls_plan(
+        Duration::from_millis(50),
+        StreamAuthTermination::CredentialExpired,
+    );
+    let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let marker = Arc::clone(&finished);
+    // A backend connect + DTLS handshake still in flight when the credential
+    // expires.
+    let stage = move || async move {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        marker.store(true, std::sync::atomic::Ordering::SeqCst);
+    };
+    let before = counters();
+    let expiry = dtls_setup_stage_under_authorization_for_test(Some(plan), stage)
+        .await
+        .expect_err("the stage must be cancelled at the absolute deadline");
+    let after = counters();
+
+    assert!(
+        !finished.load(std::sync::atomic::Ordering::SeqCst),
+        "the in-flight setup future must be dropped, not finished"
+    );
+    assert_eq!(expiry.setup_kind, Some(StreamSetupKind::AuthorizationExpired));
+    assert_eq!(expiry.error, DTLS_SETUP_EXPIRED_ERROR);
+    assert_eq!(
+        expiry.probe_releases, 1,
+        "the HALF_OPEN probe slot is released neutrally: no backend success, no failure"
+    );
+    let credential_expired_delta =
+        after.credential_expired["stream_udp"] - before.credential_expired["stream_udp"];
+    assert_eq!(
+        credential_expired_delta, 1,
+        "the fixed-cardinality termination is recorded exactly once"
+    );
+    assert_dtls_expiry_is_policy_neutral(&expiry);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_dtls_setup_stage_inside_the_plan_completes_untouched() {
+    let plan = dtls_plan(
+        Duration::from_secs(30),
+        StreamAuthTermination::CredentialExpired,
+    );
+    let stage = || async {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        "backend connected"
+    };
+    let connected = dtls_setup_stage_under_authorization_for_test(Some(plan), stage)
+        .await
+        .expect("a stage that finishes before the deadline is untouched");
+    assert_eq!(connected, "backend connected");
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unauthenticated_dtls_session_runs_setup_with_no_bound_at_all() {
+    // Plain UDP and unauthenticated DTLS behaviour is preserved: no plan means
+    // no timer is registered and the stage runs exactly as it always did.
+    let stage = || async {
+        tokio::time::sleep(Duration::from_secs(7_200)).await;
+        "backend connected"
+    };
+    let connected = dtls_setup_stage_under_authorization_for_test(None, stage)
+        .await
+        .expect("an unauthenticated session is not bounded by this contract");
+    assert_eq!(connected, "backend connected");
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_pre_relay_gate_refuses_an_elapsed_plan_and_admits_a_live_one() {
+    let plan = dtls_plan(
+        Duration::from_secs(30),
+        StreamAuthTermination::CredentialExpired,
+    );
+    let expired = Some(StreamAuthTermination::CredentialExpired);
+    let now = tokio::time::Instant::now();
+    let live = dtls_authorization_expired_before_relay_for_test(Some(plan), now);
+    // Exact equality goes to the security decision: at the instant itself the
+    // session is already outside its authorization lifetime.
+    let at_deadline = dtls_authorization_expired_before_relay_for_test(Some(plan), plan.at);
+    let past_deadline = dtls_authorization_expired_before_relay_for_test(
+        Some(plan),
+        plan.at + Duration::from_millis(1),
+    );
+    let later = plan.at + Duration::from_secs(600);
+    let unauthenticated = dtls_authorization_expired_before_relay_for_test(None, later);
+
+    assert_eq!(live, None, "a live plan still admits the relay");
+    assert_eq!(at_deadline, expired);
+    assert_eq!(past_deadline, expired);
+    assert_eq!(unauthenticated, None, "an unauthenticated session is fine");
+}
+
+#[test]
+fn a_relay_phase_dtls_expiry_publishes_the_bounded_class_exactly_once() {
+    let _guard = counter_delta_guard();
+    let latch = ferrum_edge::proxy::auth_lifetime::StreamAuthTerminationLatch::default();
+    let session_metadata = std::sync::Mutex::new(std::collections::HashMap::new());
+
+    let before = counters();
+    let first = settle_dtls_relay_authorization_expiry_for_test(
+        StreamAuthTermination::CredentialExpired,
+        &latch,
+        &session_metadata,
+    );
+    // The relay races both directions and the idle watchdog against one plan,
+    // so a second settlement must be a no-op.
+    let second = settle_dtls_relay_authorization_expiry_for_test(
+        StreamAuthTermination::CredentialExpired,
+        &latch,
+        &session_metadata,
+    );
+    let after = counters();
+
+    assert_eq!(
+        after.credential_expired["stream_udp"] - before.credential_expired["stream_udp"],
+        1
+    );
+    assert_eq!(first.setup_kind, None, "the relay phase is not setup");
+    assert_eq!(first.error, DTLS_RELAY_EXPIRED_ERROR);
+    assert_dtls_expiry_is_policy_neutral(&first);
+    assert_dtls_expiry_is_policy_neutral(&second);
+
+    // The accept loop merges `DtlsHandlerResult::metadata` over the metadata
+    // taken from `on_stream_connect` before building the summary, so the
+    // bounded class reaches `on_stream_disconnect` and the stream transaction
+    // summary through the ordinary lifecycle.
+    let mut merged =
+        std::collections::HashMap::from([("waf.signature".to_string(), "none".to_string())]);
+    merged.extend(first.metadata.clone());
+    let merged_reason = merged.get(TERMINATION_REASON_KEY).cloned();
+    let survived = merged.get("waf.signature").cloned();
+    assert_eq!(merged_reason.as_deref(), Some("credential_expired"));
+    assert_eq!(survived.as_deref(), Some("none"), "connect metadata survives");
+}
+
+#[test]
+fn the_dtls_and_upload_pump_authorization_paths_carry_no_production_panic() {
+    // Ferrum's proxy path may not panic even behind a documented logical
+    // invariant, so neither file may reintroduce one.
+    for (name, source) in [
+        ("src/proxy/udp_proxy.rs", UDP_PROXY_SOURCE),
+        ("src/proxy/upload_pump.rs", UPLOAD_PUMP_SOURCE),
+    ] {
+        let production = source.split("#[cfg(test)]").next().expect("production source");
+        for macro_name in ["unreachable!", "panic!(", "todo!", "unimplemented!"] {
+            assert!(
+                !production.contains(macro_name),
+                "{name} reintroduced `{macro_name}` on a proxy path"
+            );
+        }
+    }
+    // The disarmed upload cancellation arm expresses "this await never
+    // resolves" as an uninhabited type instead of asserting it.
+    assert!(
+        UPLOAD_PUMP_SOURCE
+            .contains("match std::future::pending::<std::convert::Infallible>().await {}"),
+        "the disarmed cancellation arm must stay a panic-free never-type match"
     );
 }

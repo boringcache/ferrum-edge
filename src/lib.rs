@@ -7202,6 +7202,119 @@ pub mod _test_support {
         crate::proxy::tcp_proxy::within_stream_auth_deadline(plan, stage).await
     }
 
+    /// Observable settlement of a DTLS authorization expiry (issue #3816),
+    /// captured from the production helpers so a test never restates them.
+    #[derive(Debug, Clone)]
+    pub struct DtlsAuthorizationExpiryForTest {
+        /// How many times the caller-supplied HALF_OPEN circuit-breaker probe
+        /// release ran. The production call sites pass a NEUTRAL release, so a
+        /// gateway security decision records no backend success or failure.
+        pub probe_releases: usize,
+        /// The session metadata map `handle_dtls_client` drains into
+        /// `DtlsHandlerResult::metadata`, which the accept loop merges into the
+        /// `StreamTransactionSummary` and delivers to `on_stream_disconnect`.
+        pub metadata: HashMap<String, String>,
+        /// `Display` of the returned typed error.
+        pub error: String,
+        /// The typed setup kind, when the error carries one.
+        pub setup_kind: Option<crate::proxy::stream_error::StreamSetupKind>,
+        /// The class / cause / direction the DTLS disconnect summary derives.
+        pub error_class: crate::retry::ErrorClass,
+        pub disconnect_cause: crate::plugins::DisconnectCause,
+        pub disconnect_direction: crate::plugins::Direction,
+    }
+
+    fn classify_dtls_session_failure_for_test(
+        error: &anyhow::Error,
+        probe_releases: usize,
+        metadata: HashMap<String, String>,
+    ) -> DtlsAuthorizationExpiryForTest {
+        let error_class = crate::proxy::udp_proxy::dtls_error_class(error);
+        DtlsAuthorizationExpiryForTest {
+            probe_releases,
+            metadata,
+            error: error.to_string(),
+            setup_kind: crate::proxy::stream_error::find_stream_setup_error(error)
+                .map(|setup| setup.kind),
+            disconnect_cause: crate::proxy::udp_proxy::dtls_disconnect_cause(error, &error_class),
+            disconnect_direction: crate::proxy::udp_proxy::dtls_disconnect_direction(
+                error,
+                &error_class,
+            ),
+            error_class,
+        }
+    }
+
+    /// Run one awaitable post-admission DTLS setup stage (DNS resolution,
+    /// backend UDP/DTLS connect and handshake) under the admitted session's
+    /// absolute authorization deadline, exactly as `handle_dtls_client_inner`
+    /// bounds them (issue #3816).
+    pub async fn dtls_setup_stage_under_authorization_for_test<S, F>(
+        plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+        stage: S,
+    ) -> Result<F::Output, DtlsAuthorizationExpiryForTest>
+    where
+        S: FnOnce() -> F,
+        F: std::future::Future,
+    {
+        let latch = crate::proxy::auth_lifetime::StreamAuthTerminationLatch::default();
+        let metadata = std::sync::Mutex::new(HashMap::new());
+        let releases = std::sync::atomic::AtomicUsize::new(0);
+        let outcome = crate::proxy::udp_proxy::dtls_setup_stage_under_authorization(
+            plan,
+            &latch,
+            &metadata,
+            || {
+                releases.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            },
+            stage,
+        )
+        .await;
+        match outcome {
+            Ok(output) => Ok(output),
+            Err(error) => Err(classify_dtls_session_failure_for_test(
+                &error,
+                releases.load(std::sync::atomic::Ordering::Relaxed),
+                metadata
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone(),
+            )),
+        }
+    }
+
+    /// Settle a RELAY-phase DTLS authorization expiry exactly as the session
+    /// relay's deadline arm does: record the bounded class once through the
+    /// session's shared latch, stamp it into the session metadata that reaches
+    /// the transaction summary, and return the typed health-neutral error
+    /// (issue #3816). Pass the same latch twice to prove once-only accounting.
+    pub fn settle_dtls_relay_authorization_expiry_for_test(
+        termination: crate::proxy::auth_lifetime::StreamAuthTermination,
+        latch: &crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+        session_metadata: &std::sync::Mutex<HashMap<String, String>>,
+    ) -> DtlsAuthorizationExpiryForTest {
+        crate::proxy::udp_proxy::settle_dtls_auth_expiry(termination, latch, session_metadata);
+        let error: anyhow::Error = crate::proxy::udp_proxy::DtlsAuthorizationExpired.into();
+        classify_dtls_session_failure_for_test(
+            &error,
+            0,
+            session_metadata
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+        )
+    }
+
+    /// Whether an admitted DTLS session may still be handed to its relay tasks,
+    /// re-checked after the synchronous setup work the deadline arms cannot
+    /// observe (issue #3816).
+    pub fn dtls_authorization_expired_before_relay_for_test(
+        plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+        now: tokio::time::Instant,
+    ) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
+        crate::proxy::udp_proxy::dtls_authorization_expired_before_relay(plan, now)
+    }
+
     /// The fixed PRE-COMMITMENT terminal the H1/H2 dispatch funnel substitutes
     /// when a request-upload authorization expiry cancelled the backend
     /// dispatch before any response head reached the client (issue #3815).

@@ -3396,11 +3396,7 @@ async fn start_dtls_frontend_listener(
                                     e
                                 );
                                 let error_message = e.to_string();
-                                let err_class = if is_udp_dtls_idle_timeout(e) {
-                                    crate::retry::ErrorClass::ReadWriteTimeout
-                                } else {
-                                    crate::retry::classify_boxed_error(e.as_ref())
-                                };
+                                let err_class = dtls_error_class(e);
                                 // handle_dtls_client_inner can fail on
                                 // backend-side setup (DNS, backend UDP bind,
                                 // backend DTLS handshake) as well as
@@ -3601,6 +3597,23 @@ async fn handle_dtls_client(
 /// typed error wrapper. See [`crate::proxy::stream_error`] for the rationale.
 pub(crate) const STREAM_ERR_BACKEND_DTLS_HANDSHAKE_FAILED: &str = "Backend DTLS handshake failed";
 
+/// Error class for a DTLS session failure.
+///
+/// Typed markers first: the idle watchdog and the authorization-lifetime
+/// terminator are both explicit types, so neither is inferred from message
+/// text. Everything else falls back to the shared boxed-error classifier.
+pub(crate) fn dtls_error_class(error: &anyhow::Error) -> crate::retry::ErrorClass {
+    if is_udp_dtls_idle_timeout(error) {
+        return crate::retry::ErrorClass::ReadWriteTimeout;
+    }
+    if is_dtls_authorization_expired(error) {
+        // The same class the typed setup-phase `AuthorizationExpired` kind maps
+        // to, so a policy expiry never reads as a transport or backend fault.
+        return crate::retry::ErrorClass::RequestError;
+    }
+    crate::retry::classify_boxed_error(error.as_ref())
+}
+
 /// Map a DTLS session failure to a `DisconnectCause`.
 ///
 /// **Typed-kind first.** When the chain carries a [`StreamSetupError`] (the
@@ -3614,7 +3627,7 @@ pub(crate) const STREAM_ERR_BACKEND_DTLS_HANDSHAKE_FAILED: &str = "Backend DTLS 
 /// `BackendError` so DTLS `stream_disconnects` metrics don't collapse every
 /// failure into `recv_error`. Generic decrypt errors remain client-side
 /// (`RecvError`).
-fn dtls_disconnect_cause(
+pub(crate) fn dtls_disconnect_cause(
     error: &anyhow::Error,
     class: &crate::retry::ErrorClass,
 ) -> crate::plugins::DisconnectCause {
@@ -3623,6 +3636,14 @@ fn dtls_disconnect_cause(
 
     if is_udp_dtls_idle_timeout(error) {
         return DisconnectCause::IdleTimeout;
+    }
+
+    // A relay-phase authorization expiry is a gateway-policy decision about the
+    // client's own credential, so it is attributed client-side exactly like the
+    // setup-phase `StreamSetupKind::AuthorizationExpired` below, and never as a
+    // backend fault.
+    if is_dtls_authorization_expired(error) {
+        return DisconnectCause::RecvError;
     }
 
     if let Some(setup_err) = find_stream_setup_error(error) {
@@ -3657,10 +3678,17 @@ fn dtls_disconnect_cause(
 /// — historically `None`, now derived from the typed kind (when present) or
 /// inferred from the error class so operators can tell whether the client or
 /// the backend tore down the session.
-fn dtls_disconnect_direction(error: &anyhow::Error, class: &crate::retry::ErrorClass) -> Direction {
+pub(crate) fn dtls_disconnect_direction(
+    error: &anyhow::Error,
+    class: &crate::retry::ErrorClass,
+) -> Direction {
     use crate::retry::ErrorClass;
     if is_udp_dtls_idle_timeout(error) {
         return Direction::Unknown;
+    }
+    // Same client-side attribution as the setup-phase typed kind.
+    if is_dtls_authorization_expired(error) {
+        return Direction::ClientToBackend;
     }
     if let Some(setup_err) = find_stream_setup_error(error) {
         return setup_err.kind.direction();
@@ -3694,6 +3722,129 @@ async fn dtls_shared_idle_watchdog(
         let last = last_activity_ms.load(Ordering::Relaxed);
         if udp_idle_expired(now, last, idle_timeout_ms) {
             return Err(UdpDtlsIdleTimeout.into());
+        }
+    }
+}
+
+/// A DTLS session terminated because the authorization lifetime of the
+/// credential that admitted it elapsed while the relay was running (issue
+/// #3816).
+///
+/// Typed rather than a bare `anyhow!` so the disconnect cause, direction, and
+/// error class are derived from the type instead of inferred from message text.
+/// Its `Display` is a compiled-in literal: it names the contract, never the
+/// credential, its subject, its provider, its expiry instant, or the client.
+#[derive(Debug)]
+pub(crate) struct DtlsAuthorizationExpired;
+
+impl std::fmt::Display for DtlsAuthorizationExpired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("authenticated DTLS session terminated: authorization lifetime reached")
+    }
+}
+
+impl std::error::Error for DtlsAuthorizationExpired {}
+
+/// `true` when this DTLS session failure is the relay-phase authorization
+/// expiry above. Health-neutral and client-side: it is a gateway-policy
+/// decision about the client's own credential, not a backend fault.
+pub(crate) fn is_dtls_authorization_expired(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<DtlsAuthorizationExpired>().is_some()
+}
+
+/// Settle a DTLS-session authorization expiry exactly once, in either phase.
+///
+/// The shared latch records the fixed-cardinality `stream_udp` termination
+/// counter for the FIRST caller only, and only that caller stamps the bounded
+/// class into the session metadata map. `handle_dtls_client` drains that map
+/// into `DtlsHandlerResult::metadata`, which the accept loop merges into the
+/// `StreamTransactionSummary` and delivers to `on_stream_disconnect` — so both
+/// the setup phase and the relay phase reach the summary through the ordinary
+/// lifecycle. Only the bounded class string is published: no identity,
+/// certificate field, expiry instant, provider detail, or client address.
+pub(crate) fn settle_dtls_auth_expiry(
+    termination: crate::proxy::auth_lifetime::StreamAuthTermination,
+    latch: &crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+    session_metadata: &std::sync::Mutex<std::collections::HashMap<String, String>>,
+) {
+    if latch.record_once(
+        termination,
+        crate::proxy::auth_lifetime::StreamAuthProtocolFamily::StreamUdp,
+    ) {
+        session_metadata
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(
+                crate::proxy::auth_lifetime::STREAM_AUTH_TERMINATION_METADATA_KEY.to_string(),
+                termination.as_str().to_string(),
+            );
+    }
+}
+
+/// The typed, client-side, health-neutral error returned when authorization
+/// elapsed during post-admission DTLS setup, before any backend or application
+/// datagram was forwarded. Fixed redacted wording.
+pub(crate) fn dtls_authorization_setup_error() -> anyhow::Error {
+    StreamSetupError::new(StreamSetupKind::AuthorizationExpired, "(DTLS session)").into()
+}
+
+/// Whether an admitted DTLS session may still be handed to the relay tasks.
+///
+/// Setup between two await points is synchronous work the deadline arms cannot
+/// observe, so the absolute plan is re-checked immediately before backend
+/// success accounting and relay task creation. Returns the bounded termination
+/// class when the session may no longer be admitted. `None` (unauthenticated)
+/// is always admissible.
+pub(crate) fn dtls_authorization_expired_before_relay(
+    plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+    now: tokio::time::Instant,
+) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
+    plan.filter(|plan| now >= plan.at).map(|plan| plan.termination)
+}
+
+/// Run one awaitable post-admission DTLS setup stage (DNS resolution, backend
+/// UDP/DTLS connect and handshake) under the admitted credential's absolute
+/// authorization deadline (issue #3816).
+///
+/// The deadline is anchored at admission and never refreshed, so composing it
+/// over a stage cannot extend it. An already-elapsed plan never builds or polls
+/// the stage at all, so an expired session resolves no name and dials no
+/// backend; a stage that started earlier has its future DROPPED at the
+/// deadline, so a partially completed connect or DTLS handshake is abandoned
+/// rather than finished.
+///
+/// On expiry `release_probe` runs first — the caller uses it to release a
+/// claimed HALF_OPEN circuit-breaker probe slot NEUTRALLY, because this is a
+/// gateway security decision and must record neither backend success nor
+/// backend failure — then the termination is settled once and the typed
+/// client-side setup error is returned.
+///
+/// `None` (an unauthenticated DTLS session) runs the stage unbounded, with no
+/// timer registered at all.
+pub(crate) async fn dtls_setup_stage_under_authorization<S, F>(
+    plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+    latch: &crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+    session_metadata: &std::sync::Mutex<std::collections::HashMap<String, String>>,
+    release_probe: impl FnOnce(),
+    stage: S,
+) -> Result<F::Output, anyhow::Error>
+where
+    S: FnOnce() -> F,
+    F: std::future::Future,
+{
+    if let Some(termination) =
+        dtls_authorization_expired_before_relay(plan, tokio::time::Instant::now())
+    {
+        release_probe();
+        settle_dtls_auth_expiry(termination, latch, session_metadata);
+        return Err(dtls_authorization_setup_error());
+    }
+    match crate::proxy::tcp_proxy::within_stream_auth_deadline(plan, stage()).await {
+        Ok(output) => Ok(output),
+        Err(termination) => {
+            release_probe();
+            settle_dtls_auth_expiry(termination, latch, session_metadata);
+            Err(dtls_authorization_setup_error())
         }
     }
 }
@@ -3771,13 +3922,41 @@ async fn handle_dtls_client_inner(
         }
     }
 
-    let candidates = match dns_cache
-        .resolve_candidates(
-            &backend_host,
-            proxy.dns_override.as_deref(),
-            proxy.dns_cache_ttl_seconds,
-        )
-        .await
+    // Once-only settlement for this session's authorization lifetime, shared by
+    // the setup-phase stages below and the relay-phase deadline arm, so a
+    // session is counted and stamped exactly once no matter which phase ended
+    // it (issue #3816).
+    let auth_termination_latch = crate::proxy::auth_lifetime::StreamAuthTerminationLatch::default();
+    // Release a claimed HALF_OPEN probe slot NEUTRALLY on an authorization
+    // expiry: the gateway dialed nothing on behalf of this credential, so the
+    // breaker must record neither success nor failure, and the slot must not
+    // leak or the breaker could never recover.
+    let release_half_open_probe = || {
+        if let Some(ref cb_config) = proxy.circuit_breaker {
+            let cb = circuit_breaker_cache.get_or_create(
+                &proxy.namespace,
+                proxy_id,
+                cb_target_key.as_deref(),
+                cb_config,
+            );
+            cb.record_neutral(cb_is_half_open_probe);
+        }
+    };
+
+    let candidates = match dtls_setup_stage_under_authorization(
+        auth_deadline,
+        &auth_termination_latch,
+        &datagram_metadata,
+        &release_half_open_probe,
+        || {
+            dns_cache.resolve_candidates(
+                &backend_host,
+                proxy.dns_override.as_deref(),
+                proxy.dns_cache_ttl_seconds,
+            )
+        },
+    )
+    .await?
     {
         Ok(addresses) => addresses,
         Err(e) => {
@@ -3819,13 +3998,14 @@ async fn handle_dtls_client_inner(
         })
         .transpose()?;
     let connect_timeout = Duration::from_millis(proxy.backend_connect_timeout_ms);
-    let (connected, backend_addr) = match connect_udp_backend_candidates(
-        &candidates,
-        backend_port,
-        connect_timeout,
-        dtls_params,
+    let (connected, backend_addr) = match dtls_setup_stage_under_authorization(
+        auth_deadline,
+        &auth_termination_latch,
+        &datagram_metadata,
+        &release_half_open_probe,
+        || connect_udp_backend_candidates(&candidates, backend_port, connect_timeout, dtls_params),
     )
-    .await
+    .await?
     {
         Ok(connected) => connected,
         Err(error) => {
@@ -3846,6 +4026,20 @@ async fn handle_dtls_client_inner(
         ConnectedUdpBackend::Plain(socket) => (Some(Arc::new(socket)), None),
         ConnectedUdpBackend::Dtls(connection) => (None, Some(Arc::new(connection))),
     };
+
+    // Synchronous work between the await points above is invisible to the
+    // deadline arms, so re-check the absolute plan before ANY backend success is
+    // recorded and before either relay task exists (issue #3816). The backend
+    // socket / DTLS connection just established is dropped on return, so an
+    // expired session forwards no application datagram and leaves no detached
+    // producer.
+    if let Some(termination) =
+        dtls_authorization_expired_before_relay(auth_deadline, tokio::time::Instant::now())
+    {
+        release_half_open_probe();
+        settle_dtls_auth_expiry(termination, &auth_termination_latch, &datagram_metadata);
+        return Err(dtls_authorization_setup_error());
+    }
 
     // Record circuit breaker success — backend connection established.
     if let Some(ref cb_config) = proxy.circuit_breaker {
@@ -4078,18 +4272,20 @@ async fn handle_dtls_client_inner(
         _ = &mut backend_to_client => Ok(()),
         result = &mut idle_watchdog => result,
         _ = &mut authorization_deadline, if authorization_deadline_active => {
-            // Fixed-cardinality termination class, recorded once on the single
-            // path that can reach this arm.
+            // Fixed-cardinality termination class, recorded once through the
+            // same latch the setup phase uses, and stamped into the session
+            // metadata so the bounded class reaches the stream transaction
+            // summary and `on_stream_disconnect` (issue #3816).
             if let Some(plan) = auth_deadline {
-                crate::proxy::auth_lifetime::record_termination(
+                settle_dtls_auth_expiry(
                     plan.termination,
-                    crate::proxy::auth_lifetime::StreamAuthProtocolFamily::StreamUdp,
+                    &auth_termination_latch,
+                    &datagram_metadata,
                 );
             }
-            // Fixed message: no expiry value, identity, or certificate detail.
-            Err(anyhow::anyhow!(
-                "authenticated DTLS session terminated: authorization lifetime reached"
-            ))
+            // Typed and health-neutral: no expiry value, identity, or
+            // certificate detail reaches the message.
+            Err(DtlsAuthorizationExpired.into())
         }
     };
     // Both relay directions and the backend connection are torn down on every

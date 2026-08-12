@@ -380,8 +380,11 @@ async fn cancel_requested(cancel: &mut Option<tokio::sync::oneshot::Receiver<()>
         let signalled = match cancel.as_mut() {
             Some(receiver) => await_cancel_signal(receiver).await,
             None => {
-                std::future::pending::<()>().await;
-                unreachable!("pending() never completes")
+                // Disarmed: no cancellation can ever arrive, so this arm must
+                // stay pending for the rest of the relay. `pending::<Infallible>()`
+                // has an uninhabited output, so the empty match expresses "this
+                // await never resolves" as a type, not as a proxy-path panic.
+                match std::future::pending::<std::convert::Infallible>().await {}
             }
         };
         if signalled.is_ok() {
