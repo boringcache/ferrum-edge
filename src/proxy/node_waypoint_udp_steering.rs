@@ -358,14 +358,16 @@ impl NodeWaypointUdpSteering {
         self.reconcile_locked(&mut state)
     }
 
-    /// Drop every destination served on `port` and apply immediately. Used when
-    /// a bound listener fails asynchronously so the destination cannot remain
-    /// marked without a serving socket until the next full reconcile.
+    /// Drop every destination served on `port` and apply immediately.
+    ///
+    /// External tests use this seam to exercise serialized per-port retraction.
+    /// Production listener exits instead use the generation-fenced
+    /// `retract_owned_node_waypoint_udp_listener` path in `stream_listener`.
     ///
     /// Filters the latest desired set while holding the same mutex the full
     /// plan update uses, so a concurrent `set_bound_destinations` cannot be
     /// lost to a stale load/filter/store.
-    #[allow(dead_code)] // External unit tests; async listener exit uses retract_owned_node_waypoint_udp_listener.
+    #[allow(dead_code)] // External unit-test seam; production exit retraction is generation-fenced.
     pub fn retract_port(&self, port: u16) -> SteerReconcileOutcome {
         let mut state = self.lock_state();
         state
@@ -392,7 +394,7 @@ impl NodeWaypointUdpSteering {
 
     /// [`Self::reconcile`] against an explicit destination set. Tests drive this
     /// form so they do not depend on another task mutating this instance.
-    #[allow(dead_code)] // External unit tests; production reconciles via set_bound_destinations/reconcile.
+    #[allow(dead_code)] // External unit-test seam; production uses the state-specific entry points.
     pub fn reconcile_with(
         &self,
         ifaces: &[String],
