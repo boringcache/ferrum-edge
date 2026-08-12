@@ -206,15 +206,23 @@ paths:
         `"degraded"` (DB disconnected / admin writes blocked / database
         incremental polling repeatedly rejecting the same delta while serving
         last known-good config; an active remote JWKS store in grace; or, in
-        database, control-plane, or file mode, a
+        database, control-plane, file, or mesh mode, a
         full config load/reload rejected while the previous generation keeps
         serving — `config_rejected: true`. In database/CP, rejection is by the
         runtime-config validation contract or by typed SQL row decoding while the
         backend is reachable, and the admin API stays writable as the in-band
         repair path, gated on any deferred schema migration applying first; in
         file mode the admin API stays read-only and operators repair by fixing
-        the file and reloading). `config_rejected` is a sticky flag cleared only
-        by an accepted authoritative full reload (Applied or Unchanged); while
+        the file and reloading. In mesh mode the flag additionally covers the
+        localized `file` and `stock_xds` mesh policy sources: a SIGHUP reload
+        whose read, parse, validation, revision-gate admission, or proxy apply
+        is rejected keeps the last known-good mesh slice / policy baseline and
+        sets the flag, and the admin API stays read-only exactly as in file
+        mode). `config_rejected` is a sticky flag cleared only
+        by an accepted authoritative full reload (Applied or Unchanged) — and,
+        for the localized mesh sources, only once the proxy apply lifecycle
+        accepts that exact recovery candidate, never on a provisional slice
+        install or policy channel send; while
         the backend is unreachable
         (`db_available` false / `admin_writes_enabled` false) the detail is
         suppressed so it never advertises the writable repair path during an
@@ -11943,13 +11951,17 @@ components:
         config_rejected:
           type: boolean
           description: |
-            Database, control-plane, and file modes, authenticated detail only.
+            Database, control-plane, file, and mesh modes, authenticated detail
+            only.
             Present and `true` when the latest **full** config load/reload was
             rejected: in database/CP, by the runtime-config validation contract
             (a reachable backend served a semantically-invalid snapshot) or by
             typed SQL row decoding (a reachable backend served an undecodable
             row); in file mode, when a SIGHUP candidate fails read, parse,
-            validation, or apply. The gateway keeps serving the last known-good
+            validation, or apply; in mesh mode, when a localized `file` or
+            `stock_xds` mesh policy reload candidate fails read, parse,
+            validation, config-revision-gate admission, or proxy apply. The
+            gateway keeps serving the last known-good
             config. In database/CP, because the backend is reachable, the admin
             API stays writable (`admin_writes_enabled` stays `true`) so the
             offending resource can be repaired in-band; `status` is forced to
@@ -11957,10 +11969,18 @@ components:
             migration applying first, so a reachable backend with a still-pending
             schema keeps writes blocked while this flag stays set. In file mode
             the admin API remains read-only; operators repair by fixing the
-            config file and reloading. The flag is sticky and clears only when
+            config file and reloading; the localized mesh sources are likewise
+            read-only and are repaired by fixing the mesh document and
+            re-signalling. The flag is sticky and clears only when
             an accepted authoritative **full** reload proves the candidate is
             valid again (Applied or Unchanged; an accepted incremental poll in
-            database/CP does not clear it). While the backend is unreachable
+            database/CP does not clear it). For the localized mesh sources the
+            clear is stricter: it happens only after the **proxy apply
+            lifecycle** accepts the exact current recovery candidate (Applied,
+            or a content-identical no-op). A provisional slice install, a stock
+            policy channel send, an older candidate's late success, or an
+            unrelated accepted slice never clears it. While the backend is
+            unreachable
             (`admin_writes_enabled` false) this detail is suppressed so it never
             advertises the writable repair path during an outage, even though the
             underlying flag remains set. A genuine connectivity failure is

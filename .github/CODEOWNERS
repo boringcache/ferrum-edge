@@ -30,3 +30,8 @@
 /scripts/check_launch_readiness.py          @jeremyjpj0916
 /.github/workflows/launch-readiness.yml     @jeremyjpj0916
 /.github/workflows/release.yml              @jeremyjpj0916
+
+# Advisory-credential trust boundary (issue #3802). These two files are the
+# whole reason a `v*` tag target cannot reach LAUNCH_ADVISORY_READ_TOKEN.
+/.github/workflows/launch-advisory-trust.yml        @jeremyjpj0916
+/.github/scripts/verify_launch_advisory_trust.py    @jeremyjpj0916
