@@ -922,3 +922,170 @@ async fn the_new_generation_is_visible_without_the_rotation_consumer_running() {
         "the live generation and the drain consumer's target must not diverge"
     );
 }
+
+// ─── Retirement is scoped to an actual WITHDRAWAL ───────────────────────────
+//
+// Advancing the backend security generation re-partitions every generation-keyed
+// pool, and (issue #3727) a committed withdrawal now also retires the two
+// fingerprint-keyed mesh pools WHOLE, synchronously, regardless of
+// `FERRUM_MESH_SVID_ROTATION_DRAIN_SECONDS`. That is the right price for a
+// revocation and the wrong price for anything else, so the predicate that gates
+// it is "does this decision remove a root the live verifier currently honours",
+// not "does this decision touch trust material".
+//
+// The distinction is load-bearing, not cosmetic: the CP encodes "this gateway
+// has no trust bundles" as an explicit `Clear` on EVERY full snapshot, and a DP
+// reconnect re-delivers an unchanged `Replace` verbatim. Treating either as a
+// withdrawal would drop every pooled mesh transport on the node each time a DP
+// reconnects — for deployments that never revoked anything, and in the common
+// case for deployments that use no CP trust bundles at all.
+
+/// Runtime trust material with an explicit authority list, so a test can express
+/// "the same roots", "one more root", and "a root removed".
+fn runtime_bundles_with(trust_domain: &str, authorities: &[&[u8]]) -> RuntimeTrustBundleSet {
+    RuntimeTrustBundleSet {
+        local: RuntimeTrustBundle {
+            trust_domain: TrustDomain::new(trust_domain).expect("test trust domain"),
+            x509_authorities: authorities.iter().map(|root| root.to_vec()).collect(),
+            jwt_authorities: Vec::new(),
+            refresh_hint_seconds: None,
+        },
+        federated: Default::default(),
+    }
+}
+
+/// How many roots the live gateway verifier actually anchors SVID chains to —
+/// the proof that a decision was INSTALLED even when it retired nothing.
+fn active_svid_authority_count(state: &ProxyState) -> usize {
+    state
+        .gateway_svid_bundle
+        .load_full()
+        .as_ref()
+        .as_ref()
+        .map(|svid| svid.trust_bundles.local.x509_authorities.len())
+        .unwrap_or(0)
+}
+
+fn dp_snapshot(version: &str) -> GatewayConfig {
+    GatewayConfig {
+        version: version.to_string(),
+        ..GatewayConfig::default()
+    }
+}
+
+#[tokio::test]
+async fn an_identical_replace_redelivered_by_a_reconnect_never_rotates_the_backend_pools() {
+    let state = state_in_mode(GatewayConfig::default(), OperatingMode::DataPlane).await;
+    seed_source_loaded_svid(&state);
+    state.update_config_with_gateway_trust(
+        dp_snapshot("dp-1"),
+        GatewayTrustCommit::Replace(runtime_bundles_with("cp.local", &[&[7]])),
+    );
+    let before = backend_security_generation(&state);
+    let revision_before = scheduled_rotation_revision(&state);
+
+    // A DP reconnect re-delivers the same bundles verbatim on its FULL_SNAPSHOT.
+    state.update_config_with_gateway_trust(
+        dp_snapshot("dp-reconnect"),
+        GatewayTrustCommit::Replace(runtime_bundles_with("cp.local", &[&[7]])),
+    );
+
+    assert_eq!(
+        backend_security_generation(&state),
+        before,
+        "re-delivering the same trust material removes no root, so it must not \
+         rotate the backend pools — a reconnect is not a revocation"
+    );
+    assert_eq!(scheduled_rotation_revision(&state), revision_before);
+    assert!(mesh_admission_open(&state));
+    assert_eq!(live_override_domain(&state).as_deref(), Some("cp.local"));
+}
+
+#[tokio::test]
+async fn a_purely_additive_replace_installs_the_root_without_rotating_the_backend_pools() {
+    let state = state_in_mode(GatewayConfig::default(), OperatingMode::DataPlane).await;
+    seed_source_loaded_svid(&state);
+    state.update_config_with_gateway_trust(
+        dp_snapshot("dp-1"),
+        GatewayTrustCommit::Replace(runtime_bundles_with("cp.local", &[&[7]])),
+    );
+    let before = backend_security_generation(&state);
+    assert_eq!(active_svid_authority_count(&state), 1);
+
+    // Cross-sign overlap: the incoming root is published ALONGSIDE the one it
+    // will eventually replace. Every transport the live verifier already
+    // admitted was admitted by a root that is still a root.
+    state.update_config_with_gateway_trust(
+        dp_snapshot("dp-overlap"),
+        GatewayTrustCommit::Replace(runtime_bundles_with("cp.local", &[&[7], &[8]])),
+    );
+
+    assert_eq!(
+        active_svid_authority_count(&state),
+        2,
+        "the added root must be live — the decision is still installed, it just \
+         retires nothing"
+    );
+    assert_eq!(
+        backend_security_generation(&state),
+        before,
+        "adding a root is overlap, not withdrawal, so no pooled transport becomes \
+         unusable and none may be retired"
+    );
+    assert!(mesh_admission_open(&state));
+}
+
+#[tokio::test]
+async fn a_replace_that_drops_a_root_retires_the_transports_it_authenticated() {
+    let state = state_in_mode(GatewayConfig::default(), OperatingMode::DataPlane).await;
+    seed_source_loaded_svid(&state);
+    state.update_config_with_gateway_trust(
+        dp_snapshot("dp-overlap"),
+        GatewayTrustCommit::Replace(runtime_bundles_with("cp.local", &[&[7], &[8]])),
+    );
+    let before = backend_security_generation(&state);
+
+    // The second half of the cross-sign rotation: the outgoing root is dropped.
+    // A transport admitted by it must not survive.
+    state.update_config_with_gateway_trust(
+        dp_snapshot("dp-drop"),
+        GatewayTrustCommit::Replace(runtime_bundles_with("cp.local", &[&[8]])),
+    );
+
+    assert_eq!(active_svid_authority_count(&state), 1);
+    assert_eq!(
+        backend_security_generation(&state),
+        before + 1,
+        "dropping a root the live verifier honoured is a withdrawal and must \
+         retire the transports it authenticated"
+    );
+    assert_eq!(scheduled_rotation_revision(&state), before + 1);
+    assert!(mesh_admission_open(&state));
+}
+
+#[tokio::test]
+async fn a_clear_with_no_installed_override_never_rotates_the_backend_pools() {
+    let state = state_in_mode(GatewayConfig::default(), OperatingMode::DataPlane).await;
+    seed_source_loaded_svid(&state);
+    let before = backend_security_generation(&state);
+    let revision_before = scheduled_rotation_revision(&state);
+    assert_eq!(live_override_domain(&state), None);
+
+    // Every CP full snapshot of a gateway with no trust bundles carries an
+    // explicit `Clear`. There is no override to withdraw.
+    state.update_config_with_gateway_trust(dp_snapshot("dp-1"), GatewayTrustCommit::Clear);
+
+    assert_eq!(
+        backend_security_generation(&state),
+        before,
+        "a Clear that withdraws nothing must not rotate the backend pools; a DP \
+         reconnect would otherwise retire every pooled mesh transport on the node"
+    );
+    assert_eq!(scheduled_rotation_revision(&state), revision_before);
+    assert!(mesh_admission_open(&state));
+    assert_eq!(
+        active_svid_domain(&state).as_deref(),
+        Some("file.local"),
+        "the source-loaded gateway trust stays live"
+    );
+}
