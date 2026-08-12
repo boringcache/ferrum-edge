@@ -12361,7 +12361,7 @@ fn seed_host_udp_placement_state(
         boot_id.trim()
     );
     std::fs::write(&path, contents)
-    .map_err(|error| format!("seed host-udp placement state: {error}"))?;
+        .map_err(|error| format!("seed host-udp placement state: {error}"))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
