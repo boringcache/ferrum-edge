@@ -1094,7 +1094,10 @@ async fn run_stock_live_phases(
         EDS_TYPE_URL,
         "eds-4",
         "eds-n4",
-        vec![any_resource(EDS_TYPE_URL, &assignment(good_cluster, &endpoint))],
+        vec![any_resource(
+            EDS_TYPE_URL,
+            &assignment(good_cluster, &endpoint),
+        )],
     ));
     ads.wait_for_ack(EDS_TYPE_URL, "eds-4").await?;
     let endpoints_restored = wait_until_reachable(outbound_port, SERVICE_HOST).await?;
@@ -1129,7 +1132,10 @@ async fn run_stock_live_phases(
         EDS_TYPE_URL,
         "eds-5",
         "eds-n5",
-        vec![any_resource(EDS_TYPE_URL, &assignment(good_cluster, &endpoint))],
+        vec![any_resource(
+            EDS_TYPE_URL,
+            &assignment(good_cluster, &endpoint),
+        )],
     ));
     ads.wait_for_ack(EDS_TYPE_URL, "eds-5").await?;
     let cluster_restored = wait_until_reachable(outbound_port, SERVICE_HOST).await?;
@@ -1189,7 +1195,10 @@ async fn run_stock_live_phases(
         EDS_TYPE_URL,
         "eds-6",
         "eds-n6",
-        vec![any_resource(EDS_TYPE_URL, &assignment(good_cluster, &endpoint))],
+        vec![any_resource(
+            EDS_TYPE_URL,
+            &assignment(good_cluster, &endpoint),
+        )],
     ));
     ads.wait_for_ack(EDS_TYPE_URL, "eds-6").await?;
     let impostor_pin = wait_until_unreachable(outbound_port, SERVICE_HOST).await?;
