@@ -449,7 +449,9 @@ fn ambient_host_udp_live_kernel_module_uses_production_scripts_and_skip_or_fail(
     // namespaces kept alive throughout, using the production retirement
     // supervisor rather than a simulated cleanup.
     assert!(
-        live.contains("host_udp_live_kernel_missed_rollout_rejoin_refuses_then_recovers_without_a_blackhole"),
+        live.contains(
+            "host_udp_live_kernel_missed_rollout_rejoin_refuses_then_recovers_without_a_blackhole"
+        ),
         "live gate must prove the #3809 missed-rollout/rejoin scenario"
     );
     assert!(
