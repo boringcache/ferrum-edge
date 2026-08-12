@@ -555,9 +555,20 @@ fn refuses_a_connect_udp_request_without_the_https_scheme() {
 
 #[test]
 fn refuses_a_connect_udp_request_without_an_authority() {
+    // `http::Uri` enforces this boundary before the H3 dispatcher: an HTTPS
+    // absolute URI cannot be represented without an authority. Keep the
+    // validator's fixed diagnostic covered directly as defense in depth.
+    assert!(
+        "https:///udp/dns.example/853/".parse::<http::Uri>().is_err(),
+        "the HTTP URI type must reject an HTTPS URI without authority"
+    );
     assert_eq!(
-        validate_connect_udp_request_shape(&uri("https:///udp/dns.example/853/")),
-        Err(ConnectUdpRequestRejection::AuthorityMissing)
+        ConnectUdpRequestRejection::AuthorityMissing.reason(),
+        "connect_udp_authority_missing"
+    );
+    assert_eq!(
+        ConnectUdpRequestRejection::AuthorityMissing.client_error_body(),
+        r#"{"error":"CONNECT-UDP requires the :authority pseudo-header"}"#
     );
 }
 
