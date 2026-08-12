@@ -124,15 +124,20 @@ impl GatewayListenerPlan {
     /// `reserved` is [`ProxyState::reserved_gateway_ports`] — the effective
     /// reservation for *this* process, not `EnvConfig` alone, so a pre-bound
     /// in-process harness socket is honored too.
+    ///
+    /// `http3_enabled` makes TLS-class listeners reserve their QUIC UDP port in
+    /// addition to the HTTP TCP port.
     pub fn from_config(
         config: &GatewayConfig,
         reserved: &std::collections::HashSet<u16>,
         existing_frontends: &BTreeMap<u16, GatewayListenerClass>,
+        http3_enabled: bool,
     ) -> Self {
-        // Only TCP/TLS raw-stream claims collide with an HTTP-family TCP
-        // listener on the same numeric port. UDP/DTLS use a different transport
-        // and may coexist (translation admits the same shape).
+        // TCP/TLS raw-stream claims collide with every HTTP-family TCP listener.
+        // UDP/DTLS claims collide only with TLS-class listeners when HTTP/3 adds
+        // a QUIC socket on the same numeric port.
         let mut tcp_stream_ports: BTreeSet<u16> = BTreeSet::new();
+        let mut udp_stream_ports: BTreeSet<u16> = BTreeSet::new();
         for proxy in &config.proxies {
             if matches!(
                 proxy.dispatch_kind,
@@ -140,6 +145,13 @@ impl GatewayListenerPlan {
             ) && let Some(port) = proxy.listen_port
             {
                 tcp_stream_ports.insert(port);
+            }
+            if matches!(
+                proxy.dispatch_kind,
+                DispatchKind::UdpRaw | DispatchKind::UdpDtls
+            ) && let Some(port) = proxy.listen_port
+            {
+                udp_stream_ports.insert(port);
             }
         }
 
@@ -199,6 +211,18 @@ impl GatewayListenerPlan {
                     format!(
                         "port {port} is claimed by a TCP/TLS stream proxy in the same config; \
                          the HTTP-family Gateway listener is not bound"
+                    )
+                });
+                continue;
+            }
+            if http3_enabled
+                && class == GatewayListenerClass::Tls
+                && udp_stream_ports.contains(&port)
+            {
+                refused.entry(port).or_insert_with(|| {
+                    format!(
+                        "port {port} is claimed by a UDP/DTLS stream proxy in the same config; \
+                         the TLS-class Gateway listener's HTTP/3 socket is not bound"
                     )
                 });
                 continue;
@@ -478,6 +502,7 @@ impl GatewayListenerManager {
             config,
             self.state.reserved_gateway_ports.as_ref(),
             &self.existing_frontends,
+            self.http3.is_some(),
         );
         let mut failures: Vec<GatewayListenerBindFailure> = plan
             .refused
