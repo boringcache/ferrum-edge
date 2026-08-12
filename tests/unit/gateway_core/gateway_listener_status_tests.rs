@@ -869,10 +869,13 @@ fn overflow_prioritizes_ledger_keys_over_new_admissions_in_encounter_order() {
     assert_eq!(entry.first_observed_unix_ms, 1_000);
 }
 
-/// A partial recovery during overflow must recover only identities genuinely
-/// absent from the full stream, without resetting history for survivors.
+/// After an overflowing pass, a later pass whose distinct identities fit under
+/// the ledger bound recovers only identities genuinely absent from the stream.
+/// Brand-new identities that now fit are admitted (and counted as onsets);
+/// survivors keep their history. The preceding overflow does not freeze the
+/// next pass into overflow or suppress new admissions below the cap.
 #[test]
-fn overflow_partial_recovery_counts_only_absent_identities() {
+fn partial_recovery_after_overflow_counts_only_absent_identities() {
     let status = GatewayListenerStatus::new();
     let tracked_ports: Vec<u16> = (1..=MAX_ACTIVE_TRACKED_FAILURES as u16).collect();
     assert!(status.publish(
@@ -886,22 +889,36 @@ fn overflow_partial_recovery_counts_only_absent_identities() {
     let mut overflow_pass = oversubscribed_failures((61_000..61_500).collect::<Vec<_>>());
     overflow_pass.extend(oversubscribed_failures(tracked_ports.clone()));
     assert!(status.publish(1, overflow_pass.len(), 0, overflow_pass, 2_000));
-
-    let survivors: Vec<u16> = tracked_ports[MAX_ACTIVE_TRACKED_FAILURES / 2..].to_vec();
-    let mut partial = oversubscribed_failures((62_000..62_500).collect::<Vec<_>>());
-    partial.extend(oversubscribed_failures(survivors.clone()));
-    assert!(status.publish(1, partial.len(), 0, partial, 3_000));
-
-    assert_eq!(
-        tcp_bind_recoveries_total(&status),
-        (MAX_ACTIVE_TRACKED_FAILURES / 2) as u64
-    );
+    assert!(status.snapshot().overflowed);
     assert_eq!(
         tcp_bind_failures_total(&status),
         MAX_ACTIVE_TRACKED_FAILURES as u64
     );
+
+    let survivors: Vec<u16> = tracked_ports[MAX_ACTIVE_TRACKED_FAILURES / 2..].to_vec();
+    let new_keys: Vec<u16> = (62_000..62_500).collect();
+    let mut partial = oversubscribed_failures(new_keys.clone());
+    partial.extend(oversubscribed_failures(survivors.clone()));
+    assert!(status.publish(1, partial.len(), 0, partial, 3_000));
+
+    let recovered_priors = (MAX_ACTIVE_TRACKED_FAILURES / 2) as u64;
+    let admitted_new = new_keys.len() as u64;
+    assert_eq!(tcp_bind_recoveries_total(&status), recovered_priors);
+    assert_eq!(
+        tcp_bind_failures_total(&status),
+        MAX_ACTIVE_TRACKED_FAILURES as u64 + admitted_new,
+        "the 500 brand-new identities fit under the cap and each count one onset"
+    );
     let snapshot = status.snapshot();
-    assert_eq!(snapshot.active_failures, MAX_ACTIVE_TRACKED_FAILURES / 2);
+    assert!(
+        !snapshot.overflowed,
+        "2048 survivors plus 500 new identities are below the ledger bound"
+    );
+    assert_eq!(
+        snapshot.active_failures,
+        survivors.len() + new_keys.len(),
+        "survivors keep their slots and every new identity that fits is admitted"
+    );
     let survivor = snapshot
         .failures
         .iter()
@@ -909,20 +926,52 @@ fn overflow_partial_recovery_counts_only_absent_identities() {
         .expect("a surviving tracked identity");
     assert_eq!(survivor.observations, 3);
     assert_eq!(survivor.first_observed_unix_ms, 1_000);
+
+    // The 500 new keys were selected: dropping them recovers exactly those
+    // identities and does not re-count onsets or disturb survivor history.
+    assert!(status.publish(
+        1,
+        survivors.len(),
+        0,
+        oversubscribed_failures(survivors.clone()),
+        4_000,
+    ));
+    assert_eq!(
+        tcp_bind_recoveries_total(&status),
+        recovered_priors + admitted_new
+    );
+    assert_eq!(
+        tcp_bind_failures_total(&status),
+        MAX_ACTIVE_TRACKED_FAILURES as u64 + admitted_new
+    );
+    let snapshot = status.snapshot();
+    assert!(!snapshot.overflowed);
+    assert_eq!(snapshot.active_failures, survivors.len());
+    let survivor = snapshot
+        .failures
+        .iter()
+        .find(|entry| entry.port == survivors[0])
+        .expect("survivor history must survive the new-key recovery");
+    assert_eq!(survivor.observations, 4);
+    assert_eq!(survivor.first_observed_unix_ms, 1_000);
 }
 
-/// Remaining ledger slots must not stay reserved for brand-new keys that
-/// arrived first. A previously tracked identity that appears late in the stream
-/// reclaims its slot; the earlier new keys overflow instead of false-recovering
-/// the prior identity.
+/// Remaining ledger slots are not reserved for brand-new keys that arrived
+/// first, and they are not left empty either. A previously tracked identity
+/// that appears late in the stream keeps its slot; brand-new identities then
+/// compete for the six leftover slots in deterministic key order.
 ///
-/// A first-N-distinct or encounter-order cap would keep the new keys, drop the
-/// late prior identities, and count those drops as recoveries.
+/// A first-N-distinct or encounter-order cap would keep the earliest new keys,
+/// drop the late prior identities, and count those drops as recoveries. A
+/// "priors only" overflow policy would discard every new key and under-count
+/// active failures below the bound.
 #[test]
-fn late_prior_identities_reclaim_slots_from_earlier_new_keys() {
+fn late_prior_identities_keep_slots_remaining_go_to_lowest_new_keys() {
     let status = GatewayListenerStatus::new();
     let prior_count = MAX_ACTIVE_TRACKED_FAILURES - 6;
     let prior: Vec<u16> = (1..=prior_count as u16).collect();
+    let lowest_new: Vec<u16> = (60_000..60_006).collect();
+    let overflowed_new: Vec<u16> = (60_006..60_100).collect();
     assert!(status.publish(
         1,
         prior.len(),
@@ -932,20 +981,21 @@ fn late_prior_identities_reclaim_slots_from_earlier_new_keys() {
     ));
     assert_eq!(tcp_bind_failures_total(&status), prior_count as u64);
 
-    let mut observations = oversubscribed_failures((60_000..60_100).collect::<Vec<_>>());
+    let mut observations = oversubscribed_failures(overflowed_new);
+    observations.extend(oversubscribed_failures(lowest_new.clone()));
     observations.extend(oversubscribed_failures(prior.clone()));
     assert!(status.publish(1, observations.len(), 0, observations, 2_000));
 
     let snapshot = status.snapshot();
     assert!(snapshot.overflowed);
     assert_eq!(
-        snapshot.active_failures, prior_count,
-        "late prior identities must reclaim every ledger slot from earlier new keys"
+        snapshot.active_failures, MAX_ACTIVE_TRACKED_FAILURES,
+        "4090 late priors keep their slots; the six leftover slots admit the lowest new keys"
     );
     assert_eq!(
         tcp_bind_failures_total(&status),
-        prior_count as u64,
-        "new keys that arrived first must not count as onsets"
+        MAX_ACTIVE_TRACKED_FAILURES as u64,
+        "the six lowest new keys each count one onset"
     );
     assert_eq!(
         tcp_bind_recoveries_total(&status),
@@ -959,6 +1009,39 @@ fn late_prior_identities_reclaim_slots_from_earlier_new_keys() {
         .expect("a late prior identity must remain active");
     assert_eq!(entry.observations, 2);
     assert_eq!(entry.first_observed_unix_ms, 1_000);
+
+    // Prove the six selected new keys were 60000..60005, not the higher keys
+    // that filled an encounter-order view first: a follow-up of prior + those
+    // six must age, not recover-and-reonset.
+    let mut next = oversubscribed_failures(prior.clone());
+    next.extend(oversubscribed_failures(lowest_new.clone()));
+    assert!(status.publish(1, next.len(), 0, next, 3_000));
+    assert_eq!(tcp_bind_recoveries_total(&status), 0);
+    assert_eq!(
+        tcp_bind_failures_total(&status),
+        MAX_ACTIVE_TRACKED_FAILURES as u64
+    );
+    let snapshot = status.snapshot();
+    assert!(!snapshot.overflowed);
+    assert_eq!(snapshot.active_failures, MAX_ACTIVE_TRACKED_FAILURES);
+    let prior_entry = snapshot
+        .failures
+        .iter()
+        .find(|entry| entry.port == prior[0])
+        .expect("prior history must keep ageing");
+    assert_eq!(prior_entry.observations, 3);
+    assert_eq!(prior_entry.first_observed_unix_ms, 1_000);
+
+    assert!(status.publish(1, prior.len(), 0, oversubscribed_failures(prior), 4_000,));
+    assert_eq!(
+        tcp_bind_recoveries_total(&status),
+        6,
+        "clearing the six lowest new keys recovers exactly those selected identities"
+    );
+    assert_eq!(
+        tcp_bind_failures_total(&status),
+        MAX_ACTIVE_TRACKED_FAILURES as u64
+    );
 }
 
 /// Brand-new identities compete for remaining slots in deterministic key order,
