@@ -5769,6 +5769,45 @@ where
         .map_err(|_| ())
 }
 
+/// Canonical, fixed terminal for an admitted request whose authorization
+/// lifetime elapsed BEFORE any response header was committed (issue #3815).
+///
+/// Every field is a compiled-in literal: no expiry value, claim, subject,
+/// certificate field, issuer, or provider error can reach the client. gRPC
+/// keeps its own semantics (`grpc-status: 16` UNAUTHENTICATED over an HTTP 200
+/// trailers-only response); everything else gets the plain redacted `401`.
+pub(crate) fn authorization_expired_plugin_result(
+    is_grpc: bool,
+    termination: crate::proxy::auth_lifetime::StreamAuthTermination,
+) -> PluginResult {
+    if is_grpc {
+        return PluginResult::Reject {
+            status_code: 200,
+            body: String::new(),
+            headers: HashMap::from([
+                ("content-type".to_string(), "application/grpc".to_string()),
+                (
+                    "grpc-status".to_string(),
+                    crate::proxy::auth_lifetime::AUTHORIZATION_EXPIRED_GRPC_STATUS_HEADER
+                        .to_string(),
+                ),
+                (
+                    "grpc-message".to_string(),
+                    termination.grpc_message().to_string(),
+                ),
+            ]),
+        };
+    }
+    PluginResult::Reject {
+        status_code: 401,
+        body: r#"{"error":"Unauthorized"}"#.to_string(),
+        headers: HashMap::from([(
+            "content-type".to_string(),
+            "application/json".to_string(),
+        )]),
+    }
+}
+
 pub(crate) fn grpc_deadline_exceeded_plugin_result() -> PluginResult {
     PluginResult::Reject {
         status_code: 200,

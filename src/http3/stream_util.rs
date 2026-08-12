@@ -132,6 +132,69 @@ where
     await_terminal_response_write_before_deadline(Some(grace_at), write).await
 }
 
+/// Outcome of one downstream HTTP/3 body write raced against the admitted
+/// stream's absolute authorization lifetime (issue #3815).
+///
+/// This is the single seam every H3 response writer uses, so the ~fifteen
+/// `send_data` / `send_trailers` / `finish` call sites across the native-H3
+/// and cross-protocol relays cannot drift apart in how they treat a write that
+/// parks past the credential's deadline.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum H3AuthorizedWrite {
+    /// The frame reached the QUIC send half.
+    Written,
+    /// The client's stream is gone; this is an ordinary disconnect.
+    ClientWriteFailed,
+    /// The absolute authorization bound elapsed while the write was parked in
+    /// flow control (or was already elapsed when the write was offered). The
+    /// fixed-cardinality termination counter has ALREADY been recorded here,
+    /// exactly once. The caller must drop any buffered tail, reset the send
+    /// half, latch the bounded class, and end its relay.
+    AuthorizationExpired(crate::proxy::auth_lifetime::StreamAuthTermination),
+}
+
+/// Race one potentially flow-control-blocked downstream H3 write against the
+/// admitted stream's absolute authorization deadline.
+///
+/// A client that stops reading holds every `send_data` / `finish` in QUIC flow
+/// control, so a relay loop never returns to its `select!` timer and the
+/// admitted stream — plus its upstream body, request/CB/LB guards, and
+/// buffered response state — survives the credential that authorized it. The
+/// deadline arm is biased for the same reason the RPC-deadline helper biases
+/// its own: once the authorization budget is spent, a simultaneously writable
+/// frame must not escape downstream.
+///
+/// The plan is **absolute**. It is anchored once at credential acceptance and
+/// passed down by value, so calling this per frame can neither refresh nor
+/// re-derive it, and an unauthenticated request (`None`) pays nothing at all —
+/// no timer is registered on that path.
+pub(crate) async fn await_authorized_response_write<F, T, E>(
+    plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+    family: crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
+    write: F,
+) -> H3AuthorizedWrite
+where
+    F: std::future::Future<Output = Result<T, E>>,
+{
+    let Some(plan) = plan else {
+        return match write.await {
+            Ok(_) => H3AuthorizedWrite::Written,
+            Err(_) => H3AuthorizedWrite::ClientWriteFailed,
+        };
+    };
+    match await_response_write_before_deadline(Some(plan.at), write).await {
+        Ok(_) => H3AuthorizedWrite::Written,
+        Err(H3ResponseWriteError::Write(_)) => H3AuthorizedWrite::ClientWriteFailed,
+        Err(H3ResponseWriteError::DeadlineExceeded) => {
+            // Sole recorder for the parked-write class. Every caller ends its
+            // relay on this outcome and the read-side `select!` arm ends it on
+            // the other, so at most one of the two records per stream.
+            crate::proxy::auth_lifetime::record_termination(plan.termination, family);
+            H3AuthorizedWrite::AuthorizationExpired(plan.termination)
+        }
+    }
+}
+
 /// Signal the peer that we are done with the receive side of the
 /// request stream. Without this call, dropping the `RequestStream`
 /// surfaces as `RESET_STREAM(0x0)` on the QUIC wire — QUIC has no

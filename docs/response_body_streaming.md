@@ -432,11 +432,13 @@ Deliberate scope notes:
   [Kernel TLS and the stream authorization deadline](frontend_tls.md#kernel-tls-and-the-stream-authorization-deadline).
 - **Plaintext TCP** stream sessions carry no gateway-verified credential from a
   built-in mechanism, so no deadline is derived for them.
-- An H3 request body that is **buffered before dispatch** is bounded by the
-  existing early-upload ceiling (`backend_read_timeout_ms` composed with the
-  client RPC deadline) and by the request-body size ceiling; the authorization
-  deadline governs the **streaming** upload bridge, which is the path that can
-  otherwise stay continuously active.
+- An H3 request body that is **buffered before dispatch** composes the
+  authorization deadline into the existing early-upload ceiling
+  (`backend_read_timeout_ms` and the optional client RPC deadline) through
+  `auth_lifetime::compose_absolute_bound`, so a continuously active trickle
+  upload cannot outlive the credential either. When the authorization bound is
+  the one that elapsed, the terminal is the fixed redacted `401` (gRPC keeps
+  `grpc-status: 16`) rather than the deadline contract.
 
 ### A downstream that stops reading
 
@@ -449,12 +451,33 @@ the one that elapsed — a client `grpc-timeout` is optional, so the client
 deadline alone would leave the common case unbounded. A stalled downstream
 receives no post-expiry bytes in any case, because it is not reading.
 
-The plain HTTP/3 response relays (`http3::server`'s native-H3 relay and the H3
-cross-protocol plain/inspected relays) have never bounded a parked downstream
-write — the pre-existing `backend_read_timeout_ms` and client-deadline bounds
-have the same property there — so a non-reading client can still hold those
-streams open past the deadline while receiving nothing. Extending the
-write-cancellation seam to those relays is tracked separately.
+**Every** H3 downstream write shares that seam, not only the gRPC ones. A single
+helper, `http3::stream_util::await_authorized_response_write`, races one
+`send_data` / `send_trailers` / `finish` against the admitted stream's absolute
+authorization plan and reports one of three outcomes (written, client write
+failed, authorization expired); it is the sole recorder of the
+fixed-cardinality counter for a parked write. It is used by:
+
+- `http3::server`'s inline native-H3 → native-H3 streaming relay, including the
+  plugin-inspected and SSE variants and the terminal
+  `finish_h3_response_with_backend_trailers`;
+- `http3::server::stream_h3_open_response_to_client` and
+  `proxy_to_backend_h3_streaming` (the refined native-H3 relays);
+- `http3::cross_protocol::stream_reqwest_response` and
+  `stream_inspected_reqwest_response` (the H3 → H1/H2 plain, inspected, and SSE
+  relays).
+
+The remaining writers reach the same plan through
+`auth_lifetime::compose_absolute_bound`, which folds the authorization deadline
+into whatever absolute bound the protocol already had: the native-H3 gRPC relay
+(`dispatch_grpc_native_h3`), the buffered native-H3 writer, and the
+cross-protocol plain bridge's header, buffered-body, and post-relay
+trailer/FIN writes. Attribution is uniform — when both bounds have elapsed the
+authorization one is reported, matching the biased `select!` ordering — and the
+terminal follows commitment state: a fixed redacted `401` (gRPC `grpc-status:
+16`) before response headers commit, a deterministic reset afterwards. A gateway
+policy expiry is health-neutral everywhere: it never moves the circuit breaker,
+passive health, or the H3 capability registry.
 
 ### Live acceptance coverage
 
@@ -463,10 +486,15 @@ end to end against a real QUIC listener with a real short-lived HS256 JWT: the
 native-H3 streaming response relay, the H3 streaming request-upload bridge
 (fixed `401` before commitment), native gRPC before and after response DATA
 (`grpc-status: 16` versus deterministic reset), gRPC-Web's bounded trailer
-frame, and the stalled-downstream regression above. Each case proves the stream
-is usable before the deadline, terminates inside a bounded grace despite
-continued backend activity, and increments the fixed-cardinality
-`credential_expired` counter for its protocol family exactly once.
+frame, and four non-reading / continuously-active regressions: a stalled gRPC
+downstream, a stalled **plain/SSE** native-H3 response, a stalled **plain/SSE**
+cross-protocol response (both with a 4 KiB per-stream receive window so the
+gateway's first `send_data` provably parks in flow control), and a
+continuously active request upload. Each case proves the stream is usable
+before the deadline, terminates inside a bounded grace despite continued
+backend activity or a client that never reads, and increments the
+fixed-cardinality `credential_expired` counter for its protocol family exactly
+once.
 
 ## Interaction with Retry Logic
 

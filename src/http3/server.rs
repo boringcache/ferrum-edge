@@ -545,6 +545,11 @@ enum H3TrailerFinishError {
     /// underlying error is intentionally dropped — call sites uniformly
     /// classify this side as `ClientDisconnect`.
     Client,
+    /// The admitted stream's absolute authorization lifetime elapsed while the
+    /// terminal trailers/FIN were parked in QUIC flow control (issue #3815).
+    /// The fixed-cardinality counter was already recorded by the shared write
+    /// seam; call sites reset the send half and latch the bounded class.
+    AuthorizationExpired(crate::proxy::auth_lifetime::StreamAuthTermination),
 }
 
 async fn finish_h3_response_with_backend_trailers<S>(
@@ -552,10 +557,34 @@ async fn finish_h3_response_with_backend_trailers<S>(
     recv_stream: &mut crate::http3::client::H3RequestStream,
     backend_read_timeout_ms: u64,
     trailer_policy: H3StreamingTrailerPolicy<'_>,
+    // Absolute authorization plan for this admitted stream, or `None` for an
+    // unauthenticated request. The trailer/FIN writes below are the LAST
+    // downstream writes of a streaming relay and are just as parkable as a DATA
+    // frame, so they race the same plan through the shared seam.
+    auth_deadline: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
 ) -> Result<(), H3TrailerFinishError>
 where
     S: SendStream<Bytes>,
 {
+    macro_rules! authorized_terminal_write {
+        ($write:expr) => {
+            match crate::http3::stream_util::await_authorized_response_write(
+                auth_deadline,
+                crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
+                $write,
+            )
+            .await
+            {
+                crate::http3::stream_util::H3AuthorizedWrite::Written => Ok(()),
+                crate::http3::stream_util::H3AuthorizedWrite::ClientWriteFailed => {
+                    Err(H3TrailerFinishError::Client)
+                }
+                crate::http3::stream_util::H3AuthorizedWrite::AuthorizationExpired(
+                    termination,
+                ) => Err(H3TrailerFinishError::AuthorizationExpired(termination)),
+            }
+        };
+    }
     // Bound the post-body trailer read by `backend_read_timeout_ms`. A backend
     // that completes the body but then stalls before sending the TRAILERS/FIN
     // frame would otherwise pin the H3 stream + request/admission guards
@@ -609,20 +638,11 @@ where
                 );
             }
             if !trailers.is_empty() {
-                h3_stream
-                    .send_trailers(trailers)
-                    .await
-                    .map_err(|_| H3TrailerFinishError::Client)?;
+                authorized_terminal_write!(h3_stream.send_trailers(trailers))?;
             }
-            h3_stream
-                .finish()
-                .await
-                .map_err(|_| H3TrailerFinishError::Client)
+            authorized_terminal_write!(h3_stream.finish())
         }
-        None => h3_stream
-            .finish()
-            .await
-            .map_err(|_| H3TrailerFinishError::Client),
+        None => authorized_terminal_write!(h3_stream.finish()),
     }
 }
 
@@ -2414,7 +2434,18 @@ async fn handle_h3_request(
         );
         let body_data = match collect_h3_request_body_with_deadline(
             drain_h3_request_body(&mut stream, max_body),
-            ctx.grpc_deadline_at(),
+            // Compose the admitted request's ABSOLUTE authorization bound
+            // (issue #3815) with the client's optional RPC deadline. A
+            // continuously active upload is otherwise bounded by neither
+            // that optional deadline nor the per-read operator timeout, so
+            // it could outlive the credential that admitted it.
+            crate::proxy::auth_lifetime::compose_absolute_bound(
+                ctx.grpc_deadline_at(),
+                crate::proxy::auth_lifetime::effective_request_auth_deadline(
+                    &ctx,
+                    state.env_config.authenticated_stream_max_lifetime_seconds,
+                ),
+            ),
             proxy.backend_read_timeout_ms,
         )
         .await
@@ -2440,6 +2471,15 @@ async fn handle_h3_request(
                 return Err(error.into());
             }
             Err(H3RequestBodyReadError::DeadlineExceeded) => {
+                // Attribute the composed bound: `Some` only when the AUTHORIZATION
+                // deadline is the one that elapsed. Recomputed from the same
+                // request-receipt anchor, so it cannot drift from the bound above.
+                let upload_authorization_expiry = crate::proxy::auth_lifetime::expired_authorization(
+                    crate::proxy::auth_lifetime::effective_request_auth_deadline(
+                        &ctx,
+                        state.env_config.authenticated_stream_max_lifetime_seconds,
+                    ),
+                );
                 finalize_h3_upload_deadline_rejection(
                     &mut stream,
                     &state,
@@ -2450,6 +2490,7 @@ async fn handle_h3_request(
                     start_time,
                     "grpc_deadline_upload_before_authenticate",
                     plugin_execution_ns,
+                    upload_authorization_expiry,
                 )
                 .await?;
                 return Ok(());
@@ -2601,7 +2642,18 @@ async fn handle_h3_request(
         if crate::proxy::early_upload_phase_needs_fresh_drain(&prebuffered_body_data) {
             let body_data = match collect_h3_request_body_with_deadline(
                 drain_h3_request_body(&mut stream, body_limit),
-                ctx.grpc_deadline_at(),
+                // Compose the admitted request's ABSOLUTE authorization bound
+                // (issue #3815) with the client's optional RPC deadline. A
+                // continuously active upload is otherwise bounded by neither
+                // that optional deadline nor the per-read operator timeout, so
+                // it could outlive the credential that admitted it.
+                crate::proxy::auth_lifetime::compose_absolute_bound(
+                    ctx.grpc_deadline_at(),
+                    crate::proxy::auth_lifetime::effective_request_auth_deadline(
+                        &ctx,
+                        state.env_config.authenticated_stream_max_lifetime_seconds,
+                    ),
+                ),
                 proxy.backend_read_timeout_ms,
             )
             .await
@@ -2627,6 +2679,15 @@ async fn handle_h3_request(
                     return Err(error.into());
                 }
                 Err(H3RequestBodyReadError::DeadlineExceeded) => {
+                    // Attribute the composed bound: `Some` only when the AUTHORIZATION
+                    // deadline is the one that elapsed. Recomputed from the same
+                    // request-receipt anchor, so it cannot drift from the bound above.
+                    let upload_authorization_expiry = crate::proxy::auth_lifetime::expired_authorization(
+                        crate::proxy::auth_lifetime::effective_request_auth_deadline(
+                            &ctx,
+                            state.env_config.authenticated_stream_max_lifetime_seconds,
+                        ),
+                    );
                     finalize_h3_upload_deadline_rejection(
                         &mut stream,
                         &state,
@@ -2637,6 +2698,7 @@ async fn handle_h3_request(
                         start_time,
                         "grpc_deadline_upload_before_authorize",
                         plugin_execution_ns,
+                        upload_authorization_expiry,
                     )
                     .await?;
                     return Ok(());
@@ -2865,7 +2927,18 @@ async fn handle_h3_request(
     {
         let body_data = match collect_h3_request_body_with_deadline(
             drain_h3_request_body(&mut stream, before_proxy_body_limit),
-            ctx.grpc_deadline_at(),
+            // Compose the admitted request's ABSOLUTE authorization bound
+            // (issue #3815) with the client's optional RPC deadline. A
+            // continuously active upload is otherwise bounded by neither
+            // that optional deadline nor the per-read operator timeout, so
+            // it could outlive the credential that admitted it.
+            crate::proxy::auth_lifetime::compose_absolute_bound(
+                ctx.grpc_deadline_at(),
+                crate::proxy::auth_lifetime::effective_request_auth_deadline(
+                    &ctx,
+                    state.env_config.authenticated_stream_max_lifetime_seconds,
+                ),
+            ),
             proxy.backend_read_timeout_ms,
         )
         .await
@@ -2891,6 +2964,15 @@ async fn handle_h3_request(
                 return Err(error.into());
             }
             Err(H3RequestBodyReadError::DeadlineExceeded) => {
+                // Attribute the composed bound: `Some` only when the AUTHORIZATION
+                // deadline is the one that elapsed. Recomputed from the same
+                // request-receipt anchor, so it cannot drift from the bound above.
+                let upload_authorization_expiry = crate::proxy::auth_lifetime::expired_authorization(
+                    crate::proxy::auth_lifetime::effective_request_auth_deadline(
+                        &ctx,
+                        state.env_config.authenticated_stream_max_lifetime_seconds,
+                    ),
+                );
                 finalize_h3_upload_deadline_rejection(
                     &mut stream,
                     &state,
@@ -2901,6 +2983,7 @@ async fn handle_h3_request(
                     start_time,
                     "grpc_deadline_upload_before_before_proxy",
                     plugin_execution_ns,
+                    upload_authorization_expiry,
                 )
                 .await?;
                 return Ok(());
@@ -3921,7 +4004,18 @@ async fn handle_h3_request(
         if !body_was_prebuffered {
             body_data = match collect_h3_request_body_with_deadline(
                 drain_h3_request_body(&mut stream, content_length_limit),
-                ctx.grpc_deadline_at(),
+                // Compose the admitted request's ABSOLUTE authorization bound
+                // (issue #3815) with the client's optional RPC deadline. A
+                // continuously active upload is otherwise bounded by neither
+                // that optional deadline nor the per-read operator timeout, so
+                // it could outlive the credential that admitted it.
+                crate::proxy::auth_lifetime::compose_absolute_bound(
+                    ctx.grpc_deadline_at(),
+                    crate::proxy::auth_lifetime::effective_request_auth_deadline(
+                        &ctx,
+                        state.env_config.authenticated_stream_max_lifetime_seconds,
+                    ),
+                ),
                 proxy.backend_read_timeout_ms,
             )
             .await
@@ -4005,6 +4099,15 @@ async fn handle_h3_request(
                         RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY.to_string(),
                         "true".to_string(),
                     );
+                    // Attribute the composed bound: `Some` only when the AUTHORIZATION
+                    // deadline is the one that elapsed. Recomputed from the same
+                    // request-receipt anchor, so it cannot drift from the bound above.
+                    let upload_authorization_expiry = crate::proxy::auth_lifetime::expired_authorization(
+                        crate::proxy::auth_lifetime::effective_request_auth_deadline(
+                            &ctx,
+                            state.env_config.authenticated_stream_max_lifetime_seconds,
+                        ),
+                    );
                     finalize_h3_upload_deadline_rejection(
                         &mut stream,
                         &state,
@@ -4015,6 +4118,7 @@ async fn handle_h3_request(
                         start_time,
                         "grpc_deadline_terminal_h3_upload",
                         plugin_execution_ns,
+                        upload_authorization_expiry,
                     )
                     .await?;
                     return Ok(());
@@ -4431,7 +4535,18 @@ async fn handle_h3_request(
         if !body_was_prebuffered {
             body_data = match collect_h3_request_body_with_deadline(
                 drain_h3_request_body(&mut stream, content_length_limit),
-                ctx.grpc_deadline_at(),
+                // Compose the admitted request's ABSOLUTE authorization bound
+                // (issue #3815) with the client's optional RPC deadline. A
+                // continuously active upload is otherwise bounded by neither
+                // that optional deadline nor the per-read operator timeout, so
+                // it could outlive the credential that admitted it.
+                crate::proxy::auth_lifetime::compose_absolute_bound(
+                    ctx.grpc_deadline_at(),
+                    crate::proxy::auth_lifetime::effective_request_auth_deadline(
+                        &ctx,
+                        state.env_config.authenticated_stream_max_lifetime_seconds,
+                    ),
+                ),
                 proxy.backend_read_timeout_ms,
             )
             .await
@@ -4484,6 +4599,15 @@ async fn handle_h3_request(
                         cb_is_half_open_probe,
                     );
                     drop(preacquired_backend_admission.take_if_acquired());
+                    // Attribute the composed bound: `Some` only when the AUTHORIZATION
+                    // deadline is the one that elapsed. Recomputed from the same
+                    // request-receipt anchor, so it cannot drift from the bound above.
+                    let upload_authorization_expiry = crate::proxy::auth_lifetime::expired_authorization(
+                        crate::proxy::auth_lifetime::effective_request_auth_deadline(
+                            &ctx,
+                            state.env_config.authenticated_stream_max_lifetime_seconds,
+                        ),
+                    );
                     finalize_h3_upload_deadline_rejection(
                         &mut stream,
                         &state,
@@ -4494,6 +4618,7 @@ async fn handle_h3_request(
                         start_time,
                         "grpc_deadline_upload_before_dispatch",
                         plugin_execution_ns,
+                        upload_authorization_expiry,
                     )
                     .await?;
                     return Ok(());
@@ -5105,7 +5230,18 @@ async fn handle_h3_request(
                 if !body_was_prebuffered {
                     body_data = match collect_h3_request_body_with_deadline(
                         drain_h3_request_body(&mut stream, content_length_limit),
-                        ctx.grpc_deadline_at(),
+                        // Compose the admitted request's ABSOLUTE authorization bound
+                        // (issue #3815) with the client's optional RPC deadline. A
+                        // continuously active upload is otherwise bounded by neither
+                        // that optional deadline nor the per-read operator timeout, so
+                        // it could outlive the credential that admitted it.
+                        crate::proxy::auth_lifetime::compose_absolute_bound(
+                            ctx.grpc_deadline_at(),
+                            crate::proxy::auth_lifetime::effective_request_auth_deadline(
+                                &ctx,
+                                state.env_config.authenticated_stream_max_lifetime_seconds,
+                            ),
+                        ),
                         proxy.backend_read_timeout_ms,
                     )
                     .await
@@ -5182,6 +5318,15 @@ async fn handle_h3_request(
                                 false,
                                 backend_start.elapsed(),
                             );
+                            // Attribute the composed bound: `Some` only when the AUTHORIZATION
+                            // deadline is the one that elapsed. Recomputed from the same
+                            // request-receipt anchor, so it cannot drift from the bound above.
+                            let upload_authorization_expiry = crate::proxy::auth_lifetime::expired_authorization(
+                                crate::proxy::auth_lifetime::effective_request_auth_deadline(
+                                    &ctx,
+                                    state.env_config.authenticated_stream_max_lifetime_seconds,
+                                ),
+                            );
                             finalize_h3_upload_deadline_rejection(
                                 &mut stream,
                                 &state,
@@ -5192,6 +5337,7 @@ async fn handle_h3_request(
                                 start_time,
                                 "grpc_deadline_upload_before_cross_protocol_dispatch",
                                 plugin_execution_ns,
+                                upload_authorization_expiry,
                             )
                             .await?;
                             return Ok(());
@@ -6055,6 +6201,48 @@ async fn handle_h3_request(
         // backpressure) to the backend. Mirrors `IdleReadTimeoutBody`'s
         // `waiting` flag on the H2 path.
         let mut just_received_backend_frame = false;
+        // The ONE downstream-write seam for this relay (issue #3815). The
+        // `auth_deadline_sleep` arm below only bounds an IDLE stream: a client
+        // that stops reading parks every `send_data`/`finish` in QUIC flow
+        // control, so the loop never returns to its timer at all. Every write
+        // therefore races the same absolute authorization plan. Response
+        // HEADERS are already committed, so the expired branch RESETS — never a
+        // fabricated clean finish — and the buffered coalesce tail is dropped
+        // because those bytes are no longer authorized.
+        macro_rules! authorized_send {
+            ($write:expr) => {
+                match crate::http3::stream_util::await_authorized_response_write(
+                    auth_deadline_plan,
+                    crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
+                    $write,
+                )
+                .await
+                {
+                    crate::http3::stream_util::H3AuthorizedWrite::Written => true,
+                    crate::http3::stream_util::H3AuthorizedWrite::ClientWriteFailed => {
+                        client_disconnected = true;
+                        body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                        false
+                    }
+                    crate::http3::stream_util::H3AuthorizedWrite::AuthorizationExpired(
+                        termination,
+                    ) => {
+                        warn!(
+                            "HTTP/3 streaming response reached its authorization lifetime \
+                             while the client was not consuming; resetting the stream"
+                        );
+                        coalesce_buf.clear();
+                        crate::http3::stream_util::abort_response_stream(&mut stream);
+                        // Health-neutral: a gateway policy expiry must not move
+                        // the circuit breaker, passive health, or the H3
+                        // capability registry.
+                        body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                        ctx.latch_authorization_termination(termination);
+                        false
+                    }
+                }
+            };
+        }
         // Skipped entirely when send_response already failed above — the
         // relay loop would only rediscover the dead stream on its first
         // send_data and there is no backend data worth pulling for it.
@@ -6109,10 +6297,7 @@ async fn handle_h3_request(
                                     ResponseStreamAction::Forward(out) => {
                                         if !out.is_empty() {
                                             let out_len = out.len() as u64;
-                                            if stream.send_data(out).await.is_err() {
-                                                client_disconnected = true;
-                                                body_error_class =
-                                                    Some(crate::retry::ErrorClass::ClientDisconnect);
+                                            if !authorized_send!(stream.send_data(out)) {
                                                 break 'outer;
                                             }
                                             bytes_streamed += out_len;
@@ -6132,16 +6317,16 @@ async fn handle_h3_request(
                                             && !fb.is_empty()
                                         {
                                             let fb_len = fb.len() as u64;
-                                            if stream.send_data(fb).await.is_ok() {
-                                                bytes_streamed += fb_len;
+                                            if !authorized_send!(stream.send_data(fb)) {
+                                                break 'outer;
                                             }
+                                            bytes_streamed += fb_len;
                                         }
-                                        if stream.finish().await.is_ok() {
+                                        // The terminal FIN races the same plan:
+                                        // a non-reading client would otherwise
+                                        // park it past the credential.
+                                        if authorized_send!(stream.finish()) {
                                             body_completed = true;
-                                        } else {
-                                            client_disconnected = true;
-                                            body_error_class =
-                                                Some(crate::retry::ErrorClass::ClientDisconnect);
                                         }
                                         break 'outer;
                                     }
@@ -6155,9 +6340,7 @@ async fn handle_h3_request(
                             ) {
                                 let data =
                                     crate::http3::config::copy_remaining_response_chunk(&mut chunk);
-                                if stream.send_data(data).await.is_err() {
-                                    client_disconnected = true;
-                                    body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                                if !authorized_send!(stream.send_data(data)) {
                                     break 'outer;
                                 }
                                 bytes_streamed += chunk_len as u64;
@@ -6171,9 +6354,7 @@ async fn handle_h3_request(
                             if coalesce_buf.len() >= coalesce_min_bytes {
                                 let data = coalesce_buf.split().freeze();
                                 let data_len = data.len() as u64;
-                                if stream.send_data(data).await.is_err() {
-                                    client_disconnected = true;
-                                    body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                                if !authorized_send!(stream.send_data(data)) {
                                     break 'outer;
                                 }
                                 bytes_streamed += data_len;
@@ -6224,9 +6405,7 @@ async fn handle_h3_request(
                 _ = &mut flush_timer, if !coalesce_buf.is_empty() && !stream_done => {
                     let data = coalesce_buf.split().freeze();
                     let data_len = data.len() as u64;
-                    if stream.send_data(data).await.is_err() {
-                        client_disconnected = true;
-                        body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                    if !authorized_send!(stream.send_data(data)) {
                         break 'outer;
                     }
                     bytes_streamed += data_len;
@@ -6283,9 +6462,10 @@ async fn handle_h3_request(
                         ResponseStreamAction::Forward(out) => {
                             if !out.is_empty() {
                                 let out_len = out.len() as u64;
-                                if stream.send_data(out).await.is_ok() {
-                                    bytes_streamed += out_len;
+                                if !authorized_send!(stream.send_data(out)) {
+                                    break 'outer;
                                 }
+                                bytes_streamed += out_len;
                             }
                         }
                         ResponseStreamAction::Terminate(final_bytes) => {
@@ -6293,27 +6473,29 @@ async fn handle_h3_request(
                                 && !fb.is_empty()
                             {
                                 let fb_len = fb.len() as u64;
-                                if stream.send_data(fb).await.is_ok() {
-                                    bytes_streamed += fb_len;
+                                if !authorized_send!(stream.send_data(fb)) {
+                                    break 'outer;
                                 }
+                                bytes_streamed += fb_len;
                             }
                         }
                     }
                 } else if !coalesce_buf.is_empty() {
                     let data = coalesce_buf.split().freeze();
                     let data_len = data.len() as u64;
-                    if stream.send_data(data).await.is_err() {
-                        client_disconnected = true;
-                        body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                    if !authorized_send!(stream.send_data(data)) {
                         break 'outer;
                     }
                     bytes_streamed += data_len;
                 }
                 let finish_result = if response_inspector.is_some() {
-                    stream
-                        .finish()
-                        .await
-                        .map_err(|_| H3TrailerFinishError::Client)
+                    if authorized_send!(stream.finish()) {
+                        Ok(())
+                    } else if ctx.authorization_termination().is_some() {
+                        break 'outer;
+                    } else {
+                        Err(H3TrailerFinishError::Client)
+                    }
                 } else {
                     finish_h3_response_with_backend_trailers(
                         &mut stream,
@@ -6327,11 +6509,21 @@ async fn handle_h3_request(
                             // `HttpFlavor::Plain`, so no field name is exempt here.
                             section: TrailerSectionKind::PlainResponse,
                         },
+                        auth_deadline_plan,
                     )
                     .await
                 };
                 match finish_result {
                     Ok(_) => body_completed = true,
+                    Err(H3TrailerFinishError::AuthorizationExpired(termination)) => {
+                        warn!(
+                            "HTTP/3 streaming response reached its authorization lifetime while \
+                             the client was not consuming the terminal trailers; resetting"
+                        );
+                        crate::http3::stream_util::abort_response_stream(&mut stream);
+                        body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                        ctx.latch_authorization_termination(termination);
+                    }
                     Err(H3TrailerFinishError::Backend(err)) => {
                         error!(
                             "Error reading backend h3 response trailers during streaming: {}",
@@ -6523,7 +6715,18 @@ async fn handle_h3_request(
     if !body_was_prebuffered {
         body_data = match collect_h3_request_body_with_deadline(
             drain_h3_request_body(&mut stream, effective_max_request_body_size_bytes),
-            ctx.grpc_deadline_at(),
+            // Compose the admitted request's ABSOLUTE authorization bound
+            // (issue #3815) with the client's optional RPC deadline. A
+            // continuously active upload is otherwise bounded by neither
+            // that optional deadline nor the per-read operator timeout, so
+            // it could outlive the credential that admitted it.
+            crate::proxy::auth_lifetime::compose_absolute_bound(
+                ctx.grpc_deadline_at(),
+                crate::proxy::auth_lifetime::effective_request_auth_deadline(
+                    &ctx,
+                    state.env_config.authenticated_stream_max_lifetime_seconds,
+                ),
+            ),
             proxy.backend_read_timeout_ms,
         )
         .await
@@ -6574,6 +6777,15 @@ async fn handle_h3_request(
                     cb_target_key.as_deref(),
                     cb_is_half_open_probe,
                 );
+                // Attribute the composed bound: `Some` only when the AUTHORIZATION
+                // deadline is the one that elapsed. Recomputed from the same
+                // request-receipt anchor, so it cannot drift from the bound above.
+                let upload_authorization_expiry = crate::proxy::auth_lifetime::expired_authorization(
+                    crate::proxy::auth_lifetime::effective_request_auth_deadline(
+                        &ctx,
+                        state.env_config.authenticated_stream_max_lifetime_seconds,
+                    ),
+                );
                 finalize_h3_upload_deadline_rejection(
                     &mut stream,
                     &state,
@@ -6584,6 +6796,7 @@ async fn handle_h3_request(
                     start_time,
                     "grpc_deadline_buffered_h3_upload",
                     plugin_execution_ns,
+                    upload_authorization_expiry,
                 )
                 .await?;
                 return Ok(());
@@ -7996,17 +8209,31 @@ async fn handle_h3_request(
         let mut client_disconnected = false;
         let mut body_error_class = None;
         let mut downstream_write_error: Option<anyhow::Error> = None;
+        // A buffered response is bounded in SIZE but not in TIME: a client that
+        // stops reading parks `send_response`/`send_data`/`send_trailers`/
+        // `finish` in QUIC flow control just as it parks a streaming frame, and
+        // the client `grpc-timeout` that used to bound them alone is OPTIONAL.
+        // Race the earliest of the two absolute plans (issue #3815).
+        let buffered_auth_deadline_plan =
+            crate::proxy::auth_lifetime::effective_request_auth_deadline(
+                &ctx,
+                state.env_config.authenticated_stream_max_lifetime_seconds,
+            );
+        let buffered_write_deadline_at = crate::proxy::auth_lifetime::compose_absolute_bound(
+            grpc_deadline_at,
+            buffered_auth_deadline_plan,
+        );
         macro_rules! await_buffered_h3_write {
             ($write:expr) => {{
                 match if terminal_gateway_deadline {
                     crate::http3::stream_util::await_terminal_response_write_before_deadline(
-                        grpc_deadline_at,
+                        buffered_write_deadline_at,
                         $write,
                     )
                     .await
                 } else {
                     crate::http3::stream_util::await_response_write_before_deadline(
-                        grpc_deadline_at,
+                        buffered_write_deadline_at,
                         $write,
                     )
                     .await
@@ -8020,11 +8247,35 @@ async fn handle_h3_request(
                         false
                     }
                     Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
-                        crate::proxy::insert_grpc_error_metadata(
-                            &mut ctx.metadata,
-                            crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
-                            GATEWAY_DEADLINE_EXCEEDED_MESSAGE,
-                        );
+                        // Attribute the composed bound. Authorization wins a tie,
+                        // matching every relay's biased select ordering, and the
+                        // fixed-cardinality counter is recorded only for the
+                        // first expiry on this stream.
+                        match crate::proxy::auth_lifetime::expired_authorization(
+                            buffered_auth_deadline_plan,
+                        ) {
+                            Some(termination) => {
+                                crate::proxy::insert_grpc_error_metadata(
+                                    &mut ctx.metadata,
+                                    crate::proxy::grpc_proxy::grpc_status::UNAUTHENTICATED,
+                                    termination.grpc_message(),
+                                );
+                                if ctx.authorization_termination().is_none() {
+                                    crate::proxy::auth_lifetime::record_termination(
+                                        termination,
+                                        crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
+                                    );
+                                }
+                                ctx.latch_authorization_termination(termination);
+                            }
+                            None => {
+                                crate::proxy::insert_grpc_error_metadata(
+                                    &mut ctx.metadata,
+                                    crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+                                    GATEWAY_DEADLINE_EXCEEDED_MESSAGE,
+                                );
+                            }
+                        }
                         crate::http3::stream_util::abort_response_stream(&mut stream);
                         crate::http3::stream_util::halt_request_body(&mut stream);
                         body_completed = false;
@@ -9622,6 +9873,47 @@ async fn stream_h3_open_response_to_client(
     // send, so slow-client backpressure is never charged to the backend.
     let mut just_received_backend_frame = false;
 
+    // The ONE downstream-write seam for this relay (issue #3815) — see the
+    // native H3 streaming loop for the full rationale: the `select!` arm bounds
+    // only an IDLE stream, while a non-reading client parks every
+    // `send_data`/`finish` in QUIC flow control and the loop never returns to
+    // its timer. Response HEADERS are committed, so the expired branch RESETS
+    // and drops the unauthorized coalesce tail rather than fabricating a clean
+    // finish. Health-neutral: a gateway policy expiry must not move the circuit
+    // breaker, passive health, or the H3 capability registry.
+    macro_rules! authorized_send {
+        ($write:expr) => {
+            match crate::http3::stream_util::await_authorized_response_write(
+                auth_deadline_plan,
+                crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
+                $write,
+            )
+            .await
+            {
+                crate::http3::stream_util::H3AuthorizedWrite::Written => true,
+                crate::http3::stream_util::H3AuthorizedWrite::ClientWriteFailed => {
+                    client_disconnected = true;
+                    body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                    false
+                }
+                crate::http3::stream_util::H3AuthorizedWrite::AuthorizationExpired(
+                    termination,
+                ) => {
+                    warn!(
+                        "HTTP/3 streaming response reached its authorization lifetime while the \
+                         client was not consuming; resetting the stream"
+                    );
+                    coalesce_buf.clear();
+                    crate::http3::stream_util::abort_response_stream(h3_stream);
+                    terminal_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                    body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                    ctx.latch_authorization_termination(termination);
+                    false
+                }
+            }
+        };
+    }
+
     'outer: loop {
         if read_timeout_active && just_received_backend_frame && coalesce_buf.is_empty() {
             read_deadline.as_mut().reset(
@@ -9653,9 +9945,7 @@ async fn stream_h3_open_response_to_client(
                         ) {
                             let data =
                                 crate::http3::config::copy_remaining_response_chunk(&mut chunk);
-                            if h3_stream.send_data(data).await.is_err() {
-                                client_disconnected = true;
-                                body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                            if !authorized_send!(h3_stream.send_data(data)) {
                                 break 'outer;
                             }
                             bytes_streamed += chunk_len as u64;
@@ -9669,9 +9959,7 @@ async fn stream_h3_open_response_to_client(
                         if coalesce_buf.len() >= coalesce_min_bytes {
                             let data = coalesce_buf.split().freeze();
                             let data_len = data.len() as u64;
-                            if h3_stream.send_data(data).await.is_err() {
-                                client_disconnected = true;
-                                body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                            if !authorized_send!(h3_stream.send_data(data)) {
                                 break 'outer;
                             }
                             bytes_streamed += data_len;
@@ -9717,9 +10005,7 @@ async fn stream_h3_open_response_to_client(
             _ = &mut flush_timer, if !coalesce_buf.is_empty() && !stream_done => {
                 let data = coalesce_buf.split().freeze();
                 let data_len = data.len() as u64;
-                if h3_stream.send_data(data).await.is_err() {
-                    client_disconnected = true;
-                    body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                if !authorized_send!(h3_stream.send_data(data)) {
                     break 'outer;
                 }
                 bytes_streamed += data_len;
@@ -9775,9 +10061,7 @@ async fn stream_h3_open_response_to_client(
             if !coalesce_buf.is_empty() {
                 let data = coalesce_buf.split().freeze();
                 let data_len = data.len() as u64;
-                if h3_stream.send_data(data).await.is_err() {
-                    client_disconnected = true;
-                    body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                if !authorized_send!(h3_stream.send_data(data)) {
                     break 'outer;
                 }
                 bytes_streamed += data_len;
@@ -9793,10 +10077,21 @@ async fn stream_h3_open_response_to_client(
                     // Plain-flavor relay: no field name is exempt here.
                     section: TrailerSectionKind::PlainResponse,
                 },
+                auth_deadline_plan,
             )
             .await
             {
                 Ok(_) => body_completed = true,
+                Err(H3TrailerFinishError::AuthorizationExpired(termination)) => {
+                    warn!(
+                        "HTTP/3 streaming response reached its authorization lifetime while the \
+                         client was not consuming the terminal trailers; resetting"
+                    );
+                    crate::http3::stream_util::abort_response_stream(h3_stream);
+                    terminal_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                    body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                    ctx.latch_authorization_termination(termination);
+                }
                 Err(H3TrailerFinishError::Backend(err)) => {
                     error!(
                         "Error reading backend h3 response trailers during refined streaming: {}",
@@ -11550,15 +11845,59 @@ async fn dispatch_grpc_native_h3(
     let upload_fault_wait = h3_grpc_terminating_upload_fault(&upload);
     tokio::pin!(upload_fault_wait);
 
+    // Every downstream write races the EARLIEST of the two absolute bounds
+    // (issue #3815). The `auth_deadline_sleep` select arm below only bounds an
+    // IDLE relay: a client that stops reading parks every `send_data` in QUIC
+    // flow control, so the loop never returns to its timer — and the client's
+    // own `grpc-timeout` is optional, which leaves the common case completely
+    // unbounded. When both have elapsed, the authorization bound is the one
+    // attributed, matching the select-arm ordering.
+    let downstream_write_deadline_at =
+        crate::proxy::auth_lifetime::compose_absolute_bound(grpc_deadline_at, auth_deadline_plan);
     macro_rules! await_downstream_grpc_write {
         ($write:expr) => {{
             match crate::http3::stream_util::await_response_write_before_deadline(
-                grpc_deadline_at,
+                downstream_write_deadline_at,
                 $write,
             )
             .await
             {
                 Ok(()) => true,
+                Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded)
+                    if crate::proxy::auth_lifetime::expired_authorization(auth_deadline_plan)
+                        .is_some() =>
+                {
+                    // `is_some()` above proves the unwrap-free read below.
+                    let termination = crate::proxy::auth_lifetime::expired_authorization(
+                        auth_deadline_plan,
+                    )
+                    .unwrap_or(crate::proxy::auth_lifetime::StreamAuthTermination::CredentialExpired);
+                    warn!(
+                        "native H3 gRPC stream reached its authorization lifetime while the \
+                         client was not consuming; resetting the stream"
+                    );
+                    // The downstream demonstrably cannot accept bytes, so a
+                    // clean terminal status cannot be written either — reset
+                    // rather than park again on a trailer write.
+                    coalesce_buf.clear();
+                    crate::http3::stream_util::abort_response_stream(&mut send_half);
+                    crate::proxy::insert_grpc_error_metadata(
+                        &mut ctx.metadata,
+                        crate::proxy::grpc_proxy::grpc_status::UNAUTHENTICATED,
+                        termination.grpc_message(),
+                    );
+                    // Every call site ends the relay on `false`, and the select
+                    // arm below also ends it, so exactly one of the two records
+                    // per terminated stream.
+                    crate::proxy::auth_lifetime::record_termination(
+                        termination,
+                        crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Grpc,
+                    );
+                    ctx.latch_authorization_termination(termination);
+                    // Health-neutral: a gateway policy expiry, not a backend fault.
+                    body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                    false
+                }
                 Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
                     client_deadline_expired = true;
                     coalesce_buf.clear();
@@ -11663,7 +12002,12 @@ async fn dispatch_grpc_native_h3(
                         &mut send_half,
                         crate::proxy::grpc_proxy::grpc_status::UNAUTHENTICATED,
                         termination.grpc_message(),
-                        grpc_deadline_at,
+                        // The already-expired composed bound, NOT the optional
+                        // client deadline: the terminal writer is write-biased,
+                        // so a ready client still receives the clean status
+                        // while a flow-control-blocked one cannot park the
+                        // terminal write past the credential.
+                        downstream_write_deadline_at,
                     )
                     .await
                     {
@@ -12776,6 +13120,47 @@ async fn proxy_to_backend_h3_streaming(
     // send, so slow-client backpressure is never charged to the backend.
     let mut just_received_backend_frame = false;
 
+    // The ONE downstream-write seam for this relay (issue #3815) — see the
+    // native H3 streaming loop for the full rationale: the `select!` arm bounds
+    // only an IDLE stream, while a non-reading client parks every
+    // `send_data`/`finish` in QUIC flow control and the loop never returns to
+    // its timer. Response HEADERS are committed, so the expired branch RESETS
+    // and drops the unauthorized coalesce tail rather than fabricating a clean
+    // finish. Health-neutral: a gateway policy expiry must not move the circuit
+    // breaker, passive health, or the H3 capability registry.
+    macro_rules! authorized_send {
+        ($write:expr) => {
+            match crate::http3::stream_util::await_authorized_response_write(
+                auth_deadline_plan,
+                crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
+                $write,
+            )
+            .await
+            {
+                crate::http3::stream_util::H3AuthorizedWrite::Written => true,
+                crate::http3::stream_util::H3AuthorizedWrite::ClientWriteFailed => {
+                    client_disconnected = true;
+                    body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                    false
+                }
+                crate::http3::stream_util::H3AuthorizedWrite::AuthorizationExpired(
+                    termination,
+                ) => {
+                    warn!(
+                        "HTTP/3 streaming response reached its authorization lifetime while the \
+                         client was not consuming; resetting the stream"
+                    );
+                    coalesce_buf.clear();
+                    crate::http3::stream_util::abort_response_stream(h3_stream);
+                    terminal_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                    body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                    ctx.latch_authorization_termination(termination);
+                    false
+                }
+            }
+        };
+    }
+
     'outer: loop {
         if read_timeout_active && just_received_backend_frame && coalesce_buf.is_empty() {
             read_deadline.as_mut().reset(
@@ -12816,9 +13201,7 @@ async fn proxy_to_backend_h3_streaming(
                         ) {
                             let data =
                                 crate::http3::config::copy_remaining_response_chunk(&mut chunk);
-                            if h3_stream.send_data(data).await.is_err() {
-                                client_disconnected = true;
-                                body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                            if !authorized_send!(h3_stream.send_data(data)) {
                                 break 'outer;
                             }
                             bytes_streamed += chunk_len as u64;
@@ -12833,9 +13216,7 @@ async fn proxy_to_backend_h3_streaming(
                         if coalesce_buf.len() >= coalesce_min_bytes {
                             let data = coalesce_buf.split().freeze();
                             let data_len = data.len() as u64;
-                            if h3_stream.send_data(data).await.is_err() {
-                                client_disconnected = true;
-                                body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                            if !authorized_send!(h3_stream.send_data(data)) {
                                 break 'outer;
                             }
                             bytes_streamed += data_len;
@@ -12885,9 +13266,7 @@ async fn proxy_to_backend_h3_streaming(
             _ = &mut flush_timer, if !coalesce_buf.is_empty() && !stream_done => {
                 let data = coalesce_buf.split().freeze();
                 let data_len = data.len() as u64;
-                if h3_stream.send_data(data).await.is_err() {
-                    client_disconnected = true;
-                    body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                if !authorized_send!(h3_stream.send_data(data)) {
                     break 'outer;
                 }
                 bytes_streamed += data_len;
@@ -12944,9 +13323,7 @@ async fn proxy_to_backend_h3_streaming(
             if !coalesce_buf.is_empty() {
                 let data = coalesce_buf.split().freeze();
                 let data_len = data.len() as u64;
-                if h3_stream.send_data(data).await.is_err() {
-                    client_disconnected = true;
-                    body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                if !authorized_send!(h3_stream.send_data(data)) {
                     break 'outer;
                 }
                 bytes_streamed += data_len;
@@ -12962,10 +13339,21 @@ async fn proxy_to_backend_h3_streaming(
                     // Plain-flavor relay: no field name is exempt here.
                     section: TrailerSectionKind::PlainResponse,
                 },
+                auth_deadline_plan,
             )
             .await
             {
                 Ok(_) => body_completed = true,
+                Err(H3TrailerFinishError::AuthorizationExpired(termination)) => {
+                    warn!(
+                        "HTTP/3 streaming response reached its authorization lifetime while the \
+                         client was not consuming the terminal trailers; resetting"
+                    );
+                    crate::http3::stream_util::abort_response_stream(h3_stream);
+                    terminal_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                    body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                    ctx.latch_authorization_termination(termination);
+                }
                 Err(H3TrailerFinishError::Backend(err)) => {
                     error!(
                         "Error reading backend h3 response trailers during streaming: {}",
@@ -13706,13 +14094,51 @@ async fn finalize_h3_upload_deadline_rejection(
     start_time: std::time::Instant,
     rejection_phase: &str,
     plugin_execution_ns: u64,
+    // `Some` when the composed upload bound fired because the admitted
+    // credential's AUTHORIZATION lifetime elapsed rather than the client's RPC
+    // deadline (issue #3815). Response headers have not been committed at this
+    // point, so the terminal is the fixed redacted `401` / gRPC `UNAUTHENTICATED`
+    // contract instead of the deadline one.
+    authorization_termination: Option<crate::proxy::auth_lifetime::StreamAuthTermination>,
 ) -> Result<(), anyhow::Error> {
-    ctx.mark_gateway_deadline_response_selected();
-    let Some(mut reject) =
-        plugin_result_into_reject_parts(crate::plugins::grpc_deadline_exceeded_plugin_result())
-    else {
+    let (rejection_phase, canonical_result) = match authorization_termination {
+        Some(termination) => {
+            // Deliberately NOT `mark_gateway_deadline_response_selected()`: that
+            // marker makes the shared writer replace the selected representation
+            // with the gRPC deadline one, which would overwrite this terminal.
+            //
+            // Exactly once per stream: this is a pre-dispatch terminal that
+            // returns immediately, so no relay can also record for it.
+            crate::proxy::auth_lifetime::record_termination(
+                termination,
+                match flavor {
+                    HttpFlavor::Grpc => crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Grpc,
+                    _ if grpc_web_response_content_type.is_some() => {
+                        crate::proxy::auth_lifetime::StreamAuthProtocolFamily::GrpcWeb
+                    }
+                    _ => crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
+                },
+            );
+            ctx.latch_authorization_termination(termination);
+            (
+                "authorization_lifetime_h3_upload",
+                crate::plugins::authorization_expired_plugin_result(
+                    matches!(flavor, HttpFlavor::Grpc),
+                    termination,
+                ),
+            )
+        }
+        None => {
+            ctx.mark_gateway_deadline_response_selected();
+            (
+                rejection_phase,
+                crate::plugins::grpc_deadline_exceeded_plugin_result(),
+            )
+        }
+    };
+    let Some(mut reject) = plugin_result_into_reject_parts(canonical_result) else {
         return Err(anyhow::anyhow!(
-            "canonical gRPC deadline rejection could not be normalized"
+            "canonical gateway upload rejection could not be normalized"
         ));
     };
     apply_reject_after_proxy_and_synthetic_body_hooks(

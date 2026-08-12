@@ -18,6 +18,16 @@
 //! * `http3::cross_protocol::stream_hyper_incoming` — native gRPC (clean
 //!   `grpc-status: 16` before DATA, deterministic reset after DATA) and the
 //!   gRPC-Web translation of the same terminal into a bounded trailer frame.
+//! * The shared downstream-write seam
+//!   (`http3::stream_util::await_authorized_response_write`) on a client that
+//!   stops reading: `send_data`/`finish` park in QUIC flow control, so the
+//!   relay never returns to its own `select!` and only a deadline raced around
+//!   the WRITE can end the stream. Covered for native gRPC, for the plain/SSE
+//!   native-H3 relay, and for the plain/SSE cross-protocol relay, each with a
+//!   4 KiB per-stream receive window so the very first downstream write
+//!   provably parks.
+//! * The request direction under CONTINUOUS activity as well as under a stall,
+//!   proving relayed request DATA cannot buy extra authorized lifetime.
 //!
 //! Every test asserts the stream is *usable before* the deadline, terminates
 //! within a bounded grace *at* the deadline despite continued backend activity,
@@ -816,4 +826,293 @@ async fn h3_auth_lifetime_stalled_downstream_cannot_outlive_the_credential() {
             harness.captured_combined().unwrap_or_default()
         ),
     }
+}
+
+/// A backend script that keeps producing LARGE response DATA frames.
+///
+/// Each chunk is far bigger than the stalled client's per-stream receive window
+/// below, so the gateway's very first downstream `send_data` parks in QUIC flow
+/// control and the relay never returns to its own `select!` timer. That is
+/// exactly the shape the write seam has to bound.
+fn h3_bulk_sse_stream(count: usize, chunk_len: usize) -> Vec<H3Step> {
+    let chunk = Bytes::from(vec![b'x'; chunk_len]);
+    let mut steps = vec![
+        H3Step::AcceptStream,
+        H3Step::RespondHeaders(vec![
+            (":status", "200".to_string()),
+            ("content-type", "text/event-stream".to_string()),
+            ("cache-control", "no-cache".to_string()),
+        ]),
+    ];
+    for _ in 0..count {
+        steps.push(H3Step::RespondData(chunk.clone()));
+    }
+    // Keep the connection alive far past the credential lifetime so only the
+    // authorization bound can end the exchange.
+    steps.push(H3Step::StallFor(Duration::from_secs(45)));
+    steps
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// 7. Regression: a NON-READING client on a PLAIN HTTP/SSE response must not be
+//    able to hold an admitted native-H3 stream past the credential deadline.
+//
+//    This is the plain-relay counterpart of test 6. `select!` alone does not
+//    cover it: a client that stops reading parks the relay inside
+//    `RequestStream::send_data`, so the authorization arm is never polled and
+//    only a deadline raced around the WRITE itself can terminate the stream.
+//    Unlike gRPC there is no `grpc-timeout` at all on this path, so the
+//    authorization bound is the only bound in existence.
+//
+//    Production path: `http3::server`'s inline native-H3 streaming relay
+//    (`stream.send_data` / `finish` through
+//    `stream_util::await_authorized_response_write`).
+// ────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn h3_auth_lifetime_stalled_plain_sse_response_cannot_outlive_the_credential() {
+    let ca = TestCa::new("h3-auth-lifetime-stalled-plain").expect("ca");
+    let (cert, key) = ca.valid().expect("leaf");
+    let (tcp_res, udp_res) = reserve_colocated_tcp_udp()
+        .await
+        .expect("colocated tcp/udp");
+    let backend_port = tcp_res.port;
+
+    // Colocated TCP+TLS side answers the capability probe; the SSE request
+    // itself must land on the native-H3 relay once h3=supported.
+    let _tcp_backend = ScriptedTlsBackend::builder(
+        tcp_res.into_listener(),
+        TlsConfig::new(cert.clone(), key.clone())
+            .with_alpn(vec![b"h2".to_vec(), b"http/1.1".to_vec()]),
+    )
+    .step(TcpStep::ReadUntil(b"\r\n\r\n".to_vec()))
+    .step(TcpStep::Write(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec(),
+    ))
+    .step(TcpStep::Drop)
+    .spawn()
+    .expect("spawn tls probe backend");
+
+    let backend_tls = H3TlsConfig::new(cert.clone(), key.clone());
+    let _h3_backend = ScriptedH3Backend::builder(udp_res.into_socket(), backend_tls)
+        .steps(h3_bulk_sse_stream(40, 64 * 1024))
+        .spawn()
+        .expect("spawn bulk h3 backend");
+
+    let (harness, https_port) = spawn_h3_gateway(protected_proxy_yaml(backend_port), false).await;
+    let entry = wait_for_h3_supported(&harness, Duration::from_secs(20)).await;
+    assert!(
+        entry.is_some(),
+        "capability registry must classify the backend h3=supported so the request takes the \
+         native-H3 relay; logs:\n{}",
+        harness.captured_combined().unwrap_or_default()
+    );
+
+    // A deliberately tiny per-stream receive window makes the backpressure
+    // deterministic instead of depending on Quinn's default.
+    let client = Http3Client::insecure_with_stream_receive_window(4 * 1024).expect("H3 client");
+    let token = mint_short_lived_token();
+    let mut stream = client
+        .open_response_stream(
+            &proxy_url(https_port, "/api/events"),
+            GetOptions::default().header("authorization", format!("Bearer {token}")),
+        )
+        .await
+        .expect("open native-H3 streaming response");
+
+    // Usable BEFORE the deadline: the response is committed.
+    let (status, headers) = stream.recv_response().await.expect("response headers");
+    assert_eq!(status.as_u16(), 200);
+    assert_eq!(
+        headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream"),
+        "the relay under test must be the streaming SSE one"
+    );
+
+    // From here the client NEVER reads a DATA frame. The gateway's downstream
+    // write parks in flow control, and only the authorization bound can end it.
+    assert_credential_expired_exactly(&harness, "http", 1).await;
+
+    // The stream must be terminated on the wire too, not merely counted, and a
+    // post-commitment expiry must RESET rather than fabricate a clean EOF.
+    let started = std::time::Instant::now();
+    loop {
+        match tokio::time::timeout(TERMINATION_GRACE, stream.recv_data()).await {
+            Ok(Err(_)) => break,
+            Ok(Ok(Some(_))) => assert!(
+                started.elapsed() < TERMINATION_GRACE,
+                "a stalled downstream kept receiving past the credential deadline"
+            ),
+            Ok(Ok(None)) => panic!(
+                "a stalled-downstream expiry must reset the stream, never close it cleanly; \
+                 logs:\n{}",
+                harness.captured_combined().unwrap_or_default()
+            ),
+            Err(_) => panic!(
+                "the stalled plain/SSE downstream was not terminated within the bounded grace; \
+                 logs:\n{}",
+                harness.captured_combined().unwrap_or_default()
+            ),
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// 8. The same non-reading-client regression on the CROSS-PROTOCOL plain bridge
+//    (H3 frontend → HTTP/2 backend), which is a different relay with its own
+//    coalescer and its own writes (`cross_protocol::stream_reqwest_response`).
+//    No `grpc-timeout` exists here either, so the authorization deadline is
+//    again the only bound.
+// ────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn h3_auth_lifetime_stalled_cross_protocol_plain_response_cannot_outlive_the_credential() {
+    let ca = TestCa::new("h3-auth-lifetime-stalled-xproto").expect("ca");
+    let (cert, key) = ca.valid().expect("leaf");
+    let reservation = reserve_port().await.expect("backend port");
+    let backend_port = reservation.port;
+
+    let big = Bytes::from(vec![b'x'; 64 * 1024]);
+    let mut steps = vec![
+        H2Step::ExpectHeaders(MatchHeaders::any()),
+        H2Step::RespondHeaders(vec![
+            (":status", "200".to_string()),
+            ("content-type", "text/event-stream".to_string()),
+            ("cache-control", "no-cache".to_string()),
+        ]),
+    ];
+    for _ in 0..40 {
+        steps.push(H2Step::RespondData {
+            data: big.clone(),
+            end_stream: false,
+        });
+    }
+    steps.push(H2Step::Sleep(Duration::from_secs(45)));
+    let _backend = ScriptedH2Backend::builder_tls(reservation.into_listener(), &cert, &key)
+        .expect("h2 tls builder")
+        .steps(steps)
+        .spawn()
+        .expect("spawn bulk h2 backend");
+
+    let (harness, https_port) = spawn_h3_gateway(protected_proxy_yaml(backend_port), false).await;
+
+    let client = Http3Client::insecure_with_stream_receive_window(4 * 1024).expect("H3 client");
+    let token = mint_short_lived_token();
+    let mut stream = client
+        .open_response_stream(
+            &proxy_url(https_port, "/api/events"),
+            GetOptions::default().header("authorization", format!("Bearer {token}")),
+        )
+        .await
+        .expect("open cross-protocol streaming response");
+
+    let (status, headers) = stream.recv_response().await.expect("response headers");
+    assert_eq!(status.as_u16(), 200);
+    assert_eq!(
+        headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream"),
+        "the relay under test must be the streaming SSE one"
+    );
+
+    // Stop reading. Only the authorization bound can end this exchange.
+    assert_credential_expired_exactly(&harness, "http", 1).await;
+
+    let started = std::time::Instant::now();
+    loop {
+        match tokio::time::timeout(TERMINATION_GRACE, stream.recv_data()).await {
+            Ok(Err(_)) => break,
+            Ok(Ok(Some(_))) => assert!(
+                started.elapsed() < TERMINATION_GRACE,
+                "a stalled downstream kept receiving past the credential deadline"
+            ),
+            Ok(Ok(None)) => panic!(
+                "a stalled-downstream expiry must reset the stream, never close it cleanly; \
+                 logs:\n{}",
+                harness.captured_combined().unwrap_or_default()
+            ),
+            Err(_) => panic!(
+                "the stalled cross-protocol downstream was not terminated within the bounded \
+                 grace; logs:\n{}",
+                harness.captured_combined().unwrap_or_default()
+            ),
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// 9. Request direction under CONTINUOUS ACTIVITY. Test 2 proves a STALLED
+//    upload is bounded; this one proves relayed request DATA cannot buy extra
+//    authorized lifetime either. A per-read operator timeout never fires for a
+//    client that trickles a frame before every deadline, and a plain HTTP
+//    upload has no `grpc-timeout` at all, so the absolute authorization bound
+//    is the only bound in existence. Response headers are not committed at this
+//    point, so the terminal is the fixed redacted `401`.
+//
+//    Production path: `http3::cross_protocol::dispatch_plain`'s upload bridge,
+//    whose absolute plan is anchored once at credential acceptance and is never
+//    refreshed by a relayed DATA frame.
+// ────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn h3_auth_lifetime_continuously_active_upload_is_a_fixed_401() {
+    let ca = TestCa::new("h3-auth-lifetime-active-upload").expect("ca");
+    let (cert, key) = ca.valid().expect("leaf");
+    let reservation = reserve_port().await.expect("backend port");
+    let backend_port = reservation.port;
+
+    // Accept and never answer: only the authorization deadline can end this
+    // exchange (`backend_read_timeout_ms` is 60s and is refreshed per read).
+    let _backend = ScriptedH2Backend::builder_tls(reservation.into_listener(), &cert, &key)
+        .expect("h2 tls builder")
+        .repeat_script(true)
+        .step(H2Step::ExpectHeaders(MatchHeaders::any()))
+        .step(H2Step::Sleep(Duration::from_secs(45)))
+        .spawn()
+        .expect("spawn silent h2 backend");
+
+    let (harness, https_port) = spawn_h3_gateway(protected_proxy_yaml(backend_port), false).await;
+
+    let client = Http3Client::insecure().expect("H3 client");
+    let token = mint_short_lived_token();
+    let mut stream = client
+        .open_request_stream_with_content_type(
+            &proxy_url(https_port, "/api/upload"),
+            "application/octet-stream",
+            &[("authorization", &format!("Bearer {token}"))],
+        )
+        .await
+        .expect("open H3 request-upload stream");
+
+    // Keep the upload CONTINUOUSLY active. Every frame is well inside the
+    // per-read operator timeout, so nothing but the absolute authorization
+    // bound can stop it. The write loop ends as soon as the gateway resets or
+    // answers the request stream.
+    let pump = async {
+        loop {
+            if stream.send_raw_data(Bytes::from_static(b"chunk")).await.is_err() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    };
+    let _ = tokio::time::timeout(TERMINATION_GRACE * 2, pump).await;
+
+    // Pre-commitment expiry: the fixed redacted 401, and exactly one
+    // fixed-cardinality termination for the `http` family.
+    let response = tokio::time::timeout(TERMINATION_GRACE, stream.recv_response())
+        .await
+        .expect("the continuously active upload was not bounded within the grace")
+        .expect("terminal response");
+    assert_eq!(
+        response.0.as_u16(),
+        401,
+        "a pre-commitment authorization expiry must be the fixed 401 contract; logs:\n{}",
+        harness.captured_combined().unwrap_or_default()
+    );
+
+    assert_credential_expired_exactly(&harness, "http", 1).await;
 }

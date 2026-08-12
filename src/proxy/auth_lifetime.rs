@@ -312,6 +312,43 @@ fn earliest(
     }
 }
 
+/// Compose an admitted request's authorization deadline with whatever absolute
+/// bound the protocol already established (a client `grpc-timeout`, an RPC
+/// deadline), returning the earliest.
+///
+/// Used by every H3 write and upload seam whose only prior bound was the
+/// client's OPTIONAL RPC deadline (plus, on the upload side, a per-read
+/// operator timeout) — neither of which stops a **continuously active** upload
+/// or a **parked** downstream write from outliving the credential that
+/// admitted the stream.
+#[inline]
+pub fn compose_absolute_bound(
+    protocol_deadline_at: Option<tokio::time::Instant>,
+    auth_deadline: Option<StreamAuthDeadline>,
+) -> Option<tokio::time::Instant> {
+    match (protocol_deadline_at, auth_deadline.map(|plan| plan.at)) {
+        (Some(protocol), Some(authorization)) => Some(protocol.min(authorization)),
+        (Some(protocol), None) => Some(protocol),
+        (None, authorization) => authorization,
+    }
+}
+
+/// Attribute an already-fired composed bound: `Some` when the authorization
+/// deadline is the one that elapsed, `None` when only the protocol's own
+/// deadline did.
+///
+/// A tie is attributed to authorization, matching the biased select-arm
+/// ordering every relay uses: when both bounds are eligible, the security
+/// decision is the one reported.
+#[inline]
+pub fn expired_authorization(
+    auth_deadline: Option<StreamAuthDeadline>,
+) -> Option<StreamAuthTermination> {
+    auth_deadline
+        .filter(|plan| tokio::time::Instant::now() >= plan.at)
+        .map(|plan| plan.termination)
+}
+
 /// Transaction-summary metadata key carrying the bounded termination class.
 ///
 /// Mirrors `websocket.termination_reason` for the body/stream paths so a log

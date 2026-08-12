@@ -14,8 +14,9 @@ use ferrum_edge::_test_support::{
 use ferrum_edge::config::types::Consumer;
 use ferrum_edge::plugins::{Plugin, RequestContext};
 use ferrum_edge::proxy::auth_lifetime::{
-    StreamAuthProtocolFamily, StreamAuthTermination, counters, effective_request_auth_deadline,
-    effective_stream_auth_deadline, record_termination, request_is_authenticated,
+    StreamAuthDeadline, StreamAuthProtocolFamily, StreamAuthTermination, compose_absolute_bound,
+    counters, effective_request_auth_deadline, effective_stream_auth_deadline,
+    expired_authorization, record_termination, request_is_authenticated,
 };
 
 const DEFAULT_MAX: u64 = 3_600;
@@ -497,4 +498,84 @@ async fn the_userspace_frontend_leg_terminates_both_directions_at_the_deadline()
 async fn an_unauthenticated_stream_session_gets_no_deadline_plan() {
     let anchor = tokio::time::Instant::now();
     assert!(effective_stream_auth_deadline(false, None, anchor, DEFAULT_MAX).is_none());
+}
+
+// ── Composed absolute bounds for the H3 write / upload seams (issue #3815) ──
+//
+// Every H3 downstream write and request-upload drain races the EARLIEST of the
+// authorization plan and whatever absolute bound the protocol already had. The
+// composer and its attribution helper are the one place that decision is made,
+// so ~fifteen call sites cannot drift apart.
+
+fn plan_at(at: tokio::time::Instant, termination: StreamAuthTermination) -> StreamAuthDeadline {
+    StreamAuthDeadline { at, termination }
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_composed_bound_is_the_earliest_of_the_two_absolute_plans() {
+    let now = tokio::time::Instant::now();
+    let earlier = now + Duration::from_secs(5);
+    let later = now + Duration::from_secs(50);
+
+    // Authorization earlier than the client's RPC deadline.
+    assert_eq!(
+        compose_absolute_bound(
+            Some(later),
+            Some(plan_at(earlier, StreamAuthTermination::CredentialExpired))
+        ),
+        Some(earlier)
+    );
+    // Client's RPC deadline earlier than authorization.
+    assert_eq!(
+        compose_absolute_bound(
+            Some(earlier),
+            Some(plan_at(later, StreamAuthTermination::CredentialExpired))
+        ),
+        Some(earlier)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_missing_bound_never_widens_the_other() {
+    let now = tokio::time::Instant::now();
+    let at = now + Duration::from_secs(5);
+
+    // The client `grpc-timeout` is OPTIONAL, which is exactly why the plain
+    // HTTP relays were unbounded before: with no protocol deadline the
+    // authorization plan must still be the bound.
+    assert_eq!(
+        compose_absolute_bound(
+            None,
+            Some(plan_at(at, StreamAuthTermination::AuthenticatedStreamMaxLifetime))
+        ),
+        Some(at)
+    );
+    // An unauthenticated request carries no authorization lifetime, so the
+    // protocol's own bound is unchanged.
+    assert_eq!(compose_absolute_bound(Some(at), None), Some(at));
+    assert_eq!(compose_absolute_bound(None, None), None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn attribution_reports_authorization_only_once_its_own_instant_has_passed() {
+    let now = tokio::time::Instant::now();
+    let plan = plan_at(
+        now + Duration::from_secs(5),
+        StreamAuthTermination::CredentialExpired,
+    );
+
+    // Before the authorization instant: a fired composed bound belongs to the
+    // protocol deadline, so the client-deadline terminal stays selected.
+    assert_eq!(expired_authorization(Some(plan)), None);
+    assert_eq!(expired_authorization(None), None);
+
+    // At/after it, authorization is attributed — a tie goes to the security
+    // decision, matching the biased `select!` ordering in every relay.
+    tokio::time::advance(Duration::from_secs(5)).await;
+    assert_eq!(
+        expired_authorization(Some(plan)),
+        Some(StreamAuthTermination::CredentialExpired)
+    );
+    // Still nothing to attribute for an unauthenticated stream.
+    assert_eq!(expired_authorization(None), None);
 }
