@@ -2670,9 +2670,11 @@ where
                     tokio::pin!(grpc_web_deadline);
                     let upload_auth_deadline_active = upload_auth_deadline_plan.is_some();
                     let upload_auth_deadline = tokio::time::sleep_until(
-                        upload_auth_deadline_plan.map(|plan| plan.at).unwrap_or_else(|| {
-                            tokio::time::Instant::now() + Duration::from_secs(86_400)
-                        }),
+                        upload_auth_deadline_plan
+                            .map(|plan| plan.at)
+                            .unwrap_or_else(|| {
+                                tokio::time::Instant::now() + Duration::from_secs(86_400)
+                            }),
                     );
                     tokio::pin!(upload_auth_deadline);
                     let mut reader_done = false;
@@ -3654,13 +3656,8 @@ where
             .await
         }
     };
-    let (
-        bytes_streamed,
-        body_completed,
-        client_disconnected,
-        body_error_class,
-        auth_termination,
-    ) = match crate::plugins::await_grpc_deadline(grpc_web_deadline_at, stream_response).await {
+    let (bytes_streamed, body_completed, client_disconnected, body_error_class, auth_termination) =
+        match crate::plugins::await_grpc_deadline(grpc_web_deadline_at, stream_response).await {
             Ok(result) => result,
             Err(()) => {
                 record_plain_grpc_web_client_deadline(
@@ -6926,9 +6923,10 @@ where
     // flushes never refresh it. Inert (arm guard permanently false) for an
     // unauthenticated request.
     let auth_deadline_active = auth_deadline.is_some();
-    let auth_deadline_sleep = tokio::time::sleep_until(auth_deadline.map(|plan| plan.at).unwrap_or_else(
-        || tokio::time::Instant::now() + std::time::Duration::from_secs(86_400),
-    ));
+    let auth_deadline_sleep =
+        tokio::time::sleep_until(auth_deadline.map(|plan| plan.at).unwrap_or_else(|| {
+            tokio::time::Instant::now() + std::time::Duration::from_secs(86_400)
+        }));
     tokio::pin!(auth_deadline_sleep);
     let mut auth_termination: Option<crate::proxy::auth_lifetime::StreamAuthTermination> = None;
     let mut stream_done = false;
@@ -7113,9 +7111,10 @@ where
     // regression, and re-arming would turn an absolute authorization bound into
     // an idle timeout. Inert for an unauthenticated request.
     let auth_deadline_active = auth_deadline.is_some();
-    let auth_deadline_sleep = tokio::time::sleep_until(auth_deadline.map(|plan| plan.at).unwrap_or_else(
-        || tokio::time::Instant::now() + std::time::Duration::from_secs(86_400),
-    ));
+    let auth_deadline_sleep =
+        tokio::time::sleep_until(auth_deadline.map(|plan| plan.at).unwrap_or_else(|| {
+            tokio::time::Instant::now() + std::time::Duration::from_secs(86_400)
+        }));
     tokio::pin!(auth_deadline_sleep);
     let mut auth_termination: Option<crate::proxy::auth_lifetime::StreamAuthTermination> = None;
 
@@ -7396,35 +7395,72 @@ where
     // deadline. `send_data`/`finish` can otherwise park forever waiting for
     // QUIC flow-control credit, preventing the select loop from polling its
     // timer and retaining the upstream H2 body indefinitely.
+    //
+    // The authorization bound (issue #3815) has to cancel a parked write too,
+    // not just win the `select!`. A client that stops reading holds every
+    // `send_data`/`finish` in flow control, so the loop never returns to its
+    // timer — and a client `grpc-timeout` is optional, so `grpc_deadline_at`
+    // alone leaves the common case completely unbounded. Race the EARLIEST of
+    // the two absolute bounds; when both have elapsed the authorization bound
+    // is the one attributed, matching the select-arm ordering above.
+    let authorization_deadline_at = auth_deadline.map(|plan| plan.at);
+    let downstream_write_deadline_at = match (grpc_deadline_at, authorization_deadline_at) {
+        (Some(client), Some(authorization)) => Some(client.min(authorization)),
+        (Some(client), None) => Some(client),
+        (None, authorization) => authorization,
+    };
     macro_rules! await_downstream_write {
         ($write:expr) => {{
             match crate::http3::stream_util::await_response_write_before_deadline(
-                grpc_deadline_at,
+                downstream_write_deadline_at,
                 $write,
             )
             .await
             {
                 Ok(()) => true,
                 Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
-                    client_deadline_expired = true;
-                    coalesce_buf.clear();
-                    if crate::http3::stream_util::grpc_deadline_can_send_terminal_status(
-                        bytes_streamed,
-                    ) {
-                        let mut deadline_trailers = HeaderMap::new();
-                        deadline_trailers.insert(
-                            "grpc-status",
-                            HeaderValue::from_static(GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER),
+                    let expired_authorization =
+                        auth_deadline.filter(|plan| tokio::time::Instant::now() >= plan.at);
+                    if let Some(plan) = expired_authorization {
+                        warn!(
+                            "cross-protocol H3 gRPC response reached its authorization lifetime \
+                             while the client was not consuming; resetting the stream"
                         );
-                        deadline_trailers.insert(
-                            "grpc-message",
-                            HeaderValue::from_static(GATEWAY_DEADLINE_EXCEEDED_MESSAGE_HEADER),
-                        );
-                        trailers = Some(deadline_trailers);
-                        clean_deadline_completion = true;
-                    } else {
+                        // The downstream demonstrably cannot accept bytes, so a
+                        // clean terminal status cannot be written either — reset
+                        // rather than park again on a trailer write.
+                        coalesce_buf.clear();
                         trailers = None;
                         crate::http3::stream_util::abort_response_stream(stream);
+                        // Every call site breaks the relay loop, so this is
+                        // recorded exactly once and the select arm cannot also
+                        // fire for the same stream.
+                        crate::proxy::auth_lifetime::record_termination(
+                            plan.termination,
+                            auth_family,
+                        );
+                        auth_termination = Some(plan.termination);
+                    } else {
+                        client_deadline_expired = true;
+                        coalesce_buf.clear();
+                        if crate::http3::stream_util::grpc_deadline_can_send_terminal_status(
+                            bytes_streamed,
+                        ) {
+                            let mut deadline_trailers = HeaderMap::new();
+                            deadline_trailers.insert(
+                                "grpc-status",
+                                HeaderValue::from_static(GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER),
+                            );
+                            deadline_trailers.insert(
+                                "grpc-message",
+                                HeaderValue::from_static(GATEWAY_DEADLINE_EXCEEDED_MESSAGE_HEADER),
+                            );
+                            trailers = Some(deadline_trailers);
+                            clean_deadline_completion = true;
+                        } else {
+                            trailers = None;
+                            crate::http3::stream_util::abort_response_stream(stream);
+                        }
                     }
                     body_error_class = Some(ErrorClass::ClientDisconnect);
                     false

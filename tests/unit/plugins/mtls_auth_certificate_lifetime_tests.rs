@@ -20,7 +20,11 @@ use super::plugin_utils::assert_continue;
 
 /// Self-signed client certificate with an explicit validity interval, in
 /// seconds relative to now. rcgen takes `time::OffsetDateTime`.
-fn cert_with_validity(cn: &str, not_before_offset_secs: i64, not_after_offset_secs: i64) -> Vec<u8> {
+fn cert_with_validity(
+    cn: &str,
+    not_before_offset_secs: i64,
+    not_after_offset_secs: i64,
+) -> Vec<u8> {
     let mut params = rcgen::CertificateParams::default();
     let mut dn = rcgen::DistinguishedName::new();
     dn.push(rcgen::DnType::CommonName, cn);
@@ -80,7 +84,10 @@ fn assert_fixed_401(result: PluginResult) {
             status_code, body, ..
         } => {
             assert_eq!(status_code, 401);
-            assert_eq!(body, r#"{"error":"Client certificate is not currently valid"}"#);
+            assert_eq!(
+                body,
+                r#"{"error":"Client certificate is not currently valid"}"#
+            );
         }
         other => panic!("expected a fixed 401 rejection, got {other:?}"),
     }
@@ -116,7 +123,9 @@ async fn default_configuration_accepts_a_currently_valid_leaf() {
 
     assert_continue(default_plugin().authenticate(&mut ctx, &index).await);
     assert_eq!(
-        ctx.identified_consumer.as_ref().map(|c| c.username.as_str()),
+        ctx.identified_consumer
+            .as_ref()
+            .map(|c| c.username.as_str()),
         Some("alice")
     );
 }

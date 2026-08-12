@@ -6039,11 +6039,10 @@ async fn handle_h3_request(
             state.env_config.authenticated_stream_max_lifetime_seconds,
         );
         let auth_deadline_active = auth_deadline_plan.is_some();
-        let auth_deadline_sleep = tokio::time::sleep_until(
-            auth_deadline_plan.map(|plan| plan.at).unwrap_or_else(|| {
+        let auth_deadline_sleep =
+            tokio::time::sleep_until(auth_deadline_plan.map(|plan| plan.at).unwrap_or_else(|| {
                 tokio::time::Instant::now() + std::time::Duration::from_secs(86_400)
-            }),
-        );
+            }));
         tokio::pin!(auth_deadline_sleep);
         let mut stream_done = false;
         let mut bytes_streamed: u64 = 0;
@@ -9607,11 +9606,10 @@ async fn stream_h3_open_response_to_client(
         state.env_config.authenticated_stream_max_lifetime_seconds,
     );
     let auth_deadline_active = auth_deadline_plan.is_some();
-    let auth_deadline_sleep = tokio::time::sleep_until(
-        auth_deadline_plan.map(|plan| plan.at).unwrap_or_else(|| {
+    let auth_deadline_sleep =
+        tokio::time::sleep_until(auth_deadline_plan.map(|plan| plan.at).unwrap_or_else(|| {
             tokio::time::Instant::now() + std::time::Duration::from_secs(86_400)
-        }),
-    );
+        }));
     tokio::pin!(auth_deadline_sleep);
     let mut stream_done = false;
     let mut bytes_streamed: u64 = 0;
@@ -12762,11 +12760,10 @@ async fn proxy_to_backend_h3_streaming(
         state.env_config.authenticated_stream_max_lifetime_seconds,
     );
     let auth_deadline_active = auth_deadline_plan.is_some();
-    let auth_deadline_sleep = tokio::time::sleep_until(
-        auth_deadline_plan.map(|plan| plan.at).unwrap_or_else(|| {
+    let auth_deadline_sleep =
+        tokio::time::sleep_until(auth_deadline_plan.map(|plan| plan.at).unwrap_or_else(|| {
             tokio::time::Instant::now() + std::time::Duration::from_secs(86_400)
-        }),
-    );
+        }));
     tokio::pin!(auth_deadline_sleep);
     let mut stream_done = false;
     let mut bytes_streamed: u64 = 0;

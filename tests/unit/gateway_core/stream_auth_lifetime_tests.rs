@@ -34,7 +34,11 @@ fn consumer(username: &str) -> Arc<Consumer> {
 }
 
 fn anonymous_ctx() -> RequestContext {
-    RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/sse".to_string())
+    RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/sse".to_string(),
+    )
 }
 
 fn authenticated_ctx() -> RequestContext {
@@ -64,10 +68,7 @@ async fn an_external_identity_alone_is_an_authenticated_principal() {
 async fn credential_deadline_wins_when_earlier_than_the_fallback_maximum() {
     let mut ctx = authenticated_ctx();
     let received_at = request_received_at_for_test(&ctx);
-    set_request_credential_deadline_for_test(
-        &mut ctx,
-        Some(received_at + Duration::from_secs(30)),
-    );
+    set_request_credential_deadline_for_test(&mut ctx, Some(received_at + Duration::from_secs(30)));
 
     let plan = effective_request_auth_deadline(&ctx, DEFAULT_MAX).expect("authenticated");
     assert_eq!(plan.termination, StreamAuthTermination::CredentialExpired);
@@ -137,10 +138,7 @@ async fn an_already_elapsed_credential_deadline_stays_in_the_past() {
 async fn activity_never_extends_the_deadline() {
     let mut ctx = authenticated_ctx();
     let received_at = request_received_at_for_test(&ctx);
-    set_request_credential_deadline_for_test(
-        &mut ctx,
-        Some(received_at + Duration::from_secs(30)),
-    );
+    set_request_credential_deadline_for_test(&mut ctx, Some(received_at + Duration::from_secs(30)));
 
     let first = effective_request_auth_deadline(&ctx, DEFAULT_MAX).expect("authenticated");
     // Simulate a continuously active stream: time advances, the request context
@@ -220,8 +218,18 @@ fn termination_classes_are_a_closed_set_of_compiled_in_literals() {
 #[test]
 fn client_visible_messages_never_carry_credential_or_expiry_detail() {
     let forbidden = [
-        "exp", "notAfter", "not_after", "notBefore", "sub", "jwt", "token", "issuer", "cert",
-        "serial", "@", "spiffe",
+        "exp",
+        "notAfter",
+        "not_after",
+        "notBefore",
+        "sub",
+        "jwt",
+        "token",
+        "issuer",
+        "cert",
+        "serial",
+        "@",
+        "spiffe",
     ];
     for termination in [
         StreamAuthTermination::CredentialExpired,
@@ -319,7 +327,10 @@ fn recording_a_termination_increments_only_its_own_class_and_family() {
     );
     // The counter carries no dimension other than the family, so recording one
     // family cannot move another.
-    assert_eq!(after.credential_expired["http"], before.credential_expired["http"]);
+    assert_eq!(
+        after.credential_expired["http"],
+        before.credential_expired["http"]
+    );
 }
 
 #[test]
@@ -431,8 +442,11 @@ async fn the_userspace_frontend_leg_terminates_both_directions_at_the_deadline()
     let (client, mut peer) = tokio::io::duplex(64 * 1024);
     let expired = Arc::new(AtomicBool::new(false));
     let deadline_at = tokio::time::Instant::now() + Duration::from_secs(5);
-    let mut leg =
-        ferrum_edge::_test_support::authorization_deadline_stream_for_test(client, deadline_at, Arc::clone(&expired));
+    let mut leg = ferrum_edge::_test_support::authorization_deadline_stream_for_test(
+        client,
+        deadline_at,
+        Arc::clone(&expired),
+    );
 
     // Continuous traffic BEFORE the deadline keeps working in both directions.
     for _ in 0..8 {
@@ -441,7 +455,9 @@ async fn the_userspace_frontend_leg_terminates_both_directions_at_the_deadline()
         peer.read_exact(&mut buf).await.expect("peer read");
         peer.write_all(b"pong").await.expect("peer write");
         let mut back = [0u8; 4];
-        leg.read_exact(&mut back).await.expect("read before deadline");
+        leg.read_exact(&mut back)
+            .await
+            .expect("read before deadline");
         assert_eq!(&back, b"pong");
         tokio::time::sleep(Duration::from_millis(400)).await;
     }
@@ -455,7 +471,10 @@ async fn the_userspace_frontend_leg_terminates_both_directions_at_the_deadline()
     // fixed, credential-free `TimedOut` classification.
     tokio::time::sleep(Duration::from_secs(3)).await;
 
-    let read_err = leg.read(&mut [0u8; 4]).await.expect_err("read after deadline");
+    let read_err = leg
+        .read(&mut [0u8; 4])
+        .await
+        .expect_err("read after deadline");
     assert_eq!(read_err.kind(), std::io::ErrorKind::TimedOut);
     let write_err = leg.write(b"ping").await.expect_err("write after deadline");
     assert_eq!(write_err.kind(), std::io::ErrorKind::TimedOut);

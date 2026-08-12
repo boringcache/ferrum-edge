@@ -715,11 +715,7 @@ pub struct AuthorizationDeadlineStream<S> {
 }
 
 impl<S> AuthorizationDeadlineStream<S> {
-    pub fn new(
-        inner: S,
-        deadline_at: tokio::time::Instant,
-        expired: Arc<AtomicBool>,
-    ) -> Self {
+    pub fn new(inner: S, deadline_at: tokio::time::Instant, expired: Arc<AtomicBool>) -> Self {
         Self {
             inner,
             deadline: Box::pin(tokio::time::sleep_until(deadline_at)),

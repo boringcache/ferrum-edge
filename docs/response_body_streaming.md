@@ -438,6 +438,36 @@ Deliberate scope notes:
   deadline governs the **streaming** upload bridge, which is the path that can
   otherwise stay continuously active.
 
+### A downstream that stops reading
+
+`send_data` / `finish` park until QUIC flow-control credit arrives, so a client
+that stops consuming keeps a relay loop out of its own `select!` and its timer
+is never polled. The H3 native-gRPC and gRPC-Web relay therefore races the
+**earliest** of the client `grpc-timeout` and the authorization deadline around
+every downstream write, and resets the stream when the authorization bound is
+the one that elapsed — a client `grpc-timeout` is optional, so the client
+deadline alone would leave the common case unbounded. A stalled downstream
+receives no post-expiry bytes in any case, because it is not reading.
+
+The plain HTTP/3 response relays (`http3::server`'s native-H3 relay and the H3
+cross-protocol plain/inspected relays) have never bounded a parked downstream
+write — the pre-existing `backend_read_timeout_ms` and client-deadline bounds
+have the same property there — so a non-reading client can still hold those
+streams open past the deadline while receiving nothing. Extending the
+write-cancellation seam to those relays is tracked separately.
+
+### Live acceptance coverage
+
+`tests/functional/functional_h3_auth_lifetime_test.rs` exercises this contract
+end to end against a real QUIC listener with a real short-lived HS256 JWT: the
+native-H3 streaming response relay, the H3 streaming request-upload bridge
+(fixed `401` before commitment), native gRPC before and after response DATA
+(`grpc-status: 16` versus deterministic reset), gRPC-Web's bounded trailer
+frame, and the stalled-downstream regression above. Each case proves the stream
+is usable before the deadline, terminates inside a bounded grace despite
+continued backend activity, and increments the fixed-cardinality
+`credential_expired` counter for its protocol family exactly once.
+
 ## Interaction with Retry Logic
 
 When retry is configured on a proxy, the gateway must be able to inspect the response status code before deciding whether to retry. That decision is made entirely at response-header time — `retry::should_retry` consults only the status code, the connection-error flag, the error class, and the request method — so retry does not require reading a response body:

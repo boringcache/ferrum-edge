@@ -174,11 +174,18 @@ async fn expiry_after_response_data_resets_instead_of_fabricating_a_status() {
 
     // One SSE event is committed downstream.
     let first = body.frame().await.unwrap().unwrap();
-    assert_eq!(first.data_ref().unwrap().as_ref(), b"event: tick\n\n".as_slice());
+    assert_eq!(
+        first.data_ref().unwrap().as_ref(),
+        b"event: tick\n\n".as_slice()
+    );
 
     // The deadline then fires. A complete message boundary cannot be proven, so
     // the body ends with a transport error — never a successful terminal status.
-    let message = match body.frame().await.expect("the deadline must terminate the body") {
+    let message = match body
+        .frame()
+        .await
+        .expect("the deadline must terminate the body")
+    {
         Ok(_) => panic!(
             "post-commitment expiry must not fabricate a successful terminal status or frame"
         ),
@@ -282,11 +289,23 @@ async fn an_unexpired_deadline_passes_frames_through_untouched() {
     );
 
     assert_eq!(
-        body.frame().await.unwrap().unwrap().data_ref().unwrap().as_ref(),
+        body.frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .data_ref()
+            .unwrap()
+            .as_ref(),
         b"one".as_slice()
     );
     assert_eq!(
-        body.frame().await.unwrap().unwrap().data_ref().unwrap().as_ref(),
+        body.frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .data_ref()
+            .unwrap()
+            .as_ref(),
         b"two".as_slice()
     );
     assert!(body.frame().await.is_none());
@@ -370,7 +389,13 @@ async fn a_body_with_no_authorization_deadline_streams_to_completion() {
     let mut body = proxy_body_streaming_for_test(Box::pin(inner));
 
     assert_eq!(
-        body.frame().await.unwrap().unwrap().data_ref().unwrap().as_ref(),
+        body.frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .data_ref()
+            .unwrap()
+            .as_ref(),
         b"public".as_slice()
     );
     assert!(body.frame().await.is_none());
