@@ -156,13 +156,32 @@ def check_workflow(text: str, failures: list[str]) -> None:
     dns_step = _named_step(text, "Collect DNS E2E baselines (3+ repetitions)")
     require(bool(hbone_step), "HBONE E2E collection step required", failures)
     require(bool(dns_step), "DNS E2E collection step required", failures)
-    for body, label in ((hbone_step, "HBONE"), (dns_step, "DNS")):
+    for body, label, harness, forbidden_cd in (
+        (
+            hbone_step,
+            "HBONE",
+            "./tests/performance/mesh-hbone-e2e/run.sh",
+            "cd tests/performance/mesh-hbone-e2e",
+        ),
+        (
+            dns_step,
+            "DNS",
+            "./tests/performance/mesh-dns-e2e/run.sh",
+            "cd tests/performance/mesh-dns-e2e",
+        ),
+    ):
         begin = body.find("--interval-begin")
-        run = body.find("./run.sh")
+        run = body.find(harness)
         end = body.find("--interval-end")
         require(
             begin != -1 and run != -1 and end != -1 and begin < run < end,
             f"{label} health probes must snapshot /proc/stat around the workload interval",
+            failures,
+        )
+        require(
+            forbidden_cd not in body,
+            f"{label} collection must invoke the harness by repository-root path "
+            "without changing directory",
             failures,
         )
         require(
@@ -233,6 +252,16 @@ def check_scripts(failures: list[str]) -> None:
     require(
         all(bench in ledger for bench in ("authz_match", "ip_restriction", "slice_apply", "xds_translation")),
         "ledger mesh benches incomplete",
+        failures,
+    )
+    require(
+        "./tests/performance/mesh-hbone-e2e/run.sh" in ledger,
+        "ledger HBONE commands must invoke the harness by repository-root path",
+        failures,
+    )
+    require(
+        "./tests/performance/mesh-dns-e2e/run.sh" in ledger,
+        "ledger DNS commands must invoke the harness by repository-root path",
         failures,
     )
 
@@ -390,7 +419,7 @@ jobs:
       - uses: ./.github/actions/setup-rust-ci
       - run: authz_match ip_restriction slice_apply xds_translation
       - run: 1kib_c50_30s 16kib_c50_30s 256kib_c100_60s
-      - run: ./run.sh --duration 60 --concurrency 100
+      - run: ./tests/performance/mesh-hbone-e2e/run.sh --duration 60 --concurrency 100
       - run: collect_mesh_baseline_provenance.py
       - run: summarize_mesh_baseline_results.py
       - run: runner_health.json runner_health_probes.jsonl
@@ -412,14 +441,14 @@ jobs:
         run: |
           python3 .github/scripts/mesh_baseline_runner_health.py --interval-begin
           set +e
-          ./run.sh --duration 60 --concurrency 100
+          ./tests/performance/mesh-hbone-e2e/run.sh --duration 60 --concurrency 100
           harness_status=${PIPESTATUS[0]}
           python3 .github/scripts/mesh_baseline_runner_health.py --interval-end
       - name: Collect DNS E2E baselines (3+ repetitions)
         run: |
           python3 .github/scripts/mesh_baseline_runner_health.py --interval-begin
           set +e
-          ./run.sh --duration 60 --concurrency 100
+          ./tests/performance/mesh-dns-e2e/run.sh --duration 60 --concurrency 100
           harness_status=${PIPESTATUS[0]}
           python3 .github/scripts/mesh_baseline_runner_health.py --interval-end
       - name: Enforce selected-suite acceptance gates

@@ -89,7 +89,8 @@ def build_ledger(suites: str, iterations: int) -> list[dict[str, object]]:
                         "scenario": scenario["key"],
                         "repetition": run,
                         "command": (
-                            "./run.sh --skip-build --json "
+                            "./tests/performance/mesh-hbone-e2e/run.sh "
+                            "--skip-build --json "
                             f"--duration {scenario['duration']} "
                             f"--concurrency {scenario['concurrency']} "
                             f"--payload-size {scenario['payload']}"
@@ -112,7 +113,8 @@ def build_ledger(suites: str, iterations: int) -> list[dict[str, object]]:
                     "suite": "dns",
                     "repetition": run,
                     "command": (
-                        "./run.sh --skip-build --json "
+                        "./tests/performance/mesh-dns-e2e/run.sh "
+                        "--skip-build --json "
                         f"--duration {DNS_DURATION_SECS} "
                         f"--concurrency {DNS_CONCURRENCY} --protocol both"
                     ),

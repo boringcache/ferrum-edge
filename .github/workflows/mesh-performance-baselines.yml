@@ -213,13 +213,11 @@ jobs:
                 --interval-begin
               harness_status=1
               set +e
-              (
-                cd tests/performance/mesh-hbone-e2e
-                ./run.sh --skip-build --json \
-                  --duration "${DURATION}" \
-                  --concurrency "${CONCURRENCY}" \
-                  --payload-size "${PAYLOAD}"
-              ) 2>&1 | tee "mesh-baseline-results/hbone/${KEY}/run_${run}.txt"
+              ./tests/performance/mesh-hbone-e2e/run.sh --skip-build --json \
+                --duration "${DURATION}" \
+                --concurrency "${CONCURRENCY}" \
+                --payload-size "${PAYLOAD}" \
+                2>&1 | tee "mesh-baseline-results/hbone/${KEY}/run_${run}.txt"
               harness_status=${PIPESTATUS[0]}
               python3 .github/scripts/mesh_baseline_runner_health.py \
                 --results-root mesh-baseline-results \
@@ -260,10 +258,9 @@ jobs:
               --interval-begin
             harness_status=1
             set +e
-            (
-              cd tests/performance/mesh-dns-e2e
-              ./run.sh --skip-build --json --duration 60 --concurrency 100 --protocol both
-            ) 2>&1 | tee "mesh-baseline-results/dns/run_${run}.txt"
+            ./tests/performance/mesh-dns-e2e/run.sh --skip-build --json \
+              --duration 60 --concurrency 100 --protocol both \
+              2>&1 | tee "mesh-baseline-results/dns/run_${run}.txt"
             harness_status=${PIPESTATUS[0]}
             python3 .github/scripts/mesh_baseline_runner_health.py \
               --results-root mesh-baseline-results \
