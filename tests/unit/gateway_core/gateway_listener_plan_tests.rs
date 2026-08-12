@@ -5,12 +5,17 @@
 //! HTTP/3 is enabled and must then be refused on a stream collision.
 
 use std::collections::{BTreeMap, HashSet};
+use std::net::IpAddr;
 
 use chrono::Utc;
 use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, GatewayConfig, Proxy};
-use ferrum_edge::proxy::gateway_listener::{GatewayListenerClass, GatewayListenerPlan};
+use ferrum_edge::modes::mesh::config::MeshConfig;
+use ferrum_edge::proxy::gateway_listener::{
+    DesiredGatewayListener, GatewayListenerClass, GatewayListenerPlan,
+};
 
 const PORT: u16 = 9000;
+const DEFAULT_BIND: IpAddr = IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
 
 fn http_proxy(id: &str, port: u16) -> Proxy {
     let proxy: Proxy = serde_json::from_value(serde_json::json!({
@@ -90,6 +95,7 @@ fn stream_proxy(id: &str, scheme: BackendScheme, port: u16) -> Proxy {
         compiled_stream_match: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
+        pending_limit_scope: None,
     }
 }
 
@@ -99,7 +105,27 @@ fn plan_for(proxies: Vec<Proxy>) -> GatewayListenerPlan {
         ..GatewayConfig::default()
     };
     config.resolve_dispatch_kind();
-    GatewayListenerPlan::from_config(&config, &HashSet::new(), &BTreeMap::new(), false)
+    GatewayListenerPlan::from_config(
+        &config,
+        &HashSet::new(),
+        &BTreeMap::new(),
+        DEFAULT_BIND,
+        false,
+    )
+}
+
+fn plan_with_frontends(
+    mut config: GatewayConfig,
+    existing_frontends: BTreeMap<u16, GatewayListenerClass>,
+) -> GatewayListenerPlan {
+    config.resolve_dispatch_kind();
+    GatewayListenerPlan::from_config(
+        &config,
+        &HashSet::new(),
+        &existing_frontends,
+        DEFAULT_BIND,
+        false,
+    )
 }
 
 fn tls_plan_for(proxies: Vec<Proxy>, http3_enabled: bool) -> GatewayListenerPlan {
@@ -111,7 +137,13 @@ fn tls_plan_for(proxies: Vec<Proxy>, http3_enabled: bool) -> GatewayListenerPlan
     config
         .http_tls_listen_ports
         .insert((ferrum_edge::config::types::default_namespace(), PORT));
-    GatewayListenerPlan::from_config(&config, &HashSet::new(), &BTreeMap::new(), http3_enabled)
+    GatewayListenerPlan::from_config(
+        &config,
+        &HashSet::new(),
+        &BTreeMap::new(),
+        DEFAULT_BIND,
+        http3_enabled,
+    )
 }
 
 #[test]
@@ -122,8 +154,8 @@ fn http_and_udp_stream_may_share_numeric_port() {
     ]);
 
     assert_eq!(
-        plan.ports.get(&PORT),
-        Some(&GatewayListenerClass::Plaintext)
+        plan.ports.get(&PORT).map(|d| d.class),
+        Some(GatewayListenerClass::Plaintext)
     );
     assert!(
         !plan.refused.contains_key(&PORT),
@@ -140,8 +172,8 @@ fn http_and_dtls_stream_may_share_numeric_port() {
     ]);
 
     assert_eq!(
-        plan.ports.get(&PORT),
-        Some(&GatewayListenerClass::Plaintext)
+        plan.ports.get(&PORT).map(|d| d.class),
+        Some(GatewayListenerClass::Plaintext)
     );
     assert!(
         !plan.refused.contains_key(&PORT),
@@ -196,7 +228,10 @@ fn https_and_udp_stream_may_share_numeric_port_when_http3_is_disabled() {
         false,
     );
 
-    assert_eq!(plan.ports.get(&PORT), Some(&GatewayListenerClass::Tls));
+    assert_eq!(
+        plan.ports.get(&PORT).map(|d| d.class),
+        Some(GatewayListenerClass::Tls)
+    );
     assert!(
         !plan.refused.contains_key(&PORT),
         "disabled HTTP/3 owns no UDP socket: {:?}",
@@ -239,5 +274,69 @@ fn http_and_tcp_tls_stream_on_same_port_is_refused() {
     assert!(
         reason.contains("TCP/TLS stream proxy"),
         "refusal must name the TCP/TLS stream collision: {reason}"
+    );
+}
+
+#[test]
+fn dedicated_sidecar_bind_is_carried_in_desired_identity() {
+    let loopback: IpAddr = "127.0.0.1".parse().expect("ip");
+    let mut mesh = MeshConfig::default();
+    mesh.sidecar_ingress_bind_overrides.insert(PORT, loopback);
+    let config = GatewayConfig {
+        proxies: vec![http_proxy("http-gw", PORT)],
+        mesh: Some(Box::new(mesh)),
+        ..GatewayConfig::default()
+    };
+    let plan = plan_with_frontends(config, BTreeMap::new());
+    assert_eq!(
+        plan.ports.get(&PORT),
+        Some(&DesiredGatewayListener {
+            class: GatewayListenerClass::Plaintext,
+            bind_addr: loopback,
+            mesh_direction: Some(ferrum_edge::modes::mesh::MeshTrafficDirection::Inbound),
+        })
+    );
+}
+
+#[test]
+fn same_class_process_global_frontend_is_already_served_without_dedicated_bind() {
+    let config = GatewayConfig {
+        proxies: vec![http_proxy("http-gw", PORT)],
+        ..GatewayConfig::default()
+    };
+    let mut existing = BTreeMap::new();
+    existing.insert(PORT, GatewayListenerClass::Plaintext);
+    let plan = plan_with_frontends(config, existing);
+    assert_eq!(
+        plan.already_served.get(&PORT),
+        Some(&GatewayListenerClass::Plaintext)
+    );
+    assert!(!plan.ports.contains_key(&PORT));
+    assert!(!plan.refused.contains_key(&PORT));
+}
+
+#[test]
+fn dedicated_bind_cannot_be_absorbed_by_process_global_same_class_frontend() {
+    let loopback: IpAddr = "127.0.0.1".parse().expect("ip");
+    let mut mesh = MeshConfig::default();
+    mesh.sidecar_ingress_bind_overrides.insert(PORT, loopback);
+    let config = GatewayConfig {
+        proxies: vec![http_proxy("http-gw", PORT)],
+        mesh: Some(Box::new(mesh)),
+        ..GatewayConfig::default()
+    };
+    let mut existing = BTreeMap::new();
+    existing.insert(PORT, GatewayListenerClass::Plaintext);
+    let plan = plan_with_frontends(config, existing);
+    assert!(
+        !plan.already_served.contains_key(&PORT),
+        "dedicated bind must not widen onto the global frontend: {:?}",
+        plan.already_served
+    );
+    assert!(!plan.ports.contains_key(&PORT));
+    let reason = plan.refused.get(&PORT).expect("refusal");
+    assert!(
+        reason.contains("dedicated Sidecar ingress bind"),
+        "refusal must name dedicated-bind isolation: {reason}"
     );
 }

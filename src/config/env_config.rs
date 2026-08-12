@@ -1808,6 +1808,11 @@ pub struct EnvConfig {
     /// a larger per-IP cap can never fire and is refused at startup rather than
     /// silently ignored.
     pub cp_grpc_max_connections_per_ip: usize,
+    /// Independent finite lifetime for every bearer-authenticated ConfigSync,
+    /// MeshSubscribe, and ADS stream admitted by a control plane. This never
+    /// extends token expiry; the earlier deadline wins. Default 3600 seconds;
+    /// validated to 60..=86400 and cannot be disabled.
+    pub cp_grpc_max_stream_lifetime_seconds: u64,
     /// Capacity of the tokio broadcast channel used to fan out config deltas
     /// to subscribed Data Planes. When a DP lags behind by more than this many
     /// updates, it receives a full config snapshot instead of the missed deltas.
@@ -2013,6 +2018,22 @@ pub struct EnvConfig {
     /// still refused for a non-root Ferrum. Set this when the co-located
     /// application runs as a different uid than the sidecar.
     pub mesh_unix_socket_allowed_uids: Vec<u32>,
+    /// Maximum concurrently-open PHYSICAL connections the sidecar-ingress Unix
+    /// backend pool may hold per admitted target identity (issue #3731).
+    ///
+    /// The bound is INBOUND transport capacity toward the co-located
+    /// application, not an Istio `DestinationRule` (which is outbound,
+    /// client-side policy and deliberately does not govern this path). It is
+    /// keyed by the pool's full structured identity — namespace, proxy id,
+    /// effective upstream id, canonical socket path, the admitted
+    /// `(dev, ino, owner_uid)`, and the wire protocol — so sibling ingress
+    /// listeners and replaced socket objects can never share or steal a lane.
+    ///
+    /// Only a NEW physical connection is admitted against it: a pooled HTTP/1.1
+    /// hit and every additional stream on a shared h2c carrier are free, so a
+    /// target pinned at `1` still serves unbounded sequential requests and
+    /// unbounded concurrent RPCs. `0` disables the bound.
+    pub mesh_unix_ingress_max_connections: u32,
     /// Comma-separated W3C `baggage` key prefixes stripped from outbound
     /// requests at dispatch. Default empty: forward unchanged. Operators set
     /// this to keep mesh-internal identity claims (e.g. `source.`) from
@@ -3360,6 +3381,8 @@ impl Default for EnvConfig {
             cp_grpc_tls_client_ca_path: None,
             cp_grpc_max_connections: 1024,
             cp_grpc_max_connections_per_ip: 64,
+            cp_grpc_max_stream_lifetime_seconds:
+                crate::grpc::auth::DEFAULT_GRPC_MAX_STREAM_LIFETIME_SECONDS,
             cp_broadcast_channel_capacity: 128,
             cp_namespaces: Vec::new(),
             cp_require_namespace_claim: false,
@@ -3406,6 +3429,8 @@ impl Default for EnvConfig {
             mesh_trusted_hbone_assertors: Vec::new(),
             mesh_unix_socket_allowed_roots: Vec::new(),
             mesh_unix_socket_allowed_uids: Vec::new(),
+            mesh_unix_ingress_max_connections:
+                crate::proxy::unix_backend_pool::DEFAULT_UNIX_INGRESS_MAX_CONNECTIONS,
             mesh_egress_strip_baggage_keys: Vec::new(),
             mesh_outbound_traffic_policy: "allow_any".to_string(),
             mesh_outbound_registry_reject_status: 502,
@@ -3925,6 +3950,7 @@ impl EnvConfig {
             cp_grpc_tls_client_ca_path: Option<String> = "FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH";
             cp_grpc_max_connections: usize = "FERRUM_CP_GRPC_MAX_CONNECTIONS" => 1024usize;
             cp_grpc_max_connections_per_ip: usize = "FERRUM_CP_GRPC_MAX_CONNECTIONS_PER_IP" => 64usize;
+            cp_grpc_max_stream_lifetime_seconds: u64 = "FERRUM_CP_GRPC_MAX_STREAM_LIFETIME_SECONDS" => crate::grpc::auth::DEFAULT_GRPC_MAX_STREAM_LIFETIME_SECONDS;
             cp_broadcast_channel_capacity: usize = "FERRUM_CP_BROADCAST_CHANNEL_CAPACITY" => 128usize;
             cp_namespaces: Vec<String> = "FERRUM_CP_NAMESPACES" => Vec::new();
             cp_require_namespace_claim: bool = "FERRUM_CP_REQUIRE_NAMESPACE_CLAIM" => false;
@@ -3962,6 +3988,7 @@ impl EnvConfig {
             mesh_trusted_hbone_assertors: Vec<String> = "FERRUM_MESH_TRUSTED_HBONE_ASSERTORS" => Vec::new();
             mesh_unix_socket_allowed_roots: Vec<String> = "FERRUM_MESH_UNIX_SOCKET_ALLOWED_ROOTS" => Vec::new();
             mesh_unix_socket_allowed_uids: Vec<u32> = "FERRUM_MESH_UNIX_SOCKET_ALLOWED_UIDS" => Vec::new();
+            mesh_unix_ingress_max_connections: u32 = "FERRUM_MESH_UNIX_INGRESS_MAX_CONNECTIONS" => crate::proxy::unix_backend_pool::DEFAULT_UNIX_INGRESS_MAX_CONNECTIONS;
             mesh_egress_strip_baggage_keys: Vec<String> = "FERRUM_MESH_EGRESS_STRIP_BAGGAGE_KEYS" => Vec::new();
             mesh_outbound_traffic_policy: String = "FERRUM_MESH_OUTBOUND_TRAFFIC_POLICY" => "allow_any".to_string();
             mesh_outbound_registry_reject_status: u16 = "FERRUM_MESH_OUTBOUND_REGISTRY_REJECT_STATUS" => 502u16;
@@ -4727,6 +4754,7 @@ impl EnvConfig {
             cp_grpc_tls_client_ca_path,
             cp_grpc_max_connections,
             cp_grpc_max_connections_per_ip,
+            cp_grpc_max_stream_lifetime_seconds,
             cp_broadcast_channel_capacity,
             cp_namespaces,
             cp_require_namespace_claim,
@@ -4764,6 +4792,7 @@ impl EnvConfig {
             mesh_trusted_hbone_assertors,
             mesh_unix_socket_allowed_roots,
             mesh_unix_socket_allowed_uids,
+            mesh_unix_ingress_max_connections,
             mesh_egress_strip_baggage_keys,
             mesh_outbound_traffic_policy,
             mesh_outbound_registry_reject_status,
@@ -5879,6 +5908,19 @@ impl EnvConfig {
             crate::proxy::stream_match::validate_canonical_gateway_ref(gateway_ref)
                 .map_err(|e| format!("FERRUM_STREAM_GATEWAY_REF: {e}"))?;
         }
+        // Sidecar-ingress Unix transport capacity (issue #3731). `0` is the
+        // explicit "no bound" opt-out; anything above the ceiling could not be
+        // reached before the process file-descriptor limit anyway, so accepting
+        // it would advertise a bound that is not one. Rejected at the config
+        // boundary rather than clamped, so an operator typo is visible.
+        if self.mesh_unix_ingress_max_connections
+            > crate::proxy::unix_backend_pool::MAX_UNIX_INGRESS_MAX_CONNECTIONS
+        {
+            return Err(format!(
+                "FERRUM_MESH_UNIX_INGRESS_MAX_CONNECTIONS must be 0 (no bound) or at most {}",
+                crate::proxy::unix_backend_pool::MAX_UNIX_INGRESS_MAX_CONNECTIONS
+            ));
+        }
 
         // Mesh config ordering domains (issues #2473 / #3611). Both are
         // validated here, at the single configuration boundary, and neither
@@ -5954,6 +5996,17 @@ impl EnvConfig {
                     ));
                 }
             }
+        }
+
+        if !(crate::grpc::auth::MIN_GRPC_MAX_STREAM_LIFETIME_SECONDS
+            ..=crate::grpc::auth::MAX_GRPC_MAX_STREAM_LIFETIME_SECONDS)
+            .contains(&self.cp_grpc_max_stream_lifetime_seconds)
+        {
+            return Err(format!(
+                "FERRUM_CP_GRPC_MAX_STREAM_LIFETIME_SECONDS must be between {} and {} seconds; 0/unbounded is not permitted",
+                crate::grpc::auth::MIN_GRPC_MAX_STREAM_LIFETIME_SECONDS,
+                crate::grpc::auth::MAX_GRPC_MAX_STREAM_LIFETIME_SECONDS,
+            ));
         }
 
         // CP/DP gRPC credential presence (advisory GHSA-3f2j-wwqw-grmg).

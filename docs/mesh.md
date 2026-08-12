@@ -24,6 +24,7 @@ Concepts map directly to the Istio service mesh model: `Workload` corresponds to
   - [PolicyScope Filtering](#policyscope-filtering)
   - [AuthorizationPolicy targetRefs](#authorizationpolicy-targetrefs-issue-3226)
   - [Evaluation Semantics](#evaluation-semantics)
+  - [AuthorizationPolicy action: CUSTOM](#authorizationpolicy-action-custom-issue-3235)
   - [Rule Matching](#rule-matching)
   - [SPIFFE Identity](#spiffe-identity)
   - [HBONE Protocol](#hbone-protocol)
@@ -176,7 +177,7 @@ This section consolidates every known residual gap so operators do not have to r
 - **`connectionPool.tcp.maxConnections`** — **applied everywhere Ferrum owns the physical backend connection**: stream-family (TCP/TCP+TLS), HTTP-family WebSocket (H1/H2/H3), the pooled multiplexed transports (direct H2, gRPC, native HTTP/3, HBONE, Sidecar mesh-mTLS), and the reqwest transports (HTTP/1.1 and ALPN-negotiated HTTP/2) — all through one shared RAII counter on `ProxyState.backend_conn_limit`, keyed per `(host, DestinationRule policy port)`. A pooled connection reserves its slot at construction and hands it to that connection's own driver, so the slot retires exactly when the socket dies and reuse/multiplexing takes NO extra slot (`http2MaxRequests` / `h2_max_concurrent_streams` remains the *stream*-concurrency knob). reqwest is admitted the same way inside its own connector via the vendored `connection_admission` hook, so an idle socket reqwest retains still holds its slot and all reqwest pool keys for a destination share ONE ceiling. Full contract in [DestinationRule `maxConnections` enforcement scope](#destinationrule-maxconnections-enforcement-scope).
 - **`connectionPool.http.h2UpgradePolicy`** — **applied** to the plain-HTTPS backend HTTP/1.1-vs-HTTP/2 dispatch fork at top-level, `portLevelSettings`, and selected-subset scope. `DO_NOT_UPGRADE` forces the reqwest/H1 path even when the backend capability registry proves H2 **and** restricts the reqwest client's ALPN to `http/1.1` (with both a force-H1 client discriminator and the selected subset in every HTTP-family pool key) so incompatible transports cannot share a client or connection; `UPGRADE` prefers direct-H2 (and treats an unclassified `Unknown` target as a hint to try H2, staying fail-safe against a proven-`Unsupported` one); `DEFAULT`/absent leaves probe-driven behavior unchanged (`DEFAULT` is carried explicitly so an explicit higher-precedence value clears an inherited override). Does NOT touch gRPC (always H2) or HBONE/mesh-mTLS transport selection. Unknown enum values are rejected at translate time.
 - **`connectionPool.http.maxRetries`** — **applied** as a **per-request retry-count CAP**, NOT Envoy's cluster-wide outstanding-retry budget (see [DestinationRule `maxRetries` semantics](#destinationrule-maxretries-semantics)). Caps each attempt to `min(original_route_ceiling, target_maxRetries)`; never increases retries and does NOT synthesize a retry policy when none exists. The original route ceiling remains available across target rotation. Zero explicitly disables an existing retry policy for the destination; negative values are rejected at translate time.
-- **`connectionPool.http.http1MaxPendingRequests`** — **applied** at top-level, `portLevelSettings`, and selected-subset scope as a per-`(host, policy port, selected subset)` cap on the **reqwest/HTTP-1.1** backend-dispatch path. **Honest reinterpretation — max concurrent in-flight H1 requests** (mirroring how DR `maxRetries` is reinterpreted as a per-request cap): Envoy's knob bounds the *pending-queue* depth (requests admitted but not yet assigned a connection), but Ferrum dispatches H1 over reqwest, whose `send().await` resolves at **response headers** and exposes **no connection-acquisition hook** — so true pending-queue depth is not measurable. Ferrum therefore reframes the knob as a bound on how many H1 requests are **simultaneously in flight** to a destination and selected subset (measured dispatch → response-headers); when a lane is at its cap a new H1 request is **shed with a 503** ("upstream overflow", classified `dispatch_policy_rejected`) rather than queued unboundedly. Because the shed happens before any backend dial, it is **neutral to backend health** — not retried, does not trip the backend circuit breaker / passive health, and does not shrink the adaptive-concurrency permit (a `client_side_no_backend_signal` class). The connection-failure **retry** path re-enters the same gate per attempt (the initial attempt's slot is released before the retry loop runs), so `retry_on_connect_failure` retries are bounded too. The gate is consulted only for dispatch **known HTTP/1.1 at acquire time** (`reqwest_dispatch_is_http1_only`): a `DO_NOT_UPGRADE` proxy, a **plaintext `http`** backend (reqwest never speaks h2c over cleartext), or an **HTTPS backend the capability registry has already classified H2-unsupported (H1-only)**; an HTTPS backend that may still ALPN-negotiate h2 is left **uncapped** (an `http1*` knob must not 503 an h2 backend — that is `http2MaxRequests`'s job). Under the in-flight framing there is **no body-shape exclusion** — bodyless GET/HEAD and streamed-upload requests are capped alike. **HTTP/1.1-scoped by design**: the multiplexed transports (direct H2, gRPC, HTTP/3, HBONE, mesh-mTLS) return before the reqwest path and never consult it. **Coverage note:** target rotation re-resolves the current target's effective policy, while the selected subset remains fixed for the route; explicit per-port entries win over selected-subset policy, which wins over top-level policy. The HTTP/3 frontend applies the selected-target effective proxy before native-H3, H3→gRPC, and H3→plain dispatch, so these knobs are no longer H1/H2-only from a configuration standpoint; transport-scoped behavior still applies. Enforced via an RAII guard on `ProxyState.backend_pending_limit` (see `src/backend_pending_limit.rs`), a sharded `CachePadded` atomic gate whose guard releases on success, error, deadline, retry transition, or task cancellation. The length-prefixed subset key prevents a sibling subset or unmatched destination from sharing the lane. Zero is rejected at translate time, and native/file mesh validation applies the same positive-value rule.
+- **`connectionPool.http.http1MaxPendingRequests`** — **applied** at top-level, `portLevelSettings`, and selected-subset scope as a per-logical-destination `(namespace, upstream/Service identity, policy port, selected subset)` cap on the **reqwest/HTTP-1.1** backend-dispatch path (and the H3→plain reqwest bridge). **Honest reinterpretation — max concurrent in-flight H1 requests** (mirroring how DR `maxRetries` is reinterpreted as a per-request cap): Envoy's knob bounds the *pending-queue* depth (requests admitted but not yet assigned a connection), but Ferrum dispatches H1 over reqwest, whose `send().await` resolves at **response headers** and exposes **no connection-acquisition hook** — so true pending-queue depth is not measurable. Ferrum therefore reframes the knob as a bound on how many H1 requests are **simultaneously in flight** to a logical destination and selected subset (measured dispatch → response-headers); when a lane is at its cap a new H1 request is **shed with a 503** ("upstream overflow", classified `dispatch_policy_rejected`) rather than queued unboundedly. The lane is keyed by precomputed logical identity (namespace/tenant, stable logical upstream/Service identity, optional Kubernetes Service UID when stamped, policy port, selected subset) — **not** by the selected endpoint host — so endpoint fan-out / DNS rotation cannot multiply the cap and independent Services sharing pods remain isolated (issue #3778). Mesh VIP/service-host and direct-pod routes for one Service use its FQDN; ordinary upstreams retain their resource ids. Because the shed happens before any backend dial, it is **neutral to backend health** — not retried, does not trip the backend circuit breaker / passive health, and does not shrink the adaptive-concurrency permit (a `client_side_no_backend_signal` class). The connection-failure **retry** path re-enters the same gate per attempt (the initial attempt's slot is released before the retry loop runs), so `retry_on_connect_failure` retries are bounded too. The gate is consulted only for dispatch **known HTTP/1.1 at acquire time** (`reqwest_dispatch_is_http1_only`): a `DO_NOT_UPGRADE` proxy, a **plaintext `http`** backend (reqwest never speaks h2c over cleartext), or an **HTTPS backend the capability registry has already classified H2-unsupported (H1-only)**; an HTTPS backend that may still ALPN-negotiate h2 is left **uncapped** (an `http1*` knob must not 503 an h2 backend — that is `http2MaxRequests`'s job). Under the in-flight framing there is **no body-shape exclusion** — bodyless GET/HEAD and streamed-upload requests are capped alike. **HTTP/1.1-scoped by design**: the multiplexed transports (direct H2, gRPC, HTTP/3, HBONE, mesh-mTLS) return before the reqwest path and never consult it. **Coverage note:** target rotation re-resolves the current target's effective policy, while the selected subset remains fixed for the route; explicit per-port entries win over selected-subset policy, which wins over top-level policy. The HTTP/3 frontend applies the selected-target effective proxy before native-H3, H3→gRPC, and H3→plain dispatch, so these knobs are no longer H1/H2-only from a configuration standpoint; transport-scoped behavior still applies. Enforced via an RAII guard on `ProxyState.backend_pending_limit` (see `src/backend_pending_limit.rs`), a sharded `CachePadded` atomic gate whose guard releases on success, error, deadline, retry transition, or task cancellation. Length-prefixed encoding isolates namespaces, logical upstream/Service identities plus optional K8s UIDs, policy ports, and subset names; zero-count keys are race-safely retired when the last guard drops. Cap updates use the requesting epoch's effective cap against the shared count so existing guards release exactly once. Zero is rejected at translate time, and native/file mesh validation applies the same positive-value rule.
   When `pool_enable_http2: false`, Ferrum treats the reqwest dispatch as known HTTP/1.1 immediately because the preconfigured-rustls path omits h2 ALPN, so the cap applies without waiting for capability-registry classification.
 - **Per-subset policy** — `connectionPool.tcp.connectTimeout`, `connectionPool.http.{h2UpgradePolicy,maxRetries,http1MaxPendingRequests,idleTimeout,http2MaxRequests}`, consistent hashing, TLS, and outlier policy are applied for proxies whose `upstream_subset` selects the subset. The HTTP fields use field-level precedence `portLevelSettings` > selected subset > top-level; unmatched destinations receive only top-level policy. **Semantics differ from Istio on purpose.** Istio applies **subset > DR `portLevelSettings`**, and a subset that sets *any* `connectionPool` field replaces the whole top-level `connectionPool` wholesale (`MergeSubsetTrafficPolicy` / `MergeTrafficPolicy`). Ferrum keeps the inverted tier order and field-level merge (the same deliberate convention already used for port-level overrides). Example: DR sets `portLevelSettings[{port:8080}].connectionPool.http.h2UpgradePolicy: UPGRADE` and `subsets[v1].trafficPolicy.connectionPool.http.h2UpgradePolicy: DO_NOT_UPGRADE` — Istio sends subset-v1 traffic on 8080 forced-H1; Ferrum negotiates h2. Likewise a subset setting only `maxRetries: 2` inherits a top-level `DO_NOT_UPGRADE` here, where Istio's wholesale replacement clears it. `subsets[].trafficPolicy.portLevelSettings` is **not applied** (deferred with a translate-time warning); express per-port policy at top-level `trafficPolicy.portLevelSettings` or use subset `connectionPool` fields.
 - **`portLevelSettings[].tls`** — **applied** per-port: resolved over the upstream-level TLS at apply time and projected onto the per-target effective proxy's `resolved_tls` (which is part of the backend pool key, so a distinct per-port TLS posture fragments its own pool). Takes precedence over the upstream-/subset-level `trafficPolicy.tls` for dials to that port.
@@ -1012,7 +1013,7 @@ Visibility and the lookup hierarchy compose in that order: `exportTo` is absolut
 | `trafficPolicy.connectionPool.http.http2MaxRequests` | Supported (HTTP-family) | Lands on the inherited dispatch fallback / explicit per-port override as `h2_max_concurrent_streams` and projects onto `Proxy.pool_http2_max_concurrent_streams` via the per-target effective proxy. Threads into the direct H2 (`src/proxy/http2_pool.rs`) and gRPC (`src/proxy/grpc_proxy.rs`) builders as both `http2::Builder::max_concurrent_streams` (peer SETTINGS) and `initial_max_send_streams` (local outbound-stream initial cap). Reqwest's H2 path does not expose the same builder knobs today. Top-level and selected-subset values ride `dispatch_port_override_fallback`; explicit `portLevelSettings` entries win per-port. Precedence is field-level per-port > selected subset > top-level. Zero/negative values rejected at translate time. Direct-H2 / gRPC pool keys include the effective `pool_http2_max_concurrent_streams` (`none` when unset) after `upstream_subset`, so same-subset divergent caps and configured-versus-removed values isolate distinct connections on update/delete. Sibling subsets stay isolated because every HTTP-family pool key already carries `upstream_subset`. Reqwest does not consume this knob in `create_client` and therefore does not key on it. |
 | `trafficPolicy.connectionPool.http.h2UpgradePolicy` | Supported (plain-HTTPS only) | Lands on the inherited/per-port dispatch policy and projects onto `Proxy.h2_upgrade_policy` via the per-target effective proxy. `DO_NOT_UPGRADE` forces reqwest/H1, restricts advertised ALPN to `http/1.1`, and adds an H1 discriminator; `UPGRADE` prefers direct-H2 while remaining fail-safe against a proven-unsupported target; `DEFAULT`/absent is probe-driven. Every HTTP-family shared-client/pool key already carries the selected `upstream_subset`, and the reqwest key additionally carries the force-H1 client behavior, so incompatible subset transports cannot share connections. Scope is plain HTTP only, not gRPC or mesh tunnels. Precedence is field-level per-port > selected subset > top-level (**Semantics differ from Istio on purpose** — Istio applies subset > port-level and wholesale `connectionPool` replacement; see the subset HTTP row above). Unknown enum values reject translation. |
 | `trafficPolicy.connectionPool.http.maxRetries` | Supported (per-request CAP — honest reinterpretation) | **Semantics differ from Envoy on purpose.** Ferrum treats the field as an upper bound on an existing per-request `Proxy.retry.max_retries`: `min(existing, effective_dr_cap)`. It never increases retries and never synthesizes retry behavior when no retry policy exists. A cap of zero explicitly disables an existing retry policy for the selected destination. The cap is resolved after target selection and before retry/deadline decisions; retry target rotation remains in an explicit port-policy lane when one exists, while subset/top-level fallback remains stable for the route's selected subset. Precedence is per-port > selected subset > top-level. Negative values reject translation. See [DestinationRule `maxRetries` semantics](#destinationrule-maxretries-semantics). |
-| `trafficPolicy.connectionPool.http.http1MaxPendingRequests` | Supported (honest reinterpretation — max concurrent in-flight HTTP/1.1 requests) | Projects onto the selected target's effective `Proxy.pool_http1_max_pending_requests`. Ferrum caps concurrent in-flight reqwest/H1 requests per `(host, policy port, selected subset)` because reqwest exposes no true connection-pending hook. A sharded `CachePadded` gate rejects overflow with a backend-neutral 503; its RAII permit releases at response headers or on every error, deadline, cancellation, and retry exit. Retry attempts reacquire independently. Direct H2, gRPC, H3, HBONE, and mesh-mTLS do not consult the H1 gate. Precedence is per-port > selected subset > top-level, and length-prefixed subset keys isolate distinct subset *names* (and unmatched destinations) on the same `(host, policy port)`. **Caveat:** the lane key has no upstream/Service identity, so two Services selecting the same pods under a conventionally-named subset (e.g. both `v1`) with different caps still share one lane. Zero rejects K8s and native/file mesh validation. |
+| `trafficPolicy.connectionPool.http.http1MaxPendingRequests` | Supported (honest reinterpretation — max concurrent in-flight HTTP/1.1 requests) | Projects onto the selected target's effective `Proxy.pool_http1_max_pending_requests`. Ferrum caps concurrent in-flight reqwest/H1 requests (including the H3→plain bridge) per logical destination `(namespace, upstream/Service identity, policy port, selected subset)` because reqwest exposes no true connection-pending hook. The selected endpoint host is intentionally absent from the key (issue #3778). A sharded `CachePadded` gate rejects overflow with a backend-neutral 503; its RAII permit releases at response headers or on every error, deadline, cancellation, and retry exit. Retry attempts reacquire independently. Direct H2, gRPC, native H3, HBONE, and mesh-mTLS do not consult the H1 gate (distinct from #3775's cross-protocol `http2MaxRequests` active-request breaker). Precedence is per-port > selected subset > top-level. Mesh VIP/service-host and direct-pod upstreams for one Service share its FQDN identity; Kubernetes Service UID additionally isolates delete/recreate (generation is not part of the lane). Native upstreams retain their resource ids, so duplicate display names do not collapse unrelated resources. Cap updates keep the shared count while checking the requesting epoch's cap; zero-count keys retire race-safely. Structured rejection logs carry a bounded FNV-1a scope digest plus the effective DestinationRule policy port (distinct from the dial port under targetPort remapping). Zero rejects K8s and native/file mesh validation. |
 | `trafficPolicy.connectionPool.tcp.maxConnections` | Supported (all transports Ferrum owns the socket for) | Cap on concurrent open backend connections per destination, enforced via a per-`(host, DestinationRule policy port)` shard-locked counter on `Upstream.port_overrides[port].max_connections` (`src/backend_conn_limit.rs`; the cap check, the reservation and the at-zero eviction all run under the same `DashMap` shard lock, so an idle destination drains from the map instead of retaining a zero-count entry for every host the gateway has ever dialed), shared by every transport so a destination gets ONE ceiling rather than one per transport. **Stream-family** (TCP / TCP+TLS / TCP-passthrough) enforces it at backend dial; exceeding the cap returns a typed `StreamSetupKind::BackendMaxConnectionsExceeded` (logged as `Backend maxConnections reached`) and the relay retry loop tries another LB target if `RetryConfig.retry_on_connect_failure` is enabled. **HTTP-family WebSocket** (H1/H2 in `src/proxy/mod.rs`, H3 in `src/http3/websocket.rs`) holds an RAII guard for the session; exceeding the cap rejects the upgrade with `503` (`rejection_phase=backend_max_connections`) before dialing. **Pooled multiplexed transports** (direct H2, gRPC, native HTTP/3, HBONE, Sidecar mesh-mTLS) reserve a shared slot at connection construction and hand it to that connection's driver, so it retires exactly when the socket closes (handshake failure, idle eviction, pool drain, reload/update/delete, SVID-rotation drain, shutdown) and unlimited multiplexed streams ride one admitted connection; an over-cap create is a pre-wire, backend-health-neutral `BackendConnectionLimit` (it may rotate to another LB target but records no circuit-breaker / passive-health / adaptive-concurrency failure for a destination that was never dialed) and the pool first falls back to an already-established shard so a capped destination keeps serving by multiplexing. **reqwest** (HTTP/1.1 and ALPN-negotiated HTTP/2) is admitted inside reqwest's own connector via the vendored `ClientBuilder::connection_admission` hook, so pooled reuse and multiplexed streams take no slot while an idle socket still holds one; an over-cap dial is refused and surfaced as a backend-health-neutral `503`. See the "DestinationRule `maxConnections` enforcement scope" note below for the per-transport contract. Top-level fan-out applies to every target port; per-port `portLevelSettings.connectionPool.tcp.maxConnections` overrides the fan-out for that specific port. `maxConnections <= 0` is rejected at translate time. |
 | `trafficPolicy.connectionPool.tcp.tcpKeepalive` (`time` / `interval` / `probes`) | Supported for stream-family AND HTTP-family multiplexed pools (direct-H2, gRPC, HBONE, mesh-mTLS); reqwest-backed HTTP and H3/QUIC are documented residuals (shared-client / non-TCP transport) | Each subfield independently optional. Applied via `setsockopt(SO_KEEPALIVE)` + `TCP_KEEPIDLE` (Linux) / `TCP_KEEPALIVE` (macOS/iOS) for `time`, `TCP_KEEPINTVL` for `interval`, `TCP_KEEPCNT` for `probes`. Set on the backend socket right after `connect()` (stream-family: TCP / TCP+TLS / TCP-passthrough; HTTP-family: the socket-owning H2-family pools resolve the same per-port override at connection creation via the shared `socket_opts::apply_pooled_tcp_keepalive` — direct-H2 `http2_pool` and `grpc_proxy` key it by the dial target's `backend_port`; the HBONE pool and the Sidecar mesh-mTLS pool key it by the destination's **app/service port** and apply it inside the shared `dial_h2_connect_sender` after dialing the transport port `:15008`/`:15006`, so it covers Ambient HBONE egress, Sidecar mesh-mTLS egress, raw-TCP egress over both transports, AND WebSocket-over-HBONE/-mesh-mTLS which ride the same dialer). Best-effort: a `setsockopt` failure logs a `warn!` and continues rather than aborting the connection. The per-port DR override is **additive and takes precedence**; absent an override the global pool keepalive (`pool_config.tcp_keepalive_seconds`, whole-seconds idle time only, applied when `enable_http_keep_alive`) remains the fallback — so existing non-mesh behavior is unchanged. **First-materializer tradeoff (HTTP-family only):** keepalive is NOT part of the pool key (forbidden by the proxy-protocol rules — see `.claude/rules/proxy-protocols.md`), and these connections are pooled+shared, so the keepalive is fixed once at connection creation and the **first dispatcher to materialize a pooled connection wins**; later dispatchers that differ only in keepalive reuse the existing connection and inherit its setting — the same tradeoff already documented for `idleTimeout` / `maxRequestsPerConnection`. **Residuals:** the reqwest-backed HTTP pool (`src/connection_pool.rs`) applies `tcp_keepalive` at builder time (seconds-only) on a client SHARED across proxies that differ only in policy fields (keepalive is excluded from pool keys per the rules), so a clean per-proxy DR override is not possible there without another vendored reqwest patch — it keeps the global seconds-only keepalive (mesh egress never uses reqwest, so mesh coverage is complete; reqwest mainly serves non-mesh + localhost inbound where keepalive is moot). H3/QUIC (`src/http3/client.rs`) is UDP — `tcpKeepalive` is N/A (a QUIC keep-alive would be a separate `TransportConfig` knob). Sub-second durations and zero values are rejected at translate time because the underlying socket options are second-granular and require at least one probe. |
 | `trafficPolicy.tls` | Supported | Overrides the `PeerAuthentication`-derived backend posture per matching `Upstream` when set. Mode mapping: `DISABLE` → clears `Upstream.backend_tls_*`; `SIMPLE` → enables server-cert verify + `backend_tls_server_ca_cert_path = caCertificates` (client cert/key cleared); `MUTUAL` → enables server-cert verify + projects `caCertificates`/`clientCertificate`/`privateKey` onto `Upstream.backend_tls_server_ca_cert_path`/`_client_cert_path`/`_client_key_path`; `ISTIO_MUTUAL` → enables server-cert verify + projects the workload SVID paths from `FERRUM_GATEWAY_SVID_CERT_PATH` / `FERRUM_GATEWAY_SVID_KEY_PATH` onto the upstream client cert/key fields, failing slice apply if either path is missing so stale/global client material is not used. `ISTIO_MUTUAL` projects **file-based** SVID paths for the outbound client cert, so when the mesh's only workload identity is a dynamic CA-backed SVID (`FERRUM_MESH_CA_BACKEND` with no `FERRUM_GATEWAY_SVID_*` files), `ISTIO_MUTUAL` on a generic backend / egress `ServiceEntry` upstream is intentionally **rejected (slice apply fails closed)** because the generic backend TLS path cannot present a dynamic SVID client cert — use file-based `FERRUM_GATEWAY_SVID_*` material, or an explicit `MUTUAL` policy with `clientCertificate` / `privateKey` paths, for those upstreams. Validated reloads of the `FERRUM_GATEWAY_SVID_*` files bump a generation in backend TLS and pool keys so new H2/gRPC/H3/HTTP connections rebuild client identity state without restarting; active HTTP health probes are restarted on each observed revision, and existing connections complete on their original config unless `FERRUM_MESH_SVID_ROTATION_DRAIN_SECONDS` force-drains old-generation pool entries. `insecureSkipVerify: true` forces `backend_tls_verify_server_cert = false`, except that pairing it with `caCertificates: system://` is rejected at Kubernetes translation, native/file/xDS slice validation, and cold-path application: selecting system roots and then disabling verification is contradictory and must fail closed. The `system://` value must use that exact spelling with no path or query suffix. `sni` projects to `Upstream.backend_tls_sni`, onto `Proxy.resolved_tls`, into backend H2/gRPC/H3 TLS handshakes, and into the backend pool key so different SNI values never share connections. Plain HTTPS requests with an SNI override prefer the direct H2 backend pool, which sets the TLS server name natively; when that pool is unavailable or the backend speaks only HTTP/1.1, the request falls back to an HTTP/1.1 reqwest dial that carries the override in the request URL's authority while pinning the socket to the selected target (see the SNI transport paragraph below). `subjectAltNames` projects to `Upstream.backend_tls_san_allow_list`, onto `Proxy.resolved_tls`, into backend TLS verifier enforcement, and into the backend pool key so different allow-lists never share connections. If per-proxy or global no-verify is enabled, SAN allow-lists are not enforced and Ferrum logs a warning. When the field is unset, behavior is identical to today and `PeerAuthentication` continues to drive the default mTLS posture. |
@@ -1120,14 +1121,291 @@ DP slices reconstruct `MeshConfig` without `waypoint_bindings`, so Gateway prese
 
 ### Evaluation Semantics
 
-`evaluate_mesh_authorization()` processes policies in order:
+`evaluate_mesh_authorization_full()` processes policies in Istio's action order:
 
-1. **DENY rules checked first** -- first match returns `Deny`.
-2. **ALLOW rules** -- if any ALLOW rule exists in the policy set but none matched, the result is **implicit deny** (Istio semantics).
-3. **AUDIT rules** -- matched audit policies are returned for logging.
-4. If no DENY or ALLOW rules exist, the result is `Allow`.
+1. **CUSTOM rules checked first** -- a matching CUSTOM rule delegates the decision to its `meshConfig.extensionProviders` external authorizer *before* any DENY or ALLOW tier can settle the request. See [AuthorizationPolicy `action: CUSTOM`](#authorizationpolicy-action-custom-issue-3235).
+2. **DENY rules** -- first match returns `Deny`. A DENY still refuses a request an external authorizer was willing to admit.
+3. **ALLOW rules** -- if any ALLOW rule exists in the policy set but none matched, the result is **implicit deny** (Istio semantics). A CUSTOM rule does **not** contribute to that implicit-deny floor: it delegates rather than grants.
+4. **AUDIT rules** -- matched audit policies are returned for logging.
+5. If no CUSTOM, DENY, or ALLOW rules exist, the result is `Allow`.
 
-**Istio empty-rule semantics**: `ALLOW` with no rules is allow-nothing (emits a `never_matches` rule so the implicit deny applies). `DENY`/`AUDIT` with no rules are no-ops.
+**Istio empty-rule semantics**: `ALLOW` with no rules is allow-nothing (emits a `never_matches` rule so the implicit deny applies). `DENY`/`AUDIT` with no rules are no-ops. `CUSTOM` with no rules is **rejected** at translation: a ruleless delegation has no matching surface, so admitting it would produce an accepted-but-inert policy.
+
+### AuthorizationPolicy `action: CUSTOM` (issue #3235)
+
+An `AuthorizationPolicy` with `action: CUSTOM` delegates matching requests to an
+external authorization service declared in the **root-namespace**
+`meshConfig.extensionProviders` list:
+
+```yaml
+# istio-system/istio ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: istio
+  namespace: istio-system
+data:
+  mesh: |
+    extensionProviders:
+    - name: sample-ext-authz
+      envoyExtAuthzHttp:
+        service: ext-authz.istio-system.svc.cluster.local
+        port: 8000
+        scheme: https           # Ferrum extension, see "Provider transport"
+        timeout: 0.5s
+        pathPrefix: /check
+        failOpen: false
+        statusOnError: "403"
+        includeRequestHeadersInCheck:
+        - x-request-id
+        includeAdditionalHeadersInCheck:
+          x-ext-authz-caller: "ferrum-mesh"
+        headersToDownstreamOnDeny:
+        - www-authenticate
+---
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: delegate-admin
+  namespace: default
+spec:
+  action: CUSTOM
+  provider:
+    name: sample-ext-authz
+  selector:
+    matchLabels: { app: reviews }
+  rules:
+  - to:
+    - operation:
+        paths: ["/admin/*"]
+```
+
+**Provider resolution is root-namespace only.** `spec.provider.name` is resolved
+against `meshConfig.extensionProviders` in `FERRUM_K8S_ISTIO_ROOT_NAMESPACE`.
+A tenant namespace cannot introduce or shadow a provider, so cross-namespace
+provider resolution is structurally impossible rather than filtered. Each
+failure mode has its own field-shaped diagnostic and **rejects the resource**
+(it is never accepted-but-inert):
+
+| Condition | Outcome |
+| --- | --- |
+| `provider` absent / not an object / unknown field | rejected |
+| `provider.name` empty, non-string, or over 253 bytes | rejected |
+| name not declared in the root-namespace meshConfig | rejected, naming the root namespace |
+| name declared as a tracing (or other non-ext-auth) provider | rejected, "is not an external authorization provider" |
+| name declared as `envoyExtAuthzGrpc` | rejected, "a variant Ferrum does not implement" |
+| `action: CUSTOM` with no `rules` | rejected |
+| `provider` on a non-CUSTOM action | rejected |
+
+**Supported provider shape.** Only `envoyExtAuthzHttp` is implemented: the
+check is a bounded HTTP request. `envoyExtAuthzGrpc` is refused at admission
+rather than approximated — the Envoy gRPC check API carries attributes Ferrum
+does not model, and an approximation would silently change what a policy
+authorizes. The `envoyExtAuthzHttp` key set is **closed**: an unmodelled field
+(including the deprecated `includeHeadersInCheck`) is rejected rather than
+ignored, so an operator can never believe a field is in force when it is not.
+The enclosing extension-provider oneof is closed too: an entry carrying an
+HTTP ext-authz block plus any sibling provider variant or unknown field is
+rejected instead of choosing whichever recognized field appears first.
+
+**Provider transport.** Istio derives the ext-auth transport from the
+destination's own mesh configuration; Ferrum's provider dial does not go
+through that path, so the operator states it with a `scheme: http|https` field
+on the provider block. A **non-loopback** provider must use `https`: an
+unencrypted off-box check (which may carry a forwarded credential) is refused
+at admission. Loopback providers (`127.0.0.1`, `::1`, `localhost`) may use
+plaintext.
+
+**`service` must be a real bare URL host** — a DNS name, an IPv4 literal, or an
+IPv6 literal (bracketed or bare). Userinfo (`@`), an embedded port, a path,
+query, fragment, backslash, percent-encoding, or a bracket imbalance is
+rejected at admission rather than deferred to a per-request URL parse.
+`pathPrefix` is validated as a real path: it must start with a single `/` and
+may not carry `?`, `#`, `\`, percent-encoding, a `.` / `..` segment, or a
+leading `//` — those forms can be normalized or can move the request path into
+a different URL component. The composed base URL is re-parsed at config
+publication and must still carry only scheme, host, port, and path.
+
+> **Deliberate narrowing:** Istio's namespace-qualified
+> `[<namespace>/]<hostname>` service syntax is **not supported** and is
+> rejected with a diagnostic naming it. Ferrum dials the provider directly
+> rather than resolving it through the mesh service registry, so the namespace
+> qualifier has no meaning here — and silently dropping it would dial a
+> different service than the operator named. Declare the fully qualified
+> hostname instead.
+
+**`statusOnError` is an HTTP status.** Upstream Istio documents it as a status
+**string**, so `statusOnError: "403"` is the real operator input shape; a JSON
+integer (`403`) is also accepted for hand-authored Ferrum mesh documents. The
+internal representation is numeric. A value outside 4xx/5xx, an Envoy enum
+*name*, a float, or a non-numeric string is rejected rather than defaulted.
+
+**At most ONE extension provider may apply to a request.** Istio permits one
+extension provider per workload. Several CUSTOM policies naming the **same**
+provider coalesce into one check. Two CUSTOM policies naming **different**
+providers are refused: a workload-scoped conflict is rejected at plugin
+construction (the previous valid generation keeps serving), and a request that
+can see two distinct applicable providers across relay/waypoint destination
+scopes is denied with the stable reason `custom:provider-conflict`. Ferrum
+never picks the first match — that would let policy iteration order choose
+which operator's authorizer enforces. Different providers on **disjoint**
+workloads or destination scopes remain fully supported: the construction-time
+refusal applies only where the generation's policy set really is one workload's,
+so a node-waypoint generation (which serves every enrolled pod on the node from
+one listener) and a waypoint generation (whose `targetRefs` retention spans
+every fronted Service) may each carry one provider per pod / per destination,
+and only a request that can genuinely see two is refused.
+
+**CUSTOM runs before DENY across destination scopes too.** A request that spans
+several destination scopes (a node-waypoint relay serving many backends)
+evaluates **every** applicable scope before applying a decision: a DENY in an
+earlier scope is recorded and the scan continues, so a delegation carried by a
+later scope is still executed and still counted. The first DENY in scope order
+remains the reported policy, and it still refuses the request once the check has
+run — stopping the scan at that DENY would have let scope order decide whether
+an operator's authorizer ever saw a request the scope it protects applied to
+(and would have hidden a two-provider conflict living in a later scope).
+
+**Bounds.** `timeout` is capped at 30s (default 1s), `includeRequestBodyInCheck.maxRequestBytes`
+at 1 MiB, provider response reads at 64 KiB, each header list at 32 exact
+entries (case-insensitively unique), and the admitted provider set at 16 per
+mesh generation. In-flight checks are capped process-wide and are **refused
+immediately** at the ceiling rather than queued, so provider slowness cannot
+become unbounded gateway latency or memory growth.
+
+**Nothing is retried.** The check is dispatched through a dedicated
+single-attempt seam on the shared plugin HTTP client, so it keeps that client's
+no-proxy, redirect-disabled, DNS/egress-policy, TLS posture, redacted logging,
+latency accounting, and typed failure classification while performing **exactly
+one attempt** — `FERRUM_PLUGIN_HTTP_MAX_RETRIES` does not apply. A check is a
+decision, not a report: replaying it would turn one client request into several
+authorization decisions and amplify load onto a struggling authorizer.
+
+**What the check carries.** The HTTP ext-auth protocol's automatic fields are
+all present: the original request **method**, the (prefixed) **path**, the
+original **Host** authority, and **Content-Length** when a body is sent.
+Carrying the original authority is a header only — the connection is always
+dialled at the provider's own configured `service`/`port`, so a client-supplied
+authority can never route the provider connection. The query string is **not**
+forwarded (a credential in it must not reach the provider).
+`includeAdditionalHeadersInCheck` values are **authoritative**: a fixed
+operator header replaces any same-named client header or
+`includeRequestHeadersInCheck` value rather than being appended beside it, and
+case-variant duplicate fixed names are rejected at admission so the winner is
+never iteration-order dependent.
+
+**Outcome classification** follows the Istio/Envoy HTTP ext-auth protocol
+exactly:
+
+| Provider response | Outcome |
+| --- | --- |
+| HTTP `200` | **allow** |
+| HTTP `5xx` | **failed check** — follows `failOpen`; `statusOnError` when fail-closed |
+| communication failure (connect / TLS / timeout, or an unreadable / oversize `200` response) | **failed check** — follows `failOpen`; `statusOnError` when fail-closed |
+| any other status (3xx, 4xx, and any non-`200` 2xx such as `204`) | **explicit denial**, carrying the provider's own status |
+
+The denial Ferrum emits is gateway-authored and carries a fixed JSON error
+body, so a denial status that cannot frame content — `1xx`, a non-`200` `2xx`
+such as `204`/`205`, and `304` — is replaced by a plain `403`. Forwarding one
+verbatim would put `Content-Length` on a response the client is required not to
+read a body for, leaving those bytes to be misparsed as the head of the next
+response on an HTTP/1.1 keep-alive connection. `3xx` (except `304`) and `4xx`
+pass through unchanged, so a redirect-to-login denial paired with
+`headersToDownstreamOnDeny: [location]` still works. Only the unrepresentable
+status is replaced: the decision is still a denial and is still counted as
+`denied_by_provider`.
+
+Ferrum never uses or forwards the provider response body. Once an explicit
+denial status has arrived, that status remains authoritative even if its
+discarded body is oversized or cannot be drained; `failOpen` therefore cannot
+convert a provider denial into an allow through a body-framing failure.
+
+A provider name this generation does not carry, a generation with no executor,
+an unavailable request body for a body-inspecting provider, a concurrency
+refusal, and task cancellation are all failed checks and therefore also honour
+`failOpen`. **Three** refusals are decided **without** contacting a provider and
+are therefore **not** subject to `failOpen`: a provider conflict (above), a
+matched delegation on a connection with no HTTP request to check, and a request
+body over the selected provider's `maxRequestBytes` (below).
+
+**Request body.** `includeRequestBodyInCheck.maxRequestBytes` is folded into
+the proxy's pre-`authorize` body ceiling, so an over-cap request is refused with
+**413 before the check is dispatched**. That shared ceiling is the **maximum**
+`maxRequestBytes` across the generation's providers, because one prebuffer
+serves whichever provider the matched CUSTOM rule selects — it is **not**
+necessarily the selected provider's own cap, so a generation that also carries a
+higher-cap provider lets a body over a lower-cap provider's `maxRequestBytes`
+reach the check. The per-provider cap is re-enforced there as an
+**unconditional client-facing 413**, before any provider I/O and before a
+concurrency permit is taken, and it is **never** subject to `failOpen`: with
+`allowPartialMessage` refused at admission there is no truncated body a strict
+provider could have decided on, so an unrelated provider's larger cap can never
+admit a request the selected provider's cap excluded. (A body that is *missing*
+rather than too large stays an ordinary failed check and still honours
+`failOpen`.) That ceiling and the buffering it implies apply **only** to
+requests a body-inspecting CUSTOM rule could actually reach: the per-request
+predicate is precise on method, path, and host, so an unrelated request on the
+same workload keeps its ordinary accepted body size.
+
+> **Deliberate narrowing:** `includeRequestBodyInCheck.allowPartialMessage:
+> true` is **rejected at every admission boundary** (Kubernetes translation,
+> the native/file mesh document, and the xDS carrier). Envoy's partial-message
+> mode checks a bounded prefix and still forwards the complete original body
+> upstream; Ferrum's authorize-phase buffer *is* the body the proxy forwards, so
+> honouring the flag would mean either truncating the backend-visible request or
+> retaining an unbounded body behind a cap the operator asked for. An
+> accepted-but-unreachable flag would be worse than a visible refusal.
+
+**Mutation is deliberately narrow.** `headersToDownstreamOnDeny` is honoured:
+those headers land on the gateway-authored denial this plugin itself produces.
+`headersToUpstreamOnAllow` and `headersToDownstreamOnAllow` are **rejected at
+admission**. Ferrum runs the check in the `authorize` phase, before route
+dispatch and before every request/response transformer, so a header written
+there would order differently against operator-authored rules on each ingress
+path; a protocol-dependent mutation of an authenticated request is exactly the
+gap this feature must not introduce. Wildcard header entries are refused for
+the same reason a prefix rule cannot be shown to exclude hop-by-hop, routing,
+mesh-identity, or gateway-reserved names. The provider's own response **body**
+is never echoed to the client. Credentials (`authorization`, `cookie`) reach a
+provider only by being named explicitly in `includeRequestHeadersInCheck`; the
+full client header map and the request query string are never forwarded.
+
+**Protocol coverage.** The check runs on every HTTP-family ingress path
+identically — HTTP/1.1, HTTP/2, native gRPC, HTTP/3, and HTTP relayed inside a
+mesh/HBONE CONNECT — because they share one `authorize` ladder. Layer-4
+sessions (raw TCP, TLS passthrough, UDP, DTLS) carry no HTTP request and cannot
+be checked: a CUSTOM rule that **matches** an L4 connection **denies** it rather
+than serving it unchecked. Following Istio, HTTP-only fields are treated as
+**always matched** on a non-HTTP port for `DENY` **and `CUSTOM`** alike, so a
+CUSTOM rule carrying `paths` / `methods` / `headers` / `when: request.auth.*`
+still matches an L4 connection and still closes it — it does not quietly become
+inert. Scope a CUSTOM policy with `to.operation.ports` when the selected
+workload also serves non-HTTP ports.
+
+**Reload and withdrawal.** Providers ride the mesh slice (and their own
+`ExtAuthzProvidersCarrier` ECDS carrier over xDS, re-validated at the ACK
+boundary), and `MeshSlice::content_eq` compares them, so editing only
+`meshConfig.extensionProviders` still republishes. Each slice carries only the
+providers its retained policies actually bind. Deleting a CUSTOM policy retires
+its executor with the generation — there is no background task or detached
+queue to leak. A provider that cannot be prepared rejects the whole plugin
+generation, so the previous valid one keeps serving.
+
+**Observability.** `ferrum_mesh_ext_authz_checks_total{outcome}` and
+`ferrum_mesh_ext_authz_check_failures_total{disposition}` are fixed-cardinality:
+the labels are closed enums plus the gateway namespace, never a provider,
+policy, route, host, principal, or status string. `mesh_authz.ext_authz_outcome`
+request metadata carries the same closed reason token. Every matched
+delegation is counted **exactly once**, including the outcomes decided without
+contacting a provider (`provider_unbound` when no executor or no binding,
+`provider_conflict`, `unexecutable` for an L4 session), so a fail-closed
+denial is never invisible. `outcome` values are `allowed`, `denied_by_provider`,
+`provider_unbound`, `provider_error`, `provider_conflict`, `unexecutable`,
+`timeout`, `transport_error`, `response_refused`, `body_unavailable`,
+`body_too_large`, and `concurrency_exhausted`. `body_unavailable` (a failed
+check `failOpen` may admit) and `body_too_large` (the unconditional over-cap
+refusal) are deliberately separate series. No request body, credential header
+value, provider secret, or resolved provider URL is ever logged.
 
 ### Rule Matching
 
@@ -2058,7 +2336,7 @@ The status writer reports the count of modeled listeners as `status.ferrum.trans
 
 ### Unix-socket backends
 
-A `unix://` `defaultEndpoint` names a Unix-domain **stream** socket the co-located application listens on. Ferrum admits the path, then dispatches matching requests over a fresh `tokio::net::UnixStream` instead of a TCP connection. Its schema-compatible loopback `host:port` carrier is never resolved or dialed and is not evaluated by `FERRUM_BACKEND_ALLOW_IPS`; the socket-specific containment, ownership, inode, and peer-credential gates below are the authoritative egress policy for this local transport.
+A `unix://` `defaultEndpoint` names a Unix-domain **stream** socket the co-located application listens on. Ferrum admits the path, then dispatches matching requests over a `tokio::net::UnixStream` instead of a TCP connection. Those connections are **pooled** — HTTP/1.1 carriers are reused across requests and one h2c carrier multiplexes concurrent RPCs (see "Connection pooling" below); only a WebSocket upgrade takes a dedicated, non-reusable connection. Its schema-compatible loopback `host:port` carrier is never resolved or dialed and is not evaluated by `FERRUM_BACKEND_ALLOW_IPS`; the socket-specific containment, ownership, inode, and peer-credential gates below are the authoritative egress policy for this local transport.
 
 #### Containment is mandatory and off by default
 
@@ -2112,29 +2390,73 @@ The wire protocol is resolved **once at translation** from the declared `port.pr
 | `http2`, `https` | h2c prior-knowledge HTTP/2 | Supported. (`https` is mapped to `Http2` by the Istio translator; a `defaultEndpoint` is a plaintext hop to a co-located app, so TLS is not re-originated onto the socket and the request `:scheme` is `http`.) |
 | `grpc` | h2c prior-knowledge HTTP/2 | Supported, natively: full request/response streaming, the receipt-anchored client deadline, upstream cancellation on deadline expiry, `te: trailers` regeneration, and terminal `grpc-status`/`grpc-message` **trailers**. |
 | gRPC request to an `http`-declared socket | — | **Refused** with gRPC `UNAVAILABLE` (14). HTTP/1.1 cannot carry gRPC trailers, and a downgrade would silently corrupt the RPC. Declare the listener `GRPC` or `HTTP2`. |
-| WebSocket upgrade to any Unix-backed listener | — | **Refused** `502`. The WebSocket dial machinery is written against TCP/TLS and the mesh CONNECT tunnels and has no Unix transport; the target's `host:port` is the gateway's own inbound listener port, so a fallback would loop the proxy into itself. |
+| WebSocket upgrade to an `http`-declared socket | HTTP/1.1 (RFC 6455) | Supported (issue #3732). The upgrade is spoken over the **admitted** `UnixStream` by a dedicated, non-reusable HTTP/1.1 carrier; admission, containment, owner/mode/type, inode identity, and peer-UID verification all complete inside the one establishment deadline and **before the first upgrade byte**; the upgrade exchange itself is bounded by what *remains* of that same deadline, not by a second full `backend_connect_timeout_ms` timer. Frame/message limits, origin and plugin gates, `101` + exact `Sec-WebSocket-Accept` validation, bytes coalesced with the handshake response, idle timeout, admission permits, connection accounting, circuit-breaker/passive-health/load-balancer accounting, cancellation, and graceful shutdown are the TCP path's — the same `run_websocket_proxy` relay serves both. |
+| WebSocket upgrade to an `http2`/`grpc`-declared socket | — | **Refused** `502`. That form would need RFC 8441 Extended CONNECT over the h2c Unix carrier, which is not implemented. It is refused rather than downgraded to an HTTP/1.1 upgrade the h2c-only app cannot answer, and never falls back to the target's placeholder `host:port` (the gateway's own inbound listener port — a fallback would loop the proxy into itself). Gateway-side and pre-dial: `ErrorClass::DispatchPolicyRejected`, health-neutral and not retried. |
 | Retry dispatch (reqwest-backed) | — | **Refused** `502`. The materialized ingress proxies configure no retry policy, so this is a defensive gate, not a live limitation. |
-| HTTP/3 frontend | — | **Refused.** The H3 bridge has no Unix transport; mesh capture is TCP-only, so an H3 frontend cannot reach a Sidecar ingress listener in practice. |
+| HTTP/3 frontend | — | **Refused**, WebSocket included. The H3 bridge has no Unix transport; mesh capture is TCP-only, so an H3 frontend cannot reach a Sidecar ingress listener in practice. H1 and H2 frontends both serve Unix-backed WebSockets (an H2 frontend's RFC 8441 Extended CONNECT is relayed to the backend's HTTP/1.1 upgrade, exactly as on TCP). |
 | Non-HTTP-family `port.protocol` (`tcp`/`tls`/…) | — | Deferred before any listener exists (raw-TCP inbound has no Host/route). |
 
-The h2c path is not a second implementation of the gRPC-over-HTTP/2 contract: it reuses `proxy_to_backend_mesh_mtls`'s dispatch body with the pooled SVID-mTLS sender swapped for a 1:1 h2c `UnixStream` sender, so gRPC flavor detection, deadline handling, the never-buffer-native-gRPC rule, and streaming trailer forwarding are literally the same code on both transports and cannot drift. Every h2c buffer is bounded: a 1 MiB initial stream window, a 2 MiB connection window, a 16 KiB max frame size, and a capped reset-stream table, on top of the request/response body ceilings the caller already applies.
+The h2c path is not a second implementation of the gRPC-over-HTTP/2 contract: it reuses `proxy_to_backend_mesh_mtls`'s dispatch body with the pooled SVID-mTLS sender swapped for a pooled h2c `UnixStream` sender, so gRPC flavor detection, deadline handling, the never-buffer-native-gRPC rule, and streaming trailer forwarding are literally the same code on both transports and cannot drift. Every h2c buffer is bounded: a 1 MiB initial stream window, a 2 MiB connection window, a 16 KiB max frame size, and a capped reset-stream table, on top of the request/response body ceilings the caller already applies.
 
 #### Timeouts, lifecycle, and the transport gate
 
 The connect is bounded by the proxy's `backend_connect_timeout_ms` (5s for a materialized ingress listener), falling back to 5s if unset; exceeding it yields a `504` with `ErrorClass::ConnectionTimeout`. Read/write bounds and request/response body ceilings are the same ones the loopback-TCP path applies.
 
+**One budget per establishment, opened before any work.** That deadline is created as an absolute instant at the very top of a checkout — before the pool's amortized idle sweep (which scans the pool's maps and `stat`s socket paths), before path admission, before any pool creation-lock wait, before `connect(2)`, before the protocol handshake, and (for a WebSocket) before the RFC 6455 upgrade exchange — and every one of those stages is bounded by that same instant. No stage derives a second budget from `backend_connect_timeout_ms`, so an establishment can never consume two or three full setup budgets. The synchronous maintenance and admission `stat`s cannot be preempted while they execute, but the time they cost is charged all the same: the next bounded await resolves immediately once the deadline has passed. An unreasonable operator duration still fails closed rather than becoming an effectively unbounded wait: a `backend_connect_timeout_ms` past the 24-hour ceiling config validation already enforces on timeout fields, or one the platform clock cannot represent, is refused at the dial with the ordinary connect-timeout response. Every value an admitted configuration can produce is unaffected, and `0` keeps its documented meaning (the 5s Unix default).
+
 On an h2c socket that one budget is **end-to-end over establishment**, and establishment means the **peer's** HTTP/2 connection preface, not the client's. Hyper's h2c `handshake()` writes the client preface and never reads, so it completes against a peer that merely accepted the socket; the dial therefore also waits for the peer's own initial `SETTINGS` frame (RFC 9113 §3.4) — the same observation the gRPC pool's h2c path uses — before the sender is handed to dispatch. Admission, `connect(2)`, the client handshake, and that wait share the single budget captured before the connect, so a slow connect cannot re-arm a fresh one. This is what stops a co-located app that accepts and then wedges from pinning a request task indefinitely when the client supplied no gRPC deadline and no backend read timeout is configured. A peer that hangs up before completing its preface is a `502` with `ErrorClass::ConnectionPoolError` (evidence about the app, health-affecting, pre-wire and therefore replay-safe); exceeding the budget is the `504` above.
 
-Connections are **not pooled** — each request dials its own socket and closes it when the response completes. The destination is a local app reached by a plain `connect(2)` with no DNS, TCP handshake, or TLS, so pooling is a performance follow-up rather than a correctness requirement.
+#### Connection pooling
+
+Admitted connections are **pooled** (issue #3731) by `src/proxy/unix_backend_pool.rs`. Pooling never weakens admission: every **new physical connection** still runs the full containment / ownership / file-type / inode / peer-UID gate under the single establishment deadline above.
+
+Connections are keyed by a **structured** transport identity — namespace, proxy id, effective upstream id, canonical resolved path, the admitted `(dev, ino, owner_uid)`, and the wire protocol. Retirement compares those fields exactly; there is deliberately no substring matching on a formatted key anywhere in the pool, because a substring rule on a security-sensitive retirement can both under- and over-retire.
+
+Before **every** checkout the path is re-admitted and its live `(dev, ino, owner_uid)` compared against the identity the pooled connections were admitted with. A mismatch — the socket file was replaced — retires every connection for that canonical path, across protocols and proxies, **before any further request byte is written**, and the caller re-admits and re-dials.
+
+Per protocol:
+
+- **h2c / native gRPC** — the multiplexable sender is shared, so concurrent RPCs ride one admitted connection's streams. Concurrent misses for one identity are coalesced behind a creation lock bounded by the same establishment deadline as the dial, so a burst opens one connection rather than N. A closed or GOAWAY carrier is evicted and replaced on the next checkout; a failed establishment leaves nothing pooled and is counted as a pool setup failure, not charged to the backend as a request failure.
+- **HTTP/1.1** — an **exclusive** lease, kept for the whole exchange and returned to the idle set only after the **entire** response body has been read. That holds for buffered *and* streaming responses. A buffered response reads the body inside the dispatch function and checks the carrier in there. When keep-alive reuse is enabled, a backend response that declares a `Content-Length` **within the gateway's eager-buffer cutoff** (`FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES`, default 64 KiB, and never a stream-mandated content type such as SSE) is forced onto that in-dispatch buffered path even if the proxy's `response_body_mode` is `stream` (mesh ingress's default): returning the carrier from the client-visible body's `Ready(None)` races a frontend `Connection: close` teardown that can drop the body without that terminal poll and otherwise force one dial per request. That cutoff is the same eager-buffer contract every other transport applies, and it is the boundary on purpose — buffering a larger declared length would make the retained bytes unbounded by that knob, fold an "unlimited" response ceiling down to the fail-closed per-response fallback (turning a previously streamable large response into a `502`), and multiply resident memory by concurrency against the shared response-buffer budget. A larger, chunked, or unknown-length streaming response is not buffered: the body leaves the dispatch function, so the lease travels with it, owned by the response body that holds the backend stream and released **only** from that body's clean end-of-stream. Every other terminal (a body error, a backend close, a client disconnect or cancellation, an early body drop, a read timeout, an aborted request, an expired client deadline, shutdown) drops the lease instead, which closes the connection — `Drop` never returns a carrier to the pool. The carrier is never handed to another request while a body is still streaming: the lease is the only handle on it and it is not in the idle set.
+
+  Receiving response headers is never sufficient, and neither is hyper's own `SendRequest::ready()` on its own — h1 `can_write_head()` is already true while a response body is still being read, so readiness alone would re-pool a connection mid-body and pipeline the next request onto it. Readiness is used only as the *second* half of the check-in, after the caller has proven the body is complete, because `try_send_request` does not wait for readiness and a sender pooled before its dispatcher re-arms would bounce the next request. A response hyper reports as end-of-stream at header time (`204`, `304`, `HEAD`, `Content-Length: 0`) checks in immediately.
+- **WebSocket** — never pooled. An RFC 6455 upgrade consumes its carrier for the whole session, so it uses a dedicated admitted dial.
+
+Bounds: the idle set per identity is capped by the global `max_idle_per_host`, entries expire against the effective `idle_timeout_seconds`, and an amortized sweep (at most once per interval, process-wide) evicts closed, expired, and identity-changed entries.
+
+**Per-target physical-connection bound.** Pooling is not a way to open unbounded connections into the local application. `FERRUM_MESH_UNIX_INGRESS_MAX_CONNECTIONS` (default `64`; `0` disables it) caps the concurrently open **physical** connections one admitted target identity may hold. It is deliberately **not** an Istio `DestinationRule` `connectionPool.tcp.maxConnections`: a `DestinationRule` is **outbound**, client-side policy about a destination service this workload calls, while sidecar ingress is traffic the mesh has already accepted being handed to the co-located app over a socket with no network authority, no dial host, and no service port to resolve a rule against — and the materialized ingress upstream's placeholder `127.0.0.1:<listener_port>` target under a synthetic `__mesh-ingress-unix-*` id would in practice match no rule at all. The bound's lane is the pool's **complete structured identity** — namespace, proxy id, effective upstream id, configured and canonical socket path, the admitted `(dev, ino, owner_uid)`, and the wire protocol — so sibling ingress listeners on one workload, an `http` ⇄ `http2` flip, and a replaced socket object each get their own lane and can neither steal nor accidentally share one. A slot is taken at the one point a **new physical connection** is about to be constructed — never on a pool hit and never per multiplexed h2c stream. A dedicated WebSocket is a new physical connection and therefore holds one slot for its complete session relay; a target pinned at `1` still serves an unbounded number of sequential HTTP/1.1 requests and concurrent RPCs over one pooled carrier, but cannot open a second dedicated WebSocket beside it. Pooled-carrier guards are owned by their connection-driver futures; a WebSocket's equivalent lease is owned beside the session relay. Both forms hold the slot for exactly the socket's lifetime — idle residence included — and release it on handshake failure, close, relay termination, eviction, withdrawal, drain, shutdown, cancellation, and a driver panic alike. An over-bound refusal is decided **before `connect(2)`**: no socket is opened and no application byte is written, and it surfaces as a typed `503` with `ErrorClass::BackendConnectionLimit` — pre-wire, health-neutral (an application at its configured transport capacity is not an unhealthy one), and retryable onto another target with its own lane.
+
+**Keep-alive.** `FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE` (and the per-proxy `pool_enable_http_keep_alive` override) is honored literally for HTTP/1.1 on this transport: with it off, a carrier is neither taken from nor returned to the idle set, so every request gets its own freshly admitted connection. Publication also treats the effective setting as part of the reusable live-identity set: an H1 target whose keep-alive/reuse is off is omitted from the published live set so resident idle H1 carriers are retired synchronously before reconciliation returns — otherwise a full idle set at the default physical and idle caps (both 64) could keep every physical slot occupied while new traffic must dial fresh and receive `BackendConnectionLimit` until idle expiry. h2c is unaffected — HTTP/2 has no keep-alive negotiation, and stream multiplexing is the transport's defining behavior rather than a keep-alive optimization.
+
+**Metrics.** The pool exports physical connects, hits, misses, identity retirements, setup failures, gateway-side checkout refusals (path admission, per-target connection-bound refusals, and the shutdown latch), and gauges for idle HTTP/1.1 carriers, shared h2c carriers, and open physical connections. They appear on the JWT-authenticated runtime metrics endpoint under `connections.unix_backend_pool` (`GET /metrics/runtime`). Cardinality is fixed: one object for the whole pool, never a per-target label. Every field is one atomic read — the gauges are maintained at each insert/removal and at each connection-driver spawn/completion, so producing the snapshot never scans a map and the request path never pays for it.
+
+**Lifecycle.** The pool is owned by `ProxyState`, which *survives* a config reload (the config itself is swapped through an `ArcSwap`), so publication retires withdrawn carriers explicitly rather than relying on the pool being rebuilt:
+
+- **Config publication / reload.** **Every** successfully published request epoch hands the pool the exact set of *reusable* `mesh.unix_socket` target identities *the config that publication made current* declares — `(namespace, proxy id, upstream id, configured socket path, wire protocol)`. HTTP/1.1 identities whose effective keep-alive/reuse is off are omitted so idle H1 carriers cannot remain continuously live across that policy flip. That is all three swap paths: the full-snapshot rebuild, the incremental delta branch of the same call, and the separate `apply_incremental` path database and CP/DP deltas use; and it runs before any early return, so a mesh-only or projected-content republication that carries no `ConfigDelta` reconciles too. Anything pooled outside that set is retired in one pass before it can serve another request. That covers a withdrawn target, a deleted proxy or upstream, a proxy re-bound to a different namespace or upstream, a re-pointed socket path, an `http` ⇄ `http2` flip, and an H1 reuse disable. Comparison is exact tuple equality — never a substring, prefix, or path-containment rule. A **rejected** candidate and one the swap reported as genuinely unchanged never become current, so neither reconciles nor advances the generation.
+- **The withdrawal fence.** Retiring the idle sets is only part of it: an exclusive HTTP/1.1 lease that is checked out is *not* in the idle set, so publication cannot see it, and its exchange can finish long after its target was withdrawn. A still-open, still-same-inode connection expresses nothing about config, so a late check-in would otherwise repopulate the pool under an identity that no longer exists. Every retirement therefore advances a monotonic **publication generation** *before* its retirement pass runs, and three rules hang off that counter:
+
+  1. **The lease token.** Each lease records the generation it was taken under, and a check-in is admitted only while that is still current. This closes same-key ABA: a target withdrawn and re-added under the identical tuple is a new incarnation, and a lease from the previous one may not re-enter it. The cost is that a lease outstanding across any publication is retired instead of reused (one connection per in-flight exchange per publication).
+  2. **The entry token.** Each pooled entry also carries the generation it was published into the map under, and a checkout refuses any entry whose token is not current, reading both under the same map guard. Without this, the two-read check-in fence leaves the old-generation entry *visible* between its insert and its own withdrawal, and a checkout landing in that window could pop it and adopt it under its own generation. The retirement pass *advances* the token of every entry it observes under a still-declared identity, while holding that entry's shard, so an unrelated publication preserves continuously-live idle carriers instead of emptying the pool.
+  3. **The live-set snapshot and withdrawal tombstone.** Publication installs a lock-free snapshot of the exact identities it declares. A check-in or h2c publish compares the identity already owned by its structured pool key against that snapshot, without constructing strings, before the carrier can become reusable. This covers a withdrawn identity even when the retirement pass had no existing slot to tombstone. For keys the pass can see, an absent identity also keeps an emptied, marked slot, closing the map insertion race under the same shard guard. A later publication that declares the identity again clears the mark on an empty slot, so the re-added incarnation starts from a freshly admitted dial.
+
+  Publication orders itself "bump, install live snapshot, then retire", and a check-in reads the generation, checks the snapshot, inserts a uniquely identified entry, releases the shard, and re-reads: either the pass saw the entry (and removed or re-stamped it) or the check-in observes the bump and withdraws exactly the entry it inserted, by id, so a losing cleanup can never delete a newer sibling carrier. The same sequence guards the shared h2c carrier published at the end of a dial. Post-swap maintenance is serialized by the request epoch's monotonic config generation, so an older publisher that resumes late cannot overwrite a newer live-set verdict.
+- **Socket replacement.** A change to the filesystem object itself (a new inode or a new owner uid) is invisible to config, so it is caught on the checkout path by the re-admission described above.
+- **Driver ownership.** Every physical connection's driver future is **registered with the pool**, not detached with a bare `tokio::spawn`. Dropping the sender maps is not equivalent: a carrier checked out into an in-flight exchange, or cloned into a multiplexed h2c request, is deliberately absent from those maps and keeps its connection open, so a detached driver would be unreachable at shutdown. Registration is what makes the close/await contract below bounded and complete.
+- **Graceful shutdown.** Each serving mode drains the pool from inside its existing bounded shutdown sequence — after accept loops stop and after in-flight requests have had their `FERRUM_SHUTDOWN_DRAIN_SECONDS` budget — so the drain neither shortens nor is shortened by that window. The drain latches the pool closed and advances the publication generation, so a streaming response finishing in the last moments of the drain retires its carrier instead of re-pooling it — including one whose check-in read the latch a moment before it was set. It then drops every pooled carrier (which closes each connection whose only remaining sender was the pooled one) and **awaits the remaining drivers under one bounded budget**, then **cancels and joins** whatever has not ended when that budget expires, under a second bounded budget. Joining the cancelled tasks is load-bearing rather than ceremony: a cancelled task releases its target connection slot and its share of the open-connections gauge when the runtime drops it, and joining is what observes that. The wait cannot be unbounded; the second budget limits how long the drain waits for cancelled tasks to reach a runtime cancellation point and be dropped. If one does not do so before expiry, that fact is logged rather than silently presented as a completed join. The drain is therefore `async` at every serving-mode call site.
+- **The shutdown latch refuses checkouts, not just check-ins.** Once latched, **every** checkout — HTTP/1.1, the forced-fresh HTTP/1.1 replay, and the h2c cold path — fails closed as its first act, before the establishment deadline, the idle sweep, path admission, and `connect(2)`. A request arriving after the drain therefore opens no socket and reserves no slot on the target's bound, and it surfaces as a `503` with `ErrorClass::DispatchPolicyRejected`: health-neutral (the gateway shutting down says nothing about the application) and not retried, because every Unix target in the process shares the one latched pool. The drain sets **both** latches *before* it retires any pooled carrier, and it sets them in a specific **order**: the driver tracker's registration flag first, under the tracker's map lock, and only then the pool's own flag. The two are independent pieces of state, so they cannot land atomically; the order is what carries the guarantee. Because the pool's flag is stored last, from the instant *anyone* can observe the pool latched closed, driver registration is already closed — there is no interval, retirement or otherwise, during which the pool reads as shutting down while a racing establishment could still be adopted. The reverse interval is deliberate and bounded: between the tracker close and the pool store a checkout can still pass the entry gate and dial, which is the same in-flight-establishment case described below and settles the same way. A checkout that passed that gate *before* the latch and reaches driver registration *after* it is resolved atomically by the tracker — the latch read, the spawn, and the map insert happen under one lock acquisition — so the losing side spawns **nothing**: no task to abort, no detached handle, no gauge or connection slot charged and released later. Its un-spawned driver future is dropped (closing the socket it just established), its connection slot is released, and it returns the same refusal rather than a sender backed by a connection nobody drives. What that does **not** claim: an establishment already in flight when the latch is set — or one that started inside the short window between the tracker close and the pool store — is not owned by that drain and may still hold its target's connection slot for the remainder of its own bounded establishment deadline; it settles exactly — slot released, gauge untouched, socket closed — before its own call returns.
+
+The containment allowlist (`FERRUM_MESH_UNIX_SOCKET_ALLOWED_ROOTS`) and UID allowlist (`FERRUM_MESH_UNIX_SOCKET_ALLOWED_UIDS`) are process environment and cannot change without a restart.
+
+A criterion harness for the dial-versus-pool comparison lives at `tests/performance/mesh/benches/unix_backend_pool.rs` (`./run.sh unix_backend_pool`). It is manually driven and has no budget gate.
 
 A listener that is edited, replaced, or deleted takes effect on the next slice apply exactly like a TCP one: the materialized route and its backing upstream are rebuilt from the new slice, so a removed listener stops routing (leaving no orphaned upstream) and a re-pointed one dials the new socket with no restart.
 
 **Fail-closed transport gate.** The socket path rides the reserved `mesh.unix_socket` tag on the materialized upstream's single target — the same mechanism `mesh.hbone` / `mesh.mtls` use, and the same reserved `mesh.` namespace that is stripped from every operator/workload label copy, so a pod label can never forge it. Operator-provided upstream targets are also forbidden from setting any `mesh.*` tag through admin create/update, API-spec import, restore, or file configuration; only Ferrum's trusted mesh projection may stamp those transport markers. A target carrying the tag is dialed over a Unix stream **or the request is refused**; it is never downgraded to the target's placeholder `host:port` (which nothing listens on).
 
-### `bind` and `captureMode` limitations
+### `bind` and `captureMode`
 
-- **`bind`** — Ferrum's capture model funnels all inbound through the shared `:15006` listener (matched by captured original destination = the dialed listener port), so a custom `bind` address does **not** open a separate OS listener; it is preserved on the parsed model for observability. Unix-socket `bind` values are invalid (Istio rejects them too). **Issue #3266** tracks dedicated bind-address socket materialization separately; stream-ingress modeling (#3260) intentionally keeps this capture-listener contract and does not absorb custom-bind behavior.
-- **`captureMode`** — Ferrum assumes `IPTABLES`/`DEFAULT` capture (the sidecar redirect model). `captureMode: NONE` (the app handles capture itself) is not separately honored; the listener-port disambiguation relies on the captured original destination or the request authority port being present.
+- **`bind` (issue #3266)** — Omitted, empty, or unspecified (`0.0.0.0` / `::`) keeps the shared capture-listener contract: inbound traffic still enters through `:15006` and is disambiguated by captured original destination / authority port. A supported **dedicated** bind (`127.0.0.1` / `::1`) is conflict-checked against Gateway/stream/mesh listener ownership and materialized as a real OS listener on `bind:port` (HTTP via `GatewayListenerManager`, stream via `StreamListenerManager`) while the shared capture path remains for mesh peers. The dedicated HTTP accept loop is stamped as mesh inbound, and its configured/accepted listener port is the authoritative AuthorizationPolicy destination port; it never widens onto an ordinary process-global frontend or falls back to the `defaultEndpoint` port for authorization. Dedicated-bind HTTP routes are exact-listener only: they do **not** participate in single-listener Service remap, so a lone loopback bind cannot steal `:15006` / process-global matches from the port-agnostic capture sibling. Unsupported or unrepresentable values (Unix-domain sockets, hostnames, `ip:port`, non-loopback addresses) fail closed with field-specific `deferred_fields` / resolve diagnostics rather than being accepted as inert metadata. A dedicated bind that collides with an already-owned port, or that pairs with a `unix://` `defaultEndpoint`, fails closed for that **whole** ingress entry: it is removed from the prepared `local_ingress_listeners` set as well as bind-proxy / capture-route materialization, so there is no silent shared-capture or authenticated-CONNECT fallback. `sidecar_ingress_declared` and `declared_ingress_http_ports` stay independent of that admission so all-rejected / empty cases still fail closed without restoring default inbound behavior or incorrectly lowering the operator-declared HTTP port count.
+- **`captureMode`** — Ferrum assumes `IPTABLES`/`DEFAULT` capture (the sidecar redirect model). `captureMode: NONE` (the app handles capture itself) is not separately honored; the listener-port disambiguation relies on the captured original destination or the request authority port being present. Dedicated loopback binds still provide direct `bind:port` exposure for local dialers that bypass capture.
 
 ### xDS / file / native parity
 
@@ -2351,7 +2673,7 @@ Top-level and per-subset DestinationRule TLS settings (`trafficPolicy.tls`, `sub
 
 Port-level `connectionPool.tcp.connectTimeout`, `loadBalancer`, and `outlierDetection` are **all enforced** for HTTP/H2/H3/gRPC/WebSocket/HBONE dispatch via `Upstream.port_overrides[port]` + `Proxy.dispatch_port_overrides[port]`. TCP, UDP, and DTLS stream paths engage per-port **`loadBalancer`** (algorithm and hash key) and **`localityLbSetting`** at selection time when all upstream targets share a single port (`initial_dispatch_port_override` non-zero); the lane engages only for selection-affecting overrides, stream-lane `consistentHash` requires a source-IP hash key, per-port `LEAST_CONN` is refused (fail-closed) on the generic stream listeners, and per-port `LEAST_LATENCY` is refused on every stream lane — see [Limitations](#limitations-and-not-supported). The mesh raw-TCP/UDP tunnel dials (HBONE `:15008` / mesh-mTLS `:15006`) and the HBONE capability probe honor the per-port `connectTimeout` for the destination's policy port. Per-port `outlierDetection` thresholds and `maxEjectionPercent` caps are honored by stream target selection using active/passive health context. Outlier thresholds are still not recorded for stream paths (raw relay sessions carry no response status). Per-port `connectTimeout` and `maxConnections`/`tcpKeepalive` apply to stream dial regardless. Port-level `connectionPool.tcp.maxConnections` is enforced for stream-family dispatch, for HTTP-family **WebSocket** dispatch, for the pooled multiplexed transports (direct H2, gRPC, native H3, HBONE, mesh-mTLS), and for the reqwest transports (see the scope note below). The pooled transports read the cap through the same per-dispatch effective proxy the rest of the per-port policy uses, and `ResolvedPortOverride::policy_port` carries the service port a `targetPort` remap was mirrored from so the counter lane stays on the destination's policy port. Port-level `connectionPool.tcp.tcpKeepalive` is now enforced for stream-family dispatch AND for the socket-owning HTTP-family multiplexed pools (direct-H2, gRPC, HBONE, mesh-mTLS — resolved at connection creation via `socket_opts::apply_pooled_tcp_keepalive`; the HBONE / mesh-mTLS sites key it by the destination's app/service port even though the transport dial is `:15008`/`:15006`), with the global pool keepalive as fallback. Because keepalive is excluded from the pool key (per `.claude/rules/proxy-protocols.md`) and these connections are shared, the first dispatcher to materialize a pooled connection fixes its keepalive (first-materializer tradeoff, like `idleTimeout`). The reqwest-backed HTTP pool (shared client) and H3/QUIC (UDP transport) are documented residuals — see the `tcpKeepalive` row in the DestinationRule table above.
 
-All five applied `connectionPool.http` fields—`h2UpgradePolicy`, `maxRetries`, `http1MaxPendingRequests`, `idleTimeout`, and `http2MaxRequests`—use an inherited fallback on every DestinationRule-backed proxy. Top-level supplies the base, the selected subset overlays it, and an explicit field in the selected target's `portLevelSettings` overlays both. This exact field-level precedence is therefore **per-port > selected subset > top-level**; omitted fields inherit from the next tier. **Semantics differ from Istio on purpose:** Istio applies subset > DR `portLevelSettings` and replaces the whole `connectionPool` wholesale when a subset sets any connection-pool field; Ferrum keeps the inverted tier order and field-level merge. Example: port-8080 `UPGRADE` plus subset-v1 `DO_NOT_UPGRADE` → Istio forces H1 on 8080 for that subset; Ferrum negotiates h2. A subset that sets only `maxRetries` inherits top-level `DO_NOT_UPGRADE` / `idleTimeout` / `http2MaxRequests` here, where Istio's wholesale replacement would clear them. `DEFAULT` is an explicit H2 value and clears a lower-tier H2 choice. Service-discovery targets use `dispatch_policy_port()` so named/numeric `targetPort` remapping does not change the policy source. Each retry/LB attempt resolves the effective transport and H1 admission policy for its current target from the unresolved proxy snapshot; the selected subset is route-stable, and explicit port-policy rotation remains pinned to that port lane. `maxRetries` is capped before retry/deadline decisions and is never synthesized. `http1MaxPendingRequests` is isolated per `(host, policy port, subset name)` and reacquired on retry — distinct subset names (and unmatched destinations) do not share a lane on the same dial target, but the key has no upstream/Service identity, so conventionally-named subsets across Services that select the same pods can still share a lane. The `port` in that key is the DR **policy** port (`dispatch_policy_port()`, i.e. the declared Service port under `targetPort` remapping), derived once by `dispatch_policy_port_for_target` and used identically by the H1/H2 initial attempt, the H1/H2 retry attempt, and both H3→HTTP plain-bridge dispatch sites — so all three frontends admit into ONE lane per destination instead of splitting a cap of N into 2N, and an explicit `portLevelSettings` cap keyed by the Service port is visible to every frontend. The dial port appears only in the shed's log line. `idleTimeout` projects onto `pool_idle_timeout_seconds` (reqwest `rcfg` identity); `http2MaxRequests` projects onto direct-H2/native-gRPC builders and those pools' keys (reqwest H2 has no equivalent knob). Every HTTP-family shared-client/pool key already carries `upstream_subset`, so same-endpoint sibling subsets cannot first-materialize each other. `connectionPool.http.maxRequestsPerConnection` remains deferred at all three scopes; `subsets[].trafficPolicy.portLevelSettings` is also deferred (not applied).
+All five applied `connectionPool.http` fields—`h2UpgradePolicy`, `maxRetries`, `http1MaxPendingRequests`, `idleTimeout`, and `http2MaxRequests`—use an inherited fallback on every DestinationRule-backed proxy. Top-level supplies the base, the selected subset overlays it, and an explicit field in the selected target's `portLevelSettings` overlays both. This exact field-level precedence is therefore **per-port > selected subset > top-level**; omitted fields inherit from the next tier. **Semantics differ from Istio on purpose:** Istio applies subset > DR `portLevelSettings` and replaces the whole `connectionPool` wholesale when a subset sets any connection-pool field; Ferrum keeps the inverted tier order and field-level merge. Example: port-8080 `UPGRADE` plus subset-v1 `DO_NOT_UPGRADE` → Istio forces H1 on 8080 for that subset; Ferrum negotiates h2. A subset that sets only `maxRetries` inherits top-level `DO_NOT_UPGRADE` / `idleTimeout` / `http2MaxRequests` here, where Istio's wholesale replacement would clear them. `DEFAULT` is an explicit H2 value and clears a lower-tier H2 choice. Service-discovery targets use `dispatch_policy_port()` so named/numeric `targetPort` remapping does not change the policy source. Each retry/LB attempt resolves the effective transport and H1 admission policy for its current target from the unresolved proxy snapshot; the selected subset is route-stable, and explicit port-policy rotation remains pinned to that port lane. `maxRetries` is capped before retry/deadline decisions and is never synthesized. `http1MaxPendingRequests` is isolated per `(namespace, logical upstream/Service identity, optional Kubernetes Service UID, policy port, subset name)` and reacquired on retry. Mesh VIP/service-host routes and direct-pod-IP routes for the same Service use its cold-stamped FQDN plus UID, so endpoint fan-out cannot multiply the cap; ordinary upstreams retain their resource id, so duplicate display names cannot collapse unrelated resources. Distinct subset names remain isolated. The `port` in that key is the DR **policy** port (`dispatch_policy_port()`, i.e. the declared Service port under `targetPort` remapping), derived once by `dispatch_policy_port_for_target` and used identically by the H1/H2 initial attempt, the H1/H2 retry attempt, and both H3→HTTP plain-bridge dispatch sites — so all three frontends admit into ONE lane per destination instead of splitting a cap of N into 2N, and an explicit `portLevelSettings` cap keyed by the Service port is visible to every frontend. The dial host/port appears only in the shed's log line. `idleTimeout` projects onto `pool_idle_timeout_seconds` (reqwest `rcfg` identity); `http2MaxRequests` projects onto direct-H2/native-gRPC builders and those pools' keys (reqwest H2 has no equivalent knob). Every HTTP-family shared-client/pool key already carries `upstream_subset`, so same-endpoint sibling subsets cannot first-materialize each other. `connectionPool.http.maxRequestsPerConnection` remains deferred at all three scopes; `subsets[].trafficPolicy.portLevelSettings` is also deferred (not applied).
 
 **Dispatch-path coverage (H1/H2 and HTTP/3 frontends).** The per-target effective-proxy override pipeline — `resolve_effective_proxy_for_target` plus the `cap_proxy_retry_for_target` / `route_retry_ceiling` seam for DestinationRule `maxRetries` — applies the DR per-port overrides (`h2UpgradePolicy` / `idleTimeout` / `http2MaxRequests` / `connectTimeout` / per-port TLS, plus `maxRetries` and the service-discovery top-level fallback) after the LB-selected target is known. It runs on the H1/H2 (`handle_proxy_request_inner`) path and on the standalone HTTP/3 frontend (`src/http3/server.rs`) before retry-dependent buffering/native-H3 decisions, H3→gRPC, and H3 WebSocket dispatch read the proxy. The original route retry ceiling is retained on `Proxy.retry`; every H3 dispatch loop that can rotate retry targets re-resolves the effective proxy per attempt from the selected target's unresolved base proxy and re-checks `retry_attempt_allowed_for_target` against that original ceiling — the buffered native-H3 retry loop, the H3→HTTP plain bridge, the H3→gRPC bridge (initial and retried attempts; the streaming variant resolves its single selected target), and the H3 WebSocket dial loop — so retry targets do not inherit the first target's port-level TLS/SNI/H1 policy or get blocked by a permanently lowered initial-port retry projection. The H1/H2 path re-resolves per attempt in `proxy_to_backend` / `proxy_to_backend_retry`, and — since issue #2416 — its WebSocket backend dial does too: the dial loop in `handle_websocket_request_authenticated` calls `resolve_backend_connection_proxy_for_target` for the CURRENT target at the top of every attempt (the same helper the H3 WebSocket bridge uses), so a retry that rotates from one port to another dials under the second port's `connectTimeout`, trust roots, client identity, and verification posture rather than the unresolved route-level policy. DNS override and TTL remain route-level inputs; target rotation changes the resolution hostname but does not project a port-level DNS policy that does not exist. Both the direct TCP/TLS dial and the mesh egress dial (`connect_mesh_websocket_backend`) receive that one target-effective proxy; there is no longer a WebSocket exception to this pipeline. See [WebSocket policy port vs transport dial port](#websocket-policy-port-vs-transport-dial-port) for what "the target's port" means when the transport rides an HBONE or mesh-mTLS tunnel. The plain bridge's per-attempt dispatch-policy rejects — a per-port backend-TLS-SNI incompatibility (502) and the `http1MaxPendingRequests` in-flight cap (503) — happen before backend admission, backend dial, or backend-health signal, matching H1/H2 ordering.
 
@@ -2411,7 +2733,7 @@ The direct WebSocket dial fails **closed** on a resolved backend TLS `sni` overr
 
 ### DestinationRule `maxConnections` enforcement scope
 
-`connectionPool.tcp.maxConnections` caps **concurrent open backend connections per destination** — Envoy's semantics. Keying is per resolved `(host, DestinationRule policy port)` endpoint, not per logical cluster, so a destination with N endpoint hosts sharing one port has an effective ceiling of N×cap rather than Envoy's per-cluster total (the two are equivalent for the typical single-host mesh destination). One shared `BackendConnectionLimiter` (`src/backend_conn_limit.rs`) lives on `ProxyState` and every transport admits against it, so a destination has ONE ceiling, not one per transport. The cap check, the reservation and the drop-time release all run under the same `DashMap` shard lock (the shape `src/backend_pending_limit.rs` uses), which is what lets the last release evict the destination's counter: mesh dial hosts are pod IPs and reqwest authorities can come from wildcard-host routing, so retaining a zero-count entry per destination ever dialed would grow the map for the gateway's lifetime. Every transport keys the lane by the **policy** port (`UpstreamTarget::dispatch_policy_port()`), never the dial/transport address, so a Kubernetes `targetPort` remap and the mesh tunnel listeners (`:15008` / `:15006`) share the destination's lane instead of splitting the ceiling. The pools that key and dial from `proxy.backend_host`/`backend_port` (direct H2, gRPC) get this through the mirrored, `policy_port`-stamped entry `resolve_backend_connection_proxy_for_target` writes; the pools that receive the LB-selected target as an explicit argument (native HTTP/3) are handed the policy port explicitly alongside it, because their effective proxy's `dispatch_port_overrides` remain keyed by the service port. The host half of the key is normalized inside the limiter (lowercased, IPv6 brackets stripped), because raw TCP / WebSocket / the direct pools pass the configured host verbatim while reqwest's connector sees a URL-normalized authority — without that, `Backend.Example` and `backend.example` (or `[::1]` and `::1`) would allocate two counters for one destination.
+`connectionPool.tcp.maxConnections` caps **concurrent open backend connections per destination** — Envoy's semantics. Keying is per resolved `(host, DestinationRule policy port)` endpoint, not per logical cluster, so a destination with N endpoint hosts sharing one port has an effective ceiling of N×cap rather than Envoy's per-cluster total (the two are equivalent for the typical single-host mesh destination). One shared `BackendConnectionLimiter` (`src/backend_conn_limit.rs`) lives on `ProxyState` and every **outbound** transport admits against it, so a destination has ONE ceiling, not one per transport. The one path deliberately outside it is the sidecar-**ingress** Unix backend transport, which carries traffic the mesh already accepted into the co-located application and is bounded by its own inbound per-target setting instead — see the table row below. The cap check, the reservation and the drop-time release all run under the same `DashMap` shard lock (the shape `src/backend_pending_limit.rs` uses), which is what lets the last release evict the destination's counter: mesh dial hosts are pod IPs and reqwest authorities can come from wildcard-host routing, so retaining a zero-count entry per destination ever dialed would grow the map for the gateway's lifetime. Every transport keys the lane by the **policy** port (`UpstreamTarget::dispatch_policy_port()`), never the dial/transport address, so a Kubernetes `targetPort` remap and the mesh tunnel listeners (`:15008` / `:15006`) share the destination's lane instead of splitting the ceiling. The pools that key and dial from `proxy.backend_host`/`backend_port` (direct H2, gRPC) get this through the mirrored, `policy_port`-stamped entry `resolve_backend_connection_proxy_for_target` writes; the pools that receive the LB-selected target as an explicit argument (native HTTP/3) are handed the policy port explicitly alongside it, because their effective proxy's `dispatch_port_overrides` remain keyed by the service port. The host half of the key is normalized inside the limiter (lowercased, IPv6 brackets stripped), because raw TCP / WebSocket / the direct pools pass the configured host verbatim while reqwest's connector sees a URL-normalized authority — without that, `Backend.Example` and `backend.example` (or `[::1]` and `::1`) would allocate two counters for one destination.
 
 | Transport / backend path | Actual backend sockets observed | `maxConnections` contract |
 |---|---:|---|
@@ -2424,6 +2746,7 @@ The direct WebSocket dial fails **closed** on a resolved backend TLS `sni` overr
 | HBONE / mesh-mTLS pooled tunnels | Pooled multiplexed H2 CONNECT transport connection(s) | Enforced per constructed tunnel connection, keyed by the destination's app/service policy port (not `:15008`/`:15006`) |
 | reqwest HTTP/1.1 | Pooled sockets reqwest keeps idle and reuses across requests | Enforced in reqwest's connector per NEW physical socket; slot held by the connection object, so an idle socket still holds it |
 | reqwest, ALPN-negotiated h2 | Pooled multiplexed H2 connection(s) | Same connector admission; multiplexed streams take no additional slot |
+| Sidecar-ingress Unix backends | Pooled HTTP/1.1 carriers + shared h2c carriers on an admitted Unix socket | **Out of scope by design.** A `DestinationRule` is outbound, client-side policy; this transport is inbound, toward the co-located app, and has no dial host or service port to key a lane on. Bounded instead by `FERRUM_MESH_UNIX_INGRESS_MAX_CONNECTIONS` per admitted target identity — see [Connection pooling](#connection-pooling) |
 
 - **Stream-family (TCP / TCP+TLS / TCP-passthrough)**: each accepted stream dials one dedicated backend socket whose lifetime equals the relay session. Enforced at dial with an RAII counter on the shared `BackendConnectionLimiter`, reached through `TcpProxyMetrics.backend_inflight` (`src/proxy/tcp_proxy.rs`). That field is an `Arc` **handle** to the one limiter `ProxyState` builds, not a per-listener limiter: `StreamListenerManager::attach_backend_conn_limit` installs it before the first `reconcile()` and every spawned listener's metrics clone the same instance, so a raw-TCP socket and a pooled/WebSocket socket to one destination share the configured ceiling, and two stream listeners cannot each get their own copy of it. The install is one-shot (`OnceLock`), so a config reload or listener restart can never swap the limiter out from under relays whose guards are still counted. Listener-local observability counters (`active_connections`, `active_backend_connections`, byte counters) stay per listener.
 - **HTTP-family WebSocket (H1/H2/H3)**: a proxied WebSocket opens one dedicated, non-pooled backend connection whose lifetime equals the session. Acquired in the WebSocket connect loop (so a failed/rotated connect attempt frees its slot before retry) and held for the session. Over the cap, the upgrade is rejected with `503` before dialing.
@@ -3231,6 +3554,7 @@ rule`/`ip route` plumbing — no extra capability is needed.
 The `MeshConfigSync.MeshSubscribe` streaming RPC is served by `MeshGrpcServer` in `src/grpc/mesh_server.rs`. It runs on the Control Plane alongside the regular `ConfigSync` service.
 
 - **JWT authentication** on every subscribe request.
+- **Finite stream authorization**: the CP binds each admitted stream to the exact verified credential and to a monotonic deadline derived from the verified JWT `exp` plus the accepted 60-second leeway. The independent `FERRUM_CP_GRPC_MAX_STREAM_LIFETIME_SECONDS` ceiling applies as well. Heartbeats and slice broadcasts never renew either deadline. A trust-bundle reload closes only streams whose accepted credential was removed; overlapping retained credentials continue until expiry or the server ceiling. Local and cross-cluster subscriptions share this enforcement, and clients reconnect with bounded backoff while rereading/reminting credentials.
 - **Namespace validation**: the requested mesh namespace must be covered by the CP scope (`FERRUM_CP_NAMESPACES`, or `FERRUM_NAMESPACE` in single-namespace mode). When `FERRUM_CP_REQUIRE_NAMESPACE_CLAIM=true`, the mesh node JWT must also carry an `ns` claim authorising that namespace. Requests outside the CP scope fail with `FAILED_PRECONDITION`; claim mismatches fail with `PERMISSION_DENIED`.
 - **Version compatibility**: the CP validates the mesh node's Ferrum version for protocol compatibility.
 - **Initial snapshot**: on subscribe, the CP loads the current `GatewayConfig`, computes a `MeshSlice` for the subscriber's identity (node ID, namespace, SPIFFE ID, labels), and sends it as the first update.
@@ -3824,6 +4148,35 @@ independent of that pipeline gate.
    file that omits the three tuple keys for this release; do not carry them
    forward with `--reuse-values`.
 
+**Node reboots and scale-out.** The node-local durable record lives in the pod
+registry hostPath (`nodeAgent.podRegistryDir`, default `/run/ferrum/...`, which
+is tmpfs on a systemd host). A node reboot recreates that directory, and a node
+that joins the cluster after the migration never had one, so neither carries a
+durable record. Both nonetheless provably carry **no** predecessor rules: pod
+network namespaces do not survive a reboot, and a new node has never run a
+predecessor producer. From the stable release onward the chart therefore renders
+`FERRUM_MESH_CAPTURE_UDP_PLACEMENT_ESTABLISHED` from the **installed**
+`ferrum-mesh-udp-placement-<release>` ConfigMap — only when that installed
+contract already records the same target in a `stable` or `finalize` phase, so
+the release that performs a change can never attest itself. A node with no
+durable record then adopts that placement, records it durably, logs the
+adoption, sets `mesh.udp_placement_migration.established_adoption` on
+authenticated `/health`, and increments
+`ferrum_mesh_udp_placement_migration_established_adoptions_total`. The
+attestation is consulted **only** when the durable record is absent: a present
+record that disagrees with the requested placement is still the hard rejection
+above, so an in-place flip on a running node can never be authorized this way.
+
+A GitOps or client-render pipeline that bypasses Helm's `lookup` must supply the
+same value from its own cluster-state gate. Omitting it is fail-closed but
+costly: rebooted and newly joined nodes keep readiness false with failure reason
+`migration_required` until an explicit cleanup/finalize pair runs. A node that
+somehow missed both migration releases while its workloads kept running (for
+example a node whose Ambient DaemonSet pod was unschedulable throughout, and
+which then rebooted or was reimaged) can be adopted by the attestation; its
+workloads were already fail-closed after the predecessor producer stopped, so
+this costs availability that was already lost and never opens plaintext egress.
+
 For example, pod-netns to host-netns uses one tuple throughout (replace
 `$GENERATION` with a deployment identifier):
 
@@ -3881,9 +4234,14 @@ non-regular, multiply-linked, foreign-UID, or unreadable
    effective UID and a single link, fsync the file, rename it, then fsync the
    directory. Retract `.udp-registry-synced` while both processes are stopped.
    For corrupt or unknown ownership, quarantine the rejected state outside the
-   registry and leave the state path absent, then run a fresh explicit cleanup
-   adoption release; absent state makes cleanup probe **both** ownership
-   domains. Never guess ownership, chown a live file, follow a symlink, or
+   registry, leave the state path absent, create an empty
+   `.udp-placement-quarantined` tombstone beside it, and then run a fresh
+   explicit cleanup adoption release; absent state makes cleanup probe **both**
+   ownership domains. The tombstone is load-bearing, not a note: while it is
+   present, **every** stable bootstrap from an absent record is refused —
+   including a release-attested adoption — so a proxy that restarts between the
+   quarantine and the cleanup release cannot silently adopt a placement instead
+   of proving cleanup. A successful finalize removes it. Never guess ownership, chown a live file, follow a symlink, or
    repair only a subset of nodes.
 5. Verify both artifacts and their tuple on every node before resuming the
    DaemonSets. Apply the matching Helm values only after that verification so
@@ -3895,9 +4253,14 @@ non-regular, multiply-linked, foreign-UID, or unreadable
 
 A planned `securityContext` UID change must use the same stopped-and-drained
 procedure (or retain the old UID until after the migration); the reader rejects
-old-UID state by design. Re-adopting `host-netns` from absent or rejected state
-always requires cleanup/finalize—stable host startup never fabricates a
-predecessor proof.
+old-UID state by design. Re-adopting `host-netns` from **rejected** state always
+requires cleanup/finalize—a corrupt, truncated, foreign-UID, or unreadable
+record is a hard failure, never an absence—and re-adopting it from **absent**
+state requires either cleanup/finalize or the release-level
+`FERRUM_MESH_CAPTURE_UDP_PLACEMENT_ESTABLISHED` attestation described under
+"Node reboots and scale-out", which a `.udp-placement-quarantined` tombstone
+refuses. Stable host startup never fabricates a predecessor proof from node-local
+inspection.
 
 **Recovery and churn contract.** Cleanup persists `(generation, from, to)`
 before touching rules. A proxy restart resumes only that tuple; a different or

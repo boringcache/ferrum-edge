@@ -554,46 +554,14 @@ every run: green when the suite passed or was legitimately irrelevant, red when
 a relevant live job failed or was unexpectedly absent. Every checkout, parsing,
 or classifier error fails closed.
 
-One narrow bootstrap exception exists for the pull request that introduces the
-suite: `origin/main` does not yet list `ambient-host-udp` among the classifier's
-`--suite` choices, so the trusted classifier rejects it with argparse's exact
-`invalid choice: 'ambient-host-udp'`. Only that exact rejection forces
-`relevant=true`, so the introducing pull request still runs the live suite
-rather than deferring it to a future merge; every other classifier failure still
-exits non-zero. Once `main` carries the suite the branch is unreachable and
-ordinary trusted-base classification applies. The required-CI verifier pins
-the workflow's unconditional pull-request / merge-group ownership and exact
-`Ambient Host UDP Live` context. The separately trusted cross-build verifier
-cannot be changed by a pull request, so the introducing bootstrap is also an
-explicit root-review boundary rather than a self-authorizing verifier change.
-
-**Required follow-up: freeze this gate's relevance job.** The other three
-required live gates (`mesh-e2e-sidecar-live.yml`,
-`multicluster-federation-live.yml`, `multicluster-poller-partition-live.yml`)
-have their `changes` job frozen byte-for-byte by
-`LIVE_SUITE_RELEVANCE_CONTRACTS` in `.github/scripts/verify_cross_build_policy.py`,
-together with the live job's `needs`/`if` binding — the only freeze a pull
-request cannot edit, because that verifier runs from the trusted base.
-`ambient-host-udp-live.yml` is **not yet** in that set, and it cannot be added
-by the pull request that introduces it: the trusted base still runs the
-three-entry contract, and the bootstrap block above makes this workflow's
-`changes` job differ from `LIVE_SUITE_RELEVANCE_JOB_TEMPLATE`, so adding the
-entry here would turn `Trusted Cross Build Policy` red on `main` immediately
-after merge. Until the follow-up lands, `Ambient Host UDP Live` is the one
-required live gate whose relevance verdict and live-job binding a later pull
-request could rewrite — note that `verify_required_ci.py` runs from the pull
-request's own checkout in `ci.yml` and is therefore a consistency check, not a
-trust boundary. Once `main` carries the `ambient-host-udp` suite, a follow-up
-pull request must (1) delete the bootstrap exception so the `changes` job is
-byte-identical to the template and (2) add
-`"ambient-host-udp-live.yml": ("changes", "ambient-host-udp-live", "Ambient host-UDP trigger", "ambient-host-udp", "ambient-host-udp")`
-to `LIVE_SUITE_RELEVANCE_CONTRACTS`. Both halves must land in the **same** pull
-request. That pull request's own gate still runs the trusted base's three-entry
-contract and so cannot see the mismatch; if the entry merged without the
-bootstrap removal, `main` would then hold a contract its own workflow violates
-and every subsequent pull request's `Trusted Cross Build Policy` would fail.
-Removing the bootstrap on its own is safe but leaves the gate unfrozen, which is
-the state this note exists to close.
+The `changes` job is frozen byte-for-byte by
+`LIVE_SUITE_RELEVANCE_CONTRACTS` in
+`.github/scripts/verify_cross_build_policy.py`, together with the live job's
+`needs`/`if` binding. The trusted-base verifier therefore rejects any pull
+request that rewrites the Ambient gate's relevance logic, points it at
+pull-request-supplied classifier code, severs the live job binding, or removes
+the required workflow. This is the same fail-closed contract used by the other
+required live-datapath gates.
 
 The relevant surfaces are host-UDP capture, mesh UDP serving, capture plan
 generators, Ambient mesh serving, Helm mesh charts, the `Dockerfile` and its
@@ -601,8 +569,12 @@ runtime tool staging, the release publication workflow, the live fixture, and
 related docs. When relevant, the job builds the lib and functional test binaries
 (without running them as the invoking user), preflights `unshare` /
 `iptables` / `ip6tables` / TPROXY primitives, then runs
-`tests/k8s/ambient_host_udp_live/run.sh` as root with
-`FERRUM_LIVE_TESTS_REQUIRED=1`. The fixture exercises the production
+`tests/k8s/ambient_host_udp_live/run.sh` as root inside an explicit hosted
+disposable outer network + private mount namespace (`unshare --mount --net`,
+#3804) with a fresh read-only sysfs view tied to the owned network namespace and
+`FERRUM_LIVE_TESTS_REQUIRED=1`. The runner itself also creates a structurally
+proven disposable outer netns for every ordinary root execution so ad-hoc runs
+share the same ownership boundary. The fixture exercises the production
 `ProxyHostUdpBackend` path: multi-veth dual-stack TPROXY delivery, original
 destination recovery, ingress-ifindex attribution, transparent replies,
 restart/cleanup ownership, and explicit negative cases. Skips under required
