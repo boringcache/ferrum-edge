@@ -295,7 +295,10 @@ fn local_delivery_routing_precedes_every_mark_rule() {
 fn a_missing_family_binary_fails_the_whole_apply_rather_than_being_skipped() {
     let script = setup_script(
         &["veth0"],
-        &[destination("10.96.0.10", 5300), destination("fd00::10", 5300)],
+        &[
+            destination("10.96.0.10", 5300),
+            destination("fd00::10", 5300),
+        ],
     );
     assert!(
         script.starts_with("set -e\n"),

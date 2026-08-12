@@ -333,9 +333,8 @@ fn node_waypoint_udp_steer_commands_for_family(
         return Vec::new();
     }
 
-    let mark_arg = format!(
-        "0x{NODE_WAYPOINT_UDP_STEER_MARK:x}/0x{NODE_WAYPOINT_UDP_STEER_MARK_MASK:x}"
-    );
+    let mark_arg =
+        format!("0x{NODE_WAYPOINT_UDP_STEER_MARK:x}/0x{NODE_WAYPOINT_UDP_STEER_MARK_MASK:x}");
     let (ip, local_route) = if ipv6 {
         ("ip -6", "local ::/0 dev lo")
     } else {
@@ -456,15 +455,19 @@ pub fn node_waypoint_udp_steer_setup_script(
     }
     for destination in destinations {
         if destination.port == 0 {
-            return Err("NodeWaypoint UDP Service steering destination port 0 is not a service \
+            return Err(
+                "NodeWaypoint UDP Service steering destination port 0 is not a service \
                         port"
-                .to_string());
+                    .to_string(),
+            );
         }
         if destination.ip.is_unspecified() || destination.ip.is_loopback() {
-            return Err("NodeWaypoint UDP Service steering refuses an unspecified or loopback \
+            return Err(
+                "NodeWaypoint UDP Service steering refuses an unspecified or loopback \
                         destination address: it would steer traffic that never belonged to a \
                         Service"
-                .to_string());
+                    .to_string(),
+            );
         }
     }
     if ifaces.is_empty() || destinations.is_empty() {
@@ -498,7 +501,8 @@ pub fn node_waypoint_udp_steer_setup_script(
 /// first setup to reap a previous generation, where a missing object is the
 /// expected outcome.
 pub fn node_waypoint_udp_steer_teardown_script() -> String {
-    let mut chunks = vec![node_waypoint_udp_steer_teardown_for_family("iptables", false).join("\n")];
+    let mut chunks =
+        vec![node_waypoint_udp_steer_teardown_for_family("iptables", false).join("\n")];
     chunks.push(format!(
         "if command -v ip6tables >/dev/null 2>&1; then\n  {}\nfi",
         node_waypoint_udp_steer_teardown_for_family("ip6tables", true).join("\n  ")

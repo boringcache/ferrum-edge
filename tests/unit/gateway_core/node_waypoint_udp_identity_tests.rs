@@ -756,13 +756,13 @@ fn an_exactly_duplicated_binding_is_steered_once() {
 #[test]
 fn an_over_bound_generation_steers_nothing_at_all() {
     let index = NodeWaypointUdpSourceIndex::new();
-    let bindings: Vec<HostUdpPodBinding> =
-        (0..(ferrum_edge::capture::MAX_HOST_UDP_CAPTURE_INTERFACES as u32 + 1))
-            .map(|i| {
-                let uid = format!("{:08x}-1111-1111-1111-111111111111", i + 1);
-                binding(&uid, "ledger", i + 1, Some("10.244.1.7"), None)
-            })
-            .collect();
+    let bindings: Vec<HostUdpPodBinding> = (0
+        ..(ferrum_edge::capture::MAX_HOST_UDP_CAPTURE_INTERFACES as u32 + 1))
+        .map(|i| {
+            let uid = format!("{:08x}-1111-1111-1111-111111111111", i + 1);
+            binding(&uid, "ledger", i + 1, Some("10.244.1.7"), None)
+        })
+        .collect();
 
     let published = index.publish(&bindings);
 

@@ -1446,9 +1446,8 @@ impl DtlsServer {
                                     // is not usable evidence, so the whole
                                     // capture is discarded and the datagram
                                     // fails closed below.
-                                    let reply_local = batch
-                                        .local_addr(i)
-                                        .filter(|local| local.ifindex != 0);
+                                    let reply_local =
+                                        batch.local_addr(i).filter(|local| local.ifindex != 0);
                                     self.dispatch_datagram(peer_addr, data, reply_local).await;
                                 }
                                 drained += n;
