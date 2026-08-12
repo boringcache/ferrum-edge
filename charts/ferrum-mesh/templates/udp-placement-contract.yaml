@@ -48,6 +48,34 @@
 {{- $existing := lookup "v1" "ConfigMap" .Release.Namespace $contractName -}}
 {{- if $existing -}}{{- $previous = default dict $existing.data -}}{{- end -}}
 {{- end -}}
+{{- /* Node-proof era (issue #3809).
+
+       The node-scoped cleanup attestation must be bound to a generation that
+       cannot RECUR, or a proof written for one placement era authorizes a later
+       one. A token derived from the release's observable shape — `<target>-<phase>`
+       — repeats the moment a target and phase recur: an old settled host era
+       writes `host-netns-stable`, the cluster migrates host -> pod and back, and
+       that same token names the NEW host era, so a same-boot node that missed the
+       later cleanup/finalize rollout could replay its stale proof into it.
+
+       The era is therefore a monotonic ordinal this contract INCREMENTS when a
+       migration starts and then carries forward, unchanged, through finalize and
+       every settled release after it. `nodeProofGeneration` is the era-qualified
+       token both DaemonSets and the runtime bind proofs to; the operator's own
+       migration generation rides along so a proof stays traceable to the
+       transition that produced it. An installed contract predating this field
+       carries no node-proof generation at all, which is fail-closed: the settled
+       host DaemonSet refuses to render until an explicit cleanup/finalize pair
+       has stamped one. */ -}}
+{{- $previousEra := 0 -}}
+{{- $previousNodeProofGeneration := "" -}}
+{{- if $previous -}}
+{{- $rawEra := trim (toString (default "" (index $previous "nodeProofEra"))) -}}
+{{- if regexMatch "^[1-9][0-9]{0,9}$" $rawEra -}}{{- $previousEra = atoi $rawEra -}}{{- end -}}
+{{- $previousNodeProofGeneration = trim (toString (default "" (index $previous "nodeProofGeneration"))) -}}
+{{- end -}}
+{{- $nodeProofEra := $previousEra -}}
+{{- $nodeProofGeneration := $previousNodeProofGeneration -}}
 {{- if eq $phase "stable" -}}
 {{- if and (not .Release.IsUpgrade) (eq $target "host-netns") -}}
 {{- fail "initial host-netns Ambient UDP placement requires an explicit cleanup phase so runtime can establish durable predecessor proof" -}}
@@ -65,6 +93,7 @@
 {{- end -}}
 {{- end -}}
 {{- else if eq $phase "cleanup" -}}
+{{- $resumeCleanup := false -}}
 {{- if and .Release.IsUpgrade $previous -}}
 {{- $previousPhase := toString (index $previous "phase") -}}
 {{- $resume := and (eq $previousPhase "cleanup") (eq (toString (index $previous "generation")) $generation) (eq (toString (index $previous "from")) $from) (eq (toString (index $previous "to")) $to) -}}
@@ -72,6 +101,14 @@
 {{- if not (or $resume $start) -}}
 {{- fail "Ambient UDP cleanup predecessor/generation does not match the installed placement contract" -}}
 {{- end -}}
+{{- $resumeCleanup = $resume -}}
+{{- end -}}
+{{- /* Starting a migration opens a NEW placement era; re-rendering the same
+       cleanup release resumes the one already open, so the ordinal is stable
+       across retries but strictly increasing across transitions. */ -}}
+{{- if not (and $resumeCleanup $nodeProofGeneration) -}}
+{{- $nodeProofEra = add1 $previousEra -}}
+{{- $nodeProofGeneration = printf "e%d.%s" $nodeProofEra $generation | trunc 64 -}}
 {{- end -}}
 {{- else -}}
 {{- if not .Release.IsUpgrade -}}
@@ -98,5 +135,12 @@ data:
   generation: {{ $generation | quote }}
   from: {{ $from | quote }}
   to: {{ $to | quote }}
+  # Migration-era provenance for the node-scoped placement proof (issue #3809).
+  # `nodeProofEra` increments once per migration and is never reused;
+  # `nodeProofGeneration` is the era-qualified token the DaemonSets render and
+  # the runtime validates, carried unchanged through finalize and every settled
+  # release after it so a proof can be bound to the exact era it was earned in.
+  nodeProofEra: {{ $nodeProofEra | toString | quote }}
+  nodeProofGeneration: {{ $nodeProofGeneration | quote }}
 {{- end -}}
 {{- end -}}

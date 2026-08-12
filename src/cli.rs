@@ -458,11 +458,26 @@ pub struct AmbientUdpPreflightArgs {
 /// prove under one continuous node-agent registry publication, and it never
 /// writes durable placement ownership — the steady-state process still decides
 /// that from its own guard.
+///
+/// Node identity is resolved AUTHORITATIVELY here, from this node's own
+/// Kubernetes object, and never from the node-agent's published
+/// `.node-identity-v1.json`. That file records the CURRENT boot id even when it
+/// was written by a PREVIOUS Kubernetes Node object on this same boot, so no
+/// reader can tell a stale publication from a live one — and the two DaemonSets
+/// have no startup ordering between them, so the replacement node-agent may not
+/// have retracted it yet when this stage runs. Consuming it would let a stale
+/// identity and the stale cleanup proof written under it agree and authorize
+/// node-name reuse under the wrong immutable UID. One bounded `get` on this
+/// node's own object, bound to the node name the downward API gave this pod,
+/// settles it; the resolver retracts the publication before the lookup and
+/// republishes only what it proved, so the steady-state container that starts
+/// next reads an identity this pod established.
 pub fn execute_ambient_udp_preflight(args: &AmbientUdpPreflightArgs) -> Result<(), String> {
     use crate::config::conf_file::resolve_ferrum_var;
     use crate::proxy::udp_placement_migration::{
-        UdpMigrationContext, UdpNodeIdentity, UdpPlacement, node_cleanup_proof_is_current,
-        node_proof_generation_from_env,
+        UdpMigrationContext, UdpPlacement, node_cleanup_proof_is_current,
+        node_proof_generation_from_env, resolve_authoritative_node_identity,
+        retract_node_cleanup_proof,
     };
 
     if let Some(path) = resolve_settings_path(args.settings.as_deref()) {
@@ -499,23 +514,13 @@ pub fn execute_ambient_udp_preflight(args: &AmbientUdpPreflightArgs) -> Result<(
         "FERRUM_MESH_CAPTURE_UDP_NODE_PROOF_GENERATION is required by the Ambient UDP node preflight"
             .to_string()
     })?;
-    let node = UdpNodeIdentity::resolve(&registry_dir).ok_or_else(|| {
-        "the Ambient UDP node preflight requires this node's Kubernetes UID (FERRUM_K8S_NODE_UID, \
-             or the node-agent's published node identity) and a readable node boot id"
-            .to_string()
-    })?;
+    let explicit_node_uid = resolve_ferrum_var("FERRUM_K8S_NODE_UID")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let node_name = resolve_ferrum_var("FERRUM_K8S_NODE_NAME")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
 
-    if node_cleanup_proof_is_current(&registry_dir, target, &node, &generation)? {
-        println!("ambient-udp-preflight: node cleanup proof is already current");
-        return Ok(());
-    }
-
-    crate::proxy::netns_udp_capture::preflight_capture_tools(true).map_err(|error| {
-        format!("the Ambient UDP node preflight image cannot run the required tooling: {error}")
-    })?;
-
-    let context =
-        UdpMigrationContext::for_node_preflight(&registry_dir, target, node, &generation)?;
     let source = std::sync::Arc::new(crate::proxy::netns_capture::DirectoryCaptureSource::new(
         registry_dir.clone(),
     ));
@@ -524,17 +529,44 @@ pub fn execute_ambient_udp_preflight(args: &AmbientUdpPreflightArgs) -> Result<(
         .enable_all()
         .build()
         .map_err(|error| format!("could not build the preflight runtime: {error}"))?;
+    let timeout_seconds = args.timeout_seconds.clamp(1, 3600);
     let outcome = runtime.block_on(async move {
-        let deadline = tokio::time::Instant::now()
-            + std::time::Duration::from_secs(args.timeout_seconds.clamp(1, 3600));
-        crate::proxy::udp_placement_cleanup::run_udp_placement_cleanup(
+        let node = resolve_authoritative_node_identity(
+            &registry_dir,
+            explicit_node_uid.as_deref(),
+            node_name.as_deref(),
+            fetch_this_node_uid,
+        )
+        .await?;
+
+        if node_cleanup_proof_is_current(&registry_dir, target, &node, &generation)? {
+            println!("ambient-udp-preflight: node cleanup proof is already current");
+            return Ok(crate::proxy::udp_placement_cleanup::UdpCleanupOutcome::Complete);
+        }
+        // Any proof that is NOT current for this exact node UID, boot id,
+        // target, and era is retired before the retirement it describes is
+        // re-attempted. Otherwise a proof published by an earlier run — under a
+        // previous Kubernetes Node object, or an earlier placement era — would
+        // remain readable to the steady-state container if this run then failed.
+        retract_node_cleanup_proof(&registry_dir)?;
+
+        crate::proxy::netns_udp_capture::preflight_capture_tools(true).map_err(|error| {
+            format!("the Ambient UDP node preflight image cannot run the required tooling: {error}")
+        })?;
+
+        let context =
+            UdpMigrationContext::for_node_preflight(&registry_dir, target, node, &generation)?;
+        let deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_seconds);
+        let outcome = crate::proxy::udp_placement_cleanup::run_udp_placement_cleanup(
             context,
             source,
             shutdown_rx,
             Some(deadline),
         )
-        .await
-    });
+        .await;
+        Ok::<_, String>(outcome)
+    })?;
     match outcome {
         crate::proxy::udp_placement_cleanup::UdpCleanupOutcome::Complete => {
             println!("ambient-udp-preflight: predecessor placements retired and proof published");
@@ -549,6 +581,55 @@ pub fn execute_ambient_udp_preflight(args: &AmbientUdpPreflightArgs) -> Result<(
         ),
     }
 }
+
+/// Read THIS node's immutable `Node.metadata.uid` with one bounded, named,
+/// timeout-guarded `get`.
+///
+/// The request is bound to the node name the downward API stamped on this pod
+/// (`FERRUM_K8S_NODE_NAME` from `spec.nodeName`), so the preflight can only ever
+/// learn the identity of the machine it is running on. The RBAC the chart grants
+/// alongside it is a read-only `nodes: get` — no list, no watch, no write — and
+/// nothing from the returned object other than the UID is read. The UID itself
+/// is never logged: it is an identity binding, not diagnostics.
+async fn fetch_this_node_uid(node_name: String) -> Result<String, String> {
+    use k8s_openapi::api::core::v1::Node;
+    use kube::Api;
+
+    let config = match kube::Config::incluster() {
+        Ok(config) => config,
+        Err(in_cluster_error) => kube::Config::infer().await.map_err(|inferred_error| {
+            format!(
+                "could not build a Kubernetes client to resolve this node's UID: \
+                 incluster={in_cluster_error}; inferred={inferred_error}"
+            )
+        })?,
+    };
+    let client = kube::Client::try_from(config)
+        .map_err(|error| format!("could not build a Kubernetes client: {error}"))?;
+    let nodes: Api<Node> = Api::all(client);
+    let node = match tokio::time::timeout(
+        std::time::Duration::from_secs(NODE_UID_LOOKUP_TIMEOUT_SECONDS),
+        nodes.get(&node_name),
+    )
+    .await
+    {
+        Ok(Ok(node)) => node,
+        Ok(Err(error)) => {
+            return Err(format!(
+                "could not read this node's Kubernetes object: {error}"
+            ));
+        }
+        Err(_) => return Err("timed out reading this node's Kubernetes object".to_string()),
+    };
+    node.metadata
+        .uid
+        .filter(|uid| !uid.trim().is_empty())
+        .ok_or_else(|| "this node's Kubernetes object carries no UID".to_string())
+}
+
+/// Matches the node-agent's own bounded node lookup, so both authorities fail in
+/// the same window rather than one masking the other's outage.
+const NODE_UID_LOOKUP_TIMEOUT_SECONDS: u64 = 10;
 
 /// Print version information and exit.
 pub fn execute_version(args: &VersionArgs) {

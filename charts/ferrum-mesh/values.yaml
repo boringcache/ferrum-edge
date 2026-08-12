@@ -223,10 +223,24 @@ ambient:
   # init stage receives hostPID/SYS_ADMIN/SYS_PTRACE; the steady-state producer
   # keeps its narrow NET_ADMIN/NET_RAW pair.
   #
+  # The preflight is also the pod's own node-identity boundary: it resolves this
+  # node's Node.metadata.uid with one bounded read-only `get` (bound to the node
+  # name the downward API supplies) and republishes it immediately before the
+  # steady-state container starts, so the identity that container reads was
+  # proven by its OWN pod rather than inherited from whatever the node-agent last
+  # left on the shared registry path.
+  #
   # Disabling it does NOT relax the runtime boundary: a node with no durable
   # record and no attestation stays fail-closed as `migration_required`. Use it
   # only on clusters that will not grant the init stage's privileges, together
   # with the documented per-node operator exemption marker in docs/mesh.md.
+  # Understand the trade-off first: with the preflight off, nothing in the
+  # ambient pod republishes the node identity, so a node whose Kubernetes Node
+  # object was deleted and recreated on the SAME boot depends on the replacement
+  # node-agent retracting the previous object's publication. Clear
+  # `.udp-node-cleanup-proof-v1.json` from the registry directory when you turn
+  # this off, and drive adoption through the explicit cleanup/finalize pair or a
+  # freshly written per-node exemption.
   udpNodePreflight:
     enabled: true
   spire:

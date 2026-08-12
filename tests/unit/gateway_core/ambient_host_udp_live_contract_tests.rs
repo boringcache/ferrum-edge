@@ -970,10 +970,30 @@ fn ambient_udp_production_entry_points_are_scheduled_by_the_trusted_classifier()
     );
     let node_agent = read("src/modes/node_agent.rs");
     assert!(
-        node_agent.contains("udp_placement_migration::publish_node_identity(registry_dir, uid)")
+        node_agent.contains("udp_placement_migration::publish_node_identity(registry_dir, &uid)")
             && node_agent.contains("udp_placement_migration::retract_node_identity(registry_dir)"),
         "src/modes/node_agent.rs must still publish node identity and retract it \
          before a lookup can fail"
+    );
+    // The preflight's own provenance is the API server, not that publication:
+    // a `.node-identity-v1.json` written by a PREVIOUS Kubernetes Node object on
+    // this same boot is indistinguishable from a live one, so consuming it could
+    // pair a stale identity with the stale cleanup proof written under it.
+    assert!(
+        cli.contains("resolve_authoritative_node_identity")
+            && cli.contains("async fn fetch_this_node_uid")
+            && cli.contains("nodes.get(&node_name)"),
+        "the preflight must resolve this node's UID from its own bounded, \
+         node-name-bound Kubernetes lookup"
+    );
+    assert!(
+        !cli.contains("UdpNodeIdentity::resolve("),
+        "the preflight must never fall back to the node-agent's published node identity"
+    );
+    assert!(
+        cli.contains("retract_node_cleanup_proof(&registry_dir)?"),
+        "a non-current node cleanup proof must be retracted before the retirement \
+         it describes is re-attempted"
     );
 }
 

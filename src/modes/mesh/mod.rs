@@ -18437,6 +18437,7 @@ mod tests {
                 registry.path(),
                 "supervisor-test",
                 &std::collections::HashSet::new(),
+                None,
             )
             .expect("registry marker")
         );

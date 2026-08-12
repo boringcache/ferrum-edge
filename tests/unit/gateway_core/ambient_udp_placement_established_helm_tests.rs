@@ -203,9 +203,17 @@ fn the_node_proof_generation_is_derived_from_the_installed_contract_for_both_dae
             && helpers.contains("lookup \"v1\" \"ConfigMap\" .Release.Namespace $contractName"),
         "the node-proof generation must be derived from the INSTALLED placement contract"
     );
+    // The helper reads the PERSISTED era-qualified token and nothing else. A
+    // token derived from the release's observable shape repeats the moment a
+    // target and phase recur, which is exactly the replay issue #3809 refuses.
     assert!(
-        helpers.contains("printf \"%s-%s\" $target $phase"),
-        "a settled contract with no migration generation must still yield a deterministic token"
+        helpers.contains("index $data \"nodeProofGeneration\""),
+        "the node-proof generation must come from the contract's persisted \
+         era-qualified field"
+    );
+    assert!(
+        !helpers.contains("printf \"%s-%s\" $target $phase"),
+        "a `<target>-<phase>` fallback recurs across placement eras and must not exist"
     );
 
     // One shared helper, so the ambient pod, its preflight, and the node-agent's
@@ -279,5 +287,81 @@ fn the_node_agent_can_read_its_own_node_object_for_the_uid_binding() {
             && !rbac.contains("\"create\"")
             && !rbac.contains("\"patch\""),
         "the nodes grant must stay read-only"
+    );
+}
+
+/// The placement contract carries the migration-era provenance the whole proof
+/// boundary rests on, and the era is what makes the token non-recurring.
+#[test]
+fn the_placement_contract_persists_a_non_recurring_node_proof_era() {
+    let contract = read("templates/udp-placement-contract.yaml");
+
+    assert!(
+        contract.contains("nodeProofEra: {{ $nodeProofEra | toString | quote }}")
+            && contract.contains("nodeProofGeneration: {{ $nodeProofGeneration | quote }}"),
+        "the installed contract must record the era and its era-qualified token"
+    );
+    // Starting a migration opens a NEW era; resuming the same cleanup release
+    // keeps the one already open, so retries are idempotent while transitions
+    // strictly advance.
+    assert!(
+        contract.contains("{{- $nodeProofEra = add1 $previousEra -}}")
+            && contract
+                .contains("{{- $nodeProofGeneration = printf \"e%d.%s\" $nodeProofEra $generation")
+            && contract.contains("{{- if not (and $resumeCleanup $nodeProofGeneration) -}}"),
+        "a cleanup START must open the next era and an era-qualified token"
+    );
+    // Finalize and every settled release after it carry the era forward
+    // unchanged: only the cleanup branch reassigns it.
+    assert!(
+        contract.matches("$nodeProofEra = ").count() == 1
+            && contract.matches("$nodeProofGeneration = ").count() == 1,
+        "only the cleanup branch may stamp a new era; every other phase carries \
+         the installed contract's value forward"
+    );
+    assert!(
+        contract.contains(
+            "$previousNodeProofGeneration = trim (toString (default \"\" (index $previous \"nodeProofGeneration\")))"
+        ),
+        "the carried-forward token must come from the installed contract"
+    );
+}
+
+/// The preflight resolves this node's UID itself, so it can never pair a stale
+/// identity publication with the stale cleanup proof written under it.
+#[test]
+fn the_preflight_binds_its_node_lookup_to_this_pods_node_name() {
+    let ambient = read("templates/ambient-daemonset.yaml");
+    let rbac = read("templates/ambient-rbac.yaml");
+
+    let (_, after_init) = ambient
+        .split_once("initContainers:")
+        .expect("init container block");
+    let (init_block, _) = after_init
+        .split_once("      containers:")
+        .expect("steady-state container block");
+    assert!(
+        init_block.contains("- name: FERRUM_K8S_NODE_NAME")
+            && init_block.contains("fieldPath: spec.nodeName"),
+        "the preflight must receive this pod's node name from the downward API"
+    );
+
+    assert!(
+        rbac.contains("resources: [\"nodes\"]") && rbac.contains("verbs: [\"get\"]"),
+        "the ambient service account needs a read-only nodes grant for the preflight lookup"
+    );
+    // Least privilege: a named `get` and nothing that could enumerate or mutate
+    // the cluster's nodes.
+    for forbidden in [
+        "\"list\"", "\"watch\"", "\"create\"", "\"update\"", "\"patch\"", "\"delete\"", "\"*\"",
+    ] {
+        assert!(
+            !rbac.contains(forbidden),
+            "the ambient nodes grant must not carry {forbidden}"
+        );
+    }
+    assert!(
+        rbac.contains("name: ferrum-mesh\n    namespace: {{ .Release.Namespace }}"),
+        "the grant must bind the ambient DaemonSet's own service account"
     );
 }

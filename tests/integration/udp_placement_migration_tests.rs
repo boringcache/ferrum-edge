@@ -8,8 +8,10 @@ use ferrum_edge::proxy::netns_udp_capture::{NetnsUdpCleanupBackend, NetnsUdpClea
 use ferrum_edge::proxy::udp_placement_migration::{
     UdpAdoptionProof, UdpCleanupProofWindow, UdpMigrationFailureReason, UdpMigrationPhase,
     UdpNodeIdentity, UdpPlacement, UdpPlacementDecision, UdpPlacementRequest, UdpRegistrySyncProof,
-    clear_registry_sync_marker, prepare_placement, publish_node_identity_for,
-    publish_registry_sync_marker_for_pods, retract_node_identity,
+    clear_registry_sync_marker, node_cleanup_proof_is_current, prepare_placement,
+    publish_node_identity_for, publish_registry_sync_marker_for_pods,
+    resolve_authoritative_node_identity_with_boot_id, retract_node_cleanup_proof,
+    retract_node_identity, validate_node_proof_generation,
 };
 
 /// Node identity is supplied EXPLICITLY in these tests rather than resolved
@@ -19,7 +21,13 @@ const NODE_A: &str = "11111111-1111-4111-8111-111111111111";
 const NODE_B: &str = "22222222-2222-4222-8222-222222222222";
 const BOOT_1: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const BOOT_2: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
-const PROOF_GENERATION: &str = "host-netns-stable";
+/// The ERA-QUALIFIED node-proof generation a settled release carries. The
+/// `e<era>` ordinal is stamped by the placement contract when a migration starts
+/// and carried forward unchanged afterwards, so a token can never recur when a
+/// target and phase do (issue #3809). A `<target>-<phase>`-shaped token is
+/// refused outright — see
+/// `a_recurring_node_proof_generation_can_never_bind_a_proof`.
+const PROOF_GENERATION: &str = "e3.pod-to-host";
 
 fn identity(node_uid: &str, boot_id: &str) -> UdpNodeIdentity {
     UdpNodeIdentity::new(node_uid, boot_id).expect("valid node identity")
@@ -198,11 +206,23 @@ fn cleanup_context(
 fn publish_registry_proof(
     context: &ferrum_edge::proxy::udp_placement_migration::UdpMigrationContext,
 ) -> UdpRegistrySyncProof {
+    publish_registry_proof_for_node(context, None)
+}
+
+/// Publish the node-agent's registry-synchronization marker, optionally bound to
+/// the node UID that agent resolved authoritatively. The privileged preflight
+/// requires that binding; the migration cleanup phase, which already decides
+/// from durable node-bound ownership, does not.
+fn publish_registry_proof_for_node(
+    context: &ferrum_edge::proxy::udp_placement_migration::UdpMigrationContext,
+    node_uid: Option<&str>,
+) -> UdpRegistrySyncProof {
     assert_eq!(
         publish_registry_sync_marker_for_pods(
             context.registry_dir(),
             context.generation(),
             &HashSet::new(),
+            node_uid,
         ),
         Ok(true)
     );
@@ -967,25 +987,31 @@ fn quarantine_tombstone_refuses_attested_adoption_until_finalize_clears_it() {
         .expect("quarantined ownership must refuse any absent-state bootstrap");
     assert!(error.contains("quarantined"));
 
-    // Only a proven cleanup/finalize pair clears the quarantine.
-    let cleanup = transition(
-        UdpMigrationPhase::Cleanup,
-        "repair-1",
-        UdpPlacement::PodNetns,
-        UdpPlacement::HostNetns,
+    // Only a proven cleanup/finalize pair clears the quarantine. Finalize is
+    // where node ownership is asserted, so it carries this node's identity.
+    let node = identity(NODE_A, BOOT_1);
+    let cleanup = on_node(
+        transition(
+            UdpMigrationPhase::Cleanup,
+            "repair-1",
+            UdpPlacement::PodNetns,
+            UdpPlacement::HostNetns,
+        ),
+        &node,
     );
     let context = cleanup_context(registry.path(), &cleanup);
     complete_cleanup(&context);
-    assert!(matches!(
-        prepare_placement(
-            registry.path(),
-            &transition(
-                UdpMigrationPhase::Finalize,
-                "repair-1",
-                UdpPlacement::PodNetns,
-                UdpPlacement::HostNetns,
-            ),
+    let repair_finalize = on_node(
+        transition(
+            UdpMigrationPhase::Finalize,
+            "repair-1",
+            UdpPlacement::PodNetns,
+            UdpPlacement::HostNetns,
         ),
+        &node,
+    );
+    assert!(matches!(
+        prepare_placement(registry.path(), &repair_finalize),
         Ok(UdpPlacementDecision::RunStable)
     ));
     assert!(
@@ -999,15 +1025,7 @@ fn quarantine_tombstone_refuses_attested_adoption_until_finalize_clears_it() {
     std::fs::create_dir(registry.path().join(".udp-placement-quarantined"))
         .expect("empty directory tombstone");
     assert!(matches!(
-        prepare_placement(
-            registry.path(),
-            &transition(
-                UdpMigrationPhase::Finalize,
-                "repair-1",
-                UdpPlacement::PodNetns,
-                UdpPlacement::HostNetns,
-            ),
-        ),
+        prepare_placement(registry.path(), &repair_finalize),
         Ok(UdpPlacementDecision::RunStable)
     ));
     assert!(
@@ -1108,7 +1126,7 @@ fn marker_publication_reaps_only_owned_exact_prefix_temporary_files() {
     std::fs::write(&foreign_prefix, b"foreign").expect("foreign file");
 
     assert_eq!(
-        publish_registry_sync_marker_for_pods(registry.path(), "temp-reap", &HashSet::new(),),
+        publish_registry_sync_marker_for_pods(registry.path(), "temp-reap", &HashSet::new(), None),
         Ok(true)
     );
     assert!(!owned.exists());
@@ -1130,7 +1148,12 @@ fn marker_temp_reaper_refuses_symlinks_and_directories() {
     std::fs::create_dir(&directory_temp).expect("directory temp");
 
     assert_eq!(
-        publish_registry_sync_marker_for_pods(registry.path(), "temp-reap-safe", &HashSet::new(),),
+        publish_registry_sync_marker_for_pods(
+            registry.path(),
+            "temp-reap-safe",
+            &HashSet::new(),
+            None,
+        ),
         Ok(true)
     );
     assert!(symlink_temp.symlink_metadata().is_ok());
@@ -1224,41 +1247,59 @@ fn pre_contract_cleanup_retires_both_domains_and_persists_that_scope() {
 #[test]
 fn host_to_pod_cleanup_and_finalize_are_symmetric() {
     let registry = tempfile::tempdir().expect("registry");
-    let bootstrap_cleanup = transition(
-        UdpMigrationPhase::Cleanup,
-        "host-bootstrap",
-        UdpPlacement::PodNetns,
-        UdpPlacement::HostNetns,
+    // Both directions land on a producer placement, so every phase carries this
+    // node's identity: finalize refuses to leave a producer-owning record that
+    // names no owning node UID.
+    let node = identity(NODE_A, BOOT_1);
+    let bootstrap_cleanup = on_node(
+        transition(
+            UdpMigrationPhase::Cleanup,
+            "host-bootstrap",
+            UdpPlacement::PodNetns,
+            UdpPlacement::HostNetns,
+        ),
+        &node,
     );
     let context = cleanup_context(registry.path(), &bootstrap_cleanup);
     complete_cleanup(&context);
     prepare_placement(
         registry.path(),
-        &transition(
-            UdpMigrationPhase::Finalize,
-            "host-bootstrap",
-            UdpPlacement::PodNetns,
-            UdpPlacement::HostNetns,
+        &on_node(
+            transition(
+                UdpMigrationPhase::Finalize,
+                "host-bootstrap",
+                UdpPlacement::PodNetns,
+                UdpPlacement::HostNetns,
+            ),
+            &node,
         ),
     )
     .expect("host bootstrap finalize");
 
-    let reverse = transition(
-        UdpMigrationPhase::Cleanup,
-        "reverse-7",
-        UdpPlacement::HostNetns,
-        UdpPlacement::PodNetns,
-    );
-    let context = cleanup_context(registry.path(), &reverse);
-    assert!(prepare_placement(registry.path(), &stable(UdpPlacement::PodNetns)).is_err());
-    complete_cleanup(&context);
-    prepare_placement(
-        registry.path(),
-        &transition(
-            UdpMigrationPhase::Finalize,
+    let reverse = on_node(
+        transition(
+            UdpMigrationPhase::Cleanup,
             "reverse-7",
             UdpPlacement::HostNetns,
             UdpPlacement::PodNetns,
+        ),
+        &node,
+    );
+    let context = cleanup_context(registry.path(), &reverse);
+    assert!(
+        prepare_placement(registry.path(), &stable_on_node(UdpPlacement::PodNetns, &node)).is_err()
+    );
+    complete_cleanup(&context);
+    prepare_placement(
+        registry.path(),
+        &on_node(
+            transition(
+                UdpMigrationPhase::Finalize,
+                "reverse-7",
+                UdpPlacement::HostNetns,
+                UdpPlacement::PodNetns,
+            ),
+            &node,
         ),
     )
     .expect("reverse finalize");
@@ -1346,73 +1387,99 @@ fn enabled_disabled_transitions_also_require_cleanup_and_finalize() {
 #[test]
 fn interrupted_cleanup_rejects_stale_generation_and_predecessor() {
     let registry = tempfile::tempdir().expect("registry");
-    prepare_placement(registry.path(), &stable(UdpPlacement::PodNetns))
-        .expect("bootstrap placement");
+    let node = identity(NODE_A, BOOT_1);
+    prepare_placement(
+        registry.path(),
+        &stable_on_node(UdpPlacement::PodNetns, &node),
+    )
+    .expect("bootstrap placement");
     cleanup_context(
         registry.path(),
-        &transition(
-            UdpMigrationPhase::Cleanup,
-            "owned-generation",
-            UdpPlacement::PodNetns,
-            UdpPlacement::HostNetns,
+        &on_node(
+            transition(
+                UdpMigrationPhase::Cleanup,
+                "owned-generation",
+                UdpPlacement::PodNetns,
+                UdpPlacement::HostNetns,
+            ),
+            &node,
         ),
     );
-    assert!(
-        prepare_placement(
-            registry.path(),
-            &transition(
+    let error = prepare_placement(
+        registry.path(),
+        &on_node(
+            transition(
                 UdpMigrationPhase::Cleanup,
                 "stale-generation",
                 UdpPlacement::PodNetns,
                 UdpPlacement::HostNetns,
             ),
-        )
-        .is_err()
-    );
-    assert!(
-        prepare_placement(
-            registry.path(),
-            &transition(
+            &node,
+        ),
+    )
+    .err()
+    .expect("a different generation must not adopt the pending migration");
+    assert!(error.contains("already pending"), "{error}");
+    let error = prepare_placement(
+        registry.path(),
+        &on_node(
+            transition(
                 UdpMigrationPhase::Finalize,
                 "owned-generation",
                 UdpPlacement::HostNetns,
                 UdpPlacement::PodNetns,
             ),
-        )
-        .is_err()
-    );
+            &node,
+        ),
+    )
+    .err()
+    .expect("a reversed predecessor must not finalize the pending migration");
+    assert!(error.contains("does not match durable cleanup ownership"), "{error}");
 }
 
 #[test]
 fn completed_generation_cannot_authorize_a_later_cleanup_transition() {
     let registry = tempfile::tempdir().expect("registry");
-    prepare_placement(registry.path(), &stable(UdpPlacement::PodNetns))
-        .expect("bootstrap placement");
-    let first = transition(
-        UdpMigrationPhase::Cleanup,
-        "generation-once",
-        UdpPlacement::PodNetns,
-        UdpPlacement::HostNetns,
+    let node = identity(NODE_A, BOOT_1);
+    prepare_placement(
+        registry.path(),
+        &stable_on_node(UdpPlacement::PodNetns, &node),
+    )
+    .expect("bootstrap placement");
+    let first = on_node(
+        transition(
+            UdpMigrationPhase::Cleanup,
+            "generation-once",
+            UdpPlacement::PodNetns,
+            UdpPlacement::HostNetns,
+        ),
+        &node,
     );
     complete_cleanup(&cleanup_context(registry.path(), &first));
     prepare_placement(
         registry.path(),
-        &transition(
-            UdpMigrationPhase::Finalize,
-            "generation-once",
-            UdpPlacement::PodNetns,
-            UdpPlacement::HostNetns,
+        &on_node(
+            transition(
+                UdpMigrationPhase::Finalize,
+                "generation-once",
+                UdpPlacement::PodNetns,
+                UdpPlacement::HostNetns,
+            ),
+            &node,
         ),
     )
     .expect("first finalize");
 
     let error = prepare_placement(
         registry.path(),
-        &transition(
-            UdpMigrationPhase::Cleanup,
-            "generation-once",
-            UdpPlacement::HostNetns,
-            UdpPlacement::PodNetns,
+        &on_node(
+            transition(
+                UdpMigrationPhase::Cleanup,
+                "generation-once",
+                UdpPlacement::HostNetns,
+                UdpPlacement::PodNetns,
+            ),
+            &node,
         ),
     )
     .err()
@@ -1434,12 +1501,22 @@ fn registry_relist_ack_is_bound_to_generation_and_retracted_on_restart() {
     );
     assert!(context.registry_sync_proof().is_none());
     assert_eq!(
-        publish_registry_sync_marker_for_pods(registry.path(), "generation-b", &HashSet::new(),),
+        publish_registry_sync_marker_for_pods(
+            registry.path(),
+            "generation-b",
+            &HashSet::new(),
+            None,
+        ),
         Ok(true)
     );
     assert!(context.registry_sync_proof().is_none());
     assert_eq!(
-        publish_registry_sync_marker_for_pods(registry.path(), "generation-a", &HashSet::new(),),
+        publish_registry_sync_marker_for_pods(
+            registry.path(),
+            "generation-a",
+            &HashSet::new(),
+            None,
+        ),
         Ok(true)
     );
     assert!(context.registry_sync_proof().is_some());
@@ -1470,13 +1547,20 @@ fn same_generation_registry_republication_has_a_distinct_proof() {
 #[test]
 fn registry_proof_change_resets_repeated_passes_and_blocks_finalize() {
     let registry = tempfile::tempdir().expect("registry");
-    prepare_placement(registry.path(), &stable(UdpPlacement::PodNetns))
-        .expect("bootstrap placement");
-    let cleanup = transition(
-        UdpMigrationPhase::Cleanup,
-        "generation-a",
-        UdpPlacement::PodNetns,
-        UdpPlacement::HostNetns,
+    let node = identity(NODE_A, BOOT_1);
+    prepare_placement(
+        registry.path(),
+        &stable_on_node(UdpPlacement::PodNetns, &node),
+    )
+    .expect("bootstrap placement");
+    let cleanup = on_node(
+        transition(
+            UdpMigrationPhase::Cleanup,
+            "generation-a",
+            UdpPlacement::PodNetns,
+            UdpPlacement::HostNetns,
+        ),
+        &node,
     );
     let context = cleanup_context(registry.path(), &cleanup);
     let first_proof = publish_registry_proof(&context);
@@ -1508,13 +1592,19 @@ fn registry_proof_change_resets_repeated_passes_and_blocks_finalize() {
     assert!(!first_replacement_pass.pod_complete());
     assert!(context.mark_cleanup_complete(&first_proof).is_err());
 
-    let finalize = transition(
-        UdpMigrationPhase::Finalize,
-        "generation-a",
-        UdpPlacement::PodNetns,
-        UdpPlacement::HostNetns,
+    let finalize = on_node(
+        transition(
+            UdpMigrationPhase::Finalize,
+            "generation-a",
+            UdpPlacement::PodNetns,
+            UdpPlacement::HostNetns,
+        ),
+        &node,
     );
-    assert!(prepare_placement(registry.path(), &finalize).is_err());
+    let error = prepare_placement(registry.path(), &finalize)
+        .err()
+        .expect("finalize must refuse without durable cleanup completion");
+    assert!(error.contains("not durably complete"), "{error}");
 }
 
 #[test]
@@ -1523,14 +1613,14 @@ fn registry_relist_ack_requires_every_expected_pod_entry() {
     let expected = HashSet::from(["pod-a".to_string(), "pod-b".to_string()]);
     std::fs::write(registry.path().join("pod-a"), b"/cg/1\n").expect("first pod entry");
     assert_eq!(
-        publish_registry_sync_marker_for_pods(registry.path(), "generation-a", &expected),
+        publish_registry_sync_marker_for_pods(registry.path(), "generation-a", &expected, None),
         Ok(false)
     );
     assert!(!registry.path().join(".udp-registry-synced").exists());
 
     std::fs::write(registry.path().join("pod-b"), b"/cg/2\n").expect("second pod entry");
     assert_eq!(
-        publish_registry_sync_marker_for_pods(registry.path(), "generation-a", &expected),
+        publish_registry_sync_marker_for_pods(registry.path(), "generation-a", &expected, None),
         Ok(true)
     );
     assert!(registry.path().join(".udp-registry-synced").is_file());
@@ -1698,4 +1788,431 @@ fn the_node_preflight_retires_both_placements_for_ipv4_and_ipv6() {
         )
         .is_err()
     );
+}
+
+// ── Node-proof generation cannot recur across placement eras (issue #3809) ───
+
+#[test]
+fn a_recurring_node_proof_generation_can_never_bind_a_proof() {
+    // The concrete replay this refuses: an old settled host era wrote its proof
+    // under a token derived from the release's observable shape, the cluster
+    // then migrated host -> pod and back, and that same token names the NEW host
+    // era. A same-boot node that missed the intervening cleanup/finalize rollout
+    // would otherwise replay its stale proof into the new era.
+    for recurring in [
+        "host-netns-stable",
+        "host-netns-finalize",
+        "pod-netns-stable",
+        // Era-shaped but not an era: no ordinal, a zero-padded ordinal, or a
+        // bare prefix with nothing bound to it.
+        "e.pod-to-host",
+        "e0.pod-to-host",
+        "e01.pod-to-host",
+        "e3",
+        "e3.",
+        "era3.pod-to-host",
+    ] {
+        assert!(
+            validate_node_proof_generation(recurring)
+                .is_err(),
+            "{recurring} must not be accepted as a node-proof generation"
+        );
+
+        let registry = tempfile::tempdir().expect("registry");
+        let node = identity(NODE_A, BOOT_1);
+        write_node_attestation(
+            registry.path(),
+            ".udp-node-cleanup-proof-v1.json",
+            &node,
+            UdpPlacement::HostNetns,
+            recurring,
+        );
+        let request = UdpPlacementRequest {
+            node: Some(node.clone()),
+            node_proof_generation: Some(recurring.to_string()),
+            ..stable_attested(UdpPlacement::HostNetns, UdpPlacement::HostNetns)
+        };
+        let error = prepare_placement(registry.path(), &request)
+            .err()
+            .expect("a recurring node-proof generation must authorize nothing");
+        assert!(error.contains("not era-qualified"), "{recurring}: {error}");
+        assert!(
+            !registry
+                .path()
+                .join(".udp-placement-state-v1.json")
+                .exists(),
+            "{recurring}: a refused release must write no ownership"
+        );
+
+        // The privileged preflight refuses to PUBLISH under one for the same
+        // reason, so a repeatable token cannot enter the system from either end.
+        assert!(
+            ferrum_edge::proxy::udp_placement_migration::UdpMigrationContext::for_node_preflight(
+                registry.path(),
+                UdpPlacement::HostNetns,
+                identity(NODE_A, BOOT_1),
+                recurring,
+            )
+            .is_err(),
+            "{recurring}: the preflight must refuse a recurring generation"
+        );
+    }
+
+    // The era-qualified shape is what both ends accept.
+    assert!(
+        validate_node_proof_generation(
+            PROOF_GENERATION
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn a_proof_earned_in_an_earlier_placement_era_is_refused_by_the_next_one() {
+    // host -> pod -> host, with the SAME operator-chosen migration generation
+    // reused for both host transitions. Only the era ordinal distinguishes them,
+    // which is exactly why it is the thing a proof is bound to.
+    let registry = tempfile::tempdir().expect("registry");
+    let node = identity(NODE_A, BOOT_1);
+    write_node_attestation(
+        registry.path(),
+        ".udp-node-cleanup-proof-v1.json",
+        &node,
+        UdpPlacement::HostNetns,
+        "e1.pod-to-host",
+    );
+    let later_era = UdpPlacementRequest {
+        node: Some(node.clone()),
+        node_proof_generation: Some("e5.pod-to-host".to_string()),
+        ..stable_attested(UdpPlacement::HostNetns, UdpPlacement::HostNetns)
+    };
+    let error = prepare_placement(registry.path(), &later_era)
+        .err()
+        .expect("an earlier era's proof must not authorize a later one");
+    assert!(error.contains("superseded node-proof generation"), "{error}");
+    assert!(
+        !registry
+            .path()
+            .join(".udp-placement-state-v1.json")
+            .exists(),
+        "a refused rejoin must write no ownership"
+    );
+
+    // Re-proving the node in the CURRENT era is what admits it.
+    write_node_attestation(
+        registry.path(),
+        ".udp-node-cleanup-proof-v1.json",
+        &node,
+        UdpPlacement::HostNetns,
+        "e5.pod-to-host",
+    );
+    assert!(matches!(
+        prepare_placement(registry.path(), &later_era),
+        Ok(UdpPlacementDecision::RunStable)
+    ));
+}
+
+// ── Authoritative node-UID provenance for the preflight (issue #3809) ───────
+
+/// The exact on-disk shape the node-agent publishes, written directly so a test
+/// can present a publication this process did not make.
+fn published_identity(registry: &std::path::Path) -> Option<UdpNodeIdentity> {
+    UdpNodeIdentity::resolve_published(registry, BOOT_1)
+}
+
+#[tokio::test]
+async fn a_same_boot_node_object_recreation_cannot_hand_over_its_identity_or_proof() {
+    // NODE_B's node-agent published its identity and its preflight published a
+    // cleanup proof. The Node object is then deleted and recreated under the
+    // same node NAME as NODE_A, on the SAME boot — so the surviving publication
+    // records the CURRENT boot id and no reader can tell it from a live one.
+    let registry = tempfile::tempdir().expect("registry");
+    let predecessor = identity(NODE_B, BOOT_1);
+    publish_node_identity_for(registry.path(), &predecessor).expect("predecessor publication");
+    write_node_attestation(
+        registry.path(),
+        ".udp-node-cleanup-proof-v1.json",
+        &predecessor,
+        UdpPlacement::HostNetns,
+        PROOF_GENERATION,
+    );
+    assert_eq!(published_identity(registry.path()), Some(predecessor));
+
+    // The preflight asks the API server instead, bound to this pod's node name.
+    let resolved =
+        resolve_authoritative_node_identity_with_boot_id(
+            registry.path(),
+            BOOT_1,
+            None,
+            Some("reused-node-name"),
+            |node_name| async move {
+                assert_eq!(node_name, "reused-node-name");
+                Ok(NODE_A.to_string())
+            },
+        )
+        .await
+        .expect("the authoritative lookup resolves this node");
+    assert_eq!(resolved, identity(NODE_A, BOOT_1));
+    assert_eq!(
+        published_identity(registry.path()),
+        Some(identity(NODE_A, BOOT_1)),
+        "the proven identity replaces the predecessor's publication"
+    );
+
+    // The predecessor's proof is not current for this node, so the preflight
+    // performs a real retirement instead of short-circuiting on it, and the
+    // steady-state guard refuses it outright.
+    assert_eq!(
+        node_cleanup_proof_is_current(
+            registry.path(),
+            UdpPlacement::HostNetns,
+            &resolved,
+            PROOF_GENERATION,
+        ),
+        Ok(false)
+    );
+    let error = prepare_placement(
+        registry.path(),
+        &stable_attested_on_node(UdpPlacement::HostNetns, UdpPlacement::HostNetns, &resolved),
+    )
+    .err()
+    .expect("node-name reuse must not inherit the predecessor's cleanup proof");
+    assert!(error.contains("different Kubernetes node UID"), "{error}");
+
+    // And the stale proof does not survive the run that refused it.
+    retract_node_cleanup_proof(registry.path())
+        .expect("stale proof retraction");
+    assert!(
+        !registry
+            .path()
+            .join(".udp-node-cleanup-proof-v1.json")
+            .exists()
+    );
+}
+
+#[tokio::test]
+async fn the_preflight_resolves_its_identity_before_the_node_agent_has_published_one() {
+    // The two DaemonSets have no startup ordering between them, so the preflight
+    // routinely runs with NO published identity at all. It must still resolve
+    // one rather than fail closed on the node-agent's schedule.
+    let registry = tempfile::tempdir().expect("registry");
+    assert_eq!(published_identity(registry.path()), None);
+
+    let resolved =
+        resolve_authoritative_node_identity_with_boot_id(
+            registry.path(),
+            BOOT_1,
+            None,
+            Some("fresh-node"),
+            |_| async { Ok(NODE_A.to_string()) },
+        )
+        .await
+        .expect("the preflight resolves its own identity");
+    assert_eq!(resolved, identity(NODE_A, BOOT_1));
+    assert_eq!(
+        published_identity(registry.path()),
+        Some(identity(NODE_A, BOOT_1))
+    );
+
+    // An explicit client-render value short-circuits the lookup entirely.
+    let explicit =
+        resolve_authoritative_node_identity_with_boot_id(
+            registry.path(),
+            BOOT_1,
+            Some(NODE_B),
+            Some("fresh-node"),
+            |_| async { panic!("an explicit node UID must not consult Kubernetes") },
+        )
+        .await
+        .expect("an explicit node UID resolves without a lookup");
+    assert_eq!(explicit, identity(NODE_B, BOOT_1));
+}
+
+#[tokio::test]
+async fn every_failed_lookup_or_publication_path_leaves_no_published_identity() {
+    for (label, explicit, node_name, fetch_result) in [
+        (
+            "lookup failure",
+            None,
+            Some("some-node"),
+            Err("the API server is unreachable".to_string()),
+        ),
+        (
+            "node object without a UID",
+            None,
+            Some("some-node"),
+            Ok(String::new()),
+        ),
+        (
+            "hostile node UID",
+            None,
+            Some("some-node"),
+            Ok("../../etc/passwd".to_string()),
+        ),
+        ("no node name and no explicit UID", None, None, Ok(String::new())),
+    ] {
+        let registry = tempfile::tempdir().expect("registry");
+        // A publication from a PREVIOUS Kubernetes Node object is present, which
+        // is precisely the state a failure must not leave behind.
+        publish_node_identity_for(registry.path(), &identity(NODE_B, BOOT_1))
+            .expect("predecessor publication");
+
+        let error =
+            resolve_authoritative_node_identity_with_boot_id(
+                registry.path(),
+                BOOT_1,
+                explicit,
+                node_name,
+                |_| async move { fetch_result },
+            )
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{label} must fail closed"));
+        assert!(!error.is_empty(), "{label}");
+        assert_eq!(
+            published_identity(registry.path()),
+            None,
+            "{label}: a failure must leave NO published identity, not a predecessor's"
+        );
+        assert!(
+            !registry.path().join(".node-identity-v1.json").exists(),
+            "{label}: the publication file itself must be gone"
+        );
+    }
+}
+
+#[test]
+fn the_preflight_refuses_a_registry_publication_from_another_node() {
+    // The registry-synchronization marker is the preflight's only evidence that
+    // the pod inventory it is about to retire against is complete. One left by
+    // the node-agent of a PREVIOUS Kubernetes Node object enumerates that
+    // object's pods, so it must not satisfy this node's preflight.
+    let registry = tempfile::tempdir().expect("registry");
+    let preflight =
+        ferrum_edge::proxy::udp_placement_migration::UdpMigrationContext::for_node_preflight(
+            registry.path(),
+            UdpPlacement::HostNetns,
+            identity(NODE_A, BOOT_1),
+            PROOF_GENERATION,
+        )
+        .expect("node preflight context");
+
+    for stale in [None, Some(NODE_B)] {
+        assert_eq!(
+            publish_registry_sync_marker_for_pods(
+                registry.path(),
+                PROOF_GENERATION,
+                &HashSet::new(),
+                stale,
+            ),
+            Ok(true)
+        );
+        assert!(
+            preflight.registry_sync_proof().is_none(),
+            "a publication that does not name this node UID must not be consumable"
+        );
+    }
+
+    assert_eq!(
+        publish_registry_sync_marker_for_pods(
+            registry.path(),
+            PROOF_GENERATION,
+            &HashSet::new(),
+            Some(NODE_A),
+        ),
+        Ok(true)
+    );
+    assert!(
+        preflight.registry_sync_proof().is_some(),
+        "the current node-agent's publication must be consumable"
+    );
+
+    // The migration cleanup phase decides from durable node-bound ownership, so
+    // it deliberately keeps consuming an unbound publication.
+    let mesh = cleanup_context(
+        registry.path(),
+        &transition(
+            UdpMigrationPhase::Cleanup,
+            "mesh-cleanup",
+            UdpPlacement::PodNetns,
+            UdpPlacement::HostNetns,
+        ),
+    );
+    assert_eq!(
+        publish_registry_sync_marker_for_pods(
+            registry.path(),
+            "mesh-cleanup",
+            &HashSet::new(),
+            None,
+        ),
+        Ok(true)
+    );
+    assert!(mesh.registry_sync_proof().is_some());
+}
+
+#[test]
+fn finalize_refuses_to_leave_an_unbound_producer_owning_record() {
+    // Cleanup/finalize is the documented recovery from unbound ownership, so it
+    // must not be able to COMPLETE into the very shape it recovers from: a
+    // record that runs a producer while naming no owning node UID. Finalize is
+    // the boundary, because it is what flips `active` and returns `RunStable`.
+    let registry = tempfile::tempdir().expect("registry");
+    let cleanup = transition(
+        UdpMigrationPhase::Cleanup,
+        "unbound-finalize",
+        UdpPlacement::PodNetns,
+        UdpPlacement::HostNetns,
+    );
+    let context = cleanup_context(registry.path(), &cleanup);
+    complete_cleanup(&context);
+
+    let finalize = transition(
+        UdpMigrationPhase::Finalize,
+        "unbound-finalize",
+        UdpPlacement::PodNetns,
+        UdpPlacement::HostNetns,
+    );
+    let error = prepare_placement(registry.path(), &finalize)
+        .err()
+        .expect("finalize must refuse to bind nothing to a producer placement");
+    assert!(error.contains("naming no owning Kubernetes node UID"), "{error}");
+
+    // Supplying the identity completes the same generation, and the record it
+    // leaves behind is this node's own ownership.
+    let node = identity(NODE_A, BOOT_1);
+    assert!(matches!(
+        prepare_placement(registry.path(), &on_node(finalize, &node)),
+        Ok(UdpPlacementDecision::RunStable)
+    ));
+    assert!(matches!(
+        prepare_placement(
+            registry.path(),
+            &stable_on_node(UdpPlacement::HostNetns, &node)
+        ),
+        Ok(UdpPlacementDecision::RunStable)
+    ));
+
+    // `disabled` runs no producer and carries no traffic, so it stays
+    // finalizable while the identity is unresolvable.
+    let disabled_registry = tempfile::tempdir().expect("registry");
+    let disable = transition(
+        UdpMigrationPhase::Cleanup,
+        "disable-unbound",
+        UdpPlacement::PodNetns,
+        UdpPlacement::Disabled,
+    );
+    let context = cleanup_context(disabled_registry.path(), &disable);
+    complete_cleanup(&context);
+    assert!(matches!(
+        prepare_placement(
+            disabled_registry.path(),
+            &transition(
+                UdpMigrationPhase::Finalize,
+                "disable-unbound",
+                UdpPlacement::PodNetns,
+                UdpPlacement::Disabled,
+            ),
+        ),
+        Ok(UdpPlacementDecision::RunStable)
+    ));
 }

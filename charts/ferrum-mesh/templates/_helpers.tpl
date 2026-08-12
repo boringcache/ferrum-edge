@@ -306,17 +306,25 @@ Optional:
 Release-bound node-proof generation for the Ambient UDP placement contract
 (issue #3809).
 
-The node-scoped cleanup attestation must be bound to a generation that CHANGES
-across every placement migration, so an attestation written before one cannot
-authorize the release after it. It is derived only from the INSTALLED contract:
-its explicit migration generation while a migration is in flight, otherwise a
-deterministic `<target>-<phase>` token for the settled release. An initial
-install has no installed contract and therefore no proof generation, which is
-fail-closed — the runtime refuses recordless host adoption without one.
+The node-scoped cleanup attestation must be bound to a generation that cannot
+RECUR, so an attestation written for one placement era can never authorize a
+later one. This helper therefore reads ONLY the installed contract's persisted,
+era-qualified `nodeProofGeneration` (`e<era>.<migration generation>`, stamped by
+`udp-placement-contract.yaml` when a migration starts and carried forward
+unchanged through finalize and every settled release after it).
+
+It deliberately has NO derived fallback. A token derived from the release's
+observable shape — `<target>-<phase>` — repeats the moment a target and phase
+recur, so after a host -> pod -> host round trip an old settled-host proof would
+name the NEW host era and a same-boot node that missed the intervening rollout
+could replay it. An initial install, and any contract installed before this
+field existed, therefore yields NO proof generation, which is fail-closed: the
+settled host DaemonSet refuses to render until an explicit cleanup/finalize pair
+has stamped one.
 
 Both DaemonSets include this SAME helper so the ambient preflight and the
 node-agent's registry-synchronization publication can never disagree about
-which generation a proof belongs to.
+which era a proof belongs to.
 */}}
 {{- define "ferrum-mesh.ambientUdpNodeProofGeneration" -}}
 {{- $env := default dict .Values.ambient.env -}}
@@ -327,14 +335,7 @@ which generation a proof belongs to.
 {{- $installed := lookup "v1" "ConfigMap" .Release.Namespace $contractName -}}
 {{- if $installed -}}
 {{- $data := default dict $installed.data -}}
-{{- $generation := trim (toString (index $data "generation")) -}}
-{{- $target := trim (toString (index $data "target")) -}}
-{{- $phase := trim (toString (index $data "phase")) -}}
-{{- if $generation -}}
-{{- $result = $generation -}}
-{{- else if and $target $phase -}}
-{{- $result = printf "%s-%s" $target $phase -}}
-{{- end -}}
+{{- $result = trim (toString (default "" (index $data "nodeProofGeneration"))) -}}
 {{- end -}}
 {{- end -}}
 {{- $result -}}

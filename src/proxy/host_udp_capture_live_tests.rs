@@ -1275,7 +1275,10 @@ fn host_udp_live_kernel_fail_closed_prerequisites_and_partial_install() {
 /// the runner's `/proc/sys/kernel/random/boot_id`.
 const LIVE_NODE_UID: &str = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
 const LIVE_BOOT_ID: &str = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
-const LIVE_PROOF_GENERATION: &str = "host-netns-stable";
+/// The ERA-QUALIFIED node-proof generation a settled release carries. The `e<n>`
+/// ordinal is what the placement contract increments at every migration, so a
+/// proof written for one era can never authorize another (issue #3809).
+const LIVE_PROOF_GENERATION: &str = "e4.pod-to-host";
 
 /// The PREDECESSOR (pod-netns) placement configuration, dual-stack. This is the
 /// exact plan the Ambient per-pod-netns producer installs inside a workload
@@ -1559,9 +1562,14 @@ fn host_udp_live_kernel_missed_rollout_rejoin_refuses_then_recovers_without_a_bl
     expected.insert(POD_A_UID.to_string());
     expected.insert(POD_B_UID.to_string());
     assert_eq!(
-        publish_registry_sync_marker_for_pods(registry.path(), LIVE_PROOF_GENERATION, &expected),
+        publish_registry_sync_marker_for_pods(
+            registry.path(),
+            LIVE_PROOF_GENERATION,
+            &expected,
+            Some(LIVE_NODE_UID),
+        ),
         Ok(true),
-        "the node-agent's authoritative registry publication must be current"
+        "the node-agent's authoritative registry publication must be current and bound to this node UID"
     );
     let context = UdpMigrationContext::for_node_preflight(
         registry.path(),

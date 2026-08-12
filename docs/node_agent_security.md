@@ -200,7 +200,17 @@ The privilege is bounded to an init stage that cannot serve traffic,
 which is strictly narrower than granting the producer setns for its whole
 lifetime, and clusters that will not grant it at all can set
 `ambient.udpNodePreflight.enabled=false` and adopt nodes with explicit
-node-bound exemption markers instead. The attestation is still consulted only
+node-bound exemption markers instead.
+
+That init stage also carries one **read-only** Kubernetes grant: `nodes: get` on
+the `ferrum-mesh` service account, with no list, watch, or write verb, so it can
+resolve this node's own `Node.metadata.uid` and nothing else. It is bound to the
+node name the downward API stamped on the pod, so the lookup cannot name another
+machine, and the UID is never logged or emitted as a metric label. The grant
+exists because the node-agent's published identity file cannot be
+staleness-checked by a reader: a file left by a previous Kubernetes Node object
+on the same boot records the current boot id, so trusting it would let a
+recreated node inherit the predecessor's durable ownership and cleanup proof. The attestation is still consulted only
 when the durable record is absent, so it can never authorize an in-place flip on
 a running node, and a `.udp-placement-quarantined` tombstone in the registry
 directory refuses every absent-state bootstrap outright, which is what makes the

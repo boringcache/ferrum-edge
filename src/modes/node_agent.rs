@@ -1712,9 +1712,20 @@ async fn run_with_backend(
     // publication before it can fail, so a failure leaves the proxy with NO
     // node identity — not with a predecessor Node object's UID — and the
     // proxy's own guard treats an absent identity as a fail-closed refusal.
-    if let Some(registry_dir) = config.node_waypoint_pod_registry_dir.as_deref() {
-        publish_node_identity(&client, config.node_name.as_str(), registry_dir).await;
-    }
+    //
+    // The resolved UID also BINDS this incarnation's registry-synchronization
+    // publications: the marker lives on a persistent registry path, so one left
+    // by the node-agent of a previous Kubernetes Node object would otherwise
+    // let the privileged preflight retire predecessor rules against that
+    // object's pod inventory. An unresolved UID publishes the marker unbound,
+    // which the preflight refuses and the migration cleanup phase — which
+    // decides from durable node-bound ownership — still accepts.
+    let udp_node_uid = match config.node_waypoint_pod_registry_dir.as_deref() {
+        Some(registry_dir) => {
+            publish_node_identity(&client, config.node_name.as_str(), registry_dir).await
+        }
+        None => None,
+    };
     let pods: Api<Pod> = Api::all(client.clone());
     let watcher_config =
         kube_watcher::Config::default().fields(&format!("spec.nodeName={}", config.node_name));
@@ -1731,6 +1742,7 @@ async fn run_with_backend(
         topology_ready,
         topology_publication_ok,
         udp_migration_generation,
+        udp_node_uid,
         pod_stream,
         std::iter::empty(),
     )
@@ -1928,6 +1940,7 @@ where
         topology_ready,
         true,
         None,
+        None,
         pod_stream,
         seed_pods,
     )
@@ -1989,6 +2002,7 @@ where
         topology_ready,
         topology_publication_ok,
         None,
+        None,
         pod_stream,
         std::iter::empty(),
     )
@@ -2008,6 +2022,11 @@ async fn run_with_pod_stream<S, I>(
     topology_ready: Arc<AtomicBool>,
     mut topology_publication_ok: bool,
     udp_migration_generation: Option<String>,
+    // This node-agent incarnation's AUTHORITATIVELY resolved
+    // `Node.metadata.uid`, or `None` when it could not prove one. It binds every
+    // registry-synchronization publication this loop makes to the machine whose
+    // pod inventory it enumerates (issue #3809).
+    udp_node_uid: Option<String>,
     mut pod_stream: S,
     seed_pods: I,
 ) -> Result<(), anyhow::Error>
@@ -2183,6 +2202,7 @@ where
                                 generation,
                                 &pod_states,
                                 config,
+                                udp_node_uid.as_deref(),
                                 &mut udp_registry_sync_published,
                                 &mut udp_registry_sync_retraction_pending,
                             );
@@ -2234,6 +2254,7 @@ where
                                 generation,
                                 &pod_states,
                                 config,
+                                udp_node_uid.as_deref(),
                                 &mut udp_registry_sync_published,
                                 &mut udp_registry_sync_retraction_pending,
                             );
@@ -2300,6 +2321,7 @@ where
                                 generation,
                                 &pod_states,
                                 config,
+                                udp_node_uid.as_deref(),
                                 &mut udp_registry_sync_published,
                                 &mut udp_registry_sync_retraction_pending,
                             );
@@ -2429,6 +2451,7 @@ where
                                 generation,
                                 &pod_states,
                                 config,
+                                udp_node_uid.as_deref(),
                                 &mut udp_registry_sync_published,
                                 &mut udp_registry_sync_retraction_pending,
                             );
@@ -2472,6 +2495,7 @@ where
                                 generation,
                                 &pod_states,
                                 config,
+                                udp_node_uid.as_deref(),
                                 &mut udp_registry_sync_published,
                                 &mut udp_registry_sync_retraction_pending,
                             );
@@ -2563,6 +2587,7 @@ where
                         generation,
                         &pod_states,
                         config,
+                        udp_node_uid.as_deref(),
                         &mut udp_registry_sync_published,
                         &mut udp_registry_sync_retraction_pending,
                     );
@@ -2830,45 +2855,59 @@ fn has_pending_capture_failures(pod_states: &DashMap<String, PodAttachmentState>
 
 /// Resolve this node's `Node.metadata.uid` with one bounded GET and publish it
 /// into the shared pod-registry directory for the Ambient proxy's UDP placement
-/// proof.
+/// proof. Returns the resolved UID only when this incarnation both proved it
+/// against the API server and durably published it.
 ///
-/// The previous publication is RETRACTED first, before anything that can fail.
-/// A failure is not merely "no new evidence": an identity file left by an
-/// EARLIER Kubernetes Node object on this same boot records a UID this
-/// incarnation cannot vouch for, and the proxy's resolver accepts it because
-/// the boot id it names is the current one. A Node deleted and recreated under
-/// the same name would then let its replacement inherit the predecessor's
-/// durable ownership and node-cleanup proof precisely when this agent could
-/// NOT read or publish its own UID. Retracting up front — and re-asserting the
-/// retraction after any failure — keeps that window closed, so every failure
-/// path here leaves NO published identity, which the placement guard treats as
-/// a fail-closed refusal.
-async fn publish_node_identity(client: &Client, node_name: &str, registry_dir: &std::path::Path) {
+/// The publication is RETRACTED first, before anything that can fail, and again
+/// after any failure. A failure is not merely "no new evidence": an identity
+/// file left by an EARLIER Kubernetes Node object on this same boot records a
+/// UID this incarnation cannot vouch for, and a reader accepts it because the
+/// boot id it names is the current one. A Node deleted and recreated under the
+/// same name would then let its replacement inherit the predecessor's durable
+/// ownership and node-cleanup proof precisely when this agent could NOT read or
+/// publish its own UID.
+///
+/// The initial retraction is therefore a HARD boundary: if the stale file cannot
+/// be removed, this function does not proceed to a lookup whose success would be
+/// indistinguishable from the stale state it failed to clear, and it returns
+/// `None` so the registry-synchronization marker is published unbound — which
+/// the privileged preflight refuses. This is a strictly narrower posture than
+/// the identity file alone, because the preflight resolves its own identity from
+/// the API server and never reads this publication as an authority.
+async fn publish_node_identity(
+    client: &Client,
+    node_name: &str,
+    registry_dir: &std::path::Path,
+) -> Option<String> {
     if let Err(error) = crate::proxy::udp_placement_migration::retract_node_identity(registry_dir) {
-        // Publication may still overwrite the stale file, so continue rather
-        // than guaranteeing it survives; the failure is loud either way.
         error!(
             %error,
             "could not retract the previously published node identity before resolving this \
-             node's Kubernetes UID; a surviving stale publication could authorize Ambient UDP \
-             host-placement adoption for a node UID this agent cannot vouch for"
+             node's Kubernetes UID; refusing to publish a node identity or a node-bound Ambient \
+             UDP registry proof on this incarnation, because a surviving stale publication names \
+             a node UID this agent cannot vouch for"
         );
+        return None;
     }
-    let Err(error) = resolve_and_publish_node_identity(client, node_name, registry_dir).await
-    else {
-        return;
-    };
-    warn!(
-        %error,
-        "could not publish this node's Kubernetes UID; Ambient UDP host-placement adoption \
-         will stay fail-closed until the node-agent can read its own Node object"
-    );
-    if let Err(error) = crate::proxy::udp_placement_migration::retract_node_identity(registry_dir) {
-        error!(
-            %error,
-            "could not remove the published Ambient UDP node identity after a failed lookup; \
-             remove it manually before relying on node-specific placement proof"
-        );
+    match resolve_and_publish_node_identity(client, node_name, registry_dir).await {
+        Ok(node_uid) => Some(node_uid),
+        Err(error) => {
+            warn!(
+                %error,
+                "could not publish this node's Kubernetes UID; Ambient UDP host-placement adoption \
+                 will stay fail-closed until the node-agent can read its own Node object"
+            );
+            if let Err(error) =
+                crate::proxy::udp_placement_migration::retract_node_identity(registry_dir)
+            {
+                error!(
+                    %error,
+                    "could not remove the published Ambient UDP node identity after a failed \
+                     lookup; remove it manually before relying on node-specific placement proof"
+                );
+            }
+            None
+        }
     }
 }
 
@@ -2876,7 +2915,7 @@ async fn resolve_and_publish_node_identity(
     client: &Client,
     node_name: &str,
     registry_dir: &std::path::Path,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let nodes: Api<Node> = Api::all(client.clone());
     let node = match tokio::time::timeout(Duration::from_secs(10), nodes.get(node_name)).await {
         Ok(Ok(node)) => node,
@@ -2891,14 +2930,17 @@ async fn resolve_and_publish_node_identity(
         .metadata
         .uid
         .as_deref()
-        .ok_or_else(|| "this node's Kubernetes object carries no UID".to_string())?;
-    crate::proxy::udp_placement_migration::publish_node_identity(registry_dir, uid)
+        .ok_or_else(|| "this node's Kubernetes object carries no UID".to_string())?
+        .to_string();
+    crate::proxy::udp_placement_migration::publish_node_identity(registry_dir, &uid)?;
+    Ok(uid)
 }
 
 fn publish_udp_migration_registry_sync_if_ready(
     generation: &str,
     pod_states: &DashMap<String, PodAttachmentState>,
     config: &NodeAgentConfig,
+    node_uid: Option<&str>,
 ) -> Result<bool, String> {
     if has_failed_pod_enrollments(pod_states) || has_pending_capture_failures(pod_states) {
         return Ok(false);
@@ -2915,6 +2957,7 @@ fn publish_udp_migration_registry_sync_if_ready(
         registry_dir,
         generation,
         &expected_pod_uids,
+        node_uid,
     )
 }
 
@@ -2937,10 +2980,11 @@ fn publish_udp_migration_registry_sync_with_recovery(
     generation: &str,
     pod_states: &DashMap<String, PodAttachmentState>,
     config: &NodeAgentConfig,
+    node_uid: Option<&str>,
     published: &mut bool,
     retraction_pending: &mut bool,
 ) {
-    match publish_udp_migration_registry_sync_if_ready(generation, pod_states, config) {
+    match publish_udp_migration_registry_sync_if_ready(generation, pod_states, config, node_uid) {
         Ok(was_published) => {
             *published = was_published;
             *retraction_pending = false;
@@ -15661,6 +15705,7 @@ mod tests {
                 registry.path(),
                 "generation-1",
                 &HashSet::new(),
+                None,
             )
             .unwrap()
         );
@@ -15697,6 +15742,7 @@ mod tests {
                 registry.path(),
                 "generation-1",
                 &HashSet::new(),
+                None,
             )
             .unwrap()
         );
@@ -15737,6 +15783,7 @@ mod tests {
             "generation-1",
             &pod_states,
             &config,
+            None,
             &mut published,
             &mut retraction_pending,
         );
@@ -15749,6 +15796,7 @@ mod tests {
             "generation-1",
             &pod_states,
             &config,
+            None,
             &mut published,
             &mut retraction_pending,
         );
@@ -15798,6 +15846,7 @@ mod tests {
             Arc::new(AtomicBool::new(true)),
             true,
             Some("generation-1".to_string()),
+            None,
             events,
             std::iter::empty(),
         )
@@ -15852,6 +15901,7 @@ mod tests {
             Arc::new(AtomicBool::new(true)),
             true,
             Some("generation-1".to_string()),
+            None,
             events,
             std::iter::empty(),
         );
@@ -15915,6 +15965,7 @@ mod tests {
                 Arc::new(AtomicBool::new(true)),
                 true,
                 Some("generation-1".to_string()),
+                None,
                 events,
                 std::iter::empty(),
             );

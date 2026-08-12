@@ -40,6 +40,10 @@ const REGISTRY_SYNC_FILE: &str = ".udp-registry-synced";
 const MAX_STATE_BYTES: u64 = 4096;
 const MAX_NODE_ATTESTATION_BYTES: u64 = 1024;
 const MAX_GENERATION_BYTES: usize = 64;
+/// Decimal digits allowed in the node-proof generation's era ordinal. Ten
+/// digits cover every `u32` era the placement contract can reach, so the bound
+/// is a parse guard rather than a policy limit.
+const MAX_NODE_PROOF_ERA_DIGITS: usize = 10;
 const MAX_NODE_IDENTIFIER_BYTES: usize = 128;
 /// Current node incarnation identifier. A reboot changes it, and every pod
 /// network namespace that could hold predecessor interception rules dies with
@@ -250,7 +254,30 @@ pub fn publish_node_identity_for(
 /// than skipped, and is made durable with a directory sync before the caller
 /// can publish or fail.
 pub fn retract_node_identity(registry_dir: &Path) -> Result<(), String> {
-    let path = registry_dir.join(NODE_IDENTITY_FILE);
+    retract_registry_file(registry_dir, NODE_IDENTITY_FILE, "node identity")
+}
+
+/// Remove any node-scoped cleanup proof left on this registry directory.
+///
+/// The privileged preflight calls this BEFORE it retires anything, so a proof
+/// published by an earlier run — under a previous Kubernetes Node object, an
+/// earlier era, or an interrupted pass — cannot survive alongside a retirement
+/// this run has not yet completed. Combined with the preflight's own
+/// authoritative node-UID lookup, that means the proof a steady-state container
+/// reads is always the one its OWN pod's init stage published.
+pub fn retract_node_cleanup_proof(registry_dir: &Path) -> Result<(), String> {
+    retract_registry_file(registry_dir, NODE_PROOF_FILE, "node cleanup proof")
+}
+
+/// Remove one exact registry publication, durably.
+///
+/// The removal is narrowly scoped to the exact pathname, never follows a
+/// symlink (`remove_file` unlinks the link itself), handles a directory entry
+/// explicitly so a crash-left or hostile entry of any type is retracted rather
+/// than skipped, and is made durable with a directory sync before the caller
+/// can publish or fail.
+fn retract_registry_file(registry_dir: &Path, file: &str, description: &str) -> Result<(), String> {
+    let path = registry_dir.join(file);
     let removal = match std::fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.file_type().is_dir() => std::fs::remove_dir(&path),
         Ok(_) => std::fs::remove_file(&path),
@@ -263,13 +290,123 @@ pub fn retract_node_identity(registry_dir: &Path) -> Result<(), String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
             return Err(format!(
-                "could not retract the published Ambient UDP node identity: {error}"
+                "could not retract the published Ambient UDP {description}: {error}"
             ));
         }
     }
     sync_directory(registry_dir).map_err(|error| {
-        format!("could not sync the Ambient UDP node identity retraction: {error}")
+        format!("could not sync the Ambient UDP {description} retraction: {error}")
     })
+}
+
+/// Resolve this node's identity AUTHORITATIVELY, then republish it.
+///
+/// This is the privileged preflight's resolver, and it deliberately does NOT
+/// share `UdpNodeIdentity::resolve`'s published-file fallback. A
+/// `.node-identity-v1.json` left by a PREVIOUS Kubernetes Node object on this
+/// same boot records the CURRENT boot id, so no reader can tell it from a live
+/// one — and the replacement node-agent may not have started (let alone
+/// retracted it) by the time this stage runs, because the two DaemonSets have
+/// no startup ordering between them. Consuming that file would let the preflight
+/// pair a stale identity with the stale cleanup proof written under it and
+/// authorize node-name reuse under the wrong immutable UID.
+///
+/// So the preflight asks the API server itself, bound to the node name the
+/// downward API gave this pod, and the ordering is what makes every failure
+/// path safe:
+///
+/// 1. retract the publication FIRST, before anything that can fail — a failure
+///    to retract aborts before any lookup, because a surviving stale file is
+///    exactly what must not be trusted;
+/// 2. resolve the UID (explicit `FERRUM_K8S_NODE_UID` for client-render
+///    pipelines, otherwise one bounded `get` on this node's own object);
+/// 3. publish only the resolved identity, and retract again on any failure.
+///
+/// Every unsuccessful path therefore leaves NO published identity, which the
+/// placement guard treats as a fail-closed refusal, and the successful path
+/// leaves an identity this run proved against the API server immediately before
+/// the steady-state container starts.
+pub async fn resolve_authoritative_node_identity<F, Fut>(
+    registry_dir: &Path,
+    explicit_node_uid: Option<&str>,
+    node_name: Option<&str>,
+    fetch_node_uid: F,
+) -> Result<UdpNodeIdentity, String>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = Result<String, String>>,
+{
+    let boot_id =
+        current_boot_id().ok_or_else(|| "could not read this node's boot id".to_string())?;
+    resolve_authoritative_node_identity_with_boot_id(
+        registry_dir,
+        &boot_id,
+        explicit_node_uid,
+        node_name,
+        fetch_node_uid,
+    )
+    .await
+}
+
+/// The incarnation-explicit form of [`resolve_authoritative_node_identity`], so
+/// the retract/lookup/publish boundary is decidable without a `/proc` read.
+pub async fn resolve_authoritative_node_identity_with_boot_id<F, Fut>(
+    registry_dir: &Path,
+    boot_id: &str,
+    explicit_node_uid: Option<&str>,
+    node_name: Option<&str>,
+    fetch_node_uid: F,
+) -> Result<UdpNodeIdentity, String>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = Result<String, String>>,
+{
+    retract_node_identity(registry_dir)?;
+    let resolved = match resolve_authoritative_node_uid(explicit_node_uid, node_name) {
+        Ok(NodeUidSource::Explicit(node_uid)) => Ok(node_uid),
+        Ok(NodeUidSource::Lookup(node_name)) => fetch_node_uid(node_name).await,
+        Err(error) => Err(error),
+    }
+    .and_then(|node_uid| UdpNodeIdentity::new(&node_uid, boot_id));
+    let identity = match resolved {
+        Ok(identity) => identity,
+        Err(error) => {
+            let _ = retract_node_identity(registry_dir);
+            return Err(error);
+        }
+    };
+    if let Err(error) = publish_node_identity_for(registry_dir, &identity) {
+        // A partially published record must not outlive the failure that
+        // produced it: the next reader cannot tell it from a proven one.
+        let _ = retract_node_identity(registry_dir);
+        return Err(error);
+    }
+    Ok(identity)
+}
+
+enum NodeUidSource {
+    Explicit(String),
+    Lookup(String),
+}
+
+fn resolve_authoritative_node_uid(
+    explicit_node_uid: Option<&str>,
+    node_name: Option<&str>,
+) -> Result<NodeUidSource, String> {
+    if let Some(node_uid) = explicit_node_uid
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(NodeUidSource::Explicit(node_uid.to_string()));
+    }
+    node_name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|node_name| NodeUidSource::Lookup(node_name.to_string()))
+        .ok_or_else(|| {
+            "resolving this node's Kubernetes UID requires its node name; set FERRUM_K8S_NODE_NAME from the downward API `spec.nodeName` (or supply FERRUM_K8S_NODE_UID directly)"
+                .to_string()
+        })
 }
 
 fn validate_node_identifier(value: &str, description: &str) -> Result<(), String> {
@@ -511,20 +648,60 @@ impl UdpPlacementRequest {
     }
 }
 
-/// The release-bound node-proof generation. The chart derives it from the
-/// INSTALLED placement contract so it changes across every migration, which is
-/// exactly what makes a superseded attestation detectable as stale.
+/// The release-bound node-proof generation.
+///
+/// The chart derives it from the placement contract's PERSISTED
+/// `nodeProofGeneration`, which is stamped when a migration starts and then
+/// carried forward unchanged through finalize and every settled release after
+/// it. That is what makes a superseded attestation detectable as stale.
 pub fn node_proof_generation_from_env() -> Result<Option<String>, String> {
     let value = resolve_ferrum_var("FERRUM_MESH_CAPTURE_UDP_NODE_PROOF_GENERATION")
         .filter(|value| !value.trim().is_empty())
         .map(|value| value.trim().to_string());
     if let Some(value) = value.as_deref() {
-        validate_generation(value).map_err(|_| {
-            "FERRUM_MESH_CAPTURE_UDP_NODE_PROOF_GENERATION must be 1..=64 ASCII alphanumeric/./_/- bytes and start alphanumeric"
-                .to_string()
-        })?;
+        validate_node_proof_generation(value)?;
     }
     Ok(value)
+}
+
+const NODE_PROOF_GENERATION_SHAPE: &str =
+    "FERRUM_MESH_CAPTURE_UDP_NODE_PROOF_GENERATION must be an era-qualified `e<era>.<migration generation>` token of 1..=64 ASCII alphanumeric/./_/- bytes, where <era> is a 1..=10 digit ordinal with no leading zero";
+
+/// Validate the ERA-QUALIFIED node-proof generation.
+///
+/// A node attestation is only stale-detectable when the generation it is bound
+/// to cannot RECUR. A token derived from the release's observable placement
+/// shape — `<target>-<phase>`, say — repeats the moment a target and phase
+/// recur, so an attestation written for an old `host-netns` era would authorize
+/// a later one after the cluster migrated host -> pod -> host (issue #3809).
+///
+/// The shape is therefore `e<era>.<migration generation>`, where `<era>` is a
+/// strictly increasing decimal ordinal the placement contract increments at
+/// every cleanup start and then persists through finalize and every settled
+/// release after it. The ordinal alone guarantees non-recurrence; the operator's
+/// own migration generation rides along so a proof stays traceable to the
+/// transition that produced it.
+///
+/// This is enforced at the runtime boundary, not only in the chart, so a
+/// client-render/GitOps pipeline supplying the variable directly is held to the
+/// same non-recurrence contract as a Helm-rendered one.
+pub fn validate_node_proof_generation(value: &str) -> Result<(), String> {
+    validate_generation(value).map_err(|_| NODE_PROOF_GENERATION_SHAPE.to_string())?;
+    let Some(rest) = value.strip_prefix('e') else {
+        return Err(NODE_PROOF_GENERATION_SHAPE.to_string());
+    };
+    let Some((era, generation)) = rest.split_once('.') else {
+        return Err(NODE_PROOF_GENERATION_SHAPE.to_string());
+    };
+    if era.is_empty()
+        || era.len() > MAX_NODE_PROOF_ERA_DIGITS
+        || era.starts_with('0')
+        || !era.bytes().all(|byte| byte.is_ascii_digit())
+        || generation.is_empty()
+    {
+        return Err(NODE_PROOF_GENERATION_SHAPE.to_string());
+    }
+    Ok(())
 }
 
 /// The generation the node-agent publishes its registry-synchronization marker
@@ -601,6 +778,17 @@ struct DurablePlacementState {
 pub struct UdpRegistrySyncProof {
     generation: String,
     publication: uuid::Uuid,
+    /// The Kubernetes node UID the publishing node-agent resolved
+    /// AUTHORITATIVELY for this incarnation, when it could resolve one.
+    ///
+    /// The marker lives on a persistent registry path, so one left by the
+    /// node-agent of a PREVIOUS Kubernetes Node object survives that object's
+    /// deletion and names a pod inventory this node no longer has. Carrying the
+    /// publisher's node UID lets the privileged preflight refuse it instead of
+    /// retiring predecessor rules against a stale enumeration; the migration
+    /// cleanup phase, which already decides from durable node-bound ownership,
+    /// keeps consuming the marker on generation alone.
+    node_uid: Option<String>,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -609,6 +797,8 @@ struct RegistrySyncMarker {
     version: u8,
     generation: String,
     publication: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    node_uid: Option<String>,
 }
 
 /// Accumulates repeated cleanup passes only while one exact inter-process
@@ -770,7 +960,7 @@ impl UdpMigrationContext {
         node: UdpNodeIdentity,
         generation: &str,
     ) -> Result<Self, String> {
-        validate_generation(generation)?;
+        validate_node_proof_generation(generation)?;
         node.validate()?;
         if target == UdpPlacement::Disabled {
             return Err(
@@ -825,9 +1015,27 @@ impl UdpMigrationContext {
             )
     }
 
+    /// The node-agent's current registry-synchronization publication, when it
+    /// is one this context may build on.
+    ///
+    /// A preflight additionally requires the publication to name THIS node's
+    /// authoritatively resolved UID. The marker is the preflight's only evidence
+    /// that the pod inventory it is about to retire against is complete, and a
+    /// marker left behind by the node-agent of a previous Kubernetes Node object
+    /// enumerates that object's pods — so accepting it would let a stale
+    /// enumeration and a stale identity agree while live workloads went
+    /// unretired.
     pub fn registry_sync_proof(&self) -> Option<UdpRegistrySyncProof> {
         let proof = registry_sync_proof(&self.registry_dir)?;
-        (proof.generation.as_str() == self.generation()).then_some(proof)
+        if proof.generation.as_str() != self.generation() {
+            return None;
+        }
+        if let Some(node) = self.node_preflight.as_ref()
+            && proof.node_uid.as_deref() != Some(node.node_uid.as_str())
+        {
+            return None;
+        }
+        Some(proof)
     }
 
     pub fn mark_cleanup_complete(&self, proof: &UdpRegistrySyncProof) -> Result<(), String> {
@@ -1126,13 +1334,40 @@ pub fn prepare_placement(
             let mut state = state.ok_or_else(|| {
                 "Ambient UDP finalize has no durable migration state on this node".to_string()
             })?;
+            // Finalize is the boundary at which node ownership is ASSERTED: it
+            // flips `active` to the incoming placement, returns `RunStable` so
+            // the producer starts in this very process, and every later start
+            // reads that record as evidence THIS node established the placement.
+            // Completing it without a resolvable identity would therefore run a
+            // producer on a record that names no owning node UID — the exact
+            // shape the stable arm refuses below — so the migration would both
+            // start an unproven producer now and be unrecoverable by repeating
+            // itself. `disabled` owns no producer and carries no traffic, so it
+            // stays finalizable while the identity is unresolvable.
+            if transition.to != UdpPlacement::Disabled
+                && request.node.is_none()
+                && state.incarnation.is_none()
+            {
+                set_failure(UdpMigrationFailureReason::NodeIdentityUnresolved);
+                return Err(format!(
+                    "Ambient UDP finalize refused: this node's identity could not be resolved, so completing the migration would leave a durable record that runs the {} producer while naming no owning Kubernetes node UID; supply FERRUM_K8S_NODE_UID (or restore the node-agent's node-identity publication) and re-run finalize with the same generation",
+                    transition.to.as_str()
+                ));
+            }
             if state.active == transition.to
                 && state.pending.is_none()
                 && state.completed.as_ref() == Some(&transition)
             {
-                // Finalize is idempotent, including its quarantine cleanup. A
-                // crash or transient filesystem error after the durable state
-                // write must not make a later retry skip the tombstone removal.
+                // Finalize is idempotent, including its quarantine cleanup and
+                // its identity binding. A crash or transient filesystem error
+                // after the durable state write must not make a later retry skip
+                // the tombstone removal, nor leave the record unbound because
+                // the run that completed the transition could not resolve an
+                // identity this one can.
+                if request.node.is_some() && state.incarnation != request.node {
+                    state.incarnation = request.node.clone();
+                    write_state(registry_dir, &state)?;
+                }
                 clear_ownership_quarantine(registry_dir);
                 set_phase(UdpMigrationStatusPhase::Stable, 0);
                 clear_failure();
@@ -1199,6 +1434,17 @@ fn resolve_recordless_node_proof(
                 .to_string(),
         );
     };
+    // A generation that can RECUR proves nothing: an attestation written for an
+    // earlier era of the same target/phase would authorize a later one after the
+    // cluster migrated away and back (issue #3809). Refuse the release rather
+    // than bind a proof to a repeatable token.
+    if validate_node_proof_generation(expected_generation).is_err() {
+        set_failure(UdpMigrationFailureReason::NodeProofMissing);
+        return Err(
+            "host-netns Ambient UDP capture has no durable predecessor proof and this release's node-proof generation is not era-qualified, so a node attestation bound to it could be replayed across placement migrations; render the settled release from an installed placement contract (or supply an `e<era>.<generation>` value)"
+                .to_string(),
+        );
+    }
     for (file, proof) in [
         (NODE_PROOF_FILE, UdpAdoptionProof::NodeCleanup),
         (NODE_EXEMPT_FILE, UdpAdoptionProof::OperatorExempt),
@@ -1468,12 +1714,22 @@ pub fn clear_registry_sync_marker(registry_dir: &Path) -> Result<(), String> {
 /// registry snapshot. Unexpected entries remain part of cleanup: they may be
 /// stale predecessor ownership and must not be silently omitted. Returns
 /// `false` without publishing when an expected pod is not present yet.
+///
+/// `node_uid` is this node-agent incarnation's AUTHORITATIVELY resolved
+/// `Node.metadata.uid`, or `None` when it could not resolve one. It binds the
+/// publication to the machine whose pod inventory it enumerates, so a marker
+/// surviving on a persistent registry path from a previous Kubernetes Node
+/// object cannot satisfy the privileged node preflight.
 pub fn publish_registry_sync_marker_for_pods(
     registry_dir: &Path,
     generation: &str,
     expected_pod_uids: &HashSet<String>,
+    node_uid: Option<&str>,
 ) -> Result<bool, String> {
     validate_generation(generation)?;
+    if let Some(node_uid) = node_uid {
+        validate_node_identifier(node_uid, "Kubernetes node UID")?;
+    }
     std::fs::create_dir_all(registry_dir)
         .map_err(|error| format!("could not create Ambient UDP registry directory: {error}"))?;
     let entries = std::fs::read_dir(registry_dir)
@@ -1515,6 +1771,7 @@ pub fn publish_registry_sync_marker_for_pods(
         version: 1,
         generation: generation.to_string(),
         publication: uuid::Uuid::new_v4().simple().to_string(),
+        node_uid: node_uid.map(str::to_string),
     };
     let bytes = serde_json::to_vec(&marker)
         .map_err(|error| format!("could not encode Ambient UDP registry sync marker: {error}"))?;
@@ -1558,9 +1815,16 @@ fn registry_sync_proof(registry_dir: &Path) -> Option<UdpRegistrySyncProof> {
     if publication.get_version() != Some(uuid::Version::Random) {
         return None;
     }
+    // A present-but-malformed node binding is refused outright rather than
+    // downgraded to "unbound": an unbound marker is consumable by the migration
+    // cleanup phase, so silently dropping a corrupt value would widen it.
+    if let Some(node_uid) = marker.node_uid.as_deref() {
+        validate_node_identifier(node_uid, "Kubernetes node UID").ok()?;
+    }
     Some(UdpRegistrySyncProof {
         generation: marker.generation,
         publication,
+        node_uid: marker.node_uid,
     })
 }
 

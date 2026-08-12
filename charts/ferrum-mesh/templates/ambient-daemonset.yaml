@@ -330,6 +330,22 @@ spec:
           env:
             - name: FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR
               value: {{ $nodeWaypointRegistryMountPath | quote }}
+            {{- /* The preflight resolves this node's immutable Node.metadata.uid
+                   ITSELF, with one bounded read-only `get` bound to this exact
+                   node name, and never from the node-agent's published identity
+                   file. That file records the CURRENT boot id even when a
+                   PREVIOUS Kubernetes Node object wrote it, so no reader can
+                   tell a stale publication from a live one — and the two
+                   DaemonSets have no startup ordering between them, so the
+                   replacement node-agent may not have retracted it yet. The
+                   downward API cannot supply the UID, only the node name, which
+                   is exactly the binding this lookup needs. */}}
+            {{- if not (hasKey $ambientEnv "FERRUM_K8S_NODE_NAME") }}
+            - name: FERRUM_K8S_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            {{- end }}
             {{- if not (hasKey $ambientEnv "FERRUM_MESH_CAPTURE_UDP_NODE_PROOF_GENERATION") }}
             - name: FERRUM_MESH_CAPTURE_UDP_NODE_PROOF_GENERATION
               value: {{ $ambientUdpNodeProofGeneration | quote }}
