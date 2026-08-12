@@ -246,14 +246,18 @@ impl HbonePoolError {
         }
     }
 
+    /// Whether this error is affirmative evidence that the selected peer
+    /// cannot establish HBONE with the configured identity/protocol contract.
+    ///
+    /// DNS and TCP reachability errors fail the current request closed, but
+    /// they are not capability evidence. Marking them `Unsupported` would make
+    /// a rolling peer restart permanent: the dispatch gate suppresses every
+    /// later tunnel attempt, so live traffic can never prove recovery.
     pub fn is_capability_failure(&self) -> bool {
         matches!(
             self,
             Self::NoSvid
                 | Self::NoLeafCert
-                | Self::DnsLookup { .. }
-                | Self::ConnectTimeout { .. }
-                | Self::Connect { .. }
                 | Self::InvalidServerName { .. }
                 | Self::TlsConfig(_)
                 | Self::TlsHandshake { .. }
@@ -3559,7 +3563,37 @@ mod tests {
     }
 
     #[test]
-    fn capability_failure_excludes_per_request_connect_failures() {
+    fn capability_failure_requires_protocol_or_configuration_evidence() {
+        let dns_failure = HbonePoolError::DnsLookup {
+            host: "orders.default.svc.cluster.local".to_string(),
+            message: "temporary resolver failure".to_string(),
+        };
+        assert!(
+            !dns_failure.is_capability_failure(),
+            "a DNS outage must fail the request without permanently disabling HBONE"
+        );
+
+        let timeout = HbonePoolError::ConnectTimeout {
+            addr: "10.0.0.8:15008".to_string(),
+            timeout_ms: 1_000,
+        };
+        assert!(
+            !timeout.is_capability_failure(),
+            "a peer startup timeout must remain retryable after the peer recovers"
+        );
+
+        let refused = HbonePoolError::Connect {
+            addr: "10.0.0.8:15008".to_string(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "peer is restarting",
+            ),
+        };
+        assert!(
+            !refused.is_capability_failure(),
+            "connection refusal during a rolling restart must not poison the capability cache"
+        );
+
         let rejected = HbonePoolError::ConnectRejected {
             authority: "orders.default.svc.cluster.local:8080".to_string(),
             status: 403,
