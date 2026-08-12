@@ -357,7 +357,7 @@ spec:
             - name: {{ $name }}
               value: {{ $value | quote }}
             {{- end }}
-          {{- if or $ambientInNetnsCapture $ambientSpireEnabled }}
+          {{- if or $ambientInNetnsCapture $ambientSpireEnabled .Values.ambient.extraVolumeMounts }}
           volumeMounts:
             {{- if $nodeWaypointRegistryEnabled }}
             - name: bpf-fs
@@ -376,6 +376,9 @@ spec:
               mountPath: {{ $ambientSpireSocketMountPath }}
               readOnly: true
             {{- end }}
+            {{- with .Values.ambient.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           {{- end }}
           {{- /* Admin-backed probes when the listener is enabled. NodeWaypoint
                  still requires a non-zero admin port (validated above). Ordinary
@@ -390,7 +393,7 @@ spec:
           {{- $ambientReadyHandler := .Values.ambient.probes.readiness.override | default dict -}}
           {{- if not $ambientReadyHandler }}{{- $ambientReadyHandler = $ambientHandlers.ready | default dict -}}{{- end -}}
           {{- include "ferrum-mesh.renderProbes" (dict "probes" .Values.ambient.probes "liveHandler" $ambientLiveHandler "readyHandler" $ambientReadyHandler) }}
-      {{- if or $ambientInNetnsCapture $ambientSpireEnabled }}
+      {{- if or $ambientInNetnsCapture $ambientSpireEnabled .Values.ambient.extraVolumes }}
       volumes:
         {{- if $nodeWaypointRegistryEnabled }}
         - name: bpf-fs
@@ -413,6 +416,9 @@ spec:
           hostPath:
             path: {{ $ambientSpireSocketHostPath }}
             type: DirectoryOrCreate
+        {{- end }}
+        {{- with .Values.ambient.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
         {{- end }}
       {{- end }}
 {{- end }}

@@ -105,10 +105,13 @@ these datagrams. Assertions, all observed from the datagram outcome:
 - `node_waypoint.udp.listener_deny_spoofed_source` — the same unenrolled pod
   FORGES the admitted pod's source address over a raw socket and is still
   refused, because attribution is the ingress interface rather than the
-  address. When the sandbox denies a raw socket the assertion records that the
-  forged datagram could not be emitted instead of claiming a refusal; the
-  unenrolled-source case above remains the required attribution proof, and the
-  address-forging property itself is pinned by
+  address. The pod is granted `NET_RAW` explicitly and the probe prints its
+  `SPOOF-SENT:` marker only after `sendto` returns, so this assertion passes
+  ONLY when a forged datagram was actually emitted and the backend log proves
+  it never arrived. A sandbox that cannot forge fails the required gate closed
+  rather than recording a refusal nothing attempted. The unenrolled-source case
+  above remains an independent attribution proof, and the address-forging
+  property itself is additionally pinned by
   `one_pod_cannot_obtain_another_pods_scope_by_forging_its_source_address` in
   `tests/integration/mesh_node_waypoint_udp_scope_tests.rs`.
 - `node_waypoint.udp.policy_change_denies_live` /
@@ -117,9 +120,43 @@ these datagrams. Assertions, all observed from the datagram outcome:
   DaemonSet's total container restart count unchanged, so recovery is a live
   reload rather than a data-plane restart.
 
-DTLS listeners are **not** exercised here: `AppProtocol::Dtls` materialization,
-its frontend-termination posture, and its bind-failure visibility are covered at
-unit/integration level only.
+## NodeWaypoint DTLS listener datapath (issue #3286)
+
+`run_node_waypoint_dtls_datapath_checks` drives a **real DTLS handshake and real
+application data** through the DTLS half of the same listener family. The
+`dtls-echo` Service declares `appProtocol: dtls` on a `protocol: UDP` port, so
+`materialize_node_waypoint_udp_listeners` gives its listener `frontend_tls:
+true`: the NodeWaypoint TERMINATES DTLS on the host-netns socket and forwards
+PLAINTEXT datagrams to the backing pod, which stays an ordinary UDP echo. The
+client is `openssl s_client -dtls1_2` from `dtls-src-a` / `dtls-src-b`, which
+reuse the `src-a` / `src-b` ServiceAccounts so the same principal-keyed
+`AuthorizationPolicy` objects govern these sessions.
+
+The listener terminates with material the harness mints per run and publishes as
+a TLS Secret mounted through `ambient.extraVolumes` /
+`ambient.extraVolumeMounts`, referenced by `FERRUM_DTLS_CERT_PATH` /
+`FERRUM_DTLS_KEY_PATH` (`FERRUM_LIVE_DTLS_LISTENER_PORT`, default `15354`). The
+server certificate is deliberately not verified by the client: the subject under
+test is the datagram datapath and its scoped source authorization, not PKI
+trust.
+
+- `node_waypoint.dtls.listener_bound` — a DTLS 1.2 handshake completes against
+  `<node IP>:$FERRUM_LIVE_DTLS_LISTENER_PORT` and the listener presents the
+  operator DTLS material. A completed handshake can only come from a bound
+  `DtlsServer`, so this is a datapath observation rather than a manifest one.
+- `node_waypoint.dtls.listener_allow_attributed_source` — the admitted enrolled
+  source's decrypted datagram reaches the backend (which logs `recv:`) and its
+  echo comes back. Because the `DtlsServer` owns the socket every encrypted
+  record leaves from, this also proves `DtlsServerLimits::socket_mark` really
+  applied `NODE_WAYPOINT_INBOUND_AUTH_MARK`: an unmarked socket's records would
+  be dropped by the pod-veth guard.
+- `node_waypoint.dtls.listener_deny_scoped_policy` — the source the
+  namespace-scoped `deny-src-b` policy names gets no application data back AND
+  the backend logs nothing from it.
+
+Not exercised live: DTLS frontend client-certificate (mTLS) verification, IPv6
+DTLS, and DTLS across a PeerAuthentication live-reload swap. Those stay at
+unit/integration level.
 
 Each run writes `target/node-waypoint-ebpf-live/live-assertions.json` using the
 shared live-assertion schema from `tests/k8s/lib/live_assertions.sh`. The current

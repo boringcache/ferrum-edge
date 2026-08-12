@@ -3495,6 +3495,17 @@ async fn start_dtls_frontend_listener(
         // kernel-reported ingress interface of their ClientHello (issue #3286),
         // so the demux must capture it. Off for every other listener.
         capture_ingress_ifindex: node_waypoint_udp_source_scoping.is_some(),
+        // The `DtlsServer` owns the socket every encrypted record leaves from,
+        // so the NodeWaypoint inbound auth mark has to be applied there rather
+        // than here: the pod-veth tc guard drops UDP toward an enrolled pod IP
+        // unless it carries the mark, which would otherwise strand every
+        // ServerHello and every application reply. `bind_with_limits` applies
+        // it before the socket is used and fails the listener if it cannot,
+        // so this is a startup precondition, not an optimization. Off for
+        // every other DTLS listener.
+        socket_mark: node_waypoint_udp_source_scoping
+            .as_ref()
+            .map(|_| crate::ebpf::NODE_WAYPOINT_INBOUND_AUTH_MARK),
     };
     let server =
         Arc::new(crate::dtls::DtlsServer::bind_with_limits(addr, dtls_config, dtls_limits).await?);

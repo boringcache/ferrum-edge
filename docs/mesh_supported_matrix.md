@@ -276,16 +276,47 @@ need them, or because they are blocked upstream / architecturally:
   to an enrolled pod stays dropped. A scoped listener that cannot set that
   mark does not start.
 
-  UDP is what the live gate carries;
-  **DTLS listener materialization, its frontend-termination posture, and its
-  bind-failure visibility are covered at unit/integration level only** — there
-  is no live DTLS handshake assertion, and the DTLS server socket does not yet
-  carry the inbound auth mark, so a NodeWaypoint DTLS listener whose backend or
-  source pod is eBPF-enrolled is not yet an end-to-end path (it fails closed —
-  the guard drops, nothing leaks). The spoof probe needs a raw socket; when
-  the sandbox denies one the assertion records that the forged datagram could
-  not be emitted rather than claiming a refusal, and the unenrolled-source
-  refusal remains the required attribution proof.
+  The spoof probe needs a raw socket, so the `udp-unmanaged` pod is granted
+  `NET_RAW` explicitly and the probe prints its `SPOOF-SENT:` marker only after
+  `sendto` returns. `node_waypoint.udp.listener_deny_spoofed_source` passes
+  only when the forged datagram was ACTUALLY emitted and the backend log proves
+  it never arrived; a sandbox that cannot forge fails the required gate closed
+  rather than recording a refusal nothing attempted. The unenrolled-source
+  refusal remains an independent attribution proof.
+
+  **DTLS carries the same live gate.** The `dtls-echo` Service declares
+  `appProtocol: dtls` on a `protocol: UDP` port, so the NodeWaypoint
+  materializes a `frontend_tls: true` listener that TERMINATES DTLS on the
+  host-netns socket and forwards plaintext datagrams to the backing pod.
+  `run_node_waypoint_dtls_datapath_checks` drives a real
+  `openssl s_client -dtls1_2` handshake through it and records
+  `node_waypoint.dtls.listener_bound` (the handshake completes and the listener
+  presents the operator DTLS material — proof it bound, not that it was
+  configured), `node_waypoint.dtls.listener_allow_attributed_source` (the
+  admitted enrolled source's decrypted datagram reaches the backend, which logs
+  it, and the echo comes back), and
+  `node_waypoint.dtls.listener_deny_scoped_policy` (a source the
+  namespace-scoped `AuthorizationPolicy` denies gets no application data AND the
+  backend logs nothing from it). Because a `DtlsServer` owns the socket every
+  encrypted record leaves from, `DtlsServerLimits::socket_mark` stamps
+  `NODE_WAYPOINT_INBOUND_AUTH_MARK` on that socket before the server exists;
+  a scoped DTLS listener that cannot apply it — or cannot enable the ingress
+  cmsg — fails construction and is reported as a bind failure. The allow
+  assertion above is what proves the mark is really applied end to end.
+
+  The DTLS material itself comes from the DTLS-specific
+  `FERRUM_DTLS_CERT_PATH` / `FERRUM_DTLS_KEY_PATH` (+ optional
+  `FERRUM_DTLS_CLIENT_CA_CERT_PATH`), which mesh mode now loads at startup and
+  the PeerAuthentication live-reload path rebuilds from. `FERRUM_FRONTEND_TLS_*`
+  is deliberately NOT reused: on a mesh proxy that pair is the inbound TCP
+  listener's server identity, and sharing it would let configuring a DTLS
+  listener replace a SPIRE-issued inbound identity. Without DTLS material a
+  `dtls` listener stays visibly deferred (`FrontendDtlsDeferred`) rather than
+  binding.
+
+  Still **not** proven live: DTLS client-certificate (mTLS) frontend
+  verification, IPv6 DTLS, and DTLS behavior across a PeerAuthentication
+  live-reload swap. Those remain unit/integration-level only.
 - **DR `connectionPool.http.maxRequestsPerConnection`** — parsed and validated
   but **Deferred** in status; backend close-after-N-requests is unsupported, so
   it is not projected as effective policy. Use `http2MaxRequests`.

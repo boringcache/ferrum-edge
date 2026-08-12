@@ -14049,6 +14049,46 @@ async fn arm_mesh_runtime_startup(
             .await;
     }
 
+    // Frontend DTLS material for mesh UDP listeners that TERMINATE DTLS
+    // (`frontend_tls: true` on a UDP-scheme proxy — today only the NodeWaypoint
+    // UDP/DTLS service listeners of issue #3286).
+    //
+    // Without this the stream listener manager holds no DTLS cert/key source at
+    // all, so every such listener is deferred forever as
+    // `FrontendDtlsDeferred` and a materialized `dtls` port could never bind.
+    // The deferral is already surfaced in readiness/status, so the failure mode
+    // is visible rather than silent — but it is also unconditional, which makes
+    // this the missing half of the path.
+    //
+    // Sourced from the DTLS-SPECIFIC `FERRUM_DTLS_CERT_PATH` /
+    // `FERRUM_DTLS_KEY_PATH` / `FERRUM_DTLS_CLIENT_CA_CERT_PATH`, exactly like
+    // the database/file/dp serving paths — NOT from
+    // `FERRUM_FRONTEND_TLS_CERT_PATH`, which on a mesh proxy is the operator
+    // override for the INBOUND TCP listener's server identity
+    // (`load_mesh_frontend_server_identity`). Reusing that pair here would make
+    // configuring a DTLS listener silently replace the mesh inbound server
+    // identity — including a SPIRE-issued one — with the DTLS leaf.
+    //
+    // Expiry is gated first with the same check the other serving modes use, so
+    // expired DTLS material is a startup error rather than a listener that
+    // binds and then fails every handshake. Absent material is not an error: a
+    // mesh proxy with no DTLS ports never needs it, and one that has them keeps
+    // the visible `FrontendDtlsDeferred` readiness entry.
+    startup_security::validate_dtls_material(env_config)?;
+    if let (Some(cert_path), Some(key_path)) = (
+        env_config.dtls_cert_path.as_ref(),
+        env_config.dtls_key_path.as_ref(),
+    ) {
+        proxy_state
+            .stream_listener_manager
+            .set_frontend_dtls_cert_key(
+                cert_path.clone(),
+                key_path.clone(),
+                env_config.dtls_client_ca_cert_path.clone(),
+            )
+            .await;
+    }
+
     // Spawn the SPIFFE trust-bundle federation poller reconciler before the
     // apply task so the first slice apply observes whatever the poller has
     // already fetched. Unlike the old one-shot spawn, the reconciler watches
@@ -17215,12 +17255,19 @@ async fn apply_mesh_inbound_tls_reload(
             if mtls_mode != config::MtlsMode::Disable {
                 let env = &proxy_state.env_config;
                 let crls = proxy_state.crls.clone();
+                // The DTLS-SPECIFIC material, i.e. the exact same sources the
+                // mesh startup path hands to `set_frontend_dtls_cert_key`. A
+                // listener that binds at startup and one that is live-swapped
+                // by a PeerAuthentication change must handshake with the same
+                // certificate; reading `FERRUM_FRONTEND_TLS_*` here (which on a
+                // mesh proxy is the INBOUND TCP listener's server identity)
+                // would silently swap DTLS sessions onto a different identity.
                 let dtls_cert_key = env
-                    .frontend_tls_cert_path
+                    .dtls_cert_path
                     .as_deref()
-                    .zip(env.frontend_tls_key_path.as_deref())
+                    .zip(env.dtls_key_path.as_deref())
                     .map(|(c, k)| (c.to_string(), k.to_string()));
-                let dtls_client_ca = env.frontend_tls_client_ca_bundle_path.clone();
+                let dtls_client_ca = env.dtls_client_ca_cert_path.clone();
                 if let Some((cert_path, key_path)) = dtls_cert_key {
                     let swapped = proxy_state
                         .stream_listener_manager

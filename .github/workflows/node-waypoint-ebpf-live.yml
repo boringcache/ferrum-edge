@@ -44,6 +44,7 @@ on:
       - "src/socket_opts.rs"
       - "charts/ferrum-mesh/**"
       - "tests/integration/mesh_node_waypoint_udp_scope_tests.rs"
+      - "tests/unit/gateway_core/node_waypoint_dtls_socket_options_tests.rs"
       - "tests/unit/gateway_core/node_waypoint_udp_identity_tests.rs"
       - "tests/k8s/lib/**"
       - "tests/k8s/node_waypoint_ebpf_live/**"

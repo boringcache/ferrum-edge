@@ -226,6 +226,15 @@ ambient:
     FERRUM_MODE: mesh
     FERRUM_MESH_TOPOLOGY: ambient
     FERRUM_MESH_HBONE_LISTEN_ADDR: 0.0.0.0:15008
+  # Free-form extra pod volumes / container mounts, same shape as
+  # controlPlane.extraVolumes. Needed when a NodeWaypoint terminates frontend
+  # DTLS on a materialized UDP/DTLS service listener
+  # (FERRUM_MESH_NODE_WAYPOINT_UDP_LISTENERS_ENABLED=true): the DTLS cert/key
+  # referenced by FERRUM_DTLS_CERT_PATH / FERRUM_DTLS_KEY_PATH must be mounted
+  # into the ambient container, or every `dtls` listener stays deferred with
+  # FrontendDtlsDeferred.
+  extraVolumes: []
+  extraVolumeMounts: []
   # Admin-backed probes (health --live / health). Readiness is skipped when
   # FERRUM_ADMIN_HTTP_PORT=0 except NodeWaypoint, which still requires admin for
   # the DaemonSet readiness contract. Timing keeps ambient/node-waypoint boot

@@ -182,6 +182,21 @@ pub struct DtlsServerLimits {
     /// reads through the shared `recvmmsg` + cmsg batch reader instead, which
     /// is the same mechanism the plain-UDP listener already uses.
     pub capture_ingress_ifindex: bool,
+    /// `SO_MARK` to stamp on the DTLS server's OWN bound socket before it is
+    /// published or used (issue #3286).
+    ///
+    /// Set only by the NodeWaypoint scoped DTLS path, to
+    /// `crate::ebpf::NODE_WAYPOINT_INBOUND_AUTH_MARK`. Unlike the plain-UDP
+    /// relay — where the proxy owns the frontend socket and marks it itself —
+    /// a `DtlsServer` owns the socket every encrypted record leaves from, so
+    /// the caller has no other place to apply the mark. Without it the
+    /// pod-veth tc guard drops the handshake and application replies heading
+    /// back to the enrolled source pod, and the listener would look healthy
+    /// while no DTLS session could ever complete.
+    ///
+    /// `None` (and `Some(0)`) leave the socket untouched, which is every
+    /// ordinary DTLS listener.
+    pub socket_mark: Option<u32>,
 }
 
 impl Default for DtlsServerLimits {
@@ -192,8 +207,75 @@ impl Default for DtlsServerLimits {
             allow_new_session: None,
             active_session_mirror: None,
             capture_ingress_ifindex: false,
+            socket_mark: None,
         }
     }
+}
+
+/// Apply the NodeWaypoint-scoped socket options a `DtlsServer` needs on its own
+/// bound socket, failing closed when either cannot be applied (issue #3286).
+///
+/// Called from [`DtlsServer::from_socket_with_limits`] on the raw `UdpSocket`
+/// **before** the server object is assembled, so a failure surfaces as a
+/// listener bind/readiness failure and no partially-configured server can be
+/// published, run, or leak a socket. A listener that never becomes a
+/// `DtlsServer` also never spawns a recv-loop task.
+///
+/// Neither branch executes for an ordinary DTLS listener: both fields are
+/// `None`/`false` in `DtlsServerLimits::default()` and are set only by the
+/// NodeWaypoint scoped path. Diagnostics name the field and the bound address
+/// only — no crypto material, peer identity, or configuration value is logged
+/// or embedded.
+fn apply_scoped_dtls_socket_options(
+    socket: &UdpSocket,
+    limits: &DtlsServerLimits,
+) -> Result<(), anyhow::Error> {
+    if !limits.capture_ingress_ifindex && limits.socket_mark.is_none_or(|mark| mark == 0) {
+        return Ok(());
+    }
+    let local = socket
+        .local_addr()
+        .map_err(|e| anyhow::anyhow!("DTLS demux cannot read its own bound address: {e}"))?;
+    #[cfg(unix)]
+    let fd = {
+        use std::os::fd::AsRawFd;
+        socket.as_raw_fd()
+    };
+    #[cfg(not(unix))]
+    let fd = 0;
+
+    // SO_MARK first: it governs every byte this socket sends, including the
+    // ServerHello of the very first handshake.
+    if let Some(mark) = limits.socket_mark.filter(|mark| *mark != 0) {
+        #[cfg(unix)]
+        crate::socket_opts::set_socket_mark(fd, mark).map_err(|error| {
+            anyhow::Error::new(error).context(format!(
+                "NodeWaypoint scoped DTLS listener on {local} could not apply \
+                 DtlsServerLimits::socket_mark (SO_MARK), so the pod-veth guard would drop every \
+                 record it sends back to an enrolled source pod"
+            ))
+        })?;
+        // SO_MARK is Linux-only and NodeWaypoint scoping never runs on a
+        // non-unix target; the ingress-capture check below fails closed there
+        // regardless, so there is nothing to apply.
+        #[cfg(not(unix))]
+        let _ = mark;
+    }
+
+    if limits.capture_ingress_ifindex {
+        let families = crate::socket_opts::enable_ingress_pktinfo(fd, local).map_err(|error| {
+            anyhow::Error::new(error).context(format!(
+                "NodeWaypoint scoped DTLS listener on {local} cannot capture the datagram ingress \
+                 interface required for source-workload authorization"
+            ))
+        })?;
+        info!(
+            local = %local,
+            families = ?families,
+            "DTLS demux armed ingress-interface capture for NodeWaypoint source attribution"
+        );
+    }
+    Ok(())
 }
 
 /// Build a DTLS client config for backend connections (gateway → backend).
@@ -1077,67 +1159,40 @@ impl DtlsServer {
     /// release/rebind window.
     #[allow(dead_code)] // Public helper used by tests and scripted DTLS backends.
     pub fn from_socket(socket: UdpSocket, frontend_config: FrontendDtlsConfig) -> Self {
-        // `DtlsServerLimits::default()` leaves `capture_ingress_ifindex` off,
-        // which is the only fallible part of construction, so this stays
-        // infallible by construction.
+        // `DtlsServerLimits::default()` leaves both scoped socket options
+        // (`capture_ingress_ifindex`, `socket_mark`) off, and they are the only
+        // fallible part of construction, so this stays infallible by
+        // construction.
         Self::build(socket, frontend_config, DtlsServerLimits::default())
     }
 
     /// Create a `DtlsServer` from an already-bound `UdpSocket` with admission
     /// limits.
     ///
-    /// Fails when `DtlsServerLimits::capture_ingress_ifindex` is set and the
-    /// socket cannot report a datagram's ingress interface. That flag is only
-    /// set by the NodeWaypoint scoped DTLS path, whose entire source-workload
-    /// authorization decision is derived from that interface: without it every
-    /// session is unattributable and denied, so a server that reports itself
-    /// constructed would be a black hole that looks healthy. Ordinary DTLS
-    /// listeners never set the flag and cannot fail here.
+    /// Fails when one of the two NodeWaypoint-scoped socket options in
+    /// [`DtlsServerLimits`] cannot be applied:
+    ///
+    /// - `capture_ingress_ifindex`, whose kernel-reported ingress interface IS
+    ///   the session's source-workload attribution — without it every session
+    ///   is unattributable and denied;
+    /// - `socket_mark`, without which the pod-veth tc guard drops every record
+    ///   this socket sends back toward the enrolled source pod.
+    ///
+    /// Either failure would leave a server that reports itself constructed
+    /// while no scoped session could ever complete, so both are startup
+    /// preconditions rather than optimizations. Ordinary DTLS listeners set
+    /// neither field and cannot fail here.
+    ///
+    /// Both options are applied to the socket BEFORE the server object exists,
+    /// so no caller can observe or run a `DtlsServer` whose socket is missing
+    /// them.
     pub fn from_socket_with_limits(
         socket: UdpSocket,
         frontend_config: FrontendDtlsConfig,
         limits: DtlsServerLimits,
     ) -> Result<Self, anyhow::Error> {
-        let capture_ingress_ifindex = limits.capture_ingress_ifindex;
-        let server = Self::build(socket, frontend_config, limits);
-        if capture_ingress_ifindex {
-            server.arm_ingress_ifindex_capture()?;
-        }
-        Ok(server)
-    }
-
-    /// Enable the ingress-interface cmsg for every address family this bound
-    /// socket actually serves, failing closed otherwise.
-    ///
-    /// Deliberately shares [`crate::socket_opts::enable_ingress_pktinfo`] with
-    /// the plain-UDP scoped listener so the two cannot disagree about which
-    /// family a dual-stack bind must cover.
-    fn arm_ingress_ifindex_capture(&self) -> Result<(), anyhow::Error> {
-        let local = self
-            .socket
-            .local_addr()
-            .map_err(|e| anyhow::anyhow!("DTLS demux cannot read its own bound address: {e}"))?;
-        #[cfg(target_os = "linux")]
-        let fd = {
-            use std::os::fd::AsRawFd;
-            self.socket.as_raw_fd()
-        };
-        #[cfg(not(target_os = "linux"))]
-        let fd = 0;
-        match crate::socket_opts::enable_ingress_pktinfo(fd, local) {
-            Ok(families) => {
-                info!(
-                    local = %local,
-                    families = ?families,
-                    "DTLS demux armed ingress-interface capture for NodeWaypoint source attribution"
-                );
-                Ok(())
-            }
-            Err(error) => Err(anyhow::Error::new(error).context(format!(
-                "NodeWaypoint scoped DTLS listener on {local} cannot capture the datagram ingress \
-                 interface required for source-workload authorization"
-            ))),
-        }
+        apply_scoped_dtls_socket_options(&socket, &limits)?;
+        Ok(Self::build(socket, frontend_config, limits))
     }
 
     /// Assemble the server without touching socket options.

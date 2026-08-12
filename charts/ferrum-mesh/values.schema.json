@@ -337,6 +337,22 @@
         "captureMode": {
           "type": "string"
         },
+        "extraVolumes": {
+          "type": "array",
+          "description": "Free-form extra ambient/NodeWaypoint pod volumes (Kubernetes Volume objects), e.g. the frontend DTLS cert/key a NodeWaypoint UDP/DTLS service listener terminates with.",
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "extraVolumeMounts": {
+          "type": "array",
+          "description": "Free-form extra ambient/NodeWaypoint container volume mounts (Kubernetes VolumeMount objects), e.g. the DTLS material at FERRUM_DTLS_CERT_PATH / FERRUM_DTLS_KEY_PATH.",
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
         "spire": {
           "type": "object",
           "additionalProperties": false,
