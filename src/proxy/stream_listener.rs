@@ -1507,12 +1507,7 @@ impl StreamListenerManager {
         key: &str,
         generation: u64,
     ) {
-        let Some(steering) = self
-            .node_waypoint_udp_steering
-            .load_full()
-            .as_ref()
-            .clone()
-        else {
+        let Some(steering) = self.node_waypoint_udp_steering.load_full().as_ref().clone() else {
             return;
         };
         retract_owned_node_waypoint_udp_listener(
@@ -2924,12 +2919,7 @@ impl StreamListenerManager {
                 return;
             }
         }
-        let Some(steering) = self
-            .node_waypoint_udp_steering
-            .load_full()
-            .as_ref()
-            .clone()
-        else {
+        let Some(steering) = self.node_waypoint_udp_steering.load_full().as_ref().clone() else {
             return;
         };
         publish_bound_node_waypoint_udp_destinations(
