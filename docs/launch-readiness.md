@@ -122,11 +122,13 @@ The boundary is drawn by *which code executes*, not by which event fired:
 |---------|-------------|------------|
 | `launch-readiness.yml` (PR, `merge_group`, `main` push, `v*` tag, schedule, dispatch) | the ref under test — untrusted | **never**, on any event |
 | `release.yml` (`v*` tag push) | the tag target — untrusted | **never** |
-| `launch-advisory-trust.yml` (`workflow_run: in_progress`, `schedule`, `workflow_dispatch`) | protected default branch, always | yes, after provenance |
+| `launch-advisory-trust.yml` (`workflow_run: in_progress`, `schedule`) | protected default branch, always | yes, after provenance |
 
-`workflow_run`, `schedule`, and `workflow_dispatch` are the only events whose
-definition GitHub resolves from the default branch, which is what makes
+`workflow_run` and `schedule` resolve this workflow from the default branch,
+which is what makes
 `launch-advisory-trust.yml` an immutable trust anchor a tag cannot rewrite.
+`workflow_dispatch` is deliberately absent: its API accepts a caller-selected
+branch or tag ref, so a manual dispatch is not intrinsically trusted code.
 
 ### How a release obtains a private-advisory verdict
 
@@ -176,8 +178,8 @@ run attempt:
 
 | Lane | Context |
 |------|---------|
-| Release (`workflow_run: in_progress`, or the recovery dispatch) | `trusted-launch-advisory-gate/release-<run id>-attempt-<attempt>` |
-| Scheduled / dispatched default-branch audit | `trusted-launch-advisory-gate/main-audit` |
+| Release (`workflow_run: in_progress`) | `trusted-launch-advisory-gate/release-<run id>-attempt-<attempt>` |
+| Scheduled default-branch audit | `trusted-launch-advisory-gate/main-audit` |
 
 Both operands are validated as strict positive decimals (`^[1-9][0-9]{0,17}$`)
 on both sides, and the whole derived context is re-checked against the admitted
@@ -191,16 +193,11 @@ it moved after the event, or if it is not reachable from protected `main`, no
 credential is released and no verdict is published, so the release times out red
 rather than proceeding.
 
-The recovery lane is a maintainer `workflow_dispatch` of
-`launch-advisory-trust.yml` with an explicit `release_tag`, `release_run_id`, and
-`release_run_attempt` — all three are required together, and it publishes only
-that one run-bound context, so it re-triggers a single stuck release rather than
-minting a verdict any release could consume. It runs the identical trusted
-checks, and additionally verifies through the API that the named run really is a
-push-triggered `Release` run for that same tag with at least that attempt,
-taking the head SHA from the run itself so the tag-moved-after-the-event check
-still applies. A dispatch with an empty `release_tag` is the default-branch
-audit lane and is refused if it also names a run ID or attempt.
+To recover a stuck evaluation, rerun the trusted workflow itself. To reevaluate
+after a Release rerun, rerun the Release workflow; its new run attempt emits a
+fresh `workflow_run: in_progress` event and receives a distinct verdict context.
+There is no manual-dispatch lane because its caller-selected ref would weaken
+the trusted-code proof.
 
 Because the policy, the exemptions, and `PRODUCTION_READINESS.md` are all read
 from the trusted anchor, the reviewed snapshot compared against the live verdict
@@ -269,8 +266,8 @@ future provisioning safe rather than exploitable.
   or pushed SHA) and asserts that the checkout is that commit. It holds no
   advisory credential on any event and reads only the redacted variables.
 - `.github/workflows/launch-advisory-trust.yml` — the sole credential holder,
-  reachable only from `workflow_run` (`in_progress`), `schedule`, and
-  `workflow_dispatch`. Its daily schedule is the live private-advisory re-audit
+  reachable only from `workflow_run` (`in_progress`) and `schedule`. Its daily
+  schedule is the live private-advisory re-audit
   of protected `main`, published under the separate `.../main-audit` context.
 - `.github/workflows/release.yml` — the `validate-launch-readiness` job gates
   every tag release on the trusted

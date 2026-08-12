@@ -12,7 +12,7 @@ workflow definitions as text — it executes nothing — and asserts:
 
 * the credential is referenced in exactly one workflow, and that workflow is
   reachable only from events whose definition GitHub loads from the protected
-  default branch (`workflow_run`, `schedule`, `workflow_dispatch`);
+  default branch (`workflow_run`, `schedule`);
 * the secret-bearing job is gated behind the secretless trust job, is bound to
   the protected deployment environment, checks out only the literal trusted ref,
   and runs only the default-branch checker with its trusted-execution pins;
@@ -71,7 +71,7 @@ SELF_TEST_STEP = "python3 -I .github/scripts/verify_launch_advisory_trust.py --s
 # Events whose workflow definition and checked-out code GitHub resolves from the
 # protected default branch. Every other event can be reached from a ref whose
 # contents an untrusted principal controls.
-TRUSTED_EVENTS = frozenset({"workflow_run", "schedule", "workflow_dispatch"})
+TRUSTED_EVENTS = frozenset({"workflow_run", "schedule"})
 
 # Payload fields that carry candidate-controlled values.
 CANDIDATE_EXPRESSIONS = (
@@ -487,8 +487,6 @@ on:
       - in_progress
   schedule:
     - cron: "45 6 * * *"
-  workflow_dispatch:
-
 permissions:
   contents: read
 
@@ -677,6 +675,18 @@ def run_self_test() -> int:  # noqa: C901 — a flat fixture table stays readabl
         any(
             "candidate-controlled events" in err
             for err in evaluate(mutated(TRUSTED_WORKFLOW, tag_reachable))
+        ),
+    )
+
+    dispatch_reachable = FIXTURE_TRUSTED.replace(
+        "  schedule:\n    - cron: \"45 6 * * *\"",
+        "  schedule:\n    - cron: \"45 6 * * *\"\n  workflow_dispatch:",
+    )
+    check(
+        "making the trusted workflow manually dispatchable is rejected",
+        any(
+            "candidate-controlled events" in err
+            for err in evaluate(mutated(TRUSTED_WORKFLOW, dispatch_reachable))
         ),
     )
 
