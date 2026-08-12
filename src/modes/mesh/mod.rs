@@ -1107,8 +1107,8 @@ impl MeshRuntimeConfig {
         validate_ingress_capture_addr(addr)
     }
 
-    /// Fail-closed validation of the NodeWaypoint UDP/DTLS listener switch
-    /// (issue #3286), for the SERVING path only.
+    /// Fail-closed validation of the NodeWaypoint UDP/DTLS listener switch and
+    /// exact-node identity (issue #3286), for the SERVING path only.
     ///
     /// `materialize_node_waypoint_udp_listeners` must stay infallible (read-only
     /// predicates and tests reach it), so a malformed
@@ -1124,7 +1124,16 @@ impl MeshRuntimeConfig {
         if self.topology != MeshTopology::NodeWaypoint {
             return Ok(());
         }
-        node_waypoint_udp_listeners_enabled_from_env().map(|_| ())
+        if node_waypoint_udp_listeners_enabled_from_env()?
+            && node_waypoint_udp_local_node_name_from_env().is_none()
+        {
+            return Err(
+                "FERRUM_K8S_NODE_NAME must be set to the current Kubernetes node when \
+                 FERRUM_MESH_NODE_WAYPOINT_UDP_LISTENERS_ENABLED=true"
+                    .to_string(),
+            );
+        }
+        Ok(())
     }
 
     /// The optional UDP TPROXY capture listener (F3 §3.3), emitted on the two
@@ -1583,6 +1592,21 @@ pub(crate) fn node_waypoint_udp_listeners_enabled_from_env() -> Result<bool, Str
     }
 }
 
+/// Exact Kubernetes node whose local workloads this NodeWaypoint may reach.
+///
+/// The UDP relay's eBPF authorization mark is socket-local metadata and does
+/// not cross a node boundary. A listener must therefore never select a backing
+/// workload owned by another node, even when that workload is in the same
+/// cluster. The serving path rejects an enabled listener surface when this
+/// downward-API value is absent; read-only materialization remains infallible
+/// and emits no listeners in that state.
+fn node_waypoint_udp_local_node_name_from_env() -> Option<String> {
+    std::env::var("FERRUM_K8S_NODE_NAME")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 /// Reserved id prefix for NodeWaypoint UDP/DTLS service listener proxies
 /// (issue #3286). A DISTINCT id space from the egress relay proxies: these are
 /// LISTENERS with a `listen_port`, not route-only relay proxies.
@@ -1622,10 +1646,12 @@ pub fn node_waypoint_udp_upstream_id(namespace: &str, name: &str, port: u16) -> 
 /// are the same L4 transport). `udp` relays opaque datagrams; `dtls` terminates
 /// frontend DTLS on the listener (`frontend_tls: true`) and forwards plaintext
 /// datagrams to the backend. The listener binds the SERVICE port number on the
-/// node, and its upstream targets are the service's local-cluster backing pods
-/// at their resolved `targetPort` — the same fail-closed named-`targetPort`
-/// resolution the east-west materializer uses, so an unresolvable named target
-/// port skips that endpoint rather than publishing it on the wrong port.
+/// node, and its upstream targets are only the service's backing pods owned by
+/// this exact Kubernetes node at their resolved `targetPort` — the same
+/// fail-closed named-`targetPort` resolution the east-west materializer uses,
+/// so an unresolvable named target port skips that endpoint rather than
+/// publishing it on the wrong port. Same-cluster pods on another node are not
+/// reachable through the node-local socket mark and are excluded.
 ///
 /// **Why the datagrams are attributable.** A co-located pod's datagram reaches
 /// this host-netns socket over that pod's veth, so the kernel-reported ingress
@@ -1641,7 +1667,7 @@ pub fn node_waypoint_udp_upstream_id(namespace: &str, name: &str, port: u16) -> 
 /// - a port already claimed by another stream proxy in this generation,
 /// - a port claimed by two different services (BOTH are dropped — a datagram
 ///   carries no host, so a shared datagram port is unresolvable),
-/// - a service port with no reachable local-cluster endpoint,
+/// - a service port with no reachable same-node endpoint,
 /// - a port number of `0`.
 ///
 /// Listener BIND failures (including a `dtls` port with no usable frontend DTLS
@@ -1663,6 +1689,13 @@ fn materialize_node_waypoint_udp_listeners(
     if !node_waypoint_udp_listeners_enabled_from_env().unwrap_or(false) {
         return;
     }
+    let Some(local_node_name) = node_waypoint_udp_local_node_name_from_env() else {
+        warn!(
+            "Skipping NodeWaypoint UDP/DTLS listener materialization: \
+             FERRUM_K8S_NODE_NAME is missing or empty"
+        );
+        return;
+    };
 
     // Ports the mesh runtime itself binds (HBONE, transparent inbound capture,
     // …). Claiming one would take the node's mesh datapath down.
@@ -1725,18 +1758,19 @@ fn materialize_node_waypoint_udp_listeners(
                 );
                 continue;
             }
-            let targets = build_east_west_service_targets(
+            let targets = build_node_waypoint_udp_service_targets(
                 service,
                 service_port,
                 &mesh_slice.workloads,
                 mesh_slice.multi_cluster.as_ref(),
+                &local_node_name,
             );
             if targets.is_empty() {
                 debug!(
                     service = %service.name,
                     namespace = %service.namespace,
                     service_port = service_port.port,
-                    "Skipping NodeWaypoint UDP/DTLS listener: no reachable local-cluster \
+                    "Skipping NodeWaypoint UDP/DTLS listener: no reachable same-node \
                      endpoint for this service port"
                 );
                 continue;
@@ -3855,8 +3889,60 @@ fn build_east_west_service_targets(
     workloads: &[crate::modes::mesh::config::Workload],
     multi_cluster: Option<&crate::modes::mesh::config::MultiClusterConfig>,
 ) -> Vec<UpstreamTarget> {
+    build_local_service_targets_where(
+        service,
+        service_port,
+        workloads,
+        multi_cluster,
+        |_| true,
+    )
+}
+
+/// Build the NodeWaypoint UDP/DTLS targets that are reachable through this
+/// exact node's host-network relay.
+///
+/// A socket's `NODE_WAYPOINT_INBOUND_AUTH_MARK` is consumed by tc on the same
+/// node and is not transported over the network. Selecting another node's pod
+/// would therefore send an unmarked datagram into that node's pod-veth guard,
+/// where it is correctly dropped. Filter by discovery's authoritative
+/// NodeWaypoint ownership metadata instead of publishing a latent black hole.
+fn build_node_waypoint_udp_service_targets(
+    service: &crate::modes::mesh::config::MeshService,
+    service_port: &crate::modes::mesh::config::ServicePort,
+    workloads: &[crate::modes::mesh::config::Workload],
+    multi_cluster: Option<&crate::modes::mesh::config::MultiClusterConfig>,
+    local_node_name: &str,
+) -> Vec<UpstreamTarget> {
+    build_local_service_targets_where(
+        service,
+        service_port,
+        workloads,
+        multi_cluster,
+        |workload| {
+            workload
+                .node_waypoint
+                .as_ref()
+                .and_then(|endpoint| endpoint.node_name.as_deref())
+                == Some(local_node_name)
+        },
+    )
+}
+
+fn build_local_service_targets_where<F>(
+    service: &crate::modes::mesh::config::MeshService,
+    service_port: &crate::modes::mesh::config::ServicePort,
+    workloads: &[crate::modes::mesh::config::Workload],
+    multi_cluster: Option<&crate::modes::mesh::config::MultiClusterConfig>,
+    mut include_workload: F,
+) -> Vec<UpstreamTarget>
+where
+    F: FnMut(&crate::modes::mesh::config::Workload) -> bool,
+{
     let mut targets = Vec::new();
     for workload in matched_local_service_workloads(service, workloads, multi_cluster) {
+        if !include_workload(workload) {
+            continue;
+        }
         // Backend (container) port for this workload address: honor
         // `service_port`'s `targetPort` (Kubernetes' authoritative
         // service-port→container-port binding). A DECLARED targetPort is
@@ -12872,9 +12958,9 @@ fn prepare_mesh_runtime_before_owner(
         })?;
 
     // Same contract again for the NodeWaypoint UDP/DTLS service listener switch
-    // (issue #3286): the materializer is infallible, so an unparseable value
-    // would otherwise leave the proxy ready while serving none of the UDP/DTLS
-    // listeners the operator asked for.
+    // and exact-node identity (issue #3286): the materializer is infallible, so
+    // an unparseable switch or missing node name would otherwise leave the proxy
+    // ready while serving none of the UDP/DTLS listeners the operator asked for.
     runtime
         .validate_node_waypoint_udp_listener_settings()
         .map_err(|e| anyhow::anyhow!("Invalid NodeWaypoint UDP/DTLS listener settings: {e}"))?;

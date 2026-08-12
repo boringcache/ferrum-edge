@@ -241,8 +241,12 @@ need them, or because they are blocked upstream / architecturally:
   (frontend DTLS termination — the same L4 transport, selected by an
   `appProtocol: dtls` / port-name hint on a `protocol: UDP` Service port, or by
   a `dtls` Istio `ServiceEntry`/port protocol) materializes ONE datagram
-  listener on that port number, forwarding to the service's backing pods at
-  their resolved `targetPort`. Materialization runs DP-side in
+  listener on that port number, forwarding only to the service's backing pods
+  whose `node_waypoint.node_name` exactly matches the current
+  `FERRUM_K8S_NODE_NAME`, at their resolved `targetPort`. The backend socket's
+  authorization mark is node-local metadata and cannot cross nodes; enabling
+  the listener surface without that node name therefore fails serving startup
+  closed. Materialization runs DP-side in
   `prepare_normalized_gateway_config_for_mesh`, exactly like the east-west and
   egress-gateway stream listeners, so it needs neither a `stream_match` (which
   `Proxy::validate` rejects on `udp`/`dtls`) nor a CP-side carrier. It is
@@ -251,7 +255,7 @@ need them, or because they are blocked upstream / architecturally:
   field-specific log line and no inert leftovers: a port already claimed by a
   mesh runtime listener or another stream proxy, a port claimed by two
   different services (BOTH refused — a datagram carries no host or SNI), a
-  service port with no reachable local-cluster endpoint, and port `0`. A
+  service port with no reachable same-node endpoint, and port `0`. A
   `dtls` port with no usable frontend DTLS material, or a scoped listener whose
   socket cannot report ingress interfaces, fails the BIND and is reported as a
   `StreamBindFailure` in readiness/status rather than starting a black-hole

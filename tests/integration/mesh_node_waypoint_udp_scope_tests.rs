@@ -759,7 +759,9 @@ async fn manager_task_abort_retracts_the_published_generation() {
 // UDP-vs-DTLS split.
 
 use ferrum_edge::config::types::{DispatchKind, GatewayConfig};
-use ferrum_edge::modes::mesh::config::{AppProtocol, MeshService, ServicePort, WorkloadRef};
+use ferrum_edge::modes::mesh::config::{
+    AppProtocol, MeshService, NodeWaypointEndpoint, ServicePort, WorkloadRef,
+};
 use ferrum_edge::modes::mesh::{
     MESH_NODE_WAYPOINT_UDP_PROXY_ID_PREFIX, MESH_NODE_WAYPOINT_UDP_UPSTREAM_ID_PREFIX,
     MeshRuntimeConfig, MeshTopology, node_waypoint_udp_proxy_id, node_waypoint_udp_upstream_id,
@@ -772,31 +774,47 @@ use super::mesh_test_support::{
 };
 
 const UDP_LISTENERS_ENV: &str = "FERRUM_MESH_NODE_WAYPOINT_UDP_LISTENERS_ENABLED";
+const K8S_NODE_NAME_ENV: &str = "FERRUM_K8S_NODE_NAME";
+const LOCAL_NODE_NAME: &str = "worker-a";
 
-/// Serializes the `FERRUM_MESH_NODE_WAYPOINT_UDP_LISTENERS_ENABLED` mutations
-/// in this test binary and restores the previous value on drop.
+/// Serializes the listener-switch and node-name environment mutations in this
+/// test binary and restores their previous values on drop.
 static UDP_LISTENER_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 struct UdpListenerEnvGuard {
     _lock: std::sync::MutexGuard<'static, ()>,
-    saved: Option<String>,
+    saved_enabled: Option<String>,
+    saved_node_name: Option<String>,
 }
 
 impl UdpListenerEnvGuard {
     fn set(value: Option<&str>) -> Self {
+        Self::set_with_node(value, Some(LOCAL_NODE_NAME))
+    }
+
+    fn set_with_node(value: Option<&str>, node_name: Option<&str>) -> Self {
         let lock = UDP_LISTENER_ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let saved = std::env::var(UDP_LISTENERS_ENV).ok();
-        // SAFETY: `_lock` serializes every mutation of this variable in this
-        // test binary, and the guard restores the snapshot on drop.
+        let saved_enabled = std::env::var(UDP_LISTENERS_ENV).ok();
+        let saved_node_name = std::env::var(K8S_NODE_NAME_ENV).ok();
+        // SAFETY: `_lock` serializes every mutation of both variables in this
+        // test binary, and the guard restores both snapshots on drop.
         unsafe {
             match value {
                 Some(value) => std::env::set_var(UDP_LISTENERS_ENV, value),
                 None => std::env::remove_var(UDP_LISTENERS_ENV),
             }
+            match node_name {
+                Some(node_name) => std::env::set_var(K8S_NODE_NAME_ENV, node_name),
+                None => std::env::remove_var(K8S_NODE_NAME_ENV),
+            }
         }
-        Self { _lock: lock, saved }
+        Self {
+            _lock: lock,
+            saved_enabled,
+            saved_node_name,
+        }
     }
 }
 
@@ -804,9 +822,13 @@ impl Drop for UdpListenerEnvGuard {
     fn drop(&mut self) {
         // SAFETY: the guard still holds `UDP_LISTENER_ENV_LOCK`.
         unsafe {
-            match self.saved.as_deref() {
+            match self.saved_enabled.as_deref() {
                 Some(value) => std::env::set_var(UDP_LISTENERS_ENV, value),
                 None => std::env::remove_var(UDP_LISTENERS_ENV),
+            }
+            match self.saved_node_name.as_deref() {
+                Some(value) => std::env::set_var(K8S_NODE_NAME_ENV, value),
+                None => std::env::remove_var(K8S_NODE_NAME_ENV),
             }
         }
     }
@@ -846,8 +868,21 @@ fn node_waypoint_runtime() -> MeshRuntimeConfig {
 fn prepare(
     runtime: &MeshRuntimeConfig,
     services: Vec<MeshService>,
-    workloads: Vec<Workload>,
+    mut workloads: Vec<Workload>,
 ) -> GatewayConfig {
+    for workload in &mut workloads {
+        if workload.node_waypoint.is_none() {
+            workload.node_waypoint = Some(NodeWaypointEndpoint {
+                address: "192.0.2.10".to_string(),
+                hbone_port: 15008,
+                spiffe_id: workload.spiffe_id.clone(),
+                node_name: Some(LOCAL_NODE_NAME.to_string()),
+                node_uid: None,
+                network: None,
+                cluster: None,
+            });
+        }
+    }
     let mesh = mesh_config_with(workloads, services, Vec::new());
     let config = gateway_config_with_mesh(Vec::new(), Vec::new(), mesh);
     prepare_gateway_config_for_mesh(config, runtime).expect("mesh config preparation must succeed")
@@ -993,6 +1028,85 @@ fn a_malformed_listener_switch_is_rejected_rather_than_silently_disabling_listen
         runtime_for_topology(MeshTopology::Ambient)
             .validate_node_waypoint_udp_listener_settings()
             .is_ok()
+    );
+}
+
+#[test]
+fn enabled_listener_surface_requires_the_current_node_name() {
+    let _env = UdpListenerEnvGuard::set_with_node(Some("true"), None);
+    let runtime = node_waypoint_runtime();
+    assert!(
+        runtime
+            .validate_node_waypoint_udp_listener_settings()
+            .is_err(),
+        "serving must fail closed when same-node target ownership cannot be established"
+    );
+
+    let backend = workload_for("dns", DEFAULT_NAMESPACE, [("app", "udp")], ["10.244.3.11"]);
+    let config = prepare(
+        &runtime,
+        vec![udp_service("dns", 5353, AppProtocol::Udp, &[&backend])],
+        vec![backend],
+    );
+    assert!(
+        udp_listeners(&config).is_empty(),
+        "infallible read-only preparation must not widen to every cluster endpoint"
+    );
+}
+
+#[test]
+fn node_waypoint_udp_targets_are_restricted_to_this_exact_node() {
+    let _env = UdpListenerEnvGuard::set(Some("true"));
+    let runtime = node_waypoint_runtime();
+    let local = workload_for("dns", DEFAULT_NAMESPACE, [("app", "udp")], ["10.244.3.11"]);
+    let mut remote = local.clone();
+    remote.addresses = vec!["10.244.4.12".to_string()];
+    remote.node_waypoint = Some(NodeWaypointEndpoint {
+        address: "192.0.2.11".to_string(),
+        hbone_port: 15008,
+        spiffe_id: remote.spiffe_id.clone(),
+        node_name: Some("worker-b".to_string()),
+        node_uid: None,
+        network: None,
+        cluster: None,
+    });
+    let mut unowned = local.clone();
+    unowned.addresses = vec!["10.244.5.13".to_string()];
+    unowned.node_waypoint = Some(NodeWaypointEndpoint {
+        address: "192.0.2.12".to_string(),
+        hbone_port: 15008,
+        spiffe_id: unowned.spiffe_id.clone(),
+        node_name: None,
+        node_uid: None,
+        network: None,
+        cluster: None,
+    });
+    let config = prepare(
+        &runtime,
+        vec![udp_service(
+            "dns",
+            5353,
+            AppProtocol::Udp,
+            &[&local, &remote, &unowned],
+        )],
+        vec![local, remote, unowned],
+    );
+
+    let upstream_id = node_waypoint_udp_upstream_id(DEFAULT_NAMESPACE, "dns", 5353);
+    let upstream = config
+        .upstreams
+        .iter()
+        .find(|upstream| upstream.id == upstream_id)
+        .expect("the same-node endpoint keeps the listener reachable");
+    assert_eq!(
+        upstream
+            .targets
+            .iter()
+            .map(|target| target.host.as_str())
+            .collect::<Vec<_>>(),
+        vec!["10.244.3.11"],
+        "another node's pod or a pod with missing node ownership must not be selected by a \
+         node-local marked UDP socket"
     );
 }
 
