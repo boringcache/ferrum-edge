@@ -137,6 +137,26 @@ def write_pre_collection(
         json.dumps(health, indent=2) + "\n",
         encoding="utf-8",
     )
+    (logs_dir / "runner_health.log").write_text(
+        "\n".join(
+            (
+                "==========================================",
+                "  RUNNER HEALTH - MESH BASELINE COLLECTION",
+                "==========================================",
+                f"runner_class={health['runner_class']}",
+                f"build_profile={health['build_profile']}",
+                f"max_cpu_steal_percent={threshold}",
+                f"commit={health['commit_sha']}",
+                "",
+                output.rstrip(),
+                "",
+                f"Average CPU steal over {PRE_COLLECTION_SAMPLES_KEPT}s: {steal}%",
+                json.dumps(health, indent=2),
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     return health
 
 

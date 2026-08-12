@@ -190,6 +190,7 @@ def check_scripts(failures: list[str]) -> None:
 
     health = HEALTH_SCRIPT.read_text(encoding="utf-8")
     require("runner_health.json" in health, "machine-readable runner_health.json required", failures)
+    require("runner_health.log" in health, "runner_health.log audit trail required", failures)
     require("runner_health_probes.jsonl" in health, "per-E2E runner health probes required", failures)
     require(
         "BENCH_MAX_CPU_STEAL_PERCENT" in health,
