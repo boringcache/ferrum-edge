@@ -406,7 +406,10 @@ async fn stall_is_strictly_after_the_configured_window() {
         metrics.contains("ferrum_cp_dp_trust_reload_worker_stalled 1\n"),
         "{metrics}"
     );
-    assert!(metrics.contains("ferrum_cp_dp_trust_degraded 1\n"), "{metrics}");
+    assert!(
+        metrics.contains("ferrum_cp_dp_trust_degraded 1\n"),
+        "{metrics}"
+    );
     assert!(metrics.contains("ferrum_cp_dp_trust_reload_worker_running 1\n"));
 }
 
@@ -493,7 +496,10 @@ async fn the_keyed_generation_id_is_stable_across_replicas_and_changes_with_the_
 
     let replica_a = status_at(Instant::now(), BOUND);
     let replica_b = status_at(Instant::now(), BOUND);
-    assert_eq!(replica_a.snapshot().active_generation.as_deref(), Some(expected.as_str()));
+    assert_eq!(
+        replica_a.snapshot().active_generation.as_deref(),
+        Some(expected.as_str())
+    );
     assert_eq!(
         replica_a.snapshot().active_generation,
         replica_b.snapshot().active_generation,
@@ -511,14 +517,17 @@ async fn the_keyed_generation_id_is_stable_across_replicas_and_changes_with_the_
     replica_a.record_attempt();
     replica_a.record_accepted(true, &ROTATED_FINGERPRINT);
     let rotated = replica_a.snapshot().active_generation.expect("rotated id");
-    assert_ne!(rotated, expected, "a semantic change must mint a new identifier");
+    assert_ne!(
+        rotated, expected,
+        "a semantic change must mint a new identifier"
+    );
     assert_eq!(
         rotated,
         keyed_generation_id(STATUS_HMAC_KEY, &ROTATED_FINGERPRINT).expect("key")
     );
 
-    let other_key = keyed_generation_id(OTHER_STATUS_HMAC_KEY, &INITIAL_FINGERPRINT)
-        .expect("other key");
+    let other_key =
+        keyed_generation_id(OTHER_STATUS_HMAC_KEY, &INITIAL_FINGERPRINT).expect("other key");
     assert_ne!(
         other_key, expected,
         "replicas with different HMAC keys are incomparable"
@@ -910,7 +919,11 @@ async fn the_health_projection_is_fixed_cardinality() {
     );
     assert_eq!(object["reason"], json!("reader_unavailable"));
     assert_eq!(object["configured"], json!(true));
-    assert!(object["active_generation"].as_str().is_some_and(|id| id.len() == 64));
+    assert!(
+        object["active_generation"]
+            .as_str()
+            .is_some_and(|id| id.len() == 64)
+    );
 }
 
 #[test]
@@ -930,8 +943,7 @@ fn coarse_health_projection_is_copy_and_has_no_reason_map() {
     assert!(!coarse.degraded);
     assert!(!coarse.worker_stalled);
     assert!(
-        std::mem::size_of::<ferrum_edge::grpc::cp_trust_health::CpDpTrustCoarse>()
-            <= 16,
+        std::mem::size_of::<ferrum_edge::grpc::cp_trust_health::CpDpTrustCoarse>() <= 16,
         "coarse verdict must stay a handful of booleans, not a snapshot"
     );
 }
