@@ -10,11 +10,13 @@
 
 use ferrum_edge::config::types::{GatewayConfig, Proxy, Upstream};
 use ferrum_edge::http3::connect_udp::{
-    AdmittedConnectUdpDestination, CONNECT_UDP_MAX_PAYLOAD_BYTES, CapsuleDecodeError,
-    CapsuleDecoder, CapsuleEvent, ConnectUdpDestinationRefusal, ConnectUdpRequestRejection,
-    ConnectUdpTargetRejection, H3ExtendedConnect, SessionEnd, StreamCloseKind, UdpSendFault,
-    admit_connect_udp_destination, classify_h3_extended_connect, classify_udp_send_error,
-    destination_is_configured, dns_override_pin_unchanged, encode_udp_datagram_capsule,
+    AdmittedConnectUdpDestination, CONNECT_UDP_MAX_PAYLOAD_BYTES,
+    CONNECT_UDP_NON_FRAGMENTATION_ENFORCEABLE, CapsuleDecodeError, CapsuleDecoder, CapsuleEvent,
+    ConnectUdpDestinationRefusal, ConnectUdpRequestRejection, ConnectUdpTargetRejection,
+    H3ExtendedConnect, RelayDirection, SessionEnd, StreamCloseKind, UdpRecvFault, UdpSendFault,
+    admit_connect_udp_destination, classify_h3_extended_connect, classify_relay_join,
+    classify_udp_recv_error, classify_udp_send_error, destination_is_configured,
+    dns_override_pin_unchanged, encode_udp_datagram_capsule,
     first_forbidden_capsule_protocol_field, parse_connect_udp_target,
     strip_forbidden_capsule_protocol_response_fields, validate_connect_udp_request_shape,
 };
@@ -574,6 +576,144 @@ fn skips_unknown_capsule_types_and_keeps_parsing() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// RFC 9297 §3.1: an unknown capsule is DROPPED AND SKIPPED, at any length
+//
+// "An endpoint that receives a Capsule Type it does not understand MUST
+// silently drop that capsule and skip over it." Nothing there permits refusing
+// one for being large, and the DATAGRAM ceiling is a property of the payloads
+// this gateway materializes, not of the capsule stream's framing. A peer may
+// legitimately negotiate an extension whose capsules dwarf the UDP ceiling; the
+// tunnel must survive them, in bounded memory, and resume exact parsing after.
+// ---------------------------------------------------------------------------
+
+/// A capsule header: type varint + length varint, both in 8-byte QUIC varint
+/// form so hostile lengths are expressible verbatim.
+fn eight_byte_varint(value: u64) -> [u8; 8] {
+    let mut encoded = value.to_be_bytes();
+    encoded[0] |= 0xc0;
+    encoded
+}
+
+#[test]
+fn an_unknown_capsule_larger_than_the_udp_ceiling_is_skipped_not_refused() {
+    const PAYLOAD_CEILING: usize = 1200;
+    // Ten times the whole configured UDP ceiling — far above the DATAGRAM
+    // capsule limit that used to reject it and reset the stream.
+    const UNKNOWN_VALUE_LEN: usize = PAYLOAD_CEILING * 10;
+
+    let mut decoder = CapsuleDecoder::new(PAYLOAD_CEILING);
+    let feed_limit = decoder.feed_limit();
+
+    let mut wire: Vec<u8> = vec![0x17];
+    wire.extend_from_slice(&eight_byte_varint(UNKNOWN_VALUE_LEN as u64));
+    wire.resize(wire.len() + UNKNOWN_VALUE_LEN, 0xa5);
+    wire.extend_from_slice(&datagram_capsule(0, b"after-the-skip"));
+
+    let mut events = Vec::new();
+    let mut peak_buffered = 0usize;
+    for chunk in wire.chunks(feed_limit) {
+        decoder.push(chunk).expect("a bounded feed must be accepted");
+        events.extend(drain(&mut decoder));
+        peak_buffered = peak_buffered.max(decoder.buffered_len());
+    }
+
+    assert_eq!(
+        events,
+        vec![
+            CapsuleEvent::UnknownCapsuleType(0x17),
+            CapsuleEvent::UdpPayload(bytes::Bytes::from_static(b"after-the-skip")),
+        ],
+        "RFC 9297 §3.1: the unknown capsule is reported once and skipped, and the capsule \
+         AFTER it must still decode exactly"
+    );
+    assert!(
+        peak_buffered <= feed_limit,
+        "the skipped value must never be retained: peak buffered {peak_buffered} bytes for a \
+         {UNKNOWN_VALUE_LEN}-byte unknown capsule"
+    );
+    decoder
+        .finish_stream()
+        .expect("the stream ended on a capsule boundary");
+}
+
+#[test]
+fn an_unknown_capsule_split_at_hostile_boundaries_still_resumes_exactly() {
+    let mut decoder = CapsuleDecoder::new(64);
+    let mut wire: Vec<u8> = vec![0x17];
+    // Declared length 4096 — above the 64 + 8 DATAGRAM ceiling.
+    wire.extend_from_slice(&eight_byte_varint(4096));
+    wire.resize(wire.len() + 4096, 0x5a);
+    wire.extend_from_slice(&datagram_capsule(0, b"tail"));
+
+    // One byte at a time: every split point lands inside the type varint, the
+    // length varint, the skipped value, and the following capsule in turn.
+    let mut events = Vec::new();
+    for byte in &wire {
+        decoder.push(&[*byte]).expect("single-byte push");
+        events.extend(drain(&mut decoder));
+        assert!(
+            decoder.buffered_len() <= decoder.feed_limit(),
+            "the decoder must stay bounded at every split point"
+        );
+    }
+    assert_eq!(
+        events,
+        vec![
+            CapsuleEvent::UnknownCapsuleType(0x17),
+            CapsuleEvent::UdpPayload(bytes::Bytes::from_static(b"tail")),
+        ]
+    );
+}
+
+#[test]
+fn a_hostile_unknown_capsule_length_neither_overflows_nor_allocates() {
+    // The largest length a QUIC varint can express. Materializing it would be
+    // an instant OOM (and on a 32-bit target a `usize` truncation); skipping it
+    // must cost nothing at all.
+    const VARINT_MAX: u64 = (1u64 << 62) - 1;
+    let mut decoder = CapsuleDecoder::new(1200);
+    let mut wire: Vec<u8> = vec![0x17];
+    wire.extend_from_slice(&eight_byte_varint(VARINT_MAX));
+    wire.extend_from_slice(b"the first bytes of an unreachable value");
+    decoder.push(&wire).expect("push must succeed");
+
+    assert_eq!(
+        drain(&mut decoder),
+        vec![CapsuleEvent::UnknownCapsuleType(0x17)],
+        "the header is reported once; the value is never materialized"
+    );
+    assert_eq!(
+        decoder.buffered_len(),
+        0,
+        "every delivered byte of the skipped value is discarded, not retained"
+    );
+    assert!(
+        decoder.is_mid_capsule(),
+        "the stream is still positioned inside the unknown capsule"
+    );
+    assert_eq!(
+        decoder.finish_stream(),
+        Err(CapsuleDecodeError::TruncatedAtStreamEnd),
+        "RFC 9297 §3.3: a FIN inside the skipped value is still a malformed message"
+    );
+}
+
+#[test]
+fn the_datagram_ceiling_still_bounds_the_capsules_the_gateway_materializes() {
+    // The unknown-type skip must not have widened the DATAGRAM bound: a
+    // Context ID 0 capsule over the ceiling is still a fatal stream fault,
+    // because its value IS buffered and relayed.
+    let mut decoder = CapsuleDecoder::new(64);
+    let mut wire: Vec<u8> = vec![0x00];
+    wire.extend_from_slice(&eight_byte_varint(4096));
+    decoder.push(&wire).expect("push must succeed");
+    assert_eq!(
+        decoder.decode_next(),
+        Err(CapsuleDecodeError::CapsuleTooLarge)
+    );
+}
+
 #[test]
 fn refuses_a_datagram_capsule_with_no_context_id() {
     let mut decoder = CapsuleDecoder::new(1200);
@@ -970,6 +1110,85 @@ fn an_oversized_datagram_is_dropped_but_an_unusable_socket_is_terminal() {
     assert_eq!(UdpSendFault::Terminal.as_str(), "socket_unusable");
 }
 
+#[test]
+fn an_icmp_error_surfacing_on_recv_is_per_datagram_loss_not_a_dead_socket() {
+    // On a CONNECTED UDP socket the kernel reports ICMP errors to the
+    // application on whichever syscall runs next — `send` OR `recv`. The
+    // target-to-client relay used to treat every `recv` error as an unusable
+    // socket, so a single ICMP port-unreachable from the target host reset a
+    // healthy tunnel that the send side would have kept alive.
+    for kind in [
+        std::io::ErrorKind::ConnectionRefused,
+        std::io::ErrorKind::ConnectionReset,
+        std::io::ErrorKind::HostUnreachable,
+        std::io::ErrorKind::NetworkUnreachable,
+        std::io::ErrorKind::NetworkDown,
+        std::io::ErrorKind::Interrupted,
+    ] {
+        assert_eq!(
+            classify_udp_recv_error(&std::io::Error::from(kind)),
+            UdpRecvFault::DropDatagram,
+            "{kind:?} on recv is per-datagram loss, exactly as it is on send"
+        );
+    }
+    for kind in [
+        std::io::ErrorKind::PermissionDenied,
+        std::io::ErrorKind::BrokenPipe,
+        std::io::ErrorKind::NotConnected,
+        std::io::ErrorKind::Other,
+    ] {
+        assert_eq!(
+            classify_udp_recv_error(&std::io::Error::from(kind)),
+            UdpRecvFault::Terminal,
+            "{kind:?} means the socket itself is unusable"
+        );
+    }
+
+    // `WouldBlock` is its own arm: retrying the syscall immediately would spin,
+    // so the relay awaits readability again instead. It is never a drop and
+    // never terminal.
+    assert_eq!(
+        classify_udp_recv_error(&std::io::Error::from(std::io::ErrorKind::WouldBlock)),
+        UdpRecvFault::AwaitReadable,
+        "a not-ready socket must send the relay back to awaiting readiness"
+    );
+
+    // errno arms. Spelled numerically because the test crate does not link
+    // `libc`; these are the values Linux and Apple share for these names.
+    #[cfg(target_os = "linux")]
+    const ECONNREFUSED: i32 = 111;
+    #[cfg(target_vendor = "apple")]
+    const ECONNREFUSED: i32 = 61;
+    #[cfg(target_os = "linux")]
+    const EHOSTUNREACH: i32 = 113;
+    #[cfg(target_vendor = "apple")]
+    const EHOSTUNREACH: i32 = 65;
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    {
+        for code in [ECONNREFUSED, EHOSTUNREACH] {
+            assert_eq!(
+                classify_udp_recv_error(&std::io::Error::from_raw_os_error(code)),
+                UdpRecvFault::DropDatagram,
+                "errno {code} is an ICMP-derived per-datagram condition on a connected socket"
+            );
+            assert_eq!(
+                classify_udp_send_error(&std::io::Error::from_raw_os_error(code)),
+                UdpSendFault::DropDatagram,
+                "the two directions must agree about errno {code}"
+            );
+        }
+        // EBADF is 9 on both: a closed descriptor is not per-datagram loss.
+        assert_eq!(
+            classify_udp_recv_error(&std::io::Error::from_raw_os_error(9)),
+            UdpRecvFault::Terminal
+        );
+    }
+
+    assert_eq!(UdpRecvFault::DropDatagram.as_str(), "datagram_dropped");
+    assert_eq!(UdpRecvFault::AwaitReadable.as_str(), "socket_not_ready");
+    assert_eq!(UdpRecvFault::Terminal.as_str(), "socket_unusable");
+}
+
 // ---------------------------------------------------------------------------
 // Session teardown classification
 //
@@ -985,7 +1204,7 @@ fn an_oversized_datagram_is_dropped_but_an_unusable_socket_is_terminal() {
 /// this module rather than silently defaulting to a clean FIN somewhere.
 const EVERY_SESSION_END: [SessionEnd; 9] = [
     SessionEnd::ClientClosed,
-    SessionEnd::TargetRelayEnded,
+    SessionEnd::RelayTaskFailed,
     SessionEnd::TargetSocketUnusable,
     SessionEnd::Idle,
     SessionEnd::Draining,
@@ -1025,17 +1244,73 @@ fn a_capsule_fault_still_closes_with_the_rfc_9114_message_error() {
         SessionEnd::CapsuleProtocolError.as_str(),
         "capsule_protocol_error"
     );
-    // And those two outcomes are the ONLY non-clean closes, so no ordinary end
+    // And those outcomes are the ONLY non-clean closes, so no ordinary end
     // of tunnel can drift into a reset either.
     for end in EVERY_SESSION_END {
         let must_reset = matches!(
             end,
-            SessionEnd::TargetSocketUnusable | SessionEnd::CapsuleProtocolError
+            SessionEnd::TargetSocketUnusable
+                | SessionEnd::CapsuleProtocolError
+                | SessionEnd::RelayTaskFailed
         );
         assert_eq!(
             end.close_kind() != StreamCloseKind::Clean,
             must_reset,
             "{} classifies its stream close wrong",
+            end.as_str()
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_relay_join_failure_is_an_internal_failure_never_a_client_fin() {
+    // The supervisor reaches `classify_relay_join` only for a handle it has NOT
+    // aborted, so a join failure there is a panic or a cancellation this
+    // session never requested. Neither is a lifecycle outcome, and mapping
+    // either to `ClientClosed` would present the client an orderly FIN for a
+    // tunnel the gateway actually lost control of.
+    //
+    // The failure is induced by cancelling a task, not by panicking one: this
+    // asserts the classification without putting a panic on any code path.
+    for relay in [RelayDirection::ClientToTarget, RelayDirection::TargetToClient] {
+        let handle = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            SessionEnd::ClientClosed
+        });
+        handle.abort();
+        let joined = handle.await;
+        assert!(joined.is_err(), "the aborted task must not have completed");
+        assert_eq!(
+            classify_relay_join(joined, relay, "proxy-under-test"),
+            SessionEnd::RelayTaskFailed,
+            "{} join failure must not be reported as a client close",
+            relay.as_str()
+        );
+    }
+
+    // And it resets rather than FINs.
+    assert_eq!(
+        SessionEnd::RelayTaskFailed.close_kind(),
+        StreamCloseKind::InternalError,
+        "an internal relay failure must reset with H3_INTERNAL_ERROR"
+    );
+    assert_eq!(SessionEnd::RelayTaskFailed.as_str(), "relay_task_failed");
+    assert_eq!(RelayDirection::ClientToTarget.as_str(), "client_to_target");
+    assert_eq!(RelayDirection::TargetToClient.as_str(), "target_to_client");
+}
+
+#[tokio::test]
+async fn a_relay_that_ran_to_completion_keeps_its_own_verdict() {
+    // The other half of the contract: classification must not overwrite an
+    // outcome the relay decided for itself, or an ordinary client FIN would
+    // start resetting.
+    for end in EVERY_SESSION_END {
+        let handle = tokio::spawn(async move { end });
+        let joined = handle.await;
+        assert_eq!(
+            classify_relay_join(joined, RelayDirection::TargetToClient, "proxy-under-test"),
+            end,
+            "{} is the relay's own verdict and must survive the join",
             end.as_str()
         );
     }
@@ -1123,6 +1398,11 @@ fn the_do_not_fragment_option_installs_on_a_real_udp_socket() {
     // The runtime contract the tunnel socket depends on: on a platform that
     // advertises the option, installing it on a freshly bound UDP socket must
     // succeed — the production path refuses the tunnel when it does not.
+    //
+    // On a target that advertises no option the call must FAIL, not silently
+    // succeed. RFC 9298 §3.1 is a MUST, so "the option was not installed" may
+    // never be reported to a caller as "the guarantee is in force"; the profile
+    // is refused at startup and at admission instead.
     for bind in ["127.0.0.1:0", "[::1]:0"] {
         let Ok(socket) = std::net::UdpSocket::bind(bind) else {
             // No IPv6 loopback on this runner; the IPv4 arm still runs.
@@ -1135,7 +1415,34 @@ fn the_do_not_fragment_option_installs_on_a_real_udp_socket() {
                 panic!("do-not-fragment must install on {bind}: {error}");
             });
         } else {
-            result.expect("the unsupported-platform shim never fails");
+            let error = result.expect_err(
+                "a target with no do-not-fragment option must report that, never succeed",
+            );
+            assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
         }
     }
+}
+
+#[test]
+fn the_rfc9298_profile_is_only_offered_where_non_fragmentation_is_enforceable() {
+    // The capability gate and the socket option are the same fact, so they can
+    // never disagree about whether this build can honour RFC 9298 §3.1. Bound
+    // to locals so the assertions are real runtime comparisons rather than
+    // constant folds.
+    let gate = CONNECT_UDP_NON_FRAGMENTATION_ENFORCEABLE;
+    let socket_option = ferrum_edge::socket_opts::UDP_DONT_FRAGMENT_SUPPORTED;
+    assert_eq!(
+        gate, socket_option,
+        "the CONNECT-UDP capability gate must be exactly the do-not-fragment capability"
+    );
+    // Every target this repository builds and tests the data plane on can
+    // enforce it, so the profile is available rather than refused here. A
+    // target that cannot is refused at startup by
+    // `validate_h3_connect_udp_limits`.
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    assert!(
+        gate,
+        "Linux and Apple both expose a do-not-fragment option; losing that would silently \
+         disable the whole profile"
+    );
 }

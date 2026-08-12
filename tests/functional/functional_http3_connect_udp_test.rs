@@ -5,7 +5,11 @@
 //! - a real UDP echo target reached through a real QUIC/H3 Extended CONNECT
 //!   tunnel, with payloads framed as RFC 9297 DATAGRAM capsules
 //! - `Capsule-Protocol: ?1` on the 200
-//! - unregistered Context IDs and unknown capsule types dropped, not proxied
+//! - unregistered Context IDs and unknown capsule types dropped, not proxied —
+//!   including an unknown capsule twice the configured UDP payload ceiling,
+//!   which RFC 9297 §3.1 requires be skipped rather than treated as a fault
+//! - an OVER-CEILING DATAGRAM capsule still resetting the tunnel, so the skip
+//!   above did not widen the bound on capsules the gateway materializes
 //! - a spoofed destination that the matched proxy is not configured to reach
 //! - a mixed upstream where the client-requested member requires HBONE while a
 //!   sibling is directly dialable: the requested member is still refused
@@ -256,6 +260,33 @@ async fn functional_h3_connect_udp_relays_datagrams_end_to_end() {
     assert_eq!(
         echoed, b"after-drops",
         "only the Context ID 0 payload may reach the target"
+    );
+
+    // RFC 9297 §3.1 puts no length bound on a capsule type the endpoint does
+    // not implement, and the RFC 9298 UDP payload ceiling is a property of the
+    // payloads this gateway materializes — not of the capsule stream's framing.
+    // So an unknown capsule an order of magnitude larger than the whole
+    // configured payload ceiling must be skipped over the wire, not treated as
+    // a fault, and the following Context ID 0 datagram must still relay.
+    // Twice the 65527-byte payload ceiling, and comfortably inside the default
+    // 256 KiB QUIC stream receive window so the assertion is about capsule
+    // parsing rather than about flow-control credit.
+    let large_unknown = vec![0x5au8; 131_072];
+    tunnel
+        .send_capsule(0x17, &large_unknown)
+        .await
+        .expect("send an unknown capsule larger than the UDP payload ceiling");
+    tunnel
+        .send_datagram(b"after-large-skip")
+        .await
+        .expect("send datagram");
+    let echoed = tunnel
+        .recv_datagram(Duration::from_secs(10))
+        .await
+        .expect("a large unknown capsule must be skipped, never reset the tunnel");
+    assert_eq!(
+        echoed, b"after-large-skip",
+        "parsing must resume exactly at the capsule after a skipped unknown one"
     );
 
     tunnel.close().await;

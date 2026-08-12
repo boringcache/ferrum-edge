@@ -891,17 +891,23 @@ pub fn set_ipv6_recvpktinfo(_fd: i32) -> std::io::Result<()> {
 /// Whether the running target exposes a usable do-not-fragment socket option.
 ///
 /// RFC 9298 §3.1 says a UDP proxy "MUST NOT introduce IP fragmentation" and
-/// that the DF bit "MUST be set if possible" on IPv4. Where the platform gives
-/// us the knob, [`set_udp_dont_fragment`] installs it and a failure is fatal to
-/// the caller (fail closed). Where it does not, the caller documents an
-/// explicit best-effort fallback rather than pretending the bit was set.
+/// that the DF bit "MUST be set if possible" on IPv4. That is not a
+/// best-effort requirement, so this constant is a *capability gate*, not a
+/// hint: where it is `false` the guarantee cannot be enforced and the RFC 9298
+/// profile is refused outright (`EnvConfig::validate_h3_connect_udp_limits` at
+/// startup, and the CONNECT-UDP dispatcher at admission). There is deliberately
+/// no path that relays UDP through a socket whose fragmentation behaviour the
+/// gateway did not set.
 ///
-/// Supported here: Linux (`IP_MTU_DISCOVER` / `IPV6_MTU_DISCOVER` set to the
-/// `PMTUDISC_DO` policy, which both sets DF and reports oversized sends as
-/// `EMSGSIZE`) and Apple/BSD (`IP_DONTFRAG` / `IPV6_DONTFRAG`). Windows exposes
+/// Supported here: Linux/Android (`IP_MTU_DISCOVER` / `IPV6_MTU_DISCOVER` set
+/// to the `PMTUDISC_DO` policy, which both sets DF and reports oversized sends
+/// as `EMSGSIZE`) and Apple (`IP_DONTFRAG` / `IPV6_DONTFRAG`). Windows exposes
 /// `IP_DONTFRAGMENT`, but Ferrum links no Winsock binding (`libc` is a
 /// `cfg(unix)` dependency and `socket2` 0.6 has no fragmentation setter), so
-/// installing it there would mean adding a dependency for one `setsockopt`.
+/// installing it there would mean adding a dependency for one `setsockopt`;
+/// other BSDs are omitted because the repository builds and tests none of them,
+/// so an untested `setsockopt` there would be a guarantee nobody has verified.
+/// Both are handled by refusing the profile rather than by relaying without it.
 pub const UDP_DONT_FRAGMENT_SUPPORTED: bool =
     cfg!(any(target_os = "linux", target_os = "android")) || cfg!(target_vendor = "apple");
 
@@ -911,10 +917,12 @@ pub const UDP_DONT_FRAGMENT_SUPPORTED: bool =
 /// actually created with, because the IPv4 option is meaningless on an
 /// `AF_INET6` socket and vice versa.
 ///
-/// Returns `Ok(())` without touching the socket on targets where
-/// [`UDP_DONT_FRAGMENT_SUPPORTED`] is `false`. On supported targets a
-/// `setsockopt` failure is surfaced verbatim so the caller can refuse the
-/// tunnel instead of relaying datagrams the kernel may fragment.
+/// On targets where [`UDP_DONT_FRAGMENT_SUPPORTED`] is `false` this fails with
+/// [`std::io::ErrorKind::Unsupported`] instead of silently succeeding: a caller
+/// that needs the RFC 9298 §3.1 guarantee must never be told it was installed
+/// when it was not. On supported targets a `setsockopt` failure is surfaced
+/// verbatim so the caller can refuse the tunnel instead of relaying datagrams
+/// the kernel may fragment.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn set_udp_dont_fragment(fd: std::os::unix::io::RawFd, is_ipv4: bool) -> std::io::Result<()> {
     let (level, name, value) = if is_ipv4 {
@@ -969,6 +977,9 @@ pub fn set_udp_dont_fragment(fd: std::os::unix::io::RawFd, is_ipv4: bool) -> std
     Ok(())
 }
 
+/// Fail-closed arm: this target has no do-not-fragment option Ferrum can
+/// install, so it reports that fact instead of returning a success the caller
+/// would read as "the RFC 9298 §3.1 guarantee is in force".
 #[cfg(all(
     unix,
     not(any(target_os = "linux", target_os = "android")),
@@ -976,14 +987,27 @@ pub fn set_udp_dont_fragment(fd: std::os::unix::io::RawFd, is_ipv4: bool) -> std
 ))]
 #[allow(dead_code)]
 pub fn set_udp_dont_fragment(_fd: std::os::unix::io::RawFd, _is_ipv4: bool) -> std::io::Result<()> {
-    Ok(())
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        UDP_DONT_FRAGMENT_UNSUPPORTED_MESSAGE,
+    ))
 }
 
+/// Fail-closed arm for non-Unix targets. See the Unix arm above.
 #[cfg(not(unix))]
 #[allow(dead_code)]
 pub fn set_udp_dont_fragment(_fd: i32, _is_ipv4: bool) -> std::io::Result<()> {
-    Ok(())
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        UDP_DONT_FRAGMENT_UNSUPPORTED_MESSAGE,
+    ))
 }
+
+/// Fixed diagnostic for the unsupported-target arms of
+/// [`set_udp_dont_fragment`]. Named so the message cannot drift between them.
+#[allow(dead_code)]
+pub const UDP_DONT_FRAGMENT_UNSUPPORTED_MESSAGE: &str =
+    "no do-not-fragment socket option is available on this build target";
 
 /// Captured local (reply-source) address from an `IP_PKTINFO` / `IPV6_PKTINFO`
 /// cmsg. The interface index is preserved so scoped IPv6 replies (notably

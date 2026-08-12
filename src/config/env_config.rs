@@ -7215,7 +7215,49 @@ impl EnvConfig {
                 crate::util::conn_limit::MAX_CONN_LIMIT
             ));
         }
+        // RFC 9298 §3.1 requires that a UDP proxy not introduce IP
+        // fragmentation. Where the build target exposes no do-not-fragment
+        // socket option the gateway cannot honour that, so the profile is
+        // refused at configuration time rather than served best effort. See
+        // `crate::socket_opts::UDP_DONT_FRAGMENT_SUPPORTED`.
+        if self.http3_connect_udp_enabled
+            && !crate::http3::connect_udp::CONNECT_UDP_NON_FRAGMENTATION_ENFORCEABLE
+        {
+            const UNSUPPORTED_TARGET: &str =
+                "FERRUM_HTTP3_CONNECT_UDP_ENABLED=true is not supported on this build \
+                 target: no do-not-fragment socket option is available, so RFC 9298 §3.1 \
+                 (\"the proxy MUST NOT introduce IP fragmentation\") cannot be enforced. \
+                 Disable the profile or run on Linux or macOS.";
+            return Err(UNSUPPORTED_TARGET.to_string());
+        }
         Ok(())
+    }
+
+    /// The QUIC `max_idle_timeout` the HTTP/3 **frontend** listener installs,
+    /// in seconds.
+    ///
+    /// `FERRUM_HTTP3_IDLE_TIMEOUT` bounds the whole QUIC connection, and a
+    /// CONNECT-UDP tunnel lives on a stream of exactly one such connection. A
+    /// tunnel that carries no datagram also generates no QUIC activity, so a
+    /// connection idle limit below
+    /// `FERRUM_HTTP3_CONNECT_UDP_IDLE_TIMEOUT_SECONDS` closes the tunnel first
+    /// and makes the advertised RFC 9298 §3.2 idle posture unreachable — with
+    /// the shipped defaults, a 120-second tunnel bound that another
+    /// gateway-owned timer terminates at 30.
+    ///
+    /// So when the profile is enabled the connection idle limit is raised to
+    /// the tunnel's, never lowered: a larger operator-configured
+    /// `FERRUM_HTTP3_IDLE_TIMEOUT` still wins, and `0` — which DISABLES the
+    /// QUIC idle timer entirely (RFC 9000 §10.1) and therefore already cannot
+    /// undercut anything — is left alone rather than being shortened to 120.
+    /// The raise is reported at listener construction rather than applied
+    /// silently.
+    pub fn effective_http3_idle_timeout_seconds(&self) -> u64 {
+        if !self.http3_connect_udp_enabled || self.http3_idle_timeout == 0 {
+            return self.http3_idle_timeout;
+        }
+        let tunnel_idle = self.http3_connect_udp_idle_timeout_seconds;
+        std::cmp::max(self.http3_idle_timeout, tunnel_idle)
     }
 
     /// The xDS ADS admission budgets this configuration resolves to

@@ -474,9 +474,23 @@ fn build_h3_quinn_server_config(
 
     let mut transport_config = quinn::TransportConfig::default();
     transport_config.initial_mtu(h3_config.initial_mtu);
+    // The FRONTEND idle timeout, which the RFC 9298 CONNECT-UDP profile raises
+    // to at least its own tunnel idle bound when enabled: a tunnel carrying no
+    // datagram generates no QUIC activity either, so a smaller connection idle
+    // limit would close it before its configured idle window elapsed. The
+    // derivation only ever raises; it is logged so it is never a silent
+    // override of an operator's `FERRUM_HTTP3_IDLE_TIMEOUT`.
+    if h3_config.connect_udp_raised_frontend_idle_timeout() {
+        info!(
+            configured_idle_timeout_seconds = h3_config.idle_timeout.as_secs(),
+            effective_idle_timeout_seconds = h3_config.frontend_idle_timeout.as_secs(),
+            "HTTP/3 frontend QUIC idle timeout raised to the configured RFC 9298 CONNECT-UDP \
+             tunnel idle timeout; a shorter connection idle limit would close idle tunnels first"
+        );
+    }
     transport_config.max_idle_timeout(Some(
         h3_config
-            .idle_timeout
+            .frontend_idle_timeout
             .try_into()
             .map_err(|e| anyhow::anyhow!("Invalid idle timeout: {}", e))?,
     ));
@@ -1136,8 +1150,14 @@ async fn handle_h3_connection(
     // depth. SETTINGS_H3_DATAGRAM is deliberately left unnegotiated: the
     // CONNECT-UDP profile carries HTTP Datagrams as RFC 9297 DATAGRAM capsules
     // on the CONNECT stream (see `crate::http3::connect_udp`).
-    let extended_connect_enabled =
-        state.env_config.http3_websocket_enabled || state.env_config.http3_connect_udp_enabled;
+    //
+    // CONNECT-UDP counts as enabled only through
+    // `connect_udp_profile_available`, which also requires this build target to
+    // be able to enforce the RFC 9298 §3.1 non-fragmentation guarantee. A build
+    // that cannot must not advertise the capability it would then have to
+    // refuse.
+    let extended_connect_enabled = state.env_config.http3_websocket_enabled
+        || crate::http3::connect_udp::connect_udp_profile_available(&state.env_config);
     let mut h3_conn = h3::server::builder()
         .enable_extended_connect(extended_connect_enabled)
         .build(h3_quinn::Connection::new(connection))
@@ -1704,9 +1724,14 @@ async fn handle_h3_request(
     // The CONNECT-UDP profile is off by default: enabling UDP tunnelling
     // changes what a route can reach. Refuse before routing, plugins, or any
     // socket work, and name the profile so a client can tell "not implemented
-    // here" from "not a valid request".
-    if is_connect_udp_request && !state.env_config.http3_connect_udp_enabled {
-        warn!("Rejected HTTP/3 CONNECT-UDP request: profile disabled");
+    // here" from "not a valid request". The same 501 covers a build target that
+    // cannot enforce RFC 9298 §3.1 non-fragmentation: the profile is
+    // unavailable there, not degraded (startup already refuses the combination,
+    // so reaching this is defence in depth).
+    if is_connect_udp_request
+        && !crate::http3::connect_udp::connect_udp_profile_available(&state.env_config)
+    {
+        warn!("Rejected HTTP/3 CONNECT-UDP request: profile not available on this gateway");
         record_h3_flavor_aware_reject(&state, http_flavor, 501);
         send_h3_error_flavor_aware(
             &mut stream,

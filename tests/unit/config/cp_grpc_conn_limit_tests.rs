@@ -269,3 +269,138 @@ fn connect_udp_session_cap_of_zero_is_the_explicit_unlimited_opt_out() {
         .validate_h3_connect_udp_limits()
         .expect("0 disables the limit deliberately");
 }
+
+// ============================================================================
+// The advertised CONNECT-UDP idle posture must be the one that actually holds
+//
+// A CONNECT-UDP tunnel lives on a stream of ONE QUIC connection, and a tunnel
+// carrying no datagram generates no QUIC activity either. With the shipped
+// defaults the connection idle limit (30s) was well below the tunnel idle
+// bound (120s), so the gateway advertised a two-minute RFC 9298 §3.2 posture
+// while a different gateway-owned timer closed the connection at thirty
+// seconds. The frontend transport idle timeout is therefore derived, not read
+// raw — it may only ever be RAISED to the tunnel bound.
+// ============================================================================
+
+fn connect_udp_idle_config(
+    enabled: bool,
+    quic_idle_seconds: u64,
+    tunnel_idle_seconds: u64,
+) -> EnvConfig {
+    EnvConfig {
+        http3_connect_udp_enabled: enabled,
+        http3_idle_timeout: quic_idle_seconds,
+        http3_connect_udp_idle_timeout_seconds: tunnel_idle_seconds,
+        ..EnvConfig::default()
+    }
+}
+
+#[test]
+fn the_shipped_default_profile_cannot_be_closed_early_by_the_quic_idle_timer() {
+    let defaults = EnvConfig::default();
+    assert_eq!(defaults.http3_idle_timeout, 30);
+    assert_eq!(defaults.http3_connect_udp_idle_timeout_seconds, 120);
+    // Disabled: nothing is derived, the operator's QUIC idle timeout stands.
+    assert_eq!(
+        defaults.effective_http3_idle_timeout_seconds(),
+        30,
+        "with CONNECT-UDP off the QUIC idle timeout is untouched"
+    );
+
+    // Enabled with the shipped defaults: the connection must outlive the tunnel
+    // bound it advertises.
+    let enabled = connect_udp_idle_config(true, 30, 120);
+    assert_eq!(
+        enabled.effective_http3_idle_timeout_seconds(),
+        120,
+        "an idle tunnel must not be closed at 30s while 120s is advertised"
+    );
+    assert!(
+        enabled.effective_http3_idle_timeout_seconds()
+            >= enabled.http3_connect_udp_idle_timeout_seconds,
+        "the QUIC idle limit may never undercut the configured tunnel idle limit"
+    );
+}
+
+#[test]
+fn a_larger_operator_quic_idle_timeout_is_never_lowered_to_the_tunnel_bound() {
+    // The derivation only raises. An operator who wants long-lived QUIC
+    // connections keeps them.
+    let config = connect_udp_idle_config(true, 900, 120);
+    assert_eq!(config.effective_http3_idle_timeout_seconds(), 900);
+
+    // And a tunnel bound below the QUIC one needs no adjustment at all.
+    let config = connect_udp_idle_config(true, 300, 60);
+    assert_eq!(config.effective_http3_idle_timeout_seconds(), 300);
+}
+
+#[test]
+fn a_zero_quic_idle_timeout_keeps_meaning_disabled_rather_than_being_raised() {
+    // RFC 9000 §10.1: `max_idle_timeout = 0` DISABLES the idle timer. Raising
+    // it to the tunnel bound would SHORTEN the connection lifetime — the exact
+    // failure this derivation exists to prevent, in reverse.
+    let config = connect_udp_idle_config(true, 0, 120);
+    assert_eq!(
+        config.effective_http3_idle_timeout_seconds(),
+        0,
+        "0 disables the QUIC idle timer and already cannot undercut the tunnel"
+    );
+}
+
+#[test]
+fn the_frontend_transport_installs_the_derived_idle_timeout_and_backends_do_not() {
+    use std::time::Duration;
+
+    use ferrum_edge::http3::config::Http3ServerConfig;
+
+    let config = Http3ServerConfig::from_env_config(&connect_udp_idle_config(true, 30, 120));
+    assert_eq!(
+        config.frontend_idle_timeout,
+        Duration::from_secs(120),
+        "the QUIC listener installs the raised value"
+    );
+    assert_eq!(
+        config.idle_timeout,
+        Duration::from_secs(30),
+        "the configured value is preserved for the H3 BACKEND pools, which carry no tunnels"
+    );
+    assert!(
+        config.connect_udp_raised_frontend_idle_timeout(),
+        "the raise must be observable so the listener can log it instead of overriding silently"
+    );
+
+    // With the profile off the two are identical and nothing is logged.
+    let config = Http3ServerConfig::from_env_config(&connect_udp_idle_config(false, 30, 120));
+    assert_eq!(config.frontend_idle_timeout, config.idle_timeout);
+    assert!(!config.connect_udp_raised_frontend_idle_timeout());
+    assert!(!Http3ServerConfig::default().connect_udp_raised_frontend_idle_timeout());
+}
+
+// ============================================================================
+// RFC 9298 §3.1 non-fragmentation is a MUST, so it is a startup precondition
+// ============================================================================
+
+#[test]
+fn connect_udp_is_refused_at_startup_where_non_fragmentation_cannot_be_enforced() {
+    let enabled = EnvConfig {
+        http3_connect_udp_enabled: true,
+        ..EnvConfig::default()
+    };
+    let result = enabled.validate_h3_connect_udp_limits();
+    if ferrum_edge::http3::connect_udp::CONNECT_UDP_NON_FRAGMENTATION_ENFORCEABLE {
+        result.expect("a target with a do-not-fragment option may serve the profile");
+    } else {
+        let error = result.expect_err(
+            "RFC 9298 §3.1 is a MUST: a target that cannot set DF must refuse the profile, \
+             not serve it best effort",
+        );
+        assert!(
+            error.contains("FERRUM_HTTP3_CONNECT_UDP_ENABLED"),
+            "the error must name the offending variable: {error}"
+        );
+    }
+    // Leaving it off is always valid, on every target.
+    EnvConfig::default()
+        .validate_h3_connect_udp_limits()
+        .expect("the profile is off by default and must validate everywhere");
+}

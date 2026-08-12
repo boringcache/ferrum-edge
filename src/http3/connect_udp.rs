@@ -36,17 +36,25 @@
 //! * **Capsule Protocol signalling** — the 200 response carries
 //!   `Capsule-Protocol: ?1` (RFC 9297 §3.4). The field is written after
 //!   response-header policy so no plugin can remove or forge it.
-//! * **Unknown capsule types** — silently dropped and skipped (RFC 9297 §3.1),
-//!   subject to the same length ceiling as a DATAGRAM capsule.
+//! * **Unknown capsule types** — silently dropped and skipped (RFC 9297 §3.1).
+//!   The skip is a *streaming* one: an unknown capsule may legally declare any
+//!   length a QUIC varint can express, including lengths far above the
+//!   configured UDP payload ceiling, and RFC 9297 §3.1 does not permit
+//!   terminating the stream over one. The decoder therefore never allocates or
+//!   retains an unknown capsule's value — it counts the declared length down in
+//!   `u64` as bytes arrive and resumes exact parsing at the following capsule.
+//!   The configured ceiling still applies to DATAGRAM capsules, whose values
+//!   the gateway does materialize.
 //!
 //! # Bounds (all fail closed)
 //!
 //! | Bound | Source |
 //! |---|---|
 //! | Concurrent sessions | `FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS` |
-//! | Idle lifetime | `FERRUM_HTTP3_CONNECT_UDP_IDLE_TIMEOUT_SECONDS` |
+//! | Idle lifetime | `FERRUM_HTTP3_CONNECT_UDP_IDLE_TIMEOUT_SECONDS`, which also raises the frontend QUIC idle floor (see [`crate::http3::config::Http3ServerConfig::frontend_idle_timeout`]) |
 //! | Datagram payload | `FERRUM_HTTP3_CONNECT_UDP_MAX_DATAGRAM_BYTES`, itself capped by the RFC 9298 §5 ceiling of 65527 |
-//! | Capsule length | payload ceiling + [`CAPSULE_FRAMING_SLACK_BYTES`] |
+//! | DATAGRAM capsule length | payload ceiling + [`CAPSULE_FRAMING_SLACK_BYTES`] |
+//! | Unknown capsule length | unbounded on the wire, zero bytes retained (streaming skip) |
 //! | Buffered partial capsule | at most [`CapsuleDecoder::feed_limit`] × 2 (the decoder's documented hard ceiling), reachable when one chunk completes a partial capsule and opens the next |
 //! | Target | must be a configured upstream destination of the matched proxy |
 //!
@@ -133,6 +141,15 @@ const SUPERVISOR_TICK: Duration = Duration::from_secs(1);
 /// Grace given to the client-bound relay to flush and `finish()` the QUIC
 /// stream after the supervisor decides to close.
 const CLOSE_GRACE: Duration = Duration::from_secs(1);
+
+/// Consecutive "socket not ready" receive rounds tolerated before the tunnel
+/// socket is declared unusable.
+///
+/// Tokio's `UdpSocket::recv` resolves readiness internally, so a `WouldBlock`
+/// surfacing to the relay is already anomalous. Re-awaiting readability is the
+/// correct response; this bound is what guarantees the anomaly can never become
+/// an unbounded spin, and every non-`AwaitReadable` outcome resets it.
+const MAX_CONSECUTIVE_NOT_READY_RECVS: u32 = 64;
 
 // ---------------------------------------------------------------------------
 // Extended CONNECT classification
@@ -707,8 +724,12 @@ pub enum CapsuleEvent {
     /// A well-formed DATAGRAM capsule naming an unregistered context. RFC 9298
     /// §4 says to drop it; the caller counts it and does not proxy it.
     UnregisteredContext(u64),
-    /// A well-formed capsule of a type this endpoint does not implement.
-    /// RFC 9297 §3.1 requires silently dropping and skipping it.
+    /// The header of a capsule whose type this endpoint does not implement.
+    /// RFC 9297 §3.1 requires silently dropping and skipping it, whatever its
+    /// declared length. Reported when the HEADER is consumed: the value is then
+    /// skipped as it arrives, without ever being buffered, so an unknown
+    /// capsule larger than the whole configured UDP ceiling costs nothing and
+    /// does not terminate the stream.
     UnknownCapsuleType(u64),
 }
 
@@ -716,7 +737,10 @@ pub enum CapsuleEvent {
 /// recoverable, because a length-framed stream cannot be resynchronized.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapsuleDecodeError {
-    /// A capsule declared a length above the configured ceiling.
+    /// A **DATAGRAM** capsule declared a length above the configured ceiling.
+    /// Only capsule types this endpoint materializes are bounded this way;
+    /// RFC 9297 §3.1 forbids terminating the stream over the length of a
+    /// capsule type that is merely skipped.
     CapsuleTooLarge,
     /// A DATAGRAM capsule whose value is too short to hold a Context ID.
     DatagramCapsuleTruncated,
@@ -754,6 +778,13 @@ pub struct CapsuleDecoder {
     buf: BytesMut,
     max_capsule_value: usize,
     max_udp_payload: usize,
+    /// Bytes of the CURRENT unknown-type capsule's value still to be discarded.
+    ///
+    /// Held as `u64` — the QUIC varint's own range — because an unknown capsule
+    /// may legally declare a length no `usize` allocation could ever satisfy.
+    /// It is a counter, never a length: nothing is reserved, allocated, or
+    /// retained for it, so a hostile declared length costs memory nowhere.
+    skip_remaining: u64,
 }
 
 impl CapsuleDecoder {
@@ -763,6 +794,7 @@ impl CapsuleDecoder {
             buf: BytesMut::with_capacity(max_capsule_value.min(16 * 1024)),
             max_capsule_value,
             max_udp_payload,
+            skip_remaining: 0,
         }
     }
 
@@ -795,8 +827,11 @@ impl CapsuleDecoder {
     /// Bytes of a partially received capsule still held after the caller has
     /// drained [`Self::decode_next`] to exhaustion.
     ///
-    /// Only ever nonzero mid-capsule, so it is exactly the RFC 9297 §3.3
-    /// "stream closed in the middle of a capsule" predicate.
+    /// This is the RETAINED byte count, which is what bounds the decoder's
+    /// memory: an unknown capsule mid-skip retains nothing, so it reads `0`
+    /// however large the capsule is. Use [`Self::is_mid_capsule`] for the RFC
+    /// 9297 §3.3 "closed in the middle of a capsule" predicate, which a skip in
+    /// progress also satisfies.
     ///
     /// `#[allow(dead_code)]` because the binary target compiles this module
     /// tree separately from the library and only the external test crates read
@@ -807,23 +842,62 @@ impl CapsuleDecoder {
         self.buf.len()
     }
 
+    /// Whether the capsule stream is currently positioned inside a capsule —
+    /// either a partially buffered one or an unknown one still being skipped.
+    ///
+    /// This, not [`Self::buffered_len`], is the RFC 9297 §3.3 "stream closed in
+    /// the middle of a capsule" predicate: a skip in progress retains no bytes
+    /// but is still mid-capsule.
+    pub fn is_mid_capsule(&self) -> bool {
+        !self.buf.is_empty() || self.skip_remaining > 0
+    }
+
     /// Classify the end of the client's send direction.
     ///
-    /// A FIN with nothing buffered is an ordinary, clean close of the capsule
-    /// stream (RFC 9298 §3.1 ends the tunnel with the stream). A FIN with a
-    /// partial capsule still buffered is a malformed message, NOT an EOF, and
-    /// the caller must terminate the request stream with an error rather than
-    /// finishing the response cleanly.
+    /// A FIN with nothing buffered and no skip outstanding is an ordinary,
+    /// clean close of the capsule stream (RFC 9298 §3.1 ends the tunnel with
+    /// the stream). A FIN inside a capsule — including inside the value of an
+    /// unknown capsule the decoder is skipping — is a malformed message, NOT an
+    /// EOF, and the caller must terminate the request stream with an error
+    /// rather than finishing the response cleanly.
     pub fn finish_stream(&self) -> Result<(), CapsuleDecodeError> {
-        if self.buf.is_empty() {
-            Ok(())
-        } else {
+        if self.is_mid_capsule() {
             Err(CapsuleDecodeError::TruncatedAtStreamEnd)
+        } else {
+            Ok(())
         }
     }
 
+    /// Discard as much of an in-progress unknown-capsule value as is buffered.
+    ///
+    /// Returns `true` once the skip is complete and parsing may resume at the
+    /// next capsule header. The take is `min`-ed against the buffer length, so
+    /// the `usize` cast can never truncate or overflow however large the
+    /// declared length is.
+    fn advance_skip(&mut self) -> bool {
+        if self.skip_remaining == 0 {
+            return true;
+        }
+        let take = self.skip_remaining.min(self.buf.len() as u64) as usize;
+        self.buf.advance(take);
+        self.skip_remaining -= take as u64;
+        self.skip_remaining == 0
+    }
+
     /// Pop the next complete capsule, or `None` when more bytes are needed.
+    ///
+    /// An unknown capsule type yields exactly one
+    /// [`CapsuleEvent::UnknownCapsuleType`] when its header is consumed; its
+    /// value is then skipped as it arrives across any number of calls, and the
+    /// capsule that follows decodes exactly. That is RFC 9297 §3.1's "silently
+    /// drop and skip", and it is why the DATAGRAM ceiling below is applied only
+    /// to the DATAGRAM type: refusing a large unknown capsule would reset a
+    /// CONNECT stream that a compliant peer is entitled to use.
     pub fn decode_next(&mut self) -> Result<Option<CapsuleEvent>, CapsuleDecodeError> {
+        if !self.advance_skip() {
+            // Still inside the unknown capsule's value; nothing is retained.
+            return Ok(None);
+        }
         let mut cursor = 0usize;
         let Some(capsule_type) = read_varint(&self.buf, &mut cursor) else {
             return Ok(None);
@@ -831,6 +905,17 @@ impl CapsuleDecoder {
         let Some(length) = read_varint(&self.buf, &mut cursor) else {
             return Ok(None);
         };
+
+        if capsule_type != CAPSULE_TYPE_DATAGRAM {
+            // RFC 9297 §3.1. Consume the header, then start (and immediately
+            // advance) a streaming skip of the value. No allocation, no
+            // ceiling, no `usize` conversion of the declared length.
+            self.buf.advance(cursor);
+            self.skip_remaining = length;
+            self.advance_skip();
+            return Ok(Some(CapsuleEvent::UnknownCapsuleType(capsule_type)));
+        }
+
         if length > self.max_capsule_value as u64 {
             return Err(CapsuleDecodeError::CapsuleTooLarge);
         }
@@ -842,10 +927,6 @@ impl CapsuleDecoder {
         // The capsule is complete: consume the header, then the value.
         self.buf.advance(cursor);
         let mut value = self.buf.split_to(length);
-
-        if capsule_type != CAPSULE_TYPE_DATAGRAM {
-            return Ok(Some(CapsuleEvent::UnknownCapsuleType(capsule_type)));
-        }
 
         let mut value_cursor = 0usize;
         let Some(context_id) = read_varint(&value, &mut value_cursor) else {
@@ -909,46 +990,150 @@ impl UdpSendFault {
     }
 }
 
-/// Whether an `io::Error` from a connected UDP `send` is per-datagram loss
-/// rather than a dead socket.
+/// Whether an `io::Error` on a CONNECTED tunnel socket describes per-datagram
+/// loss rather than a socket that has stopped working.
 ///
-/// `EMSGSIZE` (and its Windows spelling `WSAEMSGSIZE`) is called out
-/// explicitly: with the do-not-fragment policy installed by
+/// This is the ONE shared judgement behind both direction classifiers, so the
+/// two can never disagree about what an ICMP-derived condition means. On a
+/// connected UDP socket the kernel reports ICMP errors — port unreachable
+/// (`ECONNREFUSED`), protocol unreachable (`ENOPROTOOPT` on Linux), host and
+/// network unreachable, network/host down — to the application, and it does so
+/// on whichever syscall happens to run next: `send` OR `recv`. None of them
+/// says the socket is unusable; they say one earlier datagram did not arrive,
+/// which is ordinary UDP loss.
+///
+/// `EMSGSIZE` (and its Windows spelling `WSAEMSGSIZE`) is included for the same
+/// reason from the other side: with the do-not-fragment policy installed by
 /// [`bind_tunnel_socket`], an over-MTU datagram is *supposed* to fail this way,
 /// and treating it as a dead socket would let one oversized payload kill a
 /// healthy tunnel.
-pub fn classify_udp_send_error(error: &std::io::Error) -> UdpSendFault {
+fn is_transient_udp_datagram_error(error: &std::io::Error) -> bool {
     #[cfg(unix)]
-    if let Some(code) = error.raw_os_error()
-        && matches!(
+    if let Some(code) = error.raw_os_error() {
+        return matches!(
             code,
             libc::EMSGSIZE
                 | libc::EAGAIN
                 | libc::ENOBUFS
                 | libc::EINTR
                 | libc::ECONNREFUSED
+                | libc::ECONNRESET
                 | libc::EHOSTUNREACH
                 | libc::ENETUNREACH
                 | libc::ENETDOWN
                 | libc::EHOSTDOWN
-        )
-    {
-        return UdpSendFault::DropDatagram;
+                | libc::ENOPROTOOPT
+        );
     }
-    // `WSAEMSGSIZE`. Windows links no `libc` here, so the code is spelled out.
+    // Windows links no `libc` here, so the Winsock codes are spelled out:
+    // `WSAEINTR`, `WSAEWOULDBLOCK`, `WSAEMSGSIZE`, `WSAENETDOWN`,
+    // `WSAENETUNREACH`, `WSAENETRESET`, `WSAECONNRESET` (the Windows spelling
+    // of an ICMP port-unreachable on a connected datagram socket), `WSAENOBUFS`
+    // and `WSAEHOSTUNREACH`.
     #[cfg(windows)]
-    if error.raw_os_error() == Some(10040) {
-        return UdpSendFault::DropDatagram;
+    if let Some(code) = error.raw_os_error() {
+        return matches!(
+            code,
+            10004 | 10035 | 10040 | 10050 | 10051 | 10052 | 10054 | 10055 | 10065
+        );
     }
-    match error.kind() {
+    matches!(
+        error.kind(),
         std::io::ErrorKind::WouldBlock
-        | std::io::ErrorKind::Interrupted
-        | std::io::ErrorKind::ConnectionRefused
-        | std::io::ErrorKind::HostUnreachable
-        | std::io::ErrorKind::NetworkUnreachable
-        | std::io::ErrorKind::NetworkDown => UdpSendFault::DropDatagram,
-        _ => UdpSendFault::Terminal,
+            | std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::HostUnreachable
+            | std::io::ErrorKind::NetworkUnreachable
+            | std::io::ErrorKind::NetworkDown
+    )
+}
+
+/// Whether an `io::Error` from a connected UDP `send` is per-datagram loss
+/// rather than a dead socket. See [`is_transient_udp_datagram_error`].
+pub fn classify_udp_send_error(error: &std::io::Error) -> UdpSendFault {
+    if is_transient_udp_datagram_error(error) {
+        UdpSendFault::DropDatagram
+    } else {
+        UdpSendFault::Terminal
     }
+}
+
+/// What a `UdpSocket::recv` failure means for the tunnel.
+///
+/// The receive side needs its own arm set because it has one outcome the send
+/// side does not: a socket that reports "not ready" must go back to awaiting
+/// readiness, never retry immediately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UdpRecvFault {
+    /// A datagram was lost, or an ICMP error for an EARLIER datagram surfaced
+    /// on this `recv`. On a connected UDP socket both are ordinary,
+    /// per-datagram conditions — the socket is still usable, and tearing the
+    /// tunnel down would turn one unreachable probe into a session reset.
+    DropDatagram,
+    /// The socket said it is not ready. Tokio's `UdpSocket::recv` resolves
+    /// readiness internally and does not normally surface this, so it is
+    /// handled defensively: the relay awaits readability again rather than
+    /// spinning on the syscall.
+    AwaitReadable,
+    /// The socket itself is unusable, so the tunnel cannot be honoured.
+    Terminal,
+}
+
+impl UdpRecvFault {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DropDatagram => "datagram_dropped",
+            Self::AwaitReadable => "socket_not_ready",
+            Self::Terminal => "socket_unusable",
+        }
+    }
+}
+
+/// Whether an `io::Error` from a connected UDP `recv` means the tunnel socket
+/// is unusable, or merely that one datagram was lost.
+///
+/// The target-to-client direction used to treat EVERY `recv` error as a dead
+/// socket, which reset a live tunnel the first time the target's host replied
+/// with an ICMP port-unreachable — exactly the condition the send-side
+/// classifier has always treated as per-datagram loss. Both directions now read
+/// the same [`is_transient_udp_datagram_error`] judgement.
+pub fn classify_udp_recv_error(error: &std::io::Error) -> UdpRecvFault {
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        return UdpRecvFault::AwaitReadable;
+    }
+    #[cfg(unix)]
+    if matches!(error.raw_os_error(), Some(libc::EAGAIN)) {
+        return UdpRecvFault::AwaitReadable;
+    }
+    if is_transient_udp_datagram_error(error) {
+        UdpRecvFault::DropDatagram
+    } else {
+        UdpRecvFault::Terminal
+    }
+}
+
+/// Whether this build target can enforce the RFC 9298 §3.1 non-fragmentation
+/// requirement on a tunnel socket.
+///
+/// The RFC states the proxy "MUST NOT introduce IP fragmentation", so a target
+/// with no usable do-not-fragment option cannot serve the profile at all — it
+/// is refused rather than served best effort. See
+/// [`crate::socket_opts::UDP_DONT_FRAGMENT_SUPPORTED`].
+pub const CONNECT_UDP_NON_FRAGMENTATION_ENFORCEABLE: bool =
+    crate::socket_opts::UDP_DONT_FRAGMENT_SUPPORTED;
+
+/// Whether the RFC 9298 profile may be offered at all: the operator enabled it
+/// AND this build target can honour RFC 9298 §3.1.
+///
+/// This is the ONE predicate the listener's `SETTINGS_ENABLE_CONNECT_PROTOCOL`
+/// advertisement, the dispatcher's 501 gate, and the handler's defence-in-depth
+/// check all read, so the profile can never be advertised on a target that
+/// would then have to fragment to serve it. Startup refuses the combination
+/// outright (`EnvConfig::validate_h3_connect_udp_limits`); this keeps every
+/// runtime surface fail-closed even if that validation is bypassed.
+pub fn connect_udp_profile_available(env_config: &crate::config::EnvConfig) -> bool {
+    env_config.http3_connect_udp_enabled && CONNECT_UDP_NON_FRAGMENTATION_ENFORCEABLE
 }
 
 #[cfg(unix)]
@@ -959,7 +1144,13 @@ fn apply_dont_fragment(socket: &socket2::Socket, is_ipv4: bool) -> std::io::Resu
 
 #[cfg(not(unix))]
 fn apply_dont_fragment(_socket: &socket2::Socket, _is_ipv4: bool) -> std::io::Result<()> {
-    Ok(())
+    // No Winsock binding is linked, so the option cannot be installed and the
+    // tunnel must not be opened. The profile is already refused at startup and
+    // at admission; this is the last fail-closed barrier.
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        crate::socket_opts::UDP_DONT_FRAGMENT_UNSUPPORTED_MESSAGE,
+    ))
 }
 
 /// Build the tunnel's UDP socket with IP fragmentation disabled.
@@ -969,17 +1160,14 @@ fn apply_dont_fragment(_socket: &socket2::Socket, _is_ipv4: bool) -> std::io::Re
 /// through `socket2` so the platform option can be installed *before* the
 /// socket is handed to Tokio and before a single datagram can be sent:
 ///
-/// * Linux — `IP_MTU_DISCOVER` / `IPV6_MTU_DISCOVER` = `PMTUDISC_DO`, which
-///   sets DF and turns an over-MTU send into `EMSGSIZE`
+/// * Linux/Android — `IP_MTU_DISCOVER` / `IPV6_MTU_DISCOVER` = `PMTUDISC_DO`,
+///   which sets DF and turns an over-MTU send into `EMSGSIZE`
 ///   ([`classify_udp_send_error`] keeps that per-datagram).
-/// * Apple/BSD — `IP_DONTFRAG` / `IPV6_DONTFRAG`.
-/// * Everywhere else (notably Windows, where Ferrum links no Winsock binding) —
-///   [`crate::socket_opts::UDP_DONT_FRAGMENT_SUPPORTED`] is `false` and this is
-///   documented best effort: the socket is created without the option and the
-///   caller logs that the guarantee is unavailable.
+/// * Apple — `IP_DONTFRAG` / `IPV6_DONTFRAG`.
 ///
-/// On a platform that *does* expose the option, a `setsockopt` failure is
-/// fatal: the tunnel is refused rather than opened without the guarantee.
+/// There is no third arm. A `setsockopt` failure — including the
+/// `ErrorKind::Unsupported` a target with no such option reports — refuses the
+/// tunnel rather than opening one the gateway would have to fragment through.
 fn bind_tunnel_socket(bind_addr: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
     let is_ipv4 = bind_addr.is_ipv4();
     let domain = if is_ipv4 {
@@ -1009,10 +1197,13 @@ fn bind_tunnel_socket(bind_addr: SocketAddr) -> std::io::Result<std::net::UdpSoc
 pub enum SessionEnd {
     /// The client ended the tunnel, or its receive side went away.
     ClientClosed,
-    /// The client-bound relay task produced no outcome of its own — it was
-    /// cancelled or it panicked, so the supervisor labels the join failure.
-    /// Every outcome that task decides for itself is one of the other arms.
-    TargetRelayEnded,
+    /// A relay task produced no outcome of its own: it panicked, or it was
+    /// cancelled by something other than this session's own teardown. Both are
+    /// internal failures of the gateway, NOT a client FIN and not a completed
+    /// tunnel, so they reset the stream. Every outcome a relay decides for
+    /// itself is one of the other arms, and the supervisor only ever observes a
+    /// join failure on a handle it has not aborted.
+    RelayTaskFailed,
     /// The connected tunnel socket is unusable in either direction.
     TargetSocketUnusable,
     /// No datagram crossed the tunnel within the configured idle window.
@@ -1037,7 +1228,7 @@ impl SessionEnd {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ClientClosed => "client_closed",
-            Self::TargetRelayEnded => "target_relay_ended",
+            Self::RelayTaskFailed => "relay_task_failed",
             Self::TargetSocketUnusable => "target_socket_unusable",
             Self::Idle => "idle_timeout",
             Self::Draining => "gateway_draining",
@@ -1061,14 +1252,71 @@ impl SessionEnd {
             Self::CapsuleProtocolError => StreamCloseKind::MessageError,
             // The tunnel was established and then could not be honoured. A
             // clean FIN would tell the client the session ended normally.
-            Self::TargetSocketUnusable => StreamCloseKind::InternalError,
+            //
+            // A relay that failed to join is the same class of failure: the
+            // gateway does not know how much of the tunnel it carried, so it
+            // may not claim an orderly end of the capsule stream.
+            Self::TargetSocketUnusable | Self::RelayTaskFailed => StreamCloseKind::InternalError,
             Self::ClientClosed
-            | Self::TargetRelayEnded
             | Self::Idle
             | Self::Draining
             | Self::RouteWithdrawn
             | Self::RouteTargetPinChanged
             | Self::RouteAuthorizationUnreconstructable => StreamCloseKind::Clean,
+        }
+    }
+}
+
+/// Which relay a supervisor observation is about. Fixed literals: they reach
+/// logs, never a client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayDirection {
+    /// The capsule-decoding relay reading the CONNECT stream.
+    ClientToTarget,
+    /// The datagram-framing relay writing the CONNECT stream.
+    TargetToClient,
+}
+
+impl RelayDirection {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ClientToTarget => "client_to_target",
+            Self::TargetToClient => "target_to_client",
+        }
+    }
+}
+
+/// Classify the supervisor's observation of a relay `JoinHandle` that it has
+/// NOT aborted.
+///
+/// A relay that ran to completion decided its own [`SessionEnd`]; that verdict
+/// is taken verbatim. A join FAILURE at this point is a panic, or a
+/// cancellation this session did not request — neither is a lifecycle outcome,
+/// and neither may be reported as the client having closed the tunnel. Both
+/// become [`SessionEnd::RelayTaskFailed`], which resets the stream with
+/// `H3_INTERNAL_ERROR`.
+///
+/// The `JoinError` is inspected but never resumed: re-raising a relay's panic
+/// inside the supervisor would take the session permit and connection guard
+/// down with it instead of releasing them.
+pub fn classify_relay_join(
+    joined: Result<SessionEnd, tokio::task::JoinError>,
+    relay: RelayDirection,
+    proxy_id: &str,
+) -> SessionEnd {
+    match joined {
+        Ok(end) => end,
+        Err(error) => {
+            warn!(
+                proxy_id = %proxy_id,
+                relay = relay.as_str(),
+                panicked = error.is_panic(),
+                cancelled = error.is_cancelled(),
+                reason = SessionEnd::RelayTaskFailed.as_str(),
+                "H3 CONNECT-UDP relay task failed to join; the tunnel is torn down as an \
+                 internal failure rather than presented as a completed session"
+            );
+            SessionEnd::RelayTaskFailed
         }
     }
 }
@@ -1172,8 +1420,11 @@ pub(crate) async fn handle_h3_connect_udp(
         cb_is_half_open_probe,
     );
 
-    // Defense in depth: the dispatcher already gated this.
-    if !state.env_config.http3_connect_udp_enabled {
+    // Defense in depth: the dispatcher already gated this. The predicate covers
+    // both halves of availability — the operator's switch and this target's
+    // ability to honour RFC 9298 §3.1 — so a build that cannot guarantee
+    // non-fragmentation refuses the tunnel here even if it were somehow reached.
+    if !connect_udp_profile_available(&state.env_config) {
         return reject(
             &mut stream,
             &state,
@@ -1449,13 +1700,8 @@ pub(crate) async fn handle_h3_connect_udp(
         IpAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
         IpAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
     };
-    if !crate::socket_opts::UDP_DONT_FRAGMENT_SUPPORTED {
-        debug!(
-            proxy_id = %proxy.id,
-            "HTTP/3 CONNECT-UDP: this target exposes no do-not-fragment socket option; \
-             RFC 9298 §3.1 non-fragmentation is best effort here"
-        );
-    }
+    // No best-effort branch: `bind_tunnel_socket` installs the do-not-fragment
+    // option or fails, and this refusal is what that failure produces.
     let socket = match bind_tunnel_socket(bind_addr).and_then(UdpSocket::from_std) {
         Ok(socket) => socket,
         Err(error) => {
@@ -1590,6 +1836,17 @@ pub(crate) async fn handle_h3_connect_udp(
     // relays are gone and the socket is dropped.
     drop(session_permit);
     drop(session_guard);
+
+    // An internal relay failure is not a completed tunnel. The stream was
+    // already reset rather than FINed (`SessionEnd::close_kind`), and the
+    // request is additionally reported as an error so it is visible in the H3
+    // request-error path instead of being indistinguishable from a clean close.
+    if end == SessionEnd::RelayTaskFailed {
+        return Err(anyhow::anyhow!(
+            "H3 CONNECT-UDP relay task failed: {}",
+            end.as_str()
+        ));
+    }
     Ok(())
 }
 
@@ -1760,6 +2017,10 @@ async fn relay(
         // So a self-decided outcome classifies itself below, through the same
         // `SessionEnd::close_kind` mapping the supervisor's verdict comes from.
         let mut supervisor_close_kind: Option<StreamCloseKind> = None;
+        // Consecutive `recv` rounds that reported "not ready" without any
+        // datagram in between. Reset by every other outcome, so only an
+        // unbroken run can reach the bound.
+        let mut not_ready_rounds: u32 = 0;
         let end = loop {
             let received = tokio::select! {
                 biased;
@@ -1771,6 +2032,7 @@ async fn relay(
             };
             match received {
                 Ok(len) if len > max_payload => {
+                    not_ready_rounds = 0;
                     // RFC 9298 §3.1: oversized datagrams are silently dropped
                     // rather than fragmented or truncated.
                     debug!(
@@ -1779,6 +2041,7 @@ async fn relay(
                     );
                 }
                 Ok(len) => {
+                    not_ready_rounds = 0;
                     from_target_activity.store(
                         session_start.elapsed().as_millis() as u64,
                         Ordering::Relaxed,
@@ -1792,20 +2055,60 @@ async fn relay(
                         break SessionEnd::ClientClosed;
                     }
                 }
-                Err(error) => {
-                    // The tunnel's own connected socket failed. That is an
+                Err(error) => match classify_udp_recv_error(&error) {
+                    // An ICMP-derived or otherwise transient condition for one
+                    // datagram. On a CONNECTED socket the kernel surfaces these
+                    // on whichever syscall runs next, so the same conditions the
+                    // send side drops arrive here too; the socket is still
+                    // usable and the tunnel keeps running.
+                    UdpRecvFault::DropDatagram => {
+                        not_ready_rounds = 0;
+                        debug!(
+                            proxy_id = %from_target_proxy_id,
+                            fault = UdpRecvFault::DropDatagram.as_str(),
+                            "H3 CONNECT-UDP target relay: datagram lost: {error}"
+                        );
+                    }
+                    // Tokio's readiness machinery resolves `WouldBlock`
+                    // internally, so reaching this is already anomalous.
+                    // Awaiting readability again is the correct response and is
+                    // a real suspension point; the bounded counter turns a
+                    // pathological always-ready/never-readable socket into a
+                    // terminated tunnel instead of a spin.
+                    UdpRecvFault::AwaitReadable => {
+                        not_ready_rounds += 1;
+                        if not_ready_rounds > MAX_CONSECUTIVE_NOT_READY_RECVS {
+                            warn!(
+                                proxy_id = %from_target_proxy_id,
+                                reason = SessionEnd::TargetSocketUnusable.as_str(),
+                                "H3 CONNECT-UDP target relay: tunnel socket never became \
+                                 readable"
+                            );
+                            break SessionEnd::TargetSocketUnusable;
+                        }
+                        // Bounded by one supervisor tick so this defensive wait
+                        // always returns to the `select!` above, where a
+                        // supervisor close verdict is still observable. A
+                        // readiness error is not classified here: the next
+                        // `recv` reports it through the same classifier.
+                        let ready = from_target_socket.readable();
+                        let _ = tokio::time::timeout(SUPERVISOR_TICK, ready).await;
+                    }
+                    // The tunnel's own connected socket is unusable. That is an
                     // internal failure of the tunnel exactly as a terminal
                     // client-to-target `send` fault is (`UdpSendFault::Terminal`
                     // on the other relay), not an ordinary end of session: the
                     // gateway can no longer deliver target traffic, so it must
                     // not present the client a clean end of the capsule stream.
-                    warn!(
-                        proxy_id = %from_target_proxy_id,
-                        reason = SessionEnd::TargetSocketUnusable.as_str(),
-                        "H3 CONNECT-UDP target relay: tunnel socket is unusable: {error}"
-                    );
-                    break SessionEnd::TargetSocketUnusable;
-                }
+                    UdpRecvFault::Terminal => {
+                        warn!(
+                            proxy_id = %from_target_proxy_id,
+                            reason = SessionEnd::TargetSocketUnusable.as_str(),
+                            "H3 CONNECT-UDP target relay: tunnel socket is unusable: {error}"
+                        );
+                        break SessionEnd::TargetSocketUnusable;
+                    }
+                },
             }
         };
         // A supervisor verdict applies only to the outcome the supervisor
@@ -1855,13 +2158,16 @@ async fn relay(
     let mut from_target_finished = false;
     let end = loop {
         tokio::select! {
+            // Neither handle has been aborted yet — teardown below is the only
+            // place that does — so a join failure here is a panic or an
+            // unrequested cancellation, never this session's own cancellation.
             joined = &mut to_target => {
                 to_target_finished = true;
-                break joined.unwrap_or(SessionEnd::ClientClosed);
+                break classify_relay_join(joined, RelayDirection::ClientToTarget, &proxy.id);
             }
             joined = &mut from_target => {
                 from_target_finished = true;
-                break joined.unwrap_or(SessionEnd::TargetRelayEnded);
+                break classify_relay_join(joined, RelayDirection::TargetToClient, &proxy.id);
             }
             // Race-free: the token retains cancellation, so a drain that began
             // before this branch was polled is still delivered.
@@ -1944,30 +2250,74 @@ async fn relay(
         to_target.abort();
     }
     let _ = close_tx.send(end.close_kind());
-    if !from_target_finished
-        && tokio::time::timeout(CLOSE_GRACE, &mut from_target)
-            .await
-            .is_err()
-    {
-        // Still running after the flush grace. Abort, then join: an aborted
-        // handle resolves as `Err(JoinError::cancelled)` only once the task has
-        // actually stopped, which is what proves the send half is released.
-        // A `JoinHandle` must never be polled after it has completed, so this
-        // second wait is reached only on the timed-out branch.
-        from_target.abort();
-        // Await the cancellation acknowledgement itself. A second timeout
-        // would be allowed to drop this handle and detach the task, releasing
-        // the session permit while it could still own the QUIC send half and
-        // socket clone.
-        let _ = from_target.await;
+    // A relay that PANICS during teardown is not the cancellation this session
+    // requested: the client-bound task's panic drops the QUIC send half mid
+    // unwind, so the client observes a reset rather than the close this
+    // function decided. Reporting `end` unchanged would describe a clean
+    // lifecycle outcome the client never saw, so the outcome is downgraded to
+    // the internal failure it is.
+    let mut teardown_panicked = false;
+    if !from_target_finished {
+        let graceful = tokio::time::timeout(CLOSE_GRACE, &mut from_target).await;
+        let joined = match graceful {
+            Ok(joined) => joined,
+            Err(_) => {
+                // Still running after the flush grace. Abort, then join: an
+                // aborted handle resolves as `Err(JoinError::cancelled)` only
+                // once the task has actually stopped, which is what proves the
+                // send half is released. A `JoinHandle` must never be polled
+                // after it has completed, so this second wait is reached only
+                // on the timed-out branch.
+                //
+                // Awaiting the cancellation acknowledgement itself matters: a
+                // second timeout would be allowed to drop this handle and
+                // detach the task, releasing the session permit while it could
+                // still own the QUIC send half and socket clone. A `cancelled`
+                // join is exactly what was requested and is not a failure.
+                from_target.abort();
+                from_target.await
+            }
+        };
+        teardown_panicked = join_panicked(joined, RelayDirection::TargetToClient, &proxy.id);
     }
     if !to_target_finished {
         // Aborted above and never polled to completion, so joining it here is
         // both safe and the point at which the receive half and the socket
-        // clone are provably gone.
-        let _ = to_target.await;
+        // clone are provably gone. This relay owns no send half, so its panic
+        // does not change what the client saw — it is logged, not promoted.
+        join_panicked(to_target.await, RelayDirection::ClientToTarget, &proxy.id);
     }
-    end
+    if teardown_panicked {
+        SessionEnd::RelayTaskFailed
+    } else {
+        end
+    }
+}
+
+/// Log a teardown join and report whether the task PANICKED.
+///
+/// A `cancelled` join is the acknowledgement of this session's own `abort()`
+/// and is the expected outcome; only a panic is an internal failure. The
+/// `JoinError` is never resumed — re-raising a relay's panic in the supervisor
+/// would take the session permit and connection guard down with it.
+fn join_panicked(
+    joined: Result<SessionEnd, tokio::task::JoinError>,
+    relay: RelayDirection,
+    proxy_id: &str,
+) -> bool {
+    match joined {
+        Ok(_) => false,
+        Err(error) if error.is_panic() => {
+            warn!(
+                proxy_id = %proxy_id,
+                relay = relay.as_str(),
+                reason = SessionEnd::RelayTaskFailed.as_str(),
+                "H3 CONNECT-UDP relay task panicked during teardown"
+            );
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 /// `Proxy-Status` (RFC 9209) with a fixed error type. No target identity, DNS
