@@ -10,6 +10,7 @@ use ferrum_edge::proxy::udp_placement_migration::{
     UdpNodeIdentity, UdpPlacement, UdpPlacementDecision, UdpPlacementRequest, UdpRegistrySyncProof,
     clear_registry_sync_marker, node_cleanup_proof_is_current, prepare_placement,
     publish_node_identity_for, publish_registry_sync_marker_for_pods,
+    resolve_authoritative_node_identity_reading_boot_id,
     resolve_authoritative_node_identity_with_boot_id, retract_node_cleanup_proof,
     retract_node_identity, validate_node_proof_generation,
 };
@@ -1959,9 +1960,10 @@ async fn a_same_boot_node_object_recreation_cannot_hand_over_its_identity_or_pro
         "the proven identity replaces the predecessor's publication"
     );
 
-    // The predecessor's proof is not current for this node, so the preflight
-    // performs a real retirement instead of short-circuiting on it, and the
-    // steady-state guard refuses it outright.
+    // The predecessor's proof is not current for this node. The preflight
+    // retracts leftover proof on every invocation rather than treating a
+    // matching token as authority, and the steady-state guard refuses this
+    // one outright.
     assert_eq!(
         node_cleanup_proof_is_current(
             registry.path(),
@@ -2079,6 +2081,95 @@ async fn every_failed_lookup_or_publication_path_leaves_no_published_identity() 
             "{label}: the publication file itself must be gone"
         );
     }
+}
+
+#[tokio::test]
+async fn an_unreadable_boot_id_retracts_stale_identity_before_failing() {
+    // The public authoritative resolver must retract BEFORE it reads the boot
+    // id. If `/proc` (or the override path) is unreadable, a predecessor
+    // publication must not survive: that file records the CURRENT boot id even
+    // when a PREVIOUS Kubernetes Node object wrote it.
+    let registry = tempfile::tempdir().expect("registry");
+    publish_node_identity_for(registry.path(), &identity(NODE_B, BOOT_1))
+        .expect("predecessor publication");
+    let identity_path = registry.path().join(".node-identity-v1.json");
+    assert!(identity_path.exists(), "stale identity must be seeded");
+    let identity_path_at_boot_id_read = identity_path.clone();
+
+    let error = resolve_authoritative_node_identity_reading_boot_id(
+        registry.path(),
+        None,
+        Some("some-node"),
+        |_| async { panic!("boot-id failure must not consult Kubernetes") },
+        move || {
+            assert!(
+                !identity_path_at_boot_id_read.exists(),
+                "the boot id must be read only after the publication is retracted"
+            );
+            None
+        },
+    )
+    .await
+    .err()
+    .expect("an unreadable boot id must fail closed");
+    assert!(error.contains("boot id"), "{error}");
+    assert_eq!(
+        published_identity(registry.path()),
+        None,
+        "an unreadable boot id must leave NO published identity"
+    );
+    assert!(
+        !identity_path.exists(),
+        "the publication file itself must be gone"
+    );
+}
+
+#[test]
+fn a_current_cleanup_proof_is_not_a_substitute_for_a_fresh_preflight_retirement() {
+    // A leftover proof matching this node/era must not authorize a newly
+    // starting preflight pod. Retract it: Helm rollback, a re-applied
+    // historical manifest, or a restored ConfigMap can recreate the token a
+    // monotonic counter cannot disprove. The CLI always retracts before the
+    // idempotent cleanup republishes.
+    let registry = tempfile::tempdir().expect("registry");
+    let node = identity(NODE_A, BOOT_1);
+    write_node_attestation(
+        registry.path(),
+        ".udp-node-cleanup-proof-v1.json",
+        &node,
+        UdpPlacement::HostNetns,
+        PROOF_GENERATION,
+    );
+    assert_eq!(
+        node_cleanup_proof_is_current(
+            registry.path(),
+            UdpPlacement::HostNetns,
+            &node,
+            PROOF_GENERATION,
+        ),
+        Ok(true)
+    );
+
+    retract_node_cleanup_proof(registry.path()).expect("preflight retracts leftover proof");
+    assert_eq!(
+        node_cleanup_proof_is_current(
+            registry.path(),
+            UdpPlacement::HostNetns,
+            &node,
+            PROOF_GENERATION,
+        ),
+        Ok(false)
+    );
+    let error = prepare_placement(
+        registry.path(),
+        &stable_attested_on_node(UdpPlacement::HostNetns, UdpPlacement::HostNetns, &node),
+    )
+    .err()
+    .expect("a retracted leftover proof cannot admit the host placement");
+    assert!(
+        error.contains("no node-specific cleanup attestation"),
+        "{error}"
+    );
 }
 
 #[test]

@@ -469,15 +469,15 @@ pub struct AmbientUdpPreflightArgs {
 /// identity and the stale cleanup proof written under it agree and authorize
 /// node-name reuse under the wrong immutable UID. One bounded `get` on this
 /// node's own object, bound to the node name the downward API gave this pod,
-/// settles it; the resolver retracts the publication before the lookup and
-/// republishes only what it proved, so the steady-state container that starts
-/// next reads an identity this pod established.
+/// settles it; the resolver retracts the publication before it reads the boot
+/// id or performs the lookup, and republishes only what it proved, so every
+/// failure after entry leaves no identity and the steady-state container that
+/// starts next reads an identity this pod established.
 pub fn execute_ambient_udp_preflight(args: &AmbientUdpPreflightArgs) -> Result<(), String> {
     use crate::config::conf_file::resolve_ferrum_var;
     use crate::proxy::udp_placement_migration::{
-        UdpMigrationContext, UdpPlacement, node_cleanup_proof_is_current,
-        node_proof_generation_from_env, resolve_authoritative_node_identity,
-        retract_node_cleanup_proof,
+        UdpMigrationContext, UdpPlacement, node_proof_generation_from_env,
+        resolve_authoritative_node_identity, retract_node_cleanup_proof,
     };
 
     if let Some(path) = resolve_settings_path(args.settings.as_deref()) {
@@ -539,15 +539,12 @@ pub fn execute_ambient_udp_preflight(args: &AmbientUdpPreflightArgs) -> Result<(
         )
         .await?;
 
-        if node_cleanup_proof_is_current(&registry_dir, target, &node, &generation)? {
-            println!("ambient-udp-preflight: node cleanup proof is already current");
-            return Ok(crate::proxy::udp_placement_cleanup::UdpCleanupOutcome::Complete);
-        }
-        // Any proof that is NOT current for this exact node UID, boot id,
-        // target, and era is retired before the retirement it describes is
-        // re-attempted. Otherwise a proof published by an earlier run — under a
-        // previous Kubernetes Node object, or an earlier placement era — would
-        // remain readable to the steady-state container if this run then failed.
+        // A leftover proof is not authority for this pod. A Helm rollback, a
+        // re-applied historical manifest, or a restored ConfigMap can recreate
+        // an earlier era's generation token, and a mutable monotonic counter
+        // cannot prove that did not happen. Retract whatever is present and run
+        // the idempotent retirement on every invocation; publish only after
+        // this pod's own authoritative lookup and two complete passes succeed.
         retract_node_cleanup_proof(&registry_dir)?;
 
         crate::proxy::netns_udp_capture::preflight_capture_tools(true).map_err(|error| {
@@ -586,11 +583,14 @@ pub fn execute_ambient_udp_preflight(args: &AmbientUdpPreflightArgs) -> Result<(
 /// timeout-guarded `get`.
 ///
 /// The request is bound to the node name the downward API stamped on this pod
-/// (`FERRUM_K8S_NODE_NAME` from `spec.nodeName`), so the preflight can only ever
-/// learn the identity of the machine it is running on. The RBAC the chart grants
-/// alongside it is a read-only `nodes: get` — no list, no watch, no write — and
-/// nothing from the returned object other than the UID is read. The UID itself
-/// is never logged: it is an identity binding, not diagnostics.
+/// (`FERRUM_K8S_NODE_NAME` from `spec.nodeName`), so this process only ever
+/// asks for the machine it is running on. The RBAC the chart grants alongside
+/// it is a read-only `nodes: get` — no list, no watch, no write. That cannot
+/// enumerate or mutate nodes, but a `get` without `resourceNames` is not a
+/// single-object restriction: Kubernetes permits a named GET for any node whose
+/// name the caller already knows. The runtime request is the binding, not the
+/// Role. Nothing from the returned object other than the UID is read. The UID
+/// itself is never logged: it is an identity binding, not diagnostics.
 async fn fetch_this_node_uid(node_name: String) -> Result<String, String> {
     use k8s_openapi::api::core::v1::Node;
     use kube::Api;

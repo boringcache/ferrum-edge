@@ -317,10 +317,13 @@ It deliberately has NO derived fallback. A token derived from the release's
 observable shape — `<target>-<phase>` — repeats the moment a target and phase
 recur, so after a host -> pod -> host round trip an old settled-host proof would
 name the NEW host era and a same-boot node that missed the intervening rollout
-could replay it. An initial install, and any contract installed before this
-field existed, therefore yields NO proof generation, which is fail-closed: the
-settled host DaemonSet refuses to render until an explicit cleanup/finalize pair
-has stamped one.
+could replay it. The placement contract fail-closes a PRESENT era/generation
+pair that is malformed, incomplete, out of bounds, or internally inconsistent
+rather than coercing it to era 0; only the pre-contract absence of BOTH fields
+may enter cleanup and stamp era 1. An initial install, and any contract
+installed before this field existed, therefore yields NO proof generation, which
+is fail-closed: the settled host DaemonSet refuses to render until an explicit
+cleanup/finalize pair has stamped one.
 
 Both DaemonSets include this SAME helper so the ambient preflight and the
 node-agent's registry-synchronization publication can never disagree about

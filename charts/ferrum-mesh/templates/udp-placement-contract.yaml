@@ -66,13 +66,38 @@
        transition that produced it. An installed contract predating this field
        carries no node-proof generation at all, which is fail-closed: the settled
        host DaemonSet refuses to render until an explicit cleanup/finalize pair
-       has stamped one. */ -}}
+       has stamped one.
+
+       A PRESENT era/generation pair is one authority boundary. Treating a
+       malformed or out-of-range `nodeProofEra` as zero, or carrying a
+       `nodeProofGeneration` that does not name that era, would let the next
+       cleanup emit `e1.*` again and recreate a token an earlier placement era
+       already used. Both fields are therefore validated as one pair: they must
+       both be absent (the pre-contract cleanup entry that stamps era 1) or both
+       be well-formed, in bounds, and consistent. There is no compatibility
+       fallback for a partial or malformed pair. */ -}}
 {{- $previousEra := 0 -}}
 {{- $previousNodeProofGeneration := "" -}}
+{{- $rawEra := "" -}}
 {{- if $previous -}}
-{{- $rawEra := trim (toString (default "" (index $previous "nodeProofEra"))) -}}
-{{- if regexMatch "^[1-9][0-9]{0,9}$" $rawEra -}}{{- $previousEra = atoi $rawEra -}}{{- end -}}
+{{- $rawEra = trim (toString (default "" (index $previous "nodeProofEra"))) -}}
 {{- $previousNodeProofGeneration = trim (toString (default "" (index $previous "nodeProofGeneration"))) -}}
+{{- end -}}
+{{- if or $rawEra $previousNodeProofGeneration -}}
+{{- if or (not $rawEra) (not $previousNodeProofGeneration) -}}
+{{- fail "installed Ambient UDP nodeProofEra/nodeProofGeneration pair is incomplete; both must be present and consistent, or both absent so cleanup can stamp era 1" -}}
+{{- end -}}
+{{- if not (regexMatch "^[1-9][0-9]{0,9}$" $rawEra) -}}
+{{- fail "installed Ambient UDP nodeProofEra is malformed or out of supported bounds; it must be a 1..=10 digit ordinal with no leading zero" -}}
+{{- end -}}
+{{- if not (regexMatch "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" $previousNodeProofGeneration) -}}
+{{- fail "installed Ambient UDP nodeProofGeneration is malformed or out of supported bounds; it must be an era-qualified e<era>.<generation> token of 1..=64 ASCII alphanumeric/./_/- characters" -}}
+{{- end -}}
+{{- $generationPrefix := printf "e%s." $rawEra -}}
+{{- if or (not (hasPrefix $generationPrefix $previousNodeProofGeneration)) (eq $previousNodeProofGeneration $generationPrefix) -}}
+{{- fail "installed Ambient UDP nodeProofGeneration is not the era-qualified e<era>.<generation> token bound to the installed nodeProofEra" -}}
+{{- end -}}
+{{- $previousEra = atoi $rawEra -}}
 {{- end -}}
 {{- $nodeProofEra := $previousEra -}}
 {{- $nodeProofGeneration := $previousNodeProofGeneration -}}
@@ -107,7 +132,12 @@
        cleanup release resumes the one already open, so the ordinal is stable
        across retries but strictly increasing across transitions. */ -}}
 {{- if not (and $resumeCleanup $nodeProofGeneration) -}}
-{{- $nodeProofEra = add1 $previousEra -}}
+{{- $nextEra := add1 $previousEra -}}
+{{- $nextEraStr := $nextEra | toString -}}
+{{- if not (regexMatch "^[1-9][0-9]{0,9}$" $nextEraStr) -}}
+{{- fail "Ambient UDP nodeProofEra cannot increment without overflowing the supported 1..=10 digit ordinal" -}}
+{{- end -}}
+{{- $nodeProofEra = $nextEra -}}
 {{- $nodeProofGeneration = printf "e%d.%s" $nodeProofEra $generation | trunc 64 -}}
 {{- end -}}
 {{- else -}}

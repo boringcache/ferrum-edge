@@ -992,8 +992,28 @@ fn ambient_udp_production_entry_points_are_scheduled_by_the_trusted_classifier()
     );
     assert!(
         cli.contains("retract_node_cleanup_proof(&registry_dir)?"),
-        "a non-current node cleanup proof must be retracted before the retirement \
-         it describes is re-attempted"
+        "every preflight invocation must retract leftover cleanup proof before retirement"
+    );
+    assert!(
+        !cli.contains("node_cleanup_proof_is_current"),
+        "a leftover cleanup proof must not skip this pod's own retirement"
+    );
+    let retract_at = cli
+        .find("retract_node_cleanup_proof(&registry_dir)?")
+        .expect("preflight retracts leftover proof");
+    let cleanup_at = cli
+        .find("run_udp_placement_cleanup")
+        .expect("preflight runs the shared retirement supervisor");
+    assert!(
+        retract_at < cleanup_at,
+        "leftover proof must be retracted before the idempotent cleanup runs"
+    );
+
+    let migration = read("src/proxy/udp_placement_migration.rs");
+    assert!(
+        migration.contains("resolve_authoritative_node_identity_reading_boot_id")
+            && migration.contains("current_boot_id,"),
+        "the public authoritative resolver must retract, then read the boot id"
     );
 }
 

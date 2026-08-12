@@ -9,11 +9,16 @@
        written under it and authorize node-name reuse under the wrong immutable
        UID.
 
-       The grant is therefore the narrowest one that supports a named `get` on a
-       single object: no create/update/patch/delete, and deliberately no
-       list/watch, so this service account can never enumerate the cluster's
-       nodes. It is rendered only for Ambient releases, which are the only ones
-       that run the preflight. */ -}}
+       The grant is read-only `nodes: get` with no list, watch, or write. That
+       cannot enumerate or mutate nodes, but Kubernetes RBAC does not treat a
+       `get` without `resourceNames` as a single-object restriction: a named GET
+       is permitted for any node whose name the caller already knows. The
+       runtime request is what binds the lookup to this pod's `spec.nodeName`
+       (or an explicit `FERRUM_K8S_NODE_UID`). Do not describe this Role as a
+       per-node enforcement boundary Kubernetes does not provide, and do not
+       widen it with list/watch/write or a cluster-wide name grant. It is
+       rendered only for Ambient releases, which are the only ones that run the
+       preflight. */ -}}
 {{- $ambientEnv := default dict .Values.ambient.env -}}
 {{- $ambientTopology := replace "-" "_" (lower (trim (toString (index $ambientEnv "FERRUM_MESH_TOPOLOGY")))) -}}
 {{- if and .Values.ambient.enabled (eq $ambientTopology "ambient") }}

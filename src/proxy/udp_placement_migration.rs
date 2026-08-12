@@ -318,9 +318,12 @@ fn retract_registry_file(registry_dir: &Path, file: &str, description: &str) -> 
 /// 1. retract the publication FIRST, before anything that can fail — a failure
 ///    to retract aborts before any lookup, because a surviving stale file is
 ///    exactly what must not be trusted;
-/// 2. resolve the UID (explicit `FERRUM_K8S_NODE_UID` for client-render
+/// 2. read this incarnation's boot id only AFTER that retraction, so an
+///    unreadable `/proc` (or override path) cannot leave a predecessor's
+///    publication in place;
+/// 3. resolve the UID (explicit `FERRUM_K8S_NODE_UID` for client-render
 ///    pipelines, otherwise one bounded `get` on this node's own object);
-/// 3. publish only the resolved identity, and retract again on any failure.
+/// 4. publish only the resolved identity, and retract again on any failure.
 ///
 /// Every unsuccessful path therefore leaves NO published identity, which the
 /// placement guard treats as a fail-closed refusal, and the successful path
@@ -336,8 +339,40 @@ where
     F: FnOnce(String) -> Fut,
     Fut: std::future::Future<Output = Result<String, String>>,
 {
-    let boot_id =
-        current_boot_id().ok_or_else(|| "could not read this node's boot id".to_string())?;
+    resolve_authoritative_node_identity_reading_boot_id(
+        registry_dir,
+        explicit_node_uid,
+        node_name,
+        fetch_node_uid,
+        current_boot_id,
+    )
+    .await
+}
+
+/// Retract first, then obtain the boot id, then continue through
+/// [`resolve_authoritative_node_identity_with_boot_id`].
+///
+/// The public resolver passes `current_boot_id`. Tests pass a closure that
+/// returns `None` to prove an unreadable boot id cannot leave a stale
+/// publication behind. There is no compatibility fallback that skips
+/// retraction when the boot id cannot be read.
+pub async fn resolve_authoritative_node_identity_reading_boot_id<F, Fut, B>(
+    registry_dir: &Path,
+    explicit_node_uid: Option<&str>,
+    node_name: Option<&str>,
+    fetch_node_uid: F,
+    read_boot_id: B,
+) -> Result<UdpNodeIdentity, String>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = Result<String, String>>,
+    B: FnOnce() -> Option<String>,
+{
+    retract_node_identity(registry_dir)?;
+    let Some(boot_id) = read_boot_id().filter(|value| !value.trim().is_empty()) else {
+        let _ = retract_node_identity(registry_dir);
+        return Err("could not read this node's boot id".to_string());
+    };
     resolve_authoritative_node_identity_with_boot_id(
         registry_dir,
         &boot_id,
@@ -1550,8 +1585,13 @@ fn write_node_attestation(
 }
 
 /// True when this node incarnation already carries a valid, generation-bound
-/// cleanup attestation for `target`. Used by the preflight so a container
-/// restart is a cheap no-op instead of a second full retirement pass.
+/// cleanup attestation for `target`.
+///
+/// This is a predicate for tests and diagnostics, not a preflight skip. A newly
+/// starting preflight pod must retract any leftover proof and run the
+/// idempotent retirement itself: a Helm rollback, re-applied historical
+/// manifest, or restored ConfigMap can recreate an earlier era's generation
+/// token, and a mutable monotonic counter cannot prove that did not happen.
 pub fn node_cleanup_proof_is_current(
     registry_dir: &Path,
     target: UdpPlacement,

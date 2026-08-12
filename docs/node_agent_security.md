@@ -203,18 +203,22 @@ lifetime, and clusters that will not grant it at all can set
 node-bound exemption markers instead.
 
 That init stage also carries one **read-only** Kubernetes grant: `nodes: get` on
-the `ferrum-mesh` service account, with no list, watch, or write verb, so it can
-resolve this node's own `Node.metadata.uid` and nothing else. It is bound to the
-node name the downward API stamped on the pod, so the lookup cannot name another
-machine, and the UID is never logged or emitted as a metric label. The grant
-exists because the node-agent's published identity file cannot be
-staleness-checked by a reader: a file left by a previous Kubernetes Node object
-on the same boot records the current boot id, so trusting it would let a
-recreated node inherit the predecessor's durable ownership and cleanup proof. The attestation is still consulted only
-when the durable record is absent, so it can never authorize an in-place flip on
-a running node, and a `.udp-placement-quarantined` tombstone in the registry
-directory refuses every absent-state bootstrap outright, which is what makes the
-corrupt-ownership repair procedure machine-enforced rather than advisory.
+the `ferrum-mesh` service account, with no list, watch, or write verb. That
+cannot enumerate or mutate nodes, but Kubernetes RBAC does **not** treat a `get`
+without `resourceNames` as a single-object restriction — a named GET is
+permitted for any node whose name the caller already knows. The **runtime
+request** is bound to the node name the downward API stamped on the pod
+(`spec.nodeName`), so this process only asks for the machine it is running on,
+and the UID is never logged or emitted as a metric label. The grant exists
+because the node-agent's published identity file cannot be staleness-checked by
+a reader: a file left by a previous Kubernetes Node object on the same boot
+records the current boot id, so trusting it would let a recreated node inherit
+the predecessor's durable ownership and cleanup proof. The attestation is still
+consulted only when the durable record is absent, so it can never authorize an
+in-place flip on a running node, and a `.udp-placement-quarantined` tombstone in
+the registry directory refuses every absent-state bootstrap outright, which is
+what makes the corrupt-ownership repair procedure machine-enforced rather than
+advisory.
 
 What it does NOT reduce is `CAP_NET_ADMIN`: the path still writes `mangle` chains,
 an `ip rule`, and an `ip route` in the host namespace, and still binds

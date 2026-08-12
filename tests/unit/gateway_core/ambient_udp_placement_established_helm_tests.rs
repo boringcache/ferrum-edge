@@ -212,6 +212,11 @@ fn the_node_proof_generation_is_derived_from_the_installed_contract_for_both_dae
          era-qualified field"
     );
     assert!(
+        helpers.contains("fail-closes a PRESENT era/generation")
+            && helpers.contains("pre-contract absence of BOTH fields"),
+        "the helper must stay aligned with the contract's fail-closed pair boundary"
+    );
+    assert!(
         !helpers.contains("printf \"%s-%s\" $target $phase"),
         "a `<target>-<phase>` fallback recurs across placement eras and must not exist"
     );
@@ -305,7 +310,8 @@ fn the_placement_contract_persists_a_non_recurring_node_proof_era() {
     // keeps the one already open, so retries are idempotent while transitions
     // strictly advance.
     assert!(
-        contract.contains("{{- $nodeProofEra = add1 $previousEra -}}")
+        contract.contains("{{- $nextEra := add1 $previousEra -}}")
+            && contract.contains("{{- $nodeProofEra = $nextEra -}}")
             && contract
                 .contains("{{- $nodeProofGeneration = printf \"e%d.%s\" $nodeProofEra $generation")
             && contract.contains("{{- if not (and $resumeCleanup $nodeProofGeneration) -}}"),
@@ -324,6 +330,105 @@ fn the_placement_contract_persists_a_non_recurring_node_proof_era() {
             "$previousNodeProofGeneration = trim (toString (default \"\" (index $previous \"nodeProofGeneration\")))"
         ),
         "the carried-forward token must come from the installed contract"
+    );
+}
+
+/// A present installed era/generation pair is one authority boundary. Coercing
+/// a malformed era to zero, or carrying a generation that does not name that
+/// era, would let the next cleanup emit `e1.*` again.
+#[test]
+fn the_placement_contract_fails_closed_on_a_present_malformed_or_inconsistent_era_pair() {
+    let contract = read("templates/udp-placement-contract.yaml");
+
+    // Validation runs only when at least one field is present. Absence of BOTH
+    // is the pre-contract cleanup entry that may stamp era 1.
+    assert!(
+        contract.contains("{{- if or $rawEra $previousNodeProofGeneration -}}"),
+        "pair validation must run only when an installed era or generation is present"
+    );
+    assert!(
+        contract.contains(
+            "fail \"installed Ambient UDP nodeProofEra/nodeProofGeneration pair is incomplete"
+        ),
+        "a partial pair must fail rendering rather than filling the missing half"
+    );
+    assert!(
+        contract.contains(
+            "fail \"installed Ambient UDP nodeProofEra is malformed or out of supported bounds"
+        ),
+        "a malformed or out-of-range installed era must fail rendering"
+    );
+    assert!(
+        contract.contains(
+            "fail \"installed Ambient UDP nodeProofGeneration is malformed or out of supported bounds"
+        ),
+        "a generation token outside the supported charset/length must fail rendering"
+    );
+    assert!(
+        contract.contains(
+            "fail \"installed Ambient UDP nodeProofGeneration is not the era-qualified e<era>.<generation> token bound to the installed nodeProofEra"
+        ),
+        "a generation whose era does not equal nodeProofEra must fail rendering"
+    );
+    assert!(
+        contract.contains("{{- $generationPrefix := printf \"e%s.\" $rawEra -}}")
+            && contract.contains("hasPrefix $generationPrefix $previousNodeProofGeneration")
+            && contract.contains("(eq $previousNodeProofGeneration $generationPrefix)"),
+        "the installed generation must be the exact e<era>.<nonempty generation> shape \
+         whose era equals nodeProofEra"
+    );
+
+    let era_fail = contract
+        .find("installed Ambient UDP nodeProofEra is malformed or out of supported bounds")
+        .expect("malformed-era fail");
+    let atoi = contract
+        .find("$previousEra = atoi $rawEra")
+        .expect("atoi of the installed era");
+    assert!(
+        era_fail < atoi,
+        "atoi must not run on an unvalidated installed era"
+    );
+    assert!(
+        !contract.contains(
+            "{{- if regexMatch \"^[1-9][0-9]{0,9}$\" $rawEra -}}{{- $previousEra = atoi $rawEra -}}{{- end -}}"
+        ),
+        "a malformed installed era must not be silently treated as zero"
+    );
+
+    // Overflow/re-entry is refused BEFORE the ordinal is assigned.
+    assert!(
+        contract.contains(
+            "fail \"Ambient UDP nodeProofEra cannot increment without overflowing the supported 1..=10 digit ordinal"
+        ) && contract.contains("{{- $nextEraStr := $nextEra | toString -}}")
+            && contract.contains("regexMatch \"^[1-9][0-9]{0,9}$\" $nextEraStr"),
+        "increment must fail closed when the next ordinal would leave the 1..=10 digit bound"
+    );
+    let overflow = contract
+        .find("cannot increment without overflowing")
+        .expect("overflow fail");
+    let assign = contract
+        .find("$nodeProofEra = $nextEra")
+        .expect("era assignment after increment");
+    assert!(
+        overflow < assign,
+        "overflow must be refused before the next era is stamped"
+    );
+
+    // Pre-contract cleanup still stamps era 1 from a zero predecessor, and a
+    // cleanup retry with a present generation keeps the era already open.
+    assert!(
+        contract.contains("{{- $previousEra := 0 -}}")
+            && contract.contains("{{- $nextEra := add1 $previousEra -}}"),
+        "pre-contract absence of both fields must still be able to stamp era 1"
+    );
+    assert!(
+        contract.contains("{{- if not (and $resumeCleanup $nodeProofGeneration) -}}"),
+        "re-rendering the same cleanup release must keep the era already open"
+    );
+    assert!(
+        contract.matches("add1 $previousEra").count() == 1,
+        "successive cleanup starts must strictly increase the ordinal; only one \
+         increment site may exist"
     );
 }
 
@@ -350,8 +455,9 @@ fn the_preflight_binds_its_node_lookup_to_this_pods_node_name() {
         rbac.contains("resources: [\"nodes\"]") && rbac.contains("verbs: [\"get\"]"),
         "the ambient service account needs a read-only nodes grant for the preflight lookup"
     );
-    // Least privilege: a named `get` and nothing that could enumerate or mutate
-    // the cluster's nodes.
+    // Least privilege: get without list/watch/write. Kubernetes RBAC does not
+    // treat a get without resourceNames as a single-object restriction; the
+    // runtime request is bound to spec.nodeName.
     for forbidden in [
         "\"list\"", "\"watch\"", "\"create\"", "\"update\"", "\"patch\"", "\"delete\"", "\"*\"",
     ] {
@@ -361,7 +467,19 @@ fn the_preflight_binds_its_node_lookup_to_this_pods_node_name() {
         );
     }
     assert!(
+        !rbac.contains("resourceNames:"),
+        "do not add resourceNames: a static name cannot name this pod's node, \
+         and claiming a single-object restriction Kubernetes does not provide \
+         is worse than documenting the runtime binding"
+    );
+    assert!(
         rbac.contains("name: ferrum-mesh\n    namespace: {{ .Release.Namespace }}"),
         "the grant must bind the ambient DaemonSet's own service account"
+    );
+    assert!(
+        rbac.contains("a `get` without `resourceNames` as a single-object restriction")
+            && rbac.contains("runtime request is what binds the lookup"),
+        "the Role comment must not claim an enforcement boundary Kubernetes RBAC \
+         does not provide"
     );
 }

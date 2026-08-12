@@ -4215,7 +4215,17 @@ era-qualified `nodeProofGeneration` of the form `e<era>.<migration generation>`.
 The ordinal is incremented exactly once when a cleanup release *starts* a
 migration (re-rendering the same cleanup release resumes the era already open),
 and is then carried forward unchanged through finalize and every settled release
-after it. `FERRUM_MESH_CAPTURE_UDP_NODE_PROOF_GENERATION` is that persisted
+after it. A **present** installed `nodeProofEra`/`nodeProofGeneration` pair is
+validated as one unit: both must be well-formed, in the supported 1..=10 digit
+era bounds, and consistent (`nodeProofGeneration` is exactly
+`e<era>.<nonempty generation>` for that era). A malformed, incomplete,
+out-of-range, or mismatched pair fails chart rendering rather than being coerced
+to era 0 — that coercion would let the next cleanup emit `e1.*` again and
+recreate a token an earlier placement era already used. Increment is refused
+when the next ordinal would overflow those bounds. Only the pre-contract
+**absence of both fields** may enter the explicit cleanup migration, which
+stamps era 1; there is no compatibility fallback for a partial or malformed
+pair. `FERRUM_MESH_CAPTURE_UDP_NODE_PROOF_GENERATION` is that persisted
 value and nothing else — there is no derived fallback, and the runtime refuses a
 value that is not era-qualified with `node_proof_missing`, so a client-render
 pipeline supplying the variable directly is held to the same non-recurrence
@@ -4294,18 +4304,24 @@ default `true`). It runs `ferrum-edge ambient-udp-preflight` from the same
 1. It resolves this node's identity **authoritatively**, from this node's own
    Kubernetes object, and never from the node-agent's published
    `.node-identity-v1.json` (see *Node identity* below). It retracts any
-   publication first, performs one bounded read-only `get` bound to the node
-   name the downward API stamped on this pod (`FERRUM_K8S_NODE_NAME` from
-   `spec.nodeName`; an explicit `FERRUM_K8S_NODE_UID` short-circuits it), and
-   republishes only what it proved. Every failure path — an unremovable stale
-   publication, a lookup/RBAC/API failure, a node object with no UID, or a
-   failed republication — leaves NO identity and exits non-zero.
-2. It short-circuits when this node incarnation already carries a matching
-   attestation, so a container restart is not a second retirement pass. Any
-   attestation that is *not* current for this exact node UID, boot id, target,
-   and era is retracted before the retirement it describes is re-attempted, so a
-   proof written under a previous Kubernetes Node object or an earlier era can
-   never outlive the run that rejected it.
+   publication first, **then** reads this incarnation's boot id, then performs
+   one bounded read-only `get` bound to the node name the downward API stamped
+   on this pod (`FERRUM_K8S_NODE_NAME` from `spec.nodeName`; an explicit
+   `FERRUM_K8S_NODE_UID` skips the API lookup). The chart's `nodes: get` grant
+   has no list/watch/write and no `resourceNames`; Kubernetes therefore permits
+   a named GET for any node whose name is already known, and the **runtime
+   request** is what binds the lookup to this pod. It republishes only what it
+   proved. Every failure path — an unremovable stale publication, an unreadable
+   boot id, a lookup/RBAC/API failure, a node object with no UID, or a failed
+   republication — leaves NO identity and exits non-zero.
+2. It retracts any existing cleanup proof and runs the idempotent predecessor
+   retirement on **every** invocation. A leftover
+   `.udp-node-cleanup-proof-v1.json` is not authority for a newly starting
+   preflight pod: a Helm rollback, a re-applied historical manifest, or a
+   restored ConfigMap can recreate an earlier era's generation token, and a
+   mutable monotonic counter cannot prove that did not happen. Cleanup is
+   ownership-safe and idempotent, so a genuine restart is a second complete
+   pass rather than a skip.
 3. It waits for the node-agent's authoritative `.udp-registry-synced`
    publication — republished under the node-proof generation while no migration
    generation is in flight, and **bound to the node UID that agent resolved** —
@@ -4401,10 +4417,12 @@ no resolvable current identity, unbound durable ownership and its
 cleanup/finalize recovery, a finalize that would leave an unbound
 producer-owning record, a stale same-boot identity publication and its
 retraction, same-boot Node-object recreation, a preflight running before the
-node-agent has published anything, every failed retraction/lookup/publication
-path, a registry-synchronization publication from another node, a recurring
+node-agent has published anything, an unreadable boot id after identity
+retraction, every failed retraction/lookup/publication path, a
+registry-synchronization publication from another node, a recurring
 `<target>-<phase>`-shaped node-proof generation, a proof earned in an earlier
-placement era, the cleanup-complete/finalize-missed resumption,
+placement era, a leftover cleanup proof that cannot skip a new preflight pod's
+retirement, the cleanup-complete/finalize-missed resumption,
 stale/malformed/release-only evidence, and the dual-stack both-domains
 retirement plan).
 
