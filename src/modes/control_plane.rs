@@ -2975,21 +2975,57 @@ pub async fn run(
                         .await;
                     }
 
-                    if force_full_reload {
-                        // Re-resolve the namespace list every full reload so
-                        // CpScope::All picks up newly created namespaces
-                        // without dropping namespaces still present in the
-                        // current snapshot if discovery temporarily shrinks.
-                        let current_snapshot = config_poll.load_full();
-                        let retained_namespaces = retained_polled_namespaces(&current_snapshot);
-                        let nslist = resolve_polled_namespaces(
+                    // Resolve the polled namespace list ONCE per tick, before
+                    // the reload decision. For `Single`/`Set` this is the
+                    // explicit list (no DB call). For `All`, authoritative
+                    // namespace discovery runs once per tick — bounded cost vs.
+                    // the per-resource queries that dominate poll time — and
+                    // every full reload re-resolves so `CpScope::All` picks up
+                    // newly created namespaces without dropping namespaces
+                    // still present in the current snapshot if discovery
+                    // temporarily shrinks.
+                    let current_snapshot = config_poll.load_full();
+                    let retained_namespaces = retained_polled_namespaces(&current_snapshot);
+                    let nslist = resolve_polled_namespaces(
+                        db_poll.as_ref(),
+                        &poll_scope,
+                        &poll_fallback_namespace,
+                        &retained_namespaces,
+                        Some(&last_polled_namespaces),
+                    )
+                    .await;
+
+                    // Authoritative gateway trust drift check (issue #3727). A
+                    // no-op on every backend whose trust document mutation and
+                    // `config_changes` signal commit atomically (all SQL,
+                    // replica-set MongoDB). On standalone MongoDB they are
+                    // separate commits, so this poller can consume a signal,
+                    // complete a full reload that still reads the old document,
+                    // advance its cursor, and only then see the document commit
+                    // with no later signal — and a revocation is the same race
+                    // with the revoked roots left installed on every
+                    // subscriber. Comparing the stored identity against the
+                    // trust state the CURRENT published snapshot was built from
+                    // detects both, per namespace, without depending on write
+                    // ordering or on the writer surviving. It runs BEFORE the
+                    // reload decision so the drifted generation is repaired
+                    // through the one authoritative full-reload publication
+                    // path in THIS tick rather than the next, and it is skipped
+                    // when a full reload is already pending because that reload
+                    // republishes trust anyway.
+                    if !force_full_reload {
+                        let trust_drifted = detect_gateway_trust_drift(
                             db_poll.as_ref(),
-                            &poll_scope,
-                            &poll_fallback_namespace,
-                            &retained_namespaces,
-                            Some(&last_polled_namespaces),
+                            &nslist,
+                            current_snapshot.as_ref(),
                         )
                         .await;
+                        if !trust_drifted.is_empty() {
+                            force_full_reload = true;
+                        }
+                    }
+
+                    if force_full_reload {
                         match load_full_config_multi_with_sequence(
                             db_poll.as_ref(),
                             &nslist,
@@ -3082,50 +3118,6 @@ pub async fn run(
                             }
                         }
                     } else {
-                        // Resolve the polled namespace list. For `Single`
-                        // / `Set` this is the explicit list (no DB call).
-                        // For `All`, authoritative namespace discovery runs
-                        // once per tick — bounded cost vs. the per-resource
-                        // queries that dominate poll time.
-                        let current_snapshot = config_poll.load_full();
-                        let retained_namespaces = retained_polled_namespaces(&current_snapshot);
-                        let nslist = resolve_polled_namespaces(
-                            db_poll.as_ref(),
-                            &poll_scope,
-                            &poll_fallback_namespace,
-                            &retained_namespaces,
-                            Some(&last_polled_namespaces),
-                        )
-                        .await;
-
-                        // Authoritative gateway trust drift check (issue
-                        // #3727). A no-op on every backend whose trust document
-                        // mutation and `config_changes` signal commit
-                        // atomically (all SQL, replica-set MongoDB). On
-                        // standalone MongoDB they are separate commits, so this
-                        // poller can consume a signal, complete a full reload
-                        // that still reads the old document, advance its
-                        // cursor, and only then see the document commit with no
-                        // later signal — and a revocation is the same race with
-                        // the revoked roots left installed on every subscriber.
-                        // Comparing the stored identity against the trust state
-                        // the CURRENT published snapshot was built from detects
-                        // both, per namespace, without depending on write
-                        // ordering or on the writer surviving. Escalating
-                        // rather than repairing inline keeps trust publication
-                        // on the single authoritative full-reload path.
-                        let trust_drifted = detect_gateway_trust_drift(
-                            db_poll.as_ref(),
-                            &nslist,
-                            current_snapshot.as_ref(),
-                        )
-                        .await;
-                        if !trust_drifted.is_empty() {
-                            force_full_reload = true;
-                            database_delta_poll_metrics_for_poll.record_poll_completed();
-                            continue;
-                        }
-
                         // Incremental poll — only fetch changes since last poll
                         match load_incremental_config_multi(
                             db_poll.as_ref(),

@@ -294,8 +294,12 @@ already use — there is no second representation that can drift.
   whose document is gone while the roots are still published — escalates that
   namespace to an authoritative full reload, which is the single path that
   republishes trust and its `trust_bundles_json` side channel from one read.
-  Because the check reads the document rather than the change log, it depends on
-  neither write ordering nor on the writing process surviving.
+  The check runs *before* the tick's reload decision, so that full reload — and
+  the publication that withdraws revoked roots — happens in the **same** poll
+  tick that detected the drift, not the next one; a drifted tick never falls
+  into incremental polling first. Because the check reads the document rather
+  than the change log, it depends on neither write ordering nor on the writing
+  process surviving.
 
   Cost and blast radius are bounded by construction: zero additional queries on
   transactional backends, at most one projected single-document read per polled
@@ -441,6 +445,7 @@ Live, backend-by-backend acceptance runs in the hosted `Functional Tests
 | Concurrent writers racing from one read leave exactly one winner | the same HA cells |
 | An interrupted MongoDB write never leaves a committed document whose revision no change row records | `test_mongodb_{standalone,replica_set}_leaves_no_unrecorded_trust_revision` |
 | A committed create / rotation / revocation whose signal was already consumed is still detected by the next poll | `tests/unit/config/gateway_trust_bundle_tests.rs` drift-detection cells |
+| Detected drift is repaired by the full-reload publication path in the same poll tick, with poll-completion accounting unchanged | `gateway_trust_drift_escalates_into_the_same_tick_full_reload` + `{database,control_plane}_poll_tick_records_on_every_normal_exit_without_async_wrapper` in `tests/unit/gateway_core/db_poll_supervision_tests.rs` |
 
 The MongoDB interruption cells `SIGKILL` the control plane mid-rotation and then
 read the collection directly: the committed document's `revision` must still be
