@@ -301,3 +301,41 @@ Optional:
             periodSeconds: {{ $readiness.periodSeconds }}
 {{- end }}
 {{- end -}}
+
+{{/*
+Release-bound node-proof generation for the Ambient UDP placement contract
+(issue #3809).
+
+The node-scoped cleanup attestation must be bound to a generation that CHANGES
+across every placement migration, so an attestation written before one cannot
+authorize the release after it. It is derived only from the INSTALLED contract:
+its explicit migration generation while a migration is in flight, otherwise a
+deterministic `<target>-<phase>` token for the settled release. An initial
+install has no installed contract and therefore no proof generation, which is
+fail-closed — the runtime refuses recordless host adoption without one.
+
+Both DaemonSets include this SAME helper so the ambient preflight and the
+node-agent's registry-synchronization publication can never disagree about
+which generation a proof belongs to.
+*/}}
+{{- define "ferrum-mesh.ambientUdpNodeProofGeneration" -}}
+{{- $env := default dict .Values.ambient.env -}}
+{{- $topology := replace "-" "_" (lower (trim (toString (index $env "FERRUM_MESH_TOPOLOGY")))) -}}
+{{- $result := "" -}}
+{{- if and .Values.ambient.enabled (eq $topology "ambient") .Release.IsUpgrade -}}
+{{- $contractName := printf "ferrum-mesh-udp-placement-%s" .Release.Name | trunc 63 | trimSuffix "-" -}}
+{{- $installed := lookup "v1" "ConfigMap" .Release.Namespace $contractName -}}
+{{- if $installed -}}
+{{- $data := default dict $installed.data -}}
+{{- $generation := trim (toString (index $data "generation")) -}}
+{{- $target := trim (toString (index $data "target")) -}}
+{{- $phase := trim (toString (index $data "phase")) -}}
+{{- if $generation -}}
+{{- $result = $generation -}}
+{{- else if and $target $phase -}}
+{{- $result = printf "%s-%s" $target $phase -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- $result -}}
+{{- end -}}

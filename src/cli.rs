@@ -35,6 +35,17 @@ pub enum Command {
     Version(VersionArgs),
     /// Check if the gateway is healthy (for Docker HEALTHCHECK in distroless images).
     Health(HealthArgs),
+    /// Retire Ambient UDP predecessor placements on this node and publish the
+    /// node-scoped cleanup proof the steady-state host producer requires.
+    ///
+    /// Runs as a privileged init stage beside the Ambient DaemonSet's
+    /// unprivileged steady-state container (issue #3809): a node with no
+    /// durable placement record cannot tell a fresh/rebooted node from a
+    /// pre-contract node whose running workloads still redirect UDP to a
+    /// retired listener, so it proves the distinction by doing the retirement
+    /// rather than by trusting release-level desired state. Exits non-zero
+    /// without publishing anything when it cannot prove completion.
+    AmbientUdpPreflight(AmbientUdpPreflightArgs),
 }
 
 #[derive(clap::Args)]
@@ -406,7 +417,124 @@ fn format_host_port(host: &str, port: u16) -> String {
     }
 }
 
+#[derive(clap::Args)]
+pub struct AmbientUdpPreflightArgs {
+    /// Path to ferrum.conf (operational settings).
+    #[arg(short = 's', long = "settings")]
+    pub settings: Option<PathBuf>,
+
+    /// Maximum seconds to spend proving predecessor retirement before failing
+    /// closed. The init stage must fail rather than block pod creation forever.
+    #[arg(long = "timeout-seconds", default_value_t = 300)]
+    pub timeout_seconds: u64,
+
+    /// Increase log verbosity (-v=info, -vv=debug, -vvv=trace).
+    #[arg(short = 'v', long = "verbose", action = ArgAction::Count)]
+    pub verbose: u8,
+}
+
 // ── Subcommand executors ────────────────────────────────────────────────────
+
+/// Retire both Ambient UDP predecessor placements on this node and publish the
+/// node-scoped cleanup attestation.
+///
+/// This is deliberately the ONLY producer of that attestation. It is idempotent
+/// (an attestation already bound to this node UID, boot id, target and
+/// node-proof generation short-circuits), it publishes nothing it could not
+/// prove under one continuous node-agent registry publication, and it never
+/// writes durable placement ownership — the steady-state process still decides
+/// that from its own guard.
+pub fn execute_ambient_udp_preflight(args: &AmbientUdpPreflightArgs) -> Result<(), String> {
+    use crate::config::conf_file::resolve_ferrum_var;
+    use crate::proxy::udp_placement_migration::{
+        UdpMigrationContext, UdpNodeIdentity, UdpPlacement, node_cleanup_proof_is_current,
+        node_proof_generation_from_env,
+    };
+
+    if let Some(path) = resolve_settings_path(args.settings.as_deref()) {
+        // SAFETY: single-threaded context, before the tokio runtime exists.
+        unsafe { std::env::set_var("FERRUM_CONF_PATH", path) };
+    }
+
+    let settings = crate::capture::udp_capture_settings_from_env()
+        .map_err(|error| format!("invalid Ambient UDP capture settings: {error}"))?;
+    let target = UdpPlacement::from_capture_settings(
+        settings.udp_capture_enabled,
+        settings.udp_host_netns_enabled,
+    );
+    if target != UdpPlacement::HostNetns {
+        // Only the host placement drops the setns privileges that would let the
+        // steady-state process inspect a pod netns, so only it needs an
+        // out-of-band node proof. Every other placement proves predecessor
+        // retirement from its own runtime path.
+        println!(
+            "ambient-udp-preflight: nothing to prove for placement {}",
+            target.as_str()
+        );
+        return Ok(());
+    }
+
+    let registry_dir = resolve_ferrum_var("FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR")
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            "FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR is required by the Ambient UDP node preflight"
+                .to_string()
+        })?;
+    let registry_dir = PathBuf::from(registry_dir.trim());
+    let generation = node_proof_generation_from_env()?.ok_or_else(|| {
+        "FERRUM_MESH_CAPTURE_UDP_NODE_PROOF_GENERATION is required by the Ambient UDP node preflight"
+            .to_string()
+    })?;
+    let node = UdpNodeIdentity::resolve(&registry_dir).ok_or_else(|| {
+        "the Ambient UDP node preflight requires this node's Kubernetes UID (FERRUM_K8S_NODE_UID, \
+             or the node-agent's published node identity) and a readable node boot id"
+            .to_string()
+    })?;
+
+    if node_cleanup_proof_is_current(&registry_dir, target, &node, &generation)? {
+        println!("ambient-udp-preflight: node cleanup proof is already current");
+        return Ok(());
+    }
+
+    crate::proxy::netns_udp_capture::preflight_capture_tools(true).map_err(|error| {
+        format!("the Ambient UDP node preflight image cannot run the required tooling: {error}")
+    })?;
+
+    let context =
+        UdpMigrationContext::for_node_preflight(&registry_dir, target, node, &generation)?;
+    let source = std::sync::Arc::new(crate::proxy::netns_capture::DirectoryCaptureSource::new(
+        registry_dir.clone(),
+    ));
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("could not build the preflight runtime: {error}"))?;
+    let outcome = runtime.block_on(async move {
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_secs(args.timeout_seconds.clamp(1, 3600));
+        crate::proxy::udp_placement_cleanup::run_udp_placement_cleanup(
+            context,
+            source,
+            shutdown_rx,
+            Some(deadline),
+        )
+        .await
+    });
+    match outcome {
+        crate::proxy::udp_placement_cleanup::UdpCleanupOutcome::Complete => {
+            println!("ambient-udp-preflight: predecessor placements retired and proof published");
+            Ok(())
+        }
+        crate::proxy::udp_placement_cleanup::UdpCleanupOutcome::DeadlineElapsed => Err(
+            "the Ambient UDP node preflight could not prove predecessor retirement within its timeout; no proof was published"
+                .to_string(),
+        ),
+        crate::proxy::udp_placement_cleanup::UdpCleanupOutcome::ShuttingDown => Err(
+            "the Ambient UDP node preflight was interrupted; no proof was published".to_string(),
+        ),
+    }
+}
 
 /// Print version information and exit.
 pub fn execute_version(args: &VersionArgs) {

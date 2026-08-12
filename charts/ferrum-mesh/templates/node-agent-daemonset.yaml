@@ -184,6 +184,7 @@
   "FERRUM_MESH_CAPTURE_UDP_MIGRATION_GENERATION"
   "FERRUM_MESH_CAPTURE_UDP_MIGRATION_FROM"
   "FERRUM_MESH_CAPTURE_UDP_MIGRATION_TO"
+  "FERRUM_MESH_CAPTURE_UDP_NODE_PROOF_GENERATION"
   "FERRUM_MESH_TOPOLOGY"
   "FERRUM_NODE_AGENT_ADMIN_ENABLED"
   "FERRUM_ADMIN_BIND_ADDRESS"
@@ -413,6 +414,21 @@ spec:
             - name: {{ $migrationName }}
               value: {{ index $ambientEnv $migrationName | quote }}
             {{- end }}
+            {{- end }}
+            {{- /* The node-agent publishes `.udp-registry-synced` under this
+                   generation while no migration generation is in flight, so the
+                   privileged Ambient UDP node preflight (issue #3809) can require
+                   the SAME authoritative registry publication proof the cleanup
+                   phase does instead of retiring predecessor rules against a
+                   registry that may not yet list every enrolled pod. Derived from
+                   the one shared helper both DaemonSets include. */}}
+            {{- $ambientUdpNodeProofGeneration := include "ferrum-mesh.ambientUdpNodeProofGeneration" $ }}
+            {{- if hasKey $ambientEnv "FERRUM_MESH_CAPTURE_UDP_NODE_PROOF_GENERATION" }}
+            - name: FERRUM_MESH_CAPTURE_UDP_NODE_PROOF_GENERATION
+              value: {{ index $ambientEnv "FERRUM_MESH_CAPTURE_UDP_NODE_PROOF_GENERATION" | quote }}
+            {{- else if and $ambientUdpLifecycle $ambientUdpNodeProofGeneration }}
+            - name: FERRUM_MESH_CAPTURE_UDP_NODE_PROOF_GENERATION
+              value: {{ $ambientUdpNodeProofGeneration | quote }}
             {{- end }}
             {{- if .Values.nodeAgent.admin.enabled }}
             - name: FERRUM_NODE_AGENT_ADMIN_ENABLED

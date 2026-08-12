@@ -17,6 +17,19 @@ use serde::{Deserialize, Serialize};
 use crate::config::conf_file::resolve_ferrum_var;
 
 const STATE_FILE: &str = ".udp-placement-state-v1.json";
+/// Node-scoped proof that an ownership-safe predecessor retirement ran to
+/// completion on THIS node incarnation. Written only by the privileged node
+/// preflight (`ferrum-edge ambient-udp-preflight`) after both predecessor
+/// placements were retired, and consulted only when the durable placement
+/// record is absent. A release-level attestation is desired state; this file is
+/// the node-specific evidence that desired state is safe to adopt here.
+const NODE_PROOF_FILE: &str = ".udp-node-cleanup-proof-v1.json";
+/// Operator-written, node-bound exemption for a node that is intentionally
+/// decommissioned or exempt from the preflight (for example a cluster that will
+/// not grant the preflight's setns privileges). It carries the same node
+/// identity binding as the proof, so it can never be copied to another node or
+/// survive the incarnation it was written for.
+const NODE_EXEMPT_FILE: &str = ".udp-placement-node-exempt";
 /// Operator-written tombstone recording that node-local ownership was
 /// quarantined as corrupt/unknown. Its presence means "absent state is NOT
 /// evidence of a fresh node", so it refuses every stable bootstrap from absent
@@ -25,7 +38,14 @@ const STATE_FILE: &str = ".udp-placement-state-v1.json";
 const QUARANTINE_FILE: &str = ".udp-placement-quarantined";
 const REGISTRY_SYNC_FILE: &str = ".udp-registry-synced";
 const MAX_STATE_BYTES: u64 = 4096;
+const MAX_NODE_ATTESTATION_BYTES: u64 = 1024;
 const MAX_GENERATION_BYTES: usize = 64;
+const MAX_NODE_IDENTIFIER_BYTES: usize = 128;
+/// Current node incarnation identifier. A reboot changes it, and every pod
+/// network namespace that could hold predecessor interception rules dies with
+/// the previous incarnation, so a change is itself proof that no predecessor
+/// pod-netns rule can survive.
+const BOOT_ID_PATH: &str = "/proc/sys/kernel/random/boot_id";
 const MAX_REGISTRY_SYNC_MARKER_BYTES: u64 = 256;
 const MAX_REGISTRY_SYNC_ENTRIES: usize = 100_000;
 const MAX_TEMP_DIRECTORY_ENTRIES_SCANNED_PER_WRITE: usize = 4096;
@@ -71,6 +91,216 @@ impl UdpPlacement {
     }
 }
 
+/// The exact machine + incarnation a placement decision is bound to.
+///
+/// `node_uid` is the IMMUTABLE Kubernetes `Node.metadata.uid`, never the node
+/// name: a reused node name on a rebuilt machine gets a fresh UID, so it can
+/// never inherit the predecessor's proof. `boot_id` is the kernel's current
+/// boot identifier, so proof written before a reboot cannot authorize the
+/// incarnation after it (and vice versa).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UdpNodeIdentity {
+    pub node_uid: String,
+    pub boot_id: String,
+}
+
+impl UdpNodeIdentity {
+    pub fn new(node_uid: &str, boot_id: &str) -> Result<Self, String> {
+        let identity = Self {
+            node_uid: node_uid.trim().to_string(),
+            boot_id: boot_id.trim().to_string(),
+        };
+        identity.validate()?;
+        Ok(identity)
+    }
+
+    /// Resolve this node's identity from the deployment surface.
+    ///
+    /// The boot id is always read locally — it is the one half no other process
+    /// can attest for this incarnation. The node UID comes from an explicit
+    /// `FERRUM_K8S_NODE_UID` (GitOps/client-render pipelines that already know
+    /// it) or, failing that, from the node-agent's published identity file in
+    /// the shared pod-registry directory: the Kubernetes downward API does not
+    /// expose the node UID, and the proxy holds no Kubernetes client, so the
+    /// node-agent is the only local publisher of it. A published file is only
+    /// honoured when the boot id it recorded is THIS incarnation's, so a file
+    /// surviving on a persistent registry path cannot carry a stale UID
+    /// forward.
+    ///
+    /// An unresolvable identity is not an error here: it leaves the caller with
+    /// NO node-specific evidence, which every proof-requiring branch treats as
+    /// a fail-closed refusal.
+    pub fn resolve(registry_dir: &Path) -> Option<Self> {
+        let boot_id = current_boot_id()?;
+        if let Some(node_uid) = resolve_ferrum_var("FERRUM_K8S_NODE_UID")
+            .filter(|value| !value.trim().is_empty())
+            && let Ok(identity) = Self::new(&node_uid, &boot_id)
+        {
+            return Some(identity);
+        }
+        let published = read_node_identity_file(registry_dir)?;
+        (published.boot_id == boot_id).then_some(published)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        validate_node_identifier(&self.node_uid, "Kubernetes node UID")?;
+        validate_node_identifier(&self.boot_id, "node boot id")
+    }
+}
+
+fn current_boot_id() -> Option<String> {
+    let boot_id_path = resolve_ferrum_var("FERRUM_MESH_CAPTURE_UDP_NODE_BOOT_ID_PATH")
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| BOOT_ID_PATH.to_string());
+    read_bounded_identifier(Path::new(boot_id_path.trim()))
+}
+
+const NODE_IDENTITY_FILE: &str = ".node-identity-v1.json";
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NodeIdentityRecord {
+    version: u8,
+    node_uid: String,
+    boot_id: String,
+}
+
+fn read_node_identity_file(registry_dir: &Path) -> Option<UdpNodeIdentity> {
+    let path = registry_dir.join(NODE_IDENTITY_FILE);
+    let file = open_owned_regular_file(&path, MAX_NODE_ATTESTATION_BYTES).ok()?;
+    let mut bytes = Vec::new();
+    file.take(MAX_NODE_ATTESTATION_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_NODE_ATTESTATION_BYTES {
+        return None;
+    }
+    let record: NodeIdentityRecord = serde_json::from_slice(&bytes).ok()?;
+    if record.version != 1 {
+        return None;
+    }
+    UdpNodeIdentity::new(&record.node_uid, &record.boot_id).ok()
+}
+
+/// Publish this node's immutable Kubernetes UID, paired with the boot id it was
+/// observed under, into the shared pod-registry directory. Called by the
+/// node-agent, which is the only local process with a Kubernetes client.
+pub fn publish_node_identity(registry_dir: &Path, node_uid: &str) -> Result<(), String> {
+    let boot_id =
+        current_boot_id().ok_or_else(|| "could not read this node's boot id".to_string())?;
+    let identity = UdpNodeIdentity::new(node_uid, &boot_id)?;
+    if read_node_identity_file(registry_dir).as_ref() == Some(&identity) {
+        return Ok(());
+    }
+    std::fs::create_dir_all(registry_dir)
+        .map_err(|error| format!("could not create Ambient UDP registry directory: {error}"))?;
+    let bytes = serde_json::to_vec(&NodeIdentityRecord {
+        version: 1,
+        node_uid: identity.node_uid,
+        boot_id: identity.boot_id,
+    })
+    .map_err(|error| format!("could not encode the node identity record: {error}"))?;
+    atomic_write(
+        registry_dir,
+        &registry_dir.join(NODE_IDENTITY_FILE),
+        NODE_IDENTITY_FILE,
+        &bytes,
+        "node identity record",
+    )
+}
+
+fn validate_node_identifier(value: &str, description: &str) -> Result<(), String> {
+    if value.is_empty()
+        || value.len() > MAX_NODE_IDENTIFIER_BYTES
+        || !value
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(format!(
+            "{description} must be 1..={MAX_NODE_IDENTIFIER_BYTES} ASCII alphanumeric/./_/- bytes and start alphanumeric"
+        ));
+    }
+    Ok(())
+}
+
+/// Read a single-line identifier from a bounded, owned regular file. Used for
+/// the kernel boot id, which is a UUID line.
+fn read_bounded_identifier(path: &Path) -> Option<String> {
+    let file = open_owned_regular_file(path, MAX_NODE_ATTESTATION_BYTES).ok()?;
+    let mut bytes = Vec::new();
+    file.take(MAX_NODE_ATTESTATION_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_NODE_ATTESTATION_BYTES {
+        return None;
+    }
+    let value = String::from_utf8(bytes).ok()?;
+    let value = value.trim().to_string();
+    (!value.is_empty()).then_some(value)
+}
+
+/// Node-scoped, bounded evidence file. Used for both the preflight-written
+/// cleanup proof and the operator-written exemption; they differ only in who
+/// authors them and in the status they produce, never in how strictly they are
+/// bound to this node incarnation, target, and generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NodeAttestation {
+    version: u8,
+    node: UdpNodeIdentity,
+    target: UdpPlacement,
+    generation: String,
+}
+
+/// Why a node with no same-incarnation durable record was allowed to start the
+/// incoming producer. Bounded and fixed-cardinality: it never carries a node
+/// identity, path, generation, or any other operator-supplied value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UdpAdoptionProof {
+    /// No adoption happened: the node is running from its own durable record
+    /// written by this incarnation, or no placement decision has been made yet.
+    None,
+    /// A durable record written by an EARLIER boot of this same node UID. Every
+    /// predecessor pod network namespace died with that incarnation.
+    NewBoot,
+    /// The privileged node preflight retired both predecessor placements on
+    /// this exact node UID + boot id and published its completion marker.
+    NodeCleanup,
+    /// An operator explicitly exempted this node incarnation from the preflight
+    /// (decommissioned or otherwise known to carry no predecessor state).
+    OperatorExempt,
+}
+
+impl UdpAdoptionProof {
+    const fn code(self) -> u8 {
+        self as u8
+    }
+
+    const fn from_code(value: u8) -> Self {
+        match value {
+            1 => Self::NewBoot,
+            2 => Self::NodeCleanup,
+            3 => Self::OperatorExempt,
+            _ => Self::None,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::NewBoot => "new_boot",
+            Self::NodeCleanup => "node_cleanup",
+            Self::OperatorExempt => "operator_exempt",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UdpMigrationPhase {
     Stable,
@@ -105,11 +335,28 @@ pub struct UdpPlacementRequest {
     /// that performs the change. It is consulted ONLY when the node-local
     /// durable record is absent; a present record that disagrees with the
     /// requested placement is still a hard rejection.
+    ///
+    /// It is DESIRED STATE, never authorization (issue #3809). A release-level
+    /// object records no node identity, no node incarnation, and no per-node
+    /// cleanup result, so on its own it can never authorize a recordless
+    /// same-boot node whose running workloads may still carry predecessor
+    /// interception rules. It is necessary but not sufficient: node-specific
+    /// proof (`node` + a matching node attestation, or a durable record from an
+    /// earlier boot of this same node UID) must agree.
     pub established: Option<UdpPlacement>,
+    /// This node's immutable Kubernetes UID plus its current boot/incarnation
+    /// id. `None` means the deployment supplied no node identity, which is a
+    /// fail-closed refusal for every branch that needs node-specific proof.
+    pub node: Option<UdpNodeIdentity>,
+    /// The node-proof generation this release expects. A node attestation
+    /// written under any other generation is stale and never authorizes this
+    /// release, so an interrupted or superseded migration cannot be replayed
+    /// into a later one.
+    pub node_proof_generation: Option<String>,
 }
 
 impl UdpPlacementRequest {
-    pub fn from_env(target: UdpPlacement) -> Result<Self, String> {
+    pub fn from_env(target: UdpPlacement, registry_dir: &Path) -> Result<Self, String> {
         let phase_raw = resolve_ferrum_var("FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE")
             .unwrap_or_else(|| "stable".to_string());
         let phase = match phase_raw.trim() {
@@ -188,6 +435,8 @@ impl UdpPlacementRequest {
             from,
             to,
             established,
+            node: UdpNodeIdentity::resolve(registry_dir),
+            node_proof_generation: node_proof_generation_from_env()?,
         })
     }
 
@@ -197,6 +446,34 @@ impl UdpPlacementRequest {
             from: self.from?,
             to: self.to?,
         })
+    }
+}
+
+/// The release-bound node-proof generation. The chart derives it from the
+/// INSTALLED placement contract so it changes across every migration, which is
+/// exactly what makes a superseded attestation detectable as stale.
+pub fn node_proof_generation_from_env() -> Result<Option<String>, String> {
+    let value = resolve_ferrum_var("FERRUM_MESH_CAPTURE_UDP_NODE_PROOF_GENERATION")
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.trim().to_string());
+    if let Some(value) = value.as_deref() {
+        validate_generation(value).map_err(|_| {
+            "FERRUM_MESH_CAPTURE_UDP_NODE_PROOF_GENERATION must be 1..=64 ASCII alphanumeric/./_/- bytes and start alphanumeric"
+                .to_string()
+        })?;
+    }
+    Ok(value)
+}
+
+/// The generation the node-agent publishes its registry-synchronization marker
+/// under, and the one every consumer of that marker must require. An explicit
+/// migration generation always wins; otherwise the stable release's node-proof
+/// generation carries it, so the node preflight can obtain the SAME authoritative
+/// registry proof outside a cleanup/finalize rollout.
+pub fn registry_sync_generation_from_env() -> Result<Option<String>, String> {
+    match migration_generation_from_env()? {
+        Some(generation) => Ok(Some(generation)),
+        None => node_proof_generation_from_env(),
     }
 }
 
@@ -242,6 +519,13 @@ struct DurablePlacementState {
     active: UdpPlacement,
     pending: Option<PendingMigration>,
     completed: Option<UdpMigrationTransition>,
+    /// The node incarnation that last wrote this record. Absent only on a
+    /// record written before the node-proof contract; a PRESENT identity whose
+    /// node UID disagrees with this machine is a hard rejection, so a registry
+    /// directory restored from a backup or reused under a recycled node name
+    /// can never hand its ownership to a different machine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    incarnation: Option<UdpNodeIdentity>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -375,12 +659,13 @@ impl UdpCleanupProofWindow {
 }
 
 impl DurablePlacementState {
-    fn new(active: UdpPlacement) -> Self {
+    fn new(active: UdpPlacement, incarnation: Option<UdpNodeIdentity>) -> Self {
         Self {
             version: 1,
             active,
             pending: None,
             completed: None,
+            incarnation,
         }
     }
 }
@@ -395,9 +680,50 @@ pub struct UdpMigrationContext {
     registry_dir: PathBuf,
     transition: UdpMigrationTransition,
     cleanup_both: bool,
+    /// Set for the privileged node preflight. A preflight owns NO durable
+    /// placement state: it publishes a node-scoped completion attestation and
+    /// leaves the placement record for the steady-state process to write, so an
+    /// interrupted preflight can never strand a pending migration.
+    node_preflight: Option<UdpNodeIdentity>,
 }
 
 impl UdpMigrationContext {
+    /// Build the retirement context the privileged node preflight runs.
+    ///
+    /// The synthetic predecessor is `Disabled`, which makes `cleanup_both` true,
+    /// so BOTH the pod-netns and host-netns ownership domains (IPv4 and IPv6
+    /// alike) are enumerated and retired by exact Ferrum-owned name. That is the
+    /// only sound predecessor claim available to an ambiguous recordless node:
+    /// it cannot know which placement ran here before, so it must not guess.
+    pub fn for_node_preflight(
+        registry_dir: &Path,
+        target: UdpPlacement,
+        node: UdpNodeIdentity,
+        generation: &str,
+    ) -> Result<Self, String> {
+        validate_generation(generation)?;
+        node.validate()?;
+        if target == UdpPlacement::Disabled {
+            return Err(
+                "the Ambient UDP node preflight has no incoming placement to prove".to_string(),
+            );
+        }
+        Ok(Self {
+            registry_dir: registry_dir.to_path_buf(),
+            transition: UdpMigrationTransition {
+                generation: generation.to_string(),
+                from: UdpPlacement::Disabled,
+                to: target,
+            },
+            cleanup_both: true,
+            node_preflight: Some(node),
+        })
+    }
+
+    pub const fn is_node_preflight(&self) -> bool {
+        self.node_preflight.is_some()
+    }
+
     pub const fn from(&self) -> UdpPlacement {
         self.transition.from
     }
@@ -436,6 +762,28 @@ impl UdpMigrationContext {
     }
 
     pub fn mark_cleanup_complete(&self, proof: &UdpRegistrySyncProof) -> Result<(), String> {
+        if let Some(node) = &self.node_preflight {
+            // The preflight's completion evidence is node-scoped, not placement
+            // ownership. Re-check the registry publication immediately before
+            // publishing so a marker that changed during the final pass cannot
+            // be laundered into proof.
+            if self.registry_sync_proof().as_ref() != Some(proof) {
+                return Err(
+                    "Ambient UDP registry synchronization proof changed before node preflight completion"
+                        .to_string(),
+                );
+            }
+            return write_node_attestation(
+                &self.registry_dir,
+                NODE_PROOF_FILE,
+                &NodeAttestation {
+                    version: 1,
+                    node: node.clone(),
+                    target: self.transition.to,
+                    generation: self.transition.generation.clone(),
+                },
+            );
+        }
         let mut state = read_state(&self.registry_dir)?.ok_or_else(|| {
             "Ambient UDP migration state disappeared before cleanup completion".to_string()
         })?;
@@ -463,6 +811,24 @@ pub fn prepare_placement(
     request: &UdpPlacementRequest,
 ) -> Result<UdpPlacementDecision, String> {
     let mut state = read_state(registry_dir)?;
+    // A durable record is node ownership, so it is only THIS node's ownership
+    // when the identity it was written under is this machine. A record whose
+    // node UID belongs to another machine (a restored registry hostPath, a
+    // recycled node name, a copied artifact) is refused in EVERY phase before
+    // any of it is trusted — including as a predecessor claim for cleanup.
+    let mut incarnation_changed = false;
+    if let (Some(state), Some(node)) = (state.as_ref(), request.node.as_ref())
+        && let Some(recorded) = state.incarnation.as_ref()
+    {
+        if recorded.node_uid != node.node_uid {
+            set_failure(UdpMigrationFailureReason::NodeIdentityMismatch);
+            return Err(
+                "the durable Ambient UDP placement record on this registry directory was written by a different Kubernetes node UID; it cannot be inherited by this node"
+                    .to_string(),
+            );
+        }
+        incarnation_changed = recorded.boot_id != node.boot_id;
+    }
     match request.phase {
         UdpMigrationPhase::Stable => {
             if state.is_none() {
@@ -474,12 +840,18 @@ pub fn prepare_placement(
                 // deliberately dropped the setns privileges needed to look
                 // inside a pod netns, and marker absence is not proof.
                 //
-                // The RELEASE can tell them apart, because a completed earlier
-                // migration release is exactly the event that retired every
-                // then-existing node's predecessor state. Adopt the requested
-                // host placement only when the deployment attests that this
-                // placement was already established before this release; a
-                // present-but-different durable record is never overridden.
+                // A RELEASE cannot tell them apart either (issue #3809). The
+                // installed placement ConfigMap records only target/phase/
+                // generation — no node identity, no node incarnation, no
+                // per-node cleanup result — so a node that stayed booted with
+                // live workloads while it missed the cleanup and finalize
+                // rollout looks exactly like a rebooted one. Adopting on that
+                // evidence starts the host producer while every workload's pod
+                // netns still redirects UDP to the retired predecessor
+                // listener: a deterministic node-local UDP blackhole. The
+                // release attestation is therefore kept as a NECESSARY desired
+                // state check, and node-specific proof must agree with it
+                // before the incoming producer may start.
                 //
                 // An operator who quarantined unreadable/unknown ownership asked
                 // for cleanup to re-establish it. Refuse every stable bootstrap
@@ -503,26 +875,32 @@ pub fn prepare_placement(
                     }
                 }
                 let host_target = request.target == UdpPlacement::HostNetns;
-                let adopted_from_established_release =
-                    host_target && request.established == Some(request.target);
-                if host_target && !adopted_from_established_release {
-                    set_failure(UdpMigrationFailureReason::MigrationRequired);
-                    return Err(
-                        "host-netns Ambient UDP capture has no durable predecessor proof and this release does not attest an already-established host-netns placement; run an explicit cleanup migration before selecting host-netns"
-                            .to_string(),
-                    );
+                let mut adoption_proof = UdpAdoptionProof::None;
+                if host_target {
+                    if request.established != Some(request.target) {
+                        set_failure(UdpMigrationFailureReason::MigrationRequired);
+                        return Err(
+                            "host-netns Ambient UDP capture has no durable predecessor proof and this release does not attest an already-established host-netns placement; run an explicit cleanup migration before selecting host-netns"
+                                .to_string(),
+                        );
+                    }
+                    adoption_proof = resolve_recordless_node_proof(registry_dir, request)?;
                 }
-                write_state(registry_dir, &DurablePlacementState::new(request.target))?;
-                if adopted_from_established_release {
-                    record_established_adoption();
+                write_state(
+                    registry_dir,
+                    &DurablePlacementState::new(request.target, request.node.clone()),
+                )?;
+                if adoption_proof != UdpAdoptionProof::None {
+                    record_adoption(adoption_proof);
                     tracing::info!(
                         placement = request.target.as_str(),
-                        "Ambient UDP placement adopted from the release-attested established placement; this node carried no durable record (fresh node or recreated registry directory) and no predecessor cleanup is owed"
+                        proof = adoption_proof.as_str(),
+                        "Ambient UDP placement adopted with node-specific predecessor proof; this node carried no durable record and the proof is bound to its exact node UID and boot id"
                     );
                 }
                 state = read_state(registry_dir)?;
             }
-            let state = state.ok_or_else(|| {
+            let mut state = state.ok_or_else(|| {
                 "Ambient UDP placement state was not readable after initialization".to_string()
             })?;
             if state.pending.is_some() {
@@ -540,6 +918,23 @@ pub fn prepare_placement(
                     request.target.as_str()
                 ));
             }
+            // A record from an EARLIER boot of this same node UID is itself
+            // node-specific predecessor proof: every pod network namespace that
+            // could still hold predecessor interception rules died with that
+            // incarnation. Re-stamp the record so the next start reads plain
+            // same-incarnation ownership rather than replaying this decision.
+            if request.node.is_some() && (incarnation_changed || state.incarnation.is_none()) {
+                state.incarnation = request.node.clone();
+                write_state(registry_dir, &state)?;
+                if incarnation_changed {
+                    record_adoption(UdpAdoptionProof::NewBoot);
+                    tracing::info!(
+                        placement = request.target.as_str(),
+                        proof = UdpAdoptionProof::NewBoot.as_str(),
+                        "Ambient UDP placement adopted from a durable record written by an earlier boot of this same node UID; no predecessor pod network namespace can have survived the reboot"
+                    );
+                }
+            }
             set_phase(UdpMigrationStatusPhase::Stable, 0);
             clear_failure();
             Ok(UdpPlacementDecision::RunStable)
@@ -549,7 +944,10 @@ pub fn prepare_placement(
                 .transition()
                 .ok_or_else(|| "Ambient UDP cleanup transition is incomplete".to_string())?;
             let state_was_absent = state.is_none();
-            let mut state = state.unwrap_or_else(|| DurablePlacementState::new(transition.from));
+            let mut state = state.unwrap_or_else(|| {
+                DurablePlacementState::new(transition.from, request.node.clone())
+            });
+            state.incarnation = request.node.clone().or(state.incarnation);
             let cleanup_both = if let Some(pending) = &state.pending {
                 if pending.transition != transition {
                     set_failure(UdpMigrationFailureReason::GenerationMismatch);
@@ -595,6 +993,7 @@ pub fn prepare_placement(
                 registry_dir: registry_dir.to_path_buf(),
                 transition,
                 cleanup_both,
+                node_preflight: None,
             }))
         }
         UdpMigrationPhase::Finalize => {
@@ -637,6 +1036,7 @@ pub fn prepare_placement(
             state.active = transition.to;
             state.pending = None;
             state.completed = Some(transition);
+            state.incarnation = request.node.clone().or(state.incarnation);
             write_state(registry_dir, &state)?;
             // A completed cleanup/finalize pair is exactly the proof the
             // quarantine tombstone was waiting for. Clearing it fails soft: the
@@ -648,6 +1048,153 @@ pub fn prepare_placement(
             Ok(UdpPlacementDecision::RunStable)
         }
     }
+}
+
+/// Resolve the node-specific evidence that authorizes a recordless host-netns
+/// start, or fail closed as `migration_required`.
+///
+/// Every acceptance path is bound to the EXACT node UID, the CURRENT boot id,
+/// the requested target, and this release's node-proof generation. Node-name
+/// reuse under a different UID, a proof written before this incarnation, a
+/// superseded generation, a target mismatch, and an unreadable/forged/oversized
+/// attestation therefore all refuse.
+fn resolve_recordless_node_proof(
+    registry_dir: &Path,
+    request: &UdpPlacementRequest,
+) -> Result<UdpAdoptionProof, String> {
+    let Some(node) = request.node.as_ref() else {
+        set_failure(UdpMigrationFailureReason::NodeProofMissing);
+        return Err(
+            "host-netns Ambient UDP capture has no durable predecessor proof and this deployment supplied no node identity; a release-level attestation is desired state and cannot authorize a recordless node"
+                .to_string(),
+        );
+    };
+    let Some(expected_generation) = request.node_proof_generation.as_deref() else {
+        set_failure(UdpMigrationFailureReason::NodeProofMissing);
+        return Err(
+            "host-netns Ambient UDP capture has no durable predecessor proof and this release declares no node-proof generation to bind one to"
+                .to_string(),
+        );
+    };
+    for (file, proof) in [
+        (NODE_PROOF_FILE, UdpAdoptionProof::NodeCleanup),
+        (NODE_EXEMPT_FILE, UdpAdoptionProof::OperatorExempt),
+    ] {
+        let attestation = match read_node_attestation(registry_dir, file) {
+            Ok(Some(attestation)) => attestation,
+            Ok(None) => continue,
+            Err(error) => {
+                set_failure(UdpMigrationFailureReason::DurableStateRejected);
+                return Err(format!(
+                    "could not safely read the node-specific Ambient UDP placement attestation: {error}"
+                ));
+            }
+        };
+        if attestation.node.node_uid != node.node_uid {
+            set_failure(UdpMigrationFailureReason::NodeIdentityMismatch);
+            return Err(
+                "the node-specific Ambient UDP placement attestation names a different Kubernetes node UID; node-name reuse cannot inherit another machine's cleanup proof"
+                    .to_string(),
+            );
+        }
+        if attestation.node.boot_id != node.boot_id {
+            set_failure(UdpMigrationFailureReason::NodeProofMissing);
+            return Err(
+                "the node-specific Ambient UDP placement attestation was written for an earlier boot of this node; it cannot prove predecessor state was retired on this incarnation"
+                    .to_string(),
+            );
+        }
+        if attestation.target != request.target {
+            set_failure(UdpMigrationFailureReason::NodeProofMissing);
+            return Err(
+                "the node-specific Ambient UDP placement attestation proves a different incoming placement than this release requests"
+                    .to_string(),
+            );
+        }
+        if attestation.generation != expected_generation {
+            set_failure(UdpMigrationFailureReason::GenerationMismatch);
+            return Err(
+                "the node-specific Ambient UDP placement attestation was written under a superseded node-proof generation"
+                    .to_string(),
+            );
+        }
+        return Ok(proof);
+    }
+    set_failure(UdpMigrationFailureReason::MigrationRequired);
+    Err(
+        "host-netns Ambient UDP capture has no durable predecessor proof and no node-specific cleanup attestation for this node UID and boot id; run the privileged Ambient UDP node preflight (or an explicit cleanup migration) before starting the host producer"
+            .to_string(),
+    )
+}
+
+fn read_node_attestation(
+    registry_dir: &Path,
+    file: &str,
+) -> Result<Option<NodeAttestation>, String> {
+    let path = registry_dir.join(file);
+    let opened = match open_owned_regular_file(&path, MAX_NODE_ATTESTATION_BYTES) {
+        Ok(opened) => opened,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
+    let mut bytes = Vec::new();
+    opened
+        .take(MAX_NODE_ATTESTATION_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() as u64 > MAX_NODE_ATTESTATION_BYTES {
+        return Err("attestation exceeds its size limit".to_string());
+    }
+    let attestation: NodeAttestation =
+        serde_json::from_slice(&bytes).map_err(|_| "attestation is malformed".to_string())?;
+    if attestation.version != 1 {
+        return Err("attestation has an unsupported version".to_string());
+    }
+    attestation.node.validate()?;
+    validate_generation(&attestation.generation)
+        .map_err(|_| "attestation has an invalid generation".to_string())?;
+    Ok(Some(attestation))
+}
+
+fn write_node_attestation(
+    registry_dir: &Path,
+    file: &str,
+    attestation: &NodeAttestation,
+) -> Result<(), String> {
+    std::fs::create_dir_all(registry_dir)
+        .map_err(|error| format!("could not create Ambient UDP registry directory: {error}"))?;
+    let bytes = serde_json::to_vec(attestation).map_err(|error| {
+        format!("could not encode the Ambient UDP node placement attestation: {error}")
+    })?;
+    if bytes.len() as u64 > MAX_NODE_ATTESTATION_BYTES {
+        return Err("the Ambient UDP node placement attestation exceeds its size limit".to_string());
+    }
+    atomic_write(
+        registry_dir,
+        &registry_dir.join(file),
+        file,
+        &bytes,
+        "Ambient UDP node placement attestation",
+    )
+}
+
+/// True when this node incarnation already carries a valid, generation-bound
+/// cleanup attestation for `target`. Used by the preflight so a container
+/// restart is a cheap no-op instead of a second full retirement pass.
+pub fn node_cleanup_proof_is_current(
+    registry_dir: &Path,
+    target: UdpPlacement,
+    node: &UdpNodeIdentity,
+    generation: &str,
+) -> Result<bool, String> {
+    let Some(attestation) = read_node_attestation(registry_dir, NODE_PROOF_FILE)
+        .map_err(|error| format!("could not read the Ambient UDP node cleanup proof: {error}"))?
+    else {
+        return Ok(false);
+    };
+    Ok(attestation.node == *node
+        && attestation.target == target
+        && attestation.generation == generation)
 }
 
 fn state_path(registry_dir: &Path) -> PathBuf {
@@ -729,6 +1276,11 @@ fn validate_durable_state(state: &DurablePlacementState) -> Result<(), String> {
         Ok(())
     };
 
+    if let Some(incarnation) = &state.incarnation {
+        incarnation.validate().map_err(|_| {
+            "Ambient UDP migration state has an invalid node incarnation".to_string()
+        })?;
+    }
     if let Some(pending) = &state.pending {
         validate_transition(&pending.transition)?;
         if state.active != pending.transition.from || state.completed.is_some() {
@@ -1079,6 +1631,13 @@ pub enum UdpMigrationFailureReason {
     CleanupProofMissing,
     StatePersistenceFailed,
     DurableStateRejected,
+    /// A recordless node offered no node-specific cleanup/finalize evidence for
+    /// its exact node UID and current boot id, so only release-level desired
+    /// state was available and adoption was refused.
+    NodeProofMissing,
+    /// Durable ownership or a node attestation named a different Kubernetes
+    /// node UID than this machine.
+    NodeIdentityMismatch,
 }
 
 impl UdpMigrationFailureReason {
@@ -1100,6 +1659,8 @@ impl UdpMigrationFailureReason {
             10 => Self::CleanupProofMissing,
             11 => Self::StatePersistenceFailed,
             12 => Self::DurableStateRejected,
+            13 => Self::NodeProofMissing,
+            14 => Self::NodeIdentityMismatch,
             _ => Self::None,
         }
     }
@@ -1119,6 +1680,8 @@ impl UdpMigrationFailureReason {
             Self::CleanupProofMissing => "cleanup_proof_missing",
             Self::StatePersistenceFailed => "state_persistence_failed",
             Self::DurableStateRejected => "durable_state_rejected",
+            Self::NodeProofMissing => "node_proof_missing",
+            Self::NodeIdentityMismatch => "node_identity_mismatch",
         }
     }
 }
@@ -1127,8 +1690,10 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
 static STATUS_PHASE: AtomicU8 = AtomicU8::new(0);
 static OUTSTANDING: AtomicU64 = AtomicU64::new(0);
 static FAILURE_REASON: AtomicU8 = AtomicU8::new(0);
-static FAILURES_TOTAL: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
+static FAILURES_TOTAL: [AtomicU64; 15] = [const { AtomicU64::new(0) }; 15];
 static ESTABLISHED_ADOPTIONS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static ADOPTION_PROOF: AtomicU8 = AtomicU8::new(0);
+static ADOPTIONS_TOTAL: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct UdpMigrationStatusSnapshot {
@@ -1136,14 +1701,22 @@ pub struct UdpMigrationStatusSnapshot {
     pub phase: UdpMigrationStatusPhase,
     pub outstanding: u64,
     pub failure_reason: UdpMigrationFailureReason,
-    /// True when this process started its placement from the release-attested
-    /// established placement instead of a node-local durable record.
+    /// True when this process started its placement WITHOUT a same-incarnation
+    /// node-local durable record, i.e. it adopted on node-specific proof.
     pub established_adoption: bool,
+    /// Which node-specific proof authorized that adoption. Bounded and
+    /// fixed-cardinality; it never carries node identity, paths, generations,
+    /// or any other operator-supplied value.
+    pub adoption_proof: UdpAdoptionProof,
 }
 
-fn record_established_adoption() {
+fn record_adoption(proof: UdpAdoptionProof) {
     ENABLED.store(true, Ordering::Relaxed);
-    ESTABLISHED_ADOPTIONS_TOTAL.fetch_add(1, Ordering::Relaxed);
+    ADOPTION_PROOF.store(proof.code(), Ordering::Relaxed);
+    ADOPTIONS_TOTAL[proof.code() as usize].fetch_add(1, Ordering::Relaxed);
+    if proof != UdpAdoptionProof::None {
+        ESTABLISHED_ADOPTIONS_TOTAL.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 pub fn set_phase(phase: UdpMigrationStatusPhase, outstanding: usize) {
@@ -1171,6 +1744,7 @@ pub fn snapshot() -> UdpMigrationStatusSnapshot {
             FAILURE_REASON.load(Ordering::Relaxed),
         ),
         established_adoption: ESTABLISHED_ADOPTIONS_TOTAL.load(Ordering::Relaxed) > 0,
+        adoption_proof: UdpAdoptionProof::from_code(ADOPTION_PROOF.load(Ordering::Relaxed)),
     }
 }
 
@@ -1224,6 +1798,39 @@ pub fn render_prometheus(output: &mut String, gateway_ns_label: &str) {
         gateway_ns_label,
     );
     output.push_str(
+        "# HELP ferrum_mesh_udp_placement_migration_adoption_proof Node-specific proof that authorized a recordless Ambient UDP placement adoption (one bounded proof is 1).\n",
+    );
+    output.push_str("# TYPE ferrum_mesh_udp_placement_migration_adoption_proof gauge\n");
+    for proof in [
+        UdpAdoptionProof::None,
+        UdpAdoptionProof::NewBoot,
+        UdpAdoptionProof::NodeCleanup,
+        UdpAdoptionProof::OperatorExempt,
+    ] {
+        output.push_str(&format!(
+            "ferrum_mesh_udp_placement_migration_adoption_proof{{proof=\"{}\"{}}} {}\n",
+            proof.as_str(),
+            gateway_ns_label,
+            u8::from(snapshot.adoption_proof == proof)
+        ));
+    }
+    output.push_str(
+        "# HELP ferrum_mesh_udp_placement_migration_adoptions_total Recordless Ambient UDP placement adoptions by bounded node-specific proof.\n",
+    );
+    output.push_str("# TYPE ferrum_mesh_udp_placement_migration_adoptions_total counter\n");
+    for proof in [
+        UdpAdoptionProof::NewBoot,
+        UdpAdoptionProof::NodeCleanup,
+        UdpAdoptionProof::OperatorExempt,
+    ] {
+        output.push_str(&format!(
+            "ferrum_mesh_udp_placement_migration_adoptions_total{{proof=\"{}\"{}}} {}\n",
+            proof.as_str(),
+            gateway_ns_label,
+            ADOPTIONS_TOTAL[proof.code() as usize].load(Ordering::Relaxed)
+        ));
+    }
+    output.push_str(
         "# HELP ferrum_mesh_udp_placement_migration_failures_total Ambient UDP placement migration failures by bounded reason.\n",
     );
     output.push_str("# TYPE ferrum_mesh_udp_placement_migration_failures_total counter\n");
@@ -1240,6 +1847,8 @@ pub fn render_prometheus(output: &mut String, gateway_ns_label: &str) {
         UdpMigrationFailureReason::CleanupProofMissing,
         UdpMigrationFailureReason::StatePersistenceFailed,
         UdpMigrationFailureReason::DurableStateRejected,
+        UdpMigrationFailureReason::NodeProofMissing,
+        UdpMigrationFailureReason::NodeIdentityMismatch,
     ] {
         output.push_str(&format!(
             "ferrum_mesh_udp_placement_migration_failures_total{{reason=\"{}\"{}}} {}\n",

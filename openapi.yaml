@@ -11528,7 +11528,13 @@ components:
 
     UdpPlacementMigrationStatusSnapshot:
       type: object
-      required: [enabled, phase, outstanding, failure_reason, established_adoption]
+      required:
+        - enabled
+        - phase
+        - outstanding
+        - failure_reason
+        - established_adoption
+        - adoption_proof
       properties:
         enabled:
           type: boolean
@@ -11564,15 +11570,37 @@ components:
             - cleanup_proof_missing
             - state_persistence_failed
             - durable_state_rejected
-          description: Closed-set node-local failure reason; never includes pod UIDs or generations.
+            - node_proof_missing
+            - node_identity_mismatch
+          description: |
+            Closed-set node-local failure reason; never includes pod UIDs,
+            generations, node identity, or paths. `node_proof_missing` and
+            `node_identity_mismatch` are the ambiguous-adoption refusals added by
+            the node-specific proof boundary (issue #3809).
         established_adoption:
           type: boolean
           description: |
-            True when this node started its placement from the release-attested
-            established placement (`FERRUM_MESH_CAPTURE_UDP_PLACEMENT_ESTABLISHED`)
-            because it carried no node-local durable record — a fresh node, or a
-            node whose registry directory was recreated by a reboot. False for a
-            node resuming its own durable record and for every migration phase.
+            True when this node started its placement WITHOUT a same-incarnation
+            node-local durable record, i.e. it adopted on node-specific proof.
+            False for a node resuming its own durable record and for every
+            migration phase. A release-level attestation alone never sets it:
+            see `adoption_proof`.
+        adoption_proof:
+          type: string
+          enum:
+            - none
+            - new_boot
+            - node_cleanup
+            - operator_exempt
+          description: |
+            Which node-specific proof authorized a recordless adoption.
+            `new_boot` — a durable record written by an earlier boot of this same
+            node UID, so no predecessor pod network namespace survived.
+            `node_cleanup` — the privileged node preflight retired both
+            predecessor placements on this exact node UID and boot id.
+            `operator_exempt` — an operator-written, node-bound exemption.
+            `none` — no adoption happened. Bounded and fixed-cardinality; it never
+            carries node identity, paths, or generations.
 
     NodeWaypointObservabilitySnapshot:
       type: object

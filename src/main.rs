@@ -218,6 +218,35 @@ fn main() {
             }
             return;
         }
+        Some(cli::Command::AmbientUdpPreflight(args)) => {
+            // A privileged one-shot init stage: it owns no listeners, no config
+            // load, and no mode dispatch. Failure must be loud and non-zero so
+            // the unprivileged steady-state container never starts on a node
+            // whose predecessor retirement could not be proven.
+            let _ = tracing_subscriber::fmt()
+                .with_writer(std::io::stderr)
+                .with_max_level(match args.verbose {
+                    0 => tracing::Level::WARN,
+                    1 => tracing::Level::INFO,
+                    2 => tracing::Level::DEBUG,
+                    _ => tracing::Level::TRACE,
+                })
+                .try_init();
+            match cli::execute_ambient_udp_preflight(args) {
+                Ok(()) => {}
+                Err(e) => {
+                    emit_bootstrap_error(
+                        "Ambient UDP node preflight failed",
+                        &[
+                            ("command", "ambient-udp-preflight".to_string()),
+                            ("error", e.to_string()),
+                        ],
+                    );
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
         Some(cli::Command::Health(args)) => {
             match cli::execute_health(args) {
                 Ok(()) => {}

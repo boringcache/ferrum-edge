@@ -19,13 +19,27 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch"]
+  {{- /* Ambient UDP placement proof (issue #3809): the downward API exposes
+         spec.nodeName but NOT the node UID, and the ambient proxy holds no
+         Kubernetes client, so the node-agent resolves this node's immutable
+         Node.metadata.uid with one bounded GET and publishes it beside the pod
+         registry. Read-only, and scoped to `get` alone when the ingress-redirect
+         list/watch below is not also required. */}}
+  {{- $naAmbientEnv := default dict .Values.ambient.env }}
+  {{- $naAmbientTopology := replace "-" "_" (lower (trim (toString (index $naAmbientEnv "FERRUM_MESH_TOPOLOGY")))) }}
+  {{- $naAmbientUdpLifecycle := and .Values.ambient.enabled (eq $naAmbientTopology "ambient") }}
+  {{- if and $naAmbientUdpLifecycle (not .Values.nodeAgent.ingressRedirectIfaces) }}
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get"]
+  {{- end }}
   {{- if .Values.nodeAgent.ingressRedirectIfaces }}
   # NodeWaypoint ingress-interface validation derives the complete, per-family
   # remote PodCIDR/InternalIP route set from one bounded long-lived Node watch.
   # It is read-only; no interface is auto-selected from this data.
   - apiGroups: [""]
     resources: ["nodes"]
-    verbs: ["list", "watch"]
+    verbs: ["get", "list", "watch"]
   {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1

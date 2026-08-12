@@ -211,6 +211,24 @@ ambient:
   outboundPort: 15001
   hbonePort: 15008
   captureMode: iptables
+  # Privileged one-shot preflight init stage for the SETTLED host-netns UDP
+  # placement (issue #3809). The installed placement ConfigMap is release
+  # desired state and records no node identity, node incarnation, or per-node
+  # cleanup result, so it cannot prove that a recordless node is fresh/rebooted
+  # rather than a pre-contract node whose running workloads still redirect UDP
+  # to a retired listener. The preflight retires BOTH predecessor placements
+  # (IPv4 and IPv6, host netns and every enrolled pod netns) by exact
+  # Ferrum-owned name, then publishes an attestation bound to this node's
+  # Kubernetes UID, current boot id, target, and node-proof generation. Only the
+  # init stage receives hostPID/SYS_ADMIN/SYS_PTRACE; the steady-state producer
+  # keeps its narrow NET_ADMIN/NET_RAW pair.
+  #
+  # Disabling it does NOT relax the runtime boundary: a node with no durable
+  # record and no attestation stays fail-closed as `migration_required`. Use it
+  # only on clusters that will not grant the init stage's privileges, together
+  # with the documented per-node operator exemption marker in docs/mesh.md.
+  udpNodePreflight:
+    enabled: true
   spire:
     # Mount a SPIRE Agent Workload API socket and configure mesh mode to fetch
     # its runtime X.509-SVID from SPIRE. Requires workloadSpiffeId; NodeWaypoint

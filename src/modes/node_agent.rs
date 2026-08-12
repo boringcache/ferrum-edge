@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use futures_util::{Stream, StreamExt};
-use k8s_openapi::api::core::v1::{Container, Pod, PodSpec, PodStatus, Probe};
+use k8s_openapi::api::core::v1::{Container, Node, Pod, PodSpec, PodStatus, Probe};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::api::ListParams;
 use kube::runtime::watcher::{self as kube_watcher, Event};
@@ -1644,8 +1644,13 @@ async fn run_with_backend(
         Ok(client) => client,
         Err(err) => return Err(owner.fail_with(err)),
     };
+    // An explicit migration generation always wins; a settled release falls
+    // back to its node-proof generation so the privileged Ambient UDP node
+    // preflight (#3809) can require the SAME authoritative registry publication
+    // proof the cleanup phase does, instead of retiring predecessor rules
+    // against a registry that may not yet list every enrolled pod.
     let udp_migration_generation =
-        crate::proxy::udp_placement_migration::migration_generation_from_env()
+        crate::proxy::udp_placement_migration::registry_sync_generation_from_env()
             .map_err(anyhow::Error::msg)?;
     if udp_migration_generation.is_some() && config.node_waypoint_pod_registry_dir.is_none() {
         anyhow::bail!(
@@ -1697,6 +1702,17 @@ async fn run_with_backend(
         &initial_topology,
         "startup",
     );
+    // Publish this node's immutable Kubernetes UID beside the pod registry
+    // (issue #3809). The downward API exposes `spec.nodeName` but NOT the node
+    // UID, and the Ambient proxy has no Kubernetes client of its own, so the
+    // node-agent — which already holds a scoped client for this exact node — is
+    // the only place that can bind node-local UDP placement proof to an
+    // identifier a rebuilt machine cannot inherit. A missing RBAC grant or an
+    // unavailable API is NOT fatal here: it simply leaves the proxy without
+    // node identity, which its own guard treats as a fail-closed refusal.
+    if let Some(registry_dir) = config.node_waypoint_pod_registry_dir.as_deref() {
+        publish_node_identity(&client, config.node_name.as_str(), registry_dir).await;
+    }
     let pods: Api<Pod> = Api::all(client.clone());
     let watcher_config =
         kube_watcher::Config::default().fields(&format!("spec.nodeName={}", config.node_name));
@@ -2808,6 +2824,49 @@ fn has_pending_capture_failures(pod_states: &DashMap<String, PodAttachmentState>
     PENDING_CAPTURE_FAILURES
         .iter()
         .any(|entry| entry.key().starts_with(&key_prefix))
+}
+
+/// Resolve this node's `Node.metadata.uid` with one bounded GET and publish it
+/// into the shared pod-registry directory for the Ambient proxy's UDP placement
+/// proof. Every failure path warns and returns: the proxy fails closed on a
+/// missing identity, so a best-effort publication can only ever withhold an
+/// adoption, never authorize one.
+async fn publish_node_identity(
+    client: &Client,
+    node_name: &str,
+    registry_dir: &std::path::Path,
+) {
+    let nodes: Api<Node> = Api::all(client.clone());
+    let node = match tokio::time::timeout(Duration::from_secs(10), nodes.get(node_name)).await {
+        Ok(Ok(node)) => node,
+        Ok(Err(error)) => {
+            warn!(
+                %error,
+                "could not read this node's Kubernetes UID; Ambient UDP host-placement adoption \
+                 will stay fail-closed until the node-agent can read its own Node object"
+            );
+            return;
+        }
+        Err(_) => {
+            warn!(
+                "timed out reading this node's Kubernetes UID; Ambient UDP host-placement \
+                 adoption will stay fail-closed"
+            );
+            return;
+        }
+    };
+    let Some(uid) = node.metadata.uid.as_deref() else {
+        warn!("this node's Kubernetes object carries no UID; Ambient UDP host-placement adoption will stay fail-closed");
+        return;
+    };
+    if let Err(error) =
+        crate::proxy::udp_placement_migration::publish_node_identity(registry_dir, uid)
+    {
+        warn!(
+            %error,
+            "could not publish this node's identity for the Ambient UDP placement proof"
+        );
+    }
 }
 
 fn publish_udp_migration_registry_sync_if_ready(

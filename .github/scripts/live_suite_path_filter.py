@@ -247,7 +247,7 @@ SUITE_PATTERNS: dict[str, list[str]] = {
         r"^charts/ferrum-mesh/",
         r"^src/capture/",
         r"^src/modes/mesh/",
-        r"^src/proxy/(host_udp_capture|host_udp_capture_live_tests|mesh_udp_capture|netns_capture|netns_udp_capture|udp_batch|udp_placement_migration|mod)\.rs$",
+        r"^src/proxy/(host_udp_capture|host_udp_capture_live_tests|mesh_udp_capture|netns_capture|netns_udp_capture|udp_batch|udp_placement_cleanup|udp_placement_migration|mod)\.rs$",
         r"^src/socket_opts\.rs$",
         r"^src/ebpf/veth\.rs$",
         *exact_path_patterns(AMBIENT_HOST_UDP_DOCUMENTATION_PATHS),

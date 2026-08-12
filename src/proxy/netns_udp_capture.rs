@@ -1525,7 +1525,7 @@ impl<B: NetnsUdpCleanupBackend> NetnsUdpCleanupManager<B> {
 /// forever — the exact failure mode this check exists to prevent (codex).
 /// Non-`cfg`-gated so the `cfg!(target_os = "linux")` runtime gate at the call
 /// site compiles on every platform; it only runs on Linux.
-pub(crate) fn preflight_capture_tools(require_ip6tables: bool) -> Result<(), String> {
+pub fn preflight_capture_tools(require_ip6tables: bool) -> Result<(), String> {
     let probe = preflight_capture_tools_probe(require_ip6tables);
     let output = std::process::Command::new("sh")
         .arg("-c")

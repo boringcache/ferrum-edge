@@ -6,10 +6,47 @@ use ferrum_edge::proxy::netns_capture::{
 };
 use ferrum_edge::proxy::netns_udp_capture::{NetnsUdpCleanupBackend, NetnsUdpCleanupManager};
 use ferrum_edge::proxy::udp_placement_migration::{
-    UdpCleanupProofWindow, UdpMigrationFailureReason, UdpMigrationPhase, UdpPlacement,
-    UdpPlacementDecision, UdpPlacementRequest, UdpRegistrySyncProof, clear_registry_sync_marker,
-    prepare_placement, publish_registry_sync_marker_for_pods,
+    UdpAdoptionProof, UdpCleanupProofWindow, UdpMigrationFailureReason, UdpMigrationPhase,
+    UdpNodeIdentity, UdpPlacement, UdpPlacementDecision, UdpPlacementRequest, UdpRegistrySyncProof,
+    clear_registry_sync_marker, prepare_placement, publish_registry_sync_marker_for_pods,
 };
+
+/// Node identity is supplied EXPLICITLY in these tests rather than resolved
+/// from the process environment, so every proof assertion is deterministic and
+/// no test can race another over a shared env var or `/proc` read.
+const NODE_A: &str = "11111111-1111-4111-8111-111111111111";
+const NODE_B: &str = "22222222-2222-4222-8222-222222222222";
+const BOOT_1: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+const BOOT_2: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+const PROOF_GENERATION: &str = "host-netns-stable";
+
+fn identity(node_uid: &str, boot_id: &str) -> UdpNodeIdentity {
+    UdpNodeIdentity::new(node_uid, boot_id).expect("valid node identity")
+}
+
+/// Write the node-scoped attestation the privileged preflight publishes. The
+/// preflight itself needs a live pod-netns/iptables environment, so these
+/// deterministic tests exercise the RUNTIME BOUNDARY that consumes the artifact
+/// with the exact on-disk shape the preflight writes.
+fn write_node_attestation(
+    registry: &std::path::Path,
+    file: &str,
+    node: &UdpNodeIdentity,
+    target: UdpPlacement,
+    generation: &str,
+) {
+    let document = serde_json::json!({
+        "version": 1,
+        "node": {"node_uid": node.node_uid, "boot_id": node.boot_id},
+        "target": target.as_str(),
+        "generation": generation,
+    });
+    std::fs::write(
+        registry.join(file),
+        serde_json::to_vec(&document).expect("encode attestation"),
+    )
+    .expect("write attestation");
+}
 
 fn age_crash_temp(path: &std::path::Path) {
     let old = std::time::SystemTime::now()
@@ -79,12 +116,39 @@ fn stable(target: UdpPlacement) -> UdpPlacementRequest {
         from: None,
         to: None,
         established: None,
+        node: None,
+        node_proof_generation: None,
     }
 }
 
+/// A release-level attestation with NO node-specific provenance. This is the
+/// shape a bare `FERRUM_MESH_CAPTURE_UDP_PLACEMENT_ESTABLISHED=<target>` from a
+/// client-render pipeline produces, and it must authorize nothing.
 fn stable_attested(target: UdpPlacement, established: UdpPlacement) -> UdpPlacementRequest {
     UdpPlacementRequest {
         established: Some(established),
+        ..stable(target)
+    }
+}
+
+/// The Helm/GitOps-equivalent shape: release desired state PLUS this node's
+/// identity and the release's node-proof generation.
+fn stable_attested_on_node(
+    target: UdpPlacement,
+    established: UdpPlacement,
+    node: &UdpNodeIdentity,
+) -> UdpPlacementRequest {
+    UdpPlacementRequest {
+        node: Some(node.clone()),
+        node_proof_generation: Some(PROOF_GENERATION.to_string()),
+        ..stable_attested(target, established)
+    }
+}
+
+fn stable_on_node(target: UdpPlacement, node: &UdpNodeIdentity) -> UdpPlacementRequest {
+    UdpPlacementRequest {
+        node: Some(node.clone()),
+        node_proof_generation: Some(PROOF_GENERATION.to_string()),
         ..stable(target)
     }
 }
@@ -102,6 +166,8 @@ fn transition(
         from: Some(from),
         to: Some(to),
         established: None,
+        node: None,
+        node_proof_generation: None,
     }
 }
 
@@ -162,27 +228,308 @@ fn legacy_or_fresh_host_placement_requires_explicit_cleanup_proof() {
 }
 
 #[test]
-fn rebooted_or_new_node_adopts_the_release_attested_established_placement() {
-    // A node that joined after the migration, or whose tmpfs registry directory
-    // was recreated by a reboot, carries no durable record but provably no
-    // predecessor rules either. Without adoption it would refuse host-netns
-    // forever and never publish readiness.
+fn a_release_only_attestation_never_admits_a_recordless_same_boot_node() {
+    // The pre-contract node from issue #3809: it stayed booted with live
+    // workloads whose pod netns still redirect UDP to the retired predecessor
+    // listener, and it missed both migration releases. The release ConfigMap
+    // names no node, no incarnation, and no per-node cleanup result, so it
+    // looks exactly like a rebooted node — and must authorize nothing.
     let registry = tempfile::tempdir().expect("registry");
+    let error = prepare_placement(
+        registry.path(),
+        &stable_attested(UdpPlacement::HostNetns, UdpPlacement::HostNetns),
+    )
+    .err()
+    .expect("release-only attestation must not admit a recordless node");
+    assert!(error.contains("no node identity"), "{error}");
+    assert_eq!(
+        ferrum_edge::proxy::udp_placement_migration::snapshot().failure_reason,
+        UdpMigrationFailureReason::NodeProofMissing
+    );
+
+    // Supplying node identity is still not proof: nothing on this node attests
+    // that predecessor state was retired here.
+    let node = identity(NODE_A, BOOT_1);
+    let error = prepare_placement(
+        registry.path(),
+        &stable_attested_on_node(UdpPlacement::HostNetns, UdpPlacement::HostNetns, &node),
+    )
+    .err()
+    .expect("a node with no cleanup attestation must be refused");
+    assert!(error.contains("no node-specific cleanup attestation"), "{error}");
+    assert_eq!(
+        ferrum_edge::proxy::udp_placement_migration::snapshot().failure_reason,
+        UdpMigrationFailureReason::MigrationRequired
+    );
+    // Nothing was written, so the refusal is repeatable rather than a one-shot
+    // that a restart could walk past.
+    assert!(!registry.path().join(".udp-placement-state-v1.json").exists());
+}
+
+#[test]
+fn explicit_node_cleanup_proof_permits_the_host_placement() {
+    let registry = tempfile::tempdir().expect("registry");
+    let node = identity(NODE_A, BOOT_1);
+    write_node_attestation(
+        registry.path(),
+        ".udp-node-cleanup-proof-v1.json",
+        &node,
+        UdpPlacement::HostNetns,
+        PROOF_GENERATION,
+    );
     assert!(matches!(
         prepare_placement(
             registry.path(),
-            &stable_attested(UdpPlacement::HostNetns, UdpPlacement::HostNetns),
+            &stable_attested_on_node(UdpPlacement::HostNetns, UdpPlacement::HostNetns, &node),
         ),
         Ok(UdpPlacementDecision::RunStable)
     ));
-    assert!(
-        ferrum_edge::proxy::udp_placement_migration::snapshot().established_adoption,
-        "adoption must be visible to operators"
-    );
-    // The adoption is durable: a later restart resumes its own record and does
-    // not depend on the attestation staying rendered.
+    let snapshot = ferrum_edge::proxy::udp_placement_migration::snapshot();
+    assert_eq!(snapshot.adoption_proof, UdpAdoptionProof::NodeCleanup);
+    assert!(snapshot.established_adoption);
+    // The adoption is durable: a later restart resumes its own record.
     assert!(matches!(
-        prepare_placement(registry.path(), &stable(UdpPlacement::HostNetns)),
+        prepare_placement(registry.path(), &stable_on_node(UdpPlacement::HostNetns, &node)),
+        Ok(UdpPlacementDecision::RunStable)
+    ));
+}
+
+#[test]
+fn an_operator_exemption_is_node_bound_and_distinguishes_a_decommissioned_node() {
+    let registry = tempfile::tempdir().expect("registry");
+    let node = identity(NODE_A, BOOT_1);
+    write_node_attestation(
+        registry.path(),
+        ".udp-placement-node-exempt",
+        &node,
+        UdpPlacement::HostNetns,
+        PROOF_GENERATION,
+    );
+    assert!(matches!(
+        prepare_placement(
+            registry.path(),
+            &stable_attested_on_node(UdpPlacement::HostNetns, UdpPlacement::HostNetns, &node),
+        ),
+        Ok(UdpPlacementDecision::RunStable)
+    ));
+    assert_eq!(
+        ferrum_edge::proxy::udp_placement_migration::snapshot().adoption_proof,
+        UdpAdoptionProof::OperatorExempt
+    );
+}
+
+#[test]
+fn the_same_node_uid_after_a_reboot_adopts_but_a_reused_node_name_cannot() {
+    // A persistent registry path keeps the durable record across a reboot. A
+    // changed boot id proves every predecessor pod netns died with the previous
+    // incarnation, so adoption is sound and is reported as `new_boot`.
+    let registry = tempfile::tempdir().expect("registry");
+    let first_boot = identity(NODE_A, BOOT_1);
+    write_node_attestation(
+        registry.path(),
+        ".udp-node-cleanup-proof-v1.json",
+        &first_boot,
+        UdpPlacement::HostNetns,
+        PROOF_GENERATION,
+    );
+    prepare_placement(
+        registry.path(),
+        &stable_attested_on_node(UdpPlacement::HostNetns, UdpPlacement::HostNetns, &first_boot),
+    )
+    .expect("first-boot adoption");
+
+    let second_boot = identity(NODE_A, BOOT_2);
+    assert!(matches!(
+        prepare_placement(
+            registry.path(),
+            &stable_on_node(UdpPlacement::HostNetns, &second_boot),
+        ),
+        Ok(UdpPlacementDecision::RunStable)
+    ));
+    assert_eq!(
+        ferrum_edge::proxy::udp_placement_migration::snapshot().adoption_proof,
+        UdpAdoptionProof::NewBoot
+    );
+
+    // The SAME node name rebuilt as a different machine carries a different
+    // Kubernetes node UID and can never inherit that record.
+    let other_machine = identity(NODE_B, BOOT_2);
+    let error = prepare_placement(
+        registry.path(),
+        &stable_on_node(UdpPlacement::HostNetns, &other_machine),
+    )
+    .err()
+    .expect("a different node UID must not inherit durable ownership");
+    assert!(error.contains("different Kubernetes node UID"), "{error}");
+    assert_eq!(
+        ferrum_edge::proxy::udp_placement_migration::snapshot().failure_reason,
+        UdpMigrationFailureReason::NodeIdentityMismatch
+    );
+}
+
+#[test]
+fn a_node_attestation_from_another_node_or_boot_or_generation_is_refused() {
+    let node = identity(NODE_A, BOOT_1);
+
+    // Another machine's proof, copied onto this node.
+    let registry = tempfile::tempdir().expect("registry");
+    write_node_attestation(
+        registry.path(),
+        ".udp-node-cleanup-proof-v1.json",
+        &identity(NODE_B, BOOT_1),
+        UdpPlacement::HostNetns,
+        PROOF_GENERATION,
+    );
+    let error = prepare_placement(
+        registry.path(),
+        &stable_attested_on_node(UdpPlacement::HostNetns, UdpPlacement::HostNetns, &node),
+    )
+    .err()
+    .expect("another node's attestation must be refused");
+    assert!(error.contains("different Kubernetes node UID"), "{error}");
+
+    // This node's proof, but from an earlier incarnation: a same-boot
+    // pre-contract node could have installed predecessor rules since.
+    let registry = tempfile::tempdir().expect("registry");
+    write_node_attestation(
+        registry.path(),
+        ".udp-node-cleanup-proof-v1.json",
+        &identity(NODE_A, BOOT_2),
+        UdpPlacement::HostNetns,
+        PROOF_GENERATION,
+    );
+    let error = prepare_placement(
+        registry.path(),
+        &stable_attested_on_node(UdpPlacement::HostNetns, UdpPlacement::HostNetns, &node),
+    )
+    .err()
+    .expect("an earlier incarnation's attestation must be refused");
+    assert!(error.contains("earlier boot"), "{error}");
+
+    // A superseded node-proof generation: the migration moved on.
+    let registry = tempfile::tempdir().expect("registry");
+    write_node_attestation(
+        registry.path(),
+        ".udp-node-cleanup-proof-v1.json",
+        &node,
+        UdpPlacement::HostNetns,
+        "stale-generation",
+    );
+    let error = prepare_placement(
+        registry.path(),
+        &stable_attested_on_node(UdpPlacement::HostNetns, UdpPlacement::HostNetns, &node),
+    )
+    .err()
+    .expect("a stale node-proof generation must be refused");
+    assert!(error.contains("superseded node-proof generation"), "{error}");
+    assert_eq!(
+        ferrum_edge::proxy::udp_placement_migration::snapshot().failure_reason,
+        UdpMigrationFailureReason::GenerationMismatch
+    );
+
+    // A proof for a different incoming placement proves nothing about this one.
+    let registry = tempfile::tempdir().expect("registry");
+    write_node_attestation(
+        registry.path(),
+        ".udp-node-cleanup-proof-v1.json",
+        &node,
+        UdpPlacement::PodNetns,
+        PROOF_GENERATION,
+    );
+    let error = prepare_placement(
+        registry.path(),
+        &stable_attested_on_node(UdpPlacement::HostNetns, UdpPlacement::HostNetns, &node),
+    )
+    .err()
+    .expect("a proof for another placement must be refused");
+    assert!(error.contains("different incoming placement"), "{error}");
+}
+
+#[test]
+fn malformed_or_unreadable_node_proof_fails_closed() {
+    let node = identity(NODE_A, BOOT_1);
+    for body in [
+        &b"{"[..],
+        &b"{\"version\":2,\"node\":{\"node_uid\":\"a\",\"boot_id\":\"b\"},\"target\":\"host-netns\",\"generation\":\"g\"}"[..],
+        &vec![b'x'; 4096][..],
+    ] {
+        let registry = tempfile::tempdir().expect("registry");
+        std::fs::write(
+            registry.path().join(".udp-node-cleanup-proof-v1.json"),
+            body,
+        )
+        .expect("write hostile attestation");
+        let error = prepare_placement(
+            registry.path(),
+            &stable_attested_on_node(UdpPlacement::HostNetns, UdpPlacement::HostNetns, &node),
+        )
+        .err()
+        .expect("unreadable or malformed proof must fail closed");
+        assert!(error.contains("node-specific"), "{error}");
+        assert!(!registry.path().join(".udp-placement-state-v1.json").exists());
+    }
+}
+
+#[test]
+fn a_release_without_a_node_proof_generation_cannot_bind_any_proof() {
+    let registry = tempfile::tempdir().expect("registry");
+    let node = identity(NODE_A, BOOT_1);
+    write_node_attestation(
+        registry.path(),
+        ".udp-node-cleanup-proof-v1.json",
+        &node,
+        UdpPlacement::HostNetns,
+        PROOF_GENERATION,
+    );
+    let request = UdpPlacementRequest {
+        node: Some(node),
+        node_proof_generation: None,
+        ..stable_attested(UdpPlacement::HostNetns, UdpPlacement::HostNetns)
+    };
+    let error = prepare_placement(registry.path(), &request)
+        .err()
+        .expect("a release with no node-proof generation must refuse");
+    assert!(error.contains("no node-proof generation"), "{error}");
+}
+
+#[test]
+fn a_cleanup_complete_node_that_missed_finalize_still_resumes_through_finalize() {
+    // Node-specific proof is additive to the existing generation-safe
+    // resumption, never a replacement for it: a node that persisted cleanup
+    // completion and then lost its finalize release must still refuse `stable`
+    // and finalize on the exact same tuple.
+    let registry = tempfile::tempdir().expect("registry");
+    let node = identity(NODE_A, BOOT_1);
+    prepare_placement(registry.path(), &stable_on_node(UdpPlacement::PodNetns, &node))
+        .expect("pod placement bootstrap");
+    let cleanup = transition(
+        UdpMigrationPhase::Cleanup,
+        "resume-1",
+        UdpPlacement::PodNetns,
+        UdpPlacement::HostNetns,
+    );
+    let context = cleanup_context(registry.path(), &cleanup);
+    complete_cleanup(&context);
+
+    let error = prepare_placement(registry.path(), &stable_on_node(UdpPlacement::HostNetns, &node))
+        .err()
+        .expect("a cleanup-complete node must not start stable");
+    assert!(error.contains("phase=finalize"), "{error}");
+
+    let finalize = transition(
+        UdpMigrationPhase::Finalize,
+        "resume-1",
+        UdpPlacement::PodNetns,
+        UdpPlacement::HostNetns,
+    );
+    assert!(matches!(
+        prepare_placement(registry.path(), &finalize),
+        Ok(UdpPlacementDecision::RunStable)
+    ));
+    // The finalized record is this node's own proof from here on: no node
+    // attestation is consulted, because the record is present.
+    assert!(matches!(
+        prepare_placement(registry.path(), &stable_on_node(UdpPlacement::HostNetns, &node)),
         Ok(UdpPlacementDecision::RunStable)
     ));
 }
@@ -859,4 +1206,74 @@ async fn stale_gate_ack_cannot_authorize_migration_cleanup() {
     let complete = manager.migration_cleanup_once().await;
     assert_eq!(complete.outstanding, 0);
     assert_eq!(complete.failure_reason, None);
+}
+
+#[test]
+fn the_node_preflight_retires_both_placements_for_ipv4_and_ipv6() {
+    // A recordless node cannot know which placement ran here before, so it must
+    // not guess: the preflight context declares the conservative `disabled`
+    // predecessor, which reaps BOTH ownership domains.
+    let registry = tempfile::tempdir().expect("registry");
+    let context =
+        ferrum_edge::proxy::udp_placement_migration::UdpMigrationContext::for_node_preflight(
+            registry.path(),
+            UdpPlacement::HostNetns,
+            identity(NODE_A, BOOT_1),
+            PROOF_GENERATION,
+        )
+        .expect("node preflight context");
+    assert!(context.is_node_preflight());
+    assert!(
+        context.cleanup_pod_netns(),
+        "pod-netns ownership must be reaped"
+    );
+    assert!(
+        context.cleanup_host_netns(),
+        "host-netns ownership must be reaped"
+    );
+    assert_eq!(context.to(), UdpPlacement::HostNetns);
+    assert_eq!(context.generation(), PROOF_GENERATION);
+
+    // Both the pod-netns and the host-netns retirement scripts delete the exact
+    // Ferrum-owned objects in BOTH address families, and neither flushes a
+    // table nor matches a chain by pattern.
+    let pod = ferrum_edge::capture::IptablesPlan::udp_teardown_script(true);
+    let host = ferrum_edge::capture::IptablesPlan::host_udp_teardown_script();
+    for script in [&pod, &host] {
+        assert!(script.contains("iptables"), "{script}");
+        // Ownership safety: every chain flush/delete names a Ferrum-owned
+        // chain. A bare table flush would take a co-resident CNI's rules down
+        // with it, so it must never appear.
+        for line in script.lines() {
+            for token in ["-F", "-X"] {
+                if let Some(rest) = line.split(token).nth(1) {
+                    let chain = rest.split_whitespace().next().unwrap_or("");
+                    assert!(
+                        chain.starts_with("FERRUM_MESH_UDP"),
+                        "{token} must name a Ferrum-owned chain, got {chain:?} in {line}"
+                    );
+                }
+            }
+        }
+    }
+    assert!(
+        pod.contains("ip6tables"),
+        "pod teardown must cover IPv6: {pod}"
+    );
+    assert!(
+        host.contains("ip6tables"),
+        "host teardown must cover IPv6: {host}"
+    );
+
+    // A `disabled` target has no incoming placement to prove, so it is refused
+    // rather than publishing a vacuous attestation.
+    assert!(
+        ferrum_edge::proxy::udp_placement_migration::UdpMigrationContext::for_node_preflight(
+            registry.path(),
+            UdpPlacement::Disabled,
+            identity(NODE_A, BOOT_1),
+            PROOF_GENERATION,
+        )
+        .is_err()
+    );
 }

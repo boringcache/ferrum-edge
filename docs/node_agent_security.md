@@ -181,15 +181,26 @@ privilege set. See the [Ambient UDP migration procedure](mesh.md#ambient-udp-pla
 
 Once that migration has completed, a node with no node-local durable record —
 one that joined the cluster afterwards, or whose registry directory was
-recreated by a reboot — adopts the placement from the chart-rendered
+recreated by a reboot — still needs the chart-rendered
 `FERRUM_MESH_CAPTURE_UDP_PLACEMENT_ESTABLISHED` attestation, which the chart
-derives only from the already-installed placement ConfigMap. That widens no
-privilege: such a node still renders the narrowed host-placement capability set,
-and the attestation is consulted only when the durable record is absent, so it
-can never authorize an in-place flip on a running node. A
-`.udp-placement-quarantined` tombstone in the registry directory refuses every
-absent-state bootstrap outright, which is what makes the corrupt-ownership
-repair procedure machine-enforced rather than advisory.
+derives only from the already-installed placement ConfigMap. That attestation is
+release **desired state** and is no longer sufficient on its own
+([#3809](https://github.com/ferrum-edge/ferrum-edge/issues/3809)): the node must
+also carry node-specific proof bound to its immutable `Node.metadata.uid` and
+current boot id. The steady-state privilege posture is unchanged — the narrowed
+host-placement capability set still applies to the running container — but a
+settled host-netns pod now also renders a one-shot `ferrum-udp-node-preflight`
+**init container** that holds `hostPID`/`SYS_ADMIN`/`SYS_PTRACE` long enough to
+retire both predecessor placements ownership-safely and publish that proof, then
+exits. The privilege is bounded to an init stage that cannot serve traffic,
+which is strictly narrower than granting the producer setns for its whole
+lifetime, and clusters that will not grant it at all can set
+`ambient.udpNodePreflight.enabled=false` and adopt nodes with explicit
+node-bound exemption markers instead. The attestation is still consulted only
+when the durable record is absent, so it can never authorize an in-place flip on
+a running node, and a `.udp-placement-quarantined` tombstone in the registry
+directory refuses every absent-state bootstrap outright, which is what makes the
+corrupt-ownership repair procedure machine-enforced rather than advisory.
 
 What it does NOT reduce is `CAP_NET_ADMIN`: the path still writes `mangle` chains,
 an `ip rule`, and an `ip route` in the host namespace, and still binds
