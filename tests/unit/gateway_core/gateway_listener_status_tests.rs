@@ -883,12 +883,12 @@ fn overflow_partial_recovery_counts_only_absent_identities() {
         1_000,
     ));
 
-    let mut overflow_pass = oversubscribed_failures((70_000..70_500).collect::<Vec<_>>());
+    let mut overflow_pass = oversubscribed_failures((61_000..61_500).collect::<Vec<_>>());
     overflow_pass.extend(oversubscribed_failures(tracked_ports.clone()));
     assert!(status.publish(1, overflow_pass.len(), 0, overflow_pass, 2_000));
 
     let survivors: Vec<u16> = tracked_ports[MAX_ACTIVE_TRACKED_FAILURES / 2..].to_vec();
-    let mut partial = oversubscribed_failures((80_000..80_500).collect::<Vec<_>>());
+    let mut partial = oversubscribed_failures((62_000..62_500).collect::<Vec<_>>());
     partial.extend(oversubscribed_failures(survivors.clone()));
     assert!(status.publish(1, partial.len(), 0, partial, 3_000));
 

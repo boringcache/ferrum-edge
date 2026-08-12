@@ -573,6 +573,9 @@ impl GatewayListenerStatus {
     /// `observations` is consumed inside that critical section, so a rejected
     /// publication leaves the snapshot, the active ledger, the cumulative
     /// counters, and every timestamp exactly as they were.
+    // The binary target re-declares these modules, so a `pub` item consumed
+    // only by `tests/` reads as dead code there.
+    #[allow(dead_code)]
     pub fn publish(
         &self,
         config_generation: u64,
