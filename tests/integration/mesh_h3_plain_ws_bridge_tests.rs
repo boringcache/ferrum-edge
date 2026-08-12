@@ -93,6 +93,107 @@ fn h3_plain_bridge_source_routes_mesh_through_shared_helper() {
     );
 }
 
+/// Bounded source of the H3→HTTP plain dispatcher.
+fn h3_plain_dispatcher_source() -> &'static str {
+    let source = include_str!("../../src/http3/cross_protocol.rs");
+    source
+        .split("async fn dispatch_plain<S>(")
+        .nth(1)
+        .expect("H3→HTTP plain dispatcher")
+        .split("async fn dispatch_grpc<S>(")
+        .next()
+        .expect("bounded plain dispatcher")
+}
+
+/// A terminal mesh response must reach the SAME client-facing response policy
+/// pipeline as an ordinary buffered reqwest response: response inspection and
+/// security policy may not depend on whether the selected target happened to be
+/// mesh-tagged (issue #3620).
+#[test]
+fn h3_plain_bridge_mesh_response_shares_the_buffered_policy_pipeline() {
+    let plain = h3_plain_dispatcher_source();
+
+    assert!(
+        plain.contains("break PlainBridgeResponse::MeshBuffered(PlainBridgeMeshResponse {"),
+        "the terminal mesh attempt must leave the retry loop through the shared \
+         plain-response pipeline instead of writing the client response itself"
+    );
+    assert!(
+        plain.contains("PlainBridgeBodySource::MeshBuffered(body) => Ok(Ok(body)),"),
+        "the buffered mesh body must feed the shared buffered-response pipeline"
+    );
+    assert!(
+        plain.contains("matches!(body_source, PlainBridgeBodySource::MeshBuffered(_))"),
+        "a mesh response must be pinned to the buffered (fully inspected) pipeline"
+    );
+
+    // Every plain-response policy phase must exist exactly once in the shared
+    // pipeline; a second copy would mean the mesh arm forked its own.
+    for phase in [
+        "normalize_response_body_for_inspection(",
+        ".on_response_body(",
+        "crate::proxy::transform_buffered_response_body_with_deadline(",
+        ".on_final_response_body(",
+        "crate::proxy::run_deadline_bounded_response_committed_hooks(",
+        "ClientResponseFraming::for_buffered_response(",
+        "crate::http3::server::stamp_h3_original_response_metadata(",
+        "crate::http3::server::inject_sticky_cookie_with_deadline_provenance(",
+    ] {
+        assert_eq!(
+            plain.matches(phase).count(),
+            1,
+            "the plain bridge must have exactly one `{phase}` site shared by the \
+             reqwest and mesh arms"
+        );
+    }
+
+    // The terminal mesh arm itself must do nothing but hand the response over.
+    let mesh_arm = plain
+        .split("// Terminal mesh attempt.")
+        .nth(1)
+        .expect("terminal mesh attempt")
+        .split("break PlainBridgeResponse::MeshBuffered(PlainBridgeMeshResponse {")
+        .next()
+        .expect("bounded terminal mesh attempt");
+    assert!(
+        !mesh_arm.contains("run_after_proxy_hooks(")
+            && !mesh_arm.contains("inject_sticky_cookie_with_deadline_provenance(")
+            && !mesh_arm.contains("write_reject_with_headers("),
+        "the mesh arm must not re-run response hooks or write the client response \
+         ahead of the shared pipeline"
+    );
+}
+
+/// The mesh helper dispatches in buffered mode, so a streaming body variant is
+/// structurally impossible. Both the dispatch arm and the streaming writer must
+/// fail closed rather than publish a fabricated or uninspected body under the
+/// backend's status.
+#[test]
+fn h3_plain_bridge_mesh_streaming_variants_fail_closed() {
+    let plain = h3_plain_dispatcher_source();
+
+    assert!(
+        plain.contains("let crate::retry::ResponseBody::Buffered(mesh_body) = mesh_response_body"),
+        "the mesh arm must accept only a buffered response body"
+    );
+    assert!(
+        !plain.contains("Backend unavailable"),
+        "an unexpected mesh body variant must not fabricate a body under the \
+         backend's status"
+    );
+    assert!(
+        plain.contains("PlainBridgeBodySource::MeshBuffered(_) => {"),
+        "the streaming writer must handle the structurally unexpected mesh variant"
+    );
+    // Two fail-closed arms (unexpected body variant, mesh response reaching the
+    // streaming writer), each writing a gateway error rather than a success.
+    assert_eq!(
+        plain.matches("failing closed").count(),
+        2,
+        "both unexpected-variant paths must fail closed"
+    );
+}
+
 #[test]
 fn h3_websocket_bridge_source_forks_shared_mesh_egress() {
     let src = include_str!("../../src/http3/websocket.rs");
