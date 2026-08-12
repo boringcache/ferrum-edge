@@ -817,6 +817,7 @@ jobs:
               integration::mesh_node_waypoint_stream_scope_tests
               integration::mesh_runtime_overlay_consumers_tests
               integration::transformer_runtime_overlay_generation_tests
+              integration::mesh_local_reload_observability_tests
               integration::mesh_peer_auth_live_reload_tests
               integration::mesh_k8s_pod_discovery_tests
               integration::mesh_hbone_tests
@@ -860,6 +861,7 @@ jobs:
               integration::policy_path_canonicalization_tests
               integration::scripted_backend_smoke_tests
               integration::service_discovery_endpointslice_lifecycle_tests
+              integration::service_discovery_lifecycle_tests
               integration::dtls_integration_tests
               integration::dtls_accept_isolation_tests
               integration::frontend_dtls_live_reload_tests

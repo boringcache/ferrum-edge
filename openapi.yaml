@@ -205,15 +205,23 @@ paths:
         `"degraded"` (DB disconnected / admin writes blocked / database
         incremental polling repeatedly rejecting the same delta while serving
         last known-good config; an active remote JWKS store in grace; or, in
-        database, control-plane, or file mode, a
+        database, control-plane, file, or mesh mode, a
         full config load/reload rejected while the previous generation keeps
         serving — `config_rejected: true`. In database/CP, rejection is by the
         runtime-config validation contract or by typed SQL row decoding while the
         backend is reachable, and the admin API stays writable as the in-band
         repair path, gated on any deferred schema migration applying first; in
         file mode the admin API stays read-only and operators repair by fixing
-        the file and reloading). `config_rejected` is a sticky flag cleared only
-        by an accepted authoritative full reload (Applied or Unchanged); while
+        the file and reloading. In mesh mode the flag additionally covers the
+        localized `file` and `stock_xds` mesh policy sources: a SIGHUP reload
+        whose read, parse, validation, revision-gate admission, or proxy apply
+        is rejected keeps the last known-good mesh slice / policy baseline and
+        sets the flag, and the admin API stays read-only exactly as in file
+        mode). `config_rejected` is a sticky flag cleared only
+        by an accepted authoritative full reload (Applied or Unchanged) — and,
+        for the localized mesh sources, only once the proxy apply lifecycle
+        accepts that exact recovery candidate, never on a provisional slice
+        install or policy channel send; while
         the backend is unreachable
         (`db_available` false / `admin_writes_enabled` false) the detail is
         suppressed so it never advertises the writable repair path during an
@@ -2044,7 +2052,8 @@ paths:
         HTTPS traffic (native H3 pool vs. direct H2 pool vs. reqwest
         fallback) without per-request probing. Entries are populated at
         startup, refreshed on `FERRUM_BACKEND_CAPABILITY_REFRESH_INTERVAL_SECS`
-        (default 24h), and eagerly downgraded on live failures — see
+        (default 24h), and eagerly downgraded on definitive live protocol
+        failures — see
         `docs/admin_api.md#backend-capability-registry` for the full model.
 
         The endpoint exposes **only** protocol classifications and probe
@@ -11382,6 +11391,37 @@ components:
           format: uint32
           default: 1
           description: Default weight assigned to discovered targets
+        max_stale_seconds:
+          type: [integer, "null"]
+          format: uint64
+          anyOf:
+            - type: "null"
+            - type: integer
+              const: 0
+            - type: integer
+              minimum: 5
+              maximum: 86400
+          description: |
+            Per-upstream override of the maximum age of the last successfully
+            admitted **and published** discovery snapshot before the expiry
+            policy applies. Omitted uses
+            `FERRUM_SERVICE_DISCOVERY_MAX_STALE_SECONDS` (default 300). The
+            effective window is never shorter than three poll intervals for the
+            configured provider. `0` means unbounded last-known retention and is
+            honored only when `FERRUM_SERVICE_DISCOVERY_ALLOW_UNBOUNDED_STALE`
+            is `true`; otherwise the gateway warns and applies the bounded
+            process default. Non-zero values must be between 5 and 86400.
+        stale_policy:
+          type: [string, "null"]
+          enum: [retain, withdraw, fail_readiness, null]
+          description: |
+            Per-upstream override of the staleness expiry action. Omitted uses
+            `FERRUM_SERVICE_DISCOVERY_STALE_POLICY` (default `withdraw`).
+            `retain` keeps expired discovered targets routable and only degrades
+            `/health` status; `withdraw` withdraws the discovered targets while
+            retaining every statically configured target; `fail_readiness`
+            withdraws and additionally fails gateway readiness until a fresh
+            snapshot is published.
       allOf:
         - if:
             required: [provider]
@@ -11726,8 +11766,8 @@ components:
         `admin_writes_enabled`, `fips`, `cached_config`, `database_polling`,
         `config_rejected`, `mesh`, `listener_failures`, `logging`,
         `kafka_logging`, `ai_transcript_audit`, `audit_pipeline`, `jwks_trust`,
-        `dp_config`) are present only when the caller is authenticated (admin
-        JWT, metrics bearer token, or allowlisted CIDR).
+        `service_discovery`, `dp_config`) are present only when the caller is
+        authenticated (admin JWT, metrics bearer token, or allowlisted CIDR).
       required: [status, ready]
       properties:
         status:
@@ -11745,7 +11785,10 @@ components:
             cached config), the admin audit pipeline cannot durably record
             committed mutations (see `audit_pipeline`), or an active remote
             JWKS store is in grace after its refresh interval. Intentional
-            read-only mode does NOT set `degraded`.
+            read-only mode does NOT set `degraded`. A service-discovery task is
+            restarting after an unexpected poller exit, is crash-looping, or has
+            a snapshot past its staleness bound (including one whose discovered
+            targets the expiry policy withdrew) — see `service_discovery`.
             `starting` — startup not yet complete (returned with 503 and
             `ready: false`).
             `unavailable` — the gateway became ready but a supervised serving
@@ -11757,14 +11800,22 @@ components:
             and monotonic across a later readiness restore (returned with 503
             and `ready: false`). Expired JWKS trust clears after a later
             validated non-empty refresh. CP, DP, and mesh modes report the
-            sticky listener/poll form.
+            sticky listener/poll form. A service-discovery upstream configured
+            with the `fail_readiness` staleness policy whose snapshot expired,
+            or a `withdraw` upstream whose withdrawal publication is still
+            retrying, also reports `unavailable`; it clears as soon as a fresh
+            snapshot is admitted or the withdrawal publishes, without a config
+            reload.
         ready:
           type: boolean
           description: |
             `true` once the gateway has finished startup AND no supervised
             serving listener (or, in control-plane mode, the database config
             poll task) has failed unexpectedly since AND no active remote JWKS
-            store is past its maximum-stale deadline. While `false`, the
+            store is past its maximum-stale deadline AND no service-discovery
+            upstream using the `fail_readiness` staleness policy is expired AND
+            no expired `withdraw` upstream still has stale targets installed
+            because its withdrawal publication is retrying. While `false`, the
             endpoint returns `503 Service Unavailable`. In CP/DP/mesh modes a
             post-startup serving-listener failure sets `ready: false` durably
             (sticky) even though internal startup completed. In CP mode an
@@ -11946,13 +11997,17 @@ components:
         config_rejected:
           type: boolean
           description: |
-            Database, control-plane, and file modes, authenticated detail only.
+            Database, control-plane, file, and mesh modes, authenticated detail
+            only.
             Present and `true` when the latest **full** config load/reload was
             rejected: in database/CP, by the runtime-config validation contract
             (a reachable backend served a semantically-invalid snapshot) or by
             typed SQL row decoding (a reachable backend served an undecodable
             row); in file mode, when a SIGHUP candidate fails read, parse,
-            validation, or apply. The gateway keeps serving the last known-good
+            validation, or apply; in mesh mode, when a localized `file` or
+            `stock_xds` mesh policy reload candidate fails read, parse,
+            validation, config-revision-gate admission, or proxy apply. The
+            gateway keeps serving the last known-good
             config. In database/CP, because the backend is reachable, the admin
             API stays writable (`admin_writes_enabled` stays `true`) so the
             offending resource can be repaired in-band; `status` is forced to
@@ -11960,10 +12015,18 @@ components:
             migration applying first, so a reachable backend with a still-pending
             schema keeps writes blocked while this flag stays set. In file mode
             the admin API remains read-only; operators repair by fixing the
-            config file and reloading. The flag is sticky and clears only when
+            config file and reloading; the localized mesh sources are likewise
+            read-only and are repaired by fixing the mesh document and
+            re-signalling. The flag is sticky and clears only when
             an accepted authoritative **full** reload proves the candidate is
             valid again (Applied or Unchanged; an accepted incremental poll in
-            database/CP does not clear it). While the backend is unreachable
+            database/CP does not clear it). For the localized mesh sources the
+            clear is stricter: it happens only after the **proxy apply
+            lifecycle** accepts the exact current recovery candidate (Applied,
+            or a content-identical no-op). A provisional slice install, a stock
+            policy channel send, an older candidate's late success, or an
+            unrelated accepted slice never clears it. While the backend is
+            unreachable
             (`admin_writes_enabled` false) this detail is suppressed so it never
             advertises the writable repair path during an outage, even though the
             underlying flag remains set. A genuine connectivity failure is
@@ -12014,9 +12077,142 @@ components:
               sink_healthy: true
         jwks_trust:
           $ref: "#/components/schemas/JwksTrustHealthSnapshot"
+        service_discovery:
+          $ref: "#/components/schemas/ServiceDiscoveryHealthSnapshot"
         dp_config:
           $ref: "#/components/schemas/DpConfigFreshnessSnapshot"
 
+    ServiceDiscoveryHealthSnapshot:
+      type: object
+      description: |
+        Authenticated `/health`/`/status` view of supervised service-discovery
+        tasks (issues #3717 / #3721 / #3722). Present only when at least one
+        upstream configures service discovery. Every field is a count, an age,
+        or a closed-set token, plus the operator-configured
+        `namespace|upstream_id` ownership key — never a registry URL, Consul or
+        Kubernetes token, or response payload. Unauthenticated probes never
+        receive this object; they see only the coarse `status`/`ready` effects
+        (stale/withdrawn/restarting → `degraded`; an expired `fail_readiness`
+        upstream or a failed withdrawal publication → `unavailable` +
+        not-ready).
+      required:
+        - tasks
+        - running
+        - restarting
+        - crash_looping
+        - stale
+        - withdrawn
+        - readiness_failing
+        - never_succeeded
+        - max_anchor_age_seconds
+        - upstreams
+      properties:
+        tasks:
+          type: integer
+          format: uint64
+          description: Supervised discovery tasks.
+        running:
+          type: integer
+          format: uint64
+        restarting:
+          type: integer
+          format: uint64
+          description: Tasks waiting out a restart backoff after an unexpected poller exit.
+        crash_looping:
+          type: integer
+          format: uint64
+          description: >
+            Tasks that exited unexpectedly repeatedly without an intervening
+            published snapshot. The supervisor keeps retrying at the capped
+            backoff; the state exists so the condition is visible.
+        stale:
+          type: integer
+          format: uint64
+          description: Tasks whose last published snapshot is older than their staleness bound.
+        withdrawn:
+          type: integer
+          format: uint64
+          description: Tasks whose discovered targets are currently withdrawn by the expiry policy.
+        readiness_failing:
+          type: integer
+          format: uint64
+          description: >
+            Stale tasks configured with the `fail_readiness` expiry policy,
+            plus `withdraw` tasks whose fail-closed withdrawal publication is
+            still retrying.
+        never_succeeded:
+          type: integer
+          format: uint64
+        max_anchor_age_seconds:
+          type: integer
+          format: uint64
+          description: >
+            Maximum staleness-anchor age across tasks. The anchor is the last
+            published snapshot, or task start when none has ever been published.
+        upstreams:
+          type: array
+          description: Per-upstream detail, sorted by namespaced upstream key.
+          items:
+            type: object
+            required:
+              - upstream
+              - provider
+              - state
+              - stale
+              - withdrawn
+              - policy
+              - max_stale_seconds
+              - anchor_age_seconds
+              - consecutive_failures
+              - consecutive_crashes
+              - restarts
+            properties:
+              upstream:
+                type: string
+                description: "`namespace|upstream_id` ownership key."
+              provider:
+                type: string
+                enum: [dns_sd, kubernetes, consul, mesh]
+              state:
+                type: string
+                enum: [starting, running, restarting, crash_looping, stopped]
+              stale:
+                type: boolean
+              withdrawn:
+                type: boolean
+                description: Always `false` under the `retain` policy.
+              policy:
+                type: string
+                enum: [retain, withdraw, fail_readiness]
+              max_stale_seconds:
+                type: integer
+                format: uint64
+                description: Effective staleness bound; `0` reports unbounded retention.
+              last_success_age_seconds:
+                type: [integer, "null"]
+                format: uint64
+                description: Null when the task has never published an admitted snapshot.
+              anchor_age_seconds:
+                type: integer
+                format: uint64
+              consecutive_failures:
+                type: integer
+                format: uint64
+              consecutive_crashes:
+                type: integer
+                format: uint64
+              restarts:
+                type: integer
+                format: uint64
+              last_error:
+                type: [string, "null"]
+                enum:
+                  - discover_failed
+                  - snapshot_rejected
+                  - publish_failed
+                  - task_exited
+                  - null
+                description: Closed-set reason token; never a provider error string.
     DpConfigFreshnessSnapshot:
       type: object
       description: |
@@ -27637,9 +27833,13 @@ components:
           description: |
             Gateway-to-mesh HBONE support for upstream targets tagged
             `mesh.hbone=true`. `supported` means the gateway can open
-            HTTP/2 CONNECT over SPIFFE mTLS to the sidecar port; `unknown`
-            is used for untagged targets, gateways without SVIDs, or
-            not-yet-probed entries.
+            HTTP/2 CONNECT over SPIFFE mTLS to the sidecar port;
+            `unsupported` follows definitive identity/TLS configuration
+            evidence; `unknown` is used for untagged targets, gateways
+            without SVIDs, not-yet-probed entries, or cold probes that hit
+            only transient DNS/connect/timeout or post-TLS HTTP/2
+            preface/handshake failures. Transient failures preserve an
+            existing verdict so rolling peer restarts can recover.
         last_probe_at_unix_secs:
           type: integer
           format: int64
@@ -27657,7 +27857,9 @@ components:
             plaintext, H3 on most HTTPS backends, untagged HBONE,
             per-request HBONE CONNECT rejection) do NOT populate this
             field — only real connection / TLS-config errors and
-            in-flight live downgrades. An H3 probe failure against a
+            in-flight live downgrades. Transient HBONE reachability failures
+            populate this field while preserving the previous classification
+            (or leaving a cold probe unknown). An H3 probe failure against a
             target already classified `h3: supported` always populates
             it, including when a transient DNS/connect/refused/timeout
             class preserves that classification instead of downgrading

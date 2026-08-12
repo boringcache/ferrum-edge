@@ -33,8 +33,10 @@ use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 
 use ferrum_edge::modes::mesh::config::MeshConfig;
+use ferrum_edge::modes::mesh::config_consumer::file_source::MeshLocalSourceRecovery;
 use ferrum_edge::modes::mesh::config_consumer::stock_xds_client::{
-    StockXdsClientConfig, load_stock_policy_baseline, start_stock_xds_client_with_shutdown,
+    StockPolicySnapshot, StockXdsClientConfig, load_stock_policy_baseline,
+    start_stock_xds_client_with_shutdown,
 };
 use ferrum_edge::modes::mesh::runtime::MeshRuntimeState;
 use ferrum_edge::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
@@ -47,6 +49,7 @@ use ferrum_edge::xds::proto::{
 use ferrum_edge::xds::stock::StockXdsLimits;
 use ferrum_edge::xds::stock_proto as sp;
 use ferrum_edge::xds::{CDS_TYPE_URL, EDS_TYPE_URL, SDS_TYPE_URL};
+use std::sync::atomic::AtomicBool;
 
 const REVIEWS_CLUSTER: &str = "outbound|9080||reviews.default.svc.cluster.local";
 const RATINGS_CLUSTER: &str = "outbound|9080||ratings.default.svc.cluster.local";
@@ -313,7 +316,8 @@ impl StockHarness {
 
         let state = MeshRuntimeState::new();
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let (_policy_tx, policy_rx) = watch::channel(Arc::new(baseline.clone()));
+        let (_policy_tx, policy_rx) =
+            watch::channel(StockPolicySnapshot::initial(Arc::new(baseline.clone())));
 
         let config = StockXdsClientConfig {
             xds_urls: vec![format!("http://127.0.0.1:{}", addr.port())],
@@ -342,6 +346,7 @@ impl StockHarness {
             None,
             None,
             policy_rx,
+            MeshLocalSourceRecovery::new(Arc::new(AtomicBool::new(false))),
         ));
 
         Self {
