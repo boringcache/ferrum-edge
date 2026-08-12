@@ -1,11 +1,11 @@
 ---
 name: grok-agents
-description: Dispatch and orchestrate local Cursor Grok 4.5 agents via the standalone cursor-agent CLI for Ferrum Edge issue, PR, review-feedback, CI-repair, and shepherding work. Use when the user asks GPT, Codex, or Claude to delegate to Grok or Cursor Grok workers, run multiple Grok 4.5 agents, resume interrupted Grok runs, or drive agent-owned branches and PRs. Do not use for Codex-native subagents, Claude Code workers, or ordinary single-agent edits.
+description: Dispatch and orchestrate local Cursor Grok 4.6 agents via the standalone cursor-agent CLI for Ferrum Edge issue, PR, review-feedback, CI-repair, and shepherding work. Use when the user asks GPT, Codex, or Claude to delegate to Grok or Cursor Grok workers, run multiple Grok 4.6 agents, resume interrupted Grok runs, or drive agent-owned branches and PRs. Do not use for Codex-native subagents, Claude Code workers, or ordinary single-agent edits.
 ---
 
 # Grok agents
 
-Act as the orchestrator. Treat local Cursor Grok 4.5 processes as implementation workers. Own
+Act as the orchestrator. Treat local Cursor Grok 4.6 processes as implementation workers. Own
 task decomposition, worktree isolation, liveness, independent diff review, and the final merge
 recommendation. Never accept a worker's report without checking the repository and GitHub state
 yourself.
@@ -30,7 +30,7 @@ this session's model deliberately.
    would expose it) or through the CLI's own stored login — check with `cursor-agent status`. Never
    print the key or put it in prompts, files, arguments, or logs, and do not ask a worker to perform
    an interactive login.
-4. Use only the pinned non-Fast SKUs `cursor-grok-4.5-{low,medium,high}`; confirm with
+4. Use only the pinned non-Fast SKUs `cursor-grok-4.6-{low,medium,high,xhigh}`; confirm with
    `cursor-agent models`. Stop and report the exact error if authentication or model access is
    rejected. Do not silently substitute `composer-2.5`, `auto`, a `-fast` SKU, or another provider.
 
@@ -66,8 +66,9 @@ one long-lived execution session:
 ```
 
 `--effort low|medium|high|xhigh|max` selects the Grok reasoning SKU and defaults to `high`. Cursor
-publishes only three tiers, so `low`/`medium`/`high` map to `cursor-grok-4.5-{low,medium,high}` and
-`xhigh`/`max` clamp to `high` with a warning. Do not claim a tier above `high` was applied.
+publishes four tiers, so `low`/`medium`/`high`/`xhigh` map to
+`cursor-grok-4.6-{low,medium,high,xhigh}` and `max` clamps to `xhigh` with a warning. Do not claim a
+tier above `xhigh` was applied.
 
 The launcher resolves the operator's own `cursor-agent`, verifies the worktree root, and runs
 `cursor-agent --print --force --trust --model <sku> --output-format text --workspace <worktree>`
