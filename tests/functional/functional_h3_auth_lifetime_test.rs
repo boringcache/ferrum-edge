@@ -1093,7 +1093,11 @@ async fn h3_auth_lifetime_continuously_active_upload_is_a_fixed_401() {
     // answers the request stream.
     let pump = async {
         loop {
-            if stream.send_raw_data(Bytes::from_static(b"chunk")).await.is_err() {
+            if stream
+                .send_raw_data(Bytes::from_static(b"chunk"))
+                .await
+                .is_err()
+            {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;

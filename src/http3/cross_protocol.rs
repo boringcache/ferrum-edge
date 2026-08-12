@@ -3500,9 +3500,9 @@ where
                         &mut backend_admission_permits,
                         backend_admission_elapsed,
                     );
-                    if let Some(termination) = crate::proxy::auth_lifetime::expired_authorization(
-                        plain_auth_deadline_plan,
-                    ) {
+                    if let Some(termination) =
+                        crate::proxy::auth_lifetime::expired_authorization(plain_auth_deadline_plan)
+                    {
                         // Post-commitment: response HEADERS are already on the
                         // wire, so the deterministic terminal is a RESET — never
                         // a fabricated clean finish and never an appended
@@ -7121,9 +7121,7 @@ where
                     body_error_class = Some(ErrorClass::ClientDisconnect);
                     false
                 }
-                crate::http3::stream_util::H3AuthorizedWrite::AuthorizationExpired(
-                    termination,
-                ) => {
+                crate::http3::stream_util::H3AuthorizedWrite::AuthorizationExpired(termination) => {
                     warn!(
                         "cross-protocol H3 streaming response reached its authorization \
                          lifetime while the client was not consuming; resetting the stream"
@@ -7335,9 +7333,7 @@ where
                     body_error_class = Some(ErrorClass::ClientDisconnect);
                     false
                 }
-                crate::http3::stream_util::H3AuthorizedWrite::AuthorizationExpired(
-                    termination,
-                ) => {
+                crate::http3::stream_util::H3AuthorizedWrite::AuthorizationExpired(termination) => {
                     warn!(
                         "inspected cross-protocol H3 streaming response reached its \
                          authorization lifetime while the client was not consuming; \

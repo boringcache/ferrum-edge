@@ -546,7 +546,10 @@ async fn a_missing_bound_never_widens_the_other() {
     assert_eq!(
         compose_absolute_bound(
             None,
-            Some(plan_at(at, StreamAuthTermination::AuthenticatedStreamMaxLifetime))
+            Some(plan_at(
+                at,
+                StreamAuthTermination::AuthenticatedStreamMaxLifetime
+            ))
         ),
         Some(at)
     );

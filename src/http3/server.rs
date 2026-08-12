@@ -579,9 +579,9 @@ where
                 crate::http3::stream_util::H3AuthorizedWrite::ClientWriteFailed => {
                     Err(H3TrailerFinishError::Client)
                 }
-                crate::http3::stream_util::H3AuthorizedWrite::AuthorizationExpired(
-                    termination,
-                ) => Err(H3TrailerFinishError::AuthorizationExpired(termination)),
+                crate::http3::stream_util::H3AuthorizedWrite::AuthorizationExpired(termination) => {
+                    Err(H3TrailerFinishError::AuthorizationExpired(termination))
+                }
             }
         };
     }
@@ -2474,12 +2474,13 @@ async fn handle_h3_request(
                 // Attribute the composed bound: `Some` only when the AUTHORIZATION
                 // deadline is the one that elapsed. Recomputed from the same
                 // request-receipt anchor, so it cannot drift from the bound above.
-                let upload_authorization_expiry = crate::proxy::auth_lifetime::expired_authorization(
-                    crate::proxy::auth_lifetime::effective_request_auth_deadline(
-                        &ctx,
-                        state.env_config.authenticated_stream_max_lifetime_seconds,
-                    ),
-                );
+                let upload_authorization_expiry =
+                    crate::proxy::auth_lifetime::expired_authorization(
+                        crate::proxy::auth_lifetime::effective_request_auth_deadline(
+                            &ctx,
+                            state.env_config.authenticated_stream_max_lifetime_seconds,
+                        ),
+                    );
                 finalize_h3_upload_deadline_rejection(
                     &mut stream,
                     &state,
@@ -2682,12 +2683,13 @@ async fn handle_h3_request(
                     // Attribute the composed bound: `Some` only when the AUTHORIZATION
                     // deadline is the one that elapsed. Recomputed from the same
                     // request-receipt anchor, so it cannot drift from the bound above.
-                    let upload_authorization_expiry = crate::proxy::auth_lifetime::expired_authorization(
-                        crate::proxy::auth_lifetime::effective_request_auth_deadline(
-                            &ctx,
-                            state.env_config.authenticated_stream_max_lifetime_seconds,
-                        ),
-                    );
+                    let upload_authorization_expiry =
+                        crate::proxy::auth_lifetime::expired_authorization(
+                            crate::proxy::auth_lifetime::effective_request_auth_deadline(
+                                &ctx,
+                                state.env_config.authenticated_stream_max_lifetime_seconds,
+                            ),
+                        );
                     finalize_h3_upload_deadline_rejection(
                         &mut stream,
                         &state,
@@ -2967,12 +2969,13 @@ async fn handle_h3_request(
                 // Attribute the composed bound: `Some` only when the AUTHORIZATION
                 // deadline is the one that elapsed. Recomputed from the same
                 // request-receipt anchor, so it cannot drift from the bound above.
-                let upload_authorization_expiry = crate::proxy::auth_lifetime::expired_authorization(
-                    crate::proxy::auth_lifetime::effective_request_auth_deadline(
-                        &ctx,
-                        state.env_config.authenticated_stream_max_lifetime_seconds,
-                    ),
-                );
+                let upload_authorization_expiry =
+                    crate::proxy::auth_lifetime::expired_authorization(
+                        crate::proxy::auth_lifetime::effective_request_auth_deadline(
+                            &ctx,
+                            state.env_config.authenticated_stream_max_lifetime_seconds,
+                        ),
+                    );
                 finalize_h3_upload_deadline_rejection(
                     &mut stream,
                     &state,
@@ -4102,12 +4105,13 @@ async fn handle_h3_request(
                     // Attribute the composed bound: `Some` only when the AUTHORIZATION
                     // deadline is the one that elapsed. Recomputed from the same
                     // request-receipt anchor, so it cannot drift from the bound above.
-                    let upload_authorization_expiry = crate::proxy::auth_lifetime::expired_authorization(
-                        crate::proxy::auth_lifetime::effective_request_auth_deadline(
-                            &ctx,
-                            state.env_config.authenticated_stream_max_lifetime_seconds,
-                        ),
-                    );
+                    let upload_authorization_expiry =
+                        crate::proxy::auth_lifetime::expired_authorization(
+                            crate::proxy::auth_lifetime::effective_request_auth_deadline(
+                                &ctx,
+                                state.env_config.authenticated_stream_max_lifetime_seconds,
+                            ),
+                        );
                     finalize_h3_upload_deadline_rejection(
                         &mut stream,
                         &state,
@@ -4602,12 +4606,13 @@ async fn handle_h3_request(
                     // Attribute the composed bound: `Some` only when the AUTHORIZATION
                     // deadline is the one that elapsed. Recomputed from the same
                     // request-receipt anchor, so it cannot drift from the bound above.
-                    let upload_authorization_expiry = crate::proxy::auth_lifetime::expired_authorization(
-                        crate::proxy::auth_lifetime::effective_request_auth_deadline(
-                            &ctx,
-                            state.env_config.authenticated_stream_max_lifetime_seconds,
-                        ),
-                    );
+                    let upload_authorization_expiry =
+                        crate::proxy::auth_lifetime::expired_authorization(
+                            crate::proxy::auth_lifetime::effective_request_auth_deadline(
+                                &ctx,
+                                state.env_config.authenticated_stream_max_lifetime_seconds,
+                            ),
+                        );
                     finalize_h3_upload_deadline_rejection(
                         &mut stream,
                         &state,
@@ -5321,12 +5326,13 @@ async fn handle_h3_request(
                             // Attribute the composed bound: `Some` only when the AUTHORIZATION
                             // deadline is the one that elapsed. Recomputed from the same
                             // request-receipt anchor, so it cannot drift from the bound above.
-                            let upload_authorization_expiry = crate::proxy::auth_lifetime::expired_authorization(
-                                crate::proxy::auth_lifetime::effective_request_auth_deadline(
-                                    &ctx,
-                                    state.env_config.authenticated_stream_max_lifetime_seconds,
-                                ),
-                            );
+                            let upload_authorization_expiry =
+                                crate::proxy::auth_lifetime::expired_authorization(
+                                    crate::proxy::auth_lifetime::effective_request_auth_deadline(
+                                        &ctx,
+                                        state.env_config.authenticated_stream_max_lifetime_seconds,
+                                    ),
+                                );
                             finalize_h3_upload_deadline_rejection(
                                 &mut stream,
                                 &state,
@@ -6780,12 +6786,13 @@ async fn handle_h3_request(
                 // Attribute the composed bound: `Some` only when the AUTHORIZATION
                 // deadline is the one that elapsed. Recomputed from the same
                 // request-receipt anchor, so it cannot drift from the bound above.
-                let upload_authorization_expiry = crate::proxy::auth_lifetime::expired_authorization(
-                    crate::proxy::auth_lifetime::effective_request_auth_deadline(
-                        &ctx,
-                        state.env_config.authenticated_stream_max_lifetime_seconds,
-                    ),
-                );
+                let upload_authorization_expiry =
+                    crate::proxy::auth_lifetime::expired_authorization(
+                        crate::proxy::auth_lifetime::effective_request_auth_deadline(
+                            &ctx,
+                            state.env_config.authenticated_stream_max_lifetime_seconds,
+                        ),
+                    );
                 finalize_h3_upload_deadline_rejection(
                     &mut stream,
                     &state,
@@ -9896,9 +9903,7 @@ async fn stream_h3_open_response_to_client(
                     body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
                     false
                 }
-                crate::http3::stream_util::H3AuthorizedWrite::AuthorizationExpired(
-                    termination,
-                ) => {
+                crate::http3::stream_util::H3AuthorizedWrite::AuthorizationExpired(termination) => {
                     warn!(
                         "HTTP/3 streaming response reached its authorization lifetime while the \
                          client was not consuming; resetting the stream"
@@ -11868,10 +11873,11 @@ async fn dispatch_grpc_native_h3(
                         .is_some() =>
                 {
                     // `is_some()` above proves the unwrap-free read below.
-                    let termination = crate::proxy::auth_lifetime::expired_authorization(
-                        auth_deadline_plan,
-                    )
-                    .unwrap_or(crate::proxy::auth_lifetime::StreamAuthTermination::CredentialExpired);
+                    let termination =
+                        crate::proxy::auth_lifetime::expired_authorization(auth_deadline_plan)
+                            .unwrap_or(
+                            crate::proxy::auth_lifetime::StreamAuthTermination::CredentialExpired,
+                        );
                     warn!(
                         "native H3 gRPC stream reached its authorization lifetime while the \
                          client was not consuming; resetting the stream"
@@ -13143,9 +13149,7 @@ async fn proxy_to_backend_h3_streaming(
                     body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
                     false
                 }
-                crate::http3::stream_util::H3AuthorizedWrite::AuthorizationExpired(
-                    termination,
-                ) => {
+                crate::http3::stream_util::H3AuthorizedWrite::AuthorizationExpired(termination) => {
                     warn!(
                         "HTTP/3 streaming response reached its authorization lifetime while the \
                          client was not consuming; resetting the stream"

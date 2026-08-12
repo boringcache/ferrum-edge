@@ -5801,10 +5801,7 @@ pub(crate) fn authorization_expired_plugin_result(
     PluginResult::Reject {
         status_code: 401,
         body: r#"{"error":"Unauthorized"}"#.to_string(),
-        headers: HashMap::from([(
-            "content-type".to_string(),
-            "application/json".to_string(),
-        )]),
+        headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
     }
 }
 
