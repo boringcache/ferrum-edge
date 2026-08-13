@@ -63,10 +63,13 @@
 //! reload that raises or lowers the configured capacity therefore takes effect
 //! without rebuilding the lane, evicting a live marker, or changing the replay
 //! domain. Lowering the limit refuses new admissions once the shared count meets
-//! the new cap; raising it restores headroom. The first constructor does **not**
-//! freeze a cap onto the lane — that would make a later equivalent generation's
-//! configured capacity silently inert, and would make duplicate equivalent
-//! constructors order-dependent.
+//! the new cap; raising it restores headroom. An expired occupied marker is a
+//! new use of that proof: it may refresh in place only when the retained count
+//! is already within this generation's cap, and otherwise goes through the same
+//! expired-only prune-and-reserve path as a vacant insert. The first constructor
+//! does **not** freeze a cap onto the lane — that would make a later equivalent
+//! generation's configured capacity silently inert, and would make duplicate
+//! equivalent constructors order-dependent.
 //!
 //! # Retention is fixed, not configured
 //!
@@ -452,15 +455,22 @@ impl ProcessReplayLane {
                     if *existing.get() > now_millis {
                         return ReplayAdmission::Replay;
                     }
-                    // The marker is expired. Replacing it in place is atomic
-                    // under the shard guard and consumes no additional capacity
-                    // slot, so an expired entry can never accumulate as a leak
-                    // and can never be mistaken for a live claim. The stored
-                    // expiry only ever moves forward.
-                    let refreshed = (*existing.get()).max(expires_at);
-                    existing.insert(refreshed);
-                    self.note_expiry(refreshed);
-                    return ReplayAdmission::Admitted;
+                    // Expired: in-place refresh is a *new* use of this proof.
+                    // It is only safe when the retained count is already within
+                    // this authority's cap. A lowered reload cap that left the
+                    // lane over-full would otherwise admit above the new limit
+                    // by recycling the occupied slot without consulting
+                    // `max_entries`. The stored expiry only ever moves forward.
+                    if self.entry_count.load(Ordering::Acquire) <= max_entries {
+                        let refreshed = (*existing.get()).max(expires_at);
+                        existing.insert(refreshed);
+                        self.note_expiry(refreshed);
+                        return ReplayAdmission::Admitted;
+                    }
+                    // Over cap: drop the shard guard and reclaim expired
+                    // entries (including this one) so a slot can be reserved
+                    // under the new cap. Never refresh in place here, and
+                    // never evict a live marker.
                 }
                 Entry::Vacant(vacant) => {
                     if self.try_reserve_slot(max_entries) {
@@ -482,9 +492,13 @@ impl ProcessReplayLane {
                 return ReplayAdmission::CapacityRefused;
             }
             pruned = true;
-            if self.prune_expired(now_millis) == 0 {
-                return ReplayAdmission::CapacityRefused;
-            }
+            self.prune_expired(now_millis);
+            // Re-observe after the bounded prune: a concurrent request may have
+            // refreshed this same expired marker (Replay), pruning may have
+            // restored headroom (Vacant + reserve), or live markers may still
+            // fill the cap (CapacityRefused on the next iteration). Returning
+            // CapacityRefused when prune reclaimed nothing would misclassify a
+            // concurrent winner of this same marker as a capacity failure.
         }
     }
 
@@ -629,8 +643,9 @@ pub struct SharedReplayAuthorityHealth {
     /// Distinct shared authorities held by a live plugin generation. A retired
     /// generation drops its client, so it stops being counted immediately.
     pub shared_authorities: u64,
-    /// How many of those are currently unavailable. Non-zero means protected
-    /// requests on those policies are failing closed.
+    /// How many of those are currently unavailable (unproven, outage, or
+    /// terminal topology). Non-zero means protected requests on those policies
+    /// are failing closed.
     pub shared_authorities_unavailable: u64,
 }
 
@@ -640,7 +655,7 @@ impl SharedReplayAuthorityHealth {
         self.shared_authorities > 0
     }
 
-    /// Whether a required shared authority is known unavailable.
+    /// Whether a required shared authority is unproven or known unavailable.
     pub fn unavailable(self) -> bool {
         self.shared_authorities_unavailable > 0
     }
@@ -738,7 +753,9 @@ impl ReplayAuthority {
     /// Callers must pass a client from
     /// [`RedisRateLimitClient::for_replay_authority`] so connection,
     /// authentication, command, topology, and recovery diagnostics stay
-    /// classification-only. Generic rate-limiter clients retain
+    /// classification-only, the client starts unproven (fail-closed for
+    /// readiness), and a bounded readiness probe is armed when a Tokio runtime
+    /// is present. Generic rate-limiter clients retain
     /// [`RedisRateLimitClient::new`].
     pub fn shared(client: Arc<RedisRateLimitClient>, retention: Duration) -> Self {
         client.register_as_shared_replay_authority();
@@ -833,6 +850,11 @@ async fn admit_shared(
     marker: &ReplayMarker,
 ) -> ReplayAdmission {
     if !client.is_available() {
+        // Fail closed without waiting on the backend. Arm (or retry-arm) the
+        // bounded readiness probe so an unproven client constructed without a
+        // runtime can recover once one is present — without turning this
+        // request into an unbounded connect.
+        client.start_health_checker_if_needed();
         return ReplayAdmission::AuthorityUnavailable;
     }
     let key = client.make_key(&[SHARED_KEY_COMPONENT, marker.hex().as_str()]);

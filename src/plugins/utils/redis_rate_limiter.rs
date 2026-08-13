@@ -1145,8 +1145,21 @@ impl EnforcementAvailability {
     const TOPOLOGY_TERMINAL: u8 = 2;
 
     fn new() -> Self {
+        Self::with_state(Self::REACHABLE)
+    }
+
+    /// Unproven: no connection or topology screen has succeeded.
+    ///
+    /// Replay-authority clients start here so `/health` fails closed until a
+    /// screened probe proves the backend. Operational rate-limiter clients keep
+    /// [`Self::new`] (historical "reachable until an error is observed").
+    fn unproven() -> Self {
+        Self::with_state(Self::UNREACHABLE)
+    }
+
+    fn with_state(state: u8) -> Self {
         Self {
-            state: AtomicU64::new(pack_epoch_state(Self::REACHABLE, 0)),
+            state: AtomicU64::new(pack_epoch_state(state, 0)),
             shared_replay_health: OnceLock::new(),
         }
     }
@@ -1425,6 +1438,10 @@ pub struct RedisRateLimitClient {
     /// connection, command, or recovery probe completes concurrently: a Cluster
     /// node answers `PING` while still redirecting every key, so nothing may
     /// restore availability afterwards. See [`EnforcementAvailability`].
+    ///
+    /// Replay-authority clients start **unproven** (unreachable) until a
+    /// topology-screened connection or recovery probe succeeds. Operational
+    /// rate-limiter clients keep the historical initial reachable state.
     availability: Arc<EnforcementAvailability>,
     /// Whether the background health checker has been started.
     health_checker_started: AtomicBool,
@@ -1573,11 +1590,13 @@ impl RedisRateLimitClient {
 
     /// Redis client owned by the single-use replay authority.
     ///
-    /// Connection, authentication, command, topology, and recovery diagnostics
-    /// publish only a fixed classification beside the already-redacted endpoint
-    /// — never raw backend text, key material, marker material, credentials, or
-    /// the operator key prefix. Generic rate-limiter clients must keep
-    /// [`Self::new`].
+    /// Starts unproven (not available) until a topology-screened connection or
+    /// recovery probe succeeds, so a configured `shared` policy cannot publish
+    /// `/health` ready before Redis has been proven. Connection, authentication,
+    /// command, topology, and recovery diagnostics publish only a fixed
+    /// classification beside the already-redacted endpoint — never raw backend
+    /// text, key material, marker material, credentials, or the operator key
+    /// prefix. Generic rate-limiter clients must keep [`Self::new`].
     pub fn for_replay_authority(
         config: RedisConfig,
         dns_cache: Option<DnsCache>,
@@ -1622,7 +1641,10 @@ impl RedisRateLimitClient {
             pool: Arc::new(ConnectionPool::new(config.pool_size)),
             config,
             dns_cache,
-            availability: Arc::new(EnforcementAvailability::new()),
+            availability: Arc::new(match log_policy {
+                RedisClientLogPolicy::ClassificationOnly => EnforcementAvailability::unproven(),
+                RedisClientLogPolicy::Operational => EnforcementAvailability::new(),
+            }),
             health_checker_started: AtomicBool::new(false),
             health_checker_abort: Mutex::new(None),
             tls_no_verify,
@@ -1645,11 +1667,18 @@ impl RedisRateLimitClient {
     /// newest epoch; a stale sampled apply cannot overwrite that notification,
     /// so the packed `/health` word cannot remain permanently inconsistent with
     /// [`EnforcementAvailability`] after the race settles.
+    ///
+    /// A replay-authority client starts unproven, so this sample publishes
+    /// unavailable until a screened probe proves the backend. The bounded
+    /// readiness probe is armed here when a Tokio runtime is present; without
+    /// one this is panic-free and a later call (or a protected-request miss)
+    /// retries the arm.
     pub(crate) fn register_as_shared_replay_authority(&self) {
         let registration = self.ensure_shared_replay_health();
         self.attach_shared_replay_health(&registration);
         let (available, epoch) = self.availability.health_snapshot();
         registration.apply_availability(available, epoch);
+        self.start_health_checker_if_needed();
     }
 
     fn ensure_shared_replay_health(&self) -> Arc<SharedReplayHealthRegistration> {
@@ -2434,7 +2463,7 @@ impl RedisRateLimitClient {
         }
     }
 
-    /// Start a background task that periodically pings Redis to detect recovery.
+    /// Start a background task that periodically probes Redis to detect recovery.
     ///
     /// The task is aborted when this client is dropped so retired plugin
     /// generations cannot keep dialing obsolete Redis endpoints.
@@ -2444,13 +2473,20 @@ impl RedisRateLimitClient {
     /// [`Self::mark_unavailable`] outside a runtime. Do not latch the started
     /// flag until a runtime is present: a later request-path transition must
     /// still arm recovery so fail-closed consumers are not pinned unavailable.
-    fn start_health_checker_if_needed(&self) {
+    ///
+    /// Replay-authority clients probe on the first iteration (no startup sleep)
+    /// so `/health` can recover without protected traffic and without waiting
+    /// a full `redis_health_check_interval_seconds`. Operational clients keep
+    /// the historical sleep-then-probe cadence, which starts after an error.
+    pub(crate) fn start_health_checker_if_needed(&self) {
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
         if self.health_checker_started.swap(true, Ordering::Relaxed) {
             return; // Already started
         }
+
+        let probe_immediately = self.classification_only();
 
         let availability = Arc::clone(&self.availability);
         // Weak, not strong: the checker may drop cached sockets when it proves
@@ -2467,8 +2503,12 @@ impl RedisRateLimitClient {
         let log_policy = self.log_policy;
 
         let handle = runtime.spawn(async move {
+            let mut delay_before_probe = !probe_immediately;
             loop {
-                tokio::time::sleep(interval).await;
+                if delay_before_probe {
+                    tokio::time::sleep(interval).await;
+                }
+                delay_before_probe = true;
 
                 // A rejected topology is a configuration fault, not an outage:
                 // a Cluster node answers PING while still redirecting every

@@ -11,19 +11,23 @@
 //! These cases drive the real admin `/health`, `/status`, and `/live` surfaces
 //! over HTTP — not the aggregate helper alone — and cover:
 //!
-//! - an unavailable shared authority failing readiness with `unavailable`,
-//! - recovery restoring readiness with no restart and no config reload,
+//! - a configured shared authority that has never proven its backend failing
+//!   readiness with `unavailable` (unknown/unproven is fail-closed),
+//! - a topology-screened recovery restoring readiness with no restart, no
+//!   config reload, no protected traffic, and no manual state injection,
 //! - a retired plugin generation dropping out of the aggregate entirely,
 //! - the authenticated tier carrying the bounded aggregate while the
 //!   unauthenticated tier keeps the repository's coarse `status` + `ready`
 //!   contract, and
 //! - `/live` staying healthy throughout.
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use ferrum_edge::_test_support::redis_rate_limit_client_for_test;
 use ferrum_edge::admin::{
     AdminState, MetricsAuthPolicy,
     jwt_auth::{JwtConfig, JwtManager},
@@ -138,23 +142,112 @@ async fn get(base: &str, path: &str, bearer: Option<&str>) -> (u16, Value) {
 /// A shared authority pointed at a closed loopback port, exactly as a `shared`
 /// `hmac_auth` / `jwks_auth` policy builds one.
 fn shared_client(prefix: &str) -> Arc<RedisRateLimitClient> {
+    shared_client_for_url(
+        prefix,
+        "redis://readiness-user:readiness-password@127.0.0.1:1/0",
+        3600,
+    )
+}
+
+fn shared_client_for_url(
+    prefix: &str,
+    redis_url: &str,
+    health_check_interval_seconds: u64,
+) -> Arc<RedisRateLimitClient> {
     let config = RedisConfig::from_plugin_config(
         &serde_json::json!({
             "sync_mode": "redis",
-            // Port 1 is reserved and never listening.
-            "redis_url": "redis://readiness-user:readiness-password@127.0.0.1:1/0",
+            "redis_url": redis_url,
             "redis_connect_timeout_seconds": 1,
-            "redis_health_check_interval_seconds": 3600,
+            "redis_health_check_interval_seconds": health_check_interval_seconds,
         }),
         prefix,
     )
     .expect("redis config parses")
     .expect("sync_mode redis yields a config");
-    Arc::new(redis_rate_limit_client_for_test(config))
+    Arc::new(RedisRateLimitClient::for_replay_authority(
+        config, None, false, None,
+    ))
 }
 
-/// The whole lifecycle on the real admin surface: healthy → unavailable →
-/// recovered → retired.
+const INFO_CMD: &[u8] = b"$4\r\nINFO\r\n";
+
+fn resp_command_count(chunk: &[u8]) -> usize {
+    chunk.iter().filter(|&&byte| byte == b'*').count().max(1)
+}
+
+fn resp_contains(chunk: &[u8], command: &[u8]) -> bool {
+    chunk.windows(command.len()).any(|window| window == command)
+}
+
+/// Gated RESP peer: when closed, accepted sockets are dropped so the probe
+/// fails fast; when open, handshake/PING succeed and `INFO CLUSTER` reports a
+/// usable non-Cluster topology. Recovery is proven by that screen, not by PING
+/// alone and not by a protected `SET`.
+async fn spawn_gated_replay_redis(
+    initially_open: bool,
+) -> (u16, Arc<AtomicBool>, tokio::sync::oneshot::Sender<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake redis");
+    let port = listener.local_addr().expect("local addr").port();
+    let open = Arc::new(AtomicBool::new(initially_open));
+    let open_for_server = Arc::clone(&open);
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => break,
+                accepted = listener.accept() => {
+                    let Ok((mut stream, _)) = accepted else { break };
+                    if !open_for_server.load(Ordering::Acquire) {
+                        drop(stream);
+                        continue;
+                    }
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 16 * 1024];
+                        loop {
+                            let read = match stream.read(&mut buf).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(read) => read,
+                            };
+                            let chunk = &buf[..read];
+                            let reply: Vec<u8> = if resp_contains(chunk, INFO_CMD) {
+                                let text = "# Cluster\r\ncluster_enabled:0\r\n";
+                                format!("${}\r\n{text}\r\n", text.len()).into_bytes()
+                            } else {
+                                b"+OK\r\n".repeat(resp_command_count(chunk))
+                            };
+                            if stream.write_all(&reply).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    });
+
+    (port, open, shutdown_tx)
+}
+
+async fn wait_for_health(base: &str, want_ready: bool, what: &str) -> (u16, Value) {
+    let mut last = (0u16, Value::Null);
+    for _ in 0..400 {
+        last = get(base, "/health", Some(METRICS_TOKEN)).await;
+        if last.0 == (if want_ready { 200 } else { 503 }) && last.1["ready"] == want_ready {
+            return last;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("timed out waiting until {what}: status={} body={}", last.0, last.1);
+}
+
+/// The whole lifecycle on the real admin surface: unproven/dead → recovered →
+/// retired. Recovery is a screened probe, not protected traffic or test hooks.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_shared_replay_authority_outage_fails_readiness_and_recovery_restores_it() {
     let _serialized = REGISTRY_LOCK.lock().await;
@@ -170,25 +263,18 @@ async fn a_shared_replay_authority_outage_fails_readiness_and_recovery_restores_
         "the aggregate is published only when a shared authority exists: {body}"
     );
 
-    let client = shared_client("ferrum:replay_readiness:lifecycle");
-    let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
-    assert_eq!(authority.mode(), "shared");
-
-    // Registered and reachable-so-far: still ready, and the aggregate appears.
-    let (code, body) = get(&base, "/health", Some(METRICS_TOKEN)).await;
-    assert_eq!(code, 200);
-    assert_eq!(body["ready"], true);
-    assert_eq!(body["replay_authority"]["shared_authorities"], 1);
-    assert_eq!(
-        body["replay_authority"]["shared_authorities_unavailable"],
-        0
+    let dead = shared_client("ferrum:replay_readiness:lifecycle-dead");
+    let dead_authority = ReplayAuthority::shared(Arc::clone(&dead), RETENTION);
+    assert_eq!(dead_authority.mode(), "shared");
+    assert!(
+        !dead.is_available(),
+        "a replay client must start unproven, not reachable-so-far"
     );
 
-    // The backend goes away. Protected requests on that policy now fail closed,
-    // so the replica must withdraw itself.
-    client.mark_unavailable_for_test();
+    // Registered against a dead backend: fail closed on the real admin surface
+    // without waiting for a protected request to touch Redis.
     let (code, body) = get(&base, "/health", Some(METRICS_TOKEN)).await;
-    assert_eq!(code, 503, "an unavailable shared authority fails readiness");
+    assert_eq!(code, 503, "an unproven shared authority fails readiness");
     assert_eq!(body["ready"], false);
     assert_eq!(
         body["status"], "unavailable",
@@ -211,9 +297,36 @@ async fn a_shared_replay_authority_outage_fails_readiness_and_recovery_restores_
     assert_eq!(code, 200);
     assert_eq!(live, serde_json::json!({"status": "ok"}));
 
-    // Recovery restores readiness with no restart and no config reload.
-    assert!(client.publish_reachable_for_test());
+    drop(dead_authority);
+    drop(dead);
     let (code, body) = get(&base, "/health", Some(METRICS_TOKEN)).await;
+    assert_eq!(
+        code, 200,
+        "a retired dead generation must not keep readiness down: {body}"
+    );
+
+    // Recovery without protected traffic: start closed, then open a screened
+    // RESP peer. The background probe — not admit() and not publish_reachable
+    // — must restore `/health`.
+    let (port, open, redis_shutdown) = spawn_gated_replay_redis(false).await;
+    let redis_url = format!("redis://readiness-user:readiness-password@127.0.0.1:{port}/0");
+    let recovering = shared_client_for_url(
+        "ferrum:replay_readiness:lifecycle-recover",
+        &redis_url,
+        1,
+    );
+    let recovering_authority = ReplayAuthority::shared(Arc::clone(&recovering), RETENTION);
+    let (code, body) = wait_for_health(&base, false, "gated backend starts unproven").await;
+    assert_eq!(code, 503);
+    assert_eq!(body["replay_authority"]["shared_authorities_unavailable"], 1);
+
+    open.store(true, Ordering::Release);
+    let (code, body) = wait_for_health(
+        &base,
+        true,
+        "screened probe restores readiness without protected traffic",
+    )
+    .await;
     assert_eq!(code, 200);
     assert_eq!(body["ready"], true);
     assert_eq!(body["status"], "ok");
@@ -221,15 +334,13 @@ async fn a_shared_replay_authority_outage_fails_readiness_and_recovery_restores_
         body["replay_authority"]["shared_authorities_unavailable"],
         0
     );
+    assert!(
+        recovering.is_available(),
+        "readiness recovery must match the client availability word"
+    );
 
-    // A retired plugin generation stops counting entirely — including a retired
-    // generation whose backend was unavailable, which must not hold readiness
-    // down after the plugin cache rebuilt without it.
-    client.mark_unavailable_for_test();
-    let (code, _) = get(&base, "/health", Some(METRICS_TOKEN)).await;
-    assert_eq!(code, 503);
-    drop(authority);
-    drop(client);
+    drop(recovering_authority);
+    drop(recovering);
     let (code, body) = get(&base, "/health", Some(METRICS_TOKEN)).await;
     assert_eq!(
         code, 200,
@@ -242,6 +353,7 @@ async fn a_shared_replay_authority_outage_fails_readiness_and_recovery_restores_
     );
     assert_eq!(shared_health_snapshot().shared_authorities, 0);
 
+    let _ = redis_shutdown.send(());
     let _ = shutdown.send(true);
 }
 
@@ -255,7 +367,6 @@ async fn the_unauthenticated_probe_sees_readiness_but_not_the_aggregate() {
 
     let client = shared_client("ferrum:replay_readiness:coarse");
     let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
-    client.mark_unavailable_for_test();
 
     let (code, anonymous) = get(&base, "/health", None).await;
     assert_eq!(code, 503);

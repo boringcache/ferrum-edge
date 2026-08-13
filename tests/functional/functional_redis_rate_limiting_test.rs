@@ -3915,7 +3915,9 @@ async fn test_shared_replay_authority_live_redis_admits_exactly_one_winner() {
         .expect("redis mode enabled");
         // A separate client per authority: independent connection pools, exactly
         // as two gateway replicas have.
-        Arc::new(RedisRateLimitClient::new(config, None, false, None))
+        Arc::new(RedisRateLimitClient::for_replay_authority(
+            config, None, false, None,
+        ))
     };
 
     let domain = ReplayDomain::new(
@@ -3925,9 +3927,20 @@ async fn test_shared_replay_authority_live_redis_admits_exactly_one_winner() {
         &prefix,
         "live-shared",
     );
-    let authorities: Vec<Arc<ReplayAuthority>> = (0..4)
-        .map(|_| Arc::new(ReplayAuthority::shared(build_client(), retention)))
+    let clients: Vec<Arc<RedisRateLimitClient>> = (0..4).map(|_| build_client()).collect();
+    let authorities: Vec<Arc<ReplayAuthority>> = clients
+        .iter()
+        .map(|client| Arc::new(ReplayAuthority::shared(Arc::clone(client), retention)))
         .collect();
+    for (index, client) in clients.iter().enumerate() {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !client.is_available() {
+            if std::time::Instant::now() > deadline {
+                panic!("live Redis replica {index} did not pass a topology-screened probe");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
 
     // 1. One marker, raced across four independent clients: exactly one winner.
     let contested = domain.marker(&[b"consumer-1", b"nonce-contested"]);
@@ -3964,10 +3977,20 @@ async fn test_shared_replay_authority_live_redis_admits_exactly_one_winner() {
     // 3. A later claim must never SHORTEN an existing key's TTL. `SET NX` does
     //    not touch a key it did not create, which is what makes a rolling
     //    deployment safe even if a generation declared a shorter horizon.
+    let short_lived_client = build_client();
     let short_lived = Arc::new(ReplayAuthority::shared(
-        build_client(),
+        Arc::clone(&short_lived_client),
         Duration::from_secs(5),
     ));
+    {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !short_lived_client.is_available() {
+            if std::time::Instant::now() > deadline {
+                panic!("short-horizon replica did not pass a topology-screened probe");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
     let ttl_marker = domain.marker(&[b"consumer-1", b"nonce-ttl"]);
     assert_eq!(
         authorities[0].admit(&ttl_marker).await,
@@ -4002,7 +4025,7 @@ async fn test_shared_replay_authority_live_redis_admits_exactly_one_winner() {
     .expect("redis config parses")
     .expect("redis mode enabled");
     let unreachable_authority = ReplayAuthority::shared(
-        Arc::new(RedisRateLimitClient::new(
+        Arc::new(RedisRateLimitClient::for_replay_authority(
             unreachable_config,
             None,
             false,

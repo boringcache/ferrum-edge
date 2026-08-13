@@ -406,6 +406,118 @@ fn equivalent_reload_decrease_enforces_new_capacity_without_forgetting_live_mark
     );
 }
 
+/// A lowered cap must refuse a new use of an expired occupied marker while live
+/// markers still fill the new limit. Refreshing that expired slot in place would
+/// admit above the replacement generation's cap.
+#[test]
+fn decreased_capacity_refuses_an_expired_occupied_marker_while_live_markers_fill_the_cap() {
+    let first = domain("capacity-decrease-expired").marker(&[b"c", b"first"]);
+    let second = domain("capacity-decrease-expired").marker(&[b"c", b"second"]);
+    let third = domain("capacity-decrease-expired").marker(&[b"c", b"third"]);
+    let now = monotonic_millis();
+
+    let original = process_authority("capacity-decrease-expired", 3);
+    assert_eq!(
+        admit_process_at(&original, &first, now),
+        Some(ReplayAdmission::Admitted)
+    );
+    let later = now + 1_000;
+    assert_eq!(
+        admit_process_at(&original, &second, later),
+        Some(ReplayAdmission::Admitted)
+    );
+    assert_eq!(
+        admit_process_at(&original, &third, later),
+        Some(ReplayAdmission::Admitted)
+    );
+    drop(original);
+
+    let lowered = process_authority("capacity-decrease-expired", 2);
+    // `first` has expired; `second` and `third` remain live and already fill
+    // the replacement cap of 2.
+    let after_first_expires = now + RETENTION.as_millis() as u64 + 1;
+    assert_eq!(
+        admit_process_at(&lowered, &first, after_first_expires),
+        Some(ReplayAdmission::CapacityRefused),
+        "an expired occupied marker must not bypass a lowered cap while live markers remain"
+    );
+    assert_eq!(
+        admit_process_at(&lowered, &second, after_first_expires),
+        Some(ReplayAdmission::Replay),
+        "live markers must not be evicted to recycle an expired occupied key"
+    );
+    assert_eq!(
+        admit_process_at(&lowered, &third, after_first_expires),
+        Some(ReplayAdmission::Replay),
+        "every remaining live marker must stay claimed"
+    );
+    let lane = process_lane(&lowered).expect("shared lane");
+    assert_eq!(
+        lane.retained_entries(),
+        2,
+        "the expired occupied marker is pruned, live markers stay"
+    );
+}
+
+/// When expired-only pruning restores headroom under a lowered cap, a new claim
+/// — including a new use of a previously expired occupied marker — is admitted
+/// again. Live markers stay claimed.
+#[test]
+fn decreased_capacity_admits_after_expired_pruning_restores_headroom() {
+    let first = domain("capacity-decrease-headroom").marker(&[b"c", b"first"]);
+    let second = domain("capacity-decrease-headroom").marker(&[b"c", b"second"]);
+    let third = domain("capacity-decrease-headroom").marker(&[b"c", b"third"]);
+    let fourth = domain("capacity-decrease-headroom").marker(&[b"c", b"fourth"]);
+    let now = monotonic_millis();
+
+    let original = process_authority("capacity-decrease-headroom", 3);
+    assert_eq!(
+        admit_process_at(&original, &first, now),
+        Some(ReplayAdmission::Admitted)
+    );
+    assert_eq!(
+        admit_process_at(&original, &second, now),
+        Some(ReplayAdmission::Admitted)
+    );
+    let later = now + 1_000;
+    assert_eq!(
+        admit_process_at(&original, &third, later),
+        Some(ReplayAdmission::Admitted)
+    );
+    drop(original);
+
+    let lowered = process_authority("capacity-decrease-headroom", 2);
+    // Expire the two earlier markers, leaving `third` live. Pruning those two
+    // restores a slot under the new cap of 2.
+    let after_two_expire = now + RETENTION.as_millis() as u64 + 1;
+    assert_eq!(
+        admit_process_at(&lowered, &first, after_two_expire),
+        Some(ReplayAdmission::Admitted),
+        "pruning expired markers must restore headroom for the occupied key"
+    );
+    assert_eq!(
+        admit_process_at(&lowered, &third, after_two_expire),
+        Some(ReplayAdmission::Replay),
+        "the remaining live marker must stay claimed"
+    );
+    assert_eq!(
+        admit_process_at(&lowered, &second, after_two_expire),
+        Some(ReplayAdmission::CapacityRefused),
+        "the restored slot is consumed by the re-admitted marker; the new cap then refuses"
+    );
+    assert_eq!(
+        admit_process_at(&lowered, &fourth, after_two_expire),
+        Some(ReplayAdmission::CapacityRefused),
+        "once live markers fill the new cap, further claims refuse"
+    );
+    let lane = process_lane(&lowered).expect("shared lane");
+    let cap = process_max_entries(&lowered).expect("process capacity");
+    assert!(
+        lane.retained_entries() <= cap,
+        "reclamation must leave the lane within the replacement cap"
+    );
+}
+
 /// An equivalent reload that raises capacity must restore headroom against
 /// the same marker history without reopening an already-claimed proof.
 #[test]
@@ -777,7 +889,6 @@ async fn an_unavailable_shared_authority_is_visible_in_the_counters() {
     let client = Arc::new(RedisRateLimitClient::for_replay_authority(
         config, None, false, None,
     ));
-    client.mark_unavailable_for_test();
     let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
 
     let marker = domain("shared-observable").marker(&[b"c", b"proof"]);
@@ -812,6 +923,24 @@ fn shared_health_guard() -> tokio::sync::MutexGuard<'static, ()> {
 
 async fn shared_health_guard_async() -> tokio::sync::MutexGuard<'static, ()> {
     SHARED_HEALTH_LOCK.lock().await
+}
+
+async fn wait_until(mut pred: impl FnMut() -> bool, what: &str) {
+    for _ in 0..500 {
+        if pred() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("timed out waiting until {what}");
+}
+
+async fn wait_until_available(client: &RedisRateLimitClient) {
+    wait_until(
+        || client.is_available(),
+        "the replay backend completed a topology-screened probe",
+    )
+    .await;
 }
 
 fn unreachable_shared_client(prefix: &str) -> Arc<RedisRateLimitClient> {
@@ -851,19 +980,16 @@ fn shared_authority_health_tracks_outage_recovery_and_retirement() {
     );
     assert!(registered.required());
     assert_eq!(
-        registered.shared_authorities_unavailable, baseline.shared_authorities_unavailable,
-        "a freshly built client has not proven itself unavailable yet"
+        registered.shared_authorities_unavailable,
+        baseline.shared_authorities_unavailable + 1,
+        "a freshly built replay client is unproven and must fail closed"
     );
-
-    // An outage is readiness-relevant, not a per-request error.
-    client.mark_unavailable_for_test();
-    let degraded = shared_health_snapshot();
-    assert_eq!(
-        degraded.shared_authorities_unavailable,
-        baseline.shared_authorities_unavailable + 1
+    assert!(registered.unavailable());
+    assert!(!client.is_available());
+    assert!(
+        !client.health_checker_started_for_test(),
+        "registration without a Tokio runtime must not panic or latch the probe"
     );
-    assert!(degraded.unavailable());
-    assert!(shared_authority_degraded());
 
     // Recovery restores it with no rebuild and no config reload.
     assert!(client.publish_reachable_for_test());
@@ -891,6 +1017,53 @@ fn shared_authority_health_tracks_outage_recovery_and_retirement() {
         retired.shared_authorities_unavailable,
         baseline.shared_authorities_unavailable
     );
+}
+
+/// Registration under a Tokio runtime must arm the bounded readiness probe
+/// immediately so recovery does not wait for protected traffic.
+#[tokio::test]
+async fn registering_a_shared_authority_under_tokio_arms_the_readiness_probe() {
+    let _serialized = shared_health_guard_async().await;
+    let client = unreachable_shared_client("ferrum:replay_authority_tests:arm-probe");
+    let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
+    assert!(!client.is_available());
+    assert!(
+        client.health_checker_started_for_test(),
+        "a required shared backend must probe without waiting for a protected request"
+    );
+    drop(authority);
+    drop(client);
+}
+
+/// Construction/validate without a reactor must stay panic-free, and a later
+/// request-path miss under a runtime must still arm recovery.
+#[tokio::test]
+async fn a_runtime_appearing_later_still_arms_the_replay_readiness_probe() {
+    let _serialized = shared_health_guard_async().await;
+    let (client, authority) = std::thread::spawn(|| {
+        let client = unreachable_shared_client("ferrum:replay_authority_tests:later-runtime");
+        let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
+        assert!(
+            !client.health_checker_started_for_test(),
+            "no reactor: do not latch the started flag"
+        );
+        (client, authority)
+    })
+    .join()
+    .expect("thread should not panic");
+    assert!(!client.health_checker_started_for_test());
+    let marker = domain("later-runtime").marker(&[b"c", b"proof"]);
+    assert_eq!(
+        authority.admit(&marker).await,
+        ReplayAdmission::AuthorityUnavailable,
+        "unproven state fails closed without waiting on the backend"
+    );
+    assert!(
+        client.health_checker_started_for_test(),
+        "the first miss under a runtime must arm the bounded probe"
+    );
+    drop(authority);
+    drop(client);
 }
 
 /// One backend shared by several providers is one authority, not several.
@@ -995,6 +1168,10 @@ fn a_generic_redis_client_does_not_contribute_to_shared_replay_health() {
     .expect("redis config parses")
     .expect("sync_mode redis yields a config");
     let client = RedisRateLimitClient::new(config, None, false, None);
+    assert!(
+        client.is_available(),
+        "operational Redis clients keep historical initial reachability"
+    );
     client.mark_unavailable_for_test();
     assert_eq!(
         shared_health_snapshot(),
@@ -1064,8 +1241,9 @@ fn replacement_generation_clears_the_retired_count() {
         baseline.shared_authorities + 1
     );
     assert_eq!(
-        after_old.shared_authorities_unavailable, baseline.shared_authorities_unavailable,
-        "the retired unavailable generation must stop contributing immediately"
+        after_old.shared_authorities_unavailable,
+        baseline.shared_authorities_unavailable + 1,
+        "the live replacement stays unproven; only the retired generation drops"
     );
 
     drop(new);
@@ -1216,10 +1394,14 @@ fn stale_reachable_registration_sample_cannot_overwrite_later_unavailable() {
     let baseline = shared_health_snapshot();
 
     let client = unreachable_shared_client("ferrum:replay_authority_tests:stale-ready");
+    assert!(
+        client.publish_reachable_for_test(),
+        "prove reachable before capturing so the stale sample is a reachable epoch"
+    );
     let stale = client.capture_shared_replay_registration_sample_for_test();
     assert!(
         stale.available(),
-        "a fresh client is reachable until an outage is proven"
+        "the sample is a proven reachable epoch captured before the outage"
     );
     assert_eq!(
         shared_health_snapshot(),
@@ -1321,6 +1503,7 @@ fn stale_reachable_registration_sample_cannot_overwrite_terminal_topology() {
     let baseline = shared_health_snapshot();
 
     let client = unreachable_shared_client("ferrum:replay_authority_tests:stale-terminal");
+    assert!(client.publish_reachable_for_test());
     let stale = client.capture_shared_replay_registration_sample_for_test();
     assert!(stale.available());
 
@@ -1457,6 +1640,49 @@ async fn spawn_claim_redis_server(
     (port, shutdown_tx)
 }
 
+/// Handshake and PING succeed; `INFO CLUSTER` is accepted and then never
+/// answered. A PING alone must not publish replay readiness.
+async fn spawn_info_silent_redis_server() -> (u16, tokio::sync::oneshot::Sender<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake redis");
+    let port = listener.local_addr().expect("local addr").port();
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => break,
+                accepted = listener.accept() => {
+                    let Ok((mut stream, _)) = accepted else { break };
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 16 * 1024];
+                        loop {
+                            let read = match stream.read(&mut buf).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(read) => read,
+                            };
+                            let chunk = &buf[..read];
+                            if resp_contains(chunk, INFO_CMD) {
+                                // Topology screen never completes.
+                                continue;
+                            }
+                            let reply = b"+OK\r\n".repeat(resp_command_count(chunk));
+                            if stream.write_all(&reply).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    });
+
+    (port, shutdown_tx)
+}
+
 fn claim_client(port: u16, prefix: &str) -> Arc<RedisRateLimitClient> {
     let config = RedisConfig::from_plugin_config(
         &serde_json::json!({
@@ -1475,6 +1701,67 @@ fn claim_client(port: u16, prefix: &str) -> Arc<RedisRateLimitClient> {
     ))
 }
 
+/// A topology-screened probe restores availability without a protected request
+/// and without test-injected reachability.
+#[tokio::test]
+async fn a_screened_probe_restores_shared_readiness_without_protected_traffic() {
+    let _serialized = shared_health_guard_async().await;
+    let baseline = shared_health_snapshot();
+    let (port, shutdown) = spawn_claim_redis_server(ClaimBehavior::Silent).await;
+    let client = claim_client(port, "ferrum:replay_authority_tests:probe-ready");
+    assert!(!client.is_available());
+    let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
+    assert_eq!(
+        shared_health_snapshot().shared_authorities_unavailable,
+        baseline.shared_authorities_unavailable + 1,
+        "unproven registration must fail closed"
+    );
+    wait_until_available(&client).await;
+    let recovered = shared_health_snapshot();
+    assert_eq!(
+        recovered.shared_authorities_unavailable, baseline.shared_authorities_unavailable,
+        "a screened probe must restore readiness without admit or manual injection"
+    );
+    assert_eq!(
+        recovered.shared_authorities,
+        baseline.shared_authorities + 1
+    );
+    drop(authority);
+    drop(client);
+    let _ = shutdown.send(());
+    assert_eq!(shared_health_snapshot(), baseline);
+}
+
+/// Completing PING without a topology screen must not publish the authority
+/// reachable. Cluster nodes answer PING while still redirecting every key.
+#[tokio::test]
+async fn a_ping_alone_does_not_publish_replay_readiness() {
+    let _serialized = shared_health_guard_async().await;
+    let baseline = shared_health_snapshot();
+    let (port, shutdown) = spawn_info_silent_redis_server().await;
+    let client = claim_client(port, "ferrum:replay_authority_tests:ping-only");
+    let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
+    for _ in 0..150 {
+        assert!(
+            !client.is_available(),
+            "PING without INFO CLUSTER is not topology proof"
+        );
+        assert!(
+            !client.is_topology_unsupported(),
+            "an incomplete screen is an outage, not a terminal Cluster rejection"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        shared_health_snapshot().shared_authorities_unavailable,
+        baseline.shared_authorities_unavailable + 1
+    );
+    drop(authority);
+    drop(client);
+    let _ = shutdown.send(());
+    assert_eq!(shared_health_snapshot(), baseline);
+}
+
 /// A connected backend that never answers the claim must produce a fixed
 /// fail-closed result inside the admitted bound, not hold the protected request.
 #[tokio::test]
@@ -1483,6 +1770,7 @@ async fn a_connected_backend_that_never_answers_fails_closed_within_the_bound() 
     let (port, shutdown) = spawn_claim_redis_server(ClaimBehavior::Silent).await;
     let client = claim_client(port, "ferrum:replay_authority_tests:silent");
     let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
+    wait_until_available(&client).await;
     let marker = domain("shared-silent").marker(&[b"c", b"proof"]);
 
     let started = std::time::Instant::now();
@@ -1599,6 +1887,7 @@ async fn every_shared_backend_uncertainty_class_fails_closed() {
         let (port, shutdown) = spawn_claim_redis_server(behavior).await;
         let client = claim_client(port, "ferrum:replay_authority_tests:uncertainty");
         let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
+        wait_until_available(&client).await;
         let marker = domain("shared-uncertainty").marker(&[b"c", label.as_bytes()]);
 
         assert_eq!(
@@ -1641,6 +1930,7 @@ async fn a_claim_whose_reply_was_lost_stays_fail_closed_on_retry() {
     let (port, shutdown) = spawn_claim_redis_server(ClaimBehavior::ExecutedThenLost).await;
     let client = claim_client(port, "ferrum:replay_authority_tests:lost-reply");
     let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
+    wait_until_available(&client).await;
     let marker = domain("shared-lost-reply").marker(&[b"c", b"nonce"]);
 
     assert_eq!(
@@ -1810,6 +2100,7 @@ async fn shared_claim_writes_the_exact_ceil_ttl_on_the_set_command() {
         ("zero", Duration::ZERO, 1u64),
     ] {
         let authority = ReplayAuthority::shared(Arc::clone(&client), retention);
+        wait_until_available(&client).await;
         let marker = domain("shared-ttl").marker(&[b"c", label.as_bytes()]);
         assert_eq!(
             authority.admit(&marker).await,
@@ -1980,11 +2271,40 @@ async fn replay_client_logs_only_classification_and_redacted_endpoint() {
         ));
         let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
         let marker = domain("shared-logging").marker(&[b"c", label.as_bytes()]);
-        assert_eq!(
-            authority.admit(&marker).await,
-            ReplayAdmission::AuthorityUnavailable,
-            "{label}: sentinel backend must fail closed"
-        );
+        match shape {
+            LoggingShape::AuthReject => {
+                wait_until(
+                    || logs.contents().contains(expected_class),
+                    &format!("{label}: probe classification"),
+                )
+                .await;
+                assert_eq!(
+                    authority.admit(&marker).await,
+                    ReplayAdmission::AuthorityUnavailable,
+                    "{label}: sentinel backend must fail closed"
+                );
+            }
+            LoggingShape::ClusterInfo => {
+                wait_until(
+                    || client.is_topology_unsupported(),
+                    &format!("{label}: terminal topology probe"),
+                )
+                .await;
+                assert_eq!(
+                    authority.admit(&marker).await,
+                    ReplayAdmission::AuthorityUnavailable,
+                    "{label}: sentinel backend must fail closed"
+                );
+            }
+            LoggingShape::CommandError | LoggingShape::ClusterMoved => {
+                wait_until_available(&client).await;
+                assert_eq!(
+                    authority.admit(&marker).await,
+                    ReplayAdmission::AuthorityUnavailable,
+                    "{label}: sentinel backend must fail closed"
+                );
+            }
+        }
         drop(guard);
         let captured = logs.contents();
 
