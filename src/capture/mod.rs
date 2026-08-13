@@ -428,6 +428,7 @@ fn node_waypoint_udp_steer_teardown_for_family(binary: &str, ipv6: bool) -> Vec<
     // spellings are the same prefix; the match still requires this table,
     // `type local`, and `dev lo`.
     let route_case = format!("*'local {cidr} dev lo'*|*'local default dev lo'*");
+    let family = if ipv6 { 6 } else { 4 };
     vec![
         // STOP MARKING FIRST, then remove the now-unreferenced chain.
         format!("ferrum_delete_xtables_rule {binary} mangle PREROUTING -p udp -j {steer}"),
@@ -437,6 +438,12 @@ fn node_waypoint_udp_steer_teardown_for_family(binary: &str, ipv6: bool) -> Vec<
         format!("ferrum_delete_xtables_chain {binary} raw {notrack}"),
         // Routing comes last. Inspect first so only genuine absence is an
         // idempotent success; a failed delete is never reclassified as absent.
+        // `ferrum_show_steer_local_routes` classifies iproute2's missing-table
+        // dump (`FIB table does not exist`) as that absence: `set -e` plus a
+        // raw `ip route show table N` aborts first-pass teardown forever when
+        // the Ferrum table has never been created, and the same dump happens
+        // after the last local route is deleted because the kernel then drops
+        // the table. Permission, lock, and other show failures stay nonzero.
         format!(
             "ferrum_rule_state=\"$({ip} -o rule show priority {priority})\"\n\
              case \"$ferrum_rule_state\" in\n\
@@ -451,13 +458,13 @@ fn node_waypoint_udp_steer_teardown_for_family(binary: &str, ipv6: bool) -> Vec<
              esac"
         ),
         format!(
-            "ferrum_route_state=\"$({ip} route show table {table} type local)\"\n\
+            "ferrum_show_steer_local_routes {family}\n\
              case \"$ferrum_route_state\" in\n\
                {route_case})\n\
                  {ip} route del {local_route} table {table}\n\
                  ;;\n\
              esac\n\
-             ferrum_route_state=\"$({ip} route show table {table} type local)\"\n\
+             ferrum_show_steer_local_routes {family}\n\
              case \"$ferrum_route_state\" in\n\
                {route_case})\n\
                  echo 'Ferrum NodeWaypoint UDP steering route remains after deletion' >&2\n\
@@ -552,6 +559,14 @@ pub fn node_waypoint_udp_steer_setup_script(
 /// captured from a non-inverted `if`/`else`: POSIX `if ! cmd; then status=$?`
 /// records 0 (the inverted compound status) and would treat lock and
 /// permission failures as absence.
+///
+/// Route inspection has the same first-pass trap: iproute2's
+/// `ip route show table N type local` exits 2 with `FIB table does not exist`
+/// when table `N` has never been created (and again after the last local route
+/// is deleted, because the kernel then drops the table). That message is
+/// genuine absence. Other show failures — permission, dump errors that are
+/// not that message — stay nonzero. Status is captured with an uninverted
+/// `|| ferrum_status=$?` so `set -e` cannot abort before the classification.
 pub fn node_waypoint_udp_steer_teardown_script() -> String {
     let helpers = format!(
         "set -e\n\
@@ -621,6 +636,29 @@ pub fn node_waypoint_udp_steer_teardown_script() -> String {
                return \"$ferrum_status\"\n\
              fi\n\
            fi\n\
+         }}\n\
+         ferrum_show_steer_local_routes() {{\n\
+           ferrum_family=\"$1\"\n\
+           ferrum_status=0\n\
+           if [ \"$ferrum_family\" = 6 ]; then\n\
+             ferrum_show=\"$(ip -6 route show table {NODE_WAYPOINT_UDP_STEER_TABLE} type local 2>&1)\" || ferrum_status=$?\n\
+           else\n\
+             ferrum_show=\"$(ip route show table {NODE_WAYPOINT_UDP_STEER_TABLE} type local 2>&1)\" || ferrum_status=$?\n\
+           fi\n\
+           if [ \"$ferrum_status\" -ne 0 ]; then\n\
+             case \"$ferrum_show\" in\n\
+               *'FIB table does not exist'*)\n\
+                 ferrum_route_state=\"\"\n\
+                 return 0\n\
+                 ;;\n\
+               *)\n\
+                 echo 'Ferrum NodeWaypoint UDP steering route inspection failed' >&2\n\
+                 printf '%s\\n' \"$ferrum_show\" >&2\n\
+                 return \"$ferrum_status\"\n\
+                 ;;\n\
+             esac\n\
+           fi\n\
+           ferrum_route_state=\"$ferrum_show\"\n\
          }}"
     );
     [

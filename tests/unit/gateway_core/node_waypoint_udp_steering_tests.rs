@@ -492,10 +492,10 @@ fn case_globs_after_show(script: &str, show_at: usize) -> Vec<String> {
 }
 
 fn parse_family_route_teardown(script: &str, ipv6: bool) -> FamilyRouteTeardown {
-    let show_cmd = if ipv6 {
-        "ip -6 route show table 33136 type local"
+    let show_helper = if ipv6 {
+        "ferrum_show_steer_local_routes 6"
     } else {
-        "ip route show table 33136 type local"
+        "ferrum_show_steer_local_routes 4"
     };
     let delete_cmd = if ipv6 {
         "ip -6 route del local ::/0 dev lo table 33136"
@@ -505,10 +505,10 @@ fn parse_family_route_teardown(script: &str, ipv6: bool) -> FamilyRouteTeardown 
 
     let mut positions = Vec::new();
     let mut search_from = 0;
-    while let Some(rel) = script[search_from..].find(show_cmd) {
+    while let Some(rel) = script[search_from..].find(show_helper) {
         let at = search_from + rel;
         positions.push(at);
-        search_from = at + show_cmd.len();
+        search_from = at + show_helper.len();
     }
     assert_eq!(
         positions.len(),
@@ -651,16 +651,115 @@ fn teardown_matches_both_iproute2_spellings_of_the_owned_local_default() {
         line.contains("ip -o rule show priority") && !line.contains("ip -6")
     });
     let v4_route = line_index(&script, |line| {
-        line.contains("ip route show table 33136 type local")
+        line.contains("ip route del local 0.0.0.0/0 dev lo table 33136")
     });
     let v6_rule = line_index(&script, |line| line.contains("ip -6 -o rule show priority"));
     let v6_route = line_index(&script, |line| {
-        line.contains("ip -6 route show table 33136 type local")
+        line.contains("ip -6 route del local ::/0 dev lo table 33136")
     });
     assert!(
         v4_rule < v4_route && v6_rule < v6_route,
         "each family must delete the policy rule before the local route:\n{script}"
     );
+}
+
+fn steer_local_routes_helper(script: &str) -> &str {
+    let start = script
+        .find("ferrum_show_steer_local_routes() {")
+        .expect("route-show helper must be rendered");
+    let rest = &script[start..];
+    let end = rest
+        .find("\nferrum_delete_xtables_rule iptables")
+        .expect("IPv4 teardown must follow the route-show helper");
+    rest[..end].trim_end()
+}
+
+fn fib_absence_globs(helper: &str) -> Vec<String> {
+    let case_at = helper
+        .find("case \"$ferrum_show\" in")
+        .expect("missing-table classification must case on the captured show output");
+    let pattern_line = helper[case_at..]
+        .lines()
+        .nth(1)
+        .unwrap_or_else(|| panic!("FIB-absence case pattern missing:\n{helper}"));
+    parse_case_globs(pattern_line)
+}
+
+/// Hosted NodeWaypoint UDP Service-path failure: first-pass teardown ran
+/// `ip route show table 33136 type local` under `set -e` while the Ferrum FIB
+/// table had never been created. iproute2 exits 2 with
+/// `Error: ipv4: FIB table does not exist.` / `Dump terminated`, so teardown
+/// never proved absence, `reaped` stayed false, setup never ran, kube-proxy
+/// DNATed ClusterIP traffic, and the pod-veth guard dropped it
+/// (`backend_hits=0`). Direct listener probes still passed because they do
+/// not need steering. Missing-table is genuine absence; other show failures
+/// stay fail-closed. The same dump happens after the last local route is
+/// deleted, so inspect AND verify must share the helper.
+#[test]
+fn teardown_treats_a_missing_fib_table_as_genuine_absence() {
+    let script = node_waypoint_udp_steer_teardown_script();
+    let helper = steer_local_routes_helper(&script);
+
+    assert!(
+        helper.contains("ip route show table 33136 type local 2>&1")
+            && helper.contains("ip -6 route show table 33136 type local 2>&1"),
+        "both families must inspect the Ferrum table and keep stderr for classification:\n{helper}"
+    );
+    assert!(
+        !helper.contains("2>/dev/null"),
+        "swallowing stderr would lose the missing-table diagnostic:\n{helper}"
+    );
+    assert!(
+        helper.contains("|| ferrum_status=$?")
+            && helper.contains("*'FIB table does not exist'*")
+            && helper.contains("ferrum_route_state=\"\"")
+            && helper.contains("return 0"),
+        "the hosted iproute2 missing-table dump must classify as empty absence:\n{helper}"
+    );
+    assert!(
+        helper.contains("route inspection failed")
+            && helper.contains("return \"$ferrum_status\""),
+        "permission and other show failures must keep their original status:\n{helper}"
+    );
+    assert!(
+        !helper.contains("[ \"$ferrum_status\" -eq 2 ]") && !helper.contains("|| true"),
+        "exit 2 is not absence by itself; only the FIB-missing diagnostic is:\n{helper}"
+    );
+    assert_no_bang_inverted_status_capture(helper);
+
+    assert_eq!(
+        script.matches("ferrum_show_steer_local_routes 4").count(),
+        2,
+        "IPv4 inspect and post-delete verify must share the helper:\n{script}"
+    );
+    assert_eq!(
+        script.matches("ferrum_show_steer_local_routes 6").count(),
+        2,
+        "IPv6 inspect and post-delete verify must share the helper:\n{script}"
+    );
+
+    let absence_globs = fib_absence_globs(helper);
+    for dump in [
+        "Error: ipv4: FIB table does not exist.\nDump terminated",
+        "Error: ipv6: FIB table does not exist.\nDump terminated",
+        "Error: ipv4: FIB table does not exist.",
+    ] {
+        assert!(
+            posix_case_any(dump, &absence_globs),
+            "missing-table dump must classify as absence:\n{dump}\n{absence_globs:?}"
+        );
+    }
+    for dump in [
+        "RTNETLINK answers: Operation not permitted",
+        "Error: Failed to send dump request: Operation not permitted",
+        "Dump terminated",
+        "local default dev lo proto kernel scope host",
+    ] {
+        assert!(
+            !posix_case_any(dump, &absence_globs),
+            "non-absence dump must stay a show failure:\n{dump}\n{absence_globs:?}"
+        );
+    }
 }
 
 /// The update-order contract (issue #3286 root review). During a generation
