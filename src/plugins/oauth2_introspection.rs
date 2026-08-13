@@ -2170,9 +2170,12 @@ async fn discover_introspection_endpoint(
     http_client: &PluginHttpClient,
     discovery_url: &str,
 ) -> Result<String, String> {
+    let client = http_client
+        .get()
+        .map_err(|e| format!("discovery request failed: {e}"))?;
     let response = http_client
         .execute(
-            http_client.get().get(discovery_url),
+            client.get(discovery_url),
             "oauth2_introspection_discovery",
         )
         .await

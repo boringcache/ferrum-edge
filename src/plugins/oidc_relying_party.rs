@@ -3392,8 +3392,11 @@ async fn fetch_discovery(
     http_client: &PluginHttpClient,
     discovery_url: &str,
 ) -> Result<DiscoveryDoc, String> {
+    let client = http_client
+        .get()
+        .map_err(|e| format!("discovery request failed: {e}"))?;
     let response = http_client
-        .execute(http_client.get().get(discovery_url), "oidc_rp_discovery")
+        .execute(client.get(discovery_url), "oidc_rp_discovery")
         .await
         .map_err(|e| format!("discovery request failed: {e}"))?;
     if !response.status().is_success() {

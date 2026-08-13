@@ -136,7 +136,7 @@ pub use builtin_parity::{
     BUILTIN_PLUGIN_PARITY_META, BuiltinPluginClassification, BuiltinPluginParityMeta,
     builtin_plugin_parity_meta,
 };
-pub use utils::PluginHttpClient;
+pub use utils::{PluginHttpClient, PluginHttpClientUnavailable};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};

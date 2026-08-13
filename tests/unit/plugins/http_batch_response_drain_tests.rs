@@ -158,7 +158,11 @@ async fn shared_helper_reuses_http11_connection_across_successful_batches() {
     let url = format!("http://{addr}/ingest");
 
     for _ in 0..2 {
-        let req = client.get().post(&url).body("[]");
+        let req = client
+            .get()
+            .expect("plugin HTTP client")
+            .post(&url)
+            .body("[]");
         let result = client.execute(req, "http_batch_drain_test").await;
         handle_http_batch_response("http_batch_drain_test", 1, result)
             .await
@@ -191,7 +195,14 @@ async fn shared_helper_reuses_http11_connection_across_retryable_then_success() 
     let url = format!("http://{addr}/ingest");
 
     let first = client
-        .execute(client.get().post(&url).body("[]"), "http_batch_drain_retry")
+        .execute(
+            client
+                .get()
+                .expect("plugin HTTP client")
+                .post(&url)
+                .body("[]"),
+            "http_batch_drain_retry",
+        )
         .await;
     let err = handle_http_batch_response("http_batch_drain_retry", 1, first)
         .await
@@ -200,7 +211,14 @@ async fn shared_helper_reuses_http11_connection_across_retryable_then_success() 
     assert!(err.contains("response body drained"), "{err}");
 
     let second = client
-        .execute(client.get().post(&url).body("[]"), "http_batch_drain_retry")
+        .execute(
+            client
+                .get()
+                .expect("plugin HTTP client")
+                .post(&url)
+                .body("[]"),
+            "http_batch_drain_retry",
+        )
         .await;
     handle_http_batch_response("http_batch_drain_retry", 1, second)
         .await
@@ -228,7 +246,11 @@ async fn shared_helper_drain_timeout_bounds_stalled_ack_body() {
     let started = Instant::now();
     let result = client
         .execute(
-            client.get().post(format!("http://{addr}/stall")).body("[]"),
+            client
+                .get()
+                .expect("plugin HTTP client")
+                .post(format!("http://{addr}/stall"))
+                .body("[]"),
             "http_batch_drain_timeout",
         )
         .await
@@ -256,6 +278,7 @@ async fn shared_helper_rejects_oversized_advertised_content_length_without_block
         .execute(
             client
                 .get()
+                .expect("plugin HTTP client")
                 .post(format!("http://{addr}/oversized"))
                 .body("[]"),
             "http_batch_drain_cl",
@@ -280,6 +303,7 @@ async fn shared_helper_aborts_oversized_chunked_ack_body() {
         .execute(
             client
                 .get()
+                .expect("plugin HTTP client")
                 .post(format!("http://{addr}/chunked"))
                 .body("[]"),
             "http_batch_drain_chunked",
@@ -315,6 +339,7 @@ async fn shared_helper_transport_failure_is_classified_without_logging_body() {
         .execute(
             client
                 .get()
+                .expect("plugin HTTP client")
                 .post(format!("http://{addr}/truncated"))
                 .body("[]"),
             "http_batch_drain_truncated",
