@@ -3210,6 +3210,7 @@ async fn grpc_transport_diagnostic_labels_are_tag_names_never_values() {
         grpc_proxy::GrpcTransportDiagnostic::ConflictingMeshTransports,
         grpc_proxy::GrpcTransportDiagnostic::CrossClusterMissingTransport,
         grpc_proxy::GrpcTransportDiagnostic::MeshUnixSocket,
+        grpc_proxy::GrpcTransportDiagnostic::GatewayTrustNotLive,
     ] {
         let label = category.as_str();
         assert!(

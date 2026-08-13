@@ -241,6 +241,17 @@ pub fn required_mongo_indexes() -> Vec<RequiredMongoIndex> {
     ));
     plan.push(keys_only("config_changes", doc! { "sequence": 1 }));
 
+    // gateway_trust_bundles (issue #3727).
+    //
+    // No unique index is declared for the singleton rule: `_id` IS the
+    // namespace, so the implicit `_id` index already enforces one record per
+    // namespace atomically. This compound index serves the addressed
+    // `{namespace, id}` admin reads and deletes.
+    plan.push(keys_only(
+        "gateway_trust_bundles",
+        doc! { "namespace": 1, "id": 1 },
+    ));
+
     plan
 }
 

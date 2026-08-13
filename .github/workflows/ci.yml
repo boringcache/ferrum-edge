@@ -892,6 +892,8 @@ jobs:
               integration::consumer_identity_enforcement_tests
               integration::db_offline_bootstrap_tests
               integration::db_row_decode_rejection_tests
+              integration::gateway_trust_bundle_admin_tests
+              integration::gateway_trust_bundle_store_tests
               integration::vendor_integrity_tests
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
@@ -1274,6 +1276,7 @@ jobs:
               functional_db_outage_test
               functional_db_tls_test
               functional_db_upstream_test
+              functional_gateway_trust_bundle_ha_test
               functional_mesh_mode_test
               functional_mesh_stock_xds_test
               functional_mongodb_test
@@ -1325,8 +1328,10 @@ jobs:
         if: matrix.shard == 'data-plane'
         #
         # Four mongod instances on purpose:
-        # - standalone 27017: documented `POST /batch` 501 refusal + plaintext matrix
-        # - replica set 27020: transactional `POST /batch` (issue #2401)
+        # - standalone 27017: documented `POST /batch` 501 refusal + plaintext matrix,
+        #   plus the signal-first gateway-trust-bundle ordering proof (issue #3727)
+        # - replica set 27020: transactional `POST /batch` (issue #2401) and the
+        #   transactional gateway-trust-bundle acceptance cell (issue #3727)
         # - TLS 27018: verify-full + require modes (issue #2399)
         # - mTLS 27019: client certificate authentication (issue #2399)
         # Neither plaintext topology can substitute for the TLS fixtures.

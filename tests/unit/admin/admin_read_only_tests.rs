@@ -785,7 +785,11 @@ async fn test_admit_write_pins_and_blocks_on_failover_without_opt_in() {
         .expect("admit_non_config_db_write must ignore failover topology");
 }
 
+// This test drives read-only/db-unavailable refusals through `admit_non_config_db_write`,
+// which increments the same process-global rejection counter the observability tests below
+// reset and assert on; it shares their serialization key.
 #[tokio::test]
+#[serial_test::serial(admin_read_only_rejection_observability_lock)]
 async fn test_admit_non_config_db_write_keeps_read_only_and_db_unavailable_gates() {
     let config = TestConfig::default();
     let db_flag = Arc::new(AtomicBool::new(false));

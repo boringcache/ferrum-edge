@@ -3,6 +3,7 @@ mod cli;
 mod config;
 mod env_lock;
 mod gateway_core;
+mod gateway_trust_observability_lock;
 mod identity;
 mod logging_tests;
 mod notifications;
