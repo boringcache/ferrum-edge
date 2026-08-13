@@ -1109,14 +1109,19 @@ fn annotate_gateway_mesh_metadata(
     }
 }
 
-pub(crate) fn hbone_inner_baggage_strip_prefixes(configured_prefixes: &[String]) -> Vec<String> {
-    let mut prefixes = configured_prefixes.to_vec();
-    for prefix in HBONE_INNER_IDENTITY_BAGGAGE_PREFIXES {
-        if !prefixes.iter().any(|existing| existing == prefix) {
-            prefixes.push((*prefix).to_string());
-        }
-    }
-    prefixes
+/// Strip reserved identity baggage plus any configured egress prefixes from a
+/// secured-mesh inner request. Combines the borrowed configured slice with the
+/// static reserved prefix set in one filtering pass — no per-attempt
+/// `Vec<String>` clone of either list.
+pub(crate) fn strip_secured_mesh_inner_baggage_in_map(
+    headers: &mut HashMap<String, String>,
+    configured_prefixes: &[String],
+) {
+    crate::modes::mesh::hbone::strip_egress_baggage_in_map_with_static_prefixes(
+        headers,
+        configured_prefixes,
+        HBONE_INNER_IDENTITY_BAGGAGE_PREFIXES,
+    );
 }
 
 fn hbone_inner_headers_with_stripped_baggage(
@@ -1128,8 +1133,7 @@ fn hbone_inner_headers_with_stripped_baggage(
     }
 
     let mut owned = headers.clone();
-    let prefixes = hbone_inner_baggage_strip_prefixes(configured_prefixes);
-    crate::modes::mesh::hbone::strip_egress_baggage_in_map(&mut owned, &prefixes);
+    strip_secured_mesh_inner_baggage_in_map(&mut owned, configured_prefixes);
     Some(owned)
 }
 
@@ -40228,9 +40232,12 @@ pub(crate) fn mesh_mtls_dispatch_authority<'a>(
 /// `asserted_source_identity` is the authenticated frontend workload SPIFFE
 /// (`ctx.peer_spiffe_id`). It is cloned into an HBONE transport and is not
 /// borrowed from `RequestContext`, so later `ctx` mutations stay valid. Caller
-/// headers are never consulted. `None` (no LB-selected target) keeps the direct
-/// pool: the proxy's own backend host is the destination and no mesh tag exists
-/// to honor.
+/// headers are never consulted. The configured egress baggage-strip list is
+/// borrowed (not cloned) into HBONE and mesh-mTLS transports so dispatch can
+/// combine it with reserved identity prefixes in one filtering pass. Direct
+/// transports do not inherit that secured-mesh hygiene. `None` (no LB-selected
+/// target) keeps the direct pool: the proxy's own backend host is the
+/// destination and no mesh tag exists to honor.
 pub(crate) fn resolve_grpc_dispatch_transport<'a>(
     state: &'a ProxyState,
     target: Option<&'a UpstreamTarget>,

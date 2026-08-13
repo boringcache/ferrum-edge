@@ -2633,10 +2633,16 @@ pub enum GrpcDispatchTransport<'a> {
 /// A materialized Sidecar mesh-mTLS gRPC transport: the pool, the target it was
 /// resolved for, and the fail-closed dial plan (pinned peer OR trust-domain
 /// scope + destination-FQDN SNI override).
+///
+/// `baggage_strip_prefixes` borrows the configured egress strip list so dispatch
+/// can apply the same reserved-identity + configured-prefix hygiene as HBONE
+/// without cloning the vector on each resolve/attempt. Direct transports never
+/// see this list.
 pub struct MeshMtlsGrpcTransport<'a> {
     pool: &'a crate::proxy::mesh_mtls_pool::MeshMtlsConnectionPool,
     target: &'a crate::config::types::UpstreamTarget,
     plan: crate::proxy::mesh_mtls_pool::MeshMtlsDialPlan<'a>,
+    baggage_strip_prefixes: &'a [String],
 }
 
 /// A materialized Ambient HBONE gRPC transport: the pool, the target it was
@@ -2651,12 +2657,16 @@ pub struct MeshMtlsGrpcTransport<'a> {
 /// per frame. Only the authenticated frontend workload SPIFFE is stored here —
 /// never a caller header and never the gateway SVID (the pool falls back to the
 /// gateway SVID at CONNECT time only when this field is `None`).
+///
+/// `baggage_strip_prefixes` borrows the configured egress list. Reserved
+/// identity prefixes are combined with it during the one dispatch-time filter
+/// pass; they are not cloned into a new vector at resolve time.
 pub struct HboneGrpcTransport<'a> {
     pool: &'a crate::proxy::hbone_pool::HboneConnectionPool,
     target: &'a crate::config::types::UpstreamTarget,
     plan: crate::proxy::hbone_pool::HboneDialPlan<'a>,
     asserted_source_identity: Option<crate::identity::SpiffeId>,
-    baggage_strip_prefixes: Vec<String>,
+    baggage_strip_prefixes: &'a [String],
 }
 
 /// Client-visible refusal when a `mesh.mtls` target's destination identity
@@ -2876,18 +2886,20 @@ impl<'a> GrpcDispatchTransport<'a> {
         )
     }
 
-    /// Resolve a transport while binding request-scoped Ambient identity
+    /// Resolve a transport while binding request-scoped secured-mesh identity
     /// context. The asserted identity is used only by HBONE and is cloned into
     /// the transport so callers can keep mutating `RequestContext` after
-    /// resolve. The strip list is applied to inner-request baggage before it
-    /// reaches the application. Direct and mesh-mTLS transports ignore both.
+    /// resolve. The configured strip list is borrowed into HBONE and mesh-mTLS
+    /// transports and combined with reserved identity prefixes at dispatch,
+    /// before trusted proxy headers are merged. Direct transports ignore both
+    /// so they do not inherit secured-mesh semantics.
     pub fn for_target_with_hbone_context(
         grpc_pool: &'a GrpcConnectionPool,
         mesh_mtls_pool: &'a crate::proxy::mesh_mtls_pool::MeshMtlsConnectionPool,
         hbone_pool: &'a crate::proxy::hbone_pool::HboneConnectionPool,
         target: Option<&'a crate::config::types::UpstreamTarget>,
         asserted_source_identity: Option<&crate::identity::SpiffeId>,
-        baggage_strip_prefixes: &[String],
+        baggage_strip_prefixes: &'a [String],
     ) -> Result<Self, GrpcTransportError> {
         let Some(target) = target else {
             return Ok(Self::Direct(grpc_pool));
@@ -2909,6 +2921,7 @@ impl<'a> GrpcDispatchTransport<'a> {
                     pool: mesh_mtls_pool,
                     target,
                     plan,
+                    baggage_strip_prefixes,
                 }))
             }
             GrpcMeshDispatch::Hbone | GrpcMeshDispatch::HboneCrossCluster => {
@@ -2937,9 +2950,7 @@ impl<'a> GrpcDispatchTransport<'a> {
                     target,
                     plan,
                     asserted_source_identity: asserted_source_identity.cloned(),
-                    baggage_strip_prefixes: crate::proxy::hbone_inner_baggage_strip_prefixes(
-                        baggage_strip_prefixes,
-                    ),
+                    baggage_strip_prefixes,
                 }))
             }
             GrpcMeshDispatch::RefuseCrossClusterMalformed => Err(GrpcTransportError::Unsupported {
@@ -2988,25 +2999,32 @@ impl<'a> GrpcDispatchTransport<'a> {
         }
     }
 
-    /// Sanitize inner-request headers for this transport. HBONE strips reserved
-    /// identity baggage prefixes plus any configured egress prefixes once per
-    /// dispatch (not per frame). Direct and mesh-mTLS return the input unchanged.
+    /// Sanitize inner-request headers for this transport. Secured mesh
+    /// transports (HBONE and mesh-mTLS) strip reserved identity baggage
+    /// prefixes plus any configured egress prefixes once per dispatch (not per
+    /// frame), combining the borrowed configured slice with the static reserved
+    /// rules in one filtering pass. Direct returns the input unchanged.
     pub fn proxy_headers_for_dispatch<'b>(
         &self,
         headers: &'b HashMap<String, String>,
     ) -> std::borrow::Cow<'b, HashMap<String, String>> {
-        let Self::Hbone(hbone) = self else {
+        let Some(configured) = self.secured_mesh_baggage_strip_prefixes() else {
             return std::borrow::Cow::Borrowed(headers);
         };
         if !crate::modes::mesh::hbone::has_baggage_header_in_map(headers) {
             return std::borrow::Cow::Borrowed(headers);
         }
         let mut owned = headers.clone();
-        crate::modes::mesh::hbone::strip_egress_baggage_in_map(
-            &mut owned,
-            &hbone.baggage_strip_prefixes,
-        );
+        crate::proxy::strip_secured_mesh_inner_baggage_in_map(&mut owned, configured);
         std::borrow::Cow::Owned(owned)
+    }
+
+    fn secured_mesh_baggage_strip_prefixes(&self) -> Option<&[String]> {
+        match self {
+            Self::Direct(_) => None,
+            Self::MeshMtls(mesh) => Some(mesh.baggage_strip_prefixes),
+            Self::Hbone(hbone) => Some(hbone.baggage_strip_prefixes),
+        }
     }
 
     /// Acquire an HTTP/2 sender. Pool acquisition is the caller's connect
