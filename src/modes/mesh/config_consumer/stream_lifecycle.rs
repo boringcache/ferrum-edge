@@ -451,6 +451,7 @@ pub struct MeshConfigStreamStatus {
     /// True while the client is attached to a non-primary configured endpoint.
     pub fallback_active: bool,
     /// Consecutive endpoint-failure attempts since the last usable state.
+    /// Local retirements do not reset this counter.
     pub consecutive_failures: u32,
     /// External-credential posture
     /// ([`MeshConfigStreamCredential::as_label`]).
@@ -550,9 +551,11 @@ impl MeshStreamTracker {
         }
         if attempt.is_endpoint_failure() {
             self.consecutive_failures = self.consecutive_failures.saturating_add(1);
-        } else {
-            self.consecutive_failures = 0;
         }
+        // Local retirements (TLS reload, credential rotation/invalidation/
+        // deadline, shutdown, primary retry) prove nothing about the endpoint
+        // and must not erase the consecutive endpoint-failure run. Only
+        // [`Self::record_usable_state`] clears it.
         crate::plugins::mesh::prometheus_helpers::increment_mesh_config_stream_attempt(
             self.protocol,
             attempt.as_metric_label(),

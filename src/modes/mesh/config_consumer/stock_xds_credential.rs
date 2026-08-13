@@ -25,9 +25,11 @@
 //! 2. **A local authorization deadline.** A JWT-shaped token contributes its
 //!    `exp` as a *reconnect scheduling hint only*, after a bounded, non-verifying
 //!    local decode. It is never treated as proof of anything — but it is also
-//!    never allowed to schedule *past* `exp`. A token that is already expired,
-//!    or whose remaining lifetime cannot leave a positive window once the
-//!    configured skew is subtracted, is **refused**: it becomes an invalid
+//!    never allowed to schedule *past* `exp`. A token that is already expired
+//!    — including a syntactically valid integer `exp` of zero or a negative
+//!    NumericDate (Unix epoch zero and earlier are plainly expired, not "no
+//!    hint") — or whose remaining lifetime cannot leave a positive window once
+//!    the configured skew is subtracted, is **refused**: it becomes an invalid
 //!    credential source rather than being clamped up to some floor. An opaque
 //!    token gets the operator-visible maximum stream lifetime, which also caps
 //!    any JWT-derived deadline.
@@ -136,9 +138,10 @@ pub enum StockCredentialInvalidReason {
     /// The shared reader permit could not be acquired (shutdown).
     ReaderUnavailable,
     /// A JWT-shaped token whose locally decoded `exp` is already in the past
-    /// (or whose issuer's clock is far enough ahead of this node's that it
-    /// reads that way). Refused outright: opening an authenticated stream with
-    /// it would be knowingly presenting expired material.
+    /// — including Unix epoch zero and negative NumericDate values — or whose
+    /// issuer's clock is far enough ahead of this node's that it reads that
+    /// way. Refused outright: opening an authenticated stream with it would
+    /// be knowingly presenting expired material.
     Expired,
     /// A JWT-shaped token that is not yet expired but cannot leave a positive
     /// pre-expiry window once the configured refresh skew is subtracted. Using
@@ -440,7 +443,8 @@ impl StockBearerCredential {
     /// Build the `authorization` metadata value, the content fingerprint, and
     /// the absolute local authorization deadline for one raw token.
     ///
-    /// Fails closed for a JWT-shaped token that is already past `exp` or that
+    /// Fails closed for a JWT-shaped token that is already past `exp` —
+    /// including Unix epoch zero and negative NumericDate values — or that
     /// cannot leave a positive pre-expiry window after the configured skew.
     pub fn admit(
         raw_token: &str,
@@ -534,13 +538,26 @@ pub fn credential_lifetime(
 ) -> Result<(Duration, StockCredentialDeadlineBasis), StockCredentialInvalidReason> {
     let opaque = clamp_max_stream_lifetime(policy.max_stream_lifetime);
     let Some(exp) = jwt_expiration_hint(raw_token) else {
-        // Opaque (or non-JWS, or `exp`-less) material: there is no local hint at
-        // all, so the operator-visible finite maximum is the whole policy.
+        // Opaque (or non-JWS, or `exp`-less / non-integer `exp`) material:
+        // there is no local hint at all, so the operator-visible finite
+        // maximum is the whole policy.
+        return Ok((opaque, StockCredentialDeadlineBasis::MaxStreamLifetime));
+    };
+    // Unix epoch zero and negative NumericDate values are plainly expired.
+    // They must not be treated as "no hint" (which would grant the opaque
+    // maximum) and must not be cast to `u64` (which would wrap into a
+    // far-future deadline).
+    if exp <= 0 {
+        return Err(StockCredentialInvalidReason::Expired);
+    }
+    let Some(exp_at) = SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(exp as u64)) else {
+        // A positive NumericDate that cannot be represented as `SystemTime`
+        // is not a usable scheduling hint.
         return Ok((opaque, StockCredentialDeadlineBasis::MaxStreamLifetime));
     };
     // The decode is NOT authorization proof. It is only ever used to make the
     // deadline EARLIER than it would otherwise be, or to refuse outright.
-    let Ok(remaining) = exp.duration_since(now) else {
+    let Ok(remaining) = exp_at.duration_since(now) else {
         return Err(StockCredentialInvalidReason::Expired);
     };
     let before_exp = remaining.saturating_sub(policy.refresh_skew);
@@ -577,9 +594,17 @@ struct JwtExpClaim {
 ///
 /// This is a reconnect *scheduling hint* only. The signature is not checked,
 /// the issuer/audience are not checked, and no other claim is read or retained.
-/// A malformed, oversized, non-JWT, or `exp`-less token yields `None` and falls
-/// back to the operator-visible maximum stream lifetime.
-pub fn jwt_expiration_hint(raw_token: &str) -> Option<SystemTime> {
+///
+/// `None` means the token is not a three-segment JWS or the payload has no
+/// usable integer `exp` (malformed, oversized, missing, or a non-integer
+/// shape). [`credential_lifetime`] treats that as opaque.
+///
+/// `Some(n)` is the payload's NumericDate, including zero and negative values.
+/// Those are already expired (Unix epoch zero and earlier) and must never be
+/// collapsed into "no hint". This function does not convert the NumericDate
+/// into a `SystemTime` or a `Duration`, so a negative value cannot wrap or
+/// panic here.
+pub fn jwt_expiration_hint(raw_token: &str) -> Option<i64> {
     use base64::Engine as _;
 
     let mut segments = raw_token.split('.');
@@ -600,11 +625,7 @@ pub fn jwt_expiration_hint(raw_token: &str) -> Option<SystemTime> {
         return None;
     }
     let claim: JwtExpClaim = serde_json::from_slice(&decoded).ok()?;
-    let exp = claim.exp?;
-    if exp <= 0 {
-        return None;
-    }
-    SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(exp as u64))
+    claim.exp
 }
 
 /// Read the raw bearer token through the shared hardened credential boundary.

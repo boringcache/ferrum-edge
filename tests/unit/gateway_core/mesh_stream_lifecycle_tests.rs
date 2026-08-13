@@ -413,18 +413,27 @@ fn connected_requires_both_an_established_stream_and_usable_state() {
 }
 
 #[test]
-fn tracker_clears_the_failure_run_on_intentional_retirement_and_on_usable_state() {
+fn tracker_preserves_the_failure_run_on_local_retirement_and_clears_it_on_usable_state() {
     let mut tracker = tracker("xds", MeshConfigStreamCredential::NotConfigured);
     tracker.record(MeshStreamAttempt::RemoteEof);
     tracker.record(MeshStreamAttempt::RemoteEof);
     assert_eq!(tracker.status(true).consecutive_failures, 2);
 
-    tracker.record(MeshStreamAttempt::LocalRetirement(
-        MeshStreamRetirement::TlsReload,
-    ));
-    assert_eq!(tracker.status(true).consecutive_failures, 0);
+    for reason in ALL_RETIREMENTS {
+        tracker.record(MeshStreamAttempt::LocalRetirement(reason));
+        assert_eq!(
+            tracker.status(true).consecutive_failures,
+            2,
+            "{} must not erase consecutive endpoint-failure attempts since last usable state",
+            reason.as_metric_label()
+        );
+        let disposition = MeshStreamAttempt::LocalRetirement(reason).disposition();
+        assert!(!disposition.advance_endpoint, "{:?}", reason);
+        assert!(!disposition.increase_backoff, "{:?}", reason);
+    }
 
     tracker.record(MeshStreamAttempt::RemoteEof);
+    assert_eq!(tracker.status(true).consecutive_failures, 3);
     tracker.set_attachment(MeshStreamAttachment::Established);
     tracker.record_usable_state();
     let status = tracker.status(true);
@@ -952,7 +961,10 @@ fn the_opaque_maximum_stays_finite_and_capped() {
 
 #[test]
 fn jwt_expiration_hint_is_bounded_and_refuses_non_jws_shapes() {
-    assert!(jwt_expiration_hint(&jwt_with_exp(2_000_000_000)).is_some());
+    assert_eq!(
+        jwt_expiration_hint(&jwt_with_exp(2_000_000_000)),
+        Some(2_000_000_000)
+    );
     // Not three segments.
     assert!(jwt_expiration_hint("opaque").is_none());
     assert!(jwt_expiration_hint("a.b").is_none());
@@ -965,14 +977,53 @@ fn jwt_expiration_hint_is_bounded_and_refuses_non_jws_shapes() {
     // Valid base64url that is not JSON.
     let not_json = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"plain text");
     assert!(jwt_expiration_hint(&format!("a.{not_json}.c")).is_none());
-    // JSON without `exp`, and with a non-positive `exp`.
+    // JSON without `exp` is no hint. A syntactically valid integer `exp` of
+    // zero or a negative NumericDate is a hint that the token is already
+    // expired, not "no hint".
     let no_exp = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"sub":"x"}"#);
     assert!(jwt_expiration_hint(&format!("a.{no_exp}.c")).is_none());
     let zero_exp = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"exp":0}"#);
-    assert!(jwt_expiration_hint(&format!("a.{zero_exp}.c")).is_none());
+    assert_eq!(jwt_expiration_hint(&format!("a.{zero_exp}.c")), Some(0));
+    let negative_exp = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"exp":-1}"#);
+    assert_eq!(jwt_expiration_hint(&format!("a.{negative_exp}.c")), Some(-1));
     // An oversized payload segment is not parsed at all.
     let oversized = "A".repeat(9 * 1024);
     assert!(jwt_expiration_hint(&format!("a.{oversized}.c")).is_none());
+}
+
+/// Unix epoch zero and negative NumericDate values are plainly expired. They
+/// must fail closed as `Expired` rather than granting the opaque maximum, and
+/// the conversion must not wrap a negative `i64` into a far-future `u64`.
+#[test]
+fn jwt_shaped_tokens_with_zero_or_negative_exp_are_expired_not_opaque() {
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    for exp in [0_i64, -1, -3_600, i64::MIN] {
+        assert_eq!(
+            jwt_expiration_hint(&jwt_with_exp(exp)),
+            Some(exp),
+            "exp={exp}"
+        );
+        let reason = credential_lifetime(&jwt_with_exp(exp), lifetime_policy(3600, 0), now)
+            .expect_err("zero/negative NumericDate must never yield a lifetime");
+        assert_eq!(
+            reason,
+            StockCredentialInvalidReason::Expired,
+            "exp={exp} must not be treated as opaque"
+        );
+    }
+}
+
+#[test]
+fn jwt_shaped_tokens_with_zero_or_negative_exp_are_refused_at_admission() {
+    for exp in [0_i64, -1, -3_600, i64::MIN] {
+        let reason = StockBearerCredential::admit(&jwt_with_exp(exp), lifetime_policy(3600, 0))
+            .expect_err("zero/negative NumericDate must not be admitted");
+        assert_eq!(
+            reason,
+            StockCredentialInvalidReason::Expired,
+            "exp={exp}"
+        );
+    }
 }
 
 #[test]
@@ -1293,6 +1344,25 @@ async fn every_invalid_credential_source_shape_fails_closed_with_a_bounded_reaso
         source.materialize().await.expect_err("expired source"),
         StockCredentialInvalidReason::Expired
     );
+
+    // Unix epoch zero and a negative NumericDate are expired through the same
+    // reader, not opaque material that would be granted the maximum lifetime.
+    for exp in [0_i64, -1] {
+        let already_expired = temp.path().join(format!("expired-token-{exp}"));
+        std::fs::write(&already_expired, jwt_with_exp(exp).as_bytes()).expect("write");
+        let source = StockXdsCredentialSource::new(
+            Some(already_expired.to_string_lossy().into_owned()),
+            StockCredentialLifetimePolicy::default(),
+        );
+        assert_eq!(
+            source
+                .materialize()
+                .await
+                .expect_err("zero/negative NumericDate source"),
+            StockCredentialInvalidReason::Expired,
+            "exp={exp}"
+        );
+    }
 
     // Unreadable-where-portable: a mode-000 regular file. Skipped when the test
     // runs as root, where the mode is not enforced.

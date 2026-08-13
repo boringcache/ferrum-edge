@@ -1594,6 +1594,11 @@ mod tls_lifecycle {
         /// This is the "stalled consumer" shape: the client must still reach a
         /// bounded retirement instead of parking on an awaited send.
         StallRequests,
+        /// Receive/accept the authenticated streaming request (the bearer is
+        /// on the inbound metadata) and never return response headers. The
+        /// client's RPC-open future stays pending until a local credential
+        /// retirement cancels it.
+        WithholdHeaders,
     }
 
     #[derive(Clone)]
@@ -1675,8 +1680,17 @@ mod tls_lifecycle {
                 .expect("authorization mutex")
                 .push(observed);
 
-            let mut inbound = request.into_inner();
             let behaviour = self.behaviour;
+            if behaviour == TlsBehaviour::WithholdHeaders {
+                // The handler has accepted the authenticated request. Parking
+                // here never returns `Ok(Response)`, so tonic never writes
+                // response headers. Hold the inbound stream so the RPC stays
+                // accepted until the client cancels the pending open.
+                let _held = request.into_inner();
+                return std::future::pending().await;
+            }
+
+            let mut inbound = request.into_inner();
             // `Option` + `take()`: the inner spawn moves the receiver, and the
             // compiler cannot see that the `sent_eds` guard makes that happen at
             // most once per stream.
@@ -2328,6 +2342,207 @@ mod tls_lifecycle {
                 );
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
+
+            harness.shutdown_and_join().await;
+            endpoint.shutdown().await;
+        }
+    }
+
+    /// The stock bearer fence must cover the ADS RPC-open await itself: a
+    /// control plane can accept the authenticated streaming request (bearer
+    /// already attached) and then withhold response headers, leaving
+    /// `stream_aggregated_resources(...).await` pending past rotation,
+    /// invalidation, or the absolute deadline. The established-stream fence
+    /// loop cannot save that case because it starts only after headers return.
+    ///
+    /// Production first-frame timing is used on purpose. That bound is armed
+    /// only after RPC-open succeeds, so it cannot accidentally retire a
+    /// still-pending open and make this pass without the fence racing the
+    /// open future.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn withholding_rpc_open_headers_cannot_outlive_credential_retirement() {
+        struct Case {
+            label: &'static str,
+            expected_outcome: &'static str,
+            watch_credential: bool,
+            token: String,
+            policy: StockCredentialLifetimePolicy,
+            after_accept: AfterAccept,
+        }
+        enum AfterAccept {
+            WaitForDeadline,
+            Rotate,
+            Invalidate,
+        }
+
+        for case in [
+            Case {
+                label: "absolute deadline",
+                expected_outcome: "credential_deadline",
+                watch_credential: false,
+                token: "an-opaque-projected-token".to_string(),
+                policy: fast_policy(Duration::from_secs(2)),
+                after_accept: AfterAccept::WaitForDeadline,
+            },
+            Case {
+                label: "credential rotation",
+                expected_outcome: "credential_rotated",
+                watch_credential: true,
+                token: "projected-token-one".to_string(),
+                policy: fast_policy(Duration::from_secs(3600)),
+                after_accept: AfterAccept::Rotate,
+            },
+            Case {
+                label: "source invalidation",
+                expected_outcome: "credential_source_invalid",
+                watch_credential: true,
+                token: "projected-token-one".to_string(),
+                policy: fast_policy(Duration::from_secs(3600)),
+                after_accept: AfterAccept::Invalidate,
+            },
+        ] {
+            let material = issue_material(&["localhost"], false);
+            let endpoint = serve_tls(TlsBehaviour::WithholdHeaders, &material, false).await;
+            let tokens = tempfile::tempdir().expect("temp dir");
+            let token_path = write_token(&tokens, "projected-token", &case.token);
+
+            let harness = TlsHarness::start(TlsClientSpec {
+                urls: vec![endpoint.url.clone()],
+                token_path: Some(token_path.clone()),
+                policy: case.policy,
+                tls_config: Some(dp_tls(&material, false)),
+                tls_reload: None,
+                timings: MeshStreamTimings::production(),
+                watch_credential: case.watch_credential,
+            })
+            .await;
+
+            let sampler_state = harness.state.clone();
+            let sampler_stop = Arc::new(AtomicBool::new(false));
+            let stop = sampler_stop.clone();
+            let sampler = tokio::spawn(async move {
+                let mut saw_slice = false;
+                while !stop.load(Ordering::SeqCst) {
+                    if sampler_state.snapshot().as_ref().as_ref().is_some() {
+                        saw_slice = true;
+                    }
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+                saw_slice
+            });
+
+            let accepted = tokio::time::Instant::now() + Duration::from_secs(20);
+            while endpoint.ads.stream_count() == 0 {
+                assert!(
+                    tokio::time::Instant::now() < accepted,
+                    "{}: the ADS server must accept the authenticated streaming request",
+                    case.label
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let expected_bearer = format!("Bearer {}", case.token);
+            assert_eq!(
+                endpoint.ads.authorization_snapshot().first(),
+                Some(&expected_bearer),
+                "{}: the withheld-headers RPC must have carried the bearer",
+                case.label
+            );
+            let streams_at_accept = endpoint.ads.stream_count();
+
+            match case.after_accept {
+                AfterAccept::WaitForDeadline => {}
+                AfterAccept::Rotate => {
+                    std::fs::write(&token_path, b"projected-token-two").expect("rotate token");
+                }
+                AfterAccept::Invalidate => {
+                    std::fs::remove_file(&token_path).expect("delete token");
+                }
+            }
+
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+            loop {
+                if harness.status_field(|status| status.last_attempt_outcome)
+                    == Some(case.expected_outcome)
+                {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "{}: pending RPC-open must retire as {} within a bounded time; last={:?} \
+                     services={:?}",
+                    case.label,
+                    case.expected_outcome,
+                    harness.status_field(|status| status.last_attempt_outcome),
+                    harness.services()
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+
+            assert!(
+                harness.services().is_none(),
+                "{}: no discovery response can commit while headers are withheld",
+                case.label
+            );
+
+            match case.after_accept {
+                AfterAccept::WaitForDeadline => {
+                    // Opaque material is still valid, so the client reconnects
+                    // immediately. The replacement open is also withheld.
+                    let reconnect = tokio::time::Instant::now() + Duration::from_secs(10);
+                    while endpoint.ads.stream_count() <= streams_at_accept {
+                        assert!(
+                            tokio::time::Instant::now() < reconnect,
+                            "{}: a deadline retirement must reconnect without charging backoff",
+                            case.label
+                        );
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                }
+                AfterAccept::Rotate => {
+                    let reconnect = tokio::time::Instant::now() + Duration::from_secs(20);
+                    while endpoint.ads.stream_count() <= streams_at_accept {
+                        assert!(
+                            tokio::time::Instant::now() < reconnect,
+                            "{}: rotation must cancel the pending open and start a replacement",
+                            case.label
+                        );
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    let observed = endpoint.ads.authorization_snapshot();
+                    assert!(observed.len() >= 2, "{}: {observed:?}", case.label);
+                    assert_eq!(observed[0], "Bearer projected-token-one");
+                    for (index, value) in observed.iter().enumerate().skip(1) {
+                        assert_eq!(
+                            value, "Bearer projected-token-two",
+                            "{}: RPC #{index} must carry only the replacement token: {observed:?}",
+                            case.label
+                        );
+                    }
+                }
+                AfterAccept::Invalidate => {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    assert_eq!(
+                        endpoint.ads.stream_count(),
+                        streams_at_accept,
+                        "{}: an invalid source must prevent reconnection",
+                        case.label
+                    );
+                    assert_eq!(
+                        harness.status_field(|status| status.credential),
+                        Some("source_invalid"),
+                        "{}",
+                        case.label
+                    );
+                }
+            }
+
+            sampler_stop.store(true, Ordering::SeqCst);
+            let saw_slice = sampler.await.expect("sampler task");
+            assert!(
+                !saw_slice,
+                "{}: a withheld-headers RPC must never install a slice",
+                case.label
+            );
 
             harness.shutdown_and_join().await;
             endpoint.shutdown().await;

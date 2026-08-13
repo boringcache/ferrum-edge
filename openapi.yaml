@@ -11730,8 +11730,10 @@ components:
           format: uint32
           description: |
             Consecutive endpoint-failure attempts since the last usable state.
-            Reset when a stream installs usable configuration and on an
-            intentional local retirement.
+            Reset only when a stream installs usable configuration. An
+            intentional local retirement (shutdown, TLS reload, credential
+            rotation/invalidation/deadline, or primary retry) does not rotate
+            the endpoint or grow backoff, and it does not clear this counter.
         credential:
           type: string
           enum: [not_configured, unobserved, valid, source_invalid]

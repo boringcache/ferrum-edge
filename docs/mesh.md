@@ -675,9 +675,11 @@ bearer-authenticated stream a finite **local** authorization lifetime:
   local decode, used only to schedule a reconnect
   `FERRUM_MESH_STOCK_XDS_TOKEN_REFRESH_SKEW_SECONDS` early. Locally decoded
   claims are never authorization proof — but they are also never allowed to
-  schedule *past* `exp`. A token that is already expired, or whose remaining
-  lifetime cannot leave a positive window once the skew is subtracted, is
-  **refused**: it becomes an invalid credential source
+  schedule *past* `exp`. A token that is already expired — including a
+  syntactically valid integer `exp` of zero or a negative NumericDate (Unix
+  epoch zero and earlier are plainly expired, not "no hint") — or whose
+  remaining lifetime cannot leave a positive window once the skew is
+  subtracted, is **refused**: it becomes an invalid credential source
   (`token_expired` / `token_expires_within_skew`) rather than being clamped up
   to some reconnect floor. Recovery is the operator replacing the material,
   which the watcher observes; the bounded invalid-source retry is what prevents
@@ -694,10 +696,15 @@ bearer-authenticated stream a finite **local** authorization lifetime:
   activity, including heartbeats on other protocols, never extends it.
 - The credential fence is checked with PRIORITY before any response may be
   admitted, again immediately before every install/commit, and once more before
-  the end-of-stream flush. A stream retired for rotation, invalidation, or
-  deadline additionally DISCARDS the accumulated discovery and per-type
-  subscription state it produced; only the slice already installed in the
-  runtime survives.
+  the end-of-stream flush. The same fence races the initial ADS RPC-open
+  (response-headers) await: a control plane that accepts the authenticated
+  request and then withholds headers cannot keep that pending open past
+  rotation, source invalidation, or the absolute monotonic deadline. An
+  already-observed or simultaneously-ready retirement wins, drops the
+  in-flight open, and is returned as that local retirement. A stream retired
+  for rotation, invalidation, or deadline additionally DISCARDS the
+  accumulated discovery and per-type subscription state it produced; only the
+  slice already installed in the runtime survives.
 - Failover and failback always materialize the newest token rather than reusing
   the previous endpoint's interceptor value, and the materialized credential is
   re-proven to be the current observation after the dial and before the
@@ -802,7 +809,10 @@ subscriptions and response-driven ACK/NACK/dependency sends) are also
 credential-aware: an already-observed or newly arriving generation, invalidation,
 or absolute deadline wins over the send and is returned as that local retirement
 rather than as a transport failure, so the next stream discards discovery state
-touched under the retired credential. No task is detached.
+touched under the retired credential. The same fence races the initial ADS
+RPC-open (response-headers) await, so a control plane that accepts the
+authenticated request and withholds headers cannot hold the pending open past
+those retirements. No task is detached.
 
 The stock client's outer lifecycle `select` is `biased` with shutdown first and
 the inner ADS future next, so a simultaneously ready TLS-reload or primary-retry
@@ -824,7 +834,10 @@ credential path, token, or claim appears on either surface.
   exists AND no sticky liveness failure is outstanding. Publishing it is what
   makes a healthy consumer distinguishable from a quietly broken one, and
   installing usable state on that exact stream is what resets
-  `consecutive_failures` and clears `stream_liveness_failed`.
+  `consecutive_failures` and clears `stream_liveness_failed`. An intentional
+  local retirement does not reset `consecutive_failures`: the counter is
+  consecutive endpoint-failure attempts since the last usable state, not
+  since the last attempt.
 - `stream_liveness_failed` — an established stream stopped being usable
   (first-frame, first-slice, heartbeat-silence, or established-transport
   failure). It OUTRANKS both `connected` and `never_received_slice`: a bounded
@@ -854,6 +867,8 @@ forwarding an ESTABLISHED transport without FIN or RST, and a healthy
 application-idle stream that stays connected while PING acks succeed; plus a
 real TLS ADS module (rcgen CA + `ServerTlsConfig`) for projected-token rotation,
 source invalidation and recovery, the JWT and opaque authorization deadlines,
+a control plane that accepts the authenticated RPC and withholds response
+headers until rotation/invalidation/deadline cancel the still-pending open,
 failover with the newest material, coalesced TLS + token rotation, and the
 untrusted-CA / SAN-mismatch / expired-certificate / missing-client-certificate
 refusals. The native consumer's bounded status report is

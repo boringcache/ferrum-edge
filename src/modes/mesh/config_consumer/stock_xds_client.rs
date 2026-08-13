@@ -61,6 +61,7 @@
 //! are the shared [`super::stream_lifecycle`] policy (issue #3854).
 
 use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -1358,12 +1359,33 @@ async fn run_stock_ads_stream(
 
     let (tx, rx) = mpsc::channel(config.stream_channel_capacity.max(1));
     let request_stream = ReceiverStream::new(rx);
-    let mut response_stream = client
-        .stream_aggregated_resources(request_stream)
-        .await
-        // Only the canonical gRPC code: the status message is remote-authored.
-        .map_err(|status| StockStreamError::SubscriptionRefused(grpc_status_category(&status)))?
-        .into_inner();
+    // The interceptor attaches/sends the bearer as soon as this future is
+    // polled. A control plane can accept that authenticated request and then
+    // withhold response headers, so the RPC-open await itself must be raced
+    // against the bound credential observation and the absolute deadline.
+    // Already-observed or simultaneously-ready retirement wins (biased) and
+    // drops the in-flight open; the deadline is never extended from this
+    // instant. Remote Status text stays classified, never echoed.
+    let mut response_stream = match await_stock_ads_rpc_open_under_fence(
+        client.stream_aggregated_resources(request_stream),
+        &fence,
+        credential_rx,
+    )
+    .await
+    {
+        Ok(response) => response.into_inner(),
+        Err(StockStreamError::Retirement(retirement)) => {
+            return Ok(MeshStreamAttempt::LocalRetirement(retirement));
+        }
+        Err(error) => return Err(error),
+    };
+
+    // A retirement that became ready in the same poll as an open success was
+    // already preferred by the biased select. Re-check before publishing
+    // Established so `/health` cannot claim a stream we are about to drop.
+    if let Some(retirement) = fence.evaluate() {
+        return Ok(MeshStreamAttempt::LocalRetirement(retirement));
+    }
 
     // The streaming RPC is open and this consumer is about to read it: that is
     // exactly what `/health` means by `connected` (issue #3854).
@@ -2103,6 +2125,66 @@ fn is_stock_type_url(type_url: &str) -> bool {
         type_url,
         CDS_TYPE_URL | EDS_TYPE_URL | LDS_TYPE_URL | RDS_TYPE_URL
     )
+}
+
+/// Race one ADS RPC-open (response-headers) future against the credential
+/// fence. Mirrors the outbound enqueue fence: already-observed retirement
+/// wins before the wait, the select is `biased` so a simultaneously-ready
+/// generation, invalidation, or absolute deadline wins over an open success,
+/// and dropping this future is what cancels the in-flight open. No task is
+/// detached. A closed credential watcher does not spin or invent a rotation;
+/// the absolute deadline still bounds a configured credential.
+async fn await_stock_ads_rpc_open_under_fence<S>(
+    rpc_open: impl Future<Output = Result<tonic::Response<S>, tonic::Status>>,
+    fence: &StockCredentialFence,
+    credential_rx: &mut tokio::sync::watch::Receiver<StockCredentialObservation>,
+) -> Result<tonic::Response<S>, StockStreamError> {
+    if let Some(retirement) = fence.evaluate() {
+        return Err(StockStreamError::Retirement(retirement));
+    }
+
+    let deadline = fence.deadline;
+    let deadline_sleep = tokio::time::sleep_until(
+        deadline.unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(60 * 60 * 24)),
+    );
+    tokio::pin!(deadline_sleep);
+    tokio::pin!(rpc_open);
+
+    tokio::select! {
+        biased;
+        _ = &mut deadline_sleep, if deadline.is_some() => {
+            Err(StockStreamError::Retirement(
+                MeshStreamRetirement::CredentialDeadline,
+            ))
+        }
+        changed = credential_rx.changed() => {
+            if changed.is_err() {
+                // Watcher is gone (shutdown). Do not spin or mislabel that as
+                // rotation; the absolute deadline still bounds this open.
+                tokio::select! {
+                    biased;
+                    _ = &mut deadline_sleep, if deadline.is_some() => {
+                        Err(StockStreamError::Retirement(
+                            MeshStreamRetirement::CredentialDeadline,
+                        ))
+                    }
+                    result = &mut rpc_open => map_rpc_open_result(result),
+                }
+            } else {
+                Err(StockStreamError::Retirement(
+                    fence.retirement_from_observation(fence.latest()),
+                ))
+            }
+        }
+        result = &mut rpc_open => map_rpc_open_result(result),
+    }
+}
+
+fn map_rpc_open_result<S>(
+    result: Result<tonic::Response<S>, tonic::Status>,
+) -> Result<tonic::Response<S>, StockStreamError> {
+    // Only the canonical gRPC code: the status message is remote-authored.
+    result.map_err(|status| StockStreamError::SubscriptionRefused(grpc_status_category(&status)))
 }
 
 /// Enqueue one outbound `DiscoveryRequest`, bounded and credential-aware.
