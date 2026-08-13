@@ -118,7 +118,10 @@ impl PluginExtTestHarness {
     /// which proves the route has been registered by the DB poller.
     async fn wait_for_route(&self, path: &str) {
         let url = format!("{}{}/wait-for-route-probe", self.proxy_base_url, path);
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .expect("Failed to build route-readiness probe client");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         let mut last_observation = None;
 
