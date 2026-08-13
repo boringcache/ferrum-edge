@@ -132,9 +132,9 @@ PROTECTED_PATHS = (
 # exist on the trusted base: a base that cannot supply it is an incomplete
 # extraction, which fails closed rather than silently skipping enforcement. An
 # *optional* anchor is one a sibling change is still landing (issue #3802's
-# advisory-trust lane); it is unfrozen only while the trusted base also lacks
-# it, and becomes a hard anchor — deletion and byte changes both rejected — the
-# moment the base carries it.
+# advisory-trust lane). The workflow owns the one-time adoption path and
+# short-circuits before this verifier runs; if an unadopted anchor nevertheless
+# reaches this verifier, candidate-supplied executable code is rejected.
 ANCHOR_FILE_SLOTS = (
     ("verifier", True),
     ("checker", True),
@@ -1071,8 +1071,16 @@ def anchor_errors(candidate: Root, base: Root) -> list[str]:
                     f"the trusted base is missing the governed anchor {path}; "
                     "refusing to certify a candidate against an incomplete base"
                 )
-            # Optional anchor not yet adopted on the trusted base: nothing to
-            # preserve. It freezes as soon as the base carries it.
+            elif candidate_text is not None:
+                # The trusted workflow handles first adoption before invoking
+                # this verifier. Reaching this branch means there are no
+                # reviewed bytes against which candidate executable code can
+                # be authenticated, so fail closed rather than granting a
+                # filename-based exception to privileged workflow secrets.
+                errors.append(
+                    f"the candidate introduced the unanchored executable gate file {path}; "
+                    "adopt it through the trusted workflow before certification"
+                )
             continue
         if not base_text.strip():
             errors.append(
@@ -1792,7 +1800,7 @@ def run_self_test() -> int:
         "advisory lane absent from both roots",
         evaluate(adopt_advisory_base=False, adopt_advisory_candidate=False),
     )
-    expect_clean(
+    expect_rejected(
         "advisory lane adopted on an un-adopted base",
         evaluate(adopt_advisory_base=False, adopt_advisory_candidate=True),
     )
