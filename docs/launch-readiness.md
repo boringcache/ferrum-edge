@@ -666,10 +666,12 @@ launch/release gate must be byte-identical to the trusted base:
 | `.github/workflows/launch-advisory-trust.yml` | once the trusted base carries it (issue #3802) |
 | `.github/scripts/verify_launch_advisory_trust.py` | once the trusted base carries it (issue #3802) |
 
-The two optional rows are treated as absent only while the trusted base also
-lacks them; the moment the base carries one, deleting it or changing a byte
-fails. A trusted base that is missing a *required* anchor is a broken or
-tampered extraction and fails closed rather than skipping enforcement.
+The two optional rows are unfrozen only while the trusted base also lacks them;
+a candidate that introduces either file before the trusted base carries reviewed
+bytes for it is rejected rather than receiving a filename-based exception. The
+moment the base carries one, deleting it or changing a byte fails. A trusted
+base that is missing a *required* anchor is a broken or tampered extraction and
+fails closed rather than skipping enforcement.
 
 This is a deliberate replacement for a semantic contract. An earlier revision of
 this verifier tried to *permit* checker edits that "still looked fail-closed":

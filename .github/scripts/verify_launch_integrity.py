@@ -1804,6 +1804,23 @@ def run_self_test() -> int:
         "advisory lane adopted on an un-adopted base",
         evaluate(adopt_advisory_base=False, adopt_advisory_candidate=True),
     )
+
+    def introduce_advisory_workflow(workflows: dict[str, str]) -> None:
+        workflows["launch-advisory-trust.yml"] = _FIXTURE_ADVISORY_WORKFLOW
+
+    expect_rejected(
+        "unanchored advisory workflow introduced alone",
+        evaluate(mutate_workflows=introduce_advisory_workflow),
+    )
+
+    def introduce_advisory_verifier(files: dict[str, str]) -> None:
+        files[SLOT_FILENAMES["advisory_verifier"]] = _FIXTURE_ADVISORY_VERIFIER
+
+    expect_rejected(
+        "unanchored advisory verifier introduced alone",
+        evaluate(mutate_files=introduce_advisory_verifier),
+    )
+
     expect_clean(
         "advisory lane present and unchanged",
         evaluate(adopt_advisory_base=True, adopt_advisory_candidate=True),
