@@ -267,12 +267,6 @@ struct ListenerHandle {
     /// [`NamespacedResourceId`] at spawn. Never re-derived from a runtime-key
     /// substring.
     node_waypoint_udp_owner: bool,
-    /// Live exact destination route table for a shared `__nwudp_{port}`
-    /// listener (issue #3861). `None` for every other listener. Held so a
-    /// reconcile can republish routes under the running socket and retract
-    /// them before the socket leaves service.
-    node_waypoint_udp_destinations:
-        Option<Arc<crate::proxy::node_waypoint_udp_destination::NodeWaypointUdpDestinationRouter>>,
     /// Explicit DTLS ownership class (issue #3858), carried from the accepted
     /// identity at spawn. Decides which generation slot may ever reach this
     /// listener's `DtlsServer`. `Operator` for every non-generated listener,
@@ -2785,13 +2779,7 @@ impl StreamListenerManager {
             // listener observes both per-listener removal AND global SIGTERM.
             let global_shutdown = self.global_shutdown_rx.load().as_ref().clone();
 
-            let (
-                join_handle,
-                tcp_metrics,
-                udp_metrics,
-                dtls_server,
-                node_waypoint_udp_destinations,
-            ) = if scheme.is_udp() {
+            let (join_handle, tcp_metrics, udp_metrics, dtls_server) = if scheme.is_udp() {
                 let started_for_listener = started.clone();
                 // UDP or DTLS listener
                 // Passthrough proxies forward raw encrypted datagrams — no DTLS termination.
@@ -2921,8 +2909,6 @@ impl StreamListenerManager {
                 let node_waypoint_udp_destinations = node_waypoint_udp_ids
                     .as_ref()
                     .map(|_| self.node_waypoint_udp_router(*port));
-                let node_waypoint_udp_destinations_for_listener =
-                    node_waypoint_udp_destinations.clone();
                 let bind_failures = Arc::clone(&self.bind_failures);
                 let async_bind_failures = Arc::clone(&self.async_bind_failures);
                 let async_failure_tx = async_failure_tx.clone();
@@ -2982,7 +2968,7 @@ impl StreamListenerManager {
                         udp_pktinfo_enabled,
                         mesh_outbound_enforcement,
                         node_waypoint_udp_source_scoping,
-                        node_waypoint_udp_destinations: node_waypoint_udp_destinations_for_listener,
+                        node_waypoint_udp_destinations,
                     })
                     .await;
                     started_for_exit.store(false, Ordering::Release);
@@ -3094,7 +3080,6 @@ impl StreamListenerManager {
                     None,
                     listener_udp_metrics,
                     Some(dtls_server_slot),
-                    node_waypoint_udp_destinations,
                 )
             } else {
                 let started_for_listener = started.clone();
@@ -3218,7 +3203,7 @@ impl StreamListenerManager {
                         }
                     }
                 });
-                (join_handle, listener_tcp_metrics, None, None, None)
+                (join_handle, listener_tcp_metrics, None, None)
             };
 
             info!(
@@ -3272,7 +3257,6 @@ impl StreamListenerManager {
                     dtls_server,
                     generation,
                     node_waypoint_udp_owner,
-                    node_waypoint_udp_destinations,
                     dtls_owner,
                 },
             );
