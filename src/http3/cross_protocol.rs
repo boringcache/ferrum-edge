@@ -2804,12 +2804,9 @@ where
                             false,
                             backend_start.elapsed(),
                         );
-                        return write_plain_gateway_error(
+                        return write_plain_authorization_expired_terminal(
                             stream,
                             ctx,
-                            StatusCode::UNAUTHORIZED,
-                            r#"{"error":"Unauthorized"}"#,
-                            None,
                             backend_start,
                             bytes_sent,
                         )
@@ -3421,12 +3418,9 @@ where
                         termination,
                         crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
                     );
-                    return write_plain_gateway_error(
+                    return write_plain_authorization_expired_terminal(
                         stream,
                         ctx,
-                        StatusCode::UNAUTHORIZED,
-                        r#"{"error":"Unauthorized"}"#,
-                        None,
                         backend_start,
                         bytes_sent,
                     )
@@ -3663,12 +3657,9 @@ where
                     termination,
                     crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
                 );
-                return write_plain_gateway_error(
+                return write_plain_authorization_expired_terminal(
                     stream,
                     ctx,
-                    StatusCode::UNAUTHORIZED,
-                    r#"{"error":"Unauthorized"}"#,
-                    None,
                     backend_start,
                     bytes_sent,
                 )
@@ -8352,29 +8343,121 @@ async fn write_plain_gateway_reject<S>(
 where
     S: RecvStream + SendStream<Bytes>,
 {
+    write_plain_gateway_reject_with_recv_halt(
+        stream,
+        ctx,
+        status,
+        body,
+        headers,
+        backend_start,
+        bytes_sent,
+        true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn write_plain_gateway_reject_with_recv_halt<S>(
+    stream: &mut RequestStream<S, Bytes>,
+    ctx: &mut RequestContext,
+    status: StatusCode,
+    body: Bytes,
+    headers: &HashMap<String, String>,
+    backend_start: Instant,
+    bytes_sent: u64,
+    halt_recv: bool,
+) -> Result<CrossProtocolOutcome, anyhow::Error>
+where
+    S: RecvStream + SendStream<Bytes>,
+{
     let (normalized, translated) = normalize_reject_for_client(ctx, status, body, headers, false);
     if let Some(translated) = translated {
-        return write_reject_with_headers(
+        return write_reject_with_headers_and_recv_halt(
             stream,
             StatusCode::OK,
             Bytes::from(translated.body),
             &translated.headers,
             backend_start,
             bytes_sent,
+            halt_recv,
             RejectBodyDisposition::WireBody,
         )
         .await;
     }
-    write_reject_with_headers(
+    write_reject_with_headers_and_recv_halt(
         stream,
         normalized.http_status,
         normalized.body,
         &normalized.headers,
         backend_start,
         bytes_sent,
+        halt_recv,
         normalized.body_disposition,
     )
     .await
+}
+
+/// Write the already-selected pre-commitment authorization-expiry 401 under a
+/// fresh gateway-owned post-deadline write grace (issue #3815).
+///
+/// The authorization instant has already fired; racing the terminal against it
+/// would cancel even an immediately-ready HEADERS/DATA/FIN. A client that
+/// withholds H3/QPACK/QUIC response flow-control credit is cancelled when the
+/// shared post-deadline grace expires, then the send half is reset so the
+/// request task, upstream/accounting state, and stream cannot be retained
+/// indefinitely.
+///
+/// The inner writer is send-only (`halt_recv = false`) so a terminal that can
+/// still be written reaches the client before STOP_SENDING. The receive half is
+/// halted after the bounded write settles — including after a cancelled or
+/// failed write. Ordinary non-authorization `write_plain_gateway_error`
+/// callers keep the unbounded writer.
+async fn write_plain_authorization_expired_terminal<S>(
+    stream: &mut RequestStream<S, Bytes>,
+    ctx: &mut RequestContext,
+    backend_start: Instant,
+    bytes_sent: u64,
+) -> Result<CrossProtocolOutcome, anyhow::Error>
+where
+    S: RecvStream + SendStream<Bytes>,
+{
+    let headers = HashMap::new();
+    let write = write_plain_gateway_reject_with_recv_halt(
+        stream,
+        ctx,
+        StatusCode::UNAUTHORIZED,
+        Bytes::from_static(br#"{"error":"Unauthorized"}"#),
+        &headers,
+        backend_start,
+        bytes_sent,
+        false,
+    );
+    let result =
+        match crate::http3::stream_util::await_post_deadline_terminal_response_write(write).await {
+            Ok(outcome) => Ok(outcome),
+            Err(crate::http3::stream_util::H3ResponseWriteError::Write(_)) => {
+                crate::http3::stream_util::abort_response_stream(stream);
+                Ok(terminal_deadline_write_aborted_outcome(
+                    StatusCode::UNAUTHORIZED.as_u16(),
+                    0,
+                    backend_start,
+                    bytes_sent,
+                    true,
+                ))
+            }
+            Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
+                crate::http3::stream_util::abort_response_stream(stream);
+                Ok(terminal_deadline_write_aborted_outcome(
+                    StatusCode::UNAUTHORIZED.as_u16(),
+                    0,
+                    backend_start,
+                    bytes_sent,
+                    false,
+                ))
+            }
+        };
+    crate::http3::stream_util::halt_request_body(stream);
+    result
 }
 
 /// Write a plugin-driven rejection response (dynamic body + custom

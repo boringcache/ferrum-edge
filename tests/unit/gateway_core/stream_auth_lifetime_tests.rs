@@ -3255,6 +3255,132 @@ fn the_native_h3_grpc_precommit_terminal_is_unauthenticated_and_health_neutral()
     );
 }
 
+/// Cross-protocol plain pre-commitment authorization expiry writes the fixed
+/// redacted 401 under a fresh gateway-owned grace, then resets if QUIC credit
+/// is withheld. The already-expired authorization instant must not race the
+/// terminal, and a failed/timed-out write must not claim a completed body.
+#[test]
+fn cross_protocol_plain_precommit_401_is_grace_bounded_and_health_neutral() {
+    let cross = include_str!("../../../src/http3/cross_protocol.rs");
+    let dispatch = cross
+        .split("async fn dispatch_plain<S>(")
+        .nth(1)
+        .expect("cross-protocol plain dispatcher")
+        .split("async fn dispatch_grpc<S>(")
+        .next()
+        .expect("bounded cross-protocol plain dispatcher");
+
+    let upload = dispatch
+        .split("if let Some(termination) = upload_auth_expired {")
+        .nth(1)
+        .expect("streaming upload authorization-expiry arm")
+        .split("record_plain_grpc_web_client_deadline(")
+        .next()
+        .expect("bounded streaming upload authorization-expiry arm");
+    assert!(upload.contains("record_authorization_termination_once("));
+    assert!(upload.contains("write_plain_authorization_expired_terminal("));
+    assert!(
+        !upload.contains("write_plain_gateway_error("),
+        "the upload-auth-expiry 401 must not use the unbounded reject writer"
+    );
+    let record_once = upload
+        .find("record_authorization_termination_once(")
+        .expect("upload expiry records the bounded class");
+    let write_401 = upload
+        .find("write_plain_authorization_expired_terminal(")
+        .expect("upload expiry writes the bounded 401");
+    assert!(
+        record_once < write_401,
+        "fixed-cardinality authorization termination must be recorded before the 401 write"
+    );
+
+    let header_expiry_arms: Vec<&str> = dispatch
+        .split("if let Some(termination) = plain_write_bound.expired_authorization() {")
+        .skip(1)
+        .collect();
+    assert!(
+        header_expiry_arms.len() >= 3,
+        "buffered-header, buffered-body, and streaming-header authorization arms must remain"
+    );
+    for (label, arm) in [
+        ("buffered response-header", header_expiry_arms[0]),
+        ("streaming response-header", header_expiry_arms[2]),
+    ] {
+        let arm = arm
+            .split("return write_plain_grpc_web_client_deadline_without_hooks(")
+            .next()
+            .unwrap_or_else(|| panic!("bounded {label} authorization-expiry arm"));
+        assert!(
+            arm.contains("record_authorization_termination_once("),
+            "{label} expiry must record the bounded class exactly on this arm"
+        );
+        assert!(
+            arm.contains("write_plain_authorization_expired_terminal("),
+            "{label} expiry must use the grace-bounded 401 writer"
+        );
+        assert!(
+            !arm.contains("write_plain_gateway_error("),
+            "{label} expiry must not use the unbounded reject writer"
+        );
+    }
+    let postcommit = header_expiry_arms[1]
+        .split("append_plain_grpc_web_client_deadline(")
+        .next()
+        .expect("bounded post-commitment buffered-body authorization arm");
+    assert!(
+        postcommit.contains("abort_response_stream(stream)"),
+        "post-commitment expiry must RESET rather than append a 401"
+    );
+    assert!(
+        !postcommit.contains("write_plain_authorization_expired_terminal("),
+        "post-commitment expiry must not write a second client-visible terminal"
+    );
+
+    let helper = cross
+        .split("async fn write_plain_authorization_expired_terminal<S>(")
+        .nth(1)
+        .expect("bounded plain authorization-expiry terminal writer")
+        .split("async fn write_reject_with_headers<S>(")
+        .next()
+        .expect("bounded plain authorization-expiry terminal writer body");
+    assert!(helper.contains("await_post_deadline_terminal_response_write(write)"));
+    assert!(!helper.contains("await_terminal_response_write_before_deadline("));
+    assert!(helper.contains("abort_response_stream(stream)"));
+    assert!(helper.contains("halt_request_body(stream)"));
+    assert!(helper.contains("terminal_deadline_write_aborted_outcome("));
+    assert!(
+        helper.contains("StatusCode::UNAUTHORIZED"),
+        "a failed post-authorization write still accounts the gateway 401, not a backend fault"
+    );
+    assert!(
+        !helper.contains("insert_grpc_error_metadata("),
+        "plain HTTP must not fabricate gRPC metadata for the authorization 401"
+    );
+    let inner_write = helper
+        .split("write_plain_gateway_reject_with_recv_halt(")
+        .nth(1)
+        .expect("inner send-only 401 writer")
+        .split(");")
+        .next()
+        .expect("bounded inner send-only 401 writer");
+    assert!(
+        inner_write.contains("false,"),
+        "the inner 401 writer must defer STOP_SENDING until the bounded write settles"
+    );
+
+    let aborted = cross
+        .split("fn terminal_deadline_write_aborted_outcome(")
+        .nth(1)
+        .expect("terminal deadline write outcome")
+        .split("async fn write_final_body_reject<S>(")
+        .next()
+        .expect("bounded terminal deadline write outcome");
+    assert!(aborted.contains("body_completed: false,"));
+    assert!(aborted.contains("connection_error: false,"));
+    assert!(aborted.contains("error_class: None,"));
+    assert!(aborted.contains("client_disconnected.then_some(ErrorClass::ClientDisconnect)"));
+}
+
 // --- Native HTTP/3 gRPC: the post-head gap (issue #3815, root finding 5) -----
 
 /// The native-H3 gRPC relay writes its own response head, so a `ProxyBody`

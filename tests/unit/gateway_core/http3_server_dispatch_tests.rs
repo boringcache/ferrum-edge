@@ -1223,7 +1223,8 @@ async fn ready_h3_post_deadline_terminal_write_completes_within_grace() {
     assert!(
         ferrum_edge::_test_support::ready_h3_post_deadline_terminal_write_completes_for_test()
             .await,
-        "an immediately-ready post-deadline rejection write must complete within the grace"
+        "an immediately-ready post-deadline rejection write, including the \
+         post-authorization 401, must complete within the grace"
     );
 }
 
@@ -1238,7 +1239,8 @@ async fn stalled_h3_post_deadline_terminal_write_expires_grace() {
     tokio::task::yield_now().await;
     assert!(
         task.await.expect("join"),
-        "a flow-control-blocked post-deadline rejection write must not outlive the grace"
+        "a flow-control-blocked post-deadline rejection write, including the \
+         post-authorization 401, must not outlive the grace"
     );
 }
 
@@ -1251,6 +1253,126 @@ fn h3_post_deadline_terminal_write_grace_is_fixed_one_second() {
     let util = include_str!("../../../src/http3/stream_util.rs");
     assert!(util.contains("H3_POST_DEADLINE_TERMINAL_WRITE_GRACE"));
     assert!(util.contains("await_post_deadline_terminal_response_write"));
+}
+
+#[test]
+fn cross_protocol_plain_authorization_expired_terminal_uses_post_deadline_grace() {
+    let cross = include_str!("../../../src/http3/cross_protocol.rs");
+    let dispatch = cross
+        .split("async fn dispatch_plain<S>(")
+        .nth(1)
+        .expect("cross-protocol plain dispatcher")
+        .split("async fn dispatch_grpc<S>(")
+        .next()
+        .expect("bounded cross-protocol plain dispatcher");
+    assert_eq!(
+        dispatch
+            .matches("write_plain_authorization_expired_terminal(")
+            .count(),
+        3,
+        "upload-auth-expiry and both pre-commitment response-header expiry arms must share \
+         the bounded 401 writer"
+    );
+    assert!(
+        !dispatch.contains("StatusCode::UNAUTHORIZED"),
+        "dispatch_plain must not emit the fixed 401 through the unbounded reject writer"
+    );
+    assert!(
+        !dispatch.contains(r#"{"error":"Unauthorized"}"#),
+        "the compiled-in 401 body must live only in the bounded authorization terminal helper"
+    );
+
+    let helper = cross
+        .split("async fn write_plain_authorization_expired_terminal<S>(")
+        .nth(1)
+        .expect("bounded plain authorization-expiry terminal writer")
+        .split("async fn write_reject_with_headers<S>(")
+        .next()
+        .expect("bounded plain authorization-expiry terminal writer body");
+    assert!(helper.contains("await_post_deadline_terminal_response_write(write)"));
+    assert!(
+        !helper.contains("await_terminal_response_write_before_deadline("),
+        "the already-expired authorization instant must not race the selected 401"
+    );
+    assert!(
+        !helper.contains("await_response_write_before_deadline("),
+        "the selected 401 must not reuse the ordinary in-lifetime write bound"
+    );
+    assert!(helper.contains("StatusCode::UNAUTHORIZED"));
+    assert!(helper.contains(r#"{"error":"Unauthorized"}"#));
+    assert!(
+        helper.contains("write_plain_gateway_reject_with_recv_halt("),
+        "plain HTTP must keep the compiled-in 401 rather than a fabricated gRPC status"
+    );
+    let inner_write = helper
+        .split("write_plain_gateway_reject_with_recv_halt(")
+        .nth(1)
+        .expect("inner send-only 401 writer")
+        .split(");")
+        .next()
+        .expect("bounded inner send-only 401 writer");
+    assert!(
+        inner_write.contains("false,"),
+        "the inner 401 writer must defer STOP_SENDING until the bounded write settles"
+    );
+    assert_eq!(
+        helper.matches("abort_response_stream(stream)").count(),
+        2,
+        "a blocked or failed post-authorization terminal must reset the response send half"
+    );
+    assert!(helper.contains("H3ResponseWriteError::Write(_)"));
+    assert!(helper.contains("H3ResponseWriteError::DeadlineExceeded"));
+    assert!(helper.contains("terminal_deadline_write_aborted_outcome("));
+    let write_fail = helper
+        .split("H3ResponseWriteError::Write(_)")
+        .nth(1)
+        .expect("client-reset post-authorization arm")
+        .split("H3ResponseWriteError::DeadlineExceeded")
+        .next()
+        .expect("bounded client-reset post-authorization arm");
+    assert!(
+        write_fail.contains("true,"),
+        "a client-reset post-authorization write must report client_disconnected"
+    );
+    let grace_expire = helper
+        .split("H3ResponseWriteError::DeadlineExceeded")
+        .nth(1)
+        .expect("grace-expired post-authorization arm");
+    assert!(
+        grace_expire.contains("false,"),
+        "a grace-expired post-authorization write must not claim a client disconnect"
+    );
+    let grace_write = helper
+        .find("await_post_deadline_terminal_response_write(write)")
+        .expect("post-authorization 401 must use the shared grace");
+    let halt_after_grace = helper
+        .find("halt_request_body(stream)")
+        .expect("post-authorization 401 must halt the receive half after the bounded write");
+    assert!(
+        grace_write < halt_after_grace,
+        "STOP_SENDING must follow the bounded 401 write, not precede response settlement"
+    );
+    assert_eq!(
+        helper.matches("halt_request_body(stream)").count(),
+        1,
+        "the receive half must halt exactly once after the bounded write settles"
+    );
+    assert!(
+        !helper[..halt_after_grace].contains("halt_request_body(stream)"),
+        "halt_request_body must not run until await_post_deadline_terminal_response_write returns"
+    );
+
+    let ordinary = cross
+        .split("async fn write_plain_gateway_error<S>(")
+        .nth(1)
+        .expect("ordinary plain gateway error writer")
+        .split("async fn write_plain_gateway_reject<S>(")
+        .next()
+        .expect("bounded ordinary plain gateway error writer");
+    assert!(
+        !ordinary.contains("await_post_deadline_terminal_response_write("),
+        "ordinary non-authorization rejects must keep the unbounded writer"
+    );
 }
 
 #[test]
