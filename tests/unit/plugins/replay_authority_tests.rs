@@ -2205,7 +2205,11 @@ enum LoggingShape {
 
 async fn spawn_logging_redis_server(
     shape: LoggingShape,
-) -> (u16, tokio::sync::oneshot::Sender<()>) {
+) -> (
+    u16,
+    Arc<std::sync::atomic::AtomicUsize>,
+    tokio::sync::oneshot::Sender<()>,
+) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -2213,6 +2217,8 @@ async fn spawn_logging_redis_server(
         .expect("bind fake redis");
     let port = listener.local_addr().expect("local addr").port();
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let accept_probes = Arc::clone(&probes);
 
     tokio::spawn(async move {
         loop {
@@ -2220,6 +2226,7 @@ async fn spawn_logging_redis_server(
                 _ = &mut shutdown_rx => break,
                 accepted = listener.accept() => {
                     let Ok((mut stream, _)) = accepted else { break };
+                    let probes = Arc::clone(&accept_probes);
                     tokio::spawn(async move {
                         let mut buf = vec![0u8; 16 * 1024];
                         loop {
@@ -2227,6 +2234,7 @@ async fn spawn_logging_redis_server(
                                 Ok(0) | Err(_) => break,
                                 Ok(read) => read,
                             };
+                            probes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                             let chunk = &buf[..read];
                             let reply: Vec<u8> = match shape {
                                 LoggingShape::AuthReject => {
@@ -2260,7 +2268,7 @@ async fn spawn_logging_redis_server(
         }
     });
 
-    (port, shutdown_tx)
+    (port, probes, shutdown_tx)
 }
 
 fn sentinel_replay_config(port: u16) -> RedisConfig {
@@ -2324,7 +2332,7 @@ async fn replay_client_logs_only_classification_and_redacted_endpoint() {
             "unsupported_topology",
         ),
     ] {
-        let (port, shutdown) = spawn_logging_redis_server(shape).await;
+        let (port, probes, shutdown) = spawn_logging_redis_server(shape).await;
         let config = sentinel_replay_config(port);
         let redacted = config.redacted_url();
         assert!(
@@ -2340,6 +2348,11 @@ async fn replay_client_logs_only_classification_and_redacted_endpoint() {
         let marker = domain("shared-logging").marker(&[b"c", label.as_bytes()]);
         match shape {
             LoggingShape::AuthReject => {
+                wait_until(
+                    || probes.load(std::sync::atomic::Ordering::SeqCst) > 0,
+                    &format!("{label}: fake Redis observed a health-check probe"),
+                )
+                .await;
                 wait_until(
                     || logs.contents().contains(expected_class),
                     &format!("{label}: probe classification"),
@@ -2398,7 +2411,7 @@ async fn replay_client_logs_only_classification_and_redacted_endpoint() {
 /// post-handshake command error where the server detail survives in `%error`.
 #[tokio::test(flavor = "current_thread")]
 async fn generic_redis_client_still_logs_backend_error_text() {
-    let (port, shutdown) = spawn_logging_redis_server(LoggingShape::CommandError).await;
+    let (port, _probes, shutdown) = spawn_logging_redis_server(LoggingShape::CommandError).await;
     let config = sentinel_replay_config(port);
     let (logs, guard) = super::plugin_utils::capture_logs();
     let client = RedisRateLimitClient::new(config, None, false, None);

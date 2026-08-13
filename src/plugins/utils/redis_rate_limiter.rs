@@ -2476,8 +2476,14 @@ impl RedisRateLimitClient {
     ///
     /// Replay-authority clients probe on the first iteration (no startup sleep)
     /// so `/health` can recover without protected traffic and without waiting
-    /// a full `redis_health_check_interval_seconds`. Operational clients keep
-    /// the historical sleep-then-probe cadence, which starts after an error.
+    /// a full `redis_health_check_interval_seconds`. That first probe also
+    /// emits one closed-set `connection_failed` classification beside the
+    /// redacted endpoint when authentication or connection fails while the
+    /// client is still unproven — otherwise the unproven-to-unreachable
+    /// transition is silent. Later genuine available-to-unavailable
+    /// transitions keep the same diagnostic; retries while already
+    /// unavailable stay silent. Operational clients keep the historical
+    /// sleep-then-probe cadence and warn only on an availability drop.
     pub(crate) fn start_health_checker_if_needed(&self) {
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
@@ -2504,6 +2510,11 @@ impl RedisRateLimitClient {
 
         let handle = runtime.spawn(async move {
             let mut delay_before_probe = !probe_immediately;
+            // Consumed by the first probe that actually completes (Ok or Err),
+            // not by a DNS-screen `continue`. Replay clients start unproven, so
+            // `was_available` cannot distinguish that first failure from a
+            // later retry while still unreachable.
+            let mut log_unproven_probe_failure = probe_immediately;
             loop {
                 if delay_before_probe {
                     tokio::time::sleep(interval).await;
@@ -2628,6 +2639,7 @@ impl RedisRateLimitClient {
                 let was_available = availability.is_available();
                 match result {
                     Ok(()) => {
+                        log_unproven_probe_failure = false;
                         // Publication boundary: a topology rejection proven by
                         // another task while this probe was in flight wins, so a
                         // successful PING/INFO can neither restore availability
@@ -2649,21 +2661,24 @@ impl RedisRateLimitClient {
                         }
                     }
                     Err(_) => {
-                        if was_available && !availability.is_topology_terminal() {
-                            match log_policy {
-                                RedisClientLogPolicy::Operational => {
-                                    warn!(
-                                        "Redis health check failed — centralized Redis unavailable"
-                                    );
-                                }
-                                RedisClientLogPolicy::ClassificationOnly => {
-                                    warn_replay_backend(
-                                        &config.redacted_url(),
-                                        "connection_failed",
-                                        "Redis single-use claim backend failed",
-                                    );
-                                }
-                            }
+                        let topology_terminal = availability.is_topology_terminal();
+                        let log_operational_transition =
+                            matches!(log_policy, RedisClientLogPolicy::Operational)
+                                && was_available
+                                && !topology_terminal;
+                        let log_replay_connection_failed =
+                            matches!(log_policy, RedisClientLogPolicy::ClassificationOnly)
+                                && !topology_terminal
+                                && (was_available || log_unproven_probe_failure);
+                        log_unproven_probe_failure = false;
+                        if log_operational_transition {
+                            warn!("Redis health check failed — centralized Redis unavailable");
+                        } else if log_replay_connection_failed {
+                            warn_replay_backend(
+                                &config.redacted_url(),
+                                "connection_failed",
+                                "Redis single-use claim backend failed",
+                            );
                         }
                         availability.mark_unreachable();
                     }

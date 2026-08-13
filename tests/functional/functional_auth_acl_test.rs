@@ -20,7 +20,7 @@ use chrono::Utc;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub(super) fn create_rs256_token(claims: &serde_json::Value, private_key_pem: &[u8]) -> String {
     let mut header = Header::new(jsonwebtoken::Algorithm::RS256);
@@ -2811,6 +2811,42 @@ async fn send_hmac_v2(
         .expect("hmac v2 request should complete")
 }
 
+/// Wait until the `/hmacv2` route is present **and** `hmac_auth` is enforcing.
+///
+/// A first 200 on a signed POST only proves the route/backend exist. If the
+/// plugin has not reached the proxy snapshot, that POST is unauthenticated and
+/// cannot seed a replay marker. An unsigned GET is excluded from
+/// [`crate::common::spawn_http_counting_mutations`], so it neither consumes a
+/// nonce nor increments the mutation count. 401 is the activation proof:
+/// missing route is 404; route without the plugin is 200 from the backend.
+async fn wait_until_hmac_v2_route_and_plugin_active(client: &reqwest::Client, url: &str) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut last = String::from("no probe completed");
+    loop {
+        match client.get(url).send().await {
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                if status == 401 {
+                    return;
+                }
+                last = format!("HTTP {status}");
+            }
+            Err(err) => {
+                last = format!("request error: {err}");
+            }
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "hmac v2 route and plugin did not become active within 15s: \
+                 unsigned GET {url} must converge to 401 (route present and \
+                 hmac_auth enforcing) before the first signed POST; last \
+                 observation: {last}"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 #[tokio::test]
 #[ignore]
 async fn test_hmac_v2_backend_sees_exactly_one_mutation_for_a_replayed_request() {
@@ -2883,9 +2919,9 @@ async fn test_hmac_v2_backend_sees_exactly_one_mutation_for_a_replayed_request()
     .await
     .unwrap();
 
-    tokio::time::sleep(Duration::from_secs(4)).await;
-
     let url = format!("{}/hmacv2", proxy_url);
+    wait_until_hmac_v2_route_and_plugin_active(&client, &url).await;
+
     let authority = hmac_authority_from_url(&url);
     let date = Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string();
     let digest = empty_digest_header();
