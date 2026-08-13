@@ -1107,7 +1107,7 @@ fn annotate_gateway_mesh_metadata(
     }
 }
 
-fn hbone_inner_baggage_strip_prefixes(configured_prefixes: &[String]) -> Vec<String> {
+pub(crate) fn hbone_inner_baggage_strip_prefixes(configured_prefixes: &[String]) -> Vec<String> {
     let mut prefixes = configured_prefixes.to_vec();
     for prefix in HBONE_INNER_IDENTITY_BAGGAGE_PREFIXES {
         if !prefixes.iter().any(|existing| existing == prefix) {
@@ -28531,61 +28531,64 @@ async fn handle_proxy_request_inner(
         // with a Trailers-Only gRPC UNAVAILABLE whose message names the failed
         // contract and never echoes a SPIFFE ID, SNI name, trust domain, or dial
         // address. There is deliberately no direct-dial fallback.
-        let grpc_transport =
-            match resolve_grpc_dispatch_transport(&state, upstream_target.as_deref()) {
-                Ok(transport) => transport,
-                Err(transport_error) => {
-                    let message = transport_error.message();
-                    let diagnostic = transport_error.diagnostic().as_str();
-                    warn!(
-                        proxy_id = %proxy.id,
-                        target_host = %grpc_effective_host,
-                        diagnostic,
-                        refusal = ?transport_error,
+        let grpc_transport = match resolve_grpc_dispatch_transport(
+            &state,
+            upstream_target.as_deref(),
+            ctx.peer_spiffe_id.as_ref(),
+        ) {
+            Ok(transport) => transport,
+            Err(transport_error) => {
+                let message = transport_error.message();
+                let diagnostic = transport_error.diagnostic().as_str();
+                warn!(
+                    proxy_id = %proxy.id,
+                    target_host = %grpc_effective_host,
+                    diagnostic,
+                    refusal = ?transport_error,
+                    message,
+                    "No dispatchable mesh transport for the selected gRPC target; failing \
+                     closed with gRPC UNAVAILABLE instead of an unauthenticated direct dial"
+                );
+                // This reject is AFTER `grpc_probe_guard` exists, so disarm
+                // it before the explicit release (a still-armed Drop would
+                // free a SECOND, unrelated in-flight probe slot).
+                grpc_probe_guard.disarm();
+                release_circuit_breaker_probe_on_admission_reject(
+                    &state,
+                    &proxy,
+                    cb_target_key.as_deref(),
+                    cb_is_half_open_probe,
+                );
+                record_request(&state, 200); // gRPC errors ride HTTP 200 + trailers
+                if let Some(content_type) = grpc_web_response_content_type {
+                    return Ok(build_grpc_web_error_response(
+                        content_type,
+                        14,
                         message,
-                        "No dispatchable mesh transport for the selected gRPC target; failing \
-                         closed with gRPC UNAVAILABLE instead of an unauthenticated direct dial"
-                    );
-                    // This reject is AFTER `grpc_probe_guard` exists, so disarm
-                    // it before the explicit release (a still-armed Drop would
-                    // free a SECOND, unrelated in-flight probe slot).
-                    grpc_probe_guard.disarm();
-                    release_circuit_breaker_probe_on_admission_reject(
-                        &state,
-                        &proxy,
-                        cb_target_key.as_deref(),
-                        cb_is_half_open_probe,
-                    );
-                    record_request(&state, 200); // gRPC errors ride HTTP 200 + trailers
-                    if let Some(content_type) = grpc_web_response_content_type {
-                        return Ok(build_grpc_web_error_response(
-                            content_type,
-                            14,
-                            message,
-                            plugin_cache_view
-                                .initial_response_header_policy_plugins()
-                                .as_ref(),
-                        ));
-                    }
-                    if grpc_request_is_web_translated
-                        && let Some(response) = build_translated_grpc_web_error_response(
-                            &ctx,
-                            14,
-                            message,
-                            plugin_cache_view
-                                .initial_response_header_policy_plugins()
-                                .as_ref(),
-                        )
-                    {
-                        return Ok(response);
-                    }
-                    return Ok(grpc_proxy::build_grpc_error_response_with_policy(
-                        14, // UNAVAILABLE
-                        message,
-                        initial_response_header_policy_plugins.as_ref(),
+                        plugin_cache_view
+                            .initial_response_header_policy_plugins()
+                            .as_ref(),
                     ));
                 }
-            };
+                if grpc_request_is_web_translated
+                    && let Some(response) = build_translated_grpc_web_error_response(
+                        &ctx,
+                        14,
+                        message,
+                        plugin_cache_view
+                            .initial_response_header_policy_plugins()
+                            .as_ref(),
+                    )
+                {
+                    return Ok(response);
+                }
+                return Ok(grpc_proxy::build_grpc_error_response_with_policy(
+                    14, // UNAVAILABLE
+                    message,
+                    initial_response_header_policy_plugins.as_ref(),
+                ));
+            }
+        };
 
         let grpc_effective_port = grpc_dispatch_proxy.backend_port;
         let mut grpc_backend_url = build_backend_url_with_target(
@@ -29765,50 +29768,53 @@ async fn handle_proxy_request_inner(
                 // authority, pinned peer, and cross-cluster SNI / trust-domain
                 // scope, so a target that mutated across a live reload fails
                 // closed here instead of being dialed on a stale plan.
-                let grpc_retry_transport =
-                    match resolve_grpc_dispatch_transport(&state, grpc_current_target.as_deref()) {
-                        Ok(transport) => transport,
-                        Err(transport_error) => {
-                            let message = transport_error.message();
-                            warn!(
-                                proxy_id = %proxy.id,
-                                diagnostic = transport_error.diagnostic().as_str(),
-                                refusal = ?transport_error,
+                let grpc_retry_transport = match resolve_grpc_dispatch_transport(
+                    &state,
+                    grpc_current_target.as_deref(),
+                    ctx.peer_spiffe_id.as_ref(),
+                ) {
+                    Ok(transport) => transport,
+                    Err(transport_error) => {
+                        let message = transport_error.message();
+                        warn!(
+                            proxy_id = %proxy.id,
+                            diagnostic = transport_error.diagnostic().as_str(),
+                            refusal = ?transport_error,
+                            message,
+                            "gRPC retry target has no dispatchable mesh transport; failing \
+                             closed with gRPC UNAVAILABLE instead of an unauthenticated \
+                             direct dial"
+                        );
+                        record_request(&state, 200); // gRPC errors ride HTTP 200 + trailers
+                        if let Some(content_type) = grpc_web_response_content_type {
+                            return Ok(build_grpc_web_error_response(
+                                content_type,
+                                14,
                                 message,
-                                "gRPC retry target has no dispatchable mesh transport; failing \
-                                 closed with gRPC UNAVAILABLE instead of an unauthenticated \
-                                 direct dial"
-                            );
-                            record_request(&state, 200); // gRPC errors ride HTTP 200 + trailers
-                            if let Some(content_type) = grpc_web_response_content_type {
-                                return Ok(build_grpc_web_error_response(
-                                    content_type,
-                                    14,
-                                    message,
-                                    plugin_cache_view
-                                        .initial_response_header_policy_plugins()
-                                        .as_ref(),
-                                ));
-                            }
-                            if grpc_request_is_web_translated
-                                && let Some(response) = build_translated_grpc_web_error_response(
-                                    &ctx,
-                                    14,
-                                    message,
-                                    plugin_cache_view
-                                        .initial_response_header_policy_plugins()
-                                        .as_ref(),
-                                )
-                            {
-                                return Ok(response);
-                            }
-                            return Ok(grpc_proxy::build_grpc_error_response_with_policy(
-                                14, // UNAVAILABLE
-                                message,
-                                initial_response_header_policy_plugins.as_ref(),
+                                plugin_cache_view
+                                    .initial_response_header_policy_plugins()
+                                    .as_ref(),
                             ));
                         }
-                    };
+                        if grpc_request_is_web_translated
+                            && let Some(response) = build_translated_grpc_web_error_response(
+                                &ctx,
+                                14,
+                                message,
+                                plugin_cache_view
+                                    .initial_response_header_policy_plugins()
+                                    .as_ref(),
+                            )
+                        {
+                            return Ok(response);
+                        }
+                        return Ok(grpc_proxy::build_grpc_error_response_with_policy(
+                            14, // UNAVAILABLE
+                            message,
+                            initial_response_header_policy_plugins.as_ref(),
+                        ));
+                    }
+                };
                 grpc_final_upstream_target = grpc_current_target.clone();
                 grpc_lb_connection_guard = Some(LoadBalancerConnectionGuard::new(
                     grpc_current_target.clone(),
@@ -39544,12 +39550,15 @@ pub(crate) fn mesh_mtls_dispatch_authority<'a>(
 pub(crate) fn resolve_grpc_dispatch_transport<'a>(
     state: &'a ProxyState,
     target: Option<&'a UpstreamTarget>,
+    asserted_source_identity: Option<&'a crate::identity::SpiffeId>,
 ) -> Result<grpc_proxy::GrpcDispatchTransport<'a>, grpc_proxy::GrpcTransportError> {
-    grpc_proxy::GrpcDispatchTransport::for_target(
+    grpc_proxy::GrpcDispatchTransport::for_target_with_hbone_context(
         &state.grpc_pool,
         &state.mesh_mtls_pool,
         &state.hbone_pool,
         target,
+        asserted_source_identity,
+        &state.mesh_egress_strip_baggage_keys,
     )
 }
 

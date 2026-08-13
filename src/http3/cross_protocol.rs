@@ -4505,11 +4505,12 @@ where
 fn resolve_h3_grpc_transport<'a>(
     state: &'a ProxyState,
     target: Option<&'a UpstreamTarget>,
+    asserted_source_identity: Option<&'a crate::identity::SpiffeId>,
 ) -> Result<grpc_proxy::GrpcDispatchTransport<'a>, grpc_proxy::GrpcTransportError> {
     // Delegated to the SHARED resolver the standard H1/H2 native-gRPC branch
     // also uses (issue #3728), so the two frontends cannot drift on target
     // validation, dial-plan resolution, or error mapping.
-    crate::proxy::resolve_grpc_dispatch_transport(state, target)
+    crate::proxy::resolve_grpc_dispatch_transport(state, target, asserted_source_identity)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4589,7 +4590,11 @@ where
     // ambiguous-transport, or unmaterializable-identity target is refused here.
     // The probe slot a HALF_OPEN breaker may have admitted is released,
     // mirroring the pre-dispatch rejects below.
-    let initial_grpc_transport = match resolve_h3_grpc_transport(state, current_target.as_deref()) {
+    let initial_grpc_transport = match resolve_h3_grpc_transport(
+        state,
+        current_target.as_deref(),
+        ctx.peer_spiffe_id.as_ref(),
+    ) {
         Ok(transport) => transport,
         Err(transport_error) => {
             let message = transport_error.message();
@@ -5019,37 +5024,40 @@ where
             // rather than direct-dialing past the secured transport. The prior
             // attempt's failure was already recorded and the probe slot
             // released above, so only the refusal is written here.
-            let grpc_retry_transport =
-                match resolve_h3_grpc_transport(state, current_target.as_deref()) {
-                    Ok(transport) => transport,
-                    Err(transport_error) => {
-                        let message = transport_error.message();
-                        let diagnostic = transport_error.diagnostic().as_str();
-                        warn!(
-                            proxy_id = %proxy.id,
-                            target_host = current_target
-                                .as_deref()
-                                .map(|t| t.host.as_str())
-                                .unwrap_or(""),
-                            target_port = current_target.as_deref().map(|t| t.port).unwrap_or(0),
-                            diagnostic,
-                            refusal = ?transport_error,
-                            message,
-                            "cross-protocol H3→gRPC: retry rotated onto a target with no \
-                             dispatchable mesh transport; failing closed with gRPC UNAVAILABLE"
-                        );
-                        return write_grpc_error_for_request(
-                            stream,
-                            ctx,
-                            grpc_proxy::grpc_status::UNAVAILABLE,
-                            message,
-                            backend_start,
-                            bytes_sent,
-                            initial_response_header_policy_plugins,
-                        )
-                        .await;
-                    }
-                };
+            let grpc_retry_transport = match resolve_h3_grpc_transport(
+                state,
+                current_target.as_deref(),
+                ctx.peer_spiffe_id.as_ref(),
+            ) {
+                Ok(transport) => transport,
+                Err(transport_error) => {
+                    let message = transport_error.message();
+                    let diagnostic = transport_error.diagnostic().as_str();
+                    warn!(
+                        proxy_id = %proxy.id,
+                        target_host = current_target
+                            .as_deref()
+                            .map(|t| t.host.as_str())
+                            .unwrap_or(""),
+                        target_port = current_target.as_deref().map(|t| t.port).unwrap_or(0),
+                        diagnostic,
+                        refusal = ?transport_error,
+                        message,
+                        "cross-protocol H3→gRPC: retry rotated onto a target with no \
+                         dispatchable mesh transport; failing closed with gRPC UNAVAILABLE"
+                    );
+                    return write_grpc_error_for_request(
+                        stream,
+                        ctx,
+                        grpc_proxy::grpc_status::UNAVAILABLE,
+                        message,
+                        backend_start,
+                        bytes_sent,
+                        initial_response_header_policy_plugins,
+                    )
+                    .await;
+                }
+            };
 
             warn!(
                 proxy_id = %proxy.id,
@@ -6147,7 +6155,11 @@ pub(crate) async fn dispatch_grpc_streaming(
     // this path, so the single pre-dispatch resolution covers it. The probe slot
     // a HALF_OPEN breaker may have admitted is released, mirroring the buffered
     // path's pre-dispatch rejects.
-    let grpc_transport = match resolve_h3_grpc_transport(state, current_target.as_deref()) {
+    let grpc_transport = match resolve_h3_grpc_transport(
+        state,
+        current_target.as_deref(),
+        ctx.peer_spiffe_id.as_ref(),
+    ) {
         Ok(transport) => transport,
         Err(transport_error) => {
             let message = transport_error.message();

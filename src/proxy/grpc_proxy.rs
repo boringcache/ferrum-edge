@@ -2647,6 +2647,8 @@ pub struct HboneGrpcTransport<'a> {
     pool: &'a crate::proxy::hbone_pool::HboneConnectionPool,
     target: &'a crate::config::types::UpstreamTarget,
     plan: crate::proxy::hbone_pool::HboneDialPlan<'a>,
+    asserted_source_identity: Option<&'a crate::identity::SpiffeId>,
+    baggage_strip_prefixes: Vec<String>,
 }
 
 /// Client-visible refusal when a `mesh.mtls` target's destination identity
@@ -2856,6 +2858,27 @@ impl<'a> GrpcDispatchTransport<'a> {
         hbone_pool: &'a crate::proxy::hbone_pool::HboneConnectionPool,
         target: Option<&'a crate::config::types::UpstreamTarget>,
     ) -> Result<Self, GrpcTransportError> {
+        Self::for_target_with_hbone_context(
+            grpc_pool,
+            mesh_mtls_pool,
+            hbone_pool,
+            target,
+            None,
+            &[],
+        )
+    }
+
+    /// Resolve a transport while binding request-scoped Ambient identity
+    /// context. The asserted identity is used only by HBONE; the strip list is
+    /// applied to inner-request baggage before it reaches the application.
+    pub fn for_target_with_hbone_context(
+        grpc_pool: &'a GrpcConnectionPool,
+        mesh_mtls_pool: &'a crate::proxy::mesh_mtls_pool::MeshMtlsConnectionPool,
+        hbone_pool: &'a crate::proxy::hbone_pool::HboneConnectionPool,
+        target: Option<&'a crate::config::types::UpstreamTarget>,
+        asserted_source_identity: Option<&'a crate::identity::SpiffeId>,
+        baggage_strip_prefixes: &[String],
+    ) -> Result<Self, GrpcTransportError> {
         let Some(target) = target else {
             return Ok(Self::Direct(grpc_pool));
         };
@@ -2903,6 +2926,10 @@ impl<'a> GrpcDispatchTransport<'a> {
                     pool: hbone_pool,
                     target,
                     plan,
+                    asserted_source_identity,
+                    baggage_strip_prefixes: crate::proxy::hbone_inner_baggage_strip_prefixes(
+                        baggage_strip_prefixes,
+                    ),
                 }))
             }
             GrpcMeshDispatch::RefuseCrossClusterMalformed => Err(GrpcTransportError::Unsupported {
@@ -2939,6 +2966,24 @@ impl<'a> GrpcDispatchTransport<'a> {
             Self::MeshMtls(_) => "mesh_mtls",
             Self::Hbone(_) => "hbone",
         }
+    }
+
+    fn proxy_headers_for_dispatch<'b>(
+        &self,
+        headers: &'b HashMap<String, String>,
+    ) -> std::borrow::Cow<'b, HashMap<String, String>> {
+        let Self::Hbone(hbone) = self else {
+            return std::borrow::Cow::Borrowed(headers);
+        };
+        if !crate::modes::mesh::hbone::has_baggage_header_in_map(headers) {
+            return std::borrow::Cow::Borrowed(headers);
+        }
+        let mut owned = headers.clone();
+        crate::modes::mesh::hbone::strip_egress_baggage_in_map(
+            &mut owned,
+            &hbone.baggage_strip_prefixes,
+        );
+        std::borrow::Cow::Owned(owned)
     }
 
     /// Acquire an HTTP/2 sender. Pool acquisition is the caller's connect
@@ -3143,11 +3188,9 @@ fn hbone_dispatch_authority<'a>(
 /// sender and an app that answers nothing would stall the RPC outside the
 /// connect budget.
 ///
-/// The asserted source identity is left `None`, which makes the CONNECT baggage
-/// carry this gateway's own SVID — the ambient-egress default, and the same
-/// assertion the generic HTTP-family Ambient egress makes. A gRPC request
-/// arriving on a north-south frontend (H1/H2 or H3) is a client, not an
-/// authenticated mesh peer whose principal could be forwarded.
+/// When the frontend authenticated a mesh workload, its identity is asserted
+/// on CONNECT so downstream authorization and telemetry see the caller rather
+/// than this gateway's SVID.
 async fn open_hbone_grpc_sender(
     hbone: &HboneGrpcTransport<'_>,
     proxy: &Proxy,
@@ -3165,7 +3208,7 @@ async fn open_hbone_grpc_sender(
             plan.expected_peer.as_ref(),
             plan.expected_trust_domain.as_ref(),
             plan.sni_override,
-            None,
+            hbone.asserted_source_identity,
         )
         .await
         .map_err(hbone_pool_error_to_grpc)?;
@@ -3750,7 +3793,8 @@ async fn proxy_grpc_streaming_dispatch(
     // can call the steps in the wrong order. See `proxy::headers` for
     // why merging FIRST is required and why `te: trailers` is
     // synthesised at the end.
-    merge_proxy_headers_and_strip_for_grpc(&mut headers, proxy_headers);
+    let proxy_headers = transport.proxy_headers_for_dispatch(proxy_headers);
+    merge_proxy_headers_and_strip_for_grpc(&mut headers, proxy_headers.as_ref());
 
     // Bind the request line to the selected transport BEFORE the Host override,
     // mirroring `proxy_grpc_request_core` (issue #3284). The direct pool parses
@@ -4075,7 +4119,8 @@ pub(crate) async fn proxy_grpc_request_core(
     // Mirrors `proxy_grpc_request_streaming` via the shared helper so
     // the two gRPC dispatch paths cannot drift on header handling. See
     // `proxy::headers` for the rationale.
-    merge_proxy_headers_and_strip_for_grpc(&mut headers, proxy_headers);
+    let proxy_headers = transport.proxy_headers_for_dispatch(proxy_headers);
+    merge_proxy_headers_and_strip_for_grpc(&mut headers, proxy_headers.as_ref());
 
     // Bind the request line to the selected transport BEFORE the Host override
     // below, so a mesh dispatch presents (and, without `preserve_host_header`,

@@ -3338,7 +3338,9 @@ fn standard_grpc_frontend_and_h3_bridge_share_one_mesh_transport_resolver() {
          proxy/mod.rs — a second one is the drift this resolver exists to prevent"
     );
     assert!(
-        h3_src.contains("crate::proxy::resolve_grpc_dispatch_transport(state, target)"),
+        h3_src.contains(
+            "crate::proxy::resolve_grpc_dispatch_transport(state, target, asserted_source_identity)"
+        ),
         "the H3 gRPC bridge must delegate to the SHARED resolver, not re-implement it"
     );
     assert_eq!(
@@ -3359,6 +3361,32 @@ fn standard_grpc_frontend_and_h3_bridge_share_one_mesh_transport_resolver() {
         !proxy_src.contains("grpc_proxy::GrpcDispatchTransport::Direct(&state.grpc_pool)"),
         "the native-gRPC dispatch sites must use the materialized transport, never \
          a hard-wired direct pool that would bypass a mesh target's secured hop"
+    );
+}
+
+#[test]
+fn native_grpc_hbone_preserves_authenticated_identity_and_strips_identity_baggage() {
+    let grpc_src = include_str!("../../../src/proxy/grpc_proxy.rs");
+    let proxy_src = include_str!("../../../src/proxy/mod.rs");
+
+    assert!(
+        grpc_src.contains("hbone.asserted_source_identity,"),
+        "HBONE CONNECT must assert the authenticated frontend workload identity"
+    );
+    assert_eq!(
+        grpc_src
+            .matches("transport.proxy_headers_for_dispatch(proxy_headers)")
+            .count(),
+        2,
+        "both buffered and fully-streaming native gRPC paths must sanitize HBONE baggage"
+    );
+    assert!(
+        grpc_src.contains("crate::proxy::hbone_inner_baggage_strip_prefixes("),
+        "the HBONE gRPC transport must add the reserved identity prefixes to configured stripping"
+    );
+    assert!(
+        proxy_src.contains("ctx.peer_spiffe_id.as_ref(),"),
+        "the H1/H2 frontend must bind its authenticated peer identity to the gRPC transport"
     );
 }
 
