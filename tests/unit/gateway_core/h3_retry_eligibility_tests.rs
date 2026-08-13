@@ -441,8 +441,15 @@ fn every_h3_retry_surface_shares_eligible_helper_not_ad_hoc_loops() {
         "ad-hoc 32-iteration Unix skip loops must not remain in H3 retry paths"
     );
 
-    // WebSocket caller must map helper None to the abort flag (fail closed),
-    // not silently skip an `if let Some(...)` and retry the original target.
+    // WebSocket caller: helper `None` means no *alternative* eligible candidate
+    // survived exclusion — not that the current (already screened) target is
+    // ineligible. The connect-loop top screens via `h3_bridge_transport_refusal`
+    // on every attempt; `None` logs and falls through to that same target.
+    assert!(
+        ws.contains("h3_bridge_transport_refusal(current_target.as_deref())")
+            && ws.contains("target re-entering the loop are screened"),
+        "H3 WebSocket connect loop must screen targets at loop top via h3_bridge_transport_refusal"
+    );
     let ws_retry = ws
         .split("let mut retry_backend_url = current_backend_url.clone();")
         .nth(1)
@@ -452,10 +459,21 @@ fn every_h3_retry_surface_shares_eligible_helper_not_ad_hoc_loops() {
         .expect("bounded H3 WebSocket retry block");
     assert!(
         ws_retry.contains("None =>")
-            && ws_retry.contains("retry_path_mismatch = true")
-            && ws_retry
-                .contains("\"Aborting H3 WebSocket retry: no H3-eligible candidate remains\""),
-        "H3 WebSocket must abort when select_next_h3_eligible_retry_target returns None"
+            && ws_retry.contains("No alternative H3-eligible WebSocket retry candidate")
+            && ws_retry.contains("retrying the already-screened current target")
+            && !ws.contains("\"Aborting H3 WebSocket retry: no H3-eligible candidate remains\""),
+        "H3 WebSocket must fall through to the already-screened current target when helper returns None"
+    );
+    let ws_none_arm = ws_retry
+        .split("None => {")
+        .nth(1)
+        .and_then(|tail| tail.split('}').next())
+        .expect("H3 WebSocket None arm");
+    assert!(
+        !ws_none_arm.contains("retry_path_mismatch = true")
+            && !ws_none_arm.contains("WsBackendHandshake::Unix")
+            && !ws_none_arm.contains("backend_host"),
+        "H3 WebSocket None must not abort or introduce Unix/plaintext fallback"
     );
 
     // Cross-protocol keeps established Unchanged-on-None caller semantics:
