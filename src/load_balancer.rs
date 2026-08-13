@@ -2455,64 +2455,67 @@ impl<'a> RetryCandidateFilter<'a> {
     }
 }
 
-/// Drop every pool entry rejected by `filter` under `contract` from
-/// `candidate_mask`.
+/// Derive the retry candidate mask and strict-locality scope from `scope` in one
+/// bounded pass.
 ///
-/// Retry-only and bounded by the configured target pool: one pass, no
-/// allocation. The ordinary no-retry hot path never reaches this helper.
+/// Soft retry exclusion is removed only from candidates; hard ineligibility is
+/// removed from both candidates and strict-locality scope so fail-closed
+/// fallback cannot reintroduce transport-rejected targets (issue #3620).
+///
+/// Retry-only and allocation-free on the bitset lane. When
+/// `filter.eligible` is absent the pass matches the ordinary single-exclusion
+/// retry path and `scope` is returned unchanged for locality.
 #[inline]
-fn clear_retry_exclusions(
+fn split_retry_candidate_and_locality_scope_bitset(
     targets: &[Arc<UpstreamTarget>],
     filter: RetryCandidateFilter<'_>,
     contract: RetryExcludeContract,
-    candidate_mask: &mut HealthBitset,
-) {
+    scope: HealthBitset,
+) -> (HealthBitset, HealthBitset) {
+    let mut candidate_mask = scope;
+    if filter.eligible.is_none() {
+        for (idx, target) in targets.iter().enumerate() {
+            if filter.excludes_retry(target, contract) {
+                candidate_mask.clear(idx);
+            }
+        }
+        return (candidate_mask, scope);
+    }
+    let mut locality_scope = scope;
     for (idx, target) in targets.iter().enumerate() {
         if filter.rejects(target, contract) {
             candidate_mask.clear(idx);
         }
-    }
-}
-
-/// Scope for strict-locality decisions under an eligibility-aware retry filter.
-///
-/// Soft retry exclusion stays in the scope so excluding a previously tried local
-/// target does not make a local-containing upstream look remote-only. Hard
-/// ineligibility is stripped from the scope so strict fail-closed fallback cannot
-/// reintroduce transport-rejected targets (issue #3620).
-#[inline]
-fn hard_eligible_locality_scope_bitset(
-    targets: &[Arc<UpstreamTarget>],
-    filter: RetryCandidateFilter<'_>,
-    scope: HealthBitset,
-) -> HealthBitset {
-    if filter.eligible.is_none() {
-        return scope;
-    }
-    let mut eligible_scope = scope;
-    for (idx, target) in targets.iter().enumerate() {
         if filter.is_hard_ineligible(target) {
-            eligible_scope.clear(idx);
+            locality_scope.clear(idx);
         }
     }
-    eligible_scope
+    (candidate_mask, locality_scope)
 }
 
-/// Vec-path counterpart of [`hard_eligible_locality_scope_bitset`].
+/// Eligibility-aware Vec-lane counterpart: build candidate and hard-eligible
+/// locality scope indices together in one pass (two lane vectors, no third
+/// filtered scope allocation).
 #[inline]
-fn hard_eligible_locality_scope_indices(
+fn build_eligible_retry_candidate_and_locality_scope_indices(
     targets: &[Arc<UpstreamTarget>],
     filter: RetryCandidateFilter<'_>,
-    scope_indices: &[usize],
-) -> Vec<usize> {
-    if filter.eligible.is_none() {
-        return scope_indices.to_vec();
+    contract: RetryExcludeContract,
+    scope_indices: impl IntoIterator<Item = usize>,
+) -> (Vec<usize>, Vec<usize>) {
+    debug_assert!(filter.eligible.is_some());
+    let mut candidates = Vec::new();
+    let mut locality_scope = Vec::new();
+    for idx in scope_indices {
+        let target = &targets[idx];
+        if !filter.rejects(target, contract) {
+            candidates.push(idx);
+        }
+        if !filter.is_hard_ineligible(target) {
+            locality_scope.push(idx);
+        }
     }
-    scope_indices
-        .iter()
-        .copied()
-        .filter(|&idx| !filter.is_hard_ineligible(&targets[idx]))
-        .collect()
+    (candidates, locality_scope)
 }
 
 /// Build the pre-computed locality-LB state from an operator's
@@ -5758,8 +5761,12 @@ impl LoadBalancer {
         // budget can be spent on an excluded target, and clearing afterward
         // leaves viable retry candidates ejected.
         let scope = HealthBitset::all(n);
-        let mut candidate_mask = scope;
-        clear_retry_exclusions(&self.targets, filter, contract, &mut candidate_mask);
+        let (candidate_mask, locality_scope) = split_retry_candidate_and_locality_scope_bitset(
+            &self.targets,
+            filter,
+            contract,
+            scope,
+        );
         if candidate_mask.is_empty() {
             return None;
         }
@@ -5774,7 +5781,7 @@ impl LoadBalancer {
 
         let (healthy, _) = self.preferred_locality_bitset(
             &healthy,
-            &hard_eligible_locality_scope_bitset(&self.targets, filter, scope),
+            &locality_scope,
             self.locality_lb.as_ref(),
             self.failover_enabled,
         );
@@ -5847,8 +5854,12 @@ impl LoadBalancer {
         }
 
         let scope = bitset_for_indices(&port_state.target_indices);
-        let mut candidate_mask = scope;
-        clear_retry_exclusions(&self.targets, filter, contract, &mut candidate_mask);
+        let (candidate_mask, locality_scope) = split_retry_candidate_and_locality_scope_bitset(
+            &self.targets,
+            filter,
+            contract,
+            scope,
+        );
         if candidate_mask.is_empty() {
             return None;
         }
@@ -5866,7 +5877,7 @@ impl LoadBalancer {
 
         let (healthy, _) = self.preferred_locality_bitset(
             &healthy,
-            &hard_eligible_locality_scope_bitset(&self.targets, filter, scope),
+            &locality_scope,
             port_locality,
             port_state.failover_enabled,
         );
@@ -5966,8 +5977,12 @@ impl LoadBalancer {
         // remaining candidate ejected — wrongly returning None. Building the
         // mask is an alloc-free stack `u128` (no per-request `Vec`).
         let strict_scope = bitset_for_indices(subset_target_indices);
-        let mut candidate_mask = strict_scope;
-        clear_retry_exclusions(&self.targets, filter, contract, &mut candidate_mask);
+        let (candidate_mask, locality_scope) = split_retry_candidate_and_locality_scope_bitset(
+            &self.targets,
+            filter,
+            contract,
+            strict_scope,
+        );
         if candidate_mask.is_empty() {
             return None;
         }
@@ -5979,7 +5994,7 @@ impl LoadBalancer {
 
         let (subset_healthy, _) = self.preferred_locality_bitset(
             &subset_healthy,
-            &hard_eligible_locality_scope_bitset(&self.targets, filter, strict_scope),
+            &locality_scope,
             self.locality_lb.as_ref(),
             self.failover_enabled_for_subset(subset_name),
         );
@@ -6094,8 +6109,12 @@ impl LoadBalancer {
         // over the actual retry candidates rather than spending the budget on
         // an excluded target (see `select_excluding_from_subset`).
         let strict_scope = self.subset_port_mask(subset_target_indices, &port_state.target_indices);
-        let mut candidate_mask = strict_scope;
-        clear_retry_exclusions(&self.targets, filter, contract, &mut candidate_mask);
+        let (candidate_mask, locality_scope) = split_retry_candidate_and_locality_scope_bitset(
+            &self.targets,
+            filter,
+            contract,
+            strict_scope,
+        );
         if candidate_mask.is_empty() {
             return None;
         }
@@ -6111,7 +6130,7 @@ impl LoadBalancer {
             .or(self.locality_lb.as_ref());
         let (port_subset_healthy, _) = self.preferred_locality_bitset(
             &port_subset_healthy,
-            &hard_eligible_locality_scope_bitset(&self.targets, filter, strict_scope),
+            &locality_scope,
             port_locality,
             self.failover_enabled_for_port_subset(port_state, subset_name),
         );
@@ -6136,12 +6155,23 @@ impl LoadBalancer {
     ) -> Option<Arc<UpstreamTarget>> {
         // Strict locality uses the unexcluded lane for local-presence decisions;
         // retry exclusion only applies to selectable candidates.
-        let scope_indices: Vec<usize> = (0..self.targets.len()).collect();
-        let candidate_indices: Vec<usize> = scope_indices
-            .iter()
-            .copied()
-            .filter(|&idx| !filter.rejects(&self.targets[idx], contract))
-            .collect();
+        let (candidate_indices, locality_scope): (Vec<usize>, Vec<usize>) =
+            if filter.eligible.is_some() {
+                build_eligible_retry_candidate_and_locality_scope_indices(
+                    &self.targets,
+                    filter,
+                    contract,
+                    0..self.targets.len(),
+                )
+            } else {
+                let scope_indices: Vec<usize> = (0..self.targets.len()).collect();
+                let candidate_indices: Vec<usize> = scope_indices
+                    .iter()
+                    .copied()
+                    .filter(|&idx| !filter.rejects(&self.targets[idx], contract))
+                    .collect();
+                (candidate_indices, scope_indices)
+            };
         if candidate_indices.is_empty() {
             return None;
         }
@@ -6150,8 +6180,6 @@ impl LoadBalancer {
             return None;
         }
 
-        let locality_scope =
-            hard_eligible_locality_scope_indices(&self.targets, filter, &scope_indices);
         let (healthy, _) = self.preferred_locality_candidates(
             healthy,
             &locality_scope,
@@ -6171,13 +6199,24 @@ impl LoadBalancer {
     ) -> Option<Arc<UpstreamTarget>> {
         // Strict locality uses the unexcluded port lane for local-presence
         // decisions; retry exclusion only applies to selectable candidates.
-        let scope_indices: Vec<usize> = port_state.target_indices.clone();
-        let candidate_indices: Vec<usize> = port_state
-            .target_indices
-            .iter()
-            .copied()
-            .filter(|&idx| !filter.rejects(&self.targets[idx], contract))
-            .collect();
+        let (candidate_indices, locality_scope): (Vec<usize>, Vec<usize>) =
+            if filter.eligible.is_some() {
+                build_eligible_retry_candidate_and_locality_scope_indices(
+                    &self.targets,
+                    filter,
+                    contract,
+                    port_state.target_indices.iter().copied(),
+                )
+            } else {
+                let scope_indices: Vec<usize> = port_state.target_indices.clone();
+                let candidate_indices: Vec<usize> = port_state
+                    .target_indices
+                    .iter()
+                    .copied()
+                    .filter(|&idx| !filter.rejects(&self.targets[idx], contract))
+                    .collect();
+                (candidate_indices, scope_indices)
+            };
         if candidate_indices.is_empty() {
             return None;
         }
@@ -6189,8 +6228,6 @@ impl LoadBalancer {
             .locality_lb
             .as_ref()
             .or(self.locality_lb.as_ref());
-        let locality_scope =
-            hard_eligible_locality_scope_indices(&self.targets, filter, &scope_indices);
         let (candidates, _) = self.preferred_locality_candidates(
             candidates,
             &locality_scope,
@@ -6225,17 +6262,33 @@ impl LoadBalancer {
         // bitset path), so the cap's denominator/budget evaluate over the actual
         // retry candidates rather than spending the readmission on an excluded
         // target. A `Vec` here is acceptable — this is the >128-target fallback.
-        let strict_scope =
-            self.subset_port_intersection_vec(subset_indices, &port_state.target_indices);
-        let intersection: Vec<usize> = strict_scope
-            .iter()
-            .copied()
-            .filter(|&idx| !filter.rejects(&self.targets[idx], contract))
-            .collect();
-        if intersection.is_empty() {
+        let (candidate_indices, locality_scope): (Vec<usize>, Vec<usize>) =
+            if filter.eligible.is_some() {
+                let port_mask =
+                    membership_mask_for_indices(self.targets.len(), &port_state.target_indices);
+                build_eligible_retry_candidate_and_locality_scope_indices(
+                    &self.targets,
+                    filter,
+                    contract,
+                    subset_indices
+                        .iter()
+                        .copied()
+                        .filter(|&idx| port_mask.get(idx).copied().unwrap_or(false)),
+                )
+            } else {
+                let strict_scope =
+                    self.subset_port_intersection_vec(subset_indices, &port_state.target_indices);
+                let intersection: Vec<usize> = strict_scope
+                    .iter()
+                    .copied()
+                    .filter(|&idx| !filter.rejects(&self.targets[idx], contract))
+                    .collect();
+                (intersection, strict_scope)
+            };
+        if candidate_indices.is_empty() {
             return None;
         }
-        let candidates = self.healthy_targets_vec_for_indices(health, &intersection);
+        let candidates = self.healthy_targets_vec_for_indices(health, &candidate_indices);
         if candidates.is_empty() {
             return None;
         }
@@ -6243,8 +6296,6 @@ impl LoadBalancer {
             .locality_lb
             .as_ref()
             .or(self.locality_lb.as_ref());
-        let locality_scope =
-            hard_eligible_locality_scope_indices(&self.targets, filter, &strict_scope);
         let (candidates, _) = self.preferred_locality_candidates(
             candidates,
             &locality_scope,
@@ -6277,12 +6328,23 @@ impl LoadBalancer {
         // cap's denominator/budget evaluate over the actual retry candidates
         // rather than spending the readmission on an excluded target. A `Vec`
         // here is acceptable — this is the >128-target fallback.
-        let strict_scope = subset_indices.to_vec();
-        let candidate_indices: Vec<usize> = subset_indices
-            .iter()
-            .copied()
-            .filter(|&idx| !filter.rejects(&self.targets[idx], contract))
-            .collect();
+        let (candidate_indices, locality_scope): (Vec<usize>, Vec<usize>) =
+            if filter.eligible.is_some() {
+                build_eligible_retry_candidate_and_locality_scope_indices(
+                    &self.targets,
+                    filter,
+                    contract,
+                    subset_indices.iter().copied(),
+                )
+            } else {
+                let strict_scope = subset_indices.to_vec();
+                let candidate_indices: Vec<usize> = subset_indices
+                    .iter()
+                    .copied()
+                    .filter(|&idx| !filter.rejects(&self.targets[idx], contract))
+                    .collect();
+                (candidate_indices, strict_scope)
+            };
         if candidate_indices.is_empty() {
             return None;
         }
@@ -6291,8 +6353,6 @@ impl LoadBalancer {
         if subset_healthy.is_empty() {
             return None;
         }
-        let locality_scope =
-            hard_eligible_locality_scope_indices(&self.targets, filter, &strict_scope);
         let (subset_healthy, _) = self.preferred_locality_candidates(
             subset_healthy,
             &locality_scope,

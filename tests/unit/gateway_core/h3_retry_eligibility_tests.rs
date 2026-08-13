@@ -493,37 +493,37 @@ fn eligibility_is_pushed_into_selection_not_an_outer_probe_loop() {
         lb.contains("pub struct RetryCandidateFilter<'a>")
             && lb.contains("fn is_hard_ineligible(&self")
             && lb.contains("fn excludes_retry(&self")
-            && lb.contains("fn hard_eligible_locality_scope_bitset("),
+            && lb.contains("fn split_retry_candidate_and_locality_scope_bitset("),
         "load_balancer must separate soft retry exclusion from hard eligibility scope"
     );
 
     assert_eq!(
-        lb.matches("hard_eligible_locality_scope_bitset(&self.targets, filter,")
+        lb.matches("split_retry_candidate_and_locality_scope_bitset(")
             .count(),
-        4,
-        "all four bitset retry lanes must pass hard-eligible locality scope"
+        5,
+        "bitset retry lanes must derive candidate and locality scope in one pass"
     );
     assert_eq!(
-        lb.matches("hard_eligible_locality_scope_indices(&self.targets, filter,")
+        lb.matches("build_eligible_retry_candidate_and_locality_scope_indices(")
             .count(),
-        4,
-        "all four Vec-fallback retry lanes must pass hard-eligible locality scope"
+        5,
+        "Vec-fallback eligibility lanes must build both scope vectors in one pass"
+    );
+    assert!(
+        !lb.contains("hard_eligible_locality_scope_bitset(")
+            && !lb.contains("hard_eligible_locality_scope_indices(")
+            && !lb.contains("fn clear_retry_exclusions("),
+        "retry lanes must not perform a second hard-scope scan or extra filtered Vec"
     );
 
     // Every retry selection lane (upstream, per-port, subset, per-port × subset,
-    // plus their >128-target Vec fallbacks) must consult that one filter while
-    // building its candidate lane. Eight sites: four bitset `clear_retry_exclusions`
-    // calls and four `filter.rejects(...)` fallback filters.
-    assert_eq!(
-        lb.matches("clear_retry_exclusions(&self.targets, filter,")
-            .count(),
-        4,
-        "all four bitset retry lanes must clear via the shared candidate filter"
-    );
+    // plus their >128-target Vec fallbacks) must consult the shared filter while
+    // building its candidate lane. Four bitset split calls (one per lane) and
+    // four Vec fallback paths (eligibility-aware one-pass or ordinary filter).
     assert_eq!(
         lb.matches("!filter.rejects(&self.targets[idx]").count(),
         4,
-        "all four Vec-fallback retry lanes must filter via the shared candidate filter"
+        "ordinary Vec-fallback retry lanes must keep the pre-fix single-filter path"
     );
 
     // No outer probe loop and no accumulated exclusion set may return.
