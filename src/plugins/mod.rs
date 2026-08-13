@@ -3551,9 +3551,9 @@ impl RequestContext {
         }
     }
 
-    /// Absolute bound for a PRE-COMMITMENT response phase: the earliest of the
-    /// client RPC deadline and the admitted credential's authorization deadline
-    /// (issue #3815).
+    /// The composed bound for one pre-commitment response phase, captured
+    /// together with the authorization plan that a later expiry must be
+    /// attributed against (issue #3815).
     ///
     /// Every awaited response phase between backend convergence and the
     /// client-visible response head — `after_proxy`, the buffered
@@ -3567,22 +3567,18 @@ impl RequestContext {
     /// after the last pre-commitment await — and before the terminal summary is
     /// built — turns that into the fixed pre-commitment terminal.
     ///
+    /// The bound carries the authorization PLAN, not just the earliest instant:
+    /// a phase that kept only `deadline()` could not tell an authorization
+    /// expiry from the client's own RPC deadline. Taken BEFORE the phase future
+    /// borrows this context, because attributing the expiry afterwards needs
+    /// `&mut self` again.
+    ///
     /// The maximum comes from the process-wide value `EnvConfig::validate`
     /// publishes after its `1..=86400` range check, so this needs no config
     /// handle and cannot read an unvalidated number.
     ///
     /// `None` for an unauthenticated request with no RPC deadline — byte for
     /// byte the previous behavior.
-    pub(crate) fn precommit_response_phase_deadline_at(&self) -> Option<tokio::time::Instant> {
-        self.precommit_response_phase_bound().deadline()
-    }
-
-    /// The composed bound for one pre-commitment response phase, captured
-    /// together with the authorization plan that a later expiry must be
-    /// attributed against (issue #3815).
-    ///
-    /// Taken BEFORE the phase future borrows this context, because attributing
-    /// the expiry afterwards needs `&mut self` again.
     pub(crate) fn precommit_response_phase_bound(&self) -> PrecommitResponsePhaseBound {
         let authorization = crate::proxy::auth_lifetime::effective_request_auth_deadline(
             self,

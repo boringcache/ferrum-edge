@@ -311,6 +311,13 @@ impl AuthorizationConnectionCloser {
     }
 
     /// Whether a close has already been requested.
+    ///
+    /// Sender-side observation of the recorded decision. Tests read this so they
+    /// can prove the latch was stored without creating a receiver, which would
+    /// mask a silent `watch::Sender::send` drop. Production observes the same
+    /// value through [`subscribe`](Self::subscribe) and
+    /// [`authorization_close_requested`].
+    #[allow(dead_code)] // Used by external tests; dead code in the separately compiled bin target.
     #[must_use]
     pub fn close_requested(&self) -> bool {
         *self.0.borrow()

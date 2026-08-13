@@ -7244,6 +7244,13 @@ where
                         }
                         Poll::Ready(Ok(nw)) => {
                             state.pos += nw;
+                            // Count as soon as the destination accepts bytes,
+                            // matching splice. Waiting until the whole chunk
+                            // lands would report zero when a stalled write is
+                            // cut by the authorization deadline — the same
+                            // shape as the unbounded fast path, which this
+                            // direction-tracking path exists to avoid.
+                            bytes.fetch_add(nw as u64, Ordering::Relaxed);
                             if let Some(wm) = write_watermark {
                                 wm.store(coarse_now_ms(), Ordering::Relaxed);
                             }
@@ -7255,7 +7262,6 @@ where
                     }
                 }
 
-                bytes.fetch_add(state.cap as u64, Ordering::Relaxed);
                 state.pos = 0;
                 state.cap = 0;
                 state.phase = CopyPhase::Reading;

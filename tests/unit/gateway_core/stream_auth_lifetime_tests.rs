@@ -525,6 +525,56 @@ async fn the_userspace_frontend_leg_terminates_both_directions_at_the_deadline()
     leg.shutdown().await.expect("shutdown after deadline");
 }
 
+/// Backend that accepts the first non-empty write (level-triggered progress)
+/// and then parks forever on both halves. c2b therefore stays in `Writing`
+/// without polling the wrapped client leg; b2c parks on `poll_read`.
+struct StallAfterAcceptingWrite {
+    progress: tokio::sync::watch::Sender<u64>,
+}
+
+impl tokio::io::AsyncRead for StallAfterAcceptingWrite {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        _buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Pending
+    }
+}
+
+impl tokio::io::AsyncWrite for StallAfterAcceptingWrite {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        if *this.progress.borrow() > 0 {
+            return std::task::Poll::Pending;
+        }
+        let n = buf.len().min(1);
+        if n == 0 {
+            return std::task::Poll::Ready(Ok(0));
+        }
+        this.progress.send_replace(n as u64);
+        std::task::Poll::Ready(Ok(n))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Pending
+    }
+}
+
 /// A backend write stall after a client chunk is buffered must still terminate
 /// at the authorization deadline with ordinary relay timeouts disabled.
 ///
@@ -542,7 +592,10 @@ async fn a_stalled_backend_write_cannot_starve_the_tcp_authorization_deadline() 
     let before = counters();
 
     let (client, mut client_peer) = tokio::io::duplex(64 * 1024);
-    let (backend, _backend_peer) = tokio::io::duplex(32);
+    let (progress_tx, mut progress_rx) = tokio::sync::watch::channel(0u64);
+    let backend = StallAfterAcceptingWrite {
+        progress: progress_tx,
+    };
     let expired = Arc::new(AtomicBool::new(false));
     let deadline_at = tokio::time::Instant::now() + Duration::from_secs(2);
     client_peer
@@ -557,8 +610,11 @@ async fn a_stalled_backend_write_cannot_starve_the_tcp_authorization_deadline() 
         Arc::clone(&expired),
         8 * 1024,
     ));
-    tokio::task::yield_now().await;
-    tokio::task::yield_now().await;
+    progress_rx
+        .wait_for(|n| *n > 0)
+        .await
+        .expect("the copy must accept the buffered client chunk onto a stalled backend write");
+    let accepted = *progress_rx.borrow();
 
     tokio::time::sleep(Duration::from_secs(2)).await;
     let result = tokio::time::timeout(Duration::from_secs(1), copy)
@@ -585,9 +641,10 @@ async fn a_stalled_backend_write_cannot_starve_the_tcp_authorization_deadline() 
         relay_failure_is_client_facing(result.first_failure.as_ref().expect("failure")),
         "authorization expiry must stay health-neutral as a client-facing failure"
     );
-    assert!(
-        result.bytes_client_to_backend > 0,
-        "the buffered client chunk must be counted; a fast-path error reports zero"
+    assert_eq!(
+        result.bytes_client_to_backend, accepted,
+        "bytes the stalled backend already accepted must be counted; a fast-path \
+         error reports zero"
     );
 
     record_termination(

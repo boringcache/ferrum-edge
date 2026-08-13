@@ -7358,7 +7358,7 @@ pub mod _test_support {
     pub fn precommit_response_phase_deadline_for_test(
         ctx: &crate::plugins::RequestContext,
     ) -> Option<tokio::time::Instant> {
-        ctx.precommit_response_phase_deadline_at()
+        ctx.precommit_response_phase_bound().deadline()
     }
 
     /// A composed PRE-COMMITMENT response-phase bound, carried from composition
