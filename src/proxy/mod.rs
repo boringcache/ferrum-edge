@@ -95,6 +95,7 @@ mod mesh_tcp_egress;
 // Used by external tests; unused in the separately compiled bin target.
 pub(crate) use mesh_tcp_egress::connection_balancer as mesh_tcp_egress_connection_balancer;
 mod mesh_tcp_inbound;
+pub mod mesh_trust_registry;
 pub mod mesh_udp_capture;
 pub mod mesh_udp_frame;
 pub mod netns_capture;
@@ -6032,6 +6033,12 @@ pub struct ProxyState {
     /// Serializes the cold-path gateway SVID writers:
     /// CP-delivered trust-bundle apply, CP trust clear, and source SVID reload.
     pub gateway_svid_update_lock: Arc<std::sync::Mutex<()>>,
+    /// Ownership registry for every gateway-to-mesh TLS transport (issue
+    /// #3859). Both mesh pools register into it; an accepted authority-removing
+    /// trust publication retires the outgoing generation through it, which is
+    /// what actually terminates already-issued tunnels, cloned senders, and 1:1
+    /// bridges rather than only clearing the pool maps.
+    pub mesh_trust_registry: Arc<mesh_trust_registry::MeshTrustRegistry>,
     /// Listener-wide compatibility view of the dynamic mesh inbound TLS config.
     /// Mesh HTTP/HBONE accept loops use `mesh_inbound_tls_policy` as the single
     /// authoritative source; this derived slot remains for shared stream TLS
@@ -6807,11 +6814,43 @@ impl ProxyState {
     /// CP-delivered gateway trust. The gateway SVID source watcher can also swap
     /// the SVID bundle, so all gateway SVID slot writes are serialized by
     /// `gateway_svid_update_lock`.
+    ///
+    /// # Live withdrawal (issue #3859)
+    ///
+    /// A publication that no longer carries an authority the effective gateway
+    /// trust previously accepted is a **withdrawal**, and a withdrawal must
+    /// terminate live sessions, not merely stop future lookups from finding
+    /// them. When [`mesh_trust_registry::trust_withdrawal_reason`] reports one,
+    /// this fences new gateway-to-mesh admission, publishes the next accepted
+    /// trust generation, marks the outgoing one retired, synchronously signals
+    /// every transport registered under it, reopens admission, and only then
+    /// clears the mesh pool maps.
+    ///
+    /// Every no-churn shape is left completely alone: an identical `Replace`, an
+    /// additive overlap, an `Unchanged` side channel (which never reaches this
+    /// method), and a rejected candidate (which is refused before publication)
+    /// keep their generation, their pooled connections, and their live sessions.
     pub fn update_gateway_trust_bundles(&self, trust_bundles: RuntimeTrustBundleSet) {
         let _guard = self
             .gateway_svid_update_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let withdrawal = mesh_trust_registry::trust_withdrawal_reason(
+            self.effective_gateway_trust_bundles().as_ref(),
+            Some(&trust_bundles),
+            false,
+        );
+        let retirement = withdrawal.map(|reason| {
+            // FENCE + PUBLISH + RETIRE + SIGNAL, then reopen admission. Taken
+            // BEFORE the slots are swapped so no dial in flight can be admitted
+            // against material this publication is removing.
+            (
+                reason,
+                self.mesh_trust_registry.retire_for_trust_withdrawal(reason),
+            )
+        });
+
         self.gateway_trust_bundles
             .store(Arc::new(Some(trust_bundles.clone())));
 
@@ -6820,17 +6859,88 @@ impl ProxyState {
             bundle.trust_bundles = trust_bundles;
             self.gateway_svid_bundle.store(Arc::new(Some(bundle)));
         }
+
+        self.finish_gateway_trust_withdrawal(retirement);
     }
 
     /// Clear CP-delivered trust bundles and restore the latest source-loaded SVID.
+    ///
+    /// A `Clear` with no installed override, or one whose restored startup
+    /// material still carries every authority, is a no-op for live sessions. A
+    /// `Clear` that actually withdraws an authority runs the same fence /
+    /// publish / retire / signal sequence as [`Self::update_gateway_trust_bundles`].
     pub fn clear_gateway_trust_bundles(&self) {
         let _guard = self
             .gateway_svid_update_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let restored = self.gateway_file_svid_bundle.load_full();
+        let withdrawal = mesh_trust_registry::trust_withdrawal_reason(
+            self.effective_gateway_trust_bundles().as_ref(),
+            restored
+                .as_ref()
+                .as_ref()
+                .map(|bundle| &bundle.trust_bundles),
+            true,
+        );
+        let retirement = withdrawal.map(|reason| {
+            (
+                reason,
+                self.mesh_trust_registry.retire_for_trust_withdrawal(reason),
+            )
+        });
+
         self.gateway_trust_bundles.store(Arc::new(None));
-        self.gateway_svid_bundle
-            .store(self.gateway_file_svid_bundle.load_full());
+        self.gateway_svid_bundle.store(restored);
+
+        self.finish_gateway_trust_withdrawal(retirement);
+    }
+
+    /// The trust view gateway-to-mesh TLS actually verifies peers against right
+    /// now: the live SVID bundle's trust material when an SVID is installed,
+    /// otherwise the standalone CP override slot.
+    ///
+    /// Comparing against this rather than against the raw CP override is what
+    /// makes a `Clear` judged against the startup material it restores, so a
+    /// redundant `Clear` cannot look like a withdrawal.
+    fn effective_gateway_trust_bundles(&self) -> Option<RuntimeTrustBundleSet> {
+        let svid = self.gateway_svid_bundle.load_full();
+        if let Some(bundle) = svid.as_ref().as_ref() {
+            return Some(bundle.trust_bundles.clone());
+        }
+        self.gateway_trust_bundles.load_full().as_ref().clone()
+    }
+
+    /// Complete an accepted withdrawal: clear the mesh pool maps so no later
+    /// lookup can rediscover a retired connection, then log fixed-cardinality
+    /// counts. Ownership was already retired synchronously under the fence; this
+    /// is the bookkeeping half.
+    ///
+    /// No trust material, trust domain, subject, key id, fingerprint, source
+    /// path, or peer identity appears here — only the closed reason label and
+    /// counts.
+    fn finish_gateway_trust_withdrawal(
+        &self,
+        retirement: Option<(
+            mesh_trust_registry::TrustWithdrawalReason,
+            mesh_trust_registry::MeshTrustRetirementOutcome,
+        )>,
+    ) {
+        let Some((reason, outcome)) = retirement else {
+            return;
+        };
+        self.hbone_pool.force_drain_all();
+        self.mesh_mtls_pool.force_drain_all();
+        warn!(
+            reason = reason.as_str(),
+            retired_trust_generation = outcome.retired_generation,
+            accepted_trust_generation = outcome.published_generation,
+            retired_hbone_transports = outcome.retired_hbone,
+            retired_mesh_mtls_transports = outcome.retired_mesh_mtls,
+            "Gateway trust authority withdrawn; retired every live gateway-to-mesh transport \
+             authenticated under the outgoing trust generation"
+        );
     }
 
     pub(crate) fn install_gateway_runtime_svid_bundle(&self, bundle: SvidBundle) {
@@ -7532,6 +7642,13 @@ impl ProxyState {
         hbone_pool.attach_backend_conn_limit(backend_conn_limit.clone());
         mesh_mtls_pool.attach_backend_conn_limit(backend_conn_limit.clone());
         h3_pool.attach_backend_conn_limit(backend_conn_limit.clone());
+        // Gateway-to-mesh transport ownership registry (issue #3859). Both mesh
+        // pools register every transport they dial — pooled and 1:1 — so an
+        // accepted trust withdrawal can retire connection OWNERSHIP, not merely
+        // pool discoverability.
+        let mesh_trust_registry = mesh_trust_registry::MeshTrustRegistry::new();
+        hbone_pool.attach_mesh_trust_registry(mesh_trust_registry.clone());
+        mesh_mtls_pool.attach_mesh_trust_registry(mesh_trust_registry.clone());
         let backend_capabilities = Arc::new(BackendCapabilityRegistry::with_shard_amount(
             pool_shard_amount,
         ));
@@ -7935,6 +8052,7 @@ impl ProxyState {
             gateway_file_svid_bundle,
             gateway_trust_bundles,
             gateway_svid_update_lock: Arc::new(std::sync::Mutex::new(())),
+            mesh_trust_registry,
             mesh_inbound_tls,
             mesh_inbound_tls_policy,
             mesh_inbound_spiffe_verifier_active,

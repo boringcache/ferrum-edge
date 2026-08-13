@@ -41,6 +41,9 @@ use crate::config::types::{Proxy, UpstreamTarget};
 use crate::dns::DnsCache;
 use crate::identity::{SharedSvidBundle, SpiffeId, SvidBundle, TrustDomain};
 use crate::proxy::body::{ReplayableRequestBody, SizeLimitedIncoming};
+use crate::proxy::mesh_trust_registry::{
+    MeshTransportGate, MeshTransportKind, MeshTransportRegistration, MeshTrustRegistry,
+};
 use crate::tls::backend::BackendSvidGeneration;
 use crate::tls::spiffe::build_spiffe_outbound_config;
 
@@ -174,12 +177,32 @@ impl http_body::Body for MeshMtlsRequestBody {
 /// Multiplexed hyper H2 sender over the SVID-mTLS session.
 pub type MeshMtlsSender = http2::SendRequest<MeshMtlsRequestBody>;
 
+/// One established mesh-mTLS HTTP/2 transport, carried together with the
+/// retirement gate that owns it (issue #3859).
+///
+/// Pool-internal: `get_sender` still hands callers the bare [`MeshMtlsSender`],
+/// because the ownership that matters for withdrawal lives on the connection
+/// driver, not on the sender clone. Retiring the gate drops the driver, which
+/// closes the socket and makes every already-cloned sender fail readiness and
+/// refuse new streams.
+#[derive(Clone)]
+pub(crate) struct MeshMtlsTransport {
+    pub(crate) sender: MeshMtlsSender,
+    pub(crate) gate: MeshTransportGate,
+}
+
+impl MeshMtlsTransport {
+    fn is_retired(&self) -> bool {
+        self.gate.is_retired()
+    }
+}
+
 thread_local! {
     static MESH_MTLS_POOL_KEY_BUF: RefCell<String> = RefCell::new(String::with_capacity(192));
 }
 
 struct MeshMtlsPoolEntry {
-    sender: MeshMtlsSender,
+    transport: MeshMtlsTransport,
     /// Unix seconds of the last checkout; atomic so the shared-lock fast path
     /// refreshes recency without the exclusive shard write lock.
     last_used_at: AtomicU64,
@@ -476,6 +499,9 @@ pub struct MeshMtlsConnectionPool {
     /// [`MeshMtlsConnectionPool::attach_backend_conn_limit`]. Unset for focused
     /// tests and standalone callers, in which case no cap is enforced.
     backend_conn_limit: OnceLock<crate::backend_conn_limit::SharedBackendConnectionLimiter>,
+    /// Gateway-to-mesh transport ownership registry (issue #3859), installed
+    /// once by `ProxyState`. Unset for focused tests and standalone callers.
+    mesh_trust_registry: OnceLock<Arc<MeshTrustRegistry>>,
 }
 
 struct MeshMtlsSvidIdentityCache {
@@ -561,7 +587,21 @@ impl MeshMtlsConnectionPool {
             pool_config,
             last_idle_prune_unix_secs: AtomicU64::new(0),
             backend_conn_limit: OnceLock::new(),
+            mesh_trust_registry: OnceLock::new(),
         }
+    }
+
+    /// Install the gateway trust ownership registry (issue #3859) so every
+    /// mesh-mTLS transport this pool dials — pooled, raw-TCP 1:1, datagram 1:1,
+    /// or WebSocket 1:1 — is registered under the accepted gateway trust
+    /// generation and can be synchronously retired when an authority is
+    /// withdrawn. Idempotent; later calls are ignored.
+    pub fn attach_mesh_trust_registry(&self, registry: Arc<MeshTrustRegistry>) {
+        let _ = self.mesh_trust_registry.set(registry);
+    }
+
+    fn trust_registry(&self) -> Option<&Arc<MeshTrustRegistry>> {
+        self.mesh_trust_registry.get()
     }
 
     /// Install the gateway-wide `connectionPool.tcp.maxConnections` counter so
@@ -824,8 +864,8 @@ impl MeshMtlsConnectionPool {
             &pool_config,
             |key| self.try_cached_sender_read(key),
         );
-        if let Some(sender) = fast_sender {
-            return Ok(sender);
+        if let Some(transport) = fast_sender {
+            return Ok(transport.sender);
         }
 
         let key = with_mesh_mtls_pool_key(
@@ -853,6 +893,7 @@ impl MeshMtlsConnectionPool {
             &pool_config,
         )
         .await
+        .map(|transport| transport.sender)
     }
 
     /// Open a raw-TCP egress CONNECT tunnel to a peer sidecar's inbound mTLS
@@ -913,7 +954,9 @@ impl MeshMtlsConnectionPool {
         // is admitted on the destination's `maxConnections` lane (keyed by the
         // dial peer + the APP/service policy port, never `:15006`).
         let conn_admission = self.conn_admission(proxy, dial_host, target_policy_port);
-        let sender = dial_h2_connect_sender(
+        // Registered like every pooled transport (issue #3859): a 1:1 raw-TCP
+        // bridge never enters the pool map, so pool clearing could not reach it.
+        let transport = dial_h2_connect_sender(
             &self.dns_cache,
             &self.gateway_svid,
             self.crls.load_full(),
@@ -927,11 +970,13 @@ impl MeshMtlsConnectionPool {
             keepalive_override,
             Some(connect_timeout),
             conn_admission.as_ref(),
+            self.trust_registry(),
+            MeshTransportKind::MeshMtls,
         )
         .await?;
         tokio::time::timeout(
             connect_timeout,
-            open_h2_connect_stream(sender, authority_host, target_port, None, None),
+            open_h2_connect_stream(transport, authority_host, target_port, None, None),
         )
         .await
         .map_err(|_| HbonePoolError::ConnectStream {
@@ -1019,7 +1064,9 @@ impl MeshMtlsConnectionPool {
         // is admitted on the destination's `maxConnections` lane (keyed by the
         // dial peer + the APP/service policy port, never `:15006`).
         let conn_admission = self.conn_admission(proxy, dial_host, target_policy_port);
-        let sender = dial_h2_connect_sender(
+        // Registered like every pooled transport (issue #3859): a 1:1 datagram
+        // bridge never enters the pool map either.
+        let transport = dial_h2_connect_sender(
             &self.dns_cache,
             &self.gateway_svid,
             self.crls.load_full(),
@@ -1033,12 +1080,14 @@ impl MeshMtlsConnectionPool {
             keepalive_override,
             Some(connect_timeout),
             conn_admission.as_ref(),
+            self.trust_registry(),
+            MeshTransportKind::MeshMtls,
         )
         .await?;
         tokio::time::timeout(
             connect_timeout,
             open_h2_connect_stream(
-                sender,
+                transport,
                 authority_host,
                 target_port,
                 Some(&baggage),
@@ -1129,7 +1178,9 @@ impl MeshMtlsConnectionPool {
         // charge the one socket twice — and at `maxConnections: 1` the dial would refuse
         // itself, making every WebSocket upgrade to a capped mesh destination
         // fail. The session guard is the single owner; do NOT re-admit.
-        let sender = dial_h2_connect_sender(
+        // Registered like every pooled transport (issue #3859): a 1:1 WebSocket
+        // bridge never enters the pool map either.
+        let transport = dial_h2_connect_sender(
             &self.dns_cache,
             &self.gateway_svid,
             self.crls.load_full(),
@@ -1148,12 +1199,14 @@ impl MeshMtlsConnectionPool {
             None,
             // Caller-owned admission (see above).
             None,
+            self.trust_registry(),
+            MeshTransportKind::MeshMtls,
         )
         .await?;
         tokio::time::timeout(
             Duration::from_millis(proxy.backend_connect_timeout_ms),
             open_h2_ws_connect_stream(
-                sender,
+                transport,
                 authority,
                 path_and_query,
                 ws_handshake_headers,
@@ -1185,11 +1238,11 @@ impl MeshMtlsConnectionPool {
         sni_override: Option<&str>,
         key: &str,
         pool_config: &PoolConfig,
-    ) -> Result<MeshMtlsSender, HbonePoolError> {
+    ) -> Result<MeshMtlsTransport, HbonePoolError> {
         self.maybe_prune_idle_entries();
         let max_entries = pool_config.http2_connections_per_host.max(1);
-        if let Some(sender) = self.cached_sender(key, max_entries) {
-            return Ok(sender);
+        if let Some(transport) = self.cached_sender(key, max_entries) {
+            return Ok(transport);
         }
 
         let effective_connect_timeout_ms = proxy
@@ -1213,8 +1266,8 @@ impl MeshMtlsConnectionPool {
             })?;
         // Double-check under the creation lock: a coalesced waiter may find the
         // winner's connection already inserted.
-        if let Some(sender) = self.cached_sender(key, max_entries) {
-            return Ok(sender);
+        if let Some(transport) = self.cached_sender(key, max_entries) {
+            return Ok(transport);
         }
 
         let remaining = crate::pool::remaining_connect_timeout(creation_started, connect_timeout)
@@ -1238,7 +1291,7 @@ impl MeshMtlsConnectionPool {
             .and_then(|m| m.get(&app_policy_port))
             .and_then(|o| o.tcp_keepalive.as_ref());
         let pooled_conn_admission = self.conn_admission(proxy, target_host, app_policy_port);
-        let sender = match tokio::time::timeout(
+        let transport = match tokio::time::timeout(
             remaining,
             self.create_sender(
                 proxy,
@@ -1257,10 +1310,10 @@ impl MeshMtlsConnectionPool {
         )
         .await
         {
-            Ok(Ok(sender)) => {
+            Ok(Ok(transport)) => {
                 crate::runtime_metrics::global_ref()
                     .record_pool_handshake(crate::runtime_metrics::PoolKind::MeshMtls);
-                sender
+                transport
             }
             Ok(Err(err)) => {
                 crate::runtime_metrics::global_ref()
@@ -1296,6 +1349,12 @@ impl MeshMtlsConnectionPool {
             .current_svid_fingerprint_cached()
             .ok()
             .is_some_and(|current| mesh_mtls_key_svid_fingerprint(key) == Some(current.as_ref()));
+        // A gateway trust withdrawal that landed between registration and here
+        // already retired this transport; fail closed rather than pool or serve
+        // it (issue #3859).
+        if transport.is_retired() {
+            return Err(HbonePoolError::TrustWithdrawn);
+        }
         if !svid_slot_unchanged || !crls_unchanged || !key_fingerprint_is_current {
             debug!(
                 target_host,
@@ -1303,14 +1362,14 @@ impl MeshMtlsConnectionPool {
                 expected_peer = expected_peer_display(expected_peer),
                 "Sidecar SVID-mTLS connection completed under rotated TLS material; serving without pooling"
             );
-            return Ok(sender);
+            return Ok(transport);
         }
         self.entries
             .entry(key.to_string())
             .and_modify(|entries| {
                 record_mesh_mtls_evictions(prune_pool_entries(entries));
                 entries.push(MeshMtlsPoolEntry {
-                    sender: sender.clone(),
+                    transport: transport.clone(),
                     last_used_at: AtomicU64::new(unix_secs()),
                     idle_timeout_seconds: pool_config.idle_timeout_seconds,
                 });
@@ -1322,7 +1381,7 @@ impl MeshMtlsConnectionPool {
             })
             .or_insert_with(|| {
                 vec![MeshMtlsPoolEntry {
-                    sender: sender.clone(),
+                    transport: transport.clone(),
                     last_used_at: AtomicU64::new(unix_secs()),
                     idle_timeout_seconds: pool_config.idle_timeout_seconds,
                 }]
@@ -1333,22 +1392,24 @@ impl MeshMtlsConnectionPool {
             expected_peer = expected_peer_display(expected_peer),
             "Created sidecar SVID-mTLS HTTP/2 connection"
         );
-        Ok(sender)
+        Ok(transport)
     }
 
     /// Exclusive-lock scan: prune dead/idle entries, return the first live
     /// multiplexed sender. Unlike the HBONE pool there is no Ready/Pending
     /// split — hyper's H2 sender accepts new streams as long as the connection
     /// is open (`is_closed()`); per-stream backpressure is awaited at send.
-    fn cached_sender(&self, key: &str, _max_entries: usize) -> Option<MeshMtlsSender> {
+    fn cached_sender(&self, key: &str, _max_entries: usize) -> Option<MeshMtlsTransport> {
         let mut entries = self.entries.get_mut(key)?;
         record_mesh_mtls_evictions(prune_pool_entries(&mut entries));
         for entry in entries.iter() {
-            if entry.sender.is_closed() {
+            // A retired transport is never handed out again, even before its
+            // socket has finished closing (issue #3859). One relaxed load.
+            if entry.transport.is_retired() || entry.transport.sender.is_closed() {
                 continue;
             }
             entry.last_used_at.store(unix_secs(), Ordering::Relaxed);
-            return Some(entry.sender.clone());
+            return Some(entry.transport.clone());
         }
         None
     }
@@ -1357,7 +1418,7 @@ impl MeshMtlsConnectionPool {
     /// and refresh recency via a relaxed store, avoiding the exclusive shard
     /// write lock. Expired entries are skipped (not removed); dead senders fall
     /// through to the write path.
-    fn try_cached_sender_read(&self, key: &str) -> Option<MeshMtlsSender> {
+    fn try_cached_sender_read(&self, key: &str) -> Option<MeshMtlsTransport> {
         let entries = self.entries.get(key)?;
         let now = unix_secs();
         for entry in entries.value().iter() {
@@ -1365,11 +1426,11 @@ impl MeshMtlsConnectionPool {
             if entry_idle_expired(last_used, entry.idle_timeout_seconds, now) {
                 continue;
             }
-            if entry.sender.is_closed() {
+            if entry.transport.is_retired() || entry.transport.sender.is_closed() {
                 continue;
             }
             entry.last_used_at.store(now, Ordering::Relaxed);
-            return Some(entry.sender.clone());
+            return Some(entry.transport.clone());
         }
         None
     }
@@ -1421,7 +1482,14 @@ impl MeshMtlsConnectionPool {
         // A reserved slot is handed to the spawned connection driver below, so
         // it retires exactly when this pooled mesh-mTLS connection closes.
         conn_admission: Option<&crate::backend_conn_limit::PooledConnectionAdmission<'_>>,
-    ) -> Result<MeshMtlsSender, HbonePoolError> {
+    ) -> Result<MeshMtlsTransport, HbonePoolError> {
+        // Stamp the accepted trust generation BEFORE dialing (issue #3859); the
+        // registration below refuses a ticket the withdrawal path has since
+        // superseded, closing the creation race.
+        let admission_ticket = self
+            .trust_registry()
+            .map(|registry| registry.admission_ticket());
+        let trust_registry = self.trust_registry().cloned();
         let conn_slot = match conn_admission {
             Some(admission) => match admission.acquire() {
                 Ok(slot) => Some(slot),
@@ -1489,6 +1557,7 @@ impl MeshMtlsConnectionPool {
             // One reservation, cloned per DNS candidate: a failed attempt drops
             // its clone, so only an established connection keeps the slot.
             let conn_slot = conn_slot.clone();
+            let trust_registry = trust_registry.clone();
             async move {
                 let tcp = crate::socket_opts::connect_with_socket_opts(sock_addr)
                     .await
@@ -1557,23 +1626,54 @@ impl MeshMtlsConnectionPool {
                             message: e.to_string(),
                         })?;
 
+                // Admit the established transport under the generation it was
+                // dialed with, BEFORE the driver is spawned and before the
+                // sender can be pooled or served (issue #3859).
+                let gate = MeshTransportGate::new();
+                let registration: Option<Arc<MeshTransportRegistration>> =
+                    match (trust_registry.as_ref(), admission_ticket) {
+                        (Some(registry), Some(ticket)) => Some(
+                            registry
+                                .register(ticket, MeshTransportKind::MeshMtls, gate.clone())
+                                .map_err(|_| HbonePoolError::TrustWithdrawn)?,
+                        ),
+                        _ => None,
+                    };
+
                 // TLS ALPN already proved H2 for this sidecar candidate.
+                let driver_gate = gate.clone();
                 tokio::spawn(async move {
                     // The `maxConnections` slot lives exactly as long as the
                     // connection driver, i.e. as long as the socket is open.
                     let _conn_slot = conn_slot;
-                    if let Err(e) = connection.await {
-                        debug!(
-                            "mesh_mtls_pool: sidecar mTLS HTTP/2 connection closed: {}",
-                            e
-                        );
+                    // The registration lives exactly as long as the driver.
+                    let _registration = registration;
+                    tokio::pin!(connection);
+                    tokio::select! {
+                        biased;
+                        // Trust withdrawal. Returning drops the HTTP/2
+                        // connection, closing the socket, so every cloned sender
+                        // fails readiness and can open no further streams.
+                        () = driver_gate.cancelled() => {
+                            debug!(
+                                "mesh_mtls_pool: sidecar mTLS HTTP/2 connection retired after gateway trust withdrawal"
+                            );
+                        }
+                        result = &mut connection => {
+                            if let Err(e) = result {
+                                debug!(
+                                    "mesh_mtls_pool: sidecar mTLS HTTP/2 connection closed: {}",
+                                    e
+                                );
+                            }
+                        }
                     }
                 });
-                Ok(sender)
+                Ok(MeshMtlsTransport { sender, gate })
             }
         })
         .await
-        .map(|(sender, _)| sender)
+        .map(|(transport, _)| transport)
         .map_err(|error| match error {
             crate::dns::CandidateConnectError::TimedOut { last_addr } => {
                 HbonePoolError::ConnectTimeout {
@@ -1609,7 +1709,10 @@ fn prune_pool_entries(entries: &mut Vec<MeshMtlsPoolEntry>) -> usize {
     let before = entries.len();
     let now = unix_secs();
     entries.retain(|entry| {
-        !entry.sender.is_closed()
+        // Retired by a gateway trust withdrawal: evict without consulting the
+        // socket at all (issue #3859).
+        !entry.transport.is_retired()
+            && !entry.transport.sender.is_closed()
             && !entry_idle_expired(
                 entry.last_used_at.load(Ordering::Relaxed),
                 entry.idle_timeout_seconds,

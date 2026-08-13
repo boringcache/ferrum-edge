@@ -3715,6 +3715,62 @@ Non-mesh gateway modes (`database`, `file`, `cp`, `dp`) can route traffic into t
 
 The Control Plane distributes gateway SPIFFE trust bundles to Data Planes via a `trust_bundles_json` side channel on the `ConfigUpdate` proto message. DPs hot-swap received bundles into the gateway SVID identity slot, enabling mutual TLS with mesh sidecars without requiring the DP to independently obtain certificates.
 
+### Live Trust Withdrawal
+
+Withdrawing a gateway trust authority retires **connection ownership**, not only pool
+discoverability. Clearing the HBONE / mesh-mTLS pool maps stops future lookups from
+finding a connection, but an already-issued `H2ConnectTunnel` owns its HTTP/2 streams
+directly, a cloned sender can open fresh streams on the established TLS session, and the
+one-connection-per-session WebSocket / datagram / raw-CONNECT bridges were never in the
+map at all. Every one of those would otherwise keep carrying traffic authenticated under
+the withdrawn root until its own EOF or idle timeout.
+
+Every gateway-to-mesh TLS transport — pooled and 1:1 alike — registers with the
+per-process gateway trust registry (`src/proxy/mesh_trust_registry.rs`) when its
+connection driver is spawned, under the accepted trust generation, and hands its driver a
+retirement gate that travels with the sender and the tunnel rather than living in the pool.
+
+When an accepted `Replace` or `Clear` removes any authority from the **effective**
+gateway trust view (the material `build_spiffe_outbound_config` verifies peers against —
+so a `Clear` is judged against the startup material it restores), the publication path in
+`ProxyState::update_gateway_trust_bundles` / `clear_gateway_trust_bundles` runs one
+ordered sequence:
+
+1. fence new gateway-to-mesh admission;
+2. publish the next accepted trust generation;
+3. mark the outgoing generation retired;
+4. synchronously signal every transport registered under it;
+5. reopen admission;
+6. clear the HBONE and mesh-mTLS pool maps.
+
+Signalling is synchronous — the gate is set before the fence is released — so no transport
+can be admitted, pooled, or handed to a caller in the window between publication and
+teardown. Completing the teardown (dropping the HTTP/2 connection, which closes the socket
+and errors every stream on it) is a bounded task wake, not a drain timer: it does not wait
+on peer behaviour, backend liveness, or `FERRUM_SHUTDOWN_DRAIN_SECONDS`. A retired tunnel's
+next read or write fails with a fixed `gateway trust authority withdrawn` error that names
+no trust material, subject, key id, fingerprint, path, or peer identity.
+
+The **creation race** is closed by the same generation stamp: a dial takes an admission
+ticket before connecting, and a connection that completes after the publication is refused
+at registration (`HbonePoolError::TrustWithdrawn`), so it is neither pooled nor returned.
+Pool insertion re-checks the gate for the same reason.
+
+No-churn behaviour is preserved exactly. An identical `Replace`, an additive overlap
+(`before ⊆ after`), an `Unchanged` side channel, a `Clear` with no installed override, a
+`Clear` whose restored startup material still carries every authority, and every rejected
+candidate leave the generation, the registry, and every live session untouched — a rejected
+candidate never reaches the publication path at all, so it keeps the last-good generation
+and its sessions. A JWT authority swapped in place under one `kid` **is** a withdrawal.
+
+Observability is four fixed-cardinality families over closed label sets
+(`ferrum_gateway_trust_accepted_generation`, `ferrum_gateway_trust_withdrawals_total{reason}`,
+`ferrum_gateway_trust_retired_transports_total{transport}`,
+`ferrum_gateway_trust_admission_refusals_total{transport}`; `reason` ∈
+`replace_removed_authority`, `cleared_override`; `transport` ∈ `hbone`, `mesh_mtls`). The
+generation is a local monotonic counter that identifies no authority, and no metric label,
+sample value, log field, or client-visible error carries trust material.
+
 ### HBONE Outbound Pool
 
 When an upstream target is tagged with `mesh.hbone=true` metadata, the gateway routes requests through an HBONE HTTP/2 CONNECT pool (`HboneOutboundPool`) instead of direct HTTP. The pool uses the gateway's SPIFFE identity for mTLS and keys connections by SVID fingerprint so certificate rotation triggers fresh connections. DNS resolution uses the shared `DnsCacheResolver`. A target may optionally carry `mesh.hbone_dial_host` to separate the outer TCP/TLS destination from the inner CONNECT authority host, and `mesh.hbone_peer_spiffe_id` to pin a waypoint/relay peer identity while leaving `mesh.spiffe_id` as destination workload metadata.
