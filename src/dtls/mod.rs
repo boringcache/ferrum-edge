@@ -153,13 +153,17 @@ pub struct DtlsServerLimits {
     /// is eventually consistent with `active_sessions` and is not used for
     /// admission control.
     pub active_session_mirror: Option<Arc<AtomicU64>>,
-    /// Datagram client-address metadata gate (issue #3289). `Some` only when
-    /// the `dtls` proxy sets `stream_proxy_protocol: true`; then every datagram
-    /// reaching the demuxer must carry a trusted, well-formed (and, when a
-    /// secret is configured, authenticated) PROXY v2 DGRAM envelope. The
-    /// envelope is stripped before the DTLS record layer sees a byte, and the
-    /// forwarded address becomes the accepted connection's client identity.
-    /// `None` keeps ordinary DTLS behavior.
+    /// Datagram client-address metadata gate (issues #3289, #3856, #3862).
+    /// `Some` only when the `dtls` proxy sets `stream_proxy_protocol: true`;
+    /// then every datagram reaching the demuxer must carry a trusted,
+    /// well-formed (and, when a secret is configured, listener-bound,
+    /// authenticated, and fresh) PROXY v2 DGRAM envelope. The gate's binding
+    /// names the DTLS receive boundary specifically, so an envelope minted for
+    /// the plain-UDP boundary on the same numeric port cannot be laundered in
+    /// here. Validation happens before demux, before any per-peer allocation,
+    /// and before the DTLS record layer sees a byte; the forwarded address
+    /// becomes the accepted connection's client identity. `None` keeps ordinary
+    /// DTLS behavior.
     pub datagram_client_address:
         Option<Arc<crate::proxy::datagram_client_address::DatagramClientAddressGate>>,
     /// Counter incremented for every datagram the gate refuses. Shared with the

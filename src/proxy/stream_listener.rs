@@ -809,6 +809,12 @@ struct DesiredStreamListener {
     /// the restart key — the receive loop captures the gate at spawn, so a
     /// toggle must rebuild the listener rather than keep decoding (or not
     /// decoding) under the previous decision.
+    ///
+    /// The gate's other inputs — receive-boundary protocol (`frontend_tls` /
+    /// `passthrough`), `bind_addr`, and `port` — are already restart-key fields
+    /// on their own, which is what guarantees a reloaded listener rebuilds the
+    /// correct domain binding (issue #3856) instead of inheriting another
+    /// listener's, and starts from a fresh replay window (issue #3862).
     datagram_client_address: bool,
     backend_tls_reload_key: Option<BackendTlsReloadKey>,
     sni_ids: Option<Vec<NamespacedResourceId>>,
@@ -1006,9 +1012,10 @@ pub struct StreamListenerManager {
     /// (`FERRUM_DATAGRAM_PROXY_PROTOCOL_SECRET`, issue #3289), published after
     /// construction by [`Self::set_datagram_client_address_secret`] because the
     /// manager is built before that value is threaded in. `None` leaves
-    /// udp/dtls metadata trust resting on `FERRUM_TRUSTED_PROXIES` alone; it
-    /// never disables the envelope itself, so a listener can not silently fall
-    /// back to the socket peer.
+    /// udp/dtls metadata trust resting on `FERRUM_TRUSTED_PROXIES` alone (with
+    /// no authenticity and no freshness); it never disables the envelope itself,
+    /// so a listener can not silently fall back to the socket peer. Published
+    /// once at startup — the secret does not rotate under a live listener.
     datagram_client_address_secret: arc_swap::ArcSwapOption<String>,
     /// The ONE gateway-wide DestinationRule `connectionPool.tcp.maxConnections`
     /// counter, shared with `ProxyState` and therefore with WebSocket, the
@@ -2306,20 +2313,32 @@ impl StreamListenerManager {
                     None
                 };
                 let metrics = Arc::new(UdpProxyMetrics::default());
-                // Datagram client-address metadata gate (issue #3289), built
-                // once per listener from the process-wide trust boundary, the
-                // optional MAC key, and this listener's exact `listen_port`.
-                // Reload reconstructs the gate so dest-port binding cannot
-                // stick to a previous port. `None` unless this proxy opted in,
-                // so an ordinary udp/dtls listener keeps its exact prior
-                // behavior.
+                // Datagram client-address metadata gate (issues #3289, #3856,
+                // #3862), built once per listener from the process-wide trust
+                // boundary, the optional MAC key, and this listener's exact
+                // domain identity: receive-boundary protocol (DTLS-terminating
+                // versus plain UDP), canonical bind address, and port. Every
+                // component of that identity is already part of the listener
+                // restart key, so a reload reconstructs the correct binding —
+                // and a fresh replay window — instead of inheriting the
+                // previous listener's. `None` unless this proxy opted in, so an
+                // ordinary udp/dtls listener keeps its exact prior behavior.
                 let datagram_client_address = datagram_client_address.then(|| {
-                    use crate::proxy::datagram_client_address::DatagramClientAddressGate;
+                    use crate::proxy::datagram_client_address::{
+                        DatagramClientAddressGate, DatagramListenerBinding,
+                        DatagramListenerProtocol,
+                    };
+                    let protocol = if frontend_dtls_config.is_some() {
+                        DatagramListenerProtocol::Dtls
+                    } else {
+                        DatagramListenerProtocol::Udp
+                    };
                     let secret = self.datagram_client_address_secret.load();
                     let gate = DatagramClientAddressGate::new(
                         self.trusted_proxies.clone(),
                         secret.as_deref().map(String::as_str),
-                        port_val,
+                        DatagramListenerBinding::new(protocol, bind_addr, port_val),
+                        self.pool_shard_amount,
                     );
                     Arc::new(gate)
                 });

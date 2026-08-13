@@ -2703,10 +2703,15 @@ pub struct Proxy {
     ///   unordered, lossy transport). A datagram that does not decode is
     ///   dropped; nothing is forwarded and no session is created. When
     ///   `FERRUM_DATAGRAM_PROXY_PROTOCOL_SECRET` is set, every datagram must
-    ///   also carry a valid HMAC-SHA-256 tag. An identity-bearing envelope's
-    ///   declared destination port must match this proxy's `listen_port`, so a
-    ///   process-global secret cannot make a valid envelope for listener A
-    ///   portable onto listener B. Ferrum never emits the envelope toward the
+    ///   also carry a valid HMAC-SHA-256 tag and an authenticated freshness
+    ///   record. The tag covers a versioned domain-separation prefix naming the
+    ///   exact receiving listener (receive-boundary protocol, canonical bind
+    ///   address, port), so a process-global secret cannot make a valid envelope
+    ///   for listener A verify on listener B — for every command and family,
+    ///   `LOCAL` and `AF_UNSPEC` included. The envelope's declared destination
+    ///   port is also compared to this proxy's `listen_port` as defense in
+    ///   depth, and a bounded per-sender replay window admits each authenticated
+    ///   sequence at most once. Ferrum never emits the envelope toward the
     ///   backend; replies go back to the socket peer unwrapped.
     ///
     /// **Trust requirement**: the forwarded address is honoured only when the

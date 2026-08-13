@@ -24,6 +24,23 @@
 //! inherit an identity it never proved, and datagram delivery is unordered and
 //! lossy, so there is no "first" datagram to rely on.
 //!
+//! # Three separate properties
+//!
+//! The authenticated envelope provides three *distinct* guarantees. Do not
+//! conflate them, and do not weaken one on the strength of another:
+//!
+//! 1. **Authenticity** — the tag proves the envelope and payload were minted by
+//!    a holder of `FERRUM_DATAGRAM_PROXY_PROTOCOL_SECRET`.
+//! 2. **Listener-domain binding** (issue #3856) — the tag is computed over a
+//!    versioned domain-separation prefix naming the *exact receiving listener*,
+//!    so an envelope minted for listener A can never authenticate on listener B
+//!    even though both key from one process-global root secret. This holds for
+//!    every command and family, `LOCAL` and `AF_UNSPEC` included.
+//! 3. **Freshness / anti-replay** (issue #3862) — an authenticated envelope
+//!    carries a bounded, authenticated freshness record, and the receiver keeps
+//!    a bounded sliding replay window per sender so each `(sender, epoch,
+//!    sequence)` is admitted at most once.
+//!
 //! # Security model
 //!
 //! The mechanism is off unless an operator sets `stream_proxy_protocol: true`
@@ -34,46 +51,132 @@
 //! - The socket peer remains `source.ip` / `direct_client_ip` **always**. Only
 //!   the authenticated envelope may set `remote.ip` / `client_ip`.
 //! - When `FERRUM_DATAGRAM_PROXY_PROTOCOL_SECRET` is configured, every datagram
-//!   must additionally carry a valid HMAC-SHA-256 tag ([`AUTH_TLV_TYPE`]) that
-//!   covers the whole header *and* the payload. Source addresses are trivially
-//!   spoofable on UDP, so this is the only thing that makes trust in a datagram
-//!   peer meaningful on a network the operator does not fully control. The tag
-//!   binds metadata to payload; it is not an anti-replay mechanism (a verbatim
-//!   replay of a datagram remains possible, exactly as it is for plain UDP).
+//!   must additionally carry a valid HMAC-SHA-256 tag ([`AUTH_TLV_TYPE`]) and a
+//!   valid freshness record ([`FRESHNESS_TLV_TYPE`]). Source addresses are
+//!   trivially spoofable on UDP, so this is the only thing that makes trust in
+//!   a datagram peer meaningful on a network the operator does not fully
+//!   control.
 //! - Anything else fails closed: no signature, truncated header, oversized
 //!   address block, wrong address family, any transport but `DGRAM` on a
 //!   `PROXY` command (`STREAM` — i.e. a TCP header replayed onto the datagram
 //!   path — is refused whatever family it declares, `AF_UNSPEC` included),
-//!   malformed TLVs, a missing or invalid authentication tag, or a destination
-//!   port that does not match the receiving listener. There is no fallback to
-//!   the socket peer, because that would silently downgrade a spoofed datagram
-//!   into an accepted one.
+//!   malformed TLVs, a missing or invalid authentication tag, a missing or
+//!   malformed freshness record, a duplicate/stale sequence, a declared
+//!   destination port that does not match the receiving listener, or replay
+//!   state exhaustion. There is no fallback to the socket peer, because that
+//!   would silently downgrade a spoofed datagram into an accepted one.
 //!
-//! The HMAC tag authenticates the destination bytes but is keyed by a
-//! process-global secret, so a valid envelope minted for listener port A would
-//! otherwise verify on listener port B. The gate therefore captures the
-//! receiving `listen_port` at construction and refuses an identity-bearing
-//! `PROXY` envelope whose declared destination port differs, before any
-//! session, demux allocation, plugin hook, or backend send. `LOCAL` and
-//! `AF_UNSPEC` still never set a forwarded identity; they are not dest-port
-//! bound, because they cannot confer one.
+//! ## Listener-domain binding
+//!
+//! The MAC input is
+//!
+//! ```text
+//!   DOMAIN_LABEL || binding_version || protocol_tag
+//!                || family_tag || bind_addr octets || listen_port
+//!                || <the complete datagram with the 32 tag bytes elided>
+//! ```
+//!
+//! The binding half is [`DatagramListenerBinding`], serialized once at gate
+//! construction into a fixed-size inline buffer, so the receive path absorbs it
+//! without re-serializing and without allocating. It is derived entirely from
+//! *configured/bound listener properties* — never from envelope bytes:
+//!
+//! - `protocol_tag` distinguishes the plain-UDP receive boundary from the
+//!   DTLS-terminating one, so the same numeric port cannot be crossed between a
+//!   `udp` and a `dtls` frontend.
+//! - `family_tag` + `bind_addr` is the listener's **canonical bind address**
+//!   (IPv4-mapped IPv6 folded to IPv4), so a wildcard bind (`0.0.0.0` / `::`)
+//!   and a specific-address bind on the same numeric port are different domains
+//!   and cannot be crossed either.
+//! - `listen_port` is the exact receiving port.
+//!
+//! Because the binding is inside the MAC input, a cross-listener replay fails
+//! as [`DatagramMetadataError::AuthenticationTagMismatch`] for every envelope
+//! form. The envelope's own declared destination port is *also* compared to the
+//! listener's port as defense in depth; that check runs first, so an
+//! address-bearing cross-listener envelope reports the more specific
+//! [`DatagramMetadataError::ListenerBindingMismatch`]. Neither check is
+//! sufficient alone: the declared destination cannot cover `LOCAL` /
+//! `AF_UNSPEC` (they carry no address), and the MAC alone cannot produce a
+//! distinguishable reason.
+//!
+//! The root secret is read once at startup, so it does not rotate under a live
+//! listener; a listener reload reconstructs the binding from the live bind
+//! address, protocol, and port rather than inheriting the previous listener's.
+//!
+//! ## Freshness and anti-replay
+//!
+//! An authenticated envelope carries exactly one [`FRESHNESS_TLV_TYPE`] TLV
+//! whose 29-byte value is
+//!
+//! ```text
+//!   version u8 | sender_id u32 BE | epoch u64 BE | sequence u64 BE
+//!              | timestamp_ms u64 BE
+//! ```
+//!
+//! Every field is inside the MAC input, so none of it is usable unless the
+//! sender holds the root secret and minted it for *this* listener.
+//!
+//! The receiver keeps one bounded record per authenticated `sender_id`
+//! (per listener): the highest admitted sequence for the sender's current
+//! epoch, plus a [`REPLAY_WINDOW_BITS`]-bit bitmap of the sequences immediately
+//! below it. Check-and-mark happens under a single `DashMap` shard write guard,
+//! so it is one synchronization event and two receive workers can never both
+//! admit one sequence.
+//!
+//! - a sequence equal to the highest, or already marked in the window, is a
+//!   duplicate;
+//! - a sequence more than [`REPLAY_WINDOW_BITS`] behind the highest is stale;
+//! - `u64::MAX` is reserved so a sender must roll its epoch before the sequence
+//!   space wraps;
+//! - an epoch below the sender's current one is stale; a higher epoch is a
+//!   sender restart/rotation and reseeds the window at that sequence.
+//!
+//! `timestamp_ms` is checked against the receiver's clock with a fixed
+//! [`FRESHNESS_HORIZON_MS`] tolerance in both directions. That is what makes
+//! the *lifecycle* guarantees statable, and what makes bounded eviction safe.
+//!
+//! ### What is guaranteed, and what is not
+//!
+//! - **Within one Ferrum process, per listener**: every authenticated envelope
+//!   is admitted **at most once**. A byte-for-byte replay is refused before any
+//!   session, DTLS allocation, plugin hook, backend send, or idle refresh.
+//! - **Across a listener reload, a receiver process restart, or another Ferrum
+//!   replica**: replay protection is process-local, so exposure is *bounded to
+//!   [`FRESHNESS_HORIZON_MS`]* by the authenticated timestamp horizon — an
+//!   envelope older than that is refused by any receiver, restarted or not.
+//!   Ferrum does **not** claim cluster-wide anti-replay; the supported
+//!   deployment contract is per-flow sender stickiness (a datagram balancer
+//!   already pins one client flow to one Ferrum socket) plus that horizon.
+//! - **Sender restart**: the sender must publish a strictly higher `epoch`.
+//!   Reusing an old epoch with restarted sequence numbers is refused as stale.
+//!
+//! State is bounded at [`MAX_REPLAY_SENDERS`] senders per listener. At capacity
+//! the guard first reclaims entries idle longer than `4 ×
+//! FRESHNESS_HORIZON_MS` and, if that frees nothing, refuses with
+//! [`DatagramMetadataError::ReplayStateCapacity`] rather than evicting live
+//! protection. The idle threshold exceeds `2 × FRESHNESS_HORIZON_MS` on
+//! purpose: an envelope that could still be inside the horizon after the
+//! reclaim would need a timestamp newer than the entry's last activity plus
+//! `2 × FRESHNESS_HORIZON_MS`, so reclaiming can never make an old sequence
+//! valid again.
 //!
 //! Diagnostics are field-specific but bounded: they name the field and, at
 //! most, the offending numeric code or length. Payload bytes, tag bytes,
-//! secrets, and addresses asserted inside the envelope never appear in a log
-//! record.
+//! secrets, sequence-cache contents, and addresses asserted inside the envelope
+//! never appear in a log record.
 //!
 //! # Relationship to the TCP PROXY parser
 //!
 //! [`crate::proxy::proxy_protocol`] is the connection-borne TCP parser (v1
 //! text and v2 binary, STREAM transport, one header per connection). This
 //! module is a separate per-datagram parser: it requires `DGRAM` transport,
-//! walks the auth-TLV region, binds destination port to the receiving
-//! listener, and never allocates. Signature, version, family codes, and the
-//! 512-byte address-block cap MUST stay aligned with that parser; a spec-level
-//! fix must update both. Do not collapse them into one abstraction — the
-//! datagram path's transport, auth-TLV, dest-port, and hot-path checks would
-//! be lost.
+//! walks the auth/freshness TLV region, binds the MAC to the receiving
+//! listener, enforces freshness, and never allocates on the receive path.
+//! Signature, version, family codes, and the 512-byte address-block cap MUST
+//! stay aligned with that parser; a spec-level fix must update both. Do not
+//! collapse them into one abstraction — the datagram path's transport,
+//! auth-TLV, listener-binding, freshness, and hot-path checks would be lost.
 //!
 //! # Spec references
 //!
@@ -83,6 +186,9 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use dashmap::DashMap;
 
 use crate::fips::approved::HmacSha256Key;
 use crate::proxy::client_ip::TrustedProxies;
@@ -111,13 +217,269 @@ pub const AUTH_TLV_TYPE: u8 = 0xE0;
 /// Length of the authentication tag value.
 pub const AUTH_TAG_LEN: usize = 32;
 
+/// TLV type carrying the authenticated freshness record (issue #3862).
+///
+/// Also inside the `0xE0`..`0xEF` application-reserved range.
+pub const FRESHNESS_TLV_TYPE: u8 = 0xE1;
+/// Version byte of the freshness record. A different value is refused rather
+/// than best-effort parsed, so the extension can be revised without a receiver
+/// ever guessing at an unknown layout.
+pub const FRESHNESS_VERSION: u8 = 0x01;
+/// Exact length of a [`FRESHNESS_TLV_TYPE`] value: version(1) + sender_id(4) +
+/// epoch(8) + sequence(8) + timestamp_ms(8).
+pub const FRESHNESS_VALUE_LEN: usize = 29;
+/// Full on-wire size of the freshness TLV, header included.
+pub const FRESHNESS_TLV_LEN: usize = 3 + FRESHNESS_VALUE_LEN;
+
+/// Accepted skew, in either direction, between an envelope's authenticated
+/// `timestamp_ms` and the receiver's clock.
+///
+/// This is deliberately a compile-time constant rather than an operator knob:
+/// it is the *security horizon* the lifecycle guarantees are stated in terms
+/// of, and a deployment that could widen it could silently widen the
+/// cross-restart / cross-replica replay window. Senders and receivers must
+/// therefore agree on wall-clock time to within this tolerance (ordinary NTP
+/// synchronization is orders of magnitude tighter).
+pub const FRESHNESS_HORIZON_MS: u64 = 30_000;
+
+/// Width of the per-sender sliding replay window, in sequence numbers below the
+/// highest admitted one. Unique reordering inside this range is admitted once
+/// each; anything further behind is stale.
+pub const REPLAY_WINDOW_BITS: u64 = 64;
+
+/// Maximum number of distinct authenticated senders one listener keeps replay
+/// state for. Reached only by a sender population this large or by a
+/// compromised sender minting `sender_id`s (an off-path attacker cannot: the
+/// field is inside the MAC).
+pub const MAX_REPLAY_SENDERS: usize = 1024;
+
+/// Idle threshold for reclaiming a sender's replay record.
+///
+/// Strictly greater than `2 × FRESHNESS_HORIZON_MS`, which is what makes
+/// reclaiming safe: for a previously admitted envelope to be accepted again
+/// after its record is reclaimed, its authenticated timestamp would have to be
+/// no older than `now − FRESHNESS_HORIZON_MS` while also being no newer than
+/// `last_activity + FRESHNESS_HORIZON_MS`. With `now ≥ last_activity + 4 ×
+/// FRESHNESS_HORIZON_MS` those two ranges cannot overlap, so the horizon check
+/// refuses it before the (now absent) window ever matters.
+const REPLAY_ENTRY_IDLE_MS: u64 = 4 * FRESHNESS_HORIZON_MS;
+
+/// Minimum interval between idle-reclaim sweeps, so a hostile flood of new
+/// `sender_id`s at capacity cannot turn every datagram into a full map scan.
+const REPLAY_RECLAIM_MIN_INTERVAL_MS: u64 = 250;
+
+/// Versioned domain-separation label absorbed ahead of every MAC input.
+const DOMAIN_LABEL: &[u8] = b"ferrum-datagram-proxy-v1";
+/// Version of the binding serialization that follows [`DOMAIN_LABEL`].
+const DOMAIN_BINDING_VERSION: u8 = 0x01;
+/// Upper bound on the serialized domain prefix: label + version + protocol +
+/// family tag + 16 address bytes + 2 port bytes.
+const DOMAIN_PREFIX_MAX: usize = 48;
+
 /// Minimum accepted length of `FERRUM_DATAGRAM_PROXY_PROTOCOL_SECRET`.
 pub const MIN_DATAGRAM_SECRET_BYTES: usize = 32;
+
+/// Canonical protocol half of a listener's domain identity.
+///
+/// This is the *receive boundary*, not the backend scheme: a `udp` proxy with
+/// `frontend_tls: true` terminates DTLS and therefore validates envelopes in
+/// [`crate::dtls::DtlsServer::run`], while every other udp/dtls listener
+/// validates them in `udp_proxy::process_datagram`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatagramListenerProtocol {
+    /// Plain UDP receive boundary.
+    Udp,
+    /// DTLS-terminating frontend receive boundary (pre-demux).
+    Dtls,
+}
+
+impl DatagramListenerProtocol {
+    /// Stable wire tag. Never renumber: it is inside the MAC input, so a
+    /// renumbering would invalidate every sender's envelopes.
+    const fn tag(self) -> u8 {
+        match self {
+            Self::Udp => 0x01,
+            Self::Dtls => 0x02,
+        }
+    }
+}
+
+/// The exact receiving listener an authenticated envelope is bound to.
+///
+/// Built from configured/bound listener properties only. Two listeners in one
+/// process that differ in *any* of protocol, canonical bind address, or port
+/// are different cryptographic domains, so a valid envelope for one can never
+/// authenticate on the other (issue #3856).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DatagramListenerBinding {
+    protocol: DatagramListenerProtocol,
+    /// Canonical bind address: exactly what the listener bound, with an
+    /// IPv4-mapped IPv6 form folded to IPv4 so `::ffff:10.0.0.5` and `10.0.0.5`
+    /// are one domain rather than two.
+    bind_addr: IpAddr,
+    port: u16,
+}
+
+impl DatagramListenerBinding {
+    /// Canonicalize and capture a listener's domain identity.
+    pub fn new(protocol: DatagramListenerProtocol, bind_addr: IpAddr, port: u16) -> Self {
+        Self {
+            protocol,
+            bind_addr: crate::util::client_identity::canonical_ip(bind_addr),
+            port,
+        }
+    }
+
+    /// Receive-boundary protocol.
+    #[allow(dead_code)] // Accessor for the external tests; decode reads the field.
+    #[inline]
+    pub fn protocol(&self) -> DatagramListenerProtocol {
+        self.protocol
+    }
+
+    /// Canonical bind address.
+    #[allow(dead_code)] // Accessor for the external tests; decode reads the field.
+    #[inline]
+    pub fn bind_addr(&self) -> IpAddr {
+        self.bind_addr
+    }
+
+    /// Receiving port.
+    #[allow(dead_code)] // Accessor for the external tests; decode reads the field.
+    #[inline]
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// Serialize the canonical domain prefix into `out`, returning its length.
+    ///
+    /// The encoding is unambiguous without explicit lengths because the family
+    /// tag precedes the address and fixes its width, and the port is a fixed
+    /// two bytes at the end.
+    fn write_domain(&self, out: &mut [u8; DOMAIN_PREFIX_MAX]) -> usize {
+        let mut at = 0usize;
+        out[at..at + DOMAIN_LABEL.len()].copy_from_slice(DOMAIN_LABEL);
+        at += DOMAIN_LABEL.len();
+        out[at] = DOMAIN_BINDING_VERSION;
+        at += 1;
+        out[at] = self.protocol.tag();
+        at += 1;
+        match self.bind_addr {
+            IpAddr::V4(v4) => {
+                out[at] = 0x04;
+                at += 1;
+                out[at..at + 4].copy_from_slice(&v4.octets());
+                at += 4;
+            }
+            IpAddr::V6(v6) => {
+                out[at] = 0x06;
+                at += 1;
+                out[at..at + 16].copy_from_slice(&v6.octets());
+                at += 16;
+            }
+        }
+        out[at..at + 2].copy_from_slice(&self.port.to_be_bytes());
+        at + 2
+    }
+
+    /// The canonical domain bytes this binding contributes to every MAC input.
+    ///
+    /// Exposed so the sender-side encoder and the conformance tests can pin the
+    /// exact identity rather than re-deriving it.
+    #[allow(dead_code)] // Used by external tests; the receive path uses the inline buffer.
+    pub fn canonical_domain(&self) -> Vec<u8> {
+        let mut buf = [0u8; DOMAIN_PREFIX_MAX];
+        let len = self.write_domain(&mut buf);
+        buf[..len].to_vec()
+    }
+}
+
+/// Authenticated freshness record carried by every authenticated envelope.
+///
+/// All four fields are inside the MAC input, so an off-path attacker can
+/// neither mint nor edit them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DatagramFreshness {
+    /// Stable, bounded sender/key identity. One datagram balancer instance
+    /// picks one value and keeps it for the life of an epoch.
+    pub sender_id: u32,
+    /// Sender boot / key-rotation epoch. Must strictly increase across a
+    /// sender restart; a lower value than the receiver has seen is refused.
+    pub epoch: u64,
+    /// Monotonic sequence within `(sender_id, epoch)`. `u64::MAX` is reserved.
+    pub sequence: u64,
+    /// Unix milliseconds at send time, checked against
+    /// [`FRESHNESS_HORIZON_MS`].
+    pub timestamp_ms: u64,
+}
+
+impl DatagramFreshness {
+    /// Serialize the 29-byte TLV value.
+    #[allow(dead_code)] // Sender-side surface: the gateway only ever decodes.
+    pub fn encode_value(&self) -> [u8; FRESHNESS_VALUE_LEN] {
+        let mut out = [0u8; FRESHNESS_VALUE_LEN];
+        out[0] = FRESHNESS_VERSION;
+        out[1..5].copy_from_slice(&self.sender_id.to_be_bytes());
+        out[5..13].copy_from_slice(&self.epoch.to_be_bytes());
+        out[13..21].copy_from_slice(&self.sequence.to_be_bytes());
+        out[21..29].copy_from_slice(&self.timestamp_ms.to_be_bytes());
+        out
+    }
+
+    /// Serialize the complete freshness TLV (type, length, value).
+    #[allow(dead_code)] // Sender-side surface: the gateway only ever decodes.
+    pub fn encode_tlv(&self) -> [u8; FRESHNESS_TLV_LEN] {
+        let mut out = [0u8; FRESHNESS_TLV_LEN];
+        out[0] = FRESHNESS_TLV_TYPE;
+        out[1..3].copy_from_slice(&(FRESHNESS_VALUE_LEN as u16).to_be_bytes());
+        out[3..].copy_from_slice(&self.encode_value());
+        out
+    }
+
+    /// Strictly parse a freshness TLV value. Length and version are exact; no
+    /// short, long, or unknown-version value is best-effort accepted.
+    fn decode_value(value: &[u8]) -> Result<Self, DatagramMetadataError> {
+        if value.len() != FRESHNESS_VALUE_LEN {
+            return Err(DatagramMetadataError::MalformedFreshness);
+        }
+        let version = value[0];
+        if version != FRESHNESS_VERSION {
+            return Err(DatagramMetadataError::UnsupportedFreshnessVersion(version));
+        }
+        let mut sender_id = [0u8; 4];
+        sender_id.copy_from_slice(&value[1..5]);
+        let mut epoch = [0u8; 8];
+        epoch.copy_from_slice(&value[5..13]);
+        let mut sequence = [0u8; 8];
+        sequence.copy_from_slice(&value[13..21]);
+        let mut timestamp_ms = [0u8; 8];
+        timestamp_ms.copy_from_slice(&value[21..29]);
+        Ok(Self {
+            sender_id: u32::from_be_bytes(sender_id),
+            epoch: u64::from_be_bytes(epoch),
+            sequence: u64::from_be_bytes(sequence),
+            timestamp_ms: u64::from_be_bytes(timestamp_ms),
+        })
+    }
+}
+
+/// Unix milliseconds for the freshness horizon check.
+///
+/// Fails closed on a clock the platform cannot place after the Unix epoch: the
+/// resulting `0` puts every real timestamp outside the horizon, so datagrams
+/// are refused rather than admitted with an unverifiable freshness claim.
+pub fn unix_now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
 
 /// Why a datagram's client-address metadata was refused.
 ///
 /// Every variant is a fail-closed drop. Values are bounded: a code or a length,
-/// never payload bytes, addresses under construction, or tag material.
+/// never payload bytes, addresses under construction, sequence-cache contents,
+/// or tag material.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DatagramMetadataError {
     /// The socket peer is not inside `FERRUM_TRUSTED_PROXIES`.
@@ -150,7 +512,9 @@ pub enum DatagramMetadataError {
     MissingAuthenticationTag,
     /// The authentication TLV did not carry [`AUTH_TAG_LEN`] bytes.
     InvalidAuthenticationTagLength(usize),
-    /// The authentication tag did not verify under the configured secret.
+    /// The authentication tag did not verify under the configured secret and
+    /// this listener's domain binding. A valid envelope minted for another
+    /// listener lands here.
     AuthenticationTagMismatch,
     /// A secret is configured but no key could be derived from it, so nothing
     /// can be verified. Fail-closed rather than silently unauthenticated.
@@ -158,11 +522,38 @@ pub enum DatagramMetadataError {
     /// A later datagram on an established session carried a different
     /// forwarded client than the one the session was admitted with.
     ForwardedClientChanged,
-    /// An identity-bearing `PROXY` envelope declared a destination port that
-    /// is not this listener's `listen_port`. Prevents a process-global HMAC
-    /// secret from making a valid envelope for listener A portable onto
-    /// listener B.
-    DestinationPortMismatch,
+    /// The envelope's declared destination port is not this listener's
+    /// `listen_port`. Defense in depth ahead of the cryptographic listener
+    /// binding, and the specific reason for an address-bearing cross-listener
+    /// envelope.
+    ListenerBindingMismatch,
+    /// Authentication is required but the datagram carried no freshness TLV.
+    /// The pre-freshness authenticated format is deliberately not accepted.
+    MissingFreshness,
+    /// More than one freshness TLV was present, so the record is ambiguous.
+    DuplicateFreshness,
+    /// The freshness TLV value was not exactly [`FRESHNESS_VALUE_LEN`] bytes.
+    MalformedFreshness,
+    /// The freshness record declared a version this build does not implement.
+    UnsupportedFreshnessVersion(u8),
+    /// The authenticated timestamp is further than [`FRESHNESS_HORIZON_MS`]
+    /// from the receiver's clock, in either direction.
+    FreshnessOutsideHorizon,
+    /// This `(sender, epoch, sequence)` was already admitted.
+    ReplayDuplicate,
+    /// The sequence is further behind the sender's highest admitted one than
+    /// the replay window can prove anything about.
+    ReplayStale,
+    /// The sender declared an epoch below the one the receiver has admitted, so
+    /// this is state from before a restart/rotation.
+    ReplayEpochStale,
+    /// `u64::MAX` is reserved: the sender must roll its epoch rather than let
+    /// the sequence space wrap.
+    ReplaySequenceExhausted,
+    /// Replay state is at capacity and nothing was reclaimable, so freshness
+    /// cannot be proven for a new sender. Refused rather than evicting live
+    /// protection.
+    ReplayStateCapacity,
 }
 
 impl DatagramMetadataError {
@@ -186,7 +577,17 @@ impl DatagramMetadataError {
             Self::AuthenticationTagMismatch => "authentication_tag_mismatch",
             Self::AuthenticationKeyUnavailable => "authentication_key_unavailable",
             Self::ForwardedClientChanged => "forwarded_client_changed",
-            Self::DestinationPortMismatch => "destination_port_mismatch",
+            Self::ListenerBindingMismatch => "listener_binding_mismatch",
+            Self::MissingFreshness => "missing_freshness",
+            Self::DuplicateFreshness => "duplicate_freshness",
+            Self::MalformedFreshness => "malformed_freshness",
+            Self::UnsupportedFreshnessVersion(_) => "unsupported_freshness_version",
+            Self::FreshnessOutsideHorizon => "freshness_outside_horizon",
+            Self::ReplayDuplicate => "replay_duplicate",
+            Self::ReplayStale => "replay_stale",
+            Self::ReplayEpochStale => "replay_epoch_stale",
+            Self::ReplaySequenceExhausted => "replay_sequence_exhausted",
+            Self::ReplayStateCapacity => "replay_state_capacity",
         }
     }
 }
@@ -248,9 +649,9 @@ impl std::fmt::Display for DatagramMetadataError {
                 f,
                 "datagram authentication TLV carries {len} bytes, expected {AUTH_TAG_LEN}"
             ),
-            Self::AuthenticationTagMismatch => {
-                f.write_str("datagram authentication tag did not verify")
-            }
+            Self::AuthenticationTagMismatch => f.write_str(
+                "datagram authentication tag did not verify for this listener's binding",
+            ),
             Self::AuthenticationKeyUnavailable => f.write_str(
                 "FERRUM_DATAGRAM_PROXY_PROTOCOL_SECRET is configured but no authentication key \
                  could be derived from it",
@@ -259,9 +660,43 @@ impl std::fmt::Display for DatagramMetadataError {
                 "datagram carried a different forwarded client than the established session was \
                  admitted with",
             ),
-            Self::DestinationPortMismatch => {
-                f.write_str("PROXY v2 destination port does not match the receiving listener")
+            Self::ListenerBindingMismatch => f.write_str(
+                "PROXY v2 destination port does not match the receiving listener's binding",
+            ),
+            Self::MissingFreshness => f.write_str(
+                "FERRUM_DATAGRAM_PROXY_PROTOCOL_SECRET is configured but the datagram carried no \
+                 freshness TLV, so it cannot be proven to be anything but a replay",
+            ),
+            Self::DuplicateFreshness => {
+                f.write_str("more than one datagram freshness TLV present")
             }
+            Self::MalformedFreshness => {
+                f.write_str("datagram freshness TLV is not the expected fixed length")
+            }
+            Self::UnsupportedFreshnessVersion(version) => write!(
+                f,
+                "unsupported datagram freshness record version {version}"
+            ),
+            Self::FreshnessOutsideHorizon => f.write_str(
+                "datagram freshness timestamp is outside the accepted horizon from this \
+                 receiver's clock",
+            ),
+            Self::ReplayDuplicate => {
+                f.write_str("datagram freshness sequence was already admitted on this listener")
+            }
+            Self::ReplayStale => f.write_str(
+                "datagram freshness sequence is older than this listener's replay window",
+            ),
+            Self::ReplayEpochStale => f.write_str(
+                "datagram freshness epoch is older than the sender's current admitted epoch",
+            ),
+            Self::ReplaySequenceExhausted => f.write_str(
+                "datagram freshness sequence space is exhausted; the sender must roll its epoch",
+            ),
+            Self::ReplayStateCapacity => f.write_str(
+                "this listener's datagram replay state is at capacity, so freshness cannot be \
+                 proven for a new sender",
+            ),
         }
     }
 }
@@ -321,13 +756,197 @@ pub struct DecodedDatagram<'a> {
     pub forwarded: Option<SocketAddr>,
 }
 
+/// Per-sender sliding replay window for one listener.
+#[derive(Debug, Clone, Copy)]
+struct SenderReplayState {
+    /// Highest sender epoch admitted for this sender.
+    epoch: u64,
+    /// Highest sequence admitted inside `epoch`.
+    highest: u64,
+    /// Bit `i` set means sequence `highest - 1 - i` has already been admitted.
+    window: u64,
+    /// Receiver-clock millis at the last admission, for idle reclaim.
+    last_seen_ms: u64,
+}
+
+/// Bounded, concurrency-safe replay state for one listener.
+///
+/// Keyed by the authenticated `sender_id`. The listener/key domain is implicit:
+/// the guard lives on the listener's gate, and `sender_id` is only readable
+/// after a MAC that already bound both the root secret and this listener.
+#[derive(Debug)]
+struct DatagramReplayGuard {
+    senders: DashMap<u32, SenderReplayState>,
+    max_senders: usize,
+    /// Receiver-clock millis of the last idle sweep, so sweeps stay rare under
+    /// a hostile flood of unseen `sender_id`s.
+    last_reclaim_ms: AtomicU64,
+}
+
+impl DatagramReplayGuard {
+    fn new(shard_amount: usize) -> Self {
+        Self {
+            // Hot-path concurrent map: shard count comes from the shared
+            // sharding helper so one listener's replay checks do not serialize
+            // on a single internal lock.
+            senders: DashMap::with_capacity_and_shard_amount(
+                MAX_REPLAY_SENDERS.min(256),
+                crate::util::sharding::pool_shard_amount(shard_amount),
+            ),
+            max_senders: MAX_REPLAY_SENDERS,
+            last_reclaim_ms: AtomicU64::new(0),
+        }
+    }
+
+    /// Number of senders currently tracked. Bounded by [`MAX_REPLAY_SENDERS`].
+    #[allow(dead_code)] // Surfaced through the gate for the external tests.
+    fn tracked_senders(&self) -> usize {
+        self.senders.len()
+    }
+
+    /// Check-and-mark one authenticated freshness record.
+    ///
+    /// `Ok(())` means this exact `(sender_id, epoch, sequence)` had not been
+    /// admitted on this listener and now has been. The mark and the decision
+    /// happen under one `DashMap` shard write guard, so concurrent receive
+    /// workers cannot both admit the same sequence.
+    fn admit(
+        &self,
+        freshness: &DatagramFreshness,
+        now_ms: u64,
+    ) -> Result<(), DatagramMetadataError> {
+        // The horizon is checked first: it is the bound the cross-restart and
+        // cross-replica guarantees are stated in, and it keeps a far-future or
+        // ancient timestamp from ever reserving state.
+        if now_ms.abs_diff(freshness.timestamp_ms) > FRESHNESS_HORIZON_MS {
+            return Err(DatagramMetadataError::FreshnessOutsideHorizon);
+        }
+        if freshness.sequence == u64::MAX {
+            return Err(DatagramMetadataError::ReplaySequenceExhausted);
+        }
+
+        // Established sender: one shard write guard covers the whole decision.
+        if let Some(mut state) = self.senders.get_mut(&freshness.sender_id) {
+            return admit_into_window(&mut state, freshness, now_ms);
+        }
+        // Guard released. Everything below is the new-sender path.
+
+        // New sender. Capacity is settled without holding any guard, because
+        // reclaiming takes shard locks itself.
+        if self.senders.len() >= self.max_senders {
+            self.reclaim_idle(now_ms);
+            if self.senders.len() >= self.max_senders {
+                return Err(DatagramMetadataError::ReplayStateCapacity);
+            }
+        }
+        match self.senders.entry(freshness.sender_id) {
+            dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
+                // A peer worker inserted this sender in between; fall into the
+                // ordinary window decision so the sequence is still marked once.
+                admit_into_window(occupied.get_mut(), freshness, now_ms)
+            }
+            dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                vacant.insert(SenderReplayState {
+                    epoch: freshness.epoch,
+                    highest: freshness.sequence,
+                    window: 0,
+                    last_seen_ms: now_ms,
+                });
+                Ok(())
+            }
+        }
+    }
+
+    /// Drop sender records idle longer than [`REPLAY_ENTRY_IDLE_MS`].
+    ///
+    /// Safe by construction: an envelope belonging to a reclaimed record is
+    /// already outside [`FRESHNESS_HORIZON_MS`], so the horizon check refuses
+    /// it whether or not the window still remembers the sequence. Rate-limited
+    /// so a flood at capacity cannot make every datagram pay for a scan.
+    fn reclaim_idle(&self, now_ms: u64) {
+        let last = self.last_reclaim_ms.load(Ordering::Relaxed);
+        if now_ms.saturating_sub(last) < REPLAY_RECLAIM_MIN_INTERVAL_MS {
+            return;
+        }
+        if self
+            .last_reclaim_ms
+            .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        self.senders
+            .retain(|_, state| now_ms.saturating_sub(state.last_seen_ms) <= REPLAY_ENTRY_IDLE_MS);
+    }
+}
+
+/// Decide and mark one sequence against a sender's window.
+///
+/// Pure and synchronous: the caller holds the shard write guard across it, so
+/// nothing here may block, await, or touch the map.
+fn admit_into_window(
+    state: &mut SenderReplayState,
+    freshness: &DatagramFreshness,
+    now_ms: u64,
+) -> Result<(), DatagramMetadataError> {
+    if freshness.epoch < state.epoch {
+        return Err(DatagramMetadataError::ReplayEpochStale);
+    }
+    if freshness.epoch > state.epoch {
+        // Sender restart or key rotation. Reseed at this sequence: every
+        // sequence from the previous epoch is now refused as an epoch that has
+        // been retired, so nothing is reopened.
+        state.epoch = freshness.epoch;
+        state.highest = freshness.sequence;
+        state.window = 0;
+        state.last_seen_ms = now_ms;
+        return Ok(());
+    }
+
+    let sequence = freshness.sequence;
+    if sequence == state.highest {
+        return Err(DatagramMetadataError::ReplayDuplicate);
+    }
+    if sequence > state.highest {
+        let advance = sequence - state.highest;
+        let shifted = if advance >= REPLAY_WINDOW_BITS {
+            0
+        } else {
+            state.window << advance
+        };
+        // The previous highest is itself an admitted sequence, so it must keep
+        // a bit whenever the new window can still represent it.
+        let previous_highest = if advance <= REPLAY_WINDOW_BITS {
+            1u64 << (advance - 1)
+        } else {
+            0
+        };
+        state.window = shifted | previous_highest;
+        state.highest = sequence;
+        state.last_seen_ms = now_ms;
+        return Ok(());
+    }
+
+    let behind = state.highest - sequence;
+    if behind > REPLAY_WINDOW_BITS {
+        return Err(DatagramMetadataError::ReplayStale);
+    }
+    let bit = 1u64 << (behind - 1);
+    if state.window & bit != 0 {
+        return Err(DatagramMetadataError::ReplayDuplicate);
+    }
+    state.window |= bit;
+    state.last_seen_ms = now_ms;
+    Ok(())
+}
+
 /// Per-listener trust gate for datagram client-address metadata.
 ///
 /// Built once per listener at spawn from the process-wide trust boundary, the
-/// optional shared secret, and the receiving `listen_port`. Reload reconstructs
-/// the gate with the live port rather than inheriting another listener's
-/// binding. The receive path only calls [`Self::decode`], which allocates
-/// nothing.
+/// optional shared secret, and this listener's [`DatagramListenerBinding`].
+/// Reload reconstructs the gate — and with it a fresh replay window — from the
+/// live binding rather than inheriting another listener's. The receive path only
+/// calls [`Self::decode`], which allocates nothing.
 pub struct DatagramClientAddressGate {
     trusted_proxies: Arc<TrustedProxies>,
     /// Whether the operator configured a secret. Derived from the exact
@@ -342,9 +961,17 @@ pub struct DatagramClientAddressGate {
     /// key material, which then fails every datagram closed rather than
     /// downgrading the listener to unauthenticated metadata.
     auth_key: Option<HmacSha256Key>,
-    /// Exact receiving listener port captured at construction. Identity-bearing
-    /// `PROXY` envelopes must declare this destination port.
-    listener_port: u16,
+    /// Exact receiving listener identity captured at construction.
+    binding: DatagramListenerBinding,
+    /// Serialized domain prefix for `binding`, absorbed ahead of every MAC
+    /// input. Fixed-size and inline, so the receive path neither allocates nor
+    /// re-serializes.
+    domain: [u8; DOMAIN_PREFIX_MAX],
+    domain_len: usize,
+    /// Bounded per-sender replay window. Listener-scoped: a fresh gate has a
+    /// fresh window, which is why the authenticated timestamp horizon is what
+    /// bounds cross-reload and cross-restart exposure.
+    replay: DatagramReplayGuard,
 }
 
 impl std::fmt::Debug for DatagramClientAddressGate {
@@ -352,7 +979,7 @@ impl std::fmt::Debug for DatagramClientAddressGate {
         // Never render the key material or anything derived from it.
         f.debug_struct("DatagramClientAddressGate")
             .field("authenticated", &self.authentication_required)
-            .field("listener_port", &self.listener_port)
+            .field("binding", &self.binding)
             .finish()
     }
 }
@@ -365,31 +992,60 @@ impl DatagramClientAddressGate {
     /// with different bytes than `EnvConfig` validated, or drop the
     /// authentication requirement entirely.
     ///
-    /// `listener_port` is this listener's exact receiving port. It is captured
-    /// here so decode can refuse a portable envelope without consulting any
-    /// per-datagram caller-supplied identity.
+    /// `binding` is this listener's exact receive-boundary identity. It is
+    /// captured here so every decode both compares the envelope's declared
+    /// destination against it and folds it into the MAC input, without ever
+    /// consulting a per-datagram caller-supplied identity.
+    ///
+    /// `shard_amount` carries the operator's `FERRUM_POOL_SHARD_AMOUNT`
+    /// intent — either the raw value or the already-resolved one
+    /// `StreamListenerManager` holds; `0` selects the auto-derived default. It
+    /// sizes the replay map's shards through the shared sharding helper, whose
+    /// rounding is idempotent, so passing an already-resolved value is exact.
     pub fn new(
         trusted_proxies: Arc<TrustedProxies>,
         secret: Option<&str>,
-        listener_port: u16,
+        binding: DatagramListenerBinding,
+        shard_amount: usize,
     ) -> Self {
         let secret = secret.filter(|value| !value.is_empty());
         let auth_key = match secret {
             Some(value) => HmacSha256Key::new_from_slice(value.as_bytes()).ok(),
             None => None,
         };
+        let mut domain = [0u8; DOMAIN_PREFIX_MAX];
+        let domain_len = binding.write_domain(&mut domain);
         Self {
             trusted_proxies,
             authentication_required: secret.is_some(),
             auth_key,
-            listener_port,
+            binding,
+            domain,
+            domain_len,
+            replay: DatagramReplayGuard::new(shard_amount),
         }
     }
 
-    /// Whether every datagram must carry a valid authentication tag.
+    /// Whether every datagram must carry a valid authentication tag and
+    /// freshness record.
     #[inline]
     pub fn requires_authentication(&self) -> bool {
         self.authentication_required
+    }
+
+    /// This listener's canonical domain identity.
+    #[allow(dead_code)] // Accessor for the external tests; decode reads the field.
+    #[inline]
+    pub fn binding(&self) -> DatagramListenerBinding {
+        self.binding
+    }
+
+    /// Senders currently holding replay state on this listener. Bounded by
+    /// [`MAX_REPLAY_SENDERS`]; exposed so the bound is assertable.
+    #[allow(dead_code)] // Used by external tests to assert the state bound.
+    #[inline]
+    pub fn tracked_replay_senders(&self) -> usize {
+        self.replay.tracked_senders()
     }
 
     /// Whether any peer at all can satisfy the trust boundary.
@@ -402,23 +1058,53 @@ impl DatagramClientAddressGate {
         !self.trusted_proxies.is_empty()
     }
 
-    /// Decode one datagram received from `socket_peer`.
-    ///
-    /// Borrows `datagram`; the returned payload is a subslice, so the hot path
-    /// performs no copy and no allocation.
+    /// Decode one datagram received from `socket_peer`, against the receiver's
+    /// current wall clock.
+    #[inline]
     pub fn decode<'a>(
         &self,
         datagram: &'a [u8],
         socket_peer: &SocketAddr,
     ) -> Result<DecodedDatagram<'a>, DatagramMetadataError> {
+        self.decode_at(datagram, socket_peer, unix_now_millis())
+    }
+
+    /// Decode one datagram against an explicit receiver clock reading.
+    ///
+    /// Borrows `datagram`; the returned payload is a subslice, so the hot path
+    /// performs no copy and no allocation.
+    ///
+    /// Every refusal happens here, at the single receive boundary, before the
+    /// caller can look up or allocate a session, insert a pending-queue entry,
+    /// allocate DTLS demux state, run `on_stream_connect` / `on_udp_datagram`,
+    /// select or dial a backend, move byte/amplification accounting, or refresh
+    /// idle activity.
+    pub fn decode_at<'a>(
+        &self,
+        datagram: &'a [u8],
+        socket_peer: &SocketAddr,
+        now_unix_ms: u64,
+    ) -> Result<DecodedDatagram<'a>, DatagramMetadataError> {
         if !self.trusted_proxies.contains(&socket_peer.ip()) {
             return Err(DatagramMetadataError::UntrustedPeer);
         }
         let parsed = parse_datagram_header_inner(datagram)?;
-        // With no secret configured, a supplied tag is simply not honored:
-        // verifying nothing against nothing would present authenticated-looking
-        // metadata. The tag bytes stay inside the address block either way and
-        // never reach the payload.
+
+        // Defense in depth ahead of the cryptographic binding: an
+        // address-bearing envelope states which listener it was minted for, and
+        // a mismatch is the specific `listener_binding_mismatch` reason. The
+        // declared destination is attacker-supplied, so this check can only
+        // ever refuse — never admit — and the MAC below is what actually binds
+        // every envelope form (including the address-less ones) to this
+        // listener.
+        if parsed.forwarded.is_some() && parsed.destination_port != Some(self.binding.port) {
+            return Err(DatagramMetadataError::ListenerBindingMismatch);
+        }
+
+        // With no secret configured, a supplied tag or freshness record is
+        // simply not honored: verifying nothing against nothing would present
+        // authenticated-looking metadata. Those bytes stay inside the address
+        // block either way and never reach the payload.
         if self.authentication_required {
             // A configured secret that produced no key cannot verify anything,
             // so the listener refuses rather than admitting metadata the
@@ -426,18 +1112,53 @@ impl DatagramClientAddressGate {
             let Some(key) = self.auth_key.as_ref() else {
                 return Err(DatagramMetadataError::AuthenticationKeyUnavailable);
             };
-            verify_authentication_tag(key, datagram, &parsed)?;
-        }
-        // Bind identity-bearing envelopes to this listener before the caller
-        // can allocate a session or demux slot. `LOCAL` / `AF_UNSPEC` leave
-        // `forwarded` unset and are not dest-port bound.
-        if parsed.forwarded.is_some() && parsed.destination_port != Some(self.listener_port) {
-            return Err(DatagramMetadataError::DestinationPortMismatch);
+            self.verify_authentication_tag(key, datagram, &parsed)?;
+            // Only now are the freshness bytes trustworthy: the MAC has proven
+            // they were minted by a secret holder for this exact listener.
+            let Some((start, end)) = parsed.freshness else {
+                return Err(DatagramMetadataError::MissingFreshness);
+            };
+            let freshness = DatagramFreshness::decode_value(&datagram[start..end])?;
+            self.replay.admit(&freshness, now_unix_ms)?;
         }
         Ok(DecodedDatagram {
             payload: &datagram[parsed.header_len..],
             forwarded: parsed.forwarded,
         })
+    }
+
+    /// Verify the tag over this listener's domain prefix plus everything in the
+    /// datagram except the tag value itself.
+    ///
+    /// The MAC covers the domain binding and the complete datagram with the 32
+    /// tag bytes elided, so the receiving listener's protocol/address/port, the
+    /// version/command/family/transport bytes, the forwarded addresses, the
+    /// freshness record, every other TLV, and the payload are all bound.
+    /// Eliding rather than zeroing keeps the hot path free of a scratch copy of
+    /// the header.
+    fn verify_authentication_tag(
+        &self,
+        key: &HmacSha256Key,
+        datagram: &[u8],
+        parsed: &ParsedDatagramHeader,
+    ) -> Result<(), DatagramMetadataError> {
+        let Some((tag_start, tag_end)) = parsed.auth_tag else {
+            return Err(DatagramMetadataError::MissingAuthenticationTag);
+        };
+        let mut mac = key.begin();
+        mac.update(&self.domain[..self.domain_len]);
+        mac.update(&datagram[..tag_start]);
+        mac.update(&datagram[tag_end..]);
+        let expected = mac.finalize().into_bytes();
+        let verified = crate::plugins::utils::auth_flow::constant_time_eq(
+            &expected,
+            &datagram[tag_start..tag_end],
+        );
+        if verified {
+            Ok(())
+        } else {
+            Err(DatagramMetadataError::AuthenticationTagMismatch)
+        }
     }
 }
 
@@ -448,21 +1169,31 @@ struct ParsedDatagramHeader {
     forwarded: Option<SocketAddr>,
     /// Declared destination port from an `AF_INET` / `AF_INET6` address block.
     /// `None` for `AF_UNSPEC` (no addresses). Not a trust decision; the gate
-    /// compares it to the receiving listener after authentication.
+    /// compares it to the receiving listener as defense in depth.
     destination_port: Option<u16>,
     /// Absolute `[start, end)` of the authentication tag value, when present.
     auth_tag: Option<(usize, usize)>,
+    /// Absolute `[start, end)` of the freshness TLV value, when present.
+    freshness: Option<(usize, usize)>,
 }
 
-/// Parse the metadata header, without any trust, dest-port, or authentication
-/// decision. Hostile-input entry for the fuzz lane: bounded, allocation-free,
-/// and it never returns payload, tag, or secret material.
+/// Parse the metadata header, without any trust, binding, authentication, or
+/// freshness decision. Hostile-input entry for the fuzz lane: bounded,
+/// allocation-free, and it never returns payload, tag, or secret material.
 ///
 /// Compiled only with `feature = "fuzzing"`, matching the TCP PROXY fuzz
-/// entry. The production receive path uses [`DatagramClientAddressGate::decode`].
+/// entry. The production receive path uses
+/// [`DatagramClientAddressGate::decode`].
 #[cfg(feature = "fuzzing")]
 pub(crate) fn parse_datagram_header(datagram: &[u8]) -> Result<(), DatagramMetadataError> {
-    parse_datagram_header_inner(datagram).map(|_| ())
+    let parsed = parse_datagram_header_inner(datagram)?;
+    // Cover the freshness value parser too: it is reachable from hostile wire
+    // bytes as soon as a MAC verifies, so it must be bounded and panic-free on
+    // its own.
+    if let Some((start, end)) = parsed.freshness {
+        DatagramFreshness::decode_value(&datagram[start..end])?;
+    }
+    Ok(())
 }
 
 /// Parse the metadata header, without any trust or authentication decision.
@@ -566,7 +1297,8 @@ fn parse_datagram_header_inner(
         other => return Err(DatagramMetadataError::UnsupportedAddressFamily(other)),
     };
 
-    let auth_tag = find_authentication_tag(&block[fixed_len..], FIXED_HEADER_LEN + fixed_len)?;
+    let (auth_tag, freshness) =
+        walk_envelope_tlvs(&block[fixed_len..], FIXED_HEADER_LEN + fixed_len)?;
 
     Ok(ParsedDatagramHeader {
         header_len,
@@ -579,6 +1311,7 @@ fn parse_datagram_header_inner(
         },
         destination_port,
         auth_tag,
+        freshness,
     })
 }
 
@@ -594,16 +1327,21 @@ fn require_datagram_transport(transport: u8) -> Result<(), DatagramMetadataError
     }
 }
 
-/// Walk the TLV region and locate the single authentication TLV, if any.
+/// Walk the TLV region once and locate the single authentication TLV and the
+/// single freshness TLV, if present.
 ///
 /// `tlv_base` is the TLV region's absolute offset inside the datagram, so the
-/// returned range can address the original buffer without a second walk.
-fn find_authentication_tag(
+/// returned ranges can address the original buffer without a second walk. Both
+/// TLVs are capped at exactly one occurrence: a second copy is ambiguous about
+/// which one the MAC covered or which sequence was asserted, so it is refused
+/// rather than resolved by position.
+fn walk_envelope_tlvs(
     tlvs: &[u8],
     tlv_base: usize,
-) -> Result<Option<(usize, usize)>, DatagramMetadataError> {
+) -> Result<(Option<(usize, usize)>, Option<(usize, usize)>), DatagramMetadataError> {
     let mut offset = 0usize;
-    let mut found: Option<(usize, usize)> = None;
+    let mut auth: Option<(usize, usize)> = None;
+    let mut freshness: Option<(usize, usize)> = None;
     while offset < tlvs.len() {
         // type (1) + length (2) + value
         if tlvs.len() - offset < 3 {
@@ -618,49 +1356,75 @@ fn find_authentication_tag(
         if value_end > tlvs.len() {
             return Err(DatagramMetadataError::MalformedTlv);
         }
-        if tlv_type == AUTH_TLV_TYPE {
-            if found.is_some() {
-                return Err(DatagramMetadataError::DuplicateAuthenticationTag);
+        match tlv_type {
+            AUTH_TLV_TYPE => {
+                if auth.is_some() {
+                    return Err(DatagramMetadataError::DuplicateAuthenticationTag);
+                }
+                if value_len != AUTH_TAG_LEN {
+                    return Err(DatagramMetadataError::InvalidAuthenticationTagLength(
+                        value_len,
+                    ));
+                }
+                auth = Some((tlv_base + value_start, tlv_base + value_end));
             }
-            if value_len != AUTH_TAG_LEN {
-                return Err(DatagramMetadataError::InvalidAuthenticationTagLength(
-                    value_len,
-                ));
+            FRESHNESS_TLV_TYPE => {
+                if freshness.is_some() {
+                    return Err(DatagramMetadataError::DuplicateFreshness);
+                }
+                if value_len != FRESHNESS_VALUE_LEN {
+                    return Err(DatagramMetadataError::MalformedFreshness);
+                }
+                freshness = Some((tlv_base + value_start, tlv_base + value_end));
             }
-            found = Some((tlv_base + value_start, tlv_base + value_end));
+            _ => {}
         }
         offset = value_end;
     }
-    Ok(found)
+    Ok((auth, freshness))
 }
 
-/// Verify the tag over everything except the tag value itself.
+/// Which envelope form the encoder should emit.
 ///
-/// The MAC covers the complete datagram with the 32 tag bytes elided, so the
-/// version/command/family/transport bytes, the forwarded addresses, every other
-/// TLV, and the payload are all bound. Eliding rather than zeroing keeps the
-/// hot path free of a scratch copy of the header.
-fn verify_authentication_tag(
-    key: &HmacSha256Key,
-    datagram: &[u8],
-    parsed: &ParsedDatagramHeader,
-) -> Result<(), DatagramMetadataError> {
-    let Some((tag_start, tag_end)) = parsed.auth_tag else {
-        return Err(DatagramMetadataError::MissingAuthenticationTag);
-    };
-    let mut mac = key.begin();
-    mac.update(&datagram[..tag_start]);
-    mac.update(&datagram[tag_end..]);
-    let expected = mac.finalize().into_bytes();
-    let verified = crate::plugins::utils::auth_flow::constant_time_eq(
-        &expected,
-        &datagram[tag_start..tag_end],
-    );
-    if verified {
-        Ok(())
-    } else {
-        Err(DatagramMetadataError::AuthenticationTagMismatch)
-    }
+/// All four forms carry the same authentication, listener-binding, and
+/// freshness contract when a key is supplied; the address-less ones simply
+/// confer no forwarded identity.
+#[allow(dead_code)] // Sender-side surface: the gateway only ever decodes.
+#[derive(Debug, Clone, Copy)]
+pub enum DatagramEnvelopeForm {
+    /// `LOCAL`, spec-conventional `0x00` `fam_transport`, no addresses. The
+    /// balancer speaking for itself (health probes).
+    Local,
+    /// `PROXY` + `AF_UNSPEC` + `DGRAM`, no addresses.
+    Unspec,
+    /// `PROXY` + `AF_INET` / `AF_INET6` + `DGRAM`, carrying the forwarded
+    /// client and the destination the balancer sent to. `destination`'s port
+    /// must be the receiving listener's port.
+    Forwarded {
+        source: SocketAddr,
+        destination: SocketAddr,
+    },
+}
+
+/// Sender-side authentication material.
+///
+/// A sender holds the root secret, knows which listener it is addressing, and
+/// keeps a `(sender_id, epoch, sequence)` counter. All three are required
+/// together: an authenticated envelope without freshness is refused, and a
+/// freshness record minted for another listener cannot verify.
+///
+/// Deliberately not `Debug`: it holds the root HMAC key, and no formatter should
+/// ever be able to render it.
+#[allow(dead_code)] // Sender-side surface: the gateway only ever decodes.
+#[derive(Clone, Copy)]
+pub struct DatagramEnvelopeAuth<'a> {
+    /// HMAC-SHA-256 key over the exact configured
+    /// `FERRUM_DATAGRAM_PROXY_PROTOCOL_SECRET` bytes.
+    pub key: &'a HmacSha256Key,
+    /// The receiving listener this envelope is minted for.
+    pub binding: &'a DatagramListenerBinding,
+    /// Freshness record for this datagram.
+    pub freshness: DatagramFreshness,
 }
 
 /// Build a datagram carrying client-address metadata.
@@ -668,63 +1432,82 @@ fn verify_authentication_tag(
 /// Ferrum never emits this envelope in production — a datagram load balancer
 /// does — so this exists for the external conformance tests and for operators
 /// generating fixtures. It is the normative encoder for the format above.
+///
+/// With `auth` set, the envelope carries a freshness TLV and an HMAC-SHA-256
+/// tag computed over the listener's canonical domain plus the whole datagram
+/// with the tag elided. With `auth` unset, the result carries neither: that is
+/// the documented trusted-network posture, which has **no** cryptographic
+/// authenticity and **no** freshness — trust rests entirely on the socket peer
+/// being inside `FERRUM_TRUSTED_PROXIES`.
 #[allow(dead_code)] // Used by external tests; the gateway only ever decodes.
 pub fn encode_datagram_with_metadata(
-    source: SocketAddr,
-    destination: SocketAddr,
+    form: DatagramEnvelopeForm,
     payload: &[u8],
-    auth_key: Option<&HmacSha256Key>,
+    auth: Option<&DatagramEnvelopeAuth<'_>>,
 ) -> Vec<u8> {
-    let source = crate::util::client_identity::canonical_socket_addr(source);
-    let destination = crate::util::client_identity::canonical_socket_addr(destination);
-    let (family, fixed): (u8, Vec<u8>) = match (source.ip(), destination.ip()) {
-        (IpAddr::V4(src), IpAddr::V4(dst)) => {
-            let mut fixed = Vec::with_capacity(INET_ADDR_LEN);
-            fixed.extend_from_slice(&src.octets());
-            fixed.extend_from_slice(&dst.octets());
-            fixed.extend_from_slice(&source.port().to_be_bytes());
-            fixed.extend_from_slice(&destination.port().to_be_bytes());
-            (0x01, fixed)
-        }
-        (src, dst) => {
-            let to_v6 = |ip: IpAddr| match ip {
-                IpAddr::V4(v4) => v4.to_ipv6_mapped(),
-                IpAddr::V6(v6) => v6,
-            };
-            let mut fixed = Vec::with_capacity(INET6_ADDR_LEN);
-            fixed.extend_from_slice(&to_v6(src).octets());
-            fixed.extend_from_slice(&to_v6(dst).octets());
-            fixed.extend_from_slice(&source.port().to_be_bytes());
-            fixed.extend_from_slice(&destination.port().to_be_bytes());
-            (0x02, fixed)
+    let (ver_cmd, fam_transport, fixed): (u8, u8, Vec<u8>) = match form {
+        DatagramEnvelopeForm::Local => (0x20, 0x00, Vec::new()),
+        DatagramEnvelopeForm::Unspec => (0x21, 0x02, Vec::new()),
+        DatagramEnvelopeForm::Forwarded {
+            source,
+            destination,
+        } => {
+            let source = crate::util::client_identity::canonical_socket_addr(source);
+            let destination = crate::util::client_identity::canonical_socket_addr(destination);
+            match (source.ip(), destination.ip()) {
+                (IpAddr::V4(src), IpAddr::V4(dst)) => {
+                    let mut fixed = Vec::with_capacity(INET_ADDR_LEN);
+                    fixed.extend_from_slice(&src.octets());
+                    fixed.extend_from_slice(&dst.octets());
+                    fixed.extend_from_slice(&source.port().to_be_bytes());
+                    fixed.extend_from_slice(&destination.port().to_be_bytes());
+                    (0x21, 0x12, fixed)
+                }
+                (src, dst) => {
+                    let to_v6 = |ip: IpAddr| match ip {
+                        IpAddr::V4(v4) => v4.to_ipv6_mapped(),
+                        IpAddr::V6(v6) => v6,
+                    };
+                    let mut fixed = Vec::with_capacity(INET6_ADDR_LEN);
+                    fixed.extend_from_slice(&to_v6(src).octets());
+                    fixed.extend_from_slice(&to_v6(dst).octets());
+                    fixed.extend_from_slice(&source.port().to_be_bytes());
+                    fixed.extend_from_slice(&destination.port().to_be_bytes());
+                    (0x21, 0x22, fixed)
+                }
+            }
         }
     };
 
-    let tlv_len = if auth_key.is_some() {
-        3 + AUTH_TAG_LEN
+    let tlv_len = if auth.is_some() {
+        FRESHNESS_TLV_LEN + 3 + AUTH_TAG_LEN
     } else {
         0
     };
     let addr_len = (fixed.len() + tlv_len) as u16;
     let mut out = Vec::with_capacity(FIXED_HEADER_LEN + addr_len as usize + payload.len());
     out.extend_from_slice(V2_SIG);
-    out.push(0x21); // version 2, PROXY command
-    out.push((family << 4) | 0x02); // family + DGRAM
+    out.push(ver_cmd);
+    out.push(fam_transport);
     out.extend_from_slice(&addr_len.to_be_bytes());
     out.extend_from_slice(&fixed);
 
-    match auth_key {
+    match auth {
         None => {
             out.extend_from_slice(payload);
             out
         }
-        Some(key) => {
+        Some(auth) => {
+            out.extend_from_slice(&auth.freshness.encode_tlv());
             out.push(AUTH_TLV_TYPE);
             out.extend_from_slice(&(AUTH_TAG_LEN as u16).to_be_bytes());
             let tag_start = out.len();
             out.extend_from_slice(&[0u8; AUTH_TAG_LEN]);
             out.extend_from_slice(payload);
-            let mut mac = key.begin();
+            let mut domain = [0u8; DOMAIN_PREFIX_MAX];
+            let domain_len = auth.binding.write_domain(&mut domain);
+            let mut mac = auth.key.begin();
+            mac.update(&domain[..domain_len]);
             mac.update(&out[..tag_start]);
             mac.update(&out[tag_start + AUTH_TAG_LEN..]);
             let tag = mac.finalize().into_bytes();

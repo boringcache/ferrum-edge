@@ -95,11 +95,12 @@ pub fn fuzz_parse_proxy_protocol(data: &[u8]) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
-/// Parse a datagram PROXY v2 DGRAM header and walk its auth-TLV region.
+/// Parse a datagram PROXY v2 DGRAM header, walk its auth/freshness TLV region,
+/// and decode any freshness record it carries.
 ///
 /// Bounded, allocation-free, and fail-closed. The `Result` carries only a
 /// fixed-cardinality reason — never payload bytes, tag bytes, secret material,
-/// or addresses asserted inside the envelope.
+/// sequence values, or addresses asserted inside the envelope.
 pub fn fuzz_parse_datagram_header(data: &[u8]) -> Result<(), String> {
     crate::proxy::datagram_client_address::parse_datagram_header(data)
         .map_err(|error| error.reason().to_string())
@@ -195,6 +196,24 @@ pub fn smoke_invariants() -> Result<(), String> {
     datagram.extend_from_slice(&5353u16.to_be_bytes());
     datagram.extend_from_slice(b"q");
     fuzz_parse_datagram_header(&datagram)?;
+    // The authenticated shape: a freshness TLV (0xE1, 29-byte value) followed by
+    // the tag TLV (0xE0, 32 bytes). The parser must walk both and decode the
+    // freshness value without needing the secret.
+    let mut authenticated = Vec::from(*b"\r\n\r\n\x00\r\nQUIT\n");
+    authenticated.extend_from_slice(&[0x21, 0x12]);
+    authenticated.extend_from_slice(&79u16.to_be_bytes());
+    authenticated.extend_from_slice(&[203, 0, 113, 9, 10, 0, 0, 5]);
+    authenticated.extend_from_slice(&41234u16.to_be_bytes());
+    authenticated.extend_from_slice(&5353u16.to_be_bytes());
+    authenticated.extend_from_slice(&[0xE1, 0x00, 0x1D, 0x01]);
+    authenticated.extend_from_slice(&1u32.to_be_bytes());
+    authenticated.extend_from_slice(&1u64.to_be_bytes());
+    authenticated.extend_from_slice(&0u64.to_be_bytes());
+    authenticated.extend_from_slice(&1_760_000_000_000u64.to_be_bytes());
+    authenticated.extend_from_slice(&[0xE0, 0x00, 0x20]);
+    authenticated.extend_from_slice(&[0xAA; 32]);
+    authenticated.extend_from_slice(b"q");
+    fuzz_parse_datagram_header(&authenticated)?;
     let config =
         r#"{"version":"1","proxies":[],"consumers":[],"plugin_configs":[],"upstreams":[]}"#;
     fuzz_decode_config_document(config)?;

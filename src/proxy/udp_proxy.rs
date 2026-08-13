@@ -18,7 +18,10 @@
 //! authenticated PROXY v2 DGRAM envelope described in
 //! [`crate::proxy::datagram_client_address`]. The socket peer stays
 //! `direct_client_ip`; the envelope's forwarded address becomes `client_ip`.
-//! Anything that does not decode is dropped (issue #3289).
+//! Anything that does not decode is dropped (issue #3289) — including an
+//! envelope minted for another listener (issue #3856) and a duplicate or stale
+//! authenticated sequence (issue #3862), both refused at the same single
+//! receive boundary, before any session, hook, or backend effect.
 
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -130,9 +133,11 @@ pub struct UdpProxyMetrics {
     /// admission budget.
     hook_ingress_queued_bytes: AtomicUsize,
     /// Datagrams dropped by the client-address metadata gate: untrusted peer,
-    /// missing/failed authentication, malformed envelope, destination-port
-    /// mismatch, or a forwarded client that disagreed with the established
-    /// session. Every one of these is a fail-closed refusal, never a fallback
+    /// missing/failed authentication, malformed envelope, a binding that names
+    /// another listener, a duplicate/stale/malformed freshness record, replay
+    /// state exhaustion, or a forwarded client that disagreed with the
+    /// established session. Every one of these is a fail-closed refusal, never a
+    /// fallback
     /// to the socket peer. This is internal listener-local accounting shared
     /// with the frontend DTLS demuxer so both datagram paths report one
     /// counter; it is not an exported Prometheus or admin metric.
@@ -1765,11 +1770,13 @@ pub struct UdpListenerConfig {
     /// destinations are silently dropped (UDP has no RST analogue).
     pub mesh_outbound_enforcement:
         crate::modes::mesh::outbound_enforcement::SharedMeshOutboundEnforcement,
-    /// Datagram client-address metadata gate (issue #3289). `Some` only when
-    /// the proxy sets `stream_proxy_protocol: true`; then EVERY datagram must
-    /// carry a trusted, well-formed (and, when a secret is configured,
-    /// authenticated) PROXY v2 DGRAM envelope or it is dropped. `None` keeps
-    /// ordinary UDP/DTLS behavior with the socket peer as the only identity.
+    /// Datagram client-address metadata gate (issues #3289, #3856, #3862).
+    /// `Some` only when the proxy sets `stream_proxy_protocol: true`; then EVERY
+    /// datagram must carry a trusted, well-formed (and, when a secret is
+    /// configured, listener-bound, authenticated, and fresh) PROXY v2 DGRAM
+    /// envelope or it is dropped. The gate owns this listener's replay window,
+    /// so it is per-listener and rebuilt on reload. `None` keeps ordinary
+    /// UDP/DTLS behavior with the socket peer as the only identity.
     pub datagram_client_address: Option<Arc<DatagramClientAddressGate>>,
 }
 

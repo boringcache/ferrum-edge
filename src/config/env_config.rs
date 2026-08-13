@@ -3092,11 +3092,16 @@ pub struct EnvConfig {
     /// Shared secret authenticating the datagram client-address envelope on
     /// `udp` / `dtls` listeners that set `stream_proxy_protocol: true`.
     ///
-    /// When set, every such datagram must carry a valid HMAC-SHA-256 tag over
-    /// the complete envelope and payload; unauthenticated datagrams are
-    /// dropped. When unset, trust rests on the socket peer being inside
+    /// When set, every such datagram must carry a valid HMAC-SHA-256 tag over a
+    /// versioned domain-separation prefix naming the exact receiving listener
+    /// plus the complete envelope and payload, **and** an authenticated
+    /// freshness record the receiver checks against a bounded per-sender replay
+    /// window; unauthenticated, cross-listener, duplicate, and stale datagrams
+    /// are dropped. When unset, trust rests on the socket peer being inside
     /// `FERRUM_TRUSTED_PROXIES` alone — sufficient only on a network path where
-    /// source addresses cannot be spoofed. Must be at least 32 bytes.
+    /// source addresses cannot be spoofed, and with no freshness protection at
+    /// all. Must be at least 32 bytes. Read once at startup: rotating it
+    /// requires a process restart.
     pub datagram_proxy_protocol_secret: Option<String>,
 
     /// Threshold in milliseconds for logging slow plugin outbound HTTP calls.

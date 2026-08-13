@@ -178,6 +178,14 @@ reload, which rebuilds through the same constructor.
   startup; the diagnostic names the variable and does not report the value or
   its length. An unset or empty value is not a FIPS key-length failure: it
   leaves datagram listeners in the unauthenticated address-trust posture.
+- The datagram client-address envelope uses **only** HMAC-SHA-256 through
+  `fips::approved::HmacSha256Key`. Its listener-domain binding and its
+  freshness/anti-replay record introduce no new cryptographic construction: the
+  binding is a versioned byte prefix absorbed into the same HMAC input, and
+  freshness is a plaintext authenticated record inside that same MAC. There is
+  no key-derivation function, no per-listener subkey, and no non-approved
+  primitive — the root secret is the one HMAC key, at full configured strength,
+  on every listener.
 
 **Key strengths and forms (Ferrum-enforced, not provider-enforced)**
 

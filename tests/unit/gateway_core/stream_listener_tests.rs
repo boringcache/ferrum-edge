@@ -15,7 +15,10 @@ use ferrum_edge::load_balancer::LoadBalancerCache;
 use ferrum_edge::modes::mesh::config::MeshConfig;
 use ferrum_edge::plugin_cache::PluginCache;
 use ferrum_edge::proxy::client_ip::TrustedProxies;
-use ferrum_edge::proxy::datagram_client_address::encode_datagram_with_metadata;
+use ferrum_edge::proxy::datagram_client_address::{
+    DatagramEnvelopeAuth, DatagramEnvelopeForm, DatagramFreshness, DatagramListenerBinding,
+    DatagramListenerProtocol, encode_datagram_with_metadata, unix_now_millis,
+};
 use ferrum_edge::proxy::stream_listener::{StreamListenerDegradation, StreamListenerManager};
 use ferrum_edge::proxy::stream_match::{StreamMatchArm, StreamMatchCriteria};
 use ferrum_edge::request_epoch::RequestEpochStore;
@@ -327,6 +330,45 @@ const UDP_PORT_FREE_TIMEOUT: Duration = Duration::from_secs(3);
 
 fn datagram_hmac_key() -> HmacSha256Key {
     HmacSha256Key::new_from_slice(DATAGRAM_RELOAD_SECRET.as_bytes()).expect("hmac key")
+}
+
+/// The domain identity `StreamListenerManager` builds for a plain-UDP listener
+/// bound on loopback: receive-boundary protocol, canonical bind address, port.
+/// A reload must reconstruct exactly this, or nothing the balancer mints would
+/// verify (issue #3856).
+fn datagram_binding(port: u16) -> DatagramListenerBinding {
+    DatagramListenerBinding::new(
+        DatagramListenerProtocol::Udp,
+        "127.0.0.1".parse().expect("loopback bind addr"),
+        port,
+    )
+}
+
+/// Mint one authenticated envelope for `binding`, declaring `destination` and
+/// carrying the freshness record the gate requires (issue #3862).
+fn datagram_envelope(
+    binding: &DatagramListenerBinding,
+    destination: SocketAddr,
+    payload: &[u8],
+    sequence: u64,
+) -> Vec<u8> {
+    let key = datagram_hmac_key();
+    let freshness = DatagramFreshness {
+        sender_id: 1,
+        epoch: 1,
+        sequence,
+        timestamp_ms: unix_now_millis(),
+    };
+    let auth = DatagramEnvelopeAuth {
+        key: &key,
+        binding,
+        freshness,
+    };
+    let form = DatagramEnvelopeForm::Forwarded {
+        source: "203.0.113.9:41234".parse().expect("forwarded client"),
+        destination,
+    };
+    encode_datagram_with_metadata(form, payload, Some(&auth))
 }
 
 fn udp_proxy_for_datagram_reload(
@@ -2484,14 +2526,10 @@ async fn udp_stream_proxy_protocol_reload_restarts_listener_and_toggles_gate() {
     );
 
     // A correctly shaped, authenticated envelope proves the replacement listener
-    // is serving rather than merely down after the restart.
-    let forwarded_client: SocketAddr = "203.0.113.9:41234".parse().expect("forwarded client");
-    let envelope = encode_datagram_with_metadata(
-        forwarded_client,
-        gateway_addr,
-        b"gated-envelope",
-        Some(&datagram_hmac_key()),
-    );
+    // is serving rather than merely down after the restart — and that the
+    // reconstructed gate rebuilt this listener's exact domain binding.
+    let binding = datagram_binding(frontend_port);
+    let envelope = datagram_envelope(&binding, gateway_addr, b"gated-envelope", 0);
     client
         .send_to(&envelope, gateway_addr)
         .await
@@ -2501,23 +2539,43 @@ async fn udp_stream_proxy_protocol_reload_restarts_listener_and_toggles_gate() {
         .expect("the restarted gated listener must admit an authenticated envelope");
     assert_eq!(reply, b"gated-envelope");
 
-    // The replacement gate captures this listener's port: a valid tag for a
-    // different dest port is refused before a session is allocated.
-    let wrong_dest = SocketAddr::from(([127, 0, 0, 1], frontend_port.wrapping_add(1).max(1)));
-    let portable = encode_datagram_with_metadata(
-        forwarded_client,
-        wrong_dest,
-        b"wrong-port",
-        Some(&datagram_hmac_key()),
+    // The reconstructed gate carries a live replay window, not just a key: the
+    // same bytes again are dropped (issue #3862).
+    client
+        .send_to(&envelope, gateway_addr)
+        .await
+        .expect("replay the authenticated envelope");
+    assert!(
+        recv_udp_within(&client, UDP_DROP_WINDOW).await.is_none(),
+        "a verbatim replay must be dropped by the reconstructed listener's replay window"
     );
+
+    // And the reconstructed binding is this listener's: an envelope minted for
+    // another listener's binding under the same root secret is refused before a
+    // session is allocated (issue #3856).
+    let other_port = frontend_port.wrapping_add(1).max(1);
+    let other_binding = datagram_binding(other_port);
+    let other_addr = SocketAddr::from(([127, 0, 0, 1], other_port));
+    let portable = datagram_envelope(&other_binding, other_addr, b"wrong-listener", 1);
     client
         .send_to(&portable, gateway_addr)
         .await
         .expect("send portable envelope");
     assert!(
         recv_udp_within(&client, UDP_DROP_WINDOW).await.is_none(),
-        "an authenticated envelope for another listener port must be dropped after reload"
+        "an authenticated envelope for another listener must be dropped after reload"
     );
+
+    // A fresh sequence still works, so neither refusal wedged the listener.
+    let fresh = datagram_envelope(&binding, gateway_addr, b"still-serving", 2);
+    client
+        .send_to(&fresh, gateway_addr)
+        .await
+        .expect("send a fresh sequence");
+    let reply = recv_udp_within(&client, UDP_RECV_WINDOW)
+        .await
+        .expect("a fresh sequence must still round-trip");
+    assert_eq!(reply, b"still-serving");
 
     // Clearing the field must restart again and restore bare UDP behavior.
     publish_stream_config(

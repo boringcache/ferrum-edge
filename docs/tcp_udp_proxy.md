@@ -1024,45 +1024,120 @@ proxies:
 
 - `ver_cmd` is `0x21` (version 2, `PROXY`) or `0x20` (version 2, `LOCAL`).
 - `fam_tp` is `0x12` (`AF_INET` + `DGRAM`) or `0x22` (`AF_INET6` + `DGRAM`). A `PROXY` command must declare the `DGRAM` transport whatever family it uses, so the address-less `AF_UNSPEC` shape is `0x02` — `0x00` there would be a TCP header replayed onto the datagram path. A `LOCAL` command keeps the spec's convention (`0x00` is fine) because it never sets a client identity.
-- The address block holds the fixed source/destination addresses and ports, optionally followed by TLVs. `addr_len` covers both; the payload begins immediately after.
+- The address block holds the fixed source/destination addresses and ports, optionally followed by TLVs. `addr_len` covers both; the payload begins immediately after. When a secret is configured the block carries exactly one freshness TLV (`0xE1`) and exactly one authentication TLV (`0xE0`).
 - Everything after the address block is the application payload, forwarded to the backend verbatim.
 
 **Every** datagram must carry the envelope. A first-datagram-only contract would let any later datagram from the same 4-tuple inherit an identity it never proved, and datagram delivery is unordered and lossy, so there is no dependable "first" datagram.
 
+### Three separate properties
+
+An authenticated envelope provides three *distinct* guarantees. They are described separately below because they fail separately:
+
+| Property | What it proves | Mechanism |
+|----------|----------------|-----------|
+| **Authenticity** | the envelope and payload were minted by a holder of the root secret | HMAC-SHA-256 tag, TLV `0xE0` |
+| **Listener-domain binding** | it was minted for *this* listener and no other | versioned domain-separation prefix inside the MAC input |
+| **Freshness / anti-replay** | Ferrum has not already acted on these exact bytes | authenticated freshness record (TLV `0xE1`) plus a bounded per-sender replay window |
+
 ### Authentication
 
-Source addresses are trivially spoofable on UDP. Set `FERRUM_DATAGRAM_PROXY_PROTOCOL_SECRET` (at least 32 bytes) to require an HMAC-SHA-256 tag on every datagram:
+Source addresses are trivially spoofable on UDP. Set `FERRUM_DATAGRAM_PROXY_PROTOCOL_SECRET` (at least 32 bytes) to require an HMAC-SHA-256 tag and a freshness record on every datagram:
 
-- TLV type `0xE0` (the PROXY v2 application-reserved range), value length 32.
-- The tag is computed over the complete datagram with the 32 tag bytes elided — so the command, family, transport, addresses, every other TLV, and the payload are all bound to it.
+- The tag is TLV type `0xE0` (the PROXY v2 application-reserved range), value length 32.
+- It is computed over the listener's canonical domain prefix (below) **plus** the complete datagram with the 32 tag bytes elided — so the receiving listener's identity, the command, family, transport, addresses, the freshness record, every other TLV, and the payload are all bound to it.
 - A datagram with a missing, malformed, duplicated, or non-verifying tag is dropped.
-- An identity-bearing `PROXY` envelope's declared **destination port must equal this listener's `listen_port`**. The HMAC is keyed by a process-global secret, so without this check a valid envelope minted for listener A would verify on listener B and acquire the same authenticated identity. `LOCAL` and `AF_UNSPEC` still never set a forwarded identity and are not dest-port bound. Mismatches are dropped before session, demux, plugin, or backend work, with a fixed-cardinality `destination_port_mismatch` reason that does not echo ports or envelope addresses.
 - The configured value is the key **verbatim** — it is never trimmed or normalized, so leading/trailing whitespace is key material and any nonempty value makes authentication mandatory. Only an unset or empty variable leaves the listener in the address-trust posture, and startup rejects a value shorter than 32 bytes without reporting the value or its length.
+- The root secret is read once at startup. Rotating it requires a process restart; it does not rotate under a live listener.
 
-The tag binds metadata to payload; it is **not** an anti-replay mechanism. A verbatim replay of a captured datagram remains possible, exactly as it is for plain UDP.
+With no secret configured, trust rests on `FERRUM_TRUSTED_PROXIES` alone, and the envelope has **neither cryptographic authenticity nor freshness** — a spoofed source address or a captured datagram is indistinguishable from a genuine one. That is sufficient only where the network path between the balancer and the gateway cannot carry spoofed source addresses; the listener logs a warning at startup so the weaker posture is visible.
 
-With no secret configured, trust rests on `FERRUM_TRUSTED_PROXIES` alone. That is sufficient only where the network path between the balancer and the gateway cannot carry spoofed source addresses; the listener logs a warning at startup so the weaker posture is visible.
+### Listener-domain binding
+
+One process-global root secret must not make a valid envelope portable between listeners. The MAC input therefore begins with a versioned domain-separation prefix built from *configured/bound listener properties only* — never from envelope bytes:
+
+```text
+"ferrum-datagram-proxy-v1" | binding_version | protocol_tag
+                           | family_tag | bind_addr octets | listen_port
+```
+
+- `protocol_tag` distinguishes the **plain-UDP receive boundary** from the **DTLS-terminating** one, so the same numeric port cannot be crossed between a plain `udp` listener and a DTLS frontend.
+- `family_tag` + `bind_addr` is the listener's **canonical bind address** (an IPv4-mapped IPv6 bind is folded to IPv4). A wildcard bind (`0.0.0.0` / `::`) and a specific-address bind on the same numeric port are therefore different domains, as are two specific addresses on one port.
+- `listen_port` is the exact receiving port.
+
+Because the binding is inside the MAC input, this holds for **every** command and family — `LOCAL` and `AF_UNSPEC` included, even though they carry no forwarded identity and therefore no declared destination to compare. An envelope minted for listener A and replayed byte-for-byte at listener B (changing only the outer UDP destination, which is outside the envelope) fails as `authentication_tag_mismatch`.
+
+The envelope's declared destination port is *additionally* compared to the listener's `listen_port` as defense in depth. That check runs first, so an address-bearing cross-listener envelope reports the more specific `listener_binding_mismatch`. Neither check is sufficient alone: the declared destination cannot cover the address-less forms, and the MAC alone cannot produce a distinguishable reason.
+
+A listener reload rebuilds the binding from the live protocol, bind address, and port. Every component is already part of the stream-listener restart key, so a reloaded listener can never keep a previous listener's binding.
+
+### Freshness and anti-replay
+
+Authentication proves *who could have created* the bytes, not *whether Ferrum has already acted on them*. Each authenticated envelope therefore carries exactly one freshness TLV:
+
+- TLV type `0xE1`, value length 29:
+
+  ```text
+  version u8 | sender_id u32 BE | epoch u64 BE | sequence u64 BE | timestamp_ms u64 BE
+  ```
+
+- `sender_id` is a stable, bounded identifier the balancer picks for itself (it doubles as the key identifier). `epoch` must strictly increase across a balancer restart or key rotation. `sequence` is monotonic within `(sender_id, epoch)`; `u64::MAX` is reserved, so a sender rolls its epoch rather than wrapping. `timestamp_ms` is Unix milliseconds at send time.
+- Every field is inside the MAC input, so an observer can neither mint nor renumber one.
+- The receiver keeps one bounded record per authenticated `sender_id` **per listener**: the highest admitted sequence for that sender's current epoch, plus a 64-bit bitmap of the sequences immediately below it. Check-and-mark happens under a single sharded-map write guard, so two receive workers can never both admit one sequence.
+
+| Freshness outcome | Result |
+|-------------------|--------|
+| unique sequence at or ahead of the window | admitted, marked |
+| unique sequence within 64 of the highest (bounded reordering) | admitted once, marked |
+| sequence equal to the highest, or already marked | `replay_duplicate` |
+| sequence more than 64 behind the highest | `replay_stale` |
+| epoch below the sender's current admitted epoch | `replay_epoch_stale` |
+| `sequence == u64::MAX` | `replay_sequence_exhausted` |
+| `timestamp_ms` more than 30s from the receiver's clock, either direction | `freshness_outside_horizon` |
+| no freshness TLV while a secret is configured | `missing_freshness` |
+| two freshness TLVs, or a wrong-length value | `duplicate_freshness` / `malformed_freshness` |
+| unknown freshness version | `unsupported_freshness_version` |
+| replay state at capacity with nothing reclaimable | `replay_state_capacity` |
+
+The 30-second horizon is a fixed constant, not an operator knob: it is the bound the lifecycle guarantees below are stated in, and a deployment that could widen it could silently widen the cross-restart replay window. Senders and receivers must agree on wall-clock time to within it (ordinary NTP synchronization is orders of magnitude tighter).
+
+**State is bounded.** At most 1024 senders per listener. At capacity the listener first reclaims records idle longer than 120s (four times the horizon) and, if that frees nothing, refuses with `replay_state_capacity` rather than evicting live protection. The idle threshold deliberately exceeds *twice* the horizon: an envelope that could still be inside the horizon after a reclaim would need a timestamp both newer than `now − 30s` and no newer than `last_activity + 30s`, which cannot both hold, so reclaiming can never make an old sequence valid again. Sequence jumps, epoch churn, and far-future sequences cost no extra state — one record per sender, whatever the numbers are.
+
+### Lifecycle: exactly what is guaranteed
+
+- **Within one Ferrum process, per listener** — every authenticated envelope is admitted **at most once**. A byte-for-byte replay is dropped before session lookup or creation, before pending-queue admission, before DTLS demux and handshake allocation, before `on_stream_connect` / `on_udp_datagram`, before backend selection or send, before byte/amplification accounting, and without refreshing idle activity.
+- **Across a listener reload, a receiver process restart, or a second Ferrum replica** — replay state is process-local and listener-scoped, so a fresh gate has a fresh window. Exposure is therefore **bounded to the 30-second horizon**: a captured envelope older than that is refused by *any* receiver, restarted or not. Ferrum does **not** claim cluster-wide anti-replay.
+- **Supported multi-replica model** — per-flow sender stickiness (a datagram balancer already pins one client flow to one Ferrum socket) plus that horizon. If you need envelope-level exactly-once across replicas, terminate the metadata at a single receiver.
+- **Sender restart** — publish a strictly higher `epoch`. Reusing an old epoch with restarted sequence numbers is refused as `replay_epoch_stale`.
+- **Secret / key rotation** — restart the process; the new secret invalidates every envelope minted under the old one, and the fresh replay state starts empty.
+
+### Sender contract
+
+`proxy::datagram_client_address::encode_datagram_with_metadata` is the normative encoder (Ferrum only ever decodes). An authenticated sender supplies the listener binding it is addressing and a `(sender_id, epoch, sequence, timestamp_ms)` record; an unauthenticated sender supplies neither and gets the address-trust posture. There is no compatibility switch that accepts a tagged envelope *without* freshness: that shape is refused as `missing_freshness`, because a per-deployment opt-out would make the whole anti-replay contract opt-out on the wire.
 
 ### Fail-closed behavior
 
 | Scenario | Result |
 |----------|--------|
-| Trusted peer + valid envelope (+ valid tag when a secret is set) | `client_ip` = forwarded address; `direct_client_ip` = balancer socket peer |
+| Trusted peer + valid envelope (+ valid tag and fresh sequence when a secret is set) | `client_ip` = forwarded address; `direct_client_ip` = balancer socket peer |
 | Untrusted peer (not in `FERRUM_TRUSTED_PROXIES`) | Datagram **dropped** |
 | Missing / truncated / oversized / malformed envelope | Datagram **dropped** |
 | Any transport but `DGRAM` on a `PROXY` command, `AF_UNSPEC` included (a TCP PROXY header replayed onto the datagram path) | Datagram **dropped** |
 | Unsupported address family (including `AF_UNIX`) | Datagram **dropped** |
 | Missing, duplicated, wrong-length, or invalid authentication tag | Datagram **dropped** |
-| Identity-bearing envelope whose destination port is not this listener's `listen_port` | Datagram **dropped** |
+| Envelope minted for another listener's binding (any command or family) | Datagram **dropped** |
+| Envelope whose declared destination port is not this listener's `listen_port` | Datagram **dropped** |
+| Missing, duplicated, malformed, or unsupported-version freshness record | Datagram **dropped** |
+| Duplicate, stale, epoch-stale, or exhausted sequence; timestamp outside the horizon | Datagram **dropped** |
+| Replay state at capacity for a new sender | Datagram **dropped** |
 | Forwarded client differs from the established session's | Datagram **dropped** |
 | `LOCAL` command, or `PROXY` + `AF_UNSPEC` + `DGRAM` (balancer health probe) | `client_ip` = `direct_client_ip` = balancer socket peer |
 
-A drop is silent on the wire (UDP has no reset). Each one increments an internal listener-local `client_address_metadata_drops` counter (shared by the UDP receive path and the DTLS demuxer on that listener) and emits a rate-limited structured warning naming the failing field; payload bytes, tag material, and rejected forwarded addresses are never logged. That counter is **not** an exported Prometheus or admin metric — it is in-process accounting for tests and the listener's own drop path.
+A drop is silent on the wire (UDP has no reset). Each one increments an internal listener-local `client_address_metadata_drops` counter (shared by the UDP receive path and the DTLS demuxer on that listener) and emits a rate-limited structured warning carrying a fixed-cardinality reason and the direct socket peer only; payload bytes, tag material, the secret, sequence-cache contents, and rejected forwarded addresses are never logged. That counter is **not** an exported Prometheus or admin metric — it is in-process accounting for tests and the listener's own drop path.
 
 ### Session and reply semantics
 
 - Ferrum keys UDP sessions by the **socket peer**, so a balancer must allocate a distinct source port per client flow (ordinary per-flow NAT). All datagrams on one socket peer must therefore carry the same forwarded client; one that does not is dropped rather than attributed to the established session's identity.
-- **Identity pinning is fail-closed and does not refresh activity on mismatch.** Once a 4-tuple is admitted, a later datagram asserting a different forwarded identity is dropped and does not extend the idle watermark. That is the correct security behavior. The availability consequence is that an unauthenticated spoof or an authenticated replay that wins the fresh-flow race can occupy the session slot and **blackhole the genuine flow until the idle window**, after which the association expires and the genuine flow self-heals. Do not weaken the pin to recover faster.
+- **Identity pinning is fail-closed and does not refresh activity on mismatch.** Once a 4-tuple is admitted, a later datagram asserting a different forwarded identity is dropped and does not extend the idle watermark. That is the correct security behavior. The availability consequence is that an **unauthenticated** spoof winning the fresh-flow race can occupy the session slot and **blackhole the genuine flow until the idle window**, after which the association expires and the genuine flow self-heals. Do not weaken the pin to recover faster. With a secret configured this race is no longer reachable by replaying captured bytes: the replay window refuses the duplicate before a session is created, so an attacker would have to forge a fresh authenticated envelope, which requires the root secret.
 - **Replies are sent to the socket peer unwrapped.** Ferrum does not emit the envelope on the return path — the balancer demultiplexes by its own 4-tuple.
 - The envelope is stripped before anything else runs: before session lookup, before `on_stream_connect` / `on_udp_datagram` plugins, before the DTLS record layer on a `dtls` listener, and before any backend send. The backend never sees envelope bytes.
 - Backend load-balancer stickiness (`hash_on` ip-hash lanes) follows the resolved client, so one real client keeps one backend across the balancer's ports.
@@ -1074,8 +1149,10 @@ Identical to the TCP path: `client_ip` (mesh authz `remote.ip` / `remoteIpBlocks
 ### Limitations (datagram)
 
 - **Inbound only.** Ferrum never emits the datagram envelope toward a backend; `backend_proxy_protocol` remains TCP-only.
-- **No anti-replay.** See above. Destination-port binding stops a valid envelope from being replayed onto a *different* listener; it does not stop a verbatim replay onto the *same* listener.
-- **Identity-pinning availability.** See [Session and reply semantics](#session-and-reply-semantics): a spoof or replay that wins a fresh-flow race can blackhole the genuine client until idle timeout, then self-heals. The pin is not relaxed.
+- **Anti-replay is process-local, bounded by the horizon.** Exactly-once holds within one Ferrum process per listener. Across a listener reload, a receiver restart, or a second replica, a captured envelope stays usable for at most 30 seconds — see [Lifecycle](#lifecycle-exactly-what-is-guaranteed). Ferrum does not claim cluster-wide anti-replay.
+- **Freshness requires a configured secret.** Without `FERRUM_DATAGRAM_PROXY_PROTOCOL_SECRET` there is no authenticity and no replay protection at all; the address-trust posture accepts a verbatim repeat exactly as plain UDP does.
+- **Bounded clock-skew contract.** Sender and receiver wall clocks must agree to within 30 seconds, or authenticated datagrams are refused as `freshness_outside_horizon`.
+- **Identity-pinning availability.** See [Session and reply semantics](#session-and-reply-semantics): in the unauthenticated posture a spoof that wins a fresh-flow race can blackhole the genuine client until idle timeout, then self-heals. The pin is not relaxed.
 - **Not supported on mesh capture paths.** Ambient/sidecar UDP capture carries its own metadata; the envelope applies to configured `udp` / `dtls` stream listeners.
 
 ## Outbound PROXY Protocol

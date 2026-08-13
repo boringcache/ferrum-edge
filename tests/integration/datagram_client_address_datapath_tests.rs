@@ -1,20 +1,28 @@
 //! Live UDP and DTLS datapaths for the datagram client-address envelope
-//! (issue #3289).
+//! (issues #3289, #3856, #3862).
 //!
 //! A real `start_udp_listener` runs with the gate engaged, a real UDP client
 //! plays the trusted datagram load balancer, and a real echo backend answers.
 //! What is asserted is what the feature exists for: the authenticated forwarded
 //! address becomes the plugin-visible `client_ip` while `direct_client_ip`
 //! stays the balancer's socket peer, the backend receives the payload with the
-//! envelope stripped, and every unauthenticated or malformed variant is dropped
-//! with nothing reaching the backend.
+//! envelope stripped, and every unauthenticated, malformed, cross-listener, or
+//! replayed variant is dropped with nothing reaching the backend.
+//!
+//! Two listeners run side by side under one root secret so the #3856 contract is
+//! exercised the way an operator would hit it: an envelope minted for listener A
+//! and replayed byte-for-byte at listener B must be refused for every envelope
+//! form, including `LOCAL` and `AF_UNSPEC`, which carry no forwarded identity.
+//! A same-listener verbatim replay is refused by the #3862 window, and the
+//! backend must see the payload exactly once.
 //!
 //! The DTLS listener has its own pre-demux path, so it is covered separately
 //! against a real `DtlsServer`: a wrapping relay drives a real `dimpl`
 //! handshake through the gate, proving the envelope is validated and stripped
 //! before the record layer and that the authenticated forwarded client reaches
 //! the accepted `DtlsServerConn`, while handshake-shaped datagrams that fail
-//! the gate allocate no association at all.
+//! the gate — bare, unsigned, foreign-keyed, cross-listener, or replayed —
+//! allocate no association at all.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -44,7 +52,9 @@ use ferrum_edge::plugins::{
 };
 use ferrum_edge::proxy::client_ip::TrustedProxies;
 use ferrum_edge::proxy::datagram_client_address::{
-    DatagramClientAddressGate, encode_datagram_with_metadata,
+    DatagramClientAddressGate, DatagramEnvelopeAuth, DatagramEnvelopeForm, DatagramFreshness,
+    DatagramListenerBinding, DatagramListenerProtocol, FRESHNESS_HORIZON_MS,
+    encode_datagram_with_metadata, unix_now_millis,
 };
 use ferrum_edge::proxy::udp_proxy::{UdpListenerConfig, UdpProxyMetrics, start_udp_listener};
 use ferrum_edge::request_epoch::RequestEpochStore;
@@ -57,6 +67,9 @@ const RECV_TIMEOUT: Duration = Duration::from_secs(5);
 const DROP_OBSERVATION_WINDOW: Duration = Duration::from_millis(250);
 const PER_ATTEMPT_STARTED_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_GATEWAY_ATTEMPTS: u32 = 3;
+/// Every envelope form an authenticated balancer may emit. All four must be
+/// bound to the receiving listener (#3856) and replay-protected (#3862).
+const ALL_FORMS: [&str; 4] = ["LOCAL", "AF_UNSPEC", "IPv4", "IPv6"];
 
 /// Records the identities the gateway published for admitted traffic.
 #[derive(Default)]
@@ -172,12 +185,19 @@ fn udp_proxy(listen_port: u16, backend_port: u16) -> Proxy {
     }
 }
 
-async fn spawn_udp_echo_backend(socket: Arc<UdpSocket>) -> tokio::task::JoinHandle<()> {
+/// An echo backend that also counts how many datagrams it was actually handed,
+/// so "the backend saw this payload exactly once" is an observation rather than
+/// an inference from a missing reply.
+async fn spawn_counting_echo_backend(
+    socket: Arc<UdpSocket>,
+    received: Arc<AtomicU64>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut buf = vec![0u8; 65535];
         loop {
             match socket.recv_from(&mut buf).await {
                 Ok((n, peer)) => {
+                    received.fetch_add(1, Ordering::Relaxed);
                     let _ = socket.send_to(&buf[..n], peer).await;
                 }
                 Err(_) => return,
@@ -188,6 +208,7 @@ async fn spawn_udp_echo_backend(socket: Arc<UdpSocket>) -> tokio::task::JoinHand
 
 struct SpawnedGateway {
     listen_port: u16,
+    binding: DatagramListenerBinding,
     shutdown_tx: watch::Sender<bool>,
     join: tokio::task::JoinHandle<()>,
     metrics: Arc<UdpProxyMetrics>,
@@ -195,6 +216,16 @@ struct SpawnedGateway {
 }
 
 impl SpawnedGateway {
+    fn addr(&self) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), self.listen_port)
+    }
+
+    fn drops(&self) -> u64 {
+        self.metrics
+            .client_address_metadata_drops
+            .load(Ordering::Relaxed)
+    }
+
     async fn shutdown(self) {
         let _ = self.shutdown_tx.send(true);
         let _ = tokio::time::timeout(RECV_TIMEOUT, self.join).await;
@@ -248,10 +279,18 @@ async fn try_spawn_gateway(
     // The test client plays the trusted load balancer on loopback.
     let trusted_proxies =
         Arc::new(TrustedProxies::parse_strict("127.0.0.1", "test").expect("trust list"));
+    // The binding the production listener would build for this spawn: plain-UDP
+    // receive boundary, the loopback bind address, this listener's port.
+    let binding = DatagramListenerBinding::new(
+        DatagramListenerProtocol::Udp,
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        listen_port,
+    );
     let gate = Arc::new(DatagramClientAddressGate::new(
         trusted_proxies,
         authenticated.then_some(SECRET),
-        listen_port,
+        binding,
+        0,
     ));
 
     let listener_started = Arc::clone(&started);
@@ -301,6 +340,7 @@ async fn try_spawn_gateway(
         if started.load(Ordering::Acquire) {
             return Some(SpawnedGateway {
                 listen_port,
+                binding,
                 shutdown_tx,
                 join,
                 metrics,
@@ -343,14 +383,114 @@ fn key() -> HmacSha256Key {
     HmacSha256Key::new_from_slice(SECRET.as_bytes()).expect("hmac key")
 }
 
+/// The forwarded client every fixture speaks for.
+fn forwarded_client() -> SocketAddr {
+    "203.0.113.9:41234".parse().expect("client addr")
+}
+
+/// The trusted datagram load balancer: one stable sender id and epoch, a
+/// monotonic sequence, and the root secret.
+struct Balancer {
+    key: HmacSha256Key,
+    sender_id: u32,
+    epoch: u64,
+    next_sequence: u64,
+}
+
+impl Balancer {
+    fn new(sender_id: u32) -> Self {
+        Self::with_key(sender_id, key())
+    }
+
+    fn with_key(sender_id: u32, key: HmacSha256Key) -> Self {
+        Self {
+            key,
+            sender_id,
+            epoch: 1,
+            next_sequence: 0,
+        }
+    }
+
+    /// Wrap `payload` for `binding` at an explicit sequence and timestamp.
+    fn wrap_at(
+        &self,
+        binding: &DatagramListenerBinding,
+        form: DatagramEnvelopeForm,
+        payload: &[u8],
+        sequence: u64,
+        timestamp_ms: u64,
+    ) -> Vec<u8> {
+        let freshness = DatagramFreshness {
+            sender_id: self.sender_id,
+            epoch: self.epoch,
+            sequence,
+            timestamp_ms,
+        };
+        let auth = DatagramEnvelopeAuth {
+            key: &self.key,
+            binding,
+            freshness,
+        };
+        encode_datagram_with_metadata(form, payload, Some(&auth))
+    }
+
+    /// Wrap `payload` for `binding`, consuming the next sequence.
+    fn wrap(
+        &mut self,
+        binding: &DatagramListenerBinding,
+        form: DatagramEnvelopeForm,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let sequence = self.next_sequence;
+        self.next_sequence += 1;
+        self.wrap_at(binding, form, payload, sequence, unix_now_millis())
+    }
+}
+
+/// The address-bearing IPv4 form aimed at `destination`.
+fn v4_form(destination: SocketAddr) -> DatagramEnvelopeForm {
+    DatagramEnvelopeForm::Forwarded {
+        source: forwarded_client(),
+        destination,
+    }
+}
+
+/// The address-bearing IPv6 form declaring `destination`'s port.
+fn v6_form(destination: SocketAddr) -> DatagramEnvelopeForm {
+    let dest = format!("[2001:db8::1]:{}", destination.port());
+    DatagramEnvelopeForm::Forwarded {
+        source: "[2001:db8::10]:41234".parse().expect("v6 client"),
+        destination: dest.parse().expect("v6 destination"),
+    }
+}
+
+/// The four envelope forms, selected by label so every form-parameterized test
+/// reads the same way.
+fn envelope_form(label: &str, destination: SocketAddr) -> DatagramEnvelopeForm {
+    match label {
+        "LOCAL" => DatagramEnvelopeForm::Local,
+        "AF_UNSPEC" => DatagramEnvelopeForm::Unspec,
+        "IPv4" => v4_form(destination),
+        "IPv6" => v6_form(destination),
+        other => panic!("unknown envelope form {other}"),
+    }
+}
+
+/// An unauthenticated envelope: the address-trust posture only.
+fn plain(form: DatagramEnvelopeForm, payload: &[u8]) -> Vec<u8> {
+    encode_datagram_with_metadata(form, payload, None)
+}
+
 /// Run a datagram load-balancer shim between one DTLS client and Ferrum's DTLS
 /// demuxer. The first ClientHello is deliberately replayed without an envelope
 /// and must be dropped; every retransmission and application packet is wrapped
-/// with authenticated client-address metadata. Server packets travel back
-/// unchanged because the envelope is an inbound load-balancer contract.
+/// with authenticated client-address metadata carrying a fresh sequence. Server
+/// packets travel back unchanged because the envelope is an inbound
+/// load-balancer contract.
 async fn spawn_dtls_metadata_relay(
     server_addr: SocketAddr,
-    forwarded_client: SocketAddr,
+    binding: DatagramListenerBinding,
+    forwarded: SocketAddr,
 ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let socket = Arc::new(
         UdpSocket::bind("127.0.0.1:0")
@@ -359,6 +499,7 @@ async fn spawn_dtls_metadata_relay(
     );
     let relay_addr = socket.local_addr().expect("DTLS metadata relay addr");
     let task = tokio::spawn(async move {
+        let mut balancer = Balancer::new(7);
         let mut client_addr = None;
         let mut replayed_bare_client_hello = false;
         let mut buf = vec![0u8; 65_535];
@@ -381,12 +522,11 @@ async fn spawn_dtls_metadata_relay(
                 continue;
             }
 
-            let wrapped = encode_datagram_with_metadata(
-                forwarded_client,
-                server_addr,
-                &buf[..len],
-                Some(&key()),
-            );
+            let form = DatagramEnvelopeForm::Forwarded {
+                source: forwarded,
+                destination: server_addr,
+            };
+            let wrapped = balancer.wrap(&binding, form, &buf[..len]);
             let _ = socket.send_to(&wrapped, server_addr).await;
         }
     });
@@ -403,6 +543,15 @@ async fn recv_within(socket: &UdpSocket, window: Duration) -> Option<Vec<u8>> {
     }
 }
 
+/// Wait, bounded, until the listener's drop counter reaches `expected`, so the
+/// accounting assertions observe a settled recv loop rather than racing it.
+async fn wait_for_drops(counter: &AtomicU64, expected: u64) {
+    let deadline = std::time::Instant::now() + RECV_TIMEOUT;
+    while counter.load(Ordering::Relaxed) < expected && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 #[tokio::test]
 async fn authenticated_envelope_drives_the_live_dtls_demux_and_binds_identity() {
     let _ =
@@ -410,6 +559,11 @@ async fn authenticated_envelope_drives_the_live_dtls_demux_and_binds_identity() 
 
     let mut server = None;
     let mut drops = Arc::new(AtomicU64::new(0));
+    let mut binding = DatagramListenerBinding::new(
+        DatagramListenerProtocol::Dtls,
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        0,
+    );
     for attempt in 1..=MAX_GATEWAY_ATTEMPTS {
         let frontend = reserve_udp_port().await.expect("reserve DTLS port");
         let listen_port = frontend.drop_and_take_port();
@@ -425,10 +579,19 @@ async fn authenticated_envelope_drives_the_live_dtls_demux_and_binds_identity() 
             client_cert_verifier: None,
         };
         let attempt_drops = Arc::new(AtomicU64::new(0));
+        // The DTLS receive boundary is its own protocol domain, so a valid
+        // envelope for the plain-UDP listener on this port could never verify
+        // here either.
+        let attempt_binding = DatagramListenerBinding::new(
+            DatagramListenerProtocol::Dtls,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            listen_port,
+        );
         let gate = Arc::new(DatagramClientAddressGate::new(
             Arc::new(TrustedProxies::parse_strict("127.0.0.1", "test").expect("trust list")),
             Some(SECRET),
-            listen_port,
+            attempt_binding,
+            0,
         ));
         match DtlsServer::bind_with_limits(
             SocketAddr::from(([127, 0, 0, 1], listen_port)),
@@ -446,6 +609,7 @@ async fn authenticated_envelope_drives_the_live_dtls_demux_and_binds_identity() 
         {
             Ok(bound) => {
                 drops = attempt_drops;
+                binding = attempt_binding;
                 server = Some(bound);
                 break;
             }
@@ -464,7 +628,7 @@ async fn authenticated_envelope_drives_the_live_dtls_demux_and_binds_identity() 
         let _ = server_runner.run().await;
     });
 
-    let forwarded_client: SocketAddr = "203.0.113.9:41234".parse().expect("client addr");
+    let forwarded = forwarded_client();
 
     // Pre-association refusal: a handshake-shaped datagram is exactly what the
     // demuxer would otherwise spawn a session for, so each of these proves the
@@ -480,36 +644,60 @@ async fn authenticated_envelope_drives_the_live_dtls_demux_and_binds_identity() 
         packet.extend_from_slice(&[0u8; 42]);
         packet
     };
+    let hello_form = DatagramEnvelopeForm::Forwarded {
+        source: forwarded,
+        destination: server_addr,
+    };
+    // A different listener sharing the one root secret: a valid envelope minted
+    // for it must not authenticate here (#3856).
+    let other_listener = DatagramListenerBinding::new(
+        DatagramListenerProtocol::Dtls,
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        server_addr.port().wrapping_add(1).max(1),
+    );
+    // The same numeric port on the plain-UDP receive boundary: also a different
+    // domain, so a UDP-listener envelope cannot be laundered into the demuxer.
+    let udp_boundary = DatagramListenerBinding::new(
+        DatagramListenerProtocol::Udp,
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        server_addr.port(),
+    );
+    let hostile_balancer = Balancer::new(99);
+    let foreign_balancer = Balancer::with_key(98, foreign_key);
+    let now = unix_now_millis();
     let pre_association_refusals: Vec<Vec<u8>> = vec![
+        // Bare: no envelope at all on a gated listener.
         client_hello_shaped.clone(),
-        encode_datagram_with_metadata(forwarded_client, server_addr, &client_hello_shaped, None),
-        encode_datagram_with_metadata(
-            forwarded_client,
-            server_addr,
+        // Correctly shaped envelope, no authentication.
+        plain(hello_form, &client_hello_shaped),
+        // Tag minted under a foreign secret.
+        foreign_balancer.wrap_at(&binding, hello_form, &client_hello_shaped, 0, now),
+        // Valid tag, but minted for a different DTLS listener.
+        hostile_balancer.wrap_at(&other_listener, hello_form, &client_hello_shaped, 1, now),
+        // Valid tag, but minted for the plain-UDP boundary on this same port.
+        hostile_balancer.wrap_at(&udp_boundary, hello_form, &client_hello_shaped, 2, now),
+        // Authenticated but stale beyond the freshness horizon.
+        hostile_balancer.wrap_at(
+            &binding,
+            hello_form,
             &client_hello_shaped,
-            Some(&foreign_key),
-        ),
-        encode_datagram_with_metadata(
-            forwarded_client,
-            SocketAddr::new(server_addr.ip(), server_addr.port().wrapping_add(1).max(1)),
-            &client_hello_shaped,
-            Some(&key()),
+            3,
+            now - FRESHNESS_HORIZON_MS - 1_000,
         ),
     ];
+    // A correctly minted envelope, then its byte-for-byte replay. The first is
+    // admitted into the handshake path (it never completes, so it allocates and
+    // then times out); the replay must be refused at the metadata boundary
+    // (#3862). Sent last so the admitted one cannot mask the replay's refusal.
+    let replayable = hostile_balancer.wrap_at(&binding, hello_form, &client_hello_shaped, 4, now);
+    let expected_drops = pre_association_refusals.len() as u64;
     for datagram in &pre_association_refusals {
         hostile
             .send_to(datagram, server_addr)
             .await
             .expect("send refused datagram");
     }
-    // Bounded wait for the demuxer to have consumed all three, so the
-    // accounting assertions below observe a settled state rather than racing
-    // the recv loop under CI load.
-    let expected_drops = pre_association_refusals.len() as u64;
-    let deadline = std::time::Instant::now() + RECV_TIMEOUT;
-    while drops.load(Ordering::Relaxed) < expected_drops && std::time::Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    wait_for_drops(&drops, expected_drops).await;
     // Nothing may come back, and nothing may be allocated for the sender.
     assert!(
         recv_within(&hostile, DROP_OBSERVATION_WINDOW)
@@ -528,7 +716,32 @@ async fn authenticated_envelope_drives_the_live_dtls_demux_and_binds_identity() 
         "every pre-association refusal must be counted"
     );
 
-    let (relay_addr, relay_task) = spawn_dtls_metadata_relay(server_addr, forwarded_client).await;
+    // Now the replay pair, from a fresh socket so the association the first one
+    // opens cannot be confused with the relay's below.
+    let replayer = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind replay sender");
+    replayer
+        .send_to(&replayable, server_addr)
+        .await
+        .expect("send the genuine datagram");
+    replayer
+        .send_to(&replayable, server_addr)
+        .await
+        .expect("send its verbatim replay");
+    wait_for_drops(&drops, expected_drops + 1).await;
+    assert_eq!(
+        drops.load(Ordering::Relaxed),
+        expected_drops + 1,
+        "a same-listener verbatim replay must be refused at the metadata boundary"
+    );
+    assert!(
+        server.active_session_count() <= 1,
+        "the replay must not allocate a second DTLS association"
+    );
+
+    let (relay_addr, relay_task) =
+        spawn_dtls_metadata_relay(server_addr, binding, forwarded).await;
     let client_socket = UdpSocket::bind("127.0.0.1:0")
         .await
         .expect("bind DTLS client");
@@ -567,12 +780,11 @@ async fn authenticated_envelope_drives_the_live_dtls_demux_and_binds_identity() 
     );
     assert_eq!(
         server_conn.forwarded_client_addr,
-        Some(forwarded_client),
+        Some(forwarded),
         "the authenticated envelope must bind the forwarded client to the DTLS association"
     );
-    assert_eq!(
-        drops.load(Ordering::Relaxed),
-        expected_drops + 1,
+    assert!(
+        drops.load(Ordering::Relaxed) >= expected_drops + 2,
         "the deliberately bare first ClientHello must be refused before association allocation"
     );
 
@@ -608,30 +820,32 @@ async fn authenticated_envelope_drives_the_live_dtls_demux_and_binds_identity() 
 async fn authenticated_envelope_publishes_the_forwarded_client_and_strips_the_payload() {
     let backend = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("backend bind"));
     let backend_port = backend.local_addr().expect("backend addr").port();
-    let _backend = spawn_udp_echo_backend(Arc::clone(&backend)).await;
+    let backend_hits = Arc::new(AtomicU64::new(0));
+    let _backend =
+        spawn_counting_echo_backend(Arc::clone(&backend), Arc::clone(&backend_hits)).await;
 
     let gateway = spawn_gateway(backend_port, true).await;
-    let gateway_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), gateway.listen_port);
+    let gateway_addr = gateway.addr();
 
     // The balancer's own socket peer; the client it speaks for is elsewhere.
-    let balancer = UdpSocket::bind("127.0.0.1:0").await.expect("balancer bind");
-    let balancer_ip = balancer
+    let balancer_socket = UdpSocket::bind("127.0.0.1:0").await.expect("balancer bind");
+    let balancer_ip = balancer_socket
         .local_addr()
         .expect("balancer addr")
         .ip()
         .to_canonical()
         .to_string();
-    let original_client: SocketAddr = "203.0.113.9:41234".parse().expect("client addr");
 
-    let datagram = encode_datagram_with_metadata(original_client, gateway_addr, b"q", Some(&key()));
-    balancer
+    let mut balancer = Balancer::new(1);
+    let datagram = balancer.wrap(&gateway.binding, v4_form(gateway_addr), b"q");
+    balancer_socket
         .send_to(&datagram, gateway_addr)
         .await
         .expect("send wrapped datagram");
 
     // The backend echoes the payload, so a reply proves the envelope was
     // stripped before the backend send (the backend echoes whatever it got).
-    let reply = recv_within(&balancer, RECV_TIMEOUT)
+    let reply = recv_within(&balancer_socket, RECV_TIMEOUT)
         .await
         .expect("an authenticated datagram must round-trip");
     assert_eq!(
@@ -656,6 +870,334 @@ async fn authenticated_envelope_publishes_the_forwarded_client_and_strips_the_pa
         vec!["203.0.113.9".to_string()],
         "per-datagram hooks must see the forwarded client too"
     );
+    assert_eq!(
+        backend_hits.load(Ordering::Relaxed),
+        1,
+        "the backend must be handed the payload exactly once"
+    );
+
+    gateway.shutdown().await;
+}
+
+/// The #3862 headline on the live datapath: a byte-for-byte replay of an
+/// admitted authenticated datagram must reach neither the plugin hooks nor the
+/// backend a second time, and must not refresh the session it belongs to.
+#[tokio::test]
+async fn a_verbatim_replay_reaches_the_backend_exactly_once() {
+    let backend = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("backend bind"));
+    let backend_port = backend.local_addr().expect("backend addr").port();
+    let backend_hits = Arc::new(AtomicU64::new(0));
+    let _backend =
+        spawn_counting_echo_backend(Arc::clone(&backend), Arc::clone(&backend_hits)).await;
+
+    let gateway = spawn_gateway(backend_port, true).await;
+    let gateway_addr = gateway.addr();
+    let sender = UdpSocket::bind("127.0.0.1:0").await.expect("sender bind");
+
+    let mut balancer = Balancer::new(1);
+    let datagram = balancer.wrap(&gateway.binding, v4_form(gateway_addr), b"charge");
+    sender
+        .send_to(&datagram, gateway_addr)
+        .await
+        .expect("send the genuine datagram");
+    assert_eq!(
+        recv_within(&sender, RECV_TIMEOUT).await.as_deref(),
+        Some(&b"charge"[..]),
+        "the genuine datagram must round-trip"
+    );
+
+    // Replay the exact same bytes several times through the same admissible
+    // trusted-proxy path. Every one must be dropped at the metadata boundary.
+    const REPLAYS: u64 = 4;
+    for _ in 0..REPLAYS {
+        sender
+            .send_to(&datagram, gateway_addr)
+            .await
+            .expect("send verbatim replay");
+        assert!(
+            recv_within(&sender, DROP_OBSERVATION_WINDOW).await.is_none(),
+            "a verbatim replay must not be answered"
+        );
+    }
+    wait_for_drops(&gateway.metrics.client_address_metadata_drops, REPLAYS).await;
+
+    assert_eq!(
+        backend_hits.load(Ordering::Relaxed),
+        1,
+        "the backend must observe the replayed payload exactly once"
+    );
+    assert_eq!(
+        gateway.recorder.datagram_count.load(Ordering::Relaxed),
+        1,
+        "a replay must not re-run the per-datagram hooks"
+    );
+    assert_eq!(
+        gateway.recorder.stream.lock().await.len(),
+        1,
+        "a replay must not admit a second session"
+    );
+    assert_eq!(
+        gateway.drops(),
+        REPLAYS,
+        "every replay must be counted as a client-address metadata drop"
+    );
+
+    // A fresh sequence from the same balancer still works, so the window refuses
+    // duplicates without wedging the flow.
+    let next = balancer.wrap(&gateway.binding, v4_form(gateway_addr), b"next");
+    sender
+        .send_to(&next, gateway_addr)
+        .await
+        .expect("send the next sequence");
+    assert_eq!(
+        recv_within(&sender, RECV_TIMEOUT).await.as_deref(),
+        Some(&b"next"[..]),
+        "a fresh sequence must still be admitted"
+    );
+    assert_eq!(backend_hits.load(Ordering::Relaxed), 2);
+
+    gateway.shutdown().await;
+}
+
+/// Bounded reordering must be tolerated on the live path without letting a
+/// duplicate or a stale sequence through.
+#[tokio::test]
+async fn in_window_reordering_is_admitted_once_and_stale_sequences_are_dropped() {
+    let backend = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("backend bind"));
+    let backend_port = backend.local_addr().expect("backend addr").port();
+    let backend_hits = Arc::new(AtomicU64::new(0));
+    let _backend =
+        spawn_counting_echo_backend(Arc::clone(&backend), Arc::clone(&backend_hits)).await;
+
+    let gateway = spawn_gateway(backend_port, true).await;
+    let gateway_addr = gateway.addr();
+    let sender = UdpSocket::bind("127.0.0.1:0").await.expect("sender bind");
+    let balancer = Balancer::new(1);
+    let form = v4_form(gateway_addr);
+    let now = unix_now_millis();
+
+    // Unique sequences delivered out of order but inside the window.
+    for sequence in [300u64, 298, 302, 299] {
+        let datagram = balancer.wrap_at(&gateway.binding, form, b"ok", sequence, now);
+        sender
+            .send_to(&datagram, gateway_addr)
+            .await
+            .expect("send reordered datagram");
+        assert_eq!(
+            recv_within(&sender, RECV_TIMEOUT).await.as_deref(),
+            Some(&b"ok"[..]),
+            "unique in-window sequence {sequence} must be admitted"
+        );
+    }
+    assert_eq!(backend_hits.load(Ordering::Relaxed), 4);
+
+    // A duplicate inside the window and a sequence far behind it are both
+    // dropped, and neither reaches the backend.
+    let duplicate = balancer.wrap_at(&gateway.binding, form, b"dup", 299, now);
+    let stale = balancer.wrap_at(&gateway.binding, form, b"stale", 1, now);
+    for (label, datagram) in [("duplicate", duplicate), ("stale", stale)] {
+        sender
+            .send_to(&datagram, gateway_addr)
+            .await
+            .expect("send refused datagram");
+        assert!(
+            recv_within(&sender, DROP_OBSERVATION_WINDOW).await.is_none(),
+            "{label} must be dropped"
+        );
+    }
+    wait_for_drops(&gateway.metrics.client_address_metadata_drops, 2).await;
+
+    assert_eq!(
+        backend_hits.load(Ordering::Relaxed),
+        4,
+        "no refused sequence may reach the backend"
+    );
+    assert_eq!(
+        gateway.recorder.datagram_count.load(Ordering::Relaxed),
+        4,
+        "no refused sequence may run the per-datagram hooks"
+    );
+    assert_eq!(gateway.drops(), 2);
+
+    gateway.shutdown().await;
+}
+
+/// #3856 on the live datapath: two listeners in one process share one root
+/// secret, and an envelope minted for A must be refused byte-for-byte at B for
+/// **every** envelope form — including `LOCAL` and `AF_UNSPEC`, which carry no
+/// forwarded identity and therefore no declared destination to compare — while a
+/// correctly minted envelope for B is still admitted.
+#[tokio::test]
+async fn two_live_listeners_sharing_one_secret_refuse_cross_listener_replay() {
+    let backend_a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("backend bind"));
+    let backend_a_port = backend_a.local_addr().expect("backend addr").port();
+    let hits_a = Arc::new(AtomicU64::new(0));
+    let _echo_a = spawn_counting_echo_backend(Arc::clone(&backend_a), Arc::clone(&hits_a)).await;
+
+    let backend_b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("backend bind"));
+    let backend_b_port = backend_b.local_addr().expect("backend addr").port();
+    let hits_b = Arc::new(AtomicU64::new(0));
+    let _echo_b = spawn_counting_echo_backend(Arc::clone(&backend_b), Arc::clone(&hits_b)).await;
+
+    let gateway_a = spawn_gateway(backend_a_port, true).await;
+    let gateway_b = spawn_gateway(backend_b_port, true).await;
+    let addr_a = gateway_a.addr();
+    let addr_b = gateway_b.addr();
+    assert_ne!(addr_a.port(), addr_b.port());
+
+    // Every cross-listener replay is dropped before a session exists, so they
+    // can all share one socket peer.
+    let replayer = UdpSocket::bind("127.0.0.1:0").await.expect("sender bind");
+    let mut expected_b_drops = 0u64;
+    let mut expected_b_admissions = 0u64;
+
+    for label in ALL_FORMS {
+        let mut balancer = Balancer::new(1);
+        let form_a = envelope_form(label, addr_a);
+        let for_a = balancer.wrap(&gateway_a.binding, form_a, b"cross");
+
+        // Byte-for-byte at listener B: only the outer UDP destination port
+        // differs, which is outside the envelope.
+        replayer
+            .send_to(&for_a, addr_b)
+            .await
+            .expect("replay the envelope at listener B");
+        assert!(
+            recv_within(&replayer, DROP_OBSERVATION_WINDOW)
+                .await
+                .is_none(),
+            "{label} minted for A must be dropped at B"
+        );
+        expected_b_drops += 1;
+        wait_for_drops(
+            &gateway_b.metrics.client_address_metadata_drops,
+            expected_b_drops,
+        )
+        .await;
+        assert_eq!(
+            hits_b.load(Ordering::Relaxed),
+            expected_b_admissions,
+            "{label} cross-listener replay must not reach B's backend"
+        );
+        assert_eq!(
+            gateway_b.recorder.datagram_count.load(Ordering::Relaxed),
+            expected_b_admissions,
+            "{label} cross-listener replay must not run B's per-datagram hooks"
+        );
+        assert_eq!(
+            gateway_b.drops(),
+            expected_b_drops,
+            "{label} cross-listener replay must be counted at B"
+        );
+
+        // A correctly minted envelope for B is still admitted, so the refusal
+        // above is about the binding and not about listener B being broken. It
+        // needs its own socket peer: one admitted 4-tuple pins one forwarded
+        // identity, and these four forms assert different ones.
+        let native = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind a fresh balancer flow");
+        let mut balancer_b = Balancer::new(2);
+        let form_b = envelope_form(label, addr_b);
+        let for_b = balancer_b.wrap(&gateway_b.binding, form_b, b"native");
+        native
+            .send_to(&for_b, addr_b)
+            .await
+            .expect("send B's own envelope");
+        assert_eq!(
+            recv_within(&native, RECV_TIMEOUT).await.as_deref(),
+            Some(&b"native"[..]),
+            "{label} minted for B must be admitted at B"
+        );
+        expected_b_admissions += 1;
+        assert_eq!(hits_b.load(Ordering::Relaxed), expected_b_admissions);
+        assert_eq!(
+            gateway_b.drops(),
+            expected_b_drops,
+            "{label} admission must not have been counted as a drop"
+        );
+    }
+
+    // Listener A never saw any of it: the replays were aimed at B.
+    assert_eq!(
+        gateway_a.recorder.stream.lock().await.len(),
+        0,
+        "listener A must not have admitted anything"
+    );
+    assert_eq!(hits_a.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        gateway_a.drops(),
+        0,
+        "listener A saw no traffic at all, refused or otherwise"
+    );
+    assert_eq!(
+        gateway_b.recorder.stream.lock().await.len(),
+        ALL_FORMS.len(),
+        "one admitted flow per form, each on its own socket peer"
+    );
+
+    gateway_a.shutdown().await;
+    gateway_b.shutdown().await;
+}
+
+/// A stale authenticated envelope — outside the freshness horizon — is refused
+/// before a session exists at all, which is the strongest form of "before
+/// pending-session insertion, hooks, and backend I/O".
+#[tokio::test]
+async fn a_stale_envelope_is_refused_before_any_session_or_hook() {
+    let backend = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("backend bind"));
+    let backend_port = backend.local_addr().expect("backend addr").port();
+    let backend_hits = Arc::new(AtomicU64::new(0));
+    let _backend =
+        spawn_counting_echo_backend(Arc::clone(&backend), Arc::clone(&backend_hits)).await;
+
+    let gateway = spawn_gateway(backend_port, true).await;
+    let gateway_addr = gateway.addr();
+    let sender = UdpSocket::bind("127.0.0.1:0").await.expect("sender bind");
+    let balancer = Balancer::new(1);
+    let form = v4_form(gateway_addr);
+    let long_ago = unix_now_millis() - FRESHNESS_HORIZON_MS - 5_000;
+
+    let stale = balancer.wrap_at(&gateway.binding, form, b"ancient", 0, long_ago);
+    sender
+        .send_to(&stale, gateway_addr)
+        .await
+        .expect("send stale envelope");
+    assert!(
+        recv_within(&sender, DROP_OBSERVATION_WINDOW).await.is_none(),
+        "a stale envelope must be dropped"
+    );
+    wait_for_drops(&gateway.metrics.client_address_metadata_drops, 1).await;
+
+    assert!(
+        gateway.recorder.stream.lock().await.is_empty(),
+        "a stale envelope must not admit a session"
+    );
+    assert_eq!(
+        gateway.metrics.active_sessions.load(Ordering::Relaxed),
+        0,
+        "a stale envelope must not allocate a session"
+    );
+    assert_eq!(
+        gateway.recorder.datagram_count.load(Ordering::Relaxed),
+        0,
+        "a stale envelope must not reach the per-datagram hooks"
+    );
+    assert_eq!(backend_hits.load(Ordering::Relaxed), 0);
+    assert_eq!(gateway.drops(), 1);
+
+    // The listener is unharmed: a fresh envelope still round-trips.
+    let mut fresh_balancer = Balancer::new(1);
+    let good = fresh_balancer.wrap(&gateway.binding, form, b"ok");
+    sender
+        .send_to(&good, gateway_addr)
+        .await
+        .expect("send fresh envelope");
+    assert_eq!(
+        recv_within(&sender, RECV_TIMEOUT).await.as_deref(),
+        Some(&b"ok"[..]),
+        "a stale refusal must not wedge the listener"
+    );
 
     gateway.shutdown().await;
 }
@@ -664,38 +1206,42 @@ async fn authenticated_envelope_publishes_the_forwarded_client_and_strips_the_pa
 async fn unauthenticated_and_malformed_datagrams_are_dropped_before_the_backend() {
     let backend = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("backend bind"));
     let backend_port = backend.local_addr().expect("backend addr").port();
-    let _backend = spawn_udp_echo_backend(Arc::clone(&backend)).await;
+    let backend_hits = Arc::new(AtomicU64::new(0));
+    let _backend =
+        spawn_counting_echo_backend(Arc::clone(&backend), Arc::clone(&backend_hits)).await;
 
     let gateway = spawn_gateway(backend_port, true).await;
-    let gateway_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), gateway.listen_port);
+    let gateway_addr = gateway.addr();
     let sender = UdpSocket::bind("127.0.0.1:0").await.expect("sender bind");
-    let original_client: SocketAddr = "203.0.113.9:41234".parse().expect("client addr");
+    let form = v4_form(gateway_addr);
     let foreign = HmacSha256Key::new_from_slice(b"ffffffffffffffffffffffffffffffff").expect("key");
+    let foreign_balancer = Balancer::with_key(5, foreign);
+    let balancer = Balancer::new(1);
+    let now = unix_now_millis();
+    let wrong_dest = SocketAddr::new(
+        gateway_addr.ip(),
+        gateway_addr.port().wrapping_add(1).max(1),
+    );
+    let other_binding = DatagramListenerBinding::new(
+        DatagramListenerProtocol::Udp,
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        wrong_dest.port(),
+    );
 
     let refused: Vec<(&str, Vec<u8>)> = vec![
         // A bare payload on an enabled listener: no silent pass-through.
         ("bare payload", b"query".to_vec()),
-        // Correct envelope, no authentication tag.
-        (
-            "untagged envelope",
-            encode_datagram_with_metadata(original_client, gateway_addr, b"query", None),
-        ),
+        // Correct envelope, no authentication at all.
+        ("untagged envelope", plain(form, b"query")),
         // Tag minted under a different secret.
         (
             "foreign tag",
-            encode_datagram_with_metadata(original_client, gateway_addr, b"query", Some(&foreign)),
+            foreign_balancer.wrap_at(&gateway.binding, form, b"query", 0, now),
         ),
+        // Valid tag, but minted for a different listener's binding.
         (
-            "wrong listener dest port",
-            encode_datagram_with_metadata(
-                original_client,
-                SocketAddr::new(
-                    gateway_addr.ip(),
-                    gateway_addr.port().wrapping_add(1).max(1),
-                ),
-                b"query",
-                Some(&key()),
-            ),
+            "cross-listener envelope",
+            balancer.wrap_at(&other_binding, v4_form(wrong_dest), b"query", 1, now),
         ),
         // Truncated header.
         ("truncated header", b"\r\n\r\n\x00\r\nQUI".to_vec()),
@@ -707,9 +1253,7 @@ async fn unauthenticated_and_malformed_datagrams_are_dropped_before_the_backend(
             .await
             .expect("send refused datagram");
         assert!(
-            recv_within(&sender, DROP_OBSERVATION_WINDOW)
-                .await
-                .is_none(),
+            recv_within(&sender, DROP_OBSERVATION_WINDOW).await.is_none(),
             "{label} must be dropped, not forwarded"
         );
     }
@@ -728,18 +1272,17 @@ async fn unauthenticated_and_malformed_datagrams_are_dropped_before_the_backend(
         0,
         "no refused datagram may create a session"
     );
+    assert_eq!(backend_hits.load(Ordering::Relaxed), 0);
     assert_eq!(
-        gateway
-            .metrics
-            .client_address_metadata_drops
-            .load(Ordering::Relaxed),
+        gateway.drops(),
         refused.len() as u64,
         "every refusal must be counted"
     );
 
     // The listener is still healthy: a correctly authenticated datagram after
     // the refusals still round-trips.
-    let good = encode_datagram_with_metadata(original_client, gateway_addr, b"ok", Some(&key()));
+    let mut good_balancer = Balancer::new(1);
+    let good = good_balancer.wrap(&gateway.binding, form, b"ok");
     sender
         .send_to(&good, gateway_addr)
         .await
@@ -754,96 +1297,30 @@ async fn unauthenticated_and_malformed_datagrams_are_dropped_before_the_backend(
 }
 
 #[tokio::test]
-async fn authenticated_envelope_for_a_different_listener_port_is_dropped_before_session() {
-    let backend = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("backend bind"));
-    let backend_port = backend.local_addr().expect("backend addr").port();
-    let _backend = spawn_udp_echo_backend(Arc::clone(&backend)).await;
-
-    let gateway = spawn_gateway(backend_port, true).await;
-    let gateway_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), gateway.listen_port);
-    let sender = UdpSocket::bind("127.0.0.1:0").await.expect("sender bind");
-    let original_client: SocketAddr = "203.0.113.9:41234".parse().expect("client addr");
-    let wrong_dest = SocketAddr::new(
-        gateway_addr.ip(),
-        gateway_addr.port().wrapping_add(1).max(1),
-    );
-
-    sender
-        .send_to(
-            &encode_datagram_with_metadata(
-                original_client,
-                wrong_dest,
-                b"other-listener",
-                Some(&key()),
-            ),
-            gateway_addr,
-        )
-        .await
-        .expect("send portable envelope");
-
-    assert!(
-        recv_within(&sender, DROP_OBSERVATION_WINDOW)
-            .await
-            .is_none(),
-        "a valid envelope for another listener port must be dropped"
-    );
-    assert!(
-        gateway.recorder.stream.lock().await.is_empty(),
-        "wrong dest port must not admit a session"
-    );
-    assert_eq!(
-        gateway.metrics.active_sessions.load(Ordering::Relaxed),
-        0,
-        "wrong dest port must not allocate a session"
-    );
-    assert_eq!(
-        gateway.recorder.datagram_count.load(Ordering::Relaxed),
-        0,
-        "wrong dest port must not reach plugin hooks"
-    );
-    assert_eq!(
-        gateway
-            .metrics
-            .client_address_metadata_drops
-            .load(Ordering::Relaxed),
-        1,
-        "wrong dest port must be counted before any allocation"
-    );
-
-    let good = encode_datagram_with_metadata(original_client, gateway_addr, b"ok", Some(&key()));
-    sender
-        .send_to(&good, gateway_addr)
-        .await
-        .expect("send matching dest-port envelope");
-    assert_eq!(
-        recv_within(&sender, RECV_TIMEOUT).await.as_deref(),
-        Some(&b"ok"[..]),
-        "matching dest port must still be admitted"
-    );
-
-    gateway.shutdown().await;
-}
-
-#[tokio::test]
 async fn a_second_forwarded_client_on_one_socket_peer_is_refused() {
     let backend = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("backend bind"));
     let backend_port = backend.local_addr().expect("backend addr").port();
-    let _backend = spawn_udp_echo_backend(Arc::clone(&backend)).await;
+    let backend_hits = Arc::new(AtomicU64::new(0));
+    let _backend =
+        spawn_counting_echo_backend(Arc::clone(&backend), Arc::clone(&backend_hits)).await;
 
     // Address-trust posture (no secret): the session-binding rule is
     // independent of authentication.
     let gateway = spawn_gateway(backend_port, false).await;
-    let gateway_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), gateway.listen_port);
+    let gateway_addr = gateway.addr();
     let balancer = UdpSocket::bind("127.0.0.1:0").await.expect("balancer bind");
 
-    let first: SocketAddr = "203.0.113.9:41234".parse().expect("client addr");
-    let second: SocketAddr = "198.51.100.7:41234".parse().expect("client addr");
+    let first = DatagramEnvelopeForm::Forwarded {
+        source: forwarded_client(),
+        destination: gateway_addr,
+    };
+    let second = DatagramEnvelopeForm::Forwarded {
+        source: "198.51.100.7:41234".parse().expect("client addr"),
+        destination: gateway_addr,
+    };
 
     balancer
-        .send_to(
-            &encode_datagram_with_metadata(first, gateway_addr, b"first", None),
-            gateway_addr,
-        )
+        .send_to(&plain(first, b"first"), gateway_addr)
         .await
         .expect("send first client");
     assert_eq!(
@@ -853,10 +1330,7 @@ async fn a_second_forwarded_client_on_one_socket_peer_is_refused() {
     );
 
     balancer
-        .send_to(
-            &encode_datagram_with_metadata(second, gateway_addr, b"second", None),
-            gateway_addr,
-        )
+        .send_to(&plain(second, b"second"), gateway_addr)
         .await
         .expect("send second client");
     assert!(
@@ -874,13 +1348,11 @@ async fn a_second_forwarded_client_on_one_socket_peer_is_refused() {
         "only the admitted client's datagram may reach the hooks"
     );
     assert_eq!(
-        gateway
-            .metrics
-            .client_address_metadata_drops
-            .load(Ordering::Relaxed),
+        gateway.drops(),
         1,
         "the mismatch must be counted as a client-address metadata drop"
     );
+    assert_eq!(backend_hits.load(Ordering::Relaxed), 1);
 
     gateway.shutdown().await;
 }
@@ -889,10 +1361,12 @@ async fn a_second_forwarded_client_on_one_socket_peer_is_refused() {
 async fn an_untrusted_peer_cannot_assert_a_client_address() {
     let backend = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("backend bind"));
     let backend_port = backend.local_addr().expect("backend addr").port();
-    let _backend = spawn_udp_echo_backend(Arc::clone(&backend)).await;
+    let backend_hits = Arc::new(AtomicU64::new(0));
+    let _backend =
+        spawn_counting_echo_backend(Arc::clone(&backend), Arc::clone(&backend_hits)).await;
 
     let gateway = spawn_gateway(backend_port, false).await;
-    let gateway_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), gateway.listen_port);
+    let gateway_addr = gateway.addr();
 
     // 127.0.0.2 is outside the configured trust list (`127.0.0.1`), so this
     // sender is an ordinary client forging balancer metadata.
@@ -904,12 +1378,7 @@ async fn an_untrusted_peer_cannot_assert_a_client_address() {
         return;
     };
 
-    let spoofed = encode_datagram_with_metadata(
-        "203.0.113.9:41234".parse().expect("client addr"),
-        gateway_addr,
-        b"spoofed",
-        None,
-    );
+    let spoofed = plain(v4_form(gateway_addr), b"spoofed");
     untrusted
         .send_to(&spoofed, gateway_addr)
         .await
@@ -925,14 +1394,8 @@ async fn an_untrusted_peer_cannot_assert_a_client_address() {
         gateway.recorder.stream.lock().await.is_empty(),
         "an untrusted peer must not admit a session"
     );
-    assert_eq!(
-        gateway
-            .metrics
-            .client_address_metadata_drops
-            .load(Ordering::Relaxed),
-        1,
-        "the untrusted peer must be counted"
-    );
+    assert_eq!(backend_hits.load(Ordering::Relaxed), 0);
+    assert_eq!(gateway.drops(), 1, "the untrusted peer must be counted");
 
     gateway.shutdown().await;
 }
