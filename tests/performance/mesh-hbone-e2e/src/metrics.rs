@@ -78,6 +78,7 @@ impl BenchMetrics {
         target: &str,
         concurrency: u64,
         duration_secs: u64,
+        payload_size: usize,
     ) -> BenchReport {
         let rps = if duration_secs > 0 {
             self.total_requests as f64 / duration_secs as f64
@@ -89,6 +90,7 @@ impl BenchMetrics {
             target: target.to_string(),
             concurrency,
             duration_secs,
+            payload_size,
             total_requests: self.total_requests,
             total_errors: self.total_errors,
             rps,
@@ -108,6 +110,7 @@ pub struct BenchReport {
     pub target: String,
     pub concurrency: u64,
     pub duration_secs: u64,
+    pub payload_size: usize,
     pub total_requests: u64,
     pub total_errors: u64,
     pub rps: f64,

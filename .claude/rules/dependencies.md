@@ -119,3 +119,11 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
   request-upload pumps rely on it to emit `STOP_SENDING(H3_NO_ERROR)` after
   cancelling a frontend receive mid-poll; without the patch that call is a
   process abort and skipping it downgrades the wire signal to `STOP_SENDING(0)`.
+- h3 / h3-quinn per-stream `STOP_SENDING` watch (issue #3775): the vendored
+  shape contract in `tests/unit/gateway_core/http3_server_dispatch_tests.rs`
+  (`h3_quinn_vendored_send_stream_stopped_is_shared_and_static` and
+  `h3_plain_header_wait_races_per_stream_stop_sending_not_only_connection_close`)
+  plus the live same-connection cancellation tests in
+  `tests/functional/functional_destination_active_requests_h3_test.rs`. Without
+  the watch, destination `http2MaxRequests` stays held until a slow backend
+  answers after a client cancels one multiplexed stream.

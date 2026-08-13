@@ -134,6 +134,42 @@ impl Http3Client {
         Ok(Self { endpoint })
     }
 
+    /// Close every QUIC connection owned by this client.
+    pub fn close(&self) {
+        self.endpoint.close(0u32.into(), b"test-client-cancel");
+    }
+
+    /// Open a multiplexed HTTP/3 session that can issue several request streams
+    /// on one QUIC connection. Destination-admission tests use this to cancel a
+    /// single stream and then send a follow-up on the same connection.
+    pub async fn connect(
+        &self,
+        url: &str,
+    ) -> Result<Http3Connection, Box<dyn std::error::Error + Send + Sync>> {
+        let parsed: http::Uri = url.parse()?;
+        let host = parsed.host().ok_or("missing host in url")?.to_string();
+        let port = parsed.port_u16().unwrap_or(443);
+        let addr = resolve_loopback(&host, port)?;
+        let server_name = parsed.host().unwrap_or("localhost").to_string();
+        let conn = tokio::time::timeout(
+            Duration::from_secs(15),
+            self.endpoint.connect(addr, &server_name)?,
+        )
+        .await
+        .map_err(|_| "QUIC handshake timed out")??;
+        let h3_conn = h3_quinn::Connection::new(conn);
+        let (mut driver, send_request) = h3::client::new(h3_conn)
+            .await
+            .map_err(|e| format!("h3 new: {e}"))?;
+        let driver_task = tokio::spawn(async move {
+            let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
+        });
+        Ok(Http3Connection {
+            send_request,
+            driver_task,
+        })
+    }
+
     /// Fire a single `GET <url>` via QUIC. `url` must be `https://host:port/path`.
     /// Returns the buffered response.
     pub async fn get(
@@ -932,6 +968,149 @@ impl Drop for Http3GrpcStream {
     }
 }
 
+/// A multiplexed HTTP/3 client session on one QUIC connection.
+///
+/// Unlike [`Http3Client::get`] / [`Http3Client::open_response_stream`], this
+/// keeps the H3 driver alive so a follow-up request can reuse the same
+/// connection after an individual stream is cancelled.
+pub struct Http3Connection {
+    send_request: h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
+    driver_task: JoinHandle<()>,
+}
+
+impl Http3Connection {
+    /// Open a request stream. When `finish_body` is true the request direction
+    /// is FINned (GET / prebuffered). When false the caller may still send DATA
+    /// (streaming upload).
+    pub async fn open_stream(
+        &mut self,
+        url: &str,
+        options: GetOptions,
+        finish_body: bool,
+    ) -> Result<Http3ConnectionStream, Box<dyn std::error::Error + Send + Sync>> {
+        let parsed: http::Uri = url.parse()?;
+        let host = parsed.host().ok_or("missing host in url")?.to_string();
+        let port = parsed.port_u16().unwrap_or(443);
+        let mut req_builder = Request::builder().method(options.method.clone()).uri(url);
+        match &options.host_header {
+            HostHeader::Auto => {}
+            HostHeader::Explicit(value) => {
+                req_builder = req_builder.header(http::header::HOST, value.as_str());
+            }
+            HostHeader::SameAsAuthority => {
+                let host_header = format!("{host}:{port}");
+                req_builder = req_builder.header(http::header::HOST, host_header);
+            }
+        }
+        for (name, value) in &options.headers {
+            req_builder = req_builder.header(name.as_str(), value.as_str());
+        }
+        let req = req_builder
+            .body(())
+            .map_err(|e| format!("build request: {e}"))?;
+        let mut stream =
+            tokio::time::timeout(Duration::from_secs(15), self.send_request.send_request(req))
+                .await
+                .map_err(|_| "send_request timed out")?
+                .map_err(|e| format!("send_request: {e}"))?;
+        if !options.body.is_empty() {
+            stream
+                .send_data(options.body.clone())
+                .await
+                .map_err(|e| format!("send request body: {e}"))?;
+        }
+        if finish_body {
+            stream
+                .finish()
+                .await
+                .map_err(|e| format!("finish request body: {e}"))?;
+        }
+        Ok(Http3ConnectionStream { stream })
+    }
+
+    /// Buffered GET on this connection. Used as the follow-up request after a
+    /// sibling stream is cancelled.
+    pub async fn get(
+        &mut self,
+        url: &str,
+    ) -> Result<Http3Response, Box<dyn std::error::Error + Send + Sync>> {
+        let mut stream = self.open_stream(url, GetOptions::default(), true).await?;
+        let resp = tokio::time::timeout(Duration::from_secs(15), stream.stream.recv_response())
+            .await
+            .map_err(|_| "recv_response timed out")?
+            .map_err(|e| format!("recv_response: {e}"))?;
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let mut body_bytes = Vec::new();
+        let mut body_error = None;
+        loop {
+            match tokio::time::timeout(Duration::from_secs(15), stream.stream.recv_data()).await {
+                Ok(Ok(Some(mut chunk))) => {
+                    while chunk.has_remaining() {
+                        let take = chunk.chunk().to_vec();
+                        body_bytes.extend_from_slice(&take);
+                        chunk.advance(take.len());
+                    }
+                }
+                Ok(Ok(None)) => break,
+                Ok(Err(error)) => {
+                    body_error = Some(error.to_string());
+                    break;
+                }
+                Err(_) => {
+                    body_error = Some("response body read timed out".to_string());
+                    break;
+                }
+            }
+        }
+        Ok(Http3Response {
+            status,
+            headers,
+            body_bytes: Bytes::from(body_bytes),
+            trailers: None,
+            body_error,
+        })
+    }
+}
+
+impl Drop for Http3Connection {
+    fn drop(&mut self) {
+        self.driver_task.abort();
+    }
+}
+
+/// One request stream on an [`Http3Connection`]. Dropping it does not close the
+/// parent QUIC connection or abort the H3 driver.
+pub struct Http3ConnectionStream {
+    stream: h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+}
+
+impl Http3ConnectionStream {
+    /// Peer `STOP_SENDING` on the gateway response direction.
+    pub fn cancel_response_download(&mut self) {
+        self.stream
+            .stop_sending(h3::error::Code::H3_REQUEST_CANCELLED);
+    }
+
+    /// Reset the request-upload direction.
+    pub fn cancel_request_upload(&mut self) {
+        self.stream
+            .stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
+    }
+
+    /// Send request DATA without FINning (streaming upload).
+    pub async fn send_data(
+        &mut self,
+        data: impl Into<Bytes>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        tokio::time::timeout(Duration::from_secs(15), self.stream.send_data(data.into()))
+            .await
+            .map_err(|_| "send_data timed out")?
+            .map_err(|e| format!("send_data: {e}"))?;
+        Ok(())
+    }
+}
+
 /// A client-driven plain HTTP/3 response stream for slow-client and disconnect
 /// tests. Returned by [`Http3Client::open_response_stream`].
 pub struct Http3ResponseStream {
@@ -941,6 +1120,21 @@ pub struct Http3ResponseStream {
 }
 
 impl Http3ResponseStream {
+    /// Cancel the response-download direction so the gateway observes a real
+    /// client abort (`H3_REQUEST_CANCELLED`) rather than a leaked QUIC driver
+    /// keeping the request alive after the caller task is cancelled.
+    pub fn cancel_response_download(&mut self) {
+        self.stream
+            .stop_sending(h3::error::Code::H3_REQUEST_CANCELLED);
+    }
+
+    /// Reset the request-upload direction. Combined with
+    /// [`Self::cancel_response_download`] this is a full stream abort.
+    pub fn cancel_request_upload(&mut self) {
+        self.stream
+            .stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
+    }
+
     /// Await response headers.
     pub async fn recv_response(
         &mut self,

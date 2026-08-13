@@ -4925,3 +4925,276 @@ fn cross_cluster_hbone_identity_bypasses_only_the_reqwest_dns_preflight() {
         "the synthetic identity must carry no fabricated resolved IP into HBONE dispatch"
     );
 }
+
+#[test]
+fn unix_websocket_host_honors_preserve_host_header_policy() {
+    use ferrum_edge::_test_support::unix_websocket_handshake_authorities_for_test;
+
+    let backend_url = "http://backend.service.local:8080/chat";
+    let (url_authority, host) = unix_websocket_handshake_authorities_for_test(
+        false,
+        Some("attacker-vhost.example"),
+        backend_url,
+    )
+    .expect("DNS backend URL must yield a trusted authority");
+    assert_eq!(
+        url_authority, "backend.service.local:8080",
+        "the parse-only URI must use the target-effective backend authority"
+    );
+    assert_eq!(
+        host, "backend.service.local:8080",
+        "the default policy must replace the untrusted client Host"
+    );
+
+    let (url_authority, host) = unix_websocket_handshake_authorities_for_test(
+        true,
+        Some("client.example:8443"),
+        backend_url,
+    )
+    .expect("preserve-host must keep the trusted URI authority");
+    assert_eq!(
+        url_authority, "backend.service.local:8080",
+        "preserve-host must not rewrite the parse-only request-target URI"
+    );
+    assert_eq!(
+        host, "client.example:8443",
+        "an explicit preserve-host route must retain a valid client Host"
+    );
+
+    let (url_authority, host) =
+        unix_websocket_handshake_authorities_for_test(true, None, backend_url)
+            .expect("missing client Host must still parse the backend URL");
+    assert_eq!(url_authority, "backend.service.local:8080");
+    assert_eq!(
+        host, "backend.service.local:8080",
+        "a missing client Host must still use the backend authority"
+    );
+}
+
+#[test]
+fn unix_websocket_host_rejects_injection_and_fails_closed_without_authority() {
+    use ferrum_edge::_test_support::unix_websocket_handshake_authorities_for_test;
+
+    let ipv6_backend = "ws://[::1]:8080/chat";
+    let (url_authority, host) = unix_websocket_handshake_authorities_for_test(
+        false,
+        Some("attacker.example"),
+        ipv6_backend,
+    )
+    .expect("bracketed IPv6 backend URL must be a safe authority");
+    assert_eq!(url_authority, "[::1]:8080");
+    assert_eq!(
+        host, "[::1]:8080",
+        "IPv6 backend authority must keep RFC brackets and port"
+    );
+
+    let (_, host) =
+        unix_websocket_handshake_authorities_for_test(true, Some("[fd00::1]:8443"), ipv6_backend)
+            .expect("bracketed IPv6 client Host must be preservable");
+    assert_eq!(
+        host, "[fd00::1]:8443",
+        "a bracketed IPv6 client Host must be preservable"
+    );
+
+    let ipv4_backend = "http://192.0.2.10:9090/ws";
+    let (url_authority, host) = unix_websocket_handshake_authorities_for_test(
+        false,
+        Some("attacker.example"),
+        ipv4_backend,
+    )
+    .expect("IPv4 backend URL must be a safe authority");
+    assert_eq!(url_authority, "192.0.2.10:9090");
+    assert_eq!(host, "192.0.2.10:9090");
+
+    let dns_backend = "http://backend.service.local/chat";
+    let (url_authority, host) =
+        unix_websocket_handshake_authorities_for_test(true, Some("client.example"), dns_backend)
+            .expect("DNS backend URL without a port must be a safe authority");
+    assert_eq!(url_authority, "backend.service.local");
+    assert_eq!(host, "client.example");
+
+    for injected in [
+        "evil.example/steal",
+        "evil.example:80@backend",
+        "evil.example:80\r\nX-Injected: 1",
+        "::1",
+        "/var/run/app.sock",
+        "",
+    ] {
+        let (url_authority, host) =
+            unix_websocket_handshake_authorities_for_test(true, Some(injected), ipv6_backend)
+                .expect("injected Host must not fail the trusted backend URL");
+        assert_eq!(
+            url_authority, "[::1]:8080",
+            "injected Host {injected:?} must not become the parse-only URI authority"
+        );
+        assert_eq!(
+            host, "[::1]:8080",
+            "injected Host {injected:?} must not bypass rewrite policy"
+        );
+    }
+
+    let (url_authority, host) = unix_websocket_handshake_authorities_for_test(
+        true,
+        Some("  client.example:8443  "),
+        ipv6_backend,
+    )
+    .expect("surrounding whitespace must be normalized, not rejected, for a valid client Host");
+    assert_eq!(url_authority, "[::1]:8080");
+    assert_eq!(
+        host, "client.example:8443",
+        "preserve-host must return the validated authority, not the untrimmed original"
+    );
+
+    let (url_authority, host) = unix_websocket_handshake_authorities_for_test(
+        true,
+        Some("\tclient.example\n"),
+        ipv6_backend,
+    )
+    .expect("tab/newline surrounding whitespace must normalize to the client Host");
+    assert_eq!(url_authority, "[::1]:8080");
+    assert_eq!(host, "client.example");
+
+    let (url_authority, host) =
+        unix_websocket_handshake_authorities_for_test(true, Some("   "), ipv6_backend)
+            .expect("whitespace-only client Host must not fail the trusted backend URL");
+    assert_eq!(url_authority, "[::1]:8080");
+    assert_eq!(
+        host, "[::1]:8080",
+        "whitespace-only client Host must fall back to the trusted backend authority"
+    );
+
+    for unsafe_backend in [
+        "unix:///var/run/app.sock",
+        "http:///chat",
+        "not a url",
+        "http://user:pass@backend.example:8080/chat",
+        "http://[not-an-ip]:8080/chat",
+        "",
+    ] {
+        assert_eq!(
+            unix_websocket_handshake_authorities_for_test(
+                false,
+                Some("attacker.example"),
+                unsafe_backend,
+            ),
+            None,
+            "unsafe backend URL {unsafe_backend:?} must fail closed rather than substituting localhost"
+        );
+        assert_eq!(
+            unix_websocket_handshake_authorities_for_test(
+                true,
+                Some("client.example"),
+                unsafe_backend,
+            ),
+            None,
+            "preserve-host must not rescue unsafe backend URL {unsafe_backend:?}"
+        );
+    }
+
+    let (url_authority, host) =
+        unix_websocket_handshake_authorities_for_test(false, None, "http://localhost:8080/chat")
+            .expect("an explicit localhost authority in the backend URL remains valid");
+    assert_eq!(url_authority, "localhost:8080");
+    assert_eq!(host, "localhost:8080");
+}
+
+#[test]
+fn unix_websocket_invalid_backend_authority_is_dispatch_policy_rejected() {
+    use ferrum_edge::retry::{
+        ErrorClass, WS_UNIX_BACKEND_AUTHORITY_INVALID, classify_boxed_setup_error,
+        request_reached_wire,
+    };
+
+    let error: Box<dyn std::error::Error + Send + Sync> = WS_UNIX_BACKEND_AUTHORITY_INVALID.into();
+    let class = classify_boxed_setup_error(error.as_ref());
+    assert_eq!(
+        class,
+        ErrorClass::DispatchPolicyRejected,
+        "a gateway-side pre-dial Unix WebSocket authority refusal must not be reported as a backend failure"
+    );
+    assert!(
+        request_reached_wire(class),
+        "a terminal gateway decision must not satisfy the pre-wire retry gate"
+    );
+    for leaked in [
+        "localhost",
+        "/var/run",
+        "app.sock",
+        "attacker",
+        "client.example",
+        "backend.service",
+        "unix://",
+    ] {
+        assert!(
+            !WS_UNIX_BACKEND_AUTHORITY_INVALID.contains(leaked),
+            "the refusal must not leak {leaked:?}"
+        );
+    }
+}
+
+#[test]
+fn unix_websocket_dispatch_keeps_trusted_uri_separate_from_policy_host() {
+    let src = include_str!("../../../src/proxy/mod.rs");
+    let unix_dispatch = src
+        .find("let ws_unix_dispatch: Option<Result<&str, &'static str>> = current_target")
+        .expect("Unix WebSocket dispatch must remain inside the retry loop");
+    let authority = src[unix_dispatch..]
+        .find("unix_websocket_url_authority(&current_backend_url)")
+        .map(|offset| unix_dispatch + offset)
+        .expect(
+            "Unix WebSocket URI authority must be parsed from the target-effective backend URL",
+        );
+    let refusal = src[authority..]
+        .find("WS_UNIX_BACKEND_AUTHORITY_INVALID")
+        .map(|offset| authority + offset)
+        .expect("unsafe Unix WebSocket backend authority must fail closed before dial");
+    let dial = src[refusal..]
+        .find("connect_unix_websocket_backend(")
+        .map(|offset| refusal + offset)
+        .expect("Unix WebSocket dial must follow fail-closed authority selection");
+    let handshake = src
+        .find("async fn connect_unix_websocket_backend(")
+        .expect("Unix WebSocket handshake helper must remain present");
+    let host_insert = src[handshake..]
+        .find("hyper::header::HOST")
+        .map(|offset| handshake + offset)
+        .expect("Host header must be applied after the parse-only URI is built");
+
+    assert!(
+        authority < refusal && refusal < dial,
+        "authority parse and fail-closed refusal must precede socket admission/dial"
+    );
+    assert!(
+        !src[handshake..host_insert].contains("unix_websocket_url_authority("),
+        "the handshake helper must not re-parse the backend URL"
+    );
+
+    let dial_args = &src[dial..dial + 700];
+    assert!(
+        dial_args.contains("&url_authority"),
+        "the handshake URI must receive the already-validated backend authority"
+    );
+    assert!(
+        dial_args.contains("host.as_ref()"),
+        "the handshake Host must be the preserve-host policy value"
+    );
+    assert!(
+        !dial_args.contains("&current_backend_url"),
+        "the handshake must not be handed the raw backend URL after authority validation"
+    );
+
+    let handshake_body = &src[handshake..host_insert];
+    assert!(
+        handshake_body.contains("format!(\"ws://{url_authority}{path}\")"),
+        "the parse-only URI must interpolate the trusted authority, not client Host"
+    );
+    assert!(
+        !handshake_body.contains("format!(\"ws://{host}"),
+        "client or policy Host must not be interpolated into the upgrade URI"
+    );
+    assert!(
+        src[host_insert..host_insert + 160].contains("from_str(host)"),
+        "the Host header must be the policy value, not the socket path"
+    );
+}

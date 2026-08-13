@@ -20,7 +20,7 @@ pub use http1::{ClientResponse, Http1Client};
 pub use http2::Http2Client;
 pub use http3::{
     ConnectUdpStreamEnd, GetOptions, H3WebSocketFrame, HostHeader, Http3Client, Http3ConnectUdp,
-    Http3GrpcStream, Http3Response, Http3ResponseStream, Http3WebSocket, WebSocketOptions,
-    bind_quinn_client_endpoint, bind_quinn_server_endpoint,
+    Http3Connection, Http3ConnectionStream, Http3GrpcStream, Http3Response, Http3ResponseStream,
+    Http3WebSocket, WebSocketOptions, bind_quinn_client_endpoint, bind_quinn_server_endpoint,
 };
 pub use udp::UdpClient;
