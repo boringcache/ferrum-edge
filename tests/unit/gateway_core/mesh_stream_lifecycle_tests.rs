@@ -646,7 +646,10 @@ fn malformed_ambiguous_and_credential_bearing_urls_are_refused() {
             "grpc://istiod:15012",
             StockXdsTransportRefusal::UnsupportedScheme,
         ),
-        ("https://", StockXdsTransportRefusal::MissingHost),
+        // `http::Uri` rejects the scheme-only string before a host can be
+        // inspected, so the honest closed-set classification is MalformedUri
+        // rather than MissingHost. Admission still fails closed.
+        ("https://", StockXdsTransportRefusal::MalformedUri),
         (
             "https://user:secret@istiod:15012",
             StockXdsTransportRefusal::EmbeddedCredentials,

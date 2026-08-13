@@ -446,14 +446,27 @@ impl StockBearerCredential {
     /// Fails closed for a JWT-shaped token that is already past `exp` —
     /// including Unix epoch zero and negative NumericDate values — or that
     /// cannot leave a positive pre-expiry window after the configured skew.
+    /// Also fails closed when the raw token is not ASCII: tonic/`http`
+    /// `HeaderValue` admits obs-text bytes (128–255), which must never become
+    /// gRPC bearer metadata. The refusal is the closed-set
+    /// [`StockCredentialInvalidReason::NotAsciiMetadata`] and never renders
+    /// token bytes.
     pub fn admit(
         raw_token: &str,
         policy: StockCredentialLifetimePolicy,
     ) -> Result<Self, StockCredentialInvalidReason> {
+        // Explicit ASCII boundary BEFORE constructing metadata. `str::parse`
+        // into `MetadataValue<Ascii>` is not this gate: HTTP header values
+        // historically allow opaque high bytes, so a UTF-8 token such as
+        // `tökén` would otherwise be attached.
+        if !raw_token.is_ascii() {
+            return Err(StockCredentialInvalidReason::NotAsciiMetadata);
+        }
         let token: BearerToken = format!("Bearer {raw_token}")
             .parse()
             // The parse error would echo the token, so it is deliberately
-            // dropped and replaced with a closed-set reason.
+            // dropped and replaced with a closed-set reason. Survives as
+            // defense in depth for ASCII-but-not-metadata values (NUL, DEL).
             .map_err(|_| StockCredentialInvalidReason::NotAsciiMetadata)?;
         let fingerprint = StockCredentialFingerprint::of(raw_token);
         // Both clocks are read at the SAME point so the wall-clock `exp`
@@ -560,6 +573,13 @@ pub fn credential_lifetime(
     let Ok(remaining) = exp_at.duration_since(now) else {
         return Err(StockCredentialInvalidReason::Expired);
     };
+    // Remaining wall-clock lifetime of zero (exact-at-`exp`) is already
+    // expired. A *positive* lifetime that the refresh skew then consumes is
+    // the distinct `ExpiresWithinSkew` case. Do not collapse the two: a
+    // token that has no remaining lifetime must never attach.
+    if remaining.is_zero() {
+        return Err(StockCredentialInvalidReason::Expired);
+    }
     let before_exp = remaining.saturating_sub(policy.refresh_skew);
     if before_exp.is_zero() {
         return Err(StockCredentialInvalidReason::ExpiresWithinSkew);

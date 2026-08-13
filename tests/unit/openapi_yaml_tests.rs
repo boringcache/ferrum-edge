@@ -6464,7 +6464,8 @@ fn mesh_and_overload_runtime_snapshots_are_covered_by_openapi() {
             "ready": true,
             "mesh": {
                 "egress_scope": health,
-                "node_waypoint_observability": node_waypoint_observability
+                "node_waypoint_observability": node_waypoint_observability,
+                "config_stream": null
             }
         }),
         false,
@@ -6478,6 +6479,7 @@ fn mesh_and_overload_runtime_snapshots_are_covered_by_openapi() {
             "mesh": {
                 "egress_scope": health,
                 "node_waypoint_observability": node_waypoint_observability,
+                "config_stream": null,
                 "udp_placement_migration": udp_placement_migration
             }
         }),
