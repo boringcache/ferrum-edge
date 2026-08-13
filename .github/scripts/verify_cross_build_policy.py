@@ -4769,8 +4769,112 @@ def extract_job_step_block(
     return "".join(lines[start:end]).rstrip() + "\n", []
 
 
+def canonical_workflow_job_layout_errors(contents: str, source: str) -> list[str]:
+    """Require the block layout that required-check ownership can prove.
+
+    YAML does not assign meaning to a particular indentation width and also
+    permits flow mappings, explicit mapping keys, tags, anchors, and aliases.
+    The ownership scan deliberately supports rich scalar spellings *inside* a
+    direct ``name`` field, but it must first prove where every job and direct
+    job field begins.  Every workflow therefore uses one literal root
+    ``jobs:``, plain two-space job IDs, and four-space direct job fields.
+    Anything else fails closed instead of being treated as a workflow with no
+    owner of the protected required-check name.
+    """
+
+    lines = contents.splitlines()
+    scalar_bodies = block_scalar_body_lines(lines)
+    errors: list[str] = []
+    jobs_headers: list[int] = []
+
+    for index, line in enumerate(lines):
+        if (
+            index in scalar_bodies
+            or not line.strip()
+            or line.lstrip().startswith("#")
+        ):
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        if indent != 0:
+            continue
+        decoded = decode_simple_yaml_key(line)
+        if decoded is None:
+            errors.append(
+                f"{source}:{index + 1} uses unsupported top-level YAML syntax; "
+                "required-check ownership accepts only simple root mapping keys"
+            )
+            continue
+        if decoded[1] == "jobs":
+            jobs_headers.append(index)
+
+    if len(jobs_headers) != 1:
+        errors.append(
+            f"{source} must contain exactly one literal top-level jobs: block "
+            "for required-check ownership"
+        )
+        return list(dict.fromkeys(errors))
+
+    jobs_index = jobs_headers[0]
+    if lines[jobs_index] != "jobs:":
+        errors.append(
+            f"{source}:{jobs_index + 1} must spell the required-check ownership "
+            "root as the literal block key jobs:"
+        )
+        return list(dict.fromkeys(errors))
+
+    active_job: str | None = None
+    direct_field_seen = False
+    for index in range(jobs_index + 1, len(lines)):
+        line = lines[index]
+        if (
+            index in scalar_bodies
+            or not line.strip()
+            or line.lstrip().startswith("#")
+        ):
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        if indent == 0:
+            break
+        if indent == 2:
+            match = re.fullmatch(r"  (?P<name>[A-Za-z0-9_-]+):", line)
+            if match is None:
+                errors.append(
+                    f"{source}:{index + 1} must use a plain two-space job-id: "
+                    "entry for required-check ownership"
+                )
+                active_job = None
+                direct_field_seen = False
+                continue
+            active_job = match.group("name")
+            direct_field_seen = False
+            continue
+        if active_job is None:
+            errors.append(
+                f"{source}:{index + 1} has jobs mapping content before a "
+                "canonical two-space job key"
+            )
+            continue
+        if indent < 4 or (indent > 4 and not direct_field_seen):
+            errors.append(
+                f"{source}:{index + 1} job {active_job!r} must begin each "
+                "direct field at exactly four spaces"
+            )
+            continue
+        if indent == 4:
+            field = YAML_MAPPING_FIELD.match(line)
+            if field is None or field.group("dash"):
+                errors.append(
+                    f"{source}:{index + 1} job {active_job!r} has an "
+                    "unsupported direct mapping-key spelling"
+                )
+                continue
+            direct_field_seen = True
+
+    return list(dict.fromkeys(errors))
+
+
 def workflow_job_ranges(lines: list[str]) -> tuple[tuple[str, int, int], ...]:
-    """Return each top-level job with the half-open line range it occupies."""
+    """Return canonical top-level jobs with their half-open line ranges."""
 
     jobs_start: int | None = None
     for index, line in enumerate(lines):
@@ -4780,12 +4884,14 @@ def workflow_job_ranges(lines: list[str]) -> tuple[tuple[str, int, int], ...]:
     if jobs_start is None:
         return ()
     starts: list[tuple[str, int]] = []
+    jobs_end = len(lines)
     for index in range(jobs_start, len(lines)):
         decoded = decode_simple_yaml_key(lines[index])
         if decoded is None:
             continue
         indent, name = decoded
         if indent == 0:
+            jobs_end = index
             break
         if indent == 2:
             starts.append((name, index))
@@ -4793,7 +4899,7 @@ def workflow_job_ranges(lines: list[str]) -> tuple[tuple[str, int, int], ...]:
         (
             name,
             start,
-            starts[position + 1][1] if position + 1 < len(starts) else len(lines),
+            starts[position + 1][1] if position + 1 < len(starts) else jobs_end,
         )
         for position, (name, start) in enumerate(starts)
     )
@@ -4896,9 +5002,14 @@ def required_check_name_ownership_errors(
     owners: list[tuple[str, str]] = []
     errors: list[str] = []
     for filename, contents in sorted(workflows.items()):
+        located = f"{source}/{filename}"
+        layout_errors = canonical_workflow_job_layout_errors(contents, located)
+        errors.extend(layout_errors)
+        if layout_errors:
+            continue
         normalized, _mapping, flow_failures = flow_normalized_workflow(
             contents,
-            f"{source}/{filename}",
+            located,
         )
         errors.extend(flow_failures)
         inspected = normalized if normalized is not None else contents
@@ -25232,6 +25343,30 @@ pre_build = []
             "a direct job name"
         )
     if validate_workflow_collection(
+        ownership_prose_collection,
+        relevance_selftest_source,
+    ) != scan_workflow_collection_cross_surfaces(
+        ownership_prose_collection,
+        relevance_selftest_source,
+    ):
+        failures.append(
+            "full workflow-collection validation treated comment or "
+            "block-scalar prose as a required-check owner"
+        )
+    if compare_pr_workflow_collection(
+        complete_collection,
+        ownership_prose_collection,
+        relevance_selftest_source,
+    ) != scan_pr_workflow_collection_cross_surfaces(
+        complete_collection,
+        ownership_prose_collection,
+        relevance_selftest_source,
+    ):
+        failures.append(
+            "full workflow-collection comparison treated comment or "
+            "block-scalar prose as a required-check owner"
+        )
+    if validate_workflow_collection(
         complete_collection,
         relevance_selftest_source,
     ) != scan_workflow_collection_cross_surfaces(
@@ -25318,8 +25453,19 @@ pre_build = []
         "",
     )
 
-    duplicate_owner_collection = dict(complete_collection)
-    duplicate_owner_collection["duplicate-required-owner.yml"] = (
+    ownership_mutations: dict[str, tuple[dict[str, str], str]] = {}
+
+    def ownership_mutation(label: str, workflow: str, expected_error: str) -> None:
+        ownership_mutations[label] = (
+            {
+                **complete_collection,
+                f"{label.replace(' ', '-')}.yml": workflow,
+            },
+            expected_error,
+        )
+
+    ownership_mutation(
+        "duplicate required display-name owner",
         "name: Duplicate required owner\n"
         "on:\n"
         "  pull_request:\n"
@@ -25328,16 +25474,174 @@ pre_build = []
         "    name: Ambient Host UDP Live\n"
         "    runs-on: ubuntu-latest\n"
         "    steps:\n"
-        "      - run: echo counterfeit\n"
+        "      - run: echo counterfeit\n",
+        "must have exactly one parsed direct job owner",
     )
-    if duplicate_owner_collection == complete_collection:
-        failures.append(
-            "the duplicate required display-name owner mutation is stale"
+    ownership_mutation(
+        "duplicate direct name field",
+        "name: Duplicate direct name field\n"
+        "on: [pull_request]\n"
+        "jobs:\n"
+        "  counterfeit:\n"
+        "    name: Harmless name\n"
+        "    name: Ambient Host UDP Live\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - run: echo counterfeit\n",
+        "ambiguous duplicate direct name fields",
+    )
+    ownership_mutation(
+        "deeper indentation required owner",
+        "name: Counterfeit required check\n"
+        "on: [pull_request]\n"
+        "jobs:\n"
+        "    counterfeit:\n"
+        "      name: Ambient Host UDP Live\n"
+        "      runs-on: ubuntu-latest\n"
+        "      steps:\n"
+        "        - run: \"true\"\n",
+        "canonical two-space job key",
+    )
+    ownership_mutation(
+        "root flow required owner",
+        '{"name": "Counterfeit required check", "on": ["pull_request"], '
+        '"jobs": {"counterfeit": {"name": "Ambient Host UDP Live", '
+        '"runs-on": "ubuntu-latest", "steps": [{"run": "true"}]}}}\n',
+        "exactly one literal top-level jobs: block",
+    )
+    ownership_mutation(
+        "explicit mapping key required owner",
+        "name: Counterfeit required check\n"
+        "on: [pull_request]\n"
+        "jobs:\n"
+        "  ? counterfeit\n"
+        "  :\n"
+        "    name: Ambient Host UDP Live\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - run: \"true\"\n",
+        "plain two-space job-id: entry",
+    )
+    ownership_mutation(
+        "escaped quoted required owner",
+        "name: Escaped quoted required owner\n"
+        "on: [pull_request]\n"
+        "jobs:\n"
+        "  counterfeit:\n"
+        '    "na\\u006de": "Ambient\\u0020Host\\u0020UDP\\u0020Live"\n'
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - run: echo counterfeit\n",
+        "must have exactly one parsed direct job owner",
+    )
+    ownership_mutation(
+        "block scalar required owner",
+        "name: Block scalar required owner\n"
+        "on: [pull_request]\n"
+        "jobs:\n"
+        "  counterfeit:\n"
+        "    name: |\n"
+        "      Ambient Host UDP Live\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - run: echo counterfeit\n",
+        "must have exactly one parsed direct job owner",
+    )
+    ownership_mutation(
+        "expression required owner",
+        "name: Expression required owner\n"
+        "on: [pull_request]\n"
+        "jobs:\n"
+        "  counterfeit:\n"
+        "    env:\n"
+        "      REQUIRED_NAME: Ambient Host UDP Live\n"
+        "    name: ${{ env.REQUIRED_NAME }}\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - run: echo counterfeit\n",
+        "must have exactly one parsed direct job owner",
+    )
+    ownership_mutation(
+        "alias required owner",
+        "name: Alias required owner\n"
+        "on: [pull_request]\n"
+        "jobs:\n"
+        "  counterfeit:\n"
+        "    env:\n"
+        "      REQUIRED_NAME: &required-name Ambient Host UDP Live\n"
+        "    name: *required-name\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - run: echo counterfeit\n",
+        "must have exactly one parsed direct job owner",
+    )
+    ownership_mutation(
+        "tagged required owner",
+        "name: Tagged required owner\n"
+        "on: [pull_request]\n"
+        "jobs:\n"
+        "  counterfeit:\n"
+        "    name: !!str Ambient Host UDP Live\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - run: echo counterfeit\n",
+        "must have exactly one parsed direct job owner",
+    )
+    ownership_mutation(
+        "merged required owner",
+        "name: Merged required owner\n"
+        "on: [pull_request]\n"
+        "x-counterfeit: &counterfeit\n"
+        "  name: Ambient Host UDP Live\n"
+        "  runs-on: ubuntu-latest\n"
+        "jobs:\n"
+        "  counterfeit:\n"
+        "    <<: *counterfeit\n"
+        "    steps:\n"
+        "      - run: echo counterfeit\n",
+        "unsupported direct mapping-key spelling",
+    )
+
+    for mutation_name, (
+        mutated_collection,
+        expected_error,
+    ) in ownership_mutations.items():
+        production_errors = validate_workflow_collection(
+            mutated_collection,
+            relevance_selftest_source,
         )
-    else:
-        ambient_mutated_workflows[
-            "duplicate required display-name owner"
-        ] = duplicate_owner_collection
+        scanner_errors = scan_workflow_collection_cross_surfaces(
+            mutated_collection,
+            relevance_selftest_source,
+        )
+        comparison_errors = compare_pr_workflow_collection(
+            complete_collection,
+            mutated_collection,
+            relevance_selftest_source,
+        )
+        comparison_scanner_errors = scan_pr_workflow_collection_cross_surfaces(
+            complete_collection,
+            mutated_collection,
+            relevance_selftest_source,
+        )
+        if not any(
+            expected_error in error and error not in scanner_errors
+            for error in production_errors
+        ):
+            failures.append(
+                f"production workflow validation did not specifically reject "
+                f"a {mutation_name} required-check ownership bypass beyond the "
+                "generic Cross scanner"
+            )
+        if not any(
+            expected_error in error and error not in comparison_scanner_errors
+            for error in comparison_errors
+        ):
+            failures.append(
+                f"production workflow comparison did not specifically reject "
+                f"a {mutation_name} required-check ownership bypass beyond the "
+                "generic Cross scanner"
+            )
 
     for mutation_name, mutated_collection in ambient_mutated_workflows.items():
         production_errors = validate_workflow_collection(

@@ -138,6 +138,15 @@ the required check fails closed or runs fully.
 Concurrency groups include the event name and a PR number or merge-group head
 SHA so a merge-group run cannot cancel an unrelated PR (or another group).
 
+Required-check ownership validation accepts one fail-closed workflow layout:
+the root jobs mapping is spelled as a literal block `jobs:`, job IDs are plain
+mapping keys indented by two spaces, and direct job fields are mapping keys
+indented by four spaces. Flow-form root/job mappings, explicit mapping keys,
+alternate job indentation, and mapping indirection are rejected across the
+complete workflow collection. Quoted, escaped, expression, and block-scalar
+values remain supported inside a canonical direct `name` field; alias and tag
+values are conservatively treated as possible owners.
+
 **`merge_group` runs execute candidate workflow YAML.** GitHub loads workflow
 files for a `merge_group` event from the synthesized queue commit, so unlike
 `pull_request_target` there is no trusted-base copy of the workflow itself.
