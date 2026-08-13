@@ -12515,138 +12515,27 @@ async fn run_ambient_udp_placement_cleanup(
     source: Arc<dyn crate::proxy::netns_capture::PodCaptureSource>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
-    use crate::proxy::udp_placement_migration::{
-        UdpCleanupProofWindow, UdpMigrationFailureReason, UdpMigrationStatusPhase, clear_failure,
-        set_failure, set_phase,
-    };
-
-    let ready_dir = context.registry_dir().join(".udp-ready");
-    let mut pod_cleanup = context.cleanup_pod_netns().then(|| {
-        crate::proxy::netns_udp_capture::NetnsUdpCleanupManager::new(
-            source,
-            crate::proxy::netns_udp_capture::ProxyNetnsUdpCleanupBackend::new(true),
-            std::time::Duration::from_secs(2),
-        )
-        .with_ready_dir(Some(ready_dir.clone()))
-    });
-    let mut host_recovery = context.cleanup_host_netns().then(|| {
-        crate::proxy::host_udp_capture::HostUdpStaleGenerationRecovery::new(Some(ready_dir))
-    });
-    let mut proof_window =
-        UdpCleanupProofWindow::new(context.cleanup_pod_netns(), context.cleanup_host_netns());
-    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2));
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    ticker.tick().await;
-
+    // One shared supervisor implements predecessor retirement for BOTH the
+    // migration cleanup phase and the privileged node preflight, so the two can
+    // never disagree about what Ferrum owns or what counts as proof.
+    let outcome = crate::proxy::udp_placement_cleanup::run_udp_placement_cleanup(
+        context,
+        source,
+        shutdown.clone(),
+        None,
+    )
+    .await;
+    if outcome != crate::proxy::udp_placement_cleanup::UdpCleanupOutcome::Complete {
+        return;
+    }
+    // Cleanup is durably complete. Readiness stays false and no producer runs
+    // until the operator applies the matching finalize release, so park here.
     loop {
         if *shutdown.borrow() {
             return;
         }
-        if let Some(proof_before) = context.registry_sync_proof() {
-            let mut host_pass_complete = host_recovery.is_none();
-            let mut host_outstanding = 0;
-            let mut failure_reason = None;
-            if let Some(recovery) = host_recovery.as_mut() {
-                if crate::proxy::host_udp_capture::recover_and_reap_once(recovery).await {
-                    host_pass_complete = true;
-                } else {
-                    host_pass_complete = false;
-                    failure_reason = Some(if recovery.outstanding() == 0 {
-                        UdpMigrationFailureReason::HostCleanupFailed
-                    } else {
-                        UdpMigrationFailureReason::GateAcknowledgementMissing
-                    });
-                }
-                host_outstanding = recovery.outstanding();
-            }
-
-            let mut pod_complete_fingerprint = None;
-            let mut pod_outstanding = 0;
-            if let Some(manager) = pod_cleanup.as_mut() {
-                let progress = manager.migration_cleanup_once().await;
-                pod_outstanding = progress.outstanding;
-                if let Some(reason) = progress.failure_reason {
-                    failure_reason = Some(reason);
-                } else if progress.outstanding == 0 {
-                    pod_complete_fingerprint = Some(progress.registry_fingerprint);
-                }
-            }
-
-            // The node agent gives every publication a fresh identity after
-            // retracting the marker for a post-relist mutation. Count this pass
-            // only when that exact identity spans all cleanup work, so a
-            // clear/mutate/republish ABA cycle cannot preserve prior progress.
-            let proof_progress = proof_window.observe_pass(
-                Some(proof_before),
-                context.registry_sync_proof(),
-                host_pass_complete,
-                pod_complete_fingerprint,
-            );
-            if !proof_progress.proof_is_valid() {
-                set_phase(UdpMigrationStatusPhase::WaitingForRegistry, 0);
-                set_failure(UdpMigrationFailureReason::RegistryNotSynchronized);
-                ticker.tick().await;
-                continue;
-            }
-
-            let outstanding = host_outstanding.saturating_add(pod_outstanding);
-            let phase =
-                if failure_reason == Some(UdpMigrationFailureReason::GateAcknowledgementMissing) {
-                    UdpMigrationStatusPhase::WaitingForGateAck
-                } else if !proof_progress.pod_complete() {
-                    UdpMigrationStatusPhase::CleaningPodNetns
-                } else {
-                    UdpMigrationStatusPhase::CleaningHostNetns
-                };
-            set_phase(phase, outstanding);
-            if let Some(reason) = failure_reason {
-                set_failure(reason);
-            } else {
-                clear_failure();
-            }
-
-            if let Some(proof) = proof_progress.completion_proof() {
-                match context.mark_cleanup_complete(proof) {
-                    Ok(()) => {
-                        set_phase(UdpMigrationStatusPhase::CleanupComplete, 0);
-                        clear_failure();
-                        info!(
-                            from = context.from().as_str(),
-                            to = context.to().as_str(),
-                            "Ambient UDP predecessor cleanup is durably complete; phase=finalize with the same generation is now permitted"
-                        );
-                        loop {
-                            if *shutdown.borrow() {
-                                return;
-                            }
-                            if shutdown.changed().await.is_err() {
-                                return;
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        proof_window.invalidate();
-                        set_failure(UdpMigrationFailureReason::StatePersistenceFailed);
-                        warn!(
-                            %error,
-                            "Ambient UDP cleanup completed but durable proof publication failed; retrying"
-                        );
-                    }
-                }
-            }
-        } else {
-            proof_window.invalidate();
-            set_phase(UdpMigrationStatusPhase::WaitingForRegistry, 0);
-            set_failure(UdpMigrationFailureReason::RegistryNotSynchronized);
-        }
-
-        tokio::select! {
-            _ = ticker.tick() => {}
-            changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() {
-                    return;
-                }
-            }
+        if shutdown.changed().await.is_err() {
+            return;
         }
     }
 }
@@ -12850,9 +12739,11 @@ async fn arm_mesh_runtime_startup(
             settings.udp_host_netns_enabled,
         );
         let migration_request =
-            crate::proxy::udp_placement_migration::UdpPlacementRequest::from_env(target).map_err(
-                |error| anyhow::anyhow!("invalid Ambient UDP migration settings: {error}"),
-            )?;
+            crate::proxy::udp_placement_migration::UdpPlacementRequest::from_env(
+                target,
+                registry_dir,
+            )
+            .map_err(|error| anyhow::anyhow!("invalid Ambient UDP migration settings: {error}"))?;
         let placement_decision = match crate::proxy::udp_placement_migration::prepare_placement(
             registry_dir,
             &migration_request,
@@ -18477,6 +18368,8 @@ mod tests {
             from: None,
             to: None,
             established: None,
+            node: None,
+            node_proof_generation: None,
         };
         prepare_placement(registry.path(), &stable).expect("stable placement");
         let cleanup = UdpPlacementRequest {
@@ -18486,6 +18379,8 @@ mod tests {
             from: Some(UdpPlacement::PodNetns),
             to: Some(UdpPlacement::HostNetns),
             established: None,
+            node: None,
+            node_proof_generation: None,
         };
         let context = match prepare_placement(registry.path(), &cleanup).expect("cleanup placement")
         {
@@ -18512,6 +18407,7 @@ mod tests {
                 registry.path(),
                 "supervisor-test",
                 &std::collections::HashSet::new(),
+                None,
             )
             .expect("registry marker")
         );

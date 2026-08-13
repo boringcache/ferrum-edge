@@ -30,7 +30,12 @@ ferrum-edge validate [OPTIONS]
 ferrum-edge reload [--pid PID]
 ferrum-edge version [--json]
 ferrum-edge health [-p PORT] [--host H] [--tls] [--tls-no-verify] [--live]
+ferrum-edge ambient-udp-preflight [-s PATH] [--timeout-seconds N] [-v]
 ```
+
+`ambient-udp-preflight` is the privileged one-shot Ambient UDP node preflight
+(issue #3809): it retires both predecessor UDP placements on this node and
+publishes the node-scoped cleanup proof the settled host placement requires.
 
 `run`/`validate` flags: `-s/--settings <PATH>`, `-c/--spec <PATH>`, `-m/--mode <MODE>`, `-v/--verbose`. Precedence is CLI > env > conf file > smart defaults > hardcoded. CLI flags become env vars through `apply_run_overrides()` / `apply_validate_overrides()` before `CONF_FILE_CACHE` reads in `main.rs`.
 
