@@ -192,6 +192,53 @@ pub(crate) fn shutdown_queued_frontend_app_send(
     }
 }
 
+/// Lock-free, monotonically-earliest admitted authorization deadline for one
+/// terminating frontend DTLS session. Unset reads as `None` (unauthenticated).
+/// Publication only tightens; a later instant can never extend the bound.
+struct FrontendSessionAuthDeadline {
+    anchor: tokio::time::Instant,
+    earliest_ns: AtomicU64,
+}
+
+const FRONTEND_SESSION_AUTH_DEADLINE_UNSET: u64 = u64::MAX;
+
+impl FrontendSessionAuthDeadline {
+    fn new() -> Self {
+        Self {
+            anchor: tokio::time::Instant::now(),
+            earliest_ns: AtomicU64::new(FRONTEND_SESSION_AUTH_DEADLINE_UNSET),
+        }
+    }
+
+    fn publish(&self, at: tokio::time::Instant) {
+        let encoded = at.saturating_duration_since(self.anchor).as_nanos() as u64;
+        let mut current = self.earliest_ns.load(Ordering::Acquire);
+        loop {
+            if current != FRONTEND_SESSION_AUTH_DEADLINE_UNSET && encoded >= current {
+                return;
+            }
+            match self.earliest_ns.compare_exchange_weak(
+                current,
+                encoded,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn get(&self) -> Option<tokio::time::Instant> {
+        let encoded = self.earliest_ns.load(Ordering::Acquire);
+        if encoded == FRONTEND_SESSION_AUTH_DEADLINE_UNSET {
+            None
+        } else {
+            Some(self.anchor + Duration::from_nanos(encoded))
+        }
+    }
+}
+
 /// Combine a per-call application-send deadline with the session's admitted
 /// authorization deadline. `None` only when both inputs are absent; otherwise
 /// the earliest instant governs so a later per-call value cannot extend
@@ -272,12 +319,9 @@ fn fail_queued_frontend_app_sends(
     }
 }
 
-fn session_authorization_elapsed(
-    auth_deadline: &std::sync::OnceLock<tokio::time::Instant>,
-) -> bool {
+fn session_authorization_elapsed(auth_deadline: &FrontendSessionAuthDeadline) -> bool {
     auth_deadline
         .get()
-        .copied()
         .is_some_and(|at| tokio::time::Instant::now() >= at)
 }
 
@@ -373,6 +417,33 @@ pub(crate) fn frontend_app_send_reject_as_str_for_test(
     reject: FrontendAppSendReject,
 ) -> &'static str {
     reject.as_str()
+}
+
+/// Opaque handle for external hosted tests of the session authorization slot.
+#[doc(hidden)]
+pub struct FrontendSessionAuthDeadlineForTest(Arc<FrontendSessionAuthDeadline>);
+
+/// Allocate a lock-free frontend session authorization deadline for tests.
+#[allow(dead_code)] // used through library `_test_support`
+pub(crate) fn frontend_session_auth_deadline_for_test() -> FrontendSessionAuthDeadlineForTest {
+    FrontendSessionAuthDeadlineForTest(Arc::new(FrontendSessionAuthDeadline::new()))
+}
+
+/// Publish one admitted authorization instant into the session deadline slot.
+#[allow(dead_code)] // used through library `_test_support`
+pub(crate) fn publish_frontend_session_auth_deadline_for_test(
+    auth_deadline: &FrontendSessionAuthDeadlineForTest,
+    at: tokio::time::Instant,
+) {
+    auth_deadline.0.publish(at);
+}
+
+/// Read the current monotonically-earliest session authorization deadline.
+#[allow(dead_code)] // used through library `_test_support`
+pub(crate) fn read_frontend_session_auth_deadline_for_test(
+    auth_deadline: &FrontendSessionAuthDeadlineForTest,
+) -> Option<tokio::time::Instant> {
+    auth_deadline.0.get()
 }
 
 // ============================================================================
@@ -1200,10 +1271,11 @@ pub struct DtlsServerConn {
     app_rx: tokio::sync::Mutex<mpsc::Receiver<Vec<u8>>>,
     /// Signal this connection's driver task to shut down.
     shutdown_tx: mpsc::Sender<()>,
-    /// Admitted absolute authorization deadline, published once into the
-    /// per-client driver so every application ciphertext `send_to` is owned
-    /// by that bound. Unauthenticated sessions never set this.
-    auth_deadline: Arc<std::sync::OnceLock<tokio::time::Instant>>,
+    /// Admitted absolute authorization deadline, published monotonically
+    /// earliest into the per-client driver so every application ciphertext
+    /// `send_to` is owned by that bound. Unauthenticated sessions never set
+    /// this.
+    auth_deadline: Arc<FrontendSessionAuthDeadline>,
     /// DER-encoded client leaf certificate from the DTLS handshake.
     /// Populated when the client presents a certificate during mutual DTLS authentication.
     pub tls_client_cert_der: Option<Arc<Vec<u8>>>,
@@ -1220,16 +1292,17 @@ pub struct DtlsServerConn {
 pub struct DtlsServerSender {
     app_tx: mpsc::Sender<FrontendAppSend>,
     shutdown_tx: mpsc::Sender<()>,
-    auth_deadline: Arc<std::sync::OnceLock<tokio::time::Instant>>,
+    auth_deadline: Arc<FrontendSessionAuthDeadline>,
 }
 
 impl DtlsServerSender {
     /// Publish the admitted absolute authorization deadline into the per-client
-    /// driver. Handshake/control writes that already completed are unaffected;
-    /// every later application ciphertext `send_to` is owned by this bound.
+    /// driver. Only tightens the session bound; a later instant is ignored.
+    /// Handshake/control writes that already completed are unaffected; every
+    /// later application ciphertext `send_to` is owned by the earliest bound.
     /// Unauthenticated sessions must not call this.
     pub fn bind_authorization_deadline(&self, at: tokio::time::Instant) {
-        let _ = self.auth_deadline.set(at);
+        self.auth_deadline.publish(at);
     }
 
     /// Send application data through the DTLS tunnel to this client.
@@ -1307,15 +1380,14 @@ impl DtlsServerConn {
 
 async fn send_frontend_app_committed(
     app_tx: &mpsc::Sender<FrontendAppSend>,
-    auth_deadline: &std::sync::OnceLock<tokio::time::Instant>,
+    auth_deadline: &FrontendSessionAuthDeadline,
     data: &[u8],
     deadline: Option<tokio::time::Instant>,
 ) -> Result<(), anyhow::Error> {
     if let Some(at) = deadline {
-        let _ = auth_deadline.set(at);
+        auth_deadline.publish(at);
     }
-    let effective =
-        earliest_frontend_app_send_deadline(deadline, auth_deadline.get().copied());
+    let effective = earliest_frontend_app_send_deadline(deadline, auth_deadline.get());
     if matches!(
         admit_frontend_app_send(false, effective, tokio::time::Instant::now()),
         FrontendAppSendAdmit::Reject(FrontendAppSendReject::Expired)
@@ -1625,7 +1697,7 @@ impl DtlsServer {
         let mut app_out_rx = Some(app_out_rx);
         let (app_in_tx, mut app_in_rx) = mpsc::channel::<FrontendAppSend>(256);
         let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
-        let auth_deadline = Arc::new(std::sync::OnceLock::<tokio::time::Instant>::new());
+        let auth_deadline = Arc::new(FrontendSessionAuthDeadline::new());
         let generation = self.next_session_generation.fetch_add(1, Ordering::Relaxed);
         // Terminating DTLS: this is best-effort SNI for the session's identity /
         // logging field only — dimpl runs the real handshake and rejects malformed
@@ -1761,7 +1833,7 @@ impl DtlsServer {
                             mut cancel,
                             deadline,
                         } = pending;
-                        let session_deadline = auth_deadline.get().copied();
+                        let session_deadline = auth_deadline.get();
                         let cancelled = frontend_app_send_cancel_fired(&mut cancel);
                         let effective = earliest_frontend_app_send_deadline(
                             deadline,
@@ -1810,7 +1882,7 @@ impl DtlsServer {
                     _ = shutdown_rx.recv() => {
                         fail_queued_frontend_app_sends(
                             &mut app_in_rx,
-                            auth_deadline.get().copied(),
+                            auth_deadline.get(),
                         );
                         break;
                     }
@@ -1866,7 +1938,7 @@ impl DtlsServer {
                                     data,
                                     peer_addr,
                                     in_flight.as_mut(),
-                                    auth_deadline.get().copied(),
+                                    auth_deadline.get(),
                                 )
                                 .await
                                 {
@@ -1908,7 +1980,7 @@ impl DtlsServer {
                                     );
                                     fail_queued_frontend_app_sends(
                                         &mut app_in_rx,
-                                        auth_deadline.get().copied(),
+                                        auth_deadline.get(),
                                     );
                                     return;
                                 }
@@ -1928,7 +2000,7 @@ impl DtlsServer {
                                 if accept_tx.send((conn, peer_addr)).await.is_err() {
                                     fail_queued_frontend_app_sends(
                                         &mut app_in_rx,
-                                        auth_deadline.get().copied(),
+                                        auth_deadline.get(),
                                     );
                                     return;
                                 }
@@ -1944,7 +2016,7 @@ impl DtlsServer {
                                         warn!(client = %peer_addr, "Client cert validation failed: {}", e);
                                         fail_queued_frontend_app_sends(
                                             &mut app_in_rx,
-                                            auth_deadline.get().copied(),
+                                            auth_deadline.get(),
                                         );
                                         return;
                                     }
@@ -1965,7 +2037,7 @@ impl DtlsServer {
                                 }
                                 fail_queued_frontend_app_sends(
                                     &mut app_in_rx,
-                                    auth_deadline.get().copied(),
+                                    auth_deadline.get(),
                                 );
                                 return;
                             }

@@ -8892,6 +8892,27 @@ pub mod _test_support {
         })
     }
 
+    /// Allocate a lock-free frontend session authorization deadline for tests.
+    pub fn frontend_session_auth_deadline_for_test(
+    ) -> crate::dtls::FrontendSessionAuthDeadlineForTest {
+        crate::dtls::frontend_session_auth_deadline_for_test()
+    }
+
+    /// Publish one admitted authorization instant into the session deadline slot.
+    pub fn publish_frontend_session_auth_deadline_for_test(
+        auth_deadline: &crate::dtls::FrontendSessionAuthDeadlineForTest,
+        at: tokio::time::Instant,
+    ) {
+        crate::dtls::publish_frontend_session_auth_deadline_for_test(auth_deadline, at);
+    }
+
+    /// Read the current monotonically-earliest session authorization deadline.
+    pub fn read_frontend_session_auth_deadline_for_test(
+        auth_deadline: &crate::dtls::FrontendSessionAuthDeadlineForTest,
+    ) -> Option<tokio::time::Instant> {
+        crate::dtls::read_frontend_session_auth_deadline_for_test(auth_deadline)
+    }
+
     /// Observe Ferrum-managed DTLS loader key DER after zeroization and before
     /// the backing allocation is released (issue #3224 loader ownership path).
     pub fn load_dtls_certificate_with_rustls_key_drop_hook_for_test(

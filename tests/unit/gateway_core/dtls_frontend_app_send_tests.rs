@@ -15,7 +15,8 @@ use ferrum_edge::_test_support::{
     FrontendAppSendAdmitForTest, FrontendAppSendRejectForTest, admit_frontend_app_send_for_test,
     earliest_frontend_app_send_deadline_for_test, frontend_app_ciphertext_send_until_expiry_for_test,
     frontend_app_send_cancel_fired_for_test, frontend_app_send_reject_as_str_for_test,
-    shutdown_queued_frontend_app_send_for_test,
+    frontend_session_auth_deadline_for_test, publish_frontend_session_auth_deadline_for_test,
+    read_frontend_session_auth_deadline_for_test, shutdown_queued_frontend_app_send_for_test,
 };
 
 const DTLS_SOURCE: &str = include_str!("../../../src/dtls/mod.rs");
@@ -29,6 +30,80 @@ fn elapsed_deadline() -> tokio::time::Instant {
 
 fn future_deadline(delta: Duration) -> tokio::time::Instant {
     tokio::time::Instant::now() + delta
+}
+
+#[test]
+fn later_per_call_publication_then_earlier_bind_tightens_session() {
+    let auth = frontend_session_auth_deadline_for_test();
+    let now = tokio::time::Instant::now();
+    let later = now + Duration::from_secs(60);
+    let earlier = now + Duration::from_secs(5);
+
+    publish_frontend_session_auth_deadline_for_test(&auth, later);
+    assert_eq!(
+        read_frontend_session_auth_deadline_for_test(&auth),
+        Some(later),
+        "first publication installs the per-call bound"
+    );
+
+    publish_frontend_session_auth_deadline_for_test(&auth, earlier);
+    assert_eq!(
+        read_frontend_session_auth_deadline_for_test(&auth),
+        Some(earlier),
+        "an explicit earlier bind must tighten the shared session deadline"
+    );
+}
+
+#[test]
+fn earlier_session_deadline_cannot_be_extended_by_later_publication() {
+    let auth = frontend_session_auth_deadline_for_test();
+    let now = tokio::time::Instant::now();
+    let earlier = now + Duration::from_secs(5);
+    let later = now + Duration::from_secs(60);
+
+    publish_frontend_session_auth_deadline_for_test(&auth, earlier);
+    publish_frontend_session_auth_deadline_for_test(&auth, later);
+    assert_eq!(
+        read_frontend_session_auth_deadline_for_test(&auth),
+        Some(earlier),
+        "a later publication must not extend authorization"
+    );
+}
+
+#[test]
+fn concurrent_publications_settle_on_earliest_deadline() {
+    use std::sync::{Arc, Barrier};
+
+    let auth = Arc::new(frontend_session_auth_deadline_for_test());
+    let now = tokio::time::Instant::now();
+    let deadlines = [
+        now + Duration::from_secs(30),
+        now + Duration::from_secs(5),
+        now + Duration::from_secs(15),
+        now + Duration::from_secs(10),
+        now + Duration::from_secs(20),
+    ];
+    let expected = now + Duration::from_secs(5);
+    let barrier = Arc::new(Barrier::new(deadlines.len()));
+    let handles: Vec<_> = deadlines
+        .into_iter()
+        .map(|at| {
+            let auth = Arc::clone(&auth);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                publish_frontend_session_auth_deadline_for_test(&auth, at);
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.join().expect("publisher thread");
+    }
+    assert_eq!(
+        read_frontend_session_auth_deadline_for_test(&auth),
+        Some(expected),
+        "concurrent publishers must settle on the earliest instant"
+    );
 }
 
 #[test]
@@ -354,6 +429,18 @@ fn driver_and_proxy_use_the_deadline_aware_actual_commit_api() {
     assert!(
         DTLS_SOURCE.contains("earliest_frontend_app_send_deadline("),
         "per-call and session deadlines must compose with earliest-deadline-wins"
+    );
+    assert!(
+        DTLS_SOURCE.contains("struct FrontendSessionAuthDeadline"),
+        "session authorization must use a monotonically-earliest lock-free slot"
+    );
+    assert!(
+        DTLS_SOURCE.contains("compare_exchange_weak("),
+        "concurrent publication must tighten via atomic compare-exchange"
+    );
+    assert!(
+        !DTLS_SOURCE.contains("auth_deadline.set("),
+        "first-set-wins OnceLock publication must not be used for session bounds"
     );
     assert!(
         !DTLS_SOURCE.contains("deadline.or(session_deadline)"),
