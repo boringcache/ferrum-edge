@@ -576,6 +576,76 @@ fn control_plane_poll_tick_records_on_every_normal_exit_without_async_wrapper() 
     );
 }
 
+/// Issue #3727: authoritative gateway trust drift must be repaired by the
+/// full-reload publication path in the SAME poll tick that detected it.
+///
+/// Escalating with an early `continue` would satisfy the "record on every
+/// normal exit" contract while still leaving revoked roots installed on every
+/// subscriber for one whole poll interval, so the accounting test alone cannot
+/// prove this. What proves it is control flow: the check is evaluated before
+/// the reload decision, nothing between the two ends the tick or starts an
+/// incremental poll, and the branch it selects is the full snapshot load.
+#[test]
+fn gateway_trust_drift_escalates_into_the_same_tick_full_reload() {
+    for (label, source, wake_marker, shutdown_marker) in [
+        (
+            "database",
+            include_str!("../../../src/modes/database.rs"),
+            "_ = wait_for_config_poll_wake(",
+            "_ = poll_shutdown.changed() => {",
+        ),
+        (
+            "control_plane",
+            include_str!("../../../src/modes/control_plane.rs"),
+            "_ = interval.tick() => {",
+            "_ = cp_poll_shutdown.changed() => {",
+        ),
+    ] {
+        let tick = poll_attempt_body(source, wake_marker, shutdown_marker);
+
+        let drift_at = tick
+            .find("detect_gateway_trust_drift(")
+            .unwrap_or_else(|| panic!("{label}: poll tick must run the trust drift check"));
+        let decision_at = tick[drift_at..]
+            .find("if force_full_reload {")
+            .map(|offset| offset + drift_at)
+            .unwrap_or_else(|| {
+                panic!("{label}: the drift check must precede the full-reload decision")
+            });
+
+        // The escalation must be guarded so an already-pending full reload
+        // does not pay for a second authoritative read, and that guard must be
+        // the negated one — not the reload branch itself.
+        let guard_at = tick[..drift_at]
+            .rfind("if !force_full_reload {")
+            .unwrap_or_else(|| {
+                panic!("{label}: the drift check must be skipped when a reload is already pending")
+            });
+        assert!(
+            !tick[guard_at..drift_at].contains("if force_full_reload {"),
+            "{label}: the drift check must run outside the full-reload branch"
+        );
+
+        let between = &tick[guard_at..decision_at];
+        assert!(
+            !between.contains("continue;"),
+            "{label}: escalating trust drift must not end the poll tick before the reload"
+        );
+        assert!(
+            !between.contains("record_poll_completed()"),
+            "{label}: escalating trust drift must not record a poll completion of its own"
+        );
+        assert!(
+            !between.contains("load_incremental"),
+            "{label}: a drifted tick must not fall into incremental polling first"
+        );
+        assert!(
+            tick[decision_at..].contains("load_full_config"),
+            "{label}: the branch the escalation selects must be the authoritative full load"
+        );
+    }
+}
+
 #[test]
 fn database_poll_respawn_delay_remains_one_second() {
     assert_eq!(DATABASE_POLL_RESPAWN_DELAY, Duration::from_secs(1));
