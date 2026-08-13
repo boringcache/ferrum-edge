@@ -87,7 +87,7 @@ use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use rustls::pki_types::CertificateRevocationListDer;
 use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
-use x509_parser::prelude::FromDer;
+use x509_parser::prelude::{FromDer, X509Certificate};
 
 /// The closed set of frontend listener families that terminate client
 /// certificates and therefore own a client-trust generation.
@@ -297,6 +297,18 @@ impl ClientTrustMaterial {
             let mut parsed_any = false;
             for cert in rustls_pemfile::certs(&mut reader) {
                 let cert = cert.map_err(|_| ClientTrustMaterialError)?;
+                // PEM framing only proves the block was base64-decodable.
+                // `rustls_pemfile::certs` does not require those bytes to be a
+                // complete X.509 certificate, so hashing here would invent a
+                // trust-anchor identity the verifier cannot accept. Parse
+                // errors and trailing/unconsumed DER fail the whole candidate
+                // closed; a valid block is never kept while a later one is
+                // skipped.
+                let (remaining, _) = X509Certificate::from_der(cert.as_ref())
+                    .map_err(|_| ClientTrustMaterialError)?;
+                if !remaining.is_empty() {
+                    return Err(ClientTrustMaterialError);
+                }
                 parsed_any = true;
                 anchors.insert(digest_of(&[cert.as_ref()]));
             }
@@ -306,7 +318,7 @@ impl ClientTrustMaterial {
             // item-level parse error. Treating that as an empty trust set would
             // summarize and publish material the verifier rejected. `Some`
             // means client authentication was configured, so at least one
-            // parseable certificate is mandatory.
+            // complete X.509 certificate is mandatory.
             if !parsed_any {
                 return Err(ClientTrustMaterialError);
             }

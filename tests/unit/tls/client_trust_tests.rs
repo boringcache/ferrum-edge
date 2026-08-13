@@ -95,6 +95,21 @@ fn parse_crls(pem: &str) -> Vec<CertificateRevocationListDer<'static>> {
         .expect("parse CRLs")
 }
 
+fn first_cert_der(pem: &str) -> Vec<u8> {
+    rustls_pemfile::certs(&mut pem.as_bytes())
+        .next()
+        .expect("certificate block")
+        .expect("PEM-decode")
+        .as_ref()
+        .to_vec()
+}
+
+fn certificate_pem(der: &[u8]) -> String {
+    use base64::Engine;
+    let body = base64::engine::general_purpose::STANDARD.encode(der);
+    format!("-----BEGIN CERTIFICATE-----\n{body}\n-----END CERTIFICATE-----\n")
+}
+
 fn material(ca_pems: &[&str], crl_pems: &[&str]) -> ClientTrustMaterial {
     let bundle = ca_pems.concat();
     let crl_bundle = crl_pems.concat();
@@ -244,6 +259,48 @@ fn a_malformed_ca_bundle_is_refused_rather_than_summarized() {
     assert!(
         ClientTrustMaterial::from_parts(Some(garbage), &[]).is_err(),
         "an unparseable client-CA bundle must fail closed"
+    );
+}
+
+#[test]
+fn a_base64_decodable_non_x509_ca_block_is_refused() {
+    let garbage = certificate_pem(b"not an X.509 certificate");
+    assert!(
+        ClientTrustMaterial::from_parts(Some(garbage.as_bytes()), &[]).is_err(),
+        "PEM-decoded non-X.509 bytes must not become a trust-anchor identity"
+    );
+}
+
+#[test]
+fn a_ca_block_with_trailing_or_partial_der_is_refused() {
+    let ca = generate_ca("trust-ca");
+    let der = first_cert_der(&ca.cert_pem);
+
+    let mut trailing = der.clone();
+    trailing.push(0x00);
+    assert!(
+        ClientTrustMaterial::from_parts(Some(certificate_pem(&trailing).as_bytes()), &[]).is_err(),
+        "trailing unconsumed DER must fail closed"
+    );
+
+    let partial = &der[..der.len() / 2];
+    assert!(
+        ClientTrustMaterial::from_parts(Some(certificate_pem(partial).as_bytes()), &[]).is_err(),
+        "a truncated certificate DER must fail closed"
+    );
+}
+
+#[test]
+fn one_invalid_ca_block_refuses_the_entire_bundle() {
+    let ca = generate_ca("trust-ca");
+    let mixed = format!(
+        "{}{}",
+        ca.cert_pem,
+        certificate_pem(b"not an X.509 certificate")
+    );
+    assert!(
+        ClientTrustMaterial::from_parts(Some(mixed.as_bytes()), &[]).is_err(),
+        "an invalid certificate block must fail the whole candidate, not skip it"
     );
 }
 
