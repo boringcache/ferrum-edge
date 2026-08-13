@@ -67,6 +67,7 @@ mod http2_pool_tests;
 mod http3_integration_tests;
 mod injector_admission_tests;
 mod k8s_controller_gateway_status_tests;
+mod k8s_controller_istio_status_cas_tests;
 mod k8s_controller_istio_status_tests;
 mod k8s_controller_shutdown_tests;
 mod k8s_controller_status_snapshot_tests;

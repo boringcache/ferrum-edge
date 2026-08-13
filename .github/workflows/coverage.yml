@@ -164,6 +164,7 @@ jobs:
           - shard: mesh-platform
             kind: integration
             filters: |
+              integration::k8s_controller_istio_status_cas_tests
               integration::k8s_controller_istio_status_tests
               integration::k8s_controller_status_snapshot_tests
               integration::mesh_telemetry_k8s_provider_lookup_tests
