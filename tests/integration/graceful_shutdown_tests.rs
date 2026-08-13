@@ -143,6 +143,7 @@ fn create_test_proxy_state(proxies: Vec<Proxy>) -> ProxyState {
         node_waypoint_udp_steer_destinations: Vec::new(),
         node_waypoint_udp_destination_routes: Vec::new(),
         k8s_mesh_overlay: Default::default(),
+        gateway_trust_bundles: Vec::new(),
     };
     ProxyState::new(config, dns_cache, create_test_env_config(), None, None)
         .unwrap()
@@ -549,6 +550,7 @@ fn create_test_proxy_state_with_env(
         node_waypoint_udp_steer_destinations: Vec::new(),
         node_waypoint_udp_destination_routes: Vec::new(),
         k8s_mesh_overlay: Default::default(),
+        gateway_trust_bundles: Vec::new(),
     };
     ProxyState::new(config, dns_cache, env_config, None, None)
         .unwrap()

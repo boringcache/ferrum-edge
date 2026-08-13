@@ -1458,10 +1458,14 @@ async fn run_udp_egress_session(
         observability.set_target(&target);
     }
 
-    if state.gateway_svid_bundle.load().is_none() {
+    // Admitted-generation gateway trust, not the live SVID slot: see the same
+    // gate in `mesh_tcp_egress::handle_mesh_tcp_egress` (issue #3727). A UDP
+    // session is long-lived, so it must be created from a generation whose
+    // trust is actually live rather than one still being published.
+    if !state.admits_gateway_mesh_identity() {
         warn!(
             service = %entry.service_fqdn,
-            "Mesh UDP egress requires a loaded gateway SVID; ending session"
+            "Mesh UDP egress requires a live gateway trust generation; ending session"
         );
         return;
     }

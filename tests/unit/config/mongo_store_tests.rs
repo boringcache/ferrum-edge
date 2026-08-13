@@ -176,6 +176,31 @@ fn mongo_backup_restore_api_specs_methods_exist() {
     );
 }
 
+/// Namespace enumeration must scan gateway_trust_bundles so a trust-only
+/// namespace is still discovered by CP/admin listing (issue #3727 / PR #3782).
+/// Paginated listing reuses `list_namespaces()`, so covering the merge is enough.
+#[test]
+fn list_namespaces_scans_gateway_trust_bundles() {
+    let body = mongo_method("list_namespaces(");
+    for collection in [
+        "proxies",
+        "consumers",
+        "plugin_configs",
+        "upstreams",
+        "gateway_trust_bundles",
+    ] {
+        let needle = format!("distinct_namespaces(\"{collection}\")");
+        assert!(
+            body.contains(&needle),
+            "list_namespaces must scan {collection}: missing {needle}"
+        );
+    }
+    assert!(
+        body.contains("result.sort()"),
+        "list_namespaces must keep deterministic ascending order"
+    );
+}
+
 /// `rollback_ids_for_unordered_insert_error` derives "documents this call
 /// created" as *every id minus the reported write-error indices*. That is only
 /// correct for an UNORDERED `insert_many`: an ordered insert stops at the first
@@ -1399,5 +1424,18 @@ async fn delayed_primary_publish_cannot_overwrite_later_failover_topology() {
         mongo_store_published_database_name_for_test(&store),
         "later_failover",
         "active bundle must match the later failover publication"
+    );
+}
+
+#[test]
+fn gateway_trust_bundle_identity_parses_id_and_trust_domain_strictly() {
+    let body = mongo_method("gateway_trust_bundle_identity");
+    assert!(
+        !body.contains("unwrap_or_default()"),
+        "identity fields must not silently default on parse failure:\n{body}"
+    );
+    assert!(
+        body.contains("strict_stored_str_field"),
+        "identity id/trust_domain must use strict stored-field decoding:\n{body}"
     );
 }

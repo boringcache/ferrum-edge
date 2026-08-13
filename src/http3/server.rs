@@ -15831,6 +15831,7 @@ mod build_h3_backend_headers_tests {
             node_waypoint_udp_steer_destinations: Vec::new(),
             node_waypoint_udp_destination_routes: Vec::new(),
             k8s_mesh_overlay: Default::default(),
+            gateway_trust_bundles: Vec::new(),
         };
         ProxyState::new(config, dns_cache, EnvConfig::default(), None, None)
             .expect("minimal ProxyState should construct")

@@ -104,6 +104,7 @@ fn build_mesh_authz_for_workload(
         node_waypoint_udp_steer_destinations: Vec::new(),
         node_waypoint_udp_destination_routes: Vec::new(),
         k8s_mesh_overlay: Default::default(),
+        gateway_trust_bundles: Vec::new(),
     };
     let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh-prepared");
     let authz_config = prepared
@@ -1542,6 +1543,7 @@ async fn trust_domain_alias_accepts_baggage_principal_from_aliased_domain() {
         node_waypoint_udp_steer_destinations: Vec::new(),
         node_waypoint_udp_destination_routes: Vec::new(),
         k8s_mesh_overlay: Default::default(),
+        gateway_trust_bundles: Vec::new(),
     };
     let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh-prepared");
     let authz_cfg = prepared

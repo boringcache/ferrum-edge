@@ -121,6 +121,7 @@ fn create_mesh_proxy_state_with_config(
         node_waypoint_udp_steer_destinations: Vec::new(),
         node_waypoint_udp_destination_routes: Vec::new(),
         k8s_mesh_overlay: Default::default(),
+        gateway_trust_bundles: Vec::new(),
     };
     let env_config = EnvConfig {
         mode: OperatingMode::Mesh,
@@ -833,6 +834,7 @@ fn create_egress_udp_gateway_state(mesh: MeshConfig) -> ProxyState {
         node_waypoint_udp_steer_destinations: Vec::new(),
         node_waypoint_udp_destination_routes: Vec::new(),
         k8s_mesh_overlay: Default::default(),
+        gateway_trust_bundles: Vec::new(),
     };
     let env_config = EnvConfig {
         mode: OperatingMode::Mesh,
@@ -1257,6 +1259,7 @@ fn materialize_source_side_external_udp(
         node_waypoint_udp_steer_destinations: Vec::new(),
         node_waypoint_udp_destination_routes: Vec::new(),
         k8s_mesh_overlay: Default::default(),
+        gateway_trust_bundles: Vec::new(),
     };
 
     let mut runtime = source_sidecar_runtime();

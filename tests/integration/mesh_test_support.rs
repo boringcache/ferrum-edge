@@ -469,6 +469,7 @@ pub fn gateway_config_with_mesh(
         node_waypoint_udp_steer_destinations: Vec::new(),
         node_waypoint_udp_destination_routes: Vec::new(),
         k8s_mesh_overlay: Default::default(),
+        gateway_trust_bundles: Vec::new(),
     }
 }
 

@@ -13,6 +13,7 @@ pub use crate::config::batch_atomicity::{
     BATCH_ADMISSION_LEASE_LOST_MESSAGE, BatchAdmissionLeaseLost, NamespaceConfigAdmissionLeaseRef,
     atomic_batch_unsupported, is_batch_admission_lease_lost,
 };
+use crate::config::gateway_trust::{GatewayTrustBundleIdentity, GatewayTrustBundleRecord};
 use crate::config::types::{
     ApiSpec, Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, Upstream,
 };
@@ -689,6 +690,44 @@ pub fn proxy_delete_atomicity_unsupported(
         .find_map(|cause| cause.downcast_ref::<ProxyDeleteAtomicityUnsupported>())
 }
 
+/// Operator-facing message for a lost optimistic-concurrency race on a gateway
+/// trust-bundle write (issue #3727).
+pub const GATEWAY_TRUST_BUNDLE_REVISION_CONFLICT_MESSAGE: &str = "gateway trust bundle was modified concurrently; re-read the resource and retry with the \
+     current revision";
+
+/// Typed optimistic-concurrency refusal for a gateway trust-bundle update.
+///
+/// Carries the expected and observed revisions — both are monotonically
+/// increasing counters, never trust material — so an operator can tell a lost
+/// race apart from a stale client cache.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayTrustBundleRevisionConflict {
+    pub expected: u64,
+    pub current: u64,
+}
+
+impl std::fmt::Display for GatewayTrustBundleRevisionConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{GATEWAY_TRUST_BUNDLE_REVISION_CONFLICT_MESSAGE} (expected revision {}, current {})",
+            self.expected, self.current
+        )
+    }
+}
+
+impl std::error::Error for GatewayTrustBundleRevisionConflict {}
+
+/// Borrow the typed revision conflict from anywhere in an error chain so admin
+/// response mapping never renders surrounding database-driver context.
+pub fn gateway_trust_bundle_revision_conflict(
+    error: &anyhow::Error,
+) -> Option<&GatewayTrustBundleRevisionConflict> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<GatewayTrustBundleRevisionConflict>())
+}
+
 /// Durable cross-process fence for namespace-scoped config admission.
 ///
 /// Implementations atomically claim a namespace for `owner` and return the
@@ -1261,23 +1300,67 @@ impl IncrementalResult {
 #[derive(Debug)]
 pub struct IncrementalFullReloadRequired {
     namespace: String,
+    reason: IncrementalFullReloadReason,
+}
+
+/// Why an incremental batch escalated to a full reload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IncrementalFullReloadReason {
+    /// Consumer mutation — see the type-level docs.
+    ConsumerChanges,
+    /// Gateway trust-bundle mutation (issue #3727).
+    ///
+    /// Trust material is not carried in the `IncrementalResult` body: that body
+    /// is a same-major.minor CP/DP wire contract, and trust travels exclusively
+    /// through the `ConfigUpdate.trust_bundles_json` side channel so it never
+    /// enters the DP-facing `GatewayConfig` JSON. Escalating instead of
+    /// inventing a delta field keeps the rotation atomic — the control plane
+    /// republishes one snapshot whose resources and whose trust side channel
+    /// come from the same authoritative read, so a subscriber can never observe
+    /// new configuration paired with the previous generation's roots.
+    ///
+    /// Rotations and revocations are rare by construction, so the cost of a
+    /// full reload on those ticks is paid only when trust actually changes.
+    GatewayTrustBundleChanges,
 }
 
 impl IncrementalFullReloadRequired {
     pub(crate) fn for_consumer_changes(namespace: &str) -> Self {
         Self {
             namespace: namespace.to_string(),
+            reason: IncrementalFullReloadReason::ConsumerChanges,
         }
+    }
+
+    pub(crate) fn for_gateway_trust_bundle_changes(namespace: &str) -> Self {
+        Self {
+            namespace: namespace.to_string(),
+            reason: IncrementalFullReloadReason::GatewayTrustBundleChanges,
+        }
+    }
+
+    /// Read by external integration tests (which link the lib target); the bin
+    /// target never inspects the reason, so it is dead code there.
+    #[allow(dead_code)]
+    pub fn reason(&self) -> IncrementalFullReloadReason {
+        self.reason
     }
 }
 
 impl std::fmt::Display for IncrementalFullReloadRequired {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "consumer changes in namespace '{}' require an authoritative full reload to rehydrate quarantined credentials",
-            self.namespace
-        )
+        match self.reason {
+            IncrementalFullReloadReason::ConsumerChanges => write!(
+                f,
+                "consumer changes in namespace '{}' require an authoritative full reload to rehydrate quarantined credentials",
+                self.namespace
+            ),
+            IncrementalFullReloadReason::GatewayTrustBundleChanges => write!(
+                f,
+                "gateway trust bundle changes in namespace '{}' require an authoritative full reload so configuration and trust material publish from one snapshot",
+                self.namespace
+            ),
+        }
     }
 }
 
@@ -2241,6 +2324,139 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
     ) -> Result<Vec<crate::config::types::Upstream>, anyhow::Error>;
 
     // -----------------------------------------------------------------------
+    // Gateway trust bundles (issue #3727).
+    //
+    // The authoritative namespace-keyed gateway/mesh trust resource. Every
+    // method below is namespace-predicated at the query level — the namespace
+    // is in the SQL `WHERE` clause / Mongo filter document, never applied after
+    // the read — so a caller holding the wrong namespace cannot observe another
+    // tenant's roots even through an error or an empty result.
+    //
+    // All reads are authoritative-primary: trust state feeds runtime config
+    // polling and CP publication, so a read replica must never serve it.
+    // -----------------------------------------------------------------------
+
+    /// Fetch the trust-bundle record addressed by `(namespace, id)`.
+    async fn get_gateway_trust_bundle(
+        &self,
+        namespace: &str,
+        id: &str,
+    ) -> Result<Option<GatewayTrustBundleRecord>, anyhow::Error>;
+
+    /// Fetch the namespace's singleton trust-bundle record regardless of its
+    /// id. This is the projection path used by full loads and CP publication.
+    async fn get_namespace_gateway_trust_bundle(
+        &self,
+        namespace: &str,
+    ) -> Result<Option<GatewayTrustBundleRecord>, anyhow::Error>;
+
+    /// Whether a trust document mutation and its `config_changes` poll signal
+    /// commit as ONE atomic unit on this backend's connected topology.
+    ///
+    /// `true` (the default, and the answer for every SQL backend) means a
+    /// poller that consumed a change sequence could already read the mutation
+    /// that sequence describes, so the signal alone is a complete visibility
+    /// proof and the poll path performs no extra work.
+    ///
+    /// A backend that cannot make that guarantee — standalone MongoDB, which
+    /// has no multi-document transaction — MUST return `false`. No ordering of
+    /// the two writes repairs it: signal-first loses to a live poller that
+    /// consumes the signal, completes a full reload against the old document,
+    /// and advances its cursor before the document commits; document-first
+    /// loses to a crash before the signal. Returning `false` enables the
+    /// authoritative reader-side drift check
+    /// ([`crate::config::gateway_trust::detect_gateway_trust_drift`]), which
+    /// depends on neither ordering nor process survival.
+    fn gateway_trust_writes_are_atomic_with_change_log(&self) -> bool {
+        true
+    }
+
+    /// Material-free identity of the namespace's stored trust document, read
+    /// from the authoritative primary.
+    ///
+    /// This is the cold-path drift-detection read. Implementations SHOULD
+    /// project only the identity fields so trust material never crosses the
+    /// store boundary for a visibility check; the default derives it from the
+    /// full record, which is correct but reads more than it needs and is only
+    /// ever exercised by backends that report atomic trust writes.
+    async fn gateway_trust_bundle_identity(
+        &self,
+        namespace: &str,
+    ) -> Result<Option<GatewayTrustBundleIdentity>, anyhow::Error> {
+        Ok(self
+            .get_namespace_gateway_trust_bundle(namespace)
+            .await?
+            .as_ref()
+            .map(GatewayTrustBundleIdentity::of))
+    }
+
+    /// Page the namespace's trust-bundle records (0 or 1 items — the resource
+    /// is a singleton, but the paginated shape keeps the admin surface uniform
+    /// with every other resource list).
+    async fn list_gateway_trust_bundles_paginated(
+        &self,
+        namespace: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<PaginatedResult<GatewayTrustBundleRecord>, anyhow::Error>;
+
+    /// Insert a new record and its config-change row in one transaction.
+    ///
+    /// A namespace that already holds a record must fail — the store's
+    /// namespace primary key is the cross-process backstop for the singleton
+    /// rule, so a concurrent create surfaces as a unique-constraint conflict
+    /// rather than silently replacing another writer's roots.
+    ///
+    /// `record.revision` is IGNORED. The implementation must stamp a revision
+    /// taken from the backend's durable monotonic change sequence, which every
+    /// trust mutation (including a delete) advances. Starting each incarnation
+    /// at 1 — or honouring a caller-supplied value — would let a client that
+    /// read the pre-delete record win a compare-and-set against the record that
+    /// replaced it.
+    async fn create_gateway_trust_bundle(
+        &self,
+        record: &GatewayTrustBundleRecord,
+    ) -> Result<(), anyhow::Error>;
+
+    /// Replace an existing record and its config-change row in one transaction,
+    /// advancing `revision` to the next value the backend's durable change
+    /// sequence yields (not `current + 1`, which would restart per incarnation).
+    ///
+    /// `expected_revision` is the optimistic-concurrency guard: `Some(n)`
+    /// requires the stored revision to still be `n`, and a mismatch returns
+    /// [`GatewayTrustBundleRevisionConflict`] without writing. `None` skips the
+    /// check (used by restore/import, which is already serialized behind the
+    /// namespace admission lease). Returns `Ok(false)` when no record matched
+    /// `(namespace, id)` so a PUT racing a delete surfaces as not-found rather
+    /// than a phantom success.
+    ///
+    /// Both outcomes must also hold when the race is lost at the compare-and-set
+    /// itself rather than at the pre-read: an implementation whose atomic write
+    /// matches zero rows must re-read authoritatively — outside the failed
+    /// transaction, so no backend's snapshot isolation can serve the pre-race
+    /// value back — and report the revision it actually observes, or `Ok(false)`
+    /// when the record is gone. Echoing the pre-race revision would produce a
+    /// conflict whose `current` equals `expected` and would claim existence for
+    /// a record a concurrent revocation had already removed.
+    async fn update_gateway_trust_bundle(
+        &self,
+        record: &GatewayTrustBundleRecord,
+        expected_revision: Option<u64>,
+    ) -> Result<bool, anyhow::Error>;
+
+    /// Delete the record addressed by `(namespace, id)` and record the change.
+    ///
+    /// This is the explicit revocation path. It is distinguishable from "no
+    /// change" downstream: the change-log row makes the next incremental poll
+    /// observe a `delete`, which becomes a `Clear` on the ConfigSync side
+    /// channel rather than an absent field.
+    async fn delete_gateway_trust_bundle(
+        &self,
+        namespace: &str,
+        id: &str,
+    ) -> Result<bool, anyhow::Error>;
+
+    // -----------------------------------------------------------------------
     // Admin audit log (admin-only — runtime config loading and proxy hot paths
     // must never read this table/collection).
     // -----------------------------------------------------------------------
@@ -2259,6 +2475,27 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
     /// Namespace-scoped, bounded audit retention prune. No-op when retention
     /// policy is unset. Must never delete rows belonging to another namespace.
     async fn prune_audit_events(&self, namespace: &str) -> Result<u64, anyhow::Error>;
+}
+
+/// The poll path holds `Arc<dyn DatabaseBackend>`, so the narrow drift surface
+/// is implemented for exactly that trait object rather than as a blanket impl
+/// over every backend. A blanket impl would make it impossible for an external
+/// test crate to implement `GatewayTrustDriftSource` for its own deterministic
+/// fake (coherence cannot rule out that the fake also implements
+/// `DatabaseBackend`), and a fake that can interleave a consumed signal with a
+/// later document commit is the only way to prove this detector.
+#[async_trait]
+impl crate::config::gateway_trust::GatewayTrustDriftSource for dyn DatabaseBackend {
+    fn gateway_trust_writes_are_atomic_with_change_log(&self) -> bool {
+        DatabaseBackend::gateway_trust_writes_are_atomic_with_change_log(self)
+    }
+
+    async fn gateway_trust_bundle_identity(
+        &self,
+        namespace: &str,
+    ) -> Result<Option<GatewayTrustBundleIdentity>, anyhow::Error> {
+        DatabaseBackend::gateway_trust_bundle_identity(self, namespace).await
+    }
 }
 
 /// Extract resource IDs from a full config.
