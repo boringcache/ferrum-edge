@@ -2436,11 +2436,22 @@ impl<'a> RetryCandidateFilter<'a> {
         }
     }
 
+    /// Whether `target` is hard-ineligible under the optional predicate.
+    #[inline]
+    fn is_hard_ineligible(&self, target: &UpstreamTarget) -> bool {
+        self.eligible.is_some_and(|eligible| !eligible(target))
+    }
+
+    /// Soft retry exclusion: the immediately prior attempt identity.
+    #[inline]
+    fn excludes_retry(&self, target: &UpstreamTarget, contract: RetryExcludeContract) -> bool {
+        retry_exclude_matches(target, self.exclude, contract)
+    }
+
     /// Whether `target` must be dropped from the candidate lane.
     #[inline]
     fn rejects(&self, target: &UpstreamTarget, contract: RetryExcludeContract) -> bool {
-        retry_exclude_matches(target, self.exclude, contract)
-            || self.eligible.is_some_and(|eligible| !eligible(target))
+        self.excludes_retry(target, contract) || self.is_hard_ineligible(target)
     }
 }
 
@@ -2461,6 +2472,47 @@ fn clear_retry_exclusions(
             candidate_mask.clear(idx);
         }
     }
+}
+
+/// Scope for strict-locality decisions under an eligibility-aware retry filter.
+///
+/// Soft retry exclusion stays in the scope so excluding a previously tried local
+/// target does not make a local-containing upstream look remote-only. Hard
+/// ineligibility is stripped from the scope so strict fail-closed fallback cannot
+/// reintroduce transport-rejected targets (issue #3620).
+#[inline]
+fn hard_eligible_locality_scope_bitset(
+    targets: &[Arc<UpstreamTarget>],
+    filter: RetryCandidateFilter<'_>,
+    scope: HealthBitset,
+) -> HealthBitset {
+    if filter.eligible.is_none() {
+        return scope;
+    }
+    let mut eligible_scope = scope;
+    for (idx, target) in targets.iter().enumerate() {
+        if filter.is_hard_ineligible(target) {
+            eligible_scope.clear(idx);
+        }
+    }
+    eligible_scope
+}
+
+/// Vec-path counterpart of [`hard_eligible_locality_scope_bitset`].
+#[inline]
+fn hard_eligible_locality_scope_indices(
+    targets: &[Arc<UpstreamTarget>],
+    filter: RetryCandidateFilter<'_>,
+    scope_indices: &[usize],
+) -> Vec<usize> {
+    if filter.eligible.is_none() {
+        return scope_indices.to_vec();
+    }
+    scope_indices
+        .iter()
+        .copied()
+        .filter(|&idx| !filter.is_hard_ineligible(&targets[idx]))
+        .collect()
 }
 
 /// Build the pre-computed locality-LB state from an operator's
@@ -5722,7 +5774,7 @@ impl LoadBalancer {
 
         let (healthy, _) = self.preferred_locality_bitset(
             &healthy,
-            &scope,
+            &hard_eligible_locality_scope_bitset(&self.targets, filter, scope),
             self.locality_lb.as_ref(),
             self.failover_enabled,
         );
@@ -5814,7 +5866,7 @@ impl LoadBalancer {
 
         let (healthy, _) = self.preferred_locality_bitset(
             &healthy,
-            &scope,
+            &hard_eligible_locality_scope_bitset(&self.targets, filter, scope),
             port_locality,
             port_state.failover_enabled,
         );
@@ -5927,7 +5979,7 @@ impl LoadBalancer {
 
         let (subset_healthy, _) = self.preferred_locality_bitset(
             &subset_healthy,
-            &strict_scope,
+            &hard_eligible_locality_scope_bitset(&self.targets, filter, strict_scope),
             self.locality_lb.as_ref(),
             self.failover_enabled_for_subset(subset_name),
         );
@@ -6059,7 +6111,7 @@ impl LoadBalancer {
             .or(self.locality_lb.as_ref());
         let (port_subset_healthy, _) = self.preferred_locality_bitset(
             &port_subset_healthy,
-            &strict_scope,
+            &hard_eligible_locality_scope_bitset(&self.targets, filter, strict_scope),
             port_locality,
             self.failover_enabled_for_port_subset(port_state, subset_name),
         );
@@ -6098,9 +6150,11 @@ impl LoadBalancer {
             return None;
         }
 
+        let locality_scope =
+            hard_eligible_locality_scope_indices(&self.targets, filter, &scope_indices);
         let (healthy, _) = self.preferred_locality_candidates(
             healthy,
-            &scope_indices,
+            &locality_scope,
             self.locality_lb.as_ref(),
             self.failover_enabled,
         );
@@ -6135,9 +6189,11 @@ impl LoadBalancer {
             .locality_lb
             .as_ref()
             .or(self.locality_lb.as_ref());
+        let locality_scope =
+            hard_eligible_locality_scope_indices(&self.targets, filter, &scope_indices);
         let (candidates, _) = self.preferred_locality_candidates(
             candidates,
-            &scope_indices,
+            &locality_scope,
             port_locality,
             port_state.failover_enabled,
         );
@@ -6187,9 +6243,11 @@ impl LoadBalancer {
             .locality_lb
             .as_ref()
             .or(self.locality_lb.as_ref());
+        let locality_scope =
+            hard_eligible_locality_scope_indices(&self.targets, filter, &strict_scope);
         let (candidates, _) = self.preferred_locality_candidates(
             candidates,
-            &strict_scope,
+            &locality_scope,
             port_locality,
             self.failover_enabled_for_port_subset(port_state, subset_name),
         );
@@ -6233,9 +6291,11 @@ impl LoadBalancer {
         if subset_healthy.is_empty() {
             return None;
         }
+        let locality_scope =
+            hard_eligible_locality_scope_indices(&self.targets, filter, &strict_scope);
         let (subset_healthy, _) = self.preferred_locality_candidates(
             subset_healthy,
-            &strict_scope,
+            &locality_scope,
             self.locality_lb.as_ref(),
             self.failover_enabled_for_subset(subset_name),
         );

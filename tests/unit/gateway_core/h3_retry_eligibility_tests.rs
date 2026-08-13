@@ -15,8 +15,10 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use ferrum_edge::config::types::{
-    GatewayConfig, LoadBalancerAlgorithm, Proxy, Upstream, UpstreamTarget,
+    GatewayConfig, LoadBalancerAlgorithm, Proxy, Upstream, UpstreamPortOverride, UpstreamTarget,
 };
+use ferrum_edge::load_balancer::{LoadBalancerCache, RetryCandidateFilter};
+use ferrum_edge::proxy::hbone_pool::HBONE_TARGET_TAG;
 use ferrum_edge::proxy::unix_backend::MESH_UNIX_SOCKET_TAG;
 
 const NAMESPACE: &str = "ferrum";
@@ -85,6 +87,55 @@ fn rr_upstream(targets: Vec<UpstreamTarget>) -> Upstream {
         created_at: now,
         updated_at: now,
     }
+}
+
+fn strict_upstream(targets: Vec<UpstreamTarget>) -> Upstream {
+    let mut up = rr_upstream(targets);
+    up.locality_lb_strict = true;
+    up
+}
+
+fn remote_plain_target(host: &str, port: u16) -> UpstreamTarget {
+    let mut tags = HashMap::new();
+    tags.insert("mesh.remote".to_string(), "true".to_string());
+    UpstreamTarget {
+        host: host.to_string(),
+        port,
+        service_port_policy_key: None,
+        weight: 1,
+        tags,
+        locality: Some("remote-cluster-east".to_string()),
+        path: None,
+    }
+}
+
+fn remote_hbone_target(host: &str, port: u16) -> UpstreamTarget {
+    let mut tags = HashMap::new();
+    tags.insert(HBONE_TARGET_TAG.to_string(), "true".to_string());
+    tags.insert("mesh.remote".to_string(), "true".to_string());
+    UpstreamTarget {
+        host: host.to_string(),
+        port,
+        service_port_policy_key: None,
+        weight: 1,
+        tags,
+        locality: Some("remote-cluster-east".to_string()),
+        path: None,
+    }
+}
+
+fn lb_cache_for(upstream: Upstream) -> ferrum_edge::load_balancer::LoadBalancerCache {
+    let mut config = GatewayConfig {
+        upstreams: vec![upstream],
+        ..GatewayConfig::default()
+    };
+    config.normalize_fields();
+    config.resolve_dispatch_port_overrides();
+    LoadBalancerCache::new(&config)
+}
+
+fn h3_eligible(target: &UpstreamTarget) -> bool {
+    ferrum_edge::_test_support::h3_dispatch_target_eligible_for_test(target)
 }
 
 async fn retry_state_for(upstream: Upstream) -> (ferrum_edge::proxy::ProxyState, Proxy) {
@@ -227,6 +278,135 @@ async fn h3_eligible_retry_all_unix_pool_terminates_on_the_vec_fallback_lane() {
     );
 }
 
+#[tokio::test]
+async fn h3_eligible_retry_strict_locality_selects_remote_not_unix_scope_fallback() {
+    // Regression: strict no-source locality must not fail closed to a configured-
+    // local Unix placeholder merely because it survives in the unfiltered scope
+    // while the only healthy eligible candidate is remote HBONE.
+    let original = remote_plain_target("10.0.0.1", 8080);
+    let local_unix = unix_target(2);
+    let remote_hbone = remote_hbone_target("10.0.0.99", 8080);
+    let (state, proxy) = retry_state_for(strict_upstream(vec![
+        original.clone(),
+        local_unix,
+        remote_hbone.clone(),
+    ]))
+    .await;
+
+    let next = select_h3(&state, &proxy, &original)
+        .expect("remote HBONE must remain selectable when local Unix is H3-ineligible");
+    assert!(
+        ferrum_edge::_test_support::h3_dispatch_target_eligible_for_test(&next),
+        "strict-locality H3 retry must never return Unix"
+    );
+    assert_eq!(next.host, remote_hbone.host);
+    assert_eq!(next.port, remote_hbone.port);
+}
+
+#[tokio::test]
+async fn h3_eligible_retry_strict_locality_all_ineligible_scope_fails_closed() {
+    let original = remote_plain_target("10.0.0.1", 8080);
+    let (state, proxy) = retry_state_for(strict_upstream(vec![
+        original.clone(),
+        unix_target(2),
+        unix_target(3),
+    ]))
+    .await;
+
+    assert!(
+        select_h3(&state, &proxy, &original).is_none(),
+        "strict upstream with only Unix locals after exclusion must fail closed"
+    );
+}
+
+#[tokio::test]
+async fn h3_eligible_retry_strict_locality_vec_lane_skips_unix_scope_fallback() {
+    let mut targets = Vec::with_capacity(160);
+    let original = remote_plain_target("10.0.0.1", 8080);
+    targets.push(original.clone());
+    targets.push(unix_target(2));
+    for i in 0..150 {
+        targets.push(remote_plain_target(&format!("10.0.1.{i}"), 8080));
+    }
+    let remote_hbone = remote_hbone_target("10.0.0.200", 8080);
+    targets.push(remote_hbone.clone());
+    assert!(targets.len() > 128, "fixture must exceed the bitset lane");
+
+    let (state, proxy) = retry_state_for(strict_upstream(targets)).await;
+    let next = select_h3(&state, &proxy, &original)
+        .expect("Vec-lane strict locality must still reach remote HBONE");
+    assert!(
+        ferrum_edge::_test_support::h3_dispatch_target_eligible_for_test(&next),
+        "Vec-lane strict locality must not return Unix"
+    );
+    assert_eq!(next.host, remote_hbone.host);
+}
+
+#[test]
+fn h3_eligible_retry_port_lane_strict_locality_skips_unix_scope_fallback() {
+    let original = remote_plain_target("10.0.0.1", 8080);
+    let local_unix = unix_target(2);
+    let remote_hbone = remote_hbone_target("10.0.0.99", 8080);
+    let mut up = strict_upstream(vec![
+        original.clone(),
+        local_unix,
+        remote_hbone.clone(),
+    ]);
+    up.port_overrides
+        .insert(8080, UpstreamPortOverride::default());
+    let cache = lb_cache_for(up);
+    let snapshot = cache.load();
+    let filter = RetryCandidateFilter::excluding_eligible(&original, &h3_eligible);
+
+    let next = LoadBalancerCache::select_next_target_for_port_filtered_from(
+        &snapshot,
+        NAMESPACE,
+        UPSTREAM_ID,
+        "strict-port-h3-retry",
+        8080,
+        filter,
+        None,
+    )
+    .expect("port-lane strict locality must select remote HBONE");
+    assert!(
+        ferrum_edge::_test_support::h3_dispatch_target_eligible_for_test(&next),
+        "port-lane strict locality must not return Unix"
+    );
+    assert_eq!(next.host, remote_hbone.host);
+}
+
+#[test]
+fn ordinary_retry_exclusion_without_eligibility_unchanged_under_strict_locality() {
+    // Soft retry exclusion must still fail closed to the configured-local target
+    // even when remote endpoints remain eligible.
+    let local = {
+        let mut tags = HashMap::new();
+        UpstreamTarget {
+            host: "local-a.local".to_string(),
+            port: 8080,
+            service_port_policy_key: None,
+            weight: 1,
+            tags,
+            locality: Some("us-west/us-west-1/a".to_string()),
+            path: None,
+        }
+    };
+    let remote = remote_plain_target("remote-a.local", 8080);
+    let cache = lb_cache_for(strict_upstream(vec![local.clone(), remote]));
+    let snapshot = cache.load();
+
+    let next = LoadBalancerCache::select_next_target_from(
+        &snapshot,
+        NAMESPACE,
+        UPSTREAM_ID,
+        "strict-soft-retry",
+        &local,
+        None,
+    )
+    .expect("ordinary retry exclusion must still fail closed to local");
+    assert_eq!(next.host, "local-a.local");
+}
+
 #[test]
 fn every_h3_retry_surface_shares_eligible_helper_not_ad_hoc_loops() {
     let cross = include_str!("../../../src/http3/cross_protocol.rs");
@@ -311,8 +491,23 @@ fn eligibility_is_pushed_into_selection_not_an_outer_probe_loop() {
     );
     assert!(
         lb.contains("pub struct RetryCandidateFilter<'a>")
-            && lb.contains("fn rejects(&self, target: &UpstreamTarget"),
-        "load_balancer must own the combined exclusion + eligibility candidate test"
+            && lb.contains("fn is_hard_ineligible(&self")
+            && lb.contains("fn excludes_retry(&self")
+            && lb.contains("fn hard_eligible_locality_scope_bitset("),
+        "load_balancer must separate soft retry exclusion from hard eligibility scope"
+    );
+
+    assert_eq!(
+        lb.matches("hard_eligible_locality_scope_bitset(&self.targets, filter,")
+            .count(),
+        4,
+        "all four bitset retry lanes must pass hard-eligible locality scope"
+    );
+    assert_eq!(
+        lb.matches("hard_eligible_locality_scope_indices(&self.targets, filter,")
+            .count(),
+        4,
+        "all four Vec-fallback retry lanes must pass hard-eligible locality scope"
     );
 
     // Every retry selection lane (upstream, per-port, subset, per-port × subset,
