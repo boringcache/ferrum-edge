@@ -145,8 +145,8 @@ fn admit_yaml_alias_expansion_bytes(body: &[u8]) -> Result<(), YamlAliasBudgetEr
 
     let mut budgets = Budgets::new();
     match probe_alias_event(body, &mut budgets)? {
-        Probe::NoAlias | Probe::MalformedWithoutAlias => Ok(()),
-        Probe::HasAlias => {
+        Probe::Clean | Probe::Malformed => Ok(()),
+        Probe::Present => {
             let document = compose_document(body, &mut budgets)?;
             let root = document
                 .root
@@ -158,9 +158,9 @@ fn admit_yaml_alias_expansion_bytes(body: &[u8]) -> Result<(), YamlAliasBudgetEr
 }
 
 enum Probe {
-    NoAlias,
-    HasAlias,
-    MalformedWithoutAlias,
+    Clean,
+    Present,
+    Malformed,
 }
 
 fn probe_alias_event(body: &[u8], budgets: &mut Budgets) -> Result<Probe, YamlAliasBudgetError> {
@@ -173,16 +173,16 @@ fn probe_alias_event(body: &[u8], budgets: &mut Budgets) -> Result<Probe, YamlAl
             Ok(sys::YAML_ALIAS_EVENT) => saw_alias = true,
             Ok(sys::YAML_STREAM_END_EVENT) => {
                 return Ok(if saw_alias {
-                    Probe::HasAlias
+                    Probe::Present
                 } else {
-                    Probe::NoAlias
+                    Probe::Clean
                 });
             }
             Ok(_) => {}
             Err(()) if saw_alias => {
                 return Err(YamlAliasBudgetError::InvalidAliasDocument);
             }
-            Err(()) => return Ok(Probe::MalformedWithoutAlias),
+            Err(()) => return Ok(Probe::Malformed),
         }
     }
 }
