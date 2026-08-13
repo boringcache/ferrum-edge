@@ -666,6 +666,27 @@ pub struct StreamCopyResult {
     pub first_failure: Option<StreamFirstFailure>,
 }
 
+/// Fail-closed relay result when a kernel-TLS frontend leg would carry an
+/// authenticated stream authorization deadline. The kernel splice relay cannot
+/// be bounded by the accepted credential's lifetime.
+#[cfg(target_os = "linux")]
+pub(crate) fn authenticated_ktls_relay_fail_closed() -> StreamCopyResult {
+    let error = anyhow::anyhow!(
+        "kTLS client leg cannot carry an authenticated stream authorization deadline: \
+         the kernel splice relay cannot be bounded by the accepted credential's lifetime"
+    );
+    StreamCopyResult {
+        bytes_client_to_backend: 0,
+        bytes_backend_to_client: 0,
+        first_failure: Some((
+            Direction::Unknown,
+            classify_stream_error(&error),
+            None,
+            error.to_string(),
+        )),
+    }
+}
+
 /// Combine a failure's direction and IO side into the front-end / back-end
 /// socket that actually errored.
 ///
@@ -4644,25 +4665,7 @@ async fn handle_tcp_connection_inner(
         #[cfg(target_os = "linux")]
         ClientRelayStream::Ktls(..) if stream_auth_deadline.is_some() => {
             used_splice = false;
-            debug_assert!(
-                false,
-                "kTLS handoff must be refused before the handshake for a listener that can \
-                 admit an authenticated stream principal"
-            );
-            let error = anyhow::anyhow!(
-                "kTLS client leg cannot carry an authenticated stream authorization deadline: \
-                 the kernel splice relay cannot be bounded by the accepted credential's lifetime"
-            );
-            StreamCopyResult {
-                bytes_client_to_backend: 0,
-                bytes_backend_to_client: 0,
-                first_failure: Some((
-                    Direction::Unknown,
-                    classify_stream_error(&error),
-                    None,
-                    error.to_string(),
-                )),
-            }
+            authenticated_ktls_relay_fail_closed()
         }
         ClientRelayStream::Tls(tls_stream) => {
             // Userspace rustls relay. This is the fallback for every kTLS

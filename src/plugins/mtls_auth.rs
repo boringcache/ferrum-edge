@@ -48,6 +48,11 @@ enum CertField {
 
 static NEXT_MTLS_AUTH_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Client-visible and log-safe reason when optional `allowed_issuers` filtering
+/// rejects a peer certificate. Must never interpolate issuer DN/CN or other
+/// certificate identity material (issue #3816).
+const ALLOWED_ISSUER_MISMATCH: &str = "Certificate issuer does not match any allowed issuer";
+
 /// Certificate-invariant temporal window retained beside a cached identity.
 ///
 /// Only the two canonical Unix timestamps are kept. No DER, DN, SAN, serial, or
@@ -448,7 +453,7 @@ impl MtlsAuth {
     /// Returns Err(reason) if a constraint fails.
     fn verify_issuer_constraints(
         &self,
-        peer_cert: &X509Certificate<'_>,
+        _peer_cert: &X509Certificate<'_>,
         peer_cert_der: &[u8],
         chain_der: Option<&[Vec<u8>]>,
     ) -> Result<(), String> {
@@ -463,16 +468,7 @@ impl MtlsAuth {
                 self.chain_reaches_pinned_ca(peer_cert_der, chain, filter.ca_cert_der.as_slice())
             });
             if !matched {
-                let issuer_cn = peer_cert
-                    .issuer()
-                    .iter_common_name()
-                    .next()
-                    .and_then(|attr| attr.as_str().ok())
-                    .unwrap_or("<unknown>");
-                return Err(format!(
-                    "Certificate issuer '{}' does not match any allowed issuer",
-                    issuer_cn
-                ));
+                return Err(ALLOWED_ISSUER_MISMATCH.to_string());
             }
         }
 
@@ -726,7 +722,7 @@ impl MtlsAuth {
         if self.has_issuer_constraints()
             && let Err(reason) = self.verify_issuer_constraints(&parsed_cert, cert_der, chain_der)
         {
-            debug!("mtls_auth: issuer constraint failed: {}", reason);
+            debug!("mtls_auth: allowed issuer constraint failed");
             return CertificateEvaluation::Forbidden(
                 serde_json::json!({ "error": reason }).to_string(),
             );

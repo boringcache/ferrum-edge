@@ -467,6 +467,50 @@ fn the_pre_existing_ktls_refusals_are_unchanged() {
     ));
 }
 
+#[test]
+fn the_authenticated_ktls_defensive_path_fails_closed_without_a_debug_panic() {
+    let src = include_str!("../../../src/proxy/tcp_proxy.rs");
+    let arm = src
+        .split("ClientRelayStream::Ktls(..) if stream_auth_deadline.is_some() => {")
+        .nth(1)
+        .expect("authenticated kTLS defensive arm");
+    let arm_body = arm
+        .split("ClientRelayStream::Tls(tls_stream) => {")
+        .next()
+        .expect("authenticated kTLS arm bounded");
+    assert!(
+        !arm_body.contains("debug_assert!(false"),
+        "the defensive authenticated-kTLS path must fail closed without a debug panic"
+    );
+    assert!(
+        arm_body.contains("authenticated_ktls_relay_fail_closed()"),
+        "the defensive path must use the fixed fail-closed helper"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn an_authenticated_ktls_frontend_leg_fails_closed_without_relaying_bytes() {
+    use ferrum_edge::_test_support::authenticated_ktls_relay_fail_closed_for_test;
+    use ferrum_edge::plugins::Direction;
+
+    let result = authenticated_ktls_relay_fail_closed_for_test();
+    assert_eq!(result.bytes_client_to_backend, 0);
+    assert_eq!(result.bytes_backend_to_client, 0);
+    let (direction, _class, side, message) = result
+        .first_failure
+        .as_ref()
+        .expect("defensive authenticated-kTLS path must surface a typed failure");
+    assert_eq!(*direction, Direction::Unknown);
+    assert!(side.is_none());
+    assert!(
+        message.contains(
+            "kTLS client leg cannot carry an authenticated stream authorization deadline"
+        ),
+        "failure must use the fixed fail-closed diagnostic, got: {message}"
+    );
+}
+
 // --- The deadline-aware userspace frontend leg -----------------------------
 
 /// The relay wrapper terminates BOTH directions of a continuously active

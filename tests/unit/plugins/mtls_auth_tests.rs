@@ -804,6 +804,43 @@ async fn test_mtls_auth_allowed_issuers_rejects_wrong_ca() {
 }
 
 #[tokio::test]
+async fn test_mtls_auth_allowed_issuer_mismatch_reason_is_static_and_redacted() {
+    let sensitive_issuer_cn = "External Partner CA";
+    let (_ca_der, client_der) =
+        create_ca_signed_cert("Internal CA", None, None, "client.example.com");
+    let (external_ca_der, _) =
+        create_ca_signed_cert(sensitive_issuer_cn, None, None, "unused.example.com");
+    let consumer = create_mtls_consumer("c1", "alice", "client.example.com");
+    let index = ConsumerIndex::new(&[consumer]);
+
+    let plugin = MtlsAuth::new(&json!({
+        "cert_field": "subject_cn",
+        "allowed_issuers": [issuer_filter(&external_ca_der, Some(sensitive_issuer_cn), None, None)]
+    }))
+    .unwrap();
+    let mut ctx = create_ctx_with_cert(client_der);
+
+    match plugin.authenticate(&mut ctx, &index).await {
+        PluginResult::Reject { status_code, body, .. } => {
+            assert_eq!(status_code, 403);
+            assert_eq!(
+                body,
+                r#"{"error":"Certificate issuer does not match any allowed issuer"}"#
+            );
+            assert!(
+                !body.contains(sensitive_issuer_cn),
+                "client-visible reason must not echo certificate issuer material: {body}"
+            );
+            assert!(
+                !body.contains("Internal CA"),
+                "client-visible reason must not echo the leaf issuer: {body}"
+            );
+        }
+        other => panic!("expected Reject, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn test_mtls_auth_allowed_issuers_multiple_filters_or_logic() {
     let (partner_ca_der, client_der) =
         create_ca_signed_cert("Partner CA", None, None, "client.example.com");

@@ -7648,6 +7648,14 @@ pub mod _test_support {
         crate::proxy::tcp_proxy::tcp_plain_splice_eligible(plan)
     }
 
+    /// Observable fail-closed result for the defensive authenticated-kTLS relay
+    /// path (issue #3816). Only available on Linux.
+    #[cfg(target_os = "linux")]
+    pub fn authenticated_ktls_relay_fail_closed_for_test(
+    ) -> crate::proxy::tcp_proxy::StreamCopyResult {
+        crate::proxy::tcp_proxy::authenticated_ktls_relay_fail_closed()
+    }
+
     /// Observable settlement of a DTLS authorization expiry (issue #3816),
     /// captured from the production helpers so a test never restates them.
     #[derive(Debug, Clone)]
