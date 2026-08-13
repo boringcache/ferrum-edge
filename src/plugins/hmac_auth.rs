@@ -541,6 +541,11 @@ struct CachedHmacAuthorization {
 /// Owner-partitioned staging set for one request.
 type StagedHmacRecords = Vec<(HmacPrebufferOwner, CachedHmacAuthorization)>;
 
+/// Completion of the pre-buffered path: absent, verified consumer + v2 nonce, or
+/// a fixed JSON authentication error.
+type PrebufferedHmacAuthCompletion =
+    Option<Result<(Arc<Consumer>, Option<String>), String>>;
+
 /// Request-scoped bridge between HMAC's pre-body signature check and its
 /// post-body digest check, **partitioned by owning plugin instance**.
 ///
@@ -1274,7 +1279,7 @@ impl HmacAuth {
         &self,
         ctx: &mut RequestContext,
         consumer_index: &ConsumerIndex,
-    ) -> Option<Result<(Arc<Consumer>, Option<String>), String>> {
+    ) -> PrebufferedHmacAuthCompletion {
         let cached = ctx.hmac_prebuffer_state.take(self.prebuffer_owner)?;
 
         // The record is already bound to this instance by ownership, so what is
