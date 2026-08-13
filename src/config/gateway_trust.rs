@@ -258,78 +258,8 @@ impl GatewayTrustBundleRecord {
             ));
         }
 
-        let mut structural = Vec::new();
-        collect_structural_limit_errors(&self.bundle, &mut structural);
-        if !structural.is_empty() {
-            errors.extend(structural);
-            return finish_validation(errors);
-        }
-
-        match serialized_bundle_len(&self.bundle) {
-            Ok(encoded_len) => {
-                if encoded_len > MAX_TRUST_BUNDLE_JSON_BYTES {
-                    errors.push(format!(
-                        "gateway trust bundle encodes to {encoded_len} bytes; the maximum is {MAX_TRUST_BUNDLE_JSON_BYTES}"
-                    ));
-                    return finish_validation(errors);
-                }
-            }
-            Err(_) => {
-                errors.push("gateway trust bundle could not be serialized".to_string());
-                return finish_validation(errors);
-            }
-        }
-
-        if TrustDomain::new(local_domain.to_string()).is_err() {
-            errors.push(
-                "gateway trust bundle bundle.local.trust_domain is not a valid SPIFFE trust domain"
-                    .to_string(),
-            );
-        }
-
-        // Reuse the mesh validator so a bundle admitted here is exactly a
-        // bundle the mesh/DP side already accepts (empty authorities, base64,
-        // duplicate federated trust domains).
-        errors.extend(crate::modes::mesh::config::validate_mesh_config(
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            Some(&self.bundle),
-        ));
-
-        validate_single_bundle(&self.bundle.local, "bundle.local", &mut errors);
-        for (index, federated) in self.bundle.federated.iter().enumerate() {
-            validate_single_bundle(
-                federated,
-                &format!("bundle.federated[{index}]"),
-                &mut errors,
-            );
-        }
-
-        // A federated entry that repeats the local trust domain would make
-        // "which authorities are authoritative for this domain" ambiguous at
-        // verification time. `validate_mesh_config` already seeds its seen-set
-        // with the local domain, so this is covered there; the explicit check
-        // stays for the record-level message.
-        if self
-            .bundle
-            .federated
-            .iter()
-            .any(|federated| federated.trust_domain.as_str() == local_domain)
-        {
-            errors.push(
-                "gateway trust bundle federated entry repeats the local trust domain".to_string(),
-            );
-        }
-
-        // Final gate: the bundle must convert to the runtime representation the
-        // proxy actually installs. Anything that fails here would be a bundle
-        // that persists but can never be applied.
-        if self.bundle.to_runtime().is_err() {
-            errors.push("gateway trust bundle contains undecodable trust material".to_string());
+        if let Err(bundle_errors) = validate_trust_bundle_set(&self.bundle) {
+            errors.extend(bundle_errors);
         }
 
         finish_validation(errors)
@@ -351,6 +281,78 @@ impl GatewayTrustBundleRecord {
             updated_at: self.updated_at,
         }
     }
+}
+
+/// Validate the authoritative gateway trust document at every trust boundary.
+///
+/// Admin/database admission, CP wire publication, DP wire admission, and mesh
+/// federation staging all call this ONE validator. Structural and exact JSON
+/// bounds run before the deep parsers, and every diagnostic is material-free.
+/// Keeping this contract here prevents a side channel from accepting material
+/// that persistence would reject (or vice versa).
+pub fn validate_trust_bundle_set(bundle: &TrustBundleSet) -> Result<(), Vec<String>> {
+    let mut errors = Vec::new();
+    collect_structural_limit_errors(bundle, &mut errors);
+    if !errors.is_empty() {
+        return finish_validation(errors);
+    }
+
+    match serialized_bundle_len(bundle) {
+        Ok(encoded_len) if encoded_len > MAX_TRUST_BUNDLE_JSON_BYTES => {
+            errors.push(format!(
+                "gateway trust bundle encodes to {encoded_len} bytes; the maximum is {MAX_TRUST_BUNDLE_JSON_BYTES}"
+            ));
+            return finish_validation(errors);
+        }
+        Ok(_) => {}
+        Err(_) => {
+            errors.push("gateway trust bundle could not be serialized".to_string());
+            return finish_validation(errors);
+        }
+    }
+
+    let local_domain = bundle.local.trust_domain.as_str();
+    if TrustDomain::new(local_domain.to_string()).is_err() {
+        errors.push(
+            "gateway trust bundle bundle.local.trust_domain is not a valid SPIFFE trust domain"
+                .to_string(),
+        );
+    }
+
+    errors.extend(crate::modes::mesh::config::validate_mesh_config(
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        Some(bundle),
+    ));
+
+    validate_single_bundle(&bundle.local, "bundle.local", &mut errors);
+    for (index, federated) in bundle.federated.iter().enumerate() {
+        validate_single_bundle(
+            federated,
+            &format!("bundle.federated[{index}]"),
+            &mut errors,
+        );
+    }
+
+    if bundle
+        .federated
+        .iter()
+        .any(|federated| federated.trust_domain.as_str() == local_domain)
+    {
+        errors.push(
+            "gateway trust bundle federated entry repeats the local trust domain".to_string(),
+        );
+    }
+
+    if bundle.to_runtime().is_err() {
+        errors.push("gateway trust bundle contains undecodable trust material".to_string());
+    }
+
+    finish_validation(errors)
 }
 
 fn finish_validation(mut errors: Vec<String>) -> Result<(), Vec<String>> {

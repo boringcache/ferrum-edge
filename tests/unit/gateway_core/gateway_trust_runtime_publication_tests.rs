@@ -64,11 +64,20 @@ fn config_with(records: Vec<GatewayTrustBundleRecord>) -> GatewayConfig {
 }
 
 fn source_loaded_svid(trust_domain: &str, authority: &[u8]) -> SvidBundle {
+    source_loaded_svid_generation(trust_domain, authority, &[9, 9, 9], &[8, 8, 8])
+}
+
+fn source_loaded_svid_generation(
+    trust_domain: &str,
+    authority: &[u8],
+    leaf: &[u8],
+    key: &[u8],
+) -> SvidBundle {
     SvidBundle {
         spiffe_id: SpiffeId::new("spiffe://file.local/ns/ferrum/sa/gateway")
             .expect("test SPIFFE ID should be valid"),
-        cert_chain_der: vec![vec![9, 9, 9]],
-        private_key_pkcs8_der: Vec::new().into(),
+        cert_chain_der: vec![leaf.to_vec()],
+        private_key_pkcs8_der: key.to_vec().into(),
         trust_bundles: RuntimeTrustBundleSet {
             local: RuntimeTrustBundle {
                 trust_domain: TrustDomain::new(trust_domain).expect("test trust domain"),
@@ -146,6 +155,63 @@ fn runtime_bundles(trust_domain: &str, authority: &[u8]) -> RuntimeTrustBundleSe
     stored_bundle(trust_domain, authority)
         .to_runtime()
         .expect("test bundle should convert to runtime trust material")
+}
+
+#[tokio::test]
+async fn source_rotation_cannot_lift_another_publishers_fence_and_keeps_newest_identity() {
+    let state = state_in_mode(GatewayConfig::default(), OperatingMode::DataPlane).await;
+    state.install_gateway_runtime_svid_bundle(source_loaded_svid_generation(
+        "file.local",
+        &[1],
+        &[10],
+        &[20],
+    ));
+    state.update_gateway_trust_bundles(runtime_bundles("cp.local", &[7]));
+
+    // Model the exact forbidden interval: another publisher owns the complete
+    // publication boundary and has fenced admission but has not committed yet.
+    let publication = state
+        .gateway_trust_publication_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    state.fence_gateway_trust_generation();
+    assert!(!mesh_admission_open(&state));
+
+    let entered = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let worker_state = state.clone();
+    let worker_entered = entered.clone();
+    let worker = std::thread::spawn(move || {
+        worker_entered.wait();
+        worker_state.install_gateway_runtime_svid_bundle(source_loaded_svid_generation(
+            "file.local",
+            &[2],
+            &[11],
+            &[21],
+        ));
+    });
+    entered.wait();
+
+    // Publication is the outer lock. While it is held the source writer cannot
+    // have reached the nested material lock or the live-admission republish.
+    let material = state
+        .gateway_svid_update_lock
+        .try_lock()
+        .expect("a blocked source writer cannot invert the publication/material lock order");
+    assert!(!mesh_admission_open(&state));
+    drop(material);
+    drop(publication);
+    worker.join().expect("source rotation joins");
+
+    let active = state.gateway_svid_bundle.load_full();
+    let active = active.as_ref().as_ref().expect("active gateway SVID");
+    assert_eq!(active.cert_chain_der, vec![vec![11]]);
+    assert_eq!(active.private_key_pkcs8_der.as_slice(), &[21]);
+    assert_eq!(
+        active.trust_bundles.local.trust_domain.as_str(),
+        "cp.local",
+        "the newest source leaf/key must retain the authoritative override"
+    );
+    assert!(mesh_admission_open(&state));
 }
 
 #[tokio::test]

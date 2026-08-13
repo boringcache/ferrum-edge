@@ -173,7 +173,7 @@ The `ConfigUpdate` proto message carries an `UpdateType` discriminator:
 | `FULL_SNAPSHOT` | 0 | Initial subscription, fallback | Entire `GatewayConfig` as JSON |
 | `DELTA` | 1 | Incremental database changes | `IncrementalResult` with only changed resources |
 
-`ConfigUpdate.trust_bundles_json` and `FullConfigResponse.trust_bundles_json` carry the serializable mesh `TrustBundleSet` used by gateway DPs for gateway-to-mesh SPIFFE TLS, or JSON `null` when the CP is explicitly clearing previously delivered trust material. The CP also emits `null` instead of "unchanged" when configured trust bundles fail semantic validation, so DPs revoke stale CP trust anchors rather than preserving them. The CP strips `GatewayConfig.trust_bundles` from DP-facing full snapshot JSON and uses only this side channel, preserving compatibility with older DPs whose config deserializer rejects unknown fields. An empty or missing side channel is treated as "unchanged" for mixed-version CP/DP rollouts. New DPs hot-swap this trust material into the gateway SVID slot when an SVID is loaded, restore startup file trust when the CP clears it, and also retain CP-delivered bundles separately when no local SVID is configured. Older DPs ignore the field.
+`ConfigUpdate.trust_bundles_json` and `FullConfigResponse.trust_bundles_json` carry the serializable mesh `TrustBundleSet` used by gateway DPs for gateway-to-mesh SPIFFE TLS, or JSON `null` when the CP is explicitly clearing previously delivered trust material. An invalid Replace is never converted to `null`: initial Subscribe/GetFullConfig fails with a bounded internal error, and broadcast/recovery emits no partial generation, so subscribers retain their complete last-known-good config and trust. The CP strips `GatewayConfig.trust_bundles` from DP-facing full snapshot JSON and uses only this side channel, preserving compatibility with older DPs whose config deserializer rejects unknown fields. An empty or missing side channel is treated as "unchanged" for mixed-version CP/DP rollouts. New DPs hot-swap this trust material into the gateway SVID slot when an SVID is loaded, restore startup file trust when the CP clears it, and also retain CP-delivered bundles separately when no local SVID is configured. Older DPs ignore the field.
 
 #### Trust-bundle config-store capabilities
 
@@ -358,6 +358,18 @@ reconstructs trust from the snapshot alone. Resource deltas always state
 `null`, so **every** ordinary configuration change silently revoked the
 subscriber's trust.
 
+Every Replace crosses the same `config::gateway_trust` validator at admin/store
+admission, CP encoding, DP decoding, and mesh/federation staging. It enforces
+authority/federation counts, per-entry bounds, unique non-empty JWT key IDs,
+duplicate trust-domain refusal, complete X.509 DER consumption, usable JWT
+public keys, and the exact 256 KiB serialized document ceiling. The DP also
+rejects a raw side-channel value over that ceiling before deserialization.
+Diagnostics carry only fixed failure classes or bounded field/index metadata,
+never certificate or key material. Invalid FULL_SNAPSHOT input terminates the
+subscription; invalid DELTA input terminates and resyncs under the ordinary
+ConfigSync rejection lifecycle without changing config, trust equivalence,
+freshness, or received-config state.
+
 ##### Precedence and ambiguity
 
 The database resource is the authority. If a namespace somehow presents *both* a
@@ -394,11 +406,13 @@ admission, and gateway trust from the same generation, and the publication runs
 as one fenced sequence
 (`ProxyState::publish_request_epoch_with_gateway_trust`):
 
-1. **Stage.** The candidate's trust is validated and converted *before*
+1. **Stage.** The candidate's exact effective trust (including live federation
+   overlays) is validated and converted *before*
    anything is published. A candidate that cannot convert **rejects the whole
    configuration apply** — the complete previous generation (configuration and
-   trust) stays live. A candidate whose trust inputs are unchanged stages
-   `Unchanged`, so an ordinary reload costs nothing.
+   trust) stays live. `Unchanged` is resolved against the live override while
+   the publication mutex is held, so an ordinary identical reload costs
+   nothing without racing another writer.
 2. **Fence.** A generation that changes the live verifier is published with its
    gateway-to-mesh admission CLOSED. For the whole install,
    `ProxyState::admits_gateway_mesh_identity` — the predicate every
@@ -477,20 +491,25 @@ because a decision that removes no root leaves nothing to bound:
 `Unchanged` advances nothing and installs nothing, so an ordinary reload on a
 gateway that has a trust record never churns a pool. The database serving-mode
 startup install (`ProxyState::publish_gateway_trust_generation`) runs before any
-listener binds and has no pooled transport to retire, so it does not advance the
-counter either. The mesh slice apply loop publishes its federation-derived gateway trust
-unconditionally on every accepted slice and is therefore not on this path;
-`update_gateway_trust_bundles` / `clear_gateway_trust_bundles` keep their
-fence-install-republish behaviour for it.
+listener binds. Mesh slice and federation changes stage their effective
+Replace/Clear decision before config preparation and carry it through the same
+request-epoch publication; there is no post-accept trust writer or two-generation
+window. A failed trust stage rejects the complete mesh generation before
+last-applied state, resolver, DNS, TLS, enforcement, or status side effects.
 
 The gateway SVID slot (`ProxyState.gateway_svid_bundle`) remains the *material*
 the mesh pools and the inbound resolver originate from. It is not the admission
 predicate; gating dispatch on "is a bundle loaded" is exactly the split read
 this design removes. Every writer of that slot
 (`update_gateway_trust_bundles`, `clear_gateway_trust_bundles`,
-`install_gateway_runtime_svid_bundle`) fences and republishes the admission
-around its store, so a CP-delivered update and a source SVID rotation are
-covered by the same boundary as a database record.
+`install_gateway_runtime_svid_bundle`) holds the same complete cold-path
+publication mutex. Lock order is publication → request-epoch fence → SVID
+material install → request-epoch commit, with each inner lock released before
+the next is acquired and no lock held across `.await`. Replace/Clear fences;
+source rotation atomically installs its new leaf/key while preserving the
+latest authoritative override, then commits admission before releasing the
+outer boundary. A source rotation and a config/trust publication are therefore
+totally ordered, and neither can lift the other's fence.
 
 ##### Database serving mode applies its own record
 

@@ -6030,8 +6030,10 @@ pub struct ProxyState {
     /// whatever configuration the caller holds, which is the mixed generation
     /// issue #3727 removes. All writers here go through
     /// `update_gateway_trust_bundles` / `clear_gateway_trust_bundles` /
-    /// `install_gateway_runtime_svid_bundle`, each of which fences and
-    /// republishes that admission around its store.
+    /// `install_gateway_runtime_svid_bundle`, whose complete publications share
+    /// one outer mutex. Trust replacement/clear fences around the store; source
+    /// rotation atomically replaces its SVID and commits the epoch without
+    /// allowing another publisher to interleave.
     pub gateway_svid_bundle: SharedSvidBundle,
     /// Latest SVID bundle loaded from configured or runtime sources.
     /// CP-delivered trust bundles are an override; when a CP snapshot removes
@@ -6040,17 +6042,20 @@ pub struct ProxyState {
     /// Latest CP-delivered gateway trust bundles, stored even when this DP has
     /// no local SVID so later bridge phases can verify mesh peers from CP state.
     pub gateway_trust_bundles: SharedGatewayTrustBundles,
-    /// Serializes the cold-path gateway SVID writers:
-    /// CP-delivered trust-bundle apply, CP trust clear, and source SVID reload.
+    /// Serializes the two material-slot writes inside one gateway-trust
+    /// publication. Always acquired AFTER `gateway_trust_publication_lock` and
+    /// released before the request-epoch writer is entered again.
     pub gateway_svid_update_lock: Arc<std::sync::Mutex<()>>,
-    /// Serializes one accepted configuration generation's whole gateway-trust
-    /// publication — stage, fence, install, commit — so two config appliers
-    /// cannot interleave and leave a generation published with its admission
-    /// permanently fenced (issue #3727).
+    /// Serializes EVERY cold-path gateway SVID/trust writer across its complete
+    /// publication: configuration/mesh stage→fence→install→commit, standalone
+    /// trust replace/clear, and source/CA SVID rotation. A writer can therefore
+    /// never lift another writer's fence or preserve an override that changed
+    /// underneath it (issue #3727).
     ///
     /// Held only across the synchronous publication region, never across an
-    /// `.await`, and never while the request-epoch writer lock or
-    /// `gateway_svid_update_lock` is held by the same thread.
+    /// `.await`. Lock order is publication → request epoch (fence, then
+    /// release) → SVID material (install, then release) → request epoch
+    /// (commit). No helper called inside this boundary reacquires publication.
     pub gateway_trust_publication_lock: Arc<std::sync::Mutex<()>>,
     /// Listener-wide compatibility view of the dynamic mesh inbound TLS config.
     /// Mesh HTTP/HBONE accept loops use `mesh_inbound_tls_policy` as the single
@@ -6843,6 +6848,33 @@ fn runtime_trust_retains_every_authority(
     true
 }
 
+fn runtime_trust_bundle_eq(
+    left: &crate::identity::TrustBundle,
+    right: &crate::identity::TrustBundle,
+) -> bool {
+    left.trust_domain == right.trust_domain
+        && left.x509_authorities == right.x509_authorities
+        && left.jwt_authorities == right.jwt_authorities
+        && left.refresh_hint_seconds == right.refresh_hint_seconds
+}
+
+/// Exact equality for the runtime trust override. `TrustBundleSet` deliberately
+/// has no blanket `PartialEq`, so publication compares every material field and
+/// performs domain lookup rather than relying on `HashMap` iteration order.
+fn runtime_trust_bundle_sets_equal(
+    left: &RuntimeTrustBundleSet,
+    right: &RuntimeTrustBundleSet,
+) -> bool {
+    runtime_trust_bundle_eq(&left.local, &right.local)
+        && left.federated.len() == right.federated.len()
+        && left.federated.iter().all(|(domain, bundle)| {
+            right
+                .federated
+                .get(domain)
+                .is_some_and(|candidate| runtime_trust_bundle_eq(bundle, candidate))
+        })
+}
+
 fn spawn_backend_svid_rotation_task(
     mut revision_rx: tokio::sync::watch::Receiver<u64>,
     generation: BackendSvidGeneration,
@@ -7061,10 +7093,11 @@ impl ProxyState {
     /// same lock-free slot. If there is no SVID, keep the bundles separately
     /// for future gateway-mesh features.
     ///
-    /// This is called from the DP config-apply loop, which is single-writer for
-    /// CP-delivered gateway trust. The gateway SVID source watcher can also swap
-    /// the SVID bundle, so all gateway SVID slot writes are serialized by
-    /// `gateway_svid_update_lock`.
+    /// Standalone compatibility entrypoint. Configuration, DP, and mesh apply
+    /// paths stage a [`GatewayTrustCommit`] into the request-epoch publication
+    /// instead. Every writer, including this one and source rotation, is totally
+    /// ordered by `gateway_trust_publication_lock`; the nested material lock is
+    /// never the outer publication boundary.
     ///
     /// The live verifier changes across two slots, so the request-facing
     /// generation is FENCED first and republished live afterwards: for the
@@ -7072,9 +7105,11 @@ impl ProxyState {
     /// admission instead of authenticating peers against half of the change
     /// (issue #3727).
     pub fn update_gateway_trust_bundles(&self, trust_bundles: RuntimeTrustBundleSet) {
-        self.fence_gateway_trust_generation();
-        self.store_gateway_trust_material(Some(trust_bundles));
-        self.publish_live_gateway_trust();
+        let _publication = self
+            .gateway_trust_publication_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.commit_gateway_trust_generation_locked(GatewayTrustCommit::Replace(trust_bundles));
     }
 
     /// Clear CP-delivered trust bundles and restore the latest source-loaded SVID.
@@ -7083,9 +7118,11 @@ impl ProxyState {
     /// a withdrawal is the rotation direction where an un-fenced boundary would
     /// keep authenticating a peer the accepted generation revoked.
     pub fn clear_gateway_trust_bundles(&self) {
-        self.fence_gateway_trust_generation();
-        self.store_gateway_trust_material(None);
-        self.publish_live_gateway_trust();
+        let _publication = self
+            .gateway_trust_publication_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.commit_gateway_trust_generation_locked(GatewayTrustCommit::Clear);
     }
 
     /// Write one gateway trust decision into the two live slots it spans.
@@ -7535,6 +7572,43 @@ impl ProxyState {
         }
     }
 
+    /// Turn a fully validated runtime trust candidate into an authoritative
+    /// prepared Replace/Clear. Exact `Unchanged` reduction is deliberately
+    /// deferred to [`Self::normalize_gateway_trust_commit_locked`], where a
+    /// concurrent writer cannot invalidate the comparison.
+    pub(crate) fn stage_runtime_gateway_trust(
+        &self,
+        candidate: Option<RuntimeTrustBundleSet>,
+    ) -> GatewayTrustCommit {
+        match candidate {
+            Some(candidate) => GatewayTrustCommit::Replace(candidate),
+            None => GatewayTrustCommit::Clear,
+        }
+    }
+
+    /// Resolve an authoritative prepared decision against the live override
+    /// while the complete publication mutex is held. This is the only safe
+    /// place to derive `Unchanged`: doing so during off-lock staging lets a
+    /// second writer change the override before publication and turns the
+    /// first publisher's no-op into a lost authoritative update.
+    fn normalize_gateway_trust_commit_locked(
+        &self,
+        commit: GatewayTrustCommit,
+    ) -> GatewayTrustCommit {
+        let current = self.gateway_trust_bundles.load_full();
+        match commit {
+            GatewayTrustCommit::Replace(candidate)
+                if current.as_ref().is_some_and(|installed| {
+                    runtime_trust_bundle_sets_equal(installed, &candidate)
+                }) =>
+            {
+                GatewayTrustCommit::Unchanged
+            }
+            GatewayTrustCommit::Clear if current.is_none() => GatewayTrustCommit::Unchanged,
+            commit => commit,
+        }
+    }
+
     /// Install a staged trust decision and republish the accepted generation's
     /// gateway-to-mesh admission as live.
     ///
@@ -7559,8 +7633,10 @@ impl ProxyState {
     /// default `FERRUM_MESH_SVID_ROTATION_DRAIN_SECONDS=0` configuration, where
     /// the rotation consumer never force-drains anything (see
     /// [`Self::retire_backend_transports_for_committed_trust`]). A purely
-    /// additive `Replace` and a redundant `Clear` still fence and still install,
-    /// but retire nothing: they remove no root, so there is no reuse to bound.
+    /// additive `Replace` still fences and installs but retires nothing: it
+    /// removes no root, so there is no reuse to bound. Exact duplicate Replace
+    /// and redundant Clear decisions normalize to `Unchanged` under the outer
+    /// publication lock.
     ///
     /// The steps run against the slot writer directly rather than through
     /// [`Self::update_gateway_trust_bundles`] / [`Self::clear_gateway_trust_bundles`]
@@ -7569,6 +7645,19 @@ impl ProxyState {
     /// before the generation advanced and would make the advance observable as
     /// a second, independent rotation.
     pub fn commit_gateway_trust_generation(&self, commit: GatewayTrustCommit) {
+        let _publication = self
+            .gateway_trust_publication_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.commit_gateway_trust_generation_locked(commit);
+    }
+
+    /// Commit while the caller already owns `gateway_trust_publication_lock`.
+    /// Keeping this separate is load-bearing: publication helpers must never
+    /// recursively acquire the non-reentrant mutex they use as their complete
+    /// stage→fence→install→commit boundary.
+    fn commit_gateway_trust_generation_locked(&self, commit: GatewayTrustCommit) {
+        let commit = self.normalize_gateway_trust_commit_locked(commit);
         // `Unchanged` changes no material and must never churn the backend
         // pools: an ordinary resource reload on a gateway that HAS a trust
         // record stages `Unchanged`, and rotating every pooled transport on
@@ -7668,6 +7757,7 @@ impl ProxyState {
             Some(commit) => commit,
             None => self.stage_database_gateway_trust(candidate)?,
         };
+        let commit = self.normalize_gateway_trust_commit_locked(commit);
         let fenced = commit.changes_live_trust();
         let staging = if fenced {
             GatewayTrustStaging::Fence
@@ -7678,7 +7768,7 @@ impl ProxyState {
             .request_epoch
             .update_config_with_trust(staging, build, mirror)?;
         if published.is_some() || fenced {
-            self.commit_gateway_trust_generation(commit);
+            self.commit_gateway_trust_generation_locked(commit);
         } else {
             // Nothing was published and no material changed, so this is not a
             // generation and must not be counted as one. Still re-open a fence
@@ -7707,6 +7797,10 @@ impl ProxyState {
     /// pools originate from and the identity the published generation admits;
     /// storing into `gateway_svid_bundle` directly leaves the two disagreeing.
     pub fn install_gateway_runtime_svid_bundle(&self, bundle: SvidBundle) {
+        let _publication = self
+            .gateway_trust_publication_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         {
             let _guard = self
                 .gateway_svid_update_lock
@@ -7725,11 +7819,12 @@ impl ProxyState {
                 .store(Arc::new(Some(active_bundle)));
         }
         // A source rotation replaces the whole SVID (leaf, key, and its trust
-        // roots) in ONE store, so there is nothing to fence — but the published
-        // epoch must adopt the new snapshot, otherwise the mesh admission gate
-        // would keep answering from the retired identity. Published after the
-        // SVID guard is released so the epoch writer lock is never taken while
-        // `gateway_svid_update_lock` is held.
+        // roots) in ONE store, so there is nothing to fence. The OUTER
+        // publication lock nevertheless remains held until the epoch adopts
+        // the new snapshot: a config/trust publisher can be entirely before or
+        // entirely after this rotation, never between its material store and
+        // live admission commit. Published after the SVID guard is released so
+        // the epoch writer lock is never nested inside `gateway_svid_update_lock`.
         self.publish_live_gateway_trust();
     }
 
@@ -11276,8 +11371,9 @@ impl ProxyState {
         &self,
         new_config: GatewayConfig,
         trusted_mesh_ids: &TrustedMeshGeneratedResourceIds,
+        trust: GatewayTrustCommit,
     ) -> ConfigApplyOutcome {
-        self.update_config_with_mesh_ids(new_config, Some(trusted_mesh_ids), None)
+        self.update_config_with_mesh_ids(new_config, Some(trusted_mesh_ids), Some(trust))
     }
 
     fn update_config_with_mesh_ids(
@@ -11493,7 +11589,10 @@ impl ProxyState {
                     .gateway_trust_publication_lock
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                self.commit_gateway_trust_generation(commit);
+                let commit = self.normalize_gateway_trust_commit_locked(commit);
+                if commit.changes_live_trust() {
+                    self.commit_gateway_trust_generation_locked(commit);
+                }
             }
             return ConfigApplyOutcome::Unchanged;
         }
@@ -11943,7 +12042,10 @@ impl ProxyState {
                     .gateway_trust_publication_lock
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                self.commit_gateway_trust_generation(commit);
+                let commit = self.normalize_gateway_trust_commit_locked(commit);
+                if commit.changes_live_trust() {
+                    self.commit_gateway_trust_generation_locked(commit);
+                }
             }
             return ConfigApplyOutcome::Unchanged;
         }

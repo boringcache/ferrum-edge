@@ -71,7 +71,7 @@ use crate::modes::mesh::slice::{
     index_service_entry_host_owners, mesh_service_identities,
 };
 use crate::modes::startup_security;
-use crate::proxy::{self, ProxyState};
+use crate::proxy::{self, GatewayTrustCommit, ProxyState};
 use crate::startup::wait_for_start_signals;
 use crate::tls::{self, TlsPolicy};
 
@@ -13379,12 +13379,17 @@ async fn arm_mesh_runtime_startup(
         mesh_ca_svid_slot.as_ref(),
     );
     if let Some(slice) = initial_applied_mesh_slice.as_deref() {
-        publish_gateway_active_trust_bundles(
+        let gateway_trust = stage_gateway_active_trust_bundles(
             &proxy_state,
             slice,
             Some(&initial_federation_snapshot),
             federation_activation,
-        );
+        )
+        .map_err(anyhow::Error::msg)?;
+        // Startup has no bound listeners or admitted requests yet. Runtime
+        // generations instead carry this exact staged decision through
+        // `update_mesh_config`'s request-epoch publication below.
+        proxy_state.commit_gateway_trust_generation(gateway_trust);
         publish_staged_spiffe_bundle(
             &proxy_state,
             stage_gateway_runtime_spiffe_bundle_with_federation(
@@ -16873,27 +16878,28 @@ fn publish_staged_spiffe_bundle(proxy_state: &ProxyState, staged: Option<StagedS
     }
 }
 
-fn publish_gateway_active_trust_bundles(
+/// Stage the exact effective mesh/federation gateway trust decision before any
+/// configuration or accepted-generation side effect is published.
+///
+/// This uses the same bounded deep validator as database admission and the
+/// ConfigSync wire. Conversion errors are intentionally collapsed to a fixed,
+/// material-free diagnostic; the caller rejects the whole mesh generation and
+/// leaves config, trust, admission, resolver/DNS/TLS state, and status intact.
+fn stage_gateway_active_trust_bundles(
     proxy_state: &ProxyState,
     slice: &MeshSlice,
     federation: Option<&federation::FederationSnapshot>,
     activation: FederationActivation,
-) {
+) -> Result<GatewayTrustCommit, &'static str> {
     let Some(serialized) = effective_trust_bundles_for_slice(slice, federation, activation) else {
-        proxy_state.clear_gateway_trust_bundles();
-        return;
+        return Ok(proxy_state.stage_runtime_gateway_trust(None));
     };
-    match serialized.to_runtime() {
-        Ok(runtime) => proxy_state.update_gateway_trust_bundles(runtime),
-        Err(error) => {
-            warn!(
-                %error,
-                mesh_slice_version = %slice.version,
-                "Unable to publish accepted mesh federation trust to gateway SVID slot; \
-                 keeping previous outbound trust bundles"
-            );
-        }
-    }
+    crate::config::gateway_trust::validate_trust_bundle_set(&serialized)
+        .map_err(|_| "effective mesh gateway trust failed validation")?;
+    let runtime = serialized
+        .to_runtime()
+        .map_err(|_| "effective mesh gateway trust failed runtime conversion")?;
+    Ok(proxy_state.stage_runtime_gateway_trust(Some(runtime)))
 }
 
 /// Build a proxy [`GatewayConfig`] from `base_slice` overlaid with the current
@@ -16957,6 +16963,22 @@ async fn apply_mesh_slice_generation(
     }
 
     let federation_activation = FederationActivation::from_env_config(&proxy_state.env_config);
+    let staged_gateway_trust = match stage_gateway_active_trust_bundles(
+        proxy_state,
+        base_slice,
+        Some(federation_snapshot),
+        federation_activation,
+    ) {
+        Ok(commit) => commit,
+        Err(failure_class) => {
+            warn!(
+                failure_class,
+                "Rejected mesh slice before proxy config apply because effective gateway trust \
+                 was unusable"
+            );
+            return false;
+        }
+    };
     let live_reload = if live_reload_enabled {
         live_reload_inbound_mtls_mode(base_slice, runtime).and_then(|mtls_mode| {
             plan_mesh_inbound_tls_reload_with_federation(
@@ -17058,7 +17080,11 @@ async fn apply_mesh_slice_generation(
             let dns_slice = dns_proxy.as_ref().and_then(|_| {
                 node_waypoint_dns_slice_for_prepared_config(runtime, base_slice, &config)
             });
-            let outcome = proxy_state.update_mesh_config(config, &trusted_mesh_ids);
+            let outcome = proxy_state.update_mesh_config(
+                config,
+                &trusted_mesh_ids,
+                staged_gateway_trust,
+            );
             let applied = outcome.applied();
             let accepted = outcome.accepted();
             // Publish the node-waypoint resolver snapshot the instant the proxy
@@ -17090,12 +17116,6 @@ async fn apply_mesh_slice_generation(
                 revision_apply_token,
             );
             if accepted {
-                publish_gateway_active_trust_bundles(
-                    proxy_state,
-                    base_slice,
-                    Some(federation_snapshot),
-                    federation_activation,
-                );
                 // Sidecar ingress routes remain live-reloadable even when
                 // PeerAuthentication TLS rebuilding is disabled. Publish the
                 // listener-port -> backend-app-port demux table for every
@@ -17780,6 +17800,20 @@ pub mod startup_rollback_test_seams {
 
     fn ensure_crypto_provider() {
         let _ = crate::fips::base_crypto_provider().install_default();
+    }
+
+    fn test_root_ca_der_base64(common_name: &str) -> String {
+        use base64::Engine;
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
+            .expect("test CA key generates");
+        let mut params =
+            rcgen::CertificateParams::new(Vec::<String>::new()).expect("test CA params build");
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, common_name);
+        let cert = params.self_signed(&key).expect("test CA self-signs");
+        base64::engine::general_purpose::STANDARD.encode(cert.der())
     }
 
     fn probe_runtime_config() -> MeshRuntimeConfig {
@@ -31565,7 +31599,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn publish_gateway_active_trust_bundles_updates_outbound_svid_slot() {
+    async fn staged_gateway_active_trust_publishes_with_the_request_epoch() {
         use crate::identity::{SvidBundle, TrustBundle, TrustBundleSet};
         use base64::Engine;
 
@@ -31586,18 +31620,20 @@ mod tests {
         });
 
         let engine = base64::engine::general_purpose::STANDARD;
+        let slice_local_root = test_root_ca_der_base64("mesh-slice-local-root");
+        let bootstrap_root = test_root_ca_der_base64("mesh-bootstrap-root");
         let slice = MeshSlice {
             version: "outbound-trust".to_string(),
             trust_bundles: Some(config::TrustBundleSet {
                 local: config::TrustBundle {
                     trust_domain: local_td,
-                    x509_authorities: vec![engine.encode(b"slice-local")],
+                    x509_authorities: vec![slice_local_root],
                     jwt_authorities: Vec::new(),
                     refresh_hint_seconds: None,
                 },
                 federated: vec![config::TrustBundle {
                     trust_domain: remote_td.clone(),
-                    x509_authorities: vec![engine.encode(b"cp-bootstrap")],
+                    x509_authorities: vec![bootstrap_root],
                     jwt_authorities: Vec::new(),
                     refresh_hint_seconds: None,
                 }],
@@ -31620,26 +31656,46 @@ mod tests {
             poll_enabled: true,
         };
 
-        publish_gateway_active_trust_bundles(
+        let commit = stage_gateway_active_trust_bundles(
             &state,
             &slice,
             Some(&federation::FederationSnapshot::default()),
             activation,
-        );
+        )
+        .expect("effective trust stages");
+        state.update_config_with_gateway_trust(GatewayConfig::default(), commit);
         let active = state.gateway_svid_bundle.load_full();
         let bundle = active.as_ref().as_ref().expect("gateway SVID bundle");
         assert!(
             !bundle.trust_bundles.federated.contains_key(&remote_td),
             "fail-closed bootstrap root must not become outbound active trust before a poll succeeds"
         );
+        let trust_generation = state.request_epoch.load().gateway_trust().generation();
+        let identical = stage_gateway_active_trust_bundles(
+            &state,
+            &slice,
+            Some(&federation::FederationSnapshot::default()),
+            activation,
+        )
+        .expect("identical effective trust stages");
+        state.update_config_with_gateway_trust(GatewayConfig::default(), identical);
+        assert_eq!(
+            state.request_epoch.load().gateway_trust().generation(),
+            trust_generation,
+            "an identical effective mesh trust decision must normalize to Unchanged inside the publication lock"
+        );
 
         let mut polled = federation::FederationSnapshot::default();
+        let polled_root = test_root_ca_der_base64("mesh-polled-root");
+        let expected_polled_root = engine
+            .decode(&polled_root)
+            .expect("test root decodes");
         polled.bundles.insert(
             remote_td.clone(),
             federation::FederatedBundle {
                 bundle: config::TrustBundle {
                     trust_domain: remote_td.clone(),
-                    x509_authorities: vec![engine.encode(b"polled-root")],
+                    x509_authorities: vec![polled_root],
                     jwt_authorities: Vec::new(),
                     refresh_hint_seconds: None,
                 },
@@ -31648,7 +31704,14 @@ mod tests {
                 cluster_name: "remote".to_string(),
             },
         );
-        publish_gateway_active_trust_bundles(&state, &slice, Some(&polled), activation);
+        let commit = stage_gateway_active_trust_bundles(
+            &state,
+            &slice,
+            Some(&polled),
+            activation,
+        )
+        .expect("polled trust stages");
+        state.update_config_with_gateway_trust(GatewayConfig::default(), commit);
 
         let active = state.gateway_svid_bundle.load_full();
         let bundle = active.as_ref().as_ref().expect("gateway SVID bundle");
@@ -31657,7 +31720,60 @@ mod tests {
             .federated
             .get(&remote_td)
             .expect("polled remote trust is active");
-        assert_eq!(remote.x509_authorities, vec![b"polled-root".to_vec()]);
+        assert_eq!(remote.x509_authorities, vec![expected_polled_root]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn invalid_effective_gateway_trust_is_rejected_without_mutating_live_state() {
+        use crate::identity::{SvidBundle, TrustBundle, TrustBundleSet};
+        use base64::Engine;
+
+        let state = make_test_proxy_state(GatewayConfig::default());
+        let local_td = TrustDomain::new("invalid-stage.local").unwrap();
+        let id = SpiffeId::from_parts(&local_td, "ns/foo/sa/bar").unwrap();
+        state.install_gateway_runtime_svid_bundle(SvidBundle {
+            spiffe_id: id,
+            cert_chain_der: vec![vec![1, 2, 3]],
+            private_key_pkcs8_der: vec![4, 5, 6].into(),
+            trust_bundles: TrustBundleSet::local_only(TrustBundle {
+                trust_domain: local_td.clone(),
+                x509_authorities: vec![vec![7, 8, 9]],
+                jwt_authorities: Vec::new(),
+                refresh_hint_seconds: None,
+            }),
+        });
+        let before_svid = state.gateway_svid_bundle.load_full();
+        let before_epoch = state.request_epoch.load();
+        let slice = MeshSlice {
+            version: "invalid-effective-trust".to_string(),
+            trust_bundles: Some(config::TrustBundleSet {
+                local: config::TrustBundle {
+                    trust_domain: local_td,
+                    x509_authorities: vec![
+                        base64::engine::general_purpose::STANDARD
+                            .encode(b"base64-valid-but-not-x509"),
+                    ],
+                    jwt_authorities: Vec::new(),
+                    refresh_hint_seconds: None,
+                },
+                federated: Vec::new(),
+            }),
+            ..MeshSlice::default()
+        };
+
+        assert!(
+            stage_gateway_active_trust_bundles(
+                &state,
+                &slice,
+                Some(&federation::FederationSnapshot::default()),
+                FederationActivation::disabled(),
+            )
+            .is_err(),
+            "deep-invalid DER must reject the complete mesh generation"
+        );
+        assert!(Arc::ptr_eq(&state.gateway_svid_bundle.load_full(), &before_svid));
+        assert!(Arc::ptr_eq(&state.request_epoch.load(), &before_epoch));
+        assert!(state.admits_gateway_mesh_identity());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -31704,19 +31820,24 @@ mod tests {
         );
 
         let engine = base64::engine::general_purpose::STANDARD;
+        let local_root = test_root_ca_der_base64("mesh-runtime-local-root");
+        let partner_root = test_root_ca_der_base64("mesh-runtime-partner-root");
+        let expected_partner_root = engine
+            .decode(&partner_root)
+            .expect("test root decodes");
         mesh_state.install_slice(MeshSlice {
             version: "accepted-trust".to_string(),
             labels: [("trust".to_string(), "published".to_string())].into(),
             trust_bundles: Some(config::TrustBundleSet {
                 local: config::TrustBundle {
                     trust_domain: local_td,
-                    x509_authorities: vec![engine.encode(b"slice-local")],
+                    x509_authorities: vec![local_root],
                     jwt_authorities: Vec::new(),
                     refresh_hint_seconds: None,
                 },
                 federated: vec![config::TrustBundle {
                     trust_domain: remote_td.clone(),
-                    x509_authorities: vec![engine.encode(b"partner-root")],
+                    x509_authorities: vec![partner_root],
                     jwt_authorities: Vec::new(),
                     refresh_hint_seconds: None,
                 }],
@@ -31747,7 +31868,7 @@ mod tests {
             .federated
             .get(&remote_td)
             .expect("federated trust published");
-        assert_eq!(remote.x509_authorities, vec![b"partner-root".to_vec()]);
+        assert_eq!(remote.x509_authorities, vec![expected_partner_root]);
 
         let _ = shutdown_tx.send(true);
         tokio::time::timeout(Duration::from_secs(2), apply_task)

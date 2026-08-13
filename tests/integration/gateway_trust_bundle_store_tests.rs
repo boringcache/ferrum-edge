@@ -536,7 +536,8 @@ async fn two_simultaneous_authorities_keep_previously_accepted_trust() {
         &config,
         "ferrum",
         &CpScope::Single("ferrum".to_string()),
-    );
+    )
+    .expect("ambiguous trust is a valid keep-previous projection");
     assert!(
         filtered.trust_bundles.is_none(),
         "an ambiguous deployment must not publish either authority's material"
@@ -553,7 +554,8 @@ async fn two_simultaneous_authorities_keep_previously_accepted_trust() {
     // would see "database only" and publish.
     let scope = CpScope::Set(["ferrum".to_string()].into_iter().collect());
     let (multi_ns_filtered, multi_ns_side_channel) =
-        CpGrpcServer::filter_config_and_trust_for_scope(&config, "ferrum", &scope);
+        CpGrpcServer::filter_config_and_trust_for_scope(&config, "ferrum", &scope)
+            .expect("ambiguous trust is a valid keep-previous projection");
     assert!(multi_ns_filtered.trust_bundles.is_none());
     assert_eq!(
         multi_ns_side_channel, "",
@@ -1088,14 +1090,16 @@ async fn every_scope_publishes_replace_for_a_record_and_clear_for_none() {
 
     for scope in &scopes {
         let (_, side_channel) =
-            CpGrpcServer::filter_config_and_trust_for_scope(&config, "tenant-a", scope);
+            CpGrpcServer::filter_config_and_trust_for_scope(&config, "tenant-a", scope)
+                .expect("valid tenant trust must encode");
         assert!(
             side_channel.contains("a.local"),
             "a namespace with a record must receive it on {scope:?}"
         );
 
         let (other, other_side_channel) =
-            CpGrpcServer::filter_config_and_trust_for_scope(&config, "tenant-b", scope);
+            CpGrpcServer::filter_config_and_trust_for_scope(&config, "tenant-b", scope)
+                .expect("authoritative absence must encode as clear");
         assert_eq!(
             other_side_channel, "null",
             "a namespace with no record must be told so explicitly on {scope:?}"
