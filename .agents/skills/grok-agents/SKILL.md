@@ -1,6 +1,6 @@
 ---
 name: grok-agents
-description: Dispatch and orchestrate local Cursor Grok 4.6 agents via the standalone cursor-agent CLI for Ferrum Edge issue, PR, review-feedback, CI-repair, and shepherding work. Use when the user asks GPT, Codex, or Claude to delegate to Grok or Cursor Grok workers, run multiple Grok 4.6 agents, resume interrupted Grok runs, or drive agent-owned branches and PRs. Do not use for Codex-native subagents, Claude Code workers, or ordinary single-agent edits.
+description: Dispatch and orchestrate local Cursor Grok 4.6 agents via the standalone cursor-agent CLI for Ferrum Edge issue, PR, review-feedback, CI-repair, and shepherding work, with optional fast mode only when the user explicitly requests it. Use when the user asks GPT, Codex, or Claude to delegate to Grok or Cursor Grok workers, run multiple Grok 4.6 agents, resume interrupted Grok runs, or drive agent-owned branches and PRs. Do not use for Codex-native subagents, Claude Code workers, or ordinary single-agent edits.
 ---
 
 # Grok agents
@@ -31,9 +31,11 @@ this session's model deliberately.
    placed on argv, where `ps` would expose it) or through the CLI's own stored login — check with
    `cursor-agent status`. Never print the key or put it in prompts, files, arguments, or logs, and
    do not ask a worker to perform an interactive login.
-4. Use only the pinned non-Fast SKUs `cursor-grok-4.6-{low,medium,high,xhigh}`; confirm with
-   `cursor-agent models`. Stop and report the exact error if authentication or model access is
-   rejected. Do not silently substitute `composer-2.5`, `auto`, a `-fast` SKU, or another provider.
+4. Use only the pinned SKUs `cursor-grok-4.6-{low,medium,high,xhigh}` and their published `-fast`
+   variants; confirm with `cursor-agent models`. Select a `-fast` SKU only when the user explicitly
+   requested fast mode. Stop and report the exact error if authentication or model access is
+   rejected. Do not silently substitute `composer-2.5`, `auto`, a Fast SKU without explicit
+   authorization, or another provider.
 
 ## Isolate every worker
 
@@ -71,10 +73,15 @@ publishes four tiers, so `low`/`medium`/`high`/`xhigh` map to
 `cursor-grok-4.6-{low,medium,high,xhigh}` and `max` clamps to `xhigh` with a warning. Do not claim a
 tier above `xhigh` was applied.
 
+`--fast` is an opt-in controller flag. Append it only when the user explicitly requests fast mode
+for the dispatch or fleet. Never infer it from urgency, deadlines, task size, or available credits.
+Omit it for every other run, including continuations unless they remain within the same explicit
+request. Record the selected mode beside each worker.
+
 The launcher resolves the operator's own `cursor-agent`, verifies the worktree root, and runs
 `cursor-agent --print --force --trust --model <sku> --output-format text --workspace <worktree>`
-with the prompt file on stdin. The SKU is always the non-Fast variant, so runs bill at the standard
-rate instead of consuming fast credits. Delete the temporary prompt after the worker exits.
+with the prompt file on stdin. It pins the non-Fast SKU by default and appends `-fast` only with
+`--fast`; Fast runs consume fast credits. Delete the temporary prompt after the worker exits.
 
 Start each worker in its own long-lived execution session and retain its exact session handle or
 PID. Prefer one tool call per worker so completions and failures remain attributable. Never wrap
@@ -164,4 +171,4 @@ Never put credentials, tokens, cookies, or secrets in prompts or worker logs. Do
 - An explicitly requested review receives no response: verify the trigger, bot identity,
   availability, and head SHA before posting another trigger.
 - Model mismatch: stop the worker, record the exact diagnostic, correct the launch contract, and
-  relaunch. Never claim a Grok SKU without launch evidence.
+  relaunch. Never claim a Grok SKU or fast mode without launch evidence.

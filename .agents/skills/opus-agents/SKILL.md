@@ -1,6 +1,6 @@
 ---
 name: opus-agents
-description: Dispatch and orchestrate external Claude Code Opus 5 1M agents from Codex for Ferrum Edge issue, PR, review-feedback, CI-repair, and shepherding work. Use when the user asks GPT or Codex to delegate to Claude or Opus agents, run multiple Claude Code workers, select low/medium/high/xhigh/max effort, resume interrupted Claude runs, or drive agent-owned branches and PRs. Do not use for Codex-native subagents or ordinary single-agent edits.
+description: Dispatch and orchestrate external Claude Code Opus 5 1M agents from Codex for Ferrum Edge issue, PR, review-feedback, CI-repair, and shepherding work, with optional fast mode only when the user explicitly requests it. Use when the user asks GPT or Codex to delegate to Claude or Opus agents, run multiple Claude Code workers, select low/medium/high/xhigh/max effort, resume interrupted Claude runs, or drive agent-owned branches and PRs. Do not use for Codex-native subagents or ordinary single-agent edits.
 ---
 
 # Opus agents
@@ -32,8 +32,12 @@ effort. This skill is only for sessions where the USER asked Codex to delegate t
 3. Confirm that the installed CLI exposes `--effort` with `low`, `medium`, `high`, `xhigh`, and `max`.
 4. Use the pinned model `claude-opus-5[1m]`. Use `opus[1m]` only when the user explicitly asks
    for the rolling latest Opus rather than Opus 5.
-5. Stop and report the problem if authentication or 1M access is rejected. Do not silently fall
-   back to a smaller context window, another model, or a lower effort.
+5. If the user explicitly requests fast mode, confirm the CLI accepts the `fastMode` setting and
+   that the account and selected Opus model are eligible. Fast mode requires separate usage-credit
+   availability and can be disabled by organization policy.
+6. Stop and report the problem if authentication, 1M access, fast-mode eligibility, or credits are
+   rejected. Do not silently fall back to a smaller context window, another model, lower effort,
+   or standard mode after an explicitly requested Fast launch fails.
 
 ## Isolate every worker
 
@@ -86,10 +90,16 @@ file to the bundled launcher from one long-lived execution session:
   --effort <low|medium|high|xhigh|max>
 ```
 
+`--fast` is an opt-in controller flag. Append it only when the user explicitly requests fast mode
+for the dispatch or fleet. Never infer it from urgency, deadlines, task size, or available credits.
+Omit it for every other run, including continuations unless they remain within the same explicit
+request. Record the selected mode beside each worker.
+
 The launcher pins `claude-opus-5[1m]`, clears environment variables that can override effort,
 context, or thinking, omits fallback models, enables verbose text output, and closes stdin at the
-prompt file's EOF. Pass `--model 'opus[1m]'` only for an explicit rolling-latest request. Delete the
-temporary prompt after the worker finishes.
+prompt file's EOF. It passes `fastMode: false` by default so user-level settings cannot enable Fast
+implicitly, and passes `fastMode: true` only with `--fast`. Pass `--model 'opus[1m]'` only for an
+explicit rolling-latest request. Delete the temporary prompt after the worker finishes.
 
 Start every worker in its own long-lived execution session and retain the exact session handle
 or PID. Prefer one tool call per worker so completions and failures remain attributable. Never
@@ -175,6 +185,6 @@ worker logs.
   inspect the state and launch a continuation round; do not accept unfinished work as complete.
 - An explicitly requested review receives no response: verify the trigger, bot identity, credits
   or availability, and head SHA before posting another trigger.
-- Model, context, or effort mismatch: stop that worker, capture the exact diagnostic, correct the
-  launch contract, and relaunch. Never claim `max`, `xhigh`, or 1M unless the launch and resulting
-  session evidence support it.
+- Model, context, effort, or fast-mode mismatch: stop that worker, capture the exact diagnostic,
+  correct the launch contract, and relaunch. Never claim `max`, `xhigh`, 1M, or fast mode unless
+  the launch and resulting session evidence support it.

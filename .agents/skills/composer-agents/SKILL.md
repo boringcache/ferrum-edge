@@ -1,6 +1,6 @@
 ---
 name: composer-agents
-description: Dispatch and orchestrate local Cursor Composer 2.5 agents via the standalone cursor-agent CLI for Ferrum Edge issue, PR, review-feedback, CI-repair, and shepherding work. Use when the user asks GPT, Codex, or Claude to delegate to Composer or Cursor Composer workers, run multiple Composer agents, resume interrupted Composer runs, or drive agent-owned branches and PRs. Do not use for Codex-native subagents, Claude Code workers, or ordinary single-agent edits.
+description: Dispatch and orchestrate local Cursor Composer 2.5 agents via the standalone cursor-agent CLI for Ferrum Edge issue, PR, review-feedback, CI-repair, and shepherding work, with optional fast mode only when the user explicitly requests it. Use when the user asks GPT, Codex, or Claude to delegate to Composer or Cursor Composer workers, run multiple Composer agents, resume interrupted Composer runs, or drive agent-owned branches and PRs. Do not use for Codex-native subagents, Claude Code workers, or ordinary single-agent edits.
 ---
 
 # Composer agents
@@ -32,9 +32,10 @@ selected this session's model deliberately.
    placed on argv, where `ps` would expose it) or through the CLI's own stored login — check with
    `cursor-agent status`. Never print the key or put it in prompts, files, arguments, or logs, and
    do not ask a worker to perform an interactive login.
-4. Use only the pinned model `composer-2.5`; confirm with `cursor-agent models`. Stop and report the
+4. Use only the pinned Composer 2.5 SKUs confirmed by `cursor-agent models`: `composer-2.5` normally,
+   or `composer-2.5-fast` only when the user explicitly requested fast mode. Stop and report the
    exact error if authentication or model access is rejected. Do not silently substitute a Grok SKU,
-   `auto`, `composer-2.5-fast`, or another provider.
+   `auto`, the Fast SKU without explicit authorization, or another provider.
 
 ## Isolate every worker
 
@@ -70,10 +71,16 @@ one long-lived execution session:
 `--effort low|medium|high|xhigh|max` is accepted for CLI parity with sibling skills but is ignored —
 Composer 2.5 publishes no reasoning tiers. Do not claim an effort level was applied.
 
+`--fast` is an opt-in controller flag. Append it only when the user explicitly requests fast mode
+for the dispatch or fleet. Never infer it from urgency, deadlines, task size, the phrase "fast tier,"
+or available credits. Omit it for every other run, including continuations unless they remain within
+the same explicit request. Record the selected mode beside each worker.
+
 The launcher resolves the operator's own `cursor-agent`, verifies the worktree root, and runs
-`cursor-agent --print --force --trust --model composer-2.5 --output-format text --workspace
-<worktree>` with the prompt file on stdin. `composer-2.5` is the non-Fast SKU, so runs bill at the
-standard rate instead of consuming fast credits. Delete the temporary prompt after the worker exits.
+`cursor-agent --print --force --trust --model <sku> --output-format text --workspace <worktree>`
+with the prompt file on stdin. It pins `composer-2.5` by default and selects
+`composer-2.5-fast` only with `--fast`; Fast runs consume fast credits. Delete the temporary prompt
+after the worker exits.
 
 Start each worker in its own long-lived execution session and retain its exact session handle or
 PID. Prefer one tool call per worker so completions and failures remain attributable. Never wrap
@@ -163,4 +170,4 @@ Never put credentials, tokens, cookies, or secrets in prompts or worker logs. Do
 - An explicitly requested review receives no response: verify the trigger, bot identity,
   availability, and head SHA before posting another trigger.
 - Model mismatch: stop the worker, record the exact diagnostic, correct the launch contract, and
-  relaunch. Never claim `composer-2.5` without launch evidence.
+  relaunch. Never claim `composer-2.5`, its Fast variant, or fast mode without launch evidence.
