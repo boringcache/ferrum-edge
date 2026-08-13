@@ -20,7 +20,7 @@ use chrono::Utc;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 pub(super) fn create_rs256_token(claims: &serde_json::Value, private_key_pem: &[u8]) -> String {
     let mut header = Header::new(jsonwebtoken::Algorithm::RS256);
@@ -2820,22 +2820,20 @@ async fn send_hmac_v2(
 /// nonce nor increments the mutation count. 401 is the activation proof:
 /// missing route is 404; route without the plugin is 200 from the backend.
 async fn wait_until_hmac_v2_route_and_plugin_active(client: &reqwest::Client, url: &str) {
-    let deadline = Instant::now() + Duration::from_secs(15);
-    let mut last = String::from("no probe completed");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     loop {
-        match client.get(url).send().await {
-            Ok(resp) => {
+        let last = match tokio::time::timeout_at(deadline, client.get(url).send()).await {
+            Ok(Ok(resp)) => {
                 let status = resp.status().as_u16();
                 if status == 401 {
                     return;
                 }
-                last = format!("HTTP {status}");
+                format!("HTTP {status}")
             }
-            Err(err) => {
-                last = format!("request error: {err}");
-            }
-        }
-        if Instant::now() >= deadline {
+            Ok(Err(err)) => format!("request error: {err}"),
+            Err(_) => String::from("request timed out at the activation deadline"),
+        };
+        if tokio::time::Instant::now() >= deadline {
             panic!(
                 "hmac v2 route and plugin did not become active within 15s: \
                  unsigned GET {url} must converge to 401 (route present and \
