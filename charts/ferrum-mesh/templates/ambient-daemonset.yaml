@@ -47,8 +47,10 @@
 {{- /* Host-network UDP capture placement (issue #3288). The proxy already runs
        in the host network namespace, so this placement installs its
        interface-scoped mangle rules and binds its transparent socket there —
-       it needs NET_ADMIN (always granted below) but NOT the setns privilege set
-       (hostPID + SYS_ADMIN + SYS_PTRACE) the per-pod-netns producer requires.
+       it needs NET_ADMIN (always granted below) but NOT SYS_ADMIN/SYS_PTRACE
+       the per-pod-netns producer requires. Kubernetes hostPID is a separate
+       PodSpec field (pod-scoped visibility, not a capability and not setns);
+       the settled-host preflight below may still render it for the whole pod.
        Same strict `true`/`1` predicate as the capture switch. */ -}}
 {{- $ambientUdpHostNetns := false -}}
 {{- if hasKey $ambientEnv "FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED" -}}
@@ -95,15 +97,17 @@
        listeners, distroless `-ebpf` otherwise); do not conflate the two — they
        have different security contracts. */ -}}
 {{- $ambientInNetnsCapture := or $nodeWaypointRegistryEnabled $ambientUdpLifecycle -}}
-{{- /* setns privileges (hostPID + SYS_ADMIN + SYS_PTRACE) are needed ONLY by the
-       placements that enter another namespace: NodeWaypoint's in-netns TCP
-       listeners and the per-pod-netns UDP producer. The host-network UDP
-       placement deliberately does not, which is most of its value — it captures
-       UDP on clusters that will not grant those capabilities. Keeping the gate
-       narrow means enabling it does not silently widen the DaemonSet's
-       privileges. Note the disabled-cleanup manager still enters pod netns to
-       reap predecessor rules, so the lifecycle term keeps them when UDP capture
-       is off. */ -}}
+{{- /* SYS_ADMIN + SYS_PTRACE are needed ONLY by the placements that enter
+       another namespace: NodeWaypoint's in-netns TCP listeners and the
+       per-pod-netns UDP producer. The host-network UDP placement deliberately
+       does not, which is most of its value — the running producer can capture
+       UDP without those capabilities. Keeping the gate narrow means enabling
+       host placement does not silently widen the DaemonSet's container
+       capabilities. Note the disabled-cleanup manager still enters pod netns
+       to reap predecessor rules, so the lifecycle term keeps them when UDP
+       capture is off. hostPID is not part of this capability gate: it is a
+       PodSpec field rendered below when setns capture OR the settled-host
+       preflight needs host PID visibility. */ -}}
 {{- /* Release-level attestation that the rendered placement was already
        established by a COMPLETED earlier migration release (#3703). The
        node-local durable record lives in the pod-registry hostPath, which on the
@@ -133,6 +137,42 @@
 {{- $ambientUdpEstablished = $ambientUdpTarget -}}
 {{- end -}}
 {{- end -}}
+{{- end -}}
+{{- /* Node-specific proof boundary (issue #3809). The installed ConfigMap above
+       is RELEASE desired state: it names no node, no node incarnation, and no
+       per-node cleanup result, so it cannot distinguish a fresh/rebooted node
+       from a pre-contract node that stayed booted with live workloads while it
+       missed the cleanup and finalize rollout. Adopting the host placement on
+       that evidence starts the host producer while those workloads' pod netns
+       still redirect UDP to the retired predecessor listener.
+
+       So the settled host placement additionally runs a PRIVILEGED one-shot
+       preflight init stage that enumerates and retires BOTH predecessor
+       placements (IPv4 and IPv6, host netns and every enrolled pod netns) by
+       exact Ferrum-owned name, then publishes a completion attestation bound to
+       this node's Kubernetes UID, its current boot id, the incoming target, and
+       the release's node-proof generation. Kubernetes hostPID is pod-scoped,
+       not container-scoped: enabling this init stage therefore gives the whole
+       pod — init and steady-state — host PID namespace visibility.
+       hostPID does not grant setns. SYS_ADMIN and SYS_PTRACE remain confined to the init
+       container; the steady-state container keeps its narrow NET_ADMIN/NET_RAW
+       pair after the init stage exits. Clusters that refuse hostPID or those
+       init capabilities cannot use this default unchanged; set
+       ambient.udpNodePreflight.enabled=false and follow the documented
+       fail-closed operator recovery path. */ -}}
+{{- $ambientUdpNodeProofGeneration := include "ferrum-mesh.ambientUdpNodeProofGeneration" . -}}
+{{- $ambientUdpNodePreflight := default dict .Values.ambient.udpNodePreflight -}}
+{{- $ambientUdpNodePreflightEnabled := true -}}
+{{- if hasKey $ambientUdpNodePreflight "enabled" -}}
+{{- $ambientUdpNodePreflightEnabled = eq (lower (toString $ambientUdpNodePreflight.enabled)) "true" -}}
+{{- end -}}
+{{- $ambientUdpRunNodePreflight := and $ambientUdpLifecycle $ambientUdpHostNetns (eq $ambientUdpMigrationPhase "stable") $ambientUdpNodePreflightEnabled -}}
+{{- $hasExplicitNodeUid := hasKey $ambientEnv "FERRUM_K8S_NODE_UID" -}}
+{{- if and $ambientUdpRunNodePreflight (hasKey $ambientEnv "FERRUM_K8S_NODE_NAME") -}}
+{{- fail "ambient.env.FERRUM_K8S_NODE_NAME is chart-managed when the settled host-netns UDP preflight is enabled; the chart injects spec.nodeName from the downward API so the preflight's read-only nodes:get stays bound to this pod" -}}
+{{- end -}}
+{{- if and $ambientUdpRunNodePreflight (not $ambientUdpNodeProofGeneration) (not (hasKey $ambientEnv "FERRUM_MESH_CAPTURE_UDP_NODE_PROOF_GENERATION")) -}}
+{{- fail "settled host-netns Ambient UDP placement requires an installed placement contract to derive FERRUM_MESH_CAPTURE_UDP_NODE_PROOF_GENERATION; run the explicit cleanup/finalize releases (a client-render pipeline must supply the value itself)" -}}
 {{- end -}}
 {{- $ambientUdpMigrationNeedsSetns := and (eq $ambientUdpMigrationPhase "cleanup") (has $ambientUdpMigrationFrom (list "pod-netns" "disabled")) -}}
 {{- $ambientSetnsCapture := or $nodeWaypointRegistryEnabled (and $ambientUdpLifecycle (or (not $ambientUdpHostNetns) $ambientUdpMigrationNeedsSetns)) -}}
@@ -279,10 +319,78 @@ spec:
     spec:
       serviceAccountName: ferrum-mesh
       hostNetwork: true
-      {{- if $ambientSetnsCapture }}
+      {{- if or $ambientSetnsCapture $ambientUdpRunNodePreflight }}
+      {{- /* PodSpec field: Kubernetes applies hostPID to every container in
+             this pod. The settled-host preflight needs it to resolve
+             /proc/<pid>/ns/net; the steady-state container therefore also
+             sees host PIDs whenever the preflight is enabled. Visibility is
+             not setns — SYS_ADMIN/SYS_PTRACE stay on the init container. */}}
       hostPID: true
       {{- end }}
       dnsPolicy: ClusterFirstWithHostNet
+      {{- if $ambientUdpRunNodePreflight }}
+      initContainers:
+        - name: ferrum-udp-node-preflight
+          image: {{ $ambientImage | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["ambient-udp-preflight", "-v"]
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            {{- /* The one-shot stage runs as root with explicit capabilities, so
+                   it never needs to GAIN privileges, and it must not inherit the
+                   runtime's ambient/default set: dropping ALL first makes the
+                   four capabilities below the complete, declared privilege
+                   surface of this container. */}}
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+              add:
+                - NET_ADMIN
+                - NET_RAW
+                {{- /* setns(CLONE_NEWNET) + ptrace_may_access on
+                       /proc/<pid>/ns/net, so predecessor rules can be retired
+                       inside every enrolled pod netns. These are granted to the
+                       INIT stage only; it exits before the steady-state
+                       container starts, so the host producer still runs without
+                       them. */}}
+                - SYS_ADMIN
+                - SYS_PTRACE
+          env:
+            - name: FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR
+              value: {{ $nodeWaypointRegistryMountPath | quote }}
+            {{- /* The preflight resolves this node's immutable Node.metadata.uid
+                   ITSELF, with one bounded read-only `get` bound to this exact
+                   node name, and never from the node-agent's published identity
+                   file. That file records the CURRENT boot id even when a
+                   PREVIOUS Kubernetes Node object wrote it, so no reader can
+                   tell a stale publication from a live one — and the two
+                   DaemonSets have no startup ordering between them, so the
+                   replacement node-agent may not have retracted it yet. The
+                   downward API cannot supply the UID, only the node name, which
+                   is exactly the binding this lookup needs. */}}
+            {{- if not $hasExplicitNodeUid }}
+            - name: FERRUM_K8S_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            {{- end }}
+            {{- if not (hasKey $ambientEnv "FERRUM_MESH_CAPTURE_UDP_NODE_PROOF_GENERATION") }}
+            - name: FERRUM_MESH_CAPTURE_UDP_NODE_PROOF_GENERATION
+              value: {{ $ambientUdpNodeProofGeneration | quote }}
+            {{- end }}
+            {{- range $name, $value := $ambientEnv }}
+            - name: {{ $name }}
+              value: {{ $value | quote }}
+            {{- end }}
+          volumeMounts:
+            - name: cgroup
+              mountPath: {{ .Values.nodeAgent.cgroupRoot }}
+              readOnly: true
+            - name: node-waypoint-pod-registry
+              mountPath: {{ $nodeWaypointRegistryMountPath }}
+      {{- end }}
       containers:
         - name: ferrum-edge
           image: {{ $ambientImage | quote }}
@@ -328,10 +436,22 @@ spec:
             {{- /* Chart-managed: derived from the installed placement contract,
                    never from values. An explicit ambient.env entry still wins so
                    a GitOps/client-render pipeline can supply its own equivalent
-                   cluster-state attestation. */ -}}
+                   cluster-state attestation.
+
+                   This is DESIRED STATE, not authorization (issue #3809). On its
+                   own it can no longer admit a recordless node: the runtime also
+                   requires node-specific proof bound to this node's Kubernetes
+                   UID and current boot id, which the preflight init stage above
+                   publishes. A bare `FERRUM_MESH_CAPTURE_UDP_PLACEMENT_ESTABLISHED`
+                   supplied by a client-render pipeline is therefore held to the
+                   same boundary as the Helm-rendered one. */ -}}
             {{- if and $ambientUdpEstablished (not (hasKey $ambientEnv "FERRUM_MESH_CAPTURE_UDP_PLACEMENT_ESTABLISHED")) }}
             - name: FERRUM_MESH_CAPTURE_UDP_PLACEMENT_ESTABLISHED
               value: {{ $ambientUdpEstablished | quote }}
+            {{- end }}
+            {{- if and $ambientUdpNodeProofGeneration (not (hasKey $ambientEnv "FERRUM_MESH_CAPTURE_UDP_NODE_PROOF_GENERATION")) }}
+            - name: FERRUM_MESH_CAPTURE_UDP_NODE_PROOF_GENERATION
+              value: {{ $ambientUdpNodeProofGeneration | quote }}
             {{- end }}
             {{- /* The tc ingress redirect preserves the packet's original
                    destination instead of NAT-ing it, so the proxy answers it on
