@@ -43,6 +43,14 @@
 //! unscreened rather than carrying a policy command
 //! ([`TopologyScreen::ProbeFailed`]).
 //!
+//! `redis_connect_timeout_seconds` is likewise the documented bound for a
+//! *server-side reply* on a security-critical single-use claim
+//! ([`RedisRateLimitClient::set_bytes_nx_with_expire_bounded`]): the same
+//! "connected, authenticated, and then silent" endpoint that the screen refuses
+//! must not be able to hold an in-flight protected request open once the
+//! connection has been screened. Reusing this bound keeps one admitted,
+//! range-validated Redis timeout knob instead of adding a second one.
+//!
 //! Topology rejection is **terminal for the life of the client**: unlike an
 //! outage it is not something a `PING` can clear (a Cluster node answers `PING`
 //! happily while still redirecting every key), so the recovery checker never
@@ -2569,6 +2577,93 @@ impl RedisRateLimitClient {
                     operation = "SET NX EX",
                     error = %e,
                     "Redis command failed"
+                );
+                self.note_command_failure(&e);
+                Err(())
+            }
+        }
+    }
+
+    /// [`Self::set_bytes_nx_with_expire`] with a **bounded response deadline**
+    /// and **classification-only** logging.
+    ///
+    /// Two properties the general primitive does not provide, both required by
+    /// the single-use replay authority
+    /// ([`crate::plugins::utils::replay_authority`]):
+    ///
+    /// * **Bounded.** `get_connection()` bounds connection setup, but the reply
+    ///   to an already-dispatched command is otherwise awaited forever. A peer
+    ///   that completes the TCP/TLS handshake, passes the topology screen, and
+    ///   then simply stops answering would hold an in-flight protected request
+    ///   open for as long as it keeps the socket. The deadline reuses the
+    ///   documented Redis timeout contract — `redis_connect_timeout_seconds`,
+    ///   the same admitted bound the topology probe already applies to a
+    ///   server-side reply — rather than adding an unbounded new knob.
+    /// * **Redacted.** The claim path may not put backend error TEXT in a log
+    ///   record. A `RedisError` renders server-supplied detail, and the key
+    ///   itself is a replay marker. Only the fixed classification below and the
+    ///   already-redacted endpoint are logged; the key, the value, the marker,
+    ///   and the error text never are.
+    ///
+    /// Timeout, partition, connection failure, authentication rejection, and
+    /// protocol/parse uncertainty all collapse to `Err(())` — the caller's
+    /// fail-closed result. A timeout marks the client unavailable exactly like
+    /// any other command failure, so the background recovery checker owns
+    /// restoring it.
+    pub async fn set_bytes_nx_with_expire_bounded(
+        &self,
+        key: &str,
+        value: &[u8],
+        ttl_seconds: u64,
+    ) -> Result<bool, ()> {
+        let mut conn = self.get_connection().await.ok_or(())?;
+
+        let mut command = redis::cmd("SET");
+        command
+            .arg(key)
+            .arg(value)
+            .arg("NX")
+            .arg("EX")
+            .arg(expire_seconds(ttl_seconds));
+        let response: Result<Option<String>, redis::RedisError> =
+            match tokio::time::timeout(self.connect_timeout(), command.query_async(&mut conn)).await
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    // Connected but unanswered. Never a licence to admit: an
+                    // executed-but-unacknowledged `SET NX` leaves the marker in
+                    // place, so the retry sees the existing key and stays
+                    // fail-closed.
+                    warn!(
+                        redis_url = %self.config.redacted_url(),
+                        operation = "SET NX EX",
+                        classification = "response_timeout",
+                        timeout_seconds = self.config.connect_timeout_seconds,
+                        "Redis single-use claim did not answer within the bounded deadline"
+                    );
+                    self.mark_unavailable();
+                    return Err(());
+                }
+            };
+
+        match response {
+            Ok(value) => {
+                self.note_command_success()?;
+                Ok(value.is_some())
+            }
+            Err(e) => {
+                // `is_cluster_topology_error` inspects the error; nothing it
+                // reads is rendered. The published field is the fixed class.
+                let classification = if is_cluster_topology_error(&e) {
+                    "unsupported_topology"
+                } else {
+                    "command_failed"
+                };
+                warn!(
+                    redis_url = %self.config.redacted_url(),
+                    operation = "SET NX EX",
+                    classification,
+                    "Redis single-use claim failed"
                 );
                 self.note_command_failure(&e);
                 Err(())

@@ -3018,6 +3018,76 @@ fn oauth2_introspection_cache_schema_and_docs_match_runtime_constants() {
     );
 }
 
+/// `/health` publishes the shared single-use replay authority aggregate
+/// (issues #3834 / #3837). The schema must stay in exact parity with what the
+/// runtime serializes, and must stay two fixed-cardinality counters: the
+/// aggregate is the authenticated readiness surface, so its shape may not grow
+/// with configuration.
+#[test]
+fn health_shared_replay_authority_aggregate_matches_the_runtime_snapshot() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/SharedReplayAuthorityHealth")
+        .expect("SharedReplayAuthorityHealth exists");
+
+    let rendered = serde_json::to_value(
+        ferrum_edge::plugins::utils::replay_authority::shared_health_snapshot(),
+    )
+    .expect("the aggregate serializes");
+    let runtime_fields: std::collections::BTreeSet<String> = rendered
+        .as_object()
+        .expect("the aggregate is an object")
+        .keys()
+        .cloned()
+        .collect();
+    let schema_fields: std::collections::BTreeSet<String> = schema["properties"]
+        .as_object()
+        .expect("the schema declares properties")
+        .keys()
+        .cloned()
+        .collect();
+    assert_eq!(
+        runtime_fields, schema_fields,
+        "openapi.yaml must match the serialized aggregate exactly"
+    );
+    assert_eq!(
+        schema_fields.len(),
+        2,
+        "the readiness aggregate must stay fixed-cardinality"
+    );
+    assert_eq!(
+        schema["required"],
+        json!(["shared_authorities", "shared_authorities_unavailable"])
+    );
+
+    // `/health` references it, and only on the detailed tier.
+    let health = spec
+        .pointer("/components/schemas/HealthResponse")
+        .expect("HealthResponse exists");
+    assert_eq!(
+        health["properties"]["replay_authority"]["$ref"],
+        json!("#/components/schemas/SharedReplayAuthorityHealth")
+    );
+    let description = health["description"]
+        .as_str()
+        .expect("HealthResponse documents its tiering");
+    assert!(
+        description.contains("replay_authority"),
+        "the detailed-tier field list must name the aggregate: {description}"
+    );
+
+    // A `shared` policy has no local fallback, so an unavailable backend is a
+    // readiness failure rather than a coarse degradation.
+    let ready = health["properties"]["ready"]["description"]
+        .as_str()
+        .expect("`ready` is documented");
+    assert!(
+        ready.contains("replay authority"),
+        "`ready` must document the shared replay dependency: {ready}"
+    );
+}
+
 #[test]
 fn jwks_auth_schema_and_cache_guide_match_runtime_contract() {
     let spec: serde_json::Value =
@@ -3059,8 +3129,7 @@ fn jwks_auth_schema_and_cache_guide_match_runtime_contract() {
         json!(ferrum_edge::plugins::jwks_auth::MAX_JWKS_MAX_STALE_SECONDS)
     );
     assert_eq!(
-        schema["properties"]["providers"]["items"]["properties"]["dpop_replay_max_entries"]
-            ["default"],
+        schema["properties"]["providers"]["items"]["properties"]["dpop_replay_max_entries"]["default"],
         json!(ferrum_edge::plugins::jwks_auth::DEFAULT_DPOP_REPLAY_MAX_ENTRIES)
     );
     // The DPoP replay scope has no default: an operator must declare whether

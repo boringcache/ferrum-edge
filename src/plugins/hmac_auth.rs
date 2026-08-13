@@ -91,7 +91,7 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use serde_json::Value;
 use std::fmt;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex};
 use tracing::{debug, warn};
 
 use super::utils::PluginHttpClient;
@@ -100,7 +100,9 @@ use super::utils::auth_flow::{
     self, AuthMechanism, ExtractedCredential, VerifyOutcome, commit_authentication_attempt,
     constant_time_eq,
 };
-use super::utils::redis_rate_limiter::{REDIS_PLUGIN_CONFIG_KEYS, RedisConfig, RedisRateLimitClient};
+use super::utils::redis_rate_limiter::{
+    REDIS_PLUGIN_CONFIG_KEYS, RedisConfig, RedisRateLimitClient,
+};
 use super::utils::replay_authority::{
     self, ReplayAdmission, ReplayAuthority, ReplayDomain, ReplayScope, validate_scope_backend,
 };
@@ -199,10 +201,8 @@ impl HmacSigningProfile {
 /// Fixed client-visible bodies. None carries a nonce, a signature, a consumer
 /// identity, a marker, or any backend detail.
 const REPLAY_DETECTED_BODY: &str = r#"{"error":"Signed request has already been used"}"#;
-const REPLAY_CAPACITY_BODY: &str =
-    r#"{"error":"Signed-request replay protection is at capacity"}"#;
-const REPLAY_UNAVAILABLE_BODY: &str =
-    r#"{"error":"Signed-request replay protection unavailable"}"#;
+const REPLAY_CAPACITY_BODY: &str = r#"{"error":"Signed-request replay protection is at capacity"}"#;
+const REPLAY_UNAVAILABLE_BODY: &str = r#"{"error":"Signed-request replay protection unavailable"}"#;
 const MISSING_NONCE_BODY: &str = r#"{"error":"Missing nonce in HMAC authorization"}"#;
 const MALFORMED_NONCE_BODY: &str = r#"{"error":"Malformed nonce in HMAC authorization"}"#;
 const UNEXPECTED_NONCE_BODY: &str =
@@ -455,6 +455,70 @@ fn parse_hmac_authorization(
     })
 }
 
+/// Opaque, request-scoped identity of the `hmac_auth` instance that staged a
+/// preverified authorization.
+///
+/// A request can be screened by several `hmac_auth` instances at once — sibling
+/// proxy/global policies, a legacy `ferrum-hmac-v1` instance beside a
+/// `ferrum-hmac-v2` one, or two v2 policies with different replay domains. A
+/// staged record therefore may not be a request-global slot: it carries a
+/// Consumer snapshot that one *specific* policy authenticated under one
+/// *specific* signing profile and replay domain. Handing it to another instance
+/// lets that instance skip its own verification and, worse, take a decision path
+/// (v1's "no claim at all") for a proof that a different profile verified.
+///
+/// Identity is per **constructed instance** rather than per config id: the
+/// plugin object that stages and the plugin object that consumes are the same
+/// `Arc` inside one request (the `PluginCache` snapshot is pinned for the
+/// request), while two instances built from identical configuration — including
+/// two standalone/test constructions that share the placeholder config id — are
+/// genuinely different owners. The serial is folded together with the policy
+/// identity so a record can never be matched by a same-serial instance of a
+/// different profile or replay domain.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct HmacPrebufferOwner([u8; 32]);
+
+impl fmt::Debug for HmacPrebufferOwner {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("HmacPrebufferOwner(<digest>)")
+    }
+}
+
+/// Process-monotonic instance serial. Never reused, never derived from
+/// attacker-visible data, and never logged.
+static HMAC_INSTANCE_SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+impl HmacPrebufferOwner {
+    fn new(
+        namespace: &str,
+        policy_config_id: &str,
+        profile: HmacSigningProfile,
+        replay_domain: Option<&ReplayDomain>,
+    ) -> Self {
+        let serial = HMAC_INSTANCE_SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut hasher =
+            super::utils::replay_partition::PartitionHasher::new("ferrum-edge/hmac-auth/owner/v1");
+        hasher.u64_value("owner.serial", serial);
+        hasher.text("owner.namespace", namespace);
+        hasher.text("owner.config_id", policy_config_id);
+        hasher.text("owner.profile", profile.version());
+        match replay_domain {
+            Some(domain) => hasher.nested("owner.replay_domain", &domain.digest()),
+            None => hasher.count("owner.replay_domain", 0),
+        }
+        Self(hasher.digest())
+    }
+}
+
+/// Maximum preverified authorizations staged for one request.
+///
+/// One slot per `hmac_auth` instance that both preverified a signature and will
+/// consume its own record. The bound exists so a pathological chain cannot grow
+/// request-scoped credential-bearing state without limit; an instance that
+/// cannot stage simply falls through to the ordinary extract/verify path, which
+/// re-derives everything and is never weaker.
+const MAX_STAGED_HMAC_PREBUFFERS: usize = 8;
+
 struct CachedHmacAuthorization {
     authorization_fingerprint: [u8; 32],
     namespace: String,
@@ -474,18 +538,36 @@ struct CachedHmacAuthorization {
     preverified_consumer: Arc<Consumer>,
 }
 
+/// Owner-partitioned staging set for one request.
+type StagedHmacRecords = Vec<(HmacPrebufferOwner, CachedHmacAuthorization)>;
+
 /// Request-scoped bridge between HMAC's pre-body signature check and its
-/// post-body digest check.
+/// post-body digest check, **partitioned by owning plugin instance**.
 ///
-/// After preverification the parsed signature is dropped; this retains only a
-/// fingerprint used to detect Authorization changes, the already-owned signed
-/// request fields needed by the final digest check, and a Consumer containing
-/// secret material. Its custom `Debug` reveals only presence, and its custom
-/// `Clone` deliberately drops the value so deferred-log/simulation contexts can
-/// never inherit authentication data.
+/// After preverification the parsed signature is dropped; each record retains
+/// only a fingerprint used to detect Authorization changes, the already-owned
+/// signed request fields needed by the final digest check, and a Consumer
+/// containing secret material. Its custom `Debug` reveals only how many records
+/// are staged — never an owner, a consumer, or a nonce — and its custom `Clone`
+/// deliberately drops every record so deferred-log/simulation contexts can never
+/// inherit authentication data.
+///
+/// The partition is the security property. A single request-global slot let the
+/// first instance to preverify hand its record to whichever instance consumed
+/// first: an unsafe `ferrum-hmac-v1` policy could consume a `ferrum-hmac-v2`
+/// instance's verified record and then take v1's "no single-use claim" path, and
+/// two sibling v2 policies could cross-consume and claim in the wrong replay
+/// domain. Every record here is readable and removable **only** by the exact
+/// instance/policy/profile/replay-domain that staged it; one owner can neither
+/// observe nor erase another's.
 #[derive(Default)]
 pub(crate) struct HmacPrebufferState {
-    cached: OnceLock<CachedHmacAuthorization>,
+    /// Small ordered set, bounded by [`MAX_STAGED_HMAC_PREBUFFERS`]. A `Vec`
+    /// behind an uncontended request-local `Mutex` rather than a map: the
+    /// cardinality is a handful, the staging path is already the cold
+    /// post-signature-verification path, and the ordinary request that
+    /// configures no `hmac_auth` never touches it at all.
+    staged: Mutex<StagedHmacRecords>,
 }
 
 impl Clone for HmacPrebufferState {
@@ -498,22 +580,46 @@ impl fmt::Debug for HmacPrebufferState {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("HmacPrebufferState")
-            .field("staged", &self.cached.get().is_some())
+            .field("staged", &self.len())
             .finish()
     }
 }
 
 impl HmacPrebufferState {
-    fn stage(&self, cached: CachedHmacAuthorization) {
-        // Multiple hmac_auth instances may screen one request. The first valid
-        // signature uses the same immutable signed fields and Consumer snapshot
-        // that authentication will see, so retaining the first verified result
-        // is sufficient and avoids replacing credential-bearing state.
-        let _ = self.cached.set(cached);
+    fn lock(&self) -> std::sync::MutexGuard<'_, StagedHmacRecords> {
+        self.staged
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn take(&mut self) -> Option<CachedHmacAuthorization> {
-        self.cached.take()
+    fn len(&self) -> usize {
+        self.lock().len()
+    }
+
+    /// Stage `cached` for `owner`.
+    ///
+    /// Returns `false` when nothing was staged — the owner already holds a
+    /// record for this request, or the bound is reached. A refusal is safe:
+    /// the caller then declines the pre-authenticate buffering path and the
+    /// ordinary path re-extracts and re-verifies from scratch.
+    fn stage(&self, owner: HmacPrebufferOwner, cached: CachedHmacAuthorization) -> bool {
+        let mut staged = self.lock();
+        if staged.iter().any(|(existing, _)| *existing == owner) {
+            return false;
+        }
+        if staged.len() >= MAX_STAGED_HMAC_PREBUFFERS {
+            return false;
+        }
+        staged.push((owner, cached));
+        true
+    }
+
+    /// Remove and return **this owner's** record, leaving every other owner's
+    /// record untouched.
+    fn take(&mut self, owner: HmacPrebufferOwner) -> Option<CachedHmacAuthorization> {
+        let mut staged = self.lock();
+        let index = staged.iter().position(|(existing, _)| *existing == owner)?;
+        Some(staged.remove(index).1)
     }
 }
 
@@ -526,6 +632,9 @@ pub struct HmacAuth {
     /// Single-use authority v2 nonces are claimed against. Owned by the shared
     /// registry, so an equivalent reload inherits live markers.
     replay_authority: Option<Arc<ReplayAuthority>>,
+    /// Ownership token for this instance's request-scoped prebuffer records.
+    /// Precomputed at construction, so no request path hashes configuration.
+    prebuffer_owner: HmacPrebufferOwner,
 }
 
 impl HmacAuth {
@@ -606,9 +715,9 @@ impl HmacAuth {
         let profile = match config_obj.get("signing_profile") {
             None => HmacSigningProfile::V2,
             Some(value) => {
-                let value = value.as_str().ok_or_else(|| {
-                    "hmac_auth: 'signing_profile' must be a string".to_string()
-                })?;
+                let value = value
+                    .as_str()
+                    .ok_or_else(|| "hmac_auth: 'signing_profile' must be a string".to_string())?;
                 match value.trim() {
                     HMAC_SIGNING_VERSION_V2 => HmacSigningProfile::V2,
                     HMAC_SIGNING_VERSION_V1 => HmacSigningProfile::V1Unsafe,
@@ -759,11 +868,19 @@ impl HmacAuth {
             _ => None,
         };
 
+        let prebuffer_owner = HmacPrebufferOwner::new(
+            namespace,
+            policy_config_id,
+            profile,
+            replay_domain.as_ref(),
+        );
+
         Ok(Self {
             clock_skew_seconds,
             profile,
             replay_domain,
             replay_authority,
+            prebuffer_owner,
         })
     }
 
@@ -787,9 +904,11 @@ impl HmacAuth {
     #[doc(hidden)]
     #[allow(dead_code)] // exercised by external unit tests
     pub fn replay_marker_digest(&self, consumer_id: &str, nonce: &str) -> Option<[u8; 32]> {
-        self.replay_domain
-            .as_ref()
-            .map(|domain| domain.marker(&[consumer_id.as_bytes(), nonce.as_bytes()]).digest())
+        self.replay_domain.as_ref().map(|domain| {
+            domain
+                .marker(&[consumer_id.as_bytes(), nonce.as_bytes()])
+                .digest()
+        })
     }
 
     /// Claim a fully verified signed request for exactly one use.
@@ -1126,20 +1245,28 @@ impl HmacAuth {
             nonce,
             ..
         } = *credential;
-        ctx.hmac_prebuffer_state.stage(CachedHmacAuthorization {
-            authorization_fingerprint,
-            namespace,
-            username,
-            authority,
-            date,
-            method,
-            path,
-            query,
-            digest_header,
-            nonce,
-            preverified_consumer,
-        });
-        true
+        // Staged under this instance's own ownership token. A sibling
+        // `hmac_auth` instance — a different policy, a different signing
+        // profile, or a different replay domain — can neither read nor erase
+        // this record, so it can never skip its own verification or claim in the
+        // wrong replay domain. A refusal (duplicate owner or bound reached)
+        // declines the pre-authenticate path for this instance only.
+        ctx.hmac_prebuffer_state.stage(
+            self.prebuffer_owner,
+            CachedHmacAuthorization {
+                authorization_fingerprint,
+                namespace,
+                username,
+                authority,
+                date,
+                method,
+                path,
+                query,
+                digest_header,
+                nonce,
+                preverified_consumer,
+            },
+        )
     }
 
     /// Complete the pre-buffered authentication path.
@@ -1152,13 +1279,15 @@ impl HmacAuth {
         ctx: &mut RequestContext,
         consumer_index: &ConsumerIndex,
     ) -> Option<Result<(Arc<Consumer>, Option<String>), String>> {
-        let cached = ctx.hmac_prebuffer_state.take()?;
+        let cached = ctx.hmac_prebuffer_state.take(self.prebuffer_owner)?;
 
-        // H1/H2 and H3 call the prebuffer predicate immediately before body
-        // collection and authentication, with no plug-in hook in between. Bind
-        // the one-shot cache to the Authorization header, every signed request
-        // field, and the exact Consumer snapshot anyway; if that lifecycle ever
-        // changes, discard the cache and run ordinary extraction/verification.
+        // The record is already bound to this instance by ownership, so what is
+        // left to check is that the *request* did not change under it. H1/H2 and
+        // H3 call the prebuffer predicate immediately before body collection and
+        // authentication, with no plugin hook in between, but bind the
+        // Authorization header, every signed request field, and the exact
+        // Consumer snapshot anyway; if that lifecycle ever changes, discard the
+        // record and run ordinary extraction/verification.
         if !Self::cached_request_binding_matches(&cached, ctx, consumer_index) {
             return None;
         }
@@ -1407,7 +1536,15 @@ async fn run_hmac_auth(
         .await;
 
     // Claim before committing: a rejected claim must leave no identity,
-    // `auth_method`, or staged mutation behind.
+    // `auth_method`, or staged mutation behind, and must never reach backend
+    // dispatch.
+    //
+    // `commit_authentication_attempt` below can still refuse after a successful
+    // claim, which would consume the nonce. That is not attacker-reachable: the
+    // only refusal it can raise here comes from the resolved Consumer's own
+    // configured identity, which is operator data rather than request data, and
+    // an attacker cannot present a valid signature for a Consumer's secret in
+    // the first place.
     if let VerifyOutcome::Success {
         consumer: Some(consumer),
         ..

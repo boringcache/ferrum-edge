@@ -397,10 +397,22 @@ fn protection_domains_converge_for_replicas_and_isolate_across_policies() {
     );
 
     for isolated in [
-        ReplayDomain::new(DPOP_REPLAY_PROFILE, "other-ns", "jwks_auth", "policy-1", "0"),
+        ReplayDomain::new(
+            DPOP_REPLAY_PROFILE,
+            "other-ns",
+            "jwks_auth",
+            "policy-1",
+            "0",
+        ),
         ReplayDomain::new(DPOP_REPLAY_PROFILE, "ferrum", "jwks_auth", "policy-2", "0"),
         ReplayDomain::new(DPOP_REPLAY_PROFILE, "ferrum", "jwks_auth", "policy-1", "1"),
-        ReplayDomain::new("ferrum-dpop-proof-v2", "ferrum", "jwks_auth", "policy-1", "0"),
+        ReplayDomain::new(
+            "ferrum-dpop-proof-v2",
+            "ferrum",
+            "jwks_auth",
+            "policy-1",
+            "0",
+        ),
     ] {
         assert_ne!(
             replica_a.verify_ok(&claims, htu, token),

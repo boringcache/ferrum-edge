@@ -28,11 +28,17 @@
 //!
 //! Replay state is owned by a **stable policy identity** — `namespace` +
 //! plugin name + plugin-config id (+ an optional plugin-chosen sub-domain such
-//! as a provider index) — and never by the plugin object a `PluginCache`
-//! rebuild happened to construct. A `jwks_auth` provider that reloads with an
-//! equivalent configuration rejoins the same [`ProcessReplayLane`] and inherits
-//! its live markers; an empty replacement cache is exactly the reload replay
-//! opening this module exists to close.
+//! as a digest of one provider's trust anchor) — and never by the plugin object
+//! a `PluginCache` rebuild happened to construct. A `jwks_auth` provider that
+//! reloads with an equivalent configuration rejoins the same
+//! [`ProcessReplayLane`] and inherits its live markers; an empty replacement
+//! cache is exactly the reload replay opening this module exists to close.
+//!
+//! A sub-domain must be *semantic* for the same reason. `jwks_auth` derives one
+//! from each provider's trust anchor rather than from its position in the
+//! `providers` array: an ordinal is not an identity, and reordering an unchanged
+//! list would otherwise strand a provider's live markers in a lane nothing
+//! consults and readmit a proof it had already claimed.
 //!
 //! Lanes live in a process-global registry ([`PROCESS_REPLAY_LANES`]) held by
 //! **strong** reference, so a deleted or renamed policy leaves its lane behind
@@ -256,7 +262,11 @@ impl ReplayDomain {
     ///   profile revision cannot be answered from an old profile's history.
     /// * `namespace` / `plugin` / `config_id` — the stable policy identity.
     /// * `sub_domain` — a bounded, configuration-derived discriminator such as
-    ///   a provider index. Never request-controlled data.
+    ///   a digest of one provider's trust anchor. It must be *semantic*: an
+    ///   ordinal position in a configuration array is not an identity, because
+    ///   reordering an unchanged list would move a policy into a fresh lane and
+    ///   reopen every proof it had already claimed. Never request-controlled
+    ///   data.
     pub fn new(
         profile: &str,
         namespace: &str,
@@ -291,6 +301,17 @@ impl ReplayDomain {
         ReplayMarker {
             digest: hasher.digest(),
         }
+    }
+
+    /// Raw domain digest.
+    ///
+    /// Opaque and non-secret: it is a hash of configuration identity only, and
+    /// carries no credential, issuer, or request material. Callers use it to
+    /// bind other request-scoped state to *this exact protection domain* (see
+    /// `hmac_auth`'s prebuffer owner identity) and to assert domain isolation
+    /// in external tests. It is deliberately not rendered by `Debug`.
+    pub fn digest(&self) -> [u8; 32] {
+        self.digest
     }
 
     /// Stable process-lane registry key for this domain.
@@ -592,36 +613,86 @@ pub fn process_lane_registered_for_tests(domain: &ReplayDomain) -> bool {
 static SHARED_AUTHORITIES: LazyLock<Mutex<Vec<std::sync::Weak<RedisRateLimitClient>>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
 
+/// Bounded, fixed-cardinality aggregate of shared replay-authority health.
+///
+/// Two counters and nothing else. There is deliberately no endpoint, host,
+/// namespace, plugin id, provider, key prefix, credential, or backend error
+/// text here: this snapshot is published on the authenticated `/health` and
+/// `/status` tier, so its cardinality must not grow with configuration.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct SharedReplayAuthorityHealth {
+    /// Distinct shared authorities held by a live plugin generation. A retired
+    /// generation drops its client, so it stops being counted.
+    pub shared_authorities: u64,
+    /// How many of those are currently unavailable. Non-zero means protected
+    /// requests on those policies are failing closed.
+    pub shared_authorities_unavailable: u64,
+}
+
+impl SharedReplayAuthorityHealth {
+    /// Whether any live policy depends on a shared authority at all.
+    pub fn required(self) -> bool {
+        self.shared_authorities > 0
+    }
+
+    /// Whether a required shared authority is known unavailable.
+    pub fn unavailable(self) -> bool {
+        self.shared_authorities_unavailable > 0
+    }
+}
+
 fn register_shared_authority(client: &Arc<RedisRateLimitClient>) {
     let Ok(mut registry) = SHARED_AUTHORITIES.lock() else {
         return;
     };
+    // Prune retired generations first: the registry is weak precisely so a
+    // rebuilt plugin cache cannot keep an old generation's client, connections,
+    // or credentials alive, and a stale entry must not keep being aggregated.
     registry.retain(|weak| weak.strong_count() > 0);
+    // `jwks_auth` shares one client across every `shared` provider, so the same
+    // authority reaches this function once per provider. Registering it twice
+    // would report one backend as several and inflate a readiness aggregate.
+    let target = Arc::as_ptr(client);
+    if registry
+        .iter()
+        .any(|weak| std::ptr::eq(weak.as_ptr(), target))
+    {
+        return;
+    }
     registry.push(Arc::downgrade(client));
+}
+
+/// Bounded aggregate over every live shared replay authority.
+pub fn shared_health_snapshot() -> SharedReplayAuthorityHealth {
+    let Ok(registry) = SHARED_AUTHORITIES.lock() else {
+        return SharedReplayAuthorityHealth::default();
+    };
+    let mut health = SharedReplayAuthorityHealth::default();
+    for client in registry.iter().filter_map(std::sync::Weak::upgrade) {
+        health.shared_authorities += 1;
+        if !client.is_available() {
+            health.shared_authorities_unavailable += 1;
+        }
+    }
+    health
 }
 
 /// `(registered, unavailable)` shared authorities.
 fn shared_authority_health() -> (u64, u64) {
-    let Ok(registry) = SHARED_AUTHORITIES.lock() else {
-        return (0, 0);
-    };
-    let mut total = 0u64;
-    let mut unavailable = 0u64;
-    for client in registry.iter().filter_map(std::sync::Weak::upgrade) {
-        total += 1;
-        if !client.is_available() {
-            unavailable += 1;
-        }
-    }
-    (total, unavailable)
+    let health = shared_health_snapshot();
+    (
+        health.shared_authorities,
+        health.shared_authorities_unavailable,
+    )
 }
 
 /// Whether any registered shared replay authority is currently unavailable.
 ///
 /// Protected requests on those policies are failing closed, which is a
-/// readiness-relevant condition rather than a per-request error.
+/// readiness-relevant condition rather than a per-request error. Consumed by
+/// the admin `/health` + `/status` readiness decision.
 pub fn shared_authority_degraded() -> bool {
-    shared_authority_health().1 > 0
+    shared_health_snapshot().unavailable()
 }
 
 // ── The authority ───────────────────────────────────────────────────────────
@@ -707,9 +778,7 @@ impl ReplayAuthority {
             Self::Process { lane, retention } => {
                 lane.admit_at(marker, *retention, monotonic_millis())
             }
-            Self::Shared { client, retention } => {
-                admit_shared(client, *retention, marker).await
-            }
+            Self::Shared { client, retention } => admit_shared(client, *retention, marker).await,
         };
         record_admission(self.mode(), outcome);
         outcome
@@ -723,10 +792,22 @@ impl ReplayAuthority {
 /// read-then-write window and no process-local pre-check that could answer
 /// differently from the shared truth.
 ///
-/// Every failure mode — unavailable client, command error, timeout, partition,
-/// authentication rejection, or a proven-unsupported topology — arrives as
-/// `Err(())` or a false availability flag and rejects the protected request.
-/// There is no local fallback.
+/// Every failure mode — unavailable client, command error, response timeout,
+/// partition, authentication rejection, malformed protocol reply, or a
+/// proven-unsupported topology — arrives as `Err(())` or a false availability
+/// flag and rejects the protected request. There is no local fallback.
+///
+/// The claim runs through the **bounded** primitive
+/// ([`RedisRateLimitClient::set_bytes_nx_with_expire_bounded`]): a connected
+/// blackhole that accepts the command and never answers must return a fixed
+/// fail-closed result rather than hold a protected request open for as long as
+/// the peer keeps the socket. That primitive also logs only a fixed
+/// classification plus the redacted endpoint, so no key, marker, nonce, proof,
+/// signature, identity, or backend error text can reach a log line from here.
+///
+/// A command that Redis executed but whose reply was lost still fails closed:
+/// the marker exists, so the retry observes `Ok(false)` (`Replay`). Losing the
+/// reply can therefore cost the client one request, never a second acceptance.
 async fn admit_shared(
     client: &RedisRateLimitClient,
     retention: Duration,
@@ -740,7 +821,7 @@ async fn admit_shared(
     // protection interval below the declared horizon.
     let ttl_seconds = retention.as_secs().saturating_add(1);
     match client
-        .set_bytes_nx_with_expire(&key, SHARED_MARKER_RECORD, ttl_seconds)
+        .set_bytes_nx_with_expire_bounded(&key, SHARED_MARKER_RECORD, ttl_seconds)
         .await
     {
         Ok(true) => ReplayAdmission::Admitted,

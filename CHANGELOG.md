@@ -7,6 +7,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING — `hmac_auth` and `jwks_auth` DPoP single-use replay protection**
+  (issues #3834 / #3837). Both admission controls now claim each proof exactly
+  once through one shared, fail-closed replay authority. Existing configurations
+  and existing clients need changes:
+
+  - `hmac_auth`'s signing profile now defaults to **`ferrum-hmac-v2`**, which
+    requires a client `nonce` in the `Authorization: hmac …` parameters and
+    binds it into the signing base. **Client signing changes**: the v2 base is
+    `ferrum-hmac-v2\n{NAMESPACE}\n{USERNAME}\n{AUTHORITY}\n{METHOD}\n{PATH}\n{QUERY}\n{DATE}\n{DIGEST}\n{NONCE}`
+    — the profile version is the first field and the nonce is the last, so a v1
+    signature can never verify as v2. The nonce must be base64url-unpadded or
+    hex, carry at least 128 bits of entropy (22 base64url or 32 hex characters),
+    and be at most 86 characters. A verbatim transport retry **is** a replay and
+    is rejected with `401`; a client that needs safe retries sends a fresh nonce
+    with a recomputed signature.
+  - `hmac_auth` requires an explicit **`replay_scope`** (`process` or `shared`)
+    whenever the v2 profile is active. There is no default: a gateway cannot
+    observe its own replica count, so declaring it is what distinguishes a
+    single-process deployment from one silently accepting one replay per
+    replica. A missing `replay_scope` is refused at admission.
+  - The legacy freshness-only profile is now an explicit opt-in requiring
+    **both** `signing_profile: "ferrum-hmac-v1"` and
+    `allow_unsafe_replayable_v1: true`, and it accepts neither `replay_scope`
+    nor a Redis backend. It has no single-use guarantee — a captured valid
+    request replays verbatim for the whole freshness window — and every
+    acceptance under it increments the fixed-cardinality
+    `legacy_unsafe_profile_accepted` counter.
+  - `hmac_auth`'s `clock_skew_seconds` is now bounded at **300**. Larger values
+    are refused: the freshness window is the interval a captured v1 request
+    stays replayable, and the fixed replay retention horizon is derived from
+    this ceiling.
+  - `hmac_auth`'s configuration root is now a **closed key set**
+    (`clock_skew_seconds`, `signing_profile`, `allow_unsafe_replayable_v1`,
+    `replay_scope`, `replay_max_entries`, plus the shared Redis fields). A
+    misspelled key is refused rather than silently leaving a policy on a weaker
+    posture than the operator wrote. `require_digest` was already removed;
+    digests remain mandatory.
+  - `jwks_auth` requires an explicit **`providers[].dpop_replay_scope`**
+    (`process` or `shared`) whenever `providers[].require_dpop` is true, with the
+    same no-default reasoning, and rejects it when `require_dpop` is false.
+  - `jwks_auth`'s `dpop_jti_ttl_secs` and `dpop_jti_cache_max_entries` were
+    **removed**, not redefined. Retention is now a fixed 601-second horizon that
+    dominates the widest admissible acceptance window, and capacity is
+    `providers[].dpop_replay_max_entries`. Configs carrying the removed keys are
+    rejected with the replacement named.
+  - **Redis HA requirement.** Any deployment running more than one gateway
+    replica behind a load balancer — including a rolling deployment, where old
+    and new processes serve concurrently — must declare `shared` scope and
+    provision Redis via `sync_mode: "redis"`. `process` scope in a multi-replica
+    deployment means one replay per replica. There is deliberately no fallback
+    between the two scopes: a shared-backend timeout, partition, authentication
+    failure, capacity failure, or proven-unsupported topology refuses the
+    protected request rather than degrading to local acceptance. Authenticated
+    `/health` and `/status` fail readiness (`status: "unavailable"`) while a live
+    policy's shared backend is unavailable, and publish a bounded
+    `replay_authority` aggregate; recovery restores readiness with no restart.
+
+  Migration: add `"replay_scope": "process"` (single process) or
+  `"replay_scope": "shared"` with `sync_mode: "redis"` and a `redis_url`
+  (multi-replica) to every `hmac_auth` config, add
+  `"dpop_replay_scope"` to every `require_dpop` provider, drop
+  `dpop_jti_ttl_secs` / `dpop_jti_cache_max_entries`, lower any
+  `clock_skew_seconds` above 300, and update HMAC clients to send and sign a
+  nonce. To defer the client change, set the acknowledged v1 profile explicitly
+  — but not on non-idempotent routes.
+
 ### Fixed
 
 - Sidecar inbound now treats one pod selected by multiple Services as the same

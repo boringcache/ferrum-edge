@@ -195,8 +195,9 @@ paths:
         `logging`, `kafka_logging`, and `ai_transcript_audit` admitted capture
         ceilings, fixed-cardinality `jwks_trust` aggregates, the bounded
         `gateway_listeners` realization status, and the DP
-        `dp_config` staleness diagnostic, and the CP `cp_dp_trust` reload
-        diagnostic — are
+        `dp_config` staleness diagnostic, the CP `cp_dp_trust` reload
+        diagnostic, and the bounded `replay_authority` shared single-use
+        aggregate — are
         returned only when the caller presents a valid admin JWT, a matching
         `FERRUM_METRICS_BEARER_TOKEN`, or originates from
         `FERRUM_METRICS_ALLOWED_CIDRS`.
@@ -11795,8 +11796,8 @@ components:
         `config_rejected`, `mesh`, `listener_failures`, `gateway_listeners`,
         `logging`,
         `kafka_logging`, `ai_transcript_audit`, `audit_pipeline`, `jwks_trust`,
-        `service_discovery`, `dp_config`, `cp_dp_trust`) are present only when
-        the caller is
+        `service_discovery`, `dp_config`, `cp_dp_trust`, `replay_authority`) are
+        present only when the caller is
         authenticated (admin JWT, metrics bearer token, or allowlisted CIDR).
       required: [status, ready]
       properties:
@@ -11839,7 +11840,12 @@ components:
             or a `withdraw` upstream whose withdrawal publication is still
             retrying, also reports `unavailable`; it clears as soon as a fresh
             snapshot is admitted or the withdrawal publishes, without a config
-            reload.
+            reload. A `shared` single-use replay authority (`jwks_auth`
+            `dpop_replay_scope: shared`, `hmac_auth` `replay_scope: shared`)
+            whose backend is currently unavailable reports `unavailable` too:
+            those policies have no local fallback, so every protected request on
+            them is failing closed. It clears as soon as the backend recovers,
+            with no restart and no config reload — see `replay_authority`.
         ready:
           type: boolean
           description: |
@@ -11849,7 +11855,9 @@ components:
             store is past its maximum-stale deadline AND no service-discovery
             upstream using the `fail_readiness` staleness policy is expired AND
             no expired `withdraw` upstream still has stale targets installed
-            because its withdrawal publication is retrying. A recoverable
+            because its withdrawal publication is retrying AND no live plugin
+            generation's `shared` single-use replay authority is currently
+            unavailable. A recoverable
             dynamic Gateway API listener failure also sets `ready: false` when
             `FERRUM_GATEWAY_LISTENER_FAILURE_FAILS_READINESS=true`; it is ready
             by default. While `false`, the
@@ -12122,6 +12130,49 @@ components:
           $ref: "#/components/schemas/DpConfigFreshnessSnapshot"
         cp_dp_trust:
           $ref: "#/components/schemas/CpDpTrustReloadSnapshot"
+        replay_authority:
+          $ref: "#/components/schemas/SharedReplayAuthorityHealth"
+
+    SharedReplayAuthorityHealth:
+      type: object
+      description: |
+        Detailed observability for the shared single-use replay authority that
+        backs `jwks_auth` `require_dpop` proofs and `hmac_auth`'s
+        `ferrum-hmac-v2` nonces (issues #3834 / #3837). Present only when at
+        least one live plugin generation declared `shared` replay scope.
+
+        Exactly two fixed-cardinality integers. There is deliberately no
+        endpoint, host, namespace, plugin id, provider, key prefix, credential,
+        marker, or backend error text here, and the aggregate does not grow with
+        configuration size.
+
+        A `shared` policy has no local fallback by design, so while
+        `shared_authorities_unavailable` is greater than zero every protected
+        request on those policies fails closed. Readiness therefore fails
+        (`ready: false`, HTTP 503, `status: "unavailable"`) until the backend
+        recovers; the Redis client's background recovery checker republishes
+        availability and the next probe is ready again with no restart and no
+        config reload. Retired plugin generations are not counted: the registry
+        holds weak handles, so a rebuilt plugin cache neither keeps an old
+        generation's backend in the aggregate nor lets it hold readiness down.
+      required: [shared_authorities, shared_authorities_unavailable]
+      properties:
+        shared_authorities:
+          type: integer
+          format: uint64
+          description: >-
+            Distinct shared replay authorities held by live plugin generations.
+            One `jwks_auth` plugin generation shares one backend across every
+            `shared` provider, so it counts once.
+          example: 1
+        shared_authorities_unavailable:
+          type: integer
+          format: uint64
+          description: >-
+            How many of those are currently unavailable (timed out, partitioned,
+            refused authentication, or proven to be an unsupported topology).
+            Non-zero fails readiness.
+          example: 0
 
     CpDpTrustReloadSnapshot:
       type: object

@@ -3408,7 +3408,11 @@ async fn dpop_replay_is_rejected_across_equivalent_concurrent_generations() {
     let new_generation = dpop_plugin(&jwks, "dpop-rolling");
 
     let mut first = dpop_ctx(&fixture);
-    assert_continue(old_generation.authenticate(&mut first, &consumer_index).await);
+    assert_continue(
+        old_generation
+            .authenticate(&mut first, &consumer_index)
+            .await,
+    );
     let mut replay = dpop_ctx(&fixture);
     assert_reject(
         new_generation
@@ -3535,6 +3539,220 @@ fn dpop_requires_an_explicitly_declared_replay_scope() {
             default_client(),
         )
         .is_err()
+    );
+}
+
+// ── semantic provider identity ──────────────────────────────────────
+//
+// A provider's DPoP protection sub-domain is a digest of its token trust anchor
+// (issuer + JWKS source), never its position in the `providers` array. An
+// ordinal is not an identity: reordering an unchanged list, or inserting or
+// deleting an unrelated provider ahead of one, would otherwise strand a
+// provider's live markers in a lane nothing consults and readmit a proof it had
+// already claimed.
+
+fn dpop_provider(jwks: &serde_json::Value) -> serde_json::Value {
+    json!({
+        "jwks": jwks,
+        "require_dpop": true,
+        "dpop_replay_scope": "process"
+    })
+}
+
+/// A provider that requires DPoP but can never validate a token, so it is only
+/// ever an ordinal neighbour of the provider under test.
+fn dpop_decoy_provider() -> serde_json::Value {
+    dpop_provider(&json!({"keys": []}))
+}
+
+fn dpop_plugin_with_providers(providers: serde_json::Value, config_id: &str) -> JwksAuth {
+    JwksAuth::new_with_config_id(
+        &json!({ "providers": providers }),
+        default_client(),
+        Some(config_id),
+    )
+    .expect("multi-provider DPoP config with declared replay scopes")
+}
+
+/// Reordering an otherwise equivalent provider list must not reopen a proof.
+#[tokio::test]
+async fn dpop_provider_reordering_does_not_reopen_an_accepted_proof() {
+    let (fixture, jwks) = build_dpop_fixture("dpop-provider-reorder");
+    let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
+
+    let decoy_first = dpop_plugin_with_providers(
+        json!([dpop_decoy_provider(), dpop_provider(&jwks)]),
+        "dpop-reorder",
+    );
+    let mut first = dpop_ctx(&fixture);
+    assert_continue(decoy_first.authenticate(&mut first, &consumer_index).await);
+
+    // The same two providers, swapped. Under array-position identity the real
+    // provider would move from sub-domain `1` to `0` and start a fresh lane.
+    let real_first = dpop_plugin_with_providers(
+        json!([dpop_provider(&jwks), dpop_decoy_provider()]),
+        "dpop-reorder",
+    );
+    let mut replay = dpop_ctx(&fixture);
+    assert_reject(
+        real_first.authenticate(&mut replay, &consumer_index).await,
+        Some(401),
+    );
+}
+
+/// Inserting, then deleting, then recreating a neighbouring provider must not
+/// reopen a proof at any step.
+#[tokio::test]
+async fn dpop_provider_insert_delete_and_recreate_do_not_reopen_a_proof() {
+    let (fixture, jwks) = build_dpop_fixture("dpop-provider-lifecycle");
+    let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
+
+    let only = dpop_plugin_with_providers(json!([dpop_provider(&jwks)]), "dpop-lifecycle");
+    let mut first = dpop_ctx(&fixture);
+    assert_continue(only.authenticate(&mut first, &consumer_index).await);
+    drop(only);
+
+    for providers in [
+        // A neighbour inserted ahead of it.
+        json!([dpop_decoy_provider(), dpop_provider(&jwks)]),
+        // The neighbour deleted again.
+        json!([dpop_provider(&jwks)]),
+        // And recreated behind it.
+        json!([dpop_provider(&jwks), dpop_decoy_provider()]),
+    ] {
+        let generation = dpop_plugin_with_providers(providers, "dpop-lifecycle");
+        let mut replay = dpop_ctx(&fixture);
+        assert_reject(
+            generation.authenticate(&mut replay, &consumer_index).await,
+            Some(401),
+        );
+    }
+}
+
+/// A security-irrelevant edit is not a new trust anchor: it must not reopen a
+/// proof the previous generation already claimed. Widening the clock skew is the
+/// sharpest case — the fixed retention horizon already dominates the widest
+/// admissible skew, so the marker outlives the wider window.
+#[tokio::test]
+async fn security_irrelevant_provider_edits_do_not_reopen_a_proof() {
+    let (fixture, jwks) = build_dpop_fixture("dpop-provider-irrelevant-edit");
+    let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
+
+    let original = dpop_plugin_with_providers(json!([dpop_provider(&jwks)]), "dpop-irrelevant");
+    let mut first = dpop_ctx(&fixture);
+    assert_continue(original.authenticate(&mut first, &consumer_index).await);
+    drop(original);
+
+    let mut edited = dpop_provider(&jwks);
+    edited["dpop_clock_skew_secs"] = json!(120);
+    edited["dpop_replay_max_entries"] = json!(4096);
+    edited["forward_original_token"] = json!(false);
+    let reloaded = dpop_plugin_with_providers(json!([edited]), "dpop-irrelevant");
+
+    let mut replay = dpop_ctx(&fixture);
+    assert_reject(
+        reloaded.authenticate(&mut replay, &consumer_index).await,
+        Some(401),
+    );
+}
+
+/// Two duplicate provider entries are one trust anchor, so they converge on one
+/// lane. A duplicated entry can therefore not launder a second acceptance.
+#[tokio::test]
+async fn duplicate_providers_converge_on_one_replay_lane() {
+    let (fixture, jwks) = build_dpop_fixture("dpop-provider-duplicate");
+    let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
+
+    let duplicated = dpop_plugin_with_providers(
+        json!([dpop_provider(&jwks), dpop_provider(&jwks)]),
+        "dpop-duplicate",
+    );
+    let markers = duplicated.dpop_replay_domain_markers("thumbprint", "proof-id");
+    assert_eq!(markers.len(), 2);
+    assert_eq!(
+        markers[0], markers[1],
+        "equivalent providers must share one protection domain"
+    );
+
+    let mut first = dpop_ctx(&fixture);
+    assert_continue(duplicated.authenticate(&mut first, &consumer_index).await);
+    let mut replay = dpop_ctx(&fixture);
+    assert_reject(
+        duplicated.authenticate(&mut replay, &consumer_index).await,
+        Some(401),
+    );
+}
+
+/// Genuinely different trust anchors stay isolated, and an inline JWKS that
+/// differs only in member order or whitespace is the same anchor.
+#[test]
+fn dpop_provider_identity_isolates_anchors_and_canonicalizes_equivalents() {
+    let (_, jwks) = build_dpop_fixture("dpop-provider-identity");
+
+    // Different inline key sets are different trust anchors.
+    let mut other_keys = jwks.clone();
+    other_keys["keys"][0]["kid"] = json!("a-different-key-id");
+    let distinct_inline = dpop_plugin_with_providers(
+        json!([dpop_provider(&jwks), dpop_provider(&other_keys)]),
+        "dpop-identity-inline",
+    );
+    let markers = distinct_inline.dpop_replay_domain_markers("thumbprint", "proof-id");
+    assert_ne!(
+        markers[0], markers[1],
+        "different inline key sets are different trust anchors"
+    );
+
+    // Different remote sources under one issuer: still isolated.
+    let remote = |uri: &str, issuer: &str| {
+        json!({
+            "jwks_uri": uri,
+            "issuer": issuer,
+            "require_dpop": true,
+            "dpop_replay_scope": "process"
+        })
+    };
+    let distinct_sources = dpop_plugin_with_providers(
+        json!([
+            remote("https://a.example.com/jwks", "https://idp.example.com"),
+            remote("https://b.example.com/jwks", "https://idp.example.com"),
+        ]),
+        "dpop-identity-source",
+    );
+    let markers = distinct_sources.dpop_replay_domain_markers("thumbprint", "proof-id");
+    assert_ne!(
+        markers[0], markers[1],
+        "different JWKS URIs are different trust anchors"
+    );
+
+    // Same remote source, different issuers: also isolated.
+    let distinct_issuers = dpop_plugin_with_providers(
+        json!([
+            remote("https://idp.example.com/jwks", "https://a.example.com"),
+            remote("https://idp.example.com/jwks", "https://b.example.com"),
+        ]),
+        "dpop-identity-issuer",
+    );
+    let markers = distinct_issuers.dpop_replay_domain_markers("thumbprint", "proof-id");
+    assert_ne!(
+        markers[0], markers[1],
+        "different issuers over one JWKS URI are different admission domains"
+    );
+
+    // One anchor spelled two ways: the inline JWKS is canonicalized before it is
+    // hashed, so member order and whitespace are not a new lane.
+    let compact = serde_json::to_string(&jwks).expect("inline JWKS serializes");
+    let spaced = serde_json::to_string_pretty(&jwks).expect("inline JWKS pretty-prints");
+    let canonicalized = dpop_plugin_with_providers(
+        json!([
+            dpop_provider(&json!(compact)),
+            dpop_provider(&json!(spaced)),
+        ]),
+        "dpop-identity-canonical",
+    );
+    let markers = canonicalized.dpop_replay_domain_markers("thumbprint", "proof-id");
+    assert_eq!(
+        markers[0], markers[1],
+        "the same inline JWKS spelled two ways is one trust anchor"
     );
 }
 

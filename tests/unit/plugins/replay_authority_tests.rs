@@ -17,10 +17,11 @@
 use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
+use ferrum_edge::plugins::utils::redis_rate_limiter::{RedisConfig, RedisRateLimitClient};
 use ferrum_edge::plugins::utils::replay_authority::{
     MAX_PROCESS_REPLAY_LANES, ReplayAdmission, ReplayAuthority, ReplayDomain, ReplayScope,
     admit_process_at, counters, monotonic_millis, process_lane, process_lane_registered_for_tests,
-    validate_scope_backend,
+    shared_authority_degraded, shared_health_snapshot, validate_scope_backend,
 };
 
 const PROFILE: &str = "ferrum-replay-authority-tests-v1";
@@ -423,8 +424,8 @@ fn a_retired_lane_is_reclaimed_only_after_every_marker_expires() {
     let now = monotonic_millis();
 
     {
-        let authority = ReplayAuthority::process("test", &lane_domain, 8, RETENTION, 8)
-            .expect("lane");
+        let authority =
+            ReplayAuthority::process("test", &lane_domain, 8, RETENTION, 8).expect("lane");
         assert_eq!(
             admit_process_at(&authority, &marker, now),
             Some(ReplayAdmission::Admitted)
@@ -572,8 +573,7 @@ fn debug_renderings_never_disclose_marker_material() {
 /// authentication rejection lands on) without needing a live server.
 #[tokio::test]
 async fn a_shared_authority_with_an_unreachable_backend_fails_closed() {
-    use ferrum_edge::plugins::utils::redis_rate_limiter::{RedisConfig, RedisRateLimitClient};
-
+    let _serialized = shared_health_guard_async().await;
     let config = RedisConfig::from_plugin_config(
         &serde_json::json!({
             "sync_mode": "redis",
@@ -611,8 +611,7 @@ async fn a_shared_authority_with_an_unreachable_backend_fails_closed() {
 /// observable without retaining the client, its endpoint, or its credentials.
 #[tokio::test]
 async fn an_unavailable_shared_authority_is_visible_in_the_counters() {
-    use ferrum_edge::plugins::utils::redis_rate_limiter::{RedisConfig, RedisRateLimitClient};
-
+    let _serialized = shared_health_guard_async().await;
     let config = RedisConfig::from_plugin_config(
         &serde_json::json!({
             "sync_mode": "redis",
@@ -641,5 +640,426 @@ async fn an_unavailable_shared_authority_is_visible_in_the_counters() {
         after.shared_authorities_unavailable >= 1,
         "a degraded shared authority must be visible to readiness"
     );
-    assert!(ferrum_edge::plugins::utils::replay_authority::shared_authority_degraded());
+    assert!(shared_authority_degraded());
+}
+
+// ── shared-authority health for readiness ───────────────────────────
+//
+// `SHARED_AUTHORITIES` is a process-global registry, so these cases serialize
+// against each other. Nothing else in this test binary constructs a `shared`
+// authority (every other `shared` configuration in the unit suite is a rejected
+// config), so a serialized case observes only its own registrations.
+/// A tokio mutex rather than a `std` one so the async cases can hold it across
+/// their awaits without a `!Send` guard.
+static SHARED_HEALTH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn shared_health_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    SHARED_HEALTH_LOCK.blocking_lock()
+}
+
+async fn shared_health_guard_async() -> tokio::sync::MutexGuard<'static, ()> {
+    SHARED_HEALTH_LOCK.lock().await
+}
+
+fn unreachable_shared_client(prefix: &str) -> Arc<RedisRateLimitClient> {
+    let config = RedisConfig::from_plugin_config(
+        &serde_json::json!({
+            "sync_mode": "redis",
+            // Port 1 is reserved and never listening.
+            "redis_url": "redis://127.0.0.1:1",
+            "redis_connect_timeout_seconds": 1,
+            // Long enough that no background recovery dial races an assertion.
+            "redis_health_check_interval_seconds": 3600,
+        }),
+        prefix,
+    )
+    .expect("redis config parses")
+    .expect("sync_mode redis yields a config");
+    Arc::new(RedisRateLimitClient::new(config, None, false, None))
+}
+
+/// The bounded aggregate readiness consumes: an unavailable shared authority is
+/// visible, recovery clears it, and a retired plugin generation stops counting.
+#[test]
+fn shared_authority_health_tracks_outage_recovery_and_retirement() {
+    let _serialized = shared_health_guard();
+    let baseline = shared_health_snapshot();
+
+    let client = unreachable_shared_client("ferrum:replay_authority_tests:health");
+    let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
+
+    let registered = shared_health_snapshot();
+    assert_eq!(
+        registered.shared_authorities,
+        baseline.shared_authorities + 1,
+        "a live shared authority is counted exactly once"
+    );
+    assert!(registered.required());
+    assert_eq!(
+        registered.shared_authorities_unavailable, baseline.shared_authorities_unavailable,
+        "a freshly built client has not proven itself unavailable yet"
+    );
+
+    // An outage is readiness-relevant, not a per-request error.
+    client.mark_unavailable_for_test();
+    let degraded = shared_health_snapshot();
+    assert_eq!(
+        degraded.shared_authorities_unavailable,
+        baseline.shared_authorities_unavailable + 1
+    );
+    assert!(degraded.unavailable());
+    assert!(shared_authority_degraded());
+
+    // Recovery restores it with no rebuild and no config reload.
+    assert!(client.publish_reachable_for_test());
+    let recovered = shared_health_snapshot();
+    assert_eq!(
+        recovered.shared_authorities_unavailable, baseline.shared_authorities_unavailable,
+        "a recovered backend must stop failing readiness"
+    );
+    assert_eq!(recovered.shared_authorities, baseline.shared_authorities + 1);
+
+    // Retiring the generation drops it from the aggregate: the registry holds
+    // weak handles precisely so an old generation can neither hold readiness
+    // down nor inflate the count.
+    drop(authority);
+    drop(client);
+    let retired = shared_health_snapshot();
+    assert_eq!(
+        retired.shared_authorities, baseline.shared_authorities,
+        "a retired plugin generation must not remain counted"
+    );
+    assert_eq!(
+        retired.shared_authorities_unavailable,
+        baseline.shared_authorities_unavailable
+    );
+}
+
+/// One backend shared by several providers is one authority, not several.
+/// `jwks_auth` builds a single Redis client per plugin generation and hands it
+/// to every `shared` provider, so a per-provider registration would report one
+/// backend as many and inflate a readiness aggregate.
+#[test]
+fn one_backend_shared_by_several_authorities_is_counted_once() {
+    let _serialized = shared_health_guard();
+    let baseline = shared_health_snapshot();
+
+    let client = unreachable_shared_client("ferrum:replay_authority_tests:dedupe");
+    let first = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
+    let second = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
+    let third = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
+
+    assert_eq!(
+        shared_health_snapshot().shared_authorities,
+        baseline.shared_authorities + 1,
+        "three providers over one backend are one shared authority"
+    );
+
+    drop((first, second, third));
+    drop(client);
+    assert_eq!(
+        shared_health_snapshot().shared_authorities,
+        baseline.shared_authorities
+    );
+}
+
+// ── bounded, redacted shared claim ──────────────────────────────────
+
+/// How the fake backend answers the `SET` that carries a replay claim.
+#[derive(Clone, Copy)]
+enum ClaimBehavior {
+    /// Accepted, authenticated, screened — and then simply never answered.
+    Silent,
+    /// A RESP error reply (`-NOAUTH …`, `-WRONGPASS …`, `-OOM …`).
+    Error(&'static str),
+    /// A reply that is not valid RESP for this command: protocol uncertainty.
+    Garbage,
+    /// The socket closes with no reply at all: a partition mid-command.
+    Disconnect,
+    /// The command IS executed and the reply is then lost. A later attempt sees
+    /// the key that the lost command created.
+    ExecutedThenLost,
+}
+
+/// A minimal RESP server that completes connection setup and the topology
+/// screen, then answers the replay claim per [`ClaimBehavior`].
+///
+/// The interesting shapes here are the ones a *connect* timeout cannot catch:
+/// the peer accepts the TCP connection, authenticates, and answers `INFO`
+/// cleanly, so the client holds a screened, usable connection — and only then
+/// misbehaves.
+async fn spawn_claim_redis_server(
+    behavior: ClaimBehavior,
+) -> (u16, tokio::sync::oneshot::Sender<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake redis");
+    let port = listener.local_addr().expect("local addr").port();
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    // Server-side record of whether the claim key exists, for `ExecutedThenLost`.
+    let claimed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => break,
+                accepted = listener.accept() => {
+                    let Ok((mut stream, _)) = accepted else { break };
+                    let claimed = Arc::clone(&claimed);
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 16 * 1024];
+                        loop {
+                            let read = match stream.read(&mut buf).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(read) => read,
+                            };
+                            let chunk = &buf[..read];
+                            let contains = |needle: &[u8]| {
+                                chunk.windows(needle.len()).any(|window| window == needle)
+                            };
+                            let reply: Vec<u8> = if contains(b"SET") {
+                                match behavior {
+                                    ClaimBehavior::Silent => continue,
+                                    ClaimBehavior::Disconnect => break,
+                                    ClaimBehavior::Error(text) => text.as_bytes().to_vec(),
+                                    ClaimBehavior::Garbage => b"@not-resp\r\n".to_vec(),
+                                    ClaimBehavior::ExecutedThenLost => {
+                                        if claimed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                                            // The key the lost command created is
+                                            // still there: `SET NX` declines.
+                                            b"$-1\r\n".to_vec()
+                                        } else {
+                                            // Executed, then the reply is lost.
+                                            break;
+                                        }
+                                    }
+                                }
+                            } else if contains(b"INFO") {
+                                let text = "# Cluster\r\ncluster_enabled:0\r\n";
+                                format!("${}\r\n{text}\r\n", text.len()).into_bytes()
+                            } else {
+                                // The redis crate pipelines connection setup, so
+                                // reply once per command array in the chunk.
+                                let commands =
+                                    chunk.iter().filter(|&&byte| byte == b'*').count().max(1);
+                                b"+OK\r\n".repeat(commands)
+                            };
+                            if stream.write_all(&reply).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    });
+
+    (port, shutdown_tx)
+}
+
+fn claim_client(port: u16, prefix: &str) -> Arc<RedisRateLimitClient> {
+    let config = RedisConfig::from_plugin_config(
+        &serde_json::json!({
+            "sync_mode": "redis",
+            "redis_url": format!("redis://127.0.0.1:{port}/0"),
+            // The admitted Redis timeout contract, reused as the response bound.
+            "redis_connect_timeout_seconds": 1,
+            "redis_health_check_interval_seconds": 3600,
+        }),
+        prefix,
+    )
+    .expect("redis config parses")
+    .expect("sync_mode redis yields a config");
+    Arc::new(RedisRateLimitClient::new(config, None, false, None))
+}
+
+/// A connected backend that never answers the claim must produce a fixed
+/// fail-closed result inside the admitted bound, not hold the protected request.
+#[tokio::test]
+async fn a_connected_backend_that_never_answers_fails_closed_within_the_bound() {
+    let _serialized = shared_health_guard_async().await;
+    let (port, shutdown) = spawn_claim_redis_server(ClaimBehavior::Silent).await;
+    let client = claim_client(port, "ferrum:replay_authority_tests:silent");
+    let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
+    let marker = domain("shared-silent").marker(&[b"c", b"proof"]);
+
+    let started = std::time::Instant::now();
+    let outcome = authority.admit(&marker).await;
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        outcome,
+        ReplayAdmission::AuthorityUnavailable,
+        "an unanswered claim is uncertainty, never local acceptance"
+    );
+    assert!(
+        elapsed < Duration::from_secs(15),
+        "the claim must be bounded by the configured Redis timeout, took {elapsed:?}"
+    );
+    assert!(
+        !client.is_available(),
+        "an unanswered claim marks the backend unavailable so readiness can see it"
+    );
+
+    let _ = shutdown.send(());
+}
+
+/// The claim primitive publishes no backend text and no key material.
+///
+/// A `RedisError` renders server-supplied detail, and the key IS the replay
+/// marker, so the claim path may only log a fixed classification beside the
+/// already-redacted endpoint.
+#[tokio::test]
+async fn the_shared_claim_primitive_publishes_no_backend_or_key_material() {
+    let _serialized = shared_health_guard_async().await;
+    let config = RedisConfig::from_plugin_config(
+        &serde_json::json!({
+            "sync_mode": "redis",
+            "redis_url": "redis://claim-user:claim-password@127.0.0.1:1/0",
+            "redis_connect_timeout_seconds": 1,
+        }),
+        "ferrum:replay_authority_tests:redaction",
+    )
+    .expect("redis config parses")
+    .expect("sync_mode redis yields a config");
+
+    // The one endpoint rendering the claim path may log strips userinfo.
+    let redacted = config.redacted_url();
+    assert!(!redacted.contains("claim-user"));
+    assert!(!redacted.contains("claim-password"));
+
+    let client = Arc::new(RedisRateLimitClient::new(config, None, false, None));
+    let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
+    let marker = domain("shared-redaction").marker(&[b"consumer-1", b"nonce-1"]);
+
+    assert_eq!(
+        authority.admit(&marker).await,
+        ReplayAdmission::AuthorityUnavailable
+    );
+
+    // Nothing about the authority, the marker, or the outcome renders proof
+    // material: the classification set is fixed and content-free.
+    assert_eq!(format!("{marker:?}"), "ReplayMarker(<digest>)");
+    assert_eq!(
+        format!("{authority:?}"),
+        "ReplayAuthority { mode: \"shared\" }"
+    );
+    for outcome in [
+        ReplayAdmission::Admitted,
+        ReplayAdmission::Replay,
+        ReplayAdmission::CapacityRefused,
+        ReplayAdmission::AuthorityUnavailable,
+    ] {
+        let classification = outcome.classification();
+        assert!(
+            [
+                "admitted",
+                "replay",
+                "capacity_refused",
+                "authority_unavailable"
+            ]
+            .contains(&classification),
+            "classification must come from the closed set: {classification}"
+        );
+    }
+}
+
+/// Every shared-backend uncertainty class fails closed with the same fixed
+/// classification. None of them may admit, and none may fall back to a local
+/// lane.
+#[tokio::test]
+async fn every_shared_backend_uncertainty_class_fails_closed() {
+    let _serialized = shared_health_guard_async().await;
+
+    for (label, behavior) in [
+        // Authentication rejection: the client cannot enforce here at all.
+        (
+            "authentication",
+            ClaimBehavior::Error("-NOAUTH Authentication required.\r\n"),
+        ),
+        (
+            "wrong_credentials",
+            ClaimBehavior::Error("-WRONGPASS invalid username-password pair\r\n"),
+        ),
+        // Capacity: a Redis that refuses the write under memory pressure or an
+        // eviction policy is an unavailable authority, never an acceptance.
+        (
+            "capacity",
+            ClaimBehavior::Error("-OOM command not allowed when used memory > 'maxmemory'.\r\n"),
+        ),
+        // Protocol uncertainty: the reply is not something this command can mean.
+        ("protocol", ClaimBehavior::Garbage),
+        // Partition: the socket dies mid-command.
+        ("partition", ClaimBehavior::Disconnect),
+    ] {
+        let (port, shutdown) = spawn_claim_redis_server(behavior).await;
+        let client = claim_client(port, "ferrum:replay_authority_tests:uncertainty");
+        let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
+        let marker = domain("shared-uncertainty").marker(&[b"c", label.as_bytes()]);
+
+        assert_eq!(
+            authority.admit(&marker).await,
+            ReplayAdmission::AuthorityUnavailable,
+            "{label}: uncertainty must reject the protected request"
+        );
+        assert!(
+            !client.is_available(),
+            "{label}: the outage must be visible to readiness"
+        );
+        assert!(
+            process_lane(&authority).is_none(),
+            "{label}: a shared authority must never acquire a local lane"
+        );
+
+        // Still refused on retry: nothing degrades into local acceptance.
+        assert_eq!(
+            authority.admit(&marker).await,
+            ReplayAdmission::AuthorityUnavailable
+        );
+
+        drop(authority);
+        drop(client);
+        let _ = shutdown.send(());
+    }
+}
+
+/// A command Redis executed whose reply was then lost must stay fail closed on
+/// retry, because the marker the lost command wrote is still there.
+///
+/// This is the one case where "the authority is uncertain" and "the claim
+/// happened" are both true. The client sees `AuthorityUnavailable` and refuses,
+/// and the retry observes the existing key as a replay — so losing a reply can
+/// cost the client one request, never a second acceptance.
+#[tokio::test]
+async fn a_claim_whose_reply_was_lost_stays_fail_closed_on_retry() {
+    let _serialized = shared_health_guard_async().await;
+
+    let (port, shutdown) = spawn_claim_redis_server(ClaimBehavior::ExecutedThenLost).await;
+    let client = claim_client(port, "ferrum:replay_authority_tests:lost-reply");
+    let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
+    let marker = domain("shared-lost-reply").marker(&[b"c", b"nonce"]);
+
+    assert_eq!(
+        authority.admit(&marker).await,
+        ReplayAdmission::AuthorityUnavailable,
+        "an unacknowledged claim is uncertain and must refuse the request"
+    );
+    assert!(!client.is_available());
+
+    // The background recovery checker reconnects and republishes availability.
+    // Recovery must restore service — and must not reopen the lost claim.
+    assert!(client.publish_reachable_for_test());
+    assert!(client.is_available());
+
+    assert_eq!(
+        authority.admit(&marker).await,
+        ReplayAdmission::Replay,
+        "the marker the lost command wrote is still there, so the retry is a replay"
+    );
+
+    drop(authority);
+    drop(client);
+    let _ = shutdown.send(());
 }

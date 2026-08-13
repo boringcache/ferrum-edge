@@ -321,6 +321,22 @@ async fn redis_counter_value(key: &str) -> Option<u64> {
         .expect("read Redis rate-limit counter")
 }
 
+/// Remaining TTL, in seconds, for `key`. `None` when the key is absent or has
+/// no expiry.
+async fn redis_key_ttl(key: &str) -> Option<i64> {
+    let client = redis::Client::open(REDIS_URL).expect("valid Redis test URL");
+    let mut connection = client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("connect to Redis test instance");
+    let ttl: i64 = redis::cmd("TTL")
+        .arg(key)
+        .query_async(&mut connection)
+        .await
+        .expect("read Redis key TTL");
+    (ttl >= 0).then_some(ttl)
+}
+
 // ============================================================================
 // Test Harness (Database mode with Redis rate limiting)
 // ============================================================================
@@ -3257,4 +3273,748 @@ fn spawn_file_gateway_lets_harness_allocate_proxy_port_each_attempt() {
         helper.contains("FERRUM_PROXY_HTTP_PORT") && helper.contains("must not pin"),
         "spawn_file_gateway must refuse sticky proxy-port overrides from extra_env"
     );
+}
+
+// ============================================================================
+// Shared single-use replay authority — live cross-replica evidence
+// (issues #3834 / #3837)
+// ============================================================================
+//
+// `replay_scope: shared` / `dpop_replay_scope: shared` exist for exactly one
+// reason: two gateway replicas behind a load balancer must not each accept the
+// same proof once. Nothing below simulates that. Two independently spawned
+// `ferrum-edge` processes share one Redis and one counting backend, and the
+// load-bearing assertion is always the **backend mutation count** — "the
+// gateway answered 401" is weaker than "the origin was contacted exactly once",
+// because only the second rules out a duplicate side effect.
+//
+// Both replicas must see the same signed bytes, so every request carries an
+// explicit `Host`. The HMAC v2 signing base binds the request authority and the
+// DPoP `htu` binds scheme+host+path, so a per-port authority would make one
+// replica's proof structurally unusable at the other and the cross-replica
+// assertion would pass vacuously.
+
+/// Fixed authority both HMAC replicas sign and present.
+const REPLAY_HMAC_AUTHORITY: &str = "hmac-replay.example.test";
+/// Fixed authority both DPoP replicas present, and the host inside every `htu`.
+const REPLAY_DPOP_AUTHORITY: &str = "dpop-replay.example.test";
+const REPLAY_HMAC_SECRET: &str = "shared-replay-hmac-secret-at-least-32-bytes";
+
+/// A backend that counts every non-`/health` request it serves.
+async fn spawn_replay_counting_backend() -> (u16, Arc<AtomicUsize>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind counting backend");
+    let port = listener.local_addr().expect("backend addr").port();
+    let mutations = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&mutations);
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                continue;
+            };
+            let counter = Arc::clone(&counter);
+            tokio::spawn(async move {
+                use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+                let (reader, mut writer) = stream.split();
+                let mut buf_reader = tokio::io::BufReader::new(reader);
+                let mut request_line = String::new();
+                if buf_reader.read_line(&mut request_line).await.is_err() {
+                    return;
+                }
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if buf_reader.read_line(&mut line).await.is_err() {
+                        return;
+                    }
+                    if line == "\r\n" || line == "\n" {
+                        break;
+                    }
+                    let lower = line.to_ascii_lowercase();
+                    if let Some(value) = lower.strip_prefix("content-length:") {
+                        content_length = value.trim().parse().unwrap_or(0);
+                    }
+                }
+                if content_length > 0 {
+                    let mut body = vec![0u8; content_length];
+                    let _ = buf_reader.read_exact(&mut body).await;
+                }
+                let is_health = request_line.contains(" /health ");
+                if !is_health {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                }
+                let body = r#"{"ok":true}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = writer.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+
+    (port, mutations)
+}
+
+fn replay_hmac_config(backend_port: u16, prefix: &str) -> String {
+    format!(
+        r#"
+version: "1"
+proxies:
+  - id: "hmac-replay-proxy"
+    listen_path: "/hmac-replay"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+    strip_listen_path: true
+    plugins:
+      - plugin_config_id: "hmac-replay-plugin"
+
+consumers:
+  - id: "hmac-replay-consumer"
+    username: "replayuser"
+    credentials:
+      hmac_auth:
+        - secret: "{REPLAY_HMAC_SECRET}"
+
+plugin_configs:
+  - id: "hmac-replay-plugin"
+    plugin_name: "hmac_auth"
+    scope: "proxy"
+    proxy_id: "hmac-replay-proxy"
+    enabled: true
+    config:
+      clock_skew_seconds: 300
+      replay_scope: "shared"
+      sync_mode: "redis"
+      redis_url: "{REDIS_URL}"
+      redis_key_prefix: "{prefix}"
+"#,
+    )
+}
+
+fn replay_hmac_authorization(nonce: &str, date: &str, digest: &str) -> String {
+    crate::common::hmac_v2_authorization_header(
+        &crate::common::HmacV2Request {
+            method: "POST",
+            path: "/hmac-replay",
+            date,
+            username: "replayuser",
+            authority: REPLAY_HMAC_AUTHORITY,
+            secret: REPLAY_HMAC_SECRET,
+            digest_header: digest,
+            nonce,
+        },
+        None,
+    )
+}
+
+async fn send_replay_hmac(
+    client: &reqwest::Client,
+    port: u16,
+    authorization: &str,
+    date: &str,
+    digest: &str,
+) -> u16 {
+    client
+        .post(format!("http://127.0.0.1:{port}/hmac-replay"))
+        .header("Host", REPLAY_HMAC_AUTHORITY)
+        .header("Authorization", authorization)
+        .header("Date", date)
+        .header("Digest", digest)
+        .send()
+        .await
+        .expect("hmac replay request completes")
+        .status()
+        .as_u16()
+}
+
+/// Issue #3837's backend-side acceptance evidence, on a live shared authority.
+///
+/// Two independently spawned gateway replicas share one Redis and one counting
+/// backend. Covered here: a sequential replay, concurrent first-use copies of
+/// one nonce raced across both replicas, a cross-replica replay, an equivalent
+/// configuration reload (a fresh process, i.e. a fresh plugin cache), and a
+/// fresh nonce adding exactly one mutation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn test_hmac_v2_shared_redis_admits_one_backend_mutation_across_replicas() {
+    if !redis_is_available().await {
+        if std::env::var_os("FERRUM_REDIS_REQUIRED").is_some() {
+            panic!("Redis is required for the shared single-use replay CI gate");
+        }
+        return;
+    }
+
+    let (backend_port, mutations) = spawn_replay_counting_backend().await;
+    let prefix = format!("ferrum:test:hmacreplay:{}", Uuid::new_v4().simple());
+    delete_redis_keys_by_prefix(&prefix).await;
+
+    let config = replay_hmac_config(backend_port, &prefix);
+    let warmup_off = vec![(
+        "FERRUM_POOL_WARMUP_ENABLED".to_string(),
+        "false".to_string(),
+    )];
+    let mut replica_a = spawn_file_gateway(config.clone(), warmup_off.clone()).await;
+    let mut replica_b = spawn_file_gateway(config.clone(), warmup_off.clone()).await;
+    let port_a = replica_a.proxy_port;
+    let port_b = replica_b.proxy_port;
+
+    let client = reqwest::Client::new();
+    let date = chrono::Utc::now()
+        .format("%a, %d %b %Y %H:%M:%S GMT")
+        .to_string();
+    let digest = crate::common::empty_digest_header();
+
+    // 1. One accepted request reaches the backend exactly once.
+    let first_nonce = crate::common::hmac_v2_nonce(0x3837_0001);
+    let first = replay_hmac_authorization(&first_nonce, &date, &digest);
+    assert_eq!(
+        send_replay_hmac(&client, port_a, &first, &date, &digest).await,
+        200,
+        "a valid ferrum-hmac-v2 request must be accepted"
+    );
+    assert_eq!(mutations.load(Ordering::SeqCst), 1);
+
+    // 2. Sequential replay against the same replica.
+    assert_eq!(
+        send_replay_hmac(&client, port_a, &first, &date, &digest).await,
+        401,
+        "a verbatim replay must be rejected"
+    );
+    // 3. Cross-replica replay: replica B never saw this request and must still
+    //    refuse it, because the claim lives in the shared authority.
+    assert_eq!(
+        send_replay_hmac(&client, port_b, &first, &date, &digest).await,
+        401,
+        "a shared authority makes one proof single-use across replicas"
+    );
+    assert_eq!(
+        mutations.load(Ordering::SeqCst),
+        1,
+        "replays must never reach the backend"
+    );
+
+    // 4. Concurrent first-use copies of ONE fresh nonce, raced across both
+    //    replicas. Exactly one may win, and the backend may be mutated once.
+    let raced_nonce = crate::common::hmac_v2_nonce(0x3837_0002);
+    let raced = replay_hmac_authorization(&raced_nonce, &date, &digest);
+    let mut attempts = Vec::new();
+    for index in 0..8 {
+        let client = client.clone();
+        let raced = raced.clone();
+        let date = date.clone();
+        let digest = digest.clone();
+        let port = if index % 2 == 0 { port_a } else { port_b };
+        attempts.push(tokio::spawn(async move {
+            send_replay_hmac(&client, port, &raced, &date, &digest).await
+        }));
+    }
+    let mut accepted = 0usize;
+    for attempt in attempts {
+        match attempt.await.expect("raced request task completes") {
+            200 => accepted += 1,
+            401 => {}
+            other => panic!("unexpected raced status {other}"),
+        }
+    }
+    assert_eq!(
+        accepted, 1,
+        "exactly one concurrent first use may win a shared claim"
+    );
+    assert_eq!(
+        mutations.load(Ordering::SeqCst),
+        2,
+        "the race added exactly one backend mutation"
+    );
+
+    // 5. An equivalent configuration reload — a fresh process with a fresh
+    //    plugin cache — must not readmit either claimed nonce.
+    replica_a.shutdown();
+    let mut reloaded = spawn_file_gateway(config.clone(), warmup_off.clone()).await;
+    let reloaded_port = reloaded.proxy_port;
+    for authorization in [&first, &raced] {
+        assert_eq!(
+            send_replay_hmac(&client, reloaded_port, authorization, &date, &digest).await,
+            401,
+            "an equivalent reload must inherit the shared claim"
+        );
+    }
+    assert_eq!(mutations.load(Ordering::SeqCst), 2);
+
+    // 6. A fresh nonce is a new request and adds exactly one mutation.
+    let fresh_nonce = crate::common::hmac_v2_nonce(0x3837_0003);
+    let fresh = replay_hmac_authorization(&fresh_nonce, &date, &digest);
+    assert_eq!(
+        send_replay_hmac(&client, reloaded_port, &fresh, &date, &digest).await,
+        200,
+        "a fresh nonce with a recomputed signature must be accepted"
+    );
+    assert_eq!(
+        mutations.load(Ordering::SeqCst),
+        3,
+        "a fresh nonce adds exactly one backend mutation"
+    );
+
+    delete_redis_keys_by_prefix(&prefix).await;
+    reloaded.shutdown();
+    replica_b.shutdown();
+    println!("test_hmac_v2_shared_redis_admits_one_backend_mutation_across_replicas PASSED");
+}
+
+// ── DPoP (issue #3834) ──────────────────────────────────────────────
+
+fn replay_der_from_pem(pem: &str) -> Vec<u8> {
+    use base64::Engine as _;
+    let b64: String = pem
+        .lines()
+        .filter(|line| !line.starts_with("-----"))
+        .collect();
+    base64::engine::general_purpose::STANDARD
+        .decode(&b64)
+        .expect("PEM base64")
+}
+
+fn replay_asn1_length(data: &[u8]) -> (usize, usize) {
+    if data[0] < 0x80 {
+        (data[0] as usize, 1)
+    } else {
+        let num_bytes = (data[0] & 0x7f) as usize;
+        let mut length = 0usize;
+        for &byte in &data[1..=num_bytes] {
+            length = (length << 8) | byte as usize;
+        }
+        (length, 1 + num_bytes)
+    }
+}
+
+/// `(modulus, exponent)` from a SubjectPublicKeyInfo RSA DER blob.
+fn replay_rsa_public_parts(der: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let mut pos = 0usize;
+    assert_eq!(der[pos], 0x30);
+    pos += 1;
+    let (_, consumed) = replay_asn1_length(&der[pos..]);
+    pos += consumed;
+    assert_eq!(der[pos], 0x30);
+    pos += 1;
+    let (algo_len, consumed) = replay_asn1_length(&der[pos..]);
+    pos += consumed + algo_len;
+    assert_eq!(der[pos], 0x03);
+    pos += 1;
+    let (_, consumed) = replay_asn1_length(&der[pos..]);
+    pos += consumed + 1;
+    assert_eq!(der[pos], 0x30);
+    pos += 1;
+    let (_, consumed) = replay_asn1_length(&der[pos..]);
+    pos += consumed;
+    assert_eq!(der[pos], 0x02);
+    pos += 1;
+    let (n_len, consumed) = replay_asn1_length(&der[pos..]);
+    pos += consumed;
+    let mut n = der[pos..pos + n_len].to_vec();
+    pos += n_len;
+    if !n.is_empty() && n[0] == 0 {
+        n.remove(0);
+    }
+    assert_eq!(der[pos], 0x02);
+    pos += 1;
+    let (e_len, consumed) = replay_asn1_length(&der[pos..]);
+    pos += consumed;
+    (n, der[pos..pos + e_len].to_vec())
+}
+
+struct DpopReplayFixture {
+    jwks: serde_json::Value,
+    access_token: String,
+    private_key_pem: &'static [u8],
+    jwk: serde_json::Value,
+    ath: String,
+}
+
+fn build_dpop_replay_fixture() -> DpopReplayFixture {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use ferrum_edge::plugins::utils::dpop::jwk_thumbprint_sha256;
+    use jsonwebtoken::{EncodingKey, Header, encode};
+    use sha2::{Digest, Sha256};
+
+    let private_key_pem: &'static [u8] = include_bytes!("../fixtures/test_rsa_private.pem");
+    let public_key_pem: &'static [u8] = include_bytes!("../fixtures/test_rsa_public.pem");
+    let (n, e) = replay_rsa_public_parts(&replay_der_from_pem(
+        std::str::from_utf8(public_key_pem).expect("public PEM is UTF-8"),
+    ));
+    let jwk = json!({
+        "kty": "RSA",
+        "kid": "dpop-replay-key",
+        "use": "sig",
+        "alg": "RS256",
+        "n": URL_SAFE_NO_PAD.encode(&n),
+        "e": URL_SAFE_NO_PAD.encode(&e),
+    });
+    let jwks = json!({"keys": [jwk.clone()]});
+
+    let parsed_jwk: jsonwebtoken::jwk::Jwk =
+        serde_json::from_value(jwk.clone()).expect("JWK parses");
+    let jkt = jwk_thumbprint_sha256(&parsed_jwk).expect("JWK thumbprint");
+
+    let now = chrono::Utc::now().timestamp();
+    let mut access_header = Header::new(jsonwebtoken::Algorithm::RS256);
+    access_header.kid = Some("dpop-replay-key".to_string());
+    let access_token = encode(
+        &access_header,
+        &json!({"sub": "dpop-user", "cnf": {"jkt": jkt}, "exp": now + 900}),
+        &EncodingKey::from_rsa_pem(private_key_pem).expect("RSA private key"),
+    )
+    .expect("access token");
+
+    let mut hasher = Sha256::new();
+    hasher.update(access_token.as_bytes());
+    let ath = URL_SAFE_NO_PAD.encode(hasher.finalize());
+
+    DpopReplayFixture {
+        jwks,
+        access_token,
+        private_key_pem,
+        jwk,
+        ath,
+    }
+}
+
+/// Mint one DPoP proof for `jti` bound to the fixture's key and access token.
+fn dpop_replay_proof(fixture: &DpopReplayFixture, jti: &str) -> String {
+    use jsonwebtoken::{EncodingKey, Header, encode};
+
+    let now = chrono::Utc::now().timestamp();
+    let mut header = Header::new(jsonwebtoken::Algorithm::RS256);
+    header.typ = Some("dpop+jwt".to_string());
+    header.jwk = Some(serde_json::from_value(fixture.jwk.clone()).expect("JWK parses"));
+    encode(
+        &header,
+        &json!({
+            "htm": "POST",
+            "htu": format!("http://{REPLAY_DPOP_AUTHORITY}/dpop-replay"),
+            "iat": now,
+            "exp": now + 120,
+            "jti": jti,
+            "ath": fixture.ath,
+        }),
+        &EncodingKey::from_rsa_pem(fixture.private_key_pem).expect("RSA private key"),
+    )
+    .expect("dpop proof")
+}
+
+fn replay_dpop_config(backend_port: u16, prefix: &str, jwks: &serde_json::Value) -> String {
+    let jwks_json = serde_json::to_string(jwks).expect("inline JWKS serializes");
+    format!(
+        r#"
+version: "1"
+proxies:
+  - id: "dpop-replay-proxy"
+    listen_path: "/dpop-replay"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+    strip_listen_path: true
+    plugins:
+      - plugin_config_id: "dpop-replay-plugin"
+
+consumers: []
+
+plugin_configs:
+  - id: "dpop-replay-plugin"
+    plugin_name: "jwks_auth"
+    scope: "proxy"
+    proxy_id: "dpop-replay-proxy"
+    enabled: true
+    config:
+      sync_mode: "redis"
+      redis_url: "{REDIS_URL}"
+      redis_key_prefix: "{prefix}"
+      providers:
+        - jwks: '{jwks_json}'
+          require_dpop: true
+          dpop_replay_scope: "shared"
+"#,
+    )
+}
+
+async fn send_replay_dpop(
+    client: &reqwest::Client,
+    port: u16,
+    fixture: &DpopReplayFixture,
+    proof: &str,
+) -> u16 {
+    client
+        .post(format!("http://127.0.0.1:{port}/dpop-replay"))
+        .header("Host", REPLAY_DPOP_AUTHORITY)
+        .header("Authorization", format!("Bearer {}", fixture.access_token))
+        .header("DPoP", proof)
+        .send()
+        .await
+        .expect("dpop replay request completes")
+        .status()
+        .as_u16()
+}
+
+/// Issue #3834's cross-replica acceptance criterion, on a live shared
+/// authority: the same valid proof must be refused by a second, independently
+/// constructed equivalent Ferrum policy, and a two-way race admits exactly one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn test_dpop_shared_redis_admits_one_proof_across_replicas() {
+    if !redis_is_available().await {
+        if std::env::var_os("FERRUM_REDIS_REQUIRED").is_some() {
+            panic!("Redis is required for the shared DPoP single-use CI gate");
+        }
+        return;
+    }
+
+    let (backend_port, mutations) = spawn_replay_counting_backend().await;
+    let prefix = format!("ferrum:test:dpopreplay:{}", Uuid::new_v4().simple());
+    delete_redis_keys_by_prefix(&prefix).await;
+
+    let fixture = build_dpop_replay_fixture();
+    let config = replay_dpop_config(backend_port, &prefix, &fixture.jwks);
+    let warmup_off = vec![(
+        "FERRUM_POOL_WARMUP_ENABLED".to_string(),
+        "false".to_string(),
+    )];
+    let mut replica_a = spawn_file_gateway(config.clone(), warmup_off.clone()).await;
+    let mut replica_b = spawn_file_gateway(config.clone(), warmup_off.clone()).await;
+    let port_a = replica_a.proxy_port;
+    let port_b = replica_b.proxy_port;
+
+    let client = reqwest::Client::new();
+
+    // One proof, accepted exactly once, by exactly one replica.
+    let proof = dpop_replay_proof(&fixture, "dpop-replay-sequential");
+    assert_eq!(
+        send_replay_dpop(&client, port_a, &fixture, &proof).await,
+        200,
+        "a valid DPoP proof must be accepted once"
+    );
+    assert_eq!(mutations.load(Ordering::SeqCst), 1);
+
+    assert_eq!(
+        send_replay_dpop(&client, port_a, &fixture, &proof).await,
+        401,
+        "the same proof must not be accepted twice by one replica"
+    );
+    assert_eq!(
+        send_replay_dpop(&client, port_b, &fixture, &proof).await,
+        401,
+        "a second independently constructed equivalent policy must refuse it too"
+    );
+    assert_eq!(
+        mutations.load(Ordering::SeqCst),
+        1,
+        "a replayed proof must never reach the backend"
+    );
+
+    // A two-way race on a fresh proof: exactly one winner, one mutation.
+    let raced_proof = dpop_replay_proof(&fixture, "dpop-replay-raced");
+    let mut attempts = Vec::new();
+    for index in 0..8 {
+        let client = client.clone();
+        let proof = raced_proof.clone();
+        let access_token = fixture.access_token.clone();
+        let port = if index % 2 == 0 { port_a } else { port_b };
+        attempts.push(tokio::spawn(async move {
+            client
+                .post(format!("http://127.0.0.1:{port}/dpop-replay"))
+                .header("Host", REPLAY_DPOP_AUTHORITY)
+                .header("Authorization", format!("Bearer {access_token}"))
+                .header("DPoP", proof)
+                .send()
+                .await
+                .expect("raced dpop request completes")
+                .status()
+                .as_u16()
+        }));
+    }
+    let mut accepted = 0usize;
+    for attempt in attempts {
+        match attempt.await.expect("raced dpop task completes") {
+            200 => accepted += 1,
+            401 => {}
+            other => panic!("unexpected raced dpop status {other}"),
+        }
+    }
+    assert_eq!(
+        accepted, 1,
+        "exactly one concurrent presentation of one proof may win"
+    );
+    assert_eq!(
+        mutations.load(Ordering::SeqCst),
+        2,
+        "the race added exactly one backend mutation"
+    );
+
+    // A fresh proof under the same key is a new request.
+    let fresh_proof = dpop_replay_proof(&fixture, "dpop-replay-fresh");
+    assert_eq!(
+        send_replay_dpop(&client, port_b, &fixture, &fresh_proof).await,
+        200
+    );
+    assert_eq!(mutations.load(Ordering::SeqCst), 3);
+
+    delete_redis_keys_by_prefix(&prefix).await;
+    replica_a.shutdown();
+    replica_b.shutdown();
+    println!("test_dpop_shared_redis_admits_one_proof_across_replicas PASSED");
+}
+
+// ── the shared authority primitive, against a live Redis ────────────
+
+/// The atomic path itself: independent clients and independent authorities —
+/// the cross-process shape — see exactly one winner for one marker, distinct
+/// markers all win, an existing key's TTL is never shortened, and an
+/// unreachable store never falls back to local acceptance.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn test_shared_replay_authority_live_redis_admits_exactly_one_winner() {
+    use ferrum_edge::plugins::utils::redis_rate_limiter::{RedisConfig, RedisRateLimitClient};
+    use ferrum_edge::plugins::utils::replay_authority::{
+        ReplayAdmission, ReplayAuthority, ReplayDomain,
+    };
+
+    if !redis_is_available().await {
+        if std::env::var_os("FERRUM_REDIS_REQUIRED").is_some() {
+            panic!("Redis is required for the shared replay authority CI gate");
+        }
+        return;
+    }
+
+    let prefix = format!("ferrum:test:replayauth:{}", Uuid::new_v4().simple());
+    delete_redis_keys_by_prefix(&prefix).await;
+    let retention = Duration::from_secs(601);
+
+    let build_client = || {
+        let config = RedisConfig::from_plugin_config(
+            &json!({
+                "sync_mode": "redis",
+                "redis_url": REDIS_URL,
+                "redis_key_prefix": prefix,
+            }),
+            &prefix,
+        )
+        .expect("redis config parses")
+        .expect("redis mode enabled");
+        // A separate client per authority: independent connection pools, exactly
+        // as two gateway replicas have.
+        Arc::new(RedisRateLimitClient::new(config, None, false, None))
+    };
+
+    let domain = ReplayDomain::new(
+        "ferrum-hmac-v2",
+        "ferrum",
+        "hmac_auth",
+        &prefix,
+        "live-shared",
+    );
+    let authorities: Vec<Arc<ReplayAuthority>> = (0..4)
+        .map(|_| Arc::new(ReplayAuthority::shared(build_client(), retention)))
+        .collect();
+
+    // 1. One marker, raced across four independent clients: exactly one winner.
+    let contested = domain.marker(&[b"consumer-1", b"nonce-contested"]);
+    let mut attempts = Vec::new();
+    for index in 0..16 {
+        let authority = Arc::clone(&authorities[index % authorities.len()]);
+        attempts.push(tokio::spawn(async move {
+            authority.admit(&contested).await
+        }));
+    }
+    let mut admitted = 0usize;
+    for attempt in attempts {
+        match attempt.await.expect("raced claim completes") {
+            ReplayAdmission::Admitted => admitted += 1,
+            ReplayAdmission::Replay => {}
+            other => panic!("a live shared claim must not report {other:?}"),
+        }
+    }
+    assert_eq!(
+        admitted, 1,
+        "an atomic SET NX admits exactly one concurrent claim"
+    );
+
+    // 2. Distinct markers all succeed — the authority bounds proofs, not traffic.
+    for index in 0..8u32 {
+        let marker = domain.marker(&[b"consumer-1", format!("nonce-{index}").as_bytes()]);
+        assert_eq!(
+            authorities[0].admit(&marker).await,
+            ReplayAdmission::Admitted,
+            "a distinct marker must be admitted"
+        );
+    }
+
+    // 3. A later claim must never SHORTEN an existing key's TTL. `SET NX` does
+    //    not touch a key it did not create, which is what makes a rolling
+    //    deployment safe even if a generation declared a shorter horizon.
+    let short_lived = Arc::new(ReplayAuthority::shared(
+        build_client(),
+        Duration::from_secs(5),
+    ));
+    let ttl_marker = domain.marker(&[b"consumer-1", b"nonce-ttl"]);
+    assert_eq!(
+        authorities[0].admit(&ttl_marker).await,
+        ReplayAdmission::Admitted
+    );
+    assert_eq!(
+        short_lived.admit(&ttl_marker).await,
+        ReplayAdmission::Replay,
+        "the shorter-horizon generation observes the existing claim"
+    );
+    let marker_hex = hex::encode(ttl_marker.digest());
+    let marker_key = build_client().make_key(&["replay", marker_hex.as_str()]);
+    let ttl = redis_key_ttl(&marker_key)
+        .await
+        .expect("the marker key exists");
+    assert!(
+        ttl > 60,
+        "a later shorter-horizon claim must not shorten a live marker's TTL, saw {ttl}s"
+    );
+
+    // 4. An unreachable store never degrades into local acceptance.
+    let unreachable_config = RedisConfig::from_plugin_config(
+        &json!({
+            "sync_mode": "redis",
+            // Port 1 is reserved and never listening.
+            "redis_url": "redis://127.0.0.1:1",
+            "redis_connect_timeout_seconds": 1,
+            "redis_key_prefix": prefix,
+        }),
+        &prefix,
+    )
+    .expect("redis config parses")
+    .expect("redis mode enabled");
+    let unreachable_authority = ReplayAuthority::shared(
+        Arc::new(RedisRateLimitClient::new(
+            unreachable_config,
+            None,
+            false,
+            None,
+        )),
+        retention,
+    );
+    let unseen = domain.marker(&[b"consumer-1", b"nonce-never-claimed"]);
+    for _ in 0..3 {
+        assert_eq!(
+            unreachable_authority.admit(&unseen).await,
+            ReplayAdmission::AuthorityUnavailable,
+            "an unreachable shared store must reject, never admit locally"
+        );
+    }
+    // Nothing was written, so the reachable authority still sees it as fresh.
+    assert_eq!(
+        authorities[0].admit(&unseen).await,
+        ReplayAdmission::Admitted,
+        "a refused claim must not have written a marker"
+    );
+
+    delete_redis_keys_by_prefix(&prefix).await;
+    println!("test_shared_replay_authority_live_redis_admits_exactly_one_winner PASSED");
 }

@@ -727,11 +727,11 @@ async fn test_preverified_reuse_still_rejects_final_digest_mismatch() {
         "a valid pre-body signature must enable body collection"
     );
     assert!(
-        format!("{tampered:?}").contains("HmacPrebufferState { staged: true }"),
+        format!("{tampered:?}").contains("HmacPrebufferState { staged: 1 }"),
         "the request-scoped reuse path should be staged"
     );
     assert!(
-        format!("{:?}", tampered.clone()).contains("HmacPrebufferState { staged: false }"),
+        format!("{:?}", tampered.clone()).contains("HmacPrebufferState { staged: 0 }"),
         "request-context clones must not inherit staged HMAC credentials"
     );
 
@@ -1010,8 +1010,15 @@ async fn test_missing_date_header() {
 
 #[tokio::test]
 async fn test_expired_date_header() {
-    // Use a very tight clock skew of 1 second
-    let plugin = HmacAuth::new(&json!({"clock_skew_seconds": 1})).unwrap();
+    // Use a very tight clock skew of 1 second. The signing helper below builds a
+    // `ferrum-hmac-v1` base, so this fixture is deliberately the acknowledged
+    // legacy profile rather than the modern default.
+    let plugin = HmacAuth::new(&json!({
+        "clock_skew_seconds": 1,
+        "signing_profile": "ferrum-hmac-v1",
+        "allow_unsafe_replayable_v1": true
+    }))
+    .unwrap();
     let consumer = create_hmac_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -1947,7 +1954,8 @@ impl V2Request {
             v2_auth_header(TEST_USERNAME, &self.nonce, &self.signature),
         );
         ctx.headers.insert("date".to_string(), self.date.clone());
-        ctx.headers.insert("digest".to_string(), self.digest.clone());
+        ctx.headers
+            .insert("digest".to_string(), self.digest.clone());
         ctx.identified_consumer = None;
         ctx
     }
@@ -2148,16 +2156,16 @@ async fn v2_rejects_a_missing_or_malformed_nonce_before_backend_dispatch() {
     );
 
     for malformed in [
-        "",                          // empty
-        "short",                     // far below the entropy floor
+        "",                                // empty
+        "short",                           // far below the entropy floor
         "0123456789abcdef0123456789abcde", // 31 hex chars: below 128 bits
-        "0123456789abcdef0123456789abcd",   // 30 hex chars: below 128 bits
-        "aaaaaaaaaaaaaaaaaaaaa",     // 21 base64url chars: below 128 bits
-        "aaaa aaaaaaaaaaaaaaaaaaaaa", // whitespace
-        "aaaaaaaaaaaaaaaaaaaaaa\u{7f}", // control byte
-        "AAAAAAAAAAAAAAAAAAAAAA==",  // base64 padding is not base64url-unpadded
-        "AAAAAAAAAAAAAAAAAAAAAA+/",  // standard-base64 alphabet
-        &"a".repeat(87),             // above the length ceiling
+        "0123456789abcdef0123456789abcd",  // 30 hex chars: below 128 bits
+        "aaaaaaaaaaaaaaaaaaaaa",           // 21 base64url chars: below 128 bits
+        "aaaa aaaaaaaaaaaaaaaaaaaaa",      // whitespace
+        "aaaaaaaaaaaaaaaaaaaaaa\u{7f}",    // control byte
+        "AAAAAAAAAAAAAAAAAAAAAA==",        // base64 padding is not base64url-unpadded
+        "AAAAAAAAAAAAAAAAAAAAAA+/",        // standard-base64 alphabet
+        &"a".repeat(87),                   // above the length ceiling
     ] {
         let mut ctx = request.context();
         ctx.headers.insert(
@@ -2235,7 +2243,10 @@ fn v2_protection_domains_converge_on_reload_and_isolate_across_policies() {
     let standalone = HmacAuth::new(&v2_config()).unwrap();
 
     let marker = first.replay_marker_digest("consumer-1", &test_nonce(70));
-    assert_eq!(marker, reloaded.replay_marker_digest("consumer-1", &test_nonce(70)));
+    assert_eq!(
+        marker,
+        reloaded.replay_marker_digest("consumer-1", &test_nonce(70))
+    );
     assert_ne!(
         marker,
         other_policy.replay_marker_digest("consumer-1", &test_nonce(70))
@@ -2313,9 +2324,7 @@ async fn v2_replay_lanes_are_isolated_across_policies() {
     let mut first = request.context();
     assert_continue(policy_a.authenticate(&mut first, &consumer_index).await);
     let mut second = request.context();
-    assert_continue(
-        policy_b.authenticate(&mut second, &consumer_index).await,
-    );
+    assert_continue(policy_b.authenticate(&mut second, &consumer_index).await);
 }
 
 /// Invalid traffic must never reach replay state: a request whose signature
@@ -2343,4 +2352,216 @@ async fn invalid_traffic_does_not_consume_replay_capacity() {
     // the forged attempt never wrote a marker.
     let mut legitimate = request.context();
     assert_continue(plugin.authenticate(&mut legitimate, &consumer_index).await);
+}
+
+// ── cross-instance prebuffer ownership ──────────────────────────────
+//
+// `hmac_auth` verifies the signature BEFORE request-body collection and stages
+// the result on the request context, then completes the digest check after the
+// body arrives. Several `hmac_auth` instances can screen one request — sibling
+// proxy/global policies, a legacy v1 instance beside a v2 one, two v2 policies
+// with different replay domains — so a single request-global staging slot would
+// let one instance consume another's verified record. The worst shape is a v1
+// instance consuming a v2 record: v1's claim path is a no-op, so the request
+// would be accepted with no single-use guarantee at all. Every record is bound
+// to the exact instance/policy/profile/replay-domain that staged it.
+
+fn v1_plugin_named(config_id: &str) -> HmacAuth {
+    HmacAuth::new_with_http_client_and_config_id(
+        &default_config(),
+        ferrum_edge::plugins::utils::PluginHttpClient::default(),
+        Some(config_id),
+    )
+    .expect("acknowledged legacy v1 config")
+}
+
+/// How many preverified authorizations are staged on this request.
+///
+/// Read through `Debug`, which is exactly the redacted surface the production
+/// type exposes: a count and nothing else — no owner, consumer, nonce, or
+/// signature.
+fn staged_prebuffer_records(ctx: &RequestContext) -> usize {
+    const MARKER: &str = "HmacPrebufferState { staged: ";
+    let rendered = format!("{ctx:?}");
+    let start = rendered
+        .find(MARKER)
+        .expect("the request context renders its prebuffer state")
+        + MARKER.len();
+    let rest = &rendered[start..];
+    let end = rest
+        .find(' ')
+        .expect("the staged count is followed by a space");
+    rest[..end]
+        .parse()
+        .expect("the staged count renders as an integer")
+}
+
+/// A legacy v1 instance must not consume a v2 instance's preverified record.
+///
+/// This is the bypass the ownership binding exists to close: v1 makes no
+/// single-use claim, so consuming a v2 record would accept a `ferrum-hmac-v2`
+/// request without ever claiming its nonce — and the nonce would then still be
+/// replayable.
+#[tokio::test]
+async fn a_v1_instance_cannot_consume_a_v2_instances_preverified_record() {
+    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
+    let v2 = v2_plugin_named("owner-v2-first");
+    let v1 = v1_plugin_named("owner-v1-sibling");
+    let request = V2Request::new(&test_nonce(200));
+
+    let mut ctx = request.context();
+    assert!(
+        v2.should_buffer_request_body_before_authenticate(&ctx, &consumer_index),
+        "the v2 instance preverifies and stages"
+    );
+    assert!(
+        !v1.should_buffer_request_body_before_authenticate(&ctx, &consumer_index),
+        "a v2 nonce is not accepted by the v1 profile, so v1 stages nothing"
+    );
+    assert_eq!(staged_prebuffer_records(&ctx), 1);
+
+    // The v1 instance runs first. It must not read the v2 record: it falls
+    // through to its own extraction, which refuses the unexpected nonce.
+    assert_reject(v1.authenticate(&mut ctx, &consumer_index).await, Some(401));
+    assert!(
+        ctx.identified_consumer.is_none(),
+        "a refused instance must publish no identity"
+    );
+    assert_eq!(
+        staged_prebuffer_records(&ctx),
+        1,
+        "one instance must not erase another owner's staged record"
+    );
+
+    // The owning v2 instance still finds its record and claims the nonce.
+    assert_continue(v2.authenticate(&mut ctx, &consumer_index).await);
+    assert_eq!(staged_prebuffer_records(&ctx), 0);
+
+    // The claim really happened: the same signed request is now a replay.
+    let mut replay = request.context();
+    assert_reject(
+        v2.authenticate(&mut replay, &consumer_index).await,
+        Some(401),
+    );
+}
+
+/// The reverse order: a v1 instance stages first, and the v2 instance must not
+/// adopt that record — it would otherwise authenticate a v1-signed request under
+/// the v2 profile with no nonce to claim.
+#[tokio::test]
+async fn a_v2_instance_cannot_consume_a_v1_instances_preverified_record() {
+    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
+    let v1 = v1_plugin_named("owner-v1-first");
+    let v2 = v2_plugin_named("owner-v2-sibling");
+
+    // A v1-signed request: no nonce anywhere in the Authorization header.
+    let method = "POST";
+    let path = "/api/orders";
+    let date = current_date();
+    let digest = sha256_digest_header(b"");
+    let signature = sign_sha256_with_digest(TEST_SECRET, method, path, &date, &digest);
+    let mut ctx = make_ctx(method, path);
+    ctx.headers.insert(
+        "authorization".to_string(),
+        hmac_auth_header(TEST_USERNAME, Some("hmac-sha256"), &signature),
+    );
+    ctx.headers.insert("date".to_string(), date);
+    ctx.headers.insert("digest".to_string(), digest);
+
+    assert!(
+        v1.should_buffer_request_body_before_authenticate(&ctx, &consumer_index),
+        "the v1 instance preverifies and stages"
+    );
+    assert!(
+        !v2.should_buffer_request_body_before_authenticate(&ctx, &consumer_index),
+        "the v2 profile requires a nonce, so it stages nothing here"
+    );
+    assert_eq!(staged_prebuffer_records(&ctx), 1);
+
+    assert_reject(v2.authenticate(&mut ctx, &consumer_index).await, Some(401));
+    assert_eq!(
+        staged_prebuffer_records(&ctx),
+        1,
+        "the v2 instance must not consume or erase the v1 owner's record"
+    );
+
+    assert_continue(v1.authenticate(&mut ctx, &consumer_index).await);
+    assert_eq!(staged_prebuffer_records(&ctx), 0);
+}
+
+/// Two sibling v2 policies on one request: each stages and consumes only its
+/// own record, and each claims in its own replay domain. Neither may skip its
+/// own verification by adopting the other's, and neither may erase the other's.
+#[tokio::test]
+async fn sibling_v2_policies_stage_and_consume_independently() {
+    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
+    let policy_a = v2_plugin_named("owner-sibling-a");
+    let policy_b = v2_plugin_named("owner-sibling-b");
+    let request = V2Request::new(&test_nonce(201));
+
+    let mut ctx = request.context();
+    assert!(policy_a.should_buffer_request_body_before_authenticate(&ctx, &consumer_index));
+    assert!(policy_b.should_buffer_request_body_before_authenticate(&ctx, &consumer_index));
+    assert_eq!(
+        staged_prebuffer_records(&ctx),
+        2,
+        "each policy owns its own slot"
+    );
+
+    assert_continue(policy_a.authenticate(&mut ctx, &consumer_index).await);
+    assert_eq!(
+        staged_prebuffer_records(&ctx),
+        1,
+        "policy A consumed exactly its own record"
+    );
+    assert_continue(policy_b.authenticate(&mut ctx, &consumer_index).await);
+    assert_eq!(staged_prebuffer_records(&ctx), 0);
+
+    // Both policies claimed in their own domains, so both now see a replay.
+    let mut replay_a = request.context();
+    assert_reject(
+        policy_a.authenticate(&mut replay_a, &consumer_index).await,
+        Some(401),
+    );
+    let mut replay_b = request.context();
+    assert_reject(
+        policy_b.authenticate(&mut replay_b, &consumer_index).await,
+        Some(401),
+    );
+}
+
+/// A staged record is not consumed when the request changed under it, and the
+/// refusal must not leave a foreign owner's record behind either.
+#[tokio::test]
+async fn a_staged_record_is_not_consumed_when_the_request_changed() {
+    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
+    let owner = v2_plugin_named("owner-binding-mismatch");
+    let sibling = v2_plugin_named("owner-binding-sibling");
+    let request = V2Request::new(&test_nonce(202));
+
+    let mut ctx = request.context();
+    assert!(owner.should_buffer_request_body_before_authenticate(&ctx, &consumer_index));
+    assert!(sibling.should_buffer_request_body_before_authenticate(&ctx, &consumer_index));
+
+    // Rewrite the Authorization header after staging. The owner's record no
+    // longer binds this request, so it must be discarded rather than trusted.
+    ctx.headers.insert(
+        "authorization".to_string(),
+        v2_auth_header(TEST_USERNAME, &test_nonce(203), &request.signature),
+    );
+    assert_reject(
+        owner.authenticate(&mut ctx, &consumer_index).await,
+        Some(401),
+    );
+    assert!(ctx.identified_consumer.is_none());
+    assert_eq!(
+        staged_prebuffer_records(&ctx),
+        1,
+        "only the owner's own record was discarded"
+    );
+
+    // The nonce the owner staged was never claimed, so the legitimate signed
+    // request still succeeds.
+    let mut legitimate = request.context();
+    assert_continue(owner.authenticate(&mut legitimate, &consumer_index).await);
 }

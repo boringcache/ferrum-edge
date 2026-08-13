@@ -39,11 +39,14 @@ use super::utils::jwks_cache::{
 pub use super::utils::jwks_store::{DEFAULT_JWKS_MAX_STALE_SECONDS, MAX_JWKS_MAX_STALE_SECONDS};
 use super::utils::jwks_store::{JwksKeyStore, redacted_jwks_uri};
 use super::utils::jwt_verifier::{JwtVerifyParams, peek_unverified_issuer, verify_jwt_with_jwks};
-use super::utils::redis_rate_limiter::{REDIS_PLUGIN_CONFIG_KEYS, RedisConfig, RedisRateLimitClient};
+use super::utils::redis_rate_limiter::{
+    REDIS_PLUGIN_CONFIG_KEYS, RedisConfig, RedisRateLimitClient,
+};
 use super::utils::replay_authority::{
     ReplayAdmission, ReplayAuthority, ReplayDomain, ReplayMarker, ReplayScope,
     validate_scope_backend,
 };
+use super::utils::replay_partition::PartitionHasher;
 use super::utils::response_body::read_response_body_bounded;
 use super::utils::scope_role_check::{self, ScopeRoleRequirements};
 use super::utils::token_extract::{
@@ -184,9 +187,13 @@ struct JwksProvider {
     /// Stable protection-domain identity for this provider's DPoP proofs.
     ///
     /// Precomputed at construction from `{namespace, jwks_auth, config id,
-    /// provider index}` so no request path hashes configuration, and so an
-    /// equivalent reload — and every replica of the same policy — derives the
-    /// same domain and therefore the same replay lane / shared keyspace.
+    /// semantic provider identity}` so no request path hashes configuration,
+    /// and so an equivalent reload — and every replica of the same policy —
+    /// derives the same domain and therefore the same replay lane / shared
+    /// keyspace. The sub-domain is [`dpop_provider_identity`], a digest of the
+    /// provider's trust anchor, **not** its position in the `providers` array:
+    /// reordering the list must not move a provider into a fresh replay lane and
+    /// reopen a proof it already accepted.
     dpop_replay_domain: Option<ReplayDomain>,
     /// Single-use authority this provider's proofs are claimed against.
     ///
@@ -343,8 +350,9 @@ impl JwksAuth {
 
     /// Construct with the configured plugin-config resource id.
     ///
-    /// That id — together with the namespace and the provider index — is the
-    /// stable protection-domain identity. Production `PluginCache` must pass it:
+    /// That id — together with the namespace and each provider's semantic
+    /// identity ([`dpop_provider_identity`]) — is the stable protection-domain
+    /// identity. Production `PluginCache` must pass it:
     /// with `None`, every reload generation would own a private replay lane and
     /// a rebuilt plugin would accept a proof it had already admitted.
     pub fn new_with_config_id(
@@ -374,8 +382,9 @@ impl JwksAuth {
         let redis_config = RedisConfig::from_plugin_config(config, &default_redis_prefix)?;
         let redis_configured = redis_config.is_some();
         // One client per plugin generation, shared by every `shared` provider:
-        // the marker already binds the provider index, so distinct providers
-        // cannot collide inside one keyspace.
+        // the marker already binds each provider's semantic identity, so
+        // distinct providers cannot collide inside one keyspace and equivalent
+        // providers deliberately converge on one.
         let shared_replay_client = redis_config.map(|redis_config| {
             Arc::new(RedisRateLimitClient::new(
                 redis_config,
@@ -567,25 +576,40 @@ impl JwksAuth {
                 declared_dpop_scopes.push(scope);
             }
 
+            // The DPoP protection sub-domain is a **semantic** provider
+            // identity, never the provider's position in the array. An array
+            // index makes reordering an otherwise unchanged provider list a
+            // security event: provider `B` moves from sub-domain `1` to `0`, its
+            // live markers stay behind in a lane nothing consults, and an
+            // already-accepted proof is admitted a second time. The same happens
+            // when an unrelated provider is inserted or deleted ahead of it.
+            //
+            // See [`dpop_provider_identity`] for what the identity binds and,
+            // just as importantly, what it deliberately does not.
             let dpop_replay_domain = require_dpop.then(|| {
                 ReplayDomain::new(
                     DPOP_REPLAY_PROFILE,
                     &namespace,
                     "jwks_auth",
                     &policy_config_id,
-                    &idx.to_string(),
+                    &dpop_provider_identity(
+                        issuer.as_deref(),
+                        jwks_uri.as_deref(),
+                        discovery_url.as_deref(),
+                        inline_jwks.as_deref(),
+                    ),
                 )
             });
             let dpop_replay = match (declared_scope, dpop_replay_domain.as_ref()) {
-                (Some(ReplayScope::Process), Some(domain)) => Some(Arc::new(
-                    ReplayAuthority::process(
+                (Some(ReplayScope::Process), Some(domain)) => {
+                    Some(Arc::new(ReplayAuthority::process(
                         "jwks_auth",
                         domain,
                         dpop_replay_max_entries,
                         Duration::from_secs(DPOP_MARKER_RETENTION_SECONDS),
                         shard_amount,
-                    )?,
-                )),
+                    )?))
+                }
                 (Some(ReplayScope::Shared), Some(_)) => {
                     // `validate_scope_backend` below rejects `shared` without a
                     // Redis backend, so an absent client here cannot silently
@@ -1138,6 +1162,20 @@ impl JwksAuth {
                     }
                 }
 
+                // Everything after the claim is staging plus one commit, and no
+                // identity, header, or token mutation is published before that
+                // commit — a rejected claim above therefore never reaches
+                // backend dispatch and never mutates the request.
+                //
+                // `commit_authentication_attempt` can still refuse (an identity
+                // claim over the 512-byte boundary limit), which would consume
+                // the proof's single use. That refusal is a deterministic
+                // property of the *token*, not of the request: a token whose
+                // identity claim is over-long can never authenticate here at
+                // all, so the burnt `jti` buys nothing. It is also not
+                // attacker-reachable against a victim, because a proof is bound
+                // to the victim's JWK thumbprint and an attacker cannot mint one
+                // for a key it does not hold.
                 let mut attempt = AuthenticationAttempt::new();
                 if self.emit_mesh_request_principal_metadata {
                     stage_mesh_request_principal_metadata(&claims, &mut attempt);
@@ -1958,6 +1996,76 @@ fn has_non_empty_authority(url: &str) -> bool {
         .unwrap_or(authority_and_path.len());
 
     authority_end > 0
+}
+
+/// Deterministic, bounded **semantic identity** of one DPoP-requiring provider,
+/// used as its replay protection sub-domain.
+///
+/// # Why not the array index
+///
+/// The provider's position in `providers` is not an identity. Reordering an
+/// otherwise unchanged list, or inserting/deleting an unrelated provider ahead
+/// of it, moves a provider into a *fresh* replay lane (or, worse, onto another
+/// provider's lane) while its live markers stay where nothing consults them. A
+/// proof that was already accepted is then admitted a second time — the exact
+/// property `require_dpop` exists to deny. The identity below is stable across
+/// reorder, reload, restart, and every replica of one policy.
+///
+/// # What it binds
+///
+/// The provider's **token trust anchor**: the expected `iss` and the JWKS source
+/// that decides which signing keys are acceptable. Two providers that differ in
+/// either are genuinely different admission domains and must not share replay
+/// state; two that agree on both are the same trust anchor and converge on one
+/// lane, so a duplicate/equivalent provider entry cannot be used to launder a
+/// second acceptance of one proof.
+///
+/// # What it deliberately does not bind
+///
+/// Everything else a provider configures — `audiences`, `required_scopes`,
+/// `required_roles`, claim/header mappings, token locations,
+/// `forward_original_token`, `jwks_max_stale_seconds`, `dpop_replay_max_entries`,
+/// `dpop_replay_scope`, and notably `dpop_clock_skew_secs`. Folding those in
+/// would make an ordinary authorization edit *reopen every live proof*, which is
+/// strictly worse than the isolation it would buy: an already-claimed `jti` must
+/// stay claimed across a tightened scope list or a widened clock skew. The fixed
+/// retention horizon already dominates the widest admissible skew, so a skew
+/// change can never outrun a marker.
+///
+/// No raw issuer, JWKS URI, discovery URL, or JWK material is retained: every
+/// field is written through [`PartitionHasher`]'s length-prefixed framing and
+/// only the digest leaves this function. Inline JWKS material is canonicalized
+/// through `serde_json` first (its object maps are sorted), so a whitespace or
+/// member-order edit of the same key set is not a different anchor.
+fn dpop_provider_identity(
+    issuer: Option<&str>,
+    jwks_uri: Option<&str>,
+    discovery_url: Option<&str>,
+    inline_jwks: Option<&str>,
+) -> String {
+    let mut hasher = PartitionHasher::new("ferrum-edge/jwks-auth/dpop-provider-identity/v1");
+    hasher.optional_text("provider.issuer", issuer);
+    // Construction already proved exactly one source is configured; the order
+    // here is only a total function over that invariant.
+    if let Some(uri) = jwks_uri {
+        hasher.text("provider.jwks_source.kind", "jwks_uri");
+        hasher.text("provider.jwks_source.value", uri);
+    } else if let Some(url) = discovery_url {
+        hasher.text("provider.jwks_source.kind", "discovery_url");
+        hasher.text("provider.jwks_source.value", url);
+    } else if let Some(jwks) = inline_jwks {
+        hasher.text("provider.jwks_source.kind", "inline");
+        let canonical = serde_json::from_str::<Value>(jwks)
+            .ok()
+            .and_then(|value| serde_json::to_string(&value).ok());
+        hasher.text(
+            "provider.jwks_source.value",
+            canonical.as_deref().unwrap_or(jwks),
+        );
+    } else {
+        hasher.text("provider.jwks_source.kind", "none");
+    }
+    hasher.hex()
 }
 
 fn parse_inline_jwks(
