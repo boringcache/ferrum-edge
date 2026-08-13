@@ -8508,6 +8508,22 @@ pub mod _test_support {
         )
     }
 
+    /// One-shot GET/PATCH intercept for the live Istio status competing-writer
+    /// lane. After the first identity-matching GET, Ferrum waits until `resume`
+    /// is completed before PATCHing.
+    pub fn install_istio_status_write_intercept_for_test(
+        after_get: tokio::sync::oneshot::Sender<()>,
+        resume: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        crate::k8s_controller::istio_status::install_istio_status_write_intercept_for_test(
+            after_get, resume,
+        )
+    }
+
+    pub fn clear_istio_status_write_intercept_for_test() {
+        crate::k8s_controller::istio_status::clear_istio_status_write_intercept_for_test()
+    }
+
     // ── K8s controller shutdown supervision (#3220) ─────────────────────────
 
     pub use crate::k8s_controller::{
@@ -9083,6 +9099,37 @@ pub mod _test_support {
             topology_ready,
             udp_migration_ready,
         )
+    }
+
+    pub type NodeIdentityRefreshForTest = crate::modes::node_agent::NodeIdentityRefresh;
+
+    /// Drive the production node-identity retry/revalidation ordering with
+    /// injected lookup and publication so external tests can prove recovery,
+    /// UID change, and retraction/publication failure without a Kubernetes API.
+    pub async fn refresh_node_identity_binding_for_test<L, Fut, RS, RI, P>(
+        current_uid: Option<&str>,
+        shutdown: &mut tokio::sync::watch::Receiver<bool>,
+        lookup: L,
+        retract_registry_sync: RS,
+        retract_identity: RI,
+        publish_identity: P,
+    ) -> NodeIdentityRefreshForTest
+    where
+        L: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<String, String>>,
+        RS: FnOnce() -> Result<(), String>,
+        RI: FnMut() -> Result<(), String>,
+        P: FnOnce(&str) -> Result<(), String>,
+    {
+        crate::modes::node_agent::refresh_node_identity_binding(
+            current_uid,
+            shutdown,
+            lookup,
+            retract_registry_sync,
+            retract_identity,
+            publish_identity,
+        )
+        .await
     }
 
     pub async fn run_with_node_agent_topology_outcome_stream_for_test<S, T>(

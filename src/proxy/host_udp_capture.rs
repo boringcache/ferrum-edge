@@ -112,6 +112,7 @@ use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
 use super::netns_capture::{PodCaptureSource, PodCaptureTarget};
+use super::owned_shell::{self, OwnedShellError};
 use crate::capture::IptablesPlan;
 use crate::modes::mesh::hbone::UdpSourceIdentity;
 
@@ -1805,26 +1806,26 @@ impl HostUdpCaptureBackend for ProxyHostUdpBackend {
         if script.is_empty() {
             return Ok(());
         }
-        run_host_script(&script)
+        run_host_script(&script, None)
     }
 
     fn install_capture(&self, ifaces: &[String]) -> Result<(), String> {
         let script = IptablesPlan::host_udp_setup_script(&self.capture_config, ifaces)?;
-        run_host_script(&script)
+        run_host_script(&script, None)
     }
 
     fn teardown_capture_rules(&self) -> Result<(), String> {
         let script = IptablesPlan::host_udp_capture_rules_teardown_script();
-        run_host_script(&script)
+        run_host_script(&script, None)
     }
 
     fn release_guard(&self) -> Result<(), String> {
-        run_host_script(&IptablesPlan::host_udp_guard_release_script())
+        run_host_script(&IptablesPlan::host_udp_guard_release_script(), None)
     }
 
     fn teardown_all(&self) -> Result<(), String> {
         let script = IptablesPlan::host_udp_teardown_script();
-        run_host_script(&script)
+        run_host_script(&script, None)
     }
 
     fn start_listener(
@@ -1914,6 +1915,14 @@ impl HostUdpCaptureBackend for ProxyHostUdpBackend {
     }
 }
 
+/// Outcome of one host-namespace recover+reap pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HostUdpRecoverOnce {
+    Reaped,
+    Incomplete,
+    DeadlineElapsed,
+}
+
 /// Removal of every Ferrum-owned host-netns UDP object, for the deployments that
 /// are NOT running the host capture path.
 ///
@@ -1929,11 +1938,16 @@ impl HostUdpCaptureBackend for ProxyHostUdpBackend {
 /// host state exists. NOT public on its own: removing these objects is only safe
 /// once the durable readiness handshake they back has been discharged, which is
 /// what [`recover_and_reap_stale_host_udp_state`] sequences.
-fn reap_stale_host_udp_state() -> Result<(), String> {
+pub(crate) fn reap_stale_host_udp_state(
+    deadline: Option<std::time::Instant>,
+) -> Result<(), OwnedShellError> {
     if !cfg!(target_os = "linux") {
+        if owned_shell::deadline_elapsed(deadline) {
+            return Err(OwnedShellError::DeadlineElapsed);
+        }
         return Ok(());
     }
-    run_host_script(&IptablesPlan::host_udp_teardown_script())
+    run_host_script_owned(&IptablesPlan::host_udp_teardown_script(), deadline)
 }
 
 /// Discharge the durable UDP readiness handshake a previous HOST-capture
@@ -2027,11 +2041,52 @@ pub async fn recover_and_reap_stale_host_udp_state(
 }
 
 pub(crate) async fn recover_and_reap_once(recovery: &mut HostUdpStaleGenerationRecovery) -> bool {
-    if !recovery.poll_once(STALE_RECOVERY_ACK_WAIT).await {
-        return false;
+    matches!(
+        recover_and_reap_until(recovery, None, &mut |deadline| {
+            reap_stale_host_udp_state(deadline)
+        })
+        .await,
+        HostUdpRecoverOnce::Reaped
+    )
+}
+
+pub(crate) async fn recover_and_reap_until(
+    recovery: &mut HostUdpStaleGenerationRecovery,
+    deadline: Option<std::time::Instant>,
+    reap: &mut impl FnMut(Option<std::time::Instant>) -> Result<(), OwnedShellError>,
+) -> HostUdpRecoverOnce {
+    if owned_shell::deadline_elapsed(deadline) {
+        return HostUdpRecoverOnce::DeadlineElapsed;
     }
-    match reap_stale_host_udp_state() {
-        Ok(()) => true,
+    let ack_wait = match owned_shell::remaining(deadline) {
+        Some(remaining) if remaining.is_zero() => {
+            return HostUdpRecoverOnce::DeadlineElapsed;
+        }
+        Some(remaining) => STALE_RECOVERY_ACK_WAIT.min(remaining),
+        None => STALE_RECOVERY_ACK_WAIT,
+    };
+    if !recovery.poll_once(ack_wait).await {
+        if owned_shell::deadline_elapsed(deadline) {
+            return HostUdpRecoverOnce::DeadlineElapsed;
+        }
+        return HostUdpRecoverOnce::Incomplete;
+    }
+    match reap(deadline) {
+        Ok(()) => {
+            if owned_shell::deadline_elapsed(deadline) {
+                HostUdpRecoverOnce::DeadlineElapsed
+            } else {
+                HostUdpRecoverOnce::Reaped
+            }
+        }
+        Err(error) if error.is_deadline_cleanup_unproven() => {
+            warn!(
+                "Host UDP capture: stale host-namespace UDP state reap exceeded its deadline and \
+                 owned descendants could not be proven terminated"
+            );
+            HostUdpRecoverOnce::DeadlineElapsed
+        }
+        Err(error) if error.is_deadline_elapsed() => HostUdpRecoverOnce::DeadlineElapsed,
         Err(error) => {
             // A reap that cannot complete is retried, not logged once: leaving a
             // `PREROUTING` jump into a socketless chain black-holes every
@@ -2044,29 +2099,37 @@ pub(crate) async fn recover_and_reap_once(recovery: &mut HostUdpStaleGenerationR
                      retrying"
                 );
             }
-            false
+            HostUdpRecoverOnce::Incomplete
         }
     }
 }
 
 /// Run one capture script in the process's own network namespace.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn run_host_script(script: &str) -> Result<(), String> {
-    let output = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(script)
-        .output()
-        .map_err(|error| format!("could not run the host capture script: {error}"))?;
-    if output.status.success() {
-        return Ok(());
-    }
-    // Only the script's own diagnostics are surfaced, bounded in length. The
-    // script text itself is not echoed: it embeds the node's capture scope and
-    // would be noisy without adding diagnostic value.
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let detail: String = stderr.trim().chars().take(512).collect();
-    Err(format!(
-        "host capture script failed with status {}: {detail}",
-        output.status
-    ))
+fn run_host_script(script: &str, deadline: Option<std::time::Instant>) -> Result<(), String> {
+    run_host_script_owned(script, deadline).map_err(|error| match error {
+        OwnedShellError::Failed { status, stderr } => {
+            let detail: String = stderr.trim().chars().take(512).collect();
+            format!("host capture script failed with status {status}: {detail}")
+        }
+        OwnedShellError::DeadlineElapsed => "host capture script exceeded its deadline".to_string(),
+        OwnedShellError::DeadlineCleanupFailed { .. } => {
+            "host capture script exceeded its deadline and owned descendants could not be proven terminated"
+                .to_string()
+        }
+        other => format!(
+            "could not run the host capture script: {}",
+            other
+                .deadline_operator_reason()
+                .map_or_else(|| other.to_string(), str::to_string)
+        ),
+    })
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn run_host_script_owned(
+    script: &str,
+    deadline: Option<std::time::Instant>,
+) -> Result<(), OwnedShellError> {
+    owned_shell::run_sh_c(script, deadline)
 }

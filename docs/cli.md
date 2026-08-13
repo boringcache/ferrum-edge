@@ -31,6 +31,7 @@ Alternative approaches:
 | `reload` | Send a reload signal (SIGHUP) to a running gateway instance (Unix only) |
 | `health` | Check gateway health by connecting to the admin API `/health` endpoint |
 | `version` | Print version information |
+| `ambient-udp-preflight` | One-shot Ambient UDP node preflight: retire predecessor placements and publish node-scoped cleanup proof |
 
 ## run
 
@@ -321,11 +322,38 @@ $ ferrum-edge version --json
 {"version":"0.9.0","target":"aarch64-apple-darwin"}
 ```
 
+## ambient-udp-preflight
+
+Privileged one-shot Ambient UDP node preflight (issue #3809). Retires both
+predecessor UDP placements on this node and publishes the node-scoped cleanup
+proof the settled host placement requires. Exits non-zero without publishing
+when it cannot prove completion.
+
+`--settings` is materialized before any config read and before worker threads,
+matching `run` / `validate`. The command then installs Ferrum's process-default
+rustls provider through the existing FIPS gate, resolves external secrets,
+initializes lifecycle-owned logging, and verifies the fully resolved FIPS
+posture before any Kubernetes TLS client is built. It does not parse serving
+`EnvConfig` or start gateway/listener infrastructure. `version`, `reload`, and
+`health` remain early-exit commands and do not take this path.
+
+```
+ferrum-edge ambient-udp-preflight [OPTIONS]
+```
+
+### Options
+
+| Flag | Short | Description |
+|------|-------|-------------|
+| `--settings <PATH>` | `-s` | Path to `ferrum.conf` (operational settings) |
+| `--timeout-seconds <N>` | | Wall-clock ceiling in seconds (default 300, clamped 1..=3600) |
+| `--verbose` | `-v` | Increase log verbosity (repeatable: `-v`=info, `-vv`=debug, `-vvv`=trace) |
+
 ## Configuration Precedence
 
 When using CLI subcommands, the configuration resolution order is (highest precedence first):
 
-1. **CLI flag** (`--settings`, `--spec`, `--mode`, `--verbose` on `run` and `validate`)
+1. **CLI flag** (`--settings`, `--spec`, `--mode`, `--verbose` on `run` and `validate`; `--settings` / `--verbose` on `ambient-udp-preflight`)
 2. **Environment variable** (`FERRUM_CONF_PATH`, `FERRUM_FILE_CONFIG_PATH`, `FERRUM_MODE`, `FERRUM_LOG_LEVEL`)
 3. **Conf file value** (`ferrum.conf`)
 4. **Smart path defaults** (see below)

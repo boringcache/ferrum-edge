@@ -6548,6 +6548,7 @@ fn mesh_and_overload_runtime_snapshots_are_covered_by_openapi() {
         outstanding: 2,
         failure_reason: UdpMigrationFailureReason::GateAcknowledgementMissing,
         established_adoption: false,
+        adoption_proof: ferrum_edge::proxy::udp_placement_migration::UdpAdoptionProof::None,
     };
     assert_component_validity(
         &spec,

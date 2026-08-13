@@ -96,12 +96,22 @@ In mesh mode, authenticated health detail includes
 asserted-identity decisions, destination-policy rejections, missing destination
 metadata, and blocked plaintext fallback attempts; `enabled` is true only for
 `node_waypoint` topology), and `mesh.udp_placement_migration` (bounded phase,
-outstanding count, closed-set failure reason, and an `established_adoption` flag
-for the node-local Ambient UDP placement guard; no generation or pod UID is
-exposed). `established_adoption` is true when the node had no durable placement
-record and started from the release-attested established placement
-(`FERRUM_MESH_CAPTURE_UDP_PLACEMENT_ESTABLISHED`) — expected for a fresh node or
-one whose registry directory was recreated by a reboot. The authenticated `/overload`
+outstanding count, closed-set failure reason, an `established_adoption` flag,
+and a bounded `adoption_proof` for the node-local Ambient UDP placement guard;
+no generation, node identity, path, or pod UID is exposed).
+`established_adoption` is true when the node started WITHOUT a same-incarnation
+durable placement record, i.e. it adopted on node-specific proof.
+`adoption_proof` names which proof authorized that: `new_boot` (a durable record
+written by an earlier boot of this same node UID, so no predecessor pod network
+namespace survived), `node_cleanup` (the privileged node preflight retired both
+predecessor placements on this exact node UID and boot id), `operator_exempt`
+(an operator-written, node-bound exemption), or `none`. A release-level
+attestation alone never authorizes adoption: a recordless node with no
+node-specific proof reports failure reason `node_proof_missing` (or
+`node_identity_mismatch` when the evidence names another machine) and stays
+unready. A durable record that IS identity-bound while this node's current
+identity cannot be resolved reports `node_identity_unresolved` and is refused
+rather than trusted. The authenticated `/overload`
 snapshot also includes `node_waypoint_drops`, with monotonic counters for
 missing/unknown socket-cookie metadata, missing pod/workload identity data,
 unknown pods, and workload-hash mismatches. These fields are omitted from the

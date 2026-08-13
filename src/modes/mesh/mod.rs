@@ -3610,11 +3610,20 @@ pub(crate) const MESH_INBOUND_PROXY_ID_PREFIX: &str = "__mesh-inbound-";
 /// [`is_mesh_inbound_route_id`] / [`mesh_route_direction`].
 pub(crate) const MESH_INGRESS_PROXY_ID_PREFIX: &str = "__mesh-ingress-";
 
-/// Reserved sub-prefix for dedicated Sidecar ingress `bind` socket routes
-/// (issue #3266). These remain ingress routes, but are served by a listener
-/// whose accepted port already identifies the one declared listener rather
-/// than by the shared `:15006` capture listener's sibling selector.
-pub(crate) const MESH_INGRESS_BIND_PROXY_ID_PREFIX: &str = "__mesh-ingress-bind-";
+/// Reserved colon-delimited sub-prefix for dedicated Sidecar ingress `bind`
+/// socket routes (issue #3266). These remain ingress routes, but are served by
+/// a listener whose accepted port already identifies the one declared listener
+/// rather than by the shared `:15006` capture listener's sibling selector.
+///
+/// The colon is the family discriminator: `mesh_ingress_proxy_id` folds `:`,
+/// `/`, and `.` to `-`, so a shared-capture id can never start with this
+/// prefix — including the `bind-prod` namespace that used to match the old
+/// `__mesh-ingress-bind-` hyphen prefix, and a hostile `bind:…` name that
+/// would otherwise forge the colon form. Namespace and service segments after
+/// the colon are encoded with `sanitize_egress_host_id_part`, so the join is
+/// injective across namespaces and cannot collide through `-` delimiter
+/// ambiguity (`a-b`/`c` vs `a`/`b-c`).
+pub(crate) const MESH_INGRESS_BIND_PROXY_ID_PREFIX: &str = "__mesh-ingress-bind:";
 
 /// Whether a proxy id names a materialized sidecar inbound route — either a
 /// service-port default inbound route or a Sidecar `ingress[]` custom listener
@@ -3645,10 +3654,11 @@ pub(crate) fn is_mesh_ingress_bind_route_id(id: &str) -> bool {
 /// SAFE TODAY because every in-scope materializer consumes a SINGLE-namespace
 /// service set (the slice is scoped to one namespace), so the `namespace`
 /// segment is constant and only `name`+`port` vary — and a `name` cannot
-/// borrow a `-` from a fixed `namespace`. Before any MULTI-namespace caller is
-/// added, switch this family to the reversible token scheme used by the egress
-/// ids (`sanitize_egress_host_id_part`) so the id space stays injective. See
-/// #1727.
+/// borrow a `-` from a fixed `namespace`. Dedicated Sidecar ingress bind ids
+/// (`mesh_ingress_bind_proxy_id`) are the exception: they already use the
+/// reversible `sanitize_egress_host_id_part` scheme so the id space stays
+/// injective across namespaces. Before any MULTI-namespace caller is added to
+/// the rest of this family, switch those constructors the same way. See #1727.
 fn mesh_inbound_proxy_id(namespace: &str, name: &str, port: u16) -> String {
     format!("{MESH_INBOUND_PROXY_ID_PREFIX}{namespace}-{name}-{port}").replace(['/', '.'], "-")
 }
@@ -3656,9 +3666,10 @@ fn mesh_inbound_proxy_id(namespace: &str, name: &str, port: u16) -> String {
 /// Id for a materialized Sidecar `ingress[]` listener route, one per declared
 /// listener port. The local workload's namespace + service name scope the id so
 /// it never collides with another local service's ingress siblings; the port
-/// disambiguates listeners. Like the inbound id, sanitized of `/`/`.`.
+/// disambiguates listeners. Like the inbound id, sanitized of `/`/`.`; `:` is
+/// also folded so a hostile name cannot forge [`MESH_INGRESS_BIND_PROXY_ID_PREFIX`].
 fn mesh_ingress_proxy_id(namespace: &str, name: &str, port: u16) -> String {
-    format!("{MESH_INGRESS_PROXY_ID_PREFIX}{namespace}-{name}-{port}").replace(['/', '.'], "-")
+    format!("{MESH_INGRESS_PROXY_ID_PREFIX}{namespace}-{name}-{port}").replace(['/', '.', ':'], "-")
 }
 
 /// Reserved id prefix for materialized mesh OUTBOUND (egress) routes. Like the
@@ -5161,8 +5172,15 @@ fn materialize_sidecar_ingress_listener_proxies(
     );
 }
 
+/// Dedicated Sidecar ingress bind route id. Prefix is the colon family
+/// discriminator; namespace and service are encoded injectively so `-` in
+/// either field cannot collide with another `(namespace, name, port)` tuple.
 fn mesh_ingress_bind_proxy_id(namespace: &str, name: &str, port: u16) -> String {
-    format!("{MESH_INGRESS_BIND_PROXY_ID_PREFIX}{namespace}-{name}-{port}").replace(['/', '.'], "-")
+    format!(
+        "{MESH_INGRESS_BIND_PROXY_ID_PREFIX}{}-{}-{port}",
+        sanitize_egress_host_id_part(namespace),
+        sanitize_egress_host_id_part(name)
+    )
 }
 
 /// Ports already owned by Gateway/stream proxies or the fixed mesh listener
@@ -12515,138 +12533,27 @@ async fn run_ambient_udp_placement_cleanup(
     source: Arc<dyn crate::proxy::netns_capture::PodCaptureSource>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
-    use crate::proxy::udp_placement_migration::{
-        UdpCleanupProofWindow, UdpMigrationFailureReason, UdpMigrationStatusPhase, clear_failure,
-        set_failure, set_phase,
-    };
-
-    let ready_dir = context.registry_dir().join(".udp-ready");
-    let mut pod_cleanup = context.cleanup_pod_netns().then(|| {
-        crate::proxy::netns_udp_capture::NetnsUdpCleanupManager::new(
-            source,
-            crate::proxy::netns_udp_capture::ProxyNetnsUdpCleanupBackend::new(true),
-            std::time::Duration::from_secs(2),
-        )
-        .with_ready_dir(Some(ready_dir.clone()))
-    });
-    let mut host_recovery = context.cleanup_host_netns().then(|| {
-        crate::proxy::host_udp_capture::HostUdpStaleGenerationRecovery::new(Some(ready_dir))
-    });
-    let mut proof_window =
-        UdpCleanupProofWindow::new(context.cleanup_pod_netns(), context.cleanup_host_netns());
-    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2));
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    ticker.tick().await;
-
+    // One shared supervisor implements predecessor retirement for BOTH the
+    // migration cleanup phase and the privileged node preflight, so the two can
+    // never disagree about what Ferrum owns or what counts as proof.
+    let outcome = crate::proxy::udp_placement_cleanup::run_udp_placement_cleanup(
+        context,
+        source,
+        shutdown.clone(),
+        None,
+    )
+    .await;
+    if outcome != crate::proxy::udp_placement_cleanup::UdpCleanupOutcome::Complete {
+        return;
+    }
+    // Cleanup is durably complete. Readiness stays false and no producer runs
+    // until the operator applies the matching finalize release, so park here.
     loop {
         if *shutdown.borrow() {
             return;
         }
-        if let Some(proof_before) = context.registry_sync_proof() {
-            let mut host_pass_complete = host_recovery.is_none();
-            let mut host_outstanding = 0;
-            let mut failure_reason = None;
-            if let Some(recovery) = host_recovery.as_mut() {
-                if crate::proxy::host_udp_capture::recover_and_reap_once(recovery).await {
-                    host_pass_complete = true;
-                } else {
-                    host_pass_complete = false;
-                    failure_reason = Some(if recovery.outstanding() == 0 {
-                        UdpMigrationFailureReason::HostCleanupFailed
-                    } else {
-                        UdpMigrationFailureReason::GateAcknowledgementMissing
-                    });
-                }
-                host_outstanding = recovery.outstanding();
-            }
-
-            let mut pod_complete_fingerprint = None;
-            let mut pod_outstanding = 0;
-            if let Some(manager) = pod_cleanup.as_mut() {
-                let progress = manager.migration_cleanup_once().await;
-                pod_outstanding = progress.outstanding;
-                if let Some(reason) = progress.failure_reason {
-                    failure_reason = Some(reason);
-                } else if progress.outstanding == 0 {
-                    pod_complete_fingerprint = Some(progress.registry_fingerprint);
-                }
-            }
-
-            // The node agent gives every publication a fresh identity after
-            // retracting the marker for a post-relist mutation. Count this pass
-            // only when that exact identity spans all cleanup work, so a
-            // clear/mutate/republish ABA cycle cannot preserve prior progress.
-            let proof_progress = proof_window.observe_pass(
-                Some(proof_before),
-                context.registry_sync_proof(),
-                host_pass_complete,
-                pod_complete_fingerprint,
-            );
-            if !proof_progress.proof_is_valid() {
-                set_phase(UdpMigrationStatusPhase::WaitingForRegistry, 0);
-                set_failure(UdpMigrationFailureReason::RegistryNotSynchronized);
-                ticker.tick().await;
-                continue;
-            }
-
-            let outstanding = host_outstanding.saturating_add(pod_outstanding);
-            let phase =
-                if failure_reason == Some(UdpMigrationFailureReason::GateAcknowledgementMissing) {
-                    UdpMigrationStatusPhase::WaitingForGateAck
-                } else if !proof_progress.pod_complete() {
-                    UdpMigrationStatusPhase::CleaningPodNetns
-                } else {
-                    UdpMigrationStatusPhase::CleaningHostNetns
-                };
-            set_phase(phase, outstanding);
-            if let Some(reason) = failure_reason {
-                set_failure(reason);
-            } else {
-                clear_failure();
-            }
-
-            if let Some(proof) = proof_progress.completion_proof() {
-                match context.mark_cleanup_complete(proof) {
-                    Ok(()) => {
-                        set_phase(UdpMigrationStatusPhase::CleanupComplete, 0);
-                        clear_failure();
-                        info!(
-                            from = context.from().as_str(),
-                            to = context.to().as_str(),
-                            "Ambient UDP predecessor cleanup is durably complete; phase=finalize with the same generation is now permitted"
-                        );
-                        loop {
-                            if *shutdown.borrow() {
-                                return;
-                            }
-                            if shutdown.changed().await.is_err() {
-                                return;
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        proof_window.invalidate();
-                        set_failure(UdpMigrationFailureReason::StatePersistenceFailed);
-                        warn!(
-                            %error,
-                            "Ambient UDP cleanup completed but durable proof publication failed; retrying"
-                        );
-                    }
-                }
-            }
-        } else {
-            proof_window.invalidate();
-            set_phase(UdpMigrationStatusPhase::WaitingForRegistry, 0);
-            set_failure(UdpMigrationFailureReason::RegistryNotSynchronized);
-        }
-
-        tokio::select! {
-            _ = ticker.tick() => {}
-            changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() {
-                    return;
-                }
-            }
+        if shutdown.changed().await.is_err() {
+            return;
         }
     }
 }
@@ -12850,9 +12757,11 @@ async fn arm_mesh_runtime_startup(
             settings.udp_host_netns_enabled,
         );
         let migration_request =
-            crate::proxy::udp_placement_migration::UdpPlacementRequest::from_env(target).map_err(
-                |error| anyhow::anyhow!("invalid Ambient UDP migration settings: {error}"),
-            )?;
+            crate::proxy::udp_placement_migration::UdpPlacementRequest::from_env(
+                target,
+                registry_dir,
+            )
+            .map_err(|error| anyhow::anyhow!("invalid Ambient UDP migration settings: {error}"))?;
         let placement_decision = match crate::proxy::udp_placement_migration::prepare_placement(
             registry_dir,
             &migration_request,
@@ -16670,60 +16579,13 @@ async fn apply_mesh_inbound_tls_reload(
             proxy_state
                 .stream_listener_manager
                 .swap_frontend_tls_config(tls_config);
-            // And the same for UDP+DTLS: rebuild a `FrontendDtlsConfig`
-            // from the current env-config inputs and have every active
-            // `DtlsServer` swap atomically. Existing DTLS sessions keep
-            // the crypto material they handshake with; new sessions pick
-            // up the swap on the next ClientHello.
-            //
-            // The DTLS rebuild reuses operator-supplied cert/key/client-CA
-            // paths because PeerAuth live reload, per the operating
-            // invariant, never rotates cert/key paths — those remain
-            // static restart-required inputs. What changes here is the
-            // *mode* (Permissive ↔ Strict) and whether the client CA bundle
-            // is required for mTLS verification.
-            //
-            // Skip the DTLS rebuild entirely on `Disable`: TCP+TLS goes to
-            // plaintext via the cleared slot above, but DTLS cannot speak
-            // plaintext (it is encryption by definition). On topologies
-            // where `Disable` is allowed (Sidecar / EastWestGateway), an
-            // operator with UDP+DTLS listeners is expected to remove
-            // them from the proxy config rather than rely on a PeerAuth
-            // flip; the existing DtlsServer keeps its startup material
-            // so in-flight sessions and any pre-existing handshake
-            // contract remain intact until the listener is reconciled
-            // away.
-            if mtls_mode != config::MtlsMode::Disable {
-                let env = &proxy_state.env_config;
-                let crls = proxy_state.crls.clone();
-                let dtls_cert_key = env
-                    .frontend_tls_cert_path
-                    .as_deref()
-                    .zip(env.frontend_tls_key_path.as_deref())
-                    .map(|(c, k)| (c.to_string(), k.to_string()));
-                let dtls_client_ca = env.frontend_tls_client_ca_bundle_path.clone();
-                if let Some((cert_path, key_path)) = dtls_cert_key {
-                    let swapped = proxy_state
-                        .stream_listener_manager
-                        .swap_active_dtls_frontend_configs(|| {
-                            crate::dtls::build_frontend_dtls_config(
-                                &cert_path,
-                                &key_path,
-                                dtls_client_ca.as_deref(),
-                                &crls,
-                            )
-                        })
-                        .await;
-                    if swapped > 0 {
-                        info!(
-                            mesh_slice_version = %slice.version,
-                            ?mtls_mode,
-                            dtls_listeners = swapped,
-                            "Mesh inbound PeerAuthentication DTLS configs reloaded"
-                        );
-                    }
-                }
-            }
+            // Mesh never materializes a terminating UDP+DTLS stream listener.
+            // In-mesh / egress UDP stays an opaque datagram-over-mesh CONNECT
+            // (`mesh_udp_frame`); ServiceEntry UDP ports bind no DTLS frontend.
+            // PeerAuthentication therefore must not live-swap `DtlsServer`
+            // configs or publish into the ordinary `FERRUM_DTLS_*` generation:
+            // any UDP+DTLS listener in this process is operator-owned and keeps
+            // its dedicated identity and client-CA policy across this reload.
             *last_snapshot = Some(snapshot);
             info!(
                 mesh_slice_version = %slice.version,
@@ -18524,6 +18386,8 @@ mod tests {
             from: None,
             to: None,
             established: None,
+            node: None,
+            node_proof_generation: None,
         };
         prepare_placement(registry.path(), &stable).expect("stable placement");
         let cleanup = UdpPlacementRequest {
@@ -18533,6 +18397,8 @@ mod tests {
             from: Some(UdpPlacement::PodNetns),
             to: Some(UdpPlacement::HostNetns),
             established: None,
+            node: None,
+            node_proof_generation: None,
         };
         let context = match prepare_placement(registry.path(), &cleanup).expect("cleanup placement")
         {
@@ -18559,6 +18425,7 @@ mod tests {
                 registry.path(),
                 "supervisor-test",
                 &std::collections::HashSet::new(),
+                None,
             )
             .expect("registry marker")
         );
@@ -30723,11 +30590,217 @@ mod tests {
         .await
         .expect("stream-listener slot should clear when PeerAuth flips to Disable");
 
+        assert!(
+            proxy_state
+                .stream_listener_manager
+                .snapshot_frontend_dtls_generation()
+                .is_none(),
+            "PeerAuthentication reload must not seed the ordinary DTLS generation"
+        );
+        assert!(
+            proxy_state
+                .stream_listener_manager
+                .active_dtls_frontend_identities_for_test()
+                .await
+                .is_empty(),
+            "PeerAuthentication reload must not invent a DTLS listener"
+        );
+
         let _ = shutdown_tx.send(true);
         tokio::time::timeout(Duration::from_secs(2), apply_task)
             .await
             .expect("apply task should stop")
             .expect("apply task should join");
+    }
+
+    fn write_ecdsa_pem_pair(dir: &std::path::Path, name: &str) -> (String, String) {
+        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
+            .expect("generate ecdsa key");
+        let params =
+            rcgen::CertificateParams::new(vec![format!("{name}.example")]).expect("params");
+        let cert = params.self_signed(&key_pair).expect("self-sign");
+        let cert_path = dir.join(format!("{name}.crt"));
+        let key_path = dir.join(format!("{name}.key"));
+        std::fs::write(&cert_path, cert.pem()).expect("write cert");
+        std::fs::write(&key_path, key_pair.serialize_pem()).expect("write key");
+        (
+            cert_path.to_str().expect("utf8").to_string(),
+            key_path.to_str().expect("utf8").to_string(),
+        )
+    }
+
+    /// Mesh does not own a terminating UDP+DTLS listener. PeerAuthentication
+    /// live reload must not overwrite an already-active ordinary
+    /// `FERRUM_DTLS_*` server, even when `FERRUM_FRONTEND_TLS_*` material
+    /// would be a valid DTLS candidate.
+    ///
+    /// Drive `plan_mesh_inbound_tls_reload` + `apply_mesh_inbound_tls_reload`
+    /// directly. A full `start_mesh_slice_apply_task` also reconciles gateway
+    /// config and would tear down this operator-owned listener, which is
+    /// unrelated to the PeerAuthentication TLS isolation invariant.
+    #[tokio::test(flavor = "current_thread")]
+    async fn mesh_peer_auth_reload_does_not_mutate_active_ordinary_dtls_listener() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mesh_cert, mesh_key) = write_ecdsa_pem_pair(dir.path(), "mesh-frontend");
+        let (dtls_cert, dtls_key) = write_ecdsa_pem_pair(dir.path(), "dtls-dedicated");
+        let (dtls_ca, _) = write_ecdsa_pem_pair(dir.path(), "dtls-client-ca");
+
+        let holder = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("udp holder");
+        let port = holder.local_addr().expect("addr").port();
+        drop(holder);
+
+        let mut proxy: Proxy = serde_json::from_value(serde_json::json!({
+            "id": "udp-dtls-ordinary",
+            "namespace": "default",
+            "backend_scheme": "udp",
+            "backend_host": "127.0.0.1",
+            "backend_port": 9,
+            "listen_port": port,
+            "frontend_tls": true,
+            "passthrough": false,
+        }))
+        .expect("udp dtls proxy");
+        proxy.dispatch_kind = DispatchKind::from(BackendScheme::Udp);
+
+        let mut runtime = test_mesh_runtime_config();
+        runtime.inbound_listen_addr = "127.0.0.1:15006".parse().unwrap();
+        let env = EnvConfig {
+            mesh_peer_auth_live_reload_enabled: true,
+            frontend_tls_cert_path: Some(mesh_cert.clone()),
+            frontend_tls_key_path: Some(mesh_key.clone()),
+            frontend_tls_client_ca_bundle_path: Some(mesh_cert.clone()),
+            pool_warmup_enabled: false,
+            shutdown_drain_seconds: 0,
+            ..EnvConfig::default()
+        };
+        let proxy_state = make_test_proxy_state_with_env(
+            GatewayConfig {
+                proxies: vec![proxy],
+                ..GatewayConfig::default()
+            },
+            env.clone(),
+        );
+        proxy_state
+            .stream_listener_manager
+            .set_frontend_dtls_cert_key(dtls_cert, dtls_key, Some(dtls_ca))
+            .await;
+        proxy_state
+            .stream_listener_manager
+            .wait_until_started(Duration::from_secs(2))
+            .await
+            .expect("ordinary DTLS listener should start");
+
+        let before_gen = proxy_state
+            .stream_listener_manager
+            .snapshot_frontend_dtls_generation()
+            .expect("ordinary generation published");
+        let before_ids = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let ids = proxy_state
+                    .stream_listener_manager
+                    .active_dtls_frontend_identities_for_test()
+                    .await;
+                if !ids.is_empty() {
+                    return ids;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("DTLS server should publish into the listener slot");
+        assert_eq!(before_ids.len(), 1);
+        assert!(
+            before_ids[0].1,
+            "dedicated DTLS listener must require a client certificate"
+        );
+
+        let mesh_frontend_identity =
+            load_mesh_frontend_server_identity(&env, &test_svid_slot_from_env(&env))
+                .expect("mesh frontend identity");
+        let mut last_snapshot = Some(
+            mesh_inbound_tls_reload_snapshot(
+                &env,
+                config::MtlsMode::Disable,
+                std::collections::BTreeMap::new(),
+            )
+            .expect("initial snapshot"),
+        );
+        let has_termination_listener = runtime.has_inbound_tls_termination_listener();
+        let slice = MeshSlice {
+            version: "strict-dtls-isolation".to_string(),
+            ..slice_with_peer_auths(vec![peer_auth_with_workload_mode(config::MtlsMode::Strict)])
+        };
+        let plan = plan_mesh_inbound_tls_reload(
+            &proxy_state,
+            &runtime,
+            &slice,
+            config::MtlsMode::Strict,
+            mesh_frontend_identity.as_deref(),
+            last_snapshot.as_ref(),
+            None,
+            None,
+            false,
+            has_termination_listener,
+        )
+        .expect("Strict PeerAuthentication reload must produce a TLS plan");
+        assert!(
+            matches!(plan, MeshInboundTlsReloadPlan::Swap { .. }),
+            "Disable → Strict must swap inbound TLS, not skip the reload"
+        );
+
+        apply_mesh_inbound_tls_reload(
+            &proxy_state,
+            &slice,
+            config::MtlsMode::Strict,
+            plan,
+            &mut last_snapshot,
+            MeshInboundTlsReloadCtx {
+                has_termination_listener,
+                spiffe_bundle_slot_configured: false,
+                topology: runtime.topology,
+                production: false,
+            },
+        )
+        .await;
+
+        assert!(
+            proxy_state
+                .stream_listener_manager
+                .snapshot_frontend_tls_config()
+                .is_some(),
+            "TCP+TLS slot should be populated so the reload actually ran"
+        );
+        assert!(
+            proxy_state.mesh_inbound_tls.load_full().is_some(),
+            "HBONE inbound TLS slot should be populated by the same Swap"
+        );
+
+        let after_gen = proxy_state
+            .stream_listener_manager
+            .snapshot_frontend_dtls_generation()
+            .expect("ordinary generation retained");
+        assert_eq!(after_gen.generation, before_gen.generation);
+        assert!(
+            Arc::ptr_eq(&after_gen, &before_gen),
+            "mesh PeerAuthentication reload must not replace the ordinary DTLS generation"
+        );
+        let after_ids = proxy_state
+            .stream_listener_manager
+            .active_dtls_frontend_identities_for_test()
+            .await;
+        assert_eq!(
+            after_ids, before_ids,
+            "active ordinary DTLS server must retain exact dedicated config/security policy"
+        );
+        let status = proxy_state
+            .stream_listener_manager
+            .frontend_dtls_reload_status();
+        assert_eq!(status.last_outcome, "accepted");
+        assert_eq!(status.generation, before_gen.generation);
+
+        proxy_state.stream_listener_manager.shutdown_all().await;
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -30793,6 +30866,13 @@ mod tests {
             mesh_authz_label(&proxy_state, "app").as_deref(),
             Some("good-baseline"),
             "failed TLS rebuild should keep the previous proxy config"
+        );
+        assert!(
+            proxy_state
+                .stream_listener_manager
+                .snapshot_frontend_dtls_generation()
+                .is_none(),
+            "a rejected PeerAuthentication slice must not seed or reject ordinary DTLS generation"
         );
 
         let _ = shutdown_tx.send(true);
@@ -36663,7 +36743,7 @@ mod tests {
         let bind_proxy = config
             .proxies
             .iter()
-            .find(|p| p.id.starts_with("__mesh-ingress-bind-"))
+            .find(|p| p.id.starts_with("__mesh-ingress-bind:"))
             .expect("dedicated bind proxy");
         assert_eq!(bind_proxy.listen_port, Some(16379));
         assert_eq!(bind_proxy.backend_host, "127.0.0.1");
@@ -36717,7 +36797,7 @@ mod tests {
             !config
                 .proxies
                 .iter()
-                .any(|p| p.id.starts_with("__mesh-ingress-bind-")),
+                .any(|p| p.id.starts_with("__mesh-ingress-bind:")),
             "conflicting bind must not materialize a socket proxy"
         );
         assert!(
@@ -36835,7 +36915,7 @@ mod tests {
             config_v1
                 .proxies
                 .iter()
-                .any(|p| p.id.starts_with("__mesh-ingress-bind-"))
+                .any(|p| p.id.starts_with("__mesh-ingress-bind:"))
         );
 
         // Withdraw the dedicated bind (shared capture only).
@@ -36862,7 +36942,7 @@ mod tests {
             !config_v2
                 .proxies
                 .iter()
-                .any(|p| p.id.starts_with("__mesh-ingress-bind-")),
+                .any(|p| p.id.starts_with("__mesh-ingress-bind:")),
             "dedicated bind proxy must withdraw when bind is removed"
         );
         assert!(

@@ -12344,16 +12344,24 @@ impl Drop for LiveHostUdpVethPod {
 }
 
 #[cfg(target_os = "linux")]
-fn seed_host_udp_placement_state(registry_dir: &std::path::Path) -> Result<(), String> {
+fn seed_host_udp_placement_state(
+    registry_dir: &std::path::Path,
+    node_uid: &str,
+) -> Result<(), String> {
     // Host-netns placement refuses to start without durable predecessor proof
-    // (#3703). Seed a completed host-netns ownership record so the production
-    // ProxyHostUdpBackend path can RunStable in this disposable fixture.
+    // (#3703), and #3809 binds that proof to the immutable Kubernetes node UID
+    // plus this kernel boot. Seed a completed, identity-bound ownership record
+    // so the production ProxyHostUdpBackend path can RunStable in this
+    // disposable fixture without exercising the legacy-record refusal path.
     let path = registry_dir.join(".udp-placement-state-v1.json");
-    std::fs::write(
-        &path,
-        r#"{"version":1,"active":"host-netns","pending":null,"completed":null}"#,
-    )
-    .map_err(|error| format!("seed host-udp placement state: {error}"))?;
+    let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .map_err(|error| format!("read host-udp fixture boot id: {error}"))?;
+    let contents = format!(
+        r#"{{"version":1,"active":"host-netns","pending":null,"completed":null,"incarnation":{{"node_uid":"{node_uid}","boot_id":"{}"}}}}"#,
+        boot_id.trim()
+    );
+    std::fs::write(&path, contents)
+        .map_err(|error| format!("seed host-udp placement state: {error}"))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -12497,6 +12505,7 @@ async fn functional_mesh_live_host_udp_capture_proxy_backend_round_trip() {
     // and surface as `reason=missing_identity` with capture never installed.
     const POD_A: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
     const POD_B: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const NODE_UID: &str = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
     let capture_port = ferrum_edge::capture::DEFAULT_UDP_OUTBOUND_PORT;
 
     let pod_a = match LiveHostUdpVethPod::spawn(21) {
@@ -12515,7 +12524,7 @@ async fn functional_mesh_live_host_udp_capture_proxy_backend_round_trip() {
     };
 
     let registry = TempDir::new().expect("host-UDP registry");
-    seed_host_udp_placement_state(registry.path()).expect("seed placement state");
+    seed_host_udp_placement_state(registry.path(), NODE_UID).expect("seed placement state");
     let a_spiffe = "spiffe://cluster.local/ns/ferrum/sa/host-udp-a";
     let b_spiffe = "spiffe://cluster.local/ns/ferrum/sa/host-udp-b";
     let echo_spiffe = "spiffe://cluster.local/ns/ferrum/sa/host-udp-echo";
@@ -12609,6 +12618,7 @@ async fn functional_mesh_live_host_udp_capture_proxy_backend_round_trip() {
                     "FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR",
                     registry.path().display().to_string(),
                 ),
+                ("FERRUM_K8S_NODE_UID", NODE_UID.to_string()),
                 ("FERRUM_MESH_CAPTURE_UDP_ENABLED", "true".to_string()),
                 (
                     "FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED",
