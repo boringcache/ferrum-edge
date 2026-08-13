@@ -1398,11 +1398,12 @@ fn stock_credential_commit_holds_the_watch_lock_across_install() {
     let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
 
     std::thread::scope(|scope| {
-        let publisher = scope.spawn(|| {
+        let publisher_watch = &watch;
+        let publisher = scope.spawn(move || {
             entered_rx
                 .recv()
                 .expect("commit holds the observation lock");
-            watch.publish(rotated.observed_state())
+            publisher_watch.publish(rotated.observed_state())
         });
 
         let installed = run_under_stock_credential_commit_admission_for_test(
