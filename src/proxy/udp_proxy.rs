@@ -1990,9 +1990,8 @@ pub struct UdpListenerConfig {
     /// local destination is missing or is not an exact route is dropped before
     /// any session slot, pending gate or backend socket exists — there is no
     /// fallback to another route.
-    pub node_waypoint_udp_destinations: Option<
-        Arc<crate::proxy::node_waypoint_udp_destination::NodeWaypointUdpDestinationRouter>,
-    >,
+    pub node_waypoint_udp_destinations:
+        Option<Arc<crate::proxy::node_waypoint_udp_destination::NodeWaypointUdpDestinationRouter>>,
 }
 
 /// Monotonic per-process spawn generation for bound UDP listeners.

@@ -138,10 +138,8 @@ fn guard_ipv4(ctx: &TcContext) -> Result<i32, i64> {
                 return Ok(TC_ACT_PIPE);
             }
             if let Ok((src_port, _)) = ports {
-                if enrolled_destination_authorized(
-                    ctx,
-                    udp_reply_source4_allowed(src_ip, src_port),
-                ) {
+                if enrolled_destination_authorized(ctx, udp_reply_source4_allowed(src_ip, src_port))
+                {
                     return Ok(TC_ACT_PIPE);
                 }
             }

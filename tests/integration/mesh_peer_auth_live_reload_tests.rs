@@ -534,8 +534,7 @@ async fn mesh_owner_scoped_dtls_publish_without_dtls_listeners() {
         Arc::new(TrustedProxies::none()),
     );
 
-    let certificate =
-        ferrum_edge::dtls::generate_ephemeral_cert_public().expect("ephemeral cert");
+    let certificate = ferrum_edge::dtls::generate_ephemeral_cert_public().expect("ephemeral cert");
     let dtls_config = dimpl::Config::builder().build().expect("dtls config");
     let mut configs = std::collections::BTreeMap::new();
     configs.insert(

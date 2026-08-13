@@ -316,10 +316,8 @@ impl NodeWaypointUdpDestinationRouter {
     pub fn resolve(
         &self,
         local_ip: Option<IpAddr>,
-    ) -> Result<
-        (Arc<NodeWaypointUdpDestinationRoute>, u64),
-        (NodeWaypointUdpDestinationRefusal, u64),
-    > {
+    ) -> Result<(Arc<NodeWaypointUdpDestinationRoute>, u64), (NodeWaypointUdpDestinationRefusal, u64)>
+    {
         let table = self.table.load();
         let Some(local_ip) = local_ip else {
             return Err((

@@ -1242,7 +1242,9 @@ fn two_plain_udp_services_sharing_one_port_both_materialize_exact_routes() {
          never withdraw the other"
     );
     assert!(
-        listeners.iter().all(|proxy| proxy.listen_port == Some(5353)),
+        listeners
+            .iter()
+            .all(|proxy| proxy.listen_port == Some(5353)),
         "both routes share the one bound port"
     );
 
@@ -1441,12 +1443,7 @@ fn headless_service_is_unique_port_only_and_never_withdraws_its_neighbours() {
     );
 
     // Shared port: refused, and the VIP-bearing claimant is untouched.
-    let vip_backend = workload_for(
-        "logs",
-        DEFAULT_NAMESPACE,
-        [("app", "udp")],
-        ["10.244.3.22"],
-    );
+    let vip_backend = workload_for("logs", DEFAULT_NAMESPACE, [("app", "udp")], ["10.244.3.22"]);
     let mut vip = udp_service("logs", 5140, AppProtocol::Udp, &[&vip_backend]);
     vip.cluster_ips = vec!["10.96.0.20".to_string()];
     let shared = prepare(
@@ -1458,7 +1455,11 @@ fn headless_service_is_unique_port_only_and_never_withdraws_its_neighbours() {
         .iter()
         .map(|proxy| proxy.id.as_str())
         .collect();
-    assert_eq!(ids.len(), 1, "expected only the VIP-bearing claimant: {ids:?}");
+    assert_eq!(
+        ids.len(),
+        1,
+        "expected only the VIP-bearing claimant: {ids:?}"
+    );
     assert!(ids[0].contains("logs"));
 }
 
@@ -1536,8 +1537,18 @@ fn a_port_mixing_udp_and_dtls_refuses_every_claimant() {
 fn a_port_with_two_dtls_services_refuses_every_claimant() {
     let _env = UdpListenerEnvGuard::set(Some("true"));
     let runtime = node_waypoint_runtime();
-    let a = workload_for("dtls-a", DEFAULT_NAMESPACE, [("app", "udp")], ["10.244.3.41"]);
-    let b = workload_for("dtls-b", DEFAULT_NAMESPACE, [("app", "udp")], ["10.244.3.42"]);
+    let a = workload_for(
+        "dtls-a",
+        DEFAULT_NAMESPACE,
+        [("app", "udp")],
+        ["10.244.3.41"],
+    );
+    let b = workload_for(
+        "dtls-b",
+        DEFAULT_NAMESPACE,
+        [("app", "udp")],
+        ["10.244.3.42"],
+    );
     let mut service_a = udp_service("dtls-a", 6000, AppProtocol::Dtls, &[&a]);
     service_a.cluster_ips = vec!["10.96.0.30".to_string()];
     let mut service_b = udp_service("dtls-b", 6000, AppProtocol::Dtls, &[&b]);

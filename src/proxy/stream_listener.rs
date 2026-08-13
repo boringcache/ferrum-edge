@@ -270,9 +270,8 @@ struct ListenerHandle {
     /// listener (issue #3861). `None` for every other listener. Held so a
     /// reconcile can republish routes under the running socket and retract
     /// them before the socket leaves service.
-    node_waypoint_udp_destinations: Option<
-        Arc<crate::proxy::node_waypoint_udp_destination::NodeWaypointUdpDestinationRouter>,
-    >,
+    node_waypoint_udp_destinations:
+        Option<Arc<crate::proxy::node_waypoint_udp_destination::NodeWaypointUdpDestinationRouter>>,
     /// Explicit DTLS ownership class (issue #3858), carried from the accepted
     /// identity at spawn. Decides which generation slot may ever reach this
     /// listener's `DtlsServer`. `Operator` for every non-generated listener,
@@ -2959,8 +2958,7 @@ impl StreamListenerManager {
                         udp_pktinfo_enabled,
                         mesh_outbound_enforcement,
                         node_waypoint_udp_source_scoping,
-                        node_waypoint_udp_destinations:
-                            node_waypoint_udp_destinations_for_listener,
+                        node_waypoint_udp_destinations: node_waypoint_udp_destinations_for_listener,
                     })
                     .await;
                     started_for_exit.store(false, Ordering::Release);
@@ -3039,11 +3037,9 @@ impl StreamListenerManager {
                                     &publish_lock_for_collector,
                                     &mesh_generation_slot_for_collector,
                                     move |generation| {
-                                        if let Some(config) = generation
-                                            .and_then(|generation| {
-                                                generation.config_for(&listener_key)
-                                            })
-                                        {
+                                        if let Some(config) = generation.and_then(|generation| {
+                                            generation.config_for(&listener_key)
+                                        }) {
                                             server.swap_frontend_config(config.clone());
                                         }
                                         dtls_server_slot_for_collector
@@ -3382,9 +3378,7 @@ impl StreamListenerManager {
         let routes: Vec<_> = current_config
             .node_waypoint_udp_destination_routes
             .iter()
-            .filter(|route| {
-                route.listen_port == port && member_set.contains(&route.proxy.as_key())
-            })
+            .filter(|route| route.listen_port == port && member_set.contains(&route.proxy.as_key()))
             .cloned()
             .collect();
         let route_count = routes.len();

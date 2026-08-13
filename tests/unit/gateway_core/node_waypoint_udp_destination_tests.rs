@@ -201,10 +201,7 @@ fn a_refused_publication_retains_the_previous_accepted_table() {
             "__mesh-nw-udp-team-a-x-5354",
         )])
         .expect_err("a route for another port never belongs to this listener");
-    assert_eq!(
-        error,
-        NodeWaypointUdpDestinationPublishError::PortMismatch
-    );
+    assert_eq!(error, NodeWaypointUdpDestinationPublishError::PortMismatch);
 
     let (surviving, _) = router
         .resolve(Some(ip("10.96.0.10")))

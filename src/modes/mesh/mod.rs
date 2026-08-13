@@ -1882,9 +1882,8 @@ fn materialize_node_waypoint_udp_listeners(
     > = Vec::new();
     let mut vip_less_ports: Vec<String> = Vec::new();
     for (port, candidates) in by_port {
-        let claimant_label = |candidate: &Candidate| {
-            format!("{}/{}:{port}", candidate.namespace, candidate.service)
-        };
+        let claimant_label =
+            |candidate: &Candidate| format!("{}/{}:{port}", candidate.namespace, candidate.service);
         // A shared datagram socket is constructed from ONE frontend posture,
         // before any destination route can be selected, so a port that mixes
         // `udp` and `dtls` claimants has no representable answer. Refuse every
@@ -1936,9 +1935,9 @@ fn materialize_node_waypoint_udp_listeners(
         for (index, candidate) in candidates.iter().enumerate() {
             for ip in &candidate.cluster_ips {
                 claims
-                    .entry(crate::proxy::node_waypoint_udp_destination::canonical_destination_ip(
-                        *ip,
-                    ))
+                    .entry(
+                        crate::proxy::node_waypoint_udp_destination::canonical_destination_ip(*ip),
+                    )
                     .or_default()
                     .push(index);
             }
@@ -17652,14 +17651,18 @@ async fn apply_mesh_inbound_tls_reload(
 ///   `PeerAuthentication` workload/service scope resolved against the backing
 ///   workloads this NodeWaypoint actually serves, plus the accepted client-CA
 ///   bundle and the live CRL snapshot. `Strict` requires and verifies a client
-///   certificate; `Permissive` and `Disable` do not. Divergent modes across one
-///   Service's backing workloads escalate to the most restrictive
-///   (`Strict` > `Permissive` > `Disable`) — never downgrade.
+///   certificate; `Permissive` and `Disable` do not. DestinationRule client-side
+///   modes (`Simple`, `Mutual`, `IstioMutual`) are invalid here and reject the
+///   complete candidate — they must never become a no-client-auth listener.
+///   Divergent modes across one Service's backing workloads escalate to the
+///   most restrictive (`client-side DestinationRule` > `Strict` > `Permissive`
+///   > `Disable`) so a stray invalid mode cannot be masked by a valid policy.
 /// * EVERY required candidate is built here, before the slice is accepted. Any
-///   malformed/truncated CA or CRL, verifier build failure, or missing material
-///   for a `Strict` route returns `Err`, which rejects the WHOLE candidate slice
-///   and retains the complete last-good routing AND DTLS serving generation for
-///   both owners. New routes are never published beside stale DTLS posture.
+///   malformed/truncated CA or CRL, verifier build failure, missing material
+///   for a `Strict` route, or invalid client-side mode returns `Err`, which
+///   rejects the WHOLE candidate slice and retains the complete last-good
+///   routing AND DTLS serving generation for both owners. New routes are never
+///   published beside stale DTLS posture.
 ///
 /// Route identity is forward-derived (`node_waypoint_udp_proxy_id`) from the
 /// same Service/port pair `materialize_node_waypoint_udp_listeners` used, so the
@@ -17742,6 +17745,20 @@ fn build_node_waypoint_dtls_owner_configs(
                 // DTLS still encrypts; what changes is whether a client
                 // certificate is demanded and verified.
                 config::MtlsMode::Permissive | config::MtlsMode::Disable => None,
+                // DestinationRule client-side modes are invalid in server-side
+                // PeerAuthentication / NodeWaypoint DTLS policy. Refuse the
+                // complete candidate so they never silently map to PERMISSIVE /
+                // DISABLE or produce a no-client-auth listener.
+                config::MtlsMode::Simple
+                | config::MtlsMode::Mutual
+                | config::MtlsMode::IstioMutual => {
+                    return Err(format!(
+                        "generated NodeWaypoint DTLS listener on port {} resolved to \
+                         client-side DestinationRule mTLS mode {mode:?}, which is invalid \
+                         for server-side PeerAuthentication policy",
+                        service_port.port
+                    ));
+                }
             };
             let built = match crate::dtls::build_frontend_dtls_config(
                 cert_path,
@@ -17778,8 +17795,10 @@ fn build_node_waypoint_dtls_owner_configs(
 /// the workload/service scope that policy actually targets — never against the
 /// port-keyed `mesh_inbound_tls_policy`, which would let one Service's posture
 /// decide another's on a shared app port. Divergent modes escalate to the most
-/// restrictive; a Service with no resolvable backing workload keeps the mesh-wide
-/// answer for its own namespace.
+/// restrictive; invalid client-side DestinationRule modes outrank `Strict` so a
+/// mixed set reaches the refusing branch instead of being masked. A Service
+/// with no resolvable backing workload keeps the mesh-wide answer for its own
+/// namespace.
 fn effective_node_waypoint_dtls_peer_auth_mode(
     slice: &MeshSlice,
     service: &crate::modes::mesh::config::MeshService,
@@ -17790,6 +17809,12 @@ fn effective_node_waypoint_dtls_peer_auth_mode(
             config::MtlsMode::Strict => 2,
             config::MtlsMode::Permissive => 1,
             config::MtlsMode::Disable => 0,
+            // Client-side DestinationRule modes are invalid in this server-side
+            // policy. Rank them stricter than Strict so a stray value dominates
+            // a mixed set and the route-client-CA match refuses the slice.
+            config::MtlsMode::Simple
+            | config::MtlsMode::Mutual
+            | config::MtlsMode::IstioMutual => 3,
         }
     }
     let mut resolved: Option<config::MtlsMode> = None;
@@ -18125,12 +18150,12 @@ async fn apply_mesh_slice_generation(
             // Owner-scoped DTLS candidates for every generated NodeWaypoint
             // `dtls` listener on THIS candidate (issue #3858). Built and fully
             // validated BEFORE `update_mesh_config`, so a malformed/truncated
-            // client CA or CRL, a failed verifier build, or a STRICT route with
-            // no client CA rejects the COMPLETE candidate slice and retains the
-            // complete last-good routing AND DTLS serving generation for both
-            // ownership classes. New routes are never published beside stale
-            // DTLS posture, and ordinary operator listeners are never consulted
-            // or mutated.
+            // client CA or CRL, a failed verifier build, a STRICT route with
+            // no client CA, or a client-side DestinationRule mTLS mode rejects
+            // the COMPLETE candidate slice and retains the complete last-good
+            // routing AND DTLS serving generation for both ownership classes.
+            // New routes are never published beside stale DTLS posture, and
+            // ordinary operator listeners are never consulted or mutated.
             let node_waypoint_dtls_configs = match build_node_waypoint_dtls_owner_configs(
                 proxy_state,
                 runtime,
