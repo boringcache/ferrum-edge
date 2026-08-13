@@ -8992,6 +8992,78 @@ def separate_unquoted_shell_newlines(value: str) -> str:
     return "".join(rendered)
 
 
+def quote_stripped_command_scan_text(value: str) -> str:
+    """Strip quotes for split-word Cross scans without exposing quoted separators.
+
+    Split quotes such as `cr"oss" build` and `"cross" build` must still read as
+    a Cross executable, so quote characters are removed after this pass. Quoted
+    command separators are not outer-shell syntax, though:
+    `"note; backend_hits=0" "$(probe src)"` is one data word plus a data
+    substitution. Collapsing every quote first used to turn that `;` into a new
+    command, so `backend_hits=0` looked like an assignment prefix and the
+    substitution was reported as an opaque / generated executable.
+
+    `has_cross_command_context` searches this projection instead of the raw
+    text: the regex command-start vocabulary is not quote-aware, and keeping a
+    raw search let a later opaque-word substitution of `cross build` match
+    after a quoted `;`. Separators inside `$(...)`, backticks, subshells, and
+    process substitutions stay real: those interiors are nested commands even
+    when the substitution sits in a double-quoted word.
+    """
+
+    rendered = list(value)
+    quote: str | None = None
+    escaped = False
+    pending: list[tuple[str, str | None]] = []
+    index = 0
+    while index < len(value):
+        character = value[index]
+        if escaped:
+            escaped = False
+            index += 1
+            continue
+        if character == "\\" and quote != "'":
+            escaped = True
+            index += 1
+            continue
+        if quote != "'" and (value.startswith("$(", index) or character == "`"):
+            if character == "`":
+                if pending and pending[-1][0] == "`":
+                    _, quote = pending.pop()
+                else:
+                    pending.append(("`", quote))
+                    quote = None
+                index += 1
+                continue
+            pending.append((")", quote))
+            quote = None
+            index += 2
+            continue
+        if quote is not None:
+            if character in ";|&":
+                rendered[index] = " "
+            if character == quote:
+                quote = None
+            index += 1
+            continue
+        if character in "'\"":
+            quote = character
+            index += 1
+            continue
+        if pending and character == pending[-1][0]:
+            _, quote = pending.pop()
+            index += 1
+            continue
+        if character == "(" or (
+            character in "<>" and value.startswith("(", index + 1)
+        ):
+            pending.append((")", quote))
+            index += 2 if character in "<>" else 1
+            continue
+        index += 1
+    return re.sub(r"[\\'\"]", "", "".join(rendered))
+
+
 def has_cross_command_context(
     candidate: str,
     *,
@@ -9000,16 +9072,20 @@ def has_cross_command_context(
     """Recognize Cross in an executable slot, including ordinary shell quotes."""
 
     executable_text = strip_shell_comment(candidate)
+    # The token model is already quote-aware. The regex layer is not: a quoted
+    # `;` in `"moved to STRICT; backend_hits=0" "$(probe)"` looks like a new
+    # statement, so an opaque-word substitution of `cross build --target ...`
+    # into that later data argument matched as a generated executable. Search
+    # only the quote-stripped projection, which still joins `cr"oss"` while
+    # keeping quoted separators out of the command-start vocabulary. Nested
+    # `$(...)`, backticks, subshells, and process substitutions remain real
+    # because that projection restores their interiors to an unquoted parse.
     return shell_program_has_cross(
         executable_text,
         include_opaque_shell_executable=include_opaque_shell_executable,
-    ) or any(
-        CROSS_COMMAND_CONTEXT.search(variant)
-        for variant in (
-            executable_text,
-            re.sub(r"[\\'\"]", "", executable_text),
-        )
-    )
+    ) or CROSS_COMMAND_CONTEXT.search(
+        quote_stripped_command_scan_text(executable_text)
+    ) is not None
 
 
 CROSS_FRAGMENTS = frozenset(
@@ -9066,6 +9142,11 @@ def opaque_word_starts_command(
     logical line is scanned separately, so nothing a shell would dispatch stops
     being read as a command.
 
+    Quoted separators do not grant a slot. `"moved to STRICT; backend_hits=0"
+    "$(probe)"` is one data word plus a data substitution even after physical
+    backslash continuations are joined. Unquoted `;`/`&&` and separators inside
+    `$(...)`, backticks, subshells, and process substitutions still do.
+
     A backslash-escaped backtick is literal text rather than a substitution, so
     ``echo "- Test: \\`${{ matrix.test }}\\`"`` writes Markdown in a real `run:`
     block and opens no slot.
@@ -9073,9 +9154,20 @@ def opaque_word_starts_command(
 
     if not shell_evaluated:
         return False
-    prefix = line[:start].replace("\\`", "").replace("\\$", "")
-    if EXPLICIT_COMMAND_WORD_PREFIX.search(prefix):
-        return True
+    original_prefix = line[:start]
+    prefix = original_prefix.replace("\\`", "").replace("\\$", "")
+    original_match = EXPLICIT_COMMAND_WORD_PREFIX.search(original_prefix)
+    if original_match is not None:
+        # A separator inside `"data; more"` is not a statement boundary. The
+        # same character inside `$(...)`, backticks, or an unquoted command
+        # remains a real slot because `shell_quote_at` restores those interiors.
+        if shell_quote_at(line, original_match.start()) is None:
+            return True
+    elif EXPLICIT_COMMAND_WORD_PREFIX.search(prefix) is not None:
+        # Escaped-backtick stripping can reveal a slot the raw prefix hides.
+        # Honor it only when the opaque word itself is not quoted data.
+        if shell_quote_at(line, start) is None:
+            return True
     return starts_command and BARE_COMMAND_WORD_PREFIX.fullmatch(prefix) is not None
 
 
@@ -9371,7 +9463,7 @@ def scan_variants(
         )
     variants.extend(ansi_c_quoted_variants(line))
     variants.extend(word_splitting_variants(line))
-    collapsed = re.sub(r"[\\'\"]", "", line)
+    collapsed = quote_stripped_command_scan_text(line)
     if collapsed != line:
         variants.append(collapsed)
 
@@ -22431,6 +22523,78 @@ pre_build = []
         failures.append(
             "an unquoted heredoc body lost its generated inline shell surface"
         )
+    # Quote-stripping that joins `cr"oss"` used to expose a quoted `;` as an
+    # outer statement separator. The live DTLS assertion records a data
+    # message plus SPIFFE substitutions; that is not an executable slot.
+    # Hosted CI Plan scans reached automation through
+    # `validate_automation_collection`, which joins physical backslash
+    # continuations before classification. A one-line helper call is not
+    # that path: the production entrypoint must accept the exact continued
+    # source shape and still reject a separator that has moved outside quotes.
+    quoted_separator_workflow = referenced_workflow.replace(
+        "bash scripts/safe.sh",
+        "bash scripts/assert.sh",
+    )
+
+    def exact_tree_assert_script(body: str) -> list[str]:
+        return validate_automation_collection(
+            {"ci.yml": quoted_separator_workflow},
+            {"setup/action.yml": safe_action},
+            {"scripts/assert.sh": body},
+            "self-test automation directory",
+        )
+
+    benign_physical_assertion = (
+        "#!/bin/sh\n"
+        "record_live_assertion "
+        "node_waypoint.dtls.reload_permissive_to_strict pass \\\n"
+        "  dtls-src-a dtls-echo "
+        '"generated listener moved to STRICT; unauthenticated handshake '
+        'failed closed; backend_hits=0" \\\n'
+        '  "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" '
+        '"node-waypoint-dtls-reload"\n'
+    )
+    if exact_tree_assert_script(benign_physical_assertion):
+        failures.append(
+            "a physically continued quoted assertion message with a data "
+            "command substitution was reported as a generated inline shell "
+            "surface"
+        )
+    # The same assignment-prefixed substitution is an executable when the
+    # semicolon is real outer-shell syntax. Split quotes that assemble the
+    # Cross word, an opaque command-slot substitution, and a generated
+    # inline shell must keep failing closed after the quoted-separator walk,
+    # including when those attacks are themselves backslash-continued.
+    for attack_label, attack_program in (
+        (
+            "assignment-prefixed quoted substitution executable",
+            "#!/bin/sh\n"
+            f'echo safe; backend_hits=0 "$(pick-cross)" \\\n'
+            f"  build --target {TARGET}\n",
+        ),
+        (
+            "quoted substitution occupying the command word",
+            "#!/bin/sh\n"
+            f'"$(pick-cross)" \\\n'
+            f"  build --target {TARGET}\n",
+        ),
+        (
+            "split-quoted Cross executable",
+            "#!/bin/sh\n"
+            f'cr"oss" \\\n'
+            f"  build --target {TARGET}\n",
+        ),
+        (
+            "generated inline shell executable",
+            "#!/bin/sh\n"
+            'bash -c \\\n'
+            '  "$(render)"\n',
+        ),
+    ):
+        if not exact_tree_assert_script(attack_program):
+            failures.append(
+                f"a physically continued {attack_label} stopped failing closed"
+            )
 
     # Interpreter provenance can arrive after a file was already reached. A
     # suffixless script popped first is read as shell; a later `python3 <path>`
