@@ -155,8 +155,7 @@ def cp_jwt_rejection_for_node(cp_logs: str, node_id: str) -> bool:
                 continue
             if fields.get("reason") != CP_JWT_REASON:
                 continue
-            surface = fields.get("surface")
-            if surface is not None and surface != CP_JWT_SURFACE:
+            if fields.get("surface") != CP_JWT_SURFACE:
                 continue
             return True
         if not exact_field_equals(line, "node_id", node_id):
@@ -419,6 +418,18 @@ def self_test() -> None:
         "connected-without-jwt-class",
         "client_connected_without_class",
         "reject-unrelated-node-id",
+    )
+
+    jwt_without_surface = json.loads(_json_jwt_line(jwt_name))
+    del jwt_without_surface["fields"]["surface"]
+    _assert_class(
+        connected,
+        json.dumps(jwt_without_surface),
+        "10.244.0.16",
+        jwt_name,
+        "connected-without-jwt-class",
+        "client_connected_without_class",
+        "reject-jwt-without-meshsubscribe-surface",
     )
 
     prefix_cp = (
