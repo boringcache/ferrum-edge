@@ -30687,7 +30687,8 @@ mod tests {
     fn write_ecdsa_pem_pair(dir: &std::path::Path, name: &str) -> (String, String) {
         let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
             .expect("generate ecdsa key");
-        let params = rcgen::CertificateParams::new(vec![format!("{name}.example")]).expect("params");
+        let params =
+            rcgen::CertificateParams::new(vec![format!("{name}.example")]).expect("params");
         let cert = params.self_signed(&key_pair).expect("self-sign");
         let cert_path = dir.join(format!("{name}.crt"));
         let key_path = dir.join(format!("{name}.key"));

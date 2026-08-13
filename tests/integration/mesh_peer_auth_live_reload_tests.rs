@@ -34,15 +34,9 @@ fn test_proxy_state(env: EnvConfig) -> ProxyState {
 }
 
 fn test_proxy_state_with_config(env: EnvConfig, config: GatewayConfig) -> ProxyState {
-    ProxyState::new(
-        config,
-        DnsCache::new(DnsConfig::default()),
-        env,
-        None,
-        None,
-    )
-    .expect("proxy state")
-    .0
+    ProxyState::new(config, DnsCache::new(DnsConfig::default()), env, None, None)
+        .expect("proxy state")
+        .0
 }
 
 fn strict_mesh_tls_config() -> Arc<rustls::ServerConfig> {
