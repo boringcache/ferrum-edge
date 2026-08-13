@@ -27,7 +27,6 @@ pub mod slice;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::net::SocketAddr;
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -17940,144 +17939,6 @@ fn publish_gateway_active_trust_bundles(
     }
 }
 
-/// Optional operator-owned UDP+DTLS listeners that must survive mesh slice
-/// apply (issue #3858 live isolation).
-///
-/// Mesh DP `GatewayConfig` is rebuilt from the slice on every apply, which
-/// would otherwise tear down an ordinary `FERRUM_DTLS_*` listener that is not
-/// in the slice. When `{parent of FERRUM_DTLS_CERT_PATH}/operator-gateway.yaml`
-/// exists, merge only non-reserved UDP+DTLS `frontend_tls` proxies into this
-/// candidate so the operator listener is re-injected with stable timestamps
-/// when its content is unchanged. Absent or malformed overlay is a no-op for
-/// the mesh slice (warn); a live gate that depends on the listener fails
-/// closed on missing handshake evidence rather than taking TCP/UDP routing
-/// down. Overlay proxies never use reserved `__` ids and never steal a port
-/// already claimed in this generation.
-fn merge_operator_dtls_overlay(
-    config: &mut GatewayConfig,
-    env: &EnvConfig,
-    previous: &GatewayConfig,
-) {
-    let Some(cert_path) = env.dtls_cert_path.as_deref() else {
-        return;
-    };
-    let Some(parent) = Path::new(cert_path).parent() else {
-        return;
-    };
-    let overlay_path = parent.join("operator-gateway.yaml");
-    if !overlay_path.is_file() {
-        return;
-    }
-    let contents = match std::fs::read_to_string(&overlay_path) {
-        Ok(contents) => contents,
-        Err(err) => {
-            warn!(
-                error = %err,
-                "Skipping operator DTLS overlay: could not read sibling operator-gateway.yaml"
-            );
-            return;
-        }
-    };
-    let overlay: GatewayConfig = match serde_yaml::from_str(&contents) {
-        Ok(overlay) => overlay,
-        Err(err) => {
-            warn!(
-                error = %err,
-                "Skipping operator DTLS overlay: malformed operator-gateway.yaml"
-            );
-            return;
-        }
-    };
-
-    let mut claimed_ports: HashSet<u16> = config
-        .proxies
-        .iter()
-        .filter_map(|proxy| proxy.listen_port)
-        .filter(|port| *port != 0)
-        .collect();
-
-    let mut merged = 0usize;
-    for mut proxy in overlay.proxies {
-        if proxy.id.is_empty() || proxy.id.starts_with("__") {
-            warn!(
-                proxy_id = %proxy.id,
-                "Skipping operator DTLS overlay proxy: empty or reserved id"
-            );
-            continue;
-        }
-        if proxy.backend_scheme != Some(BackendScheme::Udp)
-            || !proxy.frontend_tls
-            || proxy.passthrough
-        {
-            warn!(
-                proxy_id = %proxy.id,
-                "Skipping operator DTLS overlay proxy: only UDP+DTLS frontend_tls listeners are admitted"
-            );
-            continue;
-        }
-        let Some(port) = proxy.listen_port else {
-            warn!(
-                proxy_id = %proxy.id,
-                "Skipping operator DTLS overlay proxy: listen_port is required"
-            );
-            continue;
-        };
-        if port == 0 {
-            warn!(
-                proxy_id = %proxy.id,
-                "Skipping operator DTLS overlay proxy: listen_port 0 is not bindable"
-            );
-            continue;
-        }
-        if claimed_ports.contains(&port) {
-            warn!(
-                proxy_id = %proxy.id,
-                listen_port = port,
-                "Skipping operator DTLS overlay proxy: listen_port is already claimed"
-            );
-            continue;
-        }
-        if config
-            .proxies
-            .iter()
-            .any(|existing| existing.namespace == env.namespace && existing.id == proxy.id)
-        {
-            warn!(
-                proxy_id = %proxy.id,
-                "Skipping operator DTLS overlay proxy: id already present in this generation"
-            );
-            continue;
-        }
-
-        proxy.namespace = env.namespace.clone();
-        if let Some(previous_proxy) = previous.proxies.iter().find(|candidate| {
-            candidate.namespace == proxy.namespace && candidate.id == proxy.id
-        }) && overlay_dtls_proxy_content_matches(previous_proxy, &proxy)
-        {
-            proxy.created_at = previous_proxy.created_at;
-            proxy.updated_at = previous_proxy.updated_at;
-        }
-        claimed_ports.insert(port);
-        config.proxies.push(proxy);
-        merged += 1;
-    }
-    if merged > 0 {
-        info!(
-            merged,
-            "Merged operator DTLS overlay listeners into the mesh slice candidate"
-        );
-    }
-}
-
-fn overlay_dtls_proxy_content_matches(previous: &Proxy, candidate: &Proxy) -> bool {
-    previous.listen_port == candidate.listen_port
-        && previous.backend_host == candidate.backend_host
-        && previous.backend_port == candidate.backend_port
-        && previous.backend_scheme == candidate.backend_scheme
-        && previous.frontend_tls == candidate.frontend_tls
-        && previous.passthrough == candidate.passthrough
-}
-
 /// Build a proxy [`GatewayConfig`] from `base_slice` overlaid with the current
 /// federation + remote-endpoint snapshots and apply it to the live proxy
 /// runtime, running the same TLS / node-waypoint / DNS / outbound-enforcement
@@ -18191,15 +18052,6 @@ async fn apply_mesh_slice_generation(
             let trusted_mesh_ids =
                 TrustedMeshGeneratedResourceIds::from_materialized_config(&config);
             let previous_config = proxy_state.config.load_full();
-            // Re-inject an optional operator-owned UDP+DTLS listener so a mesh
-            // slice apply cannot tear it down (issue #3858). Trusted mesh IDs
-            // were collected BEFORE this merge so an overlay proxy can never
-            // be blessed as materializer-generated.
-            merge_operator_dtls_overlay(
-                &mut config,
-                &proxy_state.env_config,
-                &previous_config,
-            );
             // Materialized mesh upstreams are rebuilt with fresh per-apply
             // timestamps every slice apply (the materializers stamp `Utc::now()`
             // and `project_mesh_source_locality` re-bumps when it stamps the

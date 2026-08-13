@@ -232,36 +232,32 @@ arriving from any other address.
 
 `run_node_waypoint_dtls_reload_isolation_checks` runs after the PERMISSIVE
 generated-listener checks. The harness enables
-`FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED` and mounts a current client CA plus
-an ordinary operator-owned DTLS listener (`operator-dtls-live` on port `15356`,
-re-injected each slice apply from sibling `operator-gateway.yaml`). The
-operator client and backend live in the unmanaged namespace so unmarked replies
-are not dropped by the enrolled-pod veth guard.
+`FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED` and mounts a current client CA.
+It does **not** inject an ordinary operator DTLS listener or depend on a
+hidden overlay file beside `FERRUM_DTLS_CERT_PATH`. Hosted-live ordinary-slot
+isolation is the authenticated `/overload`
+`stream_listeners.frontend_dtls_reload.generation` captured before and after
+the generated-owner publication. A bound ordinary listener remaining
+byte-identical is unit/integration evidence, not claimed here.
 
-- `node_waypoint.dtls.operator_listener_bound` — current-CA handshake against
-  the operator listener presents `ferrum-node-waypoint-dtls`, the unmanaged
-  backend logs the plaintext datagram, authenticated `/health` is ready, and
-  `/overload` bind_failures do not name the operator port.
-- `node_waypoint.dtls.operator_listener_rejects_unauthenticated` /
-  `node_waypoint.dtls.operator_listener_rejects_stale_ca` — no client cert and a
-  stale-CA client are rejected, with backend_hits=0.
 - `node_waypoint.dtls.reload_permissive_to_strict` /
   `node_waypoint.dtls.reload_unauthenticated_rejected` — applying the
   `dtls-echo` PeerAuthentication to STRICT (removing the PERMISSIVE
   `portLevelMtls` overlay) makes new unauthenticated sessions fail closed on
-  the generated listener.
+  the generated listener, with handshake failure and backend_hits=0.
 - `node_waypoint.dtls.reload_current_ca_admitted` /
   `node_waypoint.dtls.reload_stale_ca_rejected` — the generated listener admits
-  the current client CA and rejects the stale CA, with backend logs as
-  authority.
-- `node_waypoint.dtls.operator_isolated_across_reload` — operator
+  the current client CA (real handshake plus backend log) and rejects the
+  stale CA, with backend_hits=0 on the reject path.
+- `node_waypoint.dtls.operator_isolated_across_reload` — captured ordinary
   `frontend_dtls_reload.generation` and ambient restart count are unchanged
-  across that mesh reload; the operator listener still admits current-CA and
-  still rejects unauthenticated clients.
+  across that generated-owner publication. This does not prove a bound
+  ordinary listener was serving live.
 
 Not exercised live, and therefore not claimed: IPv6 DTLS (and IPv6 Service
-steering), kube-proxy `ipvs` and `nftables` modes, headless services, and
-multiple terminating-DTLS claimants on one port. Those stay at
+steering), kube-proxy `ipvs` and `nftables` modes, headless services,
+multiple terminating-DTLS claimants on one port, and a bound ordinary
+operator DTLS listener in the same process. Those stay at
 unit/integration level or documented residuals.
 The live `dtls-echo` Service port starts `PERMISSIVE` via a selector-scoped
 `portLevelMtls` overlay so the earlier datapath checks can handshake without a

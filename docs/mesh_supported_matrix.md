@@ -408,12 +408,16 @@ need them, or because they are blocked upstream / architecturally:
   binding.
 
   Still **not** proven live: IPv6 DTLS, kube-proxy `ipvs`/`nftables` DTLS
-  steering, headless UDP/DTLS Services, and multiple terminating-DTLS
-  claimants on one port. DTLS client-certificate (mTLS) frontend verification
-  and PeerAuthentication live-reload isolation for generated vs operator-owned
-  listeners are proven by the `node-waypoint-ebpf-live` assertions
-  `node_waypoint.dtls.reload_*` / `node_waypoint.dtls.operator_*`. Same-port
-  plain-UDP Service demultiplexing is proven by
+  steering, headless UDP/DTLS Services, multiple terminating-DTLS
+  claimants on one port, and a bound ordinary operator DTLS listener in the
+  same process (that stronger isolation remains unit/integration). Generated
+  DTLS client-certificate (mTLS) frontend verification and PeerAuthentication
+  PERMISSIVE → STRICT live-reload are proven by the
+  `node-waypoint-ebpf-live` assertions `node_waypoint.dtls.reload_*`.
+  Ordinary `FERRUM_DTLS_*` slot isolation is proven live only as unchanged
+  captured authenticated `/overload` `frontend_dtls_reload.generation` across
+  that publication (`node_waypoint.dtls.operator_isolated_across_reload`).
+  Same-port plain-UDP Service demultiplexing is proven by
   `node_waypoint.udp.same_port_demux_*`.
 - **DR `connectionPool.http.maxRequestsPerConnection`** — parsed and validated
   but **Deferred** in status; backend close-after-N-requests is unsupported, so

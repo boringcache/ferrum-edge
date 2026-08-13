@@ -265,9 +265,10 @@ spec:
 # handshake without a client cert. The harness DOES mount
 # FERRUM_DTLS_CLIENT_CA_CERT_PATH; `run_node_waypoint_dtls_reload_isolation_checks`
 # later applies this PeerAuthentication to STRICT and proves generated
-# listeners demand the current client CA while the operator-owned DTLS
-# listener in the same process is unchanged. TCP STRICT and AuthorizationPolicy
-# are unchanged.
+# listeners demand the current client CA. Ordinary `FERRUM_DTLS_*` slot
+# isolation is the captured `/overload` `frontend_dtls_reload.generation`
+# across that publication, not a bound operator listener. TCP STRICT and
+# AuthorizationPolicy are unchanged.
 apiVersion: security.istio.io/v1beta1
 kind: PeerAuthentication
 metadata:

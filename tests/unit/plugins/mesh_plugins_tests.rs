@@ -4,7 +4,7 @@ use std::sync::Arc;
 use ferrum_edge::ConsumerIndex;
 use ferrum_edge::config::types::{BackendScheme, Proxy};
 use ferrum_edge::identity::{SpiffeId, TrustDomain};
-use ferrum_edge::modes::mesh::{MESH_NODE_WAYPOINT_UDP_PROXY_ID_PREFIX, MeshTrafficDirection};
+use ferrum_edge::modes::mesh::MeshTrafficDirection;
 use ferrum_edge::modes::mesh::config::{
     AppProtocol, ConditionMatch, MeshConfig, MeshPolicy, MeshRule, MeshService, PolicyAction,
     PolicyScope, PrincipalMatch, RequestMatch, ServicePort, ServiceTargetPort, Workload,
@@ -5453,7 +5453,6 @@ async fn mesh_authz_on_stream_connect_rejects_when_scope_missing() {
     .expect("plugin config");
 
     let mut ctx = stream_context();
-    ctx.proxy_id = format!("{MESH_NODE_WAYPOINT_UDP_PROXY_ID_PREFIX}dtls-echo-15354");
     // Intentionally do not set node_waypoint_policy_scope — scope is None.
     let result = plugin.on_stream_connect(&mut ctx).await;
 
@@ -5474,50 +5473,6 @@ async fn mesh_authz_on_stream_connect_rejects_when_scope_missing() {
             .map(String::as_str),
         Some("scope_missing"),
         "fail-closed reject must stamp deny_policy=scope_missing"
-    );
-}
-
-#[tokio::test]
-async fn mesh_authz_on_stream_connect_operator_listener_missing_scope_does_not_reject() {
-    // Ordinary operator UDP/DTLS listeners share the NodeWaypoint process but
-    // have no ingress-interface attribution channel (issue #3858). Missing
-    // per-pod scope must not inherit the generated-listener fail-closed gate.
-    let ns_deny = policy_with_scope(
-        "team-a-deny",
-        PolicyScope::Namespace {
-            namespace: "team-a".to_string(),
-        },
-        PolicyAction::Deny,
-    );
-    let plugin = MeshAuthz::new(&json!({
-        "mesh_policies": [ns_deny],
-        "per_pod_policy_scoping": true,
-    }))
-    .expect("plugin config");
-
-    let mut ctx = stream_context();
-    ctx.proxy_id = "operator-dtls-live".to_string();
-    let result = plugin.on_stream_connect(&mut ctx).await;
-
-    assert!(
-        matches!(result, PluginResult::Continue),
-        "operator listener missing per-pod scope must not inherit the generated NodeWaypoint fail-closed gate, got {result:?}"
-    );
-    assert_eq!(
-        ctx.metadata
-            .as_ref()
-            .and_then(|m| m.get("mesh_authz.scope_missing"))
-            .map(String::as_str),
-        Some("true"),
-        "missing scope is still observable"
-    );
-    assert_ne!(
-        ctx.metadata
-            .as_ref()
-            .and_then(|m| m.get("mesh_authz.deny_policy"))
-            .map(String::as_str),
-        Some("scope_missing"),
-        "operator listener must not be denied for missing per-pod scope"
     );
 }
 
