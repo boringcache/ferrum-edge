@@ -3315,7 +3315,7 @@ async fn handle_tcp_connection_inner(
     // Produced by the frontend-TLS setup block below and held for the
     // entire relay so a successful admission deregisters exactly once on
     // teardown (issue #3857). Plaintext and kTLS paths yield `None`.
-    let (client_stream, client_trust_guard) = 'frontend_tls: {
+    let (client_stream, _client_trust_guard) = 'frontend_tls: {
         let Some(tls_config) = frontend_tls_config else {
             // Plaintext client: peek (non-destructively) the opening bytes. These are
             // the application bytes on the wire, so they are fully L7-inspectable and
