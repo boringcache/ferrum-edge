@@ -49,6 +49,7 @@ pub mod public_env_inventory;
 pub mod test_db_fault;
 pub mod types;
 pub(crate) mod validation_pipeline;
+pub mod yaml_alias_budget;
 
 #[allow(unused_imports)] // AutoBool is used by unit tests but not directly by the binary
 pub use env_config::AutoBool;
