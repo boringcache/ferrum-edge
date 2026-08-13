@@ -412,6 +412,17 @@ def check_scripts(failures: list[str]) -> None:
     require("archive_failure_diagnostics" in hbone_run, "HBONE harness must copy logs before deleting runtime", failures)
     require("archive_failure_diagnostics" in dns_run, "DNS harness must copy logs into the artifact destination", failures)
     require("certs" in hbone_run and "Never copy certs" in hbone_run, "HBONE diagnostics must not archive certs", failures)
+    require(
+        re.search(r'FERRUM_BACKEND_ALLOW_IPS="(?:private|public|both)"', hbone_run),
+        "HBONE harness must set FERRUM_BACKEND_ALLOW_IPS to a valid mode (private/public/both)",
+        failures,
+    )
+    require(
+        not re.search(r'FERRUM_BACKEND_ALLOW_IPS="[^"]*/', hbone_run),
+        "HBONE harness must not pass CIDR literals to FERRUM_BACKEND_ALLOW_IPS; "
+        "use FERRUM_BACKEND_ALLOW_CIDRS for address exceptions",
+        failures,
+    )
 
     hbone_loadgen = HBONE_LOADGEN.read_text(encoding="utf-8")
     dns_loadgen = DNS_LOADGEN.read_text(encoding="utf-8")
