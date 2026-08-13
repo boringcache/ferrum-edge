@@ -24,8 +24,7 @@
 use std::sync::LazyLock;
 use tokio::sync::{Mutex, MutexGuard};
 
-pub static GATEWAY_TRUST_OBSERVABILITY_LOCK: LazyLock<Mutex<()>> =
-    LazyLock::new(|| Mutex::new(()));
+pub static GATEWAY_TRUST_OBSERVABILITY_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 /// Acquire the shared lock and reset every process-global gateway-trust counter
 /// and the published-namespace map, so the caller starts from a known baseline.
