@@ -725,6 +725,42 @@ fn live_contract_sidecar_fixture_requires_exactly_the_enforced_rows() {
     );
 }
 
+/// Unquoted `<<YAML` heredocs expand shell metacharacters. Backticks inside
+/// heredoc data (even YAML comments) are executed as command substitution —
+/// the hosted mesh-e2e-sidecar live job failed at `render_client_config` when
+/// a `beta/drsvc` comment was interpreted as a command.
+#[test]
+fn live_contract_sidecar_run_sh_unquoted_yaml_heredocs_avoid_backticks() {
+    const RUN_SH: &str = include_str!("../k8s/mesh_e2e_sidecar/run.sh");
+    let mut in_unquoted_yaml_heredoc = false;
+    for (line_no, line) in RUN_SH.lines().enumerate() {
+        let trimmed = line.trim();
+        if !in_unquoted_yaml_heredoc {
+            if line.contains("<<YAML")
+                && !line.contains("<<'YAML'")
+                && !line.contains("<<\"YAML\"")
+            {
+                in_unquoted_yaml_heredoc = true;
+            }
+            continue;
+        }
+        if trimmed == "YAML" || trimmed.starts_with("YAML)") {
+            in_unquoted_yaml_heredoc = false;
+            continue;
+        }
+        assert!(
+            !line.contains('`'),
+            "run.sh:{}: backticks inside an unquoted YAML heredoc are executed \
+             as command substitution — keep shell metacharacters out of heredoc data",
+            line_no + 1
+        );
+    }
+    assert!(
+        !in_unquoted_yaml_heredoc,
+        "run.sh ended while still inside an unquoted YAML heredoc — parse guard is broken"
+    );
+}
+
 /// Issue #3855: the release-blocking native MeshSubscribe deployments must
 /// keep the production mTLS + JWT + Service-DNS posture. A PR that silently
 /// restores plaintext h2c, TLS_NO_VERIFY, or drops client-CA/client-cert

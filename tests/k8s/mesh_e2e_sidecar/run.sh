@@ -967,7 +967,7 @@ YAML
   apply_configmap ferrum-mesh-client "$(cat <<YAML
 mesh:
   istio_root_namespace: $DR_ROOT_NS
-  # Permissive Sidecar so cross-namespace MeshService `beta/drsvc` and its
+  # Permissive Sidecar so cross-namespace MeshService beta/drsvc and its
   # DestinationRules are admitted (integration suite pattern for #2465/#2469).
   sidecars:
     - name: client-egress
