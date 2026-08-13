@@ -6967,16 +6967,12 @@ fn spawn_backend_svid_rotation_task(
 }
 
 impl ProxyState {
-    /// Apply a full snapshot on Tokio's blocking pool. DP snapshots cannot
-    /// carry a CP-side node-local MMDB handoff, so their plugin-cache build may
-    /// synchronously hash, verify, and scan the configured database.
-    pub async fn update_config_off_thread(&self, new_config: GatewayConfig) -> ConfigApplyOutcome {
-        self.update_config_off_thread_with_gateway_trust(new_config, GatewayTrustCommit::Unchanged)
-            .await
-    }
-
-    /// [`Self::update_config_off_thread`] carrying the CP-delivered gateway
-    /// trust decision for this snapshot.
+    /// Apply a full snapshot on Tokio's blocking pool, carrying the CP-delivered
+    /// gateway trust decision for this snapshot.
+    ///
+    /// DP snapshots cannot carry a CP-side node-local MMDB handoff, so their
+    /// plugin-cache build may synchronously hash, verify, and scan the configured
+    /// database.
     ///
     /// The DP FULL_SNAPSHOT path must use this rather than applying the config
     /// and then the side channel: two applies leave the accepted snapshot live

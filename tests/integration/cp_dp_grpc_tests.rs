@@ -4746,7 +4746,7 @@ async fn dp_blackholed_configsync_stream_fails_over_to_fallback_cp() {
 #[tokio::test(flavor = "multi_thread")]
 async fn dp_snapshot_apply_is_never_detached_by_a_lifecycle_select_arm() {
     // Issue #2969 acceptance: a slow/in-flight FULL_SNAPSHOT apply must not be
-    // detachable by a lifecycle select! arm. `update_config_off_thread` is a
+    // detachable by a lifecycle select! arm. `update_config_off_thread_with_gateway_trust` is a
     // `spawn_blocking`, so cancelling the await would leave the swap running
     // detached and able to land after the DP has moved on — silently
     // overwriting a newer snapshot with an older one.
