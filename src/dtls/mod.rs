@@ -285,35 +285,34 @@ pub fn build_frontend_dtls_config(
 ) -> Result<FrontendDtlsConfig, anyhow::Error> {
     let certificate = load_dtls_certificate(cert_path, key_path)?;
 
-    let (require_client_cert, client_cert_verifier, client_trust) = if let Some(ca_path) =
-        client_ca_cert_path
-    {
-        // Read the bundle once and derive both the trust store and the
-        // client-trust identity from the SAME bytes; a second read could observe
-        // a different rotation and publish a generation for material that was
-        // never verified.
-        let ca_pem = std::fs::read(ca_path).map_err(|e| {
-            anyhow::anyhow!("Failed to read DTLS client CA bundle '{}': {}", ca_path, e)
-        })?;
-        let client_trust = crate::tls::ClientTrustMaterial::from_parts(Some(&ca_pem), crls)
-            .map_err(|e| anyhow::anyhow!("DTLS client CA bundle '{}': {}", ca_path, e))?;
-        let root_store = load_root_store_from_pem(ca_path)?;
-        let mut verifier_builder =
-            rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store));
-        if !crls.is_empty() {
-            verifier_builder = verifier_builder
-                .with_crls(crls.iter().cloned())
-                .allow_unknown_revocation_status()
-                .only_check_end_entity_revocation();
-        }
-        let verifier = verifier_builder
-            .build()
-            .map_err(|e| anyhow::anyhow!("Failed to build DTLS client verifier: {}", e))?;
-        debug!("Frontend DTLS mTLS enabled: requiring and verifying client certificates");
-        (true, Some(verifier), Some(client_trust))
-    } else {
-        (false, None, None)
-    };
+    let (require_client_cert, client_cert_verifier, client_trust) =
+        if let Some(ca_path) = client_ca_cert_path {
+            // Read the bundle once and derive both the trust store and the
+            // client-trust identity from the SAME bytes; a second read could observe
+            // a different rotation and publish a generation for material that was
+            // never verified.
+            let ca_pem = std::fs::read(ca_path).map_err(|e| {
+                anyhow::anyhow!("Failed to read DTLS client CA bundle '{}': {}", ca_path, e)
+            })?;
+            let client_trust = crate::tls::ClientTrustMaterial::from_parts(Some(&ca_pem), crls)
+                .map_err(|e| anyhow::anyhow!("DTLS client CA bundle '{}': {}", ca_path, e))?;
+            let root_store = load_root_store_from_pem(ca_path)?;
+            let mut verifier_builder =
+                rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store));
+            if !crls.is_empty() {
+                verifier_builder = verifier_builder
+                    .with_crls(crls.iter().cloned())
+                    .allow_unknown_revocation_status()
+                    .only_check_end_entity_revocation();
+            }
+            let verifier = verifier_builder
+                .build()
+                .map_err(|e| anyhow::anyhow!("Failed to build DTLS client verifier: {}", e))?;
+            debug!("Frontend DTLS mTLS enabled: requiring and verifying client certificates");
+            (true, Some(verifier), Some(client_trust))
+        } else {
+            (false, None, None)
+        };
 
     let config_builder = Config::builder().require_client_certificate(require_client_cert);
     let config = Arc::new(

@@ -7123,14 +7123,9 @@ pub mod _test_support {
                 .unwrap_or_else(tokio::time::Instant::now),
             reason,
         };
-        crate::proxy::wait_for_websocket_session_stop(
-            deadline,
-            Some(shutdown_rx),
-            &overload,
-            None,
-        )
-        .await
-        .as_str()
+        crate::proxy::wait_for_websocket_session_stop(deadline, Some(shutdown_rx), &overload, None)
+            .await
+            .as_str()
     }
 
     /// Await the WebSocket stop arbiter against caller-owned overload state so

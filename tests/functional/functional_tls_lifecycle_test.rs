@@ -970,7 +970,6 @@ fn extract_cn_from_der(der: &[u8]) -> Option<String> {
         .and_then(|cn| cn.as_str().ok().map(|s| s.to_string()))
 }
 
-
 // ============================================================================
 // Issue #3857 — live retirement of established frontend mTLS transports when
 // CRL or client-CA trust is withdrawn.
@@ -1002,7 +1001,9 @@ fn generate_client_cert_with_serial(ca: &GeneratedCa, cn: &str, serial: u64) -> 
     params
         .extended_key_usages
         .push(rcgen::ExtendedKeyUsagePurpose::ClientAuth);
-    let cert = params.signed_by(&key_pair, &ca.issuer).expect("sign client");
+    let cert = params
+        .signed_by(&key_pair, &ca.issuer)
+        .expect("sign client");
     GeneratedCert {
         cert_pem: cert.pem(),
         key_pem: key_pair.serialize_pem(),

@@ -78,14 +78,14 @@
 use std::collections::BTreeSet;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 
+use crate::fips::approved::Sha256;
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use rustls::pki_types::CertificateRevocationListDer;
-use sha2::{Digest, Sha256};
 use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 use x509_parser::prelude::FromDer;
 
@@ -349,7 +349,7 @@ fn digest_of(parts: &[&[u8]]) -> [u8; 32] {
     for part in parts {
         hasher.update(part);
     }
-    hasher.finalize().into()
+    hasher.finalize()
 }
 
 /// Per-scope state. One instance per [`ClientTrustScope`], created once.
@@ -621,11 +621,10 @@ impl ClientTrustAdmission {
         // caught here, so a connection being registered across a publication
         // cannot escape the fence or repopulate the domain after it.
         if self.generation < domain.withdrawal_generation.load(Ordering::Acquire) {
-            let reason =
-                ClientTrustRetirementReason::from_index(
-                    domain.last_withdrawal_reason.load(Ordering::Acquire),
-                )
-                .unwrap_or(ClientTrustRetirementReason::ClientCaWithdrawn);
+            let reason = ClientTrustRetirementReason::from_index(
+                domain.last_withdrawal_reason.load(Ordering::Acquire),
+            )
+            .unwrap_or(ClientTrustRetirementReason::ClientCaWithdrawn);
             if session.retire(reason) {
                 domain.retirements[reason.index()].fetch_add(1, Ordering::Relaxed);
             }

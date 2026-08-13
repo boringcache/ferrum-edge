@@ -208,7 +208,10 @@ fn revocations_are_scoped_by_issuer_not_by_bare_serial() {
     let ca_b = generate_ca("ca-b");
     // Serial 7 is revoked under CA A only. Moving that revocation to CA B is a
     // NEW revocation, not a no-op: serials are unique only within an issuer.
-    let before = material(&[&ca_a.cert_pem, &ca_b.cert_pem], &[&crl_pem(&ca_a, &[7], 1)]);
+    let before = material(
+        &[&ca_a.cert_pem, &ca_b.cert_pem],
+        &[&crl_pem(&ca_a, &[7], 1)],
+    );
     let after = material(
         &[&ca_a.cert_pem, &ca_b.cert_pem],
         &[&crl_pem(&ca_a, &[7], 2), &crl_pem(&ca_b, &[7], 1)],
@@ -287,7 +290,10 @@ fn an_unchanged_candidate_does_not_advance_the_generation() {
     let publication =
         client_trust::publish_accepted_material(ClientTrustScope::AdminHttps, reissued);
 
-    assert_eq!(publication.outcome, ClientTrustPublicationOutcome::Unchanged);
+    assert_eq!(
+        publication.outcome,
+        ClientTrustPublicationOutcome::Unchanged
+    );
     assert_eq!(publication.generation, 1, "generation must not advance");
     let row = scope_row(ClientTrustScope::AdminHttps);
     assert_eq!(row.publications[1], 1, "one unchanged publication recorded");
@@ -312,7 +318,10 @@ fn an_additive_change_advances_without_moving_the_fence() {
     assert_eq!(publication.outcome, ClientTrustPublicationOutcome::Advanced);
     assert_eq!(publication.generation, 2);
     assert_eq!(publication.retired_sessions, 0);
-    assert_eq!(scope_row(ClientTrustScope::ProxyFrontend).withdrawal_generation, 0);
+    assert_eq!(
+        scope_row(ClientTrustScope::ProxyFrontend).withdrawal_generation,
+        0
+    );
 }
 
 #[test]
@@ -333,10 +342,7 @@ fn scopes_are_independent_trust_domains() {
         .expect("client-cert transport is registered");
 
     // Withdraw on the proxy scope only.
-    client_trust::publish_accepted_material(
-        ClientTrustScope::ProxyFrontend,
-        material(&[], &[]),
-    );
+    client_trust::publish_accepted_material(ClientTrustScope::ProxyFrontend, material(&[], &[]));
 
     assert!(proxy_session.session().is_retired());
     assert!(
@@ -365,7 +371,10 @@ fn an_anonymous_tls_transport_is_never_registered() {
             .is_none(),
         "a transport with no verified client certificate holds no withdrawable decision"
     );
-    assert_eq!(scope_row(ClientTrustScope::ProxyFrontend).tracked_sessions, 0);
+    assert_eq!(
+        scope_row(ClientTrustScope::ProxyFrontend).tracked_sessions,
+        0
+    );
 }
 
 #[test]
@@ -387,7 +396,10 @@ fn a_withdrawal_retires_only_transports_below_the_new_generation() {
         ClientTrustScope::ProxyFrontend,
         material(&[&new_ca.cert_pem], &[]),
     );
-    assert_eq!(publication.outcome, ClientTrustPublicationOutcome::Withdrawn);
+    assert_eq!(
+        publication.outcome,
+        ClientTrustPublicationOutcome::Withdrawn
+    );
     assert_eq!(
         publication.reason,
         Some(ClientTrustRetirementReason::ClientCaWithdrawn)
@@ -514,7 +526,10 @@ fn dropping_the_guard_deregisters_the_transport() {
             .expect("armed")
             .register(true)
             .expect("registered");
-        assert_eq!(scope_row(ClientTrustScope::ProxyFrontend).tracked_sessions, 1);
+        assert_eq!(
+            scope_row(ClientTrustScope::ProxyFrontend).tracked_sessions,
+            1
+        );
     }
 
     assert_eq!(
@@ -579,7 +594,10 @@ async fn a_fenced_stream_relays_until_retirement_then_fails_bounded() {
     let mut fenced = TrustFencedStream::new(client, Some(guard.session()));
     assert!(fenced.is_fencing());
 
-    fenced.write_all(b"before").await.expect("write before fence");
+    fenced
+        .write_all(b"before")
+        .await
+        .expect("write before fence");
     let mut received = [0u8; 6];
     peer.read_exact(&mut received).await.expect("peer read");
     assert_eq!(&received, b"before");
