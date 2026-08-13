@@ -842,6 +842,20 @@ fn live_contract_sidecar_native_subscribe_fixture_is_mtls_jwt() {
     );
 }
 
+fn native_evid_assignment_line(trimmed_line: &str) -> bool {
+    trimmed_line.starts_with("NATIVE_EVID_") && trimmed_line.contains('=')
+}
+
+/// CP rejection reason literals are allowed only on closed-set `NATIVE_EVID_*`
+/// expectation constants (helper-produced evidence labels). Any other line
+/// that embeds those reasons is generic ferrum-cp log matching.
+fn run_sh_has_generic_cp_reason_literal(run_sh: &str, reason: &str) -> bool {
+    run_sh.lines().any(|line| {
+        let trimmed = line.trim_start();
+        !native_evid_assignment_line(trimmed) && line.contains(reason)
+    })
+}
+
 fn native_probe_classifier_contract_violations(
     run_sh: &str,
     helper: &str,
@@ -895,7 +909,7 @@ fn native_probe_classifier_contract_violations(
         "Tenant subscription rejected",
         "Invalid token: authentication failed",
     ] {
-        if run_sh.contains(banned) {
+        if run_sh_has_generic_cp_reason_literal(run_sh, banned) {
             errors.push(format!(
                 "run.sh must not match CP rejection reason `{banned}` itself — \
                  that is generic CP-log matching; the helper owns exact correlation"
@@ -1220,6 +1234,33 @@ classify_native_probe() {
             error.contains("generic CP-log matching") || error.contains("native_probe_classify.py")
         }),
         "contract must reject generic ferrum-cp reason greps, got {generic_violations:?}"
+    );
+
+    let renamed_cp_grep = r#"
+native_probe_classify.py
+--running-identity
+--classify
+--evidence-out
+--pod-name
+--pod-ip
+logs deploy/ferrum-cp
+get pod -l "app=${deploy}"
+classify_native_probe() {
+  cp="$(kubectl logs deploy/ferrum-cp)"
+  peer_reason='peer sent no certificates'
+  if printf '%s' "$cp" | grep -Fq "$peer_reason"; then
+    printf 'tls-handshake'
+  fi
+}
+"#;
+    let renamed_violations =
+        native_probe_classifier_contract_violations(renamed_cp_grep, HELPER, MANIFESTS);
+    assert!(
+        renamed_violations
+            .iter()
+            .any(|error| error.contains("generic CP-log matching")),
+        "contract must reject CP reason literals even when grep uses a renamed variable, \
+         got {renamed_violations:?}"
     );
 
     let no_slice_guard = r#"
