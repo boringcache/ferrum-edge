@@ -4284,10 +4284,7 @@ async fn claimed_dpop_proof_cannot_move_across_replay_authorities_on_reorder_or_
     let (fixture, jwks) = build_dpop_fixture("dpop-authority-move");
     let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
 
-    let original = dpop_plugin_with_providers(
-        json!([dpop_provider(&jwks)]),
-        "dpop-authority-move",
-    );
+    let original = dpop_plugin_with_providers(json!([dpop_provider(&jwks)]), "dpop-authority-move");
     let mut first = dpop_ctx(&fixture);
     assert_continue(original.authenticate(&mut first, &consumer_index).await);
 

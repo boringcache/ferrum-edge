@@ -1059,10 +1059,12 @@ fn replacement_generation_clears_the_retired_count() {
     drop(old);
     drop(old_client);
     let after_old = shared_health_snapshot();
-    assert_eq!(after_old.shared_authorities, baseline.shared_authorities + 1);
     assert_eq!(
-        after_old.shared_authorities_unavailable,
-        baseline.shared_authorities_unavailable,
+        after_old.shared_authorities,
+        baseline.shared_authorities + 1
+    );
+    assert_eq!(
+        after_old.shared_authorities_unavailable, baseline.shared_authorities_unavailable,
         "the retired unavailable generation must stop contributing immediately"
     );
 
@@ -1324,10 +1326,7 @@ fn stale_reachable_registration_sample_cannot_overwrite_terminal_topology() {
 
     client.mark_topology_unsupported_for_test();
     let terminal = shared_health_snapshot();
-    assert_eq!(
-        terminal.shared_authorities,
-        baseline.shared_authorities + 1
-    );
+    assert_eq!(terminal.shared_authorities, baseline.shared_authorities + 1);
     assert_eq!(
         terminal.shared_authorities_unavailable,
         baseline.shared_authorities_unavailable + 1
