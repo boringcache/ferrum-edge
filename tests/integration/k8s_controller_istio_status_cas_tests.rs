@@ -28,6 +28,7 @@ struct CasObject {
     status: Value,
 }
 
+#[derive(Default)]
 struct CasState {
     objects: HashMap<String, CasObject>,
     get_count: usize,
@@ -39,23 +40,6 @@ struct CasState {
     always_conflict: bool,
     unsupported: bool,
     not_found: bool,
-}
-
-impl Default for CasState {
-    fn default() -> Self {
-        Self {
-            objects: HashMap::new(),
-            get_count: 0,
-            patch_bodies: Vec::new(),
-            inject_foreign_on_first_get: None,
-            injected_keys: HashSet::new(),
-            recreate_after_next_get: false,
-            delete_after_next_get: false,
-            always_conflict: false,
-            unsupported: false,
-            not_found: false,
-        }
-    }
 }
 
 fn supported_kinds() -> &'static [(&'static str, &'static str, &'static str)] {
@@ -946,11 +930,10 @@ async fn deleted_object_after_get_does_not_unversioned_write() {
     let snap = metrics.snapshot();
     assert_eq!(snap.istio_status_not_found, 1);
     assert!(
-        state
+        !state
             .lock()
             .expect("lock")
             .objects
-            .get("authorizationpolicies/policy")
-            .is_none()
+            .contains_key("authorizationpolicies/policy")
     );
 }
