@@ -1059,6 +1059,38 @@ fn native_probe_classifier_contract_violations(
             "connected-without-node-id-is-not-tls-connect-proof",
             "self-test that Connected-to-CP without node_id is not proof",
         ),
+        (
+            "ROTATION_RELOAD_ANCHORS",
+            "classifier pins TLS reload surfaces as generation anchors",
+        ),
+        (
+            "TLS_RELOAD_SURFACE_DP",
+            "capp dp_grpc reload surface constant",
+        ),
+        (
+            "TLS_RELOAD_SURFACE_CP",
+            "CP cp_grpc reload surface constant",
+        ),
+        (
+            "accepts-before-reload-anchor-are-not-fresh-proof",
+            "self-test that count increases before reload anchors are not proof",
+        ),
+        (
+            "reload-anchor-without-later-accept-is-not-proof",
+            "self-test that reload anchors without later accepts are not proof",
+        ),
+        (
+            "wrong-reload-surface-is-not-anchor",
+            "self-test that the wrong TLS reload surface is not an anchor",
+        ),
+        (
+            "one-post-anchor-event-is-not-fresh-proof",
+            "self-test that only one post-anchor event is not enough",
+        ),
+        (
+            "prefix-node-id-is-not-post-anchor-proof",
+            "self-test that prefix-overlapping node ids are not post-anchor proof",
+        ),
     ] {
         if !helper.contains(needle) {
             errors.push(format!(
@@ -1169,6 +1201,22 @@ fn native_mtls_negative_control_contract_violations(run_sh: &str, helper: &str) 
             "rotation gate requires helper client_tls_connect freshness evidence",
         ),
         (
+            "printf '%s' \"$reconnect_ev\" | grep -Fq \"dp_grpc_anchor=1\"",
+            "rotation gate requires a post-baseline dp_grpc reload anchor",
+        ),
+        (
+            "printf '%s' \"$reconnect_ev\" | grep -Fq \"cp_grpc_anchor=1\"",
+            "rotation gate requires a post-baseline cp_grpc reload anchor",
+        ),
+        (
+            "printf '%s' \"$reconnect_ev\" | grep -Fq \"client_post_anchor=1\"",
+            "rotation gate requires a Connected-to-CP after the dp_grpc reload",
+        ),
+        (
+            "printf '%s' \"$reconnect_ev\" | grep -Fq \"cp_post_anchor=1\"",
+            "rotation gate requires a Tenant subscription accepted after the cp_grpc reload",
+        ),
+        (
             "wait_for_native_probe_class \"$deploy\" \"$want_pattern\" \"$want_evidence\"",
             "negative wait loop must gate on classifier evidence, not class alone",
         ),
@@ -1238,6 +1286,30 @@ fn native_mtls_negative_control_contract_violations(run_sh: &str, helper: &str) 
         (
             "pre-rotation-count-is-not-post-proof",
             "classifier self-test that the pre-swap count cannot satisfy post-swap",
+        ),
+        (
+            "ROTATION_RELOAD_ANCHORS",
+            "classifier pins TLS reload surfaces as generation anchors",
+        ),
+        (
+            "accepts-before-reload-anchor-are-not-fresh-proof",
+            "classifier self-test that count increases before reload anchors are not proof",
+        ),
+        (
+            "reload-anchor-without-later-accept-is-not-proof",
+            "classifier self-test that reload anchors without later accepts are not proof",
+        ),
+        (
+            "wrong-reload-surface-is-not-anchor",
+            "classifier self-test that the wrong TLS reload surface is not an anchor",
+        ),
+        (
+            "one-post-anchor-event-is-not-fresh-proof",
+            "classifier self-test that only one post-anchor event is not enough",
+        ),
+        (
+            "prefix-node-id-is-not-post-anchor-proof",
+            "classifier self-test that prefix-overlapping node ids are not post-anchor proof",
         ),
     ] {
         if !helper.contains(needle) {
@@ -1684,6 +1756,22 @@ fn native_rotation_observation_violations(source: &str) -> Vec<String> {
             "full current-container logs so pre-swap lines cannot slide out of a tail window",
         ),
         (
+            "dp_grpc_anchor=1",
+            "rotation evidence must report a post-baseline dp_grpc reload anchor",
+        ),
+        (
+            "cp_grpc_anchor=1",
+            "rotation evidence must report a post-baseline cp_grpc reload anchor",
+        ),
+        (
+            "client_post_anchor=1",
+            "rotation evidence must report Connected-to-CP after the dp_grpc reload",
+        ),
+        (
+            "cp_post_anchor=1",
+            "rotation evidence must report Tenant subscription accepted after the cp_grpc reload",
+        ),
+        (
             "Verify return code: 0",
             "fail-closed verified-handshake check",
         ),
@@ -2016,9 +2104,11 @@ native_probe_running_identity capp
     assert!(
         CONTRACT.contains("strictly newer than the")
             && CONTRACT.contains("pre-swap baseline")
-            && CONTRACT.contains("Reload and reconnect-attempt logs are not proof"),
-        "ga_contract.yaml must require a fresh post-swap capp MeshSubscribe accept, \
-         not reload/attempt logs"
+            && CONTRACT.contains("Reload and reconnect-attempt logs are not proof")
+            && CONTRACT.contains("surface=dp_grpc")
+            && CONTRACT.contains("surface=cp_grpc"),
+        "ga_contract.yaml must require a fresh post-swap capp MeshSubscribe accept \
+         ordered after generation-2 TLS reload anchors, not reload/attempt logs"
     );
     assert!(
         README.contains("over-the-wire mTLS handshake")
@@ -2027,8 +2117,11 @@ native_probe_running_identity capp
     );
     assert!(
         README.contains("strictly newer than the pre-swap baseline")
-            && README.contains("exact pod/node identity"),
-        "README must require identity-correlated pre/post freshness for rotation reconnect"
+            && README.contains("exact pod/node identity")
+            && README.contains("surface=dp_grpc")
+            && README.contains("surface=cp_grpc"),
+        "README must require identity-correlated post-reload-anchor freshness \
+         for rotation reconnect"
     );
     assert!(
         !RUN_SH.to_ascii_lowercase().contains("shred"),

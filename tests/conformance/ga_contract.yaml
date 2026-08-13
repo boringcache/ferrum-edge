@@ -244,8 +244,13 @@ capabilities:
     # mTLS handshake to the running CP observes the replacement leaf serial.
     # The production capp DP must complete a generation-2 TLS handshake and a
     # valid-JWT MeshSubscribe that the CP accepts for that exact pod/node
-    # identity; the accepted-connect count must be strictly newer than the
-    # pre-swap baseline. Reload and reconnect-attempt logs are not proof.
+    # identity. After the pre-swap baseline, a successful surface=dp_grpc TLS
+    # reload publication in capp logs must be followed by a subsequent
+    # exact-node Connected-to-CP, and a successful surface=cp_grpc TLS reload
+    # publication in CP logs must be followed by a subsequent exact-node
+    # Tenant subscription accepted audit. Those accepted events must be
+    # strictly newer than the pre-swap baseline and ordered after their
+    # reload anchors. Reload and reconnect-attempt logs are not proof.
     live_assertions:
       - sidecar.config.native_subscribe_delivered
       - sidecar.config.native_subscribe_mtls_omitted_client_rejected

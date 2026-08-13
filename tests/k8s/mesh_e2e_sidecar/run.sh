@@ -86,9 +86,15 @@ set -euo pipefail
 #                                               stream without a pod restart;
 #                                               capp's post-swap TLS handshake
 #                                               plus CP-accepted MeshSubscribe
-#                                               must be strictly newer than the
-#                                               pre-swap baseline for that
-#                                               exact pod/node identity; an
+#                                               must follow the matching
+#                                               generation-2 TLS reload
+#                                               publication (surface=dp_grpc in
+#                                               capp logs, surface=cp_grpc in
+#                                               CP logs) for that exact
+#                                               pod/node identity, strictly
+#                                               newer than the pre-swap
+#                                               baseline; reload publications
+#                                               are temporal anchors only; an
 #                                               over-the-wire mTLS handshake
 #                                               to the running CP observes the
 #                                               replacement leaf serial
@@ -1948,10 +1954,12 @@ native_rotation_fresh_now() {
 
 wait_for_native_rotation_evidence() {
   local _
-  # Reload / reconnect-attempt logs are not proof: they can pre-exist or show
-  # only an attempt while capp stays on last-known-good. Require a strictly
-  # increased CP MeshSubscribe accept AND capp post-TLS connect for the
-  # baseline pod/node identity captured before gen2.
+  # Reload publications are temporal generation anchors only, never proof by
+  # themselves, and reconnect-attempt logs can fire while capp stays on
+  # last-known-good. Require the captured exact capp pod/node identity, a
+  # post-baseline dp_grpc reload in capp logs followed by a subsequent
+  # exact-node Connected-to-CP, and a post-baseline cp_grpc reload in CP
+  # logs followed by a subsequent exact-node Tenant subscription accepted.
   if [[ "$NATIVE_ROTATION_BASELINE_CAPTURED" != "true" \
     || -z "$NATIVE_ROTATION_NODE_ID" ]]; then
     return 1
@@ -2236,7 +2244,11 @@ else:
     && "$stale_class" == tls-verify ]] \
     && printf '%s' "$stale_ev" | grep -Eq "$NATIVE_EVID_CP_UNKNOWN_ISSUER" \
     && printf '%s' "$reconnect_ev" | grep -Fq "cp_subscribe_accepted node_id=" \
-    && printf '%s' "$reconnect_ev" | grep -Fq "client_tls_connect before="; then
+    && printf '%s' "$reconnect_ev" | grep -Fq "client_tls_connect before=" \
+    && printf '%s' "$reconnect_ev" | grep -Fq "dp_grpc_anchor=1" \
+    && printf '%s' "$reconnect_ev" | grep -Fq "cp_grpc_anchor=1" \
+    && printf '%s' "$reconnect_ev" | grep -Fq "client_post_anchor=1" \
+    && printf '%s' "$reconnect_ev" | grep -Fq "cp_post_anchor=1"; then
     record_live_assertion sidecar.config.native_subscribe_tls_rotation_reconnects pass \
       capp ferrum-cp "$outcome" "native-mtls-rotation.txt"
     return 0

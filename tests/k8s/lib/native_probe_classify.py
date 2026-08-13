@@ -14,11 +14,15 @@ handshake or tenant subscription. Classification therefore consumes:
 Generic CP-log greps are rejected: kubelet TCP readiness and other probes can
 produce unrelated handshake or tenant-subscription lines.
 
-Rotation reconnect proof (`--rotation-count` / `--rotation-fresh`) counts the
-structured CP `Tenant subscription accepted` audit (MeshConfigSync.MeshSubscribe,
-result=success, exact node_id) and the client Connected-to-CP marker with that
-same node_id. A later observation is fresh only when both counts strictly
-exceed the pre-swap baseline. Reload and reconnect-attempt logs are ignored.
+Rotation reconnect proof (`--rotation-count` / `--rotation-fresh`) uses the
+exact running capp pod/node identity. After the pre-swap accepted-connect
+baseline, a successful `surface=dp_grpc` TLS reload publication in capp logs
+must be followed by a subsequent exact-node Connected-to-CP event, and a
+successful `surface=cp_grpc` TLS reload publication in CP logs must be
+followed by a subsequent structured exact-node `Tenant subscription accepted`
+audit (`audit.event=tenant_subscription`, `surface=MeshConfigSync.MeshSubscribe`,
+`result=success`). Reload publications are temporal generation anchors only
+and are never proof by themselves. Reconnect-attempt logs are not proof.
 """
 
 from __future__ import annotations
@@ -46,6 +50,11 @@ CP_JWT_SURFACE = "MeshConfigSync.MeshSubscribe"
 CP_SUBSCRIBE_ACCEPTED_MESSAGE = "Tenant subscription accepted"
 CP_SUBSCRIBE_ACCEPTED_RESULT = "success"
 CP_SUBSCRIBE_AUDIT_EVENT = "tenant_subscription"
+TLS_RELOAD_MESSAGE = (
+    "TLS material sources reloaded; new handshakes/connections will use rotated material"
+)
+TLS_RELOAD_SURFACE_DP = "dp_grpc"
+TLS_RELOAD_SURFACE_CP = "cp_grpc"
 LEAKED_MATERIAL = re.compile(
     r"BEGIN ([A-Z0-9 ]*CERTIFICATE|PRIVATE KEY|RSA PRIVATE KEY|EC PRIVATE KEY)"
 )
@@ -86,8 +95,9 @@ CONTROL_EVIDENCE = {
     ),
 }
 
-# Rotation reconnect proof: both halves plus a strictly increased post-swap
-# count. Reload / reconnect-attempt logs are not accepted evidence.
+# Rotation reconnect proof: both halves, ordered after their matching TLS
+# reload publication. Reload / reconnect-attempt logs are anchors or noise,
+# never accepted evidence by themselves.
 ROTATION_ACCEPTED_EVIDENCE = {
     "cp_subscribe_accepted": (
         CP_SUBSCRIBE_ACCEPTED_MESSAGE,
@@ -96,6 +106,10 @@ ROTATION_ACCEPTED_EVIDENCE = {
         CP_SUBSCRIBE_AUDIT_EVENT,
     ),
     "client_tls_connect": (CONNECTED_MARKER, "node_id"),
+}
+ROTATION_RELOAD_ANCHORS = {
+    TLS_RELOAD_SURFACE_DP: (TLS_RELOAD_MESSAGE, TLS_RELOAD_SURFACE_DP),
+    TLS_RELOAD_SURFACE_CP: (TLS_RELOAD_MESSAGE, TLS_RELOAD_SURFACE_CP),
 }
 
 FIELD_TERMINATORS = frozenset(' ",}\n\r\t')
@@ -231,6 +245,31 @@ def _compact_audit_event_equals(line: str, value: str) -> bool:
     return exact_field_equals(line, "audit.event", value)
 
 
+def _cp_subscribe_accepted_line(line: str, node_id: str) -> bool:
+    """True for a structured MeshSubscribe accept of this exact node_id."""
+    fields = json_fields(line)
+    if fields is not None:
+        if fields.get("message") != CP_SUBSCRIBE_ACCEPTED_MESSAGE:
+            return False
+        if fields.get("node_id") != node_id:
+            return False
+        if fields.get("surface") != CP_JWT_SURFACE:
+            return False
+        if fields.get("result") != CP_SUBSCRIBE_ACCEPTED_RESULT:
+            return False
+        event = fields.get("audit.event") or fields.get("event")
+        return event == CP_SUBSCRIBE_AUDIT_EVENT
+    if not exact_field_equals(line, "node_id", node_id):
+        return False
+    if CP_SUBSCRIBE_ACCEPTED_MESSAGE not in line:
+        return False
+    if not exact_field_equals(line, "surface", CP_JWT_SURFACE):
+        return False
+    if not exact_field_equals(line, "result", CP_SUBSCRIBE_ACCEPTED_RESULT):
+        return False
+    return _compact_audit_event_equals(line, CP_SUBSCRIBE_AUDIT_EVENT)
+
+
 def cp_subscribe_accepted_count(cp_logs: str, node_id: str) -> int:
     """Count CP MeshSubscribe accepts for this exact node_id.
 
@@ -240,35 +279,19 @@ def cp_subscribe_accepted_count(cp_logs: str, node_id: str) -> int:
     """
     if not is_dns1123_label(node_id):
         return 0
-    count = 0
-    for line in cp_logs.splitlines():
-        fields = json_fields(line)
-        if fields is not None:
-            if fields.get("message") != CP_SUBSCRIBE_ACCEPTED_MESSAGE:
-                continue
-            if fields.get("node_id") != node_id:
-                continue
-            if fields.get("surface") != CP_JWT_SURFACE:
-                continue
-            if fields.get("result") != CP_SUBSCRIBE_ACCEPTED_RESULT:
-                continue
-            event = fields.get("audit.event") or fields.get("event")
-            if event != CP_SUBSCRIBE_AUDIT_EVENT:
-                continue
-            count += 1
-            continue
-        if not exact_field_equals(line, "node_id", node_id):
-            continue
-        if CP_SUBSCRIBE_ACCEPTED_MESSAGE not in line:
-            continue
-        if not exact_field_equals(line, "surface", CP_JWT_SURFACE):
-            continue
-        if not exact_field_equals(line, "result", CP_SUBSCRIBE_ACCEPTED_RESULT):
-            continue
-        if not _compact_audit_event_equals(line, CP_SUBSCRIBE_AUDIT_EVENT):
-            continue
-        count += 1
-    return count
+    return sum(1 for line in cp_logs.splitlines() if _cp_subscribe_accepted_line(line, node_id))
+
+
+def _client_tls_connected_line(line: str, node_id: str) -> bool:
+    """True for a Connected-to-CP marker bound to this exact node_id."""
+    fields = json_fields(line)
+    if fields is not None:
+        return (
+            fields.get("message") == CONNECTED_MARKER and fields.get("node_id") == node_id
+        )
+    if CONNECTED_MARKER not in line:
+        return False
+    return exact_field_equals(line, "node_id", node_id)
 
 
 def client_tls_connected_count(client_logs: str, node_id: str) -> int:
@@ -280,21 +303,64 @@ def client_tls_connected_count(client_logs: str, node_id: str) -> int:
     """
     if not is_dns1123_label(node_id):
         return 0
-    count = 0
-    for line in client_logs.splitlines():
-        fields = json_fields(line)
-        if fields is not None:
-            if fields.get("message") != CONNECTED_MARKER:
-                continue
-            if fields.get("node_id") != node_id:
-                continue
-            count += 1
-            continue
-        if CONNECTED_MARKER not in line:
-            continue
-        if exact_field_equals(line, "node_id", node_id):
-            count += 1
-    return count
+    return sum(1 for line in client_logs.splitlines() if _client_tls_connected_line(line, node_id))
+
+
+def _tls_reload_line(line: str, surface: str) -> bool:
+    """True for a successful TLS material reload publication of this surface.
+
+    Matches the production info-level success log only. Rebuild failures use a
+    different message and must not count as generation anchors. Surface is an
+    exact closed token (`dp_grpc` vs `cp_grpc`); prefix overlap is rejected.
+    """
+    if not surface:
+        return False
+    fields = json_fields(line)
+    if fields is not None:
+        return (
+            fields.get("message") == TLS_RELOAD_MESSAGE
+            and fields.get("surface") == surface
+        )
+    if TLS_RELOAD_MESSAGE not in line:
+        return False
+    return exact_field_equals(line, "surface", surface)
+
+
+def _index_after_nth_match(
+    lines: list[str], predicate, count: int
+) -> int | None:
+    """Return the index after the count-th matching line, or None.
+
+    Fail-closed: the current log must still contain the pre-swap baseline
+    events. A truncated or rotated container log that dropped those lines
+    cannot establish a post-baseline suffix.
+    """
+    if count < 1:
+        return None
+    seen = 0
+    for idx, line in enumerate(lines):
+        if predicate(line):
+            seen += 1
+            if seen == count:
+                return idx + 1
+    return None
+
+
+def _event_after_reload(
+    lines: list[str], start: int, is_reload, is_event
+) -> tuple[bool, bool]:
+    """Return (saw_reload_anchor, saw_event_after_anchor) from start onward."""
+    reload_idx = None
+    for idx in range(start, len(lines)):
+        if is_reload(lines[idx]):
+            reload_idx = idx
+            break
+    if reload_idx is None:
+        return False, False
+    for idx in range(reload_idx + 1, len(lines)):
+        if is_event(lines[idx]):
+            return True, True
+    return True, False
 
 
 def rotation_observation_counts(
@@ -313,17 +379,60 @@ def rotation_fresh_evidence(
     baseline_cp: int,
     baseline_client: int,
 ) -> tuple[bool, str]:
-    """True only when both halves strictly increased after the baseline."""
+    """True only when both accepted events occur after their reload anchors.
+
+    The pre-swap baseline is a count of exact-node Connected / Tenant
+    subscription accepted events that must still be present in the current
+    logs. After those baseline events, each half needs its matching TLS reload
+    publication (`dp_grpc` in capp logs, `cp_grpc` in CP logs) and then a
+    subsequent exact-node accepted event. Count increases that happen before
+    the reload anchors are not generation-2 proof.
+    """
     if not is_dns1123_label(node_id):
         return False, "invalid-node-id"
-    if baseline_cp < 0 or baseline_client < 0:
+    if baseline_cp < 1 or baseline_client < 1:
         return False, "invalid-baseline"
     cp_after, client_after = rotation_observation_counts(client_logs, cp_logs, node_id)
+    client_lines = client_logs.splitlines()
+    cp_lines = cp_logs.splitlines()
+    client_start = _index_after_nth_match(
+        client_lines,
+        lambda line: _client_tls_connected_line(line, node_id),
+        baseline_client,
+    )
+    cp_start = _index_after_nth_match(
+        cp_lines,
+        lambda line: _cp_subscribe_accepted_line(line, node_id),
+        baseline_cp,
+    )
+    dp_anchor = False
+    cp_anchor = False
+    client_post_anchor = False
+    cp_post_anchor = False
+    if client_start is not None:
+        dp_anchor, client_post_anchor = _event_after_reload(
+            client_lines,
+            client_start,
+            lambda line: _tls_reload_line(line, TLS_RELOAD_SURFACE_DP),
+            lambda line: _client_tls_connected_line(line, node_id),
+        )
+    if cp_start is not None:
+        cp_anchor, cp_post_anchor = _event_after_reload(
+            cp_lines,
+            cp_start,
+            lambda line: _tls_reload_line(line, TLS_RELOAD_SURFACE_CP),
+            lambda line: _cp_subscribe_accepted_line(line, node_id),
+        )
     evidence = (
         f"cp_subscribe_accepted node_id={node_id} before={baseline_cp} after={cp_after} "
-        f"client_tls_connect before={baseline_client} after={client_after}"
+        f"client_tls_connect before={baseline_client} after={client_after} "
+        f"dp_grpc_anchor={int(dp_anchor)} cp_grpc_anchor={int(cp_anchor)} "
+        f"client_post_anchor={int(client_post_anchor)} "
+        f"cp_post_anchor={int(cp_post_anchor)}"
     )
-    ok = cp_after > baseline_cp and client_after > baseline_client
+    if client_start is None or cp_start is None:
+        return False, evidence
+    ok = dp_anchor and cp_anchor and client_post_anchor and cp_post_anchor
     return ok, evidence
 
 
@@ -566,6 +675,21 @@ def _json_client_connected_line(node_id: str) -> str:
                 "node_id": node_id,
                 "namespace": "ferrum",
                 "cp_url": "https://ferrum-cp.ferrum.svc.cluster.local:50051",
+            },
+        }
+    )
+
+
+def _json_tls_reload_line(surface: str, revision: int = 2) -> str:
+    return json.dumps(
+        {
+            "timestamp": "2026-08-13T13:12:03Z",
+            "level": "INFO",
+            "target": "ferrum_edge::tls::source::subscription",
+            "fields": {
+                "message": TLS_RELOAD_MESSAGE,
+                "surface": surface,
+                "revision": revision,
             },
         }
     )
@@ -903,6 +1027,14 @@ def self_test() -> None:
     reload_log = (
         "TLS material sources reloaded; new handshakes/connections will use rotated material\n"
     )
+    dp_reload = _json_tls_reload_line(TLS_RELOAD_SURFACE_DP) + "\n"
+    cp_reload = _json_tls_reload_line(TLS_RELOAD_SURFACE_CP) + "\n"
+    compact_dp_reload = (
+        f"surface={TLS_RELOAD_SURFACE_DP} revision=2 {TLS_RELOAD_MESSAGE}\n"
+    )
+    compact_cp_reload = (
+        f"surface={TLS_RELOAD_SURFACE_CP} revision=2 {TLS_RELOAD_MESSAGE}\n"
+    )
 
     if cp_subscribe_accepted_count(accepted, capp_name) != 1:
         raise AssertionError("exact-capp-node-id-accepted")
@@ -915,6 +1047,8 @@ def self_test() -> None:
     if cp_subscribe_accepted_count(reconnect_attempt + reload_log, capp_name) != 0:
         raise AssertionError("reconnect-attempt-is-not-accepted-proof")
     if client_tls_connected_count(reconnect_attempt + reload_log, capp_name) != 0:
+        raise AssertionError("reload-log-is-not-accepted-proof")
+    if client_tls_connected_count(dp_reload + cp_reload, capp_name) != 0:
         raise AssertionError("reload-log-is-not-accepted-proof")
     if client_tls_connected_count(f"info: {CONNECTED_MARKER}\n", capp_name) != 0:
         raise AssertionError("connected-without-node-id-is-not-tls-connect-proof")
@@ -930,6 +1064,20 @@ def self_test() -> None:
         raise AssertionError("compact-subscribe-accepted-counts")
     if client_tls_connected_count(compact_connected, capp_name) != 1:
         raise AssertionError("compact-client-tls-connect-counts")
+    if not _tls_reload_line(dp_reload, TLS_RELOAD_SURFACE_DP):
+        raise AssertionError("dp-grpc-reload-json-must-parse")
+    if _tls_reload_line(dp_reload, TLS_RELOAD_SURFACE_CP):
+        raise AssertionError("dp-grpc-reload-must-not-match-cp-grpc")
+    if not _tls_reload_line(compact_dp_reload, TLS_RELOAD_SURFACE_DP):
+        raise AssertionError("dp-grpc-reload-compact-must-parse")
+    if _tls_reload_line(reload_log, TLS_RELOAD_SURFACE_DP):
+        raise AssertionError("reload-without-surface-is-not-anchor")
+    rebuild_failed = (
+        f"surface={TLS_RELOAD_SURFACE_DP} "
+        "TLS material sources changed but rebuild failed; keeping previous material\n"
+    )
+    if _tls_reload_line(rebuild_failed, TLS_RELOAD_SURFACE_DP):
+        raise AssertionError("rebuild-failure-is-not-reload-anchor")
 
     pre_client = connected_json + "\n"
     pre_cp = accepted + "\n"
@@ -939,30 +1087,116 @@ def self_test() -> None:
     if "before=1 after=1" not in evidence:
         raise AssertionError(f"freshness evidence missing baseline compare: {evidence!r}")
 
-    post_client = pre_client + _json_client_connected_line(capp_name) + "\n"
-    post_cp = pre_cp + _json_subscribe_accepted_line(capp_name) + "\n"
-    ok, evidence = rotation_fresh_evidence(post_client, post_cp, capp_name, 1, 1)
+    increased_client = pre_client + _json_client_connected_line(capp_name) + "\n"
+    increased_cp = pre_cp + _json_subscribe_accepted_line(capp_name) + "\n"
+    ok, _ = rotation_fresh_evidence(increased_client, increased_cp, capp_name, 1, 1)
+    if ok:
+        raise AssertionError("accepts-before-reload-anchor-are-not-fresh-proof")
+
+    ok, _ = rotation_fresh_evidence(
+        pre_client + dp_reload,
+        pre_cp + cp_reload,
+        capp_name,
+        1,
+        1,
+    )
+    if ok:
+        raise AssertionError("reload-anchor-without-later-accept-is-not-proof")
+
+    ok, _ = rotation_fresh_evidence(
+        increased_client + dp_reload,
+        increased_cp + cp_reload,
+        capp_name,
+        1,
+        1,
+    )
+    if ok:
+        raise AssertionError("reload-anchor-without-later-accept-is-not-proof")
+
+    ok, _ = rotation_fresh_evidence(
+        pre_client + _json_tls_reload_line(TLS_RELOAD_SURFACE_CP) + "\n"
+        + _json_client_connected_line(capp_name) + "\n",
+        pre_cp + _json_tls_reload_line(TLS_RELOAD_SURFACE_DP) + "\n"
+        + _json_subscribe_accepted_line(capp_name) + "\n",
+        capp_name,
+        1,
+        1,
+    )
+    if ok:
+        raise AssertionError("wrong-reload-surface-is-not-anchor")
+
+    ok, _ = rotation_fresh_evidence(
+        pre_client + reload_log + _json_client_connected_line(capp_name) + "\n",
+        pre_cp + reload_log + _json_subscribe_accepted_line(capp_name) + "\n",
+        capp_name,
+        1,
+        1,
+    )
+    if ok:
+        raise AssertionError("wrong-reload-surface-is-not-anchor")
+
+    fresh_client = (
+        pre_client + dp_reload + _json_client_connected_line(capp_name) + "\n"
+    )
+    fresh_cp = pre_cp + cp_reload + _json_subscribe_accepted_line(capp_name) + "\n"
+    ok, evidence = rotation_fresh_evidence(fresh_client, fresh_cp, capp_name, 1, 1)
     if not ok:
         raise AssertionError(f"post-swap increase must pass: {evidence!r}")
     if "before=1 after=2" not in evidence:
         raise AssertionError(f"post-swap evidence must show increase: {evidence!r}")
+    if "dp_grpc_anchor=1" not in evidence or "cp_grpc_anchor=1" not in evidence:
+        raise AssertionError(f"post-swap evidence must report reload anchors: {evidence!r}")
+    if "client_post_anchor=1" not in evidence or "cp_post_anchor=1" not in evidence:
+        raise AssertionError(f"post-swap evidence must report post-anchor events: {evidence!r}")
 
-    ok, _ = rotation_fresh_evidence(post_client, pre_cp, capp_name, 1, 1)
+    ok, _ = rotation_fresh_evidence(fresh_client, pre_cp, capp_name, 1, 1)
     if ok:
         raise AssertionError("one-half-increase-is-not-fresh-proof client-only")
-    ok, _ = rotation_fresh_evidence(pre_client, post_cp, capp_name, 1, 1)
+    ok, _ = rotation_fresh_evidence(pre_client, fresh_cp, capp_name, 1, 1)
     if ok:
         raise AssertionError("one-half-increase-is-not-fresh-proof cp-only")
+    ok, _ = rotation_fresh_evidence(fresh_client, pre_cp + cp_reload, capp_name, 1, 1)
+    if ok:
+        raise AssertionError("one-post-anchor-event-is-not-fresh-proof client-only")
+    ok, _ = rotation_fresh_evidence(pre_client + dp_reload, fresh_cp, capp_name, 1, 1)
+    if ok:
+        raise AssertionError("one-post-anchor-event-is-not-fresh-proof cp-only")
 
     ok, _ = rotation_fresh_evidence(
-        post_client + reconnect_attempt,
-        post_cp + reload_log,
+        increased_client + dp_reload + _json_client_connected_line(prefix_name) + "\n",
+        increased_cp + cp_reload + _json_subscribe_accepted_line(prefix_name) + "\n",
+        capp_name,
+        1,
+        1,
+    )
+    if ok:
+        raise AssertionError("prefix-node-id-is-not-post-anchor-proof")
+
+    compact_fresh_client = pre_client + compact_dp_reload + compact_connected
+    compact_fresh_cp = pre_cp + compact_cp_reload + compact_accepted
+    ok, evidence = rotation_fresh_evidence(
+        compact_fresh_client, compact_fresh_cp, capp_name, 1, 1
+    )
+    if not ok:
+        raise AssertionError(f"compact post-anchor proof must pass: {evidence!r}")
+
+    ok, _ = rotation_fresh_evidence(
+        pre_client + reconnect_attempt + dp_reload
+        + _json_client_connected_line(capp_name) + "\n",
+        pre_cp + reload_log + cp_reload + _json_subscribe_accepted_line(capp_name) + "\n",
         capp_name,
         1,
         1,
     )
     if not ok:
         raise AssertionError("reload lines must not hide a real post-swap increase")
+
+    ok, reason = rotation_fresh_evidence(fresh_client, fresh_cp, capp_name, 0, 0)
+    if ok or reason != "invalid-baseline":
+        raise AssertionError(f"zero baseline must fail closed: {reason!r}")
+    ok, _ = rotation_fresh_evidence(pre_client, pre_cp, capp_name, 2, 2)
+    if ok:
+        raise AssertionError("truncated baseline events must fail closed")
 
     print("native_probe_classify.py --self-test: ok")
 

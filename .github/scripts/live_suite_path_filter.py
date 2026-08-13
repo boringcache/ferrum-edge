@@ -489,6 +489,22 @@ def native_mtls_negative_control_contract_errors(run_text: str, helper_text: str
             "rotation gate requires helper client_tls_connect freshness evidence",
         ),
         (
+            'printf \'%s\' "$reconnect_ev" | grep -Fq "dp_grpc_anchor=1"',
+            "rotation gate requires a post-baseline dp_grpc reload anchor",
+        ),
+        (
+            'printf \'%s\' "$reconnect_ev" | grep -Fq "cp_grpc_anchor=1"',
+            "rotation gate requires a post-baseline cp_grpc reload anchor",
+        ),
+        (
+            'printf \'%s\' "$reconnect_ev" | grep -Fq "client_post_anchor=1"',
+            "rotation gate requires a Connected-to-CP after the dp_grpc reload",
+        ),
+        (
+            'printf \'%s\' "$reconnect_ev" | grep -Fq "cp_post_anchor=1"',
+            "rotation gate requires a Tenant subscription accepted after the cp_grpc reload",
+        ),
+        (
             'wait_for_native_probe_class "$deploy" "$want_pattern" "$want_evidence"',
             "negative wait loop must gate on classifier evidence, not class alone",
         ),
@@ -561,6 +577,38 @@ def native_mtls_negative_control_contract_errors(run_text: str, helper_text: str
         (
             "connected-without-node-id-is-not-tls-connect-proof",
             "classifier self-test that Connected-to-CP without node_id is not proof",
+        ),
+        (
+            "ROTATION_RELOAD_ANCHORS",
+            "classifier pins TLS reload surfaces as generation anchors",
+        ),
+        (
+            "TLS_RELOAD_SURFACE_DP",
+            "capp dp_grpc reload surface constant",
+        ),
+        (
+            "TLS_RELOAD_SURFACE_CP",
+            "CP cp_grpc reload surface constant",
+        ),
+        (
+            "accepts-before-reload-anchor-are-not-fresh-proof",
+            "classifier self-test that count increases before reload anchors are not proof",
+        ),
+        (
+            "reload-anchor-without-later-accept-is-not-proof",
+            "classifier self-test that reload anchors without later accepts are not proof",
+        ),
+        (
+            "wrong-reload-surface-is-not-anchor",
+            "classifier self-test that the wrong TLS reload surface is not an anchor",
+        ),
+        (
+            "one-post-anchor-event-is-not-fresh-proof",
+            "classifier self-test that only one post-anchor event is not enough",
+        ),
+        (
+            "prefix-node-id-is-not-post-anchor-proof",
+            "classifier self-test that prefix-overlapping node ids are not post-anchor proof",
         ),
     ):
         if needle not in helper_text:
@@ -710,8 +758,11 @@ def native_mtls_rotation_observation_errors(
     that publishes NATIVE_OBSERVE_PF_PID must run in the parent shell.
 
     Rotation reconnect proof must capture a pre-swap baseline for the running
-    capp identity, then require a strictly increased CP MeshSubscribe accept
-    and capp post-TLS connect. Reload / reconnect-attempt logs are not proof.
+    capp identity, then require a successful surface=dp_grpc TLS reload in
+    capp logs followed by a subsequent exact-node Connected-to-CP, and a
+    successful surface=cp_grpc TLS reload in CP logs followed by a subsequent
+    exact-node Tenant subscription accepted. Reload publications are temporal
+    generation anchors only; reconnect-attempt logs are not proof.
     """
 
     errors: list[str] = []
@@ -787,6 +838,22 @@ def native_mtls_rotation_observation_errors(
         (
             "--tail=-1",
             "full current-container logs so pre-swap lines cannot slide out of a tail window",
+        ),
+        (
+            "dp_grpc_anchor=1",
+            "rotation evidence must report a post-baseline dp_grpc reload anchor",
+        ),
+        (
+            "cp_grpc_anchor=1",
+            "rotation evidence must report a post-baseline cp_grpc reload anchor",
+        ),
+        (
+            "client_post_anchor=1",
+            "rotation evidence must report Connected-to-CP after the dp_grpc reload",
+        ),
+        (
+            "cp_post_anchor=1",
+            "rotation evidence must report Tenant subscription accepted after the cp_grpc reload",
         ),
     )
     for needle, desc in required:
@@ -901,6 +968,30 @@ def native_mtls_rotation_observation_errors(
             (
                 "pre-rotation-count-is-not-post-proof",
                 "self-test rejecting pre-swap counts as post-swap proof",
+            ),
+            (
+                "ROTATION_RELOAD_ANCHORS",
+                "TLS reload surfaces as generation anchors",
+            ),
+            (
+                "accepts-before-reload-anchor-are-not-fresh-proof",
+                "self-test rejecting count increases before reload anchors",
+            ),
+            (
+                "reload-anchor-without-later-accept-is-not-proof",
+                "self-test rejecting reload anchors without later accepts",
+            ),
+            (
+                "wrong-reload-surface-is-not-anchor",
+                "self-test rejecting the wrong TLS reload surface as an anchor",
+            ),
+            (
+                "one-post-anchor-event-is-not-fresh-proof",
+                "self-test rejecting a single post-anchor event",
+            ),
+            (
+                "prefix-node-id-is-not-post-anchor-proof",
+                "self-test rejecting prefix-overlapping node ids after reload",
             ),
         ):
             if needle not in helper_text:
