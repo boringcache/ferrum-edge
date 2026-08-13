@@ -3297,6 +3297,22 @@ async fn handle_tcp_connection_inner(
     // (even when empty) means we read plaintext from the TLS session and must
     // therefore use a userspace relay (kTLS splice is no longer possible).
     let mut client_first_bytes_forward: Option<Vec<u8>> = None;
+    // Issue #3857. Captured BEFORE the frontend TLS config is consumed by the
+    // handshake: the publisher swaps material first and advances the generation
+    // second, so reading the generation first keeps the capture at or older than
+    // the verifier actually used. `None` (and therefore zero per-connection
+    // cost) unless the proxy frontend trust domain has accepted material, which
+    // only happens under `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED`.
+    //
+    // TCP+TLS shares the proxy HTTPS/H2 `ServerConfig`, so it is the same trust
+    // domain: an operator CRL or client-CA change retires both listener families
+    // together.
+    let client_trust_admission = if frontend_tls_config.is_some() {
+        crate::tls::client_trust::capture(crate::tls::ClientTrustScope::ProxyFrontend)
+    } else {
+        None
+    };
+    let mut client_trust_guard: Option<crate::tls::ClientTrustSessionGuard> = None;
     let client_stream = 'frontend_tls: {
         let Some(tls_config) = frontend_tls_config else {
             // Plaintext client: peek (non-destructively) the opening bytes. These are
@@ -3332,7 +3348,20 @@ async fn handle_tcp_connection_inner(
         // refuse — kernel/cipher probes, TLS 1.3, secret-extraction opt-in —
         // is decided inside `try_ktls_accept` while the socket is still
         // pristine, so a refusal costs nothing but a ClientHello peek.
-        let ktls_eligible = ktls_enabled && !is_backend_tls && !scan_first_bytes_decrypted;
+        //
+        // The kTLS fast path is additionally declined whenever this listener's
+        // client-trust domain is armed (issue #3857). A kernel-terminated leg is
+        // spliced, so there is no userspace poll seam at which a trust
+        // withdrawal could end the session; the buffered rustls relay is
+        // fence-aware and is used instead. Nothing is refused and no
+        // authentication is skipped — only the optional optimization is
+        // declined, and only in deployments that enabled frontend TLS live
+        // reload. Deciding it here, before the handshake, keeps the socket
+        // pristine.
+        let ktls_eligible = ktls_enabled
+            && !is_backend_tls
+            && !scan_first_bytes_decrypted
+            && client_trust_admission.is_none();
 
         // Frontend TLS failures return before any backend dispatch — no backend
         // circuit-breaker, pool, or socket interaction.
@@ -3477,7 +3506,21 @@ async fn handle_tcp_connection_inner(
             .await?;
         }
 
-        ClientRelayStream::Tls(Box::new(tls_stream))
+        // Register the established TCP+TLS transport against the frontend
+        // client-trust domain and wrap the client leg so a withdrawal surfaces
+        // as an ordinary client-side transport failure (issue #3857). Routing it
+        // through the relay's own error path means byte counters, first-failure
+        // attribution, circuit-breaker classification, `on_stream_disconnect`,
+        // and the stream summary all complete exactly once through paths that
+        // already exist. A connection with no verified client certificate
+        // registers nothing and the wrapper is a pass-through.
+        client_trust_guard = client_trust_admission
+            .and_then(|admission| admission.register(stream_ctx.tls_client_cert_der.is_some()));
+        let fenced = crate::tls::TrustFencedStream::new(
+            tls_stream,
+            client_trust_guard.as_ref().map(|guard| guard.session()),
+        );
+        ClientRelayStream::Tls(Box::new(fenced))
     };
 
     // Helper: record circuit breaker failure for the current target.
@@ -5560,7 +5603,12 @@ enum BackendStream {
 /// Client-side stream after optional frontend TLS termination.
 enum ClientRelayStream {
     Plain(TcpStream),
-    Tls(Box<tokio_rustls::server::TlsStream<TcpStream>>),
+    /// Buffered userspace rustls termination, wrapped by
+    /// [`crate::tls::TrustFencedStream`] so a frontend client-certificate trust
+    /// withdrawal ends the session through the relay's ordinary failure path
+    /// (issue #3857). The wrapper is a transparent pass-through when the
+    /// connection holds no withdrawable trust decision.
+    Tls(Box<crate::tls::TrustFencedStream<tokio_rustls::server::TlsStream<TcpStream>>>),
     /// Frontend TLS terminated by the **kernel**: rustls handed its TLS 1.2
     /// traffic secrets to the kTLS ULP after an unbuffered handshake reached
     /// `WriteTraffic` (issue #3619). The socket now reads decrypted plaintext

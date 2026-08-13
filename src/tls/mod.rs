@@ -17,6 +17,7 @@
 
 pub mod acme;
 pub mod backend;
+pub mod client_trust;
 pub mod events;
 pub mod frontend_reload;
 pub mod inventory;
@@ -46,9 +47,13 @@ mod store_atomicity_tests;
 #[allow(dead_code)]
 pub mod spiffe;
 
+pub use client_trust::{
+    ClientTrustAdmission, ClientTrustMaterial, ClientTrustRetirementReason, ClientTrustScope,
+    ClientTrustSession, ClientTrustSessionGuard, TrustFencedStream,
+};
 pub use frontend_reload::{
-    FrontendTlsRebuildFn, FrontendTlsReloadConfig, SharedFrontendTls, empty_frontend_tls_slot,
-    frontend_tls_slot_with, spawn_frontend_tls_reload_task,
+    FrontendTlsRebuildFn, FrontendTlsRebuilt, FrontendTlsReloadConfig, SharedFrontendTls,
+    empty_frontend_tls_slot, frontend_tls_slot_with, spawn_frontend_tls_reload_task,
 };
 
 #[allow(unused_imports)]
@@ -930,6 +935,47 @@ pub fn load_tls_config_with_client_auth_from_sources_and_ocsp(
     cert_expiry_warning_days: u64,
     crls: &[CertificateRevocationListDer<'static>],
 ) -> Result<Arc<ServerConfig>, anyhow::Error> {
+    load_frontend_tls_candidate(
+        cert_source,
+        key_source,
+        client_ca_bundle_source,
+        ocsp_response_source,
+        no_verify,
+        tls_policy,
+        cert_expiry_warning_days,
+        crls,
+    )
+    .map(|candidate| candidate.config)
+}
+
+/// One accepted frontend TLS candidate: the rebuilt `ServerConfig` plus the
+/// semantic client-CA / CRL identity of **the same load** (issue #3857).
+///
+/// The trust identity is captured from the bytes this call actually verified, so
+/// the generation an established transport is fenced against can never describe
+/// a different snapshot than the one served. Re-reading the client-CA source
+/// after the swap to derive it would race the next rotation and could publish a
+/// generation for material that was never in force.
+pub struct FrontendTlsCandidate {
+    /// The rebuilt server configuration.
+    pub config: Arc<ServerConfig>,
+    /// Semantic client-trust identity of the same accepted material.
+    pub client_trust: client_trust::ClientTrustMaterial,
+}
+
+/// [`load_tls_config_with_client_auth_from_sources_and_ocsp`] that also returns
+/// the accepted candidate's client-trust identity.
+#[allow(clippy::too_many_arguments)]
+pub fn load_frontend_tls_candidate(
+    cert_source: &CertSource,
+    key_source: &CertSource,
+    client_ca_bundle_source: Option<&CertSource>,
+    ocsp_response_source: Option<&CertSource>,
+    no_verify: bool,
+    tls_policy: &TlsPolicy,
+    cert_expiry_warning_days: u64,
+    crls: &[CertificateRevocationListDer<'static>],
+) -> Result<FrontendTlsCandidate, anyhow::Error> {
     let cert_material = load_material_blocking(cert_source, MaterialKind::Cert)?;
 
     check_cert_expiry_from_pem_bytes(
@@ -974,7 +1020,8 @@ pub fn load_tls_config_with_client_auth_from_sources_and_ocsp(
         tls_policy.crypto_provider.as_ref(),
     )?;
 
-    finish_frontend_server_config(
+    let mut client_trust = None;
+    let config = finish_frontend_server_config_capturing_trust(
         cert_resolver,
         client_ca_bundle_source,
         no_verify,
@@ -983,7 +1030,18 @@ pub fn load_tls_config_with_client_auth_from_sources_and_ocsp(
         crls,
         &cert_material.display_source_id,
         &key_source_id,
-    )
+        Some(&mut client_trust),
+    )?;
+    // The capture is unconditional inside the builder, so the only way this is
+    // `None` is a refactor that stopped threading it. Fail closed rather than
+    // publishing an empty (maximally-withdrawing) identity.
+    let client_trust = client_trust.ok_or_else(|| {
+        anyhow::anyhow!("frontend TLS candidate did not capture a client-trust identity")
+    })?;
+    Ok(FrontendTlsCandidate {
+        config,
+        client_trust,
+    })
 }
 
 /// Build the frontend/admin rustls `ServerConfig` around an already-constructed
@@ -1005,6 +1063,37 @@ pub(crate) fn finish_frontend_server_config(
     crls: &[CertificateRevocationListDer<'static>],
     cert_source_display: &str,
     key_source_display: &str,
+) -> Result<Arc<ServerConfig>, anyhow::Error> {
+    finish_frontend_server_config_capturing_trust(
+        cert_resolver,
+        client_ca_bundle_source,
+        no_verify,
+        tls_policy,
+        cert_expiry_warning_days,
+        crls,
+        cert_source_display,
+        key_source_display,
+        None,
+    )
+}
+
+/// [`finish_frontend_server_config`] with an optional out-parameter for the
+/// accepted candidate's client-trust identity (issue #3857).
+///
+/// The identity is derived from the exact client-CA bytes this call loaded and
+/// verified, together with the exact CRL list compiled into the verifier — the
+/// only point where both are known to belong to one accepted generation.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn finish_frontend_server_config_capturing_trust(
+    cert_resolver: Arc<dyn rustls::server::ResolvesServerCert>,
+    client_ca_bundle_source: Option<&CertSource>,
+    no_verify: bool,
+    tls_policy: &TlsPolicy,
+    cert_expiry_warning_days: u64,
+    crls: &[CertificateRevocationListDer<'static>],
+    cert_source_display: &str,
+    key_source_display: &str,
+    client_trust_out: Option<&mut Option<client_trust::ClientTrustMaterial>>,
 ) -> Result<Arc<ServerConfig>, anyhow::Error> {
     let builder = ServerConfig::builder_with_provider(tls_policy.crypto_provider.clone())
         .with_protocol_versions(&tls_policy.protocol_versions)
@@ -1030,6 +1119,25 @@ pub(crate) fn finish_frontend_server_config(
             Ok::<_, anyhow::Error>((ca_material, roots))
         })
         .transpose()?;
+
+    if let Some(out) = client_trust_out {
+        // `no_verify` disables client authentication outright, so no transport
+        // on this listener can hold a client-certificate trust decision and the
+        // identity is the empty one — which, being a subset of everything, can
+        // never be read as a withdrawal.
+        let material = if no_verify {
+            client_trust::ClientTrustMaterial::default()
+        } else {
+            client_trust::ClientTrustMaterial::from_parts(
+                client_ca
+                    .as_ref()
+                    .map(|(ca_material, _)| ca_material.bytes.expose_secret()),
+                crls,
+            )
+            .map_err(|error| anyhow::anyhow!("{error}"))?
+        };
+        *out = Some(material);
+    }
 
     let mut config = if no_verify {
         // No verification mode (for testing only)

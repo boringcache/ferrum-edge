@@ -1614,6 +1614,99 @@
     "emission": "always"
   },
   {
+    "name": "ferrum_frontend_client_trust_fenced_total",
+    "type": "counter",
+    "help": "Requests or streams refused before routing because the transport's client-certificate trust was withdrawn.",
+    "labels": [
+      "scope",
+      "namespace"
+    ],
+    "subsystem": "tls",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_frontend_client_trust_generation",
+    "type": "gauge",
+    "help": "Monotonic frontend client-CA/CRL trust generation currently in force for a listener scope.",
+    "labels": [
+      "scope",
+      "namespace"
+    ],
+    "subsystem": "tls",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_frontend_client_trust_publications_total",
+    "type": "counter",
+    "help": "Accepted frontend client-trust reload publications by bounded outcome.",
+    "labels": [
+      "scope",
+      "outcome",
+      "namespace"
+    ],
+    "subsystem": "tls",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_frontend_client_trust_rejected_candidates_total",
+    "type": "counter",
+    "help": "Frontend client-trust reload candidates refused; the last accepted generation and its sessions are retained.",
+    "labels": [
+      "scope",
+      "namespace"
+    ],
+    "subsystem": "tls",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_frontend_client_trust_retired_connections_total",
+    "type": "counter",
+    "help": "Established frontend transports retired because their client-certificate trust decision was withdrawn.",
+    "labels": [
+      "scope",
+      "reason",
+      "namespace"
+    ],
+    "subsystem": "tls",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_frontend_client_trust_tracked_connections",
+    "type": "gauge",
+    "help": "Established client-certificate-authenticated frontend transports currently tracked for retirement.",
+    "labels": [
+      "scope",
+      "namespace"
+    ],
+    "subsystem": "tls",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_frontend_client_trust_withdrawal_generation",
+    "type": "gauge",
+    "help": "Generation at which frontend client-certificate authority was last narrowed for a listener scope (0 = never).",
+    "labels": [
+      "scope",
+      "namespace"
+    ],
+    "subsystem": "tls",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
     "name": "ferrum_gateway_listener_failed_ports",
     "type": "gauge",
     "help": "Distinct dynamic Gateway API listener ports with at least one active failure.",

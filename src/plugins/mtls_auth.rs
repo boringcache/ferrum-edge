@@ -853,6 +853,24 @@ impl AuthMechanism for MtlsAuth {
     }
 
     fn extract(&self, ctx: &RequestContext) -> ExtractedCredential {
+        // Defense in depth for issue #3857. Every production path already fences
+        // a retired transport strictly earlier — H1/H2 in
+        // `handle_proxy_request_on_frontend_port` before routing and plugins,
+        // H3 at stream admission before the request task is spawned — so this
+        // branch should be unreachable. It exists because `mtls_auth` is the
+        // component that turns a presented certificate into an authenticated
+        // principal: if a future frontend admits a client certificate without
+        // consulting the trust fence, the credential must still not be
+        // extracted. Treating it as `Missing` reuses the existing
+        // no-certificate rejection instead of adding a second reject shape, and
+        // discloses nothing about why.
+        if ctx
+            .client_trust_session
+            .as_ref()
+            .is_some_and(|session| session.is_retired())
+        {
+            return ExtractedCredential::Missing;
+        }
         match &ctx.tls_client_cert_der {
             Some(der_bytes) => ExtractedCredential::MtlsCert {
                 der_bytes: Arc::clone(der_bytes),

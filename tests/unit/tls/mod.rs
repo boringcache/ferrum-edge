@@ -2,6 +2,7 @@
 mod acme_dns01_hook_tests;
 mod acme_http01_challenge_path_tests;
 mod acme_store_ha_tests;
+mod client_trust_tests;
 mod fips_key_admission_tests;
 mod fips_policy_tests;
 mod inventory_public_metadata_tests;

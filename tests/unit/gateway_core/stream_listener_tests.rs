@@ -2227,6 +2227,7 @@ fn ephemeral_frontend_dtls_config() -> ferrum_edge::dtls::FrontendDtlsConfig {
         dimpl_config: std::sync::Arc::new(config),
         certificate,
         client_cert_verifier: None,
+        client_trust: None,
     }
 }
 

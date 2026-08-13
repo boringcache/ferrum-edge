@@ -492,6 +492,7 @@ async fn test_dtls_client_server_handshake_and_echo() {
         dimpl_config: Arc::new(server_config),
         certificate: server_cert.into(),
         client_cert_verifier: None,
+        client_trust: None,
     };
 
     let server = Arc::new(
@@ -928,6 +929,7 @@ async fn test_dtls_server_accepts_strict_dtls13_client() {
         ),
         certificate: server_cert.into(),
         client_cert_verifier: None,
+        client_trust: None,
     };
 
     let server = Arc::new(
@@ -1029,6 +1031,7 @@ async fn test_dtls_server_close_releases_socket() {
         dimpl_config: Arc::new(dimpl::Config::builder().build().expect("build config")),
         certificate: server_cert.into(),
         client_cert_verifier: None,
+        client_trust: None,
     };
 
     let server = Arc::new(

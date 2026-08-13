@@ -120,6 +120,14 @@ pub struct FrontendDtlsConfig {
     pub dimpl_config: Arc<Config>,
     pub certificate: DtlsCertificateChain,
     pub client_cert_verifier: Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>,
+    /// Semantic client-CA / CRL identity of THIS generation (issue #3857).
+    ///
+    /// Derived from the exact bytes this candidate's verifier was built from, so
+    /// the retirement decision published for established DTLS sessions can never
+    /// describe material that was not the material actually accepted. `None`
+    /// when the listener performs no client-certificate verification, in which
+    /// case no session can hold a withdrawable trust decision.
+    pub client_trust: Option<crate::tls::ClientTrustMaterial>,
 }
 
 /// One immutable, accepted frontend DTLS material generation.
@@ -277,7 +285,18 @@ pub fn build_frontend_dtls_config(
 ) -> Result<FrontendDtlsConfig, anyhow::Error> {
     let certificate = load_dtls_certificate(cert_path, key_path)?;
 
-    let (require_client_cert, client_cert_verifier) = if let Some(ca_path) = client_ca_cert_path {
+    let (require_client_cert, client_cert_verifier, client_trust) = if let Some(ca_path) =
+        client_ca_cert_path
+    {
+        // Read the bundle once and derive both the trust store and the
+        // client-trust identity from the SAME bytes; a second read could observe
+        // a different rotation and publish a generation for material that was
+        // never verified.
+        let ca_pem = std::fs::read(ca_path).map_err(|e| {
+            anyhow::anyhow!("Failed to read DTLS client CA bundle '{}': {}", ca_path, e)
+        })?;
+        let client_trust = crate::tls::ClientTrustMaterial::from_parts(Some(&ca_pem), crls)
+            .map_err(|e| anyhow::anyhow!("DTLS client CA bundle '{}': {}", ca_path, e))?;
         let root_store = load_root_store_from_pem(ca_path)?;
         let mut verifier_builder =
             rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store));
@@ -291,9 +310,9 @@ pub fn build_frontend_dtls_config(
             .build()
             .map_err(|e| anyhow::anyhow!("Failed to build DTLS client verifier: {}", e))?;
         debug!("Frontend DTLS mTLS enabled: requiring and verifying client certificates");
-        (true, Some(verifier))
+        (true, Some(verifier), Some(client_trust))
     } else {
-        (false, None)
+        (false, None, None)
     };
 
     let config_builder = Config::builder().require_client_certificate(require_client_cert);
@@ -307,6 +326,7 @@ pub fn build_frontend_dtls_config(
         dimpl_config: config,
         certificate,
         client_cert_verifier,
+        client_trust,
     })
 }
 
@@ -1314,6 +1334,15 @@ impl DtlsServer {
             },
         );
 
+        // Issue #3857: capture the frontend DTLS client-trust generation BEFORE
+        // snapshotting the crypto material this session handshakes with. The
+        // publisher swaps the material into every active `DtlsServer` and only
+        // then advances the generation, so reading in this order guarantees the
+        // captured generation is at or older than the verifier actually used —
+        // a session can never claim a post-withdrawal generation while running
+        // the withdrawn verifier.
+        let client_trust_admission =
+            crate::tls::client_trust::capture(crate::tls::ClientTrustScope::FrontendDtls);
         // Snapshot the swappable crypto material once per session so the
         // running handshake / session cannot observe a partial rotation.
         let active = self.active_config.load_full();
@@ -1351,6 +1380,11 @@ impl DtlsServer {
             let mut connected = false;
             let mut peer_cert_der: Option<Arc<Vec<u8>>> = None;
             let mut peer_cert_chain_der: Option<Arc<Vec<Vec<u8>>>> = None;
+            // Frontend client-trust registration for this session (issue #3857).
+            // Established only once a client certificate has actually been
+            // verified; dropping the guard on any exit path deregisters it.
+            let mut client_trust_guard: Option<crate::tls::ClientTrustSessionGuard> = None;
+            let mut client_trust_retired: Option<tokio_util::sync::CancellationToken> = None;
             // Whether a client certificate was actually presented AND verified
             // against the configured client CA during the handshake. dimpl's
             // `require_client_certificate(true)` only makes the server SEND a
@@ -1431,6 +1465,24 @@ impl DtlsServer {
                             trace!(client = %peer_addr, "DTLS send error: {}", e);
                             break;
                         }
+                    }
+                    // Frontend client-certificate trust withdrawn (issue
+                    // #3857). Ends the session through the same break the
+                    // shutdown arm uses, so the `SessionGuard`, the demux entry,
+                    // the active-session counter and its mirror all release
+                    // exactly once. No reply drain: the peer is no longer
+                    // authorized, so queued application data must not be sent.
+                    _ = async {
+                        match client_trust_retired.as_ref() {
+                            Some(token) => token.cancelled().await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        warn!(
+                            client = %peer_addr,
+                            "Retiring established DTLS session: frontend client-certificate trust was withdrawn"
+                        );
+                        break;
                     }
                     // Shutdown signal — drain any queued replies before
                     // exiting so a final reply pushed right before
@@ -1535,6 +1587,21 @@ impl DtlsServer {
                                 // A client certificate was presented and verified
                                 // against the configured client CA.
                                 verified_peer_cert = true;
+                                // Only now does this session hold a trust
+                                // decision a CRL / client-CA withdrawal can
+                                // revoke, so this is where it joins the
+                                // retirement domain (issue #3857). Registration
+                                // re-checks the fence against the generation
+                                // captured at session start, so a withdrawal
+                                // published while this handshake was running
+                                // retires the session immediately instead of
+                                // letting it repopulate the domain behind the
+                                // sweep.
+                                client_trust_guard = client_trust_admission
+                                    .and_then(|admission| admission.register(true));
+                                client_trust_retired = client_trust_guard
+                                    .as_ref()
+                                    .map(|guard| guard.session().cancellation_token());
                             }
                             peer_cert_chain_der =
                                 (chain.len() > 1).then(|| Arc::new(chain[1..].to_vec()));
@@ -2040,6 +2107,7 @@ mod tests {
                 dimpl_config: Arc::new(config),
                 certificate: certificate.into(),
                 client_cert_verifier: None,
+                client_trust: None,
             },
             limits,
         )
@@ -2308,6 +2376,7 @@ mod tests {
             dimpl_config: Arc::new(new_config),
             certificate: new_certificate.clone(),
             client_cert_verifier: None,
+            client_trust: None,
         });
 
         let after = Arc::as_ptr(&server.active_config.load_full());

@@ -1697,11 +1697,16 @@ exhaustion.
 WebSocket teardown exports `ferrum_websocket_sessions_total`,
 `ferrum_websocket_session_duration_ms`, `ferrum_websocket_bytes_total`, and
 `ferrum_websocket_frames_total`. Session and duration series include the fixed
-`termination_reason` classes `credential_expired`, `max_lifetime`,
-`idle_timeout`, `drain`, `normal_peer_close`, and `relay_error`. The
-gateway-initiated `credential_expired`, `max_lifetime`, and `drain` closes carry
-`result="success"` and `error_class="none"` — they are policy decisions, not
-relay faults, so `result="error"` still means a transport or hook failure.
+`termination_reason` classes `credential_expired`, `trust_withdrawn`,
+`max_lifetime`, `idle_timeout`, `drain`, `normal_peer_close`, and
+`relay_error`. `trust_withdrawn` is the operator withdrawing the session's
+frontend client-certificate trust decision — a CRL revocation or a client-CA
+removal — and is distinct from `credential_expired`, which is the credential
+reaching its own `notAfter` (see `docs/frontend_tls.md`). The
+gateway-initiated `credential_expired`, `trust_withdrawn`, `max_lifetime`, and
+`drain` closes carry `result="success"` and `error_class="none"` — they are
+policy decisions, not relay faults, so `result="error"` still means a transport
+or hook failure.
 Terminal labels come only from bounded enums; peer-supplied close reasons,
 identities, claims, tokens, and error messages are never metric labels.
 

@@ -831,6 +831,37 @@ pub async fn start_http3_listener_with_signal(
                             revision,
                             "HTTP/3 listener server config swapped after frontend TLS reload"
                         );
+                        // Issue #3857. Publish the H3 scope's own generation
+                        // only now, AFTER quinn has actually adopted the
+                        // rebuilt config. The proxy HTTPS scope advanced when
+                        // the shared slot was swapped, which can be well before
+                        // this endpoint applies it; inheriting that generation
+                        // would let a QUIC connection that still handshakes
+                        // against the withdrawn verifier claim a
+                        // post-withdrawal generation and escape the fence.
+                        //
+                        // The material republished here is the one the proxy
+                        // frontend accepted — the same operator sources feed
+                        // both — so the semantic diff and therefore the
+                        // withdrawal decision are identical; only the instant
+                        // of the fence differs.
+                        if let Some(material) = crate::tls::client_trust::current_material(
+                            crate::tls::ClientTrustScope::ProxyFrontend,
+                        ) {
+                            let publication = crate::tls::client_trust::publish_accepted_material(
+                                crate::tls::ClientTrustScope::ProxyH3,
+                                material,
+                            );
+                            if publication.withdrew() {
+                                warn!(
+                                    revision,
+                                    generation = publication.generation,
+                                    reason = publication.reason.map(|reason| reason.label()),
+                                    retired_connections = publication.retired_sessions,
+                                    "Frontend client-certificate trust was withdrawn; established HTTP/3 client-certificate connections were retired"
+                                );
+                            }
+                        }
                     }
                     Err(error) => {
                         warn!(
@@ -954,6 +985,37 @@ pub(crate) fn h3_client_identity(addr: SocketAddr) -> (SocketAddr, Arc<str>) {
     )
 }
 
+/// HTTP/3 error code used when a connection is retired because its frontend
+/// client-certificate trust decision was withdrawn (issue #3857).
+///
+/// `H3_REQUEST_REJECTED` (0x010B) is the RFC 9114 §8.1 code for "the server did
+/// not process the request", which is exactly the contract here: nothing further
+/// on this connection is admitted, and a client is free to reconnect — where it
+/// will meet the new verifier and be refused at the handshake if it is genuinely
+/// revoked. The reason phrase is a compiled-in literal carrying no certificate
+/// field, serial, subject, or generation.
+const H3_TRUST_WITHDRAWN_ERROR_CODE: u32 = 0x010B;
+const H3_TRUST_WITHDRAWN_REASON: &[u8] = b"client certificate trust withdrawn";
+
+/// Terminate a QUIC connection whose client-certificate trust was withdrawn.
+///
+/// `Connection::close` is quinn's ordinary application close: it emits a single
+/// CONNECTION_CLOSE, fails every open stream on the connection, and resolves the
+/// `PeerConnectionSignal` watch that in-flight request tasks already observe —
+/// so per-request guards, permits, and accounting complete exactly once through
+/// paths that already exist. Idempotent, so racing the accept-loop arm and the
+/// stream-admission fence cannot double-close.
+fn close_h3_connection_for_trust_withdrawal(connection: &quinn::Connection, peer: SocketAddr) {
+    connection.close(
+        quinn::VarInt::from_u32(H3_TRUST_WITHDRAWN_ERROR_CODE),
+        H3_TRUST_WITHDRAWN_REASON,
+    );
+    debug!(
+        peer = %peer,
+        "Retiring established HTTP/3 connection: frontend client-certificate trust was withdrawn"
+    );
+}
+
 /// Handle a single HTTP/3 connection (may carry multiple streams/requests).
 async fn handle_h3_connection(
     connecting: quinn::Incoming,
@@ -970,6 +1032,18 @@ async fn handle_h3_connection(
     // disables client early data for the same listener posture.
     let early_data_enabled =
         zero_rtt_admitted(!state.early_data_methods.is_empty(), client_auth_configured);
+
+    // Issue #3857. Capture the H3 client-trust generation BEFORE
+    // `Incoming::accept()`. quinn binds the `ServerConfig` — and therefore the
+    // rustls client-certificate verifier this handshake runs — inside
+    // `accept()`, reading the endpoint's current config under the endpoint state
+    // lock (`quinn_proto::Endpoint::accept`), not when the Initial packet was
+    // parsed. The H3 reload arm applies `set_server_config` and only then
+    // publishes the generation, so reading the generation here and calling
+    // `accept()` after it means a connection can never claim a generation newer
+    // than the verifier it actually handshakes against.
+    let client_trust_admission =
+        crate::tls::client_trust::capture(crate::tls::ClientTrustScope::ProxyH3);
 
     // Single coherent per-connection identity slot. Requests take one lock-free
     // snapshot, so the early-data flag and the peer certificate can never be
@@ -1107,6 +1181,18 @@ async fn handle_h3_connection(
     if handshake_completion_rx.is_none() {
         peer_identity.publish_handshake_result(true, quinn_peer_cert_chain(&connection));
     }
+    // Register the established QUIC transport against the H3 client-trust
+    // domain. The 0.5-RTT branch cannot be reached with client authentication
+    // configured (`zero_rtt_admitted` refuses it), so a certificate-bearing
+    // connection has always published its identity above by this point; a
+    // connection with no peer certificate holds no withdrawable trust decision
+    // and `register` returns `None` for it.
+    let client_cert_authenticated = peer_identity.snapshot().client_cert_der.is_some();
+    let client_trust_guard =
+        client_trust_admission.and_then(|admission| admission.register(client_cert_authenticated));
+    let client_trust_session = client_trust_guard
+        .as_ref()
+        .map(|guard| guard.session().clone());
     let frontend_sni_hostname = connection
         .handshake_data()
         .and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
@@ -1156,6 +1242,12 @@ async fn handle_h3_connection(
         // buffered replayable stream snapshots the pre-handshake state. Only
         // after accept is Pending may successful handshake completion publish
         // the established identity for later 1-RTT streams.
+        // Issue #3857: a trust withdrawal must stop this connection from
+        // admitting further request streams without waiting for the client to
+        // reconnect. Racing it here means an idle multiplexed connection is torn
+        // down promptly instead of only when its next stream happens to arrive,
+        // and the stream-admission check below closes the remaining window where
+        // a stream was already ready when the withdrawal landed.
         let (accepted, handshake_succeeded) =
             if let Some(completion_rx) = handshake_completion_rx.as_mut() {
                 tokio::select! {
@@ -1164,9 +1256,30 @@ async fn handle_h3_connection(
                     completed = completion_rx => {
                         (None, Some(completed.unwrap_or_default()))
                     }
+                    _ = async {
+                        match client_trust_session.as_ref() {
+                            Some(session) => session.retired().await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        close_h3_connection_for_trust_withdrawal(&quinn_conn, canonical_peer);
+                        break;
+                    }
                 }
             } else {
-                (Some(h3_conn.accept().await), None)
+                tokio::select! {
+                    biased;
+                    accepted = h3_conn.accept() => (Some(accepted), None),
+                    _ = async {
+                        match client_trust_session.as_ref() {
+                            Some(session) => session.retired().await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        close_h3_connection_for_trust_withdrawal(&quinn_conn, canonical_peer);
+                        break;
+                    }
+                }
             };
 
         if let Some(handshake_succeeded) = handshake_succeeded {
@@ -1185,6 +1298,21 @@ async fn handle_h3_connection(
         };
         match accepted {
             Ok(Some(resolver)) => {
+                // Stream-admission fence (issue #3857). A stream can already be
+                // ready when the withdrawal lands, in which case `accept()` wins
+                // the biased race above; refuse it here, before the request task
+                // is spawned and therefore before routing, plugins, and any
+                // backend dispatch. The stream is dropped with the connection
+                // close rather than answered, so no accounting is started for
+                // work that was never authorized.
+                if let Some(session) = client_trust_session.as_ref()
+                    && session.is_retired()
+                {
+                    session.record_fenced();
+                    drop(resolver);
+                    close_h3_connection_for_trust_withdrawal(&quinn_conn, canonical_peer);
+                    break;
+                }
                 // Detect QUIC connection migration: compare SocketAddr (two integer
                 // fields) — zero allocation. Only re-format the IP string when the
                 // address actually changes, which is rare (mobile network handoff).
@@ -1219,6 +1347,7 @@ async fn handle_h3_connection(
                 let peer_spiffe_extraction_cache = identity.peer_spiffe_extraction_cache.clone();
                 let is_early_data = identity.is_early_data;
                 let peer_connection = peer_connection.clone();
+                let stream_client_trust = client_trust_session.clone();
                 tokio::spawn(async move {
                     match resolver.resolve_request().await {
                         Ok((req, stream)) => {
@@ -1237,6 +1366,7 @@ async fn handle_h3_connection(
                                 peer_spiffe_extraction_cache,
                                 is_early_data,
                                 peer_connection,
+                                stream_client_trust,
                             )
                             .await
                             {
@@ -1315,6 +1445,7 @@ async fn handle_h3_request(
     >,
     is_early_data: bool,
     peer_connection: crate::plugins::PeerConnectionSignal,
+    client_trust_session: Option<crate::tls::ClientTrustSession>,
 ) -> Result<(), anyhow::Error> {
     let start_time = std::time::Instant::now();
 
@@ -1505,6 +1636,10 @@ async fn handle_h3_request(
     ctx.tls_client_cert_chain_der = tls_client_cert_chain_der;
     ctx.mtls_auth_connection_cache = mtls_auth_connection_cache;
     ctx.peer_spiffe_extraction_cache = peer_spiffe_extraction_cache;
+    // Issue #3857: carried so an H3 WebSocket (RFC 9220 Extended CONNECT), which
+    // outlives this request, terminates when the connection's client-certificate
+    // trust decision is withdrawn.
+    ctx.client_trust_session = client_trust_session;
     // Lets deliberately parked work (injected fault delays) observe QUIC
     // connection close instead of holding this stream, its `RequestGuard`, and
     // its plugin snapshot until the timer expires.

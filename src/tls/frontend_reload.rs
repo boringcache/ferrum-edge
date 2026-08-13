@@ -85,11 +85,31 @@ pub struct FrontendTlsReloadConfig {
     /// CA verification, session tickets). A returned `Err` keeps the previous
     /// config and emits a `warn!`.
     pub rebuild: FrontendTlsRebuildFn,
+    /// Client-trust scope this surface owns (issue #3857). When `Some`, a
+    /// successful rebuild publishes the accompanying
+    /// [`crate::tls::ClientTrustMaterial`] into the scope **after** the slot
+    /// swap, and a refused candidate is recorded against the scope while the
+    /// last accepted generation, verifier and sessions are all retained.
+    pub client_trust_scopes: Vec<crate::tls::ClientTrustScope>,
+}
+
+/// One accepted frontend TLS candidate.
+///
+/// Carries the semantic client-trust identity alongside the rebuilt
+/// `ServerConfig` so the generation published for an established transport can
+/// never describe material other than the material actually swapped in. Deriving
+/// it by re-reading the sources after the swap would race the next rotation.
+pub struct FrontendTlsRebuilt {
+    /// The rebuilt server configuration to publish into the slot.
+    pub config: Arc<ServerConfig>,
+    /// Semantic client-CA / CRL identity of this same candidate. `None` when
+    /// the surface does not participate in client-trust generations.
+    pub client_trust: Option<crate::tls::ClientTrustMaterial>,
 }
 
 /// Surface-specific rebuild closure.
 pub type FrontendTlsRebuildFn =
-    Box<dyn Fn() -> Result<Arc<ServerConfig>, anyhow::Error> + Send + Sync + 'static>;
+    Box<dyn Fn() -> Result<FrontendTlsRebuilt, anyhow::Error> + Send + Sync + 'static>;
 
 /// Spawn the frontend TLS file-watch task.
 ///
@@ -112,11 +132,47 @@ pub fn spawn_frontend_tls_reload_task(
         revision_tx,
         max_material_bytes,
         rebuild,
+        client_trust_scopes,
     } = config;
 
     let publish_rebuild = Box::new(move || {
-        let new_config = rebuild()?;
+        let rebuilt = match rebuild() {
+            Ok(rebuilt) => rebuilt,
+            Err(error) => {
+                // A refused candidate keeps the last-good verifier, generation
+                // and every live session. Recording it here (rather than at the
+                // load site) is what makes "retained, not silently ignored"
+                // observable per scope.
+                for scope in &client_trust_scopes {
+                    crate::tls::client_trust::record_rejected_candidate(*scope);
+                }
+                return Err(error);
+            }
+        };
+        let FrontendTlsRebuilt {
+            config: new_config,
+            client_trust,
+        } = rebuilt;
+        // Order is load-bearing (issue #3857): the material must be observable
+        // to a new handshake BEFORE the generation advances, so a listener that
+        // reads the generation first and the config second can never capture a
+        // generation newer than the material it actually handshakes with.
         slot.store(Arc::new(Some(new_config)));
+        if let Some(material) = client_trust {
+            for scope in &client_trust_scopes {
+                let publication =
+                    crate::tls::client_trust::publish_accepted_material(*scope, material.clone());
+                if publication.withdrew() {
+                    tracing::warn!(
+                        scope = publication.scope.label(),
+                        generation = publication.generation,
+                        reason = publication.reason.map(|reason| reason.label()),
+                        retired_connections = publication.retired_sessions,
+                        "Frontend client-certificate trust was withdrawn; established client-certificate transports on this scope were retired"
+                    );
+                }
+            }
+        }
         Ok(())
     });
 
@@ -172,7 +228,10 @@ mod tests {
         let rebuild: FrontendTlsRebuildFn = Box::new(move || {
             let attempt = attempts_clone.fetch_add(1, Ordering::SeqCst);
             if attempt == 0 {
-                Ok(success_clone.clone())
+                Ok(FrontendTlsRebuilt {
+                    config: success_clone.clone(),
+                    client_trust: None,
+                })
             } else {
                 Err(anyhow::anyhow!("simulated cert expired"))
             }
@@ -205,6 +264,7 @@ mod tests {
                 interval: Duration::from_millis(50),
                 revision_tx,
                 rebuild,
+                client_trust_scopes: Vec::new(),
             },
             Some(shutdown_rx),
         );

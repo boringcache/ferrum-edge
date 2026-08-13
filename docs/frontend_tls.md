@@ -465,6 +465,143 @@ The frontend/admin live-reload poller atomically swaps a validated `rustls::Serv
 
 For backend HTTP-family TLS, keep `FERRUM_BACKEND_TLS_LIVE_RELOAD_ENABLED=true` to pick up in-place cert/key/CA/CRL source changes and to watch backend TLS sources added by later config reloads. Database TLS can opt in with `FERRUM_DB_TLS_LIVE_RELOAD_ENABLED=true` in database and CP modes. CP gRPC TLS swaps the server TLS slot for new handshakes when watched source bytes change; DP gRPC TLS reconnects the CP stream with fresh client-side TLS material.
 
+### Client-Trust Generations and Established-Transport Retirement
+
+Live-reloading a CRL or a client-CA bundle rebuilds the verifier used for **new**
+handshakes. That alone does not reach a connection that is already established:
+without the mechanism described here, the holder of a pre-reload TLS connection
+could keep opening new HTTP/2 and HTTP/3 request streams and new HTTP/1.1
+keep-alive requests, and keep an active WebSocket, TCP+TLS, or UDP+DTLS session
+running, under the trust decision the operator had just withdrawn.
+
+Under `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true`, Ferrum attaches a
+**client-trust generation** to every established transport that authenticated
+with a client certificate, and retires those transports when authority is
+withdrawn.
+
+**This is not certificate expiry.** A certificate reaching its own `notAfter` is
+a different control with a different lifecycle. This section is about an operator
+explicitly revoking a certificate or removing an issuing CA.
+
+#### Trust domains
+
+A generation is scoped to a listener family, never process-global, so one
+listener's rotation cannot tear down another's sessions:
+
+| Scope | Listeners | Material |
+|-------|-----------|----------|
+| `proxy_frontend` | Proxy HTTPS / HTTP-2 **and** TCP+TLS stream listeners | `FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH` + `FERRUM_TLS_CRL_FILE_PATH` |
+| `proxy_h3` | The QUIC / HTTP-3 listener | the same operator material, published separately (see below) |
+| `admin_https` | The Admin API HTTPS listener | `FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH` + `FERRUM_TLS_CRL_FILE_PATH` |
+| `frontend_dtls` | UDP + DTLS listeners | `FERRUM_DTLS_CLIENT_CA_CERT_PATH` + `FERRUM_TLS_CRL_FILE_PATH` |
+
+HTTP/3 keeps its own generation even though it serves the same material: the
+QUIC endpoint applies a reload asynchronously (`Endpoint::set_server_config`
+after the revision watch fires), so only the HTTP/3 listener can publish a
+generation that is not already ahead of the verifier QUIC is handshaking with.
+
+Mesh inbound mTLS is deliberately **out of scope**. Its verifier is owned by
+PeerAuthentication / SPIFFE trust-bundle reload, which is a separate trust plane
+with its own rotation contract.
+
+#### What advances a generation, and what retires a connection
+
+A candidate is summarized into a *semantic* identity — the set of client-CA
+trust anchors, and the set of `(issuer, serial)` revocations across every CRL —
+rather than a byte hash of the source material. A CRL is normally re-issued on a
+schedule with a fresh `thisUpdate` / `nextUpdate` / `crlNumber` and an unchanged
+revocation set, and treating that as a change would churn every live session on
+every routine re-issue.
+
+| Change | Generation | Established sessions |
+|--------|-----------|----------------------|
+| Server cert/key rotation only | unchanged | untouched |
+| CRL re-issued, same revocation set | unchanged | untouched |
+| CA **added** to the bundle (additive overlap rotation) | advances | untouched |
+| Revocation **removed** from a CRL | advances | untouched |
+| CA **removed** from the bundle | advances, fence moves | retired |
+| Revocation **added** by a CRL | advances, fence moves | retired |
+| Malformed / truncated / unreadable candidate | unchanged | untouched |
+
+A refused candidate keeps the previous verifier, the previous generation, the
+previous semantic material, and every live session, and is counted as a rejected
+candidate so the refusal is observable rather than silent.
+
+#### Retirement scope
+
+When authority narrows, **every client-certificate-authenticated transport in
+the changed scope** is retired — not only those whose chain or serial is
+provably affected. This is deliberate and conservative: deciding per-connection
+impact would mean re-running path building against each retained chain at
+publish time, and an error there fails *open*. Precision is applied instead in
+the semantic diff above, which refuses to retire anything unless authority
+actually narrowed.
+
+Anonymous TLS connections are never registered and never retired: with no
+gateway-verified client certificate they hold no trust decision a CRL or
+client-CA change can revoke. Plaintext listeners are untouched.
+
+#### What retirement does, per protocol
+
+| Transport | Behaviour |
+|-----------|-----------|
+| HTTP/1.1 keep-alive | The next request is refused with a fixed `401` before routing and plugins; the connection is closed at end of keep-alive via hyper's graceful shutdown. |
+| HTTP/2 | New streams are refused with the same fixed `401` before routing and plugins, and the connection receives a `GOAWAY`. |
+| HTTP/3 | The QUIC connection is closed with `H3_REQUEST_REJECTED` (`0x010B`); a request stream that was already ready is refused before its task is spawned. |
+| gRPC | The pre-routing refusal is a `grpc-status: 16` (`UNAUTHENTICATED`) trailers-only response. |
+| WebSocket (H1/H2/H3) | The session's stop arbiter terminates it with the bounded reason `trust_withdrawn`, through the same teardown as drain and maximum-lifetime stops. |
+| TCP+TLS | The client leg fails with a bounded transport error, so byte counters, first-failure attribution, circuit-breaker classification, `on_stream_disconnect`, and the stream summary all complete exactly once through the existing relay paths. |
+| UDP+DTLS | The session driver ends through the same break the shutdown path uses; the demux entry, the active-session counter, and its mirror all release exactly once. Queued application data is **not** flushed — the peer is no longer authorized. |
+
+Because retirement runs through each transport's existing bounded teardown,
+request guards, connection guards, permits, load-balancer and circuit-breaker
+state, and accounting all complete exactly once.
+
+**kTLS interaction.** A kernel-terminated TCP+TLS leg is spliced, so it has no
+userspace poll seam at which a withdrawal could end the session. When a
+listener's client-trust domain is armed, the optional kTLS handoff is therefore
+declined **before the handshake**, while the socket is still pristine, and the
+connection is relayed on the fence-aware buffered `rustls` path. Nothing is
+refused and no authentication is skipped; only the optimization is declined, and
+only in deployments that enabled frontend TLS live reload.
+
+#### Race behaviour
+
+Publication applies the new material first and advances the generation second;
+a listener captures the generation first and loads the configuration second. A
+connection can therefore capture a generation that is *older* than the material
+it actually handshakes with — the conservative direction, costing at most one
+unnecessary retirement for a connection handshaking exactly across a withdrawal
+— but never a newer one, so none can escape the fence. A connection being
+registered while a publication sweeps is caught by a post-registration re-check
+against the same fence, so it can neither escape nor repopulate the registry
+after the sweep.
+
+#### Observability
+
+All series are fixed-cardinality. The only label dimensions are the closed scope
+vocabulary above and the closed retirement reasons `client_ca_withdrawn` and
+`crl_changed`. No serial, subject, SAN, issuer name, fingerprint, certificate
+path, or generation of any secret appears in a metric label, a log line, or a
+client-visible error.
+
+| Metric | Type | Meaning |
+|--------|------|---------|
+| `ferrum_frontend_client_trust_generation{scope}` | gauge | Generation currently in force |
+| `ferrum_frontend_client_trust_withdrawal_generation{scope}` | gauge | Generation at which authority was last narrowed (`0` = never) |
+| `ferrum_frontend_client_trust_tracked_connections{scope}` | gauge | Established client-certificate transports tracked for retirement |
+| `ferrum_frontend_client_trust_publications_total{scope,outcome}` | counter | `armed` / `unchanged` / `advanced` / `withdrawn` |
+| `ferrum_frontend_client_trust_rejected_candidates_total{scope}` | counter | Candidates refused; previous generation retained |
+| `ferrum_frontend_client_trust_retired_connections_total{scope,reason}` | counter | Transports retired, by bounded reason |
+| `ferrum_frontend_client_trust_fenced_total{scope}` | counter | Requests / streams refused at the admission fence |
+
+`GET /metrics/runtime` carries the same state as `frontend_client_trust`, one
+entry per armed scope.
+
+Nothing is emitted, and nothing is tracked per connection, when no scope has
+accepted client-trust material — which is the default posture with
+`FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED` unset.
+
 ### Gateway API Multi-Certificate Serving (SNI)
 
 A data plane that receives its frontend TLS material from a Kubernetes Gateway (`spec.listeners[].tls.certificateRefs`) can serve **many** certificates at once. This covers two shapes that used to be refused:

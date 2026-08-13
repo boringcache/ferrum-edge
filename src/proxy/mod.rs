@@ -6235,6 +6235,12 @@ struct RequestConnectionMetadata {
     peer_spiffe_extraction_cache:
         Option<Arc<crate::plugins::mesh::spiffe_identity::SpiffeIdentityConnectionCache>>,
     websocket_shutdown_rx: Option<watch::Receiver<bool>>,
+    /// Frontend client-trust session for a connection that authenticated with a
+    /// client certificate (issue #3857). `None` for anonymous TLS, for plaintext,
+    /// and whenever the listener's trust domain has never accepted material.
+    /// Consulted once per request before routing and plugins, and handed to an
+    /// upgraded WebSocket session so a withdrawal ends it.
+    client_trust_session: Option<crate::tls::ClientTrustSession>,
 }
 
 fn empty_svid_bundle_slot() -> SharedSvidBundle {
@@ -11663,6 +11669,9 @@ async fn handle_connection(
             // Plaintext connections carry no client certificate.
             peer_spiffe_extraction_cache: None,
             websocket_shutdown_rx: Some(websocket_shutdown_rx.clone()),
+            // ... and therefore hold no client-certificate trust decision that
+            // a CRL or client-CA withdrawal could revoke.
+            client_trust_session: None,
         };
         async move {
             handle_proxy_request_on_frontend_port(
@@ -13113,6 +13122,11 @@ async fn handle_websocket_request_authenticated(
         .websocket_shutdown_rx
         .clone()
         .or_else(|| state.health_check_shutdown_rx.clone());
+    // Issue #3857: an upgraded WebSocket outlives the HTTP request that
+    // authenticated it, so the connection's client-trust session travels with
+    // the session and is one of its stop inputs. `None` for a session that was
+    // not admitted on a client certificate.
+    let ws_client_trust_session = ctx.client_trust_session.clone();
     let adaptive_buf = state.adaptive_buffer.clone();
     // Track the upgraded WebSocket session in `OverloadState.active_connections`
     // so graceful drain waits for in-flight WS sessions before exiting.
@@ -13188,6 +13202,7 @@ async fn handle_websocket_request_authenticated(
                 ws_session_deadline,
                 ws_shutdown_rx.clone(),
                 &state.overload,
+                ws_client_trust_session.clone(),
             ) => {
                 // No relay ever started, and the stop is a policy decision
                 // rather than a transport failure, so the disconnect carries
@@ -13252,6 +13267,7 @@ async fn handle_websocket_request_authenticated(
                             Arc::clone(&state.overload),
                             ws_fragment_policy,
                             &adaptive_buf,
+                            ws_client_trust_session,
                         )
                         .await
                     }
@@ -13278,6 +13294,7 @@ async fn handle_websocket_request_authenticated(
                             Arc::clone(&state.overload),
                             ws_fragment_policy,
                             &adaptive_buf,
+                            ws_client_trust_session,
                         )
                         .await
                     }
@@ -13316,6 +13333,7 @@ async fn handle_websocket_request_authenticated(
                             Arc::clone(&state.overload),
                             ws_fragment_policy,
                             &adaptive_buf,
+                            ws_client_trust_session,
                         ))
                         .await;
                         // This is the Unix pool's per-target PHYSICAL
@@ -15090,6 +15108,12 @@ pub(crate) const WS_TERMINATION_METADATA_KEY: &str = "websocket.termination_reas
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WsTerminationReason {
     CredentialExpired,
+    /// The operator withdrew the frontend client-certificate trust decision the
+    /// session was admitted under (issue #3857): a CRL now revokes the peer's
+    /// certificate, or its issuing CA left the client-CA bundle. Distinct from
+    /// [`Self::CredentialExpired`], which is the credential reaching its own
+    /// `notAfter`.
+    TrustWithdrawn,
     MaxLifetime,
     IdleTimeout,
     Drain,
@@ -15101,6 +15125,7 @@ impl WsTerminationReason {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::CredentialExpired => "credential_expired",
+            Self::TrustWithdrawn => "trust_withdrawn",
             Self::MaxLifetime => "max_lifetime",
             Self::IdleTimeout => "idle_timeout",
             Self::Drain => "drain",
@@ -15140,6 +15165,10 @@ pub(crate) fn effective_websocket_session_deadline(
 fn ws_deadline_close_frame(reason: WsTerminationReason) -> CloseFrame {
     let (code, text) = match reason {
         WsTerminationReason::CredentialExpired => (CloseCode::Policy, "credential expired"),
+        // Issue #3857. A compiled-in literal: the peer learns that its
+        // authorization was withdrawn and nothing about which certificate,
+        // serial, issuer, or generation was involved.
+        WsTerminationReason::TrustWithdrawn => (CloseCode::Policy, "client trust withdrawn"),
         WsTerminationReason::MaxLifetime => (CloseCode::Policy, "maximum lifetime reached"),
         WsTerminationReason::Drain => (CloseCode::Away, "gateway draining"),
         _ => (CloseCode::Away, "session ended"),
@@ -15154,7 +15183,17 @@ pub(crate) async fn wait_for_websocket_session_stop(
     deadline: WsSessionDeadline,
     mut shutdown: Option<watch::Receiver<bool>>,
     overload: &crate::overload::OverloadState,
+    client_trust: Option<crate::tls::ClientTrustSession>,
 ) -> WsTerminationReason {
+    // Checked before the absolute deadline: a withdrawal is an authority
+    // decision the operator has already taken, so it outranks a timer that has
+    // merely also elapsed.
+    if client_trust
+        .as_ref()
+        .is_some_and(|session| session.is_retired())
+    {
+        return WsTerminationReason::TrustWithdrawn;
+    }
     if deadline.at <= tokio::time::Instant::now() {
         return deadline.reason;
     }
@@ -15165,6 +15204,16 @@ pub(crate) async fn wait_for_websocket_session_stop(
     }
     tokio::select! {
         biased;
+        // Issue #3857: an established WebSocket keeps its admitted credential
+        // for the rest of its session lifetime, so a trust withdrawal has to be
+        // one of the session-stop inputs rather than only a next-request gate.
+        // Placed ahead of every other arm for the same reason as the pre-check.
+        _ = async {
+            match client_trust.as_ref() {
+                Some(session) => session.retired().await,
+                None => std::future::pending().await,
+            }
+        } => WsTerminationReason::TrustWithdrawn,
         _ = tokio::time::sleep_until(deadline.at) => deadline.reason,
         changed = async {
             match shutdown.as_mut() {
@@ -16159,6 +16208,11 @@ pub(crate) async fn run_websocket_proxy<C, B>(
     overload: Arc<crate::overload::OverloadState>,
     fragment_policy: WsFragmentPolicy,
     adaptive_buffer: &crate::adaptive_buffer::AdaptiveBufferTracker,
+    // Frontend client-certificate trust session for the transport this
+    // WebSocket was upgraded from (issue #3857). `None` when the session was
+    // not admitted on a client certificate, in which case the stop arbiter
+    // registers no additional waker at all.
+    client_trust: Option<crate::tls::ClientTrustSession>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -16215,6 +16269,7 @@ where
                     session_deadline,
                     shutdown_rx.clone(),
                     &overload,
+                    client_trust.clone(),
                 ) => {
                     // The residual forward was cut short by policy, not by a
                     // transport fault, so no failure is attributed; the bytes
@@ -16314,6 +16369,7 @@ where
                 session_deadline,
                 shutdown_rx.clone(),
                 &overload,
+                client_trust.clone(),
             ) => {
                 debug!(
                     proxy_id = %proxy_id,
@@ -17190,6 +17246,7 @@ where
         session_deadline,
         shutdown_rx,
         &overload,
+        client_trust.clone(),
     ));
     let first_completion = tokio::select! {
         biased;
@@ -17761,6 +17818,27 @@ impl ListenerTlsSource {
             Self::Dynamic { .. } => true,
         }
     }
+
+    /// The frontend client-trust domain this listener's client certificates are
+    /// verified against (issue #3857).
+    ///
+    /// `Static` and `Dynamic` both terminate with the operator-configured proxy
+    /// frontend material (`FERRUM_FRONTEND_TLS_*` + `FERRUM_TLS_CRL_FILE_PATH`),
+    /// so they are one domain — `Static` simply never sees its generation
+    /// advance, because that is the live-reload-disabled posture.
+    ///
+    /// `MeshInbound` is deliberately excluded: its verifier is owned by
+    /// PeerAuthentication / SPIFFE trust-bundle reload, which is a separate
+    /// trust plane with its own rotation contract. Retiring mesh peers off a
+    /// gateway CRL publication would be the wrong scope.
+    fn client_trust_scope(&self) -> Option<crate::tls::ClientTrustScope> {
+        match self {
+            Self::Static { .. } | Self::Dynamic { .. } => {
+                Some(crate::tls::ClientTrustScope::ProxyFrontend)
+            }
+            Self::MeshInbound { .. } => None,
+        }
+    }
 }
 
 struct ListenerTlsSelection {
@@ -18057,6 +18135,11 @@ struct TlsConnectionMetadata {
     destination_ip: Option<std::net::IpAddr>,
     /// See [`RequestConnectionMetadata::mesh_inbound_pre_handshake_app_port`].
     mesh_inbound_pre_handshake_app_port: Option<u16>,
+    /// Frontend client-trust generation captured before the TLS config was
+    /// loaded for this accept (issue #3857). `None` when the listener's trust
+    /// domain has never accepted material — the default, live-reload-disabled
+    /// posture, which then costs nothing per connection.
+    client_trust_admission: Option<crate::tls::ClientTrustAdmission>,
 }
 
 struct NodeWaypointAcceptIdentity {
@@ -18539,6 +18622,19 @@ async fn run_accept_loop(
                                     .flatten()
                             })
                             .map(crate::util::client_identity::canonical_ip);
+                        // Capture the frontend client-trust generation BEFORE
+                        // loading the TLS config this handshake will use
+                        // (issue #3857). Publication writes the config first
+                        // and the generation second, so reading them in this
+                        // order guarantees the captured generation is at or
+                        // older than the material actually served — the
+                        // conservative direction. Reading it after the load
+                        // would let a connection that handshakes against the
+                        // withdrawn verifier claim the post-withdrawal
+                        // generation and escape the fence.
+                        let client_trust_admission = tls_source
+                            .client_trust_scope()
+                            .and_then(crate::tls::client_trust::capture);
                         let tls_selection = tls_source.load(&state, orig_dst);
                         // Defense in depth: a TLS-required source (Dynamic
                         // frontend reload slot, MeshInbound peer-auth slot)
@@ -18771,6 +18867,7 @@ async fn run_accept_loop(
                                     orig_dst,
                                     destination_ip: connection_destination_ip,
                                     mesh_inbound_pre_handshake_app_port,
+                                    client_trust_admission,
                                 };
                                 handle_tls_connection(
                                     stream,
@@ -18876,6 +18973,19 @@ async fn handle_tls_connection(
     let client_cert_chain_der: Option<Arc<Vec<Vec<u8>>>> = peer_certs
         .filter(|certs| certs.len() > 1)
         .map(|certs| Arc::new(certs[1..].iter().map(|c| c.to_vec()).collect()));
+    // Register this transport against the frontend client-trust domain
+    // (issue #3857). Only a connection that actually presented a
+    // gateway-verified client certificate holds a trust decision a CRL or
+    // client-CA withdrawal can revoke, so an anonymous TLS connection is never
+    // registered and never retired. The guard owns deregistration on every exit
+    // path; the cloned session handle is what the per-request fence and the
+    // WebSocket relay consult.
+    let client_trust_guard = tls_connection_metadata
+        .client_trust_admission
+        .and_then(|admission| admission.register(client_cert_der.is_some()));
+    let client_trust_session = client_trust_guard
+        .as_ref()
+        .map(|guard| guard.session().clone());
     let mtls_auth_connection_cache = client_cert_der
         .as_ref()
         .map(|_| Arc::new(crate::plugins::mtls_auth::MtlsAuthConnectionCache::new()));
@@ -18933,6 +19043,9 @@ async fn handle_tls_connection(
     // WebSocket requests flow through handle_proxy_request so that authentication
     // and authorization plugins execute before the upgrade handshake.
     let websocket_shutdown_rx = shutdown_rx.clone();
+    // Kept out of the service closure so the connection-level select below can
+    // still observe retirement after the closure has taken its own handle.
+    let connection_trust_session = client_trust_session.clone();
     let svc = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
         let state = Arc::clone(&state);
         let addr = remote_addr;
@@ -18952,6 +19065,7 @@ async fn handle_tls_connection(
                 .mesh_inbound_pre_handshake_app_port,
             peer_spiffe_extraction_cache: peer_spiffe_extraction_cache.clone(),
             websocket_shutdown_rx: Some(websocket_shutdown_rx.clone()),
+            client_trust_session: client_trust_session.clone(),
         };
         async move {
             handle_proxy_request_on_frontend_port(
@@ -18974,6 +19088,27 @@ async fn handle_tls_connection(
     let result = tokio::select! {
         biased;
         res = conn.as_mut() => res,
+        // Issue #3857: the operator withdrew this connection's client-certificate
+        // trust decision. Reuse hyper's own graceful shutdown — H2 gets a GOAWAY
+        // (no further stream is admitted) and H1 ends keep-alive after the
+        // in-flight request — so guards, permits, accounting, and the transaction
+        // summary complete exactly once through the paths shutdown already uses.
+        // Requests already inside the service are additionally refused at the
+        // per-request fence before routing or plugins run, so nothing new is
+        // authorized in the drain window.
+        _ = async {
+            match connection_trust_session.as_ref() {
+                Some(session) => session.retired().await,
+                None => std::future::pending().await,
+            }
+        } => {
+            debug!(
+                remote_addr = %remote_addr.ip(),
+                "Retiring established TLS connection: frontend client-certificate trust was withdrawn"
+            );
+            conn.as_mut().graceful_shutdown();
+            conn.as_mut().await
+        }
         _ = shutdown_rx.changed() => {
             // Send GOAWAY (H2) / signal end-of-keepalive (H1) and wait for
             // in-flight requests to complete on this connection.
@@ -18981,6 +19116,7 @@ async fn handle_tls_connection(
             conn.as_mut().await
         }
     };
+    drop(client_trust_guard);
 
     if let Err(e) = result {
         let err_string = e.to_string();
@@ -25384,6 +25520,41 @@ async fn handle_proxy_request_on_frontend_port(
         ));
     }
 
+    // Frontend client-trust admission fence (issue #3857). One relaxed atomic
+    // read of connection-local state, and only for a connection that actually
+    // authenticated with a client certificate on a listener whose trust domain
+    // has accepted material — every other request loads a `None` and does no
+    // work at all.
+    //
+    // This is what makes a withdrawal bite on a MULTIPLEXED transport: the H2
+    // GOAWAY / H1 keep-alive close raced at the connection level is
+    // asynchronous, so without a per-request gate a client could still land new
+    // streams in the drain window. It sits above routing, plugins, the ACME
+    // early return, and overload admission for the same reason the stale-config
+    // fence does: this is an authority-loss boundary, not a capacity one, and no
+    // request shape may be the one that walks past it.
+    //
+    // The response is a compiled-in literal. It names no serial, subject, SAN,
+    // issuer, fingerprint, path, or generation — an authenticated peer learns
+    // only that it is no longer authorized.
+    if let Some(session) = connection_metadata.client_trust_session.as_ref()
+        && session.is_retired()
+    {
+        session.record_fenced();
+        let is_grpc = grpc_proxy::is_grpc_request(&req);
+        record_request(&state, 401);
+        if is_grpc {
+            return Ok(grpc_proxy::build_grpc_error_response(
+                grpc_proxy::grpc_status::UNAUTHENTICATED,
+                "Client certificate trust withdrawn",
+            ));
+        }
+        return Ok(build_response(
+            StatusCode::UNAUTHORIZED,
+            r#"{"error":"Client certificate trust withdrawn"}"#,
+        ));
+    }
+
     // ACME HTTP-01 is answered ahead of overload admission on purpose: losing a
     // domain validation to load shedding costs a certificate. The lookup
     // resolves the *canonical* policy path (advisory GHSA-69xf-42xm-4w4f), so an
@@ -25529,6 +25700,7 @@ async fn handle_proxy_request_inner(
     ctx.mtls_auth_connection_cache = mtls_auth_connection_cache;
     ctx.peer_spiffe_extraction_cache = connection_metadata.peer_spiffe_extraction_cache;
     ctx.websocket_shutdown_rx = connection_metadata.websocket_shutdown_rx;
+    ctx.client_trust_session = connection_metadata.client_trust_session;
     if let Some(identity) = connection_metadata.node_waypoint_identity {
         // In node-waypoint topology, the node-agent/eBPF cookie-derived pod
         // identity is the authenticated source workload for policy. It

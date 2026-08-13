@@ -1504,6 +1504,12 @@ impl StreamListenerManager {
                 last_outcome: "rejected",
             })
         });
+        // Issue #3857: a refused candidate keeps the last accepted DTLS
+        // generation, its verifier and every live session; recording it against
+        // the trust scope makes "retained, not silently ignored" observable.
+        crate::tls::client_trust::record_rejected_candidate(
+            crate::tls::ClientTrustScope::FrontendDtls,
+        );
     }
 
     /// Publish one prevalidated immutable DTLS generation and live-swap it
@@ -1544,6 +1550,26 @@ impl StreamListenerManager {
             swapped_dtls_listeners = swapped,
             "Published frontend DTLS material generation; new DTLS sessions use this generation"
         );
+        // Issue #3857. Publish the client-trust generation AFTER the material is
+        // live in every active `DtlsServer`, so a session that reads the new
+        // generation provably snapshotted the new verifier. A generation with no
+        // client-certificate verification publishes the empty identity, which is
+        // a subset of everything and therefore never reads as a withdrawal.
+        if let Some(material) = accepted.config.client_trust.clone() {
+            let publication = crate::tls::client_trust::publish_accepted_material(
+                crate::tls::ClientTrustScope::FrontendDtls,
+                material,
+            );
+            if publication.withdrew() {
+                warn!(
+                    dtls_generation = generation,
+                    trust_generation = publication.generation,
+                    reason = publication.reason.map(|reason| reason.label()),
+                    retired_sessions = publication.retired_sessions,
+                    "Frontend client-certificate trust was withdrawn; established DTLS client-certificate sessions were retired"
+                );
+            }
+        }
         ((*accepted).clone(), swapped)
     }
 

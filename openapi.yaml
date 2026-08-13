@@ -13498,7 +13498,7 @@ components:
     # ── Runtime metrics ─────────────────────────────────────────────
     RuntimeMetricsSnapshot:
       type: object
-      required: [timestamp, uptime_seconds, mode, ferrum_version, system, http, errors, dns, connections, logs, plugin_triggers, overload]
+      required: [timestamp, uptime_seconds, mode, ferrum_version, system, http, errors, dns, connections, logs, plugin_triggers, overload, frontend_client_trust]
       properties:
         timestamp:
           type: string
@@ -13527,6 +13527,113 @@ components:
           $ref: "#/components/schemas/RuntimePluginTriggerSnapshot"
         overload:
           $ref: "#/components/schemas/OverloadSnapshot"
+        frontend_client_trust:
+          type: array
+          description: |
+            Frontend client-CA / CRL trust generations and established-transport
+            retirement, one entry per listener scope that has accepted trust
+            material (issue #3857). Empty when no scope has. No certificate
+            field, serial, subject, fingerprint, or source path is representable
+            in this object.
+          items:
+            $ref: "#/components/schemas/RuntimeFrontendClientTrustSnapshot"
+
+    RuntimeFrontendClientTrustSnapshot:
+      type: object
+      description: |
+        One frontend listener scope's client-certificate trust state. Every
+        member is a counter, a gauge, or the closed scope vocabulary.
+      required:
+        [
+          scope,
+          generation,
+          withdrawal_generation,
+          tracked_connections,
+          publications_armed,
+          publications_unchanged,
+          publications_advanced,
+          publications_withdrawn,
+          rejected_candidates,
+          retired_client_ca_withdrawn,
+          retired_crl_changed,
+          fenced_requests,
+        ]
+      properties:
+        scope:
+          type: string
+          enum: [proxy_frontend, proxy_h3, admin_https, frontend_dtls]
+          description: |
+            Listener family whose client certificates are verified against one
+            trust domain. `proxy_frontend` covers the proxy HTTPS/HTTP-2
+            listeners and TCP+TLS stream listeners, which share the same
+            operator-configured frontend material.
+        generation:
+          type: integer
+          format: uint64
+          description: |
+            Monotonic generation in force. Advances only after a validated,
+            accepted candidate that semantically differs from the last accepted
+            one; a re-issued CRL with an unchanged revocation set does not
+            advance it.
+        withdrawal_generation:
+          type: integer
+          format: uint64
+          description: |
+            Generation at which client-certificate authority was last narrowed
+            (a trust anchor disappeared, or a new revocation appeared). `0` when
+            it never has been. Established transports below this generation are
+            retired and admit no further requests or streams.
+        tracked_connections:
+          type: integer
+          format: uint64
+          description: |
+            Established client-certificate-authenticated transports currently
+            registered for retirement in this scope.
+        publications_armed:
+          type: integer
+          format: uint64
+          description: Accepted publications that established the scope's baseline.
+        publications_unchanged:
+          type: integer
+          format: uint64
+          description: |
+            Accepted publications semantically identical to the previous one.
+            The generation did not advance and no session was touched.
+        publications_advanced:
+          type: integer
+          format: uint64
+          description: |
+            Accepted publications that changed the material without narrowing
+            authority (a CA added, a revocation removed). No session retired.
+        publications_withdrawn:
+          type: integer
+          format: uint64
+          description: |
+            Accepted publications that narrowed authority, moved the fence, and
+            retired established client-certificate transports.
+        rejected_candidates:
+          type: integer
+          format: uint64
+          description: |
+            Reload candidates refused. The last accepted generation, its
+            verifier, and every live session were retained.
+        retired_client_ca_withdrawn:
+          type: integer
+          format: uint64
+          description: |
+            Established transports retired because a trust anchor left the
+            client-CA bundle.
+        retired_crl_changed:
+          type: integer
+          format: uint64
+          description: |
+            Established transports retired because a CRL added a revocation.
+        fenced_requests:
+          type: integer
+          format: uint64
+          description: |
+            Requests or streams refused before routing and plugins because the
+            transport's client-certificate trust had been withdrawn.
 
     RuntimePluginTriggerSnapshot:
       type: object

@@ -969,3 +969,677 @@ fn extract_cn_from_der(der: &[u8]) -> Option<String> {
         .next()
         .and_then(|cn| cn.as_str().ok().map(|s| s.to_string()))
 }
+
+
+// ============================================================================
+// Issue #3857 — live retirement of established frontend mTLS transports when
+// CRL or client-CA trust is withdrawn.
+//
+// These are deliberately NOT bookkeeping tests. Each case establishes a REAL
+// TLS connection to a REAL gateway process with a REAL client certificate,
+// proves the connection is usable, then changes the operator's CRL or
+// client-CA bundle on disk and proves the ORIGINAL transport loses
+// authorization WITHOUT the client reconnecting.
+// ============================================================================
+
+/// Bound for "the accepted live reload has been observed". The watcher polls at
+/// 1s in these tests; this is generous enough for a loaded CI runner while still
+/// failing rather than hanging if retirement never happens.
+const RETIREMENT_DEADLINE: Duration = Duration::from_secs(45);
+
+/// Client certificate with a caller-chosen serial so a CRL can revoke exactly
+/// this leaf. `generate_signed_cert` pins one fixed serial for every leaf, which
+/// would make "revoke the client" indistinguishable from "revoke the server".
+fn generate_client_cert_with_serial(ca: &GeneratedCa, cn: &str, serial: u64) -> GeneratedCert {
+    let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("gen client key");
+    let mut params = CertificateParams::new(Vec::<String>::new()).expect("client params");
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, cn);
+    let serial = SerialNumber::from(serial);
+    params.serial_number = Some(serial.clone());
+    params.key_usages.push(KeyUsagePurpose::DigitalSignature);
+    params
+        .extended_key_usages
+        .push(rcgen::ExtendedKeyUsagePurpose::ClientAuth);
+    let cert = params.signed_by(&key_pair, &ca.issuer).expect("sign client");
+    GeneratedCert {
+        cert_pem: cert.pem(),
+        key_pem: key_pair.serialize_pem(),
+        serial,
+    }
+}
+
+/// Minimal plaintext HTTP/1.1 backend: answers every request with 200 and a
+/// fixed JSON body, keeping the connection alive.
+fn start_plain_echo_on(listener: TcpListener) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 8192];
+                loop {
+                    match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(_) => {}
+                    }
+                    let body = r#"{"status":"ok"}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    if sock.write_all(resp.as_bytes()).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    })
+}
+
+/// Build a client `rustls::ClientConfig` that verifies the gateway against
+/// `server_ca_pem` and presents `client` as its certificate.
+fn mtls_client_config(
+    server_ca_pem: &str,
+    client: &GeneratedCert,
+    alpn: &[&[u8]],
+) -> rustls::ClientConfig {
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in rustls_pemfile::certs(&mut server_ca_pem.as_bytes()) {
+        roots.add(cert.expect("parse server CA")).expect("add root");
+    }
+    let client_chain: Vec<_> = rustls_pemfile::certs(&mut client.cert_pem.as_bytes())
+        .map(|c| c.expect("parse client cert"))
+        .collect();
+    let client_key = rustls_pemfile::private_key(&mut client.key_pem.as_bytes())
+        .expect("read client key")
+        .expect("client key present");
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("client protocol versions")
+        .with_root_certificates(roots)
+        .with_client_auth_cert(client_chain, client_key)
+        .expect("client auth cert");
+    config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+    config
+}
+
+async fn connect_mtls(
+    port: u16,
+    config: rustls::ClientConfig,
+) -> std::io::Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>> {
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port)).await?;
+    let server_name = rustls::pki_types::ServerName::try_from("localhost")
+        .expect("server name")
+        .to_owned();
+    connector.connect(server_name, tcp).await
+}
+
+/// Outcome of one request attempt on an already-established transport.
+#[derive(Debug, PartialEq, Eq)]
+enum AttemptOutcome {
+    Status(u16),
+    TransportFailed,
+}
+
+impl AttemptOutcome {
+    fn is_authorized(&self) -> bool {
+        matches!(self, AttemptOutcome::Status(200))
+    }
+}
+
+/// A multiplexed / keep-alive transport that can issue further requests without
+/// a new handshake — which is exactly the property under test.
+struct EstablishedTransport {
+    sender: EstablishedSender,
+    _driver: tokio::task::JoinHandle<()>,
+}
+
+enum EstablishedSender {
+    H1(hyper::client::conn::http1::SendRequest<http_body_util::Empty<bytes::Bytes>>),
+    H2(hyper::client::conn::http2::SendRequest<http_body_util::Empty<bytes::Bytes>>),
+}
+
+impl EstablishedTransport {
+    async fn request(&mut self, authority: &str) -> AttemptOutcome {
+        let req = hyper::Request::builder()
+            .method("GET")
+            .uri("/api/test")
+            .header("host", authority)
+            .body(http_body_util::Empty::<bytes::Bytes>::new())
+            .expect("build request");
+        let result = match &mut self.sender {
+            EstablishedSender::H1(sender) => sender.send_request(req).await,
+            EstablishedSender::H2(sender) => {
+                let req = hyper::Request::builder()
+                    .method("GET")
+                    .uri(format!("https://{authority}/api/test"))
+                    .body(http_body_util::Empty::<bytes::Bytes>::new())
+                    .expect("build h2 request");
+                sender.send_request(req).await
+            }
+        };
+        match result {
+            Ok(resp) => AttemptOutcome::Status(resp.status().as_u16()),
+            Err(_) => AttemptOutcome::TransportFailed,
+        }
+    }
+
+    /// Poll the SAME transport until it stops being authorized, or the deadline
+    /// elapses. Returns the final outcome.
+    async fn wait_until_unauthorized(&mut self, authority: &str) -> AttemptOutcome {
+        let deadline = tokio::time::Instant::now() + RETIREMENT_DEADLINE;
+        let mut last = AttemptOutcome::Status(200);
+        while tokio::time::Instant::now() < deadline {
+            last = self.request(authority).await;
+            if !last.is_authorized() {
+                return last;
+            }
+            sleep(Duration::from_millis(250)).await;
+        }
+        last
+    }
+}
+
+async fn establish_h1(
+    port: u16,
+    config: rustls::ClientConfig,
+) -> std::io::Result<EstablishedTransport> {
+    let tls = connect_mtls(port, config).await?;
+    let io = hyper_util::rt::TokioIo::new(tls);
+    let (sender, conn) = hyper::client::conn::http1::handshake(io)
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    let driver = tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    Ok(EstablishedTransport {
+        sender: EstablishedSender::H1(sender),
+        _driver: driver,
+    })
+}
+
+async fn establish_h2(
+    port: u16,
+    config: rustls::ClientConfig,
+) -> std::io::Result<EstablishedTransport> {
+    let tls = connect_mtls(port, config).await?;
+    assert_eq!(
+        tls.get_ref().1.alpn_protocol(),
+        Some(&b"h2"[..]),
+        "the gateway must negotiate HTTP/2 for this case"
+    );
+    let io = hyper_util::rt::TokioIo::new(tls);
+    let (sender, conn) =
+        hyper::client::conn::http2::handshake(hyper_util::rt::TokioExecutor::new(), io)
+            .await
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+    let driver = tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    Ok(EstablishedTransport {
+        sender: EstablishedSender::H2(sender),
+        _driver: driver,
+    })
+}
+
+/// A running gateway with frontend mTLS and client-trust live reload armed.
+struct TrustRetirementFixture {
+    _dir: TempDir,
+    child: TokioChild,
+    capture: OutputCapture,
+    ports: Ports,
+    client_ca: GeneratedCa,
+    client_ca_path: String,
+    crl_path: String,
+    server_ca_pem: String,
+    client_cert: GeneratedCert,
+    revoked_serial: u64,
+    metrics_token: String,
+    _backend: tokio::task::JoinHandle<()>,
+}
+
+impl TrustRetirementFixture {
+    /// Spawn a gateway with frontend mTLS + live reload. Returns `None` when the
+    /// child failed to become healthy so the caller can retry with fresh ports.
+    async fn try_new() -> Option<Self> {
+        let dir = TempDir::new().unwrap();
+        let server_ca = generate_ca("Retirement-Server-CA");
+        let server = generate_signed_cert(&server_ca, "localhost", &["localhost", "127.0.0.1"]);
+        let client_ca = generate_ca("Retirement-Client-CA");
+        let revoked_serial = 0x3857u64;
+        let client_cert =
+            generate_client_cert_with_serial(&client_ca, "retirement-client", revoked_serial);
+
+        // A baseline CRL revoking an unrelated serial: the file exists and
+        // parses, so the first accepted generation is a genuine one and a later
+        // rewrite is a real semantic delta rather than "a CRL appeared".
+        let baseline_crl = generate_crl_pem(&client_ca, &[SerialNumber::from(1u64)]);
+
+        let cert_path = write_file(&dir, "server.crt", &server.cert_pem);
+        let key_path = write_file(&dir, "server.key", &server.key_pem);
+        let client_ca_path = write_file(&dir, "client-ca.pem", &client_ca.cert_pem);
+        let crl_path = write_file(&dir, "revocations.crl", &baseline_crl);
+        let cfg_path = dir.path().join("cfg.yaml");
+
+        let be_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_port = be_listener.local_addr().unwrap().port();
+        let backend = start_plain_echo_on(be_listener);
+
+        std::fs::write(
+            &cfg_path,
+            format!(
+                r#"
+version: "1"
+proxies:
+  - id: "trust-retirement"
+    listen_path: "/api"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+    strip_listen_path: true
+consumers: []
+upstreams: []
+plugin_configs: []
+"#
+            ),
+        )
+        .unwrap();
+
+        let ports = alloc_ports().await;
+        let metrics_token = format!("trust-retirement-{}", ports.admin_http);
+        let (child, capture) = spawn_gateway_piped(
+            cfg_path.to_str().unwrap(),
+            &ports,
+            &[
+                ("FERRUM_FRONTEND_TLS_CERT_PATH", cert_path.as_str()),
+                ("FERRUM_FRONTEND_TLS_KEY_PATH", key_path.as_str()),
+                (
+                    "FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH",
+                    client_ca_path.as_str(),
+                ),
+                ("FERRUM_TLS_CRL_FILE_PATH", crl_path.as_str()),
+                ("FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED", "true"),
+                ("FERRUM_FRONTEND_TLS_WATCH_INTERVAL_SECONDS", "1"),
+                ("FERRUM_POOL_WARMUP_ENABLED", "false"),
+                ("FERRUM_METRICS_BEARER_TOKEN", metrics_token.as_str()),
+            ],
+        );
+
+        let mut fixture = Self {
+            _dir: dir,
+            child,
+            capture,
+            ports,
+            client_ca,
+            client_ca_path,
+            crl_path,
+            server_ca_pem: server_ca.cert_pem.clone(),
+            client_cert,
+            revoked_serial,
+            metrics_token,
+            _backend: backend,
+        };
+        if wait_for_gateway(fixture.ports.admin_http, 60).await {
+            Some(fixture)
+        } else {
+            eprintln!("gateway output:\n{}", fixture.capture.snapshot().join("\n"));
+            fixture.shutdown().await;
+            None
+        }
+    }
+
+    async fn shutdown(&mut self) {
+        let _ = self.child.kill().await;
+        let _ = self.child.wait().await;
+    }
+
+    fn h1_config(&self) -> rustls::ClientConfig {
+        mtls_client_config(&self.server_ca_pem, &self.client_cert, &[b"http/1.1"])
+    }
+
+    fn h2_config(&self) -> rustls::ClientConfig {
+        mtls_client_config(&self.server_ca_pem, &self.client_cert, &[b"h2"])
+    }
+
+    /// Publish a CRL that revokes the fixture's client certificate.
+    fn revoke_client_certificate(&self) {
+        let updated = generate_crl_pem(
+            &self.client_ca,
+            &[
+                SerialNumber::from(1u64),
+                SerialNumber::from(self.revoked_serial),
+            ],
+        );
+        std::fs::write(&self.crl_path, updated).expect("rewrite CRL");
+    }
+
+    /// Re-issue the SAME revocation set under a new CRL number and validity
+    /// window — the shape a scheduled CRL refresh produces.
+    fn reissue_same_crl(&self) {
+        let mut params = CertificateRevocationListParams {
+            this_update: time::OffsetDateTime::now_utc(),
+            next_update: time::OffsetDateTime::now_utc() + time::Duration::days(60),
+            crl_number: SerialNumber::from(999u64),
+            issuing_distribution_point: None,
+            revoked_certs: Vec::new(),
+            key_identifier_method: rcgen::KeyIdMethod::Sha256,
+        };
+        params.revoked_certs.push(RevokedCertParams {
+            serial_number: SerialNumber::from(1u64),
+            revocation_time: time::OffsetDateTime::now_utc(),
+            reason_code: Some(RevocationReason::KeyCompromise),
+            invalidity_date: None,
+        });
+        let pem = params
+            .signed_by(&self.client_ca.issuer)
+            .expect("sign re-issued CRL")
+            .pem()
+            .expect("CRL PEM");
+        std::fs::write(&self.crl_path, pem).expect("rewrite CRL");
+    }
+
+    /// Replace the client-CA bundle with a completely different CA — the
+    /// withdrawal shape that invalidates every chain terminating at the old one.
+    fn withdraw_client_ca(&self) {
+        let replacement = generate_ca("Replacement-Client-CA");
+        std::fs::write(&self.client_ca_path, replacement.cert_pem).expect("rewrite client CA");
+    }
+
+    /// Append a second, unrelated CA to the bundle. Additive overlap: the old
+    /// anchor is still trusted, so nothing may be retired.
+    fn add_overlapping_client_ca(&self) {
+        let extra = generate_ca("Additional-Client-CA");
+        let bundle = format!("{}{}", self.client_ca.cert_pem, extra.cert_pem);
+        std::fs::write(&self.client_ca_path, bundle).expect("rewrite client CA");
+    }
+
+    /// Replace the CRL with a well-framed but undecodable PEM record. The
+    /// candidate must be refused outright — never summarized into an empty
+    /// revocation set, which would look like a widening — and the whole previous
+    /// generation retained.
+    fn corrupt_crl(&self) {
+        std::fs::write(
+            &self.crl_path,
+            "-----BEGIN X509 CRL-----\n!!! not base64 at all !!!\n-----END X509 CRL-----\n",
+        )
+        .expect("write malformed CRL");
+    }
+
+    async fn scrape_metrics(&self) -> String {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        client
+            .get(format!(
+                "http://127.0.0.1:{}/metrics",
+                self.ports.admin_http
+            ))
+            .header("Authorization", format!("Bearer {}", self.metrics_token))
+            .send()
+            .await
+            .expect("scrape /metrics")
+            .text()
+            .await
+            .expect("metrics body")
+    }
+}
+
+/// Spawn the fixture, retrying on port races (never on an observation).
+async fn trust_retirement_fixture() -> TrustRetirementFixture {
+    for _ in 0..3u32 {
+        if let Some(fixture) = TrustRetirementFixture::try_new().await {
+            return fixture;
+        }
+        sleep(Duration::from_secs(1)).await;
+    }
+    panic!("gateway with frontend mTLS + client-trust live reload did not become healthy");
+}
+
+// ----------------------------------------------------------------------------
+// Test 7: an established HTTP/2 connection stops admitting new streams once its
+// client certificate is revoked — with no reconnect.
+// ----------------------------------------------------------------------------
+
+#[ignore]
+#[tokio::test]
+async fn test_h2_streams_are_refused_after_crl_revocation_without_reconnect() {
+    let mut fixture = trust_retirement_fixture().await;
+
+    let mut transport = establish_h2(fixture.ports.proxy_https, fixture.h2_config())
+        .await
+        .expect("establish H2 mTLS transport");
+    assert_eq!(
+        transport.request("localhost").await,
+        AttemptOutcome::Status(200),
+        "the transport must be usable before the revocation"
+    );
+
+    fixture.revoke_client_certificate();
+
+    let outcome = transport.wait_until_unauthorized("localhost").await;
+    assert!(
+        !outcome.is_authorized(),
+        "a NEW stream on the ORIGINAL H2 connection must not be authorized after revocation, got {outcome:?}"
+    );
+    assert!(
+        matches!(
+            outcome,
+            AttemptOutcome::TransportFailed | AttemptOutcome::Status(401)
+        ),
+        "expected a fixed 401 or a closed transport, got {outcome:?}"
+    );
+
+    // The bounded, fixed-cardinality series must show exactly one retirement
+    // under the closed CRL reason, and must not carry a serial or a subject.
+    let metrics = fixture.scrape_metrics().await;
+    assert!(
+        metrics.contains(
+            "ferrum_frontend_client_trust_retired_connections_total{scope=\"proxy_frontend\",reason=\"crl_changed\"} 1"
+        ),
+        "expected exactly one CRL-reason retirement in /metrics:\n{metrics}"
+    );
+    assert!(
+        !metrics.contains("retirement-client") && !metrics.contains("14423"),
+        "client-trust series must never carry a certificate subject or serial"
+    );
+
+    fixture.shutdown().await;
+}
+
+// ----------------------------------------------------------------------------
+// Test 8: the same for an HTTP/1.1 keep-alive connection.
+// ----------------------------------------------------------------------------
+
+#[ignore]
+#[tokio::test]
+async fn test_h1_keepalive_is_refused_after_crl_revocation_without_reconnect() {
+    let mut fixture = trust_retirement_fixture().await;
+
+    let mut transport = establish_h1(fixture.ports.proxy_https, fixture.h1_config())
+        .await
+        .expect("establish H1 mTLS transport");
+    assert_eq!(
+        transport.request("localhost").await,
+        AttemptOutcome::Status(200),
+        "the keep-alive connection must be usable before the revocation"
+    );
+
+    fixture.revoke_client_certificate();
+
+    let outcome = transport.wait_until_unauthorized("localhost").await;
+    assert!(
+        !outcome.is_authorized(),
+        "a reused H1 keep-alive connection must not be authorized after revocation, got {outcome:?}"
+    );
+
+    fixture.shutdown().await;
+}
+
+// ----------------------------------------------------------------------------
+// Test 9: removing the issuing CA from the client-CA bundle retires the
+// established transport, and a fresh handshake with the same certificate is
+// refused outright by the new verifier.
+// ----------------------------------------------------------------------------
+
+#[ignore]
+#[tokio::test]
+async fn test_client_ca_withdrawal_retires_established_transport_and_new_handshakes() {
+    let mut fixture = trust_retirement_fixture().await;
+
+    let mut transport = establish_h2(fixture.ports.proxy_https, fixture.h2_config())
+        .await
+        .expect("establish H2 mTLS transport");
+    assert_eq!(
+        transport.request("localhost").await,
+        AttemptOutcome::Status(200)
+    );
+
+    fixture.withdraw_client_ca();
+
+    let outcome = transport.wait_until_unauthorized("localhost").await;
+    assert!(
+        !outcome.is_authorized(),
+        "removing the issuing CA must retire the established transport, got {outcome:?}"
+    );
+
+    // A brand-new connection must meet the new verifier only. The old client
+    // certificate no longer chains to any trusted anchor, so the handshake
+    // itself fails.
+    let deadline = tokio::time::Instant::now() + RETIREMENT_DEADLINE;
+    let mut refused = false;
+    while tokio::time::Instant::now() < deadline {
+        if establish_h2(fixture.ports.proxy_https, fixture.h2_config())
+            .await
+            .is_err()
+        {
+            refused = true;
+            break;
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+    assert!(
+        refused,
+        "a connection established after the accepted reload must use ONLY the new verifier"
+    );
+
+    let metrics = fixture.scrape_metrics().await;
+    assert!(
+        metrics.contains(
+            "ferrum_frontend_client_trust_retired_connections_total{scope=\"proxy_frontend\",reason=\"client_ca_withdrawn\"} 1"
+        ),
+        "expected exactly one CA-withdrawal retirement in /metrics:\n{metrics}"
+    );
+
+    fixture.shutdown().await;
+}
+
+// ----------------------------------------------------------------------------
+// Test 10: a malformed replacement CRL retains the prior verifier, generation,
+// and live sessions; and a routine CRL re-issue over the same revocation set
+// does not churn anything either.
+// ----------------------------------------------------------------------------
+
+#[ignore]
+#[tokio::test]
+async fn test_malformed_and_noop_candidates_retain_established_transports() {
+    let mut fixture = trust_retirement_fixture().await;
+
+    let mut transport = establish_h2(fixture.ports.proxy_https, fixture.h2_config())
+        .await
+        .expect("establish H2 mTLS transport");
+    assert_eq!(
+        transport.request("localhost").await,
+        AttemptOutcome::Status(200)
+    );
+
+    // (a) Truncated CRL — refused candidate.
+    fixture.corrupt_crl();
+    sleep(Duration::from_secs(6)).await;
+    assert_eq!(
+        transport.request("localhost").await,
+        AttemptOutcome::Status(200),
+        "a malformed CRL candidate must retain the prior verifier and live sessions"
+    );
+
+    // (b) Same revocation set, new CRL number and validity window.
+    fixture.reissue_same_crl();
+    sleep(Duration::from_secs(6)).await;
+    assert_eq!(
+        transport.request("localhost").await,
+        AttemptOutcome::Status(200),
+        "a routine CRL re-issue must not retire an unaffected session"
+    );
+
+    let metrics = fixture.scrape_metrics().await;
+    assert!(
+        metrics.contains(
+            "ferrum_frontend_client_trust_retired_connections_total{scope=\"proxy_frontend\",reason=\"crl_changed\"} 0"
+        ) && metrics.contains(
+            "ferrum_frontend_client_trust_retired_connections_total{scope=\"proxy_frontend\",reason=\"client_ca_withdrawn\"} 0"
+        ),
+        "no retirement may be recorded for a refused or no-op candidate:\n{metrics}"
+    );
+    assert!(
+        metrics.contains(concat!(
+            "ferrum_frontend_client_trust_rejected_candidates_total",
+            "{scope=\"proxy_frontend\"}"
+        )),
+        "the rejected-candidate series must be exported so a refused reload is observable:\n{metrics}"
+    );
+    assert!(
+        metrics.contains(
+            "ferrum_frontend_client_trust_publications_total{scope=\"proxy_frontend\",outcome=\"withdrawn\"} 0"
+        ),
+        "neither a refused nor a no-op candidate may publish a withdrawal:\n{metrics}"
+    );
+
+    fixture.shutdown().await;
+}
+
+// ----------------------------------------------------------------------------
+// Test 11: an additive, overlapping client-CA rotation does not retire an
+// unaffected established transport.
+// ----------------------------------------------------------------------------
+
+#[ignore]
+#[tokio::test]
+async fn test_additive_client_ca_overlap_does_not_retire_unaffected_transports() {
+    let mut fixture = trust_retirement_fixture().await;
+
+    let mut transport = establish_h2(fixture.ports.proxy_https, fixture.h2_config())
+        .await
+        .expect("establish H2 mTLS transport");
+    assert_eq!(
+        transport.request("localhost").await,
+        AttemptOutcome::Status(200)
+    );
+
+    fixture.add_overlapping_client_ca();
+    sleep(Duration::from_secs(8)).await;
+
+    assert_eq!(
+        transport.request("localhost").await,
+        AttemptOutcome::Status(200),
+        "an overlap rotation that only ADDS an anchor must leave established sessions alone"
+    );
+
+    let metrics = fixture.scrape_metrics().await;
+    assert!(
+        metrics.contains(
+            "ferrum_frontend_client_trust_publications_total{scope=\"proxy_frontend\",outcome=\"advanced\"} 1"
+        ),
+        "the additive rotation must advance the generation without withdrawing:\n{metrics}"
+    );
+    assert!(
+        metrics.contains(
+            "ferrum_frontend_client_trust_publications_total{scope=\"proxy_frontend\",outcome=\"withdrawn\"} 0"
+        ),
+        "no withdrawal may be recorded for an additive rotation:\n{metrics}"
+    );
+
+    fixture.shutdown().await;
+}

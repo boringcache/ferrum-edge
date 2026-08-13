@@ -658,6 +658,10 @@ pub(crate) async fn handle_h3_websocket(
         "H3 WebSocket (RFC 9220) upgrade request received"
     );
     let mut ctx = ctx;
+    // Issue #3857: captured before any later move of `ctx` so the upgraded H3
+    // WebSocket session carries the QUIC connection's client-trust session into
+    // the shared relay's stop arbiter.
+    let ws_client_trust_session = ctx.client_trust_session.clone();
     let ws_session_deadline = crate::proxy::effective_websocket_session_deadline(
         &ctx,
         state.env_config.websocket_max_lifetime_seconds,
@@ -1604,6 +1608,7 @@ pub(crate) async fn handle_h3_websocket(
         Arc::clone(&state.overload),
         crate::proxy::WsFragmentPolicy::from_env(&state.env_config),
         &adaptive_buf,
+        ws_client_trust_session,
     )
     .await;
 

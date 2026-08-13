@@ -21,16 +21,18 @@ use std::time::Duration;
 use rustls::ServerConfig;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::config::EnvConfig;
+use crate::tls::client_trust::{self, ClientTrustMaterial, ClientTrustScope};
 use crate::tls::source::subscription::{
     WatchedMaterialSource, material_set_poll_interval, source_is_refreshable,
 };
 use crate::tls::source::{CertSource, MaterialKind};
 use crate::tls::{
-    self, CrlList, FrontendTlsRebuildFn, FrontendTlsReloadConfig, SharedFrontendTls, TlsPolicy,
-    empty_frontend_tls_slot, frontend_tls_slot_with, spawn_frontend_tls_reload_task,
+    self, CrlList, FrontendTlsRebuildFn, FrontendTlsRebuilt, FrontendTlsReloadConfig,
+    SharedFrontendTls, TlsPolicy, empty_frontend_tls_slot, frontend_tls_slot_with,
+    spawn_frontend_tls_reload_task,
 };
 
 /// Result of wiring the proxy frontend TLS live-reload path. When live reload
@@ -126,6 +128,46 @@ pub fn prepare_proxy_frontend_tls(
         };
     };
 
+    // Arm the client-trust generations for this listener family from the
+    // startup-accepted material BEFORE the slot is published (issue #3857).
+    // Until a scope is armed, `client_trust::capture` returns `None` and the
+    // accept paths pay nothing — which is exactly the default, live-reload
+    // disabled posture. Arming here (rather than lazily on the first reload)
+    // means the very first accepted connection already carries a generation the
+    // first reload can fence it against.
+    //
+    // Both the HTTPS/H2 + TCP+TLS family and the H3 listener are armed from one
+    // baseline: they serve the same operator material. They keep SEPARATE
+    // generations because the H3 endpoint applies a reload asynchronously, so
+    // only the H3 listener itself can publish a generation that is not ahead of
+    // the material QUIC is actually handshaking with.
+    let startup_trust = frontend_startup_trust_material(
+        client_ca_source.as_ref(),
+        crls,
+        false,
+        env_config.tls_max_material_size_bytes,
+    );
+    let client_trust_scopes = match startup_trust {
+        Some(material) => {
+            client_trust::publish_accepted_material(
+                ClientTrustScope::ProxyFrontend,
+                material.clone(),
+            );
+            // The H3 baseline is the same material; the H3 listener republishes
+            // it into its own scope after `Endpoint::set_server_config`
+            // succeeds. Arming it here means an H3 connection accepted before
+            // the first reload already carries generation 1.
+            client_trust::publish_accepted_material(ClientTrustScope::ProxyH3, material);
+            vec![ClientTrustScope::ProxyFrontend]
+        }
+        None => {
+            warn!(
+                "Frontend TLS live reload is enabled but the startup client-CA/CRL material could not be summarized; established-transport trust retirement is disabled for proxy HTTPS"
+            );
+            Vec::new()
+        }
+    };
+
     let slot = frontend_tls_slot_with(tls_config);
     let (revision_tx, revision_rx) = watch::channel(0u64);
     let interval = material_set_poll_interval(
@@ -154,6 +196,7 @@ pub fn prepare_proxy_frontend_tls(
             revision_tx,
             rebuild,
             max_material_bytes: env_config.tls_max_material_size_bytes,
+            client_trust_scopes,
         },
         shutdown_rx,
     );
@@ -181,12 +224,12 @@ fn build_proxy_rebuild_fn(
     let policy = tls_policy.clone();
     let startup_crls = crls.clone();
 
-    Box::new(move || -> Result<Arc<ServerConfig>, anyhow::Error> {
+    Box::new(move || -> Result<FrontendTlsRebuilt, anyhow::Error> {
         let active_crls = match crl_source_value.as_deref() {
             Some(source) => tls::load_crls(Some(source))?,
             None => startup_crls.clone(),
         };
-        let mut config = tls::load_tls_config_with_client_auth_from_sources_and_ocsp(
+        let candidate = tls::load_frontend_tls_candidate(
             &cert_source,
             &key_source,
             client_ca_source.as_ref(),
@@ -196,14 +239,57 @@ fn build_proxy_rebuild_fn(
             warning_days,
             &active_crls,
         )?;
+        let mut config = candidate.config;
         // Reapply the proxy-frontend-specific opt-ins so rotated configs
         // match startup semantics (0-RTT, kTLS secret extraction).
         tls::enable_early_data(&mut config, &policy);
         if ktls_could_be_enabled {
             tls::enable_secret_extraction_for_ktls(&mut config);
         }
-        Ok(config)
+        Ok(FrontendTlsRebuilt {
+            config,
+            client_trust: Some(candidate.client_trust),
+        })
     })
+}
+
+/// Summarize the startup-accepted client-CA + CRL material for a frontend
+/// surface, so its client-trust scope can be armed at the same generation the
+/// listener starts serving.
+///
+/// Returns `None` when the client-CA source cannot be read; the caller then
+/// leaves the scope unarmed rather than arming it with an under-stated identity
+/// that a later, correct load would read as a withdrawal and use to retire every
+/// live session.
+fn frontend_startup_trust_material(
+    client_ca_source: Option<&CertSource>,
+    crls: &CrlList,
+    no_verify: bool,
+    max_material_bytes: usize,
+) -> Option<ClientTrustMaterial> {
+    if no_verify {
+        return Some(ClientTrustMaterial::default());
+    }
+    let ca_bytes = match client_ca_source {
+        Some(source) => {
+            match crate::tls::source::load_material_blocking_with(
+                source,
+                MaterialKind::CaBundle,
+                max_material_bytes,
+            ) {
+                Ok(material) => Some(material),
+                Err(_) => return None,
+            }
+        }
+        None => None,
+    };
+    ClientTrustMaterial::from_parts(
+        ca_bytes
+            .as_ref()
+            .map(|material| material.bytes.expose_secret()),
+        crls.as_slice(),
+    )
+    .ok()
 }
 
 fn frontend_watched_sources(
@@ -316,6 +402,27 @@ pub fn prepare_admin_frontend_tls(
         };
     };
 
+    // Same arming contract as the proxy surface, on the admin trust domain
+    // (`FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH` + the shared CRL source).
+    let startup_trust = frontend_startup_trust_material(
+        client_ca_source.as_ref(),
+        crls,
+        env_config.admin_tls_no_verify,
+        env_config.tls_max_material_size_bytes,
+    );
+    let client_trust_scopes = match startup_trust {
+        Some(material) => {
+            client_trust::publish_accepted_material(ClientTrustScope::AdminHttps, material);
+            vec![ClientTrustScope::AdminHttps]
+        }
+        None => {
+            warn!(
+                "Frontend TLS live reload is enabled but the startup admin client-CA/CRL material could not be summarized; established-transport trust retirement is disabled for admin HTTPS"
+            );
+            Vec::new()
+        }
+    };
+
     let slot = frontend_tls_slot_with(tls_config);
     let (revision_tx, _revision_rx) = watch::channel(0u64);
     let interval = material_set_poll_interval(
@@ -344,6 +451,7 @@ pub fn prepare_admin_frontend_tls(
             revision_tx,
             rebuild,
             max_material_bytes: env_config.tls_max_material_size_bytes,
+            client_trust_scopes,
         },
         shutdown_rx,
     );
@@ -370,12 +478,12 @@ fn build_admin_rebuild_fn(
     let policy = tls_policy.clone();
     let startup_crls = crls.clone();
 
-    Box::new(move || -> Result<Arc<ServerConfig>, anyhow::Error> {
+    Box::new(move || -> Result<FrontendTlsRebuilt, anyhow::Error> {
         let active_crls = match crl_source_value.as_deref() {
             Some(source) => tls::load_crls(Some(source))?,
             None => startup_crls.clone(),
         };
-        tls::load_tls_config_with_client_auth_from_sources_and_ocsp(
+        let candidate = tls::load_frontend_tls_candidate(
             &cert_source,
             &key_source,
             client_ca_source.as_ref(),
@@ -384,7 +492,11 @@ fn build_admin_rebuild_fn(
             &policy,
             warning_days,
             &active_crls,
-        )
+        )?;
+        Ok(FrontendTlsRebuilt {
+            config: candidate.config,
+            client_trust: Some(candidate.client_trust),
+        })
     })
 }
 
