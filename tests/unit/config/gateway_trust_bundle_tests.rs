@@ -136,6 +136,23 @@ fn assert_structural_fail_fast(errors: &[String]) {
     }
 }
 
+/// Cheap raw-material sum matching production `bundle_raw_material_bytes`.
+fn fixture_raw_material_bytes(bundle: &TrustBundleSet) -> usize {
+    let mut total = 0usize;
+    for entry in std::iter::once(&bundle.local).chain(bundle.federated.iter()) {
+        total = total.saturating_add(entry.trust_domain.as_str().len());
+        for encoded in &entry.x509_authorities {
+            total = total.saturating_add(encoded.len());
+        }
+        for authority in &entry.jwt_authorities {
+            total = total
+                .saturating_add(authority.key_id.len())
+                .saturating_add(authority.public_key_pem.len());
+        }
+    }
+    total
+}
+
 // ── Admission validation ────────────────────────────────────────────────────
 
 #[test]
@@ -467,8 +484,10 @@ fn an_oversized_jwt_pem_is_rejected_before_key_parsing() {
 
 #[test]
 fn an_oversized_bundle_is_rejected_before_deep_parsers_and_the_error_carries_no_material() {
-    // Just over the whole-bundle cap: 16 at-cap dummy PEMs. Individual fields
-    // stay within per-entry limits, so only the aggregate bound should fire,
+    // One local list of at-cap dummy PEMs is 256 KiB, under the 512 KiB
+    // whole-document ceiling. A second at-cap JWT list in one federated
+    // bundle stays inside every count and per-entry cap while the cheap
+    // aggregate raw sum exceeds the ceiling, so only that bound may fire
     // and the dummy material must not be decoded as keys or certificates.
     let mut record = valid_record();
     record.bundle.local.jwt_authorities = (0..MAX_JWT_AUTHORITIES_PER_BUNDLE)
@@ -477,6 +496,17 @@ fn an_oversized_bundle_is_rejected_before_deep_parsers_and_the_error_carries_no_
             public_key_pem: "A".repeat(MAX_JWT_AUTHORITY_PEM_BYTES),
         })
         .collect();
+    record.bundle.federated = vec![TrustBundle {
+        trust_domain: trust_domain("remote.example.com"),
+        x509_authorities: Vec::new(),
+        jwt_authorities: record.bundle.local.jwt_authorities.clone(),
+        refresh_hint_seconds: None,
+    }];
+    let raw = fixture_raw_material_bytes(&record.bundle);
+    assert!(
+        raw > MAX_TRUST_BUNDLE_JSON_BYTES,
+        "fixture raw material must exceed the whole-bundle cap so deep parsers never run"
+    );
 
     let errors = record
         .validate_fields()
@@ -492,32 +522,28 @@ fn an_oversized_bundle_is_rejected_before_deep_parsers_and_the_error_carries_no_
 
 #[test]
 fn json_escaping_overhead_counts_against_the_whole_bundle_cap() {
-    // Raw PEM bytes stay under the 256 KiB cap; JSON escaping of backslashes
-    // pushes the serialized document over it. The exact public contract must
-    // still refuse the record without invoking deep parsers.
+    // Raw PEM bytes stay under the whole-bundle cap; JSON escaping of
+    // backslashes in at-cap dummy PEMs pushes the serialized document over
+    // it. The exact public contract must still refuse the record without
+    // invoking deep parsers.
     let mut record = valid_record();
     record.bundle.local.jwt_authorities = (0..MAX_JWT_AUTHORITIES_PER_BUNDLE)
         .map(|index| JwtAuthority {
             key_id: format!("key-{index}"),
-            public_key_pem: "\\".repeat(10 * 1024),
+            public_key_pem: "\\".repeat(MAX_JWT_AUTHORITY_PEM_BYTES),
         })
         .collect();
 
-    let local = &record.bundle.local;
-    let raw = local.trust_domain.as_str().len()
-        + local
-            .x509_authorities
-            .iter()
-            .map(String::len)
-            .sum::<usize>()
-        + local
-            .jwt_authorities
-            .iter()
-            .map(|authority| authority.key_id.len() + authority.public_key_pem.len())
-            .sum::<usize>();
+    let raw = fixture_raw_material_bytes(&record.bundle);
     assert!(
         raw <= MAX_TRUST_BUNDLE_JSON_BYTES,
         "fixture raw material must stay under the cap so only escaping can trip it"
+    );
+    let encoded = serde_json::to_vec(&record.bundle).expect("escaping fixture serializes");
+    assert!(
+        encoded.len() > MAX_TRUST_BUNDLE_JSON_BYTES,
+        "fixture JSON must exceed the cap so only escaping trips it; encoded {} bytes",
+        encoded.len()
     );
 
     let errors = record

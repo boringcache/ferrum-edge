@@ -268,12 +268,13 @@ impl GatewayTrustBundleRecord {
     /// audit-actor diagnostics may still be collected because they do not
     /// clone or parse the bounded material.
     ///
-    /// Once the record is within those bounds, the exact serialized 256 KiB
-    /// contract is checked (including JSON escaping overhead) with a counting
-    /// writer so the check does not allocate the document. Every remaining
-    /// semantic problem is then collected so an operator repairing a bad
-    /// rotation sees the whole list. No message ever contains trust material —
-    /// only field names, indices, and sizes.
+    /// Once the record is within those bounds, the exact serialized
+    /// [`MAX_TRUST_BUNDLE_JSON_BYTES`] contract is checked (including JSON
+    /// escaping overhead) with a counting writer so the check does not
+    /// allocate the document. Every remaining semantic problem is then
+    /// collected so an operator repairing a bad rotation sees the whole list.
+    /// No message ever contains trust material — only field names, indices,
+    /// and sizes.
     pub fn validate_fields(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
