@@ -7,7 +7,7 @@
 
 use ferrum_edge::config::types::BackendScheme;
 use ferrum_edge::config_sources::k8s::{
-    K8sMetadata, K8sObject, K8sTranslationOptions, translate_k8s_objects,
+    K8sMetadata, K8sObject, K8sTranslateError, K8sTranslationOptions, translate_k8s_objects,
     udp_amplification_policy::GatewayApiUdpAmplificationPolicyStatus,
 };
 use ferrum_edge::identity::spiffe::TrustDomain;
@@ -453,14 +453,37 @@ fn unmaterialized_parent_reports_amplification_not_programmed() {
         udp_gateway("edge", "dns", 15353),
         udp_route_on("dns", "missing"),
     ];
-    assert_eq!(
-        translate_k8s_objects(&objects, options())
-            .expect("unmatched section still translates")
-            .config
-            .proxies
-            .len(),
-        0
-    );
+    let err = translate_k8s_objects(&objects, options())
+        .expect_err("unmatched sectionName must fail closed");
+    match &err {
+        K8sTranslateError::InvalidResource {
+            kind,
+            namespace,
+            name,
+            message,
+        } => {
+            assert_eq!(kind, "UDPRoute");
+            assert_eq!(namespace, "default");
+            assert_eq!(name, "dns");
+            assert_eq!(
+                message,
+                "UDPRoute parentRef does not match any known Gateway listener in namespace 'default'"
+            );
+        }
+        other => panic!("expected InvalidResource for unmatched parentRef, got {other:?}"),
+    }
+    for leaked in [
+        "amplification",
+        "UDPResponseAmplificationPolicy",
+        "FiniteDefault",
+        "NotProgrammed",
+    ] {
+        assert!(
+            !err.to_string().contains(leaked),
+            "unmatched-listener translation error must not expose amplification policy details, \
+             leaked {leaked:?}: {err}"
+        );
+    }
     let (protected, reason, message) = route_protection_named(&objects, "dns");
     assert_not_programmed(protected, &reason, &message);
 }
