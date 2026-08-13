@@ -12348,6 +12348,15 @@ async fn handle_websocket_request_authenticated(
         // loopback authority.
         let ws_dial_result: Result<WsBackendHandshake, Box<dyn std::error::Error + Send + Sync>> =
             if let Some(unix_dispatch) = ws_unix_dispatch {
+                // Match ordinary Unix HTTP dispatch: preserve the authenticated
+                // client's Host only when the route explicitly opts in.
+                // Otherwise the target-effective backend authority owns the
+                // local application's virtual-host selection. The parse-only
+                // upgrade URI always uses that backend authority so an
+                // untrusted Host cannot rewrite the request-target. A
+                // malformed, authority-less, or unsafe backend URL fails
+                // closed here — before admission/dial — rather than
+                // substituting a local virtual host.
                 match unix_dispatch {
                     // Boxed: this dial future (admission gate + hyper/tungstenite
                     // H1 upgrade + framer construction) would otherwise be stored
@@ -12358,21 +12367,40 @@ async fn handle_websocket_request_authenticated(
                     // `proxy_to_backend`: the generic future's size is a
                     // whole-gateway stack budget, not a WS-path cost.
                     #[cfg(unix)]
-                    Ok(socket_path) => Box::pin(connect_unix_websocket_backend(
-                        &state.unix_backend_pool,
-                        ws_dial_proxy,
-                        &env_config,
-                        socket_path,
-                        ws_client_host.as_deref().unwrap_or_default(),
-                        ws_path_and_query.as_ref(),
-                        &client_headers,
-                        ws_size_limits.max_frame_bytes,
-                        ws_size_limits.max_message_bytes,
-                        state.websocket_write_buffer_size,
-                        ws_idle_tracker.clone(),
-                    ))
-                    .await
-                    .map(|handshake| WsBackendHandshake::Unix(Box::new(handshake))),
+                    Ok(socket_path) => match unix_websocket_url_authority(&current_backend_url) {
+                        None => {
+                            warn!(
+                                proxy_id = %proxy.id,
+                                "Refusing WebSocket upgrade over unix-socket backend: \
+                                 target-effective URL has no safe authority; failing closed \
+                                 rather than substituting a local virtual host"
+                            );
+                            Err(retry::WS_UNIX_BACKEND_AUTHORITY_INVALID.into())
+                        }
+                        Some(url_authority) => {
+                            let host = unix_websocket_backend_host(
+                                proxy.preserve_host_header,
+                                ws_client_host.as_deref(),
+                                &url_authority,
+                            );
+                            Box::pin(connect_unix_websocket_backend(
+                                &state.unix_backend_pool,
+                                ws_dial_proxy,
+                                &env_config,
+                                socket_path,
+                                &url_authority,
+                                host.as_ref(),
+                                ws_path_and_query.as_ref(),
+                                &client_headers,
+                                ws_size_limits.max_frame_bytes,
+                                ws_size_limits.max_message_bytes,
+                                state.websocket_write_buffer_size,
+                                ws_idle_tracker.clone(),
+                            ))
+                            .await
+                            .map(|handshake| WsBackendHandshake::Unix(Box::new(handshake)))
+                        }
+                    },
                     // Non-Unix builds never produce `Ok` above.
                     #[cfg(not(unix))]
                     Ok(_) => Err(retry::WS_UNIX_SOCKET_INADMISSIBLE.into()),
@@ -14399,8 +14427,12 @@ pub(crate) async fn connect_websocket_backend(
 ///
 /// ## Policy parity with the TCP path
 ///
-/// The caller supplies the same normalized `client_headers` the TCP path
-/// forwards, and tungstenite generates `Upgrade`/`Connection`/
+/// The parse-only upgrade URI uses the target-effective backend authority
+/// (IPv6-bracketed, with port) exactly as Direct TCP WebSocket URLs do; the
+/// Host header is the one Unix HTTP/1.1 dispatch would send under
+/// `preserve_host_header`. The caller supplies the same normalized
+/// `client_headers` the TCP path forwards, and tungstenite generates
+/// `Upgrade`/`Connection`/
 /// `Sec-WebSocket-Key`/`Sec-WebSocket-Version` and validates the backend's
 /// `101 Switching Protocols` + `Sec-WebSocket-Accept` before yielding the
 /// stream. The returned framer carries the identical `WebSocketConfig` bounds
@@ -14418,7 +14450,8 @@ async fn connect_unix_websocket_backend(
     proxy: &Proxy,
     env_config: &crate::config::EnvConfig,
     socket_path: &str,
-    backend_host: &str,
+    url_authority: &str,
+    host_header: &str,
     path_and_query: &str,
     client_headers: &[(String, String)],
     max_websocket_frame_size_bytes: usize,
@@ -14434,15 +14467,22 @@ async fn connect_unix_websocket_backend(
     // (issue #2963). Matches every other backend WebSocket transport.
     ws_config.auto_pong = false;
 
-    // A Unix socket has no network authority, so the request line is built from
-    // the routing host the app matches on plus the preserved client path+query.
-    // The URL is parse-only — nothing is resolved or dialed from it.
-    let host = if backend_host.is_empty() {
-        "localhost"
+    // A Unix socket has no network authority. The caller already parsed the
+    // target-effective backend authority (never the client Host, never the
+    // socket path) and refused unsafe URLs, so request-target and TLS/SNI
+    // derivation stay on the same trusted URL the Direct TCP WebSocket path
+    // dials. Host is applied separately from the preserve-host policy value.
+    let path = if path_and_query.starts_with('/') {
+        path_and_query
     } else {
-        backend_host
+        "/"
     };
-    let ws_url = format!("ws://{host}{path_and_query}");
+    let ws_url = format!("ws://{url_authority}{path}");
+    let host = if host_header.is_empty() {
+        url_authority
+    } else {
+        host_header
+    };
     let mut ws_request = ws_url.into_client_request()?;
     ws_request.headers_mut().insert(
         hyper::header::HOST,
@@ -14561,6 +14601,59 @@ fn websocket_mesh_egress(target: &UpstreamTarget) -> Option<MeshWsEgress> {
         Some(MeshWsEgress::AmbientHbone)
     } else if mesh_mtls_pool::target_mesh_mtls_enabled(target) {
         Some(MeshWsEgress::SidecarMtls)
+    } else {
+        None
+    }
+}
+
+/// Select the Host sent by an RFC 6455 upgrade over a Unix backend socket.
+///
+/// Mirrors ordinary Unix HTTP/1.1 Host policy: the inbound Host is used only
+/// for an explicit `preserve_host_header` route, and only when it is a valid
+/// RFC 3986 authority (so a client Host cannot inject a request-target,
+/// userinfo, or header separator). Surrounding whitespace is stripped before
+/// validation and the returned value is that normalized authority — never the
+/// original untrimmed representation. Otherwise `url_authority` is used. A
+/// filesystem path is never a valid URI authority, so the socket path cannot
+/// become Host.
+pub(crate) fn unix_websocket_backend_host<'a>(
+    preserve_host_header: bool,
+    client_host: Option<&str>,
+    url_authority: &'a str,
+) -> std::borrow::Cow<'a, str> {
+    if preserve_host_header
+        && let Some(host) = client_host.and_then(unix_websocket_validated_authority)
+    {
+        return std::borrow::Cow::Owned(host.to_string());
+    }
+    std::borrow::Cow::Borrowed(url_authority)
+}
+
+/// Parse-only URI authority for a Unix WebSocket upgrade.
+///
+/// Always taken from the target-effective backend URL, never from the client
+/// Host and never from the socket filesystem path. Direct TCP WebSocket
+/// upgrades derive Host and request-target from that same URL; Unix keeps
+/// the URI on this trusted authority even when the Host header is preserved.
+/// Returns `None` for a malformed, authority-less, or unsafe URL instead of
+/// substituting a local virtual host.
+pub(crate) fn unix_websocket_url_authority(backend_url: &str) -> Option<String> {
+    let uri = backend_url.parse::<hyper::Uri>().ok()?;
+    unix_websocket_validated_authority(uri.authority()?.as_str()).map(str::to_string)
+}
+
+fn unix_websocket_validated_authority(value: &str) -> Option<&str> {
+    // Validate the trimmed form and return that same slice so surrounding
+    // whitespace cannot survive as Host/URI authority after a successful
+    // check. `split_request_authority` rejects empty values, userinfo `@`,
+    // unbracketed IPv6, invalid ports, and non-reg-name hosts (including `/`,
+    // spaces, and CRLF). `HeaderValue` rejects CTL bytes that would otherwise
+    // survive a URI parse.
+    let trimmed = value.trim();
+    if split_request_authority(trimmed).is_some()
+        && hyper::header::HeaderValue::from_str(trimmed).is_ok()
+    {
+        Some(trimmed)
     } else {
         None
     }
