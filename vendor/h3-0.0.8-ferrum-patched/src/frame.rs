@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::task::{Context, Poll};
 
 use bytes::Buf;
@@ -40,6 +41,17 @@ impl<S, B> FrameStream<S, B> {
     /// partially received/read frames.
     pub fn into_inner(self) -> BufRecvStream<S, B> {
         self.stream
+    }
+}
+
+impl<S, B> crate::quic::SendStreamStopped for FrameStream<S, B>
+where
+    S: crate::quic::SendStreamStopped,
+{
+    fn stopped(
+        &self,
+    ) -> impl Future<Output = Result<Option<u64>, StreamErrorIncoming>> + Send + 'static {
+        self.stream.stopped()
     }
 }
 

@@ -29,6 +29,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
+use tokio::task::JoinHandle;
 
 /// A buffered gRPC response, captured eagerly.
 #[derive(Debug, Clone)]
@@ -283,7 +284,11 @@ impl GrpcClient {
         let io = FrameObservingIo::new(io, Arc::clone(&framing));
 
         let (mut send_req, connection) = h2_client::handshake(io).await?;
-        let conn_task = tokio::spawn(connection);
+        // Abort the connection driver on every exit — including task
+        // cancellation. Dropping the JoinHandle alone detaches it, so
+        // `hold.abort()` would leave the client→gateway H2 session up and the
+        // gateway would never observe the cancel.
+        let conn_task = AbortOnDrop(tokio::spawn(connection));
 
         let scheme = if tls { "https" } else { "http" };
         let mut req_builder = Request::builder()
@@ -319,7 +324,6 @@ impl GrpcClient {
             Ok(Err(e)) => {
                 // Stream-level error before headers arrived. Synthesize a
                 // response so the caller can inspect it.
-                conn_task.abort();
                 let stream_error = match request_send_error.as_deref() {
                     Some(send_error) => format!("{send_error}; response error: {e}"),
                     None => format!("response error: {e}"),
@@ -335,7 +339,6 @@ impl GrpcClient {
                 });
             }
             Err(_) => {
-                conn_task.abort();
                 let stream_error = match request_send_error.as_deref() {
                     Some(send_error) => format!("{send_error}; response timed out"),
                     None => "response timed out".to_string(),
@@ -408,7 +411,6 @@ impl GrpcClient {
             match tokio::time::timeout(Duration::from_secs(20), body_trailers_fut).await {
                 Ok(collected) => collected,
                 Err(_) => {
-                    conn_task.abort();
                     return Ok(GrpcResponse {
                         http_status,
                         headers,
@@ -437,8 +439,7 @@ impl GrpcClient {
         );
 
         let messages = decode_grpc_messages(&raw_frames);
-        // Don't care if conn_task errors; the important state is above.
-        conn_task.abort();
+        drop(conn_task);
 
         Ok(GrpcResponse {
             http_status,
@@ -731,6 +732,17 @@ fn decode_grpc_messages(frames: &[Bytes]) -> Vec<Bytes> {
         i += 5 + len;
     }
     out
+}
+
+/// Abort an h2 connection driver when the request future is dropped, including
+/// `JoinHandle::abort()` of the caller task. Detaching the driver would leave
+/// the TCP session up so the gateway never saw the cancel.
+struct AbortOnDrop(JoinHandle<Result<(), h2::Error>>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 fn parse_target(t: &str) -> Result<(String, u16), Box<dyn std::error::Error + Send + Sync>> {

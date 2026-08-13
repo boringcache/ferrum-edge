@@ -7,7 +7,7 @@ use crate::{
         connection_error_creators::CloseStream, internal_error::InternalConnectionError, Code,
         StreamError,
     },
-    quic::{self},
+    quic::{self, StreamErrorIncoming},
     shared_state::{ConnectionState, SharedState},
 };
 
@@ -15,6 +15,7 @@ use super::connection::RequestEnd;
 use std::sync::Arc;
 
 use std::{
+    future::Future,
     option::Option,
     result::Result,
     task::{Context, Poll},
@@ -112,6 +113,22 @@ where
     /// Returns the underlying stream id
     pub fn id(&self) -> StreamId {
         self.inner.stream.id()
+    }
+}
+
+impl<S, B> crate::quic::SendStreamStopped for RequestStream<S, B>
+where
+    S: crate::quic::SendStreamStopped,
+{
+    /// Observe peer `STOP_SENDING` on the response (send) direction.
+    ///
+    /// The future is `'static` and does not borrow this stream, so a server can
+    /// race it against a backend wait while still using the receive half or a
+    /// later response write on the same send half.
+    fn stopped(
+        &self,
+    ) -> impl Future<Output = Result<Option<u64>, StreamErrorIncoming>> + Send + 'static {
+        crate::quic::SendStreamStopped::stopped(&self.inner)
     }
 }
 

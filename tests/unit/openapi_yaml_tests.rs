@@ -6238,6 +6238,8 @@ fn upstream_runtime_serialization_is_covered_by_openapi() {
                 "h2_upgrade_policy": "DO_NOT_UPGRADE",
                 "max_retries": 2,
                 "http1_max_pending_requests": 7,
+                "http2_max_requests": 32,
+                "h2_max_concurrent_streams": 16,
                 "passive_health_check": {}
             }
         }],
@@ -6258,6 +6260,7 @@ fn upstream_runtime_serialization_is_covered_by_openapi() {
                 "tcp_keepalive": {"time_seconds": 30, "interval_seconds": 10, "probes": 3},
                 "http_max_requests_per_connection": 1000,
                 "http_idle_timeout_ms": 30000,
+                "http2_max_requests": 256,
                 "h2_max_concurrent_streams": 128,
                 "tls": {},
                 "h2_upgrade_policy": "UPGRADE",

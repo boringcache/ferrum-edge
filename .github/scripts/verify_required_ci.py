@@ -22,6 +22,9 @@ from pr_ci_plan import FULL_CI_DOCUMENTATION_PATHS, self_test as planner_self_te
 from validate_live_assertions import (
     run_self_test as live_assertion_validator_self_test,
 )
+from verify_mesh_performance_baselines_workflow import (
+    main as mesh_baselines_workflow_main,
+)
 from verify_release_image_attestations import (
     run_self_test as release_attestation_self_test,
 )
@@ -921,6 +924,35 @@ def main() -> int:
             "jobs.performance-regression must disable rename detection when "
             "collecting changed files for pull_request and merge_group diffs"
         )
+    if "verify_mesh_performance_baselines_workflow.py" not in performance_regression_body:
+        planner_errors.append(
+            "jobs.performance-regression must invoke "
+            "verify_mesh_performance_baselines_workflow.py"
+        )
+    if (
+        "python3 .github/scripts/verify_mesh_performance_baselines_workflow.py --self-test"
+        not in performance_regression_body
+    ):
+        planner_errors.append(
+            "jobs.performance-regression must self-test the mesh baselines "
+            "workflow verifier"
+        )
+    if (
+        "python3 .github/scripts/verify_mesh_performance_baselines_workflow.py"
+        not in performance_regression_body
+    ):
+        planner_errors.append(
+            "jobs.performance-regression must run the mesh baselines workflow verifier"
+        )
+    static_idx = performance_regression_body.find(
+        "Verify mesh performance baselines workflow contract"
+    )
+    detect_idx = performance_regression_body.find("Detect performance-sensitive changes")
+    if static_idx == -1 or detect_idx == -1 or static_idx > detect_idx:
+        planner_errors.append(
+            "jobs.performance-regression must run mesh baseline workflow "
+            "contracts after checkout and before optional benchmark path gating"
+        )
 
     for output in sorted(set(PATH_GATED_JOBS.values())):
         if not re.search(rf"(?m)^      {re.escape(output)}:", ci_plan_body):
@@ -1097,6 +1129,14 @@ def main() -> int:
         planner_errors.append(
             "jobs.helm-chart must stage the trusted chart runtime checker "
             "under RUNNER_TEMP"
+        )
+    if mesh_baselines_workflow_main(["--self-test"]) != 0:
+        planner_errors.append(
+            "mesh performance baselines workflow self-test failed"
+        )
+    if mesh_baselines_workflow_main([]) != 0:
+        planner_errors.append(
+            "mesh performance baselines workflow contract failed"
         )
     # The scheduling decision above intentionally executes the trusted-base
     # planner on pull requests. Exercise the proposed planner here as data-plane

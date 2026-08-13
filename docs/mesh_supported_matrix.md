@@ -217,7 +217,9 @@ need them, or because they are blocked upstream / architecturally:
   supported topology for workload-scoped UDP/DTLS authorization.
 - **DR `connectionPool.http.maxRequestsPerConnection`** — parsed and validated
   but **Deferred** in status; backend close-after-N-requests is unsupported, so
-  it is not projected as effective policy. Use `http2MaxRequests`.
+  it is not projected as effective policy. Use `maxConcurrentStreams` for
+  per-connection HTTP/2 stream concurrency, or `http2MaxRequests` for the
+  destination-wide active-request budget.
   (`http1MaxPendingRequests` IS enforced through Ferrum's documented honest
   reinterpretation — a 503-on-overflow concurrent in-flight-request gate on the
   HTTP/1.1 dispatch path, keyed by logical destination
