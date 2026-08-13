@@ -1527,6 +1527,130 @@ fn delegated_udp_listenerset_cannot_withdraw_parent_secure_http_listener() {
     );
 }
 
+/// When SecureHttp, UDP, and raw TCP share one numeric port, TCP-family and
+/// QUIC/UDP arbitration coexist. Each conflicted candidate must report the
+/// refusal reason that actually applied to it, independent of listener order.
+#[test]
+fn secure_http_udp_and_tcp_protocol_conflicts_are_candidate_accurate() {
+    const PORT: u64 = 9443;
+    let tcp_family_message = format!(
+        "Port {PORT} is claimed by incompatible protocol families on the same TCP \
+         transport (HTTP-family vs raw stream), so every conflicting claim on this \
+         port is refused (Conflicted)."
+    );
+    let quic_udp_message = format!(
+        "Port {PORT} is claimed by secure HTTP/QUIC and a UDP stream, so the UDP \
+         claim is refused (Conflicted)."
+    );
+    let orders: [[&str; 3]; 6] = [
+        ["secure-http", "tcp", "udp"],
+        ["secure-http", "udp", "tcp"],
+        ["tcp", "secure-http", "udp"],
+        ["tcp", "udp", "secure-http"],
+        ["udp", "secure-http", "tcp"],
+        ["udp", "tcp", "secure-http"],
+    ];
+    for secure_protocol in ["HTTPS", "GRPCS"] {
+        for listener_order in orders {
+            let secret = tls_secret("edge-cert", "default");
+            let mut listeners = Vec::new();
+            for name in listener_order {
+                listeners.push(match name {
+                    "secure-http" => json!({
+                        "name": "secure-http",
+                        "port": PORT,
+                        "protocol": secure_protocol,
+                        "hostname": "secure.example.com",
+                        "tls": {
+                            "mode": "Terminate",
+                            "certificateRefs": [{ "name": "edge-cert" }]
+                        },
+                        "allowedRoutes": { "namespaces": { "from": "Same" } }
+                    }),
+                    "tcp" => json!({
+                        "name": "tcp",
+                        "port": PORT,
+                        "protocol": "TCP",
+                        "allowedRoutes": {
+                            "kinds": [{ "kind": "TCPRoute" }],
+                            "namespaces": { "from": "Same" }
+                        }
+                    }),
+                    "udp" => json!({
+                        "name": "udp",
+                        "port": PORT,
+                        "protocol": "UDP",
+                        "allowedRoutes": {
+                            "kinds": [{ "kind": "UDPRoute" }],
+                            "namespaces": { "from": "Same" }
+                        }
+                    }),
+                    other => panic!("unexpected listener fixture {other}"),
+                });
+            }
+            let mut gateway = http_gateway("edge", Some("Same"));
+            gateway.spec["listeners"] = Value::Array(listeners);
+            let translation = translate_k8s_objects(
+                &[gateway_class(), secret, gateway],
+                options(),
+            )
+            .expect("translate");
+
+            let gateway_key = GatewayApiListenerKey {
+                namespace: "default".to_string(),
+                parent_kind: GatewayApiListenerParentKind::Gateway,
+                gateway: "edge".to_string(),
+                listener: String::new(),
+            };
+            for (listener, expected_message) in [
+                ("secure-http", tcp_family_message.as_str()),
+                ("tcp", tcp_family_message.as_str()),
+                ("udp", quic_udp_message.as_str()),
+            ] {
+                let key = GatewayApiListenerKey {
+                    listener: listener.to_string(),
+                    ..gateway_key.clone()
+                };
+                let conflict = translation.listener_conflicts.get(&key).unwrap_or_else(|| {
+                    panic!(
+                        "{secure_protocol} order {:?} must ProtocolConflict {listener}: {:?}",
+                        listener_order, translation.listener_conflicts
+                    )
+                });
+                assert_eq!(conflict.reason, "ProtocolConflict");
+                assert_eq!(
+                    conflict.message, expected_message,
+                    "{secure_protocol} order {:?} listener {listener} message",
+                    listener_order
+                );
+                assert!(
+                    !conflict.message.contains("secure-http")
+                        && !conflict.message.contains("edge-cert")
+                        && !conflict.message.contains("secure.example.com"),
+                    "ProtocolConflict must not leak object identifiers: {}",
+                    conflict.message
+                );
+            }
+            assert!(
+                !translation
+                    .config
+                    .mesh
+                    .as_ref()
+                    .map(|mesh| mesh.services.as_slice())
+                    .unwrap_or(&[])
+                    .iter()
+                    .any(|service| {
+                        service.name.contains("secure-http")
+                            || service.name.contains("tcp")
+                            || service.name.contains("udp")
+                    }),
+                "{secure_protocol} order {:?} must not materialize any conflicting listener",
+                listener_order
+            );
+        }
+    }
+}
+
 /// Black-box shape: HTTP:80 plus HTTPS:443 must still attach and materialize
 /// HTTPRoutes. UDP on a different port is not a QUIC collision. Splitting
 /// SecureHttp for UDP arbitration must not drop HTTPS hostname/path proxies.
