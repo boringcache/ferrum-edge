@@ -41,6 +41,7 @@ pub mod client_ip;
 pub mod datagram_client_address;
 pub mod deferred_log;
 pub mod gateway_listener;
+pub mod gateway_listener_status;
 pub mod grpc_proxy;
 /// Shared h2c (cleartext, prior-knowledge HTTP/2) peer-preface observation.
 /// Hyper's client handshake proves only the client half, so both h2c transports
