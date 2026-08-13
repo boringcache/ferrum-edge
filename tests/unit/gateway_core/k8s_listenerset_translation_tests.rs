@@ -1280,6 +1280,50 @@ fn tcp_and_udp_gateway_listeners_may_share_a_numeric_port() {
 }
 
 #[test]
+fn secure_http_and_udp_gateway_listeners_fail_closed_on_quic_port() {
+    for secure_protocol in ["HTTPS", "GRPCS"] {
+        let mut gateway = http_gateway("edge", Some("Same"));
+        gateway.spec["listeners"] = json!([
+            {
+                "name": "secure-http",
+                "port": 9443,
+                "protocol": secure_protocol,
+                "allowedRoutes": { "namespaces": { "from": "Same" } }
+            },
+            {
+                "name": "udp",
+                "port": 9443,
+                "protocol": "UDP",
+                "allowedRoutes": {
+                    "kinds": [{ "kind": "UDPRoute" }],
+                    "namespaces": { "from": "Same" }
+                }
+            }
+        ]);
+        let translation =
+            translate_k8s_objects(&[gateway_class(), gateway], options()).expect("translate");
+
+        for listener in ["secure-http", "udp"] {
+            let key = GatewayApiListenerKey {
+                namespace: "default".to_string(),
+                parent_kind: GatewayApiListenerParentKind::Gateway,
+                gateway: "edge".to_string(),
+                listener: listener.to_string(),
+            };
+            assert_eq!(
+                translation
+                    .listener_conflicts
+                    .get(&key)
+                    .map(|conflict| conflict.reason),
+                Some("ProtocolConflict"),
+                "{secure_protocol}+UDP must refuse {listener}: {:?}",
+                translation.listener_conflicts
+            );
+        }
+    }
+}
+
+#[test]
 fn tcp_and_tls_passthrough_listeners_may_share_a_numeric_port() {
     let mut gateway = http_gateway("edge", Some("Same"));
     gateway.spec["listeners"] = json!([
