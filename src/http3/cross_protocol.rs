@@ -4519,7 +4519,7 @@ where
 fn resolve_h3_grpc_transport<'a>(
     state: &'a ProxyState,
     target: Option<&'a UpstreamTarget>,
-    asserted_source_identity: Option<&'a crate::identity::SpiffeId>,
+    asserted_source_identity: Option<&crate::identity::SpiffeId>,
 ) -> Result<grpc_proxy::GrpcDispatchTransport<'a>, grpc_proxy::GrpcTransportError> {
     // Delegated to the SHARED resolver the standard H1/H2 native-gRPC branch
     // also uses (issue #3728), so the two frontends cannot drift on target

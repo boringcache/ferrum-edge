@@ -2643,11 +2643,19 @@ pub struct MeshMtlsGrpcTransport<'a> {
 /// resolved for, and the fail-closed dial plan (dial host + CONNECT authority
 /// host + HBONE port, plus either a pinned peer OR a trust-domain scope +
 /// destination-FQDN SNI override).
+///
+/// `asserted_source_identity` is owned so the transport does not borrow
+/// `RequestContext`. Both native-gRPC frontends mutate `ctx` after materializing
+/// the transport (admission, body hooks, deadline selection); a borrow of
+/// `ctx.peer_spiffe_id` would not survive that. Clone is once per attempt, not
+/// per frame. Only the authenticated frontend workload SPIFFE is stored here —
+/// never a caller header and never the gateway SVID (the pool falls back to the
+/// gateway SVID at CONNECT time only when this field is `None`).
 pub struct HboneGrpcTransport<'a> {
     pool: &'a crate::proxy::hbone_pool::HboneConnectionPool,
     target: &'a crate::config::types::UpstreamTarget,
     plan: crate::proxy::hbone_pool::HboneDialPlan<'a>,
-    asserted_source_identity: Option<&'a crate::identity::SpiffeId>,
+    asserted_source_identity: Option<crate::identity::SpiffeId>,
     baggage_strip_prefixes: Vec<String>,
 }
 
@@ -2869,14 +2877,16 @@ impl<'a> GrpcDispatchTransport<'a> {
     }
 
     /// Resolve a transport while binding request-scoped Ambient identity
-    /// context. The asserted identity is used only by HBONE; the strip list is
-    /// applied to inner-request baggage before it reaches the application.
+    /// context. The asserted identity is used only by HBONE and is cloned into
+    /// the transport so callers can keep mutating `RequestContext` after
+    /// resolve. The strip list is applied to inner-request baggage before it
+    /// reaches the application. Direct and mesh-mTLS transports ignore both.
     pub fn for_target_with_hbone_context(
         grpc_pool: &'a GrpcConnectionPool,
         mesh_mtls_pool: &'a crate::proxy::mesh_mtls_pool::MeshMtlsConnectionPool,
         hbone_pool: &'a crate::proxy::hbone_pool::HboneConnectionPool,
         target: Option<&'a crate::config::types::UpstreamTarget>,
-        asserted_source_identity: Option<&'a crate::identity::SpiffeId>,
+        asserted_source_identity: Option<&crate::identity::SpiffeId>,
         baggage_strip_prefixes: &[String],
     ) -> Result<Self, GrpcTransportError> {
         let Some(target) = target else {
@@ -2926,7 +2936,7 @@ impl<'a> GrpcDispatchTransport<'a> {
                     pool: hbone_pool,
                     target,
                     plan,
-                    asserted_source_identity,
+                    asserted_source_identity: asserted_source_identity.cloned(),
                     baggage_strip_prefixes: crate::proxy::hbone_inner_baggage_strip_prefixes(
                         baggage_strip_prefixes,
                     ),
@@ -2968,7 +2978,20 @@ impl<'a> GrpcDispatchTransport<'a> {
         }
     }
 
-    fn proxy_headers_for_dispatch<'b>(
+    /// Authenticated frontend workload identity asserted on HBONE CONNECT.
+    /// `None` for non-HBONE transports, and for HBONE when the frontend did not
+    /// authenticate a mesh peer (the pool then falls back to the gateway SVID).
+    pub fn asserted_source_identity(&self) -> Option<&crate::identity::SpiffeId> {
+        match self {
+            Self::Hbone(hbone) => hbone.asserted_source_identity.as_ref(),
+            Self::Direct(_) | Self::MeshMtls(_) => None,
+        }
+    }
+
+    /// Sanitize inner-request headers for this transport. HBONE strips reserved
+    /// identity baggage prefixes plus any configured egress prefixes once per
+    /// dispatch (not per frame). Direct and mesh-mTLS return the input unchanged.
+    pub fn proxy_headers_for_dispatch<'b>(
         &self,
         headers: &'b HashMap<String, String>,
     ) -> std::borrow::Cow<'b, HashMap<String, String>> {
@@ -3208,7 +3231,7 @@ async fn open_hbone_grpc_sender(
             plan.expected_peer.as_ref(),
             plan.expected_trust_domain.as_ref(),
             plan.sni_override,
-            hbone.asserted_source_identity,
+            hbone.asserted_source_identity.as_ref(),
         )
         .await
         .map_err(hbone_pool_error_to_grpc)?;

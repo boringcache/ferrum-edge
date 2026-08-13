@@ -40225,12 +40225,16 @@ pub(crate) fn mesh_mtls_dispatch_authority<'a>(
 /// gRPC UNAVAILABLE, never an unauthenticated plaintext dial that would bypass
 /// SVID-mTLS, identity pinning, and mesh authz identity.
 ///
-/// `None` (no LB-selected target) keeps the direct pool: the proxy's own backend
-/// host is the destination and no mesh tag exists to honor.
+/// `asserted_source_identity` is the authenticated frontend workload SPIFFE
+/// (`ctx.peer_spiffe_id`). It is cloned into an HBONE transport and is not
+/// borrowed from `RequestContext`, so later `ctx` mutations stay valid. Caller
+/// headers are never consulted. `None` (no LB-selected target) keeps the direct
+/// pool: the proxy's own backend host is the destination and no mesh tag exists
+/// to honor.
 pub(crate) fn resolve_grpc_dispatch_transport<'a>(
     state: &'a ProxyState,
     target: Option<&'a UpstreamTarget>,
-    asserted_source_identity: Option<&'a crate::identity::SpiffeId>,
+    asserted_source_identity: Option<&crate::identity::SpiffeId>,
 ) -> Result<grpc_proxy::GrpcDispatchTransport<'a>, grpc_proxy::GrpcTransportError> {
     grpc_proxy::GrpcDispatchTransport::for_target_with_hbone_context(
         &state.grpc_pool,
