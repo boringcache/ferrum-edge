@@ -2006,17 +2006,22 @@ async fn replay_client_logs_only_classification_and_redacted_endpoint() {
 
 /// Generic rate-limiter clients keep publishing backend error text. The replay
 /// policy must not leak onto them.
+///
+/// Handshake authentication failures are normalized by redis-rs, so exercise a
+/// post-handshake command error where the server detail survives in `%error`.
 #[tokio::test(flavor = "current_thread")]
 async fn generic_redis_client_still_logs_backend_error_text() {
-    let (port, shutdown) = spawn_logging_redis_server(LoggingShape::AuthReject).await;
+    let (port, shutdown) = spawn_logging_redis_server(LoggingShape::CommandError).await;
     let config = sentinel_replay_config(port);
     let (logs, guard) = super::plugin_utils::capture_logs();
     let client = RedisRateLimitClient::new(config, None, false, None);
-    let _ = client.connect_cached_for_test().await;
+    let _ = client
+        .set_bytes_nx_with_expire("ferrum:replay:test-key", b"value", 60)
+        .await;
     drop(guard);
     let captured = logs.contents();
     assert!(
-        captured.contains(SENTINEL_AUTH_ERR),
+        captured.contains(SENTINEL_CMD_ERR),
         "operational Redis clients must still log backend error text: {captured}"
     );
     let _ = shutdown.send(());
