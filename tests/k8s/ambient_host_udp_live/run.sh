@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Ambient host-network UDP live-kernel gate (#3705 / ownership-safe cleanup #3804).
+# Ambient host-network UDP live-kernel gate (#3705 / ownership-safe cleanup #3804 /
+# missed-rollout rejoin proof #3809).
 #
 # Expects prebuilt lib and functional test binaries from the workflow (never
 # builds here). Reuses the repository skip-or-fail contract:
@@ -309,8 +310,11 @@ run_live_tests() {
   echo "Running ambient host-UDP live-kernel lib tests via $LIB_BIN"
   lib_raw="$(mktemp "${TMPDIR:-/tmp}/ferrum-host-udp-lib.XXXXXX")"
   set +e
+  # The missed-rollout/rejoin proof (#3809) drives the real retirement
+  # supervisor. Its completion window spans several polling passes, so budget
+  # for all three ignored live tests running serially.
   FERRUM_LIVE_TESTS_REQUIRED=1 \
-    timeout --signal=KILL 180s \
+    timeout --signal=KILL 420s \
     "$LIB_BIN" proxy::host_udp_capture_live_tests --ignored --nocapture --test-threads=1 \
     >"$lib_raw" 2>&1
   local lib_status=$?
@@ -323,8 +327,8 @@ run_live_tests() {
   if grep -q '^SKIP:' "$lib_raw"; then
     fail_required "ambient host-UDP lib live tests skipped under required CI mode"
   fi
-  if ! grep -Eq '^test result: ok\. 2 passed; 0 failed;' "$lib_raw"; then
-    fail_required "expected exactly 2 ambient host-UDP lib live tests to pass"
+  if ! grep -Eq '^test result: ok\. 3 passed; 0 failed;' "$lib_raw"; then
+    fail_required "expected exactly 3 ambient host-UDP lib live tests to pass"
   fi
   rm -f -- "$lib_raw"
   lib_raw=""

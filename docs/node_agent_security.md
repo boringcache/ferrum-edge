@@ -160,36 +160,79 @@ privilege footprints:
 | Placement | `FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED` | Proxy capabilities | Host access |
 |---|---|---|---|
 | Per-pod-netns producer (default) | `false` | `NET_ADMIN`, `NET_RAW`, `SYS_ADMIN`, `SYS_PTRACE` | `hostNetwork`, `hostPID`, host cgroup (ro), registry hostPath |
-| Host-network capture | `true` | `NET_ADMIN`, `NET_RAW` | `hostNetwork`, host cgroup (ro), registry hostPath |
+| Host-network capture (steady-state) | `true` | `NET_ADMIN`, `NET_RAW` | `hostNetwork`, host cgroup (ro), registry hostPath; **also `hostPID` when the default settled-host preflight is enabled** (pod-scoped visibility, not a capability) |
 
 The host placement installs its `mangle` rules and binds its transparent socket
-in the proxy's own namespace, so it calls no `setns(CLONE_NEWNET)` and never opens
-another workload's `/proc/{pid}/ns/net`. That removes both the `ptrace_may_access`
-requirement and `hostPID` from the ambient DaemonSet, which is the main reason to
-choose it: it is the UDP capture path available on clusters whose Pod Security
-posture will not grant `SYS_ADMIN`/`SYS_PTRACE`. The chart derives this
-automatically — enabling the placement narrows the rendered capabilities rather
-than adding to them.
+in the proxy's own namespace, so the running producer calls no `setns(CLONE_NEWNET)`
+and never opens another workload's `/proc/{pid}/ns/net`. That removes
+`SYS_ADMIN`/`SYS_PTRACE` from the steady-state container, which is the main
+reason to choose this path: the producer can capture UDP without those setns
+capabilities. Kubernetes `hostPID` is pod-scoped, not container-scoped. With
+the default settled-host preflight enabled, the DaemonSet still renders
+`hostPID: true`, so the steady-state container also sees host PIDs; that
+visibility does not grant `setns`. A cluster whose Pod Security posture
+refuses `hostPID` or the init stage's `SYS_ADMIN`/`SYS_PTRACE` cannot use this
+default unchanged — set `ambient.udpNodePreflight.enabled=false` and adopt
+nodes with explicit node-bound exemption markers instead. The chart derives
+the capability narrowing automatically — enabling the placement narrows the
+rendered container capabilities rather than adding to them.
 
 The narrowing happens only after the enforced UDP placement migration completes.
 An explicit `cleanup` release from `pod-netns` or `disabled` to `host-netns`
 retains `hostPID`, `SYS_ADMIN`, and `SYS_PTRACE` so it can retire exact
 Ferrum-owned rules inside every predecessor pod netns. The incoming host
 producer does not start in that release. `finalize` is admitted only after the
-node-local durable proof exists, and only then does the chart remove the setns
-privilege set. See the [Ambient UDP migration procedure](mesh.md#ambient-udp-placement-migration-enforced-hard-upgrade-guard).
+node-local durable proof exists, and only then does the chart drop
+`SYS_ADMIN`/`SYS_PTRACE` from the running container. Settled host placement
+with the default preflight still renders pod-wide `hostPID`; that field is not
+removed because the init stage in the same pod needs it. See the [Ambient UDP migration procedure](mesh.md#ambient-udp-placement-migration-enforced-hard-upgrade-guard).
 
 Once that migration has completed, a node with no node-local durable record —
 one that joined the cluster afterwards, or whose registry directory was
-recreated by a reboot — adopts the placement from the chart-rendered
+recreated by a reboot — still needs the chart-rendered
 `FERRUM_MESH_CAPTURE_UDP_PLACEMENT_ESTABLISHED` attestation, which the chart
-derives only from the already-installed placement ConfigMap. That widens no
-privilege: such a node still renders the narrowed host-placement capability set,
-and the attestation is consulted only when the durable record is absent, so it
-can never authorize an in-place flip on a running node. A
-`.udp-placement-quarantined` tombstone in the registry directory refuses every
-absent-state bootstrap outright, which is what makes the corrupt-ownership
-repair procedure machine-enforced rather than advisory.
+derives only from the already-installed placement ConfigMap. That attestation is
+release **desired state** and is no longer sufficient on its own
+([#3809](https://github.com/ferrum-edge/ferrum-edge/issues/3809)): the node must
+also carry node-specific proof bound to its immutable `Node.metadata.uid` and
+current boot id. The steady-state **capability** posture is unchanged — the
+narrowed host-placement `NET_ADMIN`/`NET_RAW` set still applies to the running
+container, which does not receive `SYS_ADMIN`/`SYS_PTRACE` — but a settled
+host-netns pod now also renders a one-shot `ferrum-udp-node-preflight`
+**init container**. Kubernetes `hostPID` is pod-scoped: enabling that init
+stage therefore gives **both** containers host PID namespace visibility. `hostPID`
+does not grant `setns`; the init container alone holds `SYS_ADMIN`/`SYS_PTRACE`
+long enough to retire both predecessor placements ownership-safely and publish
+that proof, then exits. That stage sets `allowPrivilegeEscalation: false` and drops `ALL`
+capabilities before adding back exactly `NET_ADMIN`, `NET_RAW`, `SYS_ADMIN`, and
+`SYS_PTRACE`, so its declared four are its complete privilege surface rather
+than an addition on top of whatever the runtime's ambient/default set carries.
+The setns capabilities are bounded to an init stage that cannot serve traffic,
+which is strictly narrower than granting the producer setns for its whole
+lifetime. This same-pod ordering is **not** usable unchanged on a cluster that
+refuses `hostPID` or those init capabilities; set
+`ambient.udpNodePreflight.enabled=false` and adopt nodes with explicit
+node-bound exemption markers instead.
+
+That init stage also carries one **read-only** Kubernetes grant: `nodes: get` on
+the `ferrum-mesh` service account, with no list, watch, or write verb, and only
+when the settled host-netns node preflight will actually run **and** an explicit
+`FERRUM_K8S_NODE_UID` is absent. That
+cannot enumerate or mutate nodes, but Kubernetes RBAC does **not** treat a `get`
+without `resourceNames` as a single-object restriction — a named GET is
+permitted for any node whose name the caller already knows. The **runtime
+request** is bound to the node name the downward API stamped on the pod
+(`spec.nodeName`), so this process only asks for the machine it is running on,
+and the UID is never logged or emitted as a metric label. The grant exists
+because the node-agent's published identity file cannot be staleness-checked by
+a reader: a file left by a previous Kubernetes Node object on the same boot
+records the current boot id, so trusting it would let a recreated node inherit
+the predecessor's durable ownership and cleanup proof. The attestation is still
+consulted only when the durable record is absent, so it can never authorize an
+in-place flip on a running node, and a `.udp-placement-quarantined` tombstone in
+the registry directory refuses every absent-state bootstrap outright, which is
+what makes the corrupt-ownership repair procedure machine-enforced rather than
+advisory.
 
 What it does NOT reduce is `CAP_NET_ADMIN`: the path still writes `mangle` chains,
 an `ip rule`, and an `ip route` in the host namespace, and still binds

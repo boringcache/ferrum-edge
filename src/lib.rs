@@ -9085,6 +9085,37 @@ pub mod _test_support {
         )
     }
 
+    pub type NodeIdentityRefreshForTest = crate::modes::node_agent::NodeIdentityRefresh;
+
+    /// Drive the production node-identity retry/revalidation ordering with
+    /// injected lookup and publication so external tests can prove recovery,
+    /// UID change, and retraction/publication failure without a Kubernetes API.
+    pub async fn refresh_node_identity_binding_for_test<L, Fut, RS, RI, P>(
+        current_uid: Option<&str>,
+        shutdown: &mut tokio::sync::watch::Receiver<bool>,
+        lookup: L,
+        retract_registry_sync: RS,
+        retract_identity: RI,
+        publish_identity: P,
+    ) -> NodeIdentityRefreshForTest
+    where
+        L: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<String, String>>,
+        RS: FnOnce() -> Result<(), String>,
+        RI: FnMut() -> Result<(), String>,
+        P: FnOnce(&str) -> Result<(), String>,
+    {
+        crate::modes::node_agent::refresh_node_identity_binding(
+            current_uid,
+            shutdown,
+            lookup,
+            retract_registry_sync,
+            retract_identity,
+            publish_identity,
+        )
+        .await
+    }
+
     pub async fn run_with_node_agent_topology_outcome_stream_for_test<S, T>(
         backend: &mut crate::ebpf::MockEbpfBackend,
         config: &crate::modes::node_agent::NodeAgentConfig,
