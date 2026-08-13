@@ -185,7 +185,7 @@
 //!   `0xE0`.. is reserved for application use.)
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use dashmap::DashMap;
@@ -781,6 +781,13 @@ struct DatagramReplayGuard {
     /// Receiver-clock millis of the last idle sweep, so sweeps stay rare under
     /// a hostile flood of unseen `sender_id`s.
     last_reclaim_ms: AtomicU64,
+    /// Serializes first-seen sender insertion so live cardinality cannot
+    /// exceed `max_senders` under concurrent distinct `sender_id`s. Ordinary
+    /// established-sender updates never take this lock.
+    ///
+    /// Lock order: this mutex, then a `DashMap` shard lock. No path acquires
+    /// them in reverse.
+    admission: Mutex<()>,
 }
 
 impl DatagramReplayGuard {
@@ -795,6 +802,7 @@ impl DatagramReplayGuard {
             ),
             max_senders: MAX_REPLAY_SENDERS,
             last_reclaim_ms: AtomicU64::new(0),
+            admission: Mutex::new(()),
         }
     }
 
@@ -807,9 +815,11 @@ impl DatagramReplayGuard {
     /// Check-and-mark one authenticated freshness record.
     ///
     /// `Ok(())` means this exact `(sender_id, epoch, sequence)` had not been
-    /// admitted on this listener and now has been. The mark and the decision
-    /// happen under one `DashMap` shard write guard, so concurrent receive
-    /// workers cannot both admit the same sequence.
+    /// admitted on this listener and now has been. For an established sender
+    /// the mark and the decision happen under one `DashMap` shard write guard,
+    /// so concurrent receive workers cannot both admit the same sequence.
+    /// First-seen senders additionally serialize on `admission` so concurrent
+    /// distinct identities cannot overshoot [`MAX_REPLAY_SENDERS`].
     fn admit(
         &self,
         freshness: &DatagramFreshness,
@@ -826,13 +836,28 @@ impl DatagramReplayGuard {
         }
 
         // Established sender: one shard write guard covers the whole decision.
+        // This path must not take `admission`; ordinary sequence updates stay
+        // on the single relevant shard lock.
         if let Some(mut state) = self.senders.get_mut(&freshness.sender_id) {
             return admit_into_window(&mut state, freshness, now_ms);
         }
-        // Guard released. Everything below is the new-sender path.
+        // Shard guard released. Everything below is the new-sender path.
 
-        // New sender. Capacity is settled without holding any guard, because
-        // reclaiming takes shard locks itself.
+        // Serialize first-seen admission. Recheck, reclaim, and insert all
+        // happen under this lock so a burst of distinct unseen `sender_id`s
+        // cannot each observe a below-cap length and then all insert.
+        let _admission = self
+            .admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        if let Some(mut state) = self.senders.get_mut(&freshness.sender_id) {
+            // A peer inserted this sender while we waited for admission.
+            return admit_into_window(&mut state, freshness, now_ms);
+        }
+
+        // Capacity and reclaim run with no shard lock held: `retain` takes
+        // shard locks itself, and lock order is admission then shard.
         if self.senders.len() >= self.max_senders {
             self.reclaim_idle(now_ms);
             if self.senders.len() >= self.max_senders {
@@ -841,8 +866,8 @@ impl DatagramReplayGuard {
         }
         match self.senders.entry(freshness.sender_id) {
             dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
-                // A peer worker inserted this sender in between; fall into the
-                // ordinary window decision so the sequence is still marked once.
+                // Same sender became visible between the recheck and entry;
+                // mark the sequence once under this shard guard.
                 admit_into_window(occupied.get_mut(), freshness, now_ms)
             }
             dashmap::mapref::entry::Entry::Vacant(vacant) => {

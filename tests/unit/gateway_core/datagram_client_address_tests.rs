@@ -11,7 +11,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use ferrum_edge::fips::approved::HmacSha256Key;
 use ferrum_edge::proxy::client_ip::TrustedProxies;
@@ -1550,6 +1550,105 @@ fn hostile_sender_cardinality_is_bounded_and_refuses_rather_than_evicting() {
         let _ = gate.decode(&datagram, &peer());
     }
     assert_eq!(gate.tracked_replay_senders(), MAX_REPLAY_SENDERS);
+}
+
+/// Concurrent first-seen sender admission must not overshoot the hard
+/// cardinality cap: many distinct unseen identities racing near capacity all
+/// observe a below-cap length unless insertion itself is serialized.
+#[test]
+fn concurrent_first_seen_senders_cannot_overshoot_the_hard_cardinality_cap() {
+    let gate = authenticated_gate();
+    let binding = udp_binding(LISTENER_PORT);
+    let form = v4_form(LISTENER_PORT);
+    let now_ms = 1_760_000_000_000u64;
+    // Leave a few vacant slots so every racer can pass a lock-free length
+    // check, then race far more distinct identities than remaining capacity.
+    const REMAINING: usize = 8;
+    const OCCUPIED: usize = MAX_REPLAY_SENDERS - REMAINING;
+    const RACERS: usize = 64;
+
+    for sender_id in 0..OCCUPIED as u32 {
+        let mut sender = Sender::new(sender_id);
+        sender.timestamp_ms = now_ms;
+        let datagram = sender.at(&binding, form, b"p", 0);
+        gate.decode_at(&datagram, &peer(), now_ms)
+            .unwrap_or_else(|error| panic!("sender {sender_id}: {error}"));
+    }
+    assert_eq!(gate.tracked_replay_senders(), OCCUPIED);
+
+    let newcomers: Vec<Vec<u8>> = (0..RACERS as u32)
+        .map(|offset| {
+            let mut sender = Sender::new(OCCUPIED as u32 + offset);
+            sender.timestamp_ms = now_ms;
+            sender.at(&binding, form, b"p", 0)
+        })
+        .collect();
+    let admitted = AtomicUsize::new(0);
+    let capacity = AtomicUsize::new(0);
+    let peak = AtomicUsize::new(OCCUPIED);
+    let barrier = std::sync::Barrier::new(RACERS);
+    let admitted_ref = &admitted;
+    let capacity_ref = &capacity;
+    let peak_ref = &peak;
+    let gate_ref = &gate;
+    let barrier_ref = &barrier;
+    std::thread::scope(|scope| {
+        for datagram in &newcomers {
+            scope.spawn(move || {
+                barrier_ref.wait();
+                let outcome = gate_ref.decode_at(datagram, &peer(), now_ms);
+                peak_ref.fetch_max(gate_ref.tracked_replay_senders(), Ordering::Relaxed);
+                match outcome {
+                    Ok(_) => {
+                        admitted_ref.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(DatagramMetadataError::ReplayStateCapacity) => {
+                        capacity_ref.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(other) => panic!("unexpected first-seen refusal: {other}"),
+                }
+            });
+        }
+    });
+
+    let admitted = admitted.load(Ordering::Relaxed);
+    let capacity = capacity.load(Ordering::Relaxed);
+    let live = gate.tracked_replay_senders();
+    let peak = peak.load(Ordering::Relaxed);
+    assert_eq!(
+        admitted + capacity,
+        RACERS,
+        "every racer must admit or refuse"
+    );
+    assert_eq!(
+        admitted, REMAINING,
+        "only the remaining vacant slots may admit a new sender"
+    );
+    assert_eq!(
+        capacity,
+        RACERS - REMAINING,
+        "excess first-seen identities must fail closed with the capacity error"
+    );
+    assert_eq!(live, MAX_REPLAY_SENDERS);
+    assert!(
+        peak <= MAX_REPLAY_SENDERS,
+        "live cardinality sampled during the race must never exceed the hard maximum (peak={peak})"
+    );
+    assert!(
+        live <= MAX_REPLAY_SENDERS,
+        "live cardinality must never exceed the hard maximum"
+    );
+
+    // Live protection is intact: an established sender's admitted sequence is
+    // still a duplicate, not reopened by the concurrent overflow.
+    let mut established = Sender::new(0);
+    established.timestamp_ms = now_ms;
+    let replay = established.at(&binding, form, b"p", 0);
+    assert_eq!(
+        gate.decode_at(&replay, &peer(), now_ms)
+            .expect_err("concurrent overflow must not reopen an admitted sequence"),
+        DatagramMetadataError::ReplayDuplicate
+    );
 }
 
 /// Idle reclaim frees capacity without reopening anything: a record is only
