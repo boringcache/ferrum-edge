@@ -390,41 +390,45 @@ where
     }
 }
 
-fn plain_peer_gone_before_response_headers(
-    state: &ProxyState,
-    proxy: &Proxy,
-    epoch: &RequestEpoch,
-    upstream_balancer: Option<&Arc<LoadBalancer>>,
-    current_target: Option<&Arc<UpstreamTarget>>,
-    cb_target_key: Option<&str>,
+struct PlainPeerGoneBeforeResponseHeadersCtx<'a> {
+    state: &'a ProxyState,
+    proxy: &'a Proxy,
+    epoch: &'a RequestEpoch,
+    upstream_balancer: Option<&'a Arc<LoadBalancer>>,
+    current_target: Option<&'a Arc<UpstreamTarget>>,
+    cb_target_key: Option<&'a str>,
     cb_is_half_open_probe: bool,
     backend_start: Instant,
-    backend_admission_permits: &mut Option<BackendAdmissionPermitSet>,
+    backend_admission_permits: &'a mut Option<BackendAdmissionPermitSet>,
     backend_admission_elapsed: Duration,
     bytes_sent: u64,
-    current_url: &str,
+    current_url: &'a str,
     response_streamed: bool,
+}
+
+fn plain_peer_gone_before_response_headers(
+    ctx: PlainPeerGoneBeforeResponseHeadersCtx<'_>,
 ) -> CrossProtocolOutcome {
     record_cross_protocol_header_write_disconnect(
-        state,
-        proxy,
-        epoch,
-        upstream_balancer,
-        current_target,
-        cb_target_key,
+        ctx.state,
+        ctx.proxy,
+        ctx.epoch,
+        ctx.upstream_balancer,
+        ctx.current_target,
+        ctx.cb_target_key,
         0,
         0,
-        cb_is_half_open_probe,
-        backend_start,
-        backend_admission_permits,
-        backend_admission_elapsed,
+        ctx.cb_is_half_open_probe,
+        ctx.backend_start,
+        ctx.backend_admission_permits,
+        ctx.backend_admission_elapsed,
     );
     cross_protocol_header_write_disconnect_outcome(
         0,
-        response_streamed,
-        bytes_sent,
-        backend_start,
-        Some(strip_query_from_backend_url(current_url)),
+        ctx.response_streamed,
+        ctx.bytes_sent,
+        ctx.backend_start,
+        Some(strip_query_from_backend_url(ctx.current_url)),
         None,
     )
 }
@@ -2128,19 +2132,21 @@ where
                             drop(pending_slot);
                             crate::http3::stream_util::halt_request_body(stream);
                             return Ok(plain_peer_gone_before_response_headers(
-                                state,
-                                proxy,
-                                epoch,
-                                upstream_balancer,
-                                current_target.as_ref(),
-                                current_cb_target_key.as_deref(),
-                                cb_retry_probe_slot_available,
-                                backend_start,
-                                &mut backend_admission_permits,
-                                backend_admission_start.elapsed(),
-                                bytes_sent,
-                                &current_url,
-                                false,
+                                PlainPeerGoneBeforeResponseHeadersCtx {
+                                    state,
+                                    proxy,
+                                    epoch,
+                                    upstream_balancer,
+                                    current_target: current_target.as_ref(),
+                                    cb_target_key: current_cb_target_key.as_deref(),
+                                    cb_is_half_open_probe: cb_retry_probe_slot_available,
+                                    backend_start,
+                                    backend_admission_permits: &mut backend_admission_permits,
+                                    backend_admission_elapsed: backend_admission_start.elapsed(),
+                                    bytes_sent,
+                                    current_url: &current_url,
+                                    response_streamed: false,
+                                },
                             ));
                         }
                     };
@@ -2880,19 +2886,21 @@ where
                 let Some(send_result) = send_result else {
                     if peer_gone {
                         return Ok(plain_peer_gone_before_response_headers(
-                            state,
-                            proxy,
-                            epoch,
-                            upstream_balancer,
-                            current_target.as_ref(),
-                            current_cb_target_key.as_deref(),
-                            cb_retry_probe_slot_available,
-                            backend_start,
-                            &mut backend_admission_permits,
-                            backend_admission_start.elapsed(),
-                            bytes_sent,
-                            &current_url,
-                            true,
+                            PlainPeerGoneBeforeResponseHeadersCtx {
+                                state,
+                                proxy,
+                                epoch,
+                                upstream_balancer,
+                                current_target: current_target.as_ref(),
+                                cb_target_key: current_cb_target_key.as_deref(),
+                                cb_is_half_open_probe: cb_retry_probe_slot_available,
+                                backend_start,
+                                backend_admission_permits: &mut backend_admission_permits,
+                                backend_admission_elapsed: backend_admission_start.elapsed(),
+                                bytes_sent,
+                                current_url: &current_url,
+                                response_streamed: true,
+                            },
                         ));
                     }
                     record_plain_grpc_web_client_deadline(
