@@ -2111,10 +2111,12 @@ async fn handle_admin_request_inner(
         // closed. That is a lost dependency, not a per-request error, so it must
         // withdraw the replica rather than let an orchestrator keep steering
         // authenticated DPoP / `ferrum-hmac-v2` traffic at a gateway that can
-        // only refuse it. The snapshot is a short walk over weak handles to the
-        // live shared clients — no allocation per handle, no I/O, no lock on any
-        // request path — and retired plugin generations drop out of it, so an
-        // old generation can neither hold readiness down nor inflate the count.
+        // only refuse it. The snapshot is one acquire-load of a packed atomic
+        // published on lifecycle transitions — no mutex, no registry scan, no
+        // allocation, no I/O, and no work proportional to configured or
+        // historical authorities — so an unauthenticated probe flood cannot
+        // contend plugin construction or walk reload history. Retired plugin
+        // generations drop their registration immediately and stop contributing.
         // Recovery is automatic: the client's background recovery checker
         // republishes availability and the next probe is ready again.
         let replay_authority_health =

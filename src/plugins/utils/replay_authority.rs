@@ -616,13 +616,7 @@ pub fn process_lane_registered_for_tests(domain: &ReplayDomain) -> bool {
         .unwrap_or(false)
 }
 
-// ── Shared authority health registry ────────────────────────────────────────
-
-/// Weak handles to every registered shared authority, so readiness/metrics can
-/// report "a required shared replay backend is unavailable" without retaining
-/// retired plugin generations, their connections, or their credentials.
-static SHARED_AUTHORITIES: LazyLock<Mutex<Vec<std::sync::Weak<RedisRateLimitClient>>>> =
-    LazyLock::new(|| Mutex::new(Vec::new()));
+// ── Shared authority health ─────────────────────────────────────────────────
 
 /// Bounded, fixed-cardinality aggregate of shared replay-authority health.
 ///
@@ -633,7 +627,7 @@ static SHARED_AUTHORITIES: LazyLock<Mutex<Vec<std::sync::Weak<RedisRateLimitClie
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
 pub struct SharedReplayAuthorityHealth {
     /// Distinct shared authorities held by a live plugin generation. A retired
-    /// generation drops its client, so it stops being counted.
+    /// generation drops its client, so it stops being counted immediately.
     pub shared_authorities: u64,
     /// How many of those are currently unavailable. Non-zero means protected
     /// requests on those policies are failing closed.
@@ -652,48 +646,21 @@ impl SharedReplayAuthorityHealth {
     }
 }
 
-/// Recover a poisoned registry guard rather than dropping live authorities.
-///
-/// Poison means a previous holder panicked; the map itself is still the set of
-/// weak handles that readiness aggregates. Returning the default empty/healthy
-/// snapshot, or skipping registration, would hide an unavailable shared backend.
-fn shared_authorities_lock()
--> std::sync::MutexGuard<'static, Vec<std::sync::Weak<RedisRateLimitClient>>> {
-    SHARED_AUTHORITIES
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-fn register_shared_authority(client: &Arc<RedisRateLimitClient>) {
-    let mut registry = shared_authorities_lock();
-    // Prune retired generations first: the registry is weak precisely so a
-    // rebuilt plugin cache cannot keep an old generation's client, connections,
-    // or credentials alive, and a stale entry must not keep being aggregated.
-    registry.retain(|weak| weak.strong_count() > 0);
-    // `jwks_auth` shares one client across every `shared` provider, so the same
-    // authority reaches this function once per provider. Registering it twice
-    // would report one backend as several and inflate a readiness aggregate.
-    let target = Arc::as_ptr(client);
-    if registry
-        .iter()
-        .any(|weak| std::ptr::eq(weak.as_ptr(), target))
-    {
-        return;
-    }
-    registry.push(Arc::downgrade(client));
-}
-
 /// Bounded aggregate over every live shared replay authority.
+///
+/// One acquire-load of a packed atomic published on lifecycle transitions
+/// (first registration of a distinct replay Redis client, reachable to
+/// unavailable, unavailable to reachable, terminal topology, and retirement).
+/// No mutex, no registry scan, no allocation, no I/O, and no work proportional
+/// to configured or historical authorities. `/health`, `/status`, and
+/// `/metrics/runtime` all read this same word.
 pub fn shared_health_snapshot() -> SharedReplayAuthorityHealth {
-    let registry = shared_authorities_lock();
-    let mut health = SharedReplayAuthorityHealth::default();
-    for client in registry.iter().filter_map(std::sync::Weak::upgrade) {
-        health.shared_authorities += 1;
-        if !client.is_available() {
-            health.shared_authorities_unavailable += 1;
-        }
+    let (shared_authorities, shared_authorities_unavailable) =
+        super::redis_rate_limiter::shared_replay_health_counts();
+    SharedReplayAuthorityHealth {
+        shared_authorities,
+        shared_authorities_unavailable,
     }
-    health
 }
 
 /// `(registered, unavailable)` shared authorities.
@@ -774,7 +741,7 @@ impl ReplayAuthority {
     /// classification-only. Generic rate-limiter clients retain
     /// [`RedisRateLimitClient::new`].
     pub fn shared(client: Arc<RedisRateLimitClient>, retention: Duration) -> Self {
-        register_shared_authority(&client);
+        client.register_as_shared_replay_authority();
         Self::Shared { client, retention }
     }
 
@@ -968,17 +935,4 @@ pub fn process_lane(authority: &ReplayAuthority) -> Option<&Arc<ProcessReplayLan
         ReplayAuthority::Process { lane, .. } => Some(lane),
         ReplayAuthority::Shared { .. } => None,
     }
-}
-
-/// Poison the shared-authority health registry (test support).
-///
-/// Production recovers the guard with `into_inner` so a panic in one
-/// snapshot/register cannot hide retained live authorities. This helper
-/// carries no production behavior.
-#[allow(dead_code)] // exercised by external unit tests
-pub fn poison_shared_authorities_for_tests() {
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _guard = SHARED_AUTHORITIES.lock().expect("lock before poison");
-        panic!("replay_authority: intentional shared-authorities registry poison for tests");
-    }));
 }

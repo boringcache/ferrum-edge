@@ -158,7 +158,9 @@ use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 use arc_swap::ArcSwap;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::OnceLock;
+use std::sync::Weak;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::task::AbortHandle;
 use tracing::{info, warn};
@@ -945,6 +947,146 @@ fn incomplete_topology_probe_error() -> redis::RedisError {
     ))
 }
 
+/// Packed `(shared_authorities << 32) | shared_authorities_unavailable`.
+///
+/// Published on shared-replay lifecycle transitions and read by `/health`,
+/// `/status`, and `/metrics/runtime` as a single acquire-load. There is no
+/// registry to scan, no mutex, and no work proportional to configured or
+/// historical authorities.
+static SHARED_REPLAY_HEALTH: AtomicU64 = AtomicU64::new(0);
+
+const SHARED_REPLAY_COUNT_SHIFT: u64 = 32;
+const SHARED_REPLAY_COUNT_MASK: u64 = 0xFFFF_FFFF;
+
+fn pack_shared_replay_health(authorities: u64, unavailable: u64) -> u64 {
+    (authorities << SHARED_REPLAY_COUNT_SHIFT) | (unavailable & SHARED_REPLAY_COUNT_MASK)
+}
+
+fn unpack_shared_replay_health(raw: u64) -> (u64, u64) {
+    (
+        raw >> SHARED_REPLAY_COUNT_SHIFT,
+        raw & SHARED_REPLAY_COUNT_MASK,
+    )
+}
+
+/// Current `(shared_authorities, shared_authorities_unavailable)` pair.
+///
+/// One acquire-load of the packed word published on registration, availability
+/// transitions, terminal topology, and retirement. The `/health` + `/status`
+/// probe path and `/metrics/runtime` both consume this exact pair.
+pub(crate) fn shared_replay_health_counts() -> (u64, u64) {
+    unpack_shared_replay_health(SHARED_REPLAY_HEALTH.load(Ordering::Acquire))
+}
+
+fn bump_shared_replay_health(authorities_delta: i8, unavailable_delta: i8) {
+    let _ = SHARED_REPLAY_HEALTH.fetch_update(Ordering::AcqRel, Ordering::Acquire, |raw| {
+        let (mut authorities, mut unavailable) = unpack_shared_replay_health(raw);
+        match authorities_delta {
+            1 => authorities = authorities.saturating_add(1),
+            -1 => authorities = authorities.saturating_sub(1),
+            _ => {}
+        }
+        match unavailable_delta {
+            1 => unavailable = unavailable.saturating_add(1),
+            -1 => unavailable = unavailable.saturating_sub(1),
+            _ => {}
+        }
+        Some(pack_shared_replay_health(authorities, unavailable))
+    });
+}
+
+/// Lifecycle registration for one distinct shared replay Redis client.
+///
+/// Holds only the local state machine that publishes into
+/// [`SHARED_REPLAY_HEALTH`]. It does not retain the Redis client, cached
+/// connections, endpoints, credentials, or any other secret-bearing data.
+/// Drop retires this generation's contribution immediately. Concurrent
+/// availability transitions use a single atomic CAS so a drop cannot
+/// underflow, double-count, or resurrect a retired generation.
+struct SharedReplayHealthRegistration {
+    state: AtomicU8,
+}
+
+impl SharedReplayHealthRegistration {
+    const UNREGISTERED: u8 = 0;
+    const AVAILABLE: u8 = 1;
+    const UNAVAILABLE: u8 = 2;
+    const RETIRED: u8 = 3;
+
+    fn new() -> Self {
+        Self {
+            state: AtomicU8::new(Self::UNREGISTERED),
+        }
+    }
+
+    /// First registration of this distinct client. Idempotent for additional
+    /// equivalent `jwks_auth` providers that share the same client Arc.
+    /// `currently_available` is sampled by the caller; a later `on_available` /
+    /// `on_unavailable` reconciles a transition that raced this CAS.
+    fn activate(&self, currently_available: bool) {
+        let target = if currently_available {
+            Self::AVAILABLE
+        } else {
+            Self::UNAVAILABLE
+        };
+        if self
+            .state
+            .compare_exchange(
+                Self::UNREGISTERED,
+                target,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            bump_shared_replay_health(1, if currently_available { 0 } else { 1 });
+        }
+    }
+
+    fn on_available(&self) {
+        if self
+            .state
+            .compare_exchange(
+                Self::UNAVAILABLE,
+                Self::AVAILABLE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            bump_shared_replay_health(0, -1);
+        }
+    }
+
+    fn on_unavailable(&self) {
+        if self
+            .state
+            .compare_exchange(
+                Self::AVAILABLE,
+                Self::UNAVAILABLE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            bump_shared_replay_health(0, 1);
+        }
+    }
+}
+
+impl Drop for SharedReplayHealthRegistration {
+    fn drop(&mut self) {
+        // Swap to RETIRED first so a concurrent transition's CAS cannot land
+        // after we have already subtracted, and cannot resurrect this
+        // generation.
+        match self.state.swap(Self::RETIRED, Ordering::AcqRel) {
+            Self::AVAILABLE => bump_shared_replay_health(-1, 0),
+            Self::UNAVAILABLE => bump_shared_replay_health(-1, -1),
+            _ => {}
+        }
+    }
+}
+
 /// Availability of centralized enforcement for one Redis client generation,
 /// shared with the client's recovery checker and with failover health observers.
 ///
@@ -959,9 +1101,14 @@ fn incomplete_topology_probe_error() -> redis::RedisError {
 /// win against a rejection, so terminal really is terminal.
 ///
 /// Every read is one atomic load, so hot-path callers keep their O(1) check with
-/// no locks.
+/// no locks. Shared-replay health is notified only on a real state change, via
+/// a `Weak` handle that cannot keep a retired client (or its credentials)
+/// alive.
 pub(crate) struct EnforcementAvailability {
     state: AtomicU8,
+    /// Weak: the recovery checker holds this `Arc<EnforcementAvailability>`,
+    /// and must not retain a retired generation's health contribution.
+    shared_replay_health: OnceLock<Weak<SharedReplayHealthRegistration>>,
 }
 
 impl EnforcementAvailability {
@@ -975,6 +1122,21 @@ impl EnforcementAvailability {
     fn new() -> Self {
         Self {
             state: AtomicU8::new(Self::REACHABLE),
+            shared_replay_health: OnceLock::new(),
+        }
+    }
+
+    fn notify_shared_replay_health(&self, available: bool) {
+        let Some(weak) = self.shared_replay_health.get() else {
+            return;
+        };
+        let Some(registration) = weak.upgrade() else {
+            return;
+        };
+        if available {
+            registration.on_available();
+        } else {
+            registration.on_unavailable();
         }
     }
 
@@ -992,16 +1154,17 @@ impl EnforcementAvailability {
 
     /// Atomically move to `target` unless the topology is already terminal.
     ///
-    /// Returns whether the transition happened. A single read-modify-write is
+    /// Returns the previous state on success. A single read-modify-write is
     /// what makes the terminal state actually terminal: there is no window
     /// between "check the flag" and "store availability" for a rejection to slip
-    /// into.
-    fn transition_unless_terminal(&self, target: u8) -> bool {
+    /// into. `None` means the topology is (or concurrently became) terminal and
+    /// nothing was written.
+    fn transition_unless_terminal(&self, target: u8) -> Option<u8> {
         self.state
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 (current != Self::TOPOLOGY_TERMINAL).then_some(target)
             })
-            .is_ok()
+            .ok()
     }
 
     /// Publish "reachable" — but only if the topology is not terminal.
@@ -1011,22 +1174,40 @@ impl EnforcementAvailability {
     /// operation: a command that already mutated Redis is reported as an error
     /// so the consumer's failure policy applies, because over-counting one
     /// operation is safer than admitting traffic against a topology this client
-    /// cannot enforce on.
+    /// cannot enforce on. A terminal state cannot resurrect shared-replay
+    /// health: this path never notifies "available" after a topology rejection.
     fn publish_reachable(&self) -> bool {
-        self.transition_unless_terminal(Self::REACHABLE)
+        match self.transition_unless_terminal(Self::REACHABLE) {
+            Some(previous) => {
+                if previous != Self::REACHABLE {
+                    self.notify_shared_replay_health(true);
+                }
+                true
+            }
+            None => false,
+        }
     }
 
     /// Mark enforcement unreachable, preserving a terminal topology rejection.
     fn mark_unreachable(&self) {
-        self.transition_unless_terminal(Self::UNREACHABLE);
+        if self.transition_unless_terminal(Self::UNREACHABLE) == Some(Self::REACHABLE) {
+            self.notify_shared_replay_health(false);
+        }
     }
 
     /// Reject the endpoint permanently. Returns `true` the first time only, so
     /// the operator diagnostic is emitted once per client generation rather than
-    /// once per request.
+    /// once per request. Reachable → terminal publishes unavailable exactly
+    /// once; an already-unavailable generation is already counted.
     fn reject_topology(&self) -> bool {
         let previous = self.state.swap(Self::TOPOLOGY_TERMINAL, Ordering::AcqRel);
-        previous != Self::TOPOLOGY_TERMINAL
+        if previous == Self::TOPOLOGY_TERMINAL {
+            return false;
+        }
+        if previous == Self::REACHABLE {
+            self.notify_shared_replay_health(false);
+        }
+        true
     }
 
     /// Log-safe rendering for `Debug` (never carries endpoint or credentials).
@@ -1191,6 +1372,11 @@ pub struct RedisRateLimitClient {
     /// `key_prefix`). Replay-authority clients publish only a fixed
     /// classification beside the already-redacted endpoint.
     log_policy: RedisClientLogPolicy,
+    /// Lifecycle registration for shared-replay readiness/metrics. Present
+    /// only after [`Self::register_as_shared_replay_authority`]; independent of
+    /// connections, endpoints, and credentials. Drop of this client drops the
+    /// registration and retires the precomputed counts immediately.
+    shared_replay_health: OnceLock<Arc<SharedReplayHealthRegistration>>,
 }
 
 /// Logging policy for one Redis client.
@@ -1353,6 +1539,42 @@ impl RedisRateLimitClient {
             tls_no_verify,
             tls_ca_bundle_pem,
             log_policy,
+            shared_replay_health: OnceLock::new(),
+        }
+    }
+
+    /// Count this distinct Redis client as one shared replay authority.
+    ///
+    /// Idempotent: several equivalent `jwks_auth` providers sharing one client
+    /// Arc register once. HMAC and JWKS clients remain distinct authorities
+    /// where they are distinct clients. Generic rate-limiter clients never
+    /// call this, so their availability transitions do not move replay health.
+    pub(crate) fn register_as_shared_replay_authority(&self) {
+        let registration = Arc::clone(
+            self.shared_replay_health
+                .get_or_init(|| Arc::new(SharedReplayHealthRegistration::new())),
+        );
+        // Attach the Weak before the first count so a concurrent outage or
+        // recovery notifies rather than racing an unregistered handle.
+        let _ = self
+            .availability
+            .shared_replay_health
+            .set(Arc::downgrade(&registration));
+        // Re-sample availability until the published state matches a fresh
+        // load. A stale boolean would otherwise resurrect a reachable count
+        // after a concurrent mark_unreachable (or hide a recovery). Transitions
+        // that land after this loop still publish through the Weak.
+        for _ in 0..8 {
+            let available = self.is_available();
+            registration.activate(available);
+            if available {
+                registration.on_available();
+            } else {
+                registration.on_unavailable();
+            }
+            if self.is_available() == available {
+                break;
+            }
         }
     }
 

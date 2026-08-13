@@ -12152,8 +12152,9 @@ components:
         (`ready: false`, HTTP 503, `status: "unavailable"`) until the backend
         recovers; the Redis client's background recovery checker republishes
         availability and the next probe is ready again with no restart and no
-        config reload. Retired plugin generations are not counted: the registry
-        holds weak handles, so a rebuilt plugin cache neither keeps an old
+        config reload. Retired plugin generations are not counted: counts are
+        published on lifecycle transitions into a packed atomic that probes
+        load in O(1), so a rebuilt plugin cache neither keeps an old
         generation's backend in the aggregate nor lets it hold readiness down.
       required: [shared_authorities, shared_authorities_unavailable]
       properties:

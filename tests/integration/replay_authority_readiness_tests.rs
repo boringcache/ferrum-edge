@@ -37,9 +37,9 @@ use serde_json::Value;
 const METRICS_TOKEN: &str = "replay-authority-readiness-metrics-token";
 const RETENTION: Duration = Duration::from_secs(601);
 
-/// The shared-authority registry is process-global, so these cases serialize
-/// against one another. Nothing else in this test binary registers a shared
-/// replay authority.
+/// The shared-authority health counters are process-global, so these cases
+/// serialize against one another. Nothing else in this test binary registers a
+/// shared replay authority.
 static REGISTRY_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn jwt_manager() -> JwtManager {

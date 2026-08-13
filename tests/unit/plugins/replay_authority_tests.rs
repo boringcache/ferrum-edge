@@ -23,9 +23,9 @@ use std::time::Duration;
 use ferrum_edge::plugins::utils::redis_rate_limiter::{RedisConfig, RedisRateLimitClient};
 use ferrum_edge::plugins::utils::replay_authority::{
     MAX_PROCESS_REPLAY_LANES, ReplayAdmission, ReplayAuthority, ReplayDomain, ReplayScope,
-    admit_process_at, counters, monotonic_millis, poison_shared_authorities_for_tests,
-    process_lane, process_lane_registered_for_tests, process_max_entries,
-    shared_authority_degraded, shared_health_snapshot, validate_scope_backend,
+    SharedReplayAuthorityHealth, admit_process_at, counters, monotonic_millis, process_lane,
+    process_lane_registered_for_tests, process_max_entries, shared_authority_degraded,
+    shared_health_snapshot, validate_scope_backend,
 };
 
 const PROFILE: &str = "ferrum-replay-authority-tests-v1";
@@ -798,7 +798,7 @@ async fn an_unavailable_shared_authority_is_visible_in_the_counters() {
 
 // ── shared-authority health for readiness ───────────────────────────
 //
-// `SHARED_AUTHORITIES` is a process-global registry, so these cases serialize
+// Shared-replay health counters are process-global, so these cases serialize
 // against each other. Nothing else in this test binary constructs a `shared`
 // authority (every other `shared` configuration in the unit suite is a rejected
 // config), so a serialized case observes only its own registrations.
@@ -877,9 +877,9 @@ fn shared_authority_health_tracks_outage_recovery_and_retirement() {
         baseline.shared_authorities + 1
     );
 
-    // Retiring the generation drops it from the aggregate: the registry holds
-    // weak handles precisely so an old generation can neither hold readiness
-    // down nor inflate the count.
+    // Retiring the generation drops it from the aggregate immediately: the
+    // health registration is independent of secret-bearing client data and
+    // does not retain historical handles on the probe path.
     drop(authority);
     drop(client);
     let retired = shared_health_snapshot();
@@ -919,6 +919,288 @@ fn one_backend_shared_by_several_authorities_is_counted_once() {
         shared_health_snapshot().shared_authorities,
         baseline.shared_authorities
     );
+}
+
+/// The probe/metrics snapshot is two integers loaded from a packed atomic.
+/// Admin readiness and `/metrics/runtime` must observe the same precomputed
+/// pair — never a scanned registry.
+#[test]
+fn shared_health_snapshot_is_a_lock_free_fixed_cardinality_load() {
+    let _serialized = shared_health_guard();
+    let snapshot = shared_health_snapshot();
+    assert_eq!(
+        std::mem::size_of::<SharedReplayAuthorityHealth>(),
+        2 * std::mem::size_of::<u64>(),
+        "the snapshot is two integers, not a scanned collection"
+    );
+    let runtime = counters();
+    assert_eq!(snapshot.shared_authorities, runtime.shared_authorities);
+    assert_eq!(
+        snapshot.shared_authorities_unavailable,
+        runtime.shared_authorities_unavailable
+    );
+    let copy = snapshot;
+    assert_eq!(copy, snapshot);
+}
+
+/// Distinct Redis clients are distinct authorities. HMAC and JWKS each build
+/// their own client, so two live clients must count twice.
+#[test]
+fn distinct_shared_clients_are_counted_separately() {
+    let _serialized = shared_health_guard();
+    let baseline = shared_health_snapshot();
+
+    let hmac = unreachable_shared_client("ferrum:replay_authority_tests:hmac");
+    let jwks = unreachable_shared_client("ferrum:replay_authority_tests:jwks");
+    let hmac_authority = ReplayAuthority::shared(Arc::clone(&hmac), RETENTION);
+    let jwks_authority = ReplayAuthority::shared(Arc::clone(&jwks), RETENTION);
+
+    assert_eq!(
+        shared_health_snapshot().shared_authorities,
+        baseline.shared_authorities + 2,
+        "HMAC and JWKS clients are distinct authorities"
+    );
+
+    drop(hmac_authority);
+    drop(hmac);
+    assert_eq!(
+        shared_health_snapshot().shared_authorities,
+        baseline.shared_authorities + 1,
+        "retiring one client must not retire the other"
+    );
+
+    drop(jwks_authority);
+    drop(jwks);
+    assert_eq!(
+        shared_health_snapshot(),
+        baseline,
+        "both distinct clients must clear on drop"
+    );
+}
+
+/// Generic rate-limiter clients are not shared replay authorities.
+#[test]
+fn a_generic_redis_client_does_not_contribute_to_shared_replay_health() {
+    let _serialized = shared_health_guard();
+    let baseline = shared_health_snapshot();
+    let config = RedisConfig::from_plugin_config(
+        &serde_json::json!({
+            "sync_mode": "redis",
+            "redis_url": "redis://127.0.0.1:1",
+            "redis_connect_timeout_seconds": 1,
+            "redis_health_check_interval_seconds": 3600,
+        }),
+        "ferrum:replay_authority_tests:generic",
+    )
+    .expect("redis config parses")
+    .expect("sync_mode redis yields a config");
+    let client = RedisRateLimitClient::new(config, None, false, None);
+    client.mark_unavailable_for_test();
+    assert_eq!(
+        shared_health_snapshot(),
+        baseline,
+        "generic Redis policy clients must not move replay health"
+    );
+    drop(client);
+    assert_eq!(shared_health_snapshot(), baseline);
+}
+
+/// Terminal topology is sticky: recovery cannot resurrect health, and drop
+/// still clears the generation.
+#[test]
+fn terminal_topology_publishes_unavailable_and_cannot_resurrect() {
+    let _serialized = shared_health_guard();
+    let baseline = shared_health_snapshot();
+
+    let client = unreachable_shared_client("ferrum:replay_authority_tests:terminal");
+    let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
+    client.mark_topology_unsupported_for_test();
+
+    let terminal = shared_health_snapshot();
+    assert_eq!(terminal.shared_authorities, baseline.shared_authorities + 1);
+    assert_eq!(
+        terminal.shared_authorities_unavailable,
+        baseline.shared_authorities_unavailable + 1
+    );
+    assert!(
+        !client.publish_reachable_for_test(),
+        "terminal topology must refuse resurrection"
+    );
+    assert_eq!(
+        shared_health_snapshot().shared_authorities_unavailable,
+        baseline.shared_authorities_unavailable + 1,
+        "a refused recovery must not decrement unavailable"
+    );
+
+    drop(authority);
+    drop(client);
+    assert_eq!(shared_health_snapshot(), baseline);
+}
+
+/// A replacement generation takes over the count: overlapping live generations
+/// add, and retiring the old one leaves only the new.
+#[test]
+fn replacement_generation_clears_the_retired_count() {
+    let _serialized = shared_health_guard();
+    let baseline = shared_health_snapshot();
+
+    let old_client = unreachable_shared_client("ferrum:replay_authority_tests:replace-old");
+    old_client.mark_unavailable_for_test();
+    let old = ReplayAuthority::shared(Arc::clone(&old_client), RETENTION);
+    let new_client = unreachable_shared_client("ferrum:replay_authority_tests:replace-new");
+    let new = ReplayAuthority::shared(Arc::clone(&new_client), RETENTION);
+
+    assert_eq!(
+        shared_health_snapshot().shared_authorities,
+        baseline.shared_authorities + 2,
+        "old and new generations overlap during reload"
+    );
+
+    drop(old);
+    drop(old_client);
+    let after_old = shared_health_snapshot();
+    assert_eq!(after_old.shared_authorities, baseline.shared_authorities + 1);
+    assert_eq!(
+        after_old.shared_authorities_unavailable,
+        baseline.shared_authorities_unavailable,
+        "the retired unavailable generation must stop contributing immediately"
+    );
+
+    drop(new);
+    drop(new_client);
+    assert_eq!(shared_health_snapshot(), baseline);
+}
+
+/// Retired generations clear counts without needing a later registration to
+/// prune historical handles — the previous Vec<Weak> leaked dead entries on
+/// this path.
+#[test]
+fn retired_generations_clear_counts_without_a_later_registration() {
+    let _serialized = shared_health_guard();
+    let baseline = shared_health_snapshot();
+    for idx in 0..32 {
+        let client =
+            unreachable_shared_client(&format!("ferrum:replay_authority_tests:retire-{idx}"));
+        client.mark_unavailable_for_test();
+        let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
+        assert_eq!(
+            shared_health_snapshot().shared_authorities,
+            baseline.shared_authorities + 1
+        );
+        assert_eq!(
+            shared_health_snapshot().shared_authorities_unavailable,
+            baseline.shared_authorities_unavailable + 1
+        );
+        drop(authority);
+        drop(client);
+        assert_eq!(
+            shared_health_snapshot(),
+            baseline,
+            "generation {idx} must clear without a later prune registration"
+        );
+    }
+}
+
+/// Concurrent availability transitions and drops must not underflow, double
+/// count, or leave a healthy-empty snapshot while a live authority remains.
+#[test]
+fn concurrent_transitions_and_drop_keep_exact_counts() {
+    let _serialized = shared_health_guard();
+    let baseline = shared_health_snapshot();
+
+    let client = unreachable_shared_client("ferrum:replay_authority_tests:race");
+    let authority = Arc::new(ReplayAuthority::shared(Arc::clone(&client), RETENTION));
+    const WORKERS: usize = 8;
+    let barrier = Arc::new(Barrier::new(WORKERS));
+
+    let workers: Vec<_> = (0..WORKERS)
+        .map(|idx| {
+            let client = Arc::clone(&client);
+            let authority = Arc::clone(&authority);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                match idx % 4 {
+                    0 => client.mark_unavailable_for_test(),
+                    1 => {
+                        let _ = client.publish_reachable_for_test();
+                    }
+                    2 => client.mark_topology_unsupported_for_test(),
+                    _ => {}
+                }
+                let snap = shared_health_snapshot();
+                assert!(
+                    snap.shared_authorities_unavailable <= snap.shared_authorities,
+                    "unavailable cannot exceed registered authorities"
+                );
+                drop(authority);
+                drop(client);
+            })
+        })
+        .collect();
+
+    drop(authority);
+    drop(client);
+    for worker in workers {
+        worker.join().expect("worker should not panic");
+    }
+    assert_eq!(
+        shared_health_snapshot(),
+        baseline,
+        "every generation must retire exactly once after concurrent drop"
+    );
+}
+
+/// First registration racing an outage must publish exactly one authority and
+/// the matching unavailable bit — never a healthy-empty or double count.
+#[test]
+fn concurrent_registration_and_outage_publish_exact_counts() {
+    let _serialized = shared_health_guard();
+    let baseline = shared_health_snapshot();
+
+    let client = unreachable_shared_client("ferrum:replay_authority_tests:register-race");
+    const WORKERS: usize = 6;
+    let barrier = Arc::new(Barrier::new(WORKERS));
+    let workers: Vec<_> = (0..WORKERS)
+        .map(|idx| {
+            let client = Arc::clone(&client);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                let authority = match idx % 3 {
+                    0 => Some(ReplayAuthority::shared(Arc::clone(&client), RETENTION)),
+                    1 => {
+                        client.mark_unavailable_for_test();
+                        None
+                    }
+                    _ => {
+                        let _ = client.publish_reachable_for_test();
+                        None
+                    }
+                };
+                let snap = shared_health_snapshot();
+                assert!(snap.shared_authorities_unavailable <= snap.shared_authorities);
+                assert!(snap.shared_authorities <= baseline.shared_authorities + 1);
+                authority
+            })
+        })
+        .collect();
+
+    let authorities: Vec<_> = workers
+        .into_iter()
+        .map(|worker| worker.join().expect("worker should not panic"))
+        .collect();
+    let registered = shared_health_snapshot();
+    assert_eq!(
+        registered.shared_authorities,
+        baseline.shared_authorities + 1,
+        "one client is one authority even under a registration/outage race"
+    );
+    assert!(registered.shared_authorities_unavailable <= registered.shared_authorities);
+
+    drop(authorities);
+    drop(client);
+    assert_eq!(shared_health_snapshot(), baseline);
 }
 
 // ── bounded, redacted shared claim ──────────────────────────────────
@@ -1226,50 +1508,42 @@ async fn a_claim_whose_reply_was_lost_stays_fail_closed_on_retry() {
     let _ = shutdown.send(());
 }
 
-/// Poison recovery must keep retained live authorities countable. Dropping the
-/// registration or returning the default empty/healthy snapshot would hide an
-/// unavailable shared backend from readiness.
+/// There is no bookkeeping mutex on the snapshot path. A live unavailable
+/// authority must remain visible across repeated loads — the previous poisoned
+/// `Mutex<Vec<Weak<_>>>` could hide it behind a healthy-empty default.
 #[test]
-fn shared_authority_health_recovers_a_poisoned_registry() {
+fn shared_health_snapshot_cannot_hide_a_live_unavailable_authority() {
     let _serialized = shared_health_guard();
     let baseline = shared_health_snapshot();
 
-    let client = unreachable_shared_client("ferrum:replay_authority_tests:poison");
+    let client = unreachable_shared_client("ferrum:replay_authority_tests:visible");
     client.mark_unavailable_for_test();
     let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
     let before = shared_health_snapshot();
-    assert_eq!(
-        before.shared_authorities,
-        baseline.shared_authorities + 1,
-        "the live authority must be registered before poison"
-    );
+    assert_eq!(before.shared_authorities, baseline.shared_authorities + 1);
     assert_eq!(
         before.shared_authorities_unavailable,
-        baseline.shared_authorities_unavailable + 1,
-        "unavailable state must be visible before poison"
+        baseline.shared_authorities_unavailable + 1
     );
 
-    poison_shared_authorities_for_tests();
+    for _ in 0..32 {
+        let snap = shared_health_snapshot();
+        assert_eq!(snap, before);
+        assert!(snap.unavailable());
+        let runtime = counters();
+        assert_eq!(runtime.shared_authorities, snap.shared_authorities);
+        assert_eq!(
+            runtime.shared_authorities_unavailable,
+            snap.shared_authorities_unavailable
+        );
+    }
 
-    let recovered = shared_health_snapshot();
-    assert_eq!(
-        recovered.shared_authorities, before.shared_authorities,
-        "poison recovery must keep retained live authorities countable"
-    );
-    assert_eq!(
-        recovered.shared_authorities_unavailable, before.shared_authorities_unavailable,
-        "poison recovery must not make unavailable state disappear"
-    );
-    assert!(recovered.unavailable());
-
-    let extra = unreachable_shared_client("ferrum:replay_authority_tests:poison-extra");
+    let extra = unreachable_shared_client("ferrum:replay_authority_tests:visible-extra");
     extra.mark_unavailable_for_test();
     let extra_authority = ReplayAuthority::shared(Arc::clone(&extra), RETENTION);
-    let after_register = shared_health_snapshot();
     assert_eq!(
-        after_register.shared_authorities,
-        before.shared_authorities + 1,
-        "registration after poison must still join the recovered registry"
+        shared_health_snapshot().shared_authorities,
+        before.shared_authorities + 1
     );
 
     drop(extra_authority);
