@@ -17,9 +17,9 @@
 //! `fence_gateway_trust_generation` → `commit_gateway_trust_generation`) and
 //! assert at the barrier, rather than racing a window.
 
+use crate::unit::gateway_trust_observability_lock::lock_gateway_trust_observability;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use crate::unit::gateway_trust_observability_lock::lock_gateway_trust_observability;
 use ferrum_edge::config::env_config::{EnvConfig, OperatingMode};
 use ferrum_edge::config::gateway_trust::GatewayTrustBundleRecord;
 use ferrum_edge::config::types::GatewayConfig;

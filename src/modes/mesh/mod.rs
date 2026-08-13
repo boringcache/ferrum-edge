@@ -16938,7 +16938,10 @@ pub fn stage_gateway_active_trust_bundles_unfederated_for_test(
         proxy_state,
         slice,
         Some(&federation::FederationSnapshot::default()),
-        FederationActivation::disabled(),
+        FederationActivation {
+            fail_open: false,
+            poll_enabled: false,
+        },
     )
 }
 

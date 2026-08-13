@@ -28,8 +28,8 @@ use ferrum_edge::config::gateway_trust::{
     TrustPublicationScope, detect_gateway_trust_drift, gateway_trust_state_drifted,
     observability_snapshot, project_namespace_trust, published_namespace_generation,
     published_namespace_state, record_ambiguous_authority, record_trust_generation_published,
-    record_trust_generation_published_scoped, record_trust_load_rejection,
-    resolve_trust_authority, trust_generation_fingerprint,
+    record_trust_generation_published_scoped, record_trust_load_rejection, resolve_trust_authority,
+    trust_generation_fingerprint,
 };
 use ferrum_edge::config::types::GatewayConfig;
 use ferrum_edge::identity::TrustDomain;
