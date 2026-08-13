@@ -483,20 +483,21 @@ pub struct AmbientUdpPreflightArgs {
 /// the caller, process-group cleanup failure is reported rather than claimed as
 /// success, and no usable attestation remains after the deadline wins.
 ///
-/// Node identity is resolved AUTHORITATIVELY here, from this node's own
-/// Kubernetes object, and never from the node-agent's published
-/// `.node-identity-v1.json`. That file records the CURRENT boot id even when it
-/// was written by a PREVIOUS Kubernetes Node object on this same boot, so no
-/// reader can tell a stale publication from a live one — and the two DaemonSets
-/// have no startup ordering between them, so the replacement node-agent may not
-/// have retracted it yet when this stage runs. Consuming it would let a stale
-/// identity and the stale cleanup proof written under it agree and authorize
-/// node-name reuse under the wrong immutable UID. One bounded `get` on this
+/// Node identity is resolved AUTHORITATIVELY here from a validated explicit
+/// `FERRUM_K8S_NODE_UID`, or otherwise from this node's own Kubernetes object,
+/// and never from the node-agent's published `.node-identity-v1.json`. That file
+/// records the CURRENT boot id even when it was written by a PREVIOUS Kubernetes
+/// Node object on this same boot, so no reader can tell a stale publication from
+/// a live one — and the two DaemonSets have no startup ordering between them, so
+/// the replacement node-agent may not have retracted it yet when this stage
+/// runs. Consuming it would let a stale identity and the stale cleanup proof
+/// written under it agree and authorize node-name reuse under the wrong
+/// immutable UID. When no explicit UID is supplied, one bounded `get` on this
 /// node's own object, bound to the node name the downward API gave this pod,
-/// settles it; the resolver retracts the publication before it reads the boot
-/// id or performs the lookup, and republishes only what it proved, so every
-/// failure after entry leaves no identity and the steady-state container that
-/// starts next reads an identity this pod established.
+/// settles it. In either case the resolver retracts the publication before it
+/// reads the boot id or resolves the UID, and republishes only what it proved,
+/// so every failure after entry leaves no identity and the steady-state
+/// container that starts next reads an identity this pod established.
 pub fn execute_ambient_udp_preflight(args: &AmbientUdpPreflightArgs) -> Result<(), String> {
     use crate::config::conf_file::resolve_ferrum_var;
     use crate::proxy::owned_shell::OwnedShellError;
