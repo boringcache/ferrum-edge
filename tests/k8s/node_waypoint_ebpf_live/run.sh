@@ -4399,9 +4399,20 @@ run_node_waypoint_udp_datapath_checks() {
   log "NodeWaypoint UDP Service path target ${service_ip}:${UDP_LISTENER_PORT} (udp-echo ClusterIP)"
   if ! service_reply="$(wait_for_udp_outcome match "udp-ok:svc-a" \
     "$WORKLOAD_NS" udp-src-a "$service_ip" svc-a 40)"; then
+    # A no-reply outcome has two very different causes and the backend log is
+    # what separates them: zero hits means the steering rules never diverted the
+    # datagram to the materialized listener, while a non-zero count means the
+    # forward leg worked and only the ClusterIP-sourced reply was lost on the
+    # way back to the enrolled source pod. Record it so the failure is
+    # actionable from the job log alone.
+    local unreplied_backend_hits
+    unreplied_backend_hits="$(udp_echo_backend_received svc-a)"
     record_live_assertion node_waypoint.udp.service_path_allow_attributed_source fail \
-      udp-src-a udp-echo "service_ip=$service_ip observed=$service_reply" \
+      udp-src-a udp-echo \
+      "service_ip=$service_ip observed=$service_reply backend_hits=$unreplied_backend_hits" \
       "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-listener"
+    echo "[node-waypoint-ebpf-live] Service-path probe got no reply;" \
+      "backend observed $unreplied_backend_hits svc-a datagram(s)" >&2
     collect_traffic_failure_diagnostics
     return 1
   fi

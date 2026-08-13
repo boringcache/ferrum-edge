@@ -1337,7 +1337,7 @@ fn preparation_attaches_desired_steering_metadata_without_publishing_the_live_pl
 
 #[test]
 fn a_withdrawn_or_disabled_generation_clears_desired_steering_metadata() {
-    let _env = UdpListenerEnvGuard::set(Some("true"));
+    let enabled_env = UdpListenerEnvGuard::set(Some("true"));
     let runtime = node_waypoint_runtime();
     let backend = workload_for("dns", DEFAULT_NAMESPACE, [("app", "udp")], ["10.244.3.11"]);
     let prepared = prepare(
@@ -1356,6 +1356,11 @@ fn a_withdrawn_or_disabled_generation_clears_desired_steering_metadata() {
         "withdrawing every UDP service must clear desired steering metadata"
     );
 
+    // Release the enabled guard BEFORE taking the disabled one.
+    // `UdpListenerEnvGuard` holds `UDP_LISTENER_ENV_LOCK`, a non-reentrant
+    // `std::sync::Mutex`, for its whole lifetime, so two overlapping guards on
+    // one thread deadlock the test outright.
+    drop(enabled_env);
     let _off = UdpListenerEnvGuard::set(None);
     let backend = workload_for("dns", DEFAULT_NAMESPACE, [("app", "udp")], ["10.244.3.11"]);
     let disabled = prepare(
