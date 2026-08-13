@@ -6165,9 +6165,7 @@ async fn handle_h3_request(
                 headers_committed = true;
             }
             crate::http3::stream_util::H3AuthorizedHeadersWrite::ClientWriteFailed => {
-                debug!(
-                    "HTTP/3 client disconnected before streaming response headers"
-                );
+                debug!("HTTP/3 client disconnected before streaming response headers");
                 client_disconnected = true;
                 body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
             }

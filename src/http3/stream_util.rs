@@ -274,15 +274,11 @@ pub(crate) async fn commit_authorized_streaming_response_headers<S>(
 where
     S: RecvStream + SendStream<Bytes>,
 {
-    let plan = crate::proxy::auth_lifetime::effective_request_auth_deadline(
-        ctx,
-        max_lifetime_seconds,
-    );
+    let plan =
+        crate::proxy::auth_lifetime::effective_request_auth_deadline(ctx, max_lifetime_seconds);
     let latch = ctx.authorization_termination_latch();
-    let bound = crate::proxy::auth_lifetime::ComposedAuthBound::compose(
-        ctx.grpc_deadline_at(),
-        plan,
-    );
+    let bound =
+        crate::proxy::auth_lifetime::ComposedAuthBound::compose(ctx.grpc_deadline_at(), plan);
     let outcome = await_authorized_headers_write(
         bound,
         crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
