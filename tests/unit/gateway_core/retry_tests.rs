@@ -655,6 +655,7 @@ fn test_grpc_kind_is_connect_class_partitions_correctly() {
         K::H2cHandshake,
         K::InvalidServerName,
         K::DispatchCanceled,
+        K::TrustWithdrawn,
         K::MaxConnections,
     ] {
         assert!(
@@ -708,6 +709,7 @@ fn test_every_connect_class_kind_classifies_as_pre_wire() {
             | K::InvalidServerName
             | K::BackendRequest
             | K::DispatchCanceled
+            | K::TrustWithdrawn
             | K::MaxConnections => (),
         };
         let err = GrpcProxyError::backend_unavailable(kind, format!("{kind:?} test"));

@@ -125,6 +125,18 @@ pub(crate) struct MeshH2Transport {
     pub(crate) gate: MeshTransportGate,
 }
 
+impl std::fmt::Debug for MeshH2Transport {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Keep diagnostics useful without requiring hyper's sender or the
+        // cancellation primitive to expose their internal state. The only
+        // transport-lifetime property callers may act on is retirement.
+        formatter
+            .debug_struct("MeshH2Transport")
+            .field("retired", &self.is_retired())
+            .finish_non_exhaustive()
+    }
+}
+
 impl MeshH2Transport {
     /// Wrap a sender with a gate that is never retired. For focused tests and
     /// standalone callers that run without a registry.

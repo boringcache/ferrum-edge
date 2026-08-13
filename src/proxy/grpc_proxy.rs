@@ -1400,6 +1400,11 @@ pub enum GrpcBackendUnavailableKind {
     /// keep [`Self::BackendRequest`] even on `is_canceled` because the
     /// upload may already be unreplayable.
     DispatchCanceled,
+    /// Gateway trust changed while a mesh transport was being established, or
+    /// after a pooled transport was checked out but before it opened a stream.
+    /// The request never reached the destination, and the retired transport is
+    /// not reused. Maps to [`crate::retry::ErrorClass::ConnectionPoolError`].
+    TrustWithdrawn,
     /// The destination is already at its DestinationRule
     /// `connectionPool.tcp.maxConnections` ceiling, so no NEW physical H2
     /// connection may be opened. Nothing was dialed — pre-wire, and mapped to
@@ -1432,6 +1437,7 @@ impl GrpcBackendUnavailableKind {
             | Self::H2cHandshake
             | Self::InvalidServerName
             | Self::DispatchCanceled
+            | Self::TrustWithdrawn
             // Over-cap refusal happens before any dial, so it is pre-wire and
             // `retry_on_connect_failure` may rotate to another LB target (with
             // its own admission lane) — the same posture the raw-TCP path takes.
@@ -3409,6 +3415,11 @@ fn mesh_mtls_pool_error_to_grpc(error: HbonePoolError) -> GrpcProxyError {
         ),
         E::MaxConnectionsExceeded { .. } => GrpcProxyError::backend_unavailable_with_source(
             GrpcBackendUnavailableKind::MaxConnections,
+            message,
+            error,
+        ),
+        E::TrustWithdrawn => GrpcProxyError::backend_unavailable_with_source(
+            GrpcBackendUnavailableKind::TrustWithdrawn,
             message,
             error,
         ),
