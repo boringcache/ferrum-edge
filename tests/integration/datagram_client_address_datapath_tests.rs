@@ -491,10 +491,7 @@ async fn authenticated_envelope_drives_the_live_dtls_demux_and_binds_identity() 
         ),
         encode_datagram_with_metadata(
             forwarded_client,
-            SocketAddr::new(
-                server_addr.ip(),
-                server_addr.port().wrapping_add(1).max(1),
-            ),
+            SocketAddr::new(server_addr.ip(), server_addr.port().wrapping_add(1).max(1)),
             &client_hello_shaped,
             Some(&key()),
         ),

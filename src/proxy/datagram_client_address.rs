@@ -431,9 +431,7 @@ impl DatagramClientAddressGate {
         // Bind identity-bearing envelopes to this listener before the caller
         // can allocate a session or demux slot. `LOCAL` / `AF_UNSPEC` leave
         // `forwarded` unset and are not dest-port bound.
-        if parsed.forwarded.is_some()
-            && parsed.destination_port != Some(self.listener_port)
-        {
+        if parsed.forwarded.is_some() && parsed.destination_port != Some(self.listener_port) {
             return Err(DatagramMetadataError::DestinationPortMismatch);
         }
         Ok(DecodedDatagram {

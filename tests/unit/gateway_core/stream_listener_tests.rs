@@ -2503,8 +2503,7 @@ async fn udp_stream_proxy_protocol_reload_restarts_listener_and_toggles_gate() {
 
     // The replacement gate captures this listener's port: a valid tag for a
     // different dest port is refused before a session is allocated.
-    let wrong_dest =
-        SocketAddr::from(([127, 0, 0, 1], frontend_port.wrapping_add(1).max(1)));
+    let wrong_dest = SocketAddr::from(([127, 0, 0, 1], frontend_port.wrapping_add(1).max(1)));
     let portable = encode_datagram_with_metadata(
         forwarded_client,
         wrong_dest,
