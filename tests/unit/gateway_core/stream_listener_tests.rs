@@ -2018,7 +2018,8 @@ async fn swap_frontend_tls_config_replaces_slot_without_reconcile() {
 }
 
 /// Mesh's active-only DTLS swap must not publish its TLS-derived material into
-/// the dedicated DTLS generation used by listeners created later.
+/// the dedicated DTLS generation used by listeners created later, and must not
+/// evaluate the rebuild when no DTLS server is bound.
 #[tokio::test]
 async fn swap_active_dtls_frontend_configs_does_not_publish_generation_without_listeners() {
     let manager = create_manager(empty_config());
@@ -2026,14 +2027,16 @@ async fn swap_active_dtls_frontend_configs_does_not_publish_generation_without_l
     let swapped = manager
         .swap_active_dtls_frontend_configs(|| {
             calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Ok(ephemeral_frontend_dtls_config())
+            Err(anyhow::anyhow!(
+                "no-active-listener mesh swap must not evaluate the DTLS build closure"
+            ))
         })
         .await;
     assert_eq!(swapped, 0, "no listeners should mean no live swaps");
     assert_eq!(
         calls.load(std::sync::atomic::Ordering::Relaxed),
-        1,
-        "build_config must run exactly once"
+        0,
+        "build_config must not run when no DTLS listener is active"
     );
     assert!(
         manager.snapshot_frontend_dtls_generation().is_none(),
@@ -2045,6 +2048,138 @@ async fn swap_active_dtls_frontend_configs_does_not_publish_generation_without_l
     let overload = manager.overload_snapshot();
     assert_eq!(overload.frontend_dtls_reload.generation, 0);
     assert_eq!(overload.frontend_dtls_reload.last_outcome, "none");
+}
+
+/// An ordinary FERRUM_DTLS_* publish must keep last-good generation status
+/// distinct from a no-listener mesh overlay, which must not evaluate a rebuild
+/// or advance/reject that generation.
+#[tokio::test]
+async fn mesh_active_only_dtls_swap_does_not_seed_or_advance_ordinary_generation() {
+    let manager = create_manager(empty_config());
+    let (_gen, swapped) = manager
+        .publish_frontend_dtls_generation(ephemeral_frontend_dtls_config())
+        .await;
+    assert_eq!(swapped, 0);
+    let before = manager
+        .snapshot_frontend_dtls_generation()
+        .expect("ordinary generation published");
+    assert_eq!(before.generation, 1);
+    assert_eq!(manager.frontend_dtls_reload_status().last_outcome, "accepted");
+
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    let swapped = manager
+        .swap_active_dtls_frontend_configs(|| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Err(anyhow::anyhow!(
+                "no-active-listener mesh swap must not evaluate the DTLS build closure"
+            ))
+        })
+        .await;
+    assert_eq!(swapped, 0);
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "mesh overlay must not evaluate a DTLS rebuild when no listener is active"
+    );
+    let after = manager
+        .snapshot_frontend_dtls_generation()
+        .expect("ordinary generation retained");
+    assert_eq!(after.generation, before.generation);
+    assert!(
+        Arc::ptr_eq(&after, &before),
+        "mesh active-only swap must not replace the ordinary DTLS generation slot"
+    );
+    let status = manager.frontend_dtls_reload_status();
+    assert_eq!(status.last_outcome, "accepted");
+    assert_eq!(status.generation, before.generation);
+}
+
+/// With an active DTLS server, mesh overlay must rebuild once, swap that
+/// listener, and still leave the ordinary FERRUM_DTLS_* generation unpublished.
+#[tokio::test]
+async fn mesh_active_only_dtls_swap_updates_active_listener_without_publishing_generation() {
+    let manager = create_manager(empty_config());
+    let server = Arc::new(
+        ferrum_edge::dtls::DtlsServer::bind(
+            "127.0.0.1:0".parse().expect("addr"),
+            ephemeral_frontend_dtls_config(),
+        )
+        .await
+        .expect("bind test DTLS server"),
+    );
+    manager
+        .install_active_dtls_server_for_test(Arc::clone(&server))
+        .await;
+
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    let swapped = manager
+        .swap_active_dtls_frontend_configs(|| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(ephemeral_frontend_dtls_config())
+        })
+        .await;
+    assert_eq!(swapped, 1, "the bound DTLS server must be live-swapped");
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "build_config must run exactly once when an active DTLS server exists"
+    );
+    assert!(
+        manager.snapshot_frontend_dtls_generation().is_none(),
+        "active-only mesh swap must not publish the ordinary DTLS generation"
+    );
+    let status = manager.frontend_dtls_reload_status();
+    assert_eq!(status.last_outcome, "none");
+    assert_eq!(status.generation, 0);
+    server.close().await;
+}
+
+/// A failed mesh overlay against an active listener must keep last-good
+/// listener config and must not mark the ordinary DTLS generation rejected.
+#[tokio::test]
+async fn mesh_active_only_dtls_swap_failure_does_not_reject_ordinary_generation() {
+    let manager = create_manager(empty_config());
+    let (_gen, _) = manager
+        .publish_frontend_dtls_generation(ephemeral_frontend_dtls_config())
+        .await;
+    let before = manager
+        .snapshot_frontend_dtls_generation()
+        .expect("ordinary generation published");
+
+    let server = Arc::new(
+        ferrum_edge::dtls::DtlsServer::bind(
+            "127.0.0.1:0".parse().expect("addr"),
+            ephemeral_frontend_dtls_config(),
+        )
+        .await
+        .expect("bind test DTLS server"),
+    );
+    manager
+        .install_active_dtls_server_for_test(Arc::clone(&server))
+        .await;
+
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    let swapped = manager
+        .swap_active_dtls_frontend_configs(|| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Err(anyhow::anyhow!("simulated mesh DTLS rebuild failure"))
+        })
+        .await;
+    assert_eq!(swapped, 0);
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "build_config must run once so last-good listener retention is fail-closed"
+    );
+    let after = manager
+        .snapshot_frontend_dtls_generation()
+        .expect("ordinary generation retained");
+    assert_eq!(after.generation, before.generation);
+    assert!(Arc::ptr_eq(&after, &before));
+    let status = manager.frontend_dtls_reload_status();
+    assert_eq!(status.last_outcome, "accepted");
+    assert_eq!(status.generation, before.generation);
+    server.close().await;
 }
 
 #[tokio::test]
@@ -2126,10 +2261,7 @@ async fn rejected_dtls_candidate_retains_previous_generation() {
         .snapshot_frontend_dtls_generation()
         .expect("initial generation");
 
-    let swapped = manager
-        .swap_active_dtls_frontend_configs(|| Err(anyhow::anyhow!("simulated bad candidate")))
-        .await;
-    assert_eq!(swapped, 0);
+    manager.record_frontend_dtls_candidate_failure();
     let after = manager
         .snapshot_frontend_dtls_generation()
         .expect("previous generation retained");

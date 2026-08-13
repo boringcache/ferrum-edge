@@ -46,7 +46,7 @@ paths:
 ## TLS Rotation Model
 
 - Most file-based TLS materials are static operational inputs. Cert/key file changes require gateway restart or rolling redeploy unless explicitly listed below.
-- Mesh peer-auth reload is limited to resolved inbound mTLS mode and frontend client CA verifier when `FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED=true`.
+- Mesh peer-auth reload is limited to resolved inbound mTLS mode and frontend client CA verifier when `FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED=true`. Mesh PeerAuthentication DTLS overlay may update currently active mesh-derived DTLS listeners only; it must never publish or seed the ordinary frontend DTLS generation consumed by new or restarted UDP DTLS listeners with dedicated `FERRUM_DTLS_*` identity and client-CA policy.
 - Frontend cert/key live reload is enabled only when `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true`.
 - Frontend watcher covers proxy HTTPS/H2/H3 and admin HTTPS cert/key paths at `FERRUM_FRONTEND_TLS_WATCH_INTERVAL_SECONDS`, default 30s.
 - On validated frontend change, rebuild rustls `ServerConfig`, rerun early-data and kTLS-secret-extraction settings, swap `SharedFrontendTls`, and notify H3 to call `Endpoint::set_server_config`.

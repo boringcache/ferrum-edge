@@ -1466,6 +1466,41 @@ impl StreamListenerManager {
         .await
     }
 
+    /// Install an already-bound DTLS server so tests can exercise the mesh
+    /// active-only swap without a full UDP reconcile.
+    #[doc(hidden)]
+    #[allow(dead_code)] // External unit-test seam is unused by the bin test target.
+    pub async fn install_active_dtls_server_for_test(
+        &self,
+        server: Arc<crate::dtls::DtlsServer>,
+    ) {
+        let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+        let join_handle = tokio::spawn(async {});
+        let listen_port = server.local_addr().port();
+        let bind_addr = server.local_addr().ip();
+        let slot: DtlsServerSlot = Arc::new(arc_swap::ArcSwap::from_pointee(Some(server)));
+        let mut listeners = self.listeners.lock().await;
+        listeners.insert(
+            "__test_dtls_active".to_string(),
+            ListenerHandle {
+                shutdown_tx,
+                join_handle,
+                listen_port,
+                bind_addr,
+                scheme: BackendScheme::Udp,
+                frontend_tls: true,
+                passthrough: false,
+                backend_tls_reload_key: None,
+                backend_routing_key: None,
+                sni_ids: None,
+                started: Arc::new(AtomicBool::new(true)),
+                tcp_metrics: None,
+                udp_metrics: None,
+                dtls_server: Some(slot),
+            },
+        );
+    }
+
     /// Bounded redacted DTLS live-reload status (no secrets or source paths).
     pub fn frontend_dtls_reload_status(&self) -> FrontendDtlsReloadStatus {
         (**self.frontend_dtls_reload_status.load()).clone()
@@ -1554,21 +1589,36 @@ impl StreamListenerManager {
     /// Build one validated `FrontendDtlsConfig` and swap it onto every active
     /// DTLS server without publishing it as the ordinary frontend generation.
     ///
-    /// `build_config` is invoked **once** before any listener is touched so a
-    /// transient source race cannot create mixed generations. Existing
+    /// Used by mesh PeerAuthentication live reload. `build_config` is invoked
+    /// **once**, and only when at least one DTLS server is already bound, so a
+    /// no-listener reload cannot seed the `FERRUM_DTLS_*` generation or
+    /// evaluate a mesh TLS rebuild that nothing would consume. Existing
     /// in-flight DTLS sessions keep the snapshot they handshake with; new
-    /// sessions pick up the replacement config on the next ClientHello.
-    /// Keeping this path active-only prevents mesh PeerAuthentication material
-    /// from being reused by later ordinary UDP listeners, whose generation is
-    /// sourced from the dedicated DTLS configuration.
+    /// sessions on those active listeners pick up the replacement config on
+    /// the next ClientHello. Listeners created or restarted later still
+    /// consume the dedicated DTLS generation (`FERRUM_DTLS_*` identity and
+    /// client-CA policy), not this overlay.
     ///
     /// Returns the number of listeners whose DTLS server was swapped. On
     /// build failure every listener retains its complete prior config and
-    /// this returns `0`.
+    /// this returns `0` without touching ordinary generation status.
     pub async fn swap_active_dtls_frontend_configs<F>(&self, mut build_config: F) -> usize
     where
         F: FnMut() -> Result<crate::dtls::FrontendDtlsConfig, anyhow::Error>,
     {
+        {
+            let listeners = self.listeners.lock().await;
+            let has_active_dtls = listeners.values().any(|handle| {
+                handle
+                    .dtls_server
+                    .as_ref()
+                    .is_some_and(|slot| slot.load().as_ref().is_some())
+            });
+            if !has_active_dtls {
+                return 0;
+            }
+        }
+
         let config = match build_config() {
             Ok(cfg) => cfg,
             Err(err) => {
@@ -1577,7 +1627,6 @@ impl StreamListenerManager {
                      keeping previous DTLS config on every listener",
                     err
                 );
-                self.record_frontend_dtls_candidate_failure();
                 return 0;
             }
         };

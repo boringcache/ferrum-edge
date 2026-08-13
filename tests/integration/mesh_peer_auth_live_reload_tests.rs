@@ -537,22 +537,17 @@ async fn mesh_peer_auth_live_reload_dtls_swap_noop_without_dtls_listeners() {
     let swapped = manager
         .swap_active_dtls_frontend_configs(|| {
             build_invocations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let certificate =
-                ferrum_edge::dtls::generate_ephemeral_cert_public().expect("ephemeral cert");
-            let config = dimpl::Config::builder().build().expect("dtls config");
-            Ok(ferrum_edge::dtls::FrontendDtlsConfig {
-                dimpl_config: std::sync::Arc::new(config),
-                certificate,
-                client_cert_verifier: None,
-            })
+            Err(anyhow::anyhow!(
+                "no-active-listener mesh swap must not evaluate the DTLS build closure"
+            ))
         })
         .await;
 
     assert_eq!(swapped, 0, "no active DTLS listeners means no live swaps");
     assert_eq!(
         build_invocations.load(std::sync::atomic::Ordering::Relaxed),
-        1,
-        "the active-only build closure runs exactly once"
+        0,
+        "mesh PeerAuthentication reload must not evaluate a DTLS rebuild when no listeners are active"
     );
     assert!(
         manager.snapshot_frontend_dtls_generation().is_none(),
