@@ -180,9 +180,10 @@ jobs:
               then
                 fail "could not resolve the triggering Release run through the Actions API"
               fi
-              if ! python3 -I - "$canonical_run_file" \
-                "$release_run_id" "$release_run_attempt" "$WORKFLOW_RUN_EVENT" \
-                "$event_head" "$tag" <<'PY'
+              # Keep `python3` and the quoted stdin heredoc on one physical line.
+              # A continued opener whose first word is `$event_head`/`$tag` is a
+              # computed receiver to the trusted Cross scanner, not Python.
+              if ! python3 -I - "$canonical_run_file" "$release_run_id" "$release_run_attempt" "$WORKFLOW_RUN_EVENT" "$event_head" "$tag" <<'PY'
           import json
           import sys
 

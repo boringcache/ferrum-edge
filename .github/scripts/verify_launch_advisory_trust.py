@@ -2238,7 +2238,17 @@ jobs:
           CANDIDATE_SHA: ${{ needs.establish-trust.outputs.candidate_sha }}
           VERDICT_ARTIFACT: ${{ needs.establish-trust.outputs.verdict_artifact }}
           REQUESTER_WORKFLOW_PATH: ${{ needs.establish-trust.outputs.requester_workflow_path }}
-        run: printf 'release_sha=%s\\nrelease_run_id=%s\\nrelease_run_attempt=%s\\nrequester_workflow_path=%s\\nverdict=PASS\\n' "$CANDIDATE_SHA" "$id" "$attempt" "$REQUESTER_WORKFLOW_PATH" > verdict.txt
+        run: |
+          case "$VERDICT_ARTIFACT" in
+            trusted-launch-advisory-verdict-release-*)
+              [ "$REQUESTER_WORKFLOW_PATH" = ".github/workflows/release.yml" ] || exit 1
+              ;;
+            trusted-launch-advisory-verdict-main-audit-*)
+              [ "$REQUESTER_WORKFLOW_PATH" = "schedule" ] || exit 1
+              ;;
+            *) exit 1 ;;
+          esac
+          printf 'release_sha=%s\\nrelease_run_id=%s\\nrelease_run_attempt=%s\\nrequester_workflow_path=%s\\nverdict=PASS\\n' "$CANDIDATE_SHA" "$id" "$attempt" "$REQUESTER_WORKFLOW_PATH" > verdict.txt
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: ${{ needs.establish-trust.outputs.verdict_artifact }}
@@ -4014,7 +4024,17 @@ def run_self_test() -> int:  # noqa: C901 — a flat fixture table stays readabl
     )
 
     status_handoff = FIXTURE_TRUSTED.replace(
-        "        run: printf 'release_sha=%s\\nrelease_run_id=%s\\n"
+        "        run: |\n"
+        '          case "$VERDICT_ARTIFACT" in\n'
+        "            trusted-launch-advisory-verdict-release-*)\n"
+        '              [ "$REQUESTER_WORKFLOW_PATH" = ".github/workflows/release.yml" ] || exit 1\n'
+        "              ;;\n"
+        "            trusted-launch-advisory-verdict-main-audit-*)\n"
+        '              [ "$REQUESTER_WORKFLOW_PATH" = "schedule" ] || exit 1\n'
+        "              ;;\n"
+        "            *) exit 1 ;;\n"
+        "          esac\n"
+        "          printf 'release_sha=%s\\nrelease_run_id=%s\\n"
         "release_run_attempt=%s\\nrequester_workflow_path=%s\\nverdict=PASS\\n' "
         '"$CANDIDATE_SHA" "$id" "$attempt" "$REQUESTER_WORKFLOW_PATH" '
         "> verdict.txt",
