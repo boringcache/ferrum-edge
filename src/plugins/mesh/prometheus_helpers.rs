@@ -875,13 +875,14 @@ pub fn increment_mesh_subscribe_audience_rejection(
 ///
 /// `protocol` is `native` / `xds` / `stock_xds`; `outcome` is a
 /// `MeshStreamAttempt::as_metric_label` constant covering intentional local
-/// retirement (shutdown, TLS reload, credential rotation, primary retry),
-/// remote clean EOF, transport failure, the first-frame / first-slice bounds,
-/// keepalive timeout, and policy rejection. Both are `&'static str` precisely so
-/// no endpoint URL, node id, credential path, or claim can become a label — the
-/// clean-EOF-versus-intentional-retirement split is the whole point of the
-/// series, and it must stay scrapeable without disclosing which control plane
-/// misbehaved.
+/// retirement (shutdown, TLS reload, the three credential events, primary
+/// retry), remote clean EOF, a dial-time transport failure, an
+/// established-transport failure, the first-frame / first-slice bounds, the
+/// native heartbeat-silence bound, and policy rejection. Both are
+/// `&'static str` precisely so no endpoint URL, node id, credential path, or
+/// claim can become a label — the clean-EOF-versus-intentional-retirement split
+/// is the whole point of the series, and it must stay scrapeable without
+/// disclosing which control plane misbehaved.
 pub fn increment_mesh_config_stream_attempt(protocol: &'static str, outcome: &'static str) {
     MESH_CONFIG_STREAM_ATTEMPTS
         .entry(MeshConfigStreamAttemptKey { protocol, outcome })
@@ -1312,7 +1313,7 @@ pub fn render_mesh_observability_metrics_with_gateway_namespace(
 
     if !MESH_CONFIG_STREAM_ATTEMPTS.is_empty() {
         output.push_str(
-            "# HELP ferrum_mesh_config_stream_attempts_total Completed mesh configuration-stream attempts by consumer protocol and closed-set outcome. A remote clean EOF is an endpoint failure, not a success.\n",
+            "# HELP ferrum_mesh_config_stream_attempts_total Completed mesh configuration-stream attempts by consumer protocol (native/xds/stock_xds) and closed-set outcome. A remote clean EOF is an endpoint failure, not a success. Local retirements (shutdown, tls_reload, credential_rotated, credential_source_invalid, credential_deadline, primary_retry) never rotate the endpoint or grow backoff. transport_failure is a dial failure while established_transport_failure is an already-open stream going dark; heartbeat_silence_timeout is the native application-silence bound, not an HTTP/2 keepalive timeout.\n",
         );
         output.push_str("# TYPE ferrum_mesh_config_stream_attempts_total counter\n");
         for entry in MESH_CONFIG_STREAM_ATTEMPTS.iter() {

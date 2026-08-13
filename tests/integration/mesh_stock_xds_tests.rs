@@ -43,7 +43,9 @@ use ferrum_edge::modes::mesh::config_consumer::stock_xds_credential::{
     StockCredentialInvalidReason, StockCredentialLifetimePolicy, StockCredentialState,
     StockCredentialWatch, StockXdsCredentialSource,
 };
-use ferrum_edge::modes::mesh::config_consumer::stream_lifecycle::MeshStreamTimings;
+use ferrum_edge::modes::mesh::config_consumer::stream_lifecycle::{
+    MeshConfigStreamStatus, MeshStreamTimings,
+};
 use ferrum_edge::modes::mesh::runtime::MeshRuntimeState;
 use ferrum_edge::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
 use ferrum_edge::xds::proto::aggregated_discovery_service_server::{
@@ -1003,7 +1005,7 @@ mod stream_lifecycle {
 
     /// How the scripted endpoint behaves once the client subscribes.
     #[derive(Clone, Copy, PartialEq, Eq)]
-    enum EndpointBehaviour {
+    pub(super) enum EndpointBehaviour {
         /// Accept the streaming RPC and immediately close it cleanly, forever.
         /// This is the shape that used to pin the client on the primary.
         CleanEofImmediately,
@@ -1017,11 +1019,12 @@ mod stream_lifecycle {
         Converged,
     }
 
+    /// The loopback h2c fixture. It carries NO credential machinery on
+    /// purpose: a bearer is never admissible over plaintext, so everything
+    /// credential-related is proven over real TLS in `super::tls_lifecycle`.
     #[derive(Clone)]
-    struct LifecycleAds {
+    pub(super) struct LifecycleAds {
         recorder: AdsRecorder,
-        /// `authorization` metadata observed on each accepted RPC, in order.
-        authorizations: Arc<Mutex<Vec<String>>>,
         streams: Arc<AtomicUsize>,
         behaviour: EndpointBehaviour,
     }
@@ -1030,21 +1033,13 @@ mod stream_lifecycle {
         fn new(behaviour: EndpointBehaviour) -> Self {
             Self {
                 recorder: AdsRecorder::default(),
-                authorizations: Arc::new(Mutex::new(Vec::new())),
                 streams: Arc::new(AtomicUsize::new(0)),
                 behaviour,
             }
         }
 
-        fn stream_count(&self) -> usize {
+        pub(super) fn stream_count(&self) -> usize {
             self.streams.load(Ordering::SeqCst)
-        }
-
-        fn authorization_snapshot(&self) -> Vec<String> {
-            self.authorizations
-                .lock()
-                .expect("authorization mutex is never held across a panic")
-                .clone()
         }
     }
 
@@ -1062,17 +1057,6 @@ mod stream_lifecycle {
             request: Request<Streaming<DiscoveryRequest>>,
         ) -> Result<Response<Self::StreamAggregatedResourcesStream>, Status> {
             self.streams.fetch_add(1, Ordering::SeqCst);
-            let observed = request
-                .metadata()
-                .get("authorization")
-                .and_then(|value| value.to_str().ok())
-                .unwrap_or("<none>")
-                .to_string();
-            self.authorizations
-                .lock()
-                .expect("authorization mutex")
-                .push(observed);
-
             let mut inbound = request.into_inner();
             let recorder = self.recorder.clone();
             let behaviour = self.behaviour;
@@ -1178,7 +1162,7 @@ mod stream_lifecycle {
     }
 
     /// Boot one scripted endpoint. Returns its handle and its `scheme://host:port`.
-    async fn serve(behaviour: EndpointBehaviour) -> (LifecycleAds, String) {
+    pub(super) async fn serve(behaviour: EndpointBehaviour) -> (LifecycleAds, String) {
         let handle = LifecycleAds::new(behaviour);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -1195,8 +1179,8 @@ mod stream_lifecycle {
         (handle, format!("http://127.0.0.1:{}", addr.port()))
     }
 
-    struct LifecycleHarness {
-        state: MeshRuntimeState,
+    pub(super) struct LifecycleHarness {
+        pub(super) state: MeshRuntimeState,
         shutdown_tx: watch::Sender<bool>,
         client: tokio::task::JoinHandle<()>,
         /// Held so the client's policy-watch arm stays open for the whole test;
@@ -1206,7 +1190,7 @@ mod stream_lifecycle {
     }
 
     impl LifecycleHarness {
-        async fn start(
+        pub(super) async fn start(
             urls: Vec<String>,
             credential: StockXdsCredentialSource,
             credential_watch: StockCredentialWatch,
@@ -1265,7 +1249,7 @@ mod stream_lifecycle {
             }
         }
 
-        async fn wait_for_services(&self, expected: usize) -> MeshSlice {
+        pub(super) async fn wait_for_services(&self, expected: usize) -> MeshSlice {
             for _ in 0..400 {
                 if let Some(slice) = self.state.snapshot().as_ref().clone()
                     && slice.services.len() == expected
@@ -1291,7 +1275,7 @@ mod stream_lifecycle {
 
         /// Prove the client task actually joins on shutdown rather than being
         /// left detached with a live stream.
-        async fn shutdown_and_join(self) {
+        pub(super) async fn shutdown_and_join(self) {
             let _ = self.shutdown_tx.send(true);
             tokio::time::timeout(Duration::from_secs(10), self.client)
                 .await
@@ -1390,7 +1374,7 @@ mod stream_lifecycle {
                 // FIRST-FRAME bound, and the fallback must not race a tight
                 // first-slice deadline in hosted CI.
                 first_slice: Duration::from_secs(15),
-                max_silence: Duration::from_secs(150),
+                ..MeshStreamTimings::production()
             },
         )
         .await;
@@ -1492,80 +1476,1377 @@ mod stream_lifecycle {
         harness.shutdown_and_join().await;
     }
 
-    /// Issue #3852. Rotating the credential retires the healthy stream, and the
-    /// NEXT RPC carries only the replacement token — never the previous one.
-    /// The transport gate refuses a bearer over plaintext, so this drives the
-    /// credential lifecycle directly through the watch channel the production
-    /// client races, with the observable proof taken from the ADS server's own
-    /// per-RPC `authorization` metadata.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_rotated_credential_retires_the_stream_and_the_next_rpc_carries_the_new_token() {
-        let (endpoint, url) = serve(EndpointBehaviour::Converged).await;
-        let temp = tempfile::tempdir().expect("temp dir");
-        let token_path = temp.path().join("projected-token");
-        std::fs::write(&token_path, b"projected-token-one\n").expect("write token");
+}
 
-        let credential = StockXdsCredentialSource::new(
-            Some(token_path.to_string_lossy().into_owned()),
-            StockCredentialLifetimePolicy::default(),
+// ── issues #3852 / #3853 / #3854: LIVE TLS ADS lifecycle ─────────────────
+//
+// The fixtures above run the production stock client over loopback h2c, which
+// is the only posture issue #3853 still admits without a bearer. Everything a
+// BEARER touches has to be proven over real authenticated TLS, because that is
+// the only transport the client will attach one to. This module therefore
+// stands up an actual TLS ADS server (rcgen CA + tonic `ServerTlsConfig`),
+// drives `start_stock_xds_client_with_shutdown` against it with the real
+// credential watcher running, and asserts what the *server* observed on the
+// wire — per-RPC `authorization` metadata — rather than re-testing the
+// materialization primitives in isolation.
+mod tls_lifecycle {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    // The two transport-liveness proofs below (blackhole and healthy-idle) are
+    // protocol-agnostic and reuse the loopback h2c fixtures rather than paying
+    // for TLS they do not exercise.
+    use super::stream_lifecycle::{EndpointBehaviour, LifecycleHarness, serve};
+
+    use ferrum_edge::config::env_config::EnvConfig;
+    use ferrum_edge::grpc::dp_client::{DpGrpcTlsConfig, DpGrpcTlsReload};
+    use ferrum_edge::modes::mesh::config_consumer::stock_xds_credential::{
+        StockCredentialWatch as CredentialWatch, start_stock_credential_watcher_with_shutdown,
+    };
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tonic::transport::{Certificate, Identity, ServerTlsConfig};
+
+    const THIRD_CLUSTER: &str = "outbound|9080||poison.default.svc.cluster.local";
+
+    fn ensure_crypto_provider() {
+        let _ = rustls::crypto::CryptoProvider::install_default(
+            rustls::crypto::ring::default_provider(),
         );
-        let credential_watch = StockCredentialWatch::new(StockCredentialState::Unknown);
+    }
 
-        // `allow_loopback_plaintext` is set in this harness, but a bearer is
-        // never admissible over h2c: the client must refuse the endpoint on
-        // transport grounds before it ever attaches the credential.
+    /// One CA plus a server leaf and a client leaf issued from it.
+    ///
+    /// Everything is issued in one call so the `rcgen::Issuer` never has to be
+    /// named in a struct field, which keeps this fixture insensitive to rcgen's
+    /// issuer lifetime parameterization.
+    struct IssuedMaterial {
+        ca_pem: Vec<u8>,
+        server_cert_pem: Vec<u8>,
+        server_key_pem: Vec<u8>,
+        client_cert_pem: Vec<u8>,
+        client_key_pem: Vec<u8>,
+    }
+
+    /// `server_dns` are the leaf's dNSName SANs. `server_expired` backdates the
+    /// leaf's validity window so the negative expired-certificate case uses a
+    /// genuinely expired certificate rather than a mocked verifier.
+    fn issue_material(server_dns: &[&str], server_expired: bool) -> IssuedMaterial {
+        ensure_crypto_provider();
+        let ca_key =
+            rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("generate CA key");
+        let mut ca_params =
+            rcgen::CertificateParams::new(vec!["Ferrum Stock xDS Test CA".to_string()])
+                .expect("CA params");
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_cert = ca_params.self_signed(&ca_key).expect("self-signed CA");
+        let ca_pem = ca_cert.pem().into_bytes();
+        let issuer = rcgen::Issuer::new(ca_params, ca_key);
+
+        let server_key =
+            rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("server key");
+        let mut server_params = rcgen::CertificateParams::new(
+            server_dns.iter().map(|d| (*d).to_string()).collect::<Vec<_>>(),
+        )
+        .expect("server params");
+        // The loopback iPAddress SAN is what the client actually verifies
+        // against; it is added only for leaves that are meant to be valid for
+        // this fixture, so a `wrong.example`-only leaf is a real mismatch.
+        if server_dns.contains(&"localhost") {
+            server_params
+                .subject_alt_names
+                .push(rcgen::SanType::IpAddress(std::net::IpAddr::V4(
+                    std::net::Ipv4Addr::LOCALHOST,
+                )));
+        }
+        if server_expired {
+            server_params.not_before = time::OffsetDateTime::now_utc() - time::Duration::days(30);
+            server_params.not_after = time::OffsetDateTime::now_utc() - time::Duration::days(1);
+        }
+        let server_cert = server_params
+            .signed_by(&server_key, &issuer)
+            .expect("server leaf");
+
+        let client_key =
+            rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("client key");
+        let client_params = rcgen::CertificateParams::new(vec!["ferrum-dp".to_string()])
+            .expect("client params");
+        let client_cert = client_params
+            .signed_by(&client_key, &issuer)
+            .expect("client leaf");
+
+        IssuedMaterial {
+            ca_pem,
+            server_cert_pem: server_cert.pem().into_bytes(),
+            server_key_pem: server_key.serialize_pem().into_bytes(),
+            client_cert_pem: client_cert.pem().into_bytes(),
+            client_key_pem: client_key.serialize_pem().into_bytes(),
+        }
+    }
+
+    /// What a scripted TLS ADS endpoint does once the streaming RPC is open.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum TlsBehaviour {
+        /// Serve CDS then EDS for two services and hold the stream open.
+        Converged,
+        /// Accept the RPC and neither read the request stream nor answer it.
+        /// This is the "stalled consumer" shape: the client must still reach a
+        /// bounded retirement instead of parking on an awaited send.
+        StallRequests,
+    }
+
+    #[derive(Clone)]
+    struct TlsAds {
+        /// `authorization` metadata observed on each accepted RPC, in order.
+        authorizations: Arc<Mutex<Vec<String>>>,
+        streams: Arc<AtomicUsize>,
+        behaviour: TlsBehaviour,
+        /// Flipped by the test to make the FIRST stream push an extra cluster
+        /// after the credential has already been observed as rotated.
+        poison: watch::Receiver<bool>,
+        /// Set when that extra push was actually written to the first stream.
+        poison_written: Arc<AtomicBool>,
+    }
+
+    impl TlsAds {
+        fn stream_count(&self) -> usize {
+            self.streams.load(Ordering::SeqCst)
+        }
+
+        fn authorization_snapshot(&self) -> Vec<String> {
+            self.authorizations
+                .lock()
+                .expect("authorization mutex is never held across a panic")
+                .clone()
+        }
+    }
+
+    fn cds_response(clusters: &[&str], version: &str, nonce: &str) -> DiscoveryResponse {
+        DiscoveryResponse {
+            version_info: version.to_string(),
+            resources: clusters
+                .iter()
+                .map(|name| any_resource(CDS_TYPE_URL, &eds_cluster(name, REVIEWS_SAN)))
+                .collect(),
+            canary: false,
+            type_url: CDS_TYPE_URL.to_string(),
+            nonce: nonce.to_string(),
+            control_plane: None,
+        }
+    }
+
+    fn eds_response() -> DiscoveryResponse {
+        DiscoveryResponse {
+            version_info: "eds-v1".to_string(),
+            resources: vec![
+                any_resource(EDS_TYPE_URL, &cla(REVIEWS_CLUSTER, "10.1.2.3", 9080)),
+                any_resource(EDS_TYPE_URL, &cla(RATINGS_CLUSTER, "10.1.2.4", 9080)),
+            ],
+            canary: false,
+            type_url: EDS_TYPE_URL.to_string(),
+            nonce: "eds-n1".to_string(),
+            control_plane: None,
+        }
+    }
+
+    #[tonic::async_trait]
+    impl AggregatedDiscoveryService for TlsAds {
+        type StreamAggregatedResourcesStream = std::pin::Pin<
+            Box<dyn tokio_stream::Stream<Item = Result<DiscoveryResponse, Status>> + Send>,
+        >;
+        type DeltaAggregatedResourcesStream = std::pin::Pin<
+            Box<dyn tokio_stream::Stream<Item = Result<DeltaDiscoveryResponse, Status>> + Send>,
+        >;
+
+        async fn stream_aggregated_resources(
+            &self,
+            request: Request<Streaming<DiscoveryRequest>>,
+        ) -> Result<Response<Self::StreamAggregatedResourcesStream>, Status> {
+            let stream_index = self.streams.fetch_add(1, Ordering::SeqCst);
+            let observed = request
+                .metadata()
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("<none>")
+                .to_string();
+            self.authorizations
+                .lock()
+                .expect("authorization mutex")
+                .push(observed);
+
+            let mut inbound = request.into_inner();
+            let behaviour = self.behaviour;
+            // `Option` + `take()`: the inner spawn moves the receiver, and the
+            // compiler cannot see that the `sent_eds` guard makes that happen at
+            // most once per stream.
+            let mut poison = Some(self.poison.clone());
+            let poison_written = self.poison_written.clone();
+            let (tx, rx) = mpsc::channel(32);
+
+            tokio::spawn(async move {
+                if behaviour == TlsBehaviour::StallRequests {
+                    // Never read `inbound`, never send: hold both halves open.
+                    // `inbound` and `tx` stay alive for the whole park, so the
+                    // client sees an established, silent, non-consuming peer.
+                    let _held = (inbound, tx);
+                    std::future::pending::<()>().await;
+                    return;
+                }
+
+                let mut sent_cds = false;
+                let mut sent_eds = false;
+                while let Ok(Some(discovery_request)) = inbound.message().await {
+                    let type_url = discovery_request.type_url.clone();
+                    let has_resource_names = !discovery_request.resource_names.is_empty();
+                    if type_url == CDS_TYPE_URL && !sent_cds {
+                        sent_cds = true;
+                        if tx
+                            .send(Ok(cds_response(
+                                &[REVIEWS_CLUSTER, RATINGS_CLUSTER],
+                                "cds-v1",
+                                "cds-n1",
+                            )))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                        continue;
+                    }
+                    if type_url == EDS_TYPE_URL && !sent_eds && has_resource_names {
+                        sent_eds = true;
+                        if tx.send(Ok(eds_response())).await.is_err() {
+                            return;
+                        }
+                        // Only the FIRST stream can be poisoned: every later
+                        // stream serves the same two services, so a slice that
+                        // ever shows three could only have come from the stream
+                        // the credential rotation retired.
+                        if stream_index == 0
+                            && let Some(mut poison) = poison.take()
+                        {
+                            let poison_tx = tx.clone();
+                            let written = poison_written.clone();
+                            tokio::spawn(async move {
+                                while poison.changed().await.is_ok() {
+                                    if !*poison.borrow() {
+                                        continue;
+                                    }
+                                    let sent = poison_tx
+                                        .send(Ok(cds_response(
+                                            &[REVIEWS_CLUSTER, RATINGS_CLUSTER, THIRD_CLUSTER],
+                                            "cds-v2",
+                                            "cds-n2",
+                                        )))
+                                        .await
+                                        .is_ok();
+                                    written.store(sent, Ordering::SeqCst);
+                                    return;
+                                }
+                            });
+                        }
+                    }
+                }
+            });
+
+            Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+        }
+
+        async fn delta_aggregated_resources(
+            &self,
+            _request: Request<Streaming<DeltaDiscoveryRequest>>,
+        ) -> Result<Response<Self::DeltaAggregatedResourcesStream>, Status> {
+            Err(Status::unimplemented("delta xDS is not part of this fixture"))
+        }
+    }
+
+    /// A live TLS ADS endpoint plus the handle needed to join its task.
+    struct TlsEndpoint {
+        ads: TlsAds,
+        url: String,
+        poison_tx: watch::Sender<bool>,
+        shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+        task: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+    }
+
+    impl TlsEndpoint {
+        async fn shutdown(mut self) {
+            if let Some(tx) = self.shutdown_tx.take() {
+                let _ = tx.send(());
+            }
+            // A parked handler holds its connection task, so the graceful wait
+            // is bounded and then the accept loop is torn down explicitly.
+            let _ = tokio::time::timeout(Duration::from_secs(2), &mut self.task).await;
+            self.task.abort();
+        }
+    }
+
+    /// Bind a TLS ADS endpoint. `require_client_cert` makes it mTLS.
+    async fn serve_tls(
+        behaviour: TlsBehaviour,
+        material: &IssuedMaterial,
+        require_client_cert: bool,
+    ) -> TlsEndpoint {
+        let (poison_tx, poison_rx) = watch::channel(false);
+        let ads = TlsAds {
+            authorizations: Arc::new(Mutex::new(Vec::new())),
+            streams: Arc::new(AtomicUsize::new(0)),
+            behaviour,
+            poison: poison_rx,
+            poison_written: Arc::new(AtomicBool::new(false)),
+        };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind TLS ADS listener");
+        let port = listener.local_addr().expect("listener addr").port();
+        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+
+        let mut tls = ServerTlsConfig::new().identity(Identity::from_pem(
+            &material.server_cert_pem,
+            &material.server_key_pem,
+        ));
+        if require_client_cert {
+            tls = tls.client_ca_root(Certificate::from_pem(&material.ca_pem));
+        }
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let served = ads.clone();
+        let task = tokio::spawn(async move {
+            Server::builder()
+                .tls_config(tls)
+                .expect("server TLS configuration")
+                .add_service(AggregatedDiscoveryServiceServer::new(served))
+                .serve_with_incoming_shutdown(incoming, async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+
+        TlsEndpoint {
+            ads,
+            // The literal loopback IP, matched against the leaf's iPAddress
+            // SAN. A `localhost` authority would depend on the host's
+            // resolver preferring A over AAAA, which hosted runners do not
+            // guarantee — and the SAN-mismatch case below proves hostname
+            // verification is genuinely enforced either way.
+            url: format!("https://127.0.0.1:{port}"),
+            poison_tx,
+            shutdown_tx: Some(shutdown_tx),
+            task,
+        }
+    }
+
+    /// Everything a live TLS attempt needs, so each test states only what it
+    /// varies.
+    struct TlsClientSpec {
+        urls: Vec<String>,
+        token_path: Option<std::path::PathBuf>,
+        policy: StockCredentialLifetimePolicy,
+        tls_config: Option<DpGrpcTlsConfig>,
+        tls_reload: Option<DpGrpcTlsReload>,
+        timings: MeshStreamTimings,
+        /// Run the production credential watcher alongside the client.
+        watch_credential: bool,
+    }
+
+    struct TlsHarness {
+        state: MeshRuntimeState,
+        credential_watch: CredentialWatch,
+        shutdown_tx: watch::Sender<bool>,
+        tasks: Vec<tokio::task::JoinHandle<()>>,
+        _policy_dir: tempfile::TempDir,
+        _policy_tx: watch::Sender<StockPolicySnapshot>,
+    }
+
+    impl TlsHarness {
+        async fn start(spec: TlsClientSpec) -> Self {
+            let policy_dir = tempfile::tempdir().expect("temp dir");
+            let policy_path = policy_dir.path().join("mesh-policy.yaml");
+            std::fs::write(&policy_path, POLICY_DOCUMENT).expect("write policy document");
+            let baseline =
+                load_stock_policy_baseline(&policy_path).expect("policy document is valid");
+
+            let credential = StockXdsCredentialSource::new(
+                spec.token_path
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().into_owned()),
+                spec.policy,
+            );
+            let credential_watch = CredentialWatch::new(credential.initial_state());
+
+            let state = MeshRuntimeState::new();
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let (policy_tx, policy_rx) =
+                watch::channel(StockPolicySnapshot::initial(Arc::new(baseline)));
+
+            let config = StockXdsClientConfig {
+                xds_urls: spec.urls,
+                node_id: "sidecar~10.1.2.3~reviews.default~default.svc.cluster.local".to_string(),
+                cluster: "default".to_string(),
+                namespace: "default".to_string(),
+                node_metadata: Default::default(),
+                credential: credential.clone(),
+                // Irrelevant here: every endpoint is `https://`, which is the
+                // only posture a bearer may ride.
+                allow_loopback_plaintext: false,
+                stream_channel_capacity: 32,
+                primary_retry_secs: 0,
+                connect_timeout_seconds: 5,
+                limits: StockXdsLimits::default(),
+                timings: spec.timings,
+            };
+            let request = MeshSliceRequest {
+                node_id: config.node_id.clone(),
+                namespace: "default".to_string(),
+                cluster_domain: "cluster.local".to_string(),
+                ..MeshSliceRequest::default()
+            };
+
+            let mut tasks = Vec::new();
+            if spec.watch_credential {
+                tasks.push(tokio::spawn(start_stock_credential_watcher_with_shutdown(
+                    credential,
+                    credential_watch.clone(),
+                    shutdown_rx.clone(),
+                )));
+            }
+            tasks.push(tokio::spawn(start_stock_xds_client_with_shutdown(
+                config,
+                request,
+                state.clone(),
+                shutdown_rx,
+                spec.tls_config,
+                spec.tls_reload,
+                policy_rx,
+                MeshLocalSourceRecovery::new(Arc::new(AtomicBool::new(false))),
+                credential_watch.clone(),
+            )));
+
+            Self {
+                state,
+                credential_watch,
+                shutdown_tx,
+                tasks,
+                _policy_dir: policy_dir,
+                _policy_tx: policy_tx,
+            }
+        }
+
+        fn services(&self) -> Option<usize> {
+            self.state
+                .snapshot()
+                .as_ref()
+                .as_ref()
+                .map(|slice| slice.services.len())
+        }
+
+        async fn wait_for_services(&self, expected: usize, what: &str) {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                if self.services() == Some(expected) {
+                    return;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "timed out waiting for {expected} services ({what}); observed {:?}",
+                    self.services()
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        fn status_field<T>(&self, pick: impl Fn(&MeshConfigStreamStatus) -> T) -> Option<T> {
+            self.state.config_stream_status().as_ref().map(pick)
+        }
+
+        /// Prove every spawned task joins on shutdown rather than being left
+        /// detached with a live stream or a live credential watcher.
+        async fn shutdown_and_join(self) {
+            let _ = self.shutdown_tx.send(true);
+            for task in self.tasks {
+                tokio::time::timeout(Duration::from_secs(15), task)
+                    .await
+                    .expect("every mesh background task must observe shutdown and return")
+                    .expect("no mesh background task may panic");
+            }
+        }
+    }
+
+    fn dp_tls(material: &IssuedMaterial, with_client_cert: bool) -> DpGrpcTlsConfig {
+        DpGrpcTlsConfig {
+            ca_cert_pem: Some(material.ca_pem.clone()),
+            client_cert_pem: with_client_cert.then(|| material.client_cert_pem.clone()),
+            client_key_pem: with_client_cert.then(|| material.client_key_pem.clone()),
+        }
+    }
+
+    fn write_token(dir: &tempfile::TempDir, name: &str, value: &str) -> std::path::PathBuf {
+        let path = dir.path().join(name);
+        std::fs::write(&path, value.as_bytes()).expect("write token");
+        path
+    }
+
+    /// A JWT-shaped token whose `exp` is `secs_from_now` in the future. The
+    /// signature is never verified — the client uses `exp` only as a local
+    /// reconnect-scheduling hint that may never schedule past expiry.
+    fn jwt_expiring_in(secs_from_now: i64) -> String {
+        use base64::Engine as _;
+        let exp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("after the epoch")
+            .as_secs() as i64
+            + secs_from_now;
+        let header =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256"}"#);
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(format!(r#"{{"exp":{exp},"sub":"system:serviceaccount:default:reviews"}}"#));
+        format!("{header}.{payload}.c2ln")
+    }
+
+    fn fast_timings() -> MeshStreamTimings {
+        MeshStreamTimings {
+            first_frame: Duration::from_secs(10),
+            first_slice: Duration::from_secs(20),
+            ..MeshStreamTimings::production()
+        }
+    }
+
+    fn fast_policy(max_stream_lifetime: Duration) -> StockCredentialLifetimePolicy {
+        StockCredentialLifetimePolicy {
+            max_stream_lifetime,
+            refresh_skew: Duration::from_secs(0),
+            // Compressed so a rotation is observed inside a hosted test rather
+            // than after the shipped 10s cadence.
+            watch_interval: Duration::from_millis(100),
+        }
+    }
+
+    // ── issue #3852: live rotation, invalidation, and deadlines ──────────
+
+    /// Issue #3852, acceptance criteria 1 and 5, proven against a real
+    /// authenticated TLS ADS server driving the production client.
+    ///
+    /// A healthy stream is established with token one; the projected token is
+    /// then replaced. The production credential watcher observes it, the stream
+    /// is retired, and the NEXT RPC carries only token two. A response the
+    /// retired stream emits after that observation must never be installed:
+    /// only the first stream can push a third cluster, so a slice that ever
+    /// shows three services could only have come from the retired credential.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_rotated_projected_token_retires_the_live_stream_and_only_the_new_token_is_presented()
+    {
+        let material = issue_material(&["localhost"], false);
+        let endpoint = serve_tls(TlsBehaviour::Converged, &material, false).await;
+        let tokens = tempfile::tempdir().expect("temp dir");
+        let token_path = write_token(&tokens, "projected-token", "projected-token-one");
+
+        let harness = TlsHarness::start(TlsClientSpec {
+            urls: vec![endpoint.url.clone()],
+            token_path: Some(token_path.clone()),
+            policy: fast_policy(Duration::from_secs(3600)),
+            tls_config: Some(dp_tls(&material, false)),
+            tls_reload: None,
+            timings: fast_timings(),
+            watch_credential: true,
+        })
+        .await;
+
+        harness.wait_for_services(2, "the first authenticated stream").await;
+        assert_eq!(endpoint.ads.stream_count(), 1);
+        assert_eq!(
+            endpoint.ads.authorization_snapshot(),
+            vec!["Bearer projected-token-one".to_string()],
+            "the ADS server must receive the bearer over the authenticated TLS channel"
+        );
+        assert_eq!(
+            harness.status_field(|status| status.state),
+            Some("connected"),
+            "a live stream serving usable configuration is `connected`"
+        );
+        assert_eq!(harness.status_field(|status| status.credential), Some("valid"));
+
+        // A continuous sampler: the retired stream's push must never become
+        // visible, not merely be absent at the end.
+        let sampler_state = harness.state.clone();
+        let sampler_stop = Arc::new(AtomicBool::new(false));
+        let stop = sampler_stop.clone();
+        let sampler = tokio::spawn(async move {
+            let mut worst = 0usize;
+            while !stop.load(Ordering::SeqCst) {
+                if let Some(slice) = sampler_state.snapshot().as_ref().as_ref() {
+                    worst = worst.max(slice.services.len());
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            worst
+        });
+
+        let generation_before = harness.credential_watch.latest().generation;
+        std::fs::write(&token_path, b"projected-token-two").expect("rotate token");
+
+        // Wait until the PRODUCTION watcher has observed the rotation, then
+        // make the retired stream push its poison frame.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while harness.credential_watch.latest().generation == generation_before {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the credential watcher must observe the rotation"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let _ = endpoint.poison_tx.send(true);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while endpoint.ads.stream_count() < 2 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the rotation must retire the stream and open a new one"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        harness.wait_for_services(2, "the replacement stream").await;
+
+        let observed = endpoint.ads.authorization_snapshot();
+        assert!(observed.len() >= 2, "{observed:?}");
+        assert_eq!(observed[0], "Bearer projected-token-one");
+        for (index, value) in observed.iter().enumerate().skip(1) {
+            assert_eq!(
+                value, "Bearer projected-token-two",
+                "RPC #{index} must carry only the replacement token: {observed:?}"
+            );
+        }
+
+        sampler_stop.store(true, Ordering::SeqCst);
+        let worst = sampler.await.expect("sampler task");
+        assert_eq!(
+            worst, 2,
+            "a response from the retired credential's stream must never be installed \
+             (poison_written={})",
+            endpoint.ads.poison_written.load(Ordering::SeqCst)
+        );
+
+        harness.shutdown_and_join().await;
+        endpoint.shutdown().await;
+    }
+
+    /// Issue #3852, acceptance criterion 2: invalidating a previously HEALTHY
+    /// source retires the stream and blocks reconnection until valid material
+    /// returns.
+    ///
+    /// The live case is exercised through the real reader with the
+    /// representative shapes a projected secret actually reaches — deleted,
+    /// then empty — and recovery is proven by writing valid material back. The
+    /// exhaustive boundary matrix (non-regular, oversized, invalid UTF-8,
+    /// non-ASCII metadata, unreadable-where-portable, expired) runs through the
+    /// same `StockXdsCredentialSource::materialize` boundary in
+    /// `tests/unit/gateway_core/mesh_stream_lifecycle_tests.rs`, because a
+    /// live server cannot distinguish them: they all produce the identical
+    /// closed `SourceInvalid` posture and the identical refusal to dial.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn invalidating_a_healthy_credential_source_blocks_reconnect_until_it_returns() {
+        let material = issue_material(&["localhost"], false);
+        let endpoint = serve_tls(TlsBehaviour::Converged, &material, false).await;
+        let tokens = tempfile::tempdir().expect("temp dir");
+        let token_path = write_token(&tokens, "projected-token", "projected-token-one");
+
+        let harness = TlsHarness::start(TlsClientSpec {
+            urls: vec![endpoint.url.clone()],
+            token_path: Some(token_path.clone()),
+            policy: fast_policy(Duration::from_secs(3600)),
+            tls_config: Some(dp_tls(&material, false)),
+            tls_reload: None,
+            timings: fast_timings(),
+            watch_credential: true,
+        })
+        .await;
+
+        harness.wait_for_services(2, "the healthy stream").await;
+        let healthy_streams = endpoint.ads.stream_count();
+        assert_eq!(healthy_streams, 1);
+
+        // Delete it, then leave an empty replacement: both are unusable, and
+        // neither may permit a reconnect.
+        std::fs::remove_file(&token_path).expect("delete token");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            if harness.status_field(|status| status.credential) == Some("source_invalid") {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the deleted source must be observed as invalid"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        std::fs::write(&token_path, b"   \n").expect("write empty token");
+
+        // The last-good slice keeps serving while reconnection is refused.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(
+            endpoint.ads.stream_count(),
+            healthy_streams,
+            "an invalid credential source must PREVENT reconnection, not merely fail one read"
+        );
+        assert_eq!(
+            harness.services(),
+            Some(2),
+            "the already-installed slice keeps serving"
+        );
+        assert_eq!(
+            harness.status_field(|status| status.credential),
+            Some("source_invalid")
+        );
+
+        // Valid material returns: the client reconnects and presents it.
+        std::fs::write(&token_path, b"projected-token-three").expect("restore token");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while endpoint.ads.stream_count() <= healthy_streams {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "valid replacement material must reopen the stream"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let observed = endpoint.ads.authorization_snapshot();
+        assert_eq!(
+            observed.last().map(String::as_str),
+            Some("Bearer projected-token-three")
+        );
+
+        harness.shutdown_and_join().await;
+        endpoint.shutdown().await;
+    }
+
+    /// Issue #3852, acceptance criterion 5: an unchanged token must not churn
+    /// the ADS stream, even though the watcher re-reads it ten times a second.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_unchanged_token_does_not_churn_the_stream() {
+        let material = issue_material(&["localhost"], false);
+        let endpoint = serve_tls(TlsBehaviour::Converged, &material, false).await;
+        let tokens = tempfile::tempdir().expect("temp dir");
+        let token_path = write_token(&tokens, "projected-token", "projected-token-stable");
+
+        let harness = TlsHarness::start(TlsClientSpec {
+            urls: vec![endpoint.url.clone()],
+            token_path: Some(token_path.clone()),
+            policy: fast_policy(Duration::from_secs(3600)),
+            tls_config: Some(dp_tls(&material, false)),
+            tls_reload: None,
+            timings: fast_timings(),
+            watch_credential: true,
+        })
+        .await;
+
+        harness.wait_for_services(2, "the stable stream").await;
+        let generation = harness.credential_watch.latest().generation;
+
+        // Rewrite the SAME bytes: content-based detection must not see a change.
+        for _ in 0..5 {
+            std::fs::write(&token_path, b"projected-token-stable").expect("rewrite token");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        assert_eq!(
+            endpoint.ads.stream_count(),
+            1,
+            "an unchanged credential must not retire a healthy stream"
+        );
+        assert_eq!(harness.credential_watch.latest().generation, generation);
+        assert_eq!(harness.status_field(|status| status.state), Some("connected"));
+
+        harness.shutdown_and_join().await;
+        endpoint.shutdown().await;
+    }
+
+    /// Issue #3852, acceptance criteria 3 and 4.
+    ///
+    /// A short-lived JWT reconnects strictly BEFORE `exp` even though the peer
+    /// would happily keep the stream open, and an opaque token reconnects at
+    /// the finite maximum stream lifetime even though the file never changes.
+    /// The two cases share one fixture because the observable is identical: a
+    /// second RPC with no external stimulus at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_finite_authorization_deadline_reconnects_without_any_external_stimulus() {
+        for (label, token, policy, must_reconnect_within) in [
+            (
+                "opaque",
+                "an-opaque-projected-token".to_string(),
+                // Below the operator-facing 60s minimum on purpose: that floor
+                // is enforced where an operator can set it, so a programmatic
+                // policy can prove the deadline live without a production wait.
+                fast_policy(Duration::from_secs(2)),
+                Duration::from_secs(25),
+            ),
+            (
+                "short-lived JWT",
+                jwt_expiring_in(3),
+                fast_policy(Duration::from_secs(3600)),
+                Duration::from_secs(25),
+            ),
+        ] {
+            let material = issue_material(&["localhost"], false);
+            let endpoint = serve_tls(TlsBehaviour::Converged, &material, false).await;
+            let tokens = tempfile::tempdir().expect("temp dir");
+            let token_path = write_token(&tokens, "projected-token", &token);
+
+            let harness = TlsHarness::start(TlsClientSpec {
+                urls: vec![endpoint.url.clone()],
+                token_path: Some(token_path),
+                policy,
+                tls_config: Some(dp_tls(&material, false)),
+                tls_reload: None,
+                timings: fast_timings(),
+                // No watcher: nothing about the SOURCE changes, so only the
+                // authorization deadline can produce a second RPC.
+                watch_credential: false,
+            })
+            .await;
+
+            harness
+                .wait_for_services(2, "the first deadline-bounded stream")
+                .await;
+            let started = tokio::time::Instant::now();
+            let deadline = started + must_reconnect_within;
+            while endpoint.ads.stream_count() < 2 {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "{label}: the credential deadline must retire the stream with no external \
+                     stimulus"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+
+            harness.shutdown_and_join().await;
+            endpoint.shutdown().await;
+        }
+    }
+
+    /// Issue #3852, acceptance criterion 7: failover and failback always
+    /// materialize the LATEST token rather than replaying the value captured by
+    /// an earlier endpoint's interceptor.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn failover_presents_the_newest_token_to_the_fallback_endpoint() {
+        let material = issue_material(&["localhost"], false);
+        // The primary accepts the RPC and then neither reads nor answers, so
+        // the bounded first-frame policy rotates to the fallback.
+        let primary = serve_tls(TlsBehaviour::StallRequests, &material, false).await;
+        let fallback = serve_tls(TlsBehaviour::Converged, &material, false).await;
+        let tokens = tempfile::tempdir().expect("temp dir");
+        let token_path = write_token(&tokens, "projected-token", "projected-token-one");
+
+        let harness = TlsHarness::start(TlsClientSpec {
+            urls: vec![primary.url.clone(), fallback.url.clone()],
+            token_path: Some(token_path.clone()),
+            policy: fast_policy(Duration::from_secs(3600)),
+            tls_config: Some(dp_tls(&material, false)),
+            tls_reload: None,
+            timings: MeshStreamTimings {
+                first_frame: Duration::from_millis(400),
+                first_slice: Duration::from_secs(20),
+                ..MeshStreamTimings::production()
+            },
+            watch_credential: true,
+        })
+        .await;
+
+        // Rotate while the client is still stuck on the stalled primary, so the
+        // fallback's very first RPC must carry the replacement.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while primary.ads.stream_count() == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the primary must be dialed first"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        std::fs::write(&token_path, b"projected-token-two").expect("rotate token");
+
+        harness
+            .wait_for_services(2, "the fallback after a stalled primary")
+            .await;
+
+        let observed = fallback.ads.authorization_snapshot();
+        assert!(!observed.is_empty());
+        assert_eq!(
+            observed.last().map(String::as_str),
+            Some("Bearer projected-token-two"),
+            "the fallback must present the newest material: {observed:?}"
+        );
+        assert_eq!(
+            harness.status_field(|status| status.fallback_active),
+            Some(true),
+            "the client is attached to a non-primary endpoint"
+        );
+
+        harness.shutdown_and_join().await;
+        primary.shutdown().await;
+        fallback.shutdown().await;
+    }
+
+    /// Issue #3852, acceptance criterion 6: simultaneous TLS and token rotation
+    /// produces ONE bounded reconnect that uses the newest values for both.
+    ///
+    /// The client starts with a CA file that trusts the WRONG authority, so no
+    /// stream can open. The correct CA is then written, the TLS revision is
+    /// bumped, and the token is replaced — all before the client's next attempt
+    /// — and the single resulting stream must present the new token over the
+    /// newly trusted TLS material.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn simultaneous_tls_and_token_rotation_yields_one_reconnect_with_the_newest_material() {
+        let serving = issue_material(&["localhost"], false);
+        let unrelated = issue_material(&["localhost"], false);
+        let endpoint = serve_tls(TlsBehaviour::Converged, &serving, false).await;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let ca_path = dir.path().join("cp-ca.pem");
+        std::fs::write(&ca_path, &unrelated.ca_pem).expect("write wrong CA");
+        let token_path = write_token(&dir, "projected-token", "projected-token-one");
+
+        let env_config = Arc::new(EnvConfig {
+            dp_grpc_tls_ca_cert_path: Some(ca_path.to_string_lossy().into_owned()),
+            ..EnvConfig::default()
+        });
+        let (revision_tx, revision_rx) = watch::channel(0u64);
+
+        let harness = TlsHarness::start(TlsClientSpec {
+            urls: vec![endpoint.url.clone()],
+            token_path: Some(token_path.clone()),
+            policy: fast_policy(Duration::from_secs(3600)),
+            tls_config: Some(DpGrpcTlsConfig {
+                ca_cert_pem: Some(unrelated.ca_pem.clone()),
+                client_cert_pem: None,
+                client_key_pem: None,
+            }),
+            tls_reload: Some(DpGrpcTlsReload {
+                env_config,
+                label: "Mesh",
+                revision_rx,
+            }),
+            timings: fast_timings(),
+            watch_credential: true,
+        })
+        .await;
+
+        // Nothing can converge while the wrong CA is trusted.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(
+            harness.services(),
+            None,
+            "an untrusted server certificate must fail closed before any slice is accepted"
+        );
+        assert_eq!(endpoint.ads.stream_count(), 0);
+
+        std::fs::write(&ca_path, &serving.ca_pem).expect("write correct CA");
+        std::fs::write(&token_path, b"projected-token-two").expect("rotate token");
+        revision_tx.send_replace(1);
+
+        harness
+            .wait_for_services(2, "the coalesced TLS + token rotation")
+            .await;
+        let observed = endpoint.ads.authorization_snapshot();
+        assert_eq!(
+            observed.last().map(String::as_str),
+            Some("Bearer projected-token-two"),
+            "the reconnect must use the newest token as well as the newest TLS: {observed:?}"
+        );
+        assert_eq!(
+            endpoint.ads.stream_count(),
+            1,
+            "the two simultaneous lifecycle events must coalesce into ONE stream"
+        );
+
+        harness.shutdown_and_join().await;
+        endpoint.shutdown().await;
+    }
+
+    // ── issue #3853: negative TLS acceptance ─────────────────────────────
+
+    /// Issue #3853, acceptance criterion 7. Each case must fail closed BEFORE a
+    /// slice — or any authorization-bearing discovery update — is accepted.
+    /// A bearer is configured throughout, so these also prove the credential
+    /// never rides a session whose server identity was not established.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn untrusted_mismatched_expired_and_mtls_less_servers_all_fail_closed() {
+        // (label, server material, client TLS, server requires a client cert)
+        let good = issue_material(&["localhost"], false);
+        let other = issue_material(&["localhost"], false);
+        let mismatched = issue_material(&["wrong.example"], false);
+        let expired = issue_material(&["localhost"], true);
+
+        let cases: Vec<(&str, &IssuedMaterial, DpGrpcTlsConfig, bool)> = vec![
+            (
+                "wrong/untrusted CA",
+                &good,
+                DpGrpcTlsConfig {
+                    ca_cert_pem: Some(other.ca_pem.clone()),
+                    client_cert_pem: None,
+                    client_key_pem: None,
+                },
+                false,
+            ),
+            (
+                "hostname/SAN mismatch",
+                &mismatched,
+                dp_tls(&mismatched, false),
+                false,
+            ),
+            (
+                "expired server certificate",
+                &expired,
+                dp_tls(&expired, false),
+                false,
+            ),
+            (
+                "missing required client certificate",
+                &good,
+                // Trusts the server, but presents no client identity to a
+                // server that requires one.
+                dp_tls(&good, false),
+                true,
+            ),
+        ];
+
+        for (label, material, client_tls, require_client_cert) in cases {
+            let endpoint = serve_tls(TlsBehaviour::Converged, material, require_client_cert).await;
+            let tokens = tempfile::tempdir().expect("temp dir");
+            let token_path = write_token(&tokens, "projected-token", "projected-token-one");
+
+            let harness = TlsHarness::start(TlsClientSpec {
+                urls: vec![endpoint.url.clone()],
+                token_path: Some(token_path),
+                policy: fast_policy(Duration::from_secs(3600)),
+                tls_config: Some(client_tls),
+                tls_reload: None,
+                timings: fast_timings(),
+                watch_credential: false,
+            })
+            .await;
+
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            assert_eq!(
+                harness.services(),
+                None,
+                "{label}: no slice may be accepted over a session that failed TLS admission"
+            );
+            assert!(
+                !harness.state.has_first_slice(),
+                "{label}: startup must stay blocked"
+            );
+            assert_eq!(
+                endpoint.ads.stream_count(),
+                0,
+                "{label}: the ADS handler must never be reached"
+            );
+            assert!(
+                endpoint.ads.authorization_snapshot().is_empty(),
+                "{label}: the bearer must never reach a server whose identity was not established"
+            );
+
+            // The failure is reported by a bounded, closed-set outcome — never
+            // a tonic transport error carrying the configured URI or host.
+            let outcome = harness
+                .status_field(|status| status.last_attempt_outcome)
+                .expect("an attempt was recorded");
+            assert_eq!(outcome, "transport_failure", "{label}");
+
+            harness.shutdown_and_join().await;
+            endpoint.shutdown().await;
+        }
+    }
+
+    /// A mutually authenticated server DOES admit the client once it presents
+    /// the required certificate, so the negative cases above are proving a real
+    /// gate rather than a broken fixture.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_mtls_server_admits_the_client_that_presents_its_certificate() {
+        let material = issue_material(&["localhost"], false);
+        let endpoint = serve_tls(TlsBehaviour::Converged, &material, true).await;
+        let tokens = tempfile::tempdir().expect("temp dir");
+        let token_path = write_token(&tokens, "projected-token", "projected-token-one");
+
+        let harness = TlsHarness::start(TlsClientSpec {
+            urls: vec![endpoint.url.clone()],
+            token_path: Some(token_path),
+            policy: fast_policy(Duration::from_secs(3600)),
+            tls_config: Some(dp_tls(&material, true)),
+            tls_reload: None,
+            timings: fast_timings(),
+            watch_credential: false,
+        })
+        .await;
+
+        harness.wait_for_services(2, "the mTLS stream").await;
+        assert_eq!(
+            endpoint.ads.authorization_snapshot(),
+            vec!["Bearer projected-token-one".to_string()]
+        );
+
+        harness.shutdown_and_join().await;
+        endpoint.shutdown().await;
+    }
+
+    // ── issue #3854: established-transport liveness ──────────────────────
+
+    /// A TCP relay that forwards to the real ADS endpoint until told to stop,
+    /// then holds BOTH sockets open and forwards nothing — no FIN, no RST.
+    ///
+    /// This is the half-open shape no connect timeout can see: the client's
+    /// `message()` stays pending forever unless an HTTP/2 PING is emitted and
+    /// its ack is bounded.
+    struct Blackhole {
+        port: u16,
+        stop: Arc<AtomicBool>,
+        task: tokio::task::JoinHandle<()>,
+        /// Every per-connection relay task, so nothing is left parked when the
+        /// fixture is torn down.
+        pumps: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    }
+
+    impl Blackhole {
+        async fn start(upstream_port: u16) -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind blackhole listener");
+            let port = listener.local_addr().expect("blackhole addr").port();
+            let stop = Arc::new(AtomicBool::new(false));
+            let pumps: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>> =
+                Arc::new(Mutex::new(Vec::new()));
+            let accept_stop = stop.clone();
+            let accept_pumps = pumps.clone();
+            let task = tokio::spawn(async move {
+                while let Ok((downstream, _)) = listener.accept().await {
+                    let Ok(upstream) =
+                        tokio::net::TcpStream::connect(("127.0.0.1", upstream_port)).await
+                    else {
+                        continue;
+                    };
+                    let _ = downstream.set_nodelay(true);
+                    let _ = upstream.set_nodelay(true);
+                    let (down_read, down_write) = downstream.into_split();
+                    let (up_read, up_write) = upstream.into_split();
+                    let mut registered = accept_pumps
+                        .lock()
+                        .expect("blackhole pump registry is never held across a panic");
+                    registered.push(tokio::spawn(pump(down_read, up_write, accept_stop.clone())));
+                    registered.push(tokio::spawn(pump(up_read, down_write, accept_stop.clone())));
+                }
+            });
+            Self {
+                port,
+                stop,
+                task,
+                pumps,
+            }
+        }
+
+        fn blackhole(&self) {
+            self.stop.store(true, Ordering::SeqCst);
+        }
+
+        /// A parked relay half is holding sockets open on purpose, so it can
+        /// only be cancelled — but it IS cancelled, and awaited, so no task
+        /// outlives the fixture.
+        async fn shutdown(self) {
+            self.task.abort();
+            let _ = self.task.await;
+            let pumps = std::mem::take(
+                &mut *self
+                    .pumps
+                    .lock()
+                    .expect("blackhole pump registry is never held across a panic"),
+            );
+            for pump in pumps {
+                pump.abort();
+                let _ = pump.await;
+            }
+        }
+    }
+
+    /// Copy one direction until `stop` is set, then park forever while HOLDING
+    /// both halves. Dropping them would close the socket and produce a FIN,
+    /// which is precisely the signal a blackhole does not give.
+    async fn pump(
+        mut from: tokio::net::tcp::OwnedReadHalf,
+        mut to: tokio::net::tcp::OwnedWriteHalf,
+        stop: Arc<AtomicBool>,
+    ) {
+        let mut buf = vec![0u8; 16 * 1024];
+        loop {
+            if stop.load(Ordering::SeqCst) {
+                let _held = (from, to);
+                std::future::pending::<()>().await;
+                return;
+            }
+            // The tick lets the blackhole engage even while the link is idle.
+            // `AsyncReadExt::read` is cancel-safe, so dropping it here loses no
+            // bytes that were already delivered to userspace.
+            let read = tokio::select! {
+                read = from.read(&mut buf) => read,
+                _ = tokio::time::sleep(Duration::from_millis(20)) => continue,
+            };
+            match read {
+                Ok(0) | Err(_) => return,
+                Ok(n) => {
+                    if stop.load(Ordering::SeqCst) {
+                        let _held = (from, to);
+                        std::future::pending::<()>().await;
+                        return;
+                    }
+                    if to.write_all(&buf[..n]).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Issue #3854, acceptance criterion 3 — the half-open proof.
+    ///
+    /// The client first ESTABLISHES a stream and installs a slice through the
+    /// relay. The relay then stops forwarding while holding both sockets open,
+    /// so no FIN or RST ever reaches the client. Only the HTTP/2 PING policy
+    /// can detect this, and the client must fail over to the direct fallback
+    /// within the documented bound for the timing policy it is running.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_blackholed_established_transport_fails_over_within_the_documented_bound() {
+        let (primary_ads, primary_url) = serve(EndpointBehaviour::Converged).await;
+        let primary_port: u16 = primary_url
+            .rsplit(':')
+            .next()
+            .and_then(|port| port.parse().ok())
+            .expect("primary port");
+        let blackhole = Blackhole::start(primary_port).await;
+        let (fallback_ads, fallback_url) = serve(EndpointBehaviour::Converged).await;
+
+        // Compressed, per-invocation stack state with production defaults for
+        // everything else. There is no env or global path into these values.
+        let timings = MeshStreamTimings {
+            keepalive_interval: Duration::from_millis(300),
+            keepalive_timeout: Duration::from_millis(300),
+            first_frame: Duration::from_secs(20),
+            first_slice: Duration::from_secs(30),
+            ..MeshStreamTimings::production()
+        };
         let harness = LifecycleHarness::start(
-            vec![url],
-            credential.clone(),
-            credential_watch.clone(),
-            MeshStreamTimings::production(),
+            vec![
+                format!("http://127.0.0.1:{}", blackhole.port),
+                fallback_url,
+            ],
+            StockXdsCredentialSource::unauthenticated(),
+            StockCredentialWatch::new(StockCredentialState::NotConfigured),
+            timings,
         )
         .await;
 
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        assert_eq!(
-            endpoint.stream_count(),
-            0,
-            "a bearer credential must never ride a plaintext ADS endpoint (issue #3853)"
-        );
+        // The stream must be genuinely ESTABLISHED and serving before the
+        // blackhole engages; otherwise this would only re-prove connect
+        // timeouts.
+        harness.wait_for_services(2).await;
+        assert_eq!(primary_ads.stream_count(), 1);
+        assert_eq!(fallback_ads.stream_count(), 0);
+
+        let engaged = tokio::time::Instant::now();
+        blackhole.blackhole();
+
+        let deadline = engaged + Duration::from_secs(20);
+        while fallback_ads.stream_count() == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "a blackholed established transport must be detected by the HTTP/2 keepalive \
+                 policy and fail over"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let detected = engaged.elapsed();
         assert!(
-            endpoint.authorization_snapshot().is_empty(),
-            "no authorization metadata may reach an unauthenticated endpoint"
+            detected < Duration::from_secs(15),
+            "detection must stay bounded, took {detected:?}"
         );
+
         harness.shutdown_and_join().await;
+        blackhole.shutdown().await;
+    }
 
-        // The credential half is then proven directly: a rotation of the source
-        // advances the watch generation the live stream races, and the newly
-        // materialized credential is the replacement, never the previous value.
-        let before = credential
-            .materialize()
-            .await
-            .expect("readable")
-            .expect("configured");
-        assert!(credential_watch.publish(before.observed_state()));
+    /// The other half of the same policy: a healthy but application-IDLE
+    /// standard-xDS stream must stay connected while PING acks succeed. Without
+    /// `keep_alive_while_idle`, tonic stops pinging exactly when a blackhole
+    /// would be invisible — and with a naive silence watchdog this stream would
+    /// be torn down for being legitimately quiet.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_healthy_application_idle_stream_stays_connected_while_pings_succeed() {
+        let (ads, url) = serve(EndpointBehaviour::Converged).await;
+        let timings = MeshStreamTimings {
+            keepalive_interval: Duration::from_millis(200),
+            keepalive_timeout: Duration::from_millis(200),
+            ..MeshStreamTimings::production()
+        };
+        let harness = LifecycleHarness::start(
+            vec![url],
+            StockXdsCredentialSource::unauthenticated(),
+            StockCredentialWatch::new(StockCredentialState::NotConfigured),
+            timings,
+        )
+        .await;
 
-        std::fs::write(&token_path, b"projected-token-two\n").expect("rotate token");
-        let after = credential
-            .materialize()
-            .await
-            .expect("readable")
-            .expect("configured");
-        assert_ne!(before.fingerprint(), after.fingerprint());
-        assert!(
-            credential_watch.publish(after.observed_state()),
-            "a rotation must advance the generation the ADS stream races"
-        );
+        harness.wait_for_services(2).await;
+        // Many keepalive periods with zero application frames.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
         assert_eq!(
-            after.token().to_str().expect("ascii"),
-            "Bearer projected-token-two"
+            ads.stream_count(),
+            1,
+            "an idle stream whose PINGs are acked must not be retired"
+        );
+        let status = harness
+            .state
+            .config_stream_status()
+            .expect("status is published");
+        assert_eq!(status.state, "connected");
+        assert_eq!(status.consecutive_failures, 0);
+        assert_eq!(
+            status.liveness_bound_seconds, 1,
+            "the reported bound follows the compressed policy actually in force"
         );
 
-        // Re-reading the unchanged replacement must NOT churn the stream.
-        let unchanged = credential
-            .materialize()
-            .await
-            .expect("readable")
-            .expect("configured");
-        assert!(!credential_watch.publish(unchanged.observed_state()));
+        harness.shutdown_and_join().await;
+    }
+
+    /// Issue #3854 round two: a control plane that accepts the streaming RPC
+    /// and then neither reads its request stream nor answers it must not be
+    /// able to park the client. The bounded first-frame policy retires the
+    /// attempt and the fallback converges; every task joins.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_control_plane_that_never_consumes_requests_reaches_a_bounded_retirement() {
+        let material = issue_material(&["localhost"], false);
+        let stalling = serve_tls(TlsBehaviour::StallRequests, &material, false).await;
+        let healthy = serve_tls(TlsBehaviour::Converged, &material, false).await;
+        let tokens = tempfile::tempdir().expect("temp dir");
+        let token_path = write_token(&tokens, "projected-token", "projected-token-one");
+
+        let harness = TlsHarness::start(TlsClientSpec {
+            urls: vec![stalling.url.clone(), healthy.url.clone()],
+            token_path: Some(token_path),
+            policy: fast_policy(Duration::from_secs(3600)),
+            tls_config: Some(dp_tls(&material, false)),
+            tls_reload: None,
+            timings: MeshStreamTimings {
+                first_frame: Duration::from_millis(400),
+                first_slice: Duration::from_secs(20),
+                outbound: Duration::from_millis(400),
+                ..MeshStreamTimings::production()
+            },
+            watch_credential: false,
+        })
+        .await;
+
+        harness
+            .wait_for_services(2, "the fallback after a non-consuming primary")
+            .await;
+        assert_eq!(stalling.ads.stream_count(), 1);
+        assert!(healthy.ads.stream_count() >= 1);
+
+        harness.shutdown_and_join().await;
+        stalling.shutdown().await;
+        healthy.shutdown().await;
     }
 }

@@ -24,12 +24,26 @@
 //!    comparison is over **content**, not inode identity.
 //! 2. **A local authorization deadline.** A JWT-shaped token contributes its
 //!    `exp` as a *reconnect scheduling hint only*, after a bounded, non-verifying
-//!    local decode. It is never treated as proof of anything. An opaque token
-//!    gets the operator-visible maximum stream lifetime, which also caps the
-//!    JWT-derived deadline.
+//!    local decode. It is never treated as proof of anything — but it is also
+//!    never allowed to schedule *past* `exp`. A token that is already expired,
+//!    or whose remaining lifetime cannot leave a positive window once the
+//!    configured skew is subtracted, is **refused**: it becomes an invalid
+//!    credential source rather than being clamped up to some floor. An opaque
+//!    token gets the operator-visible maximum stream lifetime, which also caps
+//!    any JWT-derived deadline.
+//!
+//!    The deadline is ABSOLUTE and is stamped at **admission**, not at stream
+//!    open. Materialization happens before the channel is dialed, so deriving
+//!    the deadline from stream-open time would silently extend a JWT past `exp`
+//!    by however long connect and RPC setup took. [`StockBearerCredential`]
+//!    therefore carries a monotonic deadline instant, and a credential whose
+//!    deadline has already been reached refuses to be attached at all.
 //! 3. **Fail-closed reconnection.** An invalid source does not merely fail the
 //!    next read: it *prevents* reconnection. There is no freshness-only path and
-//!    no fallback to the previously read token.
+//!    no fallback to the previously read token. Expired and too-short material
+//!    lands in that same closed invalid state, so the bounded invalid-source
+//!    retry (plus the watcher wakeup on replacement material) is what avoids a
+//!    hot loop — never a floor that admits the stale token anyway.
 //!
 //! Nothing here ever logs, metrics, or otherwise renders token bytes, decoded
 //! claims, the configured path, or a digest of any of them. The content
@@ -74,14 +88,6 @@ const MAX_JWT_SEGMENT_BYTES: usize = 8 * 1024;
 
 /// Longest decoded JWT payload this decoder will parse as JSON.
 const MAX_JWT_PAYLOAD_BYTES: usize = 8 * 1024;
-
-/// Never schedule a credential-driven reconnect sooner than this.
-///
-/// An already-expired or badly skewed `exp` would otherwise compute a deadline
-/// in the past and turn the reconnect loop into a hot loop against the control
-/// plane. The floor keeps the retry bounded; recovery still comes from the
-/// operator replacing the token, which the watcher observes.
-const MIN_CREDENTIAL_RECONNECT_FLOOR: Duration = Duration::from_secs(60);
 
 /// In-process content identity of a bearer credential.
 ///
@@ -129,6 +135,20 @@ pub enum StockCredentialInvalidReason {
     ReadTimeout,
     /// The shared reader permit could not be acquired (shutdown).
     ReaderUnavailable,
+    /// A JWT-shaped token whose locally decoded `exp` is already in the past
+    /// (or whose issuer's clock is far enough ahead of this node's that it
+    /// reads that way). Refused outright: opening an authenticated stream with
+    /// it would be knowingly presenting expired material.
+    Expired,
+    /// A JWT-shaped token that is not yet expired but cannot leave a positive
+    /// pre-expiry window once the configured refresh skew is subtracted. Using
+    /// it would schedule the reconnect at or after `exp`.
+    ExpiresWithinSkew,
+    /// The credential's absolute local authorization deadline was already
+    /// reached before it could be attached to a streaming RPC — for example
+    /// because dialing the control plane took longer than the token's remaining
+    /// lifetime. The stream is refused rather than opened past the deadline.
+    DeadlineReached,
 }
 
 impl StockCredentialInvalidReason {
@@ -144,6 +164,9 @@ impl StockCredentialInvalidReason {
             Self::NotAsciiMetadata => "token_source_not_ascii_metadata",
             Self::ReadTimeout => "token_source_read_timeout",
             Self::ReaderUnavailable => "token_reader_unavailable",
+            Self::Expired => "token_expired",
+            Self::ExpiresWithinSkew => "token_expires_within_skew",
+            Self::DeadlineReached => "token_deadline_reached",
         }
     }
 
@@ -201,8 +224,10 @@ impl StockCredentialState {
         match self {
             Self::NotConfigured => MeshConfigStreamCredential::NotConfigured,
             // An unobserved configured source is not yet a failure, but it is
-            // not proof of validity either. Report the safe side.
-            Self::Unknown => MeshConfigStreamCredential::NotConfigured,
+            // not proof of validity either — and it is emphatically NOT
+            // "not configured", which would tell the operator their own
+            // configured token file is absent.
+            Self::Unknown => MeshConfigStreamCredential::Unobserved,
             Self::Valid { .. } => MeshConfigStreamCredential::Valid,
             Self::Invalid { .. } => MeshConfigStreamCredential::SourceInvalid,
         }
@@ -294,11 +319,23 @@ impl Default for StockCredentialLifetimePolicy {
 pub const DEFAULT_STOCK_XDS_TOKEN_MAX_STREAM_LIFETIME_SECS: u64 = 3600;
 pub const DEFAULT_STOCK_XDS_TOKEN_REFRESH_SKEW_SECS: u64 = 60;
 pub const DEFAULT_STOCK_XDS_TOKEN_WATCH_INTERVAL_SECS: u64 = 10;
-/// Lowest admissible maximum stream lifetime. Below this the reconnect cadence
-/// is itself the availability problem.
+/// Lowest maximum stream lifetime an OPERATOR may configure. Below this the
+/// reconnect cadence is itself the availability problem, so
+/// `FERRUM_MESH_STOCK_XDS_TOKEN_MAX_STREAM_LIFETIME_SECONDS` is refused at
+/// configuration admission (`MeshRuntimeConfig::from_env_config`) rather than
+/// silently rounded up.
 pub const MIN_STOCK_XDS_TOKEN_MAX_STREAM_LIFETIME_SECS: u64 = 60;
-/// Highest admissible maximum stream lifetime (24h).
+/// Highest admissible maximum stream lifetime (24h). Enforced BOTH at
+/// configuration admission and in code: this is the bound that makes an opaque
+/// bearer's authorization lifetime finite, so it may never be bypassed.
 pub const MAX_STOCK_XDS_TOKEN_MAX_STREAM_LIFETIME_SECS: u64 = 86_400;
+/// Absolute in-code floor. Not an operator-facing knob — it only stops a
+/// programmatically constructed policy of `0` from producing an
+/// already-elapsed deadline. The operator-facing floor is
+/// [`MIN_STOCK_XDS_TOKEN_MAX_STREAM_LIFETIME_SECS`], enforced when the env var
+/// is parsed, and hosted tests use the gap between the two to prove the
+/// opaque-token deadline live without sleeping for a production minute.
+const ABSOLUTE_MAX_STREAM_LIFETIME_FLOOR: Duration = Duration::from_secs(1);
 
 /// The configured credential source plus its lifetime policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -313,6 +350,10 @@ impl StockXdsCredentialSource {
         Self { path, policy }
     }
 
+    // Constructed by the external mesh stock-xDS test suites, which drive the
+    // production client with no bearer configured. The binary target has no
+    // downstream consumer, so the accessor is dead there by construction.
+    #[allow(dead_code)]
     pub fn unauthenticated() -> Self {
         Self {
             path: None,
@@ -377,12 +418,18 @@ pub struct StockBearerCredential {
     token: BearerToken,
     fingerprint: StockCredentialFingerprint,
     lifetime: Duration,
+    /// ABSOLUTE monotonic deadline, stamped at admission. Connect latency,
+    /// TLS handshake, and RPC setup all consume it rather than extend it.
+    deadline: tokio::time::Instant,
     basis: StockCredentialDeadlineBasis,
 }
 
 impl StockBearerCredential {
     /// Build the `authorization` metadata value, the content fingerprint, and
-    /// the local authorization lifetime for one raw token.
+    /// the absolute local authorization deadline for one raw token.
+    ///
+    /// Fails closed for a JWT-shaped token that is already past `exp` or that
+    /// cannot leave a positive pre-expiry window after the configured skew.
     pub fn admit(
         raw_token: &str,
         policy: StockCredentialLifetimePolicy,
@@ -393,11 +440,15 @@ impl StockBearerCredential {
             // dropped and replaced with a closed-set reason.
             .map_err(|_| StockCredentialInvalidReason::NotAsciiMetadata)?;
         let fingerprint = StockCredentialFingerprint::of(raw_token);
-        let (lifetime, basis) = credential_lifetime(raw_token, policy, SystemTime::now());
+        // Both clocks are read at the SAME point so the wall-clock `exp`
+        // arithmetic and the monotonic deadline describe one instant.
+        let admitted_at = tokio::time::Instant::now();
+        let (lifetime, basis) = credential_lifetime(raw_token, policy, SystemTime::now())?;
         Ok(Self {
             token,
             fingerprint,
             lifetime,
+            deadline: admitted_at + lifetime,
             basis,
         })
     }
@@ -406,13 +457,30 @@ impl StockBearerCredential {
         &self.token
     }
 
+    /// The in-process content identity. Read by the external credential tests
+    /// to prove a rotation is observed as a CONTENT change (production compares
+    /// through `observed_state`), so it is dead in the binary target.
+    #[allow(dead_code)]
     pub fn fingerprint(&self) -> StockCredentialFingerprint {
         self.fingerprint
     }
 
-    /// How long this stream may stay authenticated, from now.
+    /// The authorization lifetime granted at ADMISSION. Observability only —
+    /// the enforced value is [`Self::deadline`], which does not move.
     pub fn lifetime(&self) -> Duration {
         self.lifetime
+    }
+
+    /// The absolute monotonic instant at which this stream must be retired.
+    pub fn deadline(&self) -> tokio::time::Instant {
+        self.deadline
+    }
+
+    /// True once the absolute deadline has been reached. Checked before the
+    /// credential is attached to a streaming RPC so connect latency can never
+    /// buy time past `exp`.
+    pub fn deadline_reached(&self) -> bool {
+        tokio::time::Instant::now() >= self.deadline
     }
 
     pub fn deadline_basis(&self) -> StockCredentialDeadlineBasis {
@@ -439,37 +507,52 @@ impl std::fmt::Debug for StockBearerCredential {
 /// Resolve the finite authorization lifetime for one raw token.
 ///
 /// Exposed for external tests so the JWT-hint / opaque-bound split, the skew,
-/// the maximum-lifetime cap, and the reconnect floor are all provable without a
-/// control plane.
+/// the maximum-lifetime cap, and the fail-closed expiry handling are all
+/// provable without a control plane.
+///
+/// The returned duration is measured from `now`. There is NO floor: a JWT whose
+/// usable window is empty is an error, not a short lifetime. Clamping it upward
+/// would schedule the retirement after `exp` and knowingly hold an
+/// authenticated stream open with expired material — the exact defect
+/// issue #3852 is about.
 pub fn credential_lifetime(
     raw_token: &str,
     policy: StockCredentialLifetimePolicy,
     now: SystemTime,
-) -> (Duration, StockCredentialDeadlineBasis) {
+) -> Result<(Duration, StockCredentialDeadlineBasis), StockCredentialInvalidReason> {
     let opaque = clamp_max_stream_lifetime(policy.max_stream_lifetime);
     let Some(exp) = jwt_expiration_hint(raw_token) else {
-        return (opaque, StockCredentialDeadlineBasis::MaxStreamLifetime);
+        // Opaque (or non-JWS, or `exp`-less) material: there is no local hint at
+        // all, so the operator-visible finite maximum is the whole policy.
+        return Ok((opaque, StockCredentialDeadlineBasis::MaxStreamLifetime));
     };
+    // The decode is NOT authorization proof. It is only ever used to make the
+    // deadline EARLIER than it would otherwise be, or to refuse outright.
     let Ok(remaining) = exp.duration_since(now) else {
-        // Already past (or a skewed clock). Do not treat the claim as
-        // authorization either way: reconnect at the floor so a replacement
-        // token is picked up promptly without hot-looping.
-        return (
-            MIN_CREDENTIAL_RECONNECT_FLOOR.min(opaque),
-            StockCredentialDeadlineBasis::JwtExpirationHint,
-        );
+        return Err(StockCredentialInvalidReason::Expired);
     };
     let before_exp = remaining.saturating_sub(policy.refresh_skew);
-    let bounded = before_exp.min(opaque).max(MIN_CREDENTIAL_RECONNECT_FLOOR.min(opaque));
-    (bounded, StockCredentialDeadlineBasis::JwtExpirationHint)
+    if before_exp.is_zero() {
+        return Err(StockCredentialInvalidReason::ExpiresWithinSkew);
+    }
+    Ok((
+        before_exp.min(opaque),
+        StockCredentialDeadlineBasis::JwtExpirationHint,
+    ))
 }
 
+/// Keep the configured maximum stream lifetime finite and non-zero.
+///
+/// The upper bound is the security property (an opaque bearer must not hold a
+/// stream indefinitely) and is enforced unconditionally. The lower bound here is
+/// only the absolute floor that prevents a zero-length deadline; the
+/// operator-facing 60s minimum is enforced where the operator sets it.
 fn clamp_max_stream_lifetime(configured: Duration) -> Duration {
-    let secs = configured.as_secs().clamp(
-        MIN_STOCK_XDS_TOKEN_MAX_STREAM_LIFETIME_SECS,
-        MAX_STOCK_XDS_TOKEN_MAX_STREAM_LIFETIME_SECS,
-    );
-    Duration::from_secs(secs)
+    configured
+        .max(ABSOLUTE_MAX_STREAM_LIFETIME_FLOOR)
+        .min(Duration::from_secs(
+            MAX_STOCK_XDS_TOKEN_MAX_STREAM_LIFETIME_SECS,
+        ))
 }
 
 #[derive(serde::Deserialize)]
@@ -569,6 +652,7 @@ pub async fn start_stock_credential_watcher_with_shutdown(
          rotates, becomes invalid, or reaches its authorization deadline"
     );
 
+    let mut observed_valid_before = false;
     loop {
         let next_state = match source.materialize().await {
             Ok(Some(credential)) => credential.observed_state(),
@@ -586,12 +670,17 @@ pub async fn start_stock_credential_watcher_with_shutdown(
                     "Stock xDS bearer-credential source became invalid; retiring the ADS stream \
                      and refusing reconnection until valid material is available"
                 ),
-                _ => info!(
+                StockCredentialState::Valid { .. } if observed_valid_before => info!(
                     "Stock xDS bearer credential rotated; retiring the ADS stream and \
                      reconnecting with the replacement material"
                 ),
+                StockCredentialState::Valid { .. } => info!(
+                    "Stock xDS bearer-credential source observed valid; ADS streams may open"
+                ),
+                StockCredentialState::NotConfigured | StockCredentialState::Unknown => {}
             }
         }
+        observed_valid_before |= matches!(next_state, StockCredentialState::Valid { .. });
 
         tokio::select! {
             biased;

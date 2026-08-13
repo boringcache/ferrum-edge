@@ -44,19 +44,6 @@ pub const MESH_CONFIG_STREAM_HTTP2_KEEPALIVE_TIMEOUT_SECS: u64 = 10;
 /// TCP keepalive idle probe interval for mesh configuration sockets.
 pub const MESH_CONFIG_STREAM_TCP_KEEPALIVE_SECS: u64 = 30;
 
-/// Documented upper bound, in seconds, on detecting a half-open/blackholed
-/// **established** mesh configuration stream.
-///
-/// One PING is emitted at most [`MESH_CONFIG_STREAM_HTTP2_KEEPALIVE_INTERVAL_SECS`]
-/// after the last transport activity and its ack is awaited for at most
-/// [`MESH_CONFIG_STREAM_HTTP2_KEEPALIVE_TIMEOUT_SECS`]. `keep_alive_while_idle`
-/// is on, so this holds for a stream carrying **no application frames** — a
-/// healthy but idle standard-xDS subscription does not have to be poked with
-/// discovery traffic to stay observable.
-pub const MESH_CONFIG_STREAM_LIVENESS_BOUND_SECS: u64 =
-    MESH_CONFIG_STREAM_HTTP2_KEEPALIVE_INTERVAL_SECS
-        + MESH_CONFIG_STREAM_HTTP2_KEEPALIVE_TIMEOUT_SECS;
-
 /// A control plane that accepts the streaming RPC but never sends a first
 /// message is indistinguishable from a blackhole at the application layer.
 /// Bounded so a mute primary cannot hold startup.
@@ -76,6 +63,17 @@ pub const MESH_CONFIG_STREAM_FIRST_SLICE_TIMEOUT_SECS: u64 = 120;
 /// the same fail-safe shape ConfigSync gets from explicit negotiation.
 pub const MESH_SUBSCRIBE_MAX_SILENCE_SECS: u64 = 150;
 
+/// Bound on ONE awaited outbound operation inside a stream loop: an ADS request
+/// enqueue, or the native consumer's `ReportMeshSliceStatus` unary RPC.
+///
+/// Without it, a control plane that accepts the streaming RPC and then simply
+/// stops reading (its receive window never opens) — or that leaves the unary
+/// status RPC pending forever — suspends the consumer's own receive loop, and
+/// every liveness/credential deadline in this module stops being enforced. The
+/// awaited work is best-effort by design (ACK/NACK reporting, subscription
+/// updates); it must never be able to outrank stream retirement.
+pub const MESH_CONFIG_STREAM_OUTBOUND_TIMEOUT_SECS: u64 = 15;
+
 /// Per-invocation mesh configuration-stream timing policy.
 ///
 /// Production always uses [`MeshStreamTimings::production`]. The value is
@@ -94,6 +92,16 @@ pub struct MeshStreamTimings {
     pub first_slice: Duration,
     /// Bound on application silence for consumers with an observed heartbeat.
     pub max_silence: Duration,
+    /// HTTP/2 PING interval applied to the tonic endpoint. This is the half of
+    /// the policy that detects a blackholed **established** transport with no
+    /// application frames at all.
+    pub keepalive_interval: Duration,
+    /// HTTP/2 PING ack deadline applied to the tonic endpoint.
+    pub keepalive_timeout: Duration,
+    /// Bound on ONE awaited outbound operation inside the stream loop (an ADS
+    /// request enqueue, or the native status-report unary RPC). See
+    /// [`MESH_CONFIG_STREAM_OUTBOUND_TIMEOUT_SECS`].
+    pub outbound: Duration,
 }
 
 impl MeshStreamTimings {
@@ -103,6 +111,29 @@ impl MeshStreamTimings {
             first_frame: Duration::from_secs(MESH_CONFIG_STREAM_FIRST_FRAME_TIMEOUT_SECS),
             first_slice: Duration::from_secs(MESH_CONFIG_STREAM_FIRST_SLICE_TIMEOUT_SECS),
             max_silence: Duration::from_secs(MESH_SUBSCRIBE_MAX_SILENCE_SECS),
+            keepalive_interval: Duration::from_secs(
+                MESH_CONFIG_STREAM_HTTP2_KEEPALIVE_INTERVAL_SECS,
+            ),
+            keepalive_timeout: Duration::from_secs(MESH_CONFIG_STREAM_HTTP2_KEEPALIVE_TIMEOUT_SECS),
+            outbound: Duration::from_secs(MESH_CONFIG_STREAM_OUTBOUND_TIMEOUT_SECS),
+        }
+    }
+
+    /// Upper bound on detecting a half-open established transport under *this*
+    /// policy: one PING interval plus one ack deadline.
+    pub fn liveness_bound(self) -> Duration {
+        self.keepalive_interval.saturating_add(self.keepalive_timeout)
+    }
+
+    /// The same bound, in whole seconds, for the `/health` projection. Rounded
+    /// UP so a sub-second compressed test policy never reports `0`.
+    pub fn liveness_bound_seconds(self) -> u64 {
+        let bound = self.liveness_bound();
+        let secs = bound.as_secs();
+        if bound.subsec_nanos() > 0 {
+            secs.saturating_add(1)
+        } else {
+            secs
         }
     }
 }
@@ -125,9 +156,19 @@ pub enum MeshStreamRetirement {
     Shutdown,
     /// gRPC TLS material rotated; reconnect with the new material.
     TlsReload,
-    /// The external bearer credential rotated, became invalid, or reached its
-    /// authorization deadline (issue #3852).
-    CredentialRotation,
+    /// The external bearer credential's **content** changed: the configured
+    /// source now reads as a different, still-valid token (issue #3852).
+    CredentialRotated,
+    /// The external bearer credential source became unusable — removed, empty,
+    /// non-regular, unreadable, oversized, non-ASCII, or (for a JWT-shaped
+    /// token) already expired or unable to leave a positive pre-expiry window
+    /// after the configured skew. Reconnection is refused until valid
+    /// replacement material appears (issue #3852).
+    CredentialSourceInvalid,
+    /// The stream reached the credential's absolute local authorization
+    /// deadline (issue #3852). Distinct from a rotation: the material on disk
+    /// may be unchanged; it is simply no longer allowed to hold this stream.
+    CredentialDeadline,
     /// Proactive failback to the primary endpoint after a fallback delivered a
     /// first slice.
     PrimaryRetry,
@@ -140,9 +181,21 @@ impl MeshStreamRetirement {
         match self {
             Self::Shutdown => "shutdown",
             Self::TlsReload => "tls_reload",
-            Self::CredentialRotation => "credential_rotation",
+            Self::CredentialRotated => "credential_rotated",
+            Self::CredentialSourceInvalid => "credential_source_invalid",
+            Self::CredentialDeadline => "credential_deadline",
             Self::PrimaryRetry => "primary_retry",
         }
+    }
+
+    /// True when this retirement is driven by the external bearer credential.
+    /// Such a retirement must also discard every piece of stream state the
+    /// retired credential produced (issue #3852).
+    pub fn is_credential_retirement(self) -> bool {
+        matches!(
+            self,
+            Self::CredentialRotated | Self::CredentialSourceInvalid | Self::CredentialDeadline
+        )
     }
 }
 
@@ -160,11 +213,25 @@ pub enum MeshStreamAttempt {
     /// The peer closed the stream cleanly (gRPC OK / EOF) without this data
     /// plane asking it to.
     RemoteEof,
-    /// Transport or gRPC status failure. `delivered_usable_state` records
-    /// whether this attempt had already produced usable configuration, which is
-    /// the same "healthy progress" split the DP ConfigSync client uses: a
-    /// long-lived stream that eventually breaks is not a connect-storm.
-    TransportFailure { delivered_usable_state: bool },
+    /// Transport or gRPC status failure.
+    ///
+    /// `delivered_usable_state` records whether this attempt had already
+    /// produced usable configuration, which is the same "healthy progress"
+    /// split the DP ConfigSync client uses: a long-lived stream that eventually
+    /// breaks is not a connect-storm.
+    ///
+    /// `after_established` records whether the streaming RPC had actually been
+    /// opened. That is the honest way to attribute an HTTP/2 keepalive
+    /// (PING-ack) failure: it can only be produced by an *established*
+    /// transport, so a failure with `after_established == true` is projected as
+    /// a liveness failure, while an ordinary connect/dial refusal is not. It is
+    /// deliberately NOT called "keepalive timeout" — tonic surfaces a broken
+    /// established transport as a generic status, and pretending to know it was
+    /// a PING ack would be a dishonest label.
+    TransportFailure {
+        delivered_usable_state: bool,
+        after_established: bool,
+    },
     /// The stream was accepted but no response frame arrived inside
     /// [`MeshStreamTimings::first_frame`].
     FirstFrameTimeout,
@@ -172,9 +239,12 @@ pub enum MeshStreamAttempt {
     /// [`MeshStreamTimings::first_slice`], while the runtime had no slice at
     /// all.
     FirstSliceTimeout,
-    /// An established stream went silent past [`MeshStreamTimings::max_silence`]
-    /// despite a peer that had demonstrably been emitting heartbeats.
-    LivenessTimeout,
+    /// An established native `MeshSubscribe` stream went silent past
+    /// [`MeshStreamTimings::max_silence`] despite a peer that had demonstrably
+    /// been emitting heartbeats. This is an APPLICATION-layer silence bound and
+    /// is labelled as such: it is not an HTTP/2 keepalive timeout, and the two
+    /// must stay distinguishable on `/metrics`.
+    HeartbeatSilenceTimeout,
     /// The peer's content was refused by a fail-closed local gate
     /// (subscription binding, config-revision ordering, NACK circuit breaker,
     /// unsolicited resource type). Staying attached would only let it keep
@@ -188,10 +258,17 @@ impl MeshStreamAttempt {
         match self {
             Self::LocalRetirement(reason) => reason.as_metric_label(),
             Self::RemoteEof => "remote_clean_eof",
-            Self::TransportFailure { .. } => "transport_failure",
+            Self::TransportFailure {
+                after_established: true,
+                ..
+            } => "established_transport_failure",
+            Self::TransportFailure {
+                after_established: false,
+                ..
+            } => "transport_failure",
             Self::FirstFrameTimeout => "first_frame_timeout",
             Self::FirstSliceTimeout => "first_slice_timeout",
-            Self::LivenessTimeout => "keepalive_timeout",
+            Self::HeartbeatSilenceTimeout => "heartbeat_silence_timeout",
             Self::PolicyRejected => "policy_rejected",
         }
     }
@@ -200,6 +277,22 @@ impl MeshStreamAttempt {
     /// local decision.
     pub fn is_endpoint_failure(self) -> bool {
         !matches!(self, Self::LocalRetirement(_))
+    }
+
+    /// True when this attempt is evidence that the *established* stream stopped
+    /// being usable, as opposed to never having become usable or a purely local
+    /// decision. This is what `/health` reports as `stream_liveness_failed`.
+    pub fn is_liveness_failure(self) -> bool {
+        matches!(
+            self,
+            Self::FirstFrameTimeout
+                | Self::FirstSliceTimeout
+                | Self::HeartbeatSilenceTimeout
+                | Self::TransportFailure {
+                    after_established: true,
+                    ..
+                }
+        )
     }
 
     /// What the outer reconnect loop must do next.
@@ -223,13 +316,14 @@ impl MeshStreamAttempt {
             // just failed is the one under suspicion.
             Self::TransportFailure {
                 delivered_usable_state,
+                ..
             } => MeshStreamDisposition {
                 advance_endpoint: true,
                 increase_backoff: !delivered_usable_state,
             },
             Self::FirstFrameTimeout
             | Self::FirstSliceTimeout
-            | Self::LivenessTimeout
+            | Self::HeartbeatSilenceTimeout
             | Self::PolicyRejected => MeshStreamDisposition {
                 advance_endpoint: true,
                 increase_backoff: true,
@@ -257,26 +351,26 @@ pub struct MeshStreamDisposition {
 pub fn configure_mesh_config_stream_endpoint(
     endpoint: Endpoint,
     connect_timeout_seconds: u64,
+    timings: MeshStreamTimings,
 ) -> Endpoint {
     let endpoint = if connect_timeout_seconds > 0 {
         endpoint.connect_timeout(Duration::from_secs(connect_timeout_seconds))
     } else {
         endpoint
     };
+    // TCP keepalive is a coarse backstop under the H2 policy, so it is never
+    // allowed to be looser than the PING interval this invocation enforces.
+    let tcp_keepalive = timings
+        .keepalive_interval
+        .min(Duration::from_secs(MESH_CONFIG_STREAM_TCP_KEEPALIVE_SECS));
     endpoint
-        .http2_keep_alive_interval(Duration::from_secs(
-            MESH_CONFIG_STREAM_HTTP2_KEEPALIVE_INTERVAL_SECS,
-        ))
-        .keep_alive_timeout(Duration::from_secs(
-            MESH_CONFIG_STREAM_HTTP2_KEEPALIVE_TIMEOUT_SECS,
-        ))
+        .http2_keep_alive_interval(timings.keepalive_interval)
+        .keep_alive_timeout(timings.keepalive_timeout)
         // Load-bearing: a standard xDS subscription is legitimately idle
         // between control-plane pushes, and without this tonic stops pinging
         // exactly when a blackhole would be invisible.
         .keep_alive_while_idle(true)
-        .tcp_keepalive(Some(Duration::from_secs(
-            MESH_CONFIG_STREAM_TCP_KEEPALIVE_SECS,
-        )))
+        .tcp_keepalive(Some(tcp_keepalive))
 }
 
 /// Fixed-cardinality readiness/health classification for the mesh
@@ -311,11 +405,20 @@ impl MeshConfigStreamState {
 pub enum MeshConfigStreamCredential {
     /// No external bearer credential is configured for this protocol.
     NotConfigured,
+    /// A credential source IS configured but has not been observed yet.
+    ///
+    /// Reported distinctly from [`Self::NotConfigured`] on purpose: telling an
+    /// operator "not configured" about a source they *did* configure is a false
+    /// statement about their own posture, and it hides the window in which the
+    /// very first read has not completed.
+    Unobserved,
     /// The configured credential source last read as valid.
     Valid,
     /// The configured credential source is missing, empty, non-regular,
-    /// unreadable, oversized, or not valid ASCII metadata. Reconnection is
-    /// refused while this holds (issue #3852).
+    /// unreadable, oversized, not valid ASCII metadata, or (for a JWT-shaped
+    /// token) already past `exp` or unable to leave a positive pre-expiry
+    /// window after the configured skew. Reconnection is refused while this
+    /// holds (issue #3852).
     SourceInvalid,
 }
 
@@ -323,6 +426,7 @@ impl MeshConfigStreamCredential {
     pub fn as_label(self) -> &'static str {
         match self {
             Self::NotConfigured => "not_configured",
+            Self::Unobserved => "unobserved",
             Self::Valid => "valid",
             Self::SourceInvalid => "source_invalid",
         }
@@ -351,23 +455,19 @@ pub struct MeshConfigStreamStatus {
     /// ([`MeshConfigStreamCredential::as_label`]).
     pub credential: &'static str,
     /// Documented bound (seconds) within which a half-open established stream
-    /// is detected without any application frames.
+    /// is detected without any application frames, under the timing policy this
+    /// consumer is actually running ([`MeshStreamTimings::liveness_bound_seconds`]).
     pub liveness_bound_seconds: u64,
 }
 
-impl MeshConfigStreamStatus {
-    /// The pre-first-attempt status for `protocol`.
-    pub fn initial(protocol: &'static str, credential: MeshConfigStreamCredential) -> Self {
-        Self {
-            protocol,
-            state: MeshConfigStreamState::NeverReceivedSlice.as_label(),
-            last_attempt_outcome: "none",
-            fallback_active: false,
-            consecutive_failures: 0,
-            credential: credential.as_label(),
-            liveness_bound_seconds: MESH_CONFIG_STREAM_LIVENESS_BOUND_SECS,
-        }
-    }
+/// Whether a tracked stream is currently attached to its control plane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeshStreamAttachment {
+    /// The streaming RPC is open and this consumer is reading it.
+    Established,
+    /// No stream is open: connecting, backing off, or blocked on an invalid
+    /// credential source.
+    Detached,
 }
 
 /// Rolling accounting for one consumer's reconnect loop.
@@ -380,19 +480,27 @@ pub struct MeshStreamTracker {
     credential: MeshConfigStreamCredential,
     last_attempt_outcome: &'static str,
     consecutive_failures: u32,
-    fallback_active: bool,
+    endpoint_index: usize,
+    attachment: MeshStreamAttachment,
     liveness_failed: bool,
+    liveness_bound_seconds: u64,
 }
 
 impl MeshStreamTracker {
-    pub fn new(protocol: &'static str, credential: MeshConfigStreamCredential) -> Self {
+    pub fn new(
+        protocol: &'static str,
+        credential: MeshConfigStreamCredential,
+        timings: MeshStreamTimings,
+    ) -> Self {
         Self {
             protocol,
             credential,
             last_attempt_outcome: "none",
             consecutive_failures: 0,
-            fallback_active: false,
+            endpoint_index: 0,
+            attachment: MeshStreamAttachment::Detached,
             liveness_failed: false,
+            liveness_bound_seconds: timings.liveness_bound_seconds(),
         }
     }
 
@@ -402,20 +510,43 @@ impl MeshStreamTracker {
     }
 
     /// Record which configured endpoint index the next/current attempt uses.
+    ///
+    /// This alone does NOT make `fallback_active` true: the schema and the
+    /// `/health` body both say "attached to a non-primary endpoint", so the
+    /// flag is only raised once the stream on that index is actually
+    /// established.
     pub fn set_endpoint_index(&mut self, index: usize) {
-        self.fallback_active = index != 0;
+        self.endpoint_index = index;
+    }
+
+    /// Record whether a streaming RPC is currently open.
+    ///
+    /// `Established` is published the moment the RPC is accepted and the
+    /// consumer begins reading it; `Detached` on every path that leaves that
+    /// loop, including an intentional local retirement.
+    pub fn set_attachment(&mut self, attachment: MeshStreamAttachment) {
+        self.attachment = attachment;
+    }
+
+    pub fn is_established(&self) -> bool {
+        self.attachment == MeshStreamAttachment::Established
     }
 
     /// Fold one completed attempt into the rolling view and return what the
     /// outer loop must do.
+    ///
+    /// Recording an attempt always detaches: the stream that produced it is
+    /// over by definition.
     pub fn record(&mut self, attempt: MeshStreamAttempt) -> MeshStreamDisposition {
+        self.attachment = MeshStreamAttachment::Detached;
         self.last_attempt_outcome = attempt.as_metric_label();
-        self.liveness_failed = matches!(
-            attempt,
-            MeshStreamAttempt::LivenessTimeout
-                | MeshStreamAttempt::FirstFrameTimeout
-                | MeshStreamAttempt::FirstSliceTimeout
-        );
+        // A liveness failure is STICKY until this consumer next installs usable
+        // state from an actual stream. Recomputing it per attempt would let the
+        // very next ordinary connect refusal erase the operator's only evidence
+        // that an established transport went dark.
+        if attempt.is_liveness_failure() {
+            self.liveness_failed = true;
+        }
         if attempt.is_endpoint_failure() {
             self.consecutive_failures = self.consecutive_failures.saturating_add(1);
         } else {
@@ -428,7 +559,8 @@ impl MeshStreamTracker {
         attempt.disposition()
     }
 
-    /// A stream is live and delivering; clear the failure run.
+    /// The stream currently established installed usable configuration; clear
+    /// the failure run and the sticky liveness flag.
     pub fn record_usable_state(&mut self) {
         self.consecutive_failures = 0;
         self.liveness_failed = false;
@@ -436,13 +568,20 @@ impl MeshStreamTracker {
 
     /// Project the closed-set health view. `has_first_slice` comes from the
     /// mesh runtime, so "serving last good" cannot be claimed without one.
-    pub fn status(&self, has_first_slice: bool, connected: bool) -> MeshConfigStreamStatus {
+    ///
+    /// Order matters. A liveness failure outranks `never_received_slice`,
+    /// because a data plane that has never converged AND just lost an
+    /// established transport must not report the same thing as one that is
+    /// still in its ordinary startup window — that masking is exactly what made
+    /// a bounded first-frame/first-slice/keepalive failure invisible.
+    pub fn status(&self, has_first_slice: bool) -> MeshConfigStreamStatus {
+        let connected = self.is_established();
         let state = if connected && has_first_slice {
             MeshConfigStreamState::Connected
-        } else if !has_first_slice {
-            MeshConfigStreamState::NeverReceivedSlice
         } else if self.liveness_failed {
             MeshConfigStreamState::StreamLivenessFailed
+        } else if !has_first_slice {
+            MeshConfigStreamState::NeverReceivedSlice
         } else {
             MeshConfigStreamState::ServingLastGood
         };
@@ -450,10 +589,10 @@ impl MeshStreamTracker {
             protocol: self.protocol,
             state: state.as_label(),
             last_attempt_outcome: self.last_attempt_outcome,
-            fallback_active: self.fallback_active,
+            fallback_active: connected && self.endpoint_index != 0,
             consecutive_failures: self.consecutive_failures,
             credential: self.credential.as_label(),
-            liveness_bound_seconds: MESH_CONFIG_STREAM_LIVENESS_BOUND_SECS,
+            liveness_bound_seconds: self.liveness_bound_seconds,
         }
     }
 }

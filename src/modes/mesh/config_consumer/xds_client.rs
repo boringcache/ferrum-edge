@@ -14,8 +14,8 @@ use super::common::{
     tonic_tls_config, wait_for_shutdown, wait_optional_tls_reload,
 };
 use super::stream_lifecycle::{
-    MeshConfigStreamCredential, MeshStreamAttempt, MeshStreamRetirement, MeshStreamTimings,
-    MeshStreamTracker, configure_mesh_config_stream_endpoint,
+    MeshConfigStreamCredential, MeshStreamAttachment, MeshStreamAttempt, MeshStreamRetirement,
+    MeshStreamTimings, MeshStreamTracker, configure_mesh_config_stream_endpoint,
 };
 use crate::grpc::dp_client::{DpGrpcTlsConfig, DpGrpcTlsReload, GrpcJwtSecret};
 use crate::modes::mesh::config::{
@@ -131,6 +131,17 @@ pub struct XdsClientConfig {
 
 /// Fixed-cardinality protocol label for the shared stream lifecycle.
 pub(crate) const XDS_PROTOCOL_LABEL: &str = "xds";
+
+/// Bound on one outbound ACK/NACK/subscription enqueue inside the response
+/// handler (issue #3854).
+///
+/// The Ferrum-private profile only ever talks to a Ferrum CP, so unlike the
+/// stock profile it does not take a per-invocation override — the shared
+/// production constant is the whole policy. The bound still matters: without
+/// it, a CP that stops reading its request stream would suspend the DP's
+/// receive loop and disarm the first-frame / first-slice deadlines.
+const XDS_OUTBOUND_BOUND: Duration =
+    Duration::from_secs(super::stream_lifecycle::MESH_CONFIG_STREAM_OUTBOUND_TIMEOUT_SECS);
 
 #[derive(Debug, Clone)]
 struct ClientSubscriptionState {
@@ -613,15 +624,16 @@ pub async fn start_xds_client_with_shutdown(
     let mut tracker = MeshStreamTracker::new(
         XDS_PROTOCOL_LABEL,
         MeshConfigStreamCredential::NotConfigured,
+        timings,
     );
-    state.set_config_stream_status(tracker.status(state.has_first_slice(), false));
+    state.set_config_stream_status(tracker.status(state.has_first_slice()));
 
     info!(
         node_id = %config.node_id,
         namespace = %config.namespace,
         cluster = %config.cluster,
         cp_urls = cp_urls.len(),
-        liveness_bound_secs = super::stream_lifecycle::MESH_CONFIG_STREAM_LIVENESS_BOUND_SECS,
+        liveness_bound_secs = timings.liveness_bound_seconds(),
         "xDS mesh client starting"
     );
 
@@ -655,7 +667,12 @@ pub async fn start_xds_client_with_shutdown(
         let mut stream_shutdown_rx = shutdown_rx.clone();
         let should_race_primary = should_race_primary_retry(is_fallback, config.primary_retry_secs);
         let mut delivered_usable_state = false;
+        let mut stream_established = false;
         let mut force_primary = false;
+        // Shutdown is recorded as an intentional retirement rather than an
+        // unobserved `return`, so `/metrics` distinguishes a clean stop from a
+        // stream that simply vanished.
+        let mut shutting_down = false;
         let result = if should_race_primary {
             tokio::select! {
                 result = connect_ads(
@@ -666,7 +683,9 @@ pub async fn start_xds_client_with_shutdown(
                     tls_config.as_ref(),
                     &mut stream_state,
                     timings,
+                    &mut tracker,
                     &mut delivered_usable_state,
+                    &mut stream_established,
                 ) => result,
                 _ = wait_for_first_slice_then_primary_retry(
                     state.clone(),
@@ -677,7 +696,8 @@ pub async fn start_xds_client_with_shutdown(
                 }
                 _ = wait_for_shutdown(&mut stream_shutdown_rx) => {
                     info!("xDS mesh client shutting down");
-                    return;
+                    shutting_down = true;
+                    Ok(MeshStreamAttempt::LocalRetirement(MeshStreamRetirement::Shutdown))
                 }
                 _ = wait_optional_tls_reload(tls_reload.as_ref().map(|reload| reload.revision_rx.clone())) => {
                     Ok(MeshStreamAttempt::LocalRetirement(MeshStreamRetirement::TlsReload))
@@ -693,11 +713,14 @@ pub async fn start_xds_client_with_shutdown(
                     tls_config.as_ref(),
                     &mut stream_state,
                     timings,
+                    &mut tracker,
                     &mut delivered_usable_state,
+                    &mut stream_established,
                 ) => result,
                 _ = wait_for_shutdown(&mut stream_shutdown_rx) => {
                     info!("xDS mesh client shutting down");
-                    return;
+                    shutting_down = true;
+                    Ok(MeshStreamAttempt::LocalRetirement(MeshStreamRetirement::Shutdown))
                 }
                 _ = wait_optional_tls_reload(tls_reload.as_ref().map(|reload| reload.revision_rx.clone())) => {
                     Ok(MeshStreamAttempt::LocalRetirement(MeshStreamRetirement::TlsReload))
@@ -722,8 +745,14 @@ pub async fn start_xds_client_with_shutdown(
                 attempt
             }
             Err(e) => {
+                // `after_established` separates an ordinary dial refusal from
+                // an ESTABLISHED transport going dark (the HTTP/2 PING-ack
+                // failure that detects a blackhole). It is observed, never
+                // assumed, so `/health` cannot claim a liveness failure for a
+                // connection that never came up.
                 let attempt = MeshStreamAttempt::TransportFailure {
                     delivered_usable_state,
+                    after_established: stream_established,
                 };
                 error!(
                     cp_url = %cp_url,
@@ -741,7 +770,10 @@ pub async fn start_xds_client_with_shutdown(
         } else if disposition.advance_endpoint {
             current_cp_index = (current_cp_index + 1) % cp_urls.len();
         }
-        state.set_config_stream_status(tracker.status(state.has_first_slice(), false));
+        state.set_config_stream_status(tracker.status(state.has_first_slice()));
+        if shutting_down {
+            return;
+        }
 
         if !attempt.is_endpoint_failure() {
             backoff_secs = BACKOFF_INITIAL_SECS;
@@ -779,12 +811,15 @@ async fn connect_ads(
     tls_config: Option<&DpGrpcTlsConfig>,
     stream_state: &mut XdsStreamState,
     timings: MeshStreamTimings,
+    tracker: &mut MeshStreamTracker,
     delivered_usable_state: &mut bool,
+    stream_established: &mut bool,
 ) -> Result<MeshStreamAttempt, anyhow::Error> {
     // Bounded transport liveness, shared with the native and stock consumers.
     let mut endpoint = configure_mesh_config_stream_endpoint(
         Channel::from_shared(cp_url.to_string())?,
         config.connect_timeout_seconds,
+        timings,
     );
 
     if let Some(tls) = tls_config {
@@ -834,7 +869,9 @@ async fn connect_ads(
         &consumer,
         stream_state,
         timings,
+        tracker,
         delivered_usable_state,
+        stream_established,
     )
     .await
 }
@@ -846,7 +883,9 @@ async fn run_ads_stream_with_auth(
     consumer: &XdsConfigConsumer,
     stream_state: &mut XdsStreamState,
     timings: MeshStreamTimings,
+    tracker: &mut MeshStreamTracker,
     delivered_usable_state: &mut bool,
+    stream_established: &mut bool,
 ) -> Result<MeshStreamAttempt, anyhow::Error> {
     #[allow(clippy::result_large_err)]
     let mut client = AggregatedDiscoveryServiceClient::with_interceptor(
@@ -867,6 +906,13 @@ async fn run_ads_stream_with_auth(
         .stream_aggregated_resources(request_stream)
         .await?
         .into_inner();
+    // The streaming RPC is open: `/health` may now report `connected`, and a
+    // later transport failure is attributable to an established stream.
+    *stream_established = true;
+    tracker.set_attachment(MeshStreamAttachment::Established);
+    consumer
+        .state()
+        .set_config_stream_status(tracker.status(consumer.state().has_first_slice()));
 
     // Nonce dedup is stream-scoped (per xDS spec). Clear the
     // per-type `last_processed_nonce` baseline so a deterministic-nonce CP
@@ -888,9 +934,7 @@ async fn run_ads_stream_with_auth(
             node_waypoint_capture_scoping: config.node_waypoint_capture_scoping,
         },
     ) {
-        tx.send(request)
-            .await
-            .map_err(|_| anyhow::anyhow!("xDS ADS request stream closed before initial request"))?;
+        send_ads_request(&tx, request, timings.outbound).await?;
     }
 
     let debounce = tokio::time::sleep(Duration::from_secs(60 * 60 * 24));
@@ -991,6 +1035,11 @@ async fn run_ads_stream_with_auth(
                     apply_pending_xds_slice(consumer, config, pending)?;
                     *delivered_usable_state = true;
                     awaiting_first_slice = false;
+                    // This exact stream installed usable state.
+                    tracker.record_usable_state();
+                    consumer.state().set_config_stream_status(
+                        tracker.status(consumer.state().has_first_slice()),
+                    );
                 }
                 debounce_active = false;
                 pending_since = None;
@@ -1017,6 +1066,7 @@ async fn run_ads_stream_with_auth(
     {
         apply_pending_xds_slice(consumer, config, pending)?;
         *delivered_usable_state = true;
+        tracker.record_usable_state();
     }
 
     Ok(ended)
@@ -1088,7 +1138,7 @@ async fn handle_ads_response(
         let message = format!("unknown xDS response type_url '{type_url}'");
         let mut nack = subscriptions.build_nack(&type_url, message.clone());
         nack.response_nonce = response.nonce.clone();
-        send_ads_request(tx, nack).await?;
+        send_ads_request(tx, nack, XDS_OUTBOUND_BOUND).await?;
         warn!(
             node_id = %config.node_id,
             type_url = %type_url,
@@ -1129,7 +1179,7 @@ async fn handle_ads_response(
 
     match slice_result {
         Ok(Some(slice)) => {
-            send_ads_request(tx, subscriptions.build_ack(&type_url)).await?;
+            send_ads_request(tx, subscriptions.build_ack(&type_url), XDS_OUTBOUND_BOUND).await?;
             subscriptions.mark_acked(&type_url);
             subscriptions.mark_processed(&type_url);
             nack_circuit_breaker.record_ack(&type_url);
@@ -1141,7 +1191,7 @@ async fn handle_ads_response(
             }))
         }
         Ok(None) => {
-            send_ads_request(tx, subscriptions.build_ack(&type_url)).await?;
+            send_ads_request(tx, subscriptions.build_ack(&type_url), XDS_OUTBOUND_BOUND).await?;
             subscriptions.mark_acked(&type_url);
             subscriptions.mark_processed(&type_url);
             nack_circuit_breaker.record_ack(&type_url);
@@ -1189,7 +1239,7 @@ async fn handle_ads_response(
             subscriptions.mark_processed(&type_url);
             let circuit_result =
                 trip_nack_circuit_if_needed(config, nack_circuit_breaker, &type_url);
-            send_ads_request(tx, nack).await?;
+            send_ads_request(tx, nack, XDS_OUTBOUND_BOUND).await?;
             circuit_result?;
             Ok(None)
         }
@@ -1245,13 +1295,26 @@ fn apply_pending_xds_slice(
     Ok(())
 }
 
+/// Enqueue one outbound `DiscoveryRequest`, bounded (issue #3854).
+///
+/// The outbound channel drains into the gRPC request stream, so a control plane
+/// that accepts the RPC and then stops reading — never opening its HTTP/2
+/// receive window — would otherwise leave this send pending forever and suspend
+/// the receive loop, disarming every liveness bound in this module. ACK/NACK
+/// ordering is preserved: the bound applies to a single enqueue, not to the
+/// sequence.
 async fn send_ads_request(
     tx: &mpsc::Sender<DiscoveryRequest>,
     request: DiscoveryRequest,
+    bound: Duration,
 ) -> Result<(), anyhow::Error> {
-    tx.send(request)
-        .await
-        .map_err(|_| anyhow::anyhow!("xDS ADS request stream closed"))
+    match tokio::time::timeout(bound, tx.send(request)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err(anyhow::anyhow!("xDS ADS request stream closed")),
+        Err(_) => Err(anyhow::anyhow!(
+            "xDS ADS request could not be enqueued within the bounded outbound window"
+        )),
+    }
 }
 
 #[derive(Clone)]

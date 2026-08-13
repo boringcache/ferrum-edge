@@ -29,10 +29,10 @@ use ferrum_edge::modes::mesh::config::{
     AppProtocol, MeshConfig, MeshService, MeshWaypointBinding, MeshWaypointServiceRef, ServicePort,
     TrustBundle, TrustBundleSet, Workload, WorkloadPort, WorkloadSelector,
 };
-use ferrum_edge::modes::mesh::config_consumer::stream_lifecycle::MeshStreamTimings;
 use ferrum_edge::modes::mesh::config_consumer::native_client::{
     NativeMeshClientConfig, start_native_mesh_client_with_shutdown,
 };
+use ferrum_edge::modes::mesh::config_consumer::stream_lifecycle::MeshStreamTimings;
 use ferrum_edge::modes::mesh::runtime::MeshRuntimeState;
 use ferrum_edge::proxy::ProxyState;
 use ferrum_edge::xds::{LDS_TYPE_URL, XdsAdsServer};

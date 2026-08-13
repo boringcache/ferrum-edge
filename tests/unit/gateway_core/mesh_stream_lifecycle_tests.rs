@@ -11,6 +11,9 @@ use std::time::{Duration, SystemTime};
 
 use base64::Engine as _;
 
+use ferrum_edge::modes::mesh::config_consumer::stock_xds_client::{
+    BearerToken, attach_stock_authorization,
+};
 use ferrum_edge::modes::mesh::config_consumer::stock_xds_credential::{
     DEFAULT_STOCK_XDS_TOKEN_MAX_STREAM_LIFETIME_SECS, MAX_STOCK_XDS_TOKEN_MAX_STREAM_LIFETIME_SECS,
     MIN_STOCK_XDS_TOKEN_MAX_STREAM_LIFETIME_SECS, StockBearerCredential,
@@ -24,10 +27,33 @@ use ferrum_edge::modes::mesh::config_consumer::stock_xds_transport::{
 };
 use ferrum_edge::modes::mesh::config_consumer::stream_lifecycle::{
     MESH_CONFIG_STREAM_HTTP2_KEEPALIVE_INTERVAL_SECS,
-    MESH_CONFIG_STREAM_HTTP2_KEEPALIVE_TIMEOUT_SECS, MESH_CONFIG_STREAM_LIVENESS_BOUND_SECS,
-    MESH_CONFIG_STREAM_TCP_KEEPALIVE_SECS, MeshConfigStreamCredential, MeshStreamAttempt,
-    MeshStreamRetirement, MeshStreamTimings, MeshStreamTracker,
+    MESH_CONFIG_STREAM_HTTP2_KEEPALIVE_TIMEOUT_SECS, MESH_CONFIG_STREAM_OUTBOUND_TIMEOUT_SECS,
+    MESH_CONFIG_STREAM_TCP_KEEPALIVE_SECS, MeshConfigStreamCredential, MeshStreamAttachment,
+    MeshStreamAttempt, MeshStreamRetirement, MeshStreamTimings, MeshStreamTracker,
 };
+
+/// Every `MeshStreamRetirement` this build knows about. Kept as one list so a
+/// new variant cannot quietly skip the "local decisions never penalize the
+/// endpoint" and "labels are a closed set" contracts.
+const ALL_RETIREMENTS: [MeshStreamRetirement; 6] = [
+    MeshStreamRetirement::Shutdown,
+    MeshStreamRetirement::TlsReload,
+    MeshStreamRetirement::CredentialRotated,
+    MeshStreamRetirement::CredentialSourceInvalid,
+    MeshStreamRetirement::CredentialDeadline,
+    MeshStreamRetirement::PrimaryRetry,
+];
+
+fn tracker(protocol: &'static str, credential: MeshConfigStreamCredential) -> MeshStreamTracker {
+    MeshStreamTracker::new(protocol, credential, MeshStreamTimings::production())
+}
+
+fn transport_failure(delivered_usable_state: bool, after_established: bool) -> MeshStreamAttempt {
+    MeshStreamAttempt::TransportFailure {
+        delivered_usable_state,
+        after_established,
+    }
+}
 
 // ── issue #3854: attempt classification ─────────────────────────────────
 
@@ -56,12 +82,7 @@ fn remote_clean_eof_rotates_the_endpoint_and_grows_backoff() {
 
 #[test]
 fn intentional_local_retirement_never_penalizes_the_endpoint() {
-    for reason in [
-        MeshStreamRetirement::Shutdown,
-        MeshStreamRetirement::TlsReload,
-        MeshStreamRetirement::CredentialRotation,
-        MeshStreamRetirement::PrimaryRetry,
-    ] {
+    for reason in ALL_RETIREMENTS {
         let attempt = MeshStreamAttempt::LocalRetirement(reason);
         let disposition = attempt.disposition();
         assert!(
@@ -80,19 +101,81 @@ fn intentional_local_retirement_never_penalizes_the_endpoint() {
 /// is the one under suspicion.
 #[test]
 fn transport_failure_backoff_depends_on_whether_the_attempt_made_progress() {
-    let fresh = MeshStreamAttempt::TransportFailure {
-        delivered_usable_state: false,
-    }
-    .disposition();
+    let fresh = transport_failure(false, false).disposition();
     assert!(fresh.advance_endpoint);
     assert!(fresh.increase_backoff);
 
-    let progressed = MeshStreamAttempt::TransportFailure {
-        delivered_usable_state: true,
-    }
-    .disposition();
+    let progressed = transport_failure(true, false).disposition();
     assert!(progressed.advance_endpoint);
     assert!(!progressed.increase_backoff);
+}
+
+/// Issue #3854 round two. An H2 keepalive (PING-ack) failure surfaces through
+/// tonic as an ordinary transport status, so the only honest way to attribute
+/// it is "did this failure happen after the streaming RPC was established?".
+/// A connect refusal must NOT be dressed up as a keepalive timeout, and an
+/// established transport going dark must NOT be reported as a plain connect
+/// failure — `/health` distinguishes them and so must the metric label.
+#[test]
+fn only_a_post_establishment_transport_failure_is_a_liveness_failure() {
+    assert!(!transport_failure(false, false).is_liveness_failure());
+    assert!(transport_failure(false, true).is_liveness_failure());
+    assert!(transport_failure(true, true).is_liveness_failure());
+
+    assert_eq!(
+        transport_failure(false, false).as_metric_label(),
+        "transport_failure"
+    );
+    assert_eq!(
+        transport_failure(false, true).as_metric_label(),
+        "established_transport_failure"
+    );
+
+    // The native application-silence bound is NOT an HTTP/2 keepalive timeout
+    // and must not be labelled as one.
+    assert_eq!(
+        MeshStreamAttempt::HeartbeatSilenceTimeout.as_metric_label(),
+        "heartbeat_silence_timeout"
+    );
+    assert!(MeshStreamAttempt::HeartbeatSilenceTimeout.is_liveness_failure());
+    assert!(MeshStreamAttempt::FirstFrameTimeout.is_liveness_failure());
+    assert!(MeshStreamAttempt::FirstSliceTimeout.is_liveness_failure());
+    assert!(!MeshStreamAttempt::RemoteEof.is_liveness_failure());
+    assert!(!MeshStreamAttempt::PolicyRejected.is_liveness_failure());
+}
+
+/// Issue #3852. The three credential lifecycle events are distinct outcomes.
+/// Collapsing them into one `credential_rotation` label would tell an operator
+/// that their token changed when in fact the source went missing, or when the
+/// stream simply reached its maximum authenticated lifetime.
+#[test]
+fn credential_retirements_are_three_distinct_outcomes() {
+    assert_eq!(
+        MeshStreamRetirement::CredentialRotated.as_metric_label(),
+        "credential_rotated"
+    );
+    assert_eq!(
+        MeshStreamRetirement::CredentialSourceInvalid.as_metric_label(),
+        "credential_source_invalid"
+    );
+    assert_eq!(
+        MeshStreamRetirement::CredentialDeadline.as_metric_label(),
+        "credential_deadline"
+    );
+    for reason in ALL_RETIREMENTS {
+        let credential_driven = matches!(
+            reason,
+            MeshStreamRetirement::CredentialRotated
+                | MeshStreamRetirement::CredentialSourceInvalid
+                | MeshStreamRetirement::CredentialDeadline
+        );
+        assert_eq!(
+            reason.is_credential_retirement(),
+            credential_driven,
+            "{}",
+            reason.as_metric_label()
+        );
+    }
 }
 
 #[test]
@@ -100,7 +183,7 @@ fn liveness_and_policy_outcomes_rotate_and_back_off() {
     for attempt in [
         MeshStreamAttempt::FirstFrameTimeout,
         MeshStreamAttempt::FirstSliceTimeout,
-        MeshStreamAttempt::LivenessTimeout,
+        MeshStreamAttempt::HeartbeatSilenceTimeout,
         MeshStreamAttempt::PolicyRejected,
     ] {
         let disposition = attempt.disposition();
@@ -115,22 +198,19 @@ fn liveness_and_policy_outcomes_rotate_and_back_off() {
 /// detail, and must never be able to carry an endpoint URL or a node id.
 #[test]
 fn attempt_labels_are_a_closed_set() {
-    let labels = [
-        MeshStreamAttempt::LocalRetirement(MeshStreamRetirement::Shutdown).as_metric_label(),
-        MeshStreamAttempt::LocalRetirement(MeshStreamRetirement::TlsReload).as_metric_label(),
-        MeshStreamAttempt::LocalRetirement(MeshStreamRetirement::CredentialRotation)
-            .as_metric_label(),
-        MeshStreamAttempt::LocalRetirement(MeshStreamRetirement::PrimaryRetry).as_metric_label(),
+    let mut labels: Vec<&'static str> = ALL_RETIREMENTS
+        .iter()
+        .map(|reason| MeshStreamAttempt::LocalRetirement(*reason).as_metric_label())
+        .collect();
+    labels.extend([
         MeshStreamAttempt::RemoteEof.as_metric_label(),
-        MeshStreamAttempt::TransportFailure {
-            delivered_usable_state: false,
-        }
-        .as_metric_label(),
+        transport_failure(false, false).as_metric_label(),
+        transport_failure(false, true).as_metric_label(),
         MeshStreamAttempt::FirstFrameTimeout.as_metric_label(),
         MeshStreamAttempt::FirstSliceTimeout.as_metric_label(),
-        MeshStreamAttempt::LivenessTimeout.as_metric_label(),
+        MeshStreamAttempt::HeartbeatSilenceTimeout.as_metric_label(),
         MeshStreamAttempt::PolicyRejected.as_metric_label(),
-    ];
+    ]);
     let mut sorted = labels.to_vec();
     sorted.sort_unstable();
     sorted.dedup();
@@ -145,14 +225,8 @@ fn attempt_labels_are_a_closed_set() {
     }
     // `delivered_usable_state` is a backoff input, not a label dimension.
     assert_eq!(
-        MeshStreamAttempt::TransportFailure {
-            delivered_usable_state: true
-        }
-        .as_metric_label(),
-        MeshStreamAttempt::TransportFailure {
-            delivered_usable_state: false
-        }
-        .as_metric_label()
+        transport_failure(true, false).as_metric_label(),
+        transport_failure(false, false).as_metric_label()
     );
 }
 
@@ -161,13 +235,37 @@ fn attempt_labels_are_a_closed_set() {
 /// the docs.
 #[test]
 fn documented_liveness_bound_matches_the_keepalive_policy() {
+    let production = MeshStreamTimings::production();
     assert_eq!(
-        MESH_CONFIG_STREAM_LIVENESS_BOUND_SECS,
+        production.liveness_bound_seconds(),
         MESH_CONFIG_STREAM_HTTP2_KEEPALIVE_INTERVAL_SECS
             + MESH_CONFIG_STREAM_HTTP2_KEEPALIVE_TIMEOUT_SECS
     );
-    assert_eq!(MESH_CONFIG_STREAM_LIVENESS_BOUND_SECS, 40);
+    // The figure documented in docs/mesh.md, openapi.yaml, and the `/health`
+    // `liveness_bound_seconds` field.
+    assert_eq!(production.liveness_bound_seconds(), 40);
     assert_eq!(MESH_CONFIG_STREAM_TCP_KEEPALIVE_SECS, 30);
+    assert_eq!(MESH_CONFIG_STREAM_OUTBOUND_TIMEOUT_SECS, 15);
+}
+
+/// A compressed test policy must report the bound it actually enforces, not the
+/// production one — otherwise the hosted blackhole test would advertise 40s on
+/// `/health` while detecting in well under a second.
+#[test]
+fn the_reported_liveness_bound_follows_the_invocation_policy() {
+    let compressed = MeshStreamTimings {
+        keepalive_interval: Duration::from_millis(200),
+        keepalive_timeout: Duration::from_millis(200),
+        ..MeshStreamTimings::production()
+    };
+    assert_eq!(compressed.liveness_bound(), Duration::from_millis(400));
+    // Rounded up so a sub-second policy never advertises a bound of zero.
+    assert_eq!(compressed.liveness_bound_seconds(), 1);
+
+    let reported = MeshStreamTracker::new("stock_xds", MeshConfigStreamCredential::Valid, compressed)
+        .status(false)
+        .liveness_bound_seconds;
+    assert_eq!(reported, 1);
 }
 
 #[test]
@@ -182,84 +280,201 @@ fn production_timings_are_finite_and_ordered() {
         timings.max_silence > Duration::from_secs(60),
         "the silence bound must sit above the 60s heartbeat cadence"
     );
+    assert!(timings.keepalive_interval > Duration::ZERO);
+    assert!(timings.keepalive_timeout > Duration::ZERO);
+    assert!(
+        timings.outbound > Duration::ZERO && timings.outbound < timings.first_frame,
+        "a best-effort outbound send must never be able to outlast the first-frame bound"
+    );
 }
 
 // ── issue #3854: readiness projection ───────────────────────────────────
 
 #[test]
 fn tracker_reports_never_received_slice_until_one_is_installed() {
-    let mut tracker =
-        MeshStreamTracker::new("stock_xds", MeshConfigStreamCredential::NotConfigured);
-    let status = tracker.status(false, false);
+    let mut tracker = tracker("stock_xds", MeshConfigStreamCredential::NotConfigured);
+    let status = tracker.status(false);
     assert_eq!(status.state, "never_received_slice");
     assert_eq!(status.last_attempt_outcome, "none");
     assert_eq!(status.credential, "not_configured");
     assert_eq!(
         status.liveness_bound_seconds,
-        MESH_CONFIG_STREAM_LIVENESS_BOUND_SECS
+        MeshStreamTimings::production().liveness_bound_seconds()
     );
 
-    // Even after a liveness failure, "never received a slice" is the more
-    // accurate readiness answer: there is nothing last-good to serve.
-    tracker.record(MeshStreamAttempt::LivenessTimeout);
-    assert_eq!(tracker.status(false, false).state, "never_received_slice");
+    // An ordinary connect refusal before any slice is still ordinary startup.
+    tracker.record(transport_failure(false, false));
+    assert_eq!(tracker.status(false).state, "never_received_slice");
+}
+
+/// Issue #3854 round two. `never_received_slice` used to outrank every liveness
+/// classification, so a data plane that reached a bounded first-frame /
+/// first-slice / established-transport failure BEFORE ever converging reported
+/// exactly the same readiness as one that was simply still starting up. The
+/// failure was invisible for as long as it mattered most.
+#[test]
+fn a_liveness_failure_is_visible_even_before_the_first_slice() {
+    for failure in [
+        MeshStreamAttempt::FirstFrameTimeout,
+        MeshStreamAttempt::FirstSliceTimeout,
+        MeshStreamAttempt::HeartbeatSilenceTimeout,
+        transport_failure(false, true),
+    ] {
+        let mut tracker = tracker("stock_xds", MeshConfigStreamCredential::NotConfigured);
+        // Before the failure, startup readiness is the honest answer.
+        assert_eq!(tracker.status(false).state, "never_received_slice");
+        tracker.record(failure);
+        assert_eq!(
+            tracker.status(false).state,
+            "stream_liveness_failed",
+            "{}",
+            failure.as_metric_label()
+        );
+    }
 }
 
 #[test]
 fn tracker_distinguishes_liveness_failure_from_serving_last_good() {
-    let mut tracker = MeshStreamTracker::new("native", MeshConfigStreamCredential::NotConfigured);
+    let mut tracker = tracker("native", MeshConfigStreamCredential::NotConfigured);
 
-    tracker.record(MeshStreamAttempt::LivenessTimeout);
-    let status = tracker.status(true, false);
+    tracker.record(MeshStreamAttempt::HeartbeatSilenceTimeout);
+    let status = tracker.status(true);
     assert_eq!(status.state, "stream_liveness_failed");
-    assert_eq!(status.last_attempt_outcome, "keepalive_timeout");
+    assert_eq!(status.last_attempt_outcome, "heartbeat_silence_timeout");
     assert_eq!(status.consecutive_failures, 1);
 
+    // A sticky liveness flag is deliberate: the very next ordinary failure must
+    // not erase the operator's only evidence that the transport went dark.
     tracker.record(MeshStreamAttempt::RemoteEof);
-    let status = tracker.status(true, false);
-    assert_eq!(status.state, "serving_last_good");
+    let status = tracker.status(true);
+    assert_eq!(status.state, "stream_liveness_failed");
     assert_eq!(status.last_attempt_outcome, "remote_clean_eof");
     assert_eq!(status.consecutive_failures, 2);
 
-    assert_eq!(tracker.status(true, true).state, "connected");
+    // Only usable state from an actual stream clears it.
+    tracker.set_attachment(MeshStreamAttachment::Established);
+    tracker.record_usable_state();
+    assert_eq!(tracker.status(true).state, "connected");
+    tracker.record(MeshStreamAttempt::RemoteEof);
+    assert_eq!(tracker.status(true).state, "serving_last_good");
+}
+
+/// `record_usable_state` was defined and never called: every production call
+/// site passed `connected = false`, so `/health` could not reach `connected` at
+/// all and the consecutive-failure run never reset on a healthy stream.
+#[test]
+fn connected_requires_both_an_established_stream_and_usable_state() {
+    let mut tracker = tracker("xds", MeshConfigStreamCredential::NotConfigured);
+    assert_eq!(tracker.status(true).state, "serving_last_good");
+
+    tracker.set_attachment(MeshStreamAttachment::Established);
+    assert!(tracker.is_established());
+    assert_eq!(
+        tracker.status(false).state,
+        "never_received_slice",
+        "an established stream that has delivered nothing is not `connected`"
+    );
+    assert_eq!(tracker.status(true).state, "connected");
+
+    // Recording ANY attempt means that stream is over, so the projection
+    // detaches without the caller having to remember to.
+    tracker.record(MeshStreamAttempt::LocalRetirement(
+        MeshStreamRetirement::TlsReload,
+    ));
+    assert!(!tracker.is_established());
+    assert_eq!(tracker.status(true).state, "serving_last_good");
 }
 
 #[test]
 fn tracker_clears_the_failure_run_on_intentional_retirement_and_on_usable_state() {
-    let mut tracker = MeshStreamTracker::new("xds", MeshConfigStreamCredential::NotConfigured);
+    let mut tracker = tracker("xds", MeshConfigStreamCredential::NotConfigured);
     tracker.record(MeshStreamAttempt::RemoteEof);
     tracker.record(MeshStreamAttempt::RemoteEof);
-    assert_eq!(tracker.status(true, false).consecutive_failures, 2);
+    assert_eq!(tracker.status(true).consecutive_failures, 2);
 
     tracker.record(MeshStreamAttempt::LocalRetirement(
         MeshStreamRetirement::TlsReload,
     ));
-    assert_eq!(tracker.status(true, false).consecutive_failures, 0);
+    assert_eq!(tracker.status(true).consecutive_failures, 0);
 
     tracker.record(MeshStreamAttempt::RemoteEof);
+    tracker.set_attachment(MeshStreamAttachment::Established);
     tracker.record_usable_state();
-    let status = tracker.status(true, true);
+    let status = tracker.status(true);
     assert_eq!(status.consecutive_failures, 0);
     assert_eq!(status.state, "connected");
 }
 
+/// The schema and the `/health` body both say "attached to a non-primary
+/// endpoint". Selecting an index is not attaching to it, so a client that is
+/// merely backing off toward endpoint #1 must not claim the fallback is active.
 #[test]
-fn tracker_reports_fallback_activation_without_naming_the_endpoint() {
-    let mut tracker =
-        MeshStreamTracker::new("stock_xds", MeshConfigStreamCredential::NotConfigured);
-    tracker.set_endpoint_index(0);
-    assert!(!tracker.status(true, true).fallback_active);
+fn fallback_is_reported_only_while_actually_attached_to_a_non_primary_endpoint() {
+    let mut tracker = tracker("stock_xds", MeshConfigStreamCredential::NotConfigured);
     tracker.set_endpoint_index(1);
-    assert!(tracker.status(true, true).fallback_active);
+    assert!(
+        !tracker.status(true).fallback_active,
+        "selecting a fallback index while detached is not fallback activation"
+    );
 
+    tracker.set_attachment(MeshStreamAttachment::Established);
+    assert!(tracker.status(true).fallback_active);
+
+    tracker.set_endpoint_index(0);
+    assert!(!tracker.status(true).fallback_active);
+
+    tracker.set_endpoint_index(1);
+    tracker.record(MeshStreamAttempt::RemoteEof);
+    assert!(
+        !tracker.status(true).fallback_active,
+        "the stream ended, so nothing is attached"
+    );
+}
+
+#[test]
+fn the_health_projection_never_carries_an_unbounded_value() {
+    let mut tracker = tracker("stock_xds", MeshConfigStreamCredential::SourceInvalid);
+    tracker.set_endpoint_index(1);
+    tracker.set_attachment(MeshStreamAttachment::Established);
     let rendered =
-        serde_json::to_string(&tracker.status(true, true)).expect("status serializes for /health");
-    for forbidden in ["http://", "https://", "://", "token", "/var/run"] {
+        serde_json::to_string(&tracker.status(true)).expect("status serializes for /health");
+    for forbidden in ["http://", "https://", "://", "token", "/var/run", "Bearer"] {
         assert!(
             !rendered.contains(forbidden),
             "the health projection must stay label-free: {rendered}"
         );
     }
+    assert!(rendered.contains("\"credential\":\"source_invalid\""));
+}
+
+/// Issue #3852 round two. `Unknown` (configured but not yet read) used to
+/// project as `not_configured`, which tells an operator their own configured
+/// token file is absent.
+#[test]
+fn an_unobserved_credential_source_is_not_reported_as_absent() {
+    assert_eq!(
+        MeshConfigStreamCredential::Unobserved.as_label(),
+        "unobserved"
+    );
+    assert_eq!(
+        StockCredentialState::Unknown.health(),
+        MeshConfigStreamCredential::Unobserved
+    );
+    assert_eq!(
+        StockCredentialState::NotConfigured.health(),
+        MeshConfigStreamCredential::NotConfigured
+    );
+    let source = StockXdsCredentialSource::new(
+        Some("/nonexistent/projected/token".to_string()),
+        StockCredentialLifetimePolicy::default(),
+    );
+    assert_eq!(source.initial_state(), StockCredentialState::Unknown);
+    assert_eq!(
+        tracker("stock_xds", source.initial_state().health())
+            .status(false)
+            .credential,
+        "unobserved"
+    );
 }
 
 // ── issue #3853: stock xDS transport admission ──────────────────────────
@@ -439,6 +654,61 @@ fn loopback_classification_does_not_resolve_hostnames() {
     assert!(!is_loopback_host("0.0.0.0"));
 }
 
+/// Issue #3853, acceptance criterion 4: a defense-in-depth test that BYPASSES
+/// top-level endpoint-set admission and proves the credential-INSERTION
+/// boundary itself refuses an insecure endpoint.
+///
+/// Configuring a plaintext URL and observing that no stream opens proves only
+/// connect-time classification. This drives the interceptor's own decision with
+/// a transport it would never have been handed in production, which is exactly
+/// the "an admission path was bypassed" case the gate exists for.
+#[test]
+fn the_authorization_insertion_boundary_refuses_a_non_tls_transport() {
+    let token: BearerToken = "Bearer projected-token".parse().expect("ascii metadata");
+
+    // The bypassed case: a bearer paired with the loopback development
+    // plaintext posture. Top-level admission would have refused this set.
+    let mut request = tonic::Request::new(());
+    let status = attach_stock_authorization(
+        Some(&(token.clone(), StockXdsTransport::LoopbackPlaintextDev)),
+        &mut request,
+    )
+    .expect_err("a bearer must never be attached to a plaintext endpoint");
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        request.metadata().get("authorization").is_none(),
+        "no authorization metadata may survive the refusal"
+    );
+    // The refusal message is a fixed constant and never echoes the credential.
+    assert!(!status.message().contains("projected-token"));
+
+    // The admitted case attaches exactly the materialized value.
+    let mut request = tonic::Request::new(());
+    attach_stock_authorization(
+        Some(&(token, StockXdsTransport::AuthenticatedTls)),
+        &mut request,
+    )
+    .expect("authenticated TLS may carry the bearer");
+    assert_eq!(
+        request
+            .metadata()
+            .get("authorization")
+            .and_then(|value| value.to_str().ok()),
+        Some("Bearer projected-token")
+    );
+
+    // No credential configured: no metadata, on either transport.
+    for transport in [
+        StockXdsTransport::AuthenticatedTls,
+        StockXdsTransport::LoopbackPlaintextDev,
+    ] {
+        let _ = transport;
+        let mut request = tonic::Request::new(());
+        attach_stock_authorization(None, &mut request).expect("no credential is always admissible");
+        assert!(request.metadata().get("authorization").is_none());
+    }
+}
+
 // ── issue #3852: credential lifetime ────────────────────────────────────
 
 fn jwt_with_exp(exp_epoch_secs: i64) -> String {
@@ -462,7 +732,8 @@ fn an_opaque_token_gets_the_operator_visible_maximum_stream_lifetime() {
         "an-opaque-projected-token",
         lifetime_policy(900, 60),
         SystemTime::now(),
-    );
+    )
+    .expect("an opaque token is admissible");
     assert_eq!(lifetime, Duration::from_secs(900));
     assert_eq!(basis, StockCredentialDeadlineBasis::MaxStreamLifetime);
     assert_eq!(basis.as_metric_label(), "max_stream_lifetime");
@@ -472,13 +743,39 @@ fn an_opaque_token_gets_the_operator_visible_maximum_stream_lifetime() {
 fn a_jwt_shaped_token_reconnects_before_exp_with_the_configured_skew() {
     let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
     let token = jwt_with_exp(1_000_600);
-    let (lifetime, basis) = credential_lifetime(&token, lifetime_policy(3600, 60), now);
+    let (lifetime, basis) = credential_lifetime(&token, lifetime_policy(3600, 60), now)
+        .expect("a JWT with a positive post-skew window is admissible");
     assert_eq!(
         lifetime,
         Duration::from_secs(540),
         "600s until exp, minus the 60s skew"
     );
     assert_eq!(basis, StockCredentialDeadlineBasis::JwtExpirationHint);
+    assert!(
+        lifetime < Duration::from_secs(600),
+        "the deadline must fall strictly before exp"
+    );
+}
+
+/// Issue #3852 round two. A short-lived JWT is legitimate material and must be
+/// used with a correspondingly short deadline — NOT clamped up to a reconnect
+/// floor, which is what let a stream outlive `exp`.
+#[test]
+fn a_short_lived_jwt_keeps_its_short_deadline_instead_of_being_clamped_up() {
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    // 90s until exp, 30s skew: a 60s usable window, well under any floor that
+    // a 3600s maximum-lifetime policy would otherwise suggest.
+    let token = jwt_with_exp(1_000_090);
+    let (lifetime, basis) = credential_lifetime(&token, lifetime_policy(3600, 30), now)
+        .expect("a 60s post-skew window is admissible");
+    assert_eq!(lifetime, Duration::from_secs(60));
+    assert_eq!(basis, StockCredentialDeadlineBasis::JwtExpirationHint);
+
+    // And an even shorter one: 5s until exp with a 1s skew is 4s, not 60s.
+    let token = jwt_with_exp(1_000_005);
+    let (lifetime, _) = credential_lifetime(&token, lifetime_policy(3600, 1), now)
+        .expect("a 4s post-skew window is admissible");
+    assert_eq!(lifetime, Duration::from_secs(4));
 }
 
 /// The `exp` is only ever a scheduling hint. A long-lived JWT must still be
@@ -488,22 +785,140 @@ fn a_jwt_shaped_token_reconnects_before_exp_with_the_configured_skew() {
 fn the_maximum_stream_lifetime_caps_a_far_future_jwt_exp() {
     let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
     let token = jwt_with_exp(1_000_000 + 86_400);
-    let (lifetime, basis) = credential_lifetime(&token, lifetime_policy(600, 60), now);
+    let (lifetime, basis) = credential_lifetime(&token, lifetime_policy(600, 60), now)
+        .expect("a far-future JWT is admissible, just capped");
     assert_eq!(lifetime, Duration::from_secs(600));
     assert_eq!(basis, StockCredentialDeadlineBasis::JwtExpirationHint);
 }
 
+/// Issue #3852 round two — the core fix.
+///
+/// An already-expired JWT used to be mapped onto a 60s reconnect FLOOR, which
+/// meant Ferrum knowingly opened an authenticated stream with expired material
+/// and held it open for a further minute. It is now refused outright and moves
+/// the source into the closed invalid state, where the bounded invalid-source
+/// retry (and the watcher's wakeup on replacement material) prevents a hot loop
+/// WITHOUT admitting the stale token.
 #[test]
-fn an_already_expired_or_skewed_jwt_falls_back_to_a_reconnect_floor() {
+fn an_already_expired_jwt_is_refused_rather_than_clamped_to_a_floor() {
     let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
-    let token = jwt_with_exp(999_000);
-    let (lifetime, basis) = credential_lifetime(&token, lifetime_policy(3600, 60), now);
+    let reason = credential_lifetime(&jwt_with_exp(999_000), lifetime_policy(3600, 60), now)
+        .expect_err("expired material must never yield a lifetime");
+    assert_eq!(reason, StockCredentialInvalidReason::Expired);
+    assert_eq!(reason.as_metric_label(), "token_expired");
+
+    // Exactly at `exp` is also expired.
+    let reason = credential_lifetime(&jwt_with_exp(1_000_000), lifetime_policy(3600, 0), now)
+        .expect_err("a token at exp is expired");
+    assert_eq!(reason, StockCredentialInvalidReason::Expired);
+}
+
+/// A token that has not expired yet but cannot leave a positive window once the
+/// operator's skew is applied would schedule the retirement AT OR AFTER `exp`.
+/// That is the same defect with one extra step, so it is refused too.
+#[test]
+fn a_jwt_that_cannot_clear_the_skew_is_refused() {
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    for remaining in [1u64, 30, 60] {
+        let reason = credential_lifetime(
+            &jwt_with_exp(1_000_000 + remaining as i64),
+            lifetime_policy(3600, 60),
+            now,
+        )
+        .expect_err("a non-positive post-skew window is refused");
+        assert_eq!(
+            reason,
+            StockCredentialInvalidReason::ExpiresWithinSkew,
+            "{remaining}s remaining vs a 60s skew"
+        );
+        assert_eq!(reason.as_metric_label(), "token_expires_within_skew");
+    }
+    // One second past the skew is admissible again.
+    let (lifetime, _) = credential_lifetime(&jwt_with_exp(1_000_061), lifetime_policy(3600, 60), now)
+        .expect("a 1s post-skew window is still a positive window");
+    assert_eq!(lifetime, Duration::from_secs(1));
+}
+
+/// Issue #3852 round two. Materialization happens BEFORE the channel is dialed,
+/// so a deadline derived from stream-open time would be extended by connect,
+/// TLS handshake, and RPC-setup latency — silently pushing a JWT past `exp`.
+/// The deadline is absolute and stamped at admission, so elapsed connect time
+/// SPENDS it.
+#[tokio::test]
+async fn the_absolute_deadline_is_stamped_at_admission_not_at_stream_open() {
+    let credential = StockBearerCredential::admit("opaque-projected-token", lifetime_policy(60, 5))
+        .expect("valid ascii");
+    let deadline = credential.deadline();
+    assert!(!credential.deadline_reached());
+
+    // Stand in for dial + TLS handshake + RPC setup.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
     assert_eq!(
-        lifetime,
-        Duration::from_secs(60),
-        "an expired claim must not compute a past deadline and hot-loop"
+        deadline,
+        credential.deadline(),
+        "connect latency must not move the deadline"
     );
-    assert_eq!(basis, StockCredentialDeadlineBasis::JwtExpirationHint);
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    assert!(
+        remaining < credential.lifetime(),
+        "the elapsed connect time must have been spent, not added: {remaining:?} vs {:?}",
+        credential.lifetime()
+    );
+    assert!(remaining > Duration::from_secs(58), "{remaining:?}");
+}
+
+/// The connect path refuses to attach a credential whose absolute deadline has
+/// already passed, rather than opening a stream it would have to retire in the
+/// same breath.
+#[tokio::test]
+async fn a_credential_whose_deadline_elapsed_during_connect_refuses_to_attach() {
+    // The minimum admissible maximum stream lifetime is 60s, so drive the
+    // elapsed-deadline case through a JWT whose post-skew window is 1s.
+    let now = SystemTime::now();
+    let exp = now
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("after the epoch")
+        .as_secs() as i64
+        + 1;
+    let credential = StockBearerCredential::admit(&jwt_with_exp(exp), lifetime_policy(3600, 0))
+        .expect("a 1s window is admissible at admission time");
+    assert!(!credential.deadline_reached());
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    assert!(
+        credential.deadline_reached(),
+        "a credential that expired during the dial must refuse to open a stream"
+    );
+    assert_eq!(
+        StockCredentialInvalidReason::DeadlineReached.as_metric_label(),
+        "token_deadline_reached"
+    );
+}
+
+/// The opaque bound stays finite; the UPPER clamp is the security property and
+/// is enforced in code unconditionally, so an opaque bearer can never hold a
+/// stream indefinitely. The operator-facing 60s minimum is enforced where an
+/// operator can actually set it (`FERRUM_MESH_STOCK_XDS_TOKEN_MAX_STREAM_LIFETIME_SECONDS`
+/// admission), not by silently rounding a programmatic policy up.
+#[test]
+fn the_opaque_maximum_stays_finite_and_capped() {
+    let now = SystemTime::now();
+    let (as_configured, _) = credential_lifetime("opaque", lifetime_policy(2, 0), now)
+        .expect("an opaque token is always admissible");
+    assert_eq!(as_configured, Duration::from_secs(2));
+
+    // Zero is refused as a deadline: it would be already elapsed.
+    let (floored, _) = credential_lifetime("opaque", lifetime_policy(0, 0), now)
+        .expect("an opaque token is always admissible");
+    assert_eq!(floored, Duration::from_secs(1));
+
+    let (too_large, _) = credential_lifetime("opaque", lifetime_policy(999_999, 0), now)
+        .expect("an opaque token is always admissible");
+    assert_eq!(
+        too_large,
+        Duration::from_secs(MAX_STOCK_XDS_TOKEN_MAX_STREAM_LIFETIME_SECS)
+    );
+    assert!(MIN_STOCK_XDS_TOKEN_MAX_STREAM_LIFETIME_SECS == 60);
 }
 
 #[test]
@@ -587,6 +1002,9 @@ fn invalid_reason_labels_are_a_closed_snake_case_set() {
         StockCredentialInvalidReason::NotAsciiMetadata,
         StockCredentialInvalidReason::ReadTimeout,
         StockCredentialInvalidReason::ReaderUnavailable,
+        StockCredentialInvalidReason::Expired,
+        StockCredentialInvalidReason::ExpiresWithinSkew,
+        StockCredentialInvalidReason::DeadlineReached,
     ];
     let mut labels: Vec<&str> = reasons.iter().map(|r| r.as_metric_label()).collect();
     labels.sort_unstable();
@@ -598,6 +1016,14 @@ fn invalid_reason_labels_are_a_closed_snake_case_set() {
                 .chars()
                 .all(|c| c.is_ascii_lowercase() || c == '_'),
             "'{label}'"
+        );
+    }
+    // Every invalid reason projects onto the SAME closed health value, so a new
+    // reason can never widen the authenticated `/health` surface.
+    for reason in reasons {
+        assert_eq!(
+            (StockCredentialState::Invalid { reason }).health(),
+            MeshConfigStreamCredential::SourceInvalid
         );
     }
 }
@@ -650,10 +1076,11 @@ fn a_configured_source_starts_unobserved_rather_than_assumed_valid() {
     );
     assert!(source.is_configured());
     assert_eq!(source.initial_state(), StockCredentialState::Unknown);
-    // An unobserved source must not be advertised as valid on `/health`.
+    // An unobserved source must not be advertised as valid on `/health` — nor
+    // as absent, which would misreport the operator's own configuration.
     assert_eq!(
         StockCredentialState::Unknown.health(),
-        MeshConfigStreamCredential::NotConfigured
+        MeshConfigStreamCredential::Unobserved
     );
 }
 
@@ -735,6 +1162,72 @@ async fn every_invalid_credential_source_shape_fails_closed_with_a_bounded_reaso
         source.materialize().await.expect_err("non-ascii source"),
         StockCredentialInvalidReason::NotAsciiMetadata
     );
+
+    // Invalid UTF-8 is distinguishable from valid-UTF-8-but-not-ASCII: the
+    // former never reaches the metadata parser at all.
+    let invalid_utf8 = temp.path().join("invalid-utf8-token");
+    std::fs::write(&invalid_utf8, [0x74, 0x6f, 0x6b, 0xff, 0xfe]).expect("write");
+    let source = StockXdsCredentialSource::new(
+        Some(invalid_utf8.to_string_lossy().into_owned()),
+        StockCredentialLifetimePolicy::default(),
+    );
+    assert_eq!(
+        source.materialize().await.expect_err("invalid utf-8 source"),
+        StockCredentialInvalidReason::InvalidEncoding
+    );
+
+    // A JWT-shaped token that is already past `exp` reaches the SAME closed
+    // invalid state through the real reader, so the fail-closed reconnect gate
+    // treats an expired credential exactly like a missing one.
+    let expired = temp.path().join("expired-token");
+    let past = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("after the epoch")
+        .as_secs() as i64
+        - 3_600;
+    std::fs::write(&expired, jwt_with_exp(past).as_bytes()).expect("write");
+    let source = StockXdsCredentialSource::new(
+        Some(expired.to_string_lossy().into_owned()),
+        StockCredentialLifetimePolicy::default(),
+    );
+    assert_eq!(
+        source.materialize().await.expect_err("expired source"),
+        StockCredentialInvalidReason::Expired
+    );
+
+    // Unreadable-where-portable: a mode-000 regular file. Skipped when the test
+    // runs as root, where the mode is not enforced.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let unreadable = temp.path().join("unreadable-token");
+        std::fs::write(&unreadable, b"projected-token").expect("write");
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod");
+        let source = StockXdsCredentialSource::new(
+            Some(unreadable.to_string_lossy().into_owned()),
+            StockCredentialLifetimePolicy::default(),
+        );
+        let outcome = source.materialize().await;
+        match outcome {
+            Err(reason) => assert_eq!(reason, StockCredentialInvalidReason::Unreadable),
+            // Running as root: the mode is advisory, so the read succeeds.
+            Ok(_) => assert!(
+                nix_running_as_root(),
+                "a mode-000 credential file must be refused for a non-root reader"
+            ),
+        }
+        let _ = std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o600));
+    }
+}
+
+/// The unreadable-source case is only meaningful for a non-root reader; hosted
+/// CI containers sometimes run as uid 0, where the file mode is advisory.
+#[cfg(unix)]
+fn nix_running_as_root() -> bool {
+    // SAFETY: `geteuid` is always safe; it takes no arguments, reads process
+    // credentials, and cannot fail.
+    unsafe { libc::geteuid() == 0 }
 }
 
 /// A projected Kubernetes secret rotates by swapping a symlink, not by
