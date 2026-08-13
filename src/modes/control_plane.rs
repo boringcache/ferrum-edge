@@ -2168,7 +2168,52 @@ pub async fn run(
         "CP/DP gRPC namespace authorization source: {}",
         cp_dp_verifier.describe()
     );
-    let cp_dp_verifier = Arc::new(CpDpVerifierStore::new(cp_dp_verifier));
+    // Published, bounded trust-reload health (issue #3813). The status is
+    // created only when a bundle is actually watched: without a watcher there
+    // is no reload to be degraded by, and a permanently blocked admission gate
+    // that nothing can clear would be strictly worse than none.
+    let trust_reload_interval = Duration::from_secs(env_config.secret_refresh_interval_seconds);
+    let trust_status = match env_config.cp_dp_grpc_trust_bundle_path.as_deref() {
+        Some(_) => {
+            let max_stale = env_config.cp_dp_trust_max_stale();
+            if max_stale.is_zero() {
+                warn!(
+                    "FERRUM_CP_DP_TRUST_ALLOW_UNBOUNDED_STALE=true: this control plane will keep \
+                     authorizing under its last accepted trust generation for as long as every \
+                     reload keeps failing. A credential removed from the bundle stays usable \
+                     until a valid reload lands or the process restarts. Alert on \
+                     ferrum_cp_dp_trust_degraded and ferrum_cp_dp_trust_reload_worker_stalled."
+                );
+            }
+            let status_hmac_key = env_config.admin_jwt_secret.as_deref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "FERRUM_ADMIN_JWT_SECRET must be set to publish a replica-stable CP/DP trust \
+                     generation identifier; an unkeyed digest is not a substitute"
+                )
+            })?;
+            if status_hmac_key.len() < crate::config::types::MIN_JWT_SECRET_LENGTH {
+                return Err(anyhow::anyhow!(
+                    "FERRUM_ADMIN_JWT_SECRET must be at least {} characters to publish a \
+                     replica-stable CP/DP trust generation identifier; an unkeyed digest is not \
+                     a substitute",
+                    crate::config::types::MIN_JWT_SECRET_LENGTH
+                ));
+            }
+            let status = Arc::new(
+                crate::grpc::cp_trust_health::CpDpTrustReloadStatus::watching(
+                    max_stale,
+                    env_config.cp_dp_trust_allow_unbounded_stale,
+                    trust_reload_interval,
+                    status_hmac_key.as_bytes(),
+                    &cp_dp_verifier.configuration_fingerprint(),
+                ),
+            );
+            crate::grpc::cp_trust_health::install(status)
+        }
+        None => crate::grpc::cp_trust_health::disabled_status(),
+    };
+    let cp_dp_verifier =
+        Arc::new(CpDpVerifierStore::new(cp_dp_verifier).with_trust_status(trust_status.clone()));
     let max_stream_lifetime = Duration::from_secs(env_config.cp_grpc_max_stream_lifetime_seconds);
     let trust_bundle_reload_handle = env_config.cp_dp_grpc_trust_bundle_path.clone().map(|path| {
         crate::grpc::cp_trust::spawn_trust_bundle_reload(
@@ -2176,7 +2221,8 @@ pub async fn run(
             env_config.cp_dp_grpc_jwt_secret.clone(),
             cp_dp_verifier.clone(),
             cp_scope.requires_namespace_claim_by_default(),
-            Duration::from_secs(env_config.secret_refresh_interval_seconds),
+            trust_reload_interval,
+            trust_status,
             shutdown_tx.subscribe(),
         )
     });

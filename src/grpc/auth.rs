@@ -44,6 +44,7 @@ use super::cp_trust::{
     CpDpVerifier, CpDpVerifierSnapshot, CpDpVerifierStore, CpGrpcConnectInfo,
     TenantAuthRejectReason, VerificationCredentialIdentity, resolve_authorized_namespaces,
 };
+use super::cp_trust_health::TrustStaleWatch;
 
 /// `jsonwebtoken`'s accepted clock leeway, pinned explicitly so the
 /// post-verification stream deadline uses exactly the same allowance as the
@@ -399,6 +400,19 @@ impl VerifiedGrpcIdentity {
         snapshot: &CpDpVerifierSnapshot,
         verifier: &CpDpVerifierStore,
     ) -> Result<Self, Status> {
+        // The stale-trust boundary (#3813). Every authenticated CP stream
+        // family — ConfigSync, local and remote MeshSubscribe, SotW ADS, and
+        // Delta ADS — reaches admission through this one seam, so blocking here
+        // is what makes "a credential the operator tried to revoke cannot be
+        // re-admitted under an unrevalidatable verifier" true for all of them
+        // at once. The refusal deliberately names no path, no expiry, no
+        // credential, and no configuration detail.
+        if verifier.trust_status().admission_blocked() {
+            return Err(Status::unavailable(
+                "This control plane cannot currently revalidate its verification trust source \
+                 and is not admitting new configuration streams",
+            ));
+        }
         let generation = verifier
             .active_generation_from_snapshot(snapshot, &self.credential)
             .ok_or_else(|| {
@@ -490,6 +504,10 @@ pub enum StreamAuthEndReason {
     Expired,
     VerificationKeyRemoved,
     ServerMaxLifetime,
+    /// The control plane could not revalidate its verification trust source
+    /// within the configured bound (#3813). Established streams end here rather
+    /// than being left to reconnect under a verifier nobody can confirm.
+    TrustStale,
     TransportClosed,
 }
 
@@ -499,6 +517,7 @@ impl StreamAuthEndReason {
             Self::Expired => "expired",
             Self::VerificationKeyRemoved => "verification_key_removed",
             Self::ServerMaxLifetime => "server_max_lifetime",
+            Self::TrustStale => "trust_stale",
             Self::TransportClosed => "transport_closed",
         }
     }
@@ -508,7 +527,8 @@ impl StreamAuthEndReason {
             Self::Expired => 0,
             Self::VerificationKeyRemoved => 1,
             Self::ServerMaxLifetime => 2,
-            Self::TransportClosed => 3,
+            Self::TrustStale => 3,
+            Self::TransportClosed => 4,
         }
     }
 
@@ -521,13 +541,20 @@ impl StreamAuthEndReason {
             Self::ServerMaxLifetime => {
                 Status::unauthenticated("Authenticated stream reached server maximum lifetime")
             }
+            // Deliberately shares no detail with the admission refusal beyond
+            // the fact that trust could not be revalidated: no path, no bound,
+            // no expiry, no credential.
+            Self::TrustStale => Status::unavailable(
+                "This control plane cannot currently revalidate its verification trust source",
+            ),
             Self::TransportClosed => Status::unavailable("Configuration stream transport closed"),
         }
     }
 }
 
-static STREAM_AUTH_ENDS: [[AtomicU64; 4]; 5] = [
+static STREAM_AUTH_ENDS: [[AtomicU64; 5]; 5] = [
     [
+        AtomicU64::new(0),
         AtomicU64::new(0),
         AtomicU64::new(0),
         AtomicU64::new(0),
@@ -538,11 +565,6 @@ static STREAM_AUTH_ENDS: [[AtomicU64; 4]; 5] = [
         AtomicU64::new(0),
         AtomicU64::new(0),
         AtomicU64::new(0),
-    ],
-    [
-        AtomicU64::new(0),
-        AtomicU64::new(0),
-        AtomicU64::new(0),
         AtomicU64::new(0),
     ],
     [
@@ -550,8 +572,17 @@ static STREAM_AUTH_ENDS: [[AtomicU64; 4]; 5] = [
         AtomicU64::new(0),
         AtomicU64::new(0),
         AtomicU64::new(0),
+        AtomicU64::new(0),
     ],
     [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ],
+    [
+        AtomicU64::new(0),
         AtomicU64::new(0),
         AtomicU64::new(0),
         AtomicU64::new(0),
@@ -576,6 +607,7 @@ pub fn render_stream_auth_metrics(output: &mut String, gateway_ns_label: &str) {
             StreamAuthEndReason::Expired,
             StreamAuthEndReason::VerificationKeyRemoved,
             StreamAuthEndReason::ServerMaxLifetime,
+            StreamAuthEndReason::TrustStale,
             StreamAuthEndReason::TransportClosed,
         ] {
             output.push_str(&format!(
@@ -663,6 +695,7 @@ impl StreamAuthorizationLease {
     /// Wait without polling. Used by the task-owned bidirectional ADS loops.
     pub async fn wait_for_end(&self) -> StreamAuthEndReason {
         let mut revisions = self.verifier.subscribe();
+        let mut trust_stale = TrustStaleWatch::new(Arc::clone(self.verifier.trust_status()));
         loop {
             // Credential removal is an authorization decision, so it wins
             // over a coincident expiry/server deadline. Checking the live
@@ -677,6 +710,16 @@ impl StreamAuthorizationLease {
                     if changed.is_err() || !self.credential_is_active() {
                         return StreamAuthEndReason::VerificationKeyRemoved;
                     }
+                }
+                // The stale-trust boundary (#3813). An established stream must
+                // not outlive the window in which its verifier could still be
+                // confirmed: refusing only *new* streams would leave the
+                // longest-lived sessions as the ones the bound never reaches.
+                () = trust_stale.stale() => {
+                    if !self.credential_is_active() {
+                        return StreamAuthEndReason::VerificationKeyRemoved;
+                    }
+                    return StreamAuthEndReason::TrustStale;
                 }
                 _ = tokio::time::sleep_until(self.authorization_deadline) => {
                     // A verifier update can make this arm ready in the same
@@ -744,6 +787,7 @@ pub struct AuthorizedResponseStream<S> {
     authorization_sleep: Pin<Box<Sleep>>,
     server_sleep: Pin<Box<Sleep>>,
     verifier_watch: VerifierWatch,
+    trust_stale: TrustStaleWatch,
     credential: VerificationCredentialIdentity,
     credential_generation: u64,
     verifier: Arc<CpDpVerifierStore>,
@@ -768,6 +812,7 @@ impl<S> AuthorizedResponseStream<S> {
             )),
             server_sleep: Box::pin(tokio::time::sleep_until(server_deadline)),
             verifier_watch: VerifierWatch::new(verifier.subscribe()),
+            trust_stale: TrustStaleWatch::new(Arc::clone(verifier.trust_status())),
             credential: identity.credential.clone(),
             credential_generation: identity.credential_generation,
             verifier,
@@ -794,6 +839,13 @@ impl<S> AuthorizedResponseStream<S> {
     fn authorization_end(&mut self, cx: &mut Context<'_>) -> Option<StreamAuthEndReason> {
         if !self.credential_is_active() {
             return Some(StreamAuthEndReason::VerificationKeyRemoved);
+        }
+        // The stale-trust boundary (#3813), armed as one timer at the exact
+        // instant the bound is crossed. It resolves before the lifetime timers
+        // for the same reason credential removal does: it is an authorization
+        // decision, not a scheduled expiry.
+        if self.trust_stale.poll_stale(cx).is_ready() {
+            return Some(StreamAuthEndReason::TrustStale);
         }
         if self.authorization_sleep.as_mut().poll(cx).is_ready() {
             return Some(if !self.credential_is_active() {

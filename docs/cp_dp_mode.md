@@ -151,8 +151,19 @@ DPs and mesh/xDS clients use their existing bounded reconnect backoff and reread
 The fixed-cardinality
 `ferrum_grpc_config_stream_terminations_total{surface,reason}` metric and
 structured `grpc_config_stream_*` audit events distinguish `expired`,
-`verification_key_removed`, `server_max_lifetime`, and `transport_closed`
-without token, claim, key, node, or namespace labels.
+`verification_key_removed`, `server_max_lifetime`, `trust_stale`, and
+`transport_closed` without token, claim, key, node, or namespace labels.
+
+A rejected trust-bundle reload retains the entire previous verifier, but only
+for `FERRUM_CP_DP_TRUST_MAX_STALE_SECONDS` (default 900). The first refusal
+marks trust reload degraded on authenticated `/health` and in the
+`ferrum_cp_dp_trust_*` families; a stalled worker is immediately degraded and
+`ferrum_cp_dp_trust_reload_worker_stalled` without failing readiness inside the
+bound. At the bound the CP fails readiness, refuses new ConfigSync,
+MeshSubscribe, and xDS streams, and ends established ones with `trust_stale`.
+Authenticated `/health`/`/status` also carry `active_generation`, a keyed
+HMAC-SHA-256 identifier for replica convergence. See
+[cp_namespace_tenancy.md](cp_namespace_tenancy.md#retention-of-an-unrevalidatable-verifier-is-bounded-issue-3813).
 
 ### Config Sync Flow
 

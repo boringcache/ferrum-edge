@@ -340,6 +340,71 @@ Between the two steps the old document's digest no longer matches, so the
 candidate is refused and the CP keeps the last accepted verifier — the window is
 fail-closed rather than mixed.
 
+### Retention of an unrevalidatable verifier is bounded (issue #3813)
+
+Retaining the entire last accepted verifier through a transient failure is the
+right availability policy. Left unbounded it is also a silent one: a credential
+an operator removed from the bundle keeps authorizing for as long as every
+reload keeps failing, and the hourly maximum stream lifetime does not help —
+the reconnect re-verifies under the same retained key.
+
+The reload worker therefore publishes its own health, and the retention window
+has a finite default.
+
+**What is published.** Authenticated `/health` and `/status` carry a
+`cp_dp_trust` object, and `/metrics` carries the `ferrum_cp_dp_trust_*`
+families. Both are fixed-cardinality: booleans, counters, seconds, the closed
+reason set above (plus `reader_unavailable`, `reload_reader_failed`,
+`reload_read_timed_out`, `scope_validation_failed`, and `worker_exited`).
+Nothing more on Prometheus: no path, `kid`, namespace, token, key byte, or
+generation identifier. Authenticated health additionally carries
+`active_generation`, a replica-stable HMAC-SHA-256 of the private configuration
+fingerprint under the fleet-shared `FERRUM_ADMIN_JWT_SECRET` (domain
+`ferrum-cp-dp-trust-status-id-v1\0`). Replicas that share the same accepted
+bundle and the same HMAC key publish the same 64-hex value; a semantic bundle
+change mints a new value; an unchanged revalidation keeps it. Replicas that do
+not share the HMAC key are incomparable. An admin JWT lets an operator *see*
+the identifier; it does not reveal the HMAC key. An unkeyed digest of the
+fingerprint is never published — that would be an offline oracle against a
+guessed HS\* secret. The private fingerprint stays inside the reload worker.
+Unauthenticated probes still receive only the documented coarse `status` /
+`ready` pair.
+
+**What the states mean.**
+
+| State | Trigger | Effect |
+|---|---|---|
+| degraded | The first refused attempt in an episode, a stalled worker, or an unexpected worker exit | `status: degraded`; `ferrum_cp_dp_trust_degraded 1`. Streams and admission are unaffected inside the bound — the retained verifier is still serving. A stalled worker is also `ferrum_cp_dp_trust_reload_worker_stalled 1`. |
+| stale | The active generation reaches `FERRUM_CP_DP_TRUST_MAX_STALE_SECONDS` | `ready: false`, `status: unavailable`; new ConfigSync, local/remote MeshSubscribe, SotW ADS, and Delta ADS streams are refused with `UNAVAILABLE`, and established streams end at the same boundary through the shared authorization lease. |
+| worker stalled | No attempt has completed inside three poll intervals (floored at 60s) | Immediately degraded and `worker_state=stalled`. Readiness still follows the stale bound. Cleared by the next completed attempt (acceptance or rejection); a valid candidate also clears degraded. |
+| worker failed | The reload task exited or panicked without being asked to | `ready: false` immediately, independent of the bound: nothing in that process can publish a revocation again. A shutdown-signalled exit is `stopped` and is never reported as a failure. |
+| recovered | A valid candidate is accepted | Degraded and stale clear, admission and readiness return, and `ferrum_cp_dp_trust_reload_recoveries_total` increments exactly once for the episode. |
+
+The age is measured on a monotonic clock from the last **accepted** reload, so
+an NTP step cannot extend or shorten it, and attempts, refusals, and reconnects
+never reset it. A semantically *unchanged* candidate is an acceptance: no
+verifier swap is needed, but the source was read coherently and revalidated,
+which is exactly what the bound asks about.
+
+The configured maximum is the boundary; no grace period is added to it. It must
+be at least three poll intervals (`FERRUM_SECRET_REFRESH_INTERVAL_SECONDS`) or
+startup fails closed, because a shorter bound would latch between two healthy
+polls. `FERRUM_CP_DP_TRUST_MAX_STALE_SECONDS=0` means unbounded retention and is
+refused unless `FERRUM_CP_DP_TRUST_ALLOW_UNBOUNDED_STALE=true` — "retain a
+verifier nobody can revalidate, forever, while ready" is never an implicit
+default.
+
+Suggested alerts: `ferrum_cp_dp_trust_degraded == 1` for longer than one poll
+interval (a rotation is not landing), `ferrum_cp_dp_trust_stale == 1` (this
+replica is refusing its data planes), `ferrum_cp_dp_trust_reload_worker_stalled
+== 1` (the watcher is wedged), `ferrum_cp_dp_trust_reload_worker_running
+== 0` (supervision failure), disagreement of authenticated
+`cp_dp_trust.active_generation` across replicas that share
+`FERRUM_ADMIN_JWT_SECRET` (a replica has not accepted the same bundle), and
+`max(ferrum_cp_dp_trust_last_acceptance_age_seconds) > 3 *
+FERRUM_SECRET_REFRESH_INTERVAL_SECONDS` (some replica has stopped revalidating
+even if it has not yet reached its bound).
+
 ### mTLS / SPIFFE intersection
 
 When the CP gRPC listener terminates mTLS and the peer's leaf certificate
