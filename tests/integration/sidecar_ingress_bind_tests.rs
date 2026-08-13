@@ -82,6 +82,7 @@ fn prepare_sidecar(
     let spiffe = format!("spiffe://cluster.local/ns/{namespace}/sa/{service_name}");
     let (workload, service) = local_echo(namespace, service_name, &spiffe, endpoint_port, protocol);
     let mut runtime = default_mesh_runtime();
+    runtime.namespace = namespace.to_string();
     runtime.workload_spiffe_id = Some(spiffe.to_string());
     runtime.sidecar_enforced = true;
     runtime.topology = MeshTopology::Sidecar;
