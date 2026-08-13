@@ -233,7 +233,9 @@ ambient:
   # name the downward API supplies) and republishes it immediately before the
   # steady-state container starts, so the identity that container reads was
   # proven by its OWN pod rather than inherited from whatever the node-agent last
-  # left on the shared registry path.
+  # left on the shared registry path. When the preflight is enabled the chart owns
+  # FERRUM_K8S_NODE_NAME from spec.nodeName; ambient.env.FERRUM_K8S_NODE_NAME
+  # fails rendering. Supply FERRUM_K8S_NODE_UID instead to skip the API lookup.
   #
   # Disabling it does NOT relax the runtime boundary: a node with no durable
   # record and no attestation stays fail-closed as `migration_required`. Use it

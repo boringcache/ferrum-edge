@@ -4386,8 +4386,10 @@ default `true`). It runs `ferrum-edge ambient-udp-preflight` from the same
    `.node-identity-v1.json` (see *Node identity* below). It retracts any
    publication first, **then** reads this incarnation's boot id, then performs
    one bounded read-only `get` bound to the node name the downward API stamped
-   on this pod (`FERRUM_K8S_NODE_NAME` from `spec.nodeName`; an explicit
-   `FERRUM_K8S_NODE_UID` skips the API lookup). The lookup uses in-cluster
+   on this pod. The chart injects `FERRUM_K8S_NODE_NAME` from `spec.nodeName`
+   when the preflight is enabled; `ambient.env.FERRUM_K8S_NODE_NAME` fails
+   rendering so the lookup cannot be redirected to another Node object. An
+   explicit `FERRUM_K8S_NODE_UID` skips the API lookup. The lookup uses in-cluster
    config only; a missing in-cluster config fails closed unless the explicit
    UID is set. The chart's `nodes: get` grant
    has no list/watch/write and no `resourceNames`; Kubernetes therefore permits
@@ -4583,9 +4585,12 @@ contract: a bare `FERRUM_MESH_CAPTURE_UDP_PLACEMENT_ESTABLISHED=<target>` value
 authorizes nothing on its own. Such a pipeline must render the equivalent
 privileged preflight init stage (or supply node-bound exemptions) and must carry
 an era-qualified `FERRUM_MESH_CAPTURE_UDP_NODE_PROOF_GENERATION` on the ambient
-pod, the preflight, and the node-agent, plus `FERRUM_K8S_NODE_NAME` (or
-`FERRUM_K8S_NODE_UID`) on **both** the preflight and the node-agent so they
-share the same identity binding. When a client-render pipeline overrides the
+pod, the preflight, and the node-agent. The chart injects `FERRUM_K8S_NODE_NAME`
+from `spec.nodeName` on the preflight when it is enabled (a literal
+`ambient.env.FERRUM_K8S_NODE_NAME` fails rendering); a GitOps/client-render
+pipeline may instead supply `FERRUM_K8S_NODE_UID` on **both** the preflight and
+the node-agent so they share the same identity binding without a Node API lookup.
+When a client-render pipeline overrides the
 boot-id path, it must set `FERRUM_MESH_CAPTURE_UDP_NODE_BOOT_ID_PATH` on both
 processes as well. The preflight's Kubernetes client is in-cluster only; a
 missing in-cluster config fails closed unless the explicit UID is used.

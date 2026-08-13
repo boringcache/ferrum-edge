@@ -558,6 +558,19 @@ fn the_preflight_binds_its_node_lookup_to_this_pods_node_name() {
     let ambient = read("templates/ambient-daemonset.yaml");
     let rbac = read("templates/ambient-rbac.yaml");
 
+    assert!(
+        ambient.contains(
+            "if and $ambientUdpRunNodePreflight (hasKey $ambientEnv \"FERRUM_K8S_NODE_NAME\")"
+        ) && ambient.contains(
+            "ambient.env.FERRUM_K8S_NODE_NAME is chart-managed when the settled host-netns UDP preflight is enabled"
+        ),
+        "a literal ambient.env.FERRUM_K8S_NODE_NAME must fail rendering when the preflight is enabled"
+    );
+    assert!(
+        !ambient.contains("if not (hasKey $ambientEnv \"FERRUM_K8S_NODE_NAME\")"),
+        "the preflight must not gate the downward-API fieldRef on ambient.env presence"
+    );
+
     let (_, after_init) = ambient
         .split_once("initContainers:")
         .expect("init container block");
@@ -565,9 +578,24 @@ fn the_preflight_binds_its_node_lookup_to_this_pods_node_name() {
         .split_once("      containers:")
         .expect("steady-state container block");
     assert!(
-        init_block.contains("- name: FERRUM_K8S_NODE_NAME")
+        init_block.contains("if not $hasExplicitNodeUid")
+            && init_block.contains("- name: FERRUM_K8S_NODE_NAME")
             && init_block.contains("fieldPath: spec.nodeName"),
-        "the preflight must receive this pod's node name from the downward API"
+        "the preflight must receive this pod's node name from the downward API when no explicit UID is set"
+    );
+    assert_eq!(
+        init_block.matches("- name: FERRUM_K8S_NODE_NAME").count(),
+        1,
+        "the preflight init container must render exactly one FERRUM_K8S_NODE_NAME env row"
+    );
+    assert_eq!(
+        init_block.matches("fieldPath: spec.nodeName").count(),
+        1,
+        "the preflight init container must bind FERRUM_K8S_NODE_NAME to spec.nodeName exactly once"
+    );
+    assert!(
+        !init_block.contains("index $ambientEnv \"FERRUM_K8S_NODE_NAME\""),
+        "the preflight must not source FERRUM_K8S_NODE_NAME from ambient.env"
     );
 
     assert!(
@@ -614,6 +642,63 @@ fn the_preflight_binds_its_node_lookup_to_this_pods_node_name() {
             && rbac.contains("runtime request is what binds the lookup"),
         "the Role comment must not claim an enforcement boundary Kubernetes RBAC \
          does not provide"
+    );
+}
+
+/// An explicit UID skips the Node API lookup, but a stray node-name override
+/// must still fail closed when the preflight is enabled.
+#[test]
+fn the_preflight_explicit_node_uid_skips_the_name_fieldref_but_rejects_name_override() {
+    let ambient = read("templates/ambient-daemonset.yaml");
+    let values = read("values.yaml");
+
+    assert!(
+        ambient.contains("$hasExplicitNodeUid := hasKey $ambientEnv \"FERRUM_K8S_NODE_UID\"")
+            && ambient.contains("if not $hasExplicitNodeUid"),
+        "the preflight must omit the downward-API node name when an explicit UID is supplied"
+    );
+    assert!(
+        ambient.contains(
+            "if and $ambientUdpRunNodePreflight (hasKey $ambientEnv \"FERRUM_K8S_NODE_NAME\")"
+        ),
+        "an explicit UID must not relax the chart-owned node-name binding"
+    );
+    assert!(
+        values.contains("ambient.env.FERRUM_K8S_NODE_NAME")
+            && values.contains("fails rendering"),
+        "values must document that ambient.env.FERRUM_K8S_NODE_NAME is rejected when the preflight is enabled"
+    );
+}
+
+/// SPIRE and the preflight are separate containers; each may receive its own
+/// downward-API node name without duplicating env rows inside one container.
+#[test]
+fn spire_and_preflight_each_bind_node_name_in_their_own_container() {
+    let ambient = read("templates/ambient-daemonset.yaml");
+
+    let (_, after_init) = ambient
+        .split_once("initContainers:")
+        .expect("init container block");
+    let (init_block, steady_state) = after_init
+        .split_once("      containers:")
+        .expect("steady-state container block");
+
+    assert_eq!(
+        init_block.matches("- name: FERRUM_K8S_NODE_NAME").count(),
+        1,
+        "the preflight init container must carry exactly one FERRUM_K8S_NODE_NAME row"
+    );
+    assert!(
+        steady_state.contains("if $ambientSpireUsesNodeName")
+            && steady_state.contains("- name: FERRUM_K8S_NODE_NAME")
+            && steady_state.contains("fieldPath: spec.nodeName"),
+        "SPIRE NodeWaypoint profiles must still receive their own downward-API node name in the steady-state container"
+    );
+    assert!(
+        ambient.contains(
+            "ambient.env.%s is chart-managed when ambient.spire.enabled=true; set ambient.spire values instead"
+        ),
+        "SPIRE must keep FERRUM_K8S_NODE_NAME chart-managed separately from the preflight binding"
     );
 }
 
