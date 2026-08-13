@@ -1063,9 +1063,11 @@ native_probe_classify.py
 logs deploy/ferrum-cp
 get pod -l "app=${deploy}"
 "#;
+    let helper_no_slice =
+        HELPER.replace("slice-accepted-overrides-cp-reject", "removed-slice-guard");
     let no_slice_violations = native_probe_classifier_contract_violations(
         no_slice_guard,
-        HELPER.replace("slice-accepted-overrides-cp-reject", "removed-slice-guard"),
+        &helper_no_slice,
         MANIFESTS,
     );
     assert!(
