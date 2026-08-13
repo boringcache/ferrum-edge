@@ -27,8 +27,10 @@ use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::http3::config::Http3ServerConfig;
 use ferrum_edge::proxy::ProxyState;
 use ferrum_edge::proxy::gateway_listener::{
-    GatewayListenerFailureProtocol, GatewayListenerFailureReason, GatewayListenerHttp3,
-    GatewayListenerManager, GatewayListenerTls,
+    GatewayListenerHttp3, GatewayListenerManager, GatewayListenerTls,
+};
+use ferrum_edge::proxy::gateway_listener_status::{
+    GatewayListenerFailureCategory, GatewayListenerProtocolHalf,
 };
 use ferrum_edge::tls::{NoVerifier, TlsPolicy};
 
@@ -314,14 +316,14 @@ fn assert_quic_udp_collision(
     assert!(
         failures.iter().any(|failure| {
             failure.port == port
-                && failure.protocol == GatewayListenerFailureProtocol::Quic
-                && failure.reason == GatewayListenerFailureReason::UdpStreamCollision
+                && failure.protocol == GatewayListenerProtocolHalf::Quic
+                && failure.category == GatewayListenerFailureCategory::UdpStreamCollision
         }),
         "expected QUIC udp_stream_collision failure: {failures:?}"
     );
     assert!(
         !failures.iter().any(|failure| {
-            failure.port == port && failure.protocol == GatewayListenerFailureProtocol::Tcp
+            failure.port == port && failure.protocol == GatewayListenerProtocolHalf::Tcp
         }),
         "UDP collision must not refuse TCP: {failures:?}"
     );
@@ -527,7 +529,7 @@ async fn removing_udp_claim_starts_quic_and_restores_alt_svc() {
     assert!(
         !failures.iter().any(|failure| {
             failure.port == port
-                && failure.reason == GatewayListenerFailureReason::UdpStreamCollision
+                && failure.category == GatewayListenerFailureCategory::UdpStreamCollision
         }),
         "UDP withdrawal must clear the collision: {failures:?}"
     );
@@ -569,8 +571,8 @@ async fn tcp_stream_collision_still_refuses_whole_listener() {
     assert!(
         failures.iter().any(|failure| {
             failure.port == port
-                && failure.protocol == GatewayListenerFailureProtocol::Tcp
-                && failure.reason == GatewayListenerFailureReason::TcpStreamCollision
+                && failure.protocol == GatewayListenerProtocolHalf::Tcp
+                && failure.category == GatewayListenerFailureCategory::StreamPortCollision
         }),
         "TCP/TLS stream collision must refuse the whole listener: {failures:?}"
     );

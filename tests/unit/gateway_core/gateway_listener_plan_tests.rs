@@ -12,9 +12,10 @@ use chrono::Utc;
 use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, GatewayConfig, Proxy};
 use ferrum_edge::modes::mesh::config::MeshConfig;
 use ferrum_edge::proxy::gateway_listener::{
-    DesiredGatewayListener, GatewayListenerClass, GatewayListenerFailureReason,
-    GatewayListenerPlan, GatewayListenerProtocolFailure,
+    DesiredGatewayListener, GatewayListenerClass, GatewayListenerPlan,
+    GatewayListenerProtocolFailure,
 };
+use ferrum_edge::proxy::gateway_listener_status::GatewayListenerFailureCategory;
 
 const PORT: u16 = 9000;
 const DEFAULT_BIND: IpAddr = IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
@@ -219,8 +220,8 @@ fn http3_and_udp_stream_refuses_quic_only() {
         "unexpected refusal message: {message}"
     );
     assert_eq!(
-        GatewayListenerProtocolFailure::UdpStreamCollision.reason(),
-        GatewayListenerFailureReason::UdpStreamCollision
+        GatewayListenerProtocolFailure::UdpStreamCollision.category(),
+        GatewayListenerFailureCategory::UdpStreamCollision
     );
 }
 
@@ -289,8 +290,8 @@ fn http_and_tcp_stream_on_same_port_is_refused() {
     );
     let refusal = plan.refused.get(&PORT).expect("refusal reason");
     assert_eq!(
-        refusal.reason,
-        GatewayListenerFailureReason::TcpStreamCollision
+        refusal.category,
+        GatewayListenerFailureCategory::StreamPortCollision
     );
     assert!(
         refusal.message.contains("TCP/TLS stream proxy"),
@@ -314,8 +315,8 @@ fn http_and_tcp_tls_stream_on_same_port_is_refused() {
     );
     let refusal = plan.refused.get(&PORT).expect("refusal reason");
     assert_eq!(
-        refusal.reason,
-        GatewayListenerFailureReason::TcpStreamCollision
+        refusal.category,
+        GatewayListenerFailureCategory::StreamPortCollision
     );
     assert!(
         refusal.message.contains("TCP/TLS stream proxy"),
@@ -427,8 +428,8 @@ fn dedicated_sidecar_tls_bind_is_refused_with_a_bounded_reason() {
     assert!(!plan.ports.contains_key(&PORT));
     let refusal = plan.refused.get(&PORT).expect("refusal");
     assert_eq!(
-        refusal.reason,
-        GatewayListenerFailureReason::DedicatedBindTlsUnsupported
+        refusal.category,
+        GatewayListenerFailureCategory::DedicatedBindTlsUnsupported
     );
     assert!(refusal.message.contains("plaintext HTTP-family"));
 }
@@ -471,8 +472,8 @@ fn dedicated_bind_cannot_be_absorbed_by_process_global_same_class_frontend() {
     assert!(!plan.ports.contains_key(&PORT));
     let reason = plan.refused.get(&PORT).expect("refusal");
     assert_eq!(
-        reason.reason,
-        GatewayListenerFailureReason::DedicatedBindConflict
+        reason.category,
+        GatewayListenerFailureCategory::DedicatedBindConflict
     );
     assert!(
         reason.message.contains("dedicated Sidecar ingress bind"),

@@ -855,6 +855,7 @@ jobs:
               integration::cp_grpc_handshake_admission_tests
               integration::cp_multi_namespace_tests
               integration::cp_tenant_trust_binding_tests
+              integration::cp_trust_reload_health_tests
               integration::connection_pool_tests
               integration::http2_pool_tests
               integration::http3_integration_tests
@@ -875,6 +876,7 @@ jobs:
               integration::udp_fault_injection_tests
               integration::gateway_api_udproute_datapath_tests
               integration::gateway_hbone_pool_tests
+              integration::gateway_listener_observability_tests
               integration::gateway_listener_quic_udp_collision_tests
               integration::gateway_multi_cert_sni_tests
               integration::mesh_grpc_transport_tests
@@ -1269,6 +1271,7 @@ jobs:
               functional_db_tls_test
               functional_db_upstream_test
               functional_mesh_mode_test
+              functional_mesh_stock_xds_test
               functional_mongodb_test
               functional_namespace_test
               functional_redis_rate_limiting_test
