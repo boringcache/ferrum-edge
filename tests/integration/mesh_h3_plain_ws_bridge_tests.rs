@@ -298,6 +298,14 @@ fn shared_mesh_plain_helper_never_plaintext_falls_back() {
         "helper must share H1/H2 mesh retry/security plumbing"
     );
     assert!(
+        helper.contains("boxed_proxy_to_backend_mesh_retry("),
+        "H3 plain mesh dispatch must keep the large shared retry future out of the bridge frame"
+    );
+    assert!(
+        src.contains("#[inline(never)]\nfn boxed_proxy_to_backend_mesh_retry<'a>("),
+        "the H3-only boxing boundary must be constructed out of line"
+    );
+    assert!(
         !helper.contains("proxy_to_backend_retry("),
         "helper must never fall back to the plaintext reqwest dial"
     );

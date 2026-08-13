@@ -36521,6 +36521,59 @@ pub(crate) fn target_requires_http_mesh_egress(target: &UpstreamTarget) -> bool 
     hbone_pool::target_hbone_enabled(target) || mesh_mtls_pool::target_mesh_mtls_enabled(target)
 }
 
+/// The H3 plain mesh dispatch future, constructed out of line and returned
+/// boxed so its shared HBONE / Sidecar mesh-mTLS retry future is not an inline
+/// frame slot in the H3 bridge.
+///
+/// This is the same stack-budget invariant as [`boxed_proxy_to_backend_unix`].
+/// In an unoptimized hosted functional-test build, materializing
+/// `proxy_to_backend_mesh_retry` inside `proxy_h3_plain_http_mesh_buffered`
+/// nests both large mesh transport futures beneath the already-large H3 plain
+/// bridge poll frame. A healthy transport reaches that deep poll chain and can
+/// exhaust Tokio's worker stack; early Unix and identity refusals return before
+/// it and are unaffected. Building the future in this `#[inline(never)]`
+/// factory lets the H3 helper retain only a boxed pointer. The allocation is
+/// confined to H3 plain requests that already require a secured mesh bridge.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn boxed_proxy_to_backend_mesh_retry<'a>(
+    state: &'a ProxyState,
+    proxy: &'a Proxy,
+    backend_url: &'a str,
+    method: &'a str,
+    headers: &'a HashMap<String, String>,
+    upstream_target: Option<&'a UpstreamTarget>,
+    request_body: Option<&'a Bytes>,
+    replay_headers: Option<&'a hyper::HeaderMap>,
+    dispatch_hbone: bool,
+    plugins: &'a [Arc<dyn Plugin>],
+    request_ctx: &'a RequestContext,
+    stream_response: bool,
+    client_ip: &'a str,
+    xff_append_ip: &'a str,
+    request_is_secure: bool,
+    ctx_bytes_sent_observed: &'a Arc<std::sync::atomic::AtomicU64>,
+) -> BoxedBackendDispatchFuture<'a> {
+    Box::pin(proxy_to_backend_mesh_retry(
+        state,
+        proxy,
+        backend_url,
+        method,
+        headers,
+        upstream_target,
+        request_body,
+        replay_headers,
+        dispatch_hbone,
+        plugins,
+        request_ctx,
+        stream_response,
+        client_ip,
+        xff_append_ip,
+        request_is_secure,
+        ctx_bytes_sent_observed,
+    ))
+}
+
 /// Dispatch a buffered plain-HTTP attempt over the mesh transport required by
 /// `upstream_target` (HBONE or Sidecar mesh-mTLS).
 ///
@@ -36587,7 +36640,7 @@ pub(crate) async fn proxy_h3_plain_http_mesh_buffered(
         replay_headers.append(header_name, header_value);
     }
 
-    let (response, _, _) = proxy_to_backend_mesh_retry(
+    let (response, _, _) = boxed_proxy_to_backend_mesh_retry(
         state,
         proxy,
         backend_url,
