@@ -10722,9 +10722,9 @@ components:
           maxLength: 255
           description: >-
             Admin JWT subject that last wrote the record. Server-assigned from
-            the verified token and capped at 255 bytes so every backend rejects
-            an overlong subject before persistence. A value in the request body
-            is discarded. Attribution is never truncated.
+            the verified token and capped at 255 characters so every backend
+            rejects an overlong subject before persistence. A value in the
+            request body is discarded. Attribution is never truncated.
         created_at:
           type: string
           format: date-time

@@ -23,7 +23,7 @@ use ferrum_edge::admin::{
 };
 use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig};
 use ferrum_edge::config::gateway_trust::{
-    GatewayTrustBundleRecord, MAX_AUDIT_ACTOR_BYTES, MAX_X509_AUTHORITIES_PER_BUNDLE,
+    GatewayTrustBundleRecord, MAX_AUDIT_ACTOR_CHARS, MAX_X509_AUTHORITIES_PER_BUNDLE,
     record_trust_generation_published, reset_observability_for_tests,
 };
 use jsonwebtoken::{EncodingKey, Header, encode};
@@ -291,8 +291,14 @@ async fn an_overlong_jwt_subject_is_rejected_on_create_and_restore_without_trunc
     let dir = TempDir::new().expect("temp dir");
     let (base, _shutdown) = start_admin(admin_state(make_store(&dir).await)).await;
     let authority = root_ca_der_base64("root");
-    let at_cap = "a".repeat(MAX_AUDIT_ACTOR_BYTES);
-    let overlong = "a".repeat(MAX_AUDIT_ACTOR_BYTES + 1);
+    let at_cap = "é".repeat(MAX_AUDIT_ACTOR_CHARS);
+    let overlong = "é".repeat(MAX_AUDIT_ACTOR_CHARS + 1);
+    assert_eq!(at_cap.chars().count(), MAX_AUDIT_ACTOR_CHARS);
+    assert_eq!(overlong.chars().count(), MAX_AUDIT_ACTOR_CHARS + 1);
+    assert!(
+        at_cap.len() > MAX_AUDIT_ACTOR_CHARS,
+        "fixture must exceed 255 UTF-8 bytes so a byte cap would reject it"
+    );
     let create_body = json!({
         "trust_domain": "cluster.local",
         "bundle": bundle_body("cluster.local", &authority),
@@ -306,11 +312,11 @@ async fn an_overlong_jwt_subject_is_rejected_on_create_and_restore_without_trunc
         create_body.clone(),
     )
     .await;
-    assert_eq!(status, 201, "a 255-byte subject must be admitted: {created}");
+    assert_eq!(status, 201, "a 255-character subject must be admitted: {created}");
     assert_eq!(
         created["updated_by"].as_str(),
         Some(at_cap.as_str()),
-        "attribution at the byte cap must be stored in full"
+        "attribution at the character cap must be stored in full"
     );
 
     let (status, body) = post_json_as(
@@ -332,8 +338,8 @@ async fn an_overlong_jwt_subject_is_rejected_on_create_and_restore_without_trunc
         "expected an audit-actor bound error, got {body}"
     );
     assert!(
-        !rendered.contains(&overlong),
-        "admission diagnostics must not echo the overlong subject"
+        !rendered.contains(&overlong) && !rendered.contains('é'),
+        "admission diagnostics must not echo or truncate the overlong subject"
     );
     let (status, listed) = get_json(&base, "/gateway-trust-bundles", "cap-over").await;
     assert_eq!(status, 200);
@@ -393,8 +399,8 @@ async fn an_overlong_jwt_subject_is_rejected_on_create_and_restore_without_trunc
         "expected an audit-actor bound error on restore, got {body}"
     );
     assert!(
-        !rendered.contains(&overlong),
-        "restore diagnostics must not echo the overlong subject"
+        !rendered.contains(&overlong) && !rendered.contains('é'),
+        "restore diagnostics must not echo or truncate the overlong subject"
     );
     assert!(
         body["error"]

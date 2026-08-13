@@ -734,7 +734,7 @@ hostile backup cannot inject oversized or malformed trust material by going
 around the API, and an invalid section aborts with `400` and nothing deleted.
 Server-owned fields survive the payload: `id` and `created_at` come from the
 stored record, `revision` is assigned by the store, and `updated_by` is the
-restoring admin's verified JWT subject (at most 255 bytes; an overlong subject
+restoring admin's verified JWT subject (at most 255 characters; an overlong subject
 is rejected rather than truncated).
 
 See [admin_backup_restore.md](admin_backup_restore.md) for details.

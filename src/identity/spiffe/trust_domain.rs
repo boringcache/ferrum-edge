@@ -47,15 +47,6 @@ impl TrustDomain {
         Ok(Self(raw))
     }
 
-    /// Construct without SPIFFE validation.
-    ///
-    /// Gateway-trust admission tests use this to prove structural/raw size
-    /// bounds run before [`Self::new`]. Production parsers must not call this.
-    #[allow(dead_code)] // called from the gateway-trust test fixture helper
-    pub(crate) fn from_unvalidated(value: String) -> Self {
-        Self(value)
-    }
-
     /// View as a `&str`.
     pub fn as_str(&self) -> &str {
         &self.0
@@ -95,8 +86,8 @@ pub enum TrustDomainError {
     NotLowercase(String),
     #[error("trust domain '{0}' contains '/' — trust domains do not have a path component")]
     HasPath(String),
-    #[error("trust domain '{0}' is too long (max {1}, got {2})")]
-    TooLong(String, usize, usize),
+    #[error("trust domain is too long (max {0}, got {1})")]
+    TooLong(usize, usize),
     #[error("trust domain '{0}' contains invalid character '{1}'")]
     InvalidChar(String, char),
     #[error("trust domain '{0}' must not begin or end with '.', '-', or '_'")]
@@ -115,11 +106,7 @@ fn validate(raw: &str) -> Result<(), TrustDomainError> {
         return Err(TrustDomainError::Empty);
     }
     if raw.len() > MAX_TRUST_DOMAIN_LEN {
-        return Err(TrustDomainError::TooLong(
-            raw.to_string(),
-            MAX_TRUST_DOMAIN_LEN,
-            raw.len(),
-        ));
+        return Err(TrustDomainError::TooLong(MAX_TRUST_DOMAIN_LEN, raw.len()));
     }
     if raw.contains('/') {
         return Err(TrustDomainError::HasPath(raw.to_string()));

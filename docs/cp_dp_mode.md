@@ -202,7 +202,7 @@ already use — there is no second representation that can drift.
   `bundle.local.trust_domain`), the bounded `bundle`, a backend-assigned
   `revision` (see *Incarnation-safe revisions* below),
   `updated_by` (the verified admin JWT subject — never a client-supplied value,
-  at most 255 bytes, never truncated),
+  at most 255 characters, never truncated),
   and `created_at` / `updated_at`.
 - **Bounded, validated material.** Admission caps authority counts (16 X.509 and
   16 JWT per bundle, 32 federated bundles), per-authority size (16 KiB), and the
@@ -335,7 +335,7 @@ already use — there is no second representation that can drift.
   the destructive clear rather than silently reduced to whichever record came
   first. Server-owned fields survive the payload: `id` and `created_at` come
   from the stored record, `revision` is assigned by the store, and `updated_by`
-  is the restoring admin's verified JWT subject (at most 255 bytes; an overlong
+  is the restoring admin's verified JWT subject (at most 255 characters; an overlong
   subject is rejected rather than truncated). The namespace clear that
   precedes an import deliberately does not touch trust, so restoring an older
   config backup can never silently revoke a namespace's roots.

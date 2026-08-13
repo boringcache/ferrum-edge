@@ -34,7 +34,7 @@
 //!   DER, JWT public keys, runtime conversion) walks the over-limit
 //!   collections or material.
 //! - `updated_by` is the verified admin JWT subject, never a client-supplied
-//!   value, and is capped at [`MAX_AUDIT_ACTOR_BYTES`] so every backend rejects
+//!   value, and is capped at [`MAX_AUDIT_ACTOR_CHARS`] so every backend rejects
 //!   an overlong actor before persistence. Attribution is never truncated.
 //! - Usable material, not just well-formed wrappers: every `x509_authorities`
 //!   entry must be valid base64 **and** parse as an X.509 certificate that
@@ -88,12 +88,14 @@ pub const MAX_TRUST_BUNDLE_JSON_BYTES: usize = 256 * 1024;
 /// Maximum length of the resource id.
 pub const MAX_TRUST_BUNDLE_ID_BYTES: usize = 255;
 
-/// Maximum UTF-8 byte length of a server-assigned audit actor (`updated_by`).
+/// Maximum Unicode scalar-value length of a server-assigned audit actor
+/// (`updated_by`).
 ///
-/// Matches the MySQL `VARCHAR(255)` column so PostgreSQL/SQLite cannot persist
-/// an overlong JWT subject that MySQL would reject. Attribution is never
+/// Matches MySQL `VARCHAR(255)` under utf8mb4 (255 characters, not 255 UTF-8
+/// bytes) and OpenAPI `maxLength: 255`. PostgreSQL/SQLite cannot persist an
+/// overlong JWT subject that MySQL would reject. Attribution is never
 /// truncated: an overlong subject fails admission instead.
-pub const MAX_AUDIT_ACTOR_BYTES: usize = 255;
+pub const MAX_AUDIT_ACTOR_CHARS: usize = 255;
 
 /// Authoritative, namespace-keyed gateway trust-bundle resource.
 ///
@@ -249,10 +251,10 @@ impl GatewayTrustBundleRecord {
         if self
             .updated_by
             .as_ref()
-            .is_some_and(|actor| actor.len() > MAX_AUDIT_ACTOR_BYTES)
+            .is_some_and(|actor| actor.chars().count() > MAX_AUDIT_ACTOR_CHARS)
         {
             errors.push(format!(
-                "gateway trust bundle updated_by exceeds {MAX_AUDIT_ACTOR_BYTES} bytes"
+                "gateway trust bundle updated_by exceeds {MAX_AUDIT_ACTOR_CHARS} characters"
             ));
         }
 
@@ -331,13 +333,6 @@ impl GatewayTrustBundleRecord {
         }
 
         finish_validation(errors)
-    }
-
-    /// Install a local trust-domain string that did not pass
-    /// [`TrustDomain::new`]. Admission tests use this to prove structural/raw
-    /// bounds run before that parser. Production writers must not call this.
-    pub fn set_unvalidated_local_trust_domain_for_tests(&mut self, value: String) {
-        self.bundle.local.trust_domain = TrustDomain::from_unvalidated(value);
     }
 
     /// Redacted, fixed-shape summary for logs, metrics, and admin status.

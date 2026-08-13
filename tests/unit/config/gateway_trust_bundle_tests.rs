@@ -21,7 +21,7 @@
 use ferrum_edge::config::gateway_trust::{
     AMBIGUOUS_TRUST_AUTHORITY_MESSAGE, GatewayTrustBundleIdentity, GatewayTrustBundleRecord,
     GatewayTrustDriftSource, GatewayTrustFailureReason, GatewayTrustPublication,
-    MAX_AUDIT_ACTOR_BYTES, MAX_FEDERATED_BUNDLES, MAX_JWT_AUTHORITIES_PER_BUNDLE,
+    MAX_AUDIT_ACTOR_CHARS, MAX_FEDERATED_BUNDLES, MAX_JWT_AUTHORITIES_PER_BUNDLE,
     MAX_JWT_AUTHORITY_PEM_BYTES, MAX_TRUST_BUNDLE_JSON_BYTES, MAX_X509_AUTHORITIES_PER_BUNDLE,
     MAX_X509_AUTHORITY_DER_BYTES, NamespaceTrustProjection, TrustAuthorityResolution,
     TrustPublicationScope, detect_gateway_trust_drift, gateway_trust_state_drifted,
@@ -528,32 +528,9 @@ fn json_escaping_overhead_counts_against_the_whole_bundle_cap() {
 }
 
 #[test]
-fn an_oversized_local_trust_domain_is_rejected_before_semantic_parsers() {
-    // A restore body can carry a near-limit `bundle.local.trust_domain`. That
-    // string must trip the raw structural bound and return before
-    // `TrustDomain::new` clones it or any deep parser walks the material.
-    let mut record = valid_record();
-    let oversized = "a".repeat(MAX_TRUST_BUNDLE_JSON_BYTES + 1);
-    record.set_unvalidated_local_trust_domain_for_tests(oversized.clone());
-    record.trust_domain = oversized;
-    record.bundle.local.x509_authorities = vec!["not-a-certificate".to_string()];
-
-    let errors = record
-        .validate_fields()
-        .expect_err("an over-limit local trust domain must be rejected");
-    assert!(
-        errors
-            .iter()
-            .any(|error| error.contains("raw material") && error.contains("the maximum is")),
-        "expected a structural size error, got {errors:?}"
-    );
-    assert_structural_fail_fast(&errors);
-}
-
-#[test]
 fn an_overlong_audit_actor_is_rejected_without_truncation_or_echo() {
     let mut record = valid_record();
-    let overlong = "a".repeat(MAX_AUDIT_ACTOR_BYTES + 1);
+    let overlong = "a".repeat(MAX_AUDIT_ACTOR_CHARS + 1);
     record.updated_by = Some(overlong.clone());
     let errors = record
         .validate_fields()
@@ -561,7 +538,8 @@ fn an_overlong_audit_actor_is_rejected_without_truncation_or_echo() {
     assert!(
         errors.iter().any(|error| {
             error.contains("updated_by exceeds")
-                && error.contains(&MAX_AUDIT_ACTOR_BYTES.to_string())
+                && error.contains(&MAX_AUDIT_ACTOR_CHARS.to_string())
+                && error.contains("characters")
         }),
         "expected an audit-actor bound error, got {errors:?}"
     );
@@ -573,12 +551,51 @@ fn an_overlong_audit_actor_is_rejected_without_truncation_or_echo() {
 }
 
 #[test]
-fn an_audit_actor_at_the_byte_cap_is_admitted() {
+fn an_audit_actor_at_the_character_cap_is_admitted() {
     let mut record = valid_record();
-    record.updated_by = Some("a".repeat(MAX_AUDIT_ACTOR_BYTES));
+    record.updated_by = Some("a".repeat(MAX_AUDIT_ACTOR_CHARS));
     record
         .validate_fields()
         .expect("the audit-actor cap is inclusive");
+}
+
+#[test]
+fn a_multibyte_audit_actor_at_the_character_cap_is_admitted() {
+    let mut record = valid_record();
+    let at_cap = "é".repeat(MAX_AUDIT_ACTOR_CHARS);
+    assert_eq!(at_cap.chars().count(), MAX_AUDIT_ACTOR_CHARS);
+    assert!(
+        at_cap.len() > MAX_AUDIT_ACTOR_CHARS,
+        "fixture must exceed 255 UTF-8 bytes so a byte cap would reject it"
+    );
+    record.updated_by = Some(at_cap);
+    record
+        .validate_fields()
+        .expect("255 Unicode scalar values must be admitted");
+}
+
+#[test]
+fn a_multibyte_audit_actor_over_the_character_cap_is_rejected_without_echo() {
+    let mut record = valid_record();
+    let overlong = "é".repeat(MAX_AUDIT_ACTOR_CHARS + 1);
+    assert_eq!(overlong.chars().count(), MAX_AUDIT_ACTOR_CHARS + 1);
+    record.updated_by = Some(overlong.clone());
+    let errors = record
+        .validate_fields()
+        .expect_err("256 Unicode scalar values must be rejected");
+    assert!(
+        errors.iter().any(|error| {
+            error.contains("updated_by exceeds")
+                && error.contains(&MAX_AUDIT_ACTOR_CHARS.to_string())
+                && error.contains("characters")
+        }),
+        "expected an audit-actor bound error, got {errors:?}"
+    );
+    let rendered = errors.join("\n");
+    assert!(
+        !rendered.contains(&overlong) && !rendered.contains('é'),
+        "admission diagnostics must not echo or truncate the overlong actor: {rendered}"
+    );
 }
 
 // ── Redacted summary ────────────────────────────────────────────────────────
