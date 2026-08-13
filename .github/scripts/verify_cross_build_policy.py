@@ -9157,13 +9157,26 @@ def opaque_word_starts_command(
     original_prefix = line[:start]
     prefix = original_prefix.replace("\\`", "").replace("\\$", "")
     original_match = EXPLICIT_COMMAND_WORD_PREFIX.search(original_prefix)
-    if original_match is not None:
+    had_original_match = original_match is not None
+    while original_match is not None:
         # A separator inside `"data; more"` is not a statement boundary. The
         # same character inside `$(...)`, backticks, or an unquoted command
         # remains a real slot because `shell_quote_at` restores those interiors.
         if shell_quote_at(line, original_match.start()) is None:
             return True
-    elif EXPLICIT_COMMAND_WORD_PREFIX.search(prefix) is not None:
+        # The expression is suffix-anchored, so matches from different command
+        # separators overlap all the way to the opaque word. A normal
+        # `finditer` therefore yields only the first one. Resume one character
+        # after its start so an earlier quoted `;` cannot conceal a later real
+        # separator that opens the executable slot.
+        original_match = EXPLICIT_COMMAND_WORD_PREFIX.search(
+            original_prefix,
+            original_match.start() + 1,
+        )
+    if (
+        not had_original_match
+        and EXPLICIT_COMMAND_WORD_PREFIX.search(prefix) is not None
+    ):
         # Escaped-backtick stripping can reveal a slot the raw prefix hides.
         # Honor it only when the opaque word itself is not quoted data.
         if shell_quote_at(line, start) is None:
@@ -22571,6 +22584,12 @@ pre_build = []
             "#!/bin/sh\n"
             f'echo safe; backend_hits=0 "$(pick-cross)" \\\n'
             f"  build --target {TARGET}\n",
+        ),
+        (
+            "opaque whole command after quoted and real separators",
+            "#!/bin/sh\n"
+            'echo "data; backend_hits=0"; \\\n'
+            "  $(render)\n",
         ),
         (
             "quoted substitution occupying the command word",
