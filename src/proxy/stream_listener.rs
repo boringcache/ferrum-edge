@@ -1576,8 +1576,9 @@ impl StreamListenerManager {
             let snapshot = slot.load();
             let Some(server) = snapshot.as_ref().clone() else {
                 // Collector task has not yet published the server (race with
-                // bind). Skip — the collector applies the current generation
-                // when the server arrives, and the next publish re-converges.
+                // bind). Skip — the collector applies the ordinary frontend
+                // DTLS generation when the server arrives. Mesh overlay must
+                // not seed that slot; a later ordinary publish re-converges.
                 continue;
             };
             server.swap_frontend_config(config.clone());
