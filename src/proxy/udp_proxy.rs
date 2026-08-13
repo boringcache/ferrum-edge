@@ -2884,7 +2884,7 @@ async fn process_datagram(
     tls_ca_bundle_path: Option<&str>,
     backend_dtls_config_cache: &BackendDtlsConfigCache,
     max_sessions: usize,
-    last_client: &mut Option<(SocketAddr, Arc<UdpSession>)>,
+    last_client: &mut Option<(UdpSessionKey, Arc<UdpSession>)>,
     batch_dgrams_out: &mut u64,
     batch_bytes_out: &mut u64,
     listen_port: u16,
