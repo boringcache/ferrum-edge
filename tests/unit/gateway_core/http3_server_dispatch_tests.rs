@@ -3106,18 +3106,40 @@ fn native_h3_grpc_upload_pump_source() -> &'static str {
         .expect("bounded native H3 gRPC upload pump")
 }
 
+fn native_h3_grpc_upload_await_helper_source() -> &'static str {
+    let src = include_str!("../../../src/http3/server.rs");
+    src.split("pub(crate) async fn h3_grpc_upload_await_until_authorization(")
+        .nth(1)
+        .expect("native H3 gRPC upload-pump authorization helper")
+        .split("impl H3UploadPumpExit")
+        .next()
+        .expect("bounded native H3 gRPC upload-pump authorization helper")
+}
+
 #[test]
 fn h3_native_grpc_upload_pump_awaits_are_all_cancellable() {
     let pump = native_h3_grpc_upload_pump_source();
+    let helper = native_h3_grpc_upload_await_helper_source();
 
-    // Every await the pump performs must sit in a `select!` against shutdown:
-    // frontend DATA, backend DATA, frontend trailers, backend trailers, and the
-    // backend FIN. Otherwise a bidi server that finished its response could not
-    // retire a pump parked on a flow-control-blocked write.
+    // Every await the pump performs races shutdown and the admitted
+    // authorization plan through the shared helper: frontend DATA, backend
+    // DATA, frontend trailers, backend trailers, and the backend FIN.
     assert_eq!(
-        pump.matches("shutdown.notified()").count(),
+        pump.matches("h3_grpc_upload_await_until_authorization(").count(),
         5,
-        "each pump await must race the shutdown signal"
+        "each pump await must race shutdown and the authorization plan"
+    );
+    assert!(
+        helper.contains("shutdown.notified()"),
+        "the helper must remain cancellable through the pump shutdown signal"
+    );
+    assert!(
+        helper.contains("biased;") && helper.contains("tokio::time::sleep_until(plan.at)"),
+        "the helper must race authorization first so an exact-deadline tie fails closed"
+    );
+    assert!(
+        helper.contains("if tokio::time::Instant::now() >= plan.at"),
+        "an already-elapsed plan must never poll the inner receive or commit"
     );
     for awaited in [
         "frontend_recv.recv_data()",
@@ -3150,6 +3172,10 @@ fn h3_native_grpc_upload_pump_awaits_are_all_cancellable() {
     assert!(
         pump.contains("max_request_body_size"),
         "the pump must enforce the effective gRPC receive ceiling incrementally"
+    );
+    assert!(
+        pump.contains("H3GrpcUploadFault::AuthorizationExpired("),
+        "authorization expiry must publish a typed fault rather than a clean backend FIN"
     );
 }
 
@@ -3215,8 +3241,8 @@ fn h3_native_grpc_upload_pump_publishes_only_backend_blocked_state() {
             .find(backend_await)
             .unwrap_or_else(|| panic!("pump must forward {backend_await}"));
         let arm_start = pump[..at]
-            .rfind("tokio::select! {")
-            .unwrap_or_else(|| panic!("{backend_await} must sit in a shutdown select"));
+            .rfind("h3_grpc_upload_await_until_authorization(")
+            .unwrap_or_else(|| panic!("{backend_await} must sit in the authorization helper"));
         let prefix = &pump[..arm_start];
         let last_true = prefix
             .rfind("upload.set_blocked_on_backend(true);")
@@ -3494,11 +3520,17 @@ fn h3_native_grpc_upload_fault_signalling_matches_the_h2_bridge() {
         h3_grpc_upload_fault_signal_for_test(H3GrpcUploadFaultKind::ClientAbort),
         Some((14, "Service unavailable")),
     );
+    assert_eq!(
+        h3_grpc_upload_fault_signal_for_test(H3GrpcUploadFaultKind::AuthorizationExpired),
+        Some((16, "credential expired")),
+        "an expired upload-pump authorization lifetime is UNAUTHENTICATED"
+    );
 
     for terminating in [
         H3GrpcUploadFaultKind::ClientAbort,
         H3GrpcUploadFaultKind::MalformedTrailers,
         H3GrpcUploadFaultKind::Oversize,
+        H3GrpcUploadFaultKind::AuthorizationExpired,
     ] {
         assert!(
             h3_grpc_upload_fault_terminates_rpc_for_test(terminating),
@@ -3571,6 +3603,14 @@ async fn h3_native_grpc_terminating_upload_fault_wakes_the_relay() {
         "a fault latched while the relay waits must wake it"
     );
     assert!(
+        h3_grpc_upload_fault_wakes_relay_for_test(
+            H3GrpcUploadFaultKind::AuthorizationExpired,
+            true
+        )
+        .await,
+        "an authorization-expired upload fault must wake the response relay"
+    );
+    assert!(
         !h3_grpc_upload_fault_wakes_relay_for_test(
             H3GrpcUploadFaultKind::BackendUploadHalted,
             true
@@ -3636,6 +3676,7 @@ fn h3_native_grpc_header_wait_expiry_blames_the_party_it_waited_on() {
         H3GrpcUploadFaultKind::ClientAbort,
         H3GrpcUploadFaultKind::MalformedTrailers,
         H3GrpcUploadFaultKind::Oversize,
+        H3GrpcUploadFaultKind::AuthorizationExpired,
     ] {
         assert!(
             !blames_backend(H3GrpcHeaderWaitScenario {
@@ -3672,5 +3713,235 @@ fn h3_native_grpc_header_wait_does_not_trust_client_progress() {
         !expiry.contains("upload.is_complete()"),
         "the dispatch arm must use the centralized classifier rather than \
          re-implementing upload ownership ad hoc"
+    );
+}
+
+#[test]
+fn h3_native_grpc_trailer_phase_composes_the_authorization_plan() {
+    let relay = native_h3_grpc_relay_source();
+    let trailer = relay
+        .split("if stream_done {")
+        .nth(1)
+        .expect("native H3 gRPC trailer phase")
+        .split("pump_guard.retire().await")
+        .next()
+        .expect("bounded native H3 gRPC trailer phase");
+    assert!(
+        trailer.contains("let trailer_bound = crate::proxy::auth_lifetime::ComposedAuthBound::compose("),
+        "the trailer wait must compose the captured authorization plan"
+    );
+    assert!(
+        trailer.contains("trailer_bound.expired_authorization()"),
+        "a withheld trailer must be attributed from the captured composition"
+    );
+    assert!(
+        trailer.contains("downstream_write_bound.deadline()"),
+        "trailer and FIN writes must race the composed downstream bound"
+    );
+    assert!(
+        trailer.contains("H3GrpcResponseFinish::DeadlineExceeded"),
+        "parked trailer/FIN writes must remain observable as DeadlineExceeded"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_parked_h3_grpc_upload_commit_is_dropped_at_the_authorization_deadline() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use ferrum_edge::_test_support::{
+        H3GrpcUploadAwaitOutcomeForTest, h3_grpc_upload_await_until_authorization_for_test,
+    };
+    use ferrum_edge::proxy::auth_lifetime::{StreamAuthDeadline, StreamAuthTermination};
+
+    async fn gated_commit(
+        release: tokio::sync::oneshot::Receiver<()>,
+        emitted: Arc<AtomicBool>,
+    ) -> &'static [u8] {
+        let _ = release.await;
+        emitted.store(true, Ordering::SeqCst);
+        b"late"
+    }
+
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let emitted = Arc::new(AtomicBool::new(false));
+    let emitted_commit = Arc::clone(&emitted);
+    let plan = StreamAuthDeadline {
+        at: tokio::time::Instant::now() + Duration::from_millis(20),
+        termination: StreamAuthTermination::CredentialExpired,
+    };
+    let shutdown = tokio::sync::Notify::new();
+    let raced = tokio::spawn(async move {
+        h3_grpc_upload_await_until_authorization_for_test(
+            Some(plan),
+            &shutdown,
+            gated_commit(release_rx, emitted_commit),
+        )
+        .await
+    });
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_millis(20)).await;
+    let _ = release_tx.send(());
+    assert_eq!(
+        raced.await.expect("join"),
+        H3GrpcUploadAwaitOutcomeForTest::AuthorizationExpired(
+            StreamAuthTermination::CredentialExpired
+        )
+    );
+    assert!(
+        !emitted.load(Ordering::SeqCst),
+        "a parked backend DATA/trailer/FIN commit must not run after expiry"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_already_elapsed_h3_grpc_upload_commit_never_polls() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use ferrum_edge::_test_support::{
+        H3GrpcUploadAwaitOutcomeForTest, h3_grpc_upload_await_until_authorization_for_test,
+    };
+    use ferrum_edge::proxy::auth_lifetime::{StreamAuthDeadline, StreamAuthTermination};
+
+    let plan = StreamAuthDeadline {
+        at: tokio::time::Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or_else(tokio::time::Instant::now),
+        termination: StreamAuthTermination::CredentialExpired,
+    };
+    let polled = Arc::new(AtomicBool::new(false));
+    let polled_commit = Arc::clone(&polled);
+    let shutdown = tokio::sync::Notify::new();
+    let outcome = h3_grpc_upload_await_until_authorization_for_test(
+        Some(plan),
+        &shutdown,
+        std::future::poll_fn(move |_| {
+            polled_commit.store(true, Ordering::SeqCst);
+            std::task::Poll::Ready(b"late")
+        }),
+    )
+    .await;
+    assert_eq!(
+        outcome,
+        H3GrpcUploadAwaitOutcomeForTest::AuthorizationExpired(
+            StreamAuthTermination::CredentialExpired
+        )
+    );
+    assert!(
+        !polled.load(Ordering::SeqCst),
+        "an already-elapsed plan must not poll a ready backend commit"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_exact_tie_on_a_ready_h3_grpc_upload_commit_is_expiry_first() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use ferrum_edge::_test_support::{
+        H3GrpcUploadAwaitOutcomeForTest, h3_grpc_upload_await_until_authorization_for_test,
+    };
+    use ferrum_edge::proxy::auth_lifetime::{StreamAuthDeadline, StreamAuthTermination};
+
+    let plan = StreamAuthDeadline {
+        at: tokio::time::Instant::now() + Duration::from_millis(0),
+        termination: StreamAuthTermination::CredentialExpired,
+    };
+    let polled = Arc::new(AtomicBool::new(false));
+    let polled_commit = Arc::clone(&polled);
+    let shutdown = tokio::sync::Notify::new();
+    let outcome = h3_grpc_upload_await_until_authorization_for_test(
+        Some(plan),
+        &shutdown,
+        std::future::poll_fn(move |_| {
+            polled_commit.store(true, Ordering::SeqCst);
+            std::task::Poll::Ready(b"tie")
+        }),
+    )
+    .await;
+    assert_eq!(
+        outcome,
+        H3GrpcUploadAwaitOutcomeForTest::AuthorizationExpired(
+            StreamAuthTermination::CredentialExpired
+        )
+    );
+    assert!(
+        !polled.load(Ordering::SeqCst),
+        "an exact-deadline tie must not commit a simultaneously-ready backend byte"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_withheld_h3_grpc_trailer_beyond_authorization_is_attributed_to_auth() {
+    use std::time::Duration;
+
+    use ferrum_edge::proxy::auth_lifetime::{
+        ComposedAuthBound, StreamAuthDeadline, StreamAuthTermination,
+    };
+
+    let plan = StreamAuthDeadline {
+        at: tokio::time::Instant::now() + Duration::from_millis(20),
+        termination: StreamAuthTermination::CredentialExpired,
+    };
+    let bound = ComposedAuthBound::compose(None, Some(plan));
+    tokio::time::advance(Duration::from_millis(20)).await;
+    assert_eq!(
+        bound.expired_authorization(),
+        Some(StreamAuthTermination::CredentialExpired),
+        "a withheld trailer with no protocol bound belongs to authorization"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_parked_h3_grpc_trailer_write_expires_under_authorization() {
+    use std::time::Duration;
+
+    use ferrum_edge::proxy::auth_lifetime::{
+        ComposedAuthBound, StreamAuthDeadline, StreamAuthTermination,
+    };
+
+    let plan = StreamAuthDeadline {
+        at: tokio::time::Instant::now() + Duration::from_millis(20),
+        termination: StreamAuthTermination::CredentialExpired,
+    };
+    let bound = ComposedAuthBound::compose(None, Some(plan));
+    let deadline = bound.deadline().expect("authorization supplies the write bound");
+    let task = tokio::spawn(async move {
+        ferrum_edge::_test_support::stalled_h3_response_write_expires_for_test(deadline).await
+    });
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_millis(20)).await;
+    assert!(
+        task.await.expect("join"),
+        "a parked trailer/FIN write must not commit after authorization expiry"
+    );
+    tokio::time::advance(Duration::from_millis(1)).await;
+    assert_eq!(
+        bound.expired_authorization(),
+        Some(StreamAuthTermination::CredentialExpired)
+    );
+}
+
+#[test]
+fn h3_native_grpc_zero_data_trailer_uses_the_message_safe_rule() {
+    let util = include_str!("../../../src/http3/stream_util.rs");
+    assert!(
+        util.contains("pub(crate) const fn grpc_deadline_can_send_terminal_status"),
+        "zero-DATA vs post-DATA trailer termination stays on the shared message-safe rule"
+    );
+    let relay = native_h3_grpc_relay_source();
+    let trailer = relay
+        .split("if stream_done {")
+        .nth(1)
+        .expect("native H3 gRPC trailer phase");
+    assert!(
+        trailer.contains("grpc_deadline_can_send_terminal_status("),
+        "authorization trailer expiry must keep the zero-DATA vs post-DATA message-safe split"
     );
 }

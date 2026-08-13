@@ -26,7 +26,7 @@ use ferrum_edge::_test_support::{
     relay_failure_is_client_facing, request_received_at_for_test,
     request_upload_auth_deadline_for_test, set_grpc_deadline_budget_for_test,
     set_request_credential_deadline_for_test, settle_dtls_relay_authorization_expiry_for_test,
-    within_stream_auth_deadline_for_test,
+    tcp_plain_splice_eligible_for_test, within_stream_auth_deadline_for_test,
 };
 use ferrum_edge::config::types::Consumer;
 use ferrum_edge::plugins::{Direction, DisconnectCause, RequestContext};
@@ -751,6 +751,153 @@ fn an_authorization_bound_tcp_relay_refuses_the_unbounded_fast_path() {
         tls.contains("stream_auth_deadline.map(|plan| AuthorizationCopyBound {"),
         "both TLS Deadline arms must race the authorization instant as a top-level copy bound"
     );
+}
+
+/// An admitted plaintext TCP identity never splices: the kernel cannot carry
+/// the session's authorization deadline. Unauthenticated plain-to-plain keeps
+/// splice/IORING eligibility.
+#[test]
+fn an_authenticated_plaintext_tcp_session_never_splices() {
+    assert!(
+        tcp_plain_splice_eligible_for_test(None),
+        "unauthenticated plain TCP remains splice/IORING eligible"
+    );
+    let plan = StreamAuthDeadline {
+        at: tokio::time::Instant::now(),
+        termination: StreamAuthTermination::CredentialExpired,
+    };
+    assert!(
+        !tcp_plain_splice_eligible_for_test(Some(plan)),
+        "an admitted plaintext identity must take the userspace deadline-aware relay"
+    );
+
+    let src = include_str!("../../../src/proxy/tcp_proxy.rs");
+    let plain = src
+        .split("ClientRelayStream::Plain(client_stream) => {")
+        .nth(1)
+        .expect("plain TCP relay");
+    let some_plain = plain
+        .split("(Some(plan), BackendStream::Plain(bs)) => {")
+        .nth(1)
+        .expect("authenticated plain-to-plain arm");
+    let some_plain_body = some_plain.split("(None, BackendStream::Tls(bs)) => {").next().expect(
+        "authenticated plain-to-plain arm bounded",
+    );
+    assert!(
+        some_plain_body.contains("bidirectional_copy_with_stream_auth("),
+        "an admitted plaintext identity must use the deadline-aware userspace relay"
+    );
+    assert!(
+        !some_plain_body.contains("bidirectional_splice(")
+            && !some_plain_body.contains("bidirectional_splice_io_uring"),
+        "an admitted plaintext identity must never splice"
+    );
+    let none_plain = plain
+        .split("(None, BackendStream::Plain(bs)) => {")
+        .nth(1)
+        .expect("unauthenticated plain-to-plain arm");
+    assert!(
+        none_plain.contains("debug_assert!(tcp_plain_splice_eligible(stream_auth_deadline))"),
+        "unauthenticated plain-to-plain must keep splice eligibility"
+    );
+
+    let passthrough = src
+        .split("// ----- Passthrough mode: forward encrypted bytes without TLS termination -----")
+        .nth(1)
+        .expect("passthrough branch")
+        .split("ClientRelayStream::Tls(tls_stream) => {")
+        .next()
+        .expect("passthrough branch bounded");
+    let connect_at = passthrough
+        .find("on_stream_connect")
+        .expect("passthrough on_stream_connect");
+    let plan_at = passthrough
+        .find("admitted_stream_auth_deadline(")
+        .expect("passthrough must compute the session plan after admission");
+    assert!(
+        connect_at < plan_at,
+        "passthrough must compute stream_auth_deadline immediately after on_stream_connect"
+    );
+    assert!(
+        passthrough.contains("within_stream_auth_deadline("),
+        "passthrough DNS, connect, and PROXY write must be authorization-bounded"
+    );
+    assert!(
+        passthrough.contains("bidirectional_copy_with_stream_auth("),
+        "authenticated passthrough must use the deadline-aware userspace relay"
+    );
+    assert!(
+        passthrough.contains("tcp_plain_splice_eligible(stream_auth_deadline)"),
+        "passthrough splice is only eligible for an unauthenticated session"
+    );
+}
+
+/// An admitted plaintext TCP identity relays application bytes before its
+/// deadline, then terminates both directions at it with one health-neutral
+/// authorization termination.
+#[tokio::test(start_paused = true)]
+async fn an_admitted_plaintext_tcp_identity_relays_then_expires_both_directions() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let _guard = counter_delta_guard().await;
+    let before = counters();
+
+    let (client, mut client_peer) = tokio::io::duplex(64 * 1024);
+    let (backend, mut backend_peer) = tokio::io::duplex(64 * 1024);
+    let expired = Arc::new(AtomicBool::new(false));
+    let deadline_at = tokio::time::Instant::now() + Duration::from_secs(2);
+
+    let copy = tokio::spawn(bidirectional_copy_with_authorization_for_test(
+        client,
+        backend,
+        deadline_at,
+        Arc::clone(&expired),
+        8 * 1024,
+    ));
+    client_peer
+        .write_all(b"hello")
+        .await
+        .expect("client payload before the deadline");
+    let mut got = [0u8; 5];
+    backend_peer
+        .read_exact(&mut got)
+        .await
+        .expect("plaintext payload must relay before the deadline");
+    assert_eq!(&got, b"hello");
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let result = tokio::time::timeout(Duration::from_secs(1), copy)
+        .await
+        .expect("authorization expiry must terminate both relay halves")
+        .expect("copy task");
+
+    assert!(
+        expired.load(Ordering::Acquire),
+        "the shared authorization-expiry flag must latch exactly once"
+    );
+    assert!(relay_failure_is_client_facing(
+        result
+            .first_failure
+            .as_ref()
+            .expect("expiry must surface a typed client-side TimedOut result")
+    ));
+    assert_eq!(result.bytes_client_to_backend, 5);
+
+    record_termination(
+        StreamAuthTermination::CredentialExpired,
+        StreamAuthProtocolFamily::StreamTcp,
+    );
+    let after = counters();
+    assert_eq!(
+        after.credential_expired["stream_tcp"] - before.credential_expired["stream_tcp"],
+        1,
+        "post-relay accounting must record the session exactly once"
+    );
+    assert!(!tcp_plain_splice_eligible_for_test(Some(StreamAuthDeadline {
+        at: deadline_at,
+        termination: StreamAuthTermination::CredentialExpired,
+    })));
 }
 
 /// A session with no authorization deadline is untouched: the wrapper is only
@@ -3710,6 +3857,7 @@ fn every_composed_h3_write_bound_attributes_from_the_captured_composition() {
     for (file, source, bound) in [
         ("server", H3_SERVER_SOURCE, "buffered_write_bound"),
         ("server", H3_SERVER_SOURCE, "downstream_write_bound"),
+        ("server", H3_SERVER_SOURCE, "trailer_bound"),
         ("cross", cross, "plain_write_bound"),
         ("cross", cross, "terminal_write_bound"),
         ("cross", cross, "downstream_write_bound"),

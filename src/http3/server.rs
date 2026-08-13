@@ -10208,7 +10208,7 @@ async fn stream_h3_open_response_to_client(
 
 /// Terminal fault raised by the native-H3 gRPC request-upload pump.
 ///
-/// Latched once per RPC. Three of the four are CLIENT- or gateway-policy-caused
+/// Latched once per RPC. Four of the five are CLIENT- or gateway-policy-caused
 /// and end the RPC with a specific gRPC status; `BackendUploadHalted` does NOT,
 /// because a gRPC server that has read everything it needs may legitimately
 /// STOP_SENDING / reset the request direction while it keeps streaming its
@@ -10223,6 +10223,9 @@ pub(crate) enum H3GrpcUploadFault {
     Oversize,
     /// The backend stopped accepting request DATA.
     BackendUploadHalted,
+    /// The admitted credential's authorization lifetime elapsed while this
+    /// pump still owned a gateway receive or backend commit.
+    AuthorizationExpired(crate::proxy::auth_lifetime::StreamAuthTermination),
 }
 
 impl H3GrpcUploadFault {
@@ -10231,6 +10234,8 @@ impl H3GrpcUploadFault {
     const MALFORMED_TRAILERS: u8 = 2;
     const OVERSIZE: u8 = 3;
     const BACKEND_UPLOAD_HALTED: u8 = 4;
+    const AUTHORIZATION_CREDENTIAL_EXPIRED: u8 = 5;
+    const AUTHORIZATION_MAX_LIFETIME: u8 = 6;
 
     fn code(self) -> u8 {
         match self {
@@ -10238,6 +10243,12 @@ impl H3GrpcUploadFault {
             Self::MalformedTrailers => Self::MALFORMED_TRAILERS,
             Self::Oversize => Self::OVERSIZE,
             Self::BackendUploadHalted => Self::BACKEND_UPLOAD_HALTED,
+            Self::AuthorizationExpired(
+                crate::proxy::auth_lifetime::StreamAuthTermination::CredentialExpired,
+            ) => Self::AUTHORIZATION_CREDENTIAL_EXPIRED,
+            Self::AuthorizationExpired(
+                crate::proxy::auth_lifetime::StreamAuthTermination::AuthenticatedStreamMaxLifetime,
+            ) => Self::AUTHORIZATION_MAX_LIFETIME,
         }
     }
 
@@ -10247,6 +10258,12 @@ impl H3GrpcUploadFault {
             Self::MALFORMED_TRAILERS => Some(Self::MalformedTrailers),
             Self::OVERSIZE => Some(Self::Oversize),
             Self::BACKEND_UPLOAD_HALTED => Some(Self::BackendUploadHalted),
+            Self::AUTHORIZATION_CREDENTIAL_EXPIRED => Some(Self::AuthorizationExpired(
+                crate::proxy::auth_lifetime::StreamAuthTermination::CredentialExpired,
+            )),
+            Self::AUTHORIZATION_MAX_LIFETIME => Some(Self::AuthorizationExpired(
+                crate::proxy::auth_lifetime::StreamAuthTermination::AuthenticatedStreamMaxLifetime,
+            )),
             _ => None,
         }
     }
@@ -10263,6 +10280,9 @@ impl H3GrpcUploadFault {
             Self::ClientAbort => Some(H3GrpcTerminatingUploadFault::ClientAbort),
             Self::MalformedTrailers => Some(H3GrpcTerminatingUploadFault::MalformedTrailers),
             Self::Oversize => Some(H3GrpcTerminatingUploadFault::Oversize),
+            Self::AuthorizationExpired(termination) => {
+                Some(H3GrpcTerminatingUploadFault::AuthorizationExpired(termination))
+            }
             // A gRPC server that has read everything it needs may legitimately
             // STOP_SENDING / reset the request direction while it keeps
             // streaming its response, so this is recorded and left to the
@@ -10287,6 +10307,9 @@ pub(crate) enum H3GrpcTerminatingUploadFault {
     MalformedTrailers,
     /// The client upload exceeded the effective gRPC receive ceiling.
     Oversize,
+    /// The admitted credential's authorization lifetime elapsed while the
+    /// request-upload pump still owned a gateway receive or backend commit.
+    AuthorizationExpired(crate::proxy::auth_lifetime::StreamAuthTermination),
 }
 
 impl H3GrpcTerminatingUploadFault {
@@ -10308,6 +10331,10 @@ impl H3GrpcTerminatingUploadFault {
                 crate::proxy::grpc_proxy::grpc_status::UNAVAILABLE,
                 "Service unavailable",
             ),
+            Self::AuthorizationExpired(termination) => (
+                crate::proxy::grpc_proxy::grpc_status::UNAUTHENTICATED,
+                termination.grpc_message(),
+            ),
         }
     }
 
@@ -10327,6 +10354,9 @@ impl H3GrpcTerminatingUploadFault {
             Self::ClientAbort => crate::http3::client::H3PoolError::post_wire(anyhow::anyhow!(
                 "client disconnected while sending request body"
             )),
+            Self::AuthorizationExpired(_) => crate::http3::client::H3PoolError::post_wire(
+                anyhow::anyhow!("authenticated stream authorization lifetime elapsed"),
+            ),
         }
     }
 }
@@ -10505,11 +10535,61 @@ enum H3UploadPumpExit {
     /// The client half-closed cleanly. Trailing metadata (if any) and the
     /// backend FIN still have to be written.
     ClientEof,
-    /// A latched fault (client abort, oversize) or a backend that stopped
-    /// accepting request DATA ended the upload.
+    /// A latched fault (client abort, oversize, authorization expiry) or a
+    /// backend that stopped accepting request DATA ended the upload.
     Halted,
     /// The relay retired the pump: the RPC is over.
     Cancelled,
+}
+
+/// Outcome of racing one gateway-owned upload-pump await against shutdown and
+/// the admitted authorization plan (issue #3815 / #3820).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum H3GrpcUploadAwaitOutcome<T> {
+    /// The inner receive or commit completed before expiry and before cancel.
+    Ready(T),
+    /// The response relay retired the pump.
+    Cancelled,
+    /// The admitted authorization lifetime elapsed. An already-elapsed plan
+    /// never polls the inner future; an exact-deadline tie is expiry-first.
+    AuthorizationExpired(crate::proxy::auth_lifetime::StreamAuthTermination),
+}
+
+/// Race one native-H3 gRPC upload-pump await — frontend DATA, backend DATA,
+/// request trailers, backend trailers, or backend FIN — against the admitted
+/// absolute authorization plan and the pump's shutdown signal.
+///
+/// Authenticated requests: an already-elapsed plan never polls `fut`.
+/// Otherwise the expiry arm is `biased` FIRST so an exact-deadline tie fails
+/// closed (authorization wins over a simultaneously-ready commit). Unauthenticated
+/// requests (`None`) race only shutdown against `fut` — no timer, lock, or
+/// extra clock read.
+pub(crate) async fn h3_grpc_upload_await_until_authorization<F>(
+    plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+    shutdown: &tokio::sync::Notify,
+    fut: F,
+) -> H3GrpcUploadAwaitOutcome<F::Output>
+where
+    F: std::future::Future,
+{
+    let Some(plan) = plan else {
+        return tokio::select! {
+            biased;
+            _ = shutdown.notified() => H3GrpcUploadAwaitOutcome::Cancelled,
+            result = fut => H3GrpcUploadAwaitOutcome::Ready(result),
+        };
+    };
+    if tokio::time::Instant::now() >= plan.at {
+        return H3GrpcUploadAwaitOutcome::AuthorizationExpired(plan.termination);
+    }
+    tokio::select! {
+        biased;
+        () = tokio::time::sleep_until(plan.at) => {
+            H3GrpcUploadAwaitOutcome::AuthorizationExpired(plan.termination)
+        }
+        _ = shutdown.notified() => H3GrpcUploadAwaitOutcome::Cancelled,
+        result = fut => H3GrpcUploadAwaitOutcome::Ready(result),
+    }
 }
 
 impl H3UploadPumpExit {
@@ -10542,7 +10622,17 @@ async fn run_h3_grpc_upload_pump(
     // `do_request_streaming_body` used to keep it.
     grpc_messages: Option<Arc<std::sync::atomic::AtomicU64>>,
     shutdown: Arc<tokio::sync::Notify>,
+    auth_deadline_plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+    auth_latch: crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
 ) {
+    let settle_upload_auth =
+        |termination: crate::proxy::auth_lifetime::StreamAuthTermination| {
+            auth_latch.record_once(
+                termination,
+                crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Grpc,
+            );
+            upload.publish_fault(H3GrpcUploadFault::AuthorizationExpired(termination));
+        };
     let mut total_sent: usize = 0;
     let mut grpc_scanner = grpc_messages
         .as_ref()
@@ -10554,10 +10644,19 @@ async fn run_h3_grpc_upload_pump(
     // draining the upload it asked for" — see
     // `classify_h3_grpc_header_wait_expiry`.
     let mut exit = 'pump: loop {
-        let mut chunk = tokio::select! {
-            biased;
-            _ = shutdown.notified() => break 'pump H3UploadPumpExit::Cancelled,
-            result = frontend_recv.recv_data() => match result {
+        let mut chunk = match h3_grpc_upload_await_until_authorization(
+            auth_deadline_plan,
+            shutdown.as_ref(),
+            frontend_recv.recv_data(),
+        )
+        .await
+        {
+            H3GrpcUploadAwaitOutcome::Cancelled => break 'pump H3UploadPumpExit::Cancelled,
+            H3GrpcUploadAwaitOutcome::AuthorizationExpired(termination) => {
+                settle_upload_auth(termination);
+                break 'pump H3UploadPumpExit::Halted;
+            }
+            H3GrpcUploadAwaitOutcome::Ready(result) => match result {
                 Ok(Some(chunk)) => chunk,
                 Ok(None) => break 'pump H3UploadPumpExit::ClientEof,
                 Err(_error) => {
@@ -10585,15 +10684,27 @@ async fn run_h3_grpc_upload_pump(
         // message may only be counted AFTER the forward succeeds.
         let metric_data = grpc_scanner.as_ref().map(|_| data.clone());
         upload.set_blocked_on_backend(true);
-        let sent = tokio::select! {
-            biased;
-            _ = shutdown.notified() => {
+        let sent = match h3_grpc_upload_await_until_authorization(
+            auth_deadline_plan,
+            shutdown.as_ref(),
+            backend_send.send_data(data),
+        )
+        .await
+        {
+            H3GrpcUploadAwaitOutcome::Cancelled => {
                 upload.set_blocked_on_backend(false);
                 break 'pump H3UploadPumpExit::Cancelled;
-            },
-            result = backend_send.send_data(data) => result,
+            }
+            H3GrpcUploadAwaitOutcome::AuthorizationExpired(termination) => {
+                settle_upload_auth(termination);
+                None
+            }
+            H3GrpcUploadAwaitOutcome::Ready(result) => Some(result),
         };
         upload.set_blocked_on_backend(false);
+        let Some(sent) = sent else {
+            break 'pump H3UploadPumpExit::Halted;
+        };
         if sent.is_err() {
             upload.publish_fault(H3GrpcUploadFault::BackendUploadHalted);
             break 'pump H3UploadPumpExit::Halted;
@@ -10617,26 +10728,44 @@ async fn run_h3_grpc_upload_pump(
         // error means the inbound request is malformed: fail the upload closed
         // rather than silently finishing the backend stream as if the client had
         // sent no trailing metadata.
-        let trailers = tokio::select! {
-            biased;
-            _ = shutdown.notified() => {
+        let trailers = match h3_grpc_upload_await_until_authorization(
+            auth_deadline_plan,
+            shutdown.as_ref(),
+            frontend_recv.recv_trailers(),
+        )
+        .await
+        {
+            H3GrpcUploadAwaitOutcome::Cancelled => {
                 exit = H3UploadPumpExit::Cancelled;
                 None
             }
-            result = frontend_recv.recv_trailers() => Some(result),
+            H3GrpcUploadAwaitOutcome::AuthorizationExpired(termination) => {
+                settle_upload_auth(termination);
+                None
+            }
+            H3GrpcUploadAwaitOutcome::Ready(result) => Some(result),
         };
         match trailers {
             Some(Ok(Some(mut trailers))) if !trailers.is_empty() => {
                 sanitize_backend_request_trailers(&mut trailers);
                 if !trailers.is_empty() {
                     upload.set_blocked_on_backend(true);
-                    let sent = tokio::select! {
-                        biased;
-                        _ = shutdown.notified() => {
+                    let sent = match h3_grpc_upload_await_until_authorization(
+                        auth_deadline_plan,
+                        shutdown.as_ref(),
+                        backend_send.send_trailers(trailers),
+                    )
+                    .await
+                    {
+                        H3GrpcUploadAwaitOutcome::Cancelled => {
                             exit = H3UploadPumpExit::Cancelled;
                             None
                         }
-                        result = backend_send.send_trailers(trailers) => Some(result),
+                        H3GrpcUploadAwaitOutcome::AuthorizationExpired(termination) => {
+                            settle_upload_auth(termination);
+                            None
+                        }
+                        H3GrpcUploadAwaitOutcome::Ready(result) => Some(result),
                     };
                     upload.set_blocked_on_backend(false);
                     if matches!(sent, Some(Err(_))) {
@@ -10652,13 +10781,22 @@ async fn run_h3_grpc_upload_pump(
         }
         if !exit.is_cancelled() && upload.fault().is_none() {
             upload.set_blocked_on_backend(true);
-            let finished = tokio::select! {
-                biased;
+            let finished = match h3_grpc_upload_await_until_authorization(
+                auth_deadline_plan,
+                shutdown.as_ref(),
+                backend_send.finish(),
+            )
+            .await
+            {
                 // Nothing follows the FIN, so there is no exit state left to
                 // record: leaving the upload incomplete is exactly what makes
                 // the teardown below RESET the backend request direction.
-                _ = shutdown.notified() => None,
-                result = backend_send.finish() => Some(result),
+                H3GrpcUploadAwaitOutcome::Cancelled => None,
+                H3GrpcUploadAwaitOutcome::AuthorizationExpired(termination) => {
+                    settle_upload_auth(termination);
+                    None
+                }
+                H3GrpcUploadAwaitOutcome::Ready(result) => Some(result),
             };
             upload.set_blocked_on_backend(false);
             match finished {
@@ -11480,6 +11618,8 @@ async fn dispatch_grpc_native_h3(
             effective_max_grpc_recv_size_bytes,
             grpc_request_messages,
             pump_shutdown,
+            auth_deadline_plan,
+            ctx.authorization_termination_latch(),
         )),
     );
     let mut backend_recv = backend.recv;
@@ -11495,13 +11635,20 @@ async fn dispatch_grpc_native_h3(
     let header_fut = async {
         tokio::select! {
             biased;
-            fault = h3_grpc_terminating_upload_fault(&upload) => Err(fault.as_pool_error()),
-            head = crate::http3::client::recv_h3_backend_response_head(&mut backend_recv) => head,
+            fault = h3_grpc_terminating_upload_fault(&upload) => match fault {
+                H3GrpcTerminatingUploadFault::AuthorizationExpired(termination) => {
+                    Err(termination)
+                }
+                other => Ok(Err(other.as_pool_error())),
+            },
+            head = crate::http3::client::recv_h3_backend_response_head(&mut backend_recv) => {
+                Ok(head)
+            }
         }
     };
     let head_result = match dispatch_deadline_at {
         Some(at) => match tokio::time::timeout_at(at, header_fut).await {
-            Ok(result) => Ok(result),
+            Ok(result) => result,
             // Authorization first, exactly as on the open arm. A continuously
             // active upload keeps the pump making progress forever and a
             // backend that simply withholds its response head keeps this race
@@ -11534,7 +11681,7 @@ async fn dispatch_grpc_native_h3(
                 }
             },
         },
-        None => Ok(header_fut.await),
+        None => header_fut.await,
     };
     let h3_resp = match head_result {
         Err(termination) => {
@@ -12530,6 +12677,54 @@ async fn dispatch_grpc_native_h3(
             // message may otherwise be cut mid-frame. Every terminating fault is
             // client-caused, so the recorded class stays health-neutral.
             fault = &mut upload_fault_wait => {
+                if let H3GrpcTerminatingUploadFault::AuthorizationExpired(termination) = fault {
+                    // The pump latched expiry on a parked receive or backend
+                    // commit. Same message-safe rule as the idle authorization
+                    // arm: clean UNAUTHENTICATED only before any DATA and only
+                    // under the bounded ready-client grace; otherwise reset.
+                    // Health-neutral and exact-once through the request latch.
+                    coalesce_buf.clear();
+                    if crate::http3::stream_util::grpc_deadline_can_send_terminal_status(
+                        bytes_streamed,
+                    ) {
+                        debug!(
+                            "native H3 gRPC request upload reached its authorization lifetime \
+                             before any response body; completing with grpc-status UNAUTHENTICATED"
+                        );
+                        if send_h3_grpc_terminal_trailers(
+                            &mut send_half,
+                            crate::proxy::grpc_proxy::grpc_status::UNAUTHENTICATED,
+                            termination.grpc_message(),
+                            downstream_write_bound.deadline(),
+                        )
+                        .await
+                        {
+                            body_completed = true;
+                            body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                        } else {
+                            crate::http3::stream_util::abort_response_stream(&mut send_half);
+                            client_disconnected = true;
+                            body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                        }
+                    } else {
+                        debug!(
+                            "native H3 gRPC request upload reached its authorization lifetime \
+                             mid-body; resetting the stream"
+                        );
+                        crate::http3::stream_util::abort_response_stream(&mut send_half);
+                        body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                    }
+                    crate::proxy::insert_grpc_error_metadata(
+                        &mut ctx.metadata,
+                        crate::proxy::grpc_proxy::grpc_status::UNAUTHENTICATED,
+                        termination.grpc_message(),
+                    );
+                    ctx.record_authorization_termination_once(
+                        termination,
+                        crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Grpc,
+                    );
+                    break 'outer;
+                }
                 let (fault_status, fault_message) = fault.grpc_signal();
                 warn!(
                     proxy_id = %proxy.id,
@@ -12699,13 +12894,23 @@ async fn dispatch_grpc_native_h3(
                 (backend_read_timeout_ms > 0 && !client_deadline_present).then(|| {
                     tokio::time::Instant::now() + Duration::from_millis(backend_read_timeout_ms)
                 });
-            let trailer_wait_at: Option<tokio::time::Instant> =
+            let protocol_trailer_at: Option<tokio::time::Instant> =
                 match (grpc_deadline_at, trailer_read_at) {
                     (Some(deadline), Some(read)) => Some(deadline.min(read)),
                     (Some(deadline), None) => Some(deadline),
                     (None, Some(read)) => Some(read),
                     (None, None) => None,
                 };
+            // Compose the captured authorization plan into the trailer wait:
+            // with both protocol bounds absent a backend may withhold trailers
+            // forever, and a late trailer/FIN must not commit after expiry.
+            // Authorization wins an exact tie; a strictly earlier client
+            // `grpc-timeout` or backend read timeout keeps typed ownership.
+            let trailer_bound = crate::proxy::auth_lifetime::ComposedAuthBound::compose(
+                protocol_trailer_at,
+                auth_deadline_plan,
+            );
+            let trailer_wait_at: Option<tokio::time::Instant> = trailer_bound.deadline();
             // Whether the bound firing first is the client's gRPC deadline (vs a
             // per-frame backend read timeout) — decides whether a timeout completes
             // the RPC with grpc-status: 4 or is treated as a backend read-timeout.
@@ -12733,76 +12938,173 @@ async fn dispatch_grpc_native_h3(
                 Some(at) => {
                     match tokio::time::timeout_at(at, trailer_fut).await {
                         Ok(result) => result,
-                        Err(_) if trailer_timeout_is_deadline => {
-                            client_deadline_expired = true;
-                            // `stream_done` only proves the H3 DATA stream reached
-                            // FIN — NOT that the last length-prefixed gRPC message
-                            // ended on a frame boundary (a backend can FIN mid-frame).
-                            // So only append a clean `grpc-status: 4` trailer when no
-                            // body bytes were forwarded (empty-body deadline); once
-                            // any body is on the wire, reset instead so a
-                            // possibly-truncated message isn't capped with a clean
-                            // status the client surfaces as a protocol error. Same
-                            // rule as the mid-body deadline arm.
-                            if crate::http3::stream_util::grpc_deadline_can_send_terminal_status(
-                                bytes_streamed,
-                            ) {
-                                warn!(
-                                    "gRPC deadline (grpc-timeout) exceeded while awaiting trailers \
-                                     (empty body); completing with grpc-status DEADLINE_EXCEEDED"
-                                );
-                                if send_h3_grpc_terminal_trailers(
-                                    &mut send_half,
-                                    crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
-                                    GATEWAY_DEADLINE_EXCEEDED_MESSAGE_HEADER,
-                                    grpc_deadline_at,
-                                )
-                                .await
-                                {
-                                    grpc_trailer_status = Some(
-                                        crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+                        Err(_) => match trailer_bound.expired_authorization() {
+                            Some(termination) => {
+                                coalesce_buf.clear();
+                                if crate::http3::stream_util::grpc_deadline_can_send_terminal_status(
+                                    bytes_streamed,
+                                ) {
+                                    debug!(
+                                        "native H3 gRPC stream reached its authorization lifetime \
+                                         while awaiting trailers before any response body; \
+                                         completing with grpc-status UNAUTHENTICATED"
                                     );
-                                    body_completed = true;
-                                    body_error_class =
-                                        Some(crate::retry::ErrorClass::ClientDisconnect);
-                                } else {
-                                    crate::http3::stream_util::abort_response_stream(
+                                    if send_h3_grpc_terminal_trailers(
                                         &mut send_half,
+                                        crate::proxy::grpc_proxy::grpc_status::UNAUTHENTICATED,
+                                        termination.grpc_message(),
+                                        downstream_write_bound.deadline(),
+                                    )
+                                    .await
+                                    {
+                                        body_completed = true;
+                                        body_error_class =
+                                            Some(crate::retry::ErrorClass::ClientDisconnect);
+                                    } else {
+                                        crate::http3::stream_util::abort_response_stream(
+                                            &mut send_half,
+                                        );
+                                        client_disconnected = true;
+                                        body_error_class =
+                                            Some(crate::retry::ErrorClass::ClientDisconnect);
+                                    }
+                                } else {
+                                    debug!(
+                                        "native H3 gRPC stream reached its authorization lifetime \
+                                         while awaiting trailers after body bytes; resetting"
                                     );
-                                    client_disconnected = true;
+                                    crate::http3::stream_util::abort_response_stream(&mut send_half);
                                     body_error_class =
                                         Some(crate::retry::ErrorClass::ClientDisconnect);
                                 }
-                            } else {
+                                crate::proxy::insert_grpc_error_metadata(
+                                    &mut ctx.metadata,
+                                    crate::proxy::grpc_proxy::grpc_status::UNAUTHENTICATED,
+                                    termination.grpc_message(),
+                                );
+                                ctx.record_authorization_termination_once(
+                                    termination,
+                                    crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Grpc,
+                                );
+                                break;
+                            }
+                            None if trailer_timeout_is_deadline => {
+                                client_deadline_expired = true;
+                                // `stream_done` only proves the H3 DATA stream reached
+                                // FIN — NOT that the last length-prefixed gRPC message
+                                // ended on a frame boundary (a backend can FIN mid-frame).
+                                // So only append a clean `grpc-status: 4` trailer when no
+                                // body bytes were forwarded (empty-body deadline); once
+                                // any body is on the wire, reset instead so a
+                                // possibly-truncated message isn't capped with a clean
+                                // status the client surfaces as a protocol error. Same
+                                // rule as the mid-body deadline arm.
+                                if crate::http3::stream_util::grpc_deadline_can_send_terminal_status(
+                                    bytes_streamed,
+                                ) {
+                                    warn!(
+                                        "gRPC deadline (grpc-timeout) exceeded while awaiting trailers \
+                                         (empty body); completing with grpc-status DEADLINE_EXCEEDED"
+                                    );
+                                    if send_h3_grpc_terminal_trailers(
+                                        &mut send_half,
+                                        crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+                                        GATEWAY_DEADLINE_EXCEEDED_MESSAGE_HEADER,
+                                        grpc_deadline_at,
+                                    )
+                                    .await
+                                    {
+                                        grpc_trailer_status = Some(
+                                            crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+                                        );
+                                        body_completed = true;
+                                        body_error_class =
+                                            Some(crate::retry::ErrorClass::ClientDisconnect);
+                                    } else {
+                                        crate::http3::stream_util::abort_response_stream(
+                                            &mut send_half,
+                                        );
+                                        client_disconnected = true;
+                                        body_error_class =
+                                            Some(crate::retry::ErrorClass::ClientDisconnect);
+                                    }
+                                } else {
+                                    warn!(
+                                        "gRPC deadline (grpc-timeout) exceeded while awaiting trailers \
+                                         after body bytes; resetting (gRPC frame completeness unverified)"
+                                    );
+                                    crate::http3::stream_util::abort_response_stream(
+                                        &mut send_half,
+                                    );
+                                    body_error_class =
+                                        Some(crate::retry::ErrorClass::ClientDisconnect);
+                                }
+                                crate::proxy::insert_grpc_error_metadata(
+                                    &mut ctx.metadata,
+                                    crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+                                    GATEWAY_DEADLINE_EXCEEDED_MESSAGE,
+                                );
+                                break;
+                            }
+                            None => {
                                 warn!(
-                                    "gRPC deadline (grpc-timeout) exceeded while awaiting trailers \
-                                     after body bytes; resetting (gRPC frame completeness unverified)"
+                                    "Backend trailer read timed out ({}ms) during HTTP/3 gRPC streaming response",
+                                    backend_read_timeout_ms
                                 );
                                 crate::http3::stream_util::abort_response_stream(&mut send_half);
-                                body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                                body_error_class =
+                                    Some(crate::retry::ErrorClass::ReadWriteTimeout);
+                                break;
                             }
-                            crate::proxy::insert_grpc_error_metadata(
-                                &mut ctx.metadata,
-                                crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
-                                GATEWAY_DEADLINE_EXCEEDED_MESSAGE,
-                            );
-                            break;
-                        }
-                        Err(_) => {
-                            warn!(
-                                "Backend trailer read timed out ({}ms) during HTTP/3 gRPC streaming response",
-                                backend_read_timeout_ms
-                            );
-                            crate::http3::stream_util::abort_response_stream(&mut send_half);
-                            body_error_class = Some(crate::retry::ErrorClass::ReadWriteTimeout);
-                            break;
-                        }
+                        },
                     }
                 }
                 None => trailer_fut.await,
             };
             let trailers_result = match trailer_wait_result {
                 Ok(result) => result,
+                Err(H3GrpcTerminatingUploadFault::AuthorizationExpired(termination)) => {
+                    coalesce_buf.clear();
+                    if crate::http3::stream_util::grpc_deadline_can_send_terminal_status(
+                        bytes_streamed,
+                    ) {
+                        debug!(
+                            "native H3 gRPC request upload reached its authorization lifetime \
+                             while awaiting backend trailers before any response body; \
+                             completing with grpc-status UNAUTHENTICATED"
+                        );
+                        if send_h3_grpc_terminal_trailers(
+                            &mut send_half,
+                            crate::proxy::grpc_proxy::grpc_status::UNAUTHENTICATED,
+                            termination.grpc_message(),
+                            downstream_write_bound.deadline(),
+                        )
+                        .await
+                        {
+                            body_completed = true;
+                        } else {
+                            crate::http3::stream_util::abort_response_stream(&mut send_half);
+                            client_disconnected = true;
+                        }
+                    } else {
+                        debug!(
+                            "native H3 gRPC request upload reached its authorization lifetime \
+                             while awaiting backend trailers after body bytes; resetting"
+                        );
+                        crate::http3::stream_util::abort_response_stream(&mut send_half);
+                    }
+                    crate::proxy::insert_grpc_error_metadata(
+                        &mut ctx.metadata,
+                        crate::proxy::grpc_proxy::grpc_status::UNAUTHENTICATED,
+                        termination.grpc_message(),
+                    );
+                    ctx.record_authorization_termination_once(
+                        termination,
+                        crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Grpc,
+                    );
+                    body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                    break;
+                }
                 Err(fault) => {
                     let (fault_status, fault_message) = fault.grpc_signal();
                     warn!(
@@ -12880,7 +13182,7 @@ async fn dispatch_grpc_native_h3(
                         send_h3_grpc_trailers_and_finish_before_deadline(
                             &mut send_half,
                             trailers,
-                            grpc_deadline_at,
+                            downstream_write_bound.deadline(),
                         )
                         .await
                     } else {
@@ -12892,16 +13194,33 @@ async fn dispatch_grpc_native_h3(
                             wire_grpc_status.as_deref(),
                             wire_grpc_message.as_deref(),
                             wire_grpc_status_details.as_deref(),
-                            grpc_deadline_at,
+                            downstream_write_bound.deadline(),
                         )
                         .await
                     };
                     match finish_outcome {
                         H3GrpcResponseFinish::Complete => body_completed = true,
                         H3GrpcResponseFinish::DeadlineExceeded => {
-                            client_deadline_expired = true;
                             crate::http3::stream_util::abort_response_stream(&mut send_half);
-                            body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                            if let Some(termination) =
+                                downstream_write_bound.expired_authorization()
+                            {
+                                crate::proxy::insert_grpc_error_metadata(
+                                    &mut ctx.metadata,
+                                    crate::proxy::grpc_proxy::grpc_status::UNAUTHENTICATED,
+                                    termination.grpc_message(),
+                                );
+                                ctx.record_authorization_termination_once(
+                                    termination,
+                                    crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Grpc,
+                                );
+                                body_error_class =
+                                    Some(crate::retry::ErrorClass::ClientDisconnect);
+                            } else {
+                                client_deadline_expired = true;
+                                body_error_class =
+                                    Some(crate::retry::ErrorClass::ClientDisconnect);
+                            }
                         }
                         H3GrpcResponseFinish::WriteFailed => {
                             crate::http3::stream_util::abort_response_stream(&mut send_half);
@@ -12918,15 +13237,32 @@ async fn dispatch_grpc_native_h3(
                         wire_grpc_status.as_deref(),
                         wire_grpc_message.as_deref(),
                         wire_grpc_status_details.as_deref(),
-                        grpc_deadline_at,
+                        downstream_write_bound.deadline(),
                     )
                     .await
                     {
                         H3GrpcResponseFinish::Complete => body_completed = true,
                         H3GrpcResponseFinish::DeadlineExceeded => {
-                            client_deadline_expired = true;
                             crate::http3::stream_util::abort_response_stream(&mut send_half);
-                            body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                            if let Some(termination) =
+                                downstream_write_bound.expired_authorization()
+                            {
+                                crate::proxy::insert_grpc_error_metadata(
+                                    &mut ctx.metadata,
+                                    crate::proxy::grpc_proxy::grpc_status::UNAUTHENTICATED,
+                                    termination.grpc_message(),
+                                );
+                                ctx.record_authorization_termination_once(
+                                    termination,
+                                    crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Grpc,
+                                );
+                                body_error_class =
+                                    Some(crate::retry::ErrorClass::ClientDisconnect);
+                            } else {
+                                client_deadline_expired = true;
+                                body_error_class =
+                                    Some(crate::retry::ErrorClass::ClientDisconnect);
+                            }
                         }
                         H3GrpcResponseFinish::WriteFailed => {
                             crate::http3::stream_util::abort_response_stream(&mut send_half);
@@ -12941,15 +13277,32 @@ async fn dispatch_grpc_native_h3(
                         wire_grpc_status.as_deref(),
                         wire_grpc_message.as_deref(),
                         wire_grpc_status_details.as_deref(),
-                        grpc_deadline_at,
+                        downstream_write_bound.deadline(),
                     )
                     .await
                     {
                         H3GrpcResponseFinish::Complete => body_completed = true,
                         H3GrpcResponseFinish::DeadlineExceeded => {
-                            client_deadline_expired = true;
                             crate::http3::stream_util::abort_response_stream(&mut send_half);
-                            body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                            if let Some(termination) =
+                                downstream_write_bound.expired_authorization()
+                            {
+                                crate::proxy::insert_grpc_error_metadata(
+                                    &mut ctx.metadata,
+                                    crate::proxy::grpc_proxy::grpc_status::UNAUTHENTICATED,
+                                    termination.grpc_message(),
+                                );
+                                ctx.record_authorization_termination_once(
+                                    termination,
+                                    crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Grpc,
+                                );
+                                body_error_class =
+                                    Some(crate::retry::ErrorClass::ClientDisconnect);
+                            } else {
+                                client_deadline_expired = true;
+                                body_error_class =
+                                    Some(crate::retry::ErrorClass::ClientDisconnect);
+                            }
                         }
                         H3GrpcResponseFinish::WriteFailed => {
                             crate::http3::stream_util::abort_response_stream(&mut send_half);

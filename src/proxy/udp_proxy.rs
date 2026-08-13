@@ -3094,6 +3094,46 @@ async fn forward_client_datagram_to_backend(
     session: &Arc<UdpSession>,
     data: &[u8],
 ) -> Result<(), anyhow::Error> {
+    let send = async {
+        if let Some(ref dtls) = session.dtls_conn {
+            dtls.send(data)
+                .await
+                .map(|()| data.len())
+                .map_err(|e| std::io::Error::other(e.to_string()))
+        } else if let Some(ref sock) = session.backend_socket {
+            sock.send(data).await
+        } else {
+            Err(std::io::Error::other("no backend socket available"))
+        }
+    };
+    forward_client_datagram_commit(session, data, send).await
+}
+
+/// Authorization-aware client→backend datagram commit (issue #3816 / #3820).
+///
+/// The pre-send `refuse_if_authorization_expired` check still refuses an
+/// already-elapsed plan before any amplification budget is published. The
+/// gateway-owned send itself is then raced through
+/// [`udp_frontend_send_until_expiry`]: a socket parked on writability cannot
+/// commit after the absolute deadline, an already-elapsed plan never polls
+/// `send`, and an exact-deadline tie is expiry-first. Settlement goes through
+/// the session latch and reply-task wake exactly once — never as hook-ingress
+/// overload or a backend health failure.
+///
+/// Unauthenticated sessions (`authorization == None`) take the `Option`
+/// discriminant only: no extra clock read, lock, allocation, or timer beyond
+/// that existing gate.
+///
+/// `send` is the production backend send, or a parked test future that stands
+/// in for a socket waiting on writability.
+async fn forward_client_datagram_commit<F>(
+    session: &Arc<UdpSession>,
+    data: &[u8],
+    send: F,
+) -> Result<(), anyhow::Error>
+where
+    F: std::future::Future<Output = Result<usize, std::io::Error>>,
+{
     // Authorization-lifetime gate for the client→backend direction (issue
     // #3816). Placed ahead of the amplification-budget publish and the backend
     // send so an expired credential moves no gateway state and produces no
@@ -3117,19 +3157,19 @@ async fn forward_client_datagram_to_backend(
         .last_request_size
         .store(data.len() as u64, Ordering::Release);
 
-    let send_result = if let Some(ref dtls) = session.dtls_conn {
-        dtls.send(data)
-            .await
-            .map(|()| data.len())
-            .map_err(|e| std::io::Error::other(e.to_string()))
-    } else if let Some(ref sock) = session.backend_socket {
-        sock.send(data).await
-    } else {
-        return Err(anyhow::anyhow!("no backend socket available"));
-    };
-
-    match send_result {
-        Ok(_) => {
+    let plan = session
+        .authorization
+        .as_ref()
+        .map(|authorization| authorization.plan);
+    match udp_frontend_send_until_expiry(plan, send).await {
+        UdpFrontendSendOutcome::AuthorizationExpired(_) => {
+            // Settle through the existing session latch and wake the reply task
+            // exactly once. A parked send that lost the race is dropped, so it
+            // cannot complete afterwards.
+            let _ = session.refuse_if_authorization_expired();
+            Err(udp_authorization_expired_error())
+        }
+        UdpFrontendSendOutcome::Sent(Ok(_)) => {
             session
                 .last_activity
                 .store(coarse_epoch_millis(), Ordering::Relaxed);
@@ -3138,7 +3178,12 @@ async fn forward_client_datagram_to_backend(
                 .fetch_add(data.len() as u64, Ordering::Relaxed);
             Ok(())
         }
-        Err(e) => Err(anyhow::anyhow!("send to backend failed: {}", e)),
+        UdpFrontendSendOutcome::Sent(Err(e)) if e.to_string() == "no backend socket available" => {
+            Err(anyhow::anyhow!("no backend socket available"))
+        }
+        UdpFrontendSendOutcome::Sent(Err(e)) => {
+            Err(anyhow::anyhow!("send to backend failed: {}", e))
+        }
     }
 }
 
@@ -4210,6 +4255,37 @@ where
     }
 }
 
+/// Race one DTLS client→backend stage — receive, an awaited hook, or the
+/// backend application-datagram commit — against the admitted absolute
+/// authorization plan (issue #3816 / #3820).
+///
+/// The client-to-backend task owns this boundary: the outer relay select is
+/// not sufficient, because abort is scheduled after the inner task may already
+/// have committed. An already-elapsed plan never polls `stage`. An exact
+/// deadline tie is expiry-first. Settlement goes through the shared session
+/// latch exactly once and is not counted as hook-ingress overload or a backend
+/// health failure.
+///
+/// Unauthenticated sessions (`None`) await `stage` with no timer, lock, or
+/// clock read.
+pub(crate) async fn dtls_c2b_until_expiry<F>(
+    plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+    latch: &crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+    session_metadata: &std::sync::Mutex<std::collections::HashMap<String, String>>,
+    stage: F,
+) -> Result<F::Output, crate::proxy::auth_lifetime::StreamAuthTermination>
+where
+    F: std::future::Future,
+{
+    match udp_frontend_send_until_expiry(plan, stage).await {
+        UdpFrontendSendOutcome::AuthorizationExpired(termination) => {
+            settle_dtls_auth_expiry(termination, latch, session_metadata);
+            Err(termination)
+        }
+        UdpFrontendSendOutcome::Sent(value) => Ok(value),
+    }
+}
+
 /// Race a client-facing `writable()` wait against the same absolute plan,
 /// then re-read the plan after readiness and before the caller may issue
 /// the send syscall.
@@ -4665,10 +4741,24 @@ async fn handle_dtls_client_inner(
     // (parity with plain UDP). Decrypt/receive alone must not refresh the
     // watchdog — otherwise rate-rejected application datagrams pin the session.
     let activity_fwd = Arc::clone(&shared_activity_ms);
+    // The client→backend task owns the absolute authorization boundary around
+    // receive, every awaited hook, and the backend application-datagram commit.
+    // The outer select abort is scheduled after this task may already commit,
+    // so a parked recv/hook/send must race the plan itself (issue #3816 / #3820).
+    let c2b_auth_plan = auth_deadline;
+    let c2b_auth_latch = auth_termination_latch.clone();
     let client_to_backend = tokio::spawn(async move {
-        loop {
-            let data = match client_conn.recv().await {
-                Ok(d) => d,
+        'c2b: loop {
+            let data = match dtls_c2b_until_expiry(
+                c2b_auth_plan,
+                &c2b_auth_latch,
+                dgram_metadata_fwd.as_ref(),
+                client_conn.recv(),
+            )
+            .await
+            {
+                Ok(Ok(d)) => d,
+                Ok(Err(_)) => break,
                 Err(_) => break,
             };
             let len = data.len();
@@ -4678,7 +4768,9 @@ async fn handle_dtls_client_inner(
                 .bytes_in
                 .fetch_add(len as u64, Ordering::Relaxed);
 
-            // Run per-datagram plugins before forwarding.
+            // Run per-datagram plugins before forwarding. Each awaited hook is
+            // itself an authorization boundary: a blocked plugin cannot commit
+            // an application datagram after the credential expires.
             if !dgram_plugins.is_empty() {
                 let ctx = UdpDatagramContext {
                     client_ip: Arc::clone(&dgram_client_ip),
@@ -4694,9 +4786,20 @@ async fn handle_dtls_client_inner(
                 };
                 let mut dropped = false;
                 for plugin in dgram_plugins.iter() {
-                    if matches!(plugin.on_udp_datagram(&ctx).await, UdpDatagramVerdict::Drop) {
-                        dropped = true;
-                        break;
+                    match dtls_c2b_until_expiry(
+                        c2b_auth_plan,
+                        &c2b_auth_latch,
+                        dgram_metadata_fwd.as_ref(),
+                        plugin.on_udp_datagram(&ctx),
+                    )
+                    .await
+                    {
+                        Ok(UdpDatagramVerdict::Drop) => {
+                            dropped = true;
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(_) => break 'c2b,
                     }
                 }
                 if dropped {
@@ -4709,23 +4812,37 @@ async fn handle_dtls_client_inner(
             // Publish before sending so a fast backend reply cannot observe a
             // zero or stale amplification budget.
             last_request_size_fwd.store(len as u64, Ordering::Release);
-            let send_ok = if let Some(ref dtls) = backend_dtls_write {
-                dtls.send(&data).await.map_err(|e| e.to_string())
-            } else if let Some(ref sock) = backend_udp_write {
-                sock.send(&data)
-                    .await
-                    .map(|_| ())
-                    .map_err(|e| e.to_string())
-            } else {
-                break;
+            let send = async {
+                if let Some(ref dtls) = backend_dtls_write {
+                    dtls.send(&data).await.map_err(|e| e.to_string())
+                } else if let Some(ref sock) = backend_udp_write {
+                    sock.send(&data)
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| e.to_string())
+                } else {
+                    Err("no backend socket available".to_string())
+                }
             };
-
-            if let Err(e) = send_ok {
-                debug!(
-                    proxy_id = %proxy_id_fwd,
-                    "DTLS client→backend send failed: {}", e
-                );
-                break;
+            match dtls_c2b_until_expiry(
+                c2b_auth_plan,
+                &c2b_auth_latch,
+                dgram_metadata_fwd.as_ref(),
+                send,
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    if e != "no backend socket available" {
+                        debug!(
+                            proxy_id = %proxy_id_fwd,
+                            "DTLS client→backend send failed: {}", e
+                        );
+                    }
+                    break;
+                }
+                Err(_) => break,
             }
 
             metrics_fwd.datagrams_out.fetch_add(1, Ordering::Relaxed);
@@ -4866,14 +4983,14 @@ async fn handle_dtls_client_inner(
             .unwrap_or_else(tokio::time::Instant::now),
     ));
     let outcome = tokio::select! {
-        _ = &mut client_to_backend => Ok(()),
-        _ = &mut backend_to_client => Ok(()),
-        result = &mut idle_watchdog => result,
+        biased;
         _ = &mut authorization_deadline, if authorization_deadline_active => {
             // Fixed-cardinality termination class, recorded once through the
             // same latch the setup phase uses, and stamped into the session
             // metadata so the bounded class reaches the stream transaction
-            // summary and `on_stream_disconnect` (issue #3816).
+            // summary and `on_stream_disconnect` (issue #3816). Authorization
+            // is first so an exact tie with a relay task completing (or the
+            // idle watchdog) is attributed to the security bound.
             if let Some(plan) = auth_deadline {
                 settle_dtls_auth_expiry(
                     plan.termination,
@@ -4885,6 +5002,9 @@ async fn handle_dtls_client_inner(
             // certificate detail reaches the message.
             Err(DtlsAuthorizationExpired.into())
         }
+        _ = &mut client_to_backend => Ok(()),
+        _ = &mut backend_to_client => Ok(()),
+        result = &mut idle_watchdog => result,
     };
     // Both relay directions and the backend connection are torn down on every
     // exit path below, including the authorization deadline, so no detached
@@ -6416,6 +6536,19 @@ impl UdpAuthorizationSessionProbe {
     /// Drive the production client→backend forward for one datagram.
     pub async fn forward(&self, data: &[u8]) -> Result<(), String> {
         forward_client_datagram_to_backend(&self.session, data)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Drive the production client→backend commit with a caller-owned send
+    /// future in place of the socket syscall. Used to park the send on
+    /// writability without sleeping: expiry must drop the future before it
+    /// can emit a backend datagram.
+    pub async fn forward_commit_with<F>(&self, data: &[u8], send: F) -> Result<(), String>
+    where
+        F: std::future::Future<Output = Result<usize, std::io::Error>>,
+    {
+        forward_client_datagram_commit(&self.session, data, send)
             .await
             .map_err(|e| e.to_string())
     }

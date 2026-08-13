@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use ferrum_edge::_test_support::{
     UdpAuthorizationSessionProbe, UdpFrontendSendOutcomeForTest, UdpReplyRecvOutcomeForTest,
-    udp_authorization_disconnect_classification_for_test,
+    dtls_c2b_until_expiry_for_test, udp_authorization_disconnect_classification_for_test,
     udp_authorization_expired_before_commit_for_test, udp_frontend_send_until_expiry_for_test,
     udp_frontend_writable_until_expiry_for_test, udp_setup_stage_under_authorization_for_test,
 };
@@ -795,6 +795,16 @@ async fn gated_client_emit(
     4
 }
 
+/// Production-shaped backend send future: park until `release`, then emit.
+async fn gated_backend_send(
+    release: tokio::sync::oneshot::Receiver<()>,
+    emitted: Arc<AtomicBool>,
+) -> Result<usize, std::io::Error> {
+    let _ = release.await;
+    emitted.store(true, Ordering::SeqCst);
+    Ok(4)
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_pending_client_send_to_is_dropped_at_the_authorization_deadline() {
     // Ordinary non-batched `send_to`: the socket future stays pending across
@@ -1438,23 +1448,40 @@ fn every_plain_udp_setup_stage_runs_under_the_authorization_deadline() {
     );
 }
 
-/// The gate is installed on every client→backend production path.
+/// The gate is installed on every client→backend production path, and the
+/// gateway-owned send itself is authorization-aware.
 #[test]
 fn every_client_to_backend_path_is_gated() {
     let forward = body_of("async fn forward_client_datagram_to_backend(")
         .split("\n}\n")
         .next()
         .expect("the forward body");
-    let gate_at = forward
+    assert!(
+        forward.contains("forward_client_datagram_commit("),
+        "every client→backend send must go through the authorization-aware commit"
+    );
+
+    let commit = body_of("async fn forward_client_datagram_commit<F>(")
+        .split("\n}\n")
+        .next()
+        .expect("the commit body");
+    let gate_at = commit
         .find("session.refuse_if_authorization_expired().is_some()")
         .expect("the forward gate");
-    let publish_at = forward
+    let publish_at = commit
         .find("last_request_size")
         .expect("the amplification budget publish");
+    let race_at = commit
+        .find("udp_frontend_send_until_expiry(")
+        .expect("the authorization-aware send race");
     assert!(
         gate_at < publish_at,
         "the gate must precede the amplification-budget publish and the backend send, so an \
          expired credential moves no gateway state"
+    );
+    assert!(
+        publish_at < race_at,
+        "the gateway-owned send must race the absolute plan after the pre-send refusal"
     );
 
     let enqueue = body_of("fn enqueue_session_hook_datagram(")
@@ -1685,6 +1712,10 @@ fn client_facing_sends_are_raced_against_the_authorization_plan() {
         "the raced operation is the deadline-aware actual-commit DTLS send"
     );
     assert!(
+        dtls_inner.contains("dtls_c2b_until_expiry("),
+        "DTLS client→backend receive, hooks, and backend commits must race the plan"
+    );
+    assert!(
         dtls_inner.contains("bind_authorization_deadline(plan.at)"),
         "the admitted deadline must be published into the per-client DTLS driver"
     );
@@ -1696,4 +1727,227 @@ fn client_facing_sends_are_raced_against_the_authorization_plan() {
         !dtls_inner.contains("if client_sender.send(&data).await.is_err()"),
         "the DTLS frontend send must not await unguarded"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_parked_client_to_backend_send_is_dropped_at_the_authorization_deadline() {
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let emitted = Arc::new(AtomicBool::new(false));
+    let emitted_send = Arc::clone(&emitted);
+    let plan = future_plan(
+        Duration::from_millis(20),
+        StreamAuthTermination::CredentialExpired,
+    );
+    let latch = StreamAuthTerminationLatch::default();
+    let before = stream_udp_terminations();
+    let session = Arc::new(probe(Some(plan), latch.clone(), false).await);
+
+    let raced = tokio::spawn({
+        let session = Arc::clone(&session);
+        async move {
+            session
+                .forward_commit_with(b"parked", gated_backend_send(release_rx, emitted_send))
+                .await
+        }
+    });
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_millis(20)).await;
+    let _ = release_tx.send(());
+    assert!(
+        raced.await.expect("join").is_err(),
+        "a send parked on writability must refuse at the authorization deadline"
+    );
+    assert!(
+        !emitted.load(Ordering::SeqCst),
+        "a send that became ready after the deadline must not emit a backend datagram"
+    );
+    assert!(session.forward(b"post-expiry").await.is_err());
+    let summary = session
+        .run_reply_task_exit_teardown()
+        .expect("this generation owns the removal");
+    assert!(summary.connection_error.is_some());
+    assert!(
+        stream_udp_terminations().0 > before.0,
+        "send-path expiry records the stream_udp counter once"
+    );
+    assert!(
+        !latch.record_once(
+            StreamAuthTermination::CredentialExpired,
+            StreamAuthProtocolFamily::StreamUdp,
+        ),
+        "settlement remains exactly once"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_already_elapsed_client_to_backend_send_never_polls_the_socket() {
+    let plan = elapsed_plan(StreamAuthTermination::CredentialExpired);
+    let latch = StreamAuthTerminationLatch::default();
+    let session = probe(Some(plan), latch.clone(), false).await;
+    let polled = Arc::new(AtomicBool::new(false));
+    let polled_send = Arc::clone(&polled);
+    let result = session
+        .forward_commit_with(
+            b"late",
+            std::future::poll_fn(move |_| {
+                polled_send.store(true, Ordering::SeqCst);
+                std::task::Poll::Ready(Ok::<usize, std::io::Error>(4))
+            }),
+        )
+        .await;
+    assert!(result.is_err());
+    assert!(
+        !polled.load(Ordering::SeqCst),
+        "an already-elapsed plan must refuse before polling the backend send"
+    );
+    assert!(
+        !latch.record_once(
+            StreamAuthTermination::CredentialExpired,
+            StreamAuthProtocolFamily::StreamUdp,
+        ),
+        "the pre-send refusal settles the latch once"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_exact_tie_on_a_ready_client_to_backend_send_is_expiry_first() {
+    let plan = future_plan(
+        Duration::from_millis(0),
+        StreamAuthTermination::CredentialExpired,
+    );
+    let latch = StreamAuthTerminationLatch::default();
+    let session = probe(Some(plan), latch.clone(), false).await;
+    let polled = Arc::new(AtomicBool::new(false));
+    let polled_send = Arc::clone(&polled);
+    let result = session
+        .forward_commit_with(
+            b"tie",
+            std::future::poll_fn(move |_| {
+                polled_send.store(true, Ordering::SeqCst);
+                std::task::Poll::Ready(Ok::<usize, std::io::Error>(4))
+            }),
+        )
+        .await;
+    assert!(result.is_err());
+    assert!(
+        !polled.load(Ordering::SeqCst),
+        "an exact-deadline tie must not poll a simultaneously-ready backend send"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_parked_dtls_c2b_hook_is_dropped_at_the_authorization_deadline() {
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let emitted = Arc::new(AtomicBool::new(false));
+    let emitted_hook = Arc::clone(&emitted);
+    let plan = future_plan(
+        Duration::from_millis(20),
+        StreamAuthTermination::CredentialExpired,
+    );
+    let latch = StreamAuthTerminationLatch::default();
+    let raced = tokio::spawn({
+        let latch = latch.clone();
+        async move {
+            dtls_c2b_until_expiry_for_test(
+                Some(plan),
+                &latch,
+                gated_client_emit(release_rx, emitted_hook),
+            )
+            .await
+        }
+    });
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_millis(20)).await;
+    let _ = release_tx.send(());
+    assert_eq!(
+        raced.await.expect("join"),
+        Err(StreamAuthTermination::CredentialExpired)
+    );
+    assert!(
+        !emitted.load(Ordering::SeqCst),
+        "a blocked hook must not complete after the authorization deadline"
+    );
+    assert!(
+        !latch.record_once(
+            StreamAuthTermination::CredentialExpired,
+            StreamAuthProtocolFamily::StreamUdp,
+        ),
+        "DTLS C2B expiry settles the shared latch once"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_parked_dtls_c2b_backend_send_is_dropped_at_the_authorization_deadline() {
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let emitted = Arc::new(AtomicBool::new(false));
+    let emitted_send = Arc::clone(&emitted);
+    let plan = future_plan(
+        Duration::from_millis(20),
+        StreamAuthTermination::CredentialExpired,
+    );
+    let latch = StreamAuthTerminationLatch::default();
+    let raced = tokio::spawn({
+        let latch = latch.clone();
+        async move {
+            dtls_c2b_until_expiry_for_test(
+                Some(plan),
+                &latch,
+                gated_client_emit(release_rx, emitted_send),
+            )
+            .await
+        }
+    });
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_millis(20)).await;
+    let _ = release_tx.send(());
+    assert_eq!(
+        raced.await.expect("join"),
+        Err(StreamAuthTermination::CredentialExpired)
+    );
+    assert!(
+        !emitted.load(Ordering::SeqCst),
+        "a parked backend send must not commit an application datagram after expiry"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_already_elapsed_dtls_c2b_stage_never_polls() {
+    let plan = elapsed_plan(StreamAuthTermination::CredentialExpired);
+    let latch = StreamAuthTerminationLatch::default();
+    let polled = Arc::new(AtomicBool::new(false));
+    let polled_stage = Arc::clone(&polled);
+    let result = dtls_c2b_until_expiry_for_test(
+        Some(plan),
+        &latch,
+        std::future::poll_fn(move |_| {
+            polled_stage.store(true, Ordering::SeqCst);
+            std::task::Poll::Ready(1usize)
+        }),
+    )
+    .await;
+    assert_eq!(result, Err(StreamAuthTermination::CredentialExpired));
+    assert!(
+        !polled.load(Ordering::SeqCst),
+        "an already-elapsed DTLS C2B plan must not poll receive, hook, or send"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unauthenticated_dtls_c2b_stage_has_no_timer() {
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let emitted = Arc::new(AtomicBool::new(false));
+    let emitted_stage = Arc::clone(&emitted);
+    let latch = StreamAuthTerminationLatch::default();
+    let raced = tokio::spawn(async move {
+        dtls_c2b_until_expiry_for_test(None, &latch, gated_client_emit(release_rx, emitted_stage))
+            .await
+    });
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(86_400)).await;
+    let _ = release_tx.send(());
+    assert_eq!(raced.await.expect("join"), Ok(4));
+    assert!(emitted.load(Ordering::SeqCst));
 }

@@ -6131,6 +6131,7 @@ pub mod _test_support {
         MalformedTrailers,
         Oversize,
         BackendUploadHalted,
+        AuthorizationExpired,
     }
 
     fn h3_grpc_upload_fault_for_test(
@@ -6146,6 +6147,11 @@ pub mod _test_support {
             H3GrpcUploadFaultKind::Oversize => crate::http3::server::H3GrpcUploadFault::Oversize,
             H3GrpcUploadFaultKind::BackendUploadHalted => {
                 crate::http3::server::H3GrpcUploadFault::BackendUploadHalted
+            }
+            H3GrpcUploadFaultKind::AuthorizationExpired => {
+                crate::http3::server::H3GrpcUploadFault::AuthorizationExpired(
+                    crate::proxy::auth_lifetime::StreamAuthTermination::CredentialExpired,
+                )
             }
         }
     }
@@ -6216,6 +6222,9 @@ pub mod _test_support {
             Some(crate::http3::server::H3GrpcUploadFault::BackendUploadHalted) => {
                 H3GrpcUploadFaultKind::BackendUploadHalted
             }
+            Some(crate::http3::server::H3GrpcUploadFault::AuthorizationExpired(_)) => {
+                H3GrpcUploadFaultKind::AuthorizationExpired
+            }
             None => unreachable!("a published fault must latch"),
         }
     }
@@ -6266,6 +6275,41 @@ pub mod _test_support {
                 .await,
             Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded)
         )
+    }
+
+    /// Outcome of racing one native-H3 gRPC upload-pump await against shutdown
+    /// and the admitted authorization plan.
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum H3GrpcUploadAwaitOutcomeForTest<T> {
+        Ready(T),
+        Cancelled,
+        AuthorizationExpired(crate::proxy::auth_lifetime::StreamAuthTermination),
+    }
+
+    /// Race one native-H3 gRPC upload-pump receive or commit against the
+    /// admitted authorization plan — the exact seam `run_h3_grpc_upload_pump`
+    /// uses for frontend DATA, backend DATA, trailers, and FIN.
+    pub async fn h3_grpc_upload_await_until_authorization_for_test<F>(
+        plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+        shutdown: &tokio::sync::Notify,
+        fut: F,
+    ) -> H3GrpcUploadAwaitOutcomeForTest<F::Output>
+    where
+        F: std::future::Future,
+    {
+        match crate::http3::server::h3_grpc_upload_await_until_authorization(plan, shutdown, fut)
+            .await
+        {
+            crate::http3::server::H3GrpcUploadAwaitOutcome::Ready(value) => {
+                H3GrpcUploadAwaitOutcomeForTest::Ready(value)
+            }
+            crate::http3::server::H3GrpcUploadAwaitOutcome::Cancelled => {
+                H3GrpcUploadAwaitOutcomeForTest::Cancelled
+            }
+            crate::http3::server::H3GrpcUploadAwaitOutcome::AuthorizationExpired(termination) => {
+                H3GrpcUploadAwaitOutcomeForTest::AuthorizationExpired(termination)
+            }
+        }
     }
 
     /// Return true when a terminal H3 status that is immediately writable can
@@ -7512,6 +7556,15 @@ pub mod _test_support {
         crate::proxy::tcp_proxy::within_stream_auth_deadline(plan, stage).await
     }
 
+    /// Kernel splice/IORING is legal only for an unauthenticated plain TCP
+    /// session. An admitted principal always takes the userspace deadline-aware
+    /// relay (issue #3816).
+    pub fn tcp_plain_splice_eligible_for_test(
+        plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+    ) -> bool {
+        crate::proxy::tcp_proxy::tcp_plain_splice_eligible(plan)
+    }
+
     /// Observable settlement of a DTLS authorization expiry (issue #3816),
     /// captured from the production helpers so a test never restates them.
     #[derive(Debug, Clone)]
@@ -7784,6 +7837,21 @@ pub mod _test_support {
         map_udp_frontend_send_outcome_for_test(
             crate::proxy::udp_proxy::udp_frontend_send_until_expiry(plan, send).await,
         )
+    }
+
+    /// Race one DTLS client→backend stage against the admitted absolute plan
+    /// — the exact seam `handle_dtls_client_inner` uses around receive, each
+    /// awaited hook, and the backend application-datagram commit.
+    pub async fn dtls_c2b_until_expiry_for_test<F>(
+        plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+        latch: &crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+        stage: F,
+    ) -> Result<F::Output, crate::proxy::auth_lifetime::StreamAuthTermination>
+    where
+        F: std::future::Future,
+    {
+        let metadata = std::sync::Mutex::new(std::collections::HashMap::new());
+        crate::proxy::udp_proxy::dtls_c2b_until_expiry(plan, latch, &metadata, stage).await
     }
 
     /// Race a client-facing `writable()` wait against the same plan, then

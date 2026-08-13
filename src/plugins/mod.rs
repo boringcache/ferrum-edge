@@ -3573,9 +3573,13 @@ impl RequestContext {
     /// borrows this context, because attributing the expiry afterwards needs
     /// `&mut self` again.
     ///
-    /// The maximum comes from the process-wide value `EnvConfig::validate`
-    /// publishes after its `1..=86400` range check, so this needs no config
-    /// handle and cannot read an unvalidated number.
+    /// The maximum comes from the process-wide value the accepted serving
+    /// configuration publishes (`EnvConfig::publish_process_wide_stream_settings`,
+    /// called from the startup/run gateway publication seam after
+    /// `EnvConfig::from_env()` succeeds). `EnvConfig::validate` only range-checks
+    /// `1..=86400`; it does not publish, so a rejected or `ferrum-edge validate`
+    /// candidate cannot mutate the live scalar. This needs no config handle and
+    /// cannot read an unvalidated number.
     ///
     /// `None` for an unauthenticated request with no RPC deadline — byte for
     /// byte the previous behavior.
