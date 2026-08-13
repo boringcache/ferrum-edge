@@ -1704,6 +1704,20 @@ pub(crate) async fn handle_h3_websocket(
             )
             .await
         }
+        // H3 has no Unix backend dialer; `h3_bridge_transport_refusal` screens Unix
+        // targets before the connect loop can build this variant. Handle the arm
+        // for exhaustiveness after main's `WsBackendHandshake::Unix` without
+        // weakening that gate or frame-relaying an admitted socket.
+        #[cfg(unix)]
+        crate::proxy::WsBackendHandshake::Unix(handshake) => {
+            let handshake = *handshake;
+            warn!(
+                proxy_id = %proxy_id_for_relay,
+                "H3 WebSocket: refusing Unix socket backend relay (no H3 Unix dialer)"
+            );
+            drop(handshake.conn_lease);
+            Err("Unix socket dispatch required for this backend target".into())
+        }
     };
 
     if let Err(e) = relay_result {

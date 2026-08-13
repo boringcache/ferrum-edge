@@ -106,6 +106,63 @@ fn h3_websocket_connect_loop_screens_unix_and_forks_mesh_before_dial() {
     );
 }
 
+/// After main landed Unix WebSocket backend handshakes (#3732), the H3 bridge
+/// relay must stay exhaustive on Unix without enabling Unix dispatch: the connect
+/// loop still refuses Unix targets before dial, and any impossible Unix variant
+/// reaching the relay match must fail closed without `run_websocket_proxy`.
+#[test]
+fn h3_websocket_relay_rejects_impossible_unix_handshake_without_dispatch() {
+    let src = include_str!("../../../src/http3/websocket.rs");
+    let relay_start = src
+        .find("let relay_result = match backend_handshake {")
+        .expect("h3_websocket: backend relay dispatch match not found");
+    let relay_tail = &src[relay_start..];
+    let relay_end = relay_tail
+        .find("\n    };\n\n    if let Err(e) = relay_result")
+        .expect("h3_websocket: relay match terminator not found");
+    let relay_block = &relay_tail[..relay_end];
+
+    assert!(
+        relay_block.contains("WsBackendHandshake::Direct(")
+            && relay_block.contains("WsBackendHandshake::Mesh(")
+            && relay_block.contains("WsBackendHandshake::Unix("),
+        "h3_websocket relay must dispatch Direct, Mesh, and Unix variants"
+    );
+    let unix_arm = relay_block
+        .find("WsBackendHandshake::Unix(")
+        .expect("h3_websocket relay must include Unix arm for exhaustiveness");
+    let unix_slice = &relay_block[unix_arm..];
+    assert!(
+        unix_slice.contains("drop(handshake.conn_lease)"),
+        "impossible Unix relay arm must release the admitted socket lease"
+    );
+    assert!(
+        !unix_slice.contains("run_websocket_proxy("),
+        "H3 must never frame-relay a Unix backend (no H3 Unix dialer)"
+    );
+    assert!(
+        unix_slice.contains("Unix socket dispatch required for this backend target"),
+        "impossible Unix relay arm must reuse the bridge refusal contract"
+    );
+
+    let loop_start = src
+        .find("let backend_handshake = loop {")
+        .expect("h3_websocket: backend connect loop not found");
+    let connect_tail = &src[loop_start..];
+    assert!(
+        connect_tail.contains("h3_bridge_transport_refusal("),
+        "h3_websocket connect loop must still refuse Unix before dial"
+    );
+    let connect_only = connect_tail
+        .split("let relay_result = match backend_handshake {")
+        .next()
+        .expect("h3_websocket connect loop must precede relay dispatch");
+    assert!(
+        !connect_only.contains("WsBackendHandshake::Unix("),
+        "h3_websocket connect loop must not construct Unix handshakes"
+    );
+}
+
 /// Helper `None` (no remaining H3-eligible alternative) must abort rather than
 /// leave `retry_path_mismatch` false and retry the original failed target.
 #[test]
