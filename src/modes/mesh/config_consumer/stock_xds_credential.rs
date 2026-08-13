@@ -338,11 +338,23 @@ pub const MAX_STOCK_XDS_TOKEN_MAX_STREAM_LIFETIME_SECS: u64 = 86_400;
 const ABSOLUTE_MAX_STREAM_LIFETIME_FLOOR: Duration = Duration::from_secs(1);
 
 /// The configured credential source plus its lifetime policy.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct StockXdsCredentialSource {
     /// `None` sends no `authorization` metadata at all.
     path: Option<String>,
     policy: StockCredentialLifetimePolicy,
+}
+
+impl std::fmt::Debug for StockXdsCredentialSource {
+    /// The pathname is credential metadata. An otherwise innocent `Debug`
+    /// rendering of this source — or of `StockXdsClientConfig`, which embeds
+    /// it — must never print it.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StockXdsCredentialSource")
+            .field("configured", &self.path.is_some())
+            .field("policy", &self.policy)
+            .finish()
+    }
 }
 
 impl StockXdsCredentialSource {

@@ -11670,15 +11670,18 @@ components:
             - serving_last_good
           description: |
             Readiness classification. `connected` means an RPC stream is
-            currently established AND usable configuration exists.
-            `never_received_slice` means startup has never completed and no
-            liveness bound has been hit. `stream_liveness_failed` means an
-            ESTABLISHED stream stopped being usable — a first-frame,
-            first-slice, or heartbeat-silence bound, or a transport failure
-            after the streaming RPC was open — and it OUTRANKS
-            `never_received_slice`, so a bounded liveness failure stays visible
-            even before the first slice ever arrives. It is cleared only when a
-            stream installs usable state. `serving_last_good` means a previously
+            currently established AND usable configuration exists AND no sticky
+            liveness failure is outstanding. `never_received_slice` means
+            startup has never completed and no liveness bound has been hit.
+            `stream_liveness_failed` means an ESTABLISHED stream stopped being
+            usable — a first-frame, first-slice, or heartbeat-silence bound, or
+            a transport failure after the streaming RPC was open — and it
+            OUTRANKS both `connected` and `never_received_slice`. A bounded
+            liveness failure stays visible even before the first slice ever
+            arrives, and it stays visible after a replacement RPC is accepted
+            while last-good state still exists. It is cleared only when a
+            stream installs usable state; merely attaching a new RPC does not
+            report `connected`. `serving_last_good` means a previously
             installed slice keeps serving while the stream is down or
             reconnecting for an ordinary, non-liveness reason.
         last_attempt_outcome:

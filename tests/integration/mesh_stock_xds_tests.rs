@@ -2399,20 +2399,21 @@ mod tls_lifecycle {
     /// Issue #3852, acceptance criterion 6: simultaneous TLS and token rotation
     /// produces ONE bounded reconnect that uses the newest values for both.
     ///
-    /// The client starts with a CA file that trusts the WRONG authority, so no
-    /// stream can open. The correct CA is then written, the TLS revision is
-    /// bumped, and the token is replaced — all before the client's next attempt
-    /// — and the single resulting stream must present the new token over the
-    /// newly trusted TLS material.
+    /// The client first establishes a healthy stream with token one over a
+    /// trusted CA so old-credential discovery state actually exists. The CA
+    /// file and token are then replaced together and the TLS revision is
+    /// bumped. The outer lifecycle must not let the TLS-reload arm mask the
+    /// credential retirement: the replacement RPC carries only token two over
+    /// the newly loaded CA, and a poison push from the retired stream must
+    /// never be installed.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn simultaneous_tls_and_token_rotation_yields_one_reconnect_with_the_newest_material() {
         let serving = issue_material(&["localhost"], false);
-        let unrelated = issue_material(&["localhost"], false);
         let endpoint = serve_tls(TlsBehaviour::Converged, &serving, false).await;
 
         let dir = tempfile::tempdir().expect("temp dir");
         let ca_path = dir.path().join("cp-ca.pem");
-        std::fs::write(&ca_path, &unrelated.ca_pem).expect("write wrong CA");
+        std::fs::write(&ca_path, &serving.ca_pem).expect("write serving CA");
         let token_path = write_token(&dir, "projected-token", "projected-token-one");
 
         let env_config = Arc::new(EnvConfig {
@@ -2426,7 +2427,7 @@ mod tls_lifecycle {
             token_path: Some(token_path.clone()),
             policy: fast_policy(Duration::from_secs(3600)),
             tls_config: Some(DpGrpcTlsConfig {
-                ca_cert_pem: Some(unrelated.ca_pem.clone()),
+                ca_cert_pem: Some(serving.ca_pem.clone()),
                 client_cert_pem: None,
                 client_key_pem: None,
             }),
@@ -2440,32 +2441,87 @@ mod tls_lifecycle {
         })
         .await;
 
-        // Nothing can converge while the wrong CA is trusted.
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        harness
+            .wait_for_services(2, "the established old-credential stream")
+            .await;
+        assert_eq!(endpoint.ads.stream_count(), 1);
         assert_eq!(
-            harness.services(),
-            None,
-            "an untrusted server certificate must fail closed before any slice is accepted"
+            endpoint.ads.authorization_snapshot(),
+            vec!["Bearer projected-token-one".to_string()],
+            "the first stream must present the original token over the original CA"
         );
-        assert_eq!(endpoint.ads.stream_count(), 0);
+        assert_eq!(
+            harness.status_field(|status| status.state),
+            Some("connected")
+        );
 
-        std::fs::write(&ca_path, &serving.ca_pem).expect("write correct CA");
+        let sampler_state = harness.state.clone();
+        let sampler_stop = Arc::new(AtomicBool::new(false));
+        let stop = sampler_stop.clone();
+        let sampler = tokio::spawn(async move {
+            let mut worst = 0usize;
+            while !stop.load(Ordering::SeqCst) {
+                if let Some(slice) = sampler_state.snapshot().as_ref().as_ref() {
+                    worst = worst.max(slice.services.len());
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            worst
+        });
+
+        let generation_before = harness.credential_watch.latest().generation;
+        std::fs::write(&ca_path, &serving.ca_pem).expect("reload serving CA from disk");
         std::fs::write(&token_path, b"projected-token-two").expect("rotate token");
         revision_tx.send_replace(1);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while harness.credential_watch.latest().generation == generation_before {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the credential watcher must observe the rotation"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let _ = endpoint.poison_tx.send(true);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while endpoint.ads.stream_count() < 2 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the simultaneous TLS + token events must retire the established stream \
+                 and open a replacement"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
 
         harness
             .wait_for_services(2, "the coalesced TLS + token rotation")
             .await;
         let observed = endpoint.ads.authorization_snapshot();
-        assert_eq!(
-            observed.last().map(String::as_str),
-            Some("Bearer projected-token-two"),
-            "the reconnect must use the newest token as well as the newest TLS: {observed:?}"
-        );
+        assert!(observed.len() >= 2, "{observed:?}");
+        assert_eq!(observed[0], "Bearer projected-token-one");
         assert_eq!(
             endpoint.ads.stream_count(),
-            1,
-            "the two simultaneous lifecycle events must coalesce into ONE stream"
+            2,
+            "the two simultaneous lifecycle events must coalesce into ONE replacement stream; \
+             observed {observed:?}"
+        );
+        for (index, value) in observed.iter().enumerate().skip(1) {
+            assert_eq!(
+                value, "Bearer projected-token-two",
+                "RPC #{index} must carry only the replacement token over the newest TLS: \
+                 {observed:?}"
+            );
+        }
+
+        sampler_stop.store(true, Ordering::SeqCst);
+        let worst = sampler.await.expect("sampler task");
+        assert_eq!(
+            worst,
+            2,
+            "old-credential discovery state and the retired stream's poison push must not \
+             carry across the simultaneous TLS + token event (poison_written={})",
+            endpoint.ads.poison_written.load(Ordering::SeqCst)
         );
 
         harness.shutdown_and_join().await;

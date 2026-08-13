@@ -797,7 +797,19 @@ HTTP/2 receive window, suspended the consumer's own receive loop — and every
 liveness and credential deadline above stopped being evaluated. A bounded status
 report surfaces as `DeadlineExceeded`, which the existing transient-retry
 classification already handles, so ACK/NACK ordering through the single-slot
-pending-report is unchanged.
+pending-report is unchanged. Stock ADS outbound enqueues (initial CDS/LDS
+subscriptions and response-driven ACK/NACK/dependency sends) are also
+credential-aware: an already-observed or newly arriving generation, invalidation,
+or absolute deadline wins over the send and is returned as that local retirement
+rather than as a transport failure, so the next stream discards discovery state
+touched under the retired credential. No task is detached.
+
+The stock client's outer lifecycle `select` is `biased` with shutdown first and
+the inner ADS future next, so a simultaneously ready TLS-reload or primary-retry
+arm cannot mask a credential retirement or drop its required discovery-state
+reset. A credential-fence commit holds the watch observation across the
+synchronous install so a concurrent credential publish cannot land between the
+check and `install_slice`.
 
 **Observability.** `ferrum_mesh_config_stream_attempts_total{protocol,outcome}`
 counts every completed attempt, and the authenticated `/health` mesh detail
@@ -809,14 +821,17 @@ credential path, token, or claim appears on either surface.
 `state` is published from real stream attachment, not inferred:
 
 - `connected` — an RPC stream is currently established AND usable configuration
-  exists. Publishing it is what makes a healthy consumer distinguishable from a
-  quietly broken one, and installing usable state on that exact stream is what
-  resets `consecutive_failures`.
+  exists AND no sticky liveness failure is outstanding. Publishing it is what
+  makes a healthy consumer distinguishable from a quietly broken one, and
+  installing usable state on that exact stream is what resets
+  `consecutive_failures` and clears `stream_liveness_failed`.
 - `stream_liveness_failed` — an established stream stopped being usable
   (first-frame, first-slice, heartbeat-silence, or established-transport
-  failure). It OUTRANKS `never_received_slice`, so a bounded liveness failure
-  stays visible even when no slice has ever arrived, and it is sticky until a
-  stream installs usable state.
+  failure). It OUTRANKS both `connected` and `never_received_slice`: a bounded
+  liveness failure stays visible even when no slice has ever arrived, and it
+  stays visible after a replacement RPC is accepted while last-good state still
+  exists. It is sticky until a stream installs usable state; merely attaching a
+  new RPC does not report `connected`.
 - `never_received_slice` — startup has never completed and no liveness bound has
   been hit.
 - `serving_last_good` — a previously installed slice keeps serving while the

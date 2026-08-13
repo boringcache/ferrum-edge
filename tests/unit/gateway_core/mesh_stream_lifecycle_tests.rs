@@ -360,6 +360,32 @@ fn tracker_distinguishes_liveness_failure_from_serving_last_good() {
     assert_eq!(tracker.status(true).state, "serving_last_good");
 }
 
+/// After a liveness failure with last-good state, merely opening a replacement
+/// RPC must not report `connected`. The sticky flag stays visible until that
+/// replacement stream actually installs usable state.
+#[test]
+fn a_replacement_rpc_stays_liveness_failed_until_it_installs_usable_state() {
+    let mut tracker = tracker("stock_xds", MeshConfigStreamCredential::NotConfigured);
+
+    tracker.set_attachment(MeshStreamAttachment::Established);
+    tracker.record_usable_state();
+    assert_eq!(tracker.status(true).state, "connected");
+
+    tracker.record(MeshStreamAttempt::HeartbeatSilenceTimeout);
+    assert_eq!(tracker.status(true).state, "stream_liveness_failed");
+
+    tracker.set_attachment(MeshStreamAttachment::Established);
+    assert_eq!(
+        tracker.status(true).state,
+        "stream_liveness_failed",
+        "attachment plus last-good state must not mask a sticky liveness failure"
+    );
+    assert!(tracker.is_established());
+
+    tracker.record_usable_state();
+    assert_eq!(tracker.status(true).state, "connected");
+}
+
 /// `record_usable_state` was defined and never called: every production call
 /// site passed `connected = false`, so `/health` could not reach `connected` at
 /// all and the consecutive-failure run never reset on a healthy stream.
@@ -986,6 +1012,72 @@ fn credential_debug_output_never_carries_token_material() {
     assert_eq!(fingerprint, "StockCredentialFingerprint(<redacted>)");
 }
 
+/// The credential pathname is metadata. `Debug` of the source — and of the
+/// client config that embeds it — must report only whether a source is
+/// configured plus safe policy fields.
+#[test]
+fn stock_credential_source_debug_never_renders_the_path() {
+    use std::collections::BTreeMap;
+
+    use ferrum_edge::modes::mesh::config_consumer::stock_xds_client::StockXdsClientConfig;
+    use ferrum_edge::xds::stock::StockXdsLimits;
+
+    let path = "/var/run/secrets/tokens/istio-token";
+    let source = StockXdsCredentialSource::new(
+        Some(path.to_string()),
+        StockCredentialLifetimePolicy::default(),
+    );
+    let rendered = format!("{source:?}");
+    assert!(
+        !rendered.contains(path),
+        "source Debug leaked the credential path: {rendered}"
+    );
+    assert!(
+        !rendered.contains("istio-token"),
+        "source Debug leaked a path fragment: {rendered}"
+    );
+    assert!(
+        !rendered.contains("path"),
+        "source Debug must not name the path field: {rendered}"
+    );
+    assert!(
+        rendered.contains("configured: true"),
+        "source Debug must say whether a source is configured: {rendered}"
+    );
+
+    let unconfigured = StockXdsCredentialSource::unauthenticated();
+    let unconfigured_rendered = format!("{unconfigured:?}");
+    assert!(
+        unconfigured_rendered.contains("configured: false"),
+        "{unconfigured_rendered}"
+    );
+    assert!(!unconfigured_rendered.contains("path"));
+
+    let config = StockXdsClientConfig {
+        xds_urls: vec!["https://127.0.0.1:15010".to_string()],
+        node_id: "sidecar".to_string(),
+        cluster: "default".to_string(),
+        namespace: "default".to_string(),
+        node_metadata: BTreeMap::new(),
+        credential: source,
+        allow_loopback_plaintext: false,
+        stream_channel_capacity: 32,
+        primary_retry_secs: 0,
+        connect_timeout_seconds: 5,
+        limits: StockXdsLimits::default(),
+        timings: MeshStreamTimings::production(),
+    };
+    let config_rendered = format!("{config:?}");
+    assert!(
+        !config_rendered.contains(path),
+        "client-config Debug leaked the credential path: {config_rendered}"
+    );
+    assert!(
+        !config_rendered.contains("istio-token"),
+        "client-config Debug leaked a path fragment: {config_rendered}"
+    );
+}
+
 #[test]
 fn a_non_ascii_token_is_refused_without_echoing_it() {
     let reason = StockBearerCredential::admit("tökén-with-non-ascii", lifetime_policy(3600, 60))
@@ -1286,4 +1378,274 @@ async fn a_projected_symlink_swap_is_observed_as_a_content_rotation() {
     assert!(watch.publish(before.observed_state()));
     assert!(watch.publish(after.observed_state()));
     assert_eq!(watch.latest().generation, 2);
+}
+
+/// The commit fence retains the watch observation lock across the synchronous
+/// install, so a concurrent publish cannot land a new generation between the
+/// check and `install_slice`.
+#[test]
+fn stock_credential_commit_holds_the_watch_lock_across_install() {
+    use ferrum_edge::modes::mesh::config_consumer::stock_xds_client::{
+        run_under_stock_credential_commit_admission_for_test,
+    };
+    use ferrum_edge::modes::mesh::runtime::{MeshRuntimeState, MeshSliceInstall};
+    use ferrum_edge::modes::mesh::slice::MeshSlice;
+
+    let first = StockBearerCredential::admit("token-a", lifetime_policy(3600, 60)).unwrap();
+    let rotated = StockBearerCredential::admit("token-b", lifetime_policy(3600, 60)).unwrap();
+    let watch = StockCredentialWatch::new(StockCredentialState::Unknown);
+    assert!(watch.publish(first.observed_state()));
+    let opened = watch.latest().generation;
+    let state = MeshRuntimeState::new();
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
+
+    std::thread::scope(|scope| {
+        let publisher = scope.spawn(|| {
+            entered_rx.recv().expect("commit holds the observation lock");
+            watch.publish(rotated.observed_state())
+        });
+
+        let installed = run_under_stock_credential_commit_admission_for_test(
+            &watch,
+            opened,
+            None,
+            true,
+            || {
+                entered_tx.send(()).expect("publisher may attempt publish");
+                assert_eq!(
+                    watch.latest().generation,
+                    opened,
+                    "a concurrent publish must not become visible until the commit returns"
+                );
+                state.install_slice(MeshSlice {
+                    version: "v-committed".to_string(),
+                    ..MeshSlice::default()
+                })
+            },
+        )
+        .expect("the opened generation is still current");
+
+        assert!(matches!(installed, MeshSliceInstall::Installed));
+        assert!(
+            publisher.join().expect("publisher thread"),
+            "the publish must land only after the commit guard drops"
+        );
+    });
+
+    assert_eq!(watch.latest().generation, opened + 1);
+    assert_eq!(
+        state
+            .snapshot()
+            .as_ref()
+            .as_ref()
+            .map(|slice| slice.version.as_str()),
+        Some("v-committed")
+    );
+}
+
+#[test]
+fn stock_credential_commit_refuses_a_rotated_generation_without_installing() {
+    use ferrum_edge::modes::mesh::config_consumer::stock_xds_client::{
+        run_under_stock_credential_commit_admission_for_test,
+    };
+
+    let first = StockBearerCredential::admit("token-a", lifetime_policy(3600, 60)).unwrap();
+    let rotated = StockBearerCredential::admit("token-b", lifetime_policy(3600, 60)).unwrap();
+    let watch = StockCredentialWatch::new(StockCredentialState::Unknown);
+    assert!(watch.publish(first.observed_state()));
+    let opened = watch.latest().generation;
+    assert!(watch.publish(rotated.observed_state()));
+
+    let err = run_under_stock_credential_commit_admission_for_test(
+        &watch,
+        opened,
+        None,
+        true,
+        || panic!("a rotated generation must not reach the install callback"),
+    )
+    .expect_err("stale generation is refused");
+    assert_eq!(err, MeshStreamRetirement::CredentialRotated);
+}
+
+fn filled_stock_outbound_channel() -> (
+    tokio::sync::mpsc::Sender<ferrum_edge::xds::proto::DiscoveryRequest>,
+    tokio::sync::mpsc::Receiver<ferrum_edge::xds::proto::DiscoveryRequest>,
+) {
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    tx.try_send(ferrum_edge::xds::proto::DiscoveryRequest::default())
+        .expect("fill the single-slot channel so the next send parks");
+    (tx, rx)
+}
+
+/// A blocked initial-style enqueue (filled mpsc, receiver held) must retire
+/// with the credential outcome, not `request_enqueue_timeout`.
+#[tokio::test]
+async fn a_blocked_stock_outbound_enqueue_loses_to_credential_rotation() {
+    use ferrum_edge::modes::mesh::config_consumer::stock_xds_client::{
+        StockOutboundAdmission, send_stock_outbound_racing_credential_for_test,
+    };
+
+    let (tx, _rx) = filled_stock_outbound_channel();
+    let first = StockBearerCredential::admit("token-a", lifetime_policy(3600, 60)).unwrap();
+    let rotated = StockBearerCredential::admit("token-b", lifetime_policy(3600, 60)).unwrap();
+    let watch = StockCredentialWatch::new(StockCredentialState::Unknown);
+    assert!(watch.publish(first.observed_state()));
+    let opened = watch.latest().generation;
+    let mut task_rx = watch.receiver();
+    let _ = task_rx.borrow_and_update();
+    let (parked_tx, mut parked_rx) = tokio::sync::watch::channel(false);
+    let watch_for_task = watch.clone();
+    let tx_for_task = tx.clone();
+
+    let send = tokio::spawn(async move {
+        send_stock_outbound_racing_credential_for_test(
+            &tx_for_task,
+            ferrum_edge::xds::proto::DiscoveryRequest::default(),
+            Duration::from_secs(30),
+            &watch_for_task,
+            opened,
+            None,
+            true,
+            &mut task_rx,
+            Some(&parked_tx),
+        )
+        .await
+    });
+
+    parked_rx
+        .changed()
+        .await
+        .expect("send reaches the wait");
+    assert!(
+        *parked_rx.borrow(),
+        "the production send must signal after admission and before the enqueue wait"
+    );
+    assert!(watch.publish(rotated.observed_state()));
+    assert_eq!(
+        send.await.expect("send task"),
+        StockOutboundAdmission::Retired(MeshStreamRetirement::CredentialRotated)
+    );
+}
+
+#[tokio::test]
+async fn a_blocked_stock_outbound_enqueue_loses_to_credential_invalidation() {
+    use ferrum_edge::modes::mesh::config_consumer::stock_xds_client::{
+        StockOutboundAdmission, send_stock_outbound_racing_credential_for_test,
+    };
+
+    let (tx, _rx) = filled_stock_outbound_channel();
+    let first = StockBearerCredential::admit("token-a", lifetime_policy(3600, 60)).unwrap();
+    let watch = StockCredentialWatch::new(StockCredentialState::Unknown);
+    assert!(watch.publish(first.observed_state()));
+    let opened = watch.latest().generation;
+    let mut task_rx = watch.receiver();
+    let _ = task_rx.borrow_and_update();
+    let (parked_tx, mut parked_rx) = tokio::sync::watch::channel(false);
+    let watch_for_task = watch.clone();
+    let tx_for_task = tx.clone();
+
+    let send = tokio::spawn(async move {
+        send_stock_outbound_racing_credential_for_test(
+            &tx_for_task,
+            ferrum_edge::xds::proto::DiscoveryRequest::default(),
+            Duration::from_secs(30),
+            &watch_for_task,
+            opened,
+            None,
+            true,
+            &mut task_rx,
+            Some(&parked_tx),
+        )
+        .await
+    });
+
+    parked_rx
+        .changed()
+        .await
+        .expect("send reaches the wait");
+    assert!(watch.publish(StockCredentialState::Invalid {
+        reason: StockCredentialInvalidReason::Missing,
+    }));
+    assert_eq!(
+        send.await.expect("send task"),
+        StockOutboundAdmission::Retired(MeshStreamRetirement::CredentialSourceInvalid)
+    );
+}
+
+#[tokio::test]
+async fn a_blocked_stock_outbound_enqueue_loses_to_an_already_elapsed_deadline() {
+    use ferrum_edge::modes::mesh::config_consumer::stock_xds_client::{
+        StockOutboundAdmission, send_stock_outbound_racing_credential_for_test,
+    };
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    let first = StockBearerCredential::admit("token-a", lifetime_policy(3600, 60)).unwrap();
+    let watch = StockCredentialWatch::new(StockCredentialState::Unknown);
+    assert!(watch.publish(first.observed_state()));
+    let opened = watch.latest().generation;
+    let mut credential_rx = watch.receiver();
+    let _ = credential_rx.borrow_and_update();
+
+    let result = send_stock_outbound_racing_credential_for_test(
+        &tx,
+        ferrum_edge::xds::proto::DiscoveryRequest::default(),
+        Duration::from_secs(30),
+        &watch,
+        opened,
+        Some(tokio::time::Instant::now()),
+        true,
+        &mut credential_rx,
+        None,
+    )
+    .await;
+    assert_eq!(
+        result,
+        StockOutboundAdmission::Retired(MeshStreamRetirement::CredentialDeadline)
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "an already-elapsed deadline must not enqueue the request"
+    );
+}
+
+/// Response-driven ACK/NACK/dependency sends share the same enqueue helper as
+/// the initial CDS/LDS subscriptions. An already-observed rotation must win
+/// before the send is even attempted, so a ready channel cannot smuggle a
+/// retired-credential ACK through.
+#[tokio::test]
+async fn an_already_observed_rotation_wins_over_a_ready_outbound_enqueue() {
+    use ferrum_edge::modes::mesh::config_consumer::stock_xds_client::{
+        StockOutboundAdmission, send_stock_outbound_racing_credential_for_test,
+    };
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    let first = StockBearerCredential::admit("token-a", lifetime_policy(3600, 60)).unwrap();
+    let rotated = StockBearerCredential::admit("token-b", lifetime_policy(3600, 60)).unwrap();
+    let watch = StockCredentialWatch::new(StockCredentialState::Unknown);
+    assert!(watch.publish(first.observed_state()));
+    let opened = watch.latest().generation;
+    assert!(watch.publish(rotated.observed_state()));
+    let mut credential_rx = watch.receiver();
+    let _ = credential_rx.borrow_and_update();
+
+    let result = send_stock_outbound_racing_credential_for_test(
+        &tx,
+        ferrum_edge::xds::proto::DiscoveryRequest::default(),
+        Duration::from_secs(30),
+        &watch,
+        opened,
+        None,
+        true,
+        &mut credential_rx,
+        None,
+    )
+    .await;
+    assert_eq!(
+        result,
+        StockOutboundAdmission::Retired(MeshStreamRetirement::CredentialRotated)
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "a retired credential must not enqueue even when the channel has capacity"
+    );
 }

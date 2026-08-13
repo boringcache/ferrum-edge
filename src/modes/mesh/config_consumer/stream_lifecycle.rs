@@ -570,17 +570,22 @@ impl MeshStreamTracker {
     /// Project the closed-set health view. `has_first_slice` comes from the
     /// mesh runtime, so "serving last good" cannot be claimed without one.
     ///
-    /// Order matters. A liveness failure outranks `never_received_slice`,
-    /// because a data plane that has never converged AND just lost an
-    /// established transport must not report the same thing as one that is
-    /// still in its ordinary startup window — that masking is exactly what made
-    /// a bounded first-frame/first-slice/keepalive failure invisible.
+    /// Order matters. A sticky liveness failure outranks both `connected` and
+    /// `never_received_slice`. Opening a replacement RPC after a liveness
+    /// failure — even when last-good state still exists — must not report
+    /// `connected` until that replacement stream actually installs usable
+    /// state. Checking attachment-plus-slice first would hide the failure the
+    /// moment a new RPC was accepted, which is exactly when the operator most
+    /// needs to see that the previous established transport went dark. The
+    /// same flag also outranks `never_received_slice`, so a bounded
+    /// first-frame/first-slice/keepalive failure before the first convergence
+    /// stays visible instead of looking like ordinary startup.
     pub fn status(&self, has_first_slice: bool) -> MeshConfigStreamStatus {
-        let connected = self.is_established();
-        let state = if connected && has_first_slice {
-            MeshConfigStreamState::Connected
-        } else if self.liveness_failed {
+        let established = self.is_established();
+        let state = if self.liveness_failed {
             MeshConfigStreamState::StreamLivenessFailed
+        } else if established && has_first_slice {
+            MeshConfigStreamState::Connected
         } else if !has_first_slice {
             MeshConfigStreamState::NeverReceivedSlice
         } else {
@@ -590,7 +595,7 @@ impl MeshStreamTracker {
             protocol: self.protocol,
             state: state.as_label(),
             last_attempt_outcome: self.last_attempt_outcome,
-            fallback_active: connected && self.endpoint_index != 0,
+            fallback_active: established && self.endpoint_index != 0,
             consecutive_failures: self.consecutive_failures,
             credential: self.credential.as_label(),
             liveness_bound_seconds: self.liveness_bound_seconds,

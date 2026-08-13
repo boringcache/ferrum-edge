@@ -561,6 +561,11 @@ enum StockStreamError {
     Transport(&'static str),
     /// A local fail-closed gate refused the content.
     Policy(&'static str),
+    /// An already-observed or newly arriving credential retirement won over an
+    /// awaited outbound enqueue. Must not be mislabelled as a transport
+    /// failure: the next stream has to discard discovery state touched under
+    /// the retired credential.
+    Retirement(MeshStreamRetirement),
 }
 
 impl StockStreamError {
@@ -583,6 +588,7 @@ impl StockStreamError {
             Self::Policy(reason) => {
                 StockAttemptOutcome::failed(MeshStreamAttempt::PolicyRejected, reason)
             }
+            Self::Retirement(retirement) => StockAttemptOutcome::local(retirement),
         }
     }
 }
@@ -641,37 +647,92 @@ struct StockCredentialFence {
 }
 
 impl StockCredentialFence {
+    fn bind(
+        watch: &StockCredentialWatch,
+        generation: u64,
+        deadline: Option<tokio::time::Instant>,
+        configured: bool,
+    ) -> Self {
+        Self {
+            generation,
+            deadline,
+            configured,
+            observations: watch.receiver(),
+        }
+    }
+
     fn latest(&self) -> StockCredentialObservation {
         *self.observations.borrow()
     }
 
-    /// Fail-closed check, evaluated with PRIORITY before any response may be
-    /// admitted and again immediately before every install/commit/EOF flush.
+    fn retirement_from_observation(
+        &self,
+        observed: StockCredentialObservation,
+    ) -> MeshStreamRetirement {
+        if observed.state.is_invalid() {
+            MeshStreamRetirement::CredentialSourceInvalid
+        } else {
+            MeshStreamRetirement::CredentialRotated
+        }
+    }
+
+    /// Fail-closed check used on the async path (select pre-check, outbound
+    /// enqueue). Copies the observation; the commit path must use
+    /// [`Self::admit_commit`] so the watch read lock is held across install.
     ///
     /// Returning `Some` means the stream must be retired NOW and nothing it
     /// staged may be published.
     fn evaluate(&self) -> Option<MeshStreamRetirement> {
+        self.admit_locked(&self.observations.borrow())
+    }
+
+    /// Generation validation plus the absolute deadline, evaluated while the
+    /// caller holds a watch observation. The deadline is last so it is as
+    /// close to the subsequent synchronous install as possible.
+    fn admit_locked(
+        &self,
+        observed: &StockCredentialObservation,
+    ) -> Option<MeshStreamRetirement> {
+        if self.configured {
+            if observed.generation != self.generation {
+                return Some(if observed.state.is_invalid() {
+                    MeshStreamRetirement::CredentialSourceInvalid
+                } else {
+                    MeshStreamRetirement::CredentialRotated
+                });
+            }
+            if observed.state.is_invalid() {
+                return Some(MeshStreamRetirement::CredentialSourceInvalid);
+            }
+        }
         if let Some(deadline) = self.deadline
             && tokio::time::Instant::now() >= deadline
         {
             return Some(MeshStreamRetirement::CredentialDeadline);
         }
-        if !self.configured {
-            return None;
-        }
-        let observed = self.latest();
-        if observed.generation != self.generation {
-            return Some(if observed.state.is_invalid() {
-                MeshStreamRetirement::CredentialSourceInvalid
-            } else {
-                MeshStreamRetirement::CredentialRotated
-            });
-        }
-        if observed.state.is_invalid() {
-            return Some(MeshStreamRetirement::CredentialSourceInvalid);
-        }
         None
     }
+
+    /// Fail-closed admission for a synchronous commit.
+    ///
+    /// The returned guard retains the watch observation lock, so the credential
+    /// watcher cannot publish a new generation or invalid state until the
+    /// caller drops it. `apply_pending` / `install_slice` must run before that
+    /// drop: there is no async gap between this admission and the install.
+    fn admit_commit(&self) -> Result<StockCredentialAdmission<'_>, MeshStreamRetirement> {
+        let observed = self.observations.borrow();
+        if let Some(retirement) = self.admit_locked(&observed) {
+            return Err(retirement);
+        }
+        Ok(StockCredentialAdmission { _held: observed })
+    }
+}
+
+/// Proof that the current watch generation was admitted. Holds the tokio watch
+/// read lock, so a concurrent `publish` cannot land until this value is
+/// dropped. Must not be held across an `.await`.
+struct StockCredentialAdmission<'a> {
+    _held: tokio::sync::watch::Ref<'a, StockCredentialObservation>,
 }
 
 /// Maintain a live stock ADS stream with multi-server failover.
@@ -694,7 +755,7 @@ pub async fn start_stock_xds_client_with_shutdown(
     state: MeshRuntimeState,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
     mut tls_config: Option<DpGrpcTlsConfig>,
-    tls_reload: Option<DpGrpcTlsReload>,
+    mut tls_reload: Option<DpGrpcTlsReload>,
     policy_rx: tokio::sync::watch::Receiver<StockPolicySnapshot>,
     recovery: Arc<MeshLocalSourceRecovery>,
     credential_watch: StockCredentialWatch,
@@ -820,9 +881,24 @@ pub async fn start_stock_xds_client_with_shutdown(
         // Shutdown is recorded as an intentional retirement rather than an
         // unobserved `return`, so `/metrics` distinguishes a clean stop from a
         // stream that simply vanished.
+        //
+        // The select is `biased`. Shutdown is first so a stop still terminates
+        // promptly. The inner ADS future is next so a credential retirement
+        // that is already ready cannot be masked by a simultaneously ready
+        // TLS-reload or primary-retry arm — those would cancel the inner
+        // future and return `reset_discovery_state=false`, letting the next
+        // stream reuse accumulator/subscription/nonce state touched under the
+        // retired credential. TLS/retry arms still coalesce any pending
+        // credential observation the cancelled inner had not yet consumed.
         let mut shutting_down = false;
         let outcome = if should_race_primary {
             tokio::select! {
+                biased;
+                _ = wait_for_shutdown(&mut stream_shutdown_rx) => {
+                    info!("Stock xDS mesh client shutting down");
+                    shutting_down = true;
+                    StockAttemptOutcome::local(MeshStreamRetirement::Shutdown)
+                }
                 outcome = connect_stock_ads(
                     xds_url,
                     current_index,
@@ -839,24 +915,35 @@ pub async fn start_stock_xds_client_with_shutdown(
                     &mut credential_rx,
                     &mut tracker,
                 ) => outcome,
+                _ = wait_optional_tls_reload(
+                    tls_reload.as_ref().map(|reload| reload.revision_rx.clone())
+                ) => coalesce_outer_lifecycle(
+                    MeshStreamRetirement::TlsReload,
+                    &mut credential_rx,
+                ),
                 _ = wait_for_first_slice_then_primary_retry(
                     state.clone(),
                     Duration::from_secs(config.primary_retry_secs),
                 ) => {
-                    force_primary = true;
-                    StockAttemptOutcome::local(MeshStreamRetirement::PrimaryRetry)
+                    let outcome = coalesce_outer_lifecycle(
+                        MeshStreamRetirement::PrimaryRetry,
+                        &mut credential_rx,
+                    );
+                    force_primary = matches!(
+                        outcome.attempt,
+                        MeshStreamAttempt::LocalRetirement(MeshStreamRetirement::PrimaryRetry)
+                    );
+                    outcome
                 }
+            }
+        } else {
+            tokio::select! {
+                biased;
                 _ = wait_for_shutdown(&mut stream_shutdown_rx) => {
                     info!("Stock xDS mesh client shutting down");
                     shutting_down = true;
                     StockAttemptOutcome::local(MeshStreamRetirement::Shutdown)
                 }
-                _ = wait_optional_tls_reload(
-                    tls_reload.as_ref().map(|reload| reload.revision_rx.clone())
-                ) => StockAttemptOutcome::local(MeshStreamRetirement::TlsReload),
-            }
-        } else {
-            tokio::select! {
                 outcome = connect_stock_ads(
                     xds_url,
                     current_index,
@@ -873,14 +960,12 @@ pub async fn start_stock_xds_client_with_shutdown(
                     &mut credential_rx,
                     &mut tracker,
                 ) => outcome,
-                _ = wait_for_shutdown(&mut stream_shutdown_rx) => {
-                    info!("Stock xDS mesh client shutting down");
-                    shutting_down = true;
-                    StockAttemptOutcome::local(MeshStreamRetirement::Shutdown)
-                }
                 _ = wait_optional_tls_reload(
                     tls_reload.as_ref().map(|reload| reload.revision_rx.clone())
-                ) => StockAttemptOutcome::local(MeshStreamRetirement::TlsReload),
+                ) => coalesce_outer_lifecycle(
+                    MeshStreamRetirement::TlsReload,
+                    &mut credential_rx,
+                ),
             }
         };
 
@@ -889,6 +974,20 @@ pub async fn start_stock_xds_client_with_shutdown(
             reason,
             reset_discovery_state,
         } = outcome;
+        // A TLS revision that was already published is applied at the top of
+        // the next loop via `refresh_dp_grpc_tls_config_if_changed`. Mark it
+        // seen here so a credential retirement that won the simultaneous
+        // select does not get immediately cancelled by the same TLS event.
+        if reset_discovery_state
+            || matches!(
+                attempt,
+                MeshStreamAttempt::LocalRetirement(MeshStreamRetirement::TlsReload)
+            )
+        {
+            if let Some(reload) = tls_reload.as_mut() {
+                let _ = reload.revision_rx.borrow_and_update();
+            }
+        }
         // Endpoint identity stays out of these lines: the configured URL is
         // operator-authored but unbounded, so the index plus the closed-set
         // outcome and reason are what the operator gets here and on `/metrics`.
@@ -968,6 +1067,28 @@ pub async fn start_stock_xds_client_with_shutdown(
 async fn wait_for_first_slice_then_primary_retry(state: MeshRuntimeState, interval: Duration) {
     state.wait_for_first_slice().await;
     tokio::time::sleep(interval).await;
+}
+
+/// TLS-reload and primary-retry cancel the inner ADS future. If that future
+/// already had a pending credential observation (rotation, invalidation) that
+/// it had not yet consumed, the cancellation would otherwise report the
+/// lifecycle event with `reset_discovery_state=false`. Peek the watch so the
+/// credential retirement — and its required discovery-state reset — is
+/// retained. Shutdown is not routed through here: it is selected first and
+/// still terminates promptly.
+fn coalesce_outer_lifecycle(
+    fallback: MeshStreamRetirement,
+    credential_rx: &mut tokio::sync::watch::Receiver<StockCredentialObservation>,
+) -> StockAttemptOutcome {
+    if credential_rx.has_changed().unwrap_or(false) {
+        let observed = *credential_rx.borrow_and_update();
+        return StockAttemptOutcome::local(if observed.state.is_invalid() {
+            MeshStreamRetirement::CredentialSourceInvalid
+        } else {
+            MeshStreamRetirement::CredentialRotated
+        });
+    }
+    StockAttemptOutcome::local(fallback)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1074,12 +1195,12 @@ async fn connect_stock_ads(
     // above, so `generation` is exactly the observation the materialized
     // credential produced, and `deadline` is the absolute instant stamped at
     // admission — dial latency spends it rather than extending it.
-    let fence = StockCredentialFence {
-        generation: credential_rx.borrow().generation,
-        deadline: credential.as_ref().map(StockBearerCredential::deadline),
-        configured: config.credential.is_configured(),
-        observations: credential_watch.receiver(),
-    };
+    let fence = StockCredentialFence::bind(
+        credential_watch,
+        credential_rx.borrow().generation,
+        credential.as_ref().map(StockBearerCredential::deadline),
+        config.credential.is_configured(),
+    );
 
     let channel = match endpoint.connect().await {
         Ok(channel) => channel,
@@ -1256,29 +1377,40 @@ async fn run_stock_ads_stream(
     // Nonces are stream-scoped, and every new stream must re-send `Node`.
     stream_state.subscriptions.reset_for_new_stream();
 
-    for type_url in STOCK_INITIAL_TYPE_URL_ORDER {
-        let subscribe = stream_state
-            .subscriptions
-            .build_request(type_url, config, None);
-        send_request(&tx, subscribe, config.timings.outbound)
-            .await
-            .map_err(StockStreamError::Transport)?;
-    }
-    // Resume any dependency-ordered subscription established on a previous
-    // stream so a reconnect does not lose the EDS/RDS names already derived
-    // from the retained accumulator.
-    for type_url in [EDS_TYPE_URL, RDS_TYPE_URL] {
-        if !stream_state
-            .subscriptions
-            .resource_names(type_url)
-            .is_empty()
-        {
+    {
+        let mut outbound = StockOutbound {
+            tx: &tx,
+            bound: config.timings.outbound,
+            fence: &fence,
+            credential_rx,
+        };
+
+        for type_url in STOCK_INITIAL_TYPE_URL_ORDER {
             let subscribe = stream_state
                 .subscriptions
                 .build_request(type_url, config, None);
-            send_request(&tx, subscribe, config.timings.outbound)
+            outbound
+                .enqueue(subscribe)
                 .await
-                .map_err(StockStreamError::Transport)?;
+                .map_err(StockOutboundError::into_stream_error)?;
+        }
+        // Resume any dependency-ordered subscription established on a previous
+        // stream so a reconnect does not lose the EDS/RDS names already derived
+        // from the retained accumulator.
+        for type_url in [EDS_TYPE_URL, RDS_TYPE_URL] {
+            if !stream_state
+                .subscriptions
+                .resource_names(type_url)
+                .is_empty()
+            {
+                let subscribe = stream_state
+                    .subscriptions
+                    .build_request(type_url, config, None);
+                outbound
+                    .enqueue(subscribe)
+                    .await
+                    .map_err(StockOutboundError::into_stream_error)?;
+            }
         }
     }
 
@@ -1366,15 +1498,26 @@ async fn run_stock_ads_stream(
                 debounce_active = false;
                 pending_since = None;
                 if let Some(next) = pending.take() {
-                    // Re-check immediately before the commit. Between the
-                    // response that staged this slice and this debounce firing,
-                    // the credential may have rotated or expired; installing
-                    // here would publish state the retired credential produced.
-                    if let Some(retirement) = fence.evaluate() {
-                        break MeshStreamAttempt::LocalRetirement(retirement);
+                    // Re-check immediately before the commit, holding the watch
+                    // observation across the synchronous install so a concurrent
+                    // publish cannot land a retired generation between the
+                    // check and `install_slice`.
+                    match commit_pending(
+                        &fence,
+                        config,
+                        state,
+                        next,
+                        &mut last_logged_refusals,
+                        &recovery,
+                    ) {
+                        Ok(()) => {}
+                        Err(StockCommitFailure::Retirement(retirement)) => {
+                            break MeshStreamAttempt::LocalRetirement(retirement);
+                        }
+                        Err(StockCommitFailure::Policy(reason)) => {
+                            return Err(StockStreamError::Policy(reason));
+                        }
                     }
-                    apply_pending(config, state, next, &mut last_logged_refusals, &recovery)
-                        .map_err(StockStreamError::Policy)?;
                     *delivered_usable_state = true;
                     awaiting_first_slice = false;
                     // This exact stream installed usable state: clear the
@@ -1399,7 +1542,12 @@ async fn run_stock_ads_stream(
                     baseline.mesh(),
                     baseline.recovery_epoch,
                     request,
-                    &tx,
+                    &mut StockOutbound {
+                        tx: &tx,
+                        bound: config.timings.outbound,
+                        fence: &fence,
+                        credential_rx,
+                    },
                     accumulator,
                     stream_state,
                 ).await.map_err(StockResponseError::into_stream_error)? {
@@ -1490,7 +1638,8 @@ async fn run_stock_ads_stream(
     // mid-convergence leaves the last good slice serving and fails over
     // (issue #3854 — no mixed generation is ever published).
     //
-    // The fence is re-evaluated one final time: this flush is a COMMIT, and a
+    // The fence is re-evaluated one final time while the watch observation is
+    // held across the synchronous install: this flush is a COMMIT, and a
     // credential that rotated, was invalidated, or hit its deadline while the
     // slice sat in the debounce window must retire the stream WITHOUT
     // publishing anything it staged (issue #3852). The already-installed
@@ -1498,19 +1647,31 @@ async fn run_stock_ads_stream(
     if matches!(ended, MeshStreamAttempt::RemoteEof)
         && let Some(next) = pending.take()
     {
-        if let Some(retirement) = fence.evaluate() {
-            warn!(
-                outcome = retirement.as_metric_label(),
-                "Discarding a staged stock xDS slice at stream end: the credential that produced \
-                 it is no longer current"
-            );
-            return Ok(MeshStreamAttempt::LocalRetirement(retirement));
+        match commit_pending(
+            &fence,
+            config,
+            state,
+            next,
+            &mut last_logged_refusals,
+            &recovery,
+        ) {
+            Ok(()) => {
+                *delivered_usable_state = true;
+                tracker.record_usable_state();
+                state.set_config_stream_status(tracker.status(state.has_first_slice()));
+            }
+            Err(StockCommitFailure::Retirement(retirement)) => {
+                warn!(
+                    outcome = retirement.as_metric_label(),
+                    "Discarding a staged stock xDS slice at stream end: the credential that \
+                     produced it is no longer current"
+                );
+                return Ok(MeshStreamAttempt::LocalRetirement(retirement));
+            }
+            Err(StockCommitFailure::Policy(reason)) => {
+                return Err(StockStreamError::Policy(reason));
+            }
         }
-        apply_pending(config, state, next, &mut last_logged_refusals, &recovery)
-            .map_err(StockStreamError::Policy)?;
-        *delivered_usable_state = true;
-        tracker.record_usable_state();
-        state.set_config_stream_status(tracker.status(state.has_first_slice()));
     }
     Ok(ended)
 }
@@ -1532,6 +1693,8 @@ enum StockResponseError {
     Transport(&'static str),
     /// A local fail-closed gate refused the content.
     Policy(&'static str),
+    /// Credential retirement won while an ACK/NACK/dependency send was awaited.
+    Retirement(MeshStreamRetirement),
 }
 
 impl StockResponseError {
@@ -1539,6 +1702,7 @@ impl StockResponseError {
         match self {
             Self::Transport(reason) => StockStreamError::Transport(reason),
             Self::Policy(reason) => StockStreamError::Policy(reason),
+            Self::Retirement(reason) => StockStreamError::Retirement(reason),
         }
     }
 }
@@ -1565,7 +1729,7 @@ async fn handle_stock_response(
     baseline: &MeshConfig,
     policy_recovery_epoch: Option<u64>,
     request: &MeshSliceRequest,
-    tx: &mpsc::Sender<DiscoveryRequest>,
+    outbound: &mut StockOutbound<'_>,
     accumulator: &mut StockXdsAccumulator,
     stream_state: &mut StockStreamState,
 ) -> Result<StockResponseOutcome, StockResponseError> {
@@ -1668,9 +1832,10 @@ async fn handle_stock_response(
             .build_request(&type_url, config, Some(e.clone()));
         stream_state.subscriptions.mark_processed(&type_url);
         let consecutive = stream_state.breaker.record_nack(&type_url);
-        send_request(tx, nack, config.timings.outbound)
+        outbound
+            .enqueue(nack)
             .await
-            .map_err(StockResponseError::Transport)?;
+            .map_err(StockOutboundError::into_response_error)?;
         warn!(
             node_id = %config.node_id,
             namespace = %config.namespace,
@@ -1707,9 +1872,10 @@ async fn handle_stock_response(
     let ack = stream_state
         .subscriptions
         .build_request(&type_url, config, None);
-    send_request(tx, ack, config.timings.outbound)
+    outbound
+        .enqueue(ack)
         .await
-        .map_err(StockResponseError::Transport)?;
+        .map_err(StockOutboundError::into_response_error)?;
     stream_state.subscriptions.mark_processed(&type_url);
     stream_state.breaker.record_ack(&type_url);
 
@@ -1729,9 +1895,10 @@ async fn handle_stock_response(
         let subscribe = stream_state
             .subscriptions
             .build_request(EDS_TYPE_URL, config, None);
-        send_request(tx, subscribe, config.timings.outbound)
+        outbound
+            .enqueue(subscribe)
             .await
-            .map_err(StockResponseError::Transport)?;
+            .map_err(StockOutboundError::into_response_error)?;
     }
     if type_url == LDS_TYPE_URL
         && stream_state
@@ -1747,9 +1914,10 @@ async fn handle_stock_response(
         let subscribe = stream_state
             .subscriptions
             .build_request(RDS_TYPE_URL, config, None);
-        send_request(tx, subscribe, config.timings.outbound)
+        outbound
+            .enqueue(subscribe)
             .await
-            .map_err(StockResponseError::Transport)?;
+            .map_err(StockOutboundError::into_response_error)?;
     }
 
     if !accumulator.ready() {
@@ -1789,6 +1957,27 @@ async fn handle_stock_response(
             Ok(StockResponseOutcome::Acked)
         }
     }
+}
+
+enum StockCommitFailure {
+    Retirement(MeshStreamRetirement),
+    Policy(&'static str),
+}
+
+/// Admit the current credential generation and install while the watch
+/// observation lock is held. There is no async gap between final admission and
+/// `install_slice`; a concurrent watcher publish blocks until this returns.
+fn commit_pending(
+    fence: &StockCredentialFence,
+    config: &StockXdsClientConfig,
+    state: &MeshRuntimeState,
+    pending: Box<PendingStockSlice>,
+    last_logged_refusals: &mut Option<Vec<StockRefusal>>,
+    recovery: &MeshLocalSourceRecovery,
+) -> Result<(), StockCommitFailure> {
+    let _admission = fence.admit_commit().map_err(StockCommitFailure::Retirement)?;
+    apply_pending(config, state, pending, last_logged_refusals, recovery)
+        .map_err(StockCommitFailure::Policy)
 }
 
 fn apply_pending(
@@ -1918,7 +2107,7 @@ fn is_stock_type_url(type_url: &str) -> bool {
     )
 }
 
-/// Enqueue one outbound `DiscoveryRequest`, bounded.
+/// Enqueue one outbound `DiscoveryRequest`, bounded and credential-aware.
 ///
 /// The bound is load-bearing (issue #3854). The outbound channel drains into
 /// the gRPC request stream, so a control plane that accepts the RPC and then
@@ -1927,16 +2116,175 @@ fn is_stock_type_url(type_url: &str) -> bool {
 /// liveness and credential deadline in this module would stop being enforced by
 /// an unrelated best-effort ACK. Timing out here converts that into an ordinary
 /// bounded stream failure instead.
+///
+/// An already-observed or newly arriving generation/invalid/deadline event
+/// outranks the send, including while the enqueue is blocked. Returning that
+/// as a local retirement (not a transport failure) is what makes the next
+/// stream discard accumulator/subscription/nonce state touched under the
+/// retired credential. No task is detached; ACK/NACK ordering is preserved
+/// because this waits on a single enqueue.
+struct StockOutbound<'a> {
+    tx: &'a mpsc::Sender<DiscoveryRequest>,
+    bound: Duration,
+    fence: &'a StockCredentialFence,
+    credential_rx: &'a mut tokio::sync::watch::Receiver<StockCredentialObservation>,
+}
+
+impl StockOutbound<'_> {
+    async fn enqueue(&mut self, request: DiscoveryRequest) -> Result<(), StockOutboundError> {
+        send_request(
+            self.tx,
+            request,
+            self.bound,
+            self.fence,
+            self.credential_rx,
+            None,
+        )
+        .await
+    }
+}
+
+enum StockOutboundError {
+    Transport(&'static str),
+    Retirement(MeshStreamRetirement),
+}
+
+impl StockOutboundError {
+    fn into_stream_error(self) -> StockStreamError {
+        match self {
+            Self::Transport(reason) => StockStreamError::Transport(reason),
+            Self::Retirement(reason) => StockStreamError::Retirement(reason),
+        }
+    }
+
+    fn into_response_error(self) -> StockResponseError {
+        match self {
+            Self::Transport(reason) => StockResponseError::Transport(reason),
+            Self::Retirement(reason) => StockResponseError::Retirement(reason),
+        }
+    }
+}
+
+/// Closed-set result of one credential-raced outbound enqueue. Exposed so
+/// external tests can drive the production send path through a filled channel
+/// without standing up a control plane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StockOutboundAdmission {
+    Sent,
+    Closed,
+    Timeout,
+    Retired(MeshStreamRetirement),
+}
+
 async fn send_request(
     tx: &mpsc::Sender<DiscoveryRequest>,
     request: DiscoveryRequest,
     bound: Duration,
-) -> Result<(), &'static str> {
-    match tokio::time::timeout(bound, tx.send(request)).await {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(_)) => Err("request_stream_closed"),
-        Err(_) => Err("request_enqueue_timeout"),
+    fence: &StockCredentialFence,
+    credential_rx: &mut tokio::sync::watch::Receiver<StockCredentialObservation>,
+    parked: Option<&tokio::sync::watch::Sender<bool>>,
+) -> Result<(), StockOutboundError> {
+    // Already-observed retirement wins before any enqueue wait begins.
+    if let Some(retirement) = fence.evaluate() {
+        return Err(StockOutboundError::Retirement(retirement));
     }
+    if let Some(parked) = parked {
+        let _ = parked.send(true);
+    }
+
+    let deadline = fence.deadline;
+    let deadline_sleep = tokio::time::sleep_until(
+        deadline.unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(60 * 60 * 24)),
+    );
+    tokio::pin!(deadline_sleep);
+    let send = tokio::time::timeout(bound, tx.send(request));
+    tokio::pin!(send);
+
+    tokio::select! {
+        biased;
+        _ = &mut deadline_sleep, if deadline.is_some() => {
+            Err(StockOutboundError::Retirement(
+                MeshStreamRetirement::CredentialDeadline,
+            ))
+        }
+        changed = credential_rx.changed() => {
+            if changed.is_err() {
+                // Watcher is gone (shutdown). Do not spin or mislabel that as
+                // rotation; the absolute deadline and the outbound bound still
+                // apply.
+                tokio::select! {
+                    biased;
+                    _ = &mut deadline_sleep, if deadline.is_some() => {
+                        Err(StockOutboundError::Retirement(
+                            MeshStreamRetirement::CredentialDeadline,
+                        ))
+                    }
+                    result = &mut send => map_send_result(result),
+                }
+            } else {
+                Err(StockOutboundError::Retirement(
+                    fence.retirement_from_observation(fence.latest()),
+                ))
+            }
+        }
+        result = &mut send => map_send_result(result),
+    }
+}
+
+fn map_send_result(
+    result: Result<
+        Result<(), mpsc::error::SendError<DiscoveryRequest>>,
+        tokio::time::error::Elapsed,
+    >,
+) -> Result<(), StockOutboundError> {
+    match result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err(StockOutboundError::Transport("request_stream_closed")),
+        Err(_) => Err(StockOutboundError::Transport("request_enqueue_timeout")),
+    }
+}
+
+/// Drive the production credential-raced outbound enqueue with a caller-owned
+/// channel, fence, and optional "parked" barrier. Used by external tests to
+/// prove a blocked send cannot outrank rotation, invalidation, or deadline.
+#[allow(clippy::too_many_arguments)]
+pub async fn send_stock_outbound_racing_credential_for_test(
+    tx: &mpsc::Sender<DiscoveryRequest>,
+    request: DiscoveryRequest,
+    bound: Duration,
+    watch: &StockCredentialWatch,
+    opened_generation: u64,
+    deadline: Option<tokio::time::Instant>,
+    configured: bool,
+    credential_rx: &mut tokio::sync::watch::Receiver<StockCredentialObservation>,
+    parked: Option<&tokio::sync::watch::Sender<bool>>,
+) -> StockOutboundAdmission {
+    let fence = StockCredentialFence::bind(watch, opened_generation, deadline, configured);
+    match send_request(tx, request, bound, &fence, credential_rx, parked).await {
+        Ok(()) => StockOutboundAdmission::Sent,
+        Err(StockOutboundError::Transport("request_stream_closed")) => {
+            StockOutboundAdmission::Closed
+        }
+        Err(StockOutboundError::Transport(_)) => StockOutboundAdmission::Timeout,
+        Err(StockOutboundError::Retirement(retirement)) => {
+            StockOutboundAdmission::Retired(retirement)
+        }
+    }
+}
+
+/// Run `commit` while the stock credential watch observation lock is held
+/// after generation/deadline admission. A concurrent `publish` cannot become
+/// visible until `commit` returns. There is no async gap.
+pub fn run_under_stock_credential_commit_admission_for_test<R>(
+    watch: &StockCredentialWatch,
+    opened_generation: u64,
+    deadline: Option<tokio::time::Instant>,
+    configured: bool,
+    commit: impl FnOnce() -> R,
+) -> Result<R, MeshStreamRetirement> {
+    let fence = StockCredentialFence::bind(watch, opened_generation, deadline, configured);
+    let _admission = fence.admit_commit()?;
+    Ok(commit())
 }
 
 // ── policy document watcher ──────────────────────────────────────────────

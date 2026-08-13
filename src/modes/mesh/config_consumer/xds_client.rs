@@ -1017,6 +1017,8 @@ async fn run_ads_stream_with_auth(
                             consumer,
                             config,
                             &mut pending_slice,
+                            tracker,
+                            delivered_usable_state,
                             e,
                         );
                     }
@@ -1092,14 +1094,26 @@ fn discard_pending_xds_slice_after_nack(
 /// Publish an already-complete debounced generation before surfacing a stream
 /// error, then fail the attempt. Never returns `Ok` — the return type simply
 /// matches the stream loop's.
+///
+/// A successful flush is real progress: the slice is installed, so the outer
+/// loop must see `delivered_usable_state` and the tracker must record the
+/// usable install. The original error is still the attempt's failure
+/// classification — we do not convert a broken stream into success.
 fn flush_pending_xds_slice_before_error(
     consumer: &XdsConfigConsumer,
     config: &XdsClientConfig,
     pending_slice: &mut Option<PendingXdsSlice>,
+    tracker: &mut MeshStreamTracker,
+    delivered_usable_state: &mut bool,
     error: anyhow::Error,
 ) -> Result<MeshStreamAttempt, anyhow::Error> {
     if let Some(pending) = pending_slice.take() {
         apply_pending_xds_slice(consumer, config, pending)?;
+        *delivered_usable_state = true;
+        tracker.record_usable_state();
+        consumer
+            .state()
+            .set_config_stream_status(tracker.status(consumer.state().has_first_slice()));
     }
     Err(error)
 }
@@ -2603,6 +2617,10 @@ fn xds_type_short_name(type_url: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::modes::mesh::config_consumer::stream_lifecycle::{
+        MeshConfigStreamCredential, MeshStreamAttachment, MeshStreamAttempt, MeshStreamTimings,
+        MeshStreamTracker,
+    };
     use crate::xds::translator::translate_mesh_slice_to_snapshot;
 
     fn test_config() -> XdsClientConfig {
@@ -4363,17 +4381,31 @@ mod tests {
             all_types_ready: true,
             version_skew: false,
         });
+        let mut tracker = MeshStreamTracker::new(
+            "xds",
+            MeshConfigStreamCredential::NotConfigured,
+            MeshStreamTimings::production(),
+        );
+        tracker.record(MeshStreamAttempt::HeartbeatSilenceTimeout);
+        tracker.set_attachment(MeshStreamAttachment::Established);
+        let mut delivered_usable_state = false;
 
         let err = flush_pending_xds_slice_before_error(
             &consumer,
             &config,
             &mut pending_slice,
+            &mut tracker,
+            &mut delivered_usable_state,
             anyhow::anyhow!("breaker"),
         )
         .expect_err("error is preserved after flush");
 
         assert_eq!(err.to_string(), "breaker");
         assert!(pending_slice.is_none());
+        assert!(
+            delivered_usable_state,
+            "a successful flush is progress even though the attempt still fails"
+        );
         assert_eq!(
             state
                 .snapshot()
@@ -4381,6 +4413,22 @@ mod tests {
                 .as_ref()
                 .map(|slice| slice.version.as_str()),
             Some("v-pending")
+        );
+        let status = tracker.status(state.has_first_slice());
+        assert_eq!(
+            status.state, "connected",
+            "the flush is a usable install, so a sticky liveness failure must clear"
+        );
+        assert_eq!(status.consecutive_failures, 0);
+        assert!(state.has_first_slice());
+        assert!(
+            !MeshStreamAttempt::TransportFailure {
+                delivered_usable_state: true,
+                after_established: true,
+            }
+            .disposition()
+            .increase_backoff,
+            "flush progress must keep the attempt from growing backoff"
         );
     }
 
