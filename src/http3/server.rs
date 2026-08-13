@@ -1433,29 +1433,28 @@ async fn handle_h3_request(
     // policy reject into a gRPC-Web response. CONNECT-UDP still refuses the
     // spoofed Content-Type as an RFC 9297 §3.2 malformed message; this only
     // stops that 400 from being rewritten as a gRPC-Web HTTP-200 body.
-    let grpc_web_response_content_type_owned = if detected_http_flavor == HttpFlavor::WebSocket
-        || is_connect_udp_request
-    {
-        None
-    } else {
-        req.headers()
-            .get(hyper::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|content_type| {
-                if !crate::plugins::grpc_web::is_grpc_web_content_type(content_type) {
-                    return None;
-                }
-                let negotiated =
-                    crate::plugins::grpc_web::negotiate_response_media_type_from_headers(
-                        content_type,
-                        req.headers(),
-                        state.max_header_size_bytes,
-                    );
-                Some(negotiated.unwrap_or_else(|_| {
-                    crate::plugins::grpc_web::response_content_type(content_type)
-                }))
-            })
-    };
+    let grpc_web_response_content_type_owned =
+        if detected_http_flavor == HttpFlavor::WebSocket || is_connect_udp_request {
+            None
+        } else {
+            req.headers()
+                .get(hyper::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|content_type| {
+                    if !crate::plugins::grpc_web::is_grpc_web_content_type(content_type) {
+                        return None;
+                    }
+                    let negotiated =
+                        crate::plugins::grpc_web::negotiate_response_media_type_from_headers(
+                            content_type,
+                            req.headers(),
+                            state.max_header_size_bytes,
+                        );
+                    Some(negotiated.unwrap_or_else(|_| {
+                        crate::plugins::grpc_web::response_content_type(content_type)
+                    }))
+                })
+        };
     let grpc_web_response_content_type = grpc_web_response_content_type_owned.as_deref();
     // gRPC-Web remains Plain in the shared wire classifier so the grpc_web
     // plugin retains ownership of body translation. Once its content type is

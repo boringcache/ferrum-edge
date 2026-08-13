@@ -1943,7 +1943,11 @@ async fn expiry_withdraws_on_time_while_publication_preparation_is_blocked() {
         "publication preparation was never reached"
     );
     assert!(
-        !lb_has_host(&lb_cache, "blocked-warmup", PAUSED_PREPARATION_DISCOVERED_HOST),
+        !lb_has_host(
+            &lb_cache,
+            "blocked-warmup",
+            PAUSED_PREPARATION_DISCOVERED_HOST
+        ),
         "an unprepared snapshot must not already be routable"
     );
 
@@ -1985,7 +1989,11 @@ async fn expiry_withdraws_on_time_while_publication_preparation_is_blocked() {
     drop(hold);
 
     let republished = wait_for_within(2000, || {
-        lb_has_host(&lb_cache, "blocked-warmup", PAUSED_PREPARATION_DISCOVERED_HOST)
+        lb_has_host(
+            &lb_cache,
+            "blocked-warmup",
+            PAUSED_PREPARATION_DISCOVERED_HOST,
+        )
     })
     .await;
     assert!(
@@ -2116,7 +2124,11 @@ async fn a_retain_policy_expiry_keeps_a_pending_publication_alive() {
 
     drop(hold);
     let published = wait_for_within(2000, || {
-        lb_has_host(&lb_cache, "retain-warmup", PAUSED_PREPARATION_DISCOVERED_HOST)
+        lb_has_host(
+            &lb_cache,
+            "retain-warmup",
+            PAUSED_PREPARATION_DISCOVERED_HOST,
+        )
     })
     .await;
     assert!(
