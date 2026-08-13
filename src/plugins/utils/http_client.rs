@@ -467,9 +467,7 @@ fn attach_plugin_client_dns(
     dns_cache: Option<&DnsCache>,
 ) -> reqwest::ClientBuilder {
     match dns_cache {
-        Some(dns_cache) => {
-            builder.dns_resolver(Arc::new(DnsCacheResolver::new(dns_cache.clone())))
-        }
+        Some(dns_cache) => builder.dns_resolver(Arc::new(DnsCacheResolver::new(dns_cache.clone()))),
         None => builder,
     }
 }
@@ -572,10 +570,7 @@ fn build_fail_closed_plugin_client(
         ),
     }
 
-    try_build_preconfigured_fail_closed_plugin_client(
-        http2_prior_knowledge,
-        provider_mismatch,
-    )
+    try_build_preconfigured_fail_closed_plugin_client(http2_prior_knowledge, provider_mismatch)
 }
 
 /// Build a minimal `reqwest::Client` that still uses the gateway's DNS cache
@@ -1689,12 +1684,9 @@ mod fallback_tests {
 
     #[test]
     fn fallback_client_builds_without_dns_cache() {
-        let _client = build_dns_cached_fallback_client(
-            None,
-            &PluginTlsPosture::PlatformRoots,
-            false,
-        )
-        .expect("fallback client builds without DNS cache");
+        let _client =
+            build_dns_cached_fallback_client(None, &PluginTlsPosture::PlatformRoots, false)
+                .expect("fallback client builds without DNS cache");
     }
 
     #[test]

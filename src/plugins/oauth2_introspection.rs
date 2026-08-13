@@ -2174,10 +2174,7 @@ async fn discover_introspection_endpoint(
         .get()
         .map_err(|e| format!("discovery request failed: {e}"))?;
     let response = http_client
-        .execute(
-            client.get(discovery_url),
-            "oauth2_introspection_discovery",
-        )
+        .execute(client.get(discovery_url), "oauth2_introspection_discovery")
         .await
         .map_err(|e| format!("discovery request failed: {e}"))?;
     if !response.status().is_success() {

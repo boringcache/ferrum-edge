@@ -934,8 +934,7 @@ fn plugin_http_client_terminal_fallback_is_fail_closed_no_proxy_no_redirect() {
     );
     let uncommented_fail_closed_builder = uncommented_lines(fail_closed_builder).join("\n");
     assert!(
-        !uncommented_fail_closed_builder
-            .contains("try_build_plugin_client(None, false"),
+        !uncommented_fail_closed_builder.contains("try_build_plugin_client(None, false"),
         "HTTP/2 terminal fallback must not accept an HTTP/1-capable replacement client"
     );
     assert!(
