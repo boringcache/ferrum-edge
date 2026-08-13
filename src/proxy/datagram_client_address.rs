@@ -457,6 +457,10 @@ struct ParsedDatagramHeader {
 /// Parse the metadata header, without any trust, dest-port, or authentication
 /// decision. Hostile-input entry for the fuzz lane: bounded, allocation-free,
 /// and it never returns payload, tag, or secret material.
+///
+/// Compiled only with `feature = "fuzzing"`, matching the TCP PROXY fuzz
+/// entry. The production receive path uses [`DatagramClientAddressGate::decode`].
+#[cfg(feature = "fuzzing")]
 pub(crate) fn parse_datagram_header(datagram: &[u8]) -> Result<(), DatagramMetadataError> {
     parse_datagram_header_inner(datagram).map(|_| ())
 }
