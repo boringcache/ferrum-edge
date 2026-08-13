@@ -145,6 +145,7 @@ SUITE_PATTERNS: dict[str, list[str]] = {
         r"^\.github/actions/setup-kubernetes-tools/",
         r"^tests/k8s/mesh_e2e_sidecar/",
         r"^tests/k8s/lib/(live_assertions|spire)\.sh$",
+        r"^tests/k8s/lib/native_probe_classify\.py$",
         # mod.rs wires `mod live_contract;` into the conformance tree and
         # tests/conformance_tests.rs is the harness that declares
         # `mod conformance;` — unwiring either would let the GA artifact gate
@@ -364,6 +365,16 @@ def native_mtls_fixture_contract_errors(root: Path) -> list[str]:
     errors.extend(native_mtls_rotation_observation_errors(run_text))
     if "serviceAccountName: native-mtls-probe" not in run_text:
         errors.append("run.sh native mTLS probes must not share sa/capp")
+    if "native_probe_classify.py" not in run_text:
+        errors.append(
+            "run.sh dropped the native probe classifier that correlates CP evidence "
+            "to the exact probe pod IP/node_id"
+        )
+    if "ferrum_edge::modes::control_plane=debug" not in manifests_text:
+        errors.append(
+            "ferrum-cp FERRUM_LOG_LEVEL dropped control_plane debug, hiding CP TLS "
+            "handshake rejections the classifier correlates by pod IP"
+        )
 
     required_ids = (
         "sidecar.config.native_subscribe_delivered",
@@ -684,6 +695,7 @@ def self_test() -> int:
         ("mesh-federation", ["charts/ferrum-mesh/values.yaml"], False),
         ("mesh-federation", ["docs/spire_deployment.md"], True),
         ("mesh-e2e-sidecar", ["tests/k8s/mesh_e2e_sidecar/run.sh"], True),
+        ("mesh-e2e-sidecar", ["tests/k8s/lib/native_probe_classify.py"], True),
         ("mesh-e2e-sidecar", [".github/actions/setup-kubernetes-tools/action.yml"], True),
         ("mesh-e2e-sidecar", ["src/plugins/jwks_auth.rs"], True),
         ("mesh-e2e-sidecar", ["src/plugins/utils/jwt_verifier.rs"], True),

@@ -803,8 +803,11 @@ spec:
               value: __TRUST_DOMAIN__
             - name: FERRUM_POOL_WARMUP_ENABLED
               value: "false"
+            # Handshake rejections are debug in production. The live classifier
+            # correlates those CP TLS lines to the probe pod IP; info alone
+            # would hide omit-client / foreign-client evidence.
             - name: FERRUM_LOG_LEVEL
-              value: info
+              value: "info,ferrum_edge::modes::control_plane=debug"
           volumeMounts:
             - name: cp-data
               mountPath: /data

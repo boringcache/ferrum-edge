@@ -118,6 +118,7 @@ MANIFESTS="$ROOT_DIR/tests/k8s/mesh_e2e_sidecar/manifests.yaml"
 
 LIVE_ASSERTIONS_HELPER="$ROOT_DIR/tests/k8s/lib/live_assertions.sh"
 SPIRE_HELPER="$ROOT_DIR/tests/k8s/lib/spire.sh"
+NATIVE_PROBE_CLASSIFY_HELPER="$ROOT_DIR/tests/k8s/lib/native_probe_classify.py"
 # shellcheck source=../lib/live_assertions.sh
 source "$LIVE_ASSERTIONS_HELPER"
 # shellcheck source=../lib/spire.sh
@@ -261,6 +262,10 @@ preflight() {
   need curl
   need python3
   need openssl
+  if [[ ! -f "$NATIVE_PROBE_CLASSIFY_HELPER" ]]; then
+    printf 'missing native probe classifier: %s\n' "$NATIVE_PROBE_CLASSIFY_HELPER" >&2
+    exit 1
+  fi
   docker info >/dev/null
   if [[ "${FERRUM_MESH_E2E_LIVE_ACK_DISPOSABLE:-}" != "true" ]]; then
     echo "Refusing to create/destroy a disposable kind cluster without \
@@ -1559,52 +1564,58 @@ native_probe_logs() {
     --tail=200 2>/dev/null || true
 }
 
+native_cp_logs() {
+  kubectl --context "$CONTEXT" -n "$NS" logs deploy/ferrum-cp -c ferrum-edge \
+    --tail=400 2>/dev/null || true
+}
+
+native_probe_running_identity() {
+  local deploy="$1"
+  kubectl --context "$CONTEXT" -n "$NS" get pod -l "app=${deploy}" -o json 2>/dev/null |
+    python3 "$NATIVE_PROBE_CLASSIFY_HELPER" --running-identity --deploy "$deploy"
+}
+
 # Classify a dedicated native-subscribe probe. Distinguishes:
 #   crash            process never stayed up (unrelated startup failure)
 #   slice-accepted   MeshSubscribe delivered a slice (false-positive for a negative)
-#   jwt              mTLS connected, then JWT/UNAUTHENTICATED
+#   jwt              mTLS connected, then JWT/UNAUTHENTICATED (client or CP)
 #   tls-name         hostname/SAN verification failed (never connected)
-#   tls-verify       server-certificate trust failed (never connected)
+#   tls-verify       server-certificate trust failed, or CP rejected a foreign client cert
 #   tls-handshake    TLS/mTLS handshake failed before subscribe (never connected)
 #   noop             running but no MeshSubscribe attempt evidence
+#
+# Client `Connected to CP` is only a transient transport-attempt signal and
+# must not override exact CP evidence correlated to this probe's pod IP
+# (pre-subscribe TLS) or pod/node name (tenant-subscription JWT reject).
 classify_native_probe() {
   local deploy="$1"
-  local logs connected slice jwt tls_name tls_verify tls_hs
+  local logs identity pod_name="" pod_ip="" client_file cp_file evidence_file st
+  evidence_file="$RESULTS_DIR/${deploy}.server-evidence.txt"
   if ! native_probe_container_running "$deploy"; then
+    printf 'none\n' > "$evidence_file" || true
     printf 'crash'
     return 0
   fi
   logs="$(native_probe_logs "$deploy")"
-  printf '%s' "$logs" | grep -Eqi 'BEGIN ([A-Z0-9 ]*CERTIFICATE|PRIVATE KEY|RSA PRIVATE KEY)' && {
-    printf 'leaked-material'
-    return 0
-  }
-  slice=false
-  printf '%s' "$logs" | grep -Fq 'Mesh global plugin chain prepared from initial mesh slice' && slice=true
-  printf '%s' "$logs" | grep -Fq 'Connected to CP, subscribing for native mesh config' && connected=true || connected=false
-  jwt=false
-  printf '%s' "$logs" | grep -Eqi 'unauthenticated|UNAUTHENTICATED|Unauthenticated|grpc-status: 16' && jwt=true
-  tls_name=false
-  printf '%s' "$logs" | grep -Eqi 'NotValidForName|not valid for|DnsName|hostname mismatch|certificate is not valid for' && tls_name=true
-  tls_verify=false
-  printf '%s' "$logs" | grep -Eqi 'UnknownIssuer|unknown issuer|certificate verify failed|UnknownCA' && tls_verify=true
-  printf '%s' "$logs" | grep -Eqi 'invalid peer certificate' && tls_verify=true
-  tls_hs=false
-  printf '%s' "$logs" | grep -Eqi 'tls handshake|handshake failure|certificate required|peer did not present|bad certificate|CertificateRequired' && tls_hs=true
-  printf '%s' "$logs" | grep -Fq 'Native MeshSubscribe connection failed' && tls_hs=true
-  if [[ "$slice" == "true" ]]; then
-    printf 'slice-accepted'
-  elif [[ "$connected" == "true" && "$jwt" == "true" ]]; then
-    printf 'jwt'
-  elif [[ "$connected" == "true" ]]; then
-    printf 'connected-without-jwt-class'
-  elif [[ "$tls_name" == "true" ]]; then
-    printf 'tls-name'
-  elif [[ "$tls_verify" == "true" ]]; then
-    printf 'tls-verify'
-  elif [[ "$tls_hs" == "true" ]]; then
-    printf 'tls-handshake'
-  else
+  identity="$(native_probe_running_identity "$deploy" 2>/dev/null || true)"
+  if [[ "$identity" == *$'\t'* ]]; then
+    pod_name="${identity%%$'\t'*}"
+    pod_ip="${identity#*$'\t'}"
+    pod_ip="${pod_ip%%$'\n'*}"
+  fi
+  client_file="$RESULTS_DIR/${deploy}.client-log.tmp"
+  cp_file="$RESULTS_DIR/${deploy}.cp-log.tmp"
+  printf '%s\n' "$logs" > "$client_file"
+  native_cp_logs > "$cp_file"
+  st=0
+  python3 "$NATIVE_PROBE_CLASSIFY_HELPER" --classify \
+    --pod-name "$pod_name" \
+    --pod-ip "$pod_ip" \
+    --client-log "$client_file" \
+    --cp-log "$cp_file" \
+    --evidence-out "$evidence_file" || st=$?
+  rm -f "$client_file" "$cp_file"
+  if [[ "$st" -ne 0 ]]; then
     printf 'noop'
   fi
 }
@@ -1612,8 +1623,9 @@ classify_native_probe() {
 wait_for_native_probe_class() {
   local deploy="$1" want="${2:-}"
   local class="" _
-  # JWT class is logged after the TLS channel is up ("Connected to CP..."); do
-  # not return the transient connected-without-jwt-class when a pattern is
+  # Client "Connected to CP" is a transient transport-attempt; the helper may
+  # still return connected-without-jwt-class until exact CP evidence for this
+  # probe is visible. Do not treat that as a terminal class when a pattern is
   # supplied. 30*2s covers image-already-loaded scheduling plus one reconnect.
   for _ in $(seq 1 30); do
     if native_probe_container_running "$deploy"; then
@@ -1762,23 +1774,27 @@ delete_native_mtls_probes() {
 
 record_native_negative() {
   local assertion_id="$1" deploy="$2" want_pattern="$3"
-  local class evidence
+  local class evidence server_ev=""
   class="$(wait_for_native_probe_class "$deploy" "$want_pattern")"
+  if [[ -f "$RESULTS_DIR/${deploy}.server-evidence.txt" ]]; then
+    server_ev="$(tr '\n' ' ' < "$RESULTS_DIR/${deploy}.server-evidence.txt")"
+  fi
   evidence="$(native_probe_logs "$deploy" | redact_native_transport_evidence | tr '\n' ' ')"
-  printf '%s\n' "$class $evidence" > "$RESULTS_DIR/${deploy}.txt"
-  log "$deploy class=$class (want $want_pattern)"
+  printf 'class=%s\nserver=%s\nclient=%s\n' "$class" "$server_ev" "$evidence" \
+    > "$RESULTS_DIR/${deploy}.txt"
+  log "$deploy class=$class (want $want_pattern) server=${server_ev}"
   if [[ "$class" == slice-accepted || "$class" == crash || "$class" == leaked-material || "$class" == noop ]]; then
     record_live_assertion "$assertion_id" fail "$deploy" ferrum-cp \
-      "class=$class want=$want_pattern" "${deploy}.txt"
+      "class=$class want=$want_pattern server=${server_ev}" "${deploy}.txt"
     return 1
   fi
   if printf '%s' "$class" | grep -Eq "^($want_pattern)$"; then
     record_live_assertion "$assertion_id" pass "$deploy" ferrum-cp \
-      "class=$class" "${deploy}.txt"
+      "class=$class server=${server_ev}" "${deploy}.txt"
     return 0
   fi
   record_live_assertion "$assertion_id" fail "$deploy" ferrum-cp \
-    "class=$class want=$want_pattern" "${deploy}.txt"
+    "class=$class want=$want_pattern server=${server_ev}" "${deploy}.txt"
   return 1
 }
 

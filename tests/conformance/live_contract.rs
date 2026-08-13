@@ -842,6 +842,263 @@ fn live_contract_sidecar_native_subscribe_fixture_is_mtls_jwt() {
     );
 }
 
+fn native_probe_classifier_contract_violations(
+    run_sh: &str,
+    helper: &str,
+    manifests: &str,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+
+    for (needle, desc) in [
+        (
+            "native_probe_classify.py",
+            "run.sh must invoke the native probe classifier helper",
+        ),
+        (
+            "--running-identity",
+            "run.sh must obtain the running probe pod identity from the API",
+        ),
+        (
+            "--classify",
+            "run.sh must classify through the helper, not a client-log-only grep",
+        ),
+        (
+            "--evidence-out",
+            "run.sh must store redacted server-side probe evidence",
+        ),
+        (
+            "--pod-name",
+            "run.sh must pass the exact probe pod/node name into classification",
+        ),
+        (
+            "--pod-ip",
+            "run.sh must pass the exact probe pod IP into classification",
+        ),
+        (
+            "logs deploy/ferrum-cp",
+            "run.sh must collect ferrum-cp logs for correlated CP evidence",
+        ),
+        (
+            "get pod -l \"app=${deploy}\"",
+            "run.sh must read the running probe pod from the Kubernetes API",
+        ),
+    ] {
+        if !run_sh.contains(needle) {
+            errors.push(format!(
+                "native probe classifier missing {desc} (`{needle}`)"
+            ));
+        }
+    }
+
+    for banned in [
+        "peer sent no certificates",
+        "Tenant subscription rejected",
+        "Invalid token: authentication failed",
+    ] {
+        if run_sh.contains(banned) {
+            errors.push(format!(
+                "run.sh must not match CP rejection reason `{banned}` itself — \
+                 that is generic CP-log matching; the helper owns exact correlation"
+            ));
+        }
+    }
+
+    for (needle, desc) in [
+        (
+            "exact_field_equals",
+            "literal field equality so pod IPs/node ids are never regex-interpolated",
+        ),
+        (
+            "cp_tls_rejection_for_pod",
+            "TLS rejection correlated to the exact probe pod IP",
+        ),
+        (
+            "cp_jwt_rejection_for_node",
+            "JWT rejection correlated to the exact probe node_id",
+        ),
+        (
+            "CP gRPC TLS handshake failed",
+            "fixed CP TLS handshake rejection message",
+        ),
+        (
+            "peer sent no certificates",
+            "fixed omit-client rustls reason",
+        ),
+        (
+            "invalid peer certificate: UnknownIssuer",
+            "fixed foreign-client rustls reason",
+        ),
+        (
+            "Tenant subscription rejected",
+            "fixed CP tenant-subscription rejection message",
+        ),
+        (
+            "Invalid token: authentication failed",
+            "fixed invalid-JWT reason",
+        ),
+        (
+            "MeshConfigSync.MeshSubscribe",
+            "JWT evidence bound to the MeshSubscribe surface",
+        ),
+        (
+            "slice-accepted-overrides-cp-reject",
+            "self-test that a delivered slice remains slice-accepted",
+        ),
+        (
+            "reject-unrelated-cp-ip",
+            "self-test that an unrelated CP TLS rejection is not accepted",
+        ),
+        (
+            "reject-unrelated-node-id",
+            "self-test that an unrelated CP JWT rejection is not accepted",
+        ),
+        (
+            "connected-does-not-override-cp-tls",
+            "self-test that Connected to CP does not hide CP TLS rejection",
+        ),
+        (
+            "connected-does-not-override-cp-jwt",
+            "self-test that Connected to CP does not hide CP JWT rejection",
+        ),
+        (
+            "untrusted-ca-stays-client-side",
+            "self-test that untrusted-CA stays a client-side tls-verify class",
+        ),
+        (
+            "wrong-san-stays-client-side",
+            "self-test that wrong-SAN stays a client-side tls-name class",
+        ),
+        (
+            "preserve-client-jwt-negative",
+            "self-test that client UNAUTHENTICATED still classifies as jwt",
+        ),
+        (
+            "client_slice_accepted",
+            "slice-delivery false-positive evidence label",
+        ),
+        (
+            "is_dns1123_label",
+            "Kubernetes-safe pod/node identity validation",
+        ),
+        (
+            "is_pod_ip",
+            "Kubernetes-safe pod IP validation",
+        ),
+    ] {
+        if !helper.contains(needle) {
+            errors.push(format!(
+                "native probe classifier helper missing {desc} (`{needle}`)"
+            ));
+        }
+    }
+
+    if helper.contains("re.compile(pod_ip")
+        || helper.contains("re.search(pod_ip")
+        || helper.contains("re.search(node_id")
+        || helper.contains("re.compile(node_id")
+        || helper.contains("grep -Fq 'peer sent no certificates'")
+    {
+        errors.push(
+            "classifier helper must not compile probe identity into a regex or \
+             fall back to generic CP reason greps"
+                .into(),
+        );
+    }
+
+    if !manifests.contains("ferrum_edge::modes::control_plane=debug") {
+        errors.push(
+            "ferrum-cp FERRUM_LOG_LEVEL must emit CP gRPC TLS handshake debug \
+             lines so omit-client/foreign-client evidence is collectable"
+                .into(),
+        );
+    }
+
+    errors
+}
+
+/// Issue #3855 hosted Mesh E2E Sidecar: omit-client, foreign-client, and
+/// invalid-JWT were classified `connected-without-jwt-class` from the client
+/// `Connected to CP` line even though ferrum-cp had already rejected each
+/// probe. Classification must consume CP evidence correlated to the exact
+/// running pod IP (TLS) or node_id (JWT), keep slice-accepted as a hard
+/// false-positive, and must not treat an unrelated CP rejection as proof.
+#[test]
+fn live_contract_sidecar_native_probe_classifier_correlates_cp_evidence() {
+    const RUN_SH: &str = include_str!("../k8s/mesh_e2e_sidecar/run.sh");
+    const HELPER: &str = include_str!("../k8s/lib/native_probe_classify.py");
+    const MANIFESTS: &str = include_str!("../k8s/mesh_e2e_sidecar/manifests.yaml");
+
+    let violations = native_probe_classifier_contract_violations(RUN_SH, HELPER, MANIFESTS);
+    assert!(
+        violations.is_empty(),
+        "native probe classifier must correlate exact CP evidence: {violations:?}"
+    );
+
+    let generic_cp_grep = r#"
+classify_native_probe() {
+  logs="$(native_probe_logs "$deploy")"
+  cp="$(kubectl logs deploy/ferrum-cp)"
+  if printf '%s' "$cp" | grep -Fq 'peer sent no certificates'; then
+    printf 'tls-handshake'
+  elif printf '%s' "$cp" | grep -Fq 'Tenant subscription rejected'; then
+    printf 'jwt'
+  elif printf '%s' "$logs" | grep -Fq 'Connected to CP, subscribing for native mesh config'; then
+    printf 'connected-without-jwt-class'
+  fi
+}
+"#;
+    let generic_violations = native_probe_classifier_contract_violations(
+        generic_cp_grep,
+        HELPER,
+        MANIFESTS,
+    );
+    assert!(
+        generic_violations.iter().any(|error| {
+            error.contains("generic CP-log matching")
+                || error.contains("native_probe_classify.py")
+        }),
+        "contract must reject generic ferrum-cp reason greps, got {generic_violations:?}"
+    );
+
+    let no_slice_guard = r#"
+native_probe_classify.py
+--running-identity
+--classify
+--evidence-out
+--pod-name
+--pod-ip
+logs deploy/ferrum-cp
+get pod -l "app=${deploy}"
+"#;
+    let no_slice_violations = native_probe_classifier_contract_violations(
+        no_slice_guard,
+        HELPER.replace("slice-accepted-overrides-cp-reject", "removed-slice-guard"),
+        MANIFESTS,
+    );
+    assert!(
+        no_slice_violations
+            .iter()
+            .any(|error| error.contains("slice-accepted-overrides-cp-reject")),
+        "contract must notice removal of the slice-delivery false-positive guard, \
+         got {no_slice_violations:?}"
+    );
+
+    let helper_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/k8s/lib/native_probe_classify.py");
+    let output = Command::new("python3")
+        .arg("-I")
+        .arg(&helper_path)
+        .arg("--self-test")
+        .output()
+        .expect("spawn python3 for native_probe_classify.py --self-test");
+    assert!(
+        output.status.success(),
+        "native_probe_classify.py --self-test failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 fn bash_function_name(trimmed: &str) -> Option<&str> {
     let idx = trimmed.find("()")?;
     let name = trimmed[..idx].trim();
