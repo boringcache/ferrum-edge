@@ -769,7 +769,7 @@ fn no_authority_at_all_resolves_to_the_database_with_nothing_to_publish() {
 /// rather than racing each other across cargo's parallel test threads.
 #[test]
 fn observability_counters_are_bounded_and_material_free() {
-    let _observability = lock_gateway_trust_observability();
+    let _observability = futures::executor::block_on(lock_gateway_trust_observability());
 
     let baseline = observability_snapshot();
     assert_eq!(baseline.published_generations_total, 0);
@@ -1161,7 +1161,7 @@ fn the_default_id_comes_from_the_server_selected_namespace_only() {
 
 #[test]
 fn two_authorities_keep_the_previously_accepted_trust_rather_than_revoking_it() {
-    let _observability = lock_gateway_trust_observability();
+    let _observability = futures::executor::block_on(lock_gateway_trust_observability());
     let record = valid_record();
     let file_value = bundle_with(vec![root_ca_der_base64("file-root")]);
 

@@ -15,12 +15,11 @@
 //! modules in the SAME binary, so a per-file lock would order each file against
 //! itself while leaving the two racing each other.
 //!
-//! Acquire it poison-tolerantly (`unwrap_or_else(|p| p.into_inner())`): it
-//! guards no invariant of its own, only mutual exclusion, so one panicking test
-//! must not cascade into unrelated failures across the binary.
+//! Tokio's async mutex is used so async tests can hold the guard across awaits
+//! without tripping `clippy::await_holding_lock`.
 #![allow(dead_code)] // used by sibling test modules
 
-use std::sync::{Mutex, MutexGuard};
+use tokio::sync::{Mutex, MutexGuard};
 
 pub static GATEWAY_TRUST_OBSERVABILITY_LOCK: Mutex<()> = Mutex::new(());
 
@@ -28,10 +27,8 @@ pub static GATEWAY_TRUST_OBSERVABILITY_LOCK: Mutex<()> = Mutex::new(());
 /// and the published-namespace map, so the caller starts from a known baseline.
 ///
 /// Hold the returned guard for the whole test.
-pub fn lock_gateway_trust_observability() -> MutexGuard<'static, ()> {
-    let guard = GATEWAY_TRUST_OBSERVABILITY_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+pub async fn lock_gateway_trust_observability() -> MutexGuard<'static, ()> {
+    let guard = GATEWAY_TRUST_OBSERVABILITY_LOCK.lock().await;
     ferrum_edge::config::gateway_trust::reset_observability_for_tests();
     guard
 }

@@ -162,7 +162,7 @@ fn runtime_bundles(trust_domain: &str, authority: &[u8]) -> RuntimeTrustBundleSe
 async fn source_rotation_cannot_lift_another_publishers_fence_and_keeps_newest_identity() {
     // Serialize against every other gateway-trust observability test in this
     // binary: the published-namespace map and the counters are process-global.
-    let _observability = lock_gateway_trust_observability();
+    let _observability = lock_gateway_trust_observability().await;
     let state = state_in_mode(GatewayConfig::default(), OperatingMode::DataPlane).await;
     state.install_gateway_runtime_svid_bundle(source_loaded_svid_generation(
         "file.local",
@@ -222,7 +222,7 @@ async fn source_rotation_cannot_lift_another_publishers_fence_and_keeps_newest_i
 async fn database_startup_installs_persisted_trust_into_live_verifier() {
     // Serialize against every other gateway-trust observability test in this
     // binary: the published-namespace map and the counters are process-global.
-    let _observability = lock_gateway_trust_observability();
+    let _observability = lock_gateway_trust_observability().await;
     let config = config_with(vec![record("db.local", &[10, 20, 30])]);
     let state = database_mode_state(config.clone()).await;
     seed_source_loaded_svid(&state);
@@ -247,7 +247,7 @@ async fn database_startup_installs_persisted_trust_into_live_verifier() {
 async fn accepted_trust_only_reload_rotates_the_live_verifier() {
     // Serialize against every other gateway-trust observability test in this
     // binary: the published-namespace map and the counters are process-global.
-    let _observability = lock_gateway_trust_observability();
+    let _observability = lock_gateway_trust_observability().await;
     let initial = config_with(vec![record("db-v1.local", &[1])]);
     let state = database_mode_state(initial.clone()).await;
     seed_source_loaded_svid(&state);
@@ -272,7 +272,7 @@ async fn accepted_trust_only_reload_rotates_the_live_verifier() {
 async fn accepted_revocation_withdraws_the_override_and_restores_source_trust() {
     // Serialize against every other gateway-trust observability test in this
     // binary: the published-namespace map and the counters are process-global.
-    let _observability = lock_gateway_trust_observability();
+    let _observability = lock_gateway_trust_observability().await;
     let initial = config_with(vec![record("db.local", &[1])]);
     let state = database_mode_state(initial.clone()).await;
     seed_source_loaded_svid(&state);
@@ -299,7 +299,7 @@ async fn accepted_revocation_withdraws_the_override_and_restores_source_trust() 
 async fn unconvertible_stored_material_retains_last_known_good_and_fails_closed() {
     // Serialize against every other gateway-trust observability test in this
     // binary: the published-namespace map and the counters are process-global.
-    let _observability = lock_gateway_trust_observability();
+    let _observability = lock_gateway_trust_observability().await;
     let initial = config_with(vec![record("db.local", &[1])]);
     let state = database_mode_state(initial.clone()).await;
     seed_source_loaded_svid(&state);
@@ -327,7 +327,7 @@ async fn unconvertible_stored_material_retains_last_known_good_and_fails_closed(
 async fn ambiguous_authority_keeps_the_previous_live_generation() {
     // Serialize against every other gateway-trust observability test in this
     // binary: the published-namespace map and the counters are process-global.
-    let _observability = lock_gateway_trust_observability();
+    let _observability = lock_gateway_trust_observability().await;
     let initial = config_with(vec![record("db.local", &[1])]);
     let state = database_mode_state(initial.clone()).await;
     seed_source_loaded_svid(&state);
@@ -348,7 +348,7 @@ async fn ambiguous_authority_keeps_the_previous_live_generation() {
 async fn non_database_modes_do_not_touch_the_gateway_trust_override() {
     // Serialize against every other gateway-trust observability test in this
     // binary: the published-namespace map and the counters are process-global.
-    let _observability = lock_gateway_trust_observability();
+    let _observability = lock_gateway_trust_observability().await;
     // The CP→DP side channel and the mesh apply loop own this slot in their
     // own modes; database publication must not become a second writer there.
     let config = config_with(vec![record("db.local", &[1])]);
@@ -381,7 +381,7 @@ async fn non_database_modes_do_not_touch_the_gateway_trust_override() {
 async fn rotation_closes_mesh_admission_for_the_whole_publication_boundary() {
     // Serialize against every other gateway-trust observability test in this
     // binary: the published-namespace map and the counters are process-global.
-    let _observability = lock_gateway_trust_observability();
+    let _observability = lock_gateway_trust_observability().await;
     let initial = config_with(vec![record("db-v1.local", &[1])]);
     let state = database_mode_state(initial.clone()).await;
     seed_source_loaded_svid(&state);
@@ -445,7 +445,7 @@ async fn rotation_closes_mesh_admission_for_the_whole_publication_boundary() {
 async fn revocation_closes_mesh_admission_until_the_root_is_withdrawn() {
     // Serialize against every other gateway-trust observability test in this
     // binary: the published-namespace map and the counters are process-global.
-    let _observability = lock_gateway_trust_observability();
+    let _observability = lock_gateway_trust_observability().await;
     let initial = config_with(vec![record("db.local", &[1])]);
     let state = database_mode_state(initial.clone()).await;
     seed_source_loaded_svid(&state);
@@ -483,7 +483,7 @@ async fn revocation_closes_mesh_admission_until_the_root_is_withdrawn() {
 async fn accepted_rotation_through_update_config_publishes_one_coherent_generation() {
     // Serialize against every other gateway-trust observability test in this
     // binary: the published-namespace map and the counters are process-global.
-    let _observability = lock_gateway_trust_observability();
+    let _observability = lock_gateway_trust_observability().await;
     let initial = config_with(vec![record("db-v1.local", &[1])]);
     let state = database_mode_state(initial.clone()).await;
     seed_source_loaded_svid(&state);
@@ -524,7 +524,7 @@ async fn accepted_rotation_through_update_config_publishes_one_coherent_generati
 async fn unconvertible_candidate_rejects_the_apply_and_retains_the_whole_generation() {
     // Serialize against every other gateway-trust observability test in this
     // binary: the published-namespace map and the counters are process-global.
-    let _observability = lock_gateway_trust_observability();
+    let _observability = lock_gateway_trust_observability().await;
     let initial = config_with(vec![record("db.local", &[1])]);
     let state = database_mode_state(initial.clone()).await;
     seed_source_loaded_svid(&state);
@@ -560,7 +560,7 @@ async fn unconvertible_candidate_rejects_the_apply_and_retains_the_whole_generat
 async fn a_reload_that_changes_no_trust_never_closes_mesh_admission() {
     // Serialize against every other gateway-trust observability test in this
     // binary: the published-namespace map and the counters are process-global.
-    let _observability = lock_gateway_trust_observability();
+    let _observability = lock_gateway_trust_observability().await;
     let initial = config_with(vec![record("db.local", &[1])]);
     let state = database_mode_state(initial.clone()).await;
     seed_source_loaded_svid(&state);
@@ -597,7 +597,7 @@ async fn a_reload_that_changes_no_trust_never_closes_mesh_admission() {
 async fn ambiguous_authority_stages_unchanged_and_keeps_the_complete_generation() {
     // Serialize against every other gateway-trust observability test in this
     // binary: the published-namespace map and the counters are process-global.
-    let _observability = lock_gateway_trust_observability();
+    let _observability = lock_gateway_trust_observability().await;
     let initial = config_with(vec![record("db.local", &[1])]);
     let state = database_mode_state(initial.clone()).await;
     seed_source_loaded_svid(&state);
@@ -628,7 +628,7 @@ async fn ambiguous_authority_stages_unchanged_and_keeps_the_complete_generation(
 async fn dp_snapshot_publishes_cp_trust_with_its_own_configuration_generation() {
     // Serialize against every other gateway-trust observability test in this
     // binary: the published-namespace map and the counters are process-global.
-    let _observability = lock_gateway_trust_observability();
+    let _observability = lock_gateway_trust_observability().await;
     let state = state_in_mode(GatewayConfig::default(), OperatingMode::DataPlane).await;
     seed_source_loaded_svid(&state);
     let (config_before, trust_before, _) = published_generations(&state);
@@ -670,7 +670,7 @@ async fn dp_snapshot_publishes_cp_trust_with_its_own_configuration_generation() 
 async fn dp_unchanged_side_channel_leaves_the_live_trust_generation_untouched() {
     // Serialize against every other gateway-trust observability test in this
     // binary: the published-namespace map and the counters are process-global.
-    let _observability = lock_gateway_trust_observability();
+    let _observability = lock_gateway_trust_observability().await;
     let state = state_in_mode(GatewayConfig::default(), OperatingMode::DataPlane).await;
     seed_source_loaded_svid(&state);
     state.update_config_with_gateway_trust(
@@ -699,7 +699,7 @@ async fn dp_unchanged_side_channel_leaves_the_live_trust_generation_untouched() 
 async fn dp_snapshot_clear_withdraws_cp_trust_with_the_accepted_generation() {
     // Serialize against every other gateway-trust observability test in this
     // binary: the published-namespace map and the counters are process-global.
-    let _observability = lock_gateway_trust_observability();
+    let _observability = lock_gateway_trust_observability().await;
     let state = state_in_mode(GatewayConfig::default(), OperatingMode::DataPlane).await;
     seed_source_loaded_svid(&state);
     state.update_config_with_gateway_trust(
@@ -782,7 +782,7 @@ fn empty_delta() -> ferrum_edge::config::db_loader::IncrementalResult {
 async fn a_committed_rotation_advances_the_backend_security_generation_inside_the_fence() {
     // Serialize against every other gateway-trust observability test in this
     // binary: the published-namespace map and the counters are process-global.
-    let _observability = lock_gateway_trust_observability();
+    let _observability = lock_gateway_trust_observability().await;
     let initial = config_with(vec![record("db-v1.local", &[1])]);
     let state = database_mode_state(initial.clone()).await;
     seed_source_loaded_svid(&state);
@@ -833,7 +833,7 @@ async fn a_committed_rotation_advances_the_backend_security_generation_inside_th
 async fn a_committed_revocation_retires_the_withdrawn_generation_exactly_once() {
     // Serialize against every other gateway-trust observability test in this
     // binary: the published-namespace map and the counters are process-global.
-    let _observability = lock_gateway_trust_observability();
+    let _observability = lock_gateway_trust_observability().await;
     let initial = config_with(vec![record("db.local", &[1])]);
     let state = database_mode_state(initial.clone()).await;
     seed_source_loaded_svid(&state);
@@ -864,7 +864,7 @@ async fn a_committed_revocation_retires_the_withdrawn_generation_exactly_once() 
 async fn an_unchanged_commit_never_churns_the_backend_pools() {
     // Serialize against every other gateway-trust observability test in this
     // binary: the published-namespace map and the counters are process-global.
-    let _observability = lock_gateway_trust_observability();
+    let _observability = lock_gateway_trust_observability().await;
     let initial = config_with(vec![record("db.local", &[1])]);
     let state = database_mode_state(initial.clone()).await;
     seed_source_loaded_svid(&state);
@@ -897,7 +897,7 @@ async fn an_unchanged_commit_never_churns_the_backend_pools() {
 async fn the_database_full_apply_advances_the_backend_security_generation_once() {
     // Serialize against every other gateway-trust observability test in this
     // binary: the published-namespace map and the counters are process-global.
-    let _observability = lock_gateway_trust_observability();
+    let _observability = lock_gateway_trust_observability().await;
     let initial = config_with(vec![record("db-v1.local", &[1])]);
     let state = database_mode_state(initial.clone()).await;
     seed_source_loaded_svid(&state);
@@ -934,7 +934,7 @@ async fn the_database_full_apply_advances_the_backend_security_generation_once()
 async fn dp_snapshot_replace_then_clear_each_rotate_the_backend_pools_once() {
     // Serialize against every other gateway-trust observability test in this
     // binary: the published-namespace map and the counters are process-global.
-    let _observability = lock_gateway_trust_observability();
+    let _observability = lock_gateway_trust_observability().await;
     let state = state_in_mode(GatewayConfig::default(), OperatingMode::DataPlane).await;
     seed_source_loaded_svid(&state);
     let before = backend_security_generation(&state);
@@ -984,7 +984,7 @@ async fn dp_snapshot_replace_then_clear_each_rotate_the_backend_pools_once() {
 async fn a_cp_trust_only_delta_rotates_the_backend_pools_once() {
     // Serialize against every other gateway-trust observability test in this
     // binary: the published-namespace map and the counters are process-global.
-    let _observability = lock_gateway_trust_observability();
+    let _observability = lock_gateway_trust_observability().await;
     let state = state_in_mode(GatewayConfig::default(), OperatingMode::DataPlane).await;
     seed_source_loaded_svid(&state);
     let before = backend_security_generation(&state);
@@ -1026,7 +1026,7 @@ async fn a_cp_trust_only_delta_rotates_the_backend_pools_once() {
 async fn the_new_generation_is_visible_without_the_rotation_consumer_running() {
     // Serialize against every other gateway-trust observability test in this
     // binary: the published-namespace map and the counters are process-global.
-    let _observability = lock_gateway_trust_observability();
+    let _observability = lock_gateway_trust_observability().await;
     let state = state_in_mode(GatewayConfig::default(), OperatingMode::DataPlane).await;
     seed_source_loaded_svid(&state);
     let before = backend_security_generation(&state);
@@ -1119,7 +1119,7 @@ fn dp_snapshot(version: &str) -> GatewayConfig {
 async fn an_identical_replace_redelivered_by_a_reconnect_never_rotates_the_backend_pools() {
     // Serialize against every other gateway-trust observability test in this
     // binary: the published-namespace map and the counters are process-global.
-    let _observability = lock_gateway_trust_observability();
+    let _observability = lock_gateway_trust_observability().await;
     let state = state_in_mode(GatewayConfig::default(), OperatingMode::DataPlane).await;
     seed_source_loaded_svid(&state);
     state.update_config_with_gateway_trust(
@@ -1150,7 +1150,7 @@ async fn an_identical_replace_redelivered_by_a_reconnect_never_rotates_the_backe
 async fn a_purely_additive_replace_installs_the_root_without_rotating_the_backend_pools() {
     // Serialize against every other gateway-trust observability test in this
     // binary: the published-namespace map and the counters are process-global.
-    let _observability = lock_gateway_trust_observability();
+    let _observability = lock_gateway_trust_observability().await;
     let state = state_in_mode(GatewayConfig::default(), OperatingMode::DataPlane).await;
     seed_source_loaded_svid(&state);
     state.update_config_with_gateway_trust(
@@ -1187,7 +1187,7 @@ async fn a_purely_additive_replace_installs_the_root_without_rotating_the_backen
 async fn a_replace_that_drops_a_root_retires_the_transports_it_authenticated() {
     // Serialize against every other gateway-trust observability test in this
     // binary: the published-namespace map and the counters are process-global.
-    let _observability = lock_gateway_trust_observability();
+    let _observability = lock_gateway_trust_observability().await;
     let state = state_in_mode(GatewayConfig::default(), OperatingMode::DataPlane).await;
     seed_source_loaded_svid(&state);
     state.update_config_with_gateway_trust(
@@ -1218,7 +1218,7 @@ async fn a_replace_that_drops_a_root_retires_the_transports_it_authenticated() {
 async fn a_clear_with_no_installed_override_never_rotates_the_backend_pools() {
     // Serialize against every other gateway-trust observability test in this
     // binary: the published-namespace map and the counters are process-global.
-    let _observability = lock_gateway_trust_observability();
+    let _observability = lock_gateway_trust_observability().await;
     let state = state_in_mode(GatewayConfig::default(), OperatingMode::DataPlane).await;
     seed_source_loaded_svid(&state);
     let before = backend_security_generation(&state);
@@ -1255,7 +1255,7 @@ async fn a_clear_with_no_installed_override_never_rotates_the_backend_pools() {
 async fn invalid_effective_mesh_gateway_trust_is_rejected_without_mutating_live_state() {
     // Serialize against every other gateway-trust observability test in this
     // binary: the published-namespace map and the counters are process-global.
-    let _observability = lock_gateway_trust_observability();
+    let _observability = lock_gateway_trust_observability().await;
     use ferrum_edge::modes::mesh::slice::MeshSlice;
 
     let state = state_in_mode(GatewayConfig::default(), OperatingMode::Mesh).await;
@@ -1328,7 +1328,7 @@ async fn invalid_effective_mesh_gateway_trust_is_rejected_without_mutating_live_
 async fn a_backup_bootstrap_refuses_gateway_mesh_identity_until_the_database_settles_it() {
     // Serialize against every other gateway-trust observability test in this
     // binary: the published-namespace map and the counters are process-global.
-    let _observability = lock_gateway_trust_observability();
+    let _observability = lock_gateway_trust_observability().await;
     let state = database_mode_state(config_with(Vec::new())).await;
     seed_source_loaded_svid(&state);
     assert!(
@@ -1379,7 +1379,7 @@ async fn a_backup_bootstrap_refuses_gateway_mesh_identity_until_the_database_set
 async fn an_unresolved_backup_authority_refuses_even_with_a_live_database_record() {
     // Serialize against every other gateway-trust observability test in this
     // binary: the published-namespace map and the counters are process-global.
-    let _observability = lock_gateway_trust_observability();
+    let _observability = lock_gateway_trust_observability().await;
     let config = config_with(vec![record("db.local", &[4, 5, 6])]);
     let state = database_mode_state(config.clone()).await;
     seed_source_loaded_svid(&state);
@@ -1403,13 +1403,13 @@ async fn an_unresolved_backup_authority_refuses_even_with_a_live_database_record
 
 // ── Concurrent publication must not lose another namespace's state ──────────
 
-#[test]
-fn concurrent_trust_publications_retain_every_namespaces_published_state() {
+#[tokio::test]
+async fn concurrent_trust_publications_retain_every_namespaces_published_state() {
     use ferrum_edge::config::gateway_trust::{
         published_namespace_state, record_trust_generation_published,
     };
 
-    let _observability = lock_gateway_trust_observability();
+    let _observability = lock_gateway_trust_observability().await;
 
     const NAMESPACES: usize = 24;
     let records: Vec<GatewayTrustBundleRecord> = (0..NAMESPACES)
@@ -1455,13 +1455,13 @@ fn concurrent_trust_publications_retain_every_namespaces_published_state() {
     }
 }
 
-#[test]
-fn an_ambiguous_publication_retains_only_namespaces_the_generation_still_carries() {
+#[tokio::test]
+async fn an_ambiguous_publication_retains_only_namespaces_the_generation_still_carries() {
     use ferrum_edge::config::gateway_trust::{
         published_namespace_state, record_trust_generation_published,
     };
 
-    let _observability = lock_gateway_trust_observability();
+    let _observability = lock_gateway_trust_observability().await;
 
     let make = |namespace: &str| {
         GatewayTrustBundleRecord::new(
@@ -1480,7 +1480,7 @@ fn an_ambiguous_publication_retains_only_namespaces_the_generation_still_carries
     assert!(published_namespace_state("revoked").is_some());
 
     let file_sourced = stored_bundle("file.local", &[1, 2, 3]);
-    record_trust_generation_published(&[kept.clone()], Some(&file_sourced), 2);
+    record_trust_generation_published(std::slice::from_ref(&kept), Some(&file_sourced), 2);
 
     assert!(
         published_namespace_state("kept").is_some(),
