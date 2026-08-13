@@ -4575,7 +4575,7 @@ run_node_waypoint_udp_datapath_checks() {
       udp-src-a udp-echo \
       "service_ip=$service_ip observed=$service_reply backend_hits=$unreplied_backend_hits" \
       "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-listener"
-    echo "[node-waypoint-ebpf-live] Service-path probe got no reply;" \
+    echo "[node-waypoint-ebpf-live] Service-path probe got no reply," \
       "backend observed $unreplied_backend_hits svc-a datagram(s)" >&2
     collect_traffic_failure_diagnostics
     return 1
@@ -4971,7 +4971,7 @@ run_node_waypoint_dtls_datapath_checks() {
     snippet="$(printf '%s' "$report" | sed '/-----BEGIN/,/-----END/d' | tr '\n' ' ' | cut -c1-240)"
     record_live_assertion node_waypoint.dtls.listener_bound fail \
       dtls-src-a dtls-echo \
-      "no DTLS handshake completed on ${listener_ip}:${DTLS_LISTENER_PORT}; last probe=${snippet}" \
+      "no DTLS handshake completed on ${listener_ip}:${DTLS_LISTENER_PORT}, last probe=${snippet}" \
       "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-listener"
     collect_traffic_failure_diagnostics
     return 1
@@ -5162,7 +5162,7 @@ run_node_waypoint_udp_same_port_demux_checks() {
     return 1
   fi
   record_live_assertion node_waypoint.udp.same_port_demux_isolated pass \
-    udp-src-a udp-demux-a "A payload only on A; B payload only on B" \
+    udp-src-a udp-demux-a "A payload only on A, B payload only on B" \
     "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-same-port-demux"
 
   local shared
@@ -5226,7 +5226,7 @@ run_node_waypoint_udp_same_port_demux_checks() {
   fi
   record_live_assertion node_waypoint.udp.same_port_demux_retract_a_keeps_b pass \
     udp-src-a udp-demux-b \
-    "A retracted cluster_ip=$ip_a; B still isolated on $ip_b; ambient restarts unchanged=$restarts_after" \
+    "A retracted cluster_ip=$ip_a, B still isolated on $ip_b, ambient restarts unchanged=$restarts_after" \
     "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-same-port-demux"
 }
 
@@ -5352,7 +5352,7 @@ print(json.dumps(obj))
     return 1
   fi
   record_live_assertion node_waypoint.dtls.reload_permissive_to_strict pass \
-    dtls-src-a dtls-echo "generated listener moved to STRICT; unauthenticated handshake failed closed; backend_hits=0" \
+    dtls-src-a dtls-echo "generated listener moved to STRICT, unauthenticated handshake failed closed, backend_hits=0" \
     "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-reload"
   record_live_assertion node_waypoint.dtls.reload_unauthenticated_rejected pass \
     dtls-src-a dtls-echo "payload=$payload backend_hits=0 handshake failed" \
@@ -5379,7 +5379,7 @@ print(json.dumps(obj))
     return 1
   fi
   record_live_assertion node_waypoint.dtls.reload_current_ca_admitted pass \
-    dtls-src-a dtls-echo "current-CA handshake admitted; backend_hits=$hits" \
+    dtls-src-a dtls-echo "current-CA handshake admitted, backend_hits=$hits" \
     "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-reload"
 
   reply="$(dtls_probe_from "$WORKLOAD_NS" dtls-src-a "$listener_ip" \
@@ -5397,7 +5397,7 @@ print(json.dumps(obj))
     return 1
   fi
   record_live_assertion node_waypoint.dtls.reload_stale_ca_rejected pass \
-    dtls-src-a dtls-echo "stale client CA rejected on generated listener; backend_hits=0" \
+    dtls-src-a dtls-echo "stale client CA rejected on generated listener, backend_hits=0" \
     "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-reload"
 
   if ! fetch_ambient_admin_json "$NODE_A" /overload "$overload_after"; then
@@ -5426,7 +5426,7 @@ print(json.dumps(obj))
   fi
   record_live_assertion node_waypoint.dtls.operator_isolated_across_reload pass \
     dtls-src-a dtls-echo \
-    "ordinary /overload frontend_dtls_reload.generation captured pre/post generated-owner publication unchanged=$gen_after; ambient restarts unchanged=$restarts_after; no bound ordinary listener claimed" \
+    "ordinary /overload frontend_dtls_reload.generation captured pre/post generated-owner publication unchanged=$gen_after, ambient restarts unchanged=$restarts_after, no bound ordinary listener claimed" \
     "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-reload"
 }
 

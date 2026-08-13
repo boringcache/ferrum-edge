@@ -17,7 +17,8 @@ const UDP_PROXY: &str = include_str!("../../../src/proxy/udp_proxy.rs");
 
 const GATE: &str = "crate::dp_config_freshness::new_traffic_blocked()";
 
-const SINGLE_DATAGRAM_GATE: &str = "refuse_new_udp_source(&overload) && !sessions.contains_key";
+const SINGLE_DATAGRAM_GATE: &str =
+    "if refuse_new_udp_source(&overload)\n                    && !udp_source_has_established_session(";
 
 const DTLS_PRE_ALLOCATION_GATE: &str = "allow_new_session: Some(Arc::new(move || {\n            \
      !refuse_new_udp_source(&admission_overload)";
@@ -99,11 +100,17 @@ fn every_udp_and_dtls_admission_site_routes_through_the_shared_predicate() {
     // (Linux `recvmmsg` batch, PKTINFO batch, non-Linux `try_recv_from` drain)
     // plus the single-datagram `recv_from` arm.
     assert_eq!(
-        UDP_PROXY
-            .matches("refuse_new_udp_sources && !sessions.contains_key")
-            .count(),
+        UDP_PROXY.matches("if refuse_new_udp_sources").count(),
         3,
         "each batched UDP receive path must gate new sources"
+    );
+    assert_eq!(
+        UDP_PROXY
+            .matches("&& !udp_source_has_established_session(")
+            .count(),
+        4,
+        "every UDP new-source gate (3 batched + 1 single-datagram) must consult \
+         established-session identity rather than a raw session-map key"
     );
     assert!(
         UDP_PROXY.contains(SINGLE_DATAGRAM_GATE),

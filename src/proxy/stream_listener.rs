@@ -186,11 +186,13 @@ impl DtlsListenerOwner {
 /// generation and stays deferred rather than falling back to another owner's
 /// material.
 pub struct MeshNodeWaypointDtlsGeneration {
+    #[allow(dead_code)] // External unit tests / diagnostics.
     generation: u64,
     configs: std::collections::BTreeMap<String, crate::dtls::FrontendDtlsConfig>,
 }
 
 impl MeshNodeWaypointDtlsGeneration {
+    #[allow(dead_code)] // External unit tests / diagnostics.
     #[inline]
     pub fn generation(&self) -> u64 {
         self.generation

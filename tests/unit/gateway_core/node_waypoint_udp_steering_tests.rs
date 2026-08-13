@@ -286,6 +286,38 @@ fn teardown_is_strict_for_both_families_and_verifies_exact_absence() {
     );
 }
 
+/// Issue #2084 / NodeWaypoint UDP Service steering: nft-backed iptables
+/// returns 2 for `-C PREROUTING ... -j <missing-user-chain>`, which is not
+/// the portable "absent" status 1. Teardown must establish the jump target
+/// chain with `-S` first and must not reclassify status 2 as success.
+#[test]
+fn teardown_probes_jump_target_chain_before_rule_check() {
+    let script = node_waypoint_udp_steer_teardown_script();
+
+    let chain_probe = script
+        .find("-S \"$ferrum_jump_target\"")
+        .expect("jump-target chain existence must be probed with -S");
+    let rule_check = script
+        .find("-C \"$@\"")
+        .expect("the jump itself is still checked with -C when the chain exists");
+    assert!(
+        chain_probe < rule_check,
+        "chain existence must be established before the jump probe:\n{script}"
+    );
+    assert!(
+        script.contains("jump-target chain inspection failed")
+            && script.contains("rule inspection failed")
+            && script.contains("[ \"$ferrum_status\" -ne 1 ]"),
+        "absent chains stay success via -S status 1; other statuses stay fail-closed:\n{script}"
+    );
+    assert!(
+        !script.contains("[ \"$ferrum_status\" -eq 2 ]")
+            && !script.contains("-eq 1 -o")
+            && !script.contains("-eq 1] || [ \"$ferrum_status\" -eq 2"),
+        "status 2 must not be reclassified as absence:\n{script}"
+    );
+}
+
 /// POSIX `case` glob (`*` any sequence, `?` any byte). Used to evaluate the
 /// rendered teardown arms the same way `sh` will, without executing the script.
 fn posix_case_glob(text: &str, pattern: &str) -> bool {

@@ -542,6 +542,13 @@ pub fn node_waypoint_udp_steer_setup_script(
 /// post-delete verification failures stay nonzero. Both address-family tools
 /// are mandatory because a predecessor may have left state in a family the
 /// current generation does not publish.
+///
+/// Jump deletion probes the user-chain with `-S` before `-C` of a jump into
+/// it. nft-backed iptables returns 2 for `-C ... -j <missing-chain>` (issue
+/// #2084); treating that as a resource error left first-pass teardown failing
+/// forever and blocked every subsequent setup. `-S` returns 1 for an absent
+/// chain on both legacy and nft backends, so absence stays portable without
+/// accepting lock or permission failures as success.
 pub fn node_waypoint_udp_steer_teardown_script() -> String {
     let helpers = format!(
         "set -e\n\
@@ -550,7 +557,24 @@ pub fn node_waypoint_udp_steer_teardown_script() -> String {
          command -v ip >/dev/null 2>&1 || {{ echo 'iproute2 (ip) is required to reap NodeWaypoint UDP steering' >&2; exit 1; }}\n\
          ferrum_delete_xtables_rule() {{\n\
            ferrum_binary=\"$1\"; ferrum_table=\"$2\"; shift 2\n\
-           if \"$ferrum_binary\" -t \"$ferrum_table\" -w {XTABLES_LOCK_WAIT_SECONDS} -C \"$@\"; then\n\
+           ferrum_jump_target=\"\"; ferrum_prev=\"\"\n\
+           for ferrum_arg in \"$@\"; do\n\
+             if [ \"$ferrum_prev\" = \"-j\" ]; then\n\
+               ferrum_jump_target=\"$ferrum_arg\"\n\
+             fi\n\
+             ferrum_prev=\"$ferrum_arg\"\n\
+           done\n\
+           if [ -n \"$ferrum_jump_target\" ]; then\n\
+             if ! \"$ferrum_binary\" -t \"$ferrum_table\" -w {XTABLES_LOCK_WAIT_SECONDS} -S \"$ferrum_jump_target\" >/dev/null 2>&1; then\n\
+               ferrum_status=$?\n\
+               if [ \"$ferrum_status\" -ne 1 ]; then\n\
+                 echo 'Ferrum NodeWaypoint UDP steering jump-target chain inspection failed' >&2\n\
+                 return \"$ferrum_status\"\n\
+               fi\n\
+               return 0\n\
+             fi\n\
+           fi\n\
+           if \"$ferrum_binary\" -t \"$ferrum_table\" -w {XTABLES_LOCK_WAIT_SECONDS} -C \"$@\" >/dev/null 2>&1; then\n\
              \"$ferrum_binary\" -t \"$ferrum_table\" -w {XTABLES_LOCK_WAIT_SECONDS} -D \"$@\"\n\
            else\n\
              ferrum_status=$?\n\
@@ -559,7 +583,7 @@ pub fn node_waypoint_udp_steer_teardown_script() -> String {
                return \"$ferrum_status\"\n\
              fi\n\
            fi\n\
-           if \"$ferrum_binary\" -t \"$ferrum_table\" -w {XTABLES_LOCK_WAIT_SECONDS} -C \"$@\"; then\n\
+           if \"$ferrum_binary\" -t \"$ferrum_table\" -w {XTABLES_LOCK_WAIT_SECONDS} -C \"$@\" >/dev/null 2>&1; then\n\
              echo 'Ferrum NodeWaypoint UDP steering jump remains after deletion' >&2\n\
              return 1\n\
            else\n\
@@ -572,7 +596,7 @@ pub fn node_waypoint_udp_steer_teardown_script() -> String {
          }}\n\
          ferrum_delete_xtables_chain() {{\n\
            ferrum_binary=\"$1\"; ferrum_table=\"$2\"; ferrum_chain=\"$3\"\n\
-           if \"$ferrum_binary\" -t \"$ferrum_table\" -w {XTABLES_LOCK_WAIT_SECONDS} -S \"$ferrum_chain\" >/dev/null; then\n\
+           if \"$ferrum_binary\" -t \"$ferrum_table\" -w {XTABLES_LOCK_WAIT_SECONDS} -S \"$ferrum_chain\" >/dev/null 2>&1; then\n\
              \"$ferrum_binary\" -t \"$ferrum_table\" -w {XTABLES_LOCK_WAIT_SECONDS} -F \"$ferrum_chain\"\n\
              \"$ferrum_binary\" -t \"$ferrum_table\" -w {XTABLES_LOCK_WAIT_SECONDS} -X \"$ferrum_chain\"\n\
            else\n\
@@ -582,7 +606,7 @@ pub fn node_waypoint_udp_steer_teardown_script() -> String {
                return \"$ferrum_status\"\n\
              fi\n\
            fi\n\
-           if \"$ferrum_binary\" -t \"$ferrum_table\" -w {XTABLES_LOCK_WAIT_SECONDS} -S \"$ferrum_chain\" >/dev/null; then\n\
+           if \"$ferrum_binary\" -t \"$ferrum_table\" -w {XTABLES_LOCK_WAIT_SECONDS} -S \"$ferrum_chain\" >/dev/null 2>&1; then\n\
              echo 'Ferrum NodeWaypoint UDP steering chain remains after deletion' >&2\n\
              return 1\n\
            else\n\
