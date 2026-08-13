@@ -1502,9 +1502,8 @@ async fn run_stock_ads_stream(
     // is why nothing in this loop touches it.
     let credential_deadline = fence.deadline;
     let credential_deadline_sleep = tokio::time::sleep_until(
-        credential_deadline.unwrap_or_else(|| {
-            attempt_started_at + Duration::from_secs(60 * 60 * 24)
-        }),
+        credential_deadline
+            .unwrap_or_else(|| attempt_started_at + Duration::from_secs(60 * 60 * 24)),
     );
     tokio::pin!(credential_deadline_sleep);
     let mut credential_watch_open = true;

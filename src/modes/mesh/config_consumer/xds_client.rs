@@ -1000,8 +1000,7 @@ async fn run_ads_stream_with_auth(
     // The first-frame clock starts at the RPC-open await, not when headers
     // return. Dropping the pending open future cancels it; nothing is detached.
     let attempt_started_at = tokio::time::Instant::now();
-    let first_frame_deadline =
-        tokio::time::sleep_until(attempt_started_at + timings.first_frame);
+    let first_frame_deadline = tokio::time::sleep_until(attempt_started_at + timings.first_frame);
     tokio::pin!(first_frame_deadline);
     let mut response_stream = tokio::select! {
         biased;
@@ -1062,8 +1061,7 @@ async fn run_ads_stream_with_auth(
     // another frame is admitted. Simultaneous clock vs. message/debounce
     // boundaries fail closed (the clock wins).
     let mut awaiting_first_frame = true;
-    let first_slice_deadline =
-        tokio::time::sleep_until(attempt_started_at + timings.first_slice);
+    let first_slice_deadline = tokio::time::sleep_until(attempt_started_at + timings.first_slice);
     tokio::pin!(first_slice_deadline);
     // Armed only while this data plane has never installed a slice.
     let mut awaiting_first_slice = !consumer.state().has_first_slice();
@@ -1393,7 +1391,9 @@ fn trip_nack_circuit_if_needed(
         nack_limit = XDS_CONSECUTIVE_NACK_LIMIT,
         "xDS ADS NACK circuit breaker tripped; closing stream to trigger reconnect/failover"
     );
-    Err(XdsAttemptError::Policy(XdsPolicyRefusal::NackCircuitBreaker))
+    Err(XdsAttemptError::Policy(
+        XdsPolicyRefusal::NackCircuitBreaker,
+    ))
 }
 
 fn apply_pending_xds_slice(

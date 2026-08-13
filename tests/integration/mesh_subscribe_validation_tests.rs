@@ -958,7 +958,10 @@ async fn withholding_mesh_subscribe_headers_cannot_outrun_first_frame() {
         .expect("header withholding must lose to first-frame and fail over");
 
     let snapshot = state.snapshot();
-    let slice = snapshot.as_ref().as_ref().expect("fallback slice installed");
+    let slice = snapshot
+        .as_ref()
+        .as_ref()
+        .expect("fallback slice installed");
     assert_eq!(slice.version, "v-healthy-fallback");
     assert!(withholding.subscribe_count.load(Ordering::Relaxed) >= 1);
     wait_for_native_outcome(&state, "first_frame_timeout", Duration::from_secs(5)).await;
@@ -999,7 +1002,10 @@ async fn continuous_native_heartbeats_cannot_outrun_first_slice() {
         .expect("heartbeat-only primary must lose to first-slice and fail over");
 
     let snapshot = state.snapshot();
-    let slice = snapshot.as_ref().as_ref().expect("fallback slice installed");
+    let slice = snapshot
+        .as_ref()
+        .as_ref()
+        .expect("fallback slice installed");
     assert_eq!(slice.version, "v-healthy-fallback");
     assert!(heartbeating.subscribe_count.load(Ordering::Relaxed) >= 1);
     wait_for_native_outcome(&state, "first_slice_timeout", Duration::from_secs(5)).await;

@@ -820,11 +820,7 @@ fn parse_json_exponent(digits: &[u8], negative: bool) -> Option<i32> {
             .checked_mul(10)?
             .checked_add(i32::from(digit - b'0'))?;
     }
-    if negative {
-        Some(-value)
-    } else {
-        Some(value)
-    }
+    if negative { Some(-value) } else { Some(value) }
 }
 
 fn floor_json_number_to_i64(number: JsonNumber<'_>) -> Option<i64> {
@@ -860,23 +856,16 @@ fn floor_json_number_to_i64(number: JsonNumber<'_>) -> Option<i64> {
         )
     };
 
-    let Some(magnitude) = parse_u64_significand_prefix(
-        int_digits,
-        frac_digits,
-        prefix_len,
-        trailing_zeros,
-    ) else {
+    let Some(magnitude) =
+        parse_u64_significand_prefix(int_digits, frac_digits, prefix_len, trailing_zeros)
+    else {
         return overflow_numeric_date_hint(negative);
     };
     signed_floor(negative, magnitude, has_remainder)
 }
 
 fn overflow_numeric_date_hint(negative: bool) -> Option<i64> {
-    if negative {
-        Some(i64::MIN)
-    } else {
-        None
-    }
+    if negative { Some(i64::MIN) } else { None }
 }
 
 fn digits_all_zero(digits: &[u8]) -> bool {

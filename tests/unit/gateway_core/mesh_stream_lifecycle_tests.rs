@@ -1256,23 +1256,16 @@ fn huge_numeric_date_hints_do_not_overflow_or_become_a_negative_deadline() {
     );
 
     let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
-    let (lifetime, basis) = credential_lifetime(
-        &jwt_with_exp_lexeme("1e30"),
-        lifetime_policy(3600, 0),
-        now,
-    )
-    .expect("an unrepresentable positive hint is admissible as the opaque cap");
+    let (lifetime, basis) =
+        credential_lifetime(&jwt_with_exp_lexeme("1e30"), lifetime_policy(3600, 0), now)
+            .expect("an unrepresentable positive hint is admissible as the opaque cap");
     assert_eq!(lifetime, Duration::from_secs(3600));
     assert_eq!(basis, StockCredentialDeadlineBasis::MaxStreamLifetime);
 
     let hint = jwt_expiration_hint(&jwt_with_exp_lexeme("-1e30")).expect("negative hint");
     assert!(hint < 0);
-    let reason = credential_lifetime(
-        &jwt_with_exp_lexeme("-1e30"),
-        lifetime_policy(3600, 0),
-        now,
-    )
-    .expect_err("a huge negative NumericDate is expired");
+    let reason = credential_lifetime(&jwt_with_exp_lexeme("-1e30"), lifetime_policy(3600, 0), now)
+        .expect_err("a huge negative NumericDate is expired");
     assert_eq!(reason, StockCredentialInvalidReason::Expired);
 }
 
