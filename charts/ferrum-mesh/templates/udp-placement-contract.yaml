@@ -93,7 +93,7 @@
 {{- end -}}
 {{- if or $hasPreviousEra $hasPreviousGeneration -}}
 {{- if or (not $hasPreviousEra) (not $hasPreviousGeneration) -}}
-{{- fail "installed Ambient UDP nodeProofEra/nodeProofGeneration pair is incomplete; both must be present and consistent, or both absent so cleanup can stamp era 1" -}}
+{{- fail "installed Ambient UDP nodeProofEra/nodeProofGeneration pair is incomplete; both must be present and consistent, or both must be absent so cleanup can stamp era 1" -}}
 {{- end -}}
 {{- if not (regexMatch "^[1-9][0-9]{0,9}$" $rawEra) -}}
 {{- fail "installed Ambient UDP nodeProofEra is malformed or out of supported bounds; it must be a 1..=10 digit ordinal with no leading zero" -}}

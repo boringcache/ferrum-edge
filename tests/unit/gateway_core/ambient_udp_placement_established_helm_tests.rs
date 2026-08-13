@@ -613,7 +613,8 @@ fn the_node_agent_receives_the_explicit_uid_and_boot_id_path_from_ambient_env() 
     assert!(
         node_agent.contains("hasKey $ambientEnv \"FERRUM_MESH_CAPTURE_UDP_NODE_BOOT_ID_PATH\"")
             && node_agent.contains("- name: FERRUM_MESH_CAPTURE_UDP_NODE_BOOT_ID_PATH")
-            && node_agent.contains("index $ambientEnv \"FERRUM_MESH_CAPTURE_UDP_NODE_BOOT_ID_PATH\""),
+            && node_agent
+                .contains("index $ambientEnv \"FERRUM_MESH_CAPTURE_UDP_NODE_BOOT_ID_PATH\""),
         "the node-agent must receive ambient.env FERRUM_MESH_CAPTURE_UDP_NODE_BOOT_ID_PATH \
          so it stamps .node-identity-v1.json under the same incarnation the preflight reads"
     );

@@ -235,9 +235,15 @@ fn deadline_cleanup_failed_is_observable_without_leaking_inner_detail() {
         elapsed.deadline_operator_reason(),
         Some("owned command exceeded its deadline and was terminated")
     );
-    assert_eq!(elapsed.to_string(), "script exceeded its deadline and was terminated");
+    assert_eq!(
+        elapsed.to_string(),
+        "script exceeded its deadline and was terminated"
+    );
 
-    assert!(unproven.is_deadline_elapsed(), "callers must still fail closed");
+    assert!(
+        unproven.is_deadline_elapsed(),
+        "callers must still fail closed"
+    );
     assert!(unproven.is_deadline_cleanup_unproven());
     assert_eq!(
         unproven.deadline_operator_reason(),

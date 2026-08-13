@@ -656,56 +656,6 @@ fn print_resolved_secret_sources(resolved: &secrets::ResolvedEnvSecrets) {
     );
 }
 
-/// One-shot Ambient UDP node preflight: secrets, lifecycle-owned logging, FIPS
-/// verification from the fully resolved settings, then predecessor retirement.
-///
-/// Does not parse serving `EnvConfig` or start gateway/listener infrastructure.
-fn run_ambient_udp_preflight(args: &cli::AmbientUdpPreflightArgs) -> i32 {
-    let resolved = match resolve_startup_secrets() {
-        Ok(resolved) => resolved,
-        Err(error) => {
-            emit_bootstrap_error("secret resolution failed", &[("error", error)]);
-            return 1;
-        }
-    };
-    let _logging_guards = match init_logging() {
-        Ok(guards) => guards,
-        Err(error) => {
-            emit_bootstrap_error("logging initialization failed", &[("error", error)]);
-            return 1;
-        }
-    };
-    log_resolved_secret_sources(&resolved);
-
-    // An enforce request that arrives only through ferrum.conf or an external
-    // secret is not visible when the process-default provider is installed.
-    // Fail closed here, before any Kubernetes TLS client is built, rather than
-    // using a provider chosen from that stale view.
-    let fips_raw = config::conf_file::resolve_ferrum_var(fips::FIPS_MODE_ENV)
-        .unwrap_or_else(|| "off".to_string());
-    match fips::FipsMode::parse(&fips_raw).and_then(fips::verify_resolved_mode) {
-        Ok(()) => {}
-        Err(error) => {
-            error!(
-                "FIPS verification failed: {}",
-                secrets::redact_external_secret_values(&error)
-            );
-            return 1;
-        }
-    }
-
-    match cli::execute_ambient_udp_preflight(args) {
-        Ok(()) => 0,
-        Err(error) => {
-            error!(
-                "Ambient UDP node preflight failed: {}",
-                secrets::redact_external_secret_values(&error)
-            );
-            1
-        }
-    }
-}
-
 /// Runs startup secret resolution, logging init, env-config parsing, and the
 /// gateway runtime. Returns the process exit code.
 ///
@@ -1127,4 +1077,57 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
     });
 
     gateway_exit_code
+}
+
+/// One-shot Ambient UDP node preflight: secrets, lifecycle-owned logging, FIPS
+/// verification from the fully resolved settings, then predecessor retirement.
+///
+/// Does not parse serving `EnvConfig` or start gateway/listener infrastructure.
+/// Defined after the serving environment-config parse so the bootstrap
+/// source-inspection contract cannot confuse this privileged one-shot with
+/// gateway startup.
+fn run_ambient_udp_preflight(args: &cli::AmbientUdpPreflightArgs) -> i32 {
+    let resolved = match resolve_startup_secrets() {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            emit_bootstrap_error("secret resolution failed", &[("error", error)]);
+            return 1;
+        }
+    };
+    let _logging_guards = match init_logging() {
+        Ok(guards) => guards,
+        Err(error) => {
+            emit_bootstrap_error("logging initialization failed", &[("error", error)]);
+            return 1;
+        }
+    };
+    log_resolved_secret_sources(&resolved);
+
+    // An enforce request that arrives only through ferrum.conf or an external
+    // secret is not visible when the process-default provider is installed.
+    // Fail closed here, before any Kubernetes TLS client is built, rather than
+    // using a provider chosen from that stale view.
+    let fips_raw = config::conf_file::resolve_ferrum_var(fips::FIPS_MODE_ENV)
+        .unwrap_or_else(|| "off".to_string());
+    match fips::FipsMode::parse(&fips_raw).and_then(fips::verify_resolved_mode) {
+        Ok(()) => {}
+        Err(error) => {
+            error!(
+                "FIPS verification failed: {}",
+                secrets::redact_external_secret_values(&error)
+            );
+            return 1;
+        }
+    }
+
+    match cli::execute_ambient_udp_preflight(args) {
+        Ok(()) => 0,
+        Err(error) => {
+            error!(
+                "Ambient UDP node preflight failed: {}",
+                secrets::redact_external_secret_values(&error)
+            );
+            1
+        }
+    }
 }

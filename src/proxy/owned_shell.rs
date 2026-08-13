@@ -88,9 +88,7 @@ impl OwnedShellError {
     /// pod IDs, addresses, or stderr — only which deadline variant occurred.
     pub fn deadline_operator_reason(&self) -> Option<&'static str> {
         match self {
-            Self::DeadlineElapsed => {
-                Some("owned command exceeded its deadline and was terminated")
-            }
+            Self::DeadlineElapsed => Some("owned command exceeded its deadline and was terminated"),
             Self::DeadlineCleanupFailed { .. } => Some(
                 "owned command exceeded its deadline and owned descendants could not be proven terminated",
             ),

@@ -536,9 +536,8 @@ pub fn execute_ambient_udp_preflight(args: &AmbientUdpPreflightArgs) -> Result<(
         "FERRUM_MESH_CAPTURE_UDP_NODE_PROOF_GENERATION is required by the Ambient UDP node preflight"
             .to_string()
     })?;
-    let explicit_node_uid = parse_explicit_k8s_node_uid(
-        resolve_ferrum_var("FERRUM_K8S_NODE_UID").as_deref(),
-    )?;
+    let explicit_node_uid =
+        parse_explicit_k8s_node_uid(resolve_ferrum_var("FERRUM_K8S_NODE_UID").as_deref())?;
     let node_name = resolve_ferrum_var("FERRUM_K8S_NODE_NAME")
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
