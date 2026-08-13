@@ -133,9 +133,9 @@ Keep two things distinct: the **transport** (how a peer is reached on the wire) 
 - The mesh `RequestAuthentication` (`jwks_auth`) plugin requires the JWT `exp` claim by default (`FERRUM_MESH_REQUEST_AUTH_REQUIRE_EXP=true`); operators may relax it. Expiry validation (rejecting present-but-expired `exp`) is always on.
 - With `FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED=true`, only resolved mTLS mode, frontend client CA verifier, and the lock-free SPIFFE SVID bundle slot (federated trust domains) may hot-swap on slice apply.
 - Frontend cert/key paths remain restart-required inputs for mesh peer auth reload.
-- Coverage includes mesh HTTP/HBONE termination listeners and mesh-shared TCP+TLS / UDP+DTLS stream listeners.
-- `apply_mesh_inbound_tls_reload` publishes swapped `ServerConfig` into HBONE, shared stream TLS, and active `DtlsServer` frontend DTLS configs.
-- A failed inbound `ServerConfig` rebuild (or a client-CA-bundle snapshot read failure) is computed before proxy-config apply and **rejects the whole slice**, keeping the last good config in its entirety (the one `ServerConfig` backs both HTTP/HBONE and the shared TCP+TLS slot, so no authz/policy/ServiceEntry/endpoint update from that slice applies either) — fail-closed. Only the post-accept DTLS `FrontendDtlsConfig` rebuild keeps the previous config for that path and logs a warning without rejecting the slice. Do not reword the `ServerConfig`/snapshot warns back to a path-local "keeping previous TLS config" framing.
+- Coverage includes mesh HTTP/HBONE termination listeners and mesh-shared TCP+TLS stream listeners. Mesh does not materialize terminating UDP+DTLS listeners; opaque datagram-over-mesh UDP stays opaque. PeerAuthentication reload must never mutate ordinary `FERRUM_DTLS_*` servers, active or future.
+- `apply_mesh_inbound_tls_reload` publishes swapped `ServerConfig` into HBONE and the shared TCP+TLS stream slot only.
+- A failed inbound `ServerConfig` rebuild (or a client-CA-bundle snapshot read failure) is computed before proxy-config apply and **rejects the whole slice**, keeping the last good config in its entirety (the one `ServerConfig` backs both HTTP/HBONE and the shared TCP+TLS slot, so no authz/policy/ServiceEntry/endpoint update from that slice applies either) — fail-closed. Do not reword the `ServerConfig`/snapshot warns back to a path-local "keeping previous TLS config" framing.
 - `Disable` is rejected for Ambient and EgressGateway slice updates and keeps the last good config.
 
 ## DestinationRule And Materialization
