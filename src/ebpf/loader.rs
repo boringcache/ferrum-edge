@@ -11,7 +11,7 @@ use std::collections::HashMap;
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 use std::fs::{self, File};
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 use std::os::fd::AsFd;
 
@@ -572,6 +572,11 @@ impl EbpfBackend for AyaEbpfBackend {
     fn clear_pod_inbound_ports6(&mut self, ip: Ipv6Addr) -> Result<(), String> {
         let maps = self.maps.as_mut().ok_or("BPF maps not initialized")?;
         maps.replace_pod_inbound_ports6(ip, &[])
+    }
+
+    fn replace_udp_reply_sources(&mut self, sources: &[(IpAddr, u16)]) -> Result<(), String> {
+        let maps = self.maps.as_mut().ok_or("BPF maps not initialized")?;
+        maps.replace_udp_reply_sources(sources)
     }
 
     fn update_node_probe_port(&mut self, ip: Ipv4Addr, port: u16) -> Result<(), String> {

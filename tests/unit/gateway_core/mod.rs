@@ -68,6 +68,7 @@ mod node_agent_watcher_exit_tests;
 mod node_waypoint_dtls_socket_options_tests;
 mod node_waypoint_observability_tests;
 mod node_waypoint_udp_identity_tests;
+mod node_waypoint_udp_reply_source_tests;
 mod node_waypoint_udp_steering_tests;
 mod observability_delivery_tests;
 mod overload_tests;

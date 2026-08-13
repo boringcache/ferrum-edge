@@ -581,3 +581,257 @@ fn later_full_plan_owns_the_installed_plan_over_an_in_flight_retract() {
     );
     std::mem::forget(steering);
 }
+
+// ── Reply-source authorization lifecycle (issue #3286) ─────────────────────
+//
+// Steering preserves the Service ClusterIP as the datagram's local address, so
+// the listener's reply is source-pinned to it — and a ClusterIP is never a
+// configured node IP, so `tc_inbound` drops that reply unless the exact
+// `(address, port)` pair is authorized. The rules and the authorization are
+// therefore two halves of ONE datapath, and the order they move in is the
+// contract: authorize before steering, withdraw after un-steering, and tear the
+// whole generation down if either half fails.
+
+/// Records reply-source publications on the SAME log as the scripts, so
+/// ordering between the two halves is observable as one sequence.
+struct RecordingPublisher {
+    log: Arc<Mutex<Vec<String>>>,
+    fail: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ferrum_edge::proxy::node_waypoint_udp_reply_source::NodeWaypointUdpReplySourcePublisher
+    for RecordingPublisher
+{
+    fn publish(&self, sources: &[NodeWaypointUdpSteerDestination]) -> Result<(), String> {
+        let entry = if sources.is_empty() {
+            "publish:withdraw".to_string()
+        } else {
+            format!("publish:{}", sources.len())
+        };
+        if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+            self.log
+                .lock()
+                .expect("publisher log")
+                .push(format!("{entry}:failed"));
+            return Err("injected reply-source publication failure".to_string());
+        }
+        self.log.lock().expect("publisher log").push(entry);
+        Ok(())
+    }
+}
+
+/// Runs scripts onto a shared log so publications and scripts interleave.
+struct SharedLogBackend {
+    log: Arc<Mutex<Vec<String>>>,
+}
+
+impl NodeWaypointUdpSteerBackend for SharedLogBackend {
+    fn run_script(&self, script: &str) -> Result<(), String> {
+        let entry = if is_teardown(script) {
+            "script:teardown"
+        } else {
+            "script:setup"
+        };
+        self.log.lock().expect("backend log").push(entry.to_string());
+        Ok(())
+    }
+}
+
+fn shared_log_steering(
+    fail_publish: bool,
+) -> (
+    NodeWaypointUdpSteering,
+    Arc<Mutex<Vec<String>>>,
+    Arc<std::sync::atomic::AtomicBool>,
+) {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let fail = Arc::new(std::sync::atomic::AtomicBool::new(fail_publish));
+    let steering = NodeWaypointUdpSteering::new(Arc::new(SharedLogBackend { log: log.clone() }))
+        .with_reply_source_publisher(Arc::new(RecordingPublisher {
+            log: log.clone(),
+            fail: fail.clone(),
+        }));
+    (steering, log, fail)
+}
+
+fn entries(log: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
+    log.lock().expect("shared log").clone()
+}
+
+/// The apply order. A reply source must be authorized BEFORE the rules that
+/// send datagrams at it exist; the reverse order opens a window on every new
+/// generation in which a workload's datagram reaches the listener and the
+/// listener's reply is dropped by this node's own pod-veth guard.
+#[test]
+fn a_generation_authorizes_its_reply_sources_before_it_steers_anything() {
+    let (steering, log, _fail) = shared_log_steering(false);
+
+    assert_eq!(
+        steering.reconcile_with(
+            &["veth0".to_string()],
+            &[destination("10.96.0.10", 5300), destination("fd00::a", 5300)],
+        ),
+        SteerReconcileOutcome::Applied
+    );
+
+    assert_eq!(
+        entries(&log),
+        vec![
+            // First pass still reaps a predecessor, which withdraws first.
+            "script:teardown".to_string(),
+            "publish:withdraw".to_string(),
+            // Then authorize, and only then steer.
+            "publish:2".to_string(),
+            "script:setup".to_string(),
+        ],
+        "reply sources must be authorized before the steering rules are installed"
+    );
+    forget(steering);
+}
+
+/// The teardown order is the mirror image: the rules go first, so nothing is
+/// steered at an address whose authorization is about to disappear.
+#[test]
+fn a_teardown_unsteers_before_it_withdraws_authorization() {
+    let (steering, log, _fail) = shared_log_steering(false);
+    let ifaces = vec!["veth0".to_string()];
+
+    assert_eq!(
+        steering.reconcile_with(&ifaces, &[destination("10.96.0.10", 5300)]),
+        SteerReconcileOutcome::Applied
+    );
+    log.lock().expect("shared log").clear();
+
+    // Withdrawing the last destination is the ordinary listener-stop path.
+    assert_eq!(
+        steering.reconcile_with(&ifaces, &[]),
+        SteerReconcileOutcome::Removed
+    );
+    assert_eq!(
+        entries(&log),
+        vec!["script:teardown".to_string(), "publish:withdraw".to_string()],
+        "the steering rules must be removed before the authorization they relied on"
+    );
+    forget(steering);
+}
+
+/// A publication that cannot be applied fails the WHOLE generation closed: no
+/// steering rules are installed, so the Service path stays on its pre-existing
+/// fail-closed posture (dropped at the pod-veth guard) rather than becoming a
+/// steered black hole.
+#[test]
+fn a_failed_authorization_refuses_the_generation_and_steers_nothing() {
+    let (steering, log, _fail) = shared_log_steering(true);
+
+    assert_eq!(
+        steering.reconcile_with(&["veth0".to_string()], &[destination("10.96.0.10", 5300)]),
+        SteerReconcileOutcome::Failed
+    );
+    let recorded = entries(&log);
+    assert!(
+        !recorded.iter().any(|entry| entry == "script:setup"),
+        "no steering rule may be installed for a generation whose reply sources \
+         could not be authorized: {recorded:?}"
+    );
+    assert!(
+        recorded.iter().any(|entry| entry.ends_with(":failed")),
+        "the failure must be observed: {recorded:?}"
+    );
+    forget(steering);
+}
+
+/// A failed WITHDRAWAL is never recorded as done. Without this, one transient
+/// I/O error would leave a revoked ClusterIP authorized for the life of the
+/// process, because the quiet-poll short-circuit would report `Unchanged`
+/// forever.
+#[test]
+fn a_failed_withdrawal_is_retried_rather_than_settled() {
+    let (steering, log, fail) = shared_log_steering(false);
+    let ifaces = vec!["veth0".to_string()];
+
+    assert_eq!(
+        steering.reconcile_with(&ifaces, &[destination("10.96.0.10", 5300)]),
+        SteerReconcileOutcome::Applied
+    );
+
+    // The listener stops while the claim directory is unwritable.
+    fail.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        steering.reconcile_with(&ifaces, &[]),
+        SteerReconcileOutcome::Removed
+    );
+    log.lock().expect("shared log").clear();
+
+    // Still failing: the next quiet poll must RE-attempt the withdrawal instead
+    // of settling on `Unchanged`.
+    assert_eq!(
+        steering.reconcile_with(&ifaces, &[]),
+        SteerReconcileOutcome::Removed
+    );
+    assert!(
+        entries(&log)
+            .iter()
+            .any(|entry| entry.starts_with("publish:withdraw")),
+        "an unproven withdrawal must be retried on the next reconcile"
+    );
+
+    // Once it succeeds, the loop settles and stops issuing commands.
+    fail.store(false, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        steering.reconcile_with(&ifaces, &[]),
+        SteerReconcileOutcome::Removed
+    );
+    log.lock().expect("shared log").clear();
+    assert_eq!(
+        steering.reconcile_with(&ifaces, &[]),
+        SteerReconcileOutcome::Unchanged
+    );
+    assert!(
+        entries(&log).is_empty(),
+        "a settled empty plan must run no command at all"
+    );
+    forget(steering);
+}
+
+/// A quiet poll on an UNCHANGED serving generation must not re-publish either —
+/// the reply-source set is part of the applied generation, not a per-poll write.
+#[test]
+fn an_unchanged_generation_republishes_nothing() {
+    let (steering, log, _fail) = shared_log_steering(false);
+    let ifaces = vec!["veth0".to_string()];
+    let destinations = [destination("10.96.0.10", 5300)];
+
+    assert_eq!(
+        steering.reconcile_with(&ifaces, &destinations),
+        SteerReconcileOutcome::Applied
+    );
+    log.lock().expect("shared log").clear();
+    assert_eq!(
+        steering.reconcile_with(&ifaces, &destinations),
+        SteerReconcileOutcome::Unchanged
+    );
+    assert!(entries(&log).is_empty());
+    forget(steering);
+}
+
+/// Shutdown must withdraw the authorization, not just the rules: a proxy that
+/// exits leaving a ClusterIP admissible has left the guard permanently weaker
+/// than it found it.
+#[test]
+fn shutdown_withdraws_every_authorized_reply_source() {
+    let (steering, log, _fail) = shared_log_steering(false);
+
+    assert_eq!(
+        steering.reconcile_with(&["veth0".to_string()], &[destination("10.96.0.10", 5300)]),
+        SteerReconcileOutcome::Applied
+    );
+    log.lock().expect("shared log").clear();
+
+    steering.shutdown();
+    assert_eq!(
+        entries(&log),
+        vec!["script:teardown".to_string(), "publish:withdraw".to_string()],
+        "shutdown must un-steer and then withdraw every authorization"
+    );
+    forget(steering);
+}

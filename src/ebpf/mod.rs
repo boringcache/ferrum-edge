@@ -23,7 +23,7 @@ pub mod veth;
 pub use loader::AyaEbpfBackend;
 
 use std::collections::{HashMap, HashSet};
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -67,6 +67,17 @@ pub const BPF_MAP_NODE_PROBE_PORTS6: &str = "FERRUM_NODE_PROBE_PORTS6";
 /// redirect to `(pod address, port)` pairs the workload actually serves.
 pub const BPF_MAP_POD_INBOUND_PORTS: &str = "FERRUM_POD_INBOUND_PORTS";
 pub const BPF_MAP_POD_INBOUND_PORTS6: &str = "FERRUM_POD_INBOUND_PORTS6";
+/// Exact `(source address, source port)` pairs a serving NodeWaypoint UDP/DTLS
+/// listener may reply to an enrolled pod from (issue #3286).
+///
+/// Written ONLY by the node-agent, from the proxy's serving-lifecycle claims
+/// under `<pod registry dir>/.udp-reply-src` — the proxy's bpffs mount is
+/// read-only by design, so it never touches a BPF map itself. The tc UDP arm
+/// still requires the NodeWaypoint inbound auth mark; this map only supplies
+/// the SOURCE half of that proof for a source-pinned reply whose address is a
+/// Service ClusterIP rather than a configured node IP.
+pub const BPF_MAP_UDP_REPLY_SOURCES: &str = "FERRUM_UDP_REPLY_SOURCES";
+pub const BPF_MAP_UDP_REPLY_SOURCES6: &str = "FERRUM_UDP_REPLY_SOURCES6";
 pub const BPF_MAP_BYPASS_UIDS: &str = "FERRUM_BYPASS_UIDS";
 pub const BPF_MAP_CIDR_EXCLUDE4: &str = "FERRUM_CIDR_EXCLUDE4";
 pub const BPF_MAP_CIDR_EXCLUDE6: &str = "FERRUM_CIDR_EXCLUDE6";
@@ -177,6 +188,8 @@ pub struct CaptureBpfMaps {
     pub node_probe_ports6: &'static str,
     pub pod_inbound_ports: &'static str,
     pub pod_inbound_ports6: &'static str,
+    pub udp_reply_sources: &'static str,
+    pub udp_reply_sources6: &'static str,
     pub bypass_uids: &'static str,
     pub cidr_exclude4: &'static str,
     pub cidr_exclude6: &'static str,
@@ -200,6 +213,8 @@ impl Default for CaptureBpfMaps {
             node_probe_ports6: BPF_MAP_NODE_PROBE_PORTS6,
             pod_inbound_ports: BPF_MAP_POD_INBOUND_PORTS,
             pod_inbound_ports6: BPF_MAP_POD_INBOUND_PORTS6,
+            udp_reply_sources: BPF_MAP_UDP_REPLY_SOURCES,
+            udp_reply_sources6: BPF_MAP_UDP_REPLY_SOURCES6,
             bypass_uids: BPF_MAP_BYPASS_UIDS,
             cidr_exclude4: BPF_MAP_CIDR_EXCLUDE4,
             cidr_exclude6: BPF_MAP_CIDR_EXCLUDE6,
@@ -920,6 +935,21 @@ pub trait EbpfBackend: Send + Sync {
 
     fn clear_pod_inbound_ports6(&mut self, ip: Ipv6Addr) -> Result<(), String>;
 
+    /// Replace the **whole** NodeWaypoint UDP/DTLS reply-source authorization
+    /// set with exactly `sources` (issue #3286). An empty slice revokes every
+    /// entry.
+    ///
+    /// Set-valued rather than per-entry for the same reason
+    /// [`Self::update_pod_inbound_ports`] is: the node-agent's only input is a
+    /// directory of claims the mesh proxy owns, so a proxy crash, restart, or
+    /// missed retraction must converge without the node-agent carrying an
+    /// enumerated removal list that can go stale exactly when it matters.
+    ///
+    /// Implementations MUST remove stale entries before inserting new ones, so
+    /// a partial failure can only ever leave FEWER addresses authorized than
+    /// intended — never a revoked one still live.
+    fn replace_udp_reply_sources(&mut self, sources: &[(IpAddr, u16)]) -> Result<(), String>;
+
     fn update_node_probe_port(&mut self, ip: Ipv4Addr, port: u16) -> Result<(), String>;
     fn remove_node_probe_port(&mut self, ip: Ipv4Addr, port: u16) -> Result<(), String>;
     fn update_node_probe_port6(&mut self, ip: Ipv6Addr, port: u16) -> Result<(), String>;
@@ -1024,6 +1054,13 @@ pub struct MockEbpfBackend {
     /// Declared inbound application ports written to the redirect scope maps.
     pub pod_inbound_ports: HashSet<(Ipv4Addr, u16)>,
     pub pod_inbound_ports6: HashSet<(Ipv6Addr, u16)>,
+    /// NodeWaypoint UDP/DTLS reply sources currently authorized, i.e. the live
+    /// contents of `FERRUM_UDP_REPLY_SOURCES` / `FERRUM_UDP_REPLY_SOURCES6`.
+    pub udp_reply_sources: HashSet<(IpAddr, u16)>,
+    /// Ordered whole-set replacements of [`Self::udp_reply_sources`], so tests
+    /// can assert publication/retraction ORDER (not just the final set) across
+    /// a listener's serving lifecycle.
+    pub udp_reply_source_updates: Vec<Vec<(IpAddr, u16)>>,
     /// Node capture interfaces the ingress redirect classifier is attached to.
     pub ingress_redirect_attachments: Vec<String>,
     /// Number of times `detach_ingress_redirect` ran, so lifecycle tests can
@@ -1103,6 +1140,10 @@ pub struct MockEbpfBackend {
     /// tests can prove a pod whose redirect scope could not be written is not
     /// left flagged for redirect.
     pub fail_update_pod_inbound_port: bool,
+    /// When `true`, `replace_udp_reply_sources` fails so tests can prove that a
+    /// publication the node-agent could not apply is NOT recorded as converged
+    /// and is retried, and that a failed retraction never reports success.
+    pub fail_replace_udp_reply_sources: bool,
     /// When `true`, `clear_pod_inbound_ports` / `clear_pod_inbound_ports6` fail
     /// so removal tests can prove a successful pod-IP map delete that cannot
     /// clear the bounded scope map stays pending and retryable.
@@ -1325,6 +1366,23 @@ impl EbpfBackend for MockEbpfBackend {
         Ok(())
     }
 
+    fn replace_udp_reply_sources(&mut self, sources: &[(IpAddr, u16)]) -> Result<(), String> {
+        if self.fail_replace_udp_reply_sources {
+            return Err(format!(
+                "injected NodeWaypoint UDP reply-source publication failure for {} source(s)",
+                sources.len()
+            ));
+        }
+        // Mirror the real backend: stale entries go first, so a partial failure
+        // can only narrow the authorized set.
+        let desired: HashSet<(IpAddr, u16)> = sources.iter().copied().collect();
+        self.udp_reply_sources.retain(|entry| desired.contains(entry));
+        self.udp_reply_sources.extend(desired.iter().copied());
+        self.udp_reply_source_updates.push(sources.to_vec());
+        self.record_operation(format!("replace_udp_reply_sources:{}", sources.len()));
+        Ok(())
+    }
+
     fn update_node_probe_port(&mut self, ip: Ipv4Addr, port: u16) -> Result<(), String> {
         if self.fail_update_node_probe_port {
             return Err(format!(
@@ -1475,6 +1533,10 @@ impl EbpfBackend for MockEbpfBackend {
         self.node_ips6.clear();
         self.node_probe_ports.clear();
         self.node_probe_ports6.clear();
+        // No reply source outlives the capture generation that authorized it:
+        // the real backend's maps are destroyed with the program, so the mock
+        // must not keep reporting a revoked authorization either.
+        self.udp_reply_sources.clear();
         self.include_ports.clear();
         self.workload_identities.clear();
         self.sock_ops_attached_cgroup_root = None;

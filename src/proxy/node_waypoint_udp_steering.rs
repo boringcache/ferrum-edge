@@ -75,6 +75,18 @@
 //! generation. Steering an interface publication refused would divert its
 //! datagrams to a listener that could only deny them.
 //!
+//! The same serving generation also drives the **reply-source authorization**
+//! this steering makes necessary (see
+//! [`crate::proxy::node_waypoint_udp_reply_source`]). Steering preserves the
+//! ClusterIP as the datagram's local address, so the listener's reply is pinned
+//! to it — and a ClusterIP is not a configured node IP, so `tc_inbound` would
+//! drop that reply without an exact `(address, port)` authorization. The two
+//! halves move together inside one critical section: on apply the sources are
+//! authorized BEFORE the rules exist, on teardown they are withdrawn AFTER the
+//! rules are gone, and a failure in either half tears the whole generation down
+//! rather than leaving a steered-but-unanswerable or authorized-but-unserved
+//! datapath.
+//!
 //! [`NodeWaypointUdpSteering::reconcile`] applies the pair only when it CHANGED,
 //! tears the datapath down whenever either half is empty, ALWAYS runs one
 //! exact-name teardown before this process trusts the datapath (so objects a
@@ -100,6 +112,7 @@ use arc_swap::ArcSwap;
 use tracing::{debug, info, warn};
 
 use crate::capture::NodeWaypointUdpSteerDestination;
+use crate::proxy::node_waypoint_udp_reply_source::NodeWaypointUdpReplySourcePublisher;
 
 /// The steered Service destinations one mesh generation asks for.
 ///
@@ -280,11 +293,27 @@ struct SteeringState {
     /// Latest published attribution interfaces. Paired with
     /// [`Self::desired_destinations`] inside the same critical section.
     desired_ifaces: Vec<String>,
+    /// The reply-source authorization set this process has PROVEN is published
+    /// (`Some(vec![])` = proven withdrawn). `None` means nothing is proven, so
+    /// the next pass must republish or re-withdraw rather than settle.
+    ///
+    /// Kept separate from [`Self::applied`] because the two datapath halves
+    /// fail independently: a successful `iptables` apply whose authorization
+    /// write failed would steer datagrams at a listener whose replies the
+    /// pod-veth guard drops, and a successful withdrawal of the rules whose
+    /// authorization withdrawal failed would leave a ClusterIP admissible with
+    /// no serving socket. Neither may be recorded as settled by the other.
+    published_reply_sources: Option<Vec<NodeWaypointUdpSteerDestination>>,
 }
 
 /// Reconciles the NodeWaypoint Service-steering datapath.
 pub struct NodeWaypointUdpSteering {
     backend: Arc<dyn NodeWaypointUdpSteerBackend>,
+    /// Publishes the exact reply-source authorizations for the serving
+    /// generation (issue #3286). `None` where the datapath cannot exist (no
+    /// registry directory, non-Linux), in which case authorization is
+    /// unnecessary because no listener is materialized either.
+    reply_sources: Option<Arc<dyn NodeWaypointUdpReplySourcePublisher>>,
     /// Guarded by a plain `Mutex` because it is touched once per registry poll
     /// (seconds), never on a datagram path. Desired destinations, desired
     /// interfaces, and the applied generation all live here so a stale cloned
@@ -299,9 +328,24 @@ impl NodeWaypointUdpSteering {
     pub fn new(backend: Arc<dyn NodeWaypointUdpSteerBackend>) -> Self {
         Self {
             backend,
+            reply_sources: None,
             state: Mutex::new(SteeringState::default()),
             bound_destinations: ArcSwap::from_pointee(Vec::new()),
         }
+    }
+
+    /// Attach the reply-source authorization publisher.
+    ///
+    /// Consumed at construction rather than installed later on purpose: the
+    /// publisher and the rule backend must move through every reconcile as one
+    /// unit, so there is no window in which rules are installed for a
+    /// generation whose reply sources were never authorized.
+    pub fn with_reply_source_publisher(
+        mut self,
+        publisher: Arc<dyn NodeWaypointUdpReplySourcePublisher>,
+    ) -> Self {
+        self.reply_sources = Some(publisher);
+        self
     }
 
     /// Destinations currently owned by this serving instance.
@@ -422,17 +466,27 @@ impl NodeWaypointUdpSteering {
         if desired.ifaces.is_empty() || desired.destinations.is_empty() {
             // Nothing to steer. Run the exact-name teardown unless this process
             // has already PROVEN the node holds no Ferrum-owned steering
-            // objects — which is exactly what makes the first pass reap a
-            // crashed predecessor's rules while every later quiet poll runs no
-            // command at all.
-            if state.reaped && state.applied.is_none() {
+            // objects AND no reply source is still authorized — which is
+            // exactly what makes the first pass reap a crashed predecessor's
+            // rules and claims while every later quiet poll runs no command at
+            // all.
+            if state.reaped
+                && state.applied.is_none()
+                && state
+                    .published_reply_sources
+                    .as_ref()
+                    .is_some_and(|published| published.is_empty())
+            {
                 return SteerReconcileOutcome::Unchanged;
             }
             self.tear_down(state);
             return SteerReconcileOutcome::Removed;
         }
 
-        if state.reaped && state.applied.as_ref() == Some(&desired) {
+        if state.reaped
+            && state.applied.as_ref() == Some(&desired)
+            && state.published_reply_sources.as_ref() == Some(&desired.destinations)
+        {
             return SteerReconcileOutcome::Unchanged;
         }
 
@@ -461,10 +515,35 @@ impl NodeWaypointUdpSteering {
 
         // Reap whatever may already be installed before installing the new
         // generation: the previous generation this process applied, or — on the
-        // first pass — a crashed predecessor's objects, which may name an
-        // address family or a destination this generation does not.
-        if !state.reaped || state.applied.is_some() {
+        // first pass — a crashed predecessor's objects and reply-source claims,
+        // which may name an address family or a destination this generation
+        // does not.
+        if !state.reaped
+            || state.applied.is_some()
+            || state.published_reply_sources.is_none()
+            || state
+                .published_reply_sources
+                .as_ref()
+                .is_some_and(|published| !published.is_empty())
+        {
             self.tear_down(state);
+        }
+
+        // Authorize the exact reply sources BEFORE installing the rules that
+        // steer datagrams at them. Ordered this way there is never a window in
+        // which a workload's datagram reaches the listener but the listener's
+        // source-pinned reply is dropped by this node's own pod-veth guard; the
+        // reverse order would make every new generation start with one.
+        if let Err(error) = self.publish_reply_sources(state, &desired.destinations) {
+            warn!(
+                destinations = desired.destinations.len(),
+                %error,
+                "NodeWaypoint UDP/DTLS reply sources could not be authorized; leaving the Service \
+                 path unsteered (and therefore fail-closed at the pod-veth guard) rather than \
+                 steering datagrams at a listener whose replies would be dropped"
+            );
+            self.tear_down(state);
+            return SteerReconcileOutcome::Failed;
         }
 
         match self.backend.run_script(&script) {
@@ -517,6 +596,50 @@ impl NodeWaypointUdpSteering {
         } else {
             state.reaped = true;
             debug!("NodeWaypoint UDP Service steering datapath removed");
+        }
+        // Withdraw the reply-source authorizations AFTER the rules, so nothing
+        // is steered at an address whose authorization has already gone. A
+        // failed withdrawal is NOT recorded as done — the next reconcile must
+        // retry it rather than leave a ClusterIP admissible with no serving
+        // socket.
+        if let Err(error) = self.publish_reply_sources(state, &[]) {
+            warn!(
+                %error,
+                "NodeWaypoint UDP/DTLS reply-source withdrawal reported an error; the \
+                 authorizations stay recorded as unproven and are retried on the next reconcile"
+            );
+        }
+    }
+
+    /// Replace the published reply-source authorization set, recording the
+    /// result so a later pass can tell "proven published" from "unknown".
+    ///
+    /// A publisher-less instance (no registry directory, or a platform with no
+    /// steering datapath) records the set as proven: there is no listener to
+    /// authorize either, so tracking it keeps the quiet-poll `Unchanged`
+    /// short-circuit intact without asserting anything about a node.
+    fn publish_reply_sources(
+        &self,
+        state: &mut SteeringState,
+        sources: &[NodeWaypointUdpSteerDestination],
+    ) -> Result<(), String> {
+        let Some(publisher) = self.reply_sources.as_ref() else {
+            state.published_reply_sources = Some(sources.to_vec());
+            return Ok(());
+        };
+        match publisher.publish(sources) {
+            Ok(()) => {
+                state.published_reply_sources = Some(sources.to_vec());
+                Ok(())
+            }
+            Err(error) => {
+                // The set on the node is now unknown: some claims may have been
+                // withdrawn and others not. Fail closed by forgetting, so the
+                // next pass republishes from scratch instead of trusting a
+                // half-applied generation.
+                state.published_reply_sources = None;
+                Err(error)
+            }
         }
     }
 

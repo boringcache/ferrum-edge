@@ -100,6 +100,7 @@ pub mod netns_capture;
 pub mod netns_udp_capture;
 pub(crate) mod node_waypoint_ingress_capture;
 pub mod node_waypoint_udp_identity;
+pub mod node_waypoint_udp_reply_source;
 pub mod node_waypoint_udp_steering;
 pub mod proxy_protocol;
 pub(crate) mod response_buffer_budget;

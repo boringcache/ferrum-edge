@@ -18,7 +18,7 @@ use aya::maps::{HashMap as BpfHashMap, LpmTrie, MapData};
 use ferrum_ebpf_common::{
     BpfCaptureConfig, FERRUM_CAPTURE_CONFIG_KEY, InboundRedirectKey4, InboundRedirectKey6,
     IncludePortsPolicy, NodeProbePortKey4, NodeProbePortKey6, PodInfo as BpfPodInfo,
-    WorkloadIdentity,
+    UDP_REPLY_SOURCE_MAX_ENTRIES, UdpReplySourceKey4, UdpReplySourceKey6, WorkloadIdentity,
 };
 use ferrum_ebpf_common::{CidrKey4, CidrKey6};
 
@@ -26,7 +26,8 @@ use ferrum_ebpf_common::{CidrKey4, CidrKey6};
 use super::{
     BPF_MAP_CAPTURE_CONFIG, BPF_MAP_NODE_IPS, BPF_MAP_NODE_IPS6, BPF_MAP_NODE_PROBE_PORTS,
     BPF_MAP_NODE_PROBE_PORTS6, BPF_MAP_POD_INBOUND_PORTS, BPF_MAP_POD_INBOUND_PORTS6,
-    BPF_MAP_POD_IPS6, BPF_MAP_WORKLOAD_IDENTITY, PodInfo,
+    BPF_MAP_POD_IPS6, BPF_MAP_UDP_REPLY_SOURCES, BPF_MAP_UDP_REPLY_SOURCES6,
+    BPF_MAP_WORKLOAD_IDENTITY, PodInfo,
 };
 
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
@@ -39,6 +40,8 @@ pub struct BpfMaps {
     node_probe_ports6: Option<BpfHashMap<MapData, NodeProbePortKey6, u8>>,
     pod_inbound_ports: Option<BpfHashMap<MapData, InboundRedirectKey4, u8>>,
     pod_inbound_ports6: Option<BpfHashMap<MapData, InboundRedirectKey6, u8>>,
+    udp_reply_sources: Option<BpfHashMap<MapData, UdpReplySourceKey4, u8>>,
+    udp_reply_sources6: Option<BpfHashMap<MapData, UdpReplySourceKey6, u8>>,
     bypass_uids: BpfHashMap<MapData, u32, u8>,
     cidr_exclude4: LpmTrie<MapData, CidrKey4, u8>,
     cidr_exclude6: LpmTrie<MapData, CidrKey6, u8>,
@@ -147,6 +150,38 @@ impl BpfMaps {
             }
         };
 
+        // NodeWaypoint UDP/DTLS reply-source authorization (issue #3286). A
+        // stale ELF without them is tolerated here and rejected by
+        // `validate_required` for the NodeWaypoint topology, so a node-agent
+        // that cannot authorize the relay's source-pinned replies never reports
+        // ready — rather than serving UDP/DTLS whose every reply this node's own
+        // guard would silently drop.
+        let udp_reply_sources = match bpf.take_map(BPF_MAP_UDP_REPLY_SOURCES) {
+            Some(map) => Some(
+                BpfHashMap::try_from(map)
+                    .map_err(|e| format!("FERRUM_UDP_REPLY_SOURCES type mismatch: {e}"))?,
+            ),
+            None => {
+                tracing::warn!(
+                    "FERRUM_UDP_REPLY_SOURCES map not found; startup readiness will reject node-waypoint eBPF capture before reporting ready"
+                );
+                None
+            }
+        };
+
+        let udp_reply_sources6 = match bpf.take_map(BPF_MAP_UDP_REPLY_SOURCES6) {
+            Some(map) => Some(
+                BpfHashMap::try_from(map)
+                    .map_err(|e| format!("FERRUM_UDP_REPLY_SOURCES6 type mismatch: {e}"))?,
+            ),
+            None => {
+                tracing::warn!(
+                    "FERRUM_UDP_REPLY_SOURCES6 map not found; startup readiness will reject node-waypoint eBPF capture before reporting ready"
+                );
+                None
+            }
+        };
+
         let bypass_uids = BpfHashMap::try_from(
             bpf.take_map("FERRUM_BYPASS_UIDS")
                 .ok_or("FERRUM_BYPASS_UIDS map not found")?,
@@ -241,6 +276,8 @@ impl BpfMaps {
             node_probe_ports6,
             pod_inbound_ports,
             pod_inbound_ports6,
+            udp_reply_sources,
+            udp_reply_sources6,
             bypass_uids,
             cidr_exclude4,
             cidr_exclude6,
@@ -280,6 +317,16 @@ impl BpfMaps {
         }
         if require_workload_identity && self.node_probe_ports6.is_none() {
             missing.push(BPF_MAP_NODE_PROBE_PORTS6);
+        }
+        // Both families are required together: a NodeWaypoint with only one
+        // could authorize its reply source on one family and black-hole the
+        // other, which is exactly the silent half-serving posture readiness
+        // exists to prevent.
+        if require_workload_identity && self.udp_reply_sources.is_none() {
+            missing.push(BPF_MAP_UDP_REPLY_SOURCES);
+        }
+        if require_workload_identity && self.udp_reply_sources6.is_none() {
+            missing.push(BPF_MAP_UDP_REPLY_SOURCES6);
         }
         if missing.is_empty() {
             return Ok(());
@@ -489,6 +536,56 @@ impl BpfMaps {
         Ok(())
     }
 
+    /// Replace the whole NodeWaypoint UDP/DTLS reply-source authorization set
+    /// with exactly `sources` (issue #3286). An empty slice revokes everything.
+    ///
+    /// **Stale entries are removed before new ones are inserted**, in both
+    /// families, so any partial failure can only ever leave FEWER addresses
+    /// authorized than intended. The reverse order would let a failed insert
+    /// return an error while a revoked ClusterIP stayed live.
+    ///
+    /// Absent maps are a **hard error** when there is anything to authorize:
+    /// silently succeeding would let the proxy believe its replies are admitted
+    /// while this node's own guard drops every one of them. Revoking against an
+    /// absent map is a no-op so teardown still succeeds on an older ELF.
+    ///
+    /// A key-iteration error is likewise a hard error, never skipped: the scan
+    /// is what finds the entries to revoke, so swallowing it would report a
+    /// withdrawal that never happened.
+    pub fn replace_udp_reply_sources(&mut self, sources: &[(IpAddr, u16)]) -> Result<(), String> {
+        if sources.len() > UDP_REPLY_SOURCE_MAX_ENTRIES as usize {
+            return Err(format!(
+                "refusing to publish {} NodeWaypoint UDP reply sources; the map holds at most {}",
+                sources.len(),
+                UDP_REPLY_SOURCE_MAX_ENTRIES
+            ));
+        }
+
+        let mut desired4: Vec<UdpReplySourceKey4> = Vec::new();
+        let mut desired6: Vec<UdpReplySourceKey6> = Vec::new();
+        for (addr, port) in sources {
+            match addr {
+                IpAddr::V4(addr) => {
+                    desired4.push(UdpReplySourceKey4::new(ipv4_to_nbo_key(*addr), *port));
+                }
+                IpAddr::V6(addr) => {
+                    desired6.push(UdpReplySourceKey6::new(ipv6_to_nbo_words(*addr), *port));
+                }
+            }
+        }
+
+        replace_udp_reply_source_family(
+            self.udp_reply_sources.as_mut(),
+            &desired4,
+            BPF_MAP_UDP_REPLY_SOURCES,
+        )?;
+        replace_udp_reply_source_family(
+            self.udp_reply_sources6.as_mut(),
+            &desired6,
+            BPF_MAP_UDP_REPLY_SOURCES6,
+        )
+    }
+
     pub fn insert_bypass_uid(&mut self, uid: u32) -> Result<(), String> {
         let map = &mut self.bypass_uids;
         map.insert(uid, 1u8, 0)
@@ -617,6 +714,52 @@ impl BpfMaps {
             )),
         }
     }
+}
+
+/// Shared per-family body of [`BpfMaps::replace_udp_reply_sources`]. Generic so
+/// IPv4 and IPv6 cannot drift into different removal/insert orders — the very
+/// asymmetry that would make one family fail open.
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+fn replace_udp_reply_source_family<K>(
+    map: Option<&mut BpfHashMap<MapData, K, u8>>,
+    desired: &[K],
+    map_name: &str,
+) -> Result<(), String>
+where
+    K: aya::Pod + PartialEq,
+{
+    let Some(map) = map else {
+        if desired.is_empty() {
+            return Ok(());
+        }
+        return Err(format!(
+            "{map_name} map is absent; cannot authorize NodeWaypoint UDP/DTLS reply sources"
+        ));
+    };
+
+    let mut stale: Vec<K> = Vec::new();
+    for key in map.keys() {
+        let key = key.map_err(|e| {
+            format!(
+                "Failed to scan {map_name} for withdrawn NodeWaypoint UDP/DTLS reply sources: {e}. \
+                 Refusing to report the set replaced: a withdrawn address may still be authorized."
+            )
+        })?;
+        if !desired.contains(&key) {
+            stale.push(key);
+        }
+    }
+    // Revoke first. A failure here aborts before anything new is authorized, so
+    // the map can only ever be narrower than intended, never wider.
+    for key in stale {
+        tolerate_missing_map_remove(map.remove(&key), || format!("a withdrawn {map_name} entry"))?;
+    }
+    for key in desired {
+        map.insert(*key, 1u8, 0).map_err(|e| {
+            format!("Failed to authorize a NodeWaypoint UDP/DTLS reply source in {map_name}: {e}")
+        })?;
+    }
+    Ok(())
 }
 
 #[cfg(all(feature = "ebpf", target_os = "linux"))]

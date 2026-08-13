@@ -8,8 +8,9 @@ use aya_ebpf::maps::{HashMap, LpmTrie, LruHashMap, PerCpuArray, RingBuf, SockHas
 use ferrum_ebpf_common::{
     AcceptFirstByteState, BpfCaptureConfig, CidrKey4, CidrKey6, ConnTuple4, ConnTuple6,
     InboundRedirectKey4, InboundRedirectKey6, IncludePortsPolicy, NodeProbePortKey4,
-    NodeProbePortKey6, OrigDst4, OrigDst6, OrigDstKey, PodInfo, WorkloadIdentity,
-    ACCEPT_FIRST_BYTE_MAP_MAX_ENTRIES, SOCK_OPS_RINGBUF_DEFAULT_BYTES, SOCK_OPS_STATS_LEN,
+    NodeProbePortKey6, OrigDst4, OrigDst6, OrigDstKey, PodInfo, UdpReplySourceKey4,
+    UdpReplySourceKey6, WorkloadIdentity, ACCEPT_FIRST_BYTE_MAP_MAX_ENTRIES,
+    SOCK_OPS_RINGBUF_DEFAULT_BYTES, SOCK_OPS_STATS_LEN, UDP_REPLY_SOURCE_MAX_ENTRIES,
 };
 
 /// Original IPv4 destination before connect rewrite, keyed by socket cookie.
@@ -104,6 +105,30 @@ pub static FERRUM_POD_INBOUND_PORTS: HashMap<InboundRedirectKey4, u8> =
 #[map]
 pub static FERRUM_POD_INBOUND_PORTS6: HashMap<InboundRedirectKey6, u8> =
     HashMap::with_max_entries(16384, 0);
+
+/// Exact `(source address, source port)` pairs a serving NodeWaypoint UDP/DTLS
+/// listener is authorized to reply to an enrolled pod from.
+///
+/// The tc UDP arm consults this ONLY as an alternative to
+/// `FERRUM_NODE_IPS`/`FERRUM_NODE_IPS6` for the SOURCE half of the existing
+/// two-part proof — the NodeWaypoint inbound auth mark is still required. It
+/// exists because a NodeWaypoint UDP/DTLS reply is source-PINNED rather than
+/// route-selected: on the Service path the reply must leave from the Service
+/// ClusterIP the client addressed, which is never a configured node IP, so the
+/// marked and correctly scoped reply was previously dropped by this very guard.
+///
+/// The proxy publishes an entry only while the matching listener is bound and
+/// serving, and retracts it before the socket goes away, so an entry is a live
+/// statement about a serving socket rather than about configuration. TCP never
+/// reads this map.
+#[map]
+pub static FERRUM_UDP_REPLY_SOURCES: HashMap<UdpReplySourceKey4, u8> =
+    HashMap::with_max_entries(UDP_REPLY_SOURCE_MAX_ENTRIES, 0);
+
+/// IPv6 counterpart to `FERRUM_UDP_REPLY_SOURCES`.
+#[map]
+pub static FERRUM_UDP_REPLY_SOURCES6: HashMap<UdpReplySourceKey6, u8> =
+    HashMap::with_max_entries(UDP_REPLY_SOURCE_MAX_ENTRIES, 0);
 
 /// UIDs exempt from outbound capture (proxy UID 1337).
 /// Connect hooks skip rewrite when the calling process matches.

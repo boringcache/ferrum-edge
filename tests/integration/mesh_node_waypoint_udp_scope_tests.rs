@@ -1373,3 +1373,269 @@ fn a_withdrawn_or_disabled_generation_clears_desired_steering_metadata() {
         "disabling the listener switch must clear desired steering metadata"
     );
 }
+
+// ── Reply-source authorization reconciliation (issue #3286) ────────────────
+//
+// The materialized listener's reply is source-PINNED to the address the client
+// addressed. On the Service path that is the Service ClusterIP, which is never
+// a configured node IP, so `tc_inbound`'s enrolled-destination guard dropped
+// every steered reply — the datapath the live gate's
+// `node_waypoint.udp.service_path_allow_attributed_source` exercises.
+//
+// The repair is an exact, lifecycle-bound authorization: the serving proxy
+// publishes `(address, port)` claims into the pod registry directory, and the
+// node-agent — still the sole writer of every BPF map, because the proxy's
+// bpffs mount is deliberately read-only — reconciles them into
+// `FERRUM_UDP_REPLY_SOURCES` / `FERRUM_UDP_REPLY_SOURCES6`. These tests pin the
+// node-agent half of that contract end to end, against the real publisher.
+
+use dashmap::DashMap;
+use ferrum_edge::capture::{CaptureConfig, CaptureMode, NodeWaypointUdpSteerDestination};
+use ferrum_edge::ebpf::{
+    CaptureContract, FallbackMode, MockEbpfBackend, NodeAgentProxyMode, PodAttachmentState,
+};
+use ferrum_edge::modes::node_agent::{
+    NodeAgentConfig, NodeWaypointUdpReplySourceState,
+    node_waypoint_udp_reply_source_reconcile_enabled, reconcile_node_waypoint_udp_reply_sources,
+};
+use ferrum_edge::proxy::node_waypoint_udp_reply_source::{
+    NODE_WAYPOINT_UDP_REPLY_SOURCE_DIR, NodeWaypointUdpReplySourcePublisher,
+    RegistryDirReplySourcePublisher,
+};
+
+fn reply_source(ip: &str, port: u16) -> NodeWaypointUdpSteerDestination {
+    NodeWaypointUdpSteerDestination {
+        ip: ip.parse().expect("reply source address"),
+        port,
+    }
+}
+
+fn node_waypoint_config(registry_dir: Option<&std::path::Path>) -> NodeAgentConfig {
+    let mut capture_config = CaptureConfig::explicit(15006, 15001);
+    capture_config.mode = CaptureMode::Ebpf;
+    let mut capture_contract = CaptureContract::local_pod_defaults();
+    capture_contract.proxy_mode = NodeAgentProxyMode::NodeWaypoint;
+    NodeAgentConfig {
+        node_name: "node-a".to_string(),
+        capture_config,
+        cgroup_root: "/nonexistent".to_string(),
+        bpf_fs_path: "/nonexistent".to_string(),
+        fallback_mode: FallbackMode::Fail,
+        excluded_namespaces: std::collections::HashSet::new(),
+        capture_contract,
+        trust_domain: "cluster.local".to_string(),
+        node_waypoint_pod_registry_dir: registry_dir.map(|dir| dir.to_path_buf()),
+    }
+}
+
+fn enrolled_pod(uid: &str, pod_ip: &str) -> PodAttachmentState {
+    PodAttachmentState {
+        pod_uid: uid.to_string(),
+        pod_name: "enrolled".to_string(),
+        namespace: "team-a".to_string(),
+        pod_ip: Some(pod_ip.parse().expect("pod ip")),
+        pod_ip6: None,
+        cgroup_path: None,
+        veth_iface: Some("veth-mock".to_string()),
+        attached: true,
+        include_ports_cgroup_ids: Vec::new(),
+        include_ports_policy: None,
+        workload_identity_cgroup_ids: Vec::new(),
+        node_probe_ports: Vec::new(),
+        inbound_redirect_ports: Vec::new(),
+    }
+}
+
+fn authorized(backend: &MockEbpfBackend) -> Vec<(std::net::IpAddr, u16)> {
+    let mut sources: Vec<(std::net::IpAddr, u16)> =
+        backend.udp_reply_sources.iter().copied().collect();
+    sources.sort();
+    sources
+}
+
+/// The reconciliation the live Service path depends on: what the serving proxy
+/// published is exactly what becomes authorized, on BOTH families.
+#[test]
+fn published_claims_become_the_authorized_reply_source_set() {
+    let registry = tempfile::tempdir().expect("registry dir");
+    let publisher = RegistryDirReplySourcePublisher::new(registry.path());
+    let v4 = reply_source("10.96.0.10", 5300);
+    let v6 = reply_source("fd00:10:96::a", 5300);
+    publisher.publish(&[v4, v6]).expect("publication");
+
+    let mut backend = MockEbpfBackend::default();
+    let pods = DashMap::new();
+    let config = node_waypoint_config(Some(registry.path()));
+    let mut state = NodeWaypointUdpReplySourceState::default();
+    reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
+
+    assert_eq!(authorized(&backend), {
+        let mut expected = vec![(v4.ip, v4.port), (v6.ip, v6.port)];
+        expected.sort();
+        expected
+    });
+}
+
+/// Retraction is the security-relevant half. A listener that stopped serving
+/// must lose its authorization; retaining it would leave a ClusterIP admissible
+/// to enrolled pods with no socket behind it.
+#[test]
+fn withdrawing_a_claim_revokes_its_authorization() {
+    let registry = tempfile::tempdir().expect("registry dir");
+    let publisher = RegistryDirReplySourcePublisher::new(registry.path());
+    let kept = reply_source("10.96.0.11", 5301);
+    publisher
+        .publish(&[reply_source("10.96.0.10", 5300), kept])
+        .expect("publication");
+
+    let mut backend = MockEbpfBackend::default();
+    let pods = DashMap::new();
+    let config = node_waypoint_config(Some(registry.path()));
+    let mut state = NodeWaypointUdpReplySourceState::default();
+    reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
+    assert_eq!(authorized(&backend).len(), 2);
+
+    publisher.publish(&[kept]).expect("withdrawal");
+    reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
+    assert_eq!(
+        authorized(&backend),
+        vec![(kept.ip, kept.port)],
+        "a withdrawn reply source must lose its authorization"
+    );
+
+    publisher.publish(&[]).expect("full retraction");
+    reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
+    assert!(
+        authorized(&backend).is_empty(),
+        "a full retraction must leave nothing authorized"
+    );
+}
+
+/// Containment: the relay may authorize a Service address, never a workload's
+/// own. Otherwise a compromised or buggy proxy could authorize itself to answer
+/// enrolled pods AS one of the pods this guard exists to protect.
+#[test]
+fn a_claim_naming_an_enrolled_pod_address_is_refused() {
+    let registry = tempfile::tempdir().expect("registry dir");
+    let publisher = RegistryDirReplySourcePublisher::new(registry.path());
+    let service = reply_source("10.96.0.10", 5300);
+    let pod_address = reply_source("10.244.1.7", 5300);
+    publisher
+        .publish(&[service, pod_address])
+        .expect("publication");
+
+    let mut backend = MockEbpfBackend::default();
+    let pods = DashMap::new();
+    pods.insert(
+        POD_A.to_string(),
+        enrolled_pod(POD_A, "10.244.1.7"),
+    );
+    let config = node_waypoint_config(Some(registry.path()));
+    let mut state = NodeWaypointUdpReplySourceState::default();
+    reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
+
+    assert_eq!(
+        authorized(&backend),
+        vec![(service.ip, service.port)],
+        "an enrolled pod address must never become an authorized reply source"
+    );
+}
+
+/// Nothing published means nothing authorized — and a directory that has never
+/// existed is exactly that, not an error that would make the agent retain a
+/// previous generation's set.
+#[test]
+fn an_absent_claim_directory_authorizes_nothing() {
+    let registry = tempfile::tempdir().expect("registry dir");
+    let publisher = RegistryDirReplySourcePublisher::new(registry.path());
+    publisher
+        .publish(&[reply_source("10.96.0.10", 5300)])
+        .expect("publication");
+
+    let mut backend = MockEbpfBackend::default();
+    let pods = DashMap::new();
+    let config = node_waypoint_config(Some(registry.path()));
+    let mut state = NodeWaypointUdpReplySourceState::default();
+    reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
+    assert_eq!(authorized(&backend).len(), 1);
+
+    // The proxy's whole claim directory disappears (a restart wiping its
+    // scratch state, a remount). Authorization must not survive it.
+    std::fs::remove_dir_all(registry.path().join(NODE_WAYPOINT_UDP_REPLY_SOURCE_DIR))
+        .expect("remove claim dir");
+    reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
+    assert!(
+        authorized(&backend).is_empty(),
+        "authorization must not outlive the claims that justified it"
+    );
+}
+
+/// A map write that failed is not evidence of anything, so the reconcile must
+/// not record it as converged — the next pass has to rewrite from scratch.
+#[test]
+fn a_failed_map_write_is_retried_on_the_next_pass() {
+    let registry = tempfile::tempdir().expect("registry dir");
+    let publisher = RegistryDirReplySourcePublisher::new(registry.path());
+    let service = reply_source("10.96.0.10", 5300);
+    publisher.publish(&[service]).expect("publication");
+
+    let mut backend = MockEbpfBackend {
+        fail_replace_udp_reply_sources: true,
+        ..MockEbpfBackend::default()
+    };
+    let pods = DashMap::new();
+    let config = node_waypoint_config(Some(registry.path()));
+    let mut state = NodeWaypointUdpReplySourceState::default();
+    reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
+    assert!(authorized(&backend).is_empty());
+
+    backend.fail_replace_udp_reply_sources = false;
+    reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
+    assert_eq!(
+        authorized(&backend),
+        vec![(service.ip, service.port)],
+        "a failed write must be retried rather than recorded as applied"
+    );
+}
+
+/// The reconcile runs on a 250 ms poll, so an unchanged claim set must issue no
+/// map calls at all.
+#[test]
+fn a_quiet_poll_issues_no_map_write() {
+    let registry = tempfile::tempdir().expect("registry dir");
+    let publisher = RegistryDirReplySourcePublisher::new(registry.path());
+    publisher
+        .publish(&[reply_source("10.96.0.10", 5300)])
+        .expect("publication");
+
+    let mut backend = MockEbpfBackend::default();
+    let pods = DashMap::new();
+    let config = node_waypoint_config(Some(registry.path()));
+    let mut state = NodeWaypointUdpReplySourceState::default();
+    for _ in 0..4 {
+        reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
+    }
+    assert_eq!(
+        backend.udp_reply_source_updates.len(),
+        1,
+        "only the first pass may write; the rest are already converged"
+    );
+}
+
+/// The channel exists for one topology. A local-pod node-agent has no
+/// NodeWaypoint UDP/DTLS relay whose replies could need authorizing, and
+/// without a registry directory there is no channel to read.
+#[test]
+fn the_reconcile_is_node_waypoint_and_registry_scoped() {
+    let registry = tempfile::tempdir().expect("registry dir");
+    assert!(node_waypoint_udp_reply_source_reconcile_enabled(
+        &node_waypoint_config(Some(registry.path()))
+    ));
+    assert!(!node_waypoint_udp_reply_source_reconcile_enabled(
+        &node_waypoint_config(None)
+    ));
+
+    let mut local_pod = node_waypoint_config(Some(registry.path()));
+    local_pod.capture_contract.proxy_mode = NodeAgentProxyMode::LocalPod;
+    assert!(!node_waypoint_udp_reply_source_reconcile_enabled(&local_pod));
+}

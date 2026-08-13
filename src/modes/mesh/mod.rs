@@ -13427,12 +13427,24 @@ async fn arm_mesh_runtime_startup(
             // without them fails the plan closed and logs it, leaving the
             // Service path unsteered rather than unauthorized.
             if crate::proxy::node_waypoint_udp_steering::steering_supported() {
+                // Steering preserves the ClusterIP as the datagram's local
+                // address, so the listener's reply is source-pinned to it — and
+                // a ClusterIP is never a configured node IP, so `tc_inbound`
+                // would drop that reply. The publisher authorizes exactly the
+                // serving `(ClusterIP, port)` reply sources through the pod
+                // registry directory the node-agent already polls; the
+                // node-agent stays the sole writer of every BPF map.
+                use crate::proxy::node_waypoint_udp_reply_source::RegistryDirReplySourcePublisher;
+                let reply_sources = std::sync::Arc::new(RegistryDirReplySourcePublisher::new(
+                    &env_config.mesh_node_waypoint_pod_registry_dir,
+                ));
                 let steering = std::sync::Arc::new(
                     crate::proxy::node_waypoint_udp_steering::NodeWaypointUdpSteering::new(
                         std::sync::Arc::new(
                             crate::proxy::node_waypoint_udp_steering::HostNamespaceSteerBackend,
                         ),
-                    ),
+                    )
+                    .with_reply_source_publisher(reply_sources),
                 );
                 manager = manager.with_steering(steering.clone());
                 serving_udp_steering = Some(steering);

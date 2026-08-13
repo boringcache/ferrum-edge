@@ -2098,6 +2098,13 @@ where
     let mut udp_readiness_interval = tokio::time::interval(UDP_CAPTURE_READINESS_POLL);
     udp_readiness_interval.tick().await;
     let mut udp_ready_uids = HashSet::new();
+    // NodeWaypoint UDP/DTLS reply-source authorization (issue #3286). Shares
+    // the readiness cadence: the proxy withdraws a claim before its listener's
+    // socket goes away, so this is the bound on how long a revoked ClusterIP
+    // can stay authorized, and it must stay short.
+    let mut udp_reply_source_interval = tokio::time::interval(UDP_CAPTURE_READINESS_POLL);
+    udp_reply_source_interval.tick().await;
+    let mut udp_reply_source_state = NodeWaypointUdpReplySourceState::default();
 
     let exit_reason = loop {
         if *shutdown_rx.borrow() {
@@ -2638,6 +2645,15 @@ where
                     metrics.as_ref(),
                     &mut udp_ready_uids,
                     startup_ready.load(Ordering::Acquire),
+                );
+            }
+            _ = udp_reply_source_interval.tick(),
+                if node_waypoint_udp_reply_source_reconcile_enabled(config) => {
+                reconcile_node_waypoint_udp_reply_sources(
+                    owner.backend_mut(),
+                    config,
+                    &pod_states,
+                    &mut udp_reply_source_state,
                 );
             }
         }
@@ -5989,6 +6005,159 @@ fn reap_orphaned_udp_handshake_markers_older_than(
             continue;
         }
         reaped += 1;
+    }
+}
+
+/// Whether this node-agent should reconcile the mesh proxy's NodeWaypoint
+/// UDP/DTLS reply-source claims into the BPF authorization maps (issue #3286).
+///
+/// NodeWaypoint-only: the claims authorize the source-pinned replies of a
+/// NodeWaypoint UDP/DTLS relay, and only that topology has one. Without a
+/// registry directory there is no channel the proxy could have published on.
+pub fn node_waypoint_udp_reply_source_reconcile_enabled(config: &NodeAgentConfig) -> bool {
+    config.capture_contract.proxy_mode == NodeAgentProxyMode::NodeWaypoint
+        && config.node_waypoint_pod_registry_dir.is_some()
+}
+
+/// What this node-agent has proven about the reply-source authorization maps.
+#[derive(Debug, Default)]
+pub struct NodeWaypointUdpReplySourceState {
+    /// The set last successfully written, so a quiet poll issues no map calls.
+    /// `None` means unknown — a write failed, so the next pass must rewrite.
+    applied: Option<Vec<(std::net::IpAddr, u16)>>,
+    /// Closed-set reason for the last refusal, so a 250 ms poll cannot turn a
+    /// persistent fault into a log flood: the warning fires only on transition.
+    last_diagnostic: Option<&'static str>,
+}
+
+impl NodeWaypointUdpReplySourceState {
+    /// Emit `reason` once per transition. Reasons are `&'static str` from a
+    /// closed set — never a claim value, a path, or an address.
+    fn report(&mut self, reason: Option<&'static str>, detail: Option<&str>) {
+        if self.last_diagnostic == reason {
+            return;
+        }
+        self.last_diagnostic = reason;
+        match (reason, detail) {
+            (Some(reason), Some(detail)) => warn!(
+                reason,
+                detail,
+                "NodeWaypoint UDP/DTLS reply-source authorization refused; the relay's \
+                 source-pinned replies stay denied by the pod-veth guard until it converges"
+            ),
+            (Some(reason), None) => warn!(
+                reason,
+                "NodeWaypoint UDP/DTLS reply-source authorization refused; the relay's \
+                 source-pinned replies stay denied by the pod-veth guard until it converges"
+            ),
+            (None, _) => debug!("NodeWaypoint UDP/DTLS reply-source authorization converged"),
+        }
+    }
+}
+
+/// Reconcile the proxy's published reply-source claims into
+/// `FERRUM_UDP_REPLY_SOURCES` / `FERRUM_UDP_REPLY_SOURCES6`.
+///
+/// The claims are a whole-set statement owned by the serving proxy, so this is
+/// a whole-set replacement: a proxy crash, restart, or missed retraction
+/// converges without the node-agent carrying an enumerated removal list.
+///
+/// Fail-closed at every step. An unreadable claim directory authorizes nothing
+/// rather than retaining the previous set (an inability to prove a claim is not
+/// evidence for it); an unparseable claim name is skipped; a set over the map
+/// bound refuses ENTIRELY rather than truncating to an arbitrary subset; and a
+/// claim naming an ENROLLED POD ADDRESS is refused outright, so the relay can
+/// never authorize itself to answer as one of the workloads this guard protects.
+pub fn reconcile_node_waypoint_udp_reply_sources(
+    backend: &mut dyn EbpfBackend,
+    config: &NodeAgentConfig,
+    pod_states: &DashMap<String, PodAttachmentState>,
+    state: &mut NodeWaypointUdpReplySourceState,
+) {
+    let Some(registry_dir) = config.node_waypoint_pod_registry_dir.as_deref() else {
+        return;
+    };
+
+    let (claims, unparsed) =
+        match crate::proxy::node_waypoint_udp_reply_source::read_claims(registry_dir) {
+            Ok(read) => read,
+            Err(error) => {
+                // Withdraw rather than retain: a directory this agent cannot
+                // read is not evidence that anything is still serving.
+                state.report(Some("claim_directory_unreadable"), Some(error.as_str()));
+                apply_node_waypoint_udp_reply_sources(backend, &[], state, false);
+                return;
+            }
+        };
+    if unparsed > 0 {
+        debug!(
+            unparsed,
+            "Skipped unparseable NodeWaypoint UDP/DTLS reply-source claims"
+        );
+    }
+
+    let mut enrolled_pod_addrs: HashSet<std::net::IpAddr> = HashSet::new();
+    for entry in pod_states.iter() {
+        if let Some(ip) = entry.value().pod_ip {
+            enrolled_pod_addrs.insert(std::net::IpAddr::V4(ip));
+        }
+        if let Some(ip) = entry.value().pod_ip6 {
+            enrolled_pod_addrs.insert(std::net::IpAddr::V6(ip));
+        }
+    }
+
+    let mut sources: Vec<(std::net::IpAddr, u16)> = Vec::with_capacity(claims.len());
+    let mut refused_pod_addr = 0usize;
+    for claim in &claims {
+        if enrolled_pod_addrs.contains(&claim.ip) {
+            refused_pod_addr += 1;
+            continue;
+        }
+        sources.push((claim.ip, claim.port));
+    }
+
+    if sources.len() > ferrum_ebpf_common::UDP_REPLY_SOURCE_MAX_ENTRIES as usize {
+        // Refuse the whole set: truncating would authorize an arbitrary subset
+        // and silently black-hole the rest.
+        state.report(Some("claim_count_exceeds_map_bound"), None);
+        apply_node_waypoint_udp_reply_sources(backend, &[], state, false);
+        return;
+    }
+    if refused_pod_addr > 0 {
+        state.report(Some("claim_names_enrolled_pod_address"), None);
+    }
+
+    apply_node_waypoint_udp_reply_sources(backend, &sources, state, refused_pod_addr == 0);
+}
+
+/// Write one whole-set replacement, skipping the map calls when the set is
+/// already proven applied. `clear_diagnostic` lets the caller keep a refusal
+/// reason latched while it publishes the narrowed set that refusal implies.
+fn apply_node_waypoint_udp_reply_sources(
+    backend: &mut dyn EbpfBackend,
+    sources: &[(std::net::IpAddr, u16)],
+    state: &mut NodeWaypointUdpReplySourceState,
+    clear_diagnostic: bool,
+) {
+    if state.applied.as_deref() == Some(sources) {
+        if clear_diagnostic {
+            state.report(None, None);
+        }
+        return;
+    }
+    match backend.replace_udp_reply_sources(sources) {
+        Ok(()) => {
+            state.applied = Some(sources.to_vec());
+            if clear_diagnostic {
+                state.report(None, None);
+            }
+        }
+        Err(error) => {
+            // The map contents are now unknown, so forget the applied set and
+            // rewrite from scratch on the next pass.
+            state.applied = None;
+            state.report(Some("map_write_failed"), Some(error.as_str()));
+        }
     }
 }
 

@@ -414,6 +414,73 @@ impl NodeProbePortKey6 {
     }
 }
 
+/// Key for `FERRUM_UDP_REPLY_SOURCES`: one EXACT `(source address, source
+/// port)` a serving NodeWaypoint UDP/DTLS listener is authorized to answer an
+/// enrolled pod from.
+///
+/// This is deliberately NOT a node-address or CIDR concept. A NodeWaypoint
+/// UDP/DTLS reply is not route-selected: the listener pins its source to the
+/// exact local address the client addressed (`IP_PKTINFO`/`IPV6_PKTINFO` over an
+/// `IP_TRANSPARENT` socket), which on the Service path is the Service ClusterIP,
+/// and its source PORT is the bound listener port. So the reply's own two-tuple
+/// is knowable in advance, and authorizing exactly that pair is the narrowest
+/// statement that admits the relay's reply without admitting anything else.
+///
+/// Entries exist ONLY while the matching listener is bound and serving on the
+/// accepted generation (see `crate::proxy::node_waypoint_udp_reply_source` on
+/// the userspace side). An address that was merely parsed out of a candidate
+/// configuration never reaches this map.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UdpReplySourceKey4 {
+    /// Source IPv4 address in network byte order, matching the on-wire header.
+    pub addr: u32,
+    /// UDP source port in HOST byte order (the classifier converts before the
+    /// lookup, exactly as the probe/redirect scope keys do).
+    pub port: u16,
+    pub _pad: u16,
+}
+
+impl UdpReplySourceKey4 {
+    pub const fn new(addr: u32, port: u16) -> Self {
+        Self {
+            addr,
+            port,
+            _pad: 0,
+        }
+    }
+}
+
+/// IPv6 counterpart to [`UdpReplySourceKey4`]. IPv4 and IPv6 parity is
+/// mandatory here: a dual-stack NodeWaypoint that authorized only one family
+/// would silently black-hole every reply on the other.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UdpReplySourceKey6 {
+    pub addr: [u32; 4],
+    pub port: u16,
+    pub _pad: u16,
+}
+
+impl UdpReplySourceKey6 {
+    pub const fn new(addr: [u32; 4], port: u16) -> Self {
+        Self {
+            addr,
+            port,
+            _pad: 0,
+        }
+    }
+}
+
+/// Bound on each NodeWaypoint UDP/DTLS reply-source authorization map.
+///
+/// One entry per serving `(Service address, port)` on this node. Sized well
+/// above any realistic per-node in-mesh UDP/DTLS service-port count while
+/// staying small enough that a bug cannot turn the map into an unbounded
+/// authorization surface; the userspace publisher refuses to exceed it rather
+/// than letting the kernel silently reject the overflow.
+pub const UDP_REPLY_SOURCE_MAX_ENTRIES: u32 = 1024;
+
 /// Per-cgroup workload identity in the `FERRUM_WORKLOAD_IDENTITY` map, keyed by
 /// cgroup id (`bpf_get_current_cgroup_id`).
 ///
@@ -1061,6 +1128,8 @@ mod userspace_pod {
         NodeProbePortKey6,
         InboundRedirectKey4,
         InboundRedirectKey6,
+        UdpReplySourceKey4,
+        UdpReplySourceKey6,
         WorkloadIdentity,
         BpfCaptureConfig,
         IncludePortsPolicy,
@@ -1123,6 +1192,14 @@ mod tests {
         // [u32;4] + two u16 = 20 bytes. Both are fully defined (explicit pad).
         assert_eq!(mem::size_of::<InboundRedirectKey4>(), 8);
         assert_eq!(mem::size_of::<InboundRedirectKey6>(), 20);
+        // NodeWaypoint UDP/DTLS reply-source authorization keys share the same
+        // fully-defined (address, port, explicit pad) shape, so the map bytes
+        // the userspace publisher writes and the classifier looks up cannot
+        // diverge through implicit padding.
+        assert_eq!(mem::size_of::<UdpReplySourceKey4>(), 8);
+        assert_eq!(mem::size_of::<UdpReplySourceKey6>(), 20);
+        assert_eq!(mem::align_of::<UdpReplySourceKey4>(), 4);
+        assert_eq!(mem::align_of::<UdpReplySourceKey6>(), 4);
         assert_eq!(mem::size_of::<CidrKey4>(), 4);
         assert_eq!(mem::size_of::<CidrKey6>(), 16);
         // IncludePortsPolicy: two u32 (8) + [u16; INCLUDE_PORTS_MAX] (32) = 40 bytes, 4-byte aligned.
@@ -1157,6 +1234,20 @@ mod tests {
         assert_copy::<SockOpsRecord>();
         assert_copy::<AcceptFirstByteState>();
         assert_copy::<WorkloadIdentity>();
+        assert_copy::<UdpReplySourceKey4>();
+        assert_copy::<UdpReplySourceKey6>();
+        // The constructors are the ONE place the pad word is written, so a
+        // publisher and the classifier that both go through them agree on every
+        // key byte. Exactness is the whole security property: a differing port
+        // or address must be a different key, never a near-match.
+        let v4 = UdpReplySourceKey4::new(0x0100_00c0, 5353);
+        assert_eq!(v4._pad, 0);
+        assert_ne!(v4, UdpReplySourceKey4::new(0x0100_00c0, 5354));
+        assert_ne!(v4, UdpReplySourceKey4::new(0x0200_00c0, 5353));
+        let v6 = UdpReplySourceKey6::new([1, 2, 3, 4], 5353);
+        assert_eq!(v6._pad, 0);
+        assert_ne!(v6, UdpReplySourceKey6::new([1, 2, 3, 4], 5354));
+        assert_ne!(v6, UdpReplySourceKey6::new([1, 2, 3, 5], 5353));
     }
 
     #[test]

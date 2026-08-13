@@ -7,9 +7,16 @@
 //! local-node source and carry the NodeWaypoint relay's authorized socket
 //! mark; non-initial TCP packets are allowed so replies for
 //! intentionally bypassed outbound flows can return to the pod. Direct UDP is
-//! failed closed for NodeWaypoint because there is no authorized relay path yet,
-//! except DNS responses from source port 53 to high pod-originated client ports
-//! (>=32768).
+//! failed closed for NodeWaypoint except the relay's own marked datagrams and
+//! DNS responses from source port 53 to high pod-originated client ports
+//! (>=32768). The UDP arms accept one additional SOURCE proof the TCP arm does
+//! not: an exact `(address, port)` entry in `FERRUM_UDP_REPLY_SOURCES` /
+//! `FERRUM_UDP_REPLY_SOURCES6`, which a serving NodeWaypoint UDP/DTLS listener
+//! publishes for the reply source it pins and retracts before that socket goes
+//! away. A NodeWaypoint UDP/DTLS reply is not route-selected — it is pinned to
+//! the local address the client addressed, which on the Service path is the
+//! Service ClusterIP and therefore never a configured node IP. The relay auth
+//! mark is still required in every case, and TCP semantics are unchanged.
 //! Explicitly configured local node source IPs can only bypass this guard with
 //! the relay mark, or for enrolled Kubernetes probe ports without the mark.
 //! The same classifier closes Ambient UDP enrollment: pod-IP metadata is
@@ -21,12 +28,14 @@ use aya_ebpf::bindings::{TC_ACT_OK, TC_ACT_PIPE, TC_ACT_SHOT};
 use aya_ebpf::macros::classifier;
 use aya_ebpf::programs::TcContext;
 use ferrum_ebpf_common::{
-    CidrKey6, NodeProbePortKey4, NodeProbePortKey6, FERRUM_CAPTURE_CONFIG_KEY,
+    CidrKey6, NodeProbePortKey4, NodeProbePortKey6, UdpReplySourceKey4, UdpReplySourceKey6,
+    FERRUM_CAPTURE_CONFIG_KEY,
 };
 
 use crate::maps::{
     FERRUM_CAPTURE_CONFIG, FERRUM_NODE_IPS, FERRUM_NODE_IPS6, FERRUM_NODE_PROBE_PORTS,
-    FERRUM_NODE_PROBE_PORTS6, FERRUM_POD_IPS, FERRUM_POD_IPS6,
+    FERRUM_NODE_PROBE_PORTS6, FERRUM_POD_IPS, FERRUM_POD_IPS6, FERRUM_UDP_REPLY_SOURCES,
+    FERRUM_UDP_REPLY_SOURCES6,
 };
 
 const ETH_HDR_LEN: usize = 14;
@@ -107,17 +116,28 @@ fn guard_ipv4(ctx: &TcContext) -> Result<i32, i64> {
         }
         IPPROTO_UDP => {
             // The NodeWaypoint's own UDP relay (issue #3286) is authorized by
-            // the SAME node-source + socket-mark proof the TCP arm uses: its
-            // frontend listener socket and its per-session backend socket both
-            // carry `node_waypoint_inbound_auth_mark`, so the forward datagram
-            // to an enrolled backend pod and the reply to the enrolled source
-            // pod are admitted while every unmarked datagram to an enrolled pod
-            // stays dropped. Checked BEFORE the DNS carve-out so a marked relay
-            // never depends on port heuristics.
-            if enrolled_destination_authorized(ctx, source_is_node) {
+            // the SAME socket-mark proof the TCP arm uses — its frontend
+            // listener socket and its per-session backend socket both carry
+            // `node_waypoint_inbound_auth_mark` — combined with a proof about
+            // the packet's SOURCE. The backend dial to an enrolled pod leaves
+            // from a configured node address, exactly like the TCP relay. The
+            // REPLY does not: it is source-PINNED to the local address the
+            // client addressed, which on the Service path is the Service
+            // ClusterIP, so it is admitted only by an exact, live
+            // `(address, port)` reply-source authorization the serving listener
+            // published. Both halves are still required; neither the mark alone
+            // nor the source alone admits anything. Checked BEFORE the DNS
+            // carve-out so a marked relay never depends on port heuristics.
+            let ports = udp_ports4(ctx);
+            let reply_source_authorized = match ports {
+                Ok((src_port, _)) => udp_reply_source4_allowed(src_ip, src_port),
+                // An unparseable header proves nothing about the source.
+                Err(_) => false,
+            };
+            if enrolled_destination_authorized(ctx, source_is_node || reply_source_authorized) {
                 return Ok(TC_ACT_PIPE);
             }
-            match udp_ports4(ctx) {
+            match ports {
                 Ok((src_port, dst_port)) if dns_response_allowed(src_port, dst_port) => {
                     Ok(TC_ACT_OK)
                 }
@@ -188,12 +208,20 @@ fn guard_ipv6(ctx: &TcContext) -> Result<i32, i64> {
             guard_enrolled_destination(ctx, source_is_node)
         }
         IPPROTO_UDP => {
-            // IPv6 mirror of the v4 arm: the NodeWaypoint's own marked UDP
-            // relay is authorized on the same node-source + socket-mark proof.
-            if enrolled_destination_authorized(ctx, source_is_node) {
+            // IPv6 mirror of the v4 arm, at exact parity: the NodeWaypoint's
+            // own marked UDP relay is authorized either from a configured node
+            // source (the backend dial) or from an exact, live reply-source
+            // authorization (the source-pinned reply). A dual-stack waypoint
+            // that admitted only one family would black-hole the other.
+            let ports = udp_ports6(ctx);
+            let reply_source_authorized = match ports {
+                Ok((src_port, _)) => udp_reply_source6_allowed(src_ip.addr, src_port),
+                Err(_) => false,
+            };
+            if enrolled_destination_authorized(ctx, source_is_node || reply_source_authorized) {
                 return Ok(TC_ACT_PIPE);
             }
-            match udp_ports6(ctx) {
+            match ports {
                 Ok((src_port, dst_port)) if dns_response_allowed(src_port, dst_port) => {
                     Ok(TC_ACT_OK)
                 }
@@ -219,9 +247,17 @@ fn guard_enrolled_destination(ctx: &TcContext, source_is_node: bool) -> Result<i
     Ok(TC_ACT_SHOT)
 }
 
+/// Two-part admission for a packet to an enrolled pod: the NodeWaypoint relay's
+/// socket mark AND an authorized source.
+///
+/// `source_authorized` is the caller's source-side proof. TCP passes exactly
+/// `source_is_node` (unchanged); the UDP arms additionally accept an exact,
+/// live reply-source authorization, because a NodeWaypoint UDP/DTLS reply's
+/// source is pinned to the address the client addressed rather than chosen by
+/// routing. Neither half admits anything on its own.
 #[inline(always)]
-fn enrolled_destination_authorized(ctx: &TcContext, source_is_node: bool) -> bool {
-    if !source_is_node {
+fn enrolled_destination_authorized(ctx: &TcContext, source_authorized: bool) -> bool {
+    if !source_authorized {
         return false;
     }
     let Some(config) = (unsafe { FERRUM_CAPTURE_CONFIG.get(&FERRUM_CAPTURE_CONFIG_KEY) }) else {
@@ -252,6 +288,21 @@ fn node_probe_port4_allowed(dst_ip: u32, port: u16) -> bool {
 fn node_probe_port6_allowed(dst_ip: [u32; 4], port: u16) -> bool {
     let key = NodeProbePortKey6::new(dst_ip, port);
     unsafe { FERRUM_NODE_PROBE_PORTS6.get(&key) }.is_some()
+}
+
+/// Exact IPv4 reply-source authorization lookup. Address AND port must both
+/// match a live entry; there is no prefix, range, or port-blind form.
+#[inline(always)]
+fn udp_reply_source4_allowed(src_ip: u32, src_port: u16) -> bool {
+    let key = UdpReplySourceKey4::new(src_ip, src_port);
+    unsafe { FERRUM_UDP_REPLY_SOURCES.get(&key) }.is_some()
+}
+
+/// IPv6 counterpart to [`udp_reply_source4_allowed`].
+#[inline(always)]
+fn udp_reply_source6_allowed(src_ip: [u32; 4], src_port: u16) -> bool {
+    let key = UdpReplySourceKey6::new(src_ip, src_port);
+    unsafe { FERRUM_UDP_REPLY_SOURCES6.get(&key) }.is_some()
 }
 
 #[inline(always)]
