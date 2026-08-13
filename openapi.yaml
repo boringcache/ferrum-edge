@@ -162,9 +162,16 @@ paths:
       operationId: getLive
       summary: Liveness probe (unauthenticated, minimal)
       description: |
-        Always returns `200 OK` with the body `{"status":"ok"}` and no
-        operational internals. Intended for load-balancer / Kubernetes
-        liveness probes. Never requires authentication.
+        Returns `200 OK` with the body `{"status":"ok"}` and no operational
+        internals. Intended for load-balancer / Kubernetes liveness probes.
+        Never requires authentication.
+
+        The one exception is transport-level, not endpoint-level: on an admin
+        HTTPS connection that authenticated with a client certificate whose
+        trust the operator has since withdrawn, every request on that
+        connection — this one included — is refused with `401` before it enters
+        admin routing, and the connection is closed (issue #3857). Plaintext
+        and anonymous-TLS probes are unaffected.
       tags: [Health]
       security: []
       responses:
@@ -179,6 +186,18 @@ paths:
                   status:
                     type: string
                     enum: [ok]
+        "401":
+          description: |
+            The admin HTTPS connection this request arrived on authenticated
+            with a client certificate whose trust the operator has since
+            withdrawn (a CRL now revokes it, or its issuing CA left
+            `FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH`). The request is refused
+            before it enters admin routing and the connection is closed. Never
+            reached on a plaintext or anonymous-TLS admin connection.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 
   /health:
     get:
@@ -293,6 +312,18 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthResponse"
+        "401":
+          description: |
+            The admin HTTPS connection this request arrived on authenticated
+            with a client certificate whose trust the operator has since
+            withdrawn (a CRL now revokes it, or its issuing CA left
+            `FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH`). The request is refused
+            before it enters admin routing and the connection is closed. Never
+            reached on a plaintext or anonymous-TLS admin connection.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 
   /status:
     get:
@@ -313,6 +344,18 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthResponse"
+        "401":
+          description: |
+            The admin HTTPS connection this request arrived on authenticated
+            with a client certificate whose trust the operator has since
+            withdrawn (a CRL now revokes it, or its issuing CA left
+            `FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH`). The request is refused
+            before it enters admin routing and the connection is closed. Never
+            reached on a plaintext or anonymous-TLS admin connection.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 
   /admin/tls/inventory:
     get:
@@ -1710,6 +1753,18 @@ paths:
                 oneOf:
                   - $ref: "#/components/schemas/OverloadSnapshot"
                   - $ref: "#/components/schemas/OverloadLevelOnly"
+        "401":
+          description: |
+            The admin HTTPS connection this request arrived on authenticated
+            with a client certificate whose trust the operator has since
+            withdrawn (a CRL now revokes it, or its issuing CA left
+            `FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH`). The request is refused
+            before it enters admin routing and the connection is closed. Never
+            reached on a plaintext or anonymous-TLS admin connection.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 
   # ── Metrics ─────────────────────────────────────────────────────────
   /metrics:
