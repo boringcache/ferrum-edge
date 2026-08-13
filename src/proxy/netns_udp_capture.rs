@@ -43,6 +43,7 @@ use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
 use super::netns_capture::{PodCaptureSource, PodCaptureTarget};
+use super::owned_shell::{self, OwnedShellError};
 
 const RETAINED_GUARD_NETNS_MISSING_GRACE: Duration = Duration::from_secs(10 * 60);
 
@@ -253,6 +254,31 @@ pub trait NetnsUdpCleanupBackend: Send + Sync + 'static {
     fn netns_key(&self, target: &PodCaptureTarget) -> Result<u64, String>;
 
     fn cleanup_udp_capture(&self, target: &PodCaptureTarget, expected_netns: u64) -> bool;
+
+    /// Bounded variant used by the one-shot node preflight. Test mocks have no
+    /// subprocess and ignore the deadline. Production backends honor it so a
+    /// stalled in-netns `sh`/iptables/ip child cannot outlive the init budget.
+    fn cleanup_udp_capture_until(
+        &self,
+        target: &PodCaptureTarget,
+        expected_netns: u64,
+        deadline: Option<std::time::Instant>,
+    ) -> NetnsUdpCleanupCommandOutcome {
+        let _ = deadline;
+        if self.cleanup_udp_capture(target, expected_netns) {
+            NetnsUdpCleanupCommandOutcome::Succeeded
+        } else {
+            NetnsUdpCleanupCommandOutcome::Failed
+        }
+    }
+}
+
+/// Result of one pod-netns teardown command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetnsUdpCleanupCommandOutcome {
+    Succeeded,
+    Failed,
+    DeadlineElapsed,
 }
 
 /// One active pod-netns UDP producer, keyed in the manager by netns inode.
@@ -1244,6 +1270,9 @@ pub struct NetnsUdpCleanupManager<B: NetnsUdpCleanupBackend> {
     pending_ack_netns: HashMap<u64, HashSet<String>>,
     last_target_netns_count: usize,
     cleanup_failures_last_pass: usize,
+    /// Wall-clock ceiling for the one-shot node preflight. `None` on the
+    /// ordinary migration cleanup path, which retries indefinitely.
+    deadline: Option<std::time::Instant>,
 }
 
 /// Bounded cleanup progress used by the durable UDP placement migration guard.
@@ -1255,6 +1284,7 @@ pub struct NetnsUdpCleanupProgress {
     pub outstanding: usize,
     pub registry_fingerprint: u64,
     pub failure_reason: Option<super::udp_placement_migration::UdpMigrationFailureReason>,
+    pub deadline_elapsed: bool,
 }
 
 impl<B: NetnsUdpCleanupBackend> NetnsUdpCleanupManager<B> {
@@ -1270,11 +1300,17 @@ impl<B: NetnsUdpCleanupBackend> NetnsUdpCleanupManager<B> {
             pending_ack_netns: HashMap::new(),
             last_target_netns_count: 0,
             cleanup_failures_last_pass: 0,
+            deadline: None,
         }
     }
 
     pub fn with_ready_dir(mut self, dir: Option<PathBuf>) -> Self {
         self.ready_dir = dir;
+        self
+    }
+
+    pub fn with_deadline(mut self, deadline: Option<std::time::Instant>) -> Self {
+        self.deadline = deadline;
         self
     }
 
@@ -1323,15 +1359,19 @@ impl<B: NetnsUdpCleanupBackend> NetnsUdpCleanupManager<B> {
                     failure_reason: Some(
                         super::udp_placement_migration::UdpMigrationFailureReason::RegistryNotSynchronized,
                     ),
+                    deadline_elapsed: false,
                 };
             }
         };
         self.cleanup_targets(targets).await;
+        let deadline_elapsed = owned_shell::deadline_elapsed(self.deadline);
         let outstanding = self
             .last_target_netns_count
             .saturating_sub(self.cleaned_netns.len())
             .saturating_add(self.unresolved_reasons.len());
-        let failure_reason = if !self.unresolved_reasons.is_empty() {
+        let failure_reason = if deadline_elapsed {
+            None
+        } else if !self.unresolved_reasons.is_empty() {
             Some(super::udp_placement_migration::UdpMigrationFailureReason::PodNetnsUnresolved)
         } else if !self.pending_ack_netns.is_empty() {
             Some(
@@ -1351,6 +1391,7 @@ impl<B: NetnsUdpCleanupBackend> NetnsUdpCleanupManager<B> {
             outstanding,
             registry_fingerprint: hasher.finish(),
             failure_reason,
+            deadline_elapsed,
         }
     }
 
@@ -1464,13 +1505,17 @@ impl<B: NetnsUdpCleanupBackend> NetnsUdpCleanupManager<B> {
             .iter()
             .any(|candidate| candidate.3 && candidate.4)
         {
-            let ack_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+            let ack_budget = owned_shell::remaining(self.deadline)
+                .unwrap_or(Duration::from_secs(1))
+                .min(Duration::from_secs(1));
+            let ack_deadline = tokio::time::Instant::now() + ack_budget;
             while candidates
                 .iter()
                 .any(|(_, _, pod_uids, requires_ack, valid)| {
                     *requires_ack && *valid && !self.udp_not_ready_acknowledged(pod_uids)
                 })
                 && tokio::time::Instant::now() < ack_deadline
+                && !owned_shell::deadline_elapsed(self.deadline)
             {
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
@@ -1478,6 +1523,9 @@ impl<B: NetnsUdpCleanupBackend> NetnsUdpCleanupManager<B> {
 
         let mut cleaned = 0;
         for (netns, target, pod_uids, requires_ack, handshake_valid) in candidates {
+            if owned_shell::deadline_elapsed(self.deadline) {
+                break;
+            }
             if !handshake_valid || (requires_ack && !self.udp_not_ready_acknowledged(&pod_uids)) {
                 warn!(
                     netns_inode = netns,
@@ -1490,21 +1538,28 @@ impl<B: NetnsUdpCleanupBackend> NetnsUdpCleanupManager<B> {
             if let Some(dir) = &self.ready_dir {
                 clear_udp_ack_requirement(dir, &pod_uids);
             }
-            if self.backend.cleanup_udp_capture(&target, netns) {
-                self.cleaned_netns.insert(netns);
-                cleaned += 1;
-                info!(
-                    netns_inode = netns,
-                    pod_uid = %target.pod_uid,
-                    "Ambient UDP disabled cleanup: stale pod-netns UDP rules removed"
-                );
-            } else {
-                self.cleanup_failures_last_pass += 1;
-                warn!(
-                    netns_inode = netns,
-                    pod_uid = %target.pod_uid,
-                    "Ambient UDP disabled cleanup failed; will retry"
-                );
+            match self
+                .backend
+                .cleanup_udp_capture_until(&target, netns, self.deadline)
+            {
+                NetnsUdpCleanupCommandOutcome::Succeeded => {
+                    self.cleaned_netns.insert(netns);
+                    cleaned += 1;
+                    info!(
+                        netns_inode = netns,
+                        pod_uid = %target.pod_uid,
+                        "Ambient UDP disabled cleanup: stale pod-netns UDP rules removed"
+                    );
+                }
+                NetnsUdpCleanupCommandOutcome::DeadlineElapsed => break,
+                NetnsUdpCleanupCommandOutcome::Failed => {
+                    self.cleanup_failures_last_pass += 1;
+                    warn!(
+                        netns_inode = netns,
+                        pod_uid = %target.pod_uid,
+                        "Ambient UDP disabled cleanup failed; will retry"
+                    );
+                }
             }
         }
         cleaned
@@ -1525,35 +1580,49 @@ impl<B: NetnsUdpCleanupBackend> NetnsUdpCleanupManager<B> {
 /// forever — the exact failure mode this check exists to prevent (codex).
 /// Non-`cfg`-gated so the `cfg!(target_os = "linux")` runtime gate at the call
 /// site compiles on every platform; it only runs on Linux.
-pub(crate) fn preflight_capture_tools(require_ip6tables: bool) -> Result<(), String> {
-    let probe = preflight_capture_tools_probe(require_ip6tables);
-    let output = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(&probe)
-        .output()
-        .map_err(|e| {
-            format!(
-                "Ambient UDP capture is enabled but `sh` is not available in the runtime image \
-                 (the producer runs in-netns `sh -c` scripts that call `ip`/`iptables`): {e}. Use a \
-                 runtime image that ships a shell + iproute2 + iptables, or unset \
-                 FERRUM_MESH_CAPTURE_UDP_ENABLED."
-            )
-        })?;
-    if !output.status.success() {
-        let tools = if require_ip6tables {
-            "`ip`, `iptables` with the mangle table, and `ip6tables` with the mangle table \
-             (IPv6 UDP capture is set to `required`)"
-        } else {
-            "`ip` and/or `iptables` with the mangle table"
-        };
-        return Err(format!(
-            "Ambient UDP capture is enabled but {tools} are not available in the runtime image; \
-             the per-pod-netns producer needs them to install UDP TPROXY rules. Use a runtime \
-             image that ships iproute2 + iptables (the distroless default lacks them), or unset \
+pub fn preflight_capture_tools(require_ip6tables: bool) -> Result<(), String> {
+    match preflight_capture_tools_until(require_ip6tables, None) {
+        Ok(()) => Ok(()),
+        Err(OwnedShellError::Io(e)) => Err(format!(
+            "Ambient UDP capture is enabled but `sh` is not available in the runtime image \
+             (the producer runs in-netns `sh -c` scripts that call `ip`/`iptables`): {e}. Use a \
+             runtime image that ships a shell + iproute2 + iptables, or unset \
              FERRUM_MESH_CAPTURE_UDP_ENABLED."
-        ));
+        )),
+        Err(OwnedShellError::Failed { .. }) => {
+            let tools = if require_ip6tables {
+                "`ip`, `iptables` with the mangle table, and `ip6tables` with the mangle table \
+                 (IPv6 UDP capture is set to `required`)"
+            } else {
+                "`ip` and/or `iptables` with the mangle table"
+            };
+            Err(format!(
+                "Ambient UDP capture is enabled but {tools} are not available in the runtime image; \
+                 the per-pod-netns producer needs them to install UDP TPROXY rules. Use a runtime \
+                 image that ships iproute2 + iptables (the distroless default lacks them), or unset \
+                 FERRUM_MESH_CAPTURE_UDP_ENABLED."
+            ))
+        }
+        Err(error) => Err(format!(
+            "Ambient UDP capture tool probe failed: {}",
+            error
+                .deadline_operator_reason()
+                .unwrap_or("unexpected tool probe failure")
+        )),
     }
-    Ok(())
+}
+
+/// Same tool probe as [`preflight_capture_tools`], bounded by the one-shot
+/// preflight's wall-clock deadline when supplied.
+///
+/// Returns the typed [`OwnedShellError`] so callers can distinguish a reaped
+/// deadline from one whose owned descendants could not be proven terminated
+/// without classifying formatted strings.
+pub fn preflight_capture_tools_until(
+    require_ip6tables: bool,
+    deadline: Option<std::time::Instant>,
+) -> Result<(), OwnedShellError> {
+    owned_shell::run_sh_c(&preflight_capture_tools_probe(require_ip6tables), deadline)
 }
 
 fn preflight_capture_tools_probe(require_ip6tables: bool) -> String {
@@ -1629,6 +1698,21 @@ impl NetnsUdpCleanupBackend for ProxyNetnsUdpCleanupBackend {
     }
 
     fn cleanup_udp_capture(&self, target: &PodCaptureTarget, expected_netns: u64) -> bool {
+        matches!(
+            self.cleanup_udp_capture_until(target, expected_netns, None),
+            NetnsUdpCleanupCommandOutcome::Succeeded
+        )
+    }
+
+    fn cleanup_udp_capture_until(
+        &self,
+        target: &PodCaptureTarget,
+        expected_netns: u64,
+        deadline: Option<std::time::Instant>,
+    ) -> NetnsUdpCleanupCommandOutcome {
+        if owned_shell::deadline_elapsed(deadline) {
+            return NetnsUdpCleanupCommandOutcome::DeadlineElapsed;
+        }
         let netns = match super::netns_capture::open_pod_netns_handle(&target.cgroup_path) {
             Ok(file) => file,
             Err(error) => {
@@ -1638,7 +1722,7 @@ impl NetnsUdpCleanupBackend for ProxyNetnsUdpCleanupBackend {
                     %error,
                     "Ambient UDP disabled cleanup: could not open pod netns handle"
                 );
-                return false;
+                return NetnsUdpCleanupCommandOutcome::Failed;
             }
         };
         let opened_netns = match netns
@@ -1653,7 +1737,7 @@ impl NetnsUdpCleanupBackend for ProxyNetnsUdpCleanupBackend {
                     %error,
                     "Ambient UDP disabled cleanup: could not read opened pod netns identity"
                 );
-                return false;
+                return NetnsUdpCleanupCommandOutcome::Failed;
             }
         };
         if opened_netns != expected_netns {
@@ -1664,7 +1748,7 @@ impl NetnsUdpCleanupBackend for ProxyNetnsUdpCleanupBackend {
                 opened_netns_inode = opened_netns,
                 "Ambient UDP disabled cleanup: pod netns changed between reconcile and cleanup"
             );
-            return false;
+            return NetnsUdpCleanupCommandOutcome::Failed;
         }
         match super::netns_capture::host_netns_inode() {
             Ok(host_ino) if opened_netns == host_ino => {
@@ -1675,7 +1759,7 @@ impl NetnsUdpCleanupBackend for ProxyNetnsUdpCleanupBackend {
                     "Ambient UDP disabled cleanup: target resolves to the host/proxy netns; \
                      refusing to run pod UDP teardown in the node namespace"
                 );
-                return false;
+                return NetnsUdpCleanupCommandOutcome::Failed;
             }
             Ok(_) => {}
             Err(error) => {
@@ -1685,14 +1769,18 @@ impl NetnsUdpCleanupBackend for ProxyNetnsUdpCleanupBackend {
                     %error,
                     "Ambient UDP disabled cleanup: could not compare pod vs host netns identity"
                 );
-                return false;
+                return NetnsUdpCleanupCommandOutcome::Failed;
             }
         }
 
         let teardown_script = crate::capture::IptablesPlan::udp_teardown_script(self.include_v6);
-        match super::netns_capture::run_in_netns(&netns, move || run_shell_script(&teardown_script))
-        {
-            Ok(()) => true,
+        match super::netns_capture::run_in_netns(&netns, move || {
+            run_shell_script_until(&teardown_script, deadline)
+        }) {
+            Ok(()) => NetnsUdpCleanupCommandOutcome::Succeeded,
+            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                NetnsUdpCleanupCommandOutcome::DeadlineElapsed
+            }
             Err(error) => {
                 warn!(
                     pod_uid = %target.pod_uid,
@@ -1700,7 +1788,7 @@ impl NetnsUdpCleanupBackend for ProxyNetnsUdpCleanupBackend {
                     %error,
                     "Ambient UDP disabled cleanup: pod-netns UDP teardown failed"
                 );
-                false
+                NetnsUdpCleanupCommandOutcome::Failed
             }
         }
     }
@@ -1716,6 +1804,20 @@ impl NetnsUdpCleanupBackend for ProxyNetnsUdpCleanupBackend {
     fn cleanup_udp_capture(&self, _target: &PodCaptureTarget, _expected_netns: u64) -> bool {
         let _ = self.include_v6;
         false
+    }
+
+    fn cleanup_udp_capture_until(
+        &self,
+        _target: &PodCaptureTarget,
+        _expected_netns: u64,
+        deadline: Option<std::time::Instant>,
+    ) -> NetnsUdpCleanupCommandOutcome {
+        let _ = self.include_v6;
+        if owned_shell::deadline_elapsed(deadline) {
+            NetnsUdpCleanupCommandOutcome::DeadlineElapsed
+        } else {
+            NetnsUdpCleanupCommandOutcome::Failed
+        }
     }
 }
 
@@ -2267,22 +2369,38 @@ impl NetnsUdpBackend for ProxyNetnsUdpBackend {
 /// per-command `|| true` guards for the remaining already-absent state.
 #[cfg(target_os = "linux")]
 fn run_shell_script(script: &str) -> std::io::Result<()> {
-    if script.trim().is_empty() {
-        return Ok(());
-    }
-    let output = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(script)
-        .output()?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(std::io::Error::other(format!(
+    run_shell_script_until(script, None)
+}
+
+#[cfg(target_os = "linux")]
+fn run_shell_script_until(
+    script: &str,
+    deadline: Option<std::time::Instant>,
+) -> std::io::Result<()> {
+    match owned_shell::run_sh_c(script, deadline) {
+        Ok(()) => Ok(()),
+        Err(OwnedShellError::DeadlineCleanupFailed { .. }) => {
+            tracing::warn!(
+                "in-netns script exceeded its deadline and owned descendants could not be proven terminated"
+            );
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "in-netns script exceeded its deadline and owned descendants could not be proven terminated",
+            ))
+        }
+        Err(OwnedShellError::DeadlineElapsed) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "in-netns script exceeded its deadline",
+        )),
+        Err(OwnedShellError::DeadlineUnsupported { .. }) => Err(std::io::Error::other(
+            "in-netns script cannot be run under a hard deadline",
+        )),
+        Err(OwnedShellError::Io(error)) => Err(error),
+        Err(OwnedShellError::Failed { status, stderr }) => Err(std::io::Error::other(format!(
             "in-netns script failed (exit {:?}): {}",
-            output.status.code(),
+            status.code(),
             stderr.trim()
-        )))
+        ))),
     }
 }
 
