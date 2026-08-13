@@ -38,22 +38,6 @@ wait_for_status() {
   return 1
 }
 
-wait_for_not_status() {
-  local forbidden="$1"
-  local label="$2"
-  local code=""
-  for _ in $(seq 1 45); do
-    code="$(curl_status "$AUTHORITY_HOST" "$AUTHORITY_PATH")"
-    if [ "$code" != "$forbidden" ]; then
-      echo "GatewayClass authority black-box ${label}: HTTP ${code}"
-      return 0
-    fi
-    sleep 2
-  done
-  echo "GatewayClass authority black-box ${label}: still HTTP ${forbidden}" >&2
-  return 1
-}
-
 apply_gateway_class() {
   cat <<YAML | kubectl apply -f -
 apiVersion: gateway.networking.k8s.io/v1
@@ -128,7 +112,7 @@ run_blackbox() {
   echo "owned GatewayClass programmed ${AUTHORITY_HOST}${AUTHORITY_PATH}" >> "$report"
 
   kubectl delete gatewayclass ferrum --wait=true
-  wait_for_not_status "200" "owned-class-delete" | tee -a "$report"
+  wait_for_status "404" "owned-class-delete" | tee -a "$report"
   echo "deleting GatewayClass withdrew the listener without restarting Ferrum" >> "$report"
 
   apply_gateway_class

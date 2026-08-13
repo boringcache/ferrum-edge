@@ -962,7 +962,7 @@ fn scope_cookie_session_to_route(
 /// Must not echo policy identity, Service names, or operator-authored values.
 const BACKEND_LB_POLICY_CONFLICTED_MESSAGE: &str = "Another BackendLBPolicy or XBackendTrafficPolicy already targets one or more of the same Services and merging is not supported";
 
-/// Controller name stamped on every `status.ancestors` entry Ferrum owns.
+/// Gateway API `PolicyStatus.ancestors` upper bound (`+kubebuilder:validation:MaxItems=16`).
 ///
 /// The spec forbids adding another entry when the shared list is full. This
 /// limit is only an output constraint for the status writer; status owned by
