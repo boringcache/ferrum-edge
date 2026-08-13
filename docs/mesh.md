@@ -3728,7 +3728,9 @@ the withdrawn root until its own EOF or idle timeout.
 Every gateway-to-mesh TLS transport — pooled and 1:1 alike — registers with the
 per-process gateway trust registry (`src/proxy/mesh_trust_registry.rs`) when its
 connection driver is spawned, under the accepted trust generation, and hands its driver a
-retirement gate that travels with the sender and the tunnel rather than living in the pool.
+retirement gate that travels with every cloned sender and the tunnel rather than living
+in the pool. Pooled mesh-mTLS checkout returns that gated handle; `ready` and
+`send_request` consult it synchronously before a new stream is queued.
 
 When an accepted `Replace` or `Clear` removes any authority from the **effective**
 gateway trust view (the material `build_spiffe_outbound_config` verifies peers against —
@@ -3737,27 +3739,40 @@ so a `Clear` is judged against the startup material it restores), the centralize
 sequence:
 
 1. fence new gateway-to-mesh request admission;
-2. advance the ownership-registry generation, mark the outgoing generation retired, and
+2. install the accepted trust material into every verifier source/slot it governs;
+3. advance the ownership-registry generation, mark the outgoing generation retired, and
    synchronously signal every transport registered under it;
-3. install the accepted trust material;
 4. advance the backend security generation, drain its TLS-config caches and
-   generation-keyed pools, and clear the HBONE and mesh-mTLS pool maps;
-5. publish the accepted gateway trust as live, reopening request admission.
+   generation-keyed pools, clear the HBONE and mesh-mTLS pool maps, and publish the
+   accepted gateway trust as live, reopening request admission.
+
+The request-epoch fence is a point-in-time admission check, not a lock held across a
+backend dial. A request that passed the live check immediately before fencing can still
+reach `dial_h2_connect_sender` / mesh-mTLS `create_sender` during publication and take an
+admission ticket. Installing material before advancing the generation makes that race
+fail closed: a dial whose ticket was stamped before step 3 still carries the outgoing
+generation and is refused at registration if it completes afterwards; a dial that
+receives the new ticket can only load the already-stored accepted verifier. Advancing
+the generation first would let that in-flight dial take a NEW ticket, still load OLD
+trust, and register as the published generation — escaping the outgoing-generation sweep.
 
 Signalling is synchronous — the gate is set before the ownership-registry fence is
 released — and the outer request-admission fence remains closed until material, caches,
-and pool maps all reflect the accepted generation. No transport can therefore be admitted,
-pooled, or handed to a caller in the window between publication and teardown. Completing
+and pool maps all reflect the accepted generation. Completing
 the teardown (dropping the HTTP/2 connection, which closes the socket and errors every
 stream on it) is a bounded task wake, not a drain timer: it does not wait on peer behaviour,
 backend liveness, or `FERRUM_SHUTDOWN_DRAIN_SECONDS`. A retired tunnel's next read or write
 fails with a fixed `gateway trust authority withdrawn` error that names no trust material,
-subject, key id, fingerprint, path, or peer identity.
+subject, key id, fingerprint, path, or peer identity. A retired pooled mesh-mTLS sender
+refuses `ready` / `send_request` synchronously by consulting the same gate, even if the
+underlying HTTP/2 sender has not yet observed connection close.
 
 The **creation race** is closed by the same generation stamp: a dial takes an admission
 ticket before connecting, and a connection that completes after the publication is refused
 at registration (`HbonePoolError::TrustWithdrawn`), so it is neither pooled nor returned.
-Pool insertion re-checks the gate for the same reason.
+Pool insertion re-checks the gate for the same reason. Because accepted material is stored
+before the generation advances, a ticket for the new generation cannot authenticate with
+the withdrawn verifier.
 
 No-churn behaviour is preserved exactly. An identical `Replace`, an additive overlap
 (`before ⊆ after`), an `Unchanged` side channel, a `Clear` with no installed override, a

@@ -18,14 +18,18 @@ use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain, spiffe_id_to_san};
 use ferrum_edge::identity::{
     JwtAuthority, SharedSvidBundle, SvidBundle, TrustBundle, TrustBundleSet,
 };
-use ferrum_edge::proxy::hbone_pool::HboneConnectionPool;
-use ferrum_edge::proxy::mesh_mtls_pool::MeshMtlsConnectionPool;
+use ferrum_edge::proxy::grpc_proxy::GrpcBody;
+use ferrum_edge::proxy::hbone_pool::{HboneConnectionPool, HbonePoolError};
+use ferrum_edge::proxy::mesh_mtls_pool::{
+    MeshMtlsConnectionPool, MeshMtlsRequestBody, MeshMtlsSenderError,
+};
 use ferrum_edge::proxy::mesh_trust_registry::{
     MeshTransportGate, MeshTransportKind, MeshTrustRegistry, TrustWithdrawalReason,
     trust_withdrawal_reason,
 };
 use ferrum_edge::tls::spiffe::build_spiffe_inbound_config;
-use http::{Response, StatusCode};
+use http::{Request, Response, StatusCode};
+use http_body_util::Full;
 use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
     Issuer, KeyPair, KeyUsagePurpose, PKCS_ECDSA_P256_SHA256,
@@ -845,8 +849,9 @@ async fn withdrawal_makes_a_retained_mesh_mtls_sender_fail_readiness() {
         .await
         .expect("a retired sender must resolve rather than hang");
     assert!(
-        readiness.is_err(),
-        "a retained mesh-mTLS sender must fail readiness after its trust is withdrawn"
+        matches!(readiness, Err(MeshMtlsSenderError::TrustWithdrawn)),
+        "a retained mesh-mTLS sender must fail readiness after its trust is withdrawn \
+         as TrustWithdrawn, not wait for the H2 driver to close: {readiness:?}"
     );
 
     // A later caller is served again, but never on the retired transport: the
@@ -919,4 +924,153 @@ fn retirement_metrics_are_fixed_cardinality_and_material_free() {
             "gateway trust metrics must not disclose trust material: {rendered}"
         );
     }
+}
+
+fn empty_mesh_mtls_request() -> http::Request<MeshMtlsRequestBody> {
+    Request::builder()
+        .uri("http://orders.example.com/")
+        .body(MeshMtlsRequestBody::Grpc(GrpcBody::Buffered(Full::new(
+            Bytes::new(),
+        ))))
+        .expect("empty mesh-mTLS request")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cloned_mesh_mtls_sender_refuses_the_next_stream_synchronously_after_gate_retirement() {
+    // The pooled checkout used to map away `MeshMtlsTransport.gate` and return
+    // a bare hyper sender. After checkout, a clone could race a withdrawal:
+    // the driver is only notified asynchronously, so the H2 sender can still
+    // be ready and open a stream before socket-close propagates. The gate must
+    // travel with every clone and be consulted in `send_request` before hyper
+    // queues the stream.
+    let fixture = mesh_fixture().await;
+    let registry = MeshTrustRegistry::new();
+    let pool = MeshMtlsConnectionPool::new(
+        PoolConfig::default(),
+        DnsCache::new(DnsConfig::default()),
+        fixture.gateway_slot.clone(),
+        4,
+    );
+    pool.attach_mesh_trust_registry(registry.clone());
+    let proxy = proxy_for_test();
+    let peer = SpiffeId::from_parts(
+        &TrustDomain::new("cluster.local").unwrap(),
+        "ns/default/sa/orders",
+    )
+    .unwrap();
+
+    let mut sender = tokio::time::timeout(
+        Duration::from_secs(15),
+        pool.get_sender(
+            &proxy,
+            "127.0.0.1",
+            8080,
+            8080,
+            fixture.server_addr.port(),
+            Some(&peer),
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("timely mesh-mTLS connection")
+    .expect("mesh-mTLS sender");
+    tokio::time::timeout(Duration::from_secs(5), sender.ready())
+        .await
+        .expect("timely readiness")
+        .expect("a live sender is ready");
+
+    let mut cloned = sender.clone();
+    registry.retire_for_trust_withdrawal(TrustWithdrawalReason::ReplaceRemovedAuthority);
+    // No await: the connection driver has not been scheduled to drop the H2
+    // session. `send_request` must still refuse synchronously via the gate.
+    match cloned.send_request(empty_mesh_mtls_request()) {
+        Err(HbonePoolError::TrustWithdrawn) => {}
+        Ok(_) => panic!(
+            "a cloned mesh-mTLS sender must not open a stream after gate retirement \
+             while the underlying H2 sender is still open"
+        ),
+        Err(other) => panic!(
+            "cloned send after retirement must be TrustWithdrawn, not {other:?}"
+        ),
+    }
+    match sender.send_request(empty_mesh_mtls_request()) {
+        Err(HbonePoolError::TrustWithdrawn) => {}
+        Ok(_) => panic!("the original checkout must share the clone's gate"),
+        Err(other) => panic!("original send after retirement must be TrustWithdrawn, not {other:?}"),
+    }
+}
+
+#[test]
+fn commit_installs_accepted_material_before_advancing_the_ownership_generation() {
+    // Pin the fail-closed publication order in source: a dial that takes a
+    // ticket at the material-publication boundary must not be able to load old
+    // trust under the new generation.
+    let source = include_str!("../../src/proxy/mod.rs");
+    let start = source
+        .find("fn commit_gateway_trust_generation_locked(")
+        .expect("commit_gateway_trust_generation_locked must exist");
+    let body = &source[start..];
+    let end = body
+        .find("\n    fn publish_request_epoch_with_gateway_trust(")
+        .expect("publish_request_epoch_with_gateway_trust follows the locked commit");
+    let func = &body[..end];
+
+    let fence = func
+        .find("self.fence_gateway_trust_generation()")
+        .expect("fence first");
+    let store = func
+        .find("self.store_gateway_trust_material(")
+        .expect("store accepted material");
+    let store_last = func
+        .rfind("self.store_gateway_trust_material(")
+        .expect("both Replace and Clear store before retire");
+    let retire = func
+        .find("self.mesh_trust_registry.retire_for_trust_withdrawal(")
+        .expect("then advance ownership generation and retire outgoing transports");
+    let advance = func
+        .find("self.advance_backend_security_generation()")
+        .expect("then retire cache/pool discoverability");
+    let publish = func
+        .find("self.publish_live_gateway_trust()")
+        .expect("then reopen live admission");
+
+    assert!(
+        fence < store,
+        "admission must be fenced before accepted material is installed"
+    );
+    assert!(
+        store_last < retire,
+        "every store_gateway_trust_material arm must run before retire_for_trust_withdrawal \
+         so a new-generation ticket cannot load old verifier material"
+    );
+    assert!(
+        retire < advance,
+        "ownership generation must advance before backend-security/pool retirement"
+    );
+    assert!(
+        advance < publish,
+        "live admission must reopen only after material, ownership, and pools agree"
+    );
+}
+
+#[test]
+fn mesh_mtls_get_sender_returns_the_gated_handle_not_a_bare_hyper_sender() {
+    let source = include_str!("../../src/proxy/mesh_mtls_pool.rs");
+    let start = source
+        .find("pub async fn get_sender(")
+        .expect("get_sender must exist");
+    let body = &source[start..];
+    let end = body
+        .find("\n    /// Open a raw-TCP egress CONNECT tunnel")
+        .expect("open_connect_tunnel follows get_sender");
+    let func = &body[..end];
+    assert!(
+        !func.contains("transport.sender"),
+        "get_sender must not strip MeshMtlsTransport.gate; the public handle is the gated sender"
+    );
+    assert!(
+        !func.contains(".map(|transport| transport.sender)"),
+        "get_sender must not map away the retirement gate"
+    );
 }

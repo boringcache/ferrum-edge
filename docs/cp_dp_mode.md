@@ -529,9 +529,12 @@ usable for new validation, not discoverable for a new pool checkout, and not
 usable by an already-issued gateway-to-mesh transport** the moment the commit
 returns. The ownership registry synchronously marks and signals issued
 `H2ConnectTunnel` and `MeshMtlsSender` handles plus active
-WebSocket/datagram/raw-CONNECT bridges. Their next poll, read, or write fails
-with the fixed material-free `gateway trust authority withdrawn` error; driver
-teardown completes through a bounded task wake.
+WebSocket/datagram/raw-CONNECT bridges. A retired HBONE tunnel's next poll,
+read, or write fails with the fixed material-free `gateway trust authority
+withdrawn` error. A retired pooled mesh-mTLS sender consults the same gate in
+`ready` / `send_request` and refuses the next stream synchronously, without
+waiting for driver scheduling or socket-close propagation. In-flight streams
+still terminate through driver/socket teardown.
 
 ###### The admission-refusal window, and what bounds it
 
@@ -542,10 +545,11 @@ operator-visible window and is documented rather than hidden.
 What runs inside it, in order, on the publishing thread — no `.await`, no I/O:
 
 1. the request-facing gateway trust epoch is already fenced;
-2. one ownership-registry generation advance, followed by a `retain` pass that
+2. one `ArcSwap` store of the accepted trust material into every verifier slot it
+   governs;
+3. one ownership-registry generation advance, followed by a `retain` pass that
    marks and notifies every registered HBONE or mesh-mTLS physical transport in
    the outgoing generation;
-3. one `ArcSwap` store of the trust material;
 4. one atomic advance of the backend security generation;
 5. for each generation in the retired half-open span (normally exactly one, and
    never more than `MAX_COALESCED_ROTATION_DRAIN_GENERATIONS` = 8): one backend
@@ -554,6 +558,12 @@ What runs inside it, in order, on the publishing thread — no `.await`, no I/O:
 6. one `clear()` of each of the HBONE and mesh-mTLS pool maps (entries,
    creation locks, retired-fingerprint registries), followed by publication of
    the accepted trust as live.
+
+Material is stored before the ownership generation advances so a dial that passed
+the live check immediately before fencing cannot take a *new* registry ticket and
+still load the *old* verifier. A ticket stamped before step 3 is refused at
+registration; a ticket stamped after step 3 can only load the material already
+stored in step 2.
 
 So the window scales with the number of **registered live gateway-to-mesh
 physical transports**, with **pooled occupancy** across the six pools, and,

@@ -42,7 +42,8 @@ use crate::dns::DnsCache;
 use crate::identity::{SharedSvidBundle, SpiffeId, SvidBundle, TrustDomain};
 use crate::proxy::body::{ReplayableRequestBody, SizeLimitedIncoming};
 use crate::proxy::mesh_trust_registry::{
-    MeshTransportGate, MeshTransportKind, MeshTransportRegistration, MeshTrustRegistry,
+    MESH_TRUST_WITHDRAWN_MESSAGE, MeshTransportGate, MeshTransportKind, MeshTransportRegistration,
+    MeshTrustRegistry,
 };
 use crate::tls::backend::BackendSvidGeneration;
 use crate::tls::spiffe::build_spiffe_outbound_config;
@@ -174,26 +175,145 @@ impl http_body::Body for MeshMtlsRequestBody {
     }
 }
 
-/// Multiplexed hyper H2 sender over the SVID-mTLS session.
-pub type MeshMtlsSender = http2::SendRequest<MeshMtlsRequestBody>;
-
-/// One established mesh-mTLS HTTP/2 transport, carried together with the
-/// retirement gate that owns it (issue #3859).
+/// Readiness or pre-wire send refusal for a pooled mesh-mTLS sender.
 ///
-/// Pool-internal: `get_sender` still hands callers the bare [`MeshMtlsSender`],
-/// because the ownership that matters for withdrawal lives on the connection
-/// driver, not on the sender clone. Retiring the gate drops the driver, which
-/// closes the socket and makes every already-cloned sender fail readiness and
-/// refuse new streams.
-#[derive(Clone)]
-pub(crate) struct MeshMtlsTransport {
-    pub(crate) sender: MeshMtlsSender,
-    pub(crate) gate: MeshTransportGate,
+/// [`TrustWithdrawn`](Self::TrustWithdrawn) is the gated refusal: a checkout
+/// or clone that still holds a live hyper sender must not open the next stream
+/// after a trust withdrawal, even if the connection driver has not yet dropped
+/// the H2 session. [`Hyper`](Self::Hyper) preserves the prior classification
+/// of ordinary sender-not-ready failures (`is_canceled` / protocol).
+#[derive(Debug)]
+pub enum MeshMtlsSenderError {
+    TrustWithdrawn,
+    Hyper(hyper::Error),
 }
 
-impl MeshMtlsTransport {
-    fn is_retired(&self) -> bool {
+impl MeshMtlsSenderError {
+    pub fn is_canceled(&self) -> bool {
+        matches!(self, Self::Hyper(err) if err.is_canceled())
+    }
+
+    pub fn is_timeout(&self) -> bool {
+        matches!(self, Self::Hyper(err) if err.is_timeout())
+    }
+}
+
+impl std::fmt::Display for MeshMtlsSenderError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TrustWithdrawn => formatter.write_str(MESH_TRUST_WITHDRAWN_MESSAGE),
+            Self::Hyper(err) => write!(formatter, "{err}"),
+        }
+    }
+}
+
+impl std::error::Error for MeshMtlsSenderError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::TrustWithdrawn => None,
+            Self::Hyper(err) => Some(err),
+        }
+    }
+}
+
+/// Multiplexed hyper H2 sender over the SVID-mTLS session, carried together
+/// with the retirement gate that owns the transport (issue #3859).
+///
+/// The gate travels with every clone. [`Self::ready`] and [`Self::send_request`]
+/// consult it synchronously at the last pre-wire boundary, so a trust
+/// withdrawal refuses the next stream without waiting for the connection
+/// driver to drop the H2 session. In-flight streams still terminate through
+/// driver/socket teardown.
+#[derive(Clone)]
+pub struct MeshMtlsSender {
+    inner: http2::SendRequest<MeshMtlsRequestBody>,
+    gate: MeshTransportGate,
+}
+
+/// Pool-internal name for one established mesh-mTLS HTTP/2 transport. The
+/// public checkout type [`MeshMtlsSender`] *is* this handle: the gate is not
+/// stripped on the way out of the pool.
+pub(crate) type MeshMtlsTransport = MeshMtlsSender;
+
+impl std::fmt::Debug for MeshMtlsSender {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MeshMtlsSender")
+            .field("retired", &self.is_retired())
+            .finish_non_exhaustive()
+    }
+}
+
+impl MeshMtlsSender {
+    /// Wrap a sender whose gate is never retired. Unix-domain h2c carriers and
+    /// focused tests without a trust registry share the same send/ready
+    /// surface as mesh-mTLS, so they still consult a gate — it is simply
+    /// ungoverned.
+    pub fn ungoverned(inner: http2::SendRequest<MeshMtlsRequestBody>) -> Self {
+        Self {
+            inner,
+            gate: MeshTransportGate::new(),
+        }
+    }
+
+    pub(crate) fn governed(
+        inner: http2::SendRequest<MeshMtlsRequestBody>,
+        gate: MeshTransportGate,
+    ) -> Self {
+        Self { inner, gate }
+    }
+
+    #[inline]
+    pub fn is_retired(&self) -> bool {
         self.gate.is_retired()
+    }
+
+    /// True when the gate is retired or the underlying H2 client has closed.
+    /// Pool lookup/eviction uses this so a withdrawn transport is never handed
+    /// out again, even before its socket has finished closing.
+    #[inline]
+    pub fn is_closed(&self) -> bool {
+        self.gate.is_retired() || self.inner.is_closed()
+    }
+
+    #[inline]
+    pub fn is_ready(&self) -> bool {
+        !self.gate.is_retired() && self.inner.is_ready()
+    }
+
+    /// Last-safe pre-wire readiness. A retired gate fails immediately with
+    /// [`MeshMtlsSenderError::TrustWithdrawn`] and does not wait for the
+    /// driver to close the H2 connection.
+    pub async fn ready(&mut self) -> Result<(), MeshMtlsSenderError> {
+        if self.gate.is_retired() {
+            return Err(MeshMtlsSenderError::TrustWithdrawn);
+        }
+        self.inner
+            .ready()
+            .await
+            .map_err(MeshMtlsSenderError::Hyper)?;
+        if self.gate.is_retired() {
+            return Err(MeshMtlsSenderError::TrustWithdrawn);
+        }
+        Ok(())
+    }
+
+    /// Last-safe pre-wire send. A retired gate refuses synchronously —
+    /// `Err(TrustWithdrawn)` — before hyper queues a new stream. Callers must
+    /// treat that as pre-wire and health-neutral ([`HbonePoolError::TrustWithdrawn`]).
+    pub fn send_request(
+        &mut self,
+        request: http::Request<MeshMtlsRequestBody>,
+    ) -> Result<
+        impl std::future::Future<
+            Output = Result<hyper::Response<hyper::body::Incoming>, hyper::Error>,
+        >,
+        HbonePoolError,
+    > {
+        if self.gate.is_retired() {
+            return Err(HbonePoolError::TrustWithdrawn);
+        }
+        Ok(self.inner.send_request(request))
     }
 }
 
@@ -865,7 +985,7 @@ impl MeshMtlsConnectionPool {
             |key| self.try_cached_sender_read(key),
         );
         if let Some(transport) = fast_sender {
-            return Ok(transport.sender);
+            return Ok(transport);
         }
 
         let key = with_mesh_mtls_pool_key(
@@ -893,7 +1013,6 @@ impl MeshMtlsConnectionPool {
             &pool_config,
         )
         .await
-        .map(|transport| transport.sender)
     }
 
     /// Open a raw-TCP egress CONNECT tunnel to a peer sidecar's inbound mTLS
@@ -1405,7 +1524,7 @@ impl MeshMtlsConnectionPool {
         for entry in entries.iter() {
             // A retired transport is never handed out again, even before its
             // socket has finished closing (issue #3859). One relaxed load.
-            if entry.transport.is_retired() || entry.transport.sender.is_closed() {
+            if entry.transport.is_closed() {
                 continue;
             }
             entry.last_used_at.store(unix_secs(), Ordering::Relaxed);
@@ -1426,7 +1545,7 @@ impl MeshMtlsConnectionPool {
             if entry_idle_expired(last_used, entry.idle_timeout_seconds, now) {
                 continue;
             }
-            if entry.transport.is_retired() || entry.transport.sender.is_closed() {
+            if entry.transport.is_closed() {
                 continue;
             }
             entry.last_used_at.store(now, Ordering::Relaxed);
@@ -1652,8 +1771,11 @@ impl MeshMtlsConnectionPool {
                     tokio::select! {
                         biased;
                         // Trust withdrawal. Returning drops the HTTP/2
-                        // connection, closing the socket, so every cloned sender
-                        // fails readiness and can open no further streams.
+                        // connection so in-flight streams terminate. New
+                        // streams are refused synchronously by
+                        // `MeshMtlsSender::{ready,send_request}` consulting
+                        // the gate; they must not wait for this driver to be
+                        // scheduled.
                         () = driver_gate.cancelled() => {
                             debug!(
                                 "mesh_mtls_pool: sidecar mTLS HTTP/2 connection retired after gateway trust withdrawal"
@@ -1669,7 +1791,7 @@ impl MeshMtlsConnectionPool {
                         }
                     }
                 });
-                Ok(MeshMtlsTransport { sender, gate })
+                Ok(MeshMtlsSender::governed(sender, gate))
             }
         })
         .await
@@ -1711,8 +1833,7 @@ fn prune_pool_entries(entries: &mut Vec<MeshMtlsPoolEntry>) -> usize {
     entries.retain(|entry| {
         // Retired by a gateway trust withdrawal: evict without consulting the
         // socket at all (issue #3859).
-        !entry.transport.is_retired()
-            && !entry.transport.sender.is_closed()
+        !entry.transport.is_closed()
             && !entry_idle_expired(
                 entry.last_used_at.load(Ordering::Relaxed),
                 entry.idle_timeout_seconds,

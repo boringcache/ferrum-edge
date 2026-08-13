@@ -7721,6 +7721,16 @@ impl ProxyState {
     /// duplicate Replace and redundant Clear decisions normalize to `Unchanged`
     /// under the outer publication lock.
     ///
+    /// Fail-closed ordering for every in-flight dial interleaving (issue #3859):
+    /// fence admission, install the accepted verifier, then advance the
+    /// ownership generation and retire outgoing transports, then retire
+    /// cache/pool discoverability and republish live. A dial that took a ticket
+    /// before the generation advanced still carries the outgoing generation and
+    /// is refused at registration; a dial that receives the new ticket can only
+    /// load the material already stored. Advancing the generation before the
+    /// store would let a request that passed the live check immediately before
+    /// fencing take a NEW ticket and still dial with OLD trust.
+    ///
     /// The steps run against the slot writer directly rather than through
     /// [`Self::update_gateway_trust_bundles`] / [`Self::clear_gateway_trust_bundles`]
     /// precisely so the fence spans all of them: those two fence and republish
@@ -7760,16 +7770,17 @@ impl ProxyState {
             // here.
             self.fence_gateway_trust_generation();
         }
-        // The request epoch is fenced before the registry generation advances.
-        // Old in-flight dials are either present in this sweep or fail their
-        // admission ticket when they complete; no new gateway-to-mesh dial can
-        // begin until the accepted material is published live below.
-        let retirement = withdrawal_reason.map(|reason| {
-            (
-                reason,
-                self.mesh_trust_registry.retire_for_trust_withdrawal(reason),
-            )
-        });
+        // Install accepted material BEFORE advancing the ownership generation.
+        // The request-epoch fence is only a point-in-time admission check; it
+        // is not held across a backend dial. A request that passed the live
+        // check immediately before fencing can still reach `dial_h2_connect_sender`
+        // / `create_sender` during this window and take an admission ticket.
+        // That ticket must either still carry the outgoing generation (refused
+        // at registration after the retire below) or be stamped after the
+        // retire, in which case the only verifier it can load is the one
+        // stored here. Advancing `accepted_generation` first would let that
+        // in-flight dial take a NEW ticket and still load OLD trust, then
+        // register as the published generation and escape the sweep.
         match commit {
             GatewayTrustCommit::Unchanged => {}
             GatewayTrustCommit::Replace(trust_bundles) => {
@@ -7793,6 +7804,12 @@ impl ProxyState {
                 );
             }
         }
+        let retirement = withdrawal_reason.map(|reason| {
+            (
+                reason,
+                self.mesh_trust_registry.retire_for_trust_withdrawal(reason),
+            )
+        });
         if retirement.is_some() {
             // Still fenced: gateway-to-mesh admission is refused for the whole
             // of install → advance → retire, so the generation a request
@@ -7825,8 +7842,9 @@ impl ProxyState {
     ///    complete previous generation stays live.
     /// 2. publish the request epoch, FENCED when the decision changes the live
     ///    verifier. Gateway-to-mesh admission is refused from here.
-    /// 3. install the material, advance the backend security generation, and
-    ///    republish the admission live.
+    /// 3. install the accepted trust material, then advance the ownership
+    ///    generation and retire outgoing transports, then advance the backend
+    ///    security generation and republish the admission live.
     ///
     /// There is therefore no interval in which a request pairs this
     /// generation's configuration with the previous generation's trust roots:
@@ -44686,7 +44704,34 @@ async fn proxy_to_backend_mesh_mtls(
     };
     match ready_result {
         Ok(Ok(())) => {}
-        Ok(Err(err)) => {
+        Ok(Err(mesh_mtls_pool::MeshMtlsSenderError::TrustWithdrawn)) => {
+            if is_grpc_flavored {
+                error!(
+                    proxy_id = %proxy.id,
+                    "sidecar mTLS gRPC sender retired by gateway trust withdrawal before dispatch"
+                );
+                return (
+                    mesh_grpc_unavailable_response(
+                        resolved_ip,
+                        "sidecar mTLS backend unavailable",
+                        hbone_pool::HbonePoolError::TrustWithdrawn.error_class(),
+                    ),
+                    None,
+                    None,
+                );
+            }
+            return (
+                hbone_pool_error_response(
+                    state,
+                    proxy,
+                    &hbone_pool::HbonePoolError::TrustWithdrawn,
+                    resolved_ip,
+                ),
+                None,
+                None,
+            );
+        }
+        Ok(Err(mesh_mtls_pool::MeshMtlsSenderError::Hyper(err))) => {
             if is_grpc_flavored {
                 error!(
                     proxy_id = %proxy.id,
@@ -45018,7 +45063,32 @@ async fn proxy_to_backend_mesh_mtls(
     }
 
     let backend_req = Request::from_parts(parts, body);
-    let send_fut = sender.send_request(backend_req);
+    let send_fut = match sender.send_request(backend_req) {
+        Ok(fut) => fut,
+        Err(err) => {
+            if is_grpc_flavored {
+                error!(
+                    proxy_id = %proxy.id,
+                    error = %err,
+                    "sidecar mTLS gRPC send refused before dispatch"
+                );
+                return (
+                    mesh_grpc_unavailable_response(
+                        resolved_ip,
+                        "sidecar mTLS backend unavailable",
+                        err.error_class(),
+                    ),
+                    None,
+                    None,
+                );
+            }
+            return (
+                hbone_pool_error_response(state, proxy, &err, resolved_ip),
+                None,
+                None,
+            );
+        }
+    };
     // `send_request` covers upload plus the response-header wait. The same
     // absolute RPC instant is reused; retries and earlier gateway work cannot
     // re-arm it by rewriting a relative header.

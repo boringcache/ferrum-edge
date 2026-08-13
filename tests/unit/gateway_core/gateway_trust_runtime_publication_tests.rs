@@ -28,6 +28,7 @@ use ferrum_edge::identity::{
     spiffe::{SpiffeId, TrustDomain},
 };
 use ferrum_edge::modes::mesh::config::{TrustBundle, TrustBundleSet};
+use ferrum_edge::proxy::mesh_trust_registry::{MeshTransportGate, MeshTransportKind};
 use ferrum_edge::proxy::{
     ConfigApplyOutcome, DatabaseGatewayTrustInstall, GatewayTrustCommit, ProxyState,
 };
@@ -827,6 +828,72 @@ async fn a_committed_rotation_advances_the_backend_security_generation_inside_th
         "the rotation consumer must be told to invalidate caches, restart health \
          checks, and force-drain exactly the generation that just retired"
     );
+}
+
+#[tokio::test]
+async fn a_pre_commit_ticket_cannot_register_old_trust_as_the_new_generation() {
+    // Serialize against every other gateway-trust observability test in this
+    // binary: the published-namespace map and the counters are process-global.
+    let _observability = lock_gateway_trust_observability().await;
+    // The material-publication race: if `accepted_generation` advanced BEFORE
+    // `store_gateway_trust_material`, a dial that passed the live check could
+    // take a NEW ticket and still load OLD trust, then register as the
+    // published generation. Commit order is fence → store → retire/advance, so
+    // a ticket taken before commit still carries the outgoing generation and is
+    // refused, while the live slot already holds the accepted material.
+    let initial = config_with(vec![record("db-v1.local", &[1])]);
+    let state = database_mode_state(initial.clone()).await;
+    seed_source_loaded_svid(&state);
+    state.publish_gateway_trust_generation(&initial);
+
+    let ticket = state.mesh_trust_registry.admission_ticket();
+    let generation_before = state.mesh_trust_registry.accepted_generation();
+    assert_eq!(ticket.generation(), generation_before);
+    assert_eq!(
+        active_svid_domain(&state).as_deref(),
+        Some("db-v1.local"),
+        "the outgoing verifier is what a pre-commit dial would load"
+    );
+
+    let rotated = config_with(vec![record("db-v2.local", &[2])]);
+    let commit = state
+        .stage_database_gateway_trust(&rotated)
+        .expect("a convertible candidate must stage");
+    assert!(commit.changes_live_trust());
+    state.commit_gateway_trust_generation(commit);
+
+    assert_eq!(
+        active_svid_domain(&state).as_deref(),
+        Some("db-v2.local"),
+        "accepted material must already be installed when the generation advances"
+    );
+    assert!(
+        state.mesh_trust_registry.accepted_generation() > generation_before,
+        "ownership generation must advance as part of the same commit"
+    );
+    assert!(
+        state
+            .mesh_trust_registry
+            .register(ticket, MeshTransportKind::Hbone, MeshTransportGate::new())
+            .is_err(),
+        "a ticket stamped before publication must not register as the new generation"
+    );
+
+    let fresh = state.mesh_trust_registry.admission_ticket();
+    assert_ne!(
+        fresh.generation(),
+        ticket.generation(),
+        "a post-commit ticket is the published generation, which can only load \
+         the already-stored accepted verifier"
+    );
+    state
+        .mesh_trust_registry
+        .register(
+            fresh,
+            MeshTransportKind::MeshMtls,
+            MeshTransportGate::new(),
+        )
+        .expect("a ticket for the published generation is admitted");
 }
 
 #[tokio::test]

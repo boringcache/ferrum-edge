@@ -29,9 +29,12 @@
 //!    generation.
 //!
 //! The outer gateway-trust publication fence is separate and remains closed
-//! while the accepted verifier is installed and the backend TLS caches and pool
-//! maps are retired. Releasing this registry fence therefore does not reopen
-//! request admission early.
+//! across this sequence. The publication path installs the accepted verifier
+//! **before** calling this method, so a dial that takes a ticket for the newly
+//! published generation can only load that already-stored material. Releasing
+//! this registry fence therefore does not reopen request admission early, and
+//! it does not create a window of new-generation tickets authenticated by the
+//! withdrawn verifier.
 //!
 //! Signalling is synchronous — the gate flag is set and the driver is notified
 //! before the fence is released — so no transport can be admitted, returned to
