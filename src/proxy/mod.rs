@@ -40,6 +40,7 @@ pub mod body;
 pub mod client_ip;
 pub mod deferred_log;
 pub mod gateway_listener;
+pub mod gateway_listener_status;
 pub mod grpc_proxy;
 /// Shared h2c (cleartext, prior-knowledge HTTP/2) peer-preface observation.
 /// Hyper's client handshake proves only the client half, so both h2c transports
@@ -8812,7 +8813,8 @@ impl ProxyState {
                 record.hbone = ProtocolSupport::Supported;
             }
             Ok(Err(err)) => {
-                if err.is_capability_failure() {
+                let capability_failure = err.is_capability_failure();
+                if capability_failure {
                     record.hbone = ProtocolSupport::Unsupported;
                 } else if let Some(previous) = target.previous_hbone {
                     record.hbone = previous;
@@ -8821,10 +8823,17 @@ impl ProxyState {
                     record,
                     format!("HBONE probe failed for {host}:{port} via port {hbone_port}: {err}"),
                 );
-                debug!(
-                    "HBONE probe for {}:{} via port {} classified unsupported: {}",
-                    host, port, hbone_port, err
-                );
+                if capability_failure {
+                    debug!(
+                        "HBONE probe for {}:{} via port {} classified unsupported: {}",
+                        host, port, hbone_port, err
+                    );
+                } else {
+                    debug!(
+                        "HBONE probe for {}:{} via port {} hit a transient reachability failure; preserving the prior classification: {}",
+                        host, port, hbone_port, err
+                    );
+                }
             }
             Err(_) => {
                 if let Some(previous) = target.previous_hbone {
