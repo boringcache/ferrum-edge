@@ -1085,16 +1085,23 @@ fn buffered_http3_backend_upload_honors_client_grpc_deadline() {
         .expect("HTTP/3 backend request buffering must remain bounded");
     assert_eq!(
         buffering
-            .matches("collect_request_body_with_deadline(")
+            .matches("collect_request_body_under_authorization(")
             .count(),
         2,
         "limited and unlimited HTTP/3 upload buffering must share the deadline-aware collector"
     );
     assert_eq!(
         buffering
-            .matches("Err(RequestBodyWaitError::DeadlineExceeded)")
+            .matches("RequestBodyWaitError::DeadlineExceeded")
             .count(),
         2
+    );
+    assert_eq!(
+        buffering
+            .matches("AuthorizedUploadWaitError::AuthorizationExpired(")
+            .count(),
+        2,
+        "both buffering branches must also carry the admitted stream's authorization bound"
     );
     assert_eq!(
         buffering
@@ -3022,19 +3029,32 @@ fn h3_native_grpc_failure_paths_write_the_response_before_tearing_down() {
         .split("// ── Phase 2")
         .next()
         .expect("bounded pre-split failure arm");
-    let send_at = pre_split
-        .find("send_failed_h3_grpc_dispatch_error(&dispatch_env, &mut stream, error)")
-        .expect("pre-split failure must write the trailers-only gRPC error");
-    let halt_at = pre_split
-        .find("halt_request_body(&mut stream)")
-        .expect("pre-split failure must halt the unsplit receive half gracefully");
-    let record_at = pre_split
-        .find("record_failed_h3_grpc_dispatch(")
-        .expect("pre-split failure must record the outcome");
-    assert!(
-        send_at < halt_at && halt_at < record_at,
-        "pre-split ordering must be response -> STOP_SENDING(H3_NO_ERROR) -> record"
-    );
+    // Two pre-split arms reach a client-visible terminal: the authorization
+    // terminal and the ordinary dispatch failure. Each is bounded by the
+    // `return Ok(());` that closes it, so an arm's ordering is checked against
+    // its OWN halt and record rather than against the first one in the block.
+    for write in [
+        "send_h3_grpc_authorization_expired_terminal(",
+        "send_failed_h3_grpc_dispatch_error(&dispatch_env, &mut stream, error)",
+    ] {
+        let arm = pre_split
+            .split_inclusive("return Ok(());")
+            .find(|arm| arm.contains(write))
+            .unwrap_or_else(|| panic!("pre-split arm writing `{write}` must remain present"));
+        let send_at = arm
+            .find(write)
+            .expect("pre-split failure must write the trailers-only gRPC error");
+        let halt_at = arm
+            .find("halt_request_body(&mut stream)")
+            .expect("pre-split failure must halt the unsplit receive half gracefully");
+        let record_at = arm
+            .find("record_failed_h3_grpc_dispatch(")
+            .expect("pre-split failure must record the outcome");
+        assert!(
+            send_at < halt_at && halt_at < record_at,
+            "pre-split ordering must be response -> STOP_SENDING(H3_NO_ERROR) -> record"
+        );
+    }
 
     // Post-split: each ordinary failure/reject arm writes, then retires. Arms
     // are bounded by the `return Ok(());` that closes the previous one, so a
@@ -3099,8 +3119,9 @@ fn h3_native_grpc_terminal_writes_cannot_pin_the_upload_pump() {
         relay
             .matches("await_h3_grpc_terminal_write_with_grace(")
             .count(),
-        2,
-        "oversized-response and after_proxy terminal writes must both be bounded before pump retirement"
+        3,
+        "the oversized-response, after_proxy and authorization-expiry terminal writes must all \
+         be bounded before pump retirement"
     );
     assert!(
         relay

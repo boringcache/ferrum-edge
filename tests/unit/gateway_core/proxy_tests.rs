@@ -50,7 +50,7 @@ fn terminal_final_body_dispatch_follows_path_policy_and_precedes_backend_breaker
         .find("run_final_request_body_hooks(")
         .expect("terminal final-body hook must run before the backend breaker");
     let synthetic_pipeline = src[terminal_dispatch..breaker]
-        .find("finalize_reject_response_with_after_proxy_hooks_and_commit_policy(")
+        .find("boxed_finalize_reject_response(")
         .expect("terminal response must use the synthetic response pipeline");
     let backend_transport = src
         .find("async fn proxy_to_backend(")
@@ -2168,8 +2168,9 @@ fn upload_deadline_exits_use_finalized_rejection_cleanup_and_logging() {
         source
             .matches("finalize_upload_deadline_rejection(")
             .count(),
-        8,
-        "the helper definition plus all seven H1/H2 buffered upload exits must stay routed through cleanup"
+        9,
+        "the helper definition, the out-of-line boxed factory, and all seven H1/H2 buffered \
+         upload exits must stay routed through cleanup"
     );
 
     let grpc_collect_deadline_branches: Vec<&str> = source

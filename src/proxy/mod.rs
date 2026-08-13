@@ -25173,6 +25173,191 @@ fn boxed_finalize_authorization_expired_rejection<'a>(
     ))
 }
 
+/// One normalized-reject future, heap-allocated so it is not a frame slot in
+/// the caller. See [`boxed_finalize_reject_response`].
+type BoxedNormalizedRejectFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = NormalizedRejectResponse> + Send + 'a>>;
+
+/// The shared reject finalizer, CONSTRUCTED OUT OF LINE and returned boxed.
+///
+/// Same stack-budget invariant as [`boxed_finalize_authorization_expired_rejection`]
+/// and `boxed_proxy_to_backend_unix` (issue #3764), applied to the term that
+/// dominates it. `handle_proxy_request_inner` is THE generic request future
+/// every HTTP request the gateway serves is polled through, and an unoptimized
+/// build (the coverage profile, and `dev` too) gives EVERY future it awaits
+/// inline a fixed `alloca` in that one poll frame — charged to every request,
+/// branch taken or not, with no stack colouring to reclaim it. This finalizer
+/// awaits the whole reject pipeline (the `after_proxy` + synthetic-body hook
+/// pass and the commit-policy pass), and `handle_proxy_request_inner` reaches it
+/// from a dozen mutually exclusive rejection arms, so inline construction
+/// charged a plain proxied request for a dozen copies of a pipeline it can never
+/// execute.
+///
+/// Building each one in a separate `#[inline(never)]` frame that RETURNS before
+/// anything is awaited keeps those temporaries off the deep poll stack: the
+/// request future stores only a pointer. The cost is one allocation, and only on
+/// a request that is actually being rejected. Do not fold these back into the
+/// call sites without re-measuring the generic future's stack frame.
+#[inline(never)]
+fn boxed_finalize_reject_response<'a>(
+    plugins: &'a [Arc<dyn Plugin>],
+    ctx: &'a mut RequestContext,
+    status: StatusCode,
+    body: Bytes,
+    headers: HashMap<String, String>,
+    is_grpc_request: bool,
+    invoke_response_committed: bool,
+) -> BoxedNormalizedRejectFuture<'a> {
+    Box::pin(finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
+        plugins,
+        ctx,
+        status,
+        body,
+        headers,
+        is_grpc_request,
+        invoke_response_committed,
+    ))
+}
+
+/// The client-RPC-deadline upload rejection future, constructed out of line and
+/// returned boxed, for exactly the reason documented on
+/// [`boxed_finalize_reject_response`].
+///
+/// Reached from seven upload-buffering arms of `handle_proxy_request_inner`, and
+/// it awaits the same reject pipeline plus the rejection logger.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn boxed_finalize_upload_deadline_rejection<'a>(
+    plugins: &'a [Arc<dyn Plugin>],
+    ctx: &'a mut RequestContext,
+    state: &'a ProxyState,
+    start_time: Instant,
+    rejection_phase: &'a str,
+    plugin_execution_ns: u64,
+    original_request_path: Option<&'a str>,
+    grpc_web_response_content_type: Option<&'a str>,
+) -> BoxedRejectionResponseFuture<'a> {
+    Box::pin(finalize_upload_deadline_rejection(
+        plugins,
+        ctx,
+        state,
+        start_time,
+        rejection_phase,
+        plugin_execution_ns,
+        original_request_path,
+        grpc_web_response_content_type,
+    ))
+}
+
+/// The backend-admission rejection future, constructed out of line and returned
+/// boxed, for exactly the reason documented on
+/// [`boxed_finalize_reject_response`].
+///
+/// Reached from eight admission arms of `handle_proxy_request_inner`, and it
+/// awaits the reject pipeline, the gRPC-Web translation, and the rejection
+/// logger in turn.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn boxed_handle_backend_admission_rejection<'a>(
+    rejection: backend_dispatch::BackendAdmissionRejection,
+    plugins: &'a [Arc<dyn Plugin>],
+    ctx: &'a mut RequestContext,
+    state: &'a ProxyState,
+    start_time: Instant,
+    plugin_execution_ns: u64,
+    original_request_path: Option<&'a str>,
+    is_grpc_request: bool,
+    grpc_web_error_content_type: Option<&'a str>,
+) -> BoxedRejectionResponseFuture<'a> {
+    Box::pin(handle_backend_admission_rejection(
+        rejection,
+        plugins,
+        ctx,
+        state,
+        start_time,
+        plugin_execution_ns,
+        original_request_path,
+        is_grpc_request,
+        grpc_web_error_content_type,
+    ))
+}
+
+/// One gRPC-Web reject-translation future, heap-allocated so it is not a frame
+/// slot in the caller. See [`boxed_finalize_reject_response`].
+type BoxedGrpcWebRejectFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Option<Response<ProxyBody>>> + Send + 'a>>;
+
+/// One rejection-logging future, heap-allocated so it is not a frame slot in
+/// the caller. See [`boxed_finalize_reject_response`].
+type BoxedRejectionLogFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>;
+
+/// The gRPC-Web reject translation, constructed out of line and returned boxed,
+/// for exactly the reason documented on [`boxed_finalize_reject_response`]: it
+/// pairs with that finalizer at every rejection arm of
+/// `handle_proxy_request_inner`, so an inline construction is charged the same
+/// dozen permanent frame slots.
+#[inline(never)]
+fn boxed_build_grpc_web_reject_response<'a>(
+    plugins: &'a [Arc<dyn Plugin>],
+    ctx: &'a mut RequestContext,
+    response_content_type: Option<&'a str>,
+    reject: &'a NormalizedRejectResponse,
+) -> BoxedGrpcWebRejectFuture<'a> {
+    Box::pin(build_grpc_web_reject_response(
+        plugins,
+        ctx,
+        response_content_type,
+        reject,
+    ))
+}
+
+/// The rejection logger, constructed out of line and returned boxed, for
+/// exactly the reason documented on [`boxed_finalize_reject_response`]. It
+/// builds a whole transaction summary and awaits the configured sinks, and
+/// `handle_proxy_request_inner` reaches it from every rejection arm.
+#[inline(never)]
+fn boxed_log_rejected_request<'a>(
+    plugins: &'a [Arc<dyn Plugin>],
+    ctx: &'a RequestContext,
+    status_code: u16,
+    start_time: Instant,
+    rejection_phase: &'a str,
+    plugin_execution_ns: u64,
+) -> BoxedRejectionLogFuture<'a> {
+    Box::pin(log_rejected_request(
+        plugins,
+        ctx,
+        status_code,
+        start_time,
+        rejection_phase,
+        plugin_execution_ns,
+    ))
+}
+
+/// [`boxed_log_rejected_request`] for the path-overriding variant.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn boxed_log_rejected_request_with_path<'a>(
+    plugins: &'a [Arc<dyn Plugin>],
+    ctx: &'a RequestContext,
+    status_code: u16,
+    start_time: Instant,
+    rejection_phase: &'a str,
+    plugin_execution_ns: u64,
+    request_path_override: Option<&'a str>,
+) -> BoxedRejectionLogFuture<'a> {
+    Box::pin(log_rejected_request_with_path(
+        plugins,
+        ctx,
+        status_code,
+        start_time,
+        rejection_phase,
+        plugin_execution_ns,
+        request_path_override,
+    ))
+}
+
 pub fn request_is_authenticated(ctx: &RequestContext) -> bool {
     ctx.effective_identity().is_some()
 }
@@ -27223,7 +27408,7 @@ async fn handle_proxy_request_inner(
                     r#"{"error":"Internal error"}"#,
                 ));
             };
-            let reject = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
+            let reject = boxed_finalize_reject_response(
                 &plugins,
                 &mut ctx,
                 StatusCode::from_u16(plugin_reject.status_code).unwrap_or(StatusCode::BAD_REQUEST),
@@ -27234,14 +27419,14 @@ async fn handle_proxy_request_inner(
             )
             .await;
             apply_grpc_reject_metadata(&mut ctx, &reject);
-            let grpc_web_response = build_grpc_web_reject_response(
+            let grpc_web_response = boxed_build_grpc_web_reject_response(
                 &plugins,
                 &mut ctx,
                 grpc_web_response_content_type,
                 &reject,
             )
             .await;
-            log_rejected_request(
+            boxed_log_rejected_request(
                 &plugins,
                 &ctx,
                 reject.http_status.as_u16(),
@@ -27288,7 +27473,7 @@ async fn handle_proxy_request_inner(
                         .expect("reject result should convert to rejection parts");
                     let status_code = plugin_reject.status_code;
                     plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
-                    let reject = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
+                    let reject = boxed_finalize_reject_response(
                         &plugins,
                         &mut ctx,
                         StatusCode::from_u16(status_code)
@@ -27300,14 +27485,14 @@ async fn handle_proxy_request_inner(
                     )
                     .await;
                     apply_grpc_reject_metadata(&mut ctx, &reject);
-                    let grpc_web_response = build_grpc_web_reject_response(
+                    let grpc_web_response = boxed_build_grpc_web_reject_response(
                         &plugins,
                         &mut ctx,
                         grpc_web_response_content_type,
                         &reject,
                     )
                     .await;
-                    log_rejected_request(
+                    boxed_log_rejected_request(
                         &plugins,
                         &ctx,
                         reject.http_status.as_u16(),
@@ -27449,7 +27634,7 @@ async fn handle_proxy_request_inner(
                         return Ok(response);
                     }
                     Err(RequestBodyBufferError::DeadlineExceeded) => {
-                        let response = finalize_upload_deadline_rejection(
+                        let response = boxed_finalize_upload_deadline_rejection(
                             &plugins,
                             &mut ctx,
                             &state,
@@ -27482,7 +27667,7 @@ async fn handle_proxy_request_inner(
         .await
         {
             plugin_execution_ns += auth_phase_start.elapsed().as_nanos() as u64;
-            let reject = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
+            let reject = boxed_finalize_reject_response(
                 &plugins,
                 &mut ctx,
                 StatusCode::from_u16(status_code).unwrap_or(StatusCode::UNAUTHORIZED),
@@ -27493,14 +27678,14 @@ async fn handle_proxy_request_inner(
             )
             .await;
             apply_grpc_reject_metadata(&mut ctx, &reject);
-            let grpc_web_response = build_grpc_web_reject_response(
+            let grpc_web_response = boxed_build_grpc_web_reject_response(
                 &plugins,
                 &mut ctx,
                 grpc_web_response_content_type,
                 &reject,
             )
             .await;
-            log_rejected_request(
+            boxed_log_rejected_request(
                 &plugins,
                 &ctx,
                 reject.http_status.as_u16(),
@@ -27607,7 +27792,7 @@ async fn handle_proxy_request_inner(
                         return Ok(response);
                     }
                     Err(RequestBodyBufferError::DeadlineExceeded) => {
-                        let response = finalize_upload_deadline_rejection(
+                        let response = boxed_finalize_upload_deadline_rejection(
                             &plugins,
                             &mut ctx,
                             &state,
@@ -27666,7 +27851,7 @@ async fn handle_proxy_request_inner(
                         .expect("reject result should convert to rejection parts");
                     let status_code = plugin_reject.status_code;
                     plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
-                    let reject = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
+                    let reject = boxed_finalize_reject_response(
                         &plugins,
                         &mut ctx,
                         StatusCode::from_u16(status_code).unwrap_or(StatusCode::FORBIDDEN),
@@ -27677,14 +27862,14 @@ async fn handle_proxy_request_inner(
                     )
                     .await;
                     apply_grpc_reject_metadata(&mut ctx, &reject);
-                    let grpc_web_response = build_grpc_web_reject_response(
+                    let grpc_web_response = boxed_build_grpc_web_reject_response(
                         &plugins,
                         &mut ctx,
                         grpc_web_response_content_type,
                         &reject,
                     )
                     .await;
-                    log_rejected_request(
+                    boxed_log_rejected_request(
                         &plugins,
                         &ctx,
                         reject.http_status.as_u16(),
@@ -27825,7 +28010,7 @@ async fn handle_proxy_request_inner(
                         return Ok(response);
                     }
                     Err(RequestBodyBufferError::DeadlineExceeded) => {
-                        let response = finalize_upload_deadline_rejection(
+                        let response = boxed_finalize_upload_deadline_rejection(
                             &plugins,
                             &mut ctx,
                             &state,
@@ -27945,7 +28130,7 @@ async fn handle_proxy_request_inner(
             };
             let status_code = plugin_reject.status_code;
             plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
-            let reject = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
+            let reject = boxed_finalize_reject_response(
                 &plugins,
                 &mut ctx,
                 StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
@@ -27956,14 +28141,14 @@ async fn handle_proxy_request_inner(
             )
             .await;
             apply_grpc_reject_metadata(&mut ctx, &reject);
-            let grpc_web_response = build_grpc_web_reject_response(
+            let grpc_web_response = boxed_build_grpc_web_reject_response(
                 &plugins,
                 &mut ctx,
                 grpc_web_response_content_type,
                 &reject,
             )
             .await;
-            log_rejected_request(
+            boxed_log_rejected_request(
                 &plugins,
                 &ctx,
                 reject.http_status.as_u16(),
@@ -28024,7 +28209,7 @@ async fn handle_proxy_request_inner(
                 };
                 let status_code = plugin_reject.status_code;
                 plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
-                let reject = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
+                let reject = boxed_finalize_reject_response(
                     &plugins,
                     &mut ctx,
                     StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
@@ -28035,14 +28220,14 @@ async fn handle_proxy_request_inner(
                 )
                 .await;
                 apply_grpc_reject_metadata(&mut ctx, &reject);
-                let grpc_web_response = build_grpc_web_reject_response(
+                let grpc_web_response = boxed_build_grpc_web_reject_response(
                     &plugins,
                     &mut ctx,
                     grpc_web_response_content_type,
                     &reject,
                 )
                 .await;
-                log_rejected_request(
+                boxed_log_rejected_request(
                     &plugins,
                     &ctx,
                     reject.http_status.as_u16(),
@@ -28089,7 +28274,7 @@ async fn handle_proxy_request_inner(
                 let status_code = plugin_reject.status_code;
                 plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
                 ctx.headers = tmp_headers;
-                let reject = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
+                let reject = boxed_finalize_reject_response(
                     &plugins,
                     &mut ctx,
                     StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
@@ -28100,14 +28285,14 @@ async fn handle_proxy_request_inner(
                 )
                 .await;
                 apply_grpc_reject_metadata(&mut ctx, &reject);
-                let grpc_web_response = build_grpc_web_reject_response(
+                let grpc_web_response = boxed_build_grpc_web_reject_response(
                     &plugins,
                     &mut ctx,
                     grpc_web_response_content_type,
                     &reject,
                 )
                 .await;
-                log_rejected_request(
+                boxed_log_rejected_request(
                     &plugins,
                     &ctx,
                     reject.http_status.as_u16(),
@@ -28468,7 +28653,7 @@ async fn handle_proxy_request_inner(
                 };
                 let status = StatusCode::from_u16(plugin_reject.status_code)
                     .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                let reject = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
+                let reject = boxed_finalize_reject_response(
                     &plugins,
                     &mut ctx,
                     status,
@@ -28479,14 +28664,14 @@ async fn handle_proxy_request_inner(
                 )
                 .await;
                 apply_grpc_reject_metadata(&mut ctx, &reject);
-                let grpc_web_response = build_grpc_web_reject_response(
+                let grpc_web_response = boxed_build_grpc_web_reject_response(
                     &plugins,
                     &mut ctx,
                     grpc_web_response_content_type,
                     &reject,
                 )
                 .await;
-                log_rejected_request_with_path(
+                boxed_log_rejected_request_with_path(
                     &plugins,
                     &ctx,
                     reject.http_status.as_u16(),
@@ -28701,7 +28886,7 @@ async fn handle_proxy_request_inner(
                             RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY.to_string(),
                             "true".to_string(),
                         );
-                        return Ok(finalize_upload_deadline_rejection(
+                        return Ok(boxed_finalize_upload_deadline_rejection(
                             &plugins,
                             &mut ctx,
                             &state,
@@ -28814,7 +28999,7 @@ async fn handle_proxy_request_inner(
                         let status = StatusCode::from_u16(reject.status_code)
                             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                         let normalized =
-                            finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
+                            boxed_finalize_reject_response(
                                 &plugins,
                                 &mut ctx,
                                 status,
@@ -28825,14 +29010,14 @@ async fn handle_proxy_request_inner(
                             )
                             .await;
                         apply_grpc_reject_metadata(&mut ctx, &normalized);
-                        let grpc_web_response = build_grpc_web_reject_response(
+                        let grpc_web_response = boxed_build_grpc_web_reject_response(
                             &plugins,
                             &mut ctx,
                             grpc_web_response_content_type,
                             &normalized,
                         )
                         .await;
-                        log_rejected_request_with_path(
+                        boxed_log_rejected_request_with_path(
                             &plugins,
                             &ctx,
                             normalized.http_status.as_u16(),
@@ -28911,7 +29096,7 @@ async fn handle_proxy_request_inner(
                 };
                 let status = StatusCode::from_u16(reject.status_code)
                     .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                let normalized = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
+                let normalized = boxed_finalize_reject_response(
                     &plugins,
                     &mut ctx,
                     status,
@@ -28922,14 +29107,14 @@ async fn handle_proxy_request_inner(
                 )
                 .await;
                 apply_grpc_reject_metadata(&mut ctx, &normalized);
-                let grpc_web_response = build_grpc_web_reject_response(
+                let grpc_web_response = boxed_build_grpc_web_reject_response(
                     &plugins,
                     &mut ctx,
                     grpc_web_response_content_type,
                     &normalized,
                 )
                 .await;
-                log_rejected_request_with_path(
+                boxed_log_rejected_request_with_path(
                     &plugins,
                     &ctx,
                     normalized.http_status.as_u16(),
@@ -29000,7 +29185,7 @@ async fn handle_proxy_request_inner(
                 // Use `original_request_path` so the log records the path the
                 // client actually requested, not the VirtualService-rewritten
                 // backend path stored in `ctx.path` after the rewrite above.
-                log_rejected_request_with_path(
+                boxed_log_rejected_request_with_path(
                     &plugins,
                     &ctx,
                     reject.http_status.as_u16(),
@@ -29061,7 +29246,7 @@ async fn handle_proxy_request_inner(
                         cb_target_key.as_deref(),
                         cb_is_half_open_probe,
                     );
-                    return Ok(handle_backend_admission_rejection(
+                    return Ok(boxed_handle_backend_admission_rejection(
                         rejection,
                         &plugins,
                         &mut ctx,
@@ -29150,7 +29335,7 @@ async fn handle_proxy_request_inner(
                             cb_is_half_open_probe,
                         );
                         drop(preacquired_backend_admission.take_if_acquired());
-                        let response = finalize_upload_deadline_rejection(
+                        let response = boxed_finalize_upload_deadline_rejection(
                             &plugins,
                             &mut ctx,
                             &state,
@@ -29267,7 +29452,7 @@ async fn handle_proxy_request_inner(
                         let status = StatusCode::from_u16(reject.status_code)
                             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                         let normalized =
-                            finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
+                            boxed_finalize_reject_response(
                                 &plugins,
                                 &mut ctx,
                                 status,
@@ -29278,14 +29463,14 @@ async fn handle_proxy_request_inner(
                             )
                             .await;
                         apply_grpc_reject_metadata(&mut ctx, &normalized);
-                        let grpc_web_response = build_grpc_web_reject_response(
+                        let grpc_web_response = boxed_build_grpc_web_reject_response(
                             &plugins,
                             &mut ctx,
                             grpc_web_response_content_type,
                             &normalized,
                         )
                         .await;
-                        log_rejected_request_with_path(
+                        boxed_log_rejected_request_with_path(
                             &plugins,
                             &ctx,
                             normalized.http_status.as_u16(),
@@ -29919,7 +30104,7 @@ async fn handle_proxy_request_inner(
                                 grpc_cb_probe_slot,
                             );
                             drop(preacquired_backend_admission.take_if_acquired());
-                            return Ok(finalize_upload_deadline_rejection(
+                            return Ok(boxed_finalize_upload_deadline_rejection(
                                 &plugins,
                                 &mut ctx,
                                 &state,
@@ -30139,7 +30324,7 @@ async fn handle_proxy_request_inner(
                     let status = StatusCode::from_u16(reject.status_code)
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                     let normalized =
-                        finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
+                        boxed_finalize_reject_response(
                             &plugins,
                             &mut ctx,
                             status,
@@ -30150,14 +30335,14 @@ async fn handle_proxy_request_inner(
                         )
                         .await;
                     apply_grpc_reject_metadata(&mut ctx, &normalized);
-                    let grpc_web_response = build_grpc_web_reject_response(
+                    let grpc_web_response = boxed_build_grpc_web_reject_response(
                         &plugins,
                         &mut ctx,
                         grpc_web_response_content_type,
                         &normalized,
                     )
                     .await;
-                    log_rejected_request_with_path(
+                    boxed_log_rejected_request_with_path(
                         &plugins,
                         &ctx,
                         normalized.http_status.as_u16(),
@@ -30210,7 +30395,7 @@ async fn handle_proxy_request_inner(
                         cb_target_key.as_deref(),
                         grpc_cb_probe_slot,
                     );
-                    return Ok(handle_backend_admission_rejection(
+                    return Ok(boxed_handle_backend_admission_rejection(
                         rejection,
                         &plugins,
                         &mut ctx,
@@ -30377,7 +30562,7 @@ async fn handle_proxy_request_inner(
                             cb_target_key.as_deref(),
                             grpc_cb_probe_slot,
                         );
-                        return Ok(handle_backend_admission_rejection(
+                        return Ok(boxed_handle_backend_admission_rejection(
                             rejection,
                             &plugins,
                             &mut ctx,
@@ -30494,7 +30679,7 @@ async fn handle_proxy_request_inner(
                                         cb_target_key.as_deref(),
                                         grpc_cb_probe_slot,
                                     );
-                                    return Ok(handle_backend_admission_rejection(
+                                    return Ok(boxed_handle_backend_admission_rejection(
                                         rejection,
                                         &plugins,
                                         &mut ctx,
@@ -30558,7 +30743,7 @@ async fn handle_proxy_request_inner(
                             grpc_cb_probe_slot,
                         );
                         drop(preacquired_backend_admission.take_if_acquired());
-                        return Ok(finalize_upload_deadline_rejection(
+                        return Ok(boxed_finalize_upload_deadline_rejection(
                             &plugins,
                             &mut ctx,
                             &state,
@@ -30986,7 +31171,7 @@ async fn handle_proxy_request_inner(
                             grpc_current_cb_key.as_deref(),
                             grpc_cb_probe_slot,
                         );
-                        return Ok(handle_backend_admission_rejection(
+                        return Ok(boxed_handle_backend_admission_rejection(
                             rejection,
                             &plugins,
                             &mut ctx,
@@ -31444,7 +31629,7 @@ async fn handle_proxy_request_inner(
                         // Use `original_request_path` so the log records the
                         // path the client actually requested, not the
                         // VirtualService-rewritten backend path in `ctx.path`.
-                        log_rejected_request_with_path(
+                        boxed_log_rejected_request_with_path(
                             &plugins,
                             &ctx,
                             normalized.http_status.as_u16(),
@@ -33357,7 +33542,7 @@ async fn handle_proxy_request_inner(
                 // direct gRPC branch passes `true` unconditionally to
                 // `normalize_reject_response`, which renders a Trailers-Only
                 // gRPC reject instead of HTTP/JSON.
-                return Ok(handle_backend_admission_rejection(
+                return Ok(boxed_handle_backend_admission_rejection(
                     rejection,
                     &plugins,
                     &mut ctx,
@@ -33835,7 +34020,7 @@ async fn handle_proxy_request_inner(
                     );
                     // Codex r2-2 finding 3: keep the gRPC rejection shape for
                     // gRPC-flavored requests (see the initial-dispatch arm).
-                    return Ok(handle_backend_admission_rejection(
+                    return Ok(boxed_handle_backend_admission_rejection(
                         rejection,
                         &plugins,
                         &mut ctx,
@@ -34053,7 +34238,7 @@ async fn handle_proxy_request_inner(
                 );
                 // Codex r2-2 finding 3: keep the gRPC rejection shape for
                 // gRPC-flavored requests (see the initial-dispatch arm).
-                return Ok(handle_backend_admission_rejection(
+                return Ok(boxed_handle_backend_admission_rejection(
                     rejection,
                     &plugins,
                     &mut ctx,

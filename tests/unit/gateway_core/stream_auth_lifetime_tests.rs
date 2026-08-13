@@ -319,17 +319,23 @@ fn counters_expose_every_family_and_only_those_families() {
 /// production path. The counters carry no test dimension (that is the point of
 /// their fixed cardinality), so without this the binary's default parallelism
 /// could interleave two `stream_udp` increments inside one before/after pair.
-static COUNTER_DELTA_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static COUNTER_DELTA_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-fn counter_delta_guard() -> std::sync::MutexGuard<'static, ()> {
-    COUNTER_DELTA_GUARD
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+/// Serialize every exact-delta assertion over the process-global termination
+/// counters, so a concurrent test in the same binary cannot be observed inside
+/// another test's `before`/`after` window.
+///
+/// Deliberately an ASYNC mutex: several of these tests must hold the guard
+/// across `.await` points (the whole point is that the awaited work is what
+/// moves the counter), and a `std::sync::MutexGuard` held across an await is
+/// both a clippy error here and a real cross-runtime hazard.
+async fn counter_delta_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    COUNTER_DELTA_GUARD.lock().await
 }
 
-#[test]
-fn recording_a_termination_increments_only_its_own_class_and_family() {
-    let _guard = counter_delta_guard();
+#[tokio::test]
+async fn recording_a_termination_increments_only_its_own_class_and_family() {
+    let _guard = counter_delta_guard().await;
     // Process-global monotonic counters: compare deltas, never absolutes, so
     // this stays correct alongside other tests in the same binary.
     let before = counters();
@@ -1570,13 +1576,20 @@ fn the_pre_authentication_prebuffer_stays_on_the_unbounded_collect() {
     // `buffer_request_body_for_before_proxy` runs BEFORE any principal is
     // admitted, so there is no authorization lifetime to enforce there and no
     // credential deadline to read. Widening it would be a false bound.
+    // Bounded by the function that FOLLOWS it. `request_may_have_body` is
+    // declared ahead of the prebuffer, so splitting on it left this pin reading
+    // the whole rest of the module and asserting nothing about the prebuffer.
     let prebuffer = PROXY_SOURCE
         .split("async fn buffer_request_body_for_before_proxy(")
         .nth(1)
         .expect("pre-authentication prebuffer")
-        .split("pub(crate) fn request_may_have_body")
+        .split("async fn prepare_mesh_request_body(")
         .next()
         .expect("bounded prebuffer body");
+    assert!(
+        prebuffer.contains("collect_request_body_with_deadline("),
+        "the prebuffer must still be the unbounded, deadline-only collect"
+    );
     assert!(!prebuffer.contains("collect_request_body_under_authorization"));
 }
 
@@ -2377,7 +2390,7 @@ fn assert_dtls_expiry_is_policy_neutral(expiry: &DtlsAuthorizationExpiryForTest)
 
 #[tokio::test(start_paused = true)]
 async fn an_already_elapsed_dtls_plan_never_starts_a_setup_stage() {
-    let _guard = counter_delta_guard();
+    let _guard = counter_delta_guard().await;
     let plan = dtls_plan(
         Duration::from_secs(1),
         StreamAuthTermination::CredentialExpired,
@@ -2427,7 +2440,7 @@ async fn an_already_elapsed_dtls_plan_never_starts_a_setup_stage() {
 
 #[tokio::test(start_paused = true)]
 async fn a_dtls_setup_stage_outliving_the_plan_is_cancelled_and_health_neutral() {
-    let _guard = counter_delta_guard();
+    let _guard = counter_delta_guard().await;
     let plan = dtls_plan(
         Duration::from_millis(50),
         StreamAuthTermination::CredentialExpired,
@@ -2523,9 +2536,9 @@ async fn the_pre_relay_gate_refuses_an_elapsed_plan_and_admits_a_live_one() {
     assert_eq!(unauthenticated, None, "an unauthenticated session is fine");
 }
 
-#[test]
-fn a_relay_phase_dtls_expiry_publishes_the_bounded_class_exactly_once() {
-    let _guard = counter_delta_guard();
+#[tokio::test]
+async fn a_relay_phase_dtls_expiry_publishes_the_bounded_class_exactly_once() {
+    let _guard = counter_delta_guard().await;
     let latch = ferrum_edge::proxy::auth_lifetime::StreamAuthTerminationLatch::default();
     let session_metadata = std::sync::Mutex::new(std::collections::HashMap::new());
 

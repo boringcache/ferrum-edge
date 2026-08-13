@@ -815,9 +815,7 @@ async fn an_upstream_error_immediately_before_the_deadline_stays_an_error() {
         );
 
     let terminal = body.frame().await.expect("a terminal frame");
-    let error = terminal
-        .err()
-        .expect("an upstream error must stay an error");
+    let error = terminal.expect_err("an upstream error must stay an error");
     assert!(
         error.to_string().contains("backend failed"),
         "the upstream error must be delivered verbatim, never collapsed into a clean EOF or \
@@ -1099,8 +1097,7 @@ async fn an_upstream_error_reached_before_the_deadline_survives_a_late_downstrea
         .frame()
         .await
         .expect("a terminal frame")
-        .err()
-        .expect("an upstream error must stay an error");
+        .expect_err("an upstream error must stay an error");
     assert!(
         error.to_string().contains("backend failed"),
         "the backend failure the pump decided before the deadline must reach the client \
@@ -1150,8 +1147,7 @@ async fn a_response_still_in_flight_at_the_deadline_is_still_terminated_for_a_pa
         .frame()
         .await
         .expect("a terminal frame")
-        .err()
-        .expect("an expired stream must end with an error, never a clean EOF");
+        .expect_err("an expired stream must end with an error, never a clean EOF");
     assert!(
         error.to_string().contains("credential expired"),
         "the client-visible terminal must still be the fixed authorization message: {error}"
@@ -1368,8 +1364,7 @@ async fn a_frame_queued_before_the_bound_is_never_delivered_after_it() {
         .frame()
         .await
         .expect("a terminal")
-        .err()
-        .expect("the queued protected frame must not be delivered");
+        .expect_err("the queued protected frame must not be delivered");
     assert!(
         error.to_string().contains("credential expired"),
         "a frame queued before the bound must lose to the authorization terminal: {error}"

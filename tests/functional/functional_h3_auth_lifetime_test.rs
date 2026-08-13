@@ -145,6 +145,65 @@ fn protected_proxy_yaml_with_read_timeout(backend_port: u16, read_timeout_ms: u6
     serde_yaml::to_string(&config).expect("yaml serialize")
 }
 
+/// [`protected_proxy_yaml`] with the `grpc_web` translator enabled.
+///
+/// The shared wire classifier deliberately leaves `application/grpc-web*` as a
+/// pass-through representation: the gateway promotes the request to effective
+/// gRPC for policy, but the BACKEND transport is promoted — and the response
+/// body translated — only once the `grpc_web` plugin stamps its trusted
+/// translation marker. Without it, a plugin-free deployment relays the backend's
+/// native `application/grpc` response untouched, which is a different contract
+/// from the one the gRPC-Web terminal test asserts.
+fn grpc_web_protected_proxy_yaml(backend_port: u16) -> String {
+    let config = json!({
+        "version": "1",
+        "proxies": [{
+            "id": "h3-auth-lifetime",
+            "listen_path": "/api",
+            "backend_scheme": "https",
+            "backend_host": "127.0.0.1",
+            "backend_port": backend_port,
+            "strip_listen_path": true,
+            "backend_connect_timeout_ms": 5000,
+            "backend_read_timeout_ms": 60000,
+            "backend_write_timeout_ms": 60000,
+            "backend_tls_verify_server_cert": false,
+            "plugins": [
+                {"plugin_config_id": "h3-auth-lifetime-jwt"},
+                {"plugin_config_id": "h3-auth-lifetime-grpc-web"},
+            ],
+        }],
+        "consumers": [{
+            "id": CONSUMER,
+            "username": CONSUMER,
+            "credentials": {"jwt": [{"secret": JWT_SECRET}]},
+        }],
+        "upstreams": [],
+        "plugin_configs": [
+            {
+                "id": "h3-auth-lifetime-jwt",
+                "plugin_name": "jwt_auth",
+                "scope": "proxy",
+                "proxy_id": "h3-auth-lifetime",
+                "enabled": true,
+                "config": {
+                    "token_lookup": "header:Authorization",
+                    "consumer_claim_field": "sub",
+                },
+            },
+            {
+                "id": "h3-auth-lifetime-grpc-web",
+                "plugin_name": "grpc_web",
+                "scope": "proxy",
+                "proxy_id": "h3-auth-lifetime",
+                "enabled": true,
+                "config": {},
+            },
+        ],
+    });
+    serde_yaml::to_string(&config).expect("yaml serialize")
+}
+
 fn write_frontend_certs(scratch: &std::path::Path) -> (String, String) {
     let ca = TestCa::new("h3-auth-lifetime-gw").expect("ca");
     let (cert, key) = ca.valid().expect("leaf");
@@ -678,7 +737,10 @@ async fn h3_auth_lifetime_grpc_web_expiry_emits_bounded_trailer_frame() {
         .spawn()
         .expect("spawn stalling grpc backend");
 
-    let (harness, https_port) = spawn_h3_gateway(protected_proxy_yaml(backend_port), false).await;
+    // The `grpc_web` translator is what makes this a gRPC-Web stream rather than
+    // a pass-through of the backend's native gRPC framing.
+    let (harness, https_port) =
+        spawn_h3_gateway(grpc_web_protected_proxy_yaml(backend_port), false).await;
 
     let client = Http3Client::insecure().expect("H3 client");
     let token = mint_short_lived_token();

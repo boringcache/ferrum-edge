@@ -148,11 +148,28 @@ pub(crate) const fn upload_pump_error_message(outcome: UploadPumpOutcome) -> &'s
 
 /// Aborts the pump task when the transport-side body is dropped, so a pump can
 /// never outlive the body it feeds.
-struct AbortPumpOnDrop(tokio::task::JoinHandle<()>);
+///
+/// The abort is synchronous and lands before the task can be polled again, so
+/// the task itself never observes the closed bridge channel and never publishes
+/// a terminal of its own. The terminal is therefore published HERE, before the
+/// abort: releasing the transport body IS the "consumer went away" outcome, and
+/// recording it is what lets a dispatcher joining this pump distinguish it from
+/// a task that simply died. `RUNNING` is the only state it may overwrite, so a
+/// pump that already settled keeps its own outcome.
+struct AbortPumpOnDrop {
+    handle: tokio::task::JoinHandle<()>,
+    terminal: Arc<AtomicU8>,
+}
 
 impl Drop for AbortPumpOnDrop {
     fn drop(&mut self) {
-        self.0.abort();
+        let _ = self.terminal.compare_exchange(
+            PUMP_RUNNING,
+            PUMP_CONSUMER_GONE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        self.handle.abort();
     }
 }
 
@@ -245,6 +262,11 @@ impl UploadPumpSource {
 pub(crate) struct UploadPumpJoin {
     cancel: Option<tokio::sync::oneshot::Sender<()>>,
     finished: Option<tokio::sync::oneshot::Receiver<UploadPumpOutcome>>,
+    /// Shared with the pump task and with [`UploadPumpSource`]'s abort guard.
+    /// Read only as a FALLBACK, when the task published no outcome of its own
+    /// because it was aborted — which is exactly what releasing the transport
+    /// body does.
+    terminal: Arc<AtomicU8>,
     cancel_on_drop: bool,
 }
 
@@ -282,10 +304,7 @@ impl UploadPumpJoin {
         // this handle's eventual drop as a teardown request.
         self.cancel = None;
         self.cancel_on_drop = false;
-        match self.finished.take() {
-            Some(finished) => finished.await.ok(),
-            None => None,
-        }
+        self.await_outcome().await
     }
 
     /// Cancel the pump and wait for it to finish.
@@ -298,11 +317,23 @@ impl UploadPumpJoin {
     /// flow-control window.
     pub(crate) async fn cancel_and_join(mut self) -> Option<UploadPumpOutcome> {
         self.cancel();
-        match self.finished.take() {
-            // `Err` means the task was aborted (its `finished` sender dropped),
-            // which also implies the source was dropped with it.
-            Some(finished) => finished.await.ok(),
-            None => None,
+        self.await_outcome().await
+    }
+
+    /// The pump's terminal state: its own published outcome when it ran to a
+    /// terminal, otherwise the shared one.
+    ///
+    /// A `oneshot` `Err` means the task was aborted (its `finished` sender
+    /// dropped with it), which also implies the client body was dropped. That
+    /// happens on exactly one path — the transport released
+    /// [`UploadPumpSource`] — and its abort guard publishes
+    /// [`UploadPumpOutcome::ConsumerGone`] before aborting, so the join point
+    /// reports why rather than collapsing it into "no outcome".
+    async fn await_outcome(&mut self) -> Option<UploadPumpOutcome> {
+        let finished = self.finished.take()?;
+        match finished.await {
+            Ok(outcome) => Some(outcome),
+            Err(_) => code_outcome(self.terminal.load(Ordering::Acquire)),
         }
     }
 }
@@ -354,8 +385,11 @@ where
     (
         UploadPumpSource {
             receiver,
-            terminal,
-            _abort: AbortPumpOnDrop(handle),
+            terminal: Arc::clone(&terminal),
+            _abort: AbortPumpOnDrop {
+                handle,
+                terminal: Arc::clone(&terminal),
+            },
             initial_hint,
             delivered: 0,
             ended: false,
@@ -364,6 +398,7 @@ where
         UploadPumpJoin {
             cancel: Some(cancel_tx),
             finished: Some(finished_rx),
+            terminal,
             cancel_on_drop: false,
         },
     )

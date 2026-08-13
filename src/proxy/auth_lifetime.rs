@@ -298,8 +298,16 @@ impl AuthorizationConnectionCloser {
     /// Level-triggered and idempotent: a receiver created after this call still
     /// observes the closed state, and repeated calls are indistinguishable from
     /// one.
+    ///
+    /// `send_replace`, deliberately, not `send`: `watch::Sender::send` returns
+    /// early WITHOUT storing when the channel currently has no receiver, so a
+    /// close requested before the connection task subscribed — or after its
+    /// `select!` already dropped its receiver — would be silently discarded and
+    /// [`close_requested`](Self::close_requested) would keep reporting `false`.
+    /// The signal is a security decision about an admitted stream, so it must be
+    /// RECORDED whether or not anybody is listening at that instant.
     pub fn request_close(&self) {
-        let _ = self.0.send(true);
+        let _previous = self.0.send_replace(true);
     }
 
     /// Whether a close has already been requested.

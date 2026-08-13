@@ -384,9 +384,20 @@ where
     F: std::future::Future,
 {
     match plan {
-        Some(plan) => tokio::time::timeout_at(plan.at, stage)
-            .await
-            .map_err(|_| plan.termination),
+        Some(plan) => {
+            // `timeout_at` polls the wrapped future ONCE before it consults the
+            // deadline, so an already-elapsed plan would still enter the stage
+            // and let it write a backend byte (DNS lookup, connect, handshake,
+            // outbound PROXY v2 header) on a credential that is no longer
+            // authorizing this session. Refuse outright instead: the stage
+            // future is dropped unpolled.
+            if tokio::time::Instant::now() >= plan.at {
+                return Err(plan.termination);
+            }
+            tokio::time::timeout_at(plan.at, stage)
+                .await
+                .map_err(|_| plan.termination)
+        }
         None => Ok(stage.await),
     }
 }
