@@ -1586,12 +1586,28 @@ where
     // The lane itself is the precomputed logical destination scope (issue
     // #3778), not the selected endpoint host — matching the H1/reqwest
     // `http1MaxPendingRequests` gate. Direct H2 does not consume this gate.
+    //
+    // Mesh HBONE / Sidecar mesh-mTLS bypass reqwest
+    // (`proxy_h3_plain_http_mesh_buffered`) and later drop any acquired
+    // `pending_slot`. They must never acquire or be shed by this
+    // reqwest-only lane: a typical plaintext mesh app target still
+    // satisfies `reqwest_dispatch_is_http1_only` because that classifier
+    // looks at scheme/ALPN, not transport (issue #3620). Skip the
+    // classifier entirely for those targets so the hot path stays
+    // allocation-free.
+    let mesh_egress_required =
+        current_target.is_some_and(crate::proxy::target_requires_http_mesh_egress);
     let pending_cap = crate::proxy::resolve_backend_http1_max_pending_requests(
         dispatch_proxy,
         dispatch_policy_port,
     )
     .filter(|_| {
-        crate::proxy::reqwest_dispatch_is_http1_only(state, dispatch_proxy, current_target)
+        let reqwest_http1_only = if mesh_egress_required {
+            false
+        } else {
+            crate::proxy::reqwest_dispatch_is_http1_only(state, dispatch_proxy, current_target)
+        };
+        crate::proxy::h3_plain_http1_pending_gate_applies(mesh_egress_required, reqwest_http1_only)
     });
     let pending_slot = if let Some(cap) = pending_cap {
         // Direct-backend route overrides clear both their inherited cap and

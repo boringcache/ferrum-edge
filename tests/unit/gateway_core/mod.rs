@@ -63,6 +63,7 @@ mod mesh_bpf_metrics_contract_tests;
 mod mesh_host_udp_capture_plan_tests;
 mod mesh_startup_rollback_tests;
 mod mesh_udp_capture_outcome_tests;
+mod mesh_websocket_establishment_timeout_tests;
 mod metrics_tests;
 mod node_agent_admin_https_helm_tests;
 mod node_agent_admin_https_tests;

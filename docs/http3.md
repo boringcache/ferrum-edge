@@ -659,7 +659,7 @@ H3 client                              Gateway                      Backend
 :scheme = https            ─────►
 :authority = example.com               authenticate + authorize
 :path = /chat                          plugin pipeline
-:protocol = websocket                  → connect_websocket_backend()  HTTP/1.1
+:protocol = websocket                  → WsBackendHandshake Direct/Mesh
 sec-websocket-protocol = chat                            Upgrade: websocket  ─────►
                                                          Sec-WebSocket-Key: ...
                                                                               ◄──── 101
@@ -676,10 +676,11 @@ WebSocket backends (Node `ws`, browsers acting as servers, Nginx,
 HAProxy, Envoy when configured as a forward proxy) still bootstrap
 WebSockets over HTTP/1.1 Upgrade or HTTP/2 Extended CONNECT — RFC 9220
 adoption on the server side is still emerging. The H3 frontend therefore
-always bridges to a HTTP/1.1 Upgrade backend connection via the same
-`connect_websocket_backend()` helper the H1/H2 frontends use. From the
-backend's perspective, a WebSocket arriving via H3 is indistinguishable
-from one arriving via any other frontend.
+bridges through the same `WsBackendHandshake` Direct/Mesh enum the H1/H2
+frontends dispatch: plaintext targets use `connect_websocket_backend()`,
+and `mesh.hbone` / `mesh.mtls` targets use `connect_mesh_websocket_backend()`.
+From the backend's perspective, a WebSocket arriving via H3 is
+indistinguishable from one arriving via any other frontend.
 
 ### Frame relay and plugins
 

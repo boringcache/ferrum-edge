@@ -7756,6 +7756,34 @@ pub mod _test_support {
         crate::proxy::target_requires_http_mesh_egress(target)
     }
 
+    /// Whether the H3→plain bridge should acquire the reqwest-only
+    /// `http1MaxPendingRequests` slot (issue #3620). Mesh egress targets
+    /// must never consult this lane; reqwest HTTP/1.1 direct targets keep
+    /// the existing cap.
+    pub fn h3_plain_http1_pending_gate_applies_for_test(
+        mesh_egress_required: bool,
+        reqwest_dispatch_is_http1_only: bool,
+    ) -> bool {
+        crate::proxy::h3_plain_http1_pending_gate_applies(
+            mesh_egress_required,
+            reqwest_dispatch_is_http1_only,
+        )
+    }
+
+    /// Expiration-first deadline race used by Ambient HBONE WebSocket
+    /// establishment (issue #3620). Unlike `tokio::time::timeout_at`, an
+    /// already-elapsed deadline and an exact timer/result tie expire
+    /// rather than accepting a ready success.
+    pub async fn await_deadline_first_for_test<F, T>(
+        deadline: tokio::time::Instant,
+        fut: F,
+    ) -> Result<T, ()>
+    where
+        F: std::future::Future<Output = T>,
+    {
+        crate::proxy::await_deadline_first(deadline, fut).await
+    }
+
     /// Whether the inbound request declared a request body on the wire, as the
     /// retry loop's replay gate evaluates it.
     pub fn inbound_request_declares_body_for_test(ctx: &crate::plugins::RequestContext) -> bool {

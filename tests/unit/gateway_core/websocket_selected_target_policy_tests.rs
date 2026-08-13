@@ -829,3 +829,60 @@ fn h3_websocket_mesh_egress_uses_materialized_host_not_routing_host() {
         "H3 must not duplicate the shared connector's x-forwarded-host rewrite"
     );
 }
+
+/// Ambient HBONE WebSocket establishment captures one absolute deadline
+/// before tunnel acquisition and reuses it for the inner H1 101 wait
+/// (issue #3620). A fresh relative `timeout` after the tunnel would give
+/// one establishment two full connect budgets.
+#[test]
+fn ambient_hbone_websocket_reuses_one_establishment_deadline() {
+    let connector = mesh_ws_connector();
+    let ambient = connector
+        .split("MeshWsEgress::AmbientHbone =>")
+        .nth(1)
+        .expect("Ambient HBONE WebSocket branch must remain present");
+
+    let deadline = ambient
+        .find("establishment_deadline")
+        .expect("one absolute establishment deadline must be captured");
+    let tunnel = ambient
+        .find("get_ws_byte_tunnel(")
+        .expect("HBONE byte-tunnel acquisition must remain present");
+    let handshake = ambient
+        .find("client_async_with_config(")
+        .expect("inner H1 WebSocket handshake must remain present");
+    assert!(
+        deadline < tunnel,
+        "the establishment deadline must be captured before tunnel acquisition"
+    );
+    assert!(
+        tunnel < handshake,
+        "the inner handshake must follow tunnel acquisition"
+    );
+
+    let first_helper = ambient
+        .find("await_deadline_first(")
+        .expect("tunnel acquisition must race the expiration-first helper");
+    let second_helper = ambient[first_helper + 1..]
+        .find("await_deadline_first(")
+        .map(|offset| first_helper + 1 + offset)
+        .expect("the inner handshake must reuse the same expiration-first helper");
+    assert!(
+        first_helper < tunnel && tunnel < second_helper && second_helper < handshake,
+        "both tunnel acquisition and the inner handshake must be bounded by \
+         await_deadline_first on the shared deadline"
+    );
+    assert!(
+        !ambient.contains("tokio::time::timeout("),
+        "Ambient establishment must not start a second full relative connect budget"
+    );
+    assert!(
+        !ambient.contains("timeout_at("),
+        "Ambient establishment must not use inner-first timeout_at ordering"
+    );
+    assert!(
+        ambient.contains("POST-wire"),
+        "the inner handshake timeout must be documented as POST-wire: the \
+         RFC 6455 upgrade is written before awaiting 101"
+    );
+}

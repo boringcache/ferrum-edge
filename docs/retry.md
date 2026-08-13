@@ -50,6 +50,8 @@ A client `grpc-timeout` is anchored once at request receipt into an absolute mon
 
 WebSocket retries handle connection-level failures during the initial backend connection attempt (before the upgrade response — 101 Switching Protocols for HTTP/1.1, 200 OK for HTTP/2 Extended CONNECT). Once the WebSocket connection is established, retries no longer apply — the bidirectional stream is managed by the application layer.
 
+Ambient HBONE WebSocket establishment shares one `backend_connect_timeout_ms` budget from before byte-tunnel acquisition through the inner HTTP/1.1 101 response. A timeout of an unknown tunnel phase, and a timeout of the inner upgrade wait (the RFC 6455 request is written before awaiting 101), classify as reached-wire protocol failures (`HbonePoolError::ConnectStream`) and are not retried under `retry_on_connect_failure`.
+
 ## Configuration
 
 Add a `retry` block to any proxy to enable retries:

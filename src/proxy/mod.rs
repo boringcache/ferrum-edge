@@ -14671,6 +14671,43 @@ fn unix_websocket_validated_authority(value: &str) -> Option<&str> {
     }
 }
 
+/// Race `fut` against an absolute deadline with expiration-first semantics.
+///
+/// [`tokio::time::timeout_at`] is inner-first: when both the future and the
+/// timer are ready, it returns the success. An already-elapsed deadline and
+/// an exact timer/result tie must NOT accept a ready success after the
+/// budget is spent (issue #3620). A biased `select!` with the deadline arm
+/// first is the contract.
+///
+/// Used by Ambient HBONE WebSocket establishment so byte-tunnel acquisition
+/// and the inner H1 upgrade share one connect budget.
+pub(crate) async fn await_deadline_first<F, T>(
+    deadline: tokio::time::Instant,
+    fut: F,
+) -> Result<T, ()>
+where
+    F: std::future::Future<Output = T>,
+{
+    tokio::select! {
+        biased;
+        _ = tokio::time::sleep_until(deadline) => Err(()),
+        result = fut => Ok(result),
+    }
+}
+
+/// Authority token for Ambient HBONE WebSocket establishment timeouts.
+///
+/// [`HbonePoolError::ConnectStream`] interpolates this field into Display.
+/// Timeout paths must not echo identities, dial hosts, or unredacted URLs.
+const HBONE_WEBSOCKET_TIMEOUT_AUTHORITY: &str = "hbone-websocket";
+
+fn hbone_websocket_establishment_timeout(message: &'static str) -> HbonePoolError {
+    HbonePoolError::ConnectStream {
+        authority: String::from(HBONE_WEBSOCKET_TIMEOUT_AUTHORITY),
+        message: String::from(message),
+    }
+}
+
 /// Open a backend WebSocket transport over a mesh egress tunnel for a
 /// `mesh.mtls`-tagged (Sidecar) or `mesh.hbone`-tagged (Ambient) destination.
 /// The returned stream carries raw WebSocket frames over the SVID-mTLS / HBONE
@@ -14698,6 +14735,11 @@ fn unix_websocket_validated_authority(value: &str) -> Option<&str> {
 ///     client WebSocket handshake over it; the destination's transparent HBONE
 ///     relay byte-copies the upgrade to the loopback app, which performs the WS
 ///     handshake. This makes Ambient WS egress actually work end-to-end.
+///     Tunnel acquisition and the inner 101 wait share one
+///     `backend_connect_timeout_ms` budget captured before `get_ws_byte_tunnel`;
+///     a timeout of the inner upgrade (POST-wire: the RFC 6455 request is
+///     written before awaiting 101) or of an unknown tunnel phase is a
+///     reached-wire `ConnectStream` failure, not a connect retry.
 ///
 /// For Sidecar the connection is dialed to the peer's pod address + `:15006`,
 /// while the Extended CONNECT `:authority` is the SERVICE routing key the peer's
@@ -14948,9 +14990,26 @@ pub(crate) async fn connect_mesh_websocket_backend(
             // addr:port the relay byte-copies to) — NOT an Extended CONNECT (see
             // `get_ws_byte_tunnel`). For cross-cluster the outer TLS dials the
             // gateway with the SNI override + trust-domain scope resolved above.
-            let tunnel = state
-                .hbone_pool
-                .get_ws_byte_tunnel(
+            //
+            // ONE absolute establishment deadline, captured BEFORE tunnel
+            // acquisition. `get_ws_byte_tunnel`'s dial/CONNECT phases already
+            // use connect timeouts; the inner H1 upgrade used to start a
+            // second full `backend_connect_timeout_ms`. Tunnel acquisition
+            // and the inner 101 wait share this budget (issue #3620).
+            let Some(establishment_deadline) = tokio::time::Instant::now()
+                .checked_add(Duration::from_millis(proxy.backend_connect_timeout_ms))
+            else {
+                // Unrepresentable budget: fail closed without panicking.
+                // Nothing has been dialed, so this stays a pre-wire connect
+                // timeout rather than a reached-wire protocol class.
+                return Err(Box::new(HbonePoolError::ConnectTimeout {
+                    addr: String::from(HBONE_WEBSOCKET_TIMEOUT_AUTHORITY),
+                    timeout_ms: proxy.backend_connect_timeout_ms,
+                }));
+            };
+            let tunnel = match await_deadline_first(
+                establishment_deadline,
+                state.hbone_pool.get_ws_byte_tunnel(
                     proxy,
                     dial_host,
                     hbone_port,
@@ -14969,8 +15028,23 @@ pub(crate) async fn connect_mesh_websocket_backend(
                     // egress from an unauthenticated client) falls back to the
                     // gateway SVID inside `get_ws_byte_tunnel` (issue #2010 codex).
                     source_identity,
-                )
-                .await?;
+                ),
+            )
+            .await
+            {
+                Ok(result) => result?,
+                Err(()) => {
+                    // The outer bound cancelled an in-flight tunnel future
+                    // whose phase is unknown (SVID/dial vs CONNECT already
+                    // on the wire). Fail closed as reached-wire
+                    // (`ConnectStream` → `ProtocolError`) rather than
+                    // `ConnectionTimeout`, which would retry a possibly
+                    // non-idempotent upgrade.
+                    return Err(Box::new(hbone_websocket_establishment_timeout(
+                        "timed out waiting for HBONE WebSocket tunnel acquisition",
+                    )));
+                }
+            };
 
             // Speak the WebSocket THROUGH the byte tunnel with an inner H1
             // client handshake (`Sec-WebSocket-Key`/`Upgrade`/`Connection`,
@@ -15015,21 +15089,18 @@ pub(crate) async fn connect_mesh_websocket_backend(
                 }
             }
 
-            // Bound the inner handshake by the per-proxy connect budget: a relay
-            // that wires the tunnel but whose app never answers the upgrade must
-            // not stall the WS dispatch indefinitely. A timeout is a pre-wire
-            // setup failure (the upgrade never completed), surfaced as a
-            // `HbonePoolError::ConnectStream` so the WS failure handler keeps
-            // connect-failure semantics via `classify_boxed_setup_error`'s
-            // `HbonePoolError` downcast.
-            let connect_timeout =
-                std::time::Duration::from_millis(proxy.backend_connect_timeout_ms);
-            // Use `app_host` (real pod addr) for the error surface too — for a
-            // cross-cluster target `target.host` is the synthetic identity, not
-            // a dialable authority; in-cluster this is byte-identical.
-            let handshake_authority = hbone_pool::authority_for_host_port(app_host, target.port);
-            let (stream, response) = match tokio::time::timeout(
-                connect_timeout,
+            // Bound the inner handshake by what REMAINS of the same
+            // establishment deadline. `client_async_with_config` writes and
+            // flushes the RFC 6455 upgrade request BEFORE waiting for the 101
+            // response, so a timeout here is POST-wire: the application may
+            // already have the upgrade. Map it to `HbonePoolError::ConnectStream`
+            // so `classify_boxed_setup_error` keeps the reached-wire
+            // `ProtocolError` class — `retry_on_connect_failure` must not
+            // replay a non-idempotent upgrade. Do not use inner-first
+            // `timeout_at`: an elapsed deadline or exact timer/result tie
+            // must expire.
+            let (stream, response) = match await_deadline_first(
+                establishment_deadline,
                 client_async_with_config(
                     ws_request,
                     WsActivityIo::new(tunnel, idle_tracker),
@@ -15039,15 +15110,10 @@ pub(crate) async fn connect_mesh_websocket_backend(
             .await
             {
                 Ok(result) => result?,
-                Err(_) => {
-                    return Err(Box::new(hbone_pool::HbonePoolError::ConnectStream {
-                        authority: handshake_authority,
-                        message: format!(
-                            "timed out after {}ms waiting for HBONE WebSocket inner handshake \
-                             response",
-                            proxy.backend_connect_timeout_ms
-                        ),
-                    }));
+                Err(()) => {
+                    return Err(Box::new(hbone_websocket_establishment_timeout(
+                        "timed out waiting for HBONE WebSocket inner handshake response",
+                    )));
                 }
             };
 
@@ -36705,6 +36771,22 @@ async fn proxy_to_backend_mesh_retry(
 /// refused by [`backend_dispatch::h3_bridge_transport_refusal`].
 pub(crate) fn target_requires_http_mesh_egress(target: &UpstreamTarget) -> bool {
     hbone_pool::target_hbone_enabled(target) || mesh_mtls_pool::target_mesh_mtls_enabled(target)
+}
+
+/// Whether the H3→plain bridge should acquire the reqwest-only
+/// `http1MaxPendingRequests` slot for this attempt (issue #3620).
+///
+/// True only for a reqwest HTTP/1.1 direct target. Mesh HBONE / Sidecar
+/// mesh-mTLS attempts bypass reqwest and must never acquire or be rejected
+/// by this lane, even when [`reqwest_dispatch_is_http1_only`] would be true
+/// (typical plaintext mesh app targets). Direct reqwest HTTP/1.1 attempts
+/// keep the existing cap.
+#[inline]
+pub(crate) fn h3_plain_http1_pending_gate_applies(
+    mesh_egress_required: bool,
+    reqwest_dispatch_is_http1_only: bool,
+) -> bool {
+    !mesh_egress_required && reqwest_dispatch_is_http1_only
 }
 
 /// Outcome of [`proxy_to_backend_mesh_retry`]: backend response, client-upload

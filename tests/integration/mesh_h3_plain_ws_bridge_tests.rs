@@ -65,6 +65,50 @@ fn h3_bridge_eligibility_matrix_matches_issue_3620_contract() {
     assert_eq!(direct_http_mesh_transport_refusal_for_test(&unix), None);
 }
 
+/// Mesh-tagged H3→plain attempts must never acquire or be shed by the
+/// reqwest-only `http1MaxPendingRequests` lane, even when the reqwest
+/// HTTP/1 classifier would fire (typical plaintext mesh app targets).
+/// Direct reqwest HTTP/1.1 attempts keep the existing cap (issue #3620).
+#[test]
+fn h3_plain_http1_pending_gate_skips_mesh_and_caps_direct_h1() {
+    use ferrum_edge::_test_support::h3_plain_http1_pending_gate_applies_for_test;
+
+    let plain = target_with_tags(&[]);
+    let hbone = target_with_tags(&[(HBONE_TARGET_TAG, "true")]);
+    let mtls = target_with_tags(&[(MESH_MTLS_TARGET_TAG, "true")]);
+
+    assert!(
+        h3_plain_http1_pending_gate_applies_for_test(
+            target_requires_http_mesh_egress_for_test(&plain),
+            true,
+        ),
+        "a reqwest HTTP/1-only direct target must still consult the pending cap"
+    );
+    assert!(
+        !h3_plain_http1_pending_gate_applies_for_test(
+            target_requires_http_mesh_egress_for_test(&plain),
+            false,
+        ),
+        "a reqwest attempt that may negotiate h2 must stay uncapped"
+    );
+    assert!(
+        !h3_plain_http1_pending_gate_applies_for_test(
+            target_requires_http_mesh_egress_for_test(&hbone),
+            true,
+        ),
+        "Ambient HBONE must skip the reqwest HTTP/1 pending lane even when \
+         the classifier would fire"
+    );
+    assert!(
+        !h3_plain_http1_pending_gate_applies_for_test(
+            target_requires_http_mesh_egress_for_test(&mtls),
+            true,
+        ),
+        "Sidecar mesh-mTLS must skip the reqwest HTTP/1 pending lane even when \
+         the classifier would fire"
+    );
+}
+
 #[test]
 fn h3_plain_bridge_source_routes_mesh_through_shared_helper() {
     let source = include_str!("../../src/http3/cross_protocol.rs");
@@ -89,6 +133,11 @@ fn h3_plain_bridge_source_routes_mesh_through_shared_helper() {
     assert!(
         policy_gate.contains("h3_bridge_transport_refusal("),
         "plain bridge must refuse Unix, not all mesh tags"
+    );
+    assert!(
+        policy_gate.contains("h3_plain_http1_pending_gate_applies(")
+            && policy_gate.contains("target_requires_http_mesh_egress"),
+        "the reqwest HTTP/1 pending lane must skip mesh egress via the shared predicate"
     );
     assert!(
         plain.contains("proxy_h3_plain_http_mesh_buffered("),
