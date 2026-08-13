@@ -75,6 +75,22 @@ fn tagged_scalar_without_alias_is_admitted() {
 }
 
 #[test]
+fn modest_tagged_aliases_on_scalar_sequence_and_mapping_are_admitted() {
+    let yaml = concat!(
+        "host: &host !hostname localhost\n",
+        "first: *host\n",
+        "second: *host\n",
+        "nums: &nums !items [1, 2]\n",
+        "nums_copy: *nums\n",
+        "meta: &meta !record {k: v}\n",
+        "meta_copy: *meta\n",
+        "core: &core !!str hello\n",
+        "core_copy: *core\n",
+    );
+    admit_yaml_alias_expansion(yaml).expect("modest tagged aliases");
+}
+
+#[test]
 fn flow_and_block_forms_without_aliases_are_admitted() {
     admit_yaml_alias_expansion("{a: 1, b: [2, 3]}\n").expect("flow mapping");
     admit_yaml_alias_expansion("a:\n  - 1\n  - 2\n").expect("block sequence");
@@ -248,4 +264,90 @@ fn duplicate_anchor_redefinition_matches_serde_yaml_last_definition() {
     let value: serde_yaml::Value = serde_yaml::from_str(yaml).expect("parse redefined anchor");
     assert_eq!(value["before"].as_str(), Some("one"));
     assert_eq!(value["after"].as_str(), Some("two"));
+}
+
+/// Distinctive local-tag prefix used only to prove diagnostics stay redacted.
+const HOSTILE_TAG_MARKER: &str = "z9tagbudget";
+
+#[derive(Clone, Copy)]
+enum TaggedReplayKind {
+    Scalar,
+    Sequence,
+    Mapping,
+}
+
+/// Small source: one anchored node with a large custom tag, then many aliases.
+/// Each expansion visit recharges the tag bytes under the shared payload cap.
+fn tagged_alias_replay_yaml(kind: TaggedReplayKind, tag_len: usize, alias_count: usize) -> String {
+    let marker_prefix = 1 + HOSTILE_TAG_MARKER.len();
+    assert!(
+        tag_len > marker_prefix,
+        "tag_len must include bang, marker, and padding"
+    );
+    let padding = tag_len - marker_prefix;
+    let mut tag = String::with_capacity(tag_len);
+    tag.push('!');
+    tag.push_str(HOSTILE_TAG_MARKER);
+    tag.extend(std::iter::repeat_n('B', padding));
+
+    let value = match kind {
+        TaggedReplayKind::Scalar => " x",
+        TaggedReplayKind::Sequence => " [x]",
+        TaggedReplayKind::Mapping => " {k: v}",
+    };
+    let mut yaml = String::with_capacity(32 + tag_len + alias_count * 10);
+    yaml.push_str("seed: &seed ");
+    yaml.push_str(&tag);
+    yaml.push_str(value);
+    yaml.push('\n');
+    yaml.push_str("items:\n");
+    for _ in 0..alias_count {
+        yaml.push_str("  - *seed\n");
+    }
+    yaml
+}
+
+fn oversized_tagged_alias_replay(kind: TaggedReplayKind) -> String {
+    // 256 KiB tag: source stays far below the 64 MiB read ceiling, but
+    // alias_count + 1 materializations exceed MAX_YAML_EXPANDED_BYTES.
+    let tag_len = 256 * 1024;
+    let alias_count = MAX_YAML_EXPANDED_BYTES / tag_len;
+    tagged_alias_replay_yaml(kind, tag_len, alias_count)
+}
+
+fn assert_expanded_byte_limit_redacted(err: YamlAliasBudgetError) {
+    assert_eq!(err, YamlAliasBudgetError::ExpandedByteLimitExceeded);
+    let rendered = err.to_string();
+    assert_eq!(
+        rendered,
+        "YAML document exceeds expanded byte limit; reduce alias reuse or document size"
+    );
+    assert!(
+        !rendered.contains(HOSTILE_TAG_MARKER),
+        "diagnostics must not echo the hostile tag: {rendered}"
+    );
+}
+
+#[test]
+fn large_tagged_scalar_replayed_through_aliases_hits_expanded_byte_limit() {
+    let yaml = oversized_tagged_alias_replay(TaggedReplayKind::Scalar);
+    let err = admit_yaml_alias_expansion(&yaml)
+        .expect_err("tagged scalar alias replay must hit the payload cap");
+    assert_expanded_byte_limit_redacted(err);
+}
+
+#[test]
+fn large_tagged_sequence_replayed_through_aliases_hits_expanded_byte_limit() {
+    let yaml = oversized_tagged_alias_replay(TaggedReplayKind::Sequence);
+    let err = admit_yaml_alias_expansion(&yaml)
+        .expect_err("tagged sequence alias replay must hit the payload cap");
+    assert_expanded_byte_limit_redacted(err);
+}
+
+#[test]
+fn large_tagged_mapping_replayed_through_aliases_hits_expanded_byte_limit() {
+    let yaml = oversized_tagged_alias_replay(TaggedReplayKind::Mapping);
+    let err = admit_yaml_alias_expansion(&yaml)
+        .expect_err("tagged mapping alias replay must hit the payload cap");
+    assert_expanded_byte_limit_redacted(err);
 }

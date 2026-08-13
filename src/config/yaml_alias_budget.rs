@@ -11,11 +11,12 @@
 //! anchors/aliases). Documents without alias events return after that bounded
 //! preflight. Alias-bearing documents are parsed a second time into a compact,
 //! alias-preserving graph and charged against cumulative event / composition
-//! node / expansion node / depth / alias-reference / expanded-scalar-byte /
-//! work budgets before `serde_yaml` is allowed to materialize them.
+//! node / expansion node / depth / alias-reference / expanded scalar-plus-tag
+//! payload-byte / work budgets before `serde_yaml` is allowed to materialize
+//! them.
 //!
-//! Diagnostics are fixed strings and never echo scalar payloads, anchor names,
-//! or file contents.
+//! Diagnostics are fixed strings and never echo scalar payloads, tag contents,
+//! anchor names, or file contents.
 
 use crate::config::stable_file::MAX_GATEWAY_CONFIG_FILE_BYTES;
 use std::collections::{HashMap, HashSet};
@@ -47,10 +48,13 @@ pub const MAX_YAML_EXPANDED_NODES: usize = 500_000;
 /// Maximum YAML source bytes admitted by this trust boundary.
 pub const MAX_YAML_SOURCE_BYTES: usize = MAX_GATEWAY_CONFIG_FILE_BYTES as usize;
 
-/// Fail-closed ceiling on scalar bytes visited during expansion, including
-/// bytes revisited through aliases. This deliberately matches the 64 MiB
-/// source-file read ceiling: alias reuse may rearrange or repeat a document,
-/// but may not authorize more scalar payload than the largest source document.
+/// Fail-closed ceiling on scalar-plus-tag payload bytes visited during
+/// expansion, including bytes revisited through aliases. Tag lengths are
+/// measured from libyaml's resolved tag C strings on scalar, sequence-start,
+/// and mapping-start events and are charged again each time that tagged node
+/// is materialized. This deliberately matches the 64 MiB source-file read
+/// ceiling: alias reuse may rearrange or repeat a document, but may not
+/// authorize more materialized payload than the largest source document.
 pub const MAX_YAML_EXPANDED_BYTES: usize = MAX_YAML_SOURCE_BYTES;
 
 /// Maximum live bytes retained for unique anchor identifiers during
@@ -58,13 +62,17 @@ pub const MAX_YAML_EXPANDED_BYTES: usize = MAX_YAML_SOURCE_BYTES;
 /// valid stream, but keeping it explicit protects the foreign-data boundary.
 const MAX_YAML_ANCHOR_BYTES: usize = MAX_YAML_SOURCE_BYTES;
 
+/// Bound on foreign NUL-terminated identifier and tag scans. Overlong C
+/// strings fail closed without copying their contents.
+const MAX_YAML_CSTR_BYTES: usize = 1_048_576;
+
 /// Maximum cumulative work across the complete preflight, alias composition,
 /// and expansion traversal. This matches the hardened API-spec YAML parser's
 /// composition/expansion ceiling while also charging this module's preflight.
 pub const MAX_YAML_WORK: usize = 2_000_000;
 
 /// Fail-closed outcomes. Display text is field-oriented and must not include
-/// attacker-controlled scalar or anchor text.
+/// attacker-controlled scalar, tag, or anchor text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum YamlAliasBudgetError {
     SourceByteLimitExceeded,
@@ -274,9 +282,18 @@ fn charge_event(events: &mut usize, budgets: &mut Budgets) -> Result<(), YamlAli
 }
 
 enum NodeKind {
-    Scalar { bytes: usize },
-    Sequence(Vec<usize>),
-    Mapping(Vec<(usize, usize)>),
+    Scalar {
+        bytes: usize,
+        tag_bytes: usize,
+    },
+    Sequence {
+        items: Vec<usize>,
+        tag_bytes: usize,
+    },
+    Mapping {
+        pairs: Vec<(usize, usize)>,
+        tag_bytes: usize,
+    },
     Alias { target: usize },
 }
 
@@ -308,13 +325,16 @@ enum Event {
     Scalar {
         anchor: Option<String>,
         bytes: usize,
+        tag_bytes: usize,
     },
     SequenceStart {
         anchor: Option<String>,
+        tag_bytes: usize,
     },
     SequenceEnd,
     MappingStart {
         anchor: Option<String>,
+        tag_bytes: usize,
     },
     MappingEnd,
 }
@@ -383,22 +403,32 @@ fn compose_document(body: &[u8], budgets: &mut Budgets) -> Result<Document, Yaml
                 let id = alloc_node(&mut document, NodeKind::Alias { target })?;
                 attach_child(&mut document, &mut stack, id)?;
             }
-            Event::Scalar { anchor, bytes } => {
+            Event::Scalar {
+                anchor,
+                bytes,
+                tag_bytes,
+            } => {
                 if !seen_document || finished_document {
                     return Err(YamlAliasBudgetError::InvalidAliasDocument);
                 }
-                let id = alloc_node(&mut document, NodeKind::Scalar { bytes })?;
+                let id = alloc_node(&mut document, NodeKind::Scalar { bytes, tag_bytes })?;
                 register_anchor(&mut document, anchor, id, budgets)?;
                 attach_child(&mut document, &mut stack, id)?;
             }
-            Event::SequenceStart { anchor } => {
+            Event::SequenceStart { anchor, tag_bytes } => {
                 if !seen_document || finished_document {
                     return Err(YamlAliasBudgetError::InvalidAliasDocument);
                 }
                 if stack.len() >= MAX_YAML_DEPTH {
                     return Err(YamlAliasBudgetError::DepthExceeded);
                 }
-                let id = alloc_node(&mut document, NodeKind::Sequence(Vec::new()))?;
+                let id = alloc_node(
+                    &mut document,
+                    NodeKind::Sequence {
+                        items: Vec::new(),
+                        tag_bytes,
+                    },
+                )?;
                 register_anchor(&mut document, anchor, id, budgets)?;
                 attach_child(&mut document, &mut stack, id)?;
                 stack.push(Frame::Sequence { node: id });
@@ -410,14 +440,20 @@ fn compose_document(body: &[u8], budgets: &mut Budgets) -> Result<Document, Yaml
                 Some(Frame::Sequence { .. }) => {}
                 _ => return Err(YamlAliasBudgetError::InvalidAliasDocument),
             },
-            Event::MappingStart { anchor } => {
+            Event::MappingStart { anchor, tag_bytes } => {
                 if !seen_document || finished_document {
                     return Err(YamlAliasBudgetError::InvalidAliasDocument);
                 }
                 if stack.len() >= MAX_YAML_DEPTH {
                     return Err(YamlAliasBudgetError::DepthExceeded);
                 }
-                let id = alloc_node(&mut document, NodeKind::Mapping(Vec::new()))?;
+                let id = alloc_node(
+                    &mut document,
+                    NodeKind::Mapping {
+                        pairs: Vec::new(),
+                        tag_bytes,
+                    },
+                )?;
                 register_anchor(&mut document, anchor, id, budgets)?;
                 attach_child(&mut document, &mut stack, id)?;
                 stack.push(Frame::Mapping {
@@ -494,7 +530,7 @@ fn attach_child(
         Frame::Sequence { node } => {
             let node = *node;
             match document.nodes.get_mut(node) {
-                Some(NodeKind::Sequence(items)) => {
+                Some(NodeKind::Sequence { items, .. }) => {
                     items.push(child);
                     Ok(())
                 }
@@ -505,7 +541,7 @@ fn attach_child(
             if let Some(key) = *pending_key {
                 let node = *node;
                 match document.nodes.get_mut(node) {
-                    Some(NodeKind::Mapping(pairs)) => {
+                    Some(NodeKind::Mapping { pairs, .. }) => {
                         pairs.push((key, child));
                         *pending_key = None;
                         Ok(())
@@ -553,22 +589,27 @@ fn expand_node_inner(
             }
             expand_node(document, *target, budgets, expanding)
         }
-        NodeKind::Scalar { bytes } => {
+        NodeKind::Scalar { bytes, tag_bytes } => {
             budgets.charge_expanded_node()?;
-            budgets.charge_bytes(*bytes)
+            let n = bytes
+                .checked_add(*tag_bytes)
+                .ok_or(YamlAliasBudgetError::ExpandedByteLimitExceeded)?;
+            budgets.charge_bytes(n)
         }
-        NodeKind::Sequence(items) => {
+        NodeKind::Sequence { items, tag_bytes } => {
             budgets.enter_depth()?;
             budgets.charge_expanded_node()?;
+            budgets.charge_bytes(*tag_bytes)?;
             for child in items {
                 expand_node(document, *child, budgets, expanding)?;
             }
             budgets.leave_depth();
             Ok(())
         }
-        NodeKind::Mapping(pairs) => {
+        NodeKind::Mapping { pairs, tag_bytes } => {
             budgets.enter_depth()?;
             budgets.charge_expanded_node()?;
+            budgets.charge_bytes(*tag_bytes)?;
             for (key, value) in pairs {
                 expand_node(document, *key, budgets, expanding)?;
                 expand_node(document, *value, budgets, expanding)?;
@@ -635,7 +676,8 @@ impl<'input> Parser<'input> {
             let parser = &mut *self.sys as *mut sys::yaml_parser_t;
             let event_ptr = event.as_mut_ptr();
             // Conversion borrows event-owned fields only until it has copied
-            // bounded identifiers/counts. Delete the event for every result.
+            // bounded identifiers or measured tag/scalar counts. Delete the
+            // event for every result.
             if sys::yaml_parser_parse(parser, event_ptr).fail {
                 sys::yaml_event_delete(event_ptr);
                 return Err(());
@@ -669,17 +711,26 @@ unsafe fn convert_event(event: &sys::yaml_event_t) -> Result<Event, ()> {
         }
         sys::YAML_SCALAR_EVENT => {
             let anchor = unsafe { optional_cstr(event.data.scalar.anchor) }?;
+            // Measure the resolved tag without copying it; expansion charges
+            // this length on every materialization of the scalar.
+            let tag_bytes = unsafe { optional_cstr_len(event.data.scalar.tag) }?;
             let bytes = usize::try_from(unsafe { event.data.scalar.length }).map_err(|_| ())?;
-            Ok(Event::Scalar { anchor, bytes })
+            Ok(Event::Scalar {
+                anchor,
+                bytes,
+                tag_bytes,
+            })
         }
         sys::YAML_SEQUENCE_START_EVENT => {
             let anchor = unsafe { optional_cstr(event.data.sequence_start.anchor) }?;
-            Ok(Event::SequenceStart { anchor })
+            let tag_bytes = unsafe { optional_cstr_len(event.data.sequence_start.tag) }?;
+            Ok(Event::SequenceStart { anchor, tag_bytes })
         }
         sys::YAML_SEQUENCE_END_EVENT => Ok(Event::SequenceEnd),
         sys::YAML_MAPPING_START_EVENT => {
             let anchor = unsafe { optional_cstr(event.data.mapping_start.anchor) }?;
-            Ok(Event::MappingStart { anchor })
+            let tag_bytes = unsafe { optional_cstr_len(event.data.mapping_start.tag) }?;
+            Ok(Event::MappingStart { anchor, tag_bytes })
         }
         sys::YAML_MAPPING_END_EVENT => Ok(Event::MappingEnd),
         _ => Err(()),
@@ -694,19 +745,36 @@ unsafe fn optional_cstr(ptr: *const u8) -> Result<Option<String>, ()> {
     if s.is_empty() { Ok(None) } else { Ok(Some(s)) }
 }
 
+/// Length of an optional libyaml C string without allocating or copying.
+///
+/// Null and empty tags account as zero bytes. Overlong strings fail closed so
+/// a hostile tag cannot bypass the scan bound. The pointer is event-owned and
+/// must only be read before `yaml_event_delete`.
+unsafe fn optional_cstr_len(ptr: *const u8) -> Result<usize, ()> {
+    let Some(nn) = NonNull::new(ptr as *mut i8) else {
+        return Ok(0);
+    };
+    unsafe { cstr_len(nn.as_ptr()) }.ok_or(())
+}
+
 unsafe fn cstr_to_string(ptr: *const i8) -> Option<String> {
+    let len = unsafe { cstr_len(ptr)? };
+    let bytes = unsafe { slice::from_raw_parts(ptr as *const u8, len) };
+    std::str::from_utf8(bytes).ok().map(str::to_owned)
+}
+
+unsafe fn cstr_len(ptr: *const i8) -> Option<usize> {
     if ptr.is_null() {
         return None;
     }
     let mut len = 0usize;
     unsafe {
         while *ptr.add(len) != 0 {
-            if len == 1_048_576 {
+            if len == MAX_YAML_CSTR_BYTES {
                 return None;
             }
             len += 1;
         }
-        let bytes = slice::from_raw_parts(ptr as *const u8, len);
-        std::str::from_utf8(bytes).ok().map(str::to_owned)
     }
+    Some(len)
 }
