@@ -672,7 +672,7 @@ both roots may omit either file in that state. Once
 candidate that introduces either optional file before the trusted base carries
 reviewed bytes for it is rejected rather than receiving a filename-based
 exception; legitimate first adoption lands on protected `main` through the
-auditable administrative bypass in [Consequences for contributors](#consequences-for-contributors),
+auditable administrative bypass described in the contributor guidance below,
 followed immediately by hosted runs on the new `main` tip. The moment the base
 carries one, deleting it or changing a byte fails. A trusted base that is
 missing a *required* anchor is a broken or tampered extraction and fails closed
