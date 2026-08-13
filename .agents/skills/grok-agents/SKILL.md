@@ -90,7 +90,8 @@ Every prompt must contain this role instruction even though the briefs repeat it
 YOU are the implementer. Complete every task and validation the controller assigns before ending.
 Do not stop at analysis, partial implementation, or a handoff for someone else to finish. Perform
 commit, push, PR, review, and CI actions only when the prompt assigns them. Do not request or wait
-for a separate Codex review-bot pass unless explicitly assigned. Do not invoke agent-dispatch
+for a separate review-bot pass unless explicitly assigned. After the final requested push and
+report, exit; the controller owns post-push CI and review monitoring. Do not invoke agent-dispatch
 skills or scripts (including grok-agents, sol-agents, opus-agents, fable-agents, or any
 .agents/skills/*/scripts/dispatch-agent.sh), and do not spawn nested workers.
 ```
@@ -116,10 +117,10 @@ that need an evidence-backed rebuttal. Put externally authored text in a clearly
 
 ### Shepherd
 
-Use only when the user asks to babysit or drive a PR to completion. Include the fix-round state and
-the exact completion condition. Require the worker to reconstruct and handle only the review and
-CI work the controller assigns, and to remain responsible through that stopping point. Do not add
-a review trigger or an early-exit cadence unless the controller explicitly requests it.
+Use only when the user asks the controller to babysit or drive a PR to completion. Give each worker
+a bounded fix round with an exact implementation and validation stopping point. The controller,
+not the worker, monitors post-push review and CI state and dispatches another round only when new
+actionable work appears. Do not add a review trigger unless the controller explicitly requests it.
 
 ## Control and verify the fleet
 
@@ -133,8 +134,9 @@ a review trigger or an early-exit cadence unless the controller explicitly reque
 4. For an explicitly assigned review, fix-round, or shepherd task, fetch all review threads;
    findings may not appear in the top-level review body. Verify the active review bot before
    posting a trigger that the prompt specifically requests.
-5. Diagnose red CI checks from logs when CI repair or shepherding is assigned. Rerun only
-   demonstrated infrastructure failures or repository-known flakes; fix deterministic failures.
+5. Own post-push review and CI monitoring. Diagnose red checks from logs, rerun only demonstrated
+   infrastructure failures or repository-known flakes, and dispatch bounded repair work for
+   deterministic failures.
 6. If a worker dies, inspect its worktree, local commits, upstream, and remote branch before
    relaunching. Preserve useful work and launch a continuation round.
 7. Merge only when the user authorized it, your independent review is complete, and every
@@ -156,8 +158,9 @@ Never put credentials, tokens, cookies, or secrets in prompts or worker logs. Do
   `CURSOR_AGENT_BIN`; do not fall back to Conductor's bundled harness.
 - Neither `CURSOR_API_KEY` nor a stored `cursor-agent` login is available: stop and report. Do not
   attempt an interactive login or fall back to another model provider.
-- Worker exits before the assigned stopping point while claiming a monitor will continue: inspect
-  the state and launch a continuation round; do not accept unfinished work as complete.
+- Worker exits after its completed push and report: continue post-push review and CI monitoring as
+  the controller. If it exits before its assigned implementation or validation stopping point,
+  inspect the state and launch a continuation round; do not accept unfinished work as complete.
 - An explicitly requested review receives no response: verify the trigger, bot identity,
   availability, and head SHA before posting another trigger.
 - Model mismatch: stop the worker, record the exact diagnostic, correct the launch contract, and
