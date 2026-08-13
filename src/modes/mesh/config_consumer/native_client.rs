@@ -7,13 +7,13 @@ use tracing::{error, info, warn};
 
 use super::common::{
     BACKOFF_INITIAL_SECS, MESH_CONFIG_GRPC_MAX_DECODING_MESSAGE_SIZE, jittered_backoff,
-    next_backoff_secs, refresh_dp_grpc_tls_config_if_changed, tonic_tls_config, wait_for_shutdown,
+    refresh_dp_grpc_tls_config_if_changed, tonic_tls_config, wait_for_shutdown,
     wait_optional_tls_reload,
 };
 use super::stream_lifecycle::{
     MeshConfigStreamCredential, MeshStreamAttachment, MeshStreamAttempt, MeshStreamAttemptProgress,
     MeshStreamRetirement, MeshStreamTimings, MeshStreamTracker,
-    configure_mesh_config_stream_endpoint,
+    configure_mesh_config_stream_endpoint, reconnect_backoff_after_attempt,
 };
 use super::update_validation::{
     MeshUpdateConsumer, MeshUpdateExpectation, MeshUpdateRejection, validate_mesh_config_update,
@@ -268,7 +268,12 @@ pub async fn start_native_mesh_client_with_shutdown(
             continue;
         }
 
-        let sleep_duration = jittered_backoff(backoff_secs);
+        let (sleep_secs, next_secs) = reconnect_backoff_after_attempt(
+            backoff_secs,
+            disposition.increase_backoff,
+            delivered_usable_state,
+        );
+        let sleep_duration = jittered_backoff(sleep_secs);
         let mut sleep_shutdown_rx = shutdown_rx.clone();
         tokio::select! {
             _ = tokio::time::sleep(sleep_duration) => {}
@@ -281,7 +286,7 @@ pub async fn start_native_mesh_client_with_shutdown(
                 continue;
             }
         }
-        backoff_secs = next_backoff_secs(backoff_secs, disposition.increase_backoff);
+        backoff_secs = next_secs;
     }
 }
 
@@ -361,7 +366,24 @@ async fn connect_mesh_subscribe(
         MeshUpdateExpectation::from_subscribe_request(&subscribe_request),
     );
     let request = tonic::Request::new(subscribe_request);
-    let mut stream = client.mesh_subscribe(request).await?.into_inner();
+    // The first-frame clock starts at the RPC-open await, not when headers
+    // return: a CP can accept the authenticated request, keep HTTP/2 healthy,
+    // and never send response headers. Dropping this select cancels the
+    // in-flight open; nothing is detached. The same absolute Instant continues
+    // until the first response frame.
+    let attempt_started_at = tokio::time::Instant::now();
+    let first_frame_deadline =
+        tokio::time::sleep_until(attempt_started_at + config.timings.first_frame);
+    tokio::pin!(first_frame_deadline);
+    let mut stream = tokio::select! {
+        biased;
+        _ = &mut first_frame_deadline => {
+            return Ok(MeshStreamAttempt::FirstFrameTimeout);
+        }
+        result = client.mesh_subscribe(request) => {
+            result?.into_inner()
+        }
+    };
     // The streaming RPC is open: that is what `/health` means by `connected`,
     // and it is also the observation that lets a later transport failure be
     // attributed to an ESTABLISHED stream rather than to a dial refusal.
@@ -380,7 +402,12 @@ async fn connect_mesh_subscribe(
     let mut pending_status_report: Option<(MeshSliceStatusReport, u8)> = None;
 
     // ── issue #3854: bounded liveness for an ESTABLISHED stream ──
-    let opened_at = tokio::time::Instant::now();
+    // Clocks are absolute from `attempt_started_at` (the RPC-open await). They
+    // are polled before `stream.message()` so an already-expired bound cannot
+    // lose indefinitely to a continuously ready heartbeat or other frame.
+    let first_slice_deadline =
+        tokio::time::sleep_until(attempt_started_at + config.timings.first_slice);
+    tokio::pin!(first_slice_deadline);
     let mut awaiting_first_frame = true;
     let mut awaiting_first_slice = !state.has_first_slice();
     // Application silence is only a liveness signal once this CP has actually
@@ -389,23 +416,31 @@ async fn connect_mesh_subscribe(
     // correct (and sufficient) bound. Set true and never cleared.
     let mut heartbeats_observed = false;
     let mut last_stream_activity = tokio::time::Instant::now();
+    let silence_deadline =
+        tokio::time::sleep_until(last_stream_activity + config.timings.max_silence);
+    tokio::pin!(silence_deadline);
 
     loop {
-        let first_frame_remaining = config
-            .timings
-            .first_frame
-            .saturating_sub(opened_at.elapsed());
-        let first_slice_remaining = config
-            .timings
-            .first_slice
-            .saturating_sub(opened_at.elapsed());
-        let silence_remaining = config
-            .timings
-            .max_silence
-            .saturating_sub(last_stream_activity.elapsed());
-
         let update = tokio::select! {
             biased;
+            _ = &mut first_frame_deadline, if awaiting_first_frame => {
+                return Ok(MeshStreamAttempt::FirstFrameTimeout);
+            }
+            _ = &mut first_slice_deadline, if awaiting_first_slice => {
+                if state.has_first_slice() {
+                    awaiting_first_slice = false;
+                    continue;
+                }
+                return Ok(MeshStreamAttempt::FirstSliceTimeout);
+            }
+            _ = &mut silence_deadline, if heartbeats_observed => {
+                warn!(
+                    cp_url = %cp_url,
+                    max_silence_secs = config.timings.max_silence.as_secs(),
+                    "Native MeshSubscribe stream went silent past the heartbeat bound; failing over"
+                );
+                return Ok(MeshStreamAttempt::HeartbeatSilenceTimeout);
+            }
             message = stream.message() => {
                 match message {
                     Ok(Some(update)) => update,
@@ -415,27 +450,12 @@ async fn connect_mesh_subscribe(
                     Err(status) => return Err(anyhow::Error::new(status)),
                 }
             }
-            _ = tokio::time::sleep(first_frame_remaining), if awaiting_first_frame => {
-                return Ok(MeshStreamAttempt::FirstFrameTimeout);
-            }
-            _ = tokio::time::sleep(first_slice_remaining), if awaiting_first_slice => {
-                if state.has_first_slice() {
-                    awaiting_first_slice = false;
-                    continue;
-                }
-                return Ok(MeshStreamAttempt::FirstSliceTimeout);
-            }
-            _ = tokio::time::sleep(silence_remaining), if heartbeats_observed => {
-                warn!(
-                    cp_url = %cp_url,
-                    max_silence_secs = config.timings.max_silence.as_secs(),
-                    "Native MeshSubscribe stream went silent past the heartbeat bound; failing over"
-                );
-                return Ok(MeshStreamAttempt::HeartbeatSilenceTimeout);
-            }
         };
         awaiting_first_frame = false;
         last_stream_activity = tokio::time::Instant::now();
+        silence_deadline
+            .as_mut()
+            .reset(last_stream_activity + config.timings.max_silence);
 
         if let Some((report, attempts_left)) = pending_status_report.take() {
             let version = report.version.clone();

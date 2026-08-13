@@ -542,18 +542,43 @@ async fn start_cp(updates: Vec<MeshConfigUpdate>) -> CpHandle {
 
 type ClientHandle = (watch::Sender<bool>, tokio::task::JoinHandle<()>);
 
-fn spawn_client(cp_urls: Vec<String>, state: MeshRuntimeState) -> ClientHandle {
+fn spawn_client_with_timings(
+    cp_urls: Vec<String>,
+    state: MeshRuntimeState,
+    timings: MeshStreamTimings,
+) -> ClientHandle {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let handle = tokio::spawn(start_native_mesh_client_with_shutdown(
         cp_urls,
         GrpcJwtSecret::new(JWT_SECRET.to_string()),
-        client_config(None, Some(SPIFFE)),
+        client_config_with_timings(None, Some(SPIFFE), timings),
         state,
         shutdown_rx,
         None,
         None,
     ));
     (shutdown_tx, handle)
+}
+
+async fn wait_for_native_outcome(
+    state: &MeshRuntimeState,
+    expected: &'static str,
+    deadline: Duration,
+) {
+    let until = tokio::time::Instant::now() + deadline;
+    loop {
+        if let Some(status) = state.config_stream_status()
+            && status.last_attempt_outcome == expected
+        {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < until,
+            "timed out waiting for native outcome {expected}; status={:?}",
+            state.config_stream_status()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 async fn stop_client(client: ClientHandle) {
@@ -896,4 +921,204 @@ fn consumer_never_installs_an_unbound_response() {
         .apply_update(&update_for(&bound))
         .expect("a bound response applies");
     assert!(state.has_first_slice());
+}
+
+/// A control plane that accepts the authenticated MeshSubscribe RPC and then
+/// never returns response headers must not hold startup: the first-frame bound
+/// covers the RPC-open await itself, not only frames after headers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn withholding_mesh_subscribe_headers_cannot_outrun_first_frame() {
+    let withholding = start_withholding_headers_cp().await;
+    let healthy_slice = MeshSlice {
+        version: "v-healthy-fallback".to_string(),
+        workload_spiffe_id: Some(SPIFFE.to_string()),
+        ..bound_slice()
+    };
+    let healthy = start_cp(vec![update_for(&healthy_slice)]).await;
+
+    let state = MeshRuntimeState::new();
+    let timings = MeshStreamTimings {
+        first_frame: Duration::from_millis(300),
+        first_slice: Duration::from_secs(15),
+        ..MeshStreamTimings::production()
+    };
+    let client = spawn_client_with_timings(
+        vec![withholding.url.clone(), healthy.url.clone()],
+        state.clone(),
+        timings,
+    );
+
+    let first_slice = state.wait_for_first_slice();
+    tokio::time::timeout(Duration::from_secs(20), first_slice)
+        .await
+        .expect("header withholding must lose to first-frame and fail over");
+
+    let snapshot = state.snapshot();
+    let slice = snapshot.as_ref().as_ref().expect("fallback slice installed");
+    assert_eq!(slice.version, "v-healthy-fallback");
+    assert!(withholding.subscribe_count.load(Ordering::Relaxed) >= 1);
+    wait_for_native_outcome(&state, "first_frame_timeout", Duration::from_secs(5)).await;
+
+    stop_client(client).await;
+    withholding.shutdown().await;
+    healthy.shutdown().await;
+}
+
+/// Continuous native heartbeats are frames, so they satisfy first-frame, but
+/// they must not starve the first-slice clock. A primary that only heartbeats
+/// cannot hold startup forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn continuous_native_heartbeats_cannot_outrun_first_slice() {
+    let heartbeating = start_heartbeat_only_cp().await;
+    let healthy_slice = MeshSlice {
+        version: "v-healthy-fallback".to_string(),
+        workload_spiffe_id: Some(SPIFFE.to_string()),
+        ..bound_slice()
+    };
+    let healthy = start_cp(vec![update_for(&healthy_slice)]).await;
+
+    let state = MeshRuntimeState::new();
+    let timings = MeshStreamTimings {
+        first_frame: Duration::from_secs(5),
+        first_slice: Duration::from_millis(400),
+        ..MeshStreamTimings::production()
+    };
+    let client = spawn_client_with_timings(
+        vec![heartbeating.url.clone(), healthy.url.clone()],
+        state.clone(),
+        timings,
+    );
+
+    let first_slice = state.wait_for_first_slice();
+    tokio::time::timeout(Duration::from_secs(20), first_slice)
+        .await
+        .expect("heartbeat-only primary must lose to first-slice and fail over");
+
+    let snapshot = state.snapshot();
+    let slice = snapshot.as_ref().as_ref().expect("fallback slice installed");
+    assert_eq!(slice.version, "v-healthy-fallback");
+    assert!(heartbeating.subscribe_count.load(Ordering::Relaxed) >= 1);
+    wait_for_native_outcome(&state, "first_slice_timeout", Duration::from_secs(5)).await;
+
+    stop_client(client).await;
+    heartbeating.shutdown().await;
+    healthy.shutdown().await;
+}
+
+#[derive(Clone)]
+struct WithholdingHeadersCp {
+    subscribe_count: Arc<AtomicUsize>,
+}
+
+#[tonic::async_trait]
+impl MeshConfigSync for WithholdingHeadersCp {
+    type MeshSubscribeStream =
+        Pin<Box<dyn tokio_stream::Stream<Item = Result<MeshConfigUpdate, Status>> + Send>>;
+
+    async fn mesh_subscribe(
+        &self,
+        request: Request<MeshSubscribeRequest>,
+    ) -> Result<Response<Self::MeshSubscribeStream>, Status> {
+        self.subscribe_count.fetch_add(1, Ordering::Relaxed);
+        // Accept the RPC and never return response headers. Hold the inbound
+        // request so the HTTP/2 stream stays accepted until the client cancels
+        // the pending open.
+        let _held = request.into_inner();
+        std::future::pending().await
+    }
+
+    async fn report_mesh_slice_status(
+        &self,
+        _request: Request<ferrum_edge::grpc::proto::MeshSliceStatusReport>,
+    ) -> Result<Response<ferrum_edge::grpc::proto::MeshSliceStatusResponse>, Status> {
+        Ok(Response::new(
+            ferrum_edge::grpc::proto::MeshSliceStatusResponse {},
+        ))
+    }
+}
+
+async fn start_withholding_headers_cp() -> CpHandle {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind withholding stub CP");
+    let addr = listener.local_addr().expect("withholding stub CP addr");
+    let subscribe_count = Arc::new(AtomicUsize::new(0));
+    let cp = WithholdingHeadersCp {
+        subscribe_count: subscribe_count.clone(),
+    };
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let incoming = TcpListenerStream::new(listener);
+    let task = tokio::spawn(async move {
+        Server::builder()
+            .add_service(MeshConfigSyncServer::new(cp))
+            .serve_with_incoming_shutdown(incoming, async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+    });
+    CpHandle {
+        url: format!("http://{addr}"),
+        subscribe_count,
+        shutdown_tx: Some(shutdown_tx),
+        task,
+    }
+}
+
+#[derive(Clone)]
+struct HeartbeatOnlyCp {
+    subscribe_count: Arc<AtomicUsize>,
+}
+
+#[tonic::async_trait]
+impl MeshConfigSync for HeartbeatOnlyCp {
+    type MeshSubscribeStream =
+        Pin<Box<dyn tokio_stream::Stream<Item = Result<MeshConfigUpdate, Status>> + Send>>;
+
+    async fn mesh_subscribe(
+        &self,
+        _request: Request<MeshSubscribeRequest>,
+    ) -> Result<Response<Self::MeshSubscribeStream>, Status> {
+        self.subscribe_count.fetch_add(1, Ordering::Relaxed);
+        let heartbeats = tokio_stream::wrappers::IntervalStream::new(tokio::time::interval(
+            Duration::from_millis(20),
+        ))
+        .map(|_| Ok(heartbeat()));
+        Ok(Response::new(Box::pin(heartbeats)))
+    }
+
+    async fn report_mesh_slice_status(
+        &self,
+        _request: Request<ferrum_edge::grpc::proto::MeshSliceStatusReport>,
+    ) -> Result<Response<ferrum_edge::grpc::proto::MeshSliceStatusResponse>, Status> {
+        Ok(Response::new(
+            ferrum_edge::grpc::proto::MeshSliceStatusResponse {},
+        ))
+    }
+}
+
+async fn start_heartbeat_only_cp() -> CpHandle {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind heartbeat-only stub CP");
+    let addr = listener.local_addr().expect("heartbeat-only stub CP addr");
+    let subscribe_count = Arc::new(AtomicUsize::new(0));
+    let cp = HeartbeatOnlyCp {
+        subscribe_count: subscribe_count.clone(),
+    };
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let incoming = TcpListenerStream::new(listener);
+    let task = tokio::spawn(async move {
+        Server::builder()
+            .add_service(MeshConfigSyncServer::new(cp))
+            .serve_with_incoming_shutdown(incoming, async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+    });
+    CpHandle {
+        url: format!("http://{addr}"),
+        subscribe_count,
+        shutdown_tx: Some(shutdown_tx),
+        task,
+    }
 }

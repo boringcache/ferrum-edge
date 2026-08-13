@@ -30,7 +30,9 @@ use ferrum_edge::modes::mesh::config_consumer::stream_lifecycle::{
     MESH_CONFIG_STREAM_HTTP2_KEEPALIVE_TIMEOUT_SECS, MESH_CONFIG_STREAM_OUTBOUND_TIMEOUT_SECS,
     MESH_CONFIG_STREAM_TCP_KEEPALIVE_SECS, MeshConfigStreamCredential, MeshStreamAttachment,
     MeshStreamAttempt, MeshStreamRetirement, MeshStreamTimings, MeshStreamTracker,
+    reconnect_backoff_after_attempt,
 };
+use ferrum_edge::util::backoff::{BACKOFF_INITIAL_SECS, BACKOFF_MAX_SECS};
 
 /// Every `MeshStreamRetirement` this build knows about. Kept as one list so a
 /// new variant cannot quietly skip the "local decisions never penalize the
@@ -108,6 +110,59 @@ fn transport_failure_backoff_depends_on_whether_the_attempt_made_progress() {
     let progressed = transport_failure(true, false).disposition();
     assert!(progressed.advance_endpoint);
     assert!(!progressed.increase_backoff);
+}
+
+/// A usable install on this attempt must reset the reconnect delay *before*
+/// the next sleep. Earlier no-progress failures that grew the shared backoff
+/// (possibly to the 30s cap) must not leave that stale delay in front of a
+/// stream that already made progress — including when the terminal
+/// classification is a clean EOF, which still grows backoff when there was
+/// no progress.
+#[test]
+fn usable_install_resets_reconnect_delay_before_the_next_sleep() {
+    let grown = BACKOFF_MAX_SECS;
+    let eof = MeshStreamAttempt::RemoteEof.disposition();
+    assert!(eof.increase_backoff);
+
+    let (sleep_secs, next_secs) =
+        reconnect_backoff_after_attempt(grown, eof.increase_backoff, true);
+    assert_eq!(
+        sleep_secs, BACKOFF_INITIAL_SECS,
+        "progress must not sleep the stale grown delay"
+    );
+    assert_eq!(next_secs, BACKOFF_INITIAL_SECS);
+
+    let (sleep_secs, next_secs) =
+        reconnect_backoff_after_attempt(grown, eof.increase_backoff, false);
+    assert_eq!(
+        sleep_secs, grown,
+        "no-progress EOF must still sleep the current delay"
+    );
+    assert_eq!(next_secs, BACKOFF_MAX_SECS);
+
+    let (sleep_secs, next_secs) =
+        reconnect_backoff_after_attempt(BACKOFF_INITIAL_SECS, eof.increase_backoff, false);
+    assert_eq!(sleep_secs, BACKOFF_INITIAL_SECS);
+    assert_eq!(next_secs, 2);
+
+    let silence = MeshStreamAttempt::HeartbeatSilenceTimeout.disposition();
+    let (sleep_secs, next_secs) =
+        reconnect_backoff_after_attempt(grown, silence.increase_backoff, true);
+    assert_eq!(sleep_secs, BACKOFF_INITIAL_SECS);
+    assert_eq!(next_secs, BACKOFF_INITIAL_SECS);
+
+    let transport = transport_failure(true, true).disposition();
+    let (sleep_secs, next_secs) =
+        reconnect_backoff_after_attempt(grown, transport.increase_backoff, true);
+    assert_eq!(sleep_secs, BACKOFF_INITIAL_SECS);
+    assert_eq!(next_secs, BACKOFF_INITIAL_SECS);
+
+    let policy = MeshStreamAttempt::PolicyRejected.disposition();
+    assert!(policy.increase_backoff);
+    let (sleep_secs, next_secs) =
+        reconnect_backoff_after_attempt(grown, policy.increase_backoff, true);
+    assert_eq!(sleep_secs, BACKOFF_INITIAL_SECS);
+    assert_eq!(next_secs, BACKOFF_INITIAL_SECS);
 }
 
 /// Issue #3854 round two. An H2 keepalive (PING-ack) failure surfaces through

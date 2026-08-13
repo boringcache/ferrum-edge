@@ -742,6 +742,8 @@ and `src/modes/mesh/config_consumer/stock_xds_credential.rs` (credential
 lifetime). Tests: `tests/unit/gateway_core/stock_xds_tests.rs`,
 `tests/unit/gateway_core/mesh_stream_lifecycle_tests.rs`,
 `tests/integration/mesh_stock_xds_tests.rs`,
+`tests/integration/mesh_xds_stream_lifecycle_tests.rs`,
+`tests/integration/mesh_subscribe_validation_tests.rs`,
 `tests/functional/functional_mesh_stock_xds_test.rs`, and
 `tests/conformance/stock_xds_interop.rs`.
 
@@ -759,7 +761,11 @@ rotates to the next configured endpoint and grows the bounded, jittered backoff.
 Previously all three consumers classified `Ok(())` as success, reset backoff, and
 returned to (or stayed on) the primary — a control plane that accepted and
 immediately closed could pin the data plane in a primary-only hot loop while a
-healthy fallback was never consulted.
+healthy fallback was never consulted. A usable install on the attempt that just
+ended resets the reconnect delay *before* the next sleep, even when earlier
+no-progress failures grew the shared backoff to its cap. Repeated no-progress
+remote EOF or failure still grows that bounded, jittered delay. The progress bit
+is per-attempt, not inferred from last-good state left by another stream.
 
 **Intentional local retirement never penalizes the endpoint.** Shutdown, gRPC
 TLS reload, the three stock bearer-credential events (`credential_rotated`,
@@ -787,12 +793,33 @@ went dark" — rather than being labelled a keepalive timeout Ferrum cannot prov
 An ordinary dial refusal stays `transport_failure`. Only the former projects as
 `stream_liveness_failed` on `/health`.
 
-**A mute or incomplete control plane cannot hold startup.** A stream that
-delivers no response frame within 60s fails as `first_frame_timeout`. A stream
-that delivers frames but never completes a generation, while this data plane has
-never installed a slice at all, fails as `first_slice_timeout` after 120s. The
+**A mute or incomplete control plane cannot hold startup.** The 60s
+`first_frame_timeout` bound is one absolute attempt clock: it starts at the
+streaming RPC-open await and continues until the first response frame. Headers
+do not reset it. A control plane that accepts the
+authenticated request, keeps HTTP/2 healthy, and never returns headers is
+therefore the same mute peer as one that returns headers and then stays silent.
+Dropping the pending open future cancels it; no task is detached. On stock xDS
+the credential fence still outranks that clock: an already-ready or
+simultaneous generation, invalidation, or absolute credential deadline wins and
+resets retired-credential discovery state as before. A stream that delivers
+frames but never completes a generation, while this data plane has never
+installed a slice at all, fails as `first_slice_timeout` after 120s. The
 first-slice bound is armed only in that never-converged state, so a legitimately
 quiet control plane never tears down a converged proxy.
+
+Receive loops poll already-expired first-frame, first-slice, silence, and stock
+credential clocks before admitting a ready response, so a primary that
+continuously sends heartbeats or incomplete frames cannot hold startup forever.
+Debounce commit still outranks the next message so a complete generation is
+published before another frame is admitted; simultaneous clock vs.
+message/debounce boundaries fail closed.
+
+**Policy refusal is not transport liveness.** A Ferrum-private ADS stream that
+the local revision gate or NACK circuit breaker refuses is `policy_rejected`.
+That is a content failure: `/health` does not label it
+`established_transport_failure` or `stream_liveness_failed`. Dial, RPC-open,
+status, and outbound enqueue failures stay transport.
 
 **Partial generations are never published.** Both ADS consumers only stage a
 slice once their own required-type gate is satisfied, so an EOF mid-convergence
@@ -822,9 +849,11 @@ credential-aware: an already-observed or newly arriving generation, invalidation
 or absolute deadline wins over the send and is returned as that local retirement
 rather than as a transport failure, so the next stream discards discovery state
 touched under the retired credential. The same fence races the initial ADS
-RPC-open (response-headers) await, so a control plane that accepts the
-authenticated request and withholds headers cannot hold the pending open past
-those retirements. No task is detached.
+RPC-open (response-headers) await together with the first-frame bound, so a
+control plane that accepts the request and withholds headers cannot hold the
+pending open past credential retirement *or* the first-frame clock. Credential
+generation, invalidation, and deadline still win when they are already ready or
+simultaneous with first-frame or open success. No task is detached.
 
 The stock client's outer lifecycle `select` is `biased` with shutdown first and
 the inner ADS future next, so a simultaneously ready TLS-reload or primary-retry

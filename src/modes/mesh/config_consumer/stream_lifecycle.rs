@@ -32,6 +32,8 @@ use std::time::Duration;
 
 use tonic::transport::Endpoint;
 
+use crate::util::backoff::{BACKOFF_INITIAL_SECS, next_backoff_secs};
+
 /// HTTP/2 PING interval on every mesh configuration stream.
 ///
 /// Matches the hardened DP ConfigSync client
@@ -84,11 +86,14 @@ pub const MESH_CONFIG_STREAM_OUTBOUND_TIMEOUT_SECS: u64 = 15;
 /// minutes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MeshStreamTimings {
-    /// Bound from stream open to the first response frame of any subscribed
-    /// type.
+    /// Absolute bound from the streaming-RPC-open await through the first
+    /// response frame of any subscribed type. The clock is not reset when
+    /// headers arrive: a control plane that accepts the authenticated request
+    /// and withholds headers is the same mute peer as one that returns headers
+    /// and then stays silent.
     pub first_frame: Duration,
-    /// Bound from stream open to the first *installed* slice, armed only while
-    /// the runtime has never had one.
+    /// Bound from the same attempt origin as [`Self::first_frame`] to the first
+    /// *installed* slice, armed only while the runtime has never had one.
     pub first_slice: Duration,
     /// Bound on application silence for consumers with an observed heartbeat.
     pub max_silence: Duration,
@@ -233,8 +238,10 @@ pub enum MeshStreamAttempt {
         delivered_usable_state: bool,
         after_established: bool,
     },
-    /// The stream was accepted but no response frame arrived inside
-    /// [`MeshStreamTimings::first_frame`].
+    /// No response frame arrived inside [`MeshStreamTimings::first_frame`],
+    /// counting from the streaming-RPC-open await. Covers both a peer that
+    /// withholds response headers and one that returns headers and then stays
+    /// silent.
     FirstFrameTimeout,
     /// Frames arrived but no complete generation was ever installed inside
     /// [`MeshStreamTimings::first_slice`], while the runtime had no slice at
@@ -331,6 +338,30 @@ impl MeshStreamAttempt {
             },
         }
     }
+}
+
+/// Sleep delay and subsequent stored backoff after one endpoint-failure attempt.
+///
+/// A usable install on *this* attempt resets to the initial delay before the
+/// next sleep, even when earlier no-progress failures grew the shared backoff
+/// and even when the terminal classification would otherwise increase it
+/// (clean EOF, silence, policy). Repeated no-progress failures keep the
+/// current delay for this sleep and grow it afterwards. Local retirements
+/// never reach here.
+pub fn reconnect_backoff_after_attempt(
+    current_secs: u64,
+    increase_backoff: bool,
+    delivered_usable_state: bool,
+) -> (u64, u64) {
+    if delivered_usable_state {
+        return (BACKOFF_INITIAL_SECS, BACKOFF_INITIAL_SECS);
+    }
+    let sleep_secs = if increase_backoff {
+        current_secs
+    } else {
+        BACKOFF_INITIAL_SECS
+    };
+    (sleep_secs, next_backoff_secs(sleep_secs, increase_backoff))
 }
 
 /// The outer reconnect loop's next move for one attempt.

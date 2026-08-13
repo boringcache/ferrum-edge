@@ -114,6 +114,7 @@ mod mesh_service_waypoint_tests;
 mod mesh_sidecar_e2e_tests;
 mod mesh_stock_xds_tests;
 mod mesh_subscribe_validation_tests;
+mod mesh_xds_stream_lifecycle_tests;
 mod mesh_telemetry_k8s_provider_lookup_tests;
 mod mesh_telemetry_tracing_tests;
 mod mesh_test_support;

@@ -107,6 +107,7 @@ use super::stock_xds_transport::{
 use super::stream_lifecycle::{
     MeshConfigStreamCredential, MeshStreamAttachment, MeshStreamAttempt, MeshStreamRetirement,
     MeshStreamTimings, MeshStreamTracker, configure_mesh_config_stream_endpoint,
+    reconnect_backoff_after_attempt,
 };
 use crate::grpc::dp_client::{DpGrpcTlsConfig, DpGrpcTlsReload};
 use crate::modes::mesh::config::MeshConfig;
@@ -519,6 +520,10 @@ struct StockAttemptOutcome {
     /// nothing a retired credential produced may survive into the stream that
     /// replaces it).
     reset_discovery_state: bool,
+    /// Whether THIS attempt installed usable configuration. Distinct from the
+    /// runtime's last-good `has_first_slice`, which may be leftover from
+    /// another stream.
+    delivered_usable_state: bool,
 }
 
 impl StockAttemptOutcome {
@@ -527,6 +532,7 @@ impl StockAttemptOutcome {
             attempt: MeshStreamAttempt::LocalRetirement(reason),
             reason: None,
             reset_discovery_state: reason.is_credential_retirement(),
+            delivered_usable_state: false,
         }
     }
 
@@ -535,14 +541,16 @@ impl StockAttemptOutcome {
             attempt: MeshStreamAttempt::LocalRetirement(retirement),
             reason: Some(reason),
             reset_discovery_state: retirement.is_credential_retirement(),
+            delivered_usable_state: false,
         }
     }
 
-    fn ended(attempt: MeshStreamAttempt) -> Self {
+    fn ended(attempt: MeshStreamAttempt, delivered_usable_state: bool) -> Self {
         Self {
             attempt,
             reason: None,
             reset_discovery_state: false,
+            delivered_usable_state,
         }
     }
 
@@ -551,6 +559,7 @@ impl StockAttemptOutcome {
             attempt,
             reason: Some(reason),
             reset_discovery_state: false,
+            delivered_usable_state: false,
         }
     }
 }
@@ -580,7 +589,7 @@ enum StockStreamError {
 
 impl StockStreamError {
     fn into_outcome(self, delivered_usable_state: bool) -> StockAttemptOutcome {
-        match self {
+        let mut outcome = match self {
             Self::SubscriptionRefused(reason) => StockAttemptOutcome::failed(
                 MeshStreamAttempt::TransportFailure {
                     delivered_usable_state,
@@ -599,7 +608,9 @@ impl StockStreamError {
                 StockAttemptOutcome::failed(MeshStreamAttempt::PolicyRejected, reason)
             }
             Self::Retirement(retirement) => StockAttemptOutcome::local(retirement),
-        }
+        };
+        outcome.delivered_usable_state = delivered_usable_state;
+        outcome
     }
 }
 
@@ -980,6 +991,7 @@ pub async fn start_stock_xds_client_with_shutdown(
             attempt,
             reason,
             reset_discovery_state,
+            delivered_usable_state,
         } = outcome;
         // A TLS revision that was already published is applied at the top of
         // the next loop via `refresh_dp_grpc_tls_config_if_changed`. Mark it
@@ -1051,7 +1063,12 @@ pub async fn start_stock_xds_client_with_shutdown(
             continue;
         }
 
-        let sleep_duration = jittered_backoff(backoff_secs);
+        let (sleep_secs, next_secs) = reconnect_backoff_after_attempt(
+            backoff_secs,
+            disposition.increase_backoff,
+            delivered_usable_state,
+        );
+        let sleep_duration = jittered_backoff(sleep_secs);
         let mut sleep_shutdown_rx = shutdown_rx.clone();
         tokio::select! {
             _ = tokio::time::sleep(sleep_duration) => {}
@@ -1066,7 +1083,7 @@ pub async fn start_stock_xds_client_with_shutdown(
                 continue;
             }
         }
-        backoff_secs = next_backoff_secs(backoff_secs, disposition.increase_backoff);
+        backoff_secs = next_secs;
     }
 }
 
@@ -1261,6 +1278,7 @@ async fn connect_stock_ads(
     );
 
     let mut delivered_usable_state = false;
+    let attempt_started_at = tokio::time::Instant::now();
     let result = run_stock_ads_stream(
         channel,
         credential,
@@ -1277,6 +1295,7 @@ async fn connect_stock_ads(
         credential_rx,
         tracker,
         &mut delivered_usable_state,
+        attempt_started_at,
     )
     .await;
     tracker.set_attachment(MeshStreamAttachment::Detached);
@@ -1284,7 +1303,7 @@ async fn connect_stock_ads(
 
     match result {
         Ok(attempt) => {
-            let mut outcome = StockAttemptOutcome::ended(attempt);
+            let mut outcome = StockAttemptOutcome::ended(attempt, delivered_usable_state);
             if let MeshStreamAttempt::LocalRetirement(retirement) = attempt {
                 outcome.reset_discovery_state = retirement.is_credential_retirement();
             }
@@ -1348,6 +1367,7 @@ async fn run_stock_ads_stream(
     credential_rx: &mut tokio::sync::watch::Receiver<StockCredentialObservation>,
     tracker: &mut MeshStreamTracker,
     delivered_usable_state: &mut bool,
+    attempt_started_at: tokio::time::Instant,
 ) -> Result<MeshStreamAttempt, StockStreamError> {
     // The authorization metadata and the endpoint's admitted transport travel
     // together into the interceptor. This is the issue-#3853 defense in depth:
@@ -1371,18 +1391,25 @@ async fn run_stock_ads_stream(
     // The interceptor attaches/sends the bearer as soon as this future is
     // polled. A control plane can accept that authenticated request and then
     // withhold response headers, so the RPC-open await itself must be raced
-    // against the bound credential observation and the absolute deadline.
-    // Already-observed or simultaneously-ready retirement wins (biased) and
-    // drops the in-flight open; the deadline is never extended from this
-    // instant. Remote Status text stays classified, never echoed.
+    // against credential generation/invalidation/deadline AND the absolute
+    // first-frame bound. Already-observed or simultaneously-ready credential
+    // retirement wins (biased) and still resets discovery state; first-frame
+    // covers the no-bearer withhold case. Dropping the pending open cancels
+    // it; nothing is detached. Remote Status text stays classified, never
+    // echoed.
+    let first_frame_at = attempt_started_at + config.timings.first_frame;
     let mut response_stream = match await_stock_ads_rpc_open_under_fence(
         client.stream_aggregated_resources(request_stream),
         &fence,
         credential_rx,
+        first_frame_at,
     )
     .await
     {
-        Ok(response) => response.into_inner(),
+        Ok(StockRpcOpen::Ready(response)) => response.into_inner(),
+        Ok(StockRpcOpen::FirstFrameTimeout) => {
+            return Ok(MeshStreamAttempt::FirstFrameTimeout);
+        }
         Err(StockStreamError::Retirement(retirement)) => {
             return Ok(MeshStreamAttempt::LocalRetirement(retirement));
         }
@@ -1452,12 +1479,16 @@ async fn run_stock_ads_stream(
     // ── issue #3854: bounded liveness for an ESTABLISHED stream ──
     // HTTP/2 + TCP keepalive (applied on the endpoint) already fail a
     // blackholed transport. These two deadlines cover the other half: a control
-    // plane that accepts the RPC and then supplies nothing usable.
-    let opened_at = tokio::time::Instant::now();
-    let first_frame_deadline = tokio::time::sleep_until(opened_at + config.timings.first_frame);
+    // plane that accepts the RPC and then supplies nothing usable. They are
+    // the SAME absolute clocks that covered RPC-open: headers do not reset
+    // them. Already-expired clocks are polled before debounce and before
+    // `message()`, so a continuously ready incomplete frame cannot starve
+    // them; debounce still outranks the next message.
+    let first_frame_deadline = tokio::time::sleep_until(first_frame_at);
     tokio::pin!(first_frame_deadline);
     let mut awaiting_first_frame = true;
-    let first_slice_deadline = tokio::time::sleep_until(opened_at + config.timings.first_slice);
+    let first_slice_deadline =
+        tokio::time::sleep_until(attempt_started_at + config.timings.first_slice);
     tokio::pin!(first_slice_deadline);
     // Armed only while this data plane has never had a slice at all: a
     // converged proxy must not be torn down for a legitimately quiet CP.
@@ -1471,7 +1502,9 @@ async fn run_stock_ads_stream(
     // is why nothing in this loop touches it.
     let credential_deadline = fence.deadline;
     let credential_deadline_sleep = tokio::time::sleep_until(
-        credential_deadline.unwrap_or_else(|| opened_at + Duration::from_secs(60 * 60 * 24)),
+        credential_deadline.unwrap_or_else(|| {
+            attempt_started_at + Duration::from_secs(60 * 60 * 24)
+        }),
     );
     tokio::pin!(credential_deadline_sleep);
     let mut credential_watch_open = true;
@@ -2128,17 +2161,24 @@ fn stock_log_type_label(type_url: &str) -> &'static str {
 }
 
 /// Race one ADS RPC-open (response-headers) future against the credential
-/// fence. Mirrors the outbound enqueue fence: already-observed retirement
-/// wins before the wait, the select is `biased` so a simultaneously-ready
-/// generation, invalidation, or absolute deadline wins over an open success,
-/// and dropping this future is what cancels the in-flight open. No task is
+/// fence and the absolute first-frame bound. Mirrors the outbound enqueue
+/// fence: already-observed retirement wins before the wait, the select is
+/// `biased` so a simultaneously-ready generation, invalidation, or absolute
+/// credential deadline wins over first-frame and over an open success, and
+/// dropping this future is what cancels the in-flight open. No task is
 /// detached. A closed credential watcher does not spin or invent a rotation;
-/// the absolute deadline still bounds a configured credential.
+/// the absolute credential deadline and the first-frame bound still apply.
+enum StockRpcOpen<S> {
+    Ready(tonic::Response<S>),
+    FirstFrameTimeout,
+}
+
 async fn await_stock_ads_rpc_open_under_fence<S>(
     rpc_open: impl Future<Output = Result<tonic::Response<S>, tonic::Status>>,
     fence: &StockCredentialFence,
     credential_rx: &mut tokio::sync::watch::Receiver<StockCredentialObservation>,
-) -> Result<tonic::Response<S>, StockStreamError> {
+    first_frame_at: tokio::time::Instant,
+) -> Result<StockRpcOpen<S>, StockStreamError> {
     if let Some(retirement) = fence.evaluate() {
         return Err(StockStreamError::Retirement(retirement));
     }
@@ -2148,6 +2188,8 @@ async fn await_stock_ads_rpc_open_under_fence<S>(
         deadline.unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(60 * 60 * 24)),
     );
     tokio::pin!(deadline_sleep);
+    let first_frame_deadline = tokio::time::sleep_until(first_frame_at);
+    tokio::pin!(first_frame_deadline);
     tokio::pin!(rpc_open);
 
     tokio::select! {
@@ -2160,13 +2202,17 @@ async fn await_stock_ads_rpc_open_under_fence<S>(
         changed = credential_rx.changed() => {
             if changed.is_err() {
                 // Watcher is gone (shutdown). Do not spin or mislabel that as
-                // rotation; the absolute deadline still bounds this open.
+                // rotation; the absolute credential deadline and first-frame
+                // bound still cover this open.
                 tokio::select! {
                     biased;
                     _ = &mut deadline_sleep, if deadline.is_some() => {
                         Err(StockStreamError::Retirement(
                             MeshStreamRetirement::CredentialDeadline,
                         ))
+                    }
+                    _ = &mut first_frame_deadline => {
+                        Ok(StockRpcOpen::FirstFrameTimeout)
                     }
                     result = &mut rpc_open => map_rpc_open_result(result),
                 }
@@ -2176,15 +2222,20 @@ async fn await_stock_ads_rpc_open_under_fence<S>(
                 ))
             }
         }
+        _ = &mut first_frame_deadline => {
+            Ok(StockRpcOpen::FirstFrameTimeout)
+        }
         result = &mut rpc_open => map_rpc_open_result(result),
     }
 }
 
 fn map_rpc_open_result<S>(
     result: Result<tonic::Response<S>, tonic::Status>,
-) -> Result<tonic::Response<S>, StockStreamError> {
+) -> Result<StockRpcOpen<S>, StockStreamError> {
     // Only the canonical gRPC code: the status message is remote-authored.
-    result.map_err(|status| StockStreamError::SubscriptionRefused(grpc_status_category(&status)))
+    result
+        .map(StockRpcOpen::Ready)
+        .map_err(|status| StockStreamError::SubscriptionRefused(grpc_status_category(&status)))
 }
 
 /// Enqueue one outbound `DiscoveryRequest`, bounded and credential-aware.

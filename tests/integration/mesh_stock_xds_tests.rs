@@ -1015,6 +1015,13 @@ mod stream_lifecycle {
         PartialThenCleanEof,
         /// Accept the RPC and never send anything at all.
         Mute,
+        /// Accept the authenticated streaming request and never return
+        /// response headers. The RPC-open future stays pending until the
+        /// first-frame bound cancels it.
+        WithholdHeaders,
+        /// Keep sending CDS-only frames so `message()` stays ready, without
+        /// ever completing a generation. First-slice must still fire.
+        IncompleteForever,
         /// Serve the converged CDS+EDS script.
         Converged,
     }
@@ -1057,9 +1064,13 @@ mod stream_lifecycle {
             request: Request<Streaming<DiscoveryRequest>>,
         ) -> Result<Response<Self::StreamAggregatedResourcesStream>, Status> {
             self.streams.fetch_add(1, Ordering::SeqCst);
+            let behaviour = self.behaviour;
+            if behaviour == EndpointBehaviour::WithholdHeaders {
+                let _held = request.into_inner();
+                return std::future::pending().await;
+            }
             let mut inbound = request.into_inner();
             let recorder = self.recorder.clone();
-            let behaviour = self.behaviour;
             let (tx, rx) = mpsc::channel(32);
 
             tokio::spawn(async move {
@@ -1085,6 +1096,36 @@ mod stream_lifecycle {
                     }
                     // Hold the response stream open forever without a frame.
                     std::future::pending::<()>().await;
+                }
+                if behaviour == EndpointBehaviour::IncompleteForever {
+                    tokio::spawn(async move {
+                        while inbound.message().await.ok().flatten().is_some() {}
+                    });
+                    let mut nonce = 0u64;
+                    loop {
+                        nonce = nonce.saturating_add(1);
+                        let response = DiscoveryResponse {
+                            version_info: format!("cds-v{nonce}"),
+                            resources: vec![
+                                any_resource(
+                                    CDS_TYPE_URL,
+                                    &eds_cluster(REVIEWS_CLUSTER, REVIEWS_SAN),
+                                ),
+                                any_resource(
+                                    CDS_TYPE_URL,
+                                    &eds_cluster(RATINGS_CLUSTER, REVIEWS_SAN),
+                                ),
+                            ],
+                            canary: false,
+                            type_url: CDS_TYPE_URL.to_string(),
+                            nonce: format!("cds-n{nonce}"),
+                            control_plane: None,
+                        };
+                        if tx.send(Ok(response)).await.is_err() {
+                            return;
+                        }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
                 }
 
                 let mut sent_cds = false;
@@ -1382,6 +1423,68 @@ mod stream_lifecycle {
         let slice = harness.wait_for_services(2).await;
         assert_eq!(slice.services.len(), 2);
         assert!(mute.stream_count() >= 1);
+        harness.shutdown_and_join().await;
+    }
+
+    /// A control plane that accepts the streaming RPC and never returns
+    /// response headers — with no stock bearer configured — must still lose
+    /// to the first-frame bound. The RPC-open await is inside that absolute
+    /// clock; headers do not have to arrive before it starts.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn withholding_headers_without_a_bearer_cannot_hold_startup() {
+        let (withholding, withholding_url) = serve(EndpointBehaviour::WithholdHeaders).await;
+        let (_fallback, fallback_url) = serve(EndpointBehaviour::Converged).await;
+
+        let harness = LifecycleHarness::start(
+            vec![withholding_url, fallback_url],
+            StockXdsCredentialSource::unauthenticated(),
+            StockCredentialWatch::new(StockCredentialState::NotConfigured),
+            MeshStreamTimings {
+                first_frame: Duration::from_millis(300),
+                first_slice: Duration::from_secs(15),
+                ..MeshStreamTimings::production()
+            },
+        )
+        .await;
+
+        let slice = harness.wait_for_services(2).await;
+        assert_eq!(slice.services.len(), 2);
+        assert!(withholding.stream_count() >= 1);
+        assert_eq!(
+            harness.last_outcome(),
+            Some("first_frame_timeout"),
+            "header withholding must be classified as first-frame, not a hang"
+        );
+        harness.shutdown_and_join().await;
+    }
+
+    /// Incomplete CDS-only frames that keep `message()` ready must not starve
+    /// the first-slice clock. The fallback delivers the first usable slice.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn incomplete_frames_cannot_outrun_first_slice() {
+        let (incomplete, incomplete_url) = serve(EndpointBehaviour::IncompleteForever).await;
+        let (_fallback, fallback_url) = serve(EndpointBehaviour::Converged).await;
+
+        let harness = LifecycleHarness::start(
+            vec![incomplete_url, fallback_url],
+            StockXdsCredentialSource::unauthenticated(),
+            StockCredentialWatch::new(StockCredentialState::NotConfigured),
+            MeshStreamTimings {
+                first_frame: Duration::from_secs(5),
+                first_slice: Duration::from_millis(400),
+                ..MeshStreamTimings::production()
+            },
+        )
+        .await;
+
+        let slice = harness.wait_for_services(2).await;
+        assert_eq!(slice.services.len(), 2);
+        assert!(incomplete.stream_count() >= 1);
+        assert_eq!(
+            harness.last_outcome(),
+            Some("first_slice_timeout"),
+            "a continuously ready incomplete generation must still hit first-slice"
+        );
         harness.shutdown_and_join().await;
     }
 
@@ -2355,10 +2458,11 @@ mod tls_lifecycle {
     /// invalidation, or the absolute deadline. The established-stream fence
     /// loop cannot save that case because it starts only after headers return.
     ///
-    /// Production first-frame timing is used on purpose. That bound is armed
-    /// only after RPC-open succeeds, so it cannot accidentally retire a
-    /// still-pending open and make this pass without the fence racing the
-    /// open future.
+    /// Production first-frame timing is used so this proof is about the
+    /// credential fence, not the first-frame bound: a 2s credential deadline
+    /// still wins over a 60s first-frame clock, including when both become
+    /// ready in the same poll. An already-ready or simultaneous credential
+    /// retirement must reset retired-credential discovery state as today.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn withholding_rpc_open_headers_cannot_outlive_credential_retirement() {
         struct Case {
