@@ -2622,10 +2622,10 @@ fn h3_plain_header_wait_races_per_stream_stop_sending_not_only_connection_close(
         .split("}\n        }")
         .next()
         .expect("bounded deadline select body");
-    let biased_at = bounded.find("biased;").expect("deadline-first biased select");
-    let sleep_at = bounded
-        .find("sleep_until(deadline)")
-        .expect("deadline arm");
+    let biased_at = bounded
+        .find("biased;")
+        .expect("deadline-first biased select");
+    let sleep_at = bounded.find("sleep_until(deadline)").expect("deadline arm");
     let ready_at = bounded
         .find("value = &mut future")
         .expect("backend-ready arm");

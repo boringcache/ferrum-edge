@@ -11712,7 +11712,6 @@ async fn dispatch_grpc_native_h3(
             }
         },
     };
-    };
     let h3_resp = match head_result {
         Err(termination) => {
             // Nothing is client-visible yet, so the fixed pre-commitment

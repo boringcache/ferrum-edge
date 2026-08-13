@@ -23,9 +23,8 @@ use ferrum_edge::_test_support::{
     collect_buffered_upload_under_composed_bound_for_test,
     collect_h3_upload_under_authorization_for_test, compose_buffered_upload_bound_for_test,
     compose_dispatch_phase_bound_for_test, compose_h3_upload_bound_for_test,
-    compose_precommit_response_phase_bound_for_test,
-    direct_h2_upload_join_bound_for_test, dispatch_phase_authorization_expiry_for_test,
-    dtls_authorization_expired_before_relay_for_test,
+    compose_precommit_response_phase_bound_for_test, direct_h2_upload_join_bound_for_test,
+    dispatch_phase_authorization_expiry_for_test, dtls_authorization_expired_before_relay_for_test,
     dtls_setup_stage_under_authorization_for_test, precommit_authorization_gate_for_test,
     relay_failure_is_client_facing, request_received_at_for_test,
     request_upload_auth_deadline_for_test, set_grpc_deadline_budget_for_test,
@@ -4260,12 +4259,8 @@ async fn an_already_elapsed_h3_upload_bound_never_polls_a_ready_ok_future() {
         ),
     );
     let polled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let outcome = collect_h3_upload_under_authorization_for_test(
-        ready_ok_h3_upload(&polled),
-        bound,
-        0,
-    )
-    .await;
+    let outcome =
+        collect_h3_upload_under_authorization_for_test(ready_ok_h3_upload(&polled), bound, 0).await;
 
     assert_eq!(
         outcome,
@@ -4292,12 +4287,8 @@ async fn an_exact_h3_upload_tie_refuses_a_ready_ok_future_as_authorization() {
         ),
     );
     let polled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let outcome = collect_h3_upload_under_authorization_for_test(
-        ready_ok_h3_upload(&polled),
-        bound,
-        0,
-    )
-    .await;
+    let outcome =
+        collect_h3_upload_under_authorization_for_test(ready_ok_h3_upload(&polled), bound, 0).await;
 
     assert_eq!(
         outcome,
@@ -4323,12 +4314,8 @@ async fn a_strictly_earlier_client_deadline_refuses_a_ready_ok_future_as_deadlin
         ),
     );
     let polled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let outcome = collect_h3_upload_under_authorization_for_test(
-        ready_ok_h3_upload(&polled),
-        bound,
-        0,
-    )
-    .await;
+    let outcome =
+        collect_h3_upload_under_authorization_for_test(ready_ok_h3_upload(&polled), bound, 0).await;
 
     assert_eq!(
         outcome,
@@ -4804,10 +4791,7 @@ async fn an_elapsed_response_collect_authorization_bound_never_polls_ready_work(
         Some(&plan),
     )
     .await;
-    assert_eq!(
-        outcome,
-        ResponseCollectBoundForTest::AuthorizationExpired
-    );
+    assert_eq!(outcome, ResponseCollectBoundForTest::AuthorizationExpired);
     assert_eq!(polled.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
 
@@ -4849,10 +4833,7 @@ async fn an_exact_response_collect_tie_never_polls_ready_work_and_goes_to_author
         Some(&plan),
     )
     .await;
-    assert_eq!(
-        outcome,
-        ResponseCollectBoundForTest::AuthorizationExpired
-    );
+    assert_eq!(outcome, ResponseCollectBoundForTest::AuthorizationExpired);
     assert_eq!(polled.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
 
@@ -4877,11 +4858,9 @@ async fn a_live_response_collect_bound_completes_ready_work() {
 async fn an_elapsed_h3_backend_wait_never_polls_a_ready_backend() {
     let now = paused_clock_with_history().await;
     let (polled, work) = ready_poll_counter();
-    let outcome = await_h3_backend_or_peer_for_test(
-        Some(elapsed_by(now, Duration::from_secs(1))),
-        work,
-    )
-    .await;
+    let outcome =
+        await_h3_backend_or_peer_for_test(Some(elapsed_by(now, Duration::from_secs(1))), work)
+            .await;
     assert_eq!(outcome, H3BackendOrPeerForTest::Deadline);
     assert_eq!(polled.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
@@ -4953,9 +4932,7 @@ fn composed_authorization_waits_use_the_shared_expiry_first_primitive() {
         "an already-elapsed bound must refuse before the protected future is polled"
     );
     let biased_at = helper.find("biased;").expect("biased select");
-    let sleep_at = helper
-        .find("sleep_until(deadline)")
-        .expect("deadline arm");
+    let sleep_at = helper.find("sleep_until(deadline)").expect("deadline arm");
     let future_at = helper.find("result = future").expect("protected-work arm");
     assert!(
         biased_at < sleep_at && sleep_at < future_at,
