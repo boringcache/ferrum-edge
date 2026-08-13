@@ -2965,11 +2965,10 @@ where
                     tokio::pin!(reader_future);
                     let upload_deadline_at = plain_write_bound.deadline();
                     let upload_deadline_active = upload_deadline_at.is_some();
-                    let upload_deadline = tokio::time::sleep_until(
-                        upload_deadline_at.unwrap_or_else(|| {
+                    let upload_deadline =
+                        tokio::time::sleep_until(upload_deadline_at.unwrap_or_else(|| {
                             tokio::time::Instant::now() + Duration::from_secs(86_400)
-                        }),
-                    );
+                        }));
                     tokio::pin!(upload_deadline);
                     tokio::pin!(stream_cancelled);
                     let peer_closed = async {
