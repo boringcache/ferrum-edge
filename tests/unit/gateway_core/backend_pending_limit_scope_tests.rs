@@ -15,8 +15,50 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
 use ferrum_edge::backend_pending_limit::{BackendPendingLimiter, BackendPendingScopeBase};
-use ferrum_edge::config::types::{GatewayConfig, Proxy, Upstream};
+use ferrum_edge::config::types::{
+    BackendTlsConfig, GatewayConfig, Proxy, ResolvedPortOverride, Upstream, UpstreamPortOverride,
+};
 use ferrum_edge::plugins::RequestContext;
+
+fn namespaced_snapshot(
+    namespace: &str,
+    id: &str,
+    upstream: Arc<Upstream>,
+) -> HashMap<String, Arc<Upstream>> {
+    HashMap::from([(
+        ferrum_edge::config::db_backend::namespaced_runtime_key(namespace, id),
+        upstream,
+    )])
+}
+
+fn source_upstream_tls() -> BackendTlsConfig {
+    BackendTlsConfig {
+        client_cert_path: Some("/certs/source.pem".to_string()),
+        client_key_path: Some("/certs/source.key".to_string()),
+        server_ca_cert_path: Some("/certs/source-ca.pem".to_string()),
+        verify_server_cert: false,
+        sni: None,
+        san_allow_list: Vec::new(),
+        san_allow_list_key_digest: None,
+    }
+}
+
+fn source_port_overlay() -> HashMap<u16, ResolvedPortOverride> {
+    HashMap::from([(
+        8080,
+        ResolvedPortOverride {
+            connect_timeout_ms: Some(1_000),
+            ..Default::default()
+        },
+    )])
+}
+
+fn source_port_fallback() -> ResolvedPortOverride {
+    ResolvedPortOverride {
+        http1_max_pending_requests: Some(11),
+        ..Default::default()
+    }
+}
 
 fn scope(ns: &str, id: &str, uid: Option<&str>, sub: Option<&str>) -> BackendPendingScopeBase {
     BackendPendingScopeBase::new(ns, id, uid, sub)
@@ -431,11 +473,7 @@ fn upstream_route_override_rebinds_pending_scope_away_from_source_lane() {
         "upstream carrier is top-level only (subset cleared on override)"
     );
 
-    let mut upstreams = HashMap::new();
-    upstreams.insert(
-        ferrum_edge::config::db_backend::namespaced_runtime_key("shop", "upstream-b"),
-        Arc::clone(&upstream_b),
-    );
+    let upstreams = namespaced_snapshot("shop", "upstream-b", Arc::clone(&upstream_b));
 
     let mut ctx = RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
     ctx.route_override_upstream_id = Some("upstream-b".to_string());
@@ -472,10 +510,10 @@ fn upstream_route_override_rebinds_pending_scope_away_from_source_lane() {
 }
 
 #[test]
-fn upstream_route_override_missing_snapshot_clears_pending_scope() {
-    // Production upstream snapshots are keyed by namespace|id. A bare-id entry
-    // (or an absent destination) must fail closed: clear the stale source lane
-    // instead of retaining A's capped scope on the rebound proxy.
+fn upstream_route_override_rebinds_all_destination_derived_fields() {
+    // One namespaced snapshot lookup must drive TLS, per-port overlays,
+    // fallback, and pending-limit scope together. Bare-id maps must not be
+    // able to supply a different destination's security/policy state.
     let mut upstream_a: Upstream = serde_json::from_value(serde_json::json!({
         "id": "upstream-a",
         "namespace": "shop",
@@ -488,9 +526,24 @@ fn upstream_route_override_missing_snapshot_clears_pending_scope() {
         "id": "upstream-b",
         "namespace": "shop",
         "targets": [{"host": "10.0.0.1", "port": 8080}],
+        "backend_tls_client_cert_path": "/certs/dest.pem",
+        "backend_tls_client_key_path": "/certs/dest.key",
+        "backend_tls_server_ca_cert_path": "/certs/dest-ca.pem",
+        "backend_tls_verify_server_cert": true,
     }))
     .expect("upstream B");
     upstream_b.k8s_service_uid = Some("uid-b".to_string());
+    upstream_b.port_overrides = HashMap::from([(
+        9090,
+        UpstreamPortOverride {
+            connect_timeout_ms: Some(250),
+            ..Default::default()
+        },
+    )]);
+    upstream_b.dispatch_port_override_fallback = Some(UpstreamPortOverride {
+        http1_max_pending_requests: Some(22),
+        ..Default::default()
+    });
 
     let proxy: Proxy = serde_json::from_value(serde_json::json!({
         "id": "route-a",
@@ -509,7 +562,176 @@ fn upstream_route_override_missing_snapshot_clears_pending_scope() {
     };
     config.resolve_pending_limit_scopes();
 
-    let proxy = Arc::new(config.proxies[0].clone());
+    let mut proxy = config.proxies[0].clone();
+    proxy.resolved_tls = source_upstream_tls();
+    proxy.dispatch_port_overrides = Some(source_port_overlay());
+    proxy.dispatch_port_override_fallback = Some(source_port_fallback());
+    let proxy = Arc::new(proxy);
+
+    let dest = Arc::new(config.upstreams[1].clone());
+    let dest_scope = dest
+        .pending_limit_scope
+        .as_ref()
+        .expect("destination pending scope");
+    let upstreams = namespaced_snapshot("shop", "upstream-b", Arc::clone(&dest));
+
+    let mut ctx = RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
+    ctx.route_override_upstream_id = Some("upstream-b".to_string());
+    let effective = ctx.apply_route_overrides_with_upstreams(Arc::clone(&proxy), &upstreams);
+
+    assert_eq!(effective.upstream_id.as_deref(), Some("upstream-b"));
+    assert_eq!(
+        effective.resolved_tls.client_cert_path.as_deref(),
+        Some("/certs/dest.pem")
+    );
+    assert_eq!(
+        effective.resolved_tls.client_key_path.as_deref(),
+        Some("/certs/dest.key")
+    );
+    assert_eq!(
+        effective.resolved_tls.server_ca_cert_path.as_deref(),
+        Some("/certs/dest-ca.pem")
+    );
+    assert!(effective.resolved_tls.verify_server_cert);
+    assert_eq!(
+        effective
+            .dispatch_port_overrides
+            .as_ref()
+            .and_then(|overrides| overrides.get(&9090))
+            .and_then(|override_config| override_config.connect_timeout_ms),
+        Some(250)
+    );
+    assert!(
+        !effective
+            .dispatch_port_overrides
+            .as_ref()
+            .is_some_and(|overrides| overrides.contains_key(&8080)),
+        "source port overlay must not survive a destination rebind"
+    );
+    assert_eq!(
+        effective
+            .dispatch_port_override_fallback
+            .as_ref()
+            .and_then(|fallback| fallback.http1_max_pending_requests),
+        Some(22)
+    );
+    assert!(
+        Arc::ptr_eq(
+            effective
+                .pending_limit_scope
+                .as_ref()
+                .expect("destination pending scope"),
+            dest_scope
+        ),
+        "pending-limit lane must come from the same destination snapshot"
+    );
+}
+
+#[test]
+fn explicit_tls_override_wins_over_destination_snapshot() {
+    let dest: Upstream = serde_json::from_value(serde_json::json!({
+        "id": "upstream-b",
+        "namespace": "shop",
+        "targets": [{"host": "10.0.0.1", "port": 8080}],
+        "backend_tls_client_cert_path": "/certs/dest.pem",
+        "backend_tls_client_key_path": "/certs/dest.key",
+        "backend_tls_verify_server_cert": true,
+    }))
+    .expect("destination upstream");
+
+    let mut proxy: Proxy = serde_json::from_value(serde_json::json!({
+        "id": "route-a",
+        "namespace": "shop",
+        "backend_host": "10.0.0.1",
+        "backend_port": 8080,
+        "upstream_id": "upstream-a",
+    }))
+    .expect("proxy");
+    proxy.resolved_tls = source_upstream_tls();
+    let proxy = Arc::new(proxy);
+    let upstreams = namespaced_snapshot("shop", "upstream-b", Arc::new(dest));
+
+    let mut ctx = RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
+    ctx.route_override_upstream_id = Some("upstream-b".to_string());
+    ctx.route_override_resolved_tls = Some(BackendTlsConfig {
+        client_cert_path: Some("/certs/explicit.pem".to_string()),
+        client_key_path: Some("/certs/explicit.key".to_string()),
+        server_ca_cert_path: Some("/certs/explicit-ca.pem".to_string()),
+        verify_server_cert: false,
+        sni: None,
+        san_allow_list: Vec::new(),
+        san_allow_list_key_digest: None,
+    });
+
+    let effective = ctx.apply_route_overrides_with_upstreams(Arc::clone(&proxy), &upstreams);
+    assert_eq!(
+        effective.resolved_tls.client_cert_path.as_deref(),
+        Some("/certs/explicit.pem")
+    );
+    assert_eq!(
+        effective.resolved_tls.client_key_path.as_deref(),
+        Some("/certs/explicit.key")
+    );
+    assert!(!effective.resolved_tls.verify_server_cert);
+}
+
+#[test]
+fn upstream_route_override_missing_snapshot_clears_pending_scope() {
+    // Production upstream snapshots are keyed by namespace|id. A bare-id entry
+    // (or an absent destination) must fail closed: drop source TLS, port
+    // overlays, fallback, and the stale pending-limit lane.
+    let mut upstream_a: Upstream = serde_json::from_value(serde_json::json!({
+        "id": "upstream-a",
+        "namespace": "shop",
+        "targets": [{"host": "10.0.0.1", "port": 8080}],
+    }))
+    .expect("upstream A");
+    upstream_a.k8s_service_uid = Some("uid-a".to_string());
+
+    let mut upstream_b: Upstream = serde_json::from_value(serde_json::json!({
+        "id": "upstream-b",
+        "namespace": "shop",
+        "targets": [{"host": "10.0.0.1", "port": 8080}],
+        "backend_tls_client_cert_path": "/certs/dest.pem",
+        "backend_tls_client_key_path": "/certs/dest.key",
+        "backend_tls_verify_server_cert": false,
+    }))
+    .expect("upstream B");
+    upstream_b.k8s_service_uid = Some("uid-b".to_string());
+    upstream_b.port_overrides = HashMap::from([(
+        9090,
+        UpstreamPortOverride {
+            connect_timeout_ms: Some(250),
+            ..Default::default()
+        },
+    )]);
+    upstream_b.dispatch_port_override_fallback = Some(UpstreamPortOverride {
+        http1_max_pending_requests: Some(22),
+        ..Default::default()
+    });
+
+    let proxy: Proxy = serde_json::from_value(serde_json::json!({
+        "id": "route-a",
+        "namespace": "shop",
+        "backend_host": "10.0.0.1",
+        "backend_port": 8080,
+        "upstream_id": "upstream-a",
+        "upstream_subset": "v1",
+    }))
+    .expect("proxy");
+
+    let mut config = GatewayConfig {
+        proxies: vec![proxy],
+        upstreams: vec![upstream_a, upstream_b],
+        ..GatewayConfig::default()
+    };
+    config.resolve_pending_limit_scopes();
+
+    let mut proxy = config.proxies[0].clone();
+    proxy.resolved_tls = source_upstream_tls();
+    proxy.dispatch_port_overrides = Some(source_port_overlay());
+    proxy.dispatch_port_override_fallback = Some(source_port_fallback());
+    let proxy = Arc::new(proxy);
     assert!(
         proxy.pending_limit_scope.is_some(),
         "source proxy must carry A's interned scope"
@@ -531,55 +753,109 @@ fn upstream_route_override_missing_snapshot_clears_pending_scope() {
         effective.pending_limit_scope.is_none(),
         "missing namespaced snapshot lookup must clear the stale capped lane"
     );
+    assert!(
+        effective.resolved_tls.client_cert_path.is_none()
+            && effective.resolved_tls.verify_server_cert,
+        "missing destination must reset source upstream TLS rather than keep it"
+    );
+    assert!(
+        effective.dispatch_port_overrides.is_none(),
+        "missing destination must drop source per-port overlays"
+    );
+    assert!(
+        effective.dispatch_port_override_fallback.is_none(),
+        "missing destination must drop source dispatch-port fallback"
+    );
 }
 
 #[test]
 fn upstream_route_override_resolves_proxy_namespace_not_colliding_id() {
     // Same upstream id in two namespaces must not cross-pollinate when the
     // override lookup uses the proxy's namespace with the canonical runtime key.
+    let mut checkout: Upstream = serde_json::from_value(serde_json::json!({
+        "id": "checkout",
+        "namespace": "tenant-a",
+        "targets": [{"host": "10.0.0.1", "port": 8080}],
+        "backend_tls_client_cert_path": "/certs/checkout.pem",
+        "backend_tls_verify_server_cert": false,
+    }))
+    .expect("tenant-a source upstream");
+    checkout.k8s_service_uid = Some("uid-checkout".to_string());
+
     let mut upstream_a: Upstream = serde_json::from_value(serde_json::json!({
         "id": "reviews",
         "namespace": "tenant-a",
         "targets": [{"host": "10.0.0.1", "port": 8080}],
+        "backend_tls_client_cert_path": "/certs/tenant-a.pem",
+        "backend_tls_client_key_path": "/certs/tenant-a.key",
+        "backend_tls_verify_server_cert": true,
     }))
     .expect("tenant-a upstream");
     upstream_a.k8s_service_uid = Some("uid-a".to_string());
+    upstream_a.port_overrides = HashMap::from([(
+        9080,
+        UpstreamPortOverride {
+            connect_timeout_ms: Some(100),
+            ..Default::default()
+        },
+    )]);
+    upstream_a.dispatch_port_override_fallback = Some(UpstreamPortOverride {
+        http1_max_pending_requests: Some(7),
+        ..Default::default()
+    });
 
     let mut upstream_b: Upstream = serde_json::from_value(serde_json::json!({
         "id": "reviews",
         "namespace": "tenant-b",
         "targets": [{"host": "10.0.0.1", "port": 8080}],
+        "backend_tls_client_cert_path": "/certs/tenant-b.pem",
+        "backend_tls_client_key_path": "/certs/tenant-b.key",
+        "backend_tls_verify_server_cert": false,
     }))
     .expect("tenant-b upstream");
     upstream_b.k8s_service_uid = Some("uid-b".to_string());
+    upstream_b.port_overrides = HashMap::from([(
+        9090,
+        UpstreamPortOverride {
+            connect_timeout_ms: Some(999),
+            ..Default::default()
+        },
+    )]);
+    upstream_b.dispatch_port_override_fallback = Some(UpstreamPortOverride {
+        http1_max_pending_requests: Some(99),
+        ..Default::default()
+    });
 
-    let proxy: Proxy = serde_json::from_value(serde_json::json!({
+    let mut proxy: Proxy = serde_json::from_value(serde_json::json!({
         "id": "route-a",
         "namespace": "tenant-a",
         "backend_host": "10.0.0.1",
         "backend_port": 8080,
-        "upstream_id": "reviews",
+        "upstream_id": "checkout",
     }))
     .expect("proxy");
+    proxy.resolved_tls = source_upstream_tls();
+    proxy.dispatch_port_overrides = Some(source_port_overlay());
+    proxy.dispatch_port_override_fallback = Some(source_port_fallback());
 
     let mut config = GatewayConfig {
         proxies: vec![proxy],
-        upstreams: vec![upstream_a, upstream_b],
+        upstreams: vec![checkout, upstream_a, upstream_b],
         ..GatewayConfig::default()
     };
     config.resolve_pending_limit_scopes();
 
     let proxy = Arc::new(config.proxies[0].clone());
     let scope_a = Arc::clone(
-        config.upstreams[0]
+        config.upstreams[1]
             .pending_limit_scope
             .as_ref()
-            .expect("tenant-a scope"),
+            .expect("tenant-a reviews scope"),
     );
-    let scope_b = config.upstreams[1]
+    let scope_b = config.upstreams[2]
         .pending_limit_scope
         .as_ref()
-        .expect("tenant-b scope");
+        .expect("tenant-b reviews scope");
     assert_ne!(
         scope_a.prefix(),
         scope_b.prefix(),
@@ -589,11 +865,11 @@ fn upstream_route_override_resolves_proxy_namespace_not_colliding_id() {
     let mut upstreams = HashMap::new();
     upstreams.insert(
         ferrum_edge::config::db_backend::namespaced_runtime_key("tenant-a", "reviews"),
-        Arc::new(config.upstreams[0].clone()),
+        Arc::new(config.upstreams[1].clone()),
     );
     upstreams.insert(
         ferrum_edge::config::db_backend::namespaced_runtime_key("tenant-b", "reviews"),
-        Arc::new(config.upstreams[1].clone()),
+        Arc::new(config.upstreams[2].clone()),
     );
 
     let mut ctx = RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
@@ -612,6 +888,36 @@ fn upstream_route_override_resolves_proxy_namespace_not_colliding_id() {
         effective_scope.prefix().contains("uid-a")
             && !effective_scope.prefix().contains("uid-b"),
         "rebound scope must stay in the proxy namespace"
+    );
+    assert_eq!(
+        effective.resolved_tls.client_cert_path.as_deref(),
+        Some("/certs/tenant-a.pem")
+    );
+    assert!(
+        effective.resolved_tls.verify_server_cert,
+        "tenant-b's verify=false TLS must not cross-bind"
+    );
+    assert_eq!(
+        effective
+            .dispatch_port_overrides
+            .as_ref()
+            .and_then(|overrides| overrides.get(&9080))
+            .and_then(|override_config| override_config.connect_timeout_ms),
+        Some(100)
+    );
+    assert!(
+        !effective
+            .dispatch_port_overrides
+            .as_ref()
+            .is_some_and(|overrides| overrides.contains_key(&9090)),
+        "tenant-b per-port overlay must not bind a tenant-a proxy"
+    );
+    assert_eq!(
+        effective
+            .dispatch_port_override_fallback
+            .as_ref()
+            .and_then(|fallback| fallback.http1_max_pending_requests),
+        Some(7)
     );
 }
 
@@ -682,10 +988,11 @@ fn no_route_override_preserves_proxy_pending_scope_arc() {
     config.resolve_pending_limit_scopes();
 
     let proxy = Arc::new(config.proxies[0].clone());
-    let upstreams = HashMap::from([(
-        "upstream-a".to_string(),
+    let upstreams = namespaced_snapshot(
+        "shop",
+        "upstream-a",
         Arc::new(config.upstreams[0].clone()),
-    )]);
+    );
     let ctx = RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
     let effective = ctx.apply_route_overrides_with_upstreams(Arc::clone(&proxy), &upstreams);
     assert!(

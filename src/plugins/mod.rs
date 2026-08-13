@@ -4880,23 +4880,28 @@ impl RequestContext {
     /// backend pool that keys or dials from those proxy fields must bake the
     /// selected target into its per-dispatch proxy after LB selection.
     ///
-    /// This convenience helper cannot re-resolve `resolved_tls` when
-    /// `route_override_upstream_id` points at a different upstream because it
-    /// has no upstream snapshot. Custom dispatch paths that allow upstream
-    /// overrides should call [`RequestContext::apply_route_overrides_with_upstreams`]
-    /// instead, or they can silently keep the original proxy's backend TLS
-    /// client certificate / CA / verify policy.
+    /// This convenience helper has no upstream snapshot, so it cannot project
+    /// destination TLS / per-port overlays / pending-limit scope when
+    /// `route_override_upstream_id` changes. An upstream-id change therefore
+    /// fail-closes those fields (proxy-level TLS reset; overlays and pending
+    /// lane cleared) rather than retaining the source upstream. Custom dispatch
+    /// paths that allow upstream overrides should call
+    /// [`RequestContext::apply_route_overrides_with_upstreams`] so the
+    /// destination snapshot can supply those fields.
     pub fn apply_route_overrides(&self, proxy: Arc<Proxy>) -> Arc<Proxy> {
         self.apply_route_overrides_inner(proxy, None)
     }
 
     /// Build a `Proxy` Arc with plugin-set route overrides applied, re-resolving
-    /// backend TLS from the supplied upstream snapshot when
+    /// destination-derived fields from the supplied upstream snapshot when
     /// `route_override_upstream_id` changes the effective upstream.
     ///
-    /// Use this variant for dispatch paths that might honor upstream-id
-    /// overrides. It preserves the upstream-id / TLS / per-port-policy /
-    /// pending-admission-scope portion of the effective routing target.
+    /// `upstreams` must use the production `namespace|id` key shape. The
+    /// destination is resolved once and reused for `resolved_tls`,
+    /// `dispatch_port_overrides`, `dispatch_port_override_fallback`, and
+    /// `pending_limit_scope`. A missing destination fail-closes those fields
+    /// instead of keeping the source upstream's TLS or policy overlays.
+    /// Explicit `route_override_resolved_tls` still wins over snapshot TLS.
     /// Pool-backed transports that read `proxy.backend_host` /
     /// `proxy.backend_port` directly must still rebase those fields after
     /// load-balancer target selection.
@@ -4946,11 +4951,27 @@ impl RequestContext {
             && (backend_host_changed
                 || self.route_override_dns_policy == RouteOverrideDnsPolicy::ClearInherited);
 
-        let upstream_tls_override = if upstream_id_changed {
-            self.route_override_upstream_id
-                .as_deref()
-                .and_then(|id| upstreams.and_then(|map| map.get(id)))
-                .map(|upstream| BackendTlsConfig::from_upstream(upstream))
+        // One canonical `namespace|id` lookup for every destination-derived
+        // field. Production snapshots are never keyed by bare id; a miss must
+        // fail closed rather than keep the source upstream's TLS or overlays.
+        let destination_upstream = if upstream_id_changed && !direct_backend_override {
+            self.route_override_upstream_id.as_deref().and_then(|id| {
+                crate::load_balancer::lookup_namespaced_upstream(
+                    upstreams?,
+                    proxy.namespace.as_str(),
+                    id,
+                )
+                .map(|upstream| upstream.as_ref())
+            })
+        } else {
+            None
+        };
+        let upstream_tls_override = if upstream_id_changed && !direct_backend_override {
+            Some(
+                destination_upstream
+                    .map(BackendTlsConfig::from_upstream)
+                    .unwrap_or_else(|| BackendTlsConfig::from_proxy(&proxy)),
+            )
         } else {
             None
         };
@@ -4972,12 +4993,7 @@ impl RequestContext {
             if direct_backend_override {
                 Some(None)
             } else {
-                Some(
-                    self.route_override_upstream_id
-                        .as_deref()
-                        .and_then(|id| upstreams.and_then(|map| map.get(id)))
-                        .and_then(|upstream| dispatch_port_overrides_from_upstream(upstream)),
-                )
+                Some(destination_upstream.and_then(dispatch_port_overrides_from_upstream))
             }
         } else {
             None
@@ -5006,17 +5022,11 @@ impl RequestContext {
                 // Runtime clears `upstream_subset` when the override upstream
                 // differs from the proxy default, so admission/runtime both use
                 // top-level-only inheritance for the new destination.
-                Some(
-                    self.route_override_upstream_id
-                        .as_deref()
-                        .and_then(|id| upstreams.and_then(|map| map.get(id)))
-                        .and_then(|upstream| {
-                            crate::config::types::dispatch_port_override_fallback_for_selected_subset(
-                                upstream,
-                                None,
-                            )
-                        }),
-                )
+                Some(destination_upstream.and_then(|upstream| {
+                    crate::config::types::dispatch_port_override_fallback_for_selected_subset(
+                        upstream, None,
+                    )
+                }))
             }
         } else {
             None
@@ -5029,21 +5039,20 @@ impl RequestContext {
                 Some(None)
             } else {
                 Some(
-                    self.route_override_upstream_id
-                        .as_deref()
-                        .and_then(|id| {
-                            let key = crate::config::db_backend::namespaced_runtime_key(
-                                proxy.namespace.as_str(),
-                                id,
-                            );
-                            upstreams.and_then(|map| map.get(&key))
-                        })
+                    destination_upstream
                         .and_then(|upstream| upstream.pending_limit_scope.clone()),
                 )
             }
         } else {
             None
         };
+        let pending_limit_scope_changed = pending_limit_scope_override.as_ref().is_some_and(
+            |overridden| match (overridden, &proxy.pending_limit_scope) {
+                (None, None) => false,
+                (Some(next), Some(current)) => !Arc::ptr_eq(next, current),
+                _ => true,
+            },
+        );
         let backend_read_timeout_changed = self
             .route_override_backend_read_timeout_ms
             .is_some_and(|timeout| timeout != proxy.backend_read_timeout_ms);
@@ -5075,6 +5084,7 @@ impl RequestContext {
             && !resolved_tls_changed
             && !dispatch_port_overrides_changed
             && !dispatch_port_override_fallback_changed
+            && !pending_limit_scope_changed
             && !backend_read_timeout_changed
             && !backend_connect_timeout_changed
             && !retry_changed
@@ -11361,7 +11371,10 @@ mod tests {
         }))
         .expect("minimal upstream should deserialize");
         let mut upstreams = HashMap::new();
-        upstreams.insert("canary".to_string(), Arc::new(canary));
+        upstreams.insert(
+            crate::config::db_backend::namespaced_runtime_key(&proxy.namespace, "canary"),
+            Arc::new(canary),
+        );
 
         let mut ctx =
             RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
@@ -11413,7 +11426,10 @@ mod tests {
             ..Default::default()
         });
         let mut upstreams = HashMap::new();
-        upstreams.insert("canary".to_string(), Arc::new(canary));
+        upstreams.insert(
+            crate::config::db_backend::namespaced_runtime_key(&proxy.namespace, "canary"),
+            Arc::new(canary),
+        );
 
         let mut ctx =
             RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
@@ -11453,7 +11469,10 @@ mod tests {
         }))
         .expect("minimal upstream should deserialize");
         let mut upstreams = HashMap::new();
-        upstreams.insert("plain".to_string(), Arc::new(plain));
+        upstreams.insert(
+            crate::config::db_backend::namespaced_runtime_key(&proxy.namespace, "plain"),
+            Arc::new(plain),
+        );
 
         let mut ctx =
             RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
