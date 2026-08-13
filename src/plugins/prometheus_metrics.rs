@@ -2806,11 +2806,6 @@ impl MetricsRegistry {
             return;
         };
         let snapshot = metrics.snapshot();
-        let ns_label = self
-            .namespace_label
-            .read()
-            .map(|label| label.clone())
-            .unwrap_or_default();
         output.push_str(
             "# HELP ferrum_k8s_controller_istio_status_conflicts_total Istio status JSON Merge Patch 409 conflicts observed while applying Ferrum-owned conditions.\n",
         );
@@ -2821,7 +2816,7 @@ impl MetricsRegistry {
             output,
             "ferrum_k8s_controller_istio_status_conflicts_total",
             snapshot.istio_status_conflicts,
-            &ns_label,
+            "",
         );
         output.push_str(
             "# HELP ferrum_k8s_controller_istio_status_missing_uid_total Istio status writes refused because the planned watch-snapshot UID was missing.\n",
@@ -2833,7 +2828,7 @@ impl MetricsRegistry {
             output,
             "ferrum_k8s_controller_istio_status_missing_uid_total",
             snapshot.istio_status_missing_uid,
-            &ns_label,
+            "",
         );
         output.push_str(
             "# HELP ferrum_k8s_controller_istio_status_not_found_total Istio status writes aborted because the object was not found.\n",
@@ -2845,7 +2840,7 @@ impl MetricsRegistry {
             output,
             "ferrum_k8s_controller_istio_status_not_found_total",
             snapshot.istio_status_not_found,
-            &ns_label,
+            "",
         );
         output.push_str(
             "# HELP ferrum_k8s_controller_istio_status_recreated_total Istio status writes aborted because the live UID no longer matched the planned object.\n",
@@ -2857,7 +2852,7 @@ impl MetricsRegistry {
             output,
             "ferrum_k8s_controller_istio_status_recreated_total",
             snapshot.istio_status_recreated,
-            &ns_label,
+            "",
         );
         output.push_str(
             "# HELP ferrum_k8s_controller_istio_status_retries_total Istio status writes that succeeded after at least one resourceVersion conflict retry.\n",
@@ -2869,7 +2864,7 @@ impl MetricsRegistry {
             output,
             "ferrum_k8s_controller_istio_status_retries_total",
             snapshot.istio_status_retries,
-            &ns_label,
+            "",
         );
         output.push_str(
             "# HELP ferrum_k8s_controller_istio_status_retry_exhausted_total Istio status writes that exhausted the bounded conflict retry budget without an unversioned fallback.\n",
@@ -2881,7 +2876,7 @@ impl MetricsRegistry {
             output,
             "ferrum_k8s_controller_istio_status_retry_exhausted_total",
             snapshot.istio_status_retry_exhausted,
-            &ns_label,
+            "",
         );
         output.push_str(
             "# HELP ferrum_k8s_controller_istio_status_unsupported_total Istio status writes aborted because the CRD has no status subresource.\n",
@@ -2893,7 +2888,7 @@ impl MetricsRegistry {
             output,
             "ferrum_k8s_controller_istio_status_unsupported_total",
             snapshot.istio_status_unsupported,
-            &ns_label,
+            "",
         );
     }
 

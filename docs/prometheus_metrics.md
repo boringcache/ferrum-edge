@@ -150,17 +150,17 @@ and the metrics clear when it succeeds.
 
 ### Istio status CAS
 
-Emitted after `FERRUM_K8S_CONTROLLER_ENABLED=true` starts the Kubernetes controller and registers its shared `ControllerMetrics` `Arc` with the Prometheus registry. Series use only the process `namespace` label. Object names, UIDs, resourceVersions, condition text, and API error strings are never labels.
+Emitted after `FERRUM_K8S_CONTROLLER_ENABLED=true` starts the Kubernetes controller and registers its shared `ControllerMetrics` `Arc` with the Prometheus registry. These families have no labels. Object names, UIDs, resourceVersions, condition text, and API error strings are never labels.
 
 | Family | Type | Labels | Guidance |
 |--------|------|--------|----------|
-| `ferrum_k8s_controller_istio_status_conflicts_total` | counter | `namespace` | JSON Merge Patch 409s while applying Ferrum-owned Istio conditions. A rise during reconcile is expected when another controller writes status concurrently. |
-| `ferrum_k8s_controller_istio_status_retries_total` | counter | `namespace` | Writes that succeeded after at least one resourceVersion conflict retry. Pair with conflicts: retries should track resolved races. |
-| `ferrum_k8s_controller_istio_status_retry_exhausted_total` | counter | `namespace` | Bounded retry budget exhausted with no unversioned fallback. The newer foreign status is left intact. Alert on any sustained increase. |
-| `ferrum_k8s_controller_istio_status_recreated_total` | counter | `namespace` | Live UID no longer matched the watch-snapshot plan (delete/recreate under the same name). The stale plan is abandoned. |
-| `ferrum_k8s_controller_istio_status_missing_uid_total` | counter | `namespace` | Planned watch-snapshot UID was empty, so the write was refused before GET/PATCH. Production planning omits identity-less objects; a non-zero value is a planner/bug signal. |
-| `ferrum_k8s_controller_istio_status_not_found_total` | counter | `namespace` | Object gone before the status write. |
-| `ferrum_k8s_controller_istio_status_unsupported_total` | counter | `namespace` | CRD has no `status` subresource. Check the Istio CRD manifests. |
+| `ferrum_k8s_controller_istio_status_conflicts_total` | counter | — | JSON Merge Patch 409s while applying Ferrum-owned Istio conditions. A rise during reconcile is expected when another controller writes status concurrently. |
+| `ferrum_k8s_controller_istio_status_retries_total` | counter | — | Writes that succeeded after at least one resourceVersion conflict retry. Pair with conflicts: retries should track resolved races. |
+| `ferrum_k8s_controller_istio_status_retry_exhausted_total` | counter | — | Bounded retry budget exhausted with no unversioned fallback. The newer foreign status is left intact. Alert on any sustained increase. |
+| `ferrum_k8s_controller_istio_status_recreated_total` | counter | — | Live UID no longer matched the watch-snapshot plan (delete/recreate under the same name). The stale plan is abandoned. |
+| `ferrum_k8s_controller_istio_status_missing_uid_total` | counter | — | Planned watch-snapshot UID was empty, so the write was refused before GET/PATCH. Production planning filters identity-less objects before constructing an update; a non-zero value indicates a direct invalid writer input or invariant violation. |
+| `ferrum_k8s_controller_istio_status_not_found_total` | counter | — | Object gone before the status write. |
+| `ferrum_k8s_controller_istio_status_unsupported_total` | counter | — | CRD has no `status` subresource. Check the Istio CRD manifests. |
 
 **Suggested alert:** `increase(ferrum_k8s_controller_istio_status_retry_exhausted_total[15m]) > 0`. Confirm a competing status writer and that Ferrum still merges only `Ferrum*` conditions. See [Istio CRD Status](mesh.md#istio-crd-status).
 
@@ -317,13 +317,13 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_jwks_refresh_failures_total` | counter | `class` | `jwks` | `documented_only` | `always` | Remote JWKS refresh failures by fixed failure class. |
 | `ferrum_jwks_trust_age_seconds` | gauge | `state` | `jwks` | `documented_only` | `always` | Maximum age of the last validated non-empty JWKS among active remote stores in each trust state. |
 | `ferrum_jwks_trust_stores` | gauge | `state` | `jwks` | `documented_only` | `always` | Active remote JWKS stores by bounded trust state. |
-| `ferrum_k8s_controller_istio_status_conflicts_total` | counter | `namespace` | `k8s_controller` | `documented_only` | `conditional` | Istio status JSON Merge Patch 409 conflicts observed while applying Ferrum-owned conditions. |
-| `ferrum_k8s_controller_istio_status_missing_uid_total` | counter | `namespace` | `k8s_controller` | `documented_only` | `conditional` | Istio status writes refused because the planned watch-snapshot UID was missing. |
-| `ferrum_k8s_controller_istio_status_not_found_total` | counter | `namespace` | `k8s_controller` | `documented_only` | `conditional` | Istio status writes aborted because the object was not found. |
-| `ferrum_k8s_controller_istio_status_recreated_total` | counter | `namespace` | `k8s_controller` | `documented_only` | `conditional` | Istio status writes aborted because the live UID no longer matched the planned object. |
-| `ferrum_k8s_controller_istio_status_retries_total` | counter | `namespace` | `k8s_controller` | `documented_only` | `conditional` | Istio status writes that succeeded after at least one resourceVersion conflict retry. |
-| `ferrum_k8s_controller_istio_status_retry_exhausted_total` | counter | `namespace` | `k8s_controller` | `documented_only` | `conditional` | Istio status writes that exhausted the bounded conflict retry budget without an unversioned fallback. |
-| `ferrum_k8s_controller_istio_status_unsupported_total` | counter | `namespace` | `k8s_controller` | `documented_only` | `conditional` | Istio status writes aborted because the CRD has no status subresource. |
+| `ferrum_k8s_controller_istio_status_conflicts_total` | counter | — | `k8s_controller` | `documented_only` | `conditional` | Istio status JSON Merge Patch 409 conflicts observed while applying Ferrum-owned conditions. |
+| `ferrum_k8s_controller_istio_status_missing_uid_total` | counter | — | `k8s_controller` | `documented_only` | `conditional` | Istio status writes refused because the planned watch-snapshot UID was missing. |
+| `ferrum_k8s_controller_istio_status_not_found_total` | counter | — | `k8s_controller` | `documented_only` | `conditional` | Istio status writes aborted because the object was not found. |
+| `ferrum_k8s_controller_istio_status_recreated_total` | counter | — | `k8s_controller` | `documented_only` | `conditional` | Istio status writes aborted because the live UID no longer matched the planned object. |
+| `ferrum_k8s_controller_istio_status_retries_total` | counter | — | `k8s_controller` | `documented_only` | `conditional` | Istio status writes that succeeded after at least one resourceVersion conflict retry. |
+| `ferrum_k8s_controller_istio_status_retry_exhausted_total` | counter | — | `k8s_controller` | `documented_only` | `conditional` | Istio status writes that exhausted the bounded conflict retry budget without an unversioned fallback. |
+| `ferrum_k8s_controller_istio_status_unsupported_total` | counter | — | `k8s_controller` | `documented_only` | `conditional` | Istio status writes aborted because the CRD has no status subresource. |
 | `ferrum_kafka_logging_accepting` | gauge | `generation` | `kafka_logging` | `documented_only` | `when_plugin_enabled` | Whether the Kafka logging generation still admits new records. |
 | `ferrum_kafka_logging_healthy` | gauge | `generation` | `kafka_logging` | `documented_only` | `when_plugin_enabled` | Whether the Kafka logging generation recovered from its latest failure. |
 | `ferrum_kafka_logging_in_flight` | gauge | `generation` | `kafka_logging` | `documented_only` | `when_plugin_enabled` | Records waiting in librdkafka for terminal delivery. |

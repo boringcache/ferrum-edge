@@ -1757,9 +1757,7 @@
     "name": "ferrum_k8s_controller_istio_status_conflicts_total",
     "type": "counter",
     "help": "Istio status JSON Merge Patch 409 conflicts observed while applying Ferrum-owned conditions.",
-    "labels": [
-      "namespace"
-    ],
+    "labels": [],
     "subsystem": "k8s_controller",
     "export_surface": "/metrics",
     "bundled": "documented_only",
@@ -1769,9 +1767,7 @@
     "name": "ferrum_k8s_controller_istio_status_missing_uid_total",
     "type": "counter",
     "help": "Istio status writes refused because the planned watch-snapshot UID was missing.",
-    "labels": [
-      "namespace"
-    ],
+    "labels": [],
     "subsystem": "k8s_controller",
     "export_surface": "/metrics",
     "bundled": "documented_only",
@@ -1781,9 +1777,7 @@
     "name": "ferrum_k8s_controller_istio_status_not_found_total",
     "type": "counter",
     "help": "Istio status writes aborted because the object was not found.",
-    "labels": [
-      "namespace"
-    ],
+    "labels": [],
     "subsystem": "k8s_controller",
     "export_surface": "/metrics",
     "bundled": "documented_only",
@@ -1793,9 +1787,7 @@
     "name": "ferrum_k8s_controller_istio_status_recreated_total",
     "type": "counter",
     "help": "Istio status writes aborted because the live UID no longer matched the planned object.",
-    "labels": [
-      "namespace"
-    ],
+    "labels": [],
     "subsystem": "k8s_controller",
     "export_surface": "/metrics",
     "bundled": "documented_only",
@@ -1805,9 +1797,7 @@
     "name": "ferrum_k8s_controller_istio_status_retries_total",
     "type": "counter",
     "help": "Istio status writes that succeeded after at least one resourceVersion conflict retry.",
-    "labels": [
-      "namespace"
-    ],
+    "labels": [],
     "subsystem": "k8s_controller",
     "export_surface": "/metrics",
     "bundled": "documented_only",
@@ -1817,9 +1807,7 @@
     "name": "ferrum_k8s_controller_istio_status_retry_exhausted_total",
     "type": "counter",
     "help": "Istio status writes that exhausted the bounded conflict retry budget without an unversioned fallback.",
-    "labels": [
-      "namespace"
-    ],
+    "labels": [],
     "subsystem": "k8s_controller",
     "export_surface": "/metrics",
     "bundled": "documented_only",
@@ -1829,9 +1817,7 @@
     "name": "ferrum_k8s_controller_istio_status_unsupported_total",
     "type": "counter",
     "help": "Istio status writes aborted because the CRD has no status subresource.",
-    "labels": [
-      "namespace"
-    ],
+    "labels": [],
     "subsystem": "k8s_controller",
     "export_surface": "/metrics",
     "bundled": "documented_only",

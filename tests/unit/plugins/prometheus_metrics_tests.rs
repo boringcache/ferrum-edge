@@ -677,6 +677,7 @@ async fn test_registry_omits_topology_degraded_gauge_without_node_agent_metrics(
 #[tokio::test]
 async fn test_registry_renders_k8s_controller_istio_status_counters() {
     let registry = MetricsRegistry::new();
+    registry.configure(3600, 3600, 0, 10_000, "istio-metrics-ns");
     let metrics = Arc::new(ControllerMetrics::new());
     metrics.istio_status_conflicts.store(2, Ordering::Relaxed);
     metrics.istio_status_retries.store(1, Ordering::Relaxed);
@@ -693,16 +694,47 @@ async fn test_registry_renders_k8s_controller_istio_status_counters() {
         "# HELP ferrum_k8s_controller_istio_status_conflicts_total Istio status JSON Merge Patch 409 conflicts observed while applying Ferrum-owned conditions."
     ));
     assert!(output.contains("# TYPE ferrum_k8s_controller_istio_status_conflicts_total counter"));
-    assert!(output.contains("ferrum_k8s_controller_istio_status_conflicts_total 2"));
+    let istio_status_families = [
+        (
+            "ferrum_k8s_controller_istio_status_conflicts_total",
+            "2",
+        ),
+        (
+            "ferrum_k8s_controller_istio_status_missing_uid_total",
+            "7",
+        ),
+        ("ferrum_k8s_controller_istio_status_not_found_total", "5"),
+        ("ferrum_k8s_controller_istio_status_recreated_total", "4"),
+        ("ferrum_k8s_controller_istio_status_retries_total", "1"),
+        (
+            "ferrum_k8s_controller_istio_status_retry_exhausted_total",
+            "3",
+        ),
+        ("ferrum_k8s_controller_istio_status_unsupported_total", "6"),
+    ];
+    for (family, value) in istio_status_families {
+        assert!(
+            output.contains(&format!(
+                "# HELP {family} Istio status"
+            )) || output.contains(&format!("# HELP {family}")),
+            "missing HELP for {family}"
+        );
+        assert!(
+            output.contains(&format!("{family} {value}")),
+            "Istio status CAS family must render unlabeled even with a process namespace configured:\n{output}"
+        );
+        for line in output.lines() {
+            if line.starts_with(family) {
+                assert!(
+                    !line.contains('{'),
+                    "Istio status CAS family must not carry labels:\n{line}"
+                );
+            }
+        }
+    }
     assert!(output.contains(
         "# HELP ferrum_k8s_controller_istio_status_missing_uid_total Istio status writes refused because the planned watch-snapshot UID was missing."
     ));
-    assert!(output.contains("ferrum_k8s_controller_istio_status_missing_uid_total 7"));
-    assert!(output.contains("ferrum_k8s_controller_istio_status_not_found_total 5"));
-    assert!(output.contains("ferrum_k8s_controller_istio_status_recreated_total 4"));
-    assert!(output.contains("ferrum_k8s_controller_istio_status_retries_total 1"));
-    assert!(output.contains("ferrum_k8s_controller_istio_status_retry_exhausted_total 3"));
-    assert!(output.contains("ferrum_k8s_controller_istio_status_unsupported_total 6"));
     assert!(
         !output.contains("uid-"),
         "Istio status CAS counters must not expose object UIDs:\n{output}"
@@ -712,7 +744,7 @@ async fn test_registry_renders_k8s_controller_istio_status_counters() {
 #[tokio::test]
 async fn test_k8s_controller_istio_status_counters_bypass_render_cache() {
     let registry = MetricsRegistry::new();
-    registry.configure(3600, 3600, 0, 10_000, "");
+    registry.configure(3600, 3600, 0, 10_000, "istio-metrics-ns");
     let metrics = Arc::new(ControllerMetrics::new());
     registry.set_k8s_controller_metrics(Arc::clone(&metrics));
     let first = registry.render();
@@ -722,6 +754,10 @@ async fn test_k8s_controller_istio_status_counters_bypass_render_cache() {
     assert!(
         second.contains("ferrum_k8s_controller_istio_status_conflicts_total 9"),
         "live-appended Istio status counters must not stick at the cached zero:\n{second}"
+    );
+    assert!(
+        !second.contains("ferrum_k8s_controller_istio_status_conflicts_total{"),
+        "Istio status CAS counters must stay unlabeled when the render cache is bypassed:\n{second}"
     );
 }
 
