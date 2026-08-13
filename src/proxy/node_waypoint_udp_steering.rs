@@ -52,9 +52,9 @@
 //!   `OUTPUT`, which is never hooked, so they are structurally incapable of
 //!   being steered back into the waypoint.
 //! * **No plaintext lane.** When steering is absent (never published, refused,
-//!   or torn down) the datagram takes the pre-existing path and is dropped by
-//!   the pod-veth guard. Losing steering loses the service, it does not open an
-//!   unauthorized one.
+//!   or successfully torn down) the datagram takes the pre-existing path and is
+//!   dropped by the pod-veth guard. Losing steering loses the service, it does
+//!   not open an unauthorized one.
 //! * **The direct-pod guard is untouched.** No rule here admits anything to a
 //!   pod; steering only diverts traffic to a local socket.
 //!
@@ -82,10 +82,10 @@
 //! to it — and a ClusterIP is not a configured node IP, so `tc_inbound` would
 //! drop that reply without an exact `(address, port)` authorization. The two
 //! halves move together inside one critical section: on apply the sources are
-//! authorized BEFORE the rules exist, on teardown they are withdrawn AFTER the
-//! rules are gone, and a failure in either half tears the whole generation down
-//! rather than leaving a steered-but-unanswerable or authorized-but-unserved
-//! datapath.
+//! authorized BEFORE the rules exist, and on teardown they are withdrawn only
+//! AFTER the rules are proven gone. A failure prevents a replacement or
+//! withdrawal from settling; a teardown error leaves predecessor state
+//! explicitly unproven and retryable.
 //!
 //! # Publishing is not applying: the acknowledgement gate
 //!
@@ -109,13 +109,12 @@
 //! different sequence (an earlier set, or a differently ordered rendering of
 //! one) satisfies nothing.
 //!
-//! [`NodeWaypointUdpSteering::reconcile`] applies the pair only when it CHANGED,
-//! tears the datapath down whenever either half is empty, ALWAYS runs one
-//! exact-name teardown before this process trusts the datapath (so objects a
-//! crashed prior process left installed are reaped on the first pass rather than
-//! surviving until this process exits), and tears it down on drop (task abort or
-//! panic included) so a dead reconcile loop cannot leave marked-but-unserved
-//! destinations installed.
+//! [`NodeWaypointUdpSteering::reconcile`] applies the pair only when it CHANGED
+//! and ALWAYS runs one strict exact-name teardown before this process trusts the
+//! datapath (so objects a crashed prior process left installed are reaped on the
+//! first pass rather than surviving until this process exits). Empty state and
+//! every owner exit invoke the same teardown, including task abort and panic;
+//! only success records proof, while an error remains unproven and retryable.
 //!
 //! Destination and interface updates share one cold-path mutex: each event
 //! mutates only its component, then the backend reconcile derives from the
@@ -290,9 +289,9 @@ pub enum SteerReconcileOutcome {
     /// Service path stays on its pre-existing fail-closed posture. The next
     /// reconcile retries; nothing waits.
     PendingAck,
-    /// The plan could not be rendered, published, or applied. The datapath is
-    /// left torn down, so the Service path fails closed rather than
-    /// half-steered.
+    /// The plan could not be rendered, published, applied, or strictly torn
+    /// down. No replacement/withdrawal is settled; a teardown failure may
+    /// leave predecessor rules in place and is retried without claiming proof.
     Failed,
 }
 
@@ -340,8 +339,9 @@ struct SteeringState {
     /// no serving socket. Neither may be recorded as settled by the other.
     published_reply_sources: Option<(ReplySourceGeneration, Vec<NodeWaypointUdpSteerDestination>)>,
     /// The generation the node-agent was last OBSERVED to acknowledge, i.e. to
-    /// have made live in BOTH BPF map families. Publishing is a request; only
-    /// this is evidence, and only when it equals the generation in
+    /// have made complete in BOTH BPF map families and opened through their
+    /// shared gate. Publishing is a request; only this is evidence, and only
+    /// when it equals the generation in
     /// [`Self::published_reply_sources`].
     acknowledged_reply_sources: Option<ReplySourceGeneration>,
 }
@@ -419,8 +419,9 @@ impl NodeWaypointUdpSteering {
     /// last published attribution interfaces (or `ifaces` when supplied).
     ///
     /// Whole-plan replacement: a generation is applied or it is not. An empty
-    /// set tears the datapath down. Callers must pass only destinations whose
-    /// listeners are actually bound on the accepted serving generation.
+    /// set requests strict teardown and settles only after removal is proven.
+    /// Callers must pass only destinations whose listeners are actually bound
+    /// on the accepted serving generation.
     ///
     /// The destination (and optional interface) update and the backend
     /// reconcile share one critical section so a concurrent later event cannot
@@ -598,8 +599,8 @@ impl NodeWaypointUdpSteering {
         };
 
         // Publishing is a request, not proof. The node-agent owns every BPF map
-        // write, so until it has acknowledged THIS generation the maps may hold
-        // an older set, a narrower set, or nothing at all — and steering into
+        // write, so until it has acknowledged THIS generation the shared gate
+        // may be closed or map storage may be stale/partial — and steering into
         // that is the Service-path black hole. No rule is installed until the
         // acknowledgement is exact.
         match self.observe_acknowledgement(state) {
@@ -733,8 +734,8 @@ impl NodeWaypointUdpSteering {
 
     /// Remove every Ferrum-owned steering object and forget the applied
     /// generation, leaving the published authorizations alone. The teardown
-    /// script tolerates missing objects, so it is a no-op when nothing is
-    /// installed.
+    /// script proves exact absence, so genuinely missing objects are an
+    /// idempotent success while inspection and deletion failures remain errors.
     ///
     /// `reaped` is set ONLY when the script succeeded: a failed teardown has not
     /// proven anything about the node, so the next reconcile must try again
