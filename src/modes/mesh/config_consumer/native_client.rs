@@ -11,8 +11,9 @@ use super::common::{
     wait_optional_tls_reload,
 };
 use super::stream_lifecycle::{
-    MeshConfigStreamCredential, MeshStreamAttachment, MeshStreamAttempt, MeshStreamRetirement,
-    MeshStreamTimings, MeshStreamTracker, configure_mesh_config_stream_endpoint,
+    MeshConfigStreamCredential, MeshStreamAttachment, MeshStreamAttempt,
+    MeshStreamAttemptProgress, MeshStreamRetirement, MeshStreamTimings, MeshStreamTracker,
+    configure_mesh_config_stream_endpoint,
 };
 use super::update_validation::{
     MeshUpdateConsumer, MeshUpdateExpectation, MeshUpdateRejection, validate_mesh_config_update,
@@ -162,9 +163,11 @@ pub async fn start_native_mesh_client_with_shutdown(
                     &config,
                     &state,
                     tls_config.as_ref(),
-                    &mut tracker,
-                    &mut delivered_usable_state,
-                    &mut stream_established,
+                    MeshStreamAttemptProgress {
+                        tracker: &mut tracker,
+                        delivered_usable_state: &mut delivered_usable_state,
+                        stream_established: &mut stream_established,
+                    },
                 ) => result,
                 _ = wait_for_first_slice_then_primary_retry(
                     state.clone(),
@@ -190,9 +193,11 @@ pub async fn start_native_mesh_client_with_shutdown(
                     &config,
                     &state,
                     tls_config.as_ref(),
-                    &mut tracker,
-                    &mut delivered_usable_state,
-                    &mut stream_established,
+                    MeshStreamAttemptProgress {
+                        tracker: &mut tracker,
+                        delivered_usable_state: &mut delivered_usable_state,
+                        stream_established: &mut stream_established,
+                    },
                 ) => result,
                 _ = wait_for_shutdown(&mut stream_shutdown_rx) => {
                     info!("Native mesh client shutting down");
@@ -286,10 +291,14 @@ async fn connect_mesh_subscribe(
     config: &NativeMeshClientConfig,
     state: &MeshRuntimeState,
     tls_config: Option<&DpGrpcTlsConfig>,
-    tracker: &mut MeshStreamTracker,
-    delivered_usable_state: &mut bool,
-    stream_established: &mut bool,
+    progress: MeshStreamAttemptProgress<'_>,
 ) -> Result<MeshStreamAttempt, anyhow::Error> {
+    let MeshStreamAttemptProgress {
+        tracker,
+        delivered_usable_state,
+        stream_established,
+    } = progress;
+
     // Bounded transport liveness, shared with the two ADS consumers and with
     // the hardened DP ConfigSync client: HTTP/2 PING + TCP keepalive, kept alive
     // while idle so a blackholed established stream fails instead of hanging.

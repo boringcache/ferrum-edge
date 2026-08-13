@@ -975,15 +975,14 @@ pub async fn start_stock_xds_client_with_shutdown(
         // the next loop via `refresh_dp_grpc_tls_config_if_changed`. Mark it
         // seen here so a credential retirement that won the simultaneous
         // select does not get immediately cancelled by the same TLS event.
-        if reset_discovery_state
+        if (reset_discovery_state
             || matches!(
                 attempt,
                 MeshStreamAttempt::LocalRetirement(MeshStreamRetirement::TlsReload)
-            )
+            ))
+            && let Some(reload) = tls_reload.as_mut()
         {
-            if let Some(reload) = tls_reload.as_mut() {
-                let _ = reload.revision_rx.borrow_and_update();
-            }
+            let _ = reload.revision_rx.borrow_and_update();
         }
         // Endpoint identity stays out of these lines: the configured URL is
         // operator-authored but unbounded, so the index plus the closed-set

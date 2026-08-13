@@ -18389,8 +18389,9 @@ fn parse_stock_xds_credential_policy() -> Result<StockCredentialLifetimePolicy, 
         Some(raw) => parse_duration_seconds(MAX_LIFETIME_KEY, raw.trim())?,
         None => DEFAULT_STOCK_XDS_TOKEN_MAX_STREAM_LIFETIME_SECS,
     };
-    if max_stream_lifetime_secs < MIN_STOCK_XDS_TOKEN_MAX_STREAM_LIFETIME_SECS
-        || max_stream_lifetime_secs > MAX_STOCK_XDS_TOKEN_MAX_STREAM_LIFETIME_SECS
+    if !(MIN_STOCK_XDS_TOKEN_MAX_STREAM_LIFETIME_SECS
+        ..=MAX_STOCK_XDS_TOKEN_MAX_STREAM_LIFETIME_SECS)
+        .contains(&max_stream_lifetime_secs)
     {
         return Err(format!(
             "{MAX_LIFETIME_KEY} must be between \

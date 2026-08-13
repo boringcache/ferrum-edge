@@ -323,9 +323,7 @@ pub fn admit_stock_xds_endpoints(
         admitted.push(classify_stock_xds_endpoint(index, url, policy)?);
     }
 
-    let has_tls = admitted
-        .iter()
-        .any(|transport| *transport == StockXdsTransport::AuthenticatedTls);
+    let has_tls = admitted.contains(&StockXdsTransport::AuthenticatedTls);
     let first_plaintext = admitted
         .iter()
         .position(|transport| *transport != StockXdsTransport::AuthenticatedTls);

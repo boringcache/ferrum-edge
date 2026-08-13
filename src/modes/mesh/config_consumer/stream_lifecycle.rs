@@ -602,3 +602,18 @@ impl MeshStreamTracker {
         }
     }
 }
+
+/// Mutable per-attempt progress the inner configuration-stream future writes
+/// for the outer lifecycle loop.
+///
+/// `tracker` is the shared `/health` and metric projection.
+/// `delivered_usable_state` records whether this attempt installed a slice, so
+/// a later failure does not grow backoff.
+/// `stream_established` records whether the streaming RPC opened, so a later
+/// transport failure is `established_transport_failure` rather than a dial
+/// refusal.
+pub(crate) struct MeshStreamAttemptProgress<'a> {
+    pub tracker: &'a mut MeshStreamTracker,
+    pub delivered_usable_state: &'a mut bool,
+    pub stream_established: &'a mut bool,
+}

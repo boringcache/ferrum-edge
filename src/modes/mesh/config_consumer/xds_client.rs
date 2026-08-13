@@ -14,8 +14,9 @@ use super::common::{
     tonic_tls_config, wait_for_shutdown, wait_optional_tls_reload,
 };
 use super::stream_lifecycle::{
-    MeshConfigStreamCredential, MeshStreamAttachment, MeshStreamAttempt, MeshStreamRetirement,
-    MeshStreamTimings, MeshStreamTracker, configure_mesh_config_stream_endpoint,
+    MeshConfigStreamCredential, MeshStreamAttachment, MeshStreamAttempt,
+    MeshStreamAttemptProgress, MeshStreamRetirement, MeshStreamTimings, MeshStreamTracker,
+    configure_mesh_config_stream_endpoint,
 };
 use crate::grpc::dp_client::{DpGrpcTlsConfig, DpGrpcTlsReload, GrpcJwtSecret};
 use crate::modes::mesh::config::{
@@ -869,9 +870,11 @@ async fn connect_ads(
         &consumer,
         stream_state,
         timings,
-        tracker,
-        delivered_usable_state,
-        stream_established,
+        MeshStreamAttemptProgress {
+            tracker,
+            delivered_usable_state,
+            stream_established,
+        },
     )
     .await
 }
@@ -883,10 +886,14 @@ async fn run_ads_stream_with_auth(
     consumer: &XdsConfigConsumer,
     stream_state: &mut XdsStreamState,
     timings: MeshStreamTimings,
-    tracker: &mut MeshStreamTracker,
-    delivered_usable_state: &mut bool,
-    stream_established: &mut bool,
+    progress: MeshStreamAttemptProgress<'_>,
 ) -> Result<MeshStreamAttempt, anyhow::Error> {
+    let MeshStreamAttemptProgress {
+        tracker,
+        delivered_usable_state,
+        stream_established,
+    } = progress;
+
     #[allow(clippy::result_large_err)]
     let mut client = AggregatedDiscoveryServiceClient::with_interceptor(
         channel,
