@@ -132,45 +132,44 @@ fn invalid_utf8_is_rejected_without_byte_leakage() {
 }
 
 #[test]
-fn format_selection_uses_content_only_for_unknown_paths() {
-    assert!(detect_json_or_yaml_extension(Path::new("mesh.yaml"), "{}"));
-    assert!(detect_json_or_yaml_extension(Path::new("mesh.yml"), "[]"));
-    assert!(detect_json_or_yaml_extension(Path::new("mesh.YAML"), "{}"));
-    assert!(!detect_json_or_yaml_extension(
-        Path::new("mesh.unknown"),
-        "  {mesh: &root {services: *root}}"
-    ));
-    assert!(!detect_json_or_yaml_extension(Path::new("mesh"), "\n[]"));
-    assert!(detect_json_or_yaml_extension(
-        Path::new("mesh.unknown"),
-        "mesh: {}"
-    ));
-    assert!(!detect_json_or_yaml_extension(
-        Path::new("mesh.json"),
-        "---"
-    ));
-    assert!(!detect_json_or_yaml_extension(
-        Path::new("mesh.JSON"),
-        "---"
-    ));
+fn format_selection_is_extension_only_and_defaults_unknown_paths_to_yaml() {
+    // Only `.json` selects the JSON parser. Everything else — including
+    // unknown and extensionless paths — selects YAML.
+    assert!(detect_json_or_yaml_extension(Path::new("mesh.yaml")));
+    assert!(detect_json_or_yaml_extension(Path::new("mesh.yml")));
+    assert!(detect_json_or_yaml_extension(Path::new("mesh.YAML")));
+    assert!(detect_json_or_yaml_extension(Path::new("mesh.unknown")));
+    assert!(detect_json_or_yaml_extension(Path::new("mesh")));
+    assert!(!detect_json_or_yaml_extension(Path::new("mesh.json")));
+    assert!(!detect_json_or_yaml_extension(Path::new("mesh.JSON")));
 }
 
 #[test]
-fn unknown_extension_routes_json_looking_content_to_json() {
+fn unknown_extension_selects_yaml_with_no_json_fallback() {
+    // YAML is a superset of JSON, so an unknown-extension path holding an
+    // ordinary JSON document parses. That is the ONLY reason JSON keeps
+    // working there — it is not a fallback.
     let ordinary_json = r#"{"mesh": {"services": []}}"#;
-    assert!(!detect_json_or_yaml_extension(
-        Path::new("mesh.unknown"),
-        ordinary_json
-    ));
+    assert!(detect_json_or_yaml_extension(Path::new("mesh.unknown")));
+    serde_yaml::from_str::<serde_yaml::Value>(ordinary_json)
+        .expect("ordinary JSON is inside the YAML superset");
 
+    // A JSON-only shape that YAML rejects proves the removed content-sniffing
+    // fallback really is gone: libyaml invalidates a simple key once it runs
+    // past 1024 bytes, so this document is valid JSON and invalid YAML.
     let long_key = "k".repeat(2048);
     let json_only = format!("{{\"{long_key}\": 1}}");
     serde_json::from_str::<serde_json::Value>(&json_only)
         .expect("a 2 KiB object key is perfectly valid JSON");
-    assert!(!detect_json_or_yaml_extension(
-        Path::new("doc.unknown"),
-        &json_only
-    ));
+    assert!(
+        serde_yaml::from_str::<serde_yaml::Value>(&json_only).is_err(),
+        "a mapping key past libyaml's 1024-byte simple-key limit must fail YAML parsing"
+    );
+
+    // Selection therefore decides the outcome: the same bytes load under a
+    // `.json` extension and fail closed under an unknown one.
+    assert!(!detect_json_or_yaml_extension(Path::new("doc.json")));
+    assert!(detect_json_or_yaml_extension(Path::new("doc.unknown")));
 }
 
 #[test]

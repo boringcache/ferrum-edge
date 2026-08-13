@@ -38,6 +38,7 @@ use crate::config::stable_file::{
     read_stable_file, stable_file_error_anyhow,
 };
 use crate::config::types::{CURRENT_CONFIG_VERSION, GatewayConfig};
+use crate::config::yaml_alias_budget::admit_yaml_alias_expansion;
 use crate::modes::mesh::revision::MeshRevisionContentIdentity;
 use crate::modes::mesh::runtime::{MeshRuntimeState, MeshSliceInstall, slice_content_identity};
 use crate::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
@@ -123,9 +124,13 @@ pub fn read_mesh_config_document(
     let content = read_stable_file(path, options)
         .map_err(|error| stable_file_error_anyhow(path, options, error))?;
 
-    let is_yaml = detect_json_or_yaml_extension(path, &content);
+    // Extension only; unknown/extensionless paths use YAML, which also admits
+    // ordinary JSON without a separate full-document detection parse.
+    let is_yaml = detect_json_or_yaml_extension(path);
 
     let document: MeshFileDocument = if is_yaml {
+        admit_yaml_alias_expansion(&content)
+            .map_err(|e| anyhow::anyhow!(mesh_doc_parse_error(e)))?;
         serde_yaml::from_str(&content).map_err(|e| anyhow::anyhow!(mesh_doc_parse_error(e)))?
     } else {
         serde_json::from_str(&content).map_err(|e| anyhow::anyhow!(mesh_doc_parse_error(e)))?

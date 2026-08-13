@@ -39,6 +39,7 @@ use crate::config::stable_file::{
 };
 use crate::config::types::{CURRENT_CONFIG_VERSION, GatewayConfig};
 use crate::config::validation_pipeline::{ValidationAction, ValidationPipeline};
+use crate::config::yaml_alias_budget::admit_yaml_alias_expansion;
 use serde::Deserialize;
 use std::path::Path;
 use tracing::{info, warn};
@@ -151,7 +152,9 @@ pub fn load_config_from_file(
     }
 
     let content = read_stable_config_file(file_path)?;
-    let is_yaml = detect_json_or_yaml_extension(file_path, &content);
+    // Extension only; unknown/extensionless paths use YAML, which also admits
+    // ordinary JSON without a separate full-document detection parse.
+    let is_yaml = detect_json_or_yaml_extension(file_path);
 
     if is_yaml {
         info!("Loading YAML configuration from {}", file_path.display());
@@ -164,6 +167,7 @@ pub fn load_config_from_file(
     // force an otherwise-current YAML document through JSON and discard
     // YAML-specific tags.
     let (mut value, mut yaml_value): (serde_json::Value, Option<serde_yaml::Value>) = if is_yaml {
+        admit_yaml_alias_expansion(&content)?;
         let yaml_val: serde_yaml::Value = serde_yaml::from_str(&content)?;
         (serde_json::to_value(&yaml_val)?, Some(yaml_val))
     } else {
@@ -433,6 +437,10 @@ pub fn decode_and_validate_config_document(
     if content.len() as u64 > MAX_CONFIG_FILE_BYTES {
         anyhow::bail!("config document exceeds maximum size of {MAX_CONFIG_FILE_BYTES} bytes");
     }
+
+    // Admit YAML alias expansion before the detection parse. The detector uses
+    // `serde_yaml::from_str`, which would otherwise materialize aliases first.
+    admit_yaml_alias_expansion(content)?;
 
     let is_yaml = serde_yaml::from_str::<serde_yaml::Value>(content).is_ok()
         && !content.trim_start().starts_with('{');

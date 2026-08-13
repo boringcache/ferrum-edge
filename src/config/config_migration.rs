@@ -9,6 +9,7 @@ use std::path::Path;
 use tracing::{info, warn};
 
 use crate::config::types::CURRENT_CONFIG_VERSION;
+use crate::config::yaml_alias_budget::admit_yaml_alias_expansion;
 
 /// Type alias for a config migration step function.
 /// Each function transforms a `serde_json::Value` from version N to version N+1.
@@ -120,11 +121,7 @@ impl ConfigMigrator {
         // Parse to serde_json::Value (works for both YAML and JSON)
         let mut value: serde_json::Value = match ext.as_str() {
             "json" => serde_json::from_str(&content)?,
-            _ => {
-                // YAML (or unknown — try YAML first)
-                let yaml_val: serde_yaml::Value = serde_yaml::from_str(&content)?;
-                serde_json::to_value(yaml_val)?
-            }
+            _ => parse_yaml_value(&content)?,
         };
 
         let from_version = value
@@ -204,10 +201,7 @@ impl ConfigMigrator {
 
         let value: serde_json::Value = match ext.as_str() {
             "json" => serde_json::from_str(&content)?,
-            _ => {
-                let yaml_val: serde_yaml::Value = serde_yaml::from_str(&content)?;
-                serde_json::to_value(yaml_val)?
-            }
+            _ => parse_yaml_value(&content)?,
         };
 
         let version = value
@@ -243,6 +237,12 @@ impl ConfigMigrator {
         }
         Ok(steps)
     }
+}
+
+fn parse_yaml_value(content: &str) -> Result<serde_json::Value, anyhow::Error> {
+    admit_yaml_alias_expansion(content)?;
+    let yaml_val: serde_yaml::Value = serde_yaml::from_str(content)?;
+    Ok(serde_json::to_value(yaml_val)?)
 }
 
 // ---- Future migration functions go here ----
