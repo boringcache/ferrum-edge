@@ -1257,3 +1257,68 @@ extensionProviders:
     assert_eq!(body.max_request_bytes, 4096);
     assert!(!body.allow_partial_message);
 }
+
+// ── YAML alias admission at ConfigMap data.mesh ───────────────────────────
+
+#[test]
+fn mesh_config_alias_bomb_is_rejected_without_echoing_payload() {
+    let mesh_yaml = concat!(
+        "a: &attacker-chosen-anchor [1,2,3,4,5,6,7,8]\n",
+        "b: &b [*attacker-chosen-anchor,*attacker-chosen-anchor,*attacker-chosen-anchor,*attacker-chosen-anchor,*attacker-chosen-anchor,*attacker-chosen-anchor,*attacker-chosen-anchor,*attacker-chosen-anchor]\n",
+        "c: &c [*b,*b,*b,*b,*b,*b,*b,*b]\n",
+        "d: &d [*c,*c,*c,*c,*c,*c,*c,*c]\n",
+        "e: &e [*d,*d,*d,*d,*d,*d,*d,*d]\n",
+        "f: &f [*e,*e,*e,*e,*e,*e,*e,*e]\n",
+        "g: &g [*f,*f,*f,*f,*f,*f,*f,*f]\n",
+        "root: *g\n",
+        "marker: attacker-marker-payload\n",
+        "extensionProviders:\n",
+        "- name: sample-ext-authz\n",
+        "  envoyExtAuthzHttp:\n",
+        "    service: ext-authz.istio-system.svc.cluster.local\n",
+        "    port: 8000\n",
+        "    scheme: https\n",
+    );
+    let err = translate(&[mesh_config_map(ROOT_NS, mesh_yaml)])
+        .expect_err("alias bomb must fail closed before serde_yaml materializes data.mesh");
+    assert!(
+        err.contains("exceeds") || err.contains("limit"),
+        "guard diagnostic must name the budget, got: {err}"
+    );
+    assert!(
+        err.contains("istio-system") && err.contains("istio"),
+        "resource wrapper may identify the ConfigMap, got: {err}"
+    );
+    assert!(
+        !err.contains("attacker-chosen-anchor")
+            && !err.contains("attacker-marker-payload")
+            && !err.contains("[1,2,3")
+            && !err.contains("*g"),
+        "parser diagnostics must not echo the hostile YAML: {err}"
+    );
+}
+
+#[test]
+fn mesh_config_modest_anchor_reuse_is_admitted() {
+    let mesh_yaml = concat!(
+        "sharedHost: &svc ext-authz.istio-system.svc.cluster.local\n",
+        "extensionProviders:\n",
+        "- name: sample-ext-authz\n",
+        "  envoyExtAuthzHttp:\n",
+        "    service: *svc\n",
+        "    port: 8000\n",
+        "    scheme: https\n",
+    );
+    let mesh = translate(&[
+        mesh_config_map(ROOT_NS, mesh_yaml),
+        custom_policy(json!({ "name": "sample-ext-authz" })),
+    ])
+    .expect("finite alias reuse in data.mesh is in budget");
+
+    let sample = mesh
+        .ext_authz_providers
+        .iter()
+        .find(|provider| provider.name == "sample-ext-authz")
+        .expect("aliased provider is admitted");
+    assert_eq!(sample.service, "ext-authz.istio-system.svc.cluster.local");
+}

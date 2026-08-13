@@ -1739,7 +1739,7 @@ fn port_scoped_siblings_select_by_frontend_port() {
 /// Dedicated Sidecar ingress `bind` routes must not ride single-listener
 /// Service remap onto `:15006` / process-global frontends (issue #3266).
 ///
-/// A lone `__mesh-ingress-bind-*` listen_port would otherwise arm
+/// A lone `__mesh-ingress-bind:*` listen_port would otherwise arm
 /// `single_nontls_listen_port`, beat the port-agnostic capture sibling on the
 /// shared inbound listener, then fail the bind-route exact-port gate and 502
 /// mesh peers that should have stayed on the capture path.
@@ -1751,7 +1751,7 @@ fn dedicated_sidecar_ingress_bind_does_not_service_remap_over_capture() {
     capture.listen_port = None;
     capture.backend_port = 8080;
 
-    let mut dedicated = test_proxy("__mesh-ingress-bind-default-reviews-8443", "/");
+    let mut dedicated = test_proxy("__mesh-ingress-bind:default-reviews-8443", "/");
     dedicated.hosts = vec![host.into()];
     dedicated.listen_port = Some(8443);
     dedicated.backend_port = 8080;
@@ -1771,7 +1771,7 @@ fn dedicated_sidecar_ingress_bind_does_not_service_remap_over_capture() {
         .find_proxy_on_frontend(Some(host), "/", Some(8443), false)
         .expect("exact dedicated bind frontend");
     assert_eq!(
-        on_dedicated.proxy.id, "__mesh-ingress-bind-default-reviews-8443",
+        on_dedicated.proxy.id, "__mesh-ingress-bind:default-reviews-8443",
         "dedicated bind still wins on its own OS listener"
     );
 }

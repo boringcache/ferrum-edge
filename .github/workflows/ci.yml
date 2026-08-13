@@ -800,6 +800,7 @@ jobs:
               integration::gateway_api_listenerset_tests
               integration::k8s_controller_gateway_status_tests
               integration::k8s_controller_gatewayclass_authority_tests
+              integration::k8s_controller_istio_status_cas_tests
               integration::k8s_controller_istio_status_tests
               integration::k8s_controller_shutdown_tests
               integration::k8s_controller_status_snapshot_tests

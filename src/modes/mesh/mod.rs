@@ -3610,11 +3610,20 @@ pub(crate) const MESH_INBOUND_PROXY_ID_PREFIX: &str = "__mesh-inbound-";
 /// [`is_mesh_inbound_route_id`] / [`mesh_route_direction`].
 pub(crate) const MESH_INGRESS_PROXY_ID_PREFIX: &str = "__mesh-ingress-";
 
-/// Reserved sub-prefix for dedicated Sidecar ingress `bind` socket routes
-/// (issue #3266). These remain ingress routes, but are served by a listener
-/// whose accepted port already identifies the one declared listener rather
-/// than by the shared `:15006` capture listener's sibling selector.
-pub(crate) const MESH_INGRESS_BIND_PROXY_ID_PREFIX: &str = "__mesh-ingress-bind-";
+/// Reserved colon-delimited sub-prefix for dedicated Sidecar ingress `bind`
+/// socket routes (issue #3266). These remain ingress routes, but are served by
+/// a listener whose accepted port already identifies the one declared listener
+/// rather than by the shared `:15006` capture listener's sibling selector.
+///
+/// The colon is the family discriminator: `mesh_ingress_proxy_id` folds `:`,
+/// `/`, and `.` to `-`, so a shared-capture id can never start with this
+/// prefix — including the `bind-prod` namespace that used to match the old
+/// `__mesh-ingress-bind-` hyphen prefix, and a hostile `bind:…` name that
+/// would otherwise forge the colon form. Namespace and service segments after
+/// the colon are encoded with `sanitize_egress_host_id_part`, so the join is
+/// injective across namespaces and cannot collide through `-` delimiter
+/// ambiguity (`a-b`/`c` vs `a`/`b-c`).
+pub(crate) const MESH_INGRESS_BIND_PROXY_ID_PREFIX: &str = "__mesh-ingress-bind:";
 
 /// Whether a proxy id names a materialized sidecar inbound route — either a
 /// service-port default inbound route or a Sidecar `ingress[]` custom listener
@@ -3645,10 +3654,11 @@ pub(crate) fn is_mesh_ingress_bind_route_id(id: &str) -> bool {
 /// SAFE TODAY because every in-scope materializer consumes a SINGLE-namespace
 /// service set (the slice is scoped to one namespace), so the `namespace`
 /// segment is constant and only `name`+`port` vary — and a `name` cannot
-/// borrow a `-` from a fixed `namespace`. Before any MULTI-namespace caller is
-/// added, switch this family to the reversible token scheme used by the egress
-/// ids (`sanitize_egress_host_id_part`) so the id space stays injective. See
-/// #1727.
+/// borrow a `-` from a fixed `namespace`. Dedicated Sidecar ingress bind ids
+/// (`mesh_ingress_bind_proxy_id`) are the exception: they already use the
+/// reversible `sanitize_egress_host_id_part` scheme so the id space stays
+/// injective across namespaces. Before any MULTI-namespace caller is added to
+/// the rest of this family, switch those constructors the same way. See #1727.
 fn mesh_inbound_proxy_id(namespace: &str, name: &str, port: u16) -> String {
     format!("{MESH_INBOUND_PROXY_ID_PREFIX}{namespace}-{name}-{port}").replace(['/', '.'], "-")
 }
@@ -3656,9 +3666,10 @@ fn mesh_inbound_proxy_id(namespace: &str, name: &str, port: u16) -> String {
 /// Id for a materialized Sidecar `ingress[]` listener route, one per declared
 /// listener port. The local workload's namespace + service name scope the id so
 /// it never collides with another local service's ingress siblings; the port
-/// disambiguates listeners. Like the inbound id, sanitized of `/`/`.`.
+/// disambiguates listeners. Like the inbound id, sanitized of `/`/`.`; `:` is
+/// also folded so a hostile name cannot forge [`MESH_INGRESS_BIND_PROXY_ID_PREFIX`].
 fn mesh_ingress_proxy_id(namespace: &str, name: &str, port: u16) -> String {
-    format!("{MESH_INGRESS_PROXY_ID_PREFIX}{namespace}-{name}-{port}").replace(['/', '.'], "-")
+    format!("{MESH_INGRESS_PROXY_ID_PREFIX}{namespace}-{name}-{port}").replace(['/', '.', ':'], "-")
 }
 
 /// Reserved id prefix for materialized mesh OUTBOUND (egress) routes. Like the
@@ -5161,8 +5172,15 @@ fn materialize_sidecar_ingress_listener_proxies(
     );
 }
 
+/// Dedicated Sidecar ingress bind route id. Prefix is the colon family
+/// discriminator; namespace and service are encoded injectively so `-` in
+/// either field cannot collide with another `(namespace, name, port)` tuple.
 fn mesh_ingress_bind_proxy_id(namespace: &str, name: &str, port: u16) -> String {
-    format!("{MESH_INGRESS_BIND_PROXY_ID_PREFIX}{namespace}-{name}-{port}").replace(['/', '.'], "-")
+    format!(
+        "{MESH_INGRESS_BIND_PROXY_ID_PREFIX}{}-{}-{port}",
+        sanitize_egress_host_id_part(namespace),
+        sanitize_egress_host_id_part(name)
+    )
 }
 
 /// Ports already owned by Gateway/stream proxies or the fixed mesh listener
@@ -36725,7 +36743,7 @@ mod tests {
         let bind_proxy = config
             .proxies
             .iter()
-            .find(|p| p.id.starts_with("__mesh-ingress-bind-"))
+            .find(|p| p.id.starts_with("__mesh-ingress-bind:"))
             .expect("dedicated bind proxy");
         assert_eq!(bind_proxy.listen_port, Some(16379));
         assert_eq!(bind_proxy.backend_host, "127.0.0.1");
@@ -36779,7 +36797,7 @@ mod tests {
             !config
                 .proxies
                 .iter()
-                .any(|p| p.id.starts_with("__mesh-ingress-bind-")),
+                .any(|p| p.id.starts_with("__mesh-ingress-bind:")),
             "conflicting bind must not materialize a socket proxy"
         );
         assert!(
@@ -36897,7 +36915,7 @@ mod tests {
             config_v1
                 .proxies
                 .iter()
-                .any(|p| p.id.starts_with("__mesh-ingress-bind-"))
+                .any(|p| p.id.starts_with("__mesh-ingress-bind:"))
         );
 
         // Withdraw the dedicated bind (shared capture only).
@@ -36924,7 +36942,7 @@ mod tests {
             !config_v2
                 .proxies
                 .iter()
-                .any(|p| p.id.starts_with("__mesh-ingress-bind-")),
+                .any(|p| p.id.starts_with("__mesh-ingress-bind:")),
             "dedicated bind proxy must withdraw when bind is removed"
         );
         assert!(
