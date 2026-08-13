@@ -421,6 +421,7 @@ fn a_withdrawal_retires_only_transports_below_the_new_generation() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // `isolated_registry()` must span awaits to serialize process-global registry state
 async fn retirement_resolves_the_session_wait_future() {
     let _guard = isolated_registry();
     let ca = generate_ca("trust-ca");
@@ -576,6 +577,7 @@ fn a_refused_candidate_retains_generation_material_and_sessions() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // `isolated_registry()` must span awaits to serialize process-global registry state
 async fn a_fenced_stream_relays_until_retirement_then_fails_bounded() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
