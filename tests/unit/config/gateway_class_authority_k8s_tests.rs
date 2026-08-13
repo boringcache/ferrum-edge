@@ -157,8 +157,7 @@ fn service() -> K8sObject {
 
 fn programmed(objects: &[K8sObject]) -> bool {
     let translation = translate_k8s_objects(objects, options()).expect("translation succeeds");
-    !translation.config.proxies.is_empty()
-        || !translation.materialized_gateway_listeners.is_empty()
+    !translation.config.proxies.is_empty() || !translation.materialized_gateway_listeners.is_empty()
 }
 
 fn gateway_status_planned(objects: &[K8sObject]) -> bool {
@@ -212,7 +211,10 @@ fn absent_class_named_ferrum_is_not_managed() {
 
     let translation = translate_k8s_objects(&objects, options()).expect("translation succeeds");
     assert!(
-        translation.config.frontend_tls_certificate_sources.is_empty(),
+        translation
+            .config
+            .frontend_tls_certificate_sources
+            .is_empty(),
         "absent class must not produce a frontend TLS serving plan"
     );
     assert!(
@@ -241,7 +243,12 @@ fn creating_owned_class_programs_the_unchanged_gateway() {
     let without_class = vec![http_gateway("ferrum"), http_route(), service()];
     assert!(!programmed(&without_class));
 
-    let with_class = vec![ferrum_class(), http_gateway("ferrum"), http_route(), service()];
+    let with_class = vec![
+        ferrum_class(),
+        http_gateway("ferrum"),
+        http_route(),
+        service(),
+    ];
     assert!(
         programmed(&with_class),
         "creating the owned GatewayClass must program the unchanged Gateway"
@@ -251,7 +258,12 @@ fn creating_owned_class_programs_the_unchanged_gateway() {
 
 #[test]
 fn deleting_owned_class_withdraws_generated_state() {
-    let present = vec![ferrum_class(), http_gateway("ferrum"), http_route(), service()];
+    let present = vec![
+        ferrum_class(),
+        http_gateway("ferrum"),
+        http_route(),
+        service(),
+    ];
     let owned = translate_k8s_objects(&present, options()).expect("owned snapshot translates");
     assert!(
         !owned.config.proxies.is_empty(),
@@ -287,7 +299,12 @@ fn deleting_owned_class_withdraws_generated_state() {
 
 #[test]
 fn changing_controller_name_to_foreign_withdraws() {
-    let owned = vec![ferrum_class(), http_gateway("ferrum"), http_route(), service()];
+    let owned = vec![
+        ferrum_class(),
+        http_gateway("ferrum"),
+        http_route(),
+        service(),
+    ];
     assert!(programmed(&owned));
 
     let foreign = vec![
@@ -339,12 +356,7 @@ fn informer_list_order_does_not_change_authority() {
     let route = http_route();
     let svc = service();
 
-    let class_first = vec![
-        class.clone(),
-        gateway.clone(),
-        route.clone(),
-        svc.clone(),
-    ];
+    let class_first = vec![class.clone(), gateway.clone(), route.clone(), svc.clone()];
     let gateway_first = vec![gateway, route, svc, class];
     assert!(programmed(&class_first));
     assert!(programmed(&gateway_first));
@@ -364,7 +376,10 @@ fn incomplete_snapshot_without_cluster_scoped_class_cannot_become_ownership() {
         translation.config.proxies.is_empty()
             && translation.materialized_gateway_listeners.is_empty()
             && translation.materialized_route_parents.is_empty()
-            && translation.config.frontend_tls_certificate_sources.is_empty(),
+            && translation
+                .config
+                .frontend_tls_certificate_sources
+                .is_empty(),
         "an incomplete cluster-scoped snapshot must not become positive ownership"
     );
     assert!(

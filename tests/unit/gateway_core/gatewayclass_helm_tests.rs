@@ -47,7 +47,8 @@ fn template_creates_cluster_scoped_gatewayclass_without_name_fallback() {
         "create=false must disable the object; Sprig default would treat false as true"
     );
     assert!(
-        template.contains("fail \"gatewayClass.controllerName must be ferrum.io/gateway-controller"),
+        template
+            .contains("fail \"gatewayClass.controllerName must be ferrum.io/gateway-controller"),
         "chart must refuse a non-Ferrum controllerName instead of shipping a name-only shim"
     );
     assert!(

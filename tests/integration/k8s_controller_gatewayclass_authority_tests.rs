@@ -114,7 +114,11 @@ fn translation_and_status_agree_across_create_delete_and_foreign_class() {
     let foreign_translation =
         translate_k8s_objects(&foreign, options()).expect("foreign class translates");
     let foreign_status = plan_gateway_api_status_updates(&foreign, options(), &[]);
-    assert!(foreign_translation.materialized_gateway_listeners.is_empty());
+    assert!(
+        foreign_translation
+            .materialized_gateway_listeners
+            .is_empty()
+    );
     assert!(
         !foreign_status
             .iter()

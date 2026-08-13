@@ -44,8 +44,7 @@ impl GatewayClassAuthority {
     /// `lookup` returns `Some` only when the class object was observed.
     /// Absence, an empty `gatewayClassName`, or a missing field is [`Self::Missing`].
     pub fn for_gateway(gateway: &K8sObject, lookup: impl FnOnce(&str) -> Option<Self>) -> Self {
-        let Some(class_name) = gateway.spec.get("gatewayClassName").and_then(Value::as_str)
-        else {
+        let Some(class_name) = gateway.spec.get("gatewayClassName").and_then(Value::as_str) else {
             return Self::Missing;
         };
         if class_name.is_empty() {
