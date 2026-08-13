@@ -115,8 +115,9 @@ pub mod _test_support {
             preserve_host_header,
             client_host,
             &url_authority,
-        );
-        Some((url_authority, host.into_owned()))
+        )
+            .into_owned();
+        Some((url_authority, host))
     }
 
     /// Release an xDS node permit through the production last-stream cleanup
