@@ -12129,8 +12129,7 @@ pub async fn run(
         // stream instead of letting it outlive the credential that opened it.
         // The handle joins with the other mesh background tasks, so nothing is
         // left detached at shutdown.
-        let credential_watch =
-            StockCredentialWatch::new(stock_config.credential.initial_state());
+        let credential_watch = StockCredentialWatch::new(stock_config.credential.initial_state());
         background_handles.push(tokio::spawn(
             config_consumer::stock_xds_credential::start_stock_credential_watcher_with_shutdown(
                 stock_config.credential.clone(),

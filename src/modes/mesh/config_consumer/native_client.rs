@@ -576,7 +576,9 @@ async fn connect_mesh_subscribe(
 /// control plane produces the same bounded, ordered retry a slow one does —
 /// while the receive loop regains control and its liveness bounds keep running.
 fn status_report_deadline_exceeded() -> tonic::Status {
-    tonic::Status::deadline_exceeded("mesh slice status report exceeded the bounded outbound window")
+    tonic::Status::deadline_exceeded(
+        "mesh slice status report exceeded the bounded outbound window",
+    )
 }
 
 async fn wait_for_first_slice_then_primary_retry(state: MeshRuntimeState, interval: Duration) {

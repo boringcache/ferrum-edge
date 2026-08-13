@@ -645,8 +645,8 @@ pub async fn start_stock_credential_watcher_with_shutdown(
     let interval = source.policy().watch_interval.max(Duration::from_secs(1));
     info!(
         watch_interval_secs = interval.as_secs(),
-        max_stream_lifetime_secs = clamp_max_stream_lifetime(source.policy().max_stream_lifetime)
-            .as_secs(),
+        max_stream_lifetime_secs =
+            clamp_max_stream_lifetime(source.policy().max_stream_lifetime).as_secs(),
         refresh_skew_secs = source.policy().refresh_skew.as_secs(),
         "Stock xDS bearer-credential watcher starting; ADS streams are retired when the source \
          rotates, becomes invalid, or reaches its authorization deadline"
@@ -674,9 +674,9 @@ pub async fn start_stock_credential_watcher_with_shutdown(
                     "Stock xDS bearer credential rotated; retiring the ADS stream and \
                      reconnecting with the replacement material"
                 ),
-                StockCredentialState::Valid { .. } => info!(
-                    "Stock xDS bearer-credential source observed valid; ADS streams may open"
-                ),
+                StockCredentialState::Valid { .. } => {
+                    info!("Stock xDS bearer-credential source observed valid; ADS streams may open")
+                }
                 StockCredentialState::NotConfigured | StockCredentialState::Unknown => {}
             }
         }

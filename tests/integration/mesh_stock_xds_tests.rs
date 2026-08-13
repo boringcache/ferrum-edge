@@ -1157,7 +1157,9 @@ mod stream_lifecycle {
             &self,
             _request: Request<Streaming<DeltaDiscoveryRequest>>,
         ) -> Result<Response<Self::DeltaAggregatedResourcesStream>, Status> {
-            Err(Status::unimplemented("delta xDS is not part of this fixture"))
+            Err(Status::unimplemented(
+                "delta xDS is not part of this fixture",
+            ))
         }
     }
 
@@ -1262,9 +1264,7 @@ mod stream_lifecycle {
         }
 
         fn config_stream_state(&self) -> Option<&'static str> {
-            self.state
-                .config_stream_status()
-                .map(|status| status.state)
+            self.state.config_stream_status().map(|status| status.state)
         }
 
         fn last_outcome(&self) -> Option<&'static str> {
@@ -1475,7 +1475,6 @@ mod stream_lifecycle {
         );
         harness.shutdown_and_join().await;
     }
-
 }
 
 // ── issues #3852 / #3853 / #3854: LIVE TLS ADS lifecycle ─────────────────
@@ -1545,7 +1544,10 @@ mod tls_lifecycle {
         let server_key =
             rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("server key");
         let mut server_params = rcgen::CertificateParams::new(
-            server_dns.iter().map(|d| (*d).to_string()).collect::<Vec<_>>(),
+            server_dns
+                .iter()
+                .map(|d| (*d).to_string())
+                .collect::<Vec<_>>(),
         )
         .expect("server params");
         // The loopback iPAddress SAN is what the client actually verifies
@@ -1568,8 +1570,8 @@ mod tls_lifecycle {
 
         let client_key =
             rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("client key");
-        let client_params = rcgen::CertificateParams::new(vec!["ferrum-dp".to_string()])
-            .expect("client params");
+        let client_params =
+            rcgen::CertificateParams::new(vec!["ferrum-dp".to_string()]).expect("client params");
         let client_cert = client_params
             .signed_by(&client_key, &issuer)
             .expect("client leaf");
@@ -1755,7 +1757,9 @@ mod tls_lifecycle {
             &self,
             _request: Request<Streaming<DeltaDiscoveryRequest>>,
         ) -> Result<Response<Self::DeltaAggregatedResourcesStream>, Status> {
-            Err(Status::unimplemented("delta xDS is not part of this fixture"))
+            Err(Status::unimplemented(
+                "delta xDS is not part of this fixture",
+            ))
         }
     }
 
@@ -1996,10 +2000,10 @@ mod tls_lifecycle {
             .expect("after the epoch")
             .as_secs() as i64
             + secs_from_now;
-        let header =
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256"}"#);
-        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(format!(r#"{{"exp":{exp},"sub":"system:serviceaccount:default:reviews"}}"#));
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256"}"#);
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!(
+            r#"{{"exp":{exp},"sub":"system:serviceaccount:default:reviews"}}"#
+        ));
         format!("{header}.{payload}.c2ln")
     }
 
@@ -2051,7 +2055,9 @@ mod tls_lifecycle {
         })
         .await;
 
-        harness.wait_for_services(2, "the first authenticated stream").await;
+        harness
+            .wait_for_services(2, "the first authenticated stream")
+            .await;
         assert_eq!(endpoint.ads.stream_count(), 1);
         assert_eq!(
             endpoint.ads.authorization_snapshot(),
@@ -2063,7 +2069,10 @@ mod tls_lifecycle {
             Some("connected"),
             "a live stream serving usable configuration is `connected`"
         );
-        assert_eq!(harness.status_field(|status| status.credential), Some("valid"));
+        assert_eq!(
+            harness.status_field(|status| status.credential),
+            Some("valid")
+        );
 
         // A continuous sampler: the retired stream's push must never become
         // visible, not merely be absent at the end.
@@ -2119,7 +2128,8 @@ mod tls_lifecycle {
         sampler_stop.store(true, Ordering::SeqCst);
         let worst = sampler.await.expect("sampler task");
         assert_eq!(
-            worst, 2,
+            worst,
+            2,
             "a response from the retired credential's stream must never be installed \
              (poison_written={})",
             endpoint.ads.poison_written.load(Ordering::SeqCst)
@@ -2252,7 +2262,10 @@ mod tls_lifecycle {
             "an unchanged credential must not retire a healthy stream"
         );
         assert_eq!(harness.credential_watch.latest().generation, generation);
-        assert_eq!(harness.status_field(|status| status.state), Some("connected"));
+        assert_eq!(
+            harness.status_field(|status| status.state),
+            Some("connected")
+        );
 
         harness.shutdown_and_join().await;
         endpoint.shutdown().await;
@@ -2728,10 +2741,7 @@ mod tls_lifecycle {
             ..MeshStreamTimings::production()
         };
         let harness = LifecycleHarness::start(
-            vec![
-                format!("http://127.0.0.1:{}", blackhole.port),
-                fallback_url,
-            ],
+            vec![format!("http://127.0.0.1:{}", blackhole.port), fallback_url],
             StockXdsCredentialSource::unauthenticated(),
             StockCredentialWatch::new(StockCredentialState::NotConfigured),
             timings,

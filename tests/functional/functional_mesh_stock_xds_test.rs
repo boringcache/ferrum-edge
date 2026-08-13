@@ -1123,10 +1123,7 @@ async fn drive_stock_xds_live_datapath() -> Result<StockLiveObservations, String
                     // metadata over the authenticated TLS channel." Without a
                     // bearer configured, the happy path proved only that TLS
                     // works — not that the credential rides it.
-                    (
-                        "FERRUM_MESH_STOCK_XDS_TOKEN_FILE",
-                        ads_token_path.clone(),
-                    ),
+                    ("FERRUM_MESH_STOCK_XDS_TOKEN_FILE", ads_token_path.clone()),
                     (
                         "FERRUM_MESH_STOCK_XDS_NODE_ID",
                         "sidecar~127.0.0.1~client-app.ferrum~ferrum.svc.cluster.local".to_string(),
@@ -1752,7 +1749,11 @@ async fn functional_mesh_stock_xds_refuses_plaintext_transport_postures() {
             .env("FERRUM_MESH_ALLOW_NO_CA", "true")
             .env(
                 "FERRUM_MESH_STOCK_XDS_ALLOW_PLAINTEXT",
-                if case.allow_plaintext { "true" } else { "false" },
+                if case.allow_plaintext {
+                    "true"
+                } else {
+                    "false"
+                },
             )
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());

@@ -122,7 +122,8 @@ impl MeshStreamTimings {
     /// Upper bound on detecting a half-open established transport under *this*
     /// policy: one PING interval plus one ack deadline.
     pub fn liveness_bound(self) -> Duration {
-        self.keepalive_interval.saturating_add(self.keepalive_timeout)
+        self.keepalive_interval
+            .saturating_add(self.keepalive_timeout)
     }
 
     /// The same bound, in whole seconds, for the `/health` projection. Rounded

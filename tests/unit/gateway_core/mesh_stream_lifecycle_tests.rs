@@ -262,9 +262,10 @@ fn the_reported_liveness_bound_follows_the_invocation_policy() {
     // Rounded up so a sub-second policy never advertises a bound of zero.
     assert_eq!(compressed.liveness_bound_seconds(), 1);
 
-    let reported = MeshStreamTracker::new("stock_xds", MeshConfigStreamCredential::Valid, compressed)
-        .status(false)
-        .liveness_bound_seconds;
+    let reported =
+        MeshStreamTracker::new("stock_xds", MeshConfigStreamCredential::Valid, compressed)
+            .status(false)
+            .liveness_bound_seconds;
     assert_eq!(reported, 1);
 }
 
@@ -713,8 +714,9 @@ fn the_authorization_insertion_boundary_refuses_a_non_tls_transport() {
 
 fn jwt_with_exp(exp_epoch_secs: i64) -> String {
     let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256"}"#);
-    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .encode(format!(r#"{{"exp":{exp_epoch_secs},"sub":"system:serviceaccount:x:y"}}"#));
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!(
+        r#"{{"exp":{exp_epoch_secs},"sub":"system:serviceaccount:x:y"}}"#
+    ));
     format!("{header}.{payload}.c2ln")
 }
 
@@ -834,8 +836,9 @@ fn a_jwt_that_cannot_clear_the_skew_is_refused() {
         assert_eq!(reason.as_metric_label(), "token_expires_within_skew");
     }
     // One second past the skew is admissible again.
-    let (lifetime, _) = credential_lifetime(&jwt_with_exp(1_000_061), lifetime_policy(3600, 60), now)
-        .expect("a 1s post-skew window is still a positive window");
+    let (lifetime, _) =
+        credential_lifetime(&jwt_with_exp(1_000_061), lifetime_policy(3600, 60), now)
+            .expect("a 1s post-skew window is still a positive window");
     assert_eq!(lifetime, Duration::from_secs(1));
 }
 
@@ -973,7 +976,10 @@ fn credential_debug_output_never_carries_token_material() {
         StockBearerCredential::admit("super-secret-projected-token", lifetime_policy(3600, 60))
             .expect("valid ascii");
     let rendered = format!("{credential:?}");
-    assert!(!rendered.contains("super-secret-projected-token"), "{rendered}");
+    assert!(
+        !rendered.contains("super-secret-projected-token"),
+        "{rendered}"
+    );
     assert!(rendered.contains("<redacted>"), "{rendered}");
 
     let fingerprint = format!("{:?}", credential.fingerprint());
@@ -1012,9 +1018,7 @@ fn invalid_reason_labels_are_a_closed_snake_case_set() {
     assert_eq!(labels.len(), reasons.len());
     for label in labels {
         assert!(
-            label
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c == '_'),
+            label.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
             "'{label}'"
         );
     }
@@ -1172,7 +1176,10 @@ async fn every_invalid_credential_source_shape_fails_closed_with_a_bounded_reaso
         StockCredentialLifetimePolicy::default(),
     );
     assert_eq!(
-        source.materialize().await.expect_err("invalid utf-8 source"),
+        source
+            .materialize()
+            .await
+            .expect_err("invalid utf-8 source"),
         StockCredentialInvalidReason::InvalidEncoding
     );
 

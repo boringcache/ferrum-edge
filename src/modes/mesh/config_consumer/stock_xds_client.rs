@@ -76,6 +76,13 @@ use super::common::{
     next_backoff_secs, refresh_dp_grpc_tls_config_if_changed, should_race_primary_retry,
     tonic_tls_config, wait_for_shutdown, wait_optional_tls_reload,
 };
+#[cfg(unix)]
+use super::file_source::SignalReloadNotifier;
+use super::file_source::{
+    MeshLocalReloadApply, MeshLocalReloadResult, MeshLocalSourceRecovery, MeshReloadLoopMessages,
+    mark_mesh_local_reload_rejected, normalized_mesh_gateway_config, read_mesh_config_document,
+    run_mesh_local_reload_loop,
+};
 use super::stock_xds_credential::{
     StockBearerCredential, StockCredentialInvalidReason, StockCredentialObservation,
     StockCredentialState, StockCredentialWatch, StockXdsCredentialSource,
@@ -87,13 +94,6 @@ use super::stock_xds_transport::{
 use super::stream_lifecycle::{
     MeshConfigStreamCredential, MeshStreamAttachment, MeshStreamAttempt, MeshStreamRetirement,
     MeshStreamTimings, MeshStreamTracker, configure_mesh_config_stream_endpoint,
-};
-#[cfg(unix)]
-use super::file_source::SignalReloadNotifier;
-use super::file_source::{
-    MeshLocalReloadApply, MeshLocalReloadResult, MeshLocalSourceRecovery, MeshReloadLoopMessages,
-    mark_mesh_local_reload_rejected, normalized_mesh_gateway_config, read_mesh_config_document,
-    run_mesh_local_reload_loop,
 };
 use crate::grpc::dp_client::{DpGrpcTlsConfig, DpGrpcTlsReload};
 use crate::modes::mesh::config::MeshConfig;
@@ -1191,7 +1191,9 @@ pub fn attach_stock_authorization(
              classified as authenticated TLS",
         ));
     }
-    request.metadata_mut().insert("authorization", token.clone());
+    request
+        .metadata_mut()
+        .insert("authorization", token.clone());
     Ok(())
 }
 
