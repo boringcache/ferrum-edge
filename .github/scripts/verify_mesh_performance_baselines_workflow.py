@@ -44,6 +44,12 @@ APPROVED_SETUP = (
     "./.github/actions/setup-fast-linker",
 )
 PINNED_SHA = re.compile(r"^[0-9a-f]{40}$")
+HBONE_BACKEND_ALLOW_IPS_VAR = "FERRUM_BACKEND_ALLOW_IPS"
+HBONE_BACKEND_ALLOW_IPS_VALUE = "private"
+ALLOW_IPS_ASSIGN_RE = re.compile(
+    rf"{re.escape(HBONE_BACKEND_ALLOW_IPS_VAR)}="
+    r'(?:"(?P<dq>[^"]*)"|\'(?P<sq>[^\']*)\'|(?P<bare>[^\s\\&|;]+))'
+)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -55,6 +61,86 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def require(condition: bool, message: str, failures: list[str]) -> None:
     if not condition:
         failures.append(message)
+
+
+def _strip_shell_comment(value: str) -> str:
+    """Remove an unquoted shell comment while preserving quoted ``#`` data."""
+    quote: str | None = None
+    escaped = False
+    for index, character in enumerate(value):
+        if escaped:
+            escaped = False
+            continue
+        if character == "\\" and quote != "'":
+            escaped = True
+            continue
+        if quote is not None:
+            if character == quote:
+                quote = None
+            continue
+        if character in "'\"":
+            quote = character
+            continue
+        if character == "#" and (index == 0 or value[index - 1].isspace()):
+            return value[:index]
+    return value
+
+
+def _logical_shell_lines(text: str) -> list[str]:
+    """Join backslash-continued shell lines into one logical command line."""
+    logical: list[str] = []
+    parts: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.rstrip()
+        if line.endswith("\\"):
+            parts.append(line[:-1].rstrip())
+            continue
+        parts.append(line)
+        logical.append(" ".join(parts))
+        parts = []
+    if parts:
+        logical.append(" ".join(parts))
+    return logical
+
+
+def _active_backend_allow_ips_assignments(text: str) -> list[str]:
+    """Return values from active ``FERRUM_BACKEND_ALLOW_IPS`` shell assignments."""
+    values: list[str] = []
+    for logical_line in _logical_shell_lines(text):
+        active = _strip_shell_comment(logical_line).strip()
+        if not active or active.startswith("#"):
+            continue
+        for match in ALLOW_IPS_ASSIGN_RE.finditer(active):
+            value = match.group("dq")
+            if value is None:
+                value = match.group("sq")
+            if value is None:
+                value = match.group("bare")
+            values.append(value)
+    return values
+
+
+def _check_hbone_backend_allow_ips(hbone_run: str, failures: list[str]) -> None:
+    """Require exactly one active ``FERRUM_BACKEND_ALLOW_IPS="private"`` assignment."""
+    values = _active_backend_allow_ips_assignments(hbone_run)
+    if not values:
+        failures.append(
+            f'HBONE harness must set exactly one active '
+            f'{HBONE_BACKEND_ALLOW_IPS_VAR}="{HBONE_BACKEND_ALLOW_IPS_VALUE}" assignment'
+        )
+        return
+    if len(values) != 1:
+        failures.append(
+            f"HBONE harness must have exactly one active {HBONE_BACKEND_ALLOW_IPS_VAR} assignment "
+            f"(found {len(values)}: {values!r})"
+        )
+        return
+    value = values[0]
+    if value != HBONE_BACKEND_ALLOW_IPS_VALUE:
+        failures.append(
+            f'HBONE harness must set {HBONE_BACKEND_ALLOW_IPS_VAR}="{HBONE_BACKEND_ALLOW_IPS_VALUE}" '
+            f"for loopback/private backends (found active assignment {value!r})"
+        )
 
 
 def check_workflow(text: str, failures: list[str]) -> None:
@@ -412,17 +498,7 @@ def check_scripts(failures: list[str]) -> None:
     require("archive_failure_diagnostics" in hbone_run, "HBONE harness must copy logs before deleting runtime", failures)
     require("archive_failure_diagnostics" in dns_run, "DNS harness must copy logs into the artifact destination", failures)
     require("certs" in hbone_run and "Never copy certs" in hbone_run, "HBONE diagnostics must not archive certs", failures)
-    require(
-        re.search(r'FERRUM_BACKEND_ALLOW_IPS="(?:private|public|both)"', hbone_run),
-        "HBONE harness must set FERRUM_BACKEND_ALLOW_IPS to a valid mode (private/public/both)",
-        failures,
-    )
-    require(
-        not re.search(r'FERRUM_BACKEND_ALLOW_IPS="[^"]*/', hbone_run),
-        "HBONE harness must not pass CIDR literals to FERRUM_BACKEND_ALLOW_IPS; "
-        "use FERRUM_BACKEND_ALLOW_CIDRS for address exceptions",
-        failures,
-    )
+    _check_hbone_backend_allow_ips(hbone_run, failures)
 
     hbone_loadgen = HBONE_LOADGEN.read_text(encoding="utf-8")
     dns_loadgen = DNS_LOADGEN.read_text(encoding="utf-8")
@@ -543,6 +619,74 @@ def check_docs_and_baselines(failures: list[str]) -> None:
         )
 
 
+def _self_test_hbone_backend_allow_ips(failures: list[str]) -> None:
+    """Prove active-assignment parsing rejects comment camouflage and widening."""
+    good = """
+    env \\
+        FERRUM_BACKEND_ALLOW_IPS="private" \\
+        ./target/release/ferrum-edge
+"""
+    good_failures: list[str] = []
+    _check_hbone_backend_allow_ips(good, good_failures)
+    require(not good_failures, "active private assignment must pass", failures)
+
+    cases = (
+        (
+            """
+# FERRUM_BACKEND_ALLOW_IPS="private"
+    env \\
+        FERRUM_BACKEND_ALLOW_IPS="public" \\
+        ./target/release/ferrum-edge
+""",
+            "comment camouflage",
+        ),
+        (
+            """
+    env \\
+        FERRUM_BACKEND_ALLOW_IPS="both" \\
+        ./target/release/ferrum-edge
+""",
+            "both widening",
+        ),
+        (
+            """
+    env \\
+        FERRUM_BACKEND_ALLOW_IPS="10.0.0.0/8" \\
+        ./target/release/ferrum-edge
+""",
+            "CIDR literal",
+        ),
+        (
+            """
+    env \\
+        FERRUM_BACKEND_ALLOW_IPS="private" \\
+        FERRUM_BACKEND_ALLOW_IPS="private" \\
+        ./target/release/ferrum-edge
+""",
+            "duplicate assignment",
+        ),
+        (
+            """
+    env \\
+        ./target/release/ferrum-edge
+""",
+            "missing assignment",
+        ),
+        (
+            """
+    env \\
+        FERRUM_BACKEND_ALLOW_IPS="public" # FERRUM_BACKEND_ALLOW_IPS="private"
+        ./target/release/ferrum-edge
+""",
+            "inline comment camouflage",
+        ),
+    )
+    for sample, label in cases:
+        case_failures: list[str] = []
+        _check_hbone_backend_allow_ips(sample, case_failures)
+        require(case_failures, f"{label} must be rejected", failures)
+
+
 def self_test() -> int:
     sample = """
 name: Mesh Performance Baselines
@@ -631,6 +775,7 @@ jobs:
 """
     failures: list[str] = []
     check_workflow(sample, failures)
+    _self_test_hbone_backend_allow_ips(failures)
     # Intentionally skip docs checks in self-test.
     if failures:
         print("self-test failures:", *failures, sep="\n- ")
