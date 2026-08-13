@@ -409,14 +409,11 @@ pub fn stable_file_error_anyhow(
 
 /// Select JSON vs YAML from a file extension.
 ///
-/// `.yaml`/`.yml` and unknown or extensionless paths select YAML; only `.json`
-/// selects the JSON parser. YAML is a superset of JSON, so an unknown-extension
-/// path holding an ordinary JSON document still parses — but the parser really
-/// is YAML, and a JSON-only shape YAML rejects (for example a mapping key past
-/// libyaml's 1024-byte simple-key limit) fails closed. There is deliberately no
-/// content sniffing and no JSON fallback: detection must not parse a large
-/// document once to classify it and again to deserialize it.
-pub fn detect_json_or_yaml_extension(path: &Path) -> bool {
+/// Explicit `.yaml`/`.yml` and `.json` extensions select their corresponding
+/// parser. For unknown or extensionless paths, JSON-looking objects and arrays
+/// select the JSON parser so YAML aliases cannot be expanded through an
+/// ambiguous path; all other content selects YAML.
+pub fn detect_json_or_yaml_extension(path: &Path, content: &str) -> bool {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -425,6 +422,9 @@ pub fn detect_json_or_yaml_extension(path: &Path) -> bool {
     match ext.as_str() {
         "yaml" | "yml" => true,
         "json" => false,
-        _ => true,
+        _ => {
+            let trimmed = content.trim_start();
+            !(trimmed.starts_with('{') || trimmed.starts_with('['))
+        }
     }
 }

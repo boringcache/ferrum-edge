@@ -232,10 +232,7 @@ fn mesh_file_at_documented_ceiling_constant_is_admitted_by_stable_reader() {
 }
 
 #[test]
-fn unknown_extension_json_object_parses_once_through_yaml_superset() {
-    // Unknown paths use the YAML parser directly. JSON remains accepted because
-    // it is a YAML subset, and YAML flow mappings retain their historical
-    // behavior instead of being misclassified as strict JSON.
+fn unknown_extension_json_object_uses_json_parser() {
     let json = serde_json::json!({
         "mesh": {
             "services": [{
@@ -258,9 +255,12 @@ fn unknown_extension_json_object_parses_once_through_yaml_superset() {
         "unknown",
         "{mesh: {services: [{name: api, namespace: ferrum, ports: [{port: 80, protocol: http}]}]}}",
     );
-    let flow_slice = load_mesh_slice_from_file(&flow_yaml, request_for_namespace("ferrum"))
-        .expect("YAML flow mapping with unknown extension");
-    assert_eq!(flow_slice.services.len(), 1);
+    let err = load_mesh_slice_from_file(&flow_yaml, request_for_namespace("ferrum"))
+        .expect_err("JSON-looking YAML must not reach the YAML parser through an unknown path");
+    assert!(
+        err.to_string()
+            .contains("invalid mesh configuration document")
+    );
 }
 
 #[test]

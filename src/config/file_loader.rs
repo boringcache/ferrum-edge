@@ -151,9 +151,7 @@ pub fn load_config_from_file(
     }
 
     let content = read_stable_config_file(file_path)?;
-    // Extension only; unknown/extensionless paths use YAML, which also admits
-    // ordinary JSON without a separate full-document detection parse.
-    let is_yaml = detect_json_or_yaml_extension(file_path);
+    let is_yaml = detect_json_or_yaml_extension(file_path, &content);
 
     if is_yaml {
         info!("Loading YAML configuration from {}", file_path.display());

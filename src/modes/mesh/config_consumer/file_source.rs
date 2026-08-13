@@ -123,9 +123,7 @@ pub fn read_mesh_config_document(
     let content = read_stable_file(path, options)
         .map_err(|error| stable_file_error_anyhow(path, options, error))?;
 
-    // Extension only; unknown/extensionless paths use YAML, which also admits
-    // ordinary JSON without a separate full-document detection parse.
-    let is_yaml = detect_json_or_yaml_extension(path);
+    let is_yaml = detect_json_or_yaml_extension(path, &content);
 
     let document: MeshFileDocument = if is_yaml {
         serde_yaml::from_str(&content).map_err(|e| anyhow::anyhow!(mesh_doc_parse_error(e)))?
