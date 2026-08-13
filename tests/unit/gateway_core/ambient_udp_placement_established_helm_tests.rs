@@ -664,8 +664,7 @@ fn the_preflight_explicit_node_uid_skips_the_name_fieldref_but_rejects_name_over
         "an explicit UID must not relax the chart-owned node-name binding"
     );
     assert!(
-        values.contains("ambient.env.FERRUM_K8S_NODE_NAME")
-            && values.contains("fails rendering"),
+        values.contains("ambient.env.FERRUM_K8S_NODE_NAME") && values.contains("fails rendering"),
         "values must document that ambient.env.FERRUM_K8S_NODE_NAME is rejected when the preflight is enabled"
     );
 }
