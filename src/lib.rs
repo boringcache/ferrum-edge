@@ -99,16 +99,21 @@ pub mod _test_support {
     use crate::modes::node_agent::startup_cleanup_test_seams as node_agent_cleanup_seams;
     use crate::plugins::Plugin;
 
-    /// Exercise Unix WebSocket Host selection without opening a socket.
-    pub fn unix_websocket_backend_authority_for_test(
+    /// Parse-only URI authority and Host header a Unix WebSocket handshake uses.
+    /// The URI authority is always the trusted backend URL; Host follows
+    /// `preserve_host_header` only for a valid client authority.
+    pub fn unix_websocket_handshake_authorities_for_test(
         preserve_host_header: bool,
         client_host: Option<&str>,
         backend_url: &str,
-    ) -> String {
-        crate::proxy::unix_websocket_backend_authority(
-            preserve_host_header,
-            client_host,
-            backend_url,
+    ) -> (String, String) {
+        (
+            crate::proxy::unix_websocket_url_authority(backend_url),
+            crate::proxy::unix_websocket_backend_authority(
+                preserve_host_header,
+                client_host,
+                backend_url,
+            ),
         )
     }
 
