@@ -965,13 +965,17 @@ impl Drop for DtlsConnection {
 
 /// Snapshot of the swappable per-DTLS-server crypto material.
 ///
-/// Stored in [`DtlsServer::active_config`] behind an `ArcSwap` so an operator
-/// rotating the underlying mTLS materials (PeerAuthentication live reload for
-/// mesh UDP+DTLS stream listeners) can publish a new `dimpl_config`,
-/// `certificate`, and client verifier without dropping in-flight DTLS
-/// sessions. New sessions snapshot the slot in
-/// [`DtlsServer::spawn_session`]; existing sessions retain the material they
-/// were spawned with until they end.
+/// Stored in [`DtlsServer::active_config`] behind an `ArcSwap` so ordinary
+/// frontend DTLS live reload (`FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED` /
+/// `FERRUM_DTLS_*` generation publish) and owner-scoped NodeWaypoint mesh
+/// DTLS publish can publish a new `dimpl_config`, `certificate`, and client
+/// verifier without dropping in-flight DTLS sessions. New sessions snapshot
+/// the slot in [`DtlsServer::spawn_session`]; existing sessions retain the
+/// material they were spawned with until they end. Mesh PeerAuthentication
+/// TCP+TLS reload must not write this slot as a process-wide fanout:
+/// generated NodeWaypoint listeners are swapped only through the owner-scoped
+/// generation, and ordinary `FERRUM_DTLS_*` listeners keep their dedicated
+/// identity.
 struct DtlsServerActiveConfig {
     dimpl_config: Arc<Config>,
     certificate: DtlsCertificateChain,
@@ -1311,12 +1315,16 @@ impl DtlsServer {
     /// Atomically swap the DTLS crypto material used for **new** sessions.
     ///
     /// Used by frontend DTLS live reload (`FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED`)
-    /// and mesh PeerAuthentication live reload to rotate the inbound DTLS
+    /// and owner-scoped NodeWaypoint DTLS publish to rotate the inbound DTLS
     /// `ServerConfig` equivalent (dimpl `Config` + certificate + optional
     /// `ClientCertVerifier`) without re-binding the socket or evicting any
     /// in-flight session. Active sessions keep the snapshot they handshake
     /// with until they end (see
-    /// [`DtlsServerActiveConfig`] doc-comment for the invariant).
+    /// [`DtlsServerActiveConfig`] doc-comment for the invariant). Mesh
+    /// PeerAuthentication TCP+TLS reload must not call this as a process-wide
+    /// fanout: ordinary operator listeners keep their dedicated `FERRUM_DTLS_*`
+    /// identity, and generated listeners are swapped only by
+    /// `publish_mesh_node_waypoint_dtls_generation`.
     pub fn swap_frontend_config(&self, frontend_config: FrontendDtlsConfig) {
         self.active_config.store(Arc::new(DtlsServerActiveConfig {
             dimpl_config: frontend_config.dimpl_config,
@@ -1327,6 +1335,19 @@ impl DtlsServer {
             local_addr = ?self.socket.local_addr().ok(),
             "DTLS server frontend crypto material swapped (existing sessions retain old material)"
         );
+    }
+
+    /// Test-support snapshot of the live frontend crypto slot: the Arc pointer
+    /// of the active config (exact identity) and whether a client-certificate
+    /// verifier is installed.
+    #[doc(hidden)]
+    #[allow(dead_code)] // External unit/integration-test seam.
+    pub fn frontend_config_identity_for_test(&self) -> (usize, bool) {
+        let active = self.active_config.load_full();
+        (
+            Arc::as_ptr(&active) as usize,
+            active.client_cert_verifier.is_some(),
+        )
     }
 
     /// Get the local address this server is bound to.
@@ -2765,11 +2786,11 @@ mod tests {
         );
     }
 
-    /// PeerAuthentication live reload (T3-A) for mesh UDP+DTLS stream
-    /// listeners hot-swaps the `FrontendDtlsConfig` on a running
-    /// `DtlsServer` without recycling the socket. The swap is atomic and
-    /// new sessions snapshot the latest material at spawn time; existing
-    /// sessions are unaffected.
+    /// `swap_frontend_config` is the per-server generation path used by ordinary
+    /// `FERRUM_DTLS_*` publish and by owner-scoped NodeWaypoint DTLS publish.
+    /// The swap is atomic and new sessions snapshot the latest material at spawn
+    /// time; existing sessions are unaffected. Mesh PeerAuthentication reload
+    /// must not fan this out process-wide onto ordinary listeners.
     #[tokio::test]
     async fn dtls_server_swap_frontend_config_updates_active_config_atomically() {
         let server = test_server(DtlsServerLimits::default()).await;

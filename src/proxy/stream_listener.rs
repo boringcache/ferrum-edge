@@ -255,7 +255,8 @@ struct ListenerHandle {
     /// Live DTLS server slot for UDP+DTLS listeners. The collector task
     /// publishes the server into this slot once
     /// `start_dtls_frontend_listener` has bound and constructed it. Held so
-    /// mesh PeerAuth live reload can call
+    /// ordinary frontend DTLS live reload
+    /// ([`StreamListenerManager::publish_frontend_dtls_generation`]) can call
     /// [`crate::dtls::DtlsServer::swap_frontend_config`] on the same instance
     /// the recv loop is using. `None` for TCP/UDP-plain listeners.
     dtls_server: Option<DtlsServerSlot>,
@@ -1037,7 +1038,7 @@ pub struct StreamListenerManager {
     /// Monotonic counter backing [`crate::dtls::FrontendDtlsGeneration::generation`].
     frontend_dtls_generation_counter: AtomicU64,
     /// Serializes the complete generation publish and active-listener swap so
-    /// concurrent frontend and mesh PeerAuth rotations cannot publish an older
+    /// concurrent ordinary frontend DTLS rotations cannot publish an older
     /// generation after a newer one.
     frontend_dtls_publish: Arc<tokio::sync::Mutex<()>>,
     /// Redacted reload status for admin/metrics (no PEM, keys, or secret URIs).
@@ -1760,10 +1761,10 @@ impl StreamListenerManager {
     /// the config only at handshake time). New accepts use the swapped
     /// config on the next handshake.
     ///
-    /// Used by mesh PeerAuthentication live reload alongside
-    /// [`Self::publish_frontend_dtls_generation`]; ordinary HTTPS / non-mesh
+    /// Used by mesh PeerAuthentication live reload. Ordinary HTTPS / non-mesh
     /// modes continue to use [`Self::set_frontend_tls_config`] at startup
     /// (followed by a static lifetime — those modes do not call swap).
+    /// Mesh reload never live-swaps dedicated `FERRUM_DTLS_*` servers.
     pub fn swap_frontend_tls_config(&self, tls_config: Option<Arc<rustls::ServerConfig>>) {
         self.frontend_tls_config.store(Arc::new(tls_config));
     }
@@ -1806,6 +1807,27 @@ impl StreamListenerManager {
             |generation| generation.map(|generation| generation.generation),
         )
         .await
+    }
+
+    /// Snapshot live DTLS servers' frontend-config identity for tests.
+    ///
+    /// Each entry is `(active_config Arc pointer, client certificate required)`.
+    /// Pointer equality proves the dedicated `FERRUM_DTLS_*` slot was not
+    /// replaced; the boolean is the client-CA policy bit. Established off the
+    /// request/datagram hot path under the listener map lock.
+    #[doc(hidden)]
+    #[allow(dead_code)] // External unit/integration-test seam.
+    pub async fn active_dtls_frontend_identities_for_test(&self) -> Vec<(usize, bool)> {
+        let listeners = self.listeners.lock().await;
+        listeners
+            .values()
+            .filter_map(|handle| {
+                let slot = handle.dtls_server.as_ref()?;
+                let snapshot = slot.load();
+                let server = snapshot.as_ref().clone()?;
+                Some(server.frontend_config_identity_for_test())
+            })
+            .collect()
     }
 
     /// Bounded redacted DTLS live-reload status (no secrets or source paths).
@@ -1891,8 +1913,9 @@ impl StreamListenerManager {
             let snapshot = slot.load();
             let Some(server) = snapshot.as_ref().clone() else {
                 // Collector task has not yet published the server (race with
-                // bind). Skip — the collector applies the current generation
-                // when the server arrives, and the next publish re-converges.
+                // bind). Skip — the collector applies the ordinary frontend
+                // DTLS generation when the server arrives, and a later
+                // ordinary publish re-converges.
                 continue;
             };
             server.swap_frontend_config(config.clone());
@@ -2007,6 +2030,7 @@ impl StreamListenerManager {
             })
         });
     }
+
 
     /// Reconcile active listeners against the current config.
     ///
@@ -3004,11 +3028,11 @@ impl StreamListenerManager {
                 // The DTLS server `Arc` will be published shortly after the
                 // listener task binds. Stash a shared slot here so the spawned
                 // collector task can store it once `start_dtls_frontend_listener`
-                // sends. Reconcile does not block waiting for the bind; if the
-                // first PeerAuth live-reload swap fires before the collector
-                // resolves, the swap path simply finds an empty slot for that
-                // listener and skips it (re-reconcile or the next swap picks
-                // it up — the swap is idempotent over slice apply).
+                // sends. Reconcile does not block waiting for the bind; if an
+                // ordinary generation publish fires before the collector
+                // resolves, the swap path finds an empty slot and skips it —
+                // the collector then applies the accepted generation when the
+                // server arrives.
                 let dtls_server_slot: Arc<arc_swap::ArcSwap<Option<Arc<crate::dtls::DtlsServer>>>> =
                     Arc::new(arc_swap::ArcSwap::from_pointee(None));
                 let dtls_server_slot_for_collector = Arc::clone(&dtls_server_slot);

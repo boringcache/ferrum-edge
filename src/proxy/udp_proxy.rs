@@ -1908,11 +1908,12 @@ pub struct UdpListenerConfig {
     pub frontend_dtls_config: Option<crate::dtls::FrontendDtlsConfig>,
     /// Optional sender that receives the `Arc<DtlsServer>` once the DTLS
     /// listener has bound and constructed its server instance. Used by
-    /// [`crate::proxy::stream_listener::StreamListenerManager`] so mesh
-    /// PeerAuthentication live reload can call
+    /// [`crate::proxy::stream_listener::StreamListenerManager`] so the matching
+    /// owner's generation (ordinary `FERRUM_DTLS_*` or owner-scoped
+    /// NodeWaypoint) can call
     /// [`crate::dtls::DtlsServer::swap_frontend_config`] on the same instance
-    /// the recv loop is using. `None` for non-mesh paths and for plain UDP
-    /// listeners (no DTLS server is built).
+    /// the recv loop is using. `None` for plain UDP listeners (no DTLS server
+    /// is built).
     pub dtls_server_tx: Option<tokio::sync::oneshot::Sender<Arc<crate::dtls::DtlsServer>>>,
     pub tls_no_verify: bool,
     /// Global CA bundle path for outbound TLS verification (fallback when proxy has no per-proxy CA).
@@ -3895,12 +3896,12 @@ async fn start_dtls_frontend_listener(
     };
     let server =
         Arc::new(crate::dtls::DtlsServer::bind_with_limits(addr, dtls_config, dtls_limits).await?);
-    // Publish the live DTLS server handle so mesh PeerAuthentication live
-    // reload (extending the existing HTTP/HBONE carve-out to UDP+DTLS stream
-    // listeners) can call `swap_frontend_config` on the same instance the
-    // recv loop is using. Send-failure is benign: the receiver may have been
-    // dropped (non-mesh path) or the manager may have moved on without
-    // wanting the handle.
+    // Publish the live DTLS server handle so StreamListenerManager can apply
+    // the matching owner's generation (`publish_frontend_dtls_generation` or
+    // `publish_mesh_node_waypoint_dtls_generation`) via `swap_frontend_config`
+    // on the same instance the recv loop is using.
+    // Send-failure is benign: the receiver may have been dropped or the
+    // manager may have moved on without wanting the handle.
     if let Some(tx) = dtls_server_tx {
         let _ = tx.send(server.clone());
     }

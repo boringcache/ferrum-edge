@@ -30,15 +30,13 @@ fn test_env_config() -> EnvConfig {
 }
 
 fn test_proxy_state(env: EnvConfig) -> ProxyState {
-    ProxyState::new(
-        GatewayConfig::default(),
-        DnsCache::new(DnsConfig::default()),
-        env,
-        None,
-        None,
-    )
-    .expect("proxy state")
-    .0
+    test_proxy_state_with_config(env, GatewayConfig::default())
+}
+
+fn test_proxy_state_with_config(env: EnvConfig, config: GatewayConfig) -> ProxyState {
+    ProxyState::new(config, DnsCache::new(DnsConfig::default()), env, None, None)
+        .expect("proxy state")
+        .0
 }
 
 fn strict_mesh_tls_config() -> Arc<rustls::ServerConfig> {
@@ -477,62 +475,8 @@ async fn mesh_peer_auth_live_reload_tcp_tls_swap_takes_effect_on_next_accept() {
 /// ordinary operator `FERRUM_DTLS_*` slot.
 #[tokio::test]
 async fn mesh_owner_scoped_dtls_publish_without_dtls_listeners() {
-    use ferrum_edge::circuit_breaker::CircuitBreakerCache;
-    use ferrum_edge::config::types::GatewayConfig;
-    use ferrum_edge::consumer_index::ConsumerIndex;
-    use ferrum_edge::load_balancer::LoadBalancerCache;
-    use ferrum_edge::plugin_cache::PluginCache;
-    use ferrum_edge::proxy::client_ip::TrustedProxies;
-    use ferrum_edge::proxy::stream_listener::StreamListenerManager;
-    use ferrum_edge::request_epoch::RequestEpochStore;
-    use std::net::IpAddr;
-
-    let config = GatewayConfig::default();
-    let config_arc = Arc::new(arc_swap::ArcSwap::from_pointee(config.clone()));
-    let dns_cache = DnsCache::new(DnsConfig::default());
-    let lb_cache = Arc::new(LoadBalancerCache::new(&config));
-    let consumer_index = Arc::new(ConsumerIndex::new(&config.consumers));
-    let plugin_cache = Arc::new(PluginCache::new(&config).expect("plugin cache"));
-    let request_epoch = Arc::new(RequestEpochStore::from_runtime_parts(
-        config.clone(),
-        &plugin_cache,
-        &consumer_index,
-        &lb_cache,
-    ));
-    let manager = StreamListenerManager::new(
-        "127.0.0.1".parse::<IpAddr>().unwrap(),
-        config_arc,
-        dns_cache,
-        request_epoch,
-        Arc::new(CircuitBreakerCache::new()),
-        None,
-        false,
-        None,
-        300,
-        300,
-        10,
-        10_000,
-        10,
-        None,
-        Arc::new(Vec::new()),
-        Arc::new(ferrum_edge::adaptive_buffer::AdaptiveBufferTracker::new(
-            true, true, 300, 8192, 262_144, 65_536, 6000,
-        )),
-        64,
-        false,
-        2048,
-        1,
-        256,
-        Arc::new(ferrum_edge::overload::OverloadState::new()),
-        false,
-        false,
-        false,
-        0,
-        false,
-        false,
-        false,
-        Arc::new(TrustedProxies::none()),
-    );
+    let state = test_proxy_state(test_env_config());
+    let manager = &state.stream_listener_manager;
 
     let certificate = ferrum_edge::dtls::generate_ephemeral_cert_public().expect("ephemeral cert");
     let dtls_config = dimpl::Config::builder().build().expect("dtls config");
@@ -561,4 +505,130 @@ async fn mesh_owner_scoped_dtls_publish_without_dtls_listeners() {
         manager.snapshot_frontend_dtls_generation().is_none(),
         "a mesh publish must never seed the ordinary FERRUM_DTLS_* generation"
     );
+    let status = manager.frontend_dtls_reload_status();
+    assert_eq!(status.last_outcome, "none");
+    assert_eq!(status.generation, 0);
+}
+
+/// Mesh PeerAuthentication live reload swaps the shared TCP+TLS slot and must
+/// not seed the ordinary `FERRUM_DTLS_*` generation when no DTLS listener exists.
+#[tokio::test]
+async fn mesh_peer_auth_live_reload_does_not_seed_ordinary_dtls_generation() {
+    let state = test_proxy_state(test_env_config());
+    let manager = &state.stream_listener_manager;
+
+    manager.swap_frontend_tls_config(Some(strict_mesh_tls_config()));
+
+    assert!(
+        manager.snapshot_frontend_dtls_generation().is_none(),
+        "mesh TLS material must not seed the ordinary DTLS listener generation"
+    );
+    assert!(
+        manager
+            .active_dtls_frontend_identities_for_test()
+            .await
+            .is_empty(),
+        "no DTLS listener should be present on a TCP+TLS-only reload"
+    );
+    let status = manager.frontend_dtls_reload_status();
+    assert_eq!(status.last_outcome, "none");
+    assert_eq!(status.generation, 0);
+}
+
+/// An already-active ordinary UDP+DTLS listener keeps its dedicated identity
+/// and client-CA policy across a mesh PeerAuthentication TCP+TLS swap.
+#[tokio::test]
+async fn mesh_peer_auth_live_reload_does_not_mutate_active_ordinary_dtls_listener() {
+    ensure_crypto_provider();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (cert_path, key_path) = write_ecdsa_pem_pair(dir.path(), "dtls-dedicated");
+    let (ca_path, _) = write_ecdsa_pem_pair(dir.path(), "dtls-client-ca");
+
+    let holder = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("udp holder");
+    let port = holder.local_addr().expect("addr").port();
+    drop(holder);
+
+    let mut proxy: ferrum_edge::config::types::Proxy = serde_json::from_value(serde_json::json!({
+        "id": "udp-dtls-ordinary",
+        "namespace": "ferrum",
+        "backend_scheme": "udp",
+        "backend_host": "127.0.0.1",
+        "backend_port": 9,
+        "listen_port": port,
+        "frontend_tls": true,
+        "passthrough": false,
+    }))
+    .expect("udp dtls proxy");
+    proxy.dispatch_kind = ferrum_edge::config::types::DispatchKind::from(
+        ferrum_edge::config::types::BackendScheme::Udp,
+    );
+
+    let config = GatewayConfig {
+        proxies: vec![proxy],
+        ..GatewayConfig::default()
+    };
+    let state = test_proxy_state_with_config(test_env_config(), config);
+    let manager = &state.stream_listener_manager;
+    manager
+        .set_frontend_dtls_cert_key(cert_path, key_path, Some(ca_path))
+        .await;
+    manager
+        .wait_until_started(Duration::from_secs(2))
+        .await
+        .expect("ordinary DTLS listener should start");
+
+    let before_gen = manager
+        .snapshot_frontend_dtls_generation()
+        .expect("ordinary generation published");
+    let before_ids = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let ids = manager.active_dtls_frontend_identities_for_test().await;
+            if !ids.is_empty() {
+                return ids;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("DTLS server should publish into the listener slot");
+    assert_eq!(before_ids.len(), 1);
+    assert!(
+        before_ids[0].1,
+        "dedicated DTLS listener must require a client certificate"
+    );
+
+    manager.swap_frontend_tls_config(Some(strict_mesh_tls_config()));
+
+    let after_gen = manager
+        .snapshot_frontend_dtls_generation()
+        .expect("ordinary generation retained");
+    assert_eq!(after_gen.generation, before_gen.generation);
+    assert!(
+        Arc::ptr_eq(&after_gen, &before_gen),
+        "mesh PeerAuthentication reload must not replace the ordinary DTLS generation"
+    );
+    let after_ids = manager.active_dtls_frontend_identities_for_test().await;
+    assert_eq!(
+        after_ids, before_ids,
+        "active ordinary DTLS server must retain exact dedicated config/security policy"
+    );
+
+    manager.shutdown_all().await;
+}
+
+fn write_ecdsa_pem_pair(dir: &std::path::Path, name: &str) -> (String, String) {
+    let key_pair =
+        rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("generate key");
+    let params = rcgen::CertificateParams::new(vec![format!("{name}.example")]).expect("params");
+    let cert = params.self_signed(&key_pair).expect("self-sign");
+    let cert_path = dir.join(format!("{name}.crt"));
+    let key_path = dir.join(format!("{name}.key"));
+    std::fs::write(&cert_path, cert.pem()).expect("write cert");
+    std::fs::write(&key_path, key_pair.serialize_pem()).expect("write key");
+    (
+        cert_path.to_str().expect("utf8").to_string(),
+        key_path.to_str().expect("utf8").to_string(),
+    )
 }
