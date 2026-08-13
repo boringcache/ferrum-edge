@@ -84,7 +84,12 @@ set -euo pipefail
 #                                               swap of CP/DP gRPC TLS
 #                                               material reconnects the native
 #                                               stream without a pod restart;
-#                                               an over-the-wire mTLS handshake
+#                                               capp's post-swap TLS handshake
+#                                               plus CP-accepted MeshSubscribe
+#                                               must be strictly newer than the
+#                                               pre-swap baseline for that
+#                                               exact pod/node identity; an
+#                                               over-the-wire mTLS handshake
 #                                               to the running CP observes the
 #                                               replacement leaf serial
 #
@@ -216,6 +221,11 @@ NATIVE_CLIENT_SERIAL_GEN2=""
 NATIVE_CP_SERVED_CLASS=""
 NATIVE_CP_SERVED_REASON=""
 NATIVE_CP_SERVED_SERIAL=""
+NATIVE_ROTATION_NODE_ID=""
+NATIVE_ROTATION_POD_IP=""
+NATIVE_ROTATION_BASELINE_CP=0
+NATIVE_ROTATION_BASELINE_CLIENT=0
+NATIVE_ROTATION_BASELINE_CAPTURED=false
 
 LIVE_ASSERTIONS_INITIALIZED=false
 REQUIRED_LIVE_ASSERTIONS=(
@@ -1858,23 +1868,102 @@ probe_native_mtls_negatives() {
   fi
 }
 
+native_rotation_component_logs() {
+  local target="$1"
+  # Full current-container logs so the pre-swap baseline cannot slide out of a
+  # --tail window and later be mistaken for a post-swap increase.
+  kubectl --context "$CONTEXT" -n "$NS" logs "$target" -c ferrum-edge \
+    --tail=-1 2>/dev/null || true
+}
+
+count_native_rotation_observations() {
+  local client_file cp_file
+  client_file="$RESULTS_DIR/native-rotation.client-log.tmp"
+  cp_file="$RESULTS_DIR/native-rotation.cp-log.tmp"
+  native_rotation_component_logs deploy/capp > "$client_file"
+  native_rotation_component_logs deploy/ferrum-cp > "$cp_file"
+  python3 "$NATIVE_PROBE_CLASSIFY_HELPER" --rotation-count \
+    --pod-name "$NATIVE_ROTATION_NODE_ID" \
+    --client-log "$client_file" \
+    --cp-log "$cp_file"
+  rm -f "$client_file" "$cp_file"
+}
+
+capture_native_rotation_baseline() {
+  local identity raw cp_count client_count
+  NATIVE_ROTATION_BASELINE_CAPTURED=false
+  NATIVE_ROTATION_NODE_ID=""
+  NATIVE_ROTATION_POD_IP=""
+  NATIVE_ROTATION_BASELINE_CP=0
+  NATIVE_ROTATION_BASELINE_CLIENT=0
+  identity="$(native_probe_running_identity capp 2>/dev/null || true)"
+  if [[ "$identity" != *$'\t'* ]]; then
+    log "native TLS rotation baseline: failed to read running capp identity"
+    return 1
+  fi
+  NATIVE_ROTATION_NODE_ID="${identity%%$'\t'*}"
+  NATIVE_ROTATION_POD_IP="${identity#*$'\t'}"
+  NATIVE_ROTATION_POD_IP="${NATIVE_ROTATION_POD_IP%%$'\n'*}"
+  raw="$(count_native_rotation_observations 2>/dev/null || true)"
+  if [[ "$raw" != *$'\t'* ]]; then
+    log "native TLS rotation baseline: helper count failed for node_id=$NATIVE_ROTATION_NODE_ID"
+    return 1
+  fi
+  cp_count="${raw%%$'\t'*}"
+  client_count="${raw#*$'\t'}"
+  client_count="${client_count%%$'\n'*}"
+  if [[ ! "$cp_count" =~ ^[0-9]+$ || ! "$client_count" =~ ^[0-9]+$ ]]; then
+    log "native TLS rotation baseline: non-integer counts raw=$raw"
+    return 1
+  fi
+  NATIVE_ROTATION_BASELINE_CP="$cp_count"
+  NATIVE_ROTATION_BASELINE_CLIENT="$client_count"
+  NATIVE_ROTATION_BASELINE_CAPTURED=true
+  log "native TLS rotation baseline: node_id=$NATIVE_ROTATION_NODE_ID pod_ip=$NATIVE_ROTATION_POD_IP cp_accepted=$NATIVE_ROTATION_BASELINE_CP client_tls_connect=$NATIVE_ROTATION_BASELINE_CLIENT"
+}
+
+native_rotation_fresh_now() {
+  local client_file cp_file evidence_file st
+  evidence_file="$RESULTS_DIR/native-mtls-rotation-reconnect.txt"
+  if [[ "$NATIVE_ROTATION_BASELINE_CAPTURED" != "true" \
+    || -z "$NATIVE_ROTATION_NODE_ID" ]]; then
+    printf 'baseline-missing\n' > "$evidence_file" || true
+    return 1
+  fi
+  client_file="$RESULTS_DIR/native-rotation.client-log.tmp"
+  cp_file="$RESULTS_DIR/native-rotation.cp-log.tmp"
+  native_rotation_component_logs deploy/capp > "$client_file"
+  native_rotation_component_logs deploy/ferrum-cp > "$cp_file"
+  st=0
+  python3 "$NATIVE_PROBE_CLASSIFY_HELPER" --rotation-fresh \
+    --pod-name "$NATIVE_ROTATION_NODE_ID" \
+    --client-log "$client_file" \
+    --cp-log "$cp_file" \
+    --baseline-cp "$NATIVE_ROTATION_BASELINE_CP" \
+    --baseline-client "$NATIVE_ROTATION_BASELINE_CLIENT" \
+    --evidence-out "$evidence_file" >/dev/null || st=$?
+  rm -f "$client_file" "$cp_file"
+  return "$st"
+}
+
 wait_for_native_rotation_evidence() {
-  local _ cp_logs capp_logs
+  local _
+  # Reload / reconnect-attempt logs are not proof: they can pre-exist or show
+  # only an attempt while capp stays on last-known-good. Require a strictly
+  # increased CP MeshSubscribe accept AND capp post-TLS connect for the
+  # baseline pod/node identity captured before gen2.
+  if [[ "$NATIVE_ROTATION_BASELINE_CAPTURED" != "true" \
+    || -z "$NATIVE_ROTATION_NODE_ID" ]]; then
+    return 1
+  fi
   # kubelet projected-volume propagation plus FERRUM_BACKEND_TLS_WATCH_INTERVAL_SECONDS=2.
   for _ in $(seq 1 45); do
-    cp_logs="$(kubectl --context "$CONTEXT" -n "$NS" logs deploy/ferrum-cp -c ferrum-edge --tail=200 2>/dev/null || true)"
-    capp_logs="$(kubectl --context "$CONTEXT" -n "$NS" logs deploy/capp -c ferrum-edge --tail=200 2>/dev/null || true)"
-    if printf '%s' "$cp_logs" | grep -Fq 'TLS material sources reloaded; new handshakes/connections will use rotated material' \
-      && printf '%s' "$capp_logs" | grep -Fq 'Mesh gRPC TLS source changed; reconnecting native MeshSubscribe stream'; then
-      return 0
-    fi
-    # DP may reconnect from the next failed handshake after CP swapped first.
-    if printf '%s' "$cp_logs" | grep -Fq 'TLS material sources reloaded; new handshakes/connections will use rotated material' \
-      && printf '%s' "$capp_logs" | grep -Fq 'TLS material sources reloaded; new handshakes/connections will use rotated material'; then
+    if native_rotation_fresh_now; then
       return 0
     fi
     sleep 2
   done
+  native_rotation_fresh_now || true
   return 1
 }
 
@@ -2061,6 +2150,7 @@ PY
 
 probe_native_mtls_rotation() {
   log "rotating native MeshSubscribe TLS material via projected Secret generation"
+  capture_native_rotation_baseline || true
   apply_native_mtls_secrets gen2
   local rotated=false
   if wait_for_native_rotation_evidence; then
@@ -2134,15 +2224,19 @@ else:
   kubectl --context "$CONTEXT" -n "$NS" delete secret ferrum-native-mtls-stale-client \
     --wait=false >/dev/null 2>&1 || true
 
+  local reconnect_ev=""
+  reconnect_ev="$(normalize_native_evidence_file "$RESULTS_DIR/native-mtls-rotation-reconnect.txt")"
   local outcome
-  outcome="rotated=$rotated live_serial=$live_serial want_serial=$NATIVE_SERVER_SERIAL_GEN2 observe_class=${NATIVE_CP_SERVED_CLASS:-} traffic=$status stale_class=$stale_class stale_evidence=$stale_ev $drift_verdict"
+  outcome="rotated=$rotated reconnect=$reconnect_ev live_serial=$live_serial want_serial=$NATIVE_SERVER_SERIAL_GEN2 observe_class=${NATIVE_CP_SERVED_CLASS:-} traffic=$status stale_class=$stale_class stale_evidence=$stale_ev $drift_verdict"
   printf '%s\n' "$outcome" > "$RESULTS_DIR/native-mtls-rotation.txt"
   log "native TLS rotation: $outcome"
   if [[ "$rotated" == "true" && "$observe_ok" == "true" \
     && -n "$live_serial" && "$live_serial" == "$NATIVE_SERVER_SERIAL_GEN2" \
     && "$traffic_ok" == "true" && "$drift_verdict" == native-slice-received* \
     && "$stale_class" == tls-verify ]] \
-    && printf '%s' "$stale_ev" | grep -Eq "$NATIVE_EVID_CP_UNKNOWN_ISSUER"; then
+    && printf '%s' "$stale_ev" | grep -Eq "$NATIVE_EVID_CP_UNKNOWN_ISSUER" \
+    && printf '%s' "$reconnect_ev" | grep -Fq "cp_subscribe_accepted node_id=" \
+    && printf '%s' "$reconnect_ev" | grep -Fq "client_tls_connect before="; then
     record_live_assertion sidecar.config.native_subscribe_tls_rotation_reconnects pass \
       capp ferrum-cp "$outcome" "native-mtls-rotation.txt"
     return 0

@@ -1015,6 +1015,50 @@ fn native_probe_classifier_contract_violations(
             "Kubernetes-safe pod/node identity validation",
         ),
         ("is_pod_ip", "Kubernetes-safe pod IP validation"),
+        (
+            "ROTATION_ACCEPTED_EVIDENCE",
+            "classifier pins rotation accepted-connect evidence",
+        ),
+        (
+            "Tenant subscription accepted",
+            "exact CP MeshSubscribe success audit message",
+        ),
+        (
+            "cp_subscribe_accepted_count",
+            "CP MeshSubscribe accept count correlated to exact node_id",
+        ),
+        (
+            "client_tls_connected_count",
+            "capp post-TLS connect count correlated to exact node_id",
+        ),
+        (
+            "rotation_fresh_evidence",
+            "pre/post freshness comparison for rotation reconnect",
+        ),
+        (
+            "reconnect-attempt-is-not-accepted-proof",
+            "self-test that reconnect-attempt logs are not accepts",
+        ),
+        (
+            "reload-log-is-not-accepted-proof",
+            "self-test that TLS reload logs are not accepts",
+        ),
+        (
+            "pre-rotation-count-is-not-post-proof",
+            "self-test that the pre-swap count cannot satisfy post-swap",
+        ),
+        (
+            "one-half-increase-is-not-fresh-proof",
+            "self-test that one half of the rotation proof is not enough",
+        ),
+        (
+            "exact-capp-node-id-accepted",
+            "self-test that MeshSubscribe accepts use exact node_id",
+        ),
+        (
+            "connected-without-node-id-is-not-tls-connect-proof",
+            "self-test that Connected-to-CP without node_id is not proof",
+        ),
     ] {
         if !helper.contains(needle) {
             errors.push(format!(
@@ -1117,6 +1161,14 @@ fn native_mtls_negative_control_contract_violations(run_sh: &str, helper: &str) 
             "rotation gate requires CP UnknownIssuer evidence for gen1 stale client",
         ),
         (
+            "printf '%s' \"$reconnect_ev\" | grep -Fq \"cp_subscribe_accepted node_id=\"",
+            "rotation gate requires helper cp_subscribe_accepted evidence for capp",
+        ),
+        (
+            "printf '%s' \"$reconnect_ev\" | grep -Fq \"client_tls_connect before=\"",
+            "rotation gate requires helper client_tls_connect freshness evidence",
+        ),
+        (
             "wait_for_native_probe_class \"$deploy\" \"$want_pattern\" \"$want_evidence\"",
             "negative wait loop must gate on classifier evidence, not class alone",
         ),
@@ -1158,6 +1210,34 @@ fn native_mtls_negative_control_contract_violations(run_sh: &str, helper: &str) 
         (
             "flattened-tonic-error-is-not-client-verify-proof",
             "classifier self-test that flattened tonic errors stay handshake",
+        ),
+        (
+            "ROTATION_ACCEPTED_EVIDENCE",
+            "classifier pins rotation accepted-connect evidence",
+        ),
+        (
+            "Tenant subscription accepted",
+            "exact CP MeshSubscribe success audit message",
+        ),
+        (
+            "cp_subscribe_accepted_count",
+            "CP MeshSubscribe accept count correlated to exact node_id",
+        ),
+        (
+            "client_tls_connected_count",
+            "capp post-TLS connect count correlated to exact node_id",
+        ),
+        (
+            "rotation_fresh_evidence",
+            "pre/post freshness comparison for rotation reconnect",
+        ),
+        (
+            "reconnect-attempt-is-not-accepted-proof",
+            "classifier self-test that reconnect-attempt logs are not accepts",
+        ),
+        (
+            "pre-rotation-count-is-not-post-proof",
+            "classifier self-test that the pre-swap count cannot satisfy post-swap",
         ),
     ] {
         if !helper.contains(needle) {
@@ -1312,6 +1392,43 @@ fn bash_function_name(trimmed: &str) -> Option<&str> {
     } else {
         None
     }
+}
+
+fn bash_function_body(source: &str, name: &str) -> String {
+    let needle = format!("{name}()");
+    let lines: Vec<&str> = source.lines().collect();
+    let Some(start) = lines.iter().position(|line| {
+        let trimmed = line.trim();
+        trimmed.starts_with(&needle) && trimmed[needle.len()..].trim_start().starts_with('{')
+    }) else {
+        return String::new();
+    };
+    let mut collected = Vec::new();
+    let mut depth = 0i32;
+    let mut started = false;
+    for line in &lines[start..] {
+        for ch in line.chars() {
+            if ch == '{' {
+                depth += 1;
+                started = true;
+            } else if ch == '}' {
+                depth -= 1;
+            }
+        }
+        collected.push(*line);
+        if started && depth <= 0 {
+            break;
+        }
+    }
+    collected.join("\n")
+}
+
+fn non_comment_lines(source: &str) -> String {
+    source
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn bash_functions_publishing_observe_pid(source: &str) -> Vec<&str> {
@@ -1532,7 +1649,39 @@ fn native_rotation_observation_violations(source: &str) -> Vec<String> {
         ),
         (
             "wait_for_native_rotation_evidence",
-            "independent CP/DP reload-log evidence",
+            "fresh capp MeshSubscribe accept evidence",
+        ),
+        (
+            "capture_native_rotation_baseline",
+            "pre-swap accepted-connect baseline for capp",
+        ),
+        (
+            "--rotation-count",
+            "helper pre-swap accepted-connect count",
+        ),
+        (
+            "--rotation-fresh",
+            "helper post-swap freshness comparison",
+        ),
+        (
+            "NATIVE_ROTATION_BASELINE_CAPTURED",
+            "rotation wait must require a captured baseline",
+        ),
+        (
+            "native_probe_running_identity capp",
+            "rotation baseline must use capp's running pod/node identity",
+        ),
+        (
+            "--baseline-cp",
+            "CP accept baseline passed into freshness comparison",
+        ),
+        (
+            "--baseline-client",
+            "capp TLS-connect baseline passed into freshness comparison",
+        ),
+        (
+            "--tail=-1",
+            "full current-container logs so pre-swap lines cannot slide out of a tail window",
         ),
         (
             "Verify return code: 0",
@@ -1613,6 +1762,61 @@ fn native_rotation_observation_violations(source: &str) -> Vec<String> {
     {
         errors
             .push("rotation outcome must read NATIVE_CP_SERVED_CLASS from the parent shell".into());
+    }
+
+    let wait_body = non_comment_lines(&bash_function_body(
+        source,
+        "wait_for_native_rotation_evidence",
+    ));
+    if !wait_body.is_empty() {
+        if wait_body.contains("reconnecting native MeshSubscribe stream") {
+            errors.push(
+                "wait_for_native_rotation_evidence must not treat reconnect-attempt \
+                 logs as rotation proof"
+                    .into(),
+            );
+        }
+        if wait_body.contains("TLS material sources reloaded") {
+            errors.push(
+                "wait_for_native_rotation_evidence must not treat TLS reload logs \
+                 as rotation proof"
+                    .into(),
+            );
+        }
+        if !wait_body.contains("--rotation-fresh")
+            && !wait_body.contains("native_rotation_fresh_now")
+        {
+            errors.push(
+                "wait_for_native_rotation_evidence must require helper freshness \
+                 comparison, not reload/attempt greps"
+                    .into(),
+            );
+        }
+        if !wait_body.contains("NATIVE_ROTATION_BASELINE_CAPTURED") {
+            errors.push(
+                "wait_for_native_rotation_evidence must refuse to pass without a \
+                 captured pre-swap baseline"
+                    .into(),
+            );
+        }
+    }
+
+    let probe_body = bash_function_body(source, "probe_native_mtls_rotation");
+    if !probe_body.is_empty() {
+        let idx_base = probe_body.find("capture_native_rotation_baseline");
+        let idx_gen2 = probe_body.find("apply_native_mtls_secrets gen2");
+        let idx_wait = probe_body.find("wait_for_native_rotation_evidence");
+        let ordered = matches!(
+            (idx_base, idx_gen2, idx_wait),
+            (Some(base), Some(gen2), Some(wait)) if base < gen2 && gen2 < wait
+        );
+        if !ordered {
+            errors.push(
+                "probe_native_mtls_rotation must capture the capp baseline, apply \
+                 gen2, then wait for a strictly newer accepted MeshSubscribe"
+                    .into(),
+            );
+        }
     }
 
     errors
@@ -1714,15 +1918,117 @@ NATIVE_SERVER_SERIAL_GEN2
          shell when the observe helper is captured via $(), got {subshell_violations:?}"
     );
 
+    let reload_false_proof = r#"
+capture_native_rotation_baseline() { return 0; }
+wait_for_native_rotation_evidence() {
+  grep -Fq 'TLS material sources reloaded; new handshakes/connections will use rotated material'
+  grep -Fq 'Mesh gRPC TLS source changed; reconnecting native MeshSubscribe stream'
+  return 0
+}
+probe_native_mtls_rotation() {
+  capture_native_rotation_baseline
+  apply_native_mtls_secrets gen2
+  wait_for_native_rotation_evidence
+  kubectl port-forward svc/ferrum-cp "${port}:50051"
+  openssl s_client -connect 127.0.0.1:${port} -servername "$NATIVE_CP_DNS" \
+    -verify_hostname "$NATIVE_CP_DNS" -verify_return_error \
+    -CAfile gen2-ca.pem -cert gen2-client.pem -key gen2-client-key.pem
+  openssl x509 -noout -serial
+  Verify return code: 0
+  live_serial="${NATIVE_CP_SERVED_SERIAL:-}"
+  outcome="observe_class=${NATIVE_CP_SERVED_CLASS:-}"
+  record_live_assertion sidecar.config.native_subscribe_tls_rotation_reconnects pass
+}
+NATIVE_OBSERVE_PF_PID=""
+NATIVE_CP_SERVED_SERIAL=""
+NATIVE_CP_SERVED_CLASS=""
+NATIVE_SERVER_SERIAL_GEN2=""
+NATIVE_ROTATION_BASELINE_CAPTURED=true
+--rotation-count
+--rotation-fresh
+--baseline-cp
+--baseline-client
+native_probe_running_identity capp
+"#;
+    let reload_violations = native_rotation_observation_violations(reload_false_proof);
+    assert!(
+        !reload_violations.is_empty(),
+        "rotation observation contract must reject reload/reconnect-attempt logs \
+         as MeshSubscribe accept proof"
+    );
+    assert!(
+        reload_violations.iter().any(|error| {
+            error.contains("reconnect-attempt")
+                || error.contains("TLS reload")
+                || error.contains("freshness")
+        }),
+        "rotation observation contract must name reload/attempt-only evidence, \
+         got {reload_violations:?}"
+    );
+
+    let no_baseline_false_proof = r#"
+wait_for_native_rotation_evidence() {
+  python3 helper --rotation-fresh --pod-name "$pod"
+  return 0
+}
+probe_native_mtls_rotation() {
+  apply_native_mtls_secrets gen2
+  wait_for_native_rotation_evidence
+  kubectl port-forward svc/ferrum-cp "${port}:50051"
+  openssl s_client -connect 127.0.0.1:${port} -servername "$NATIVE_CP_DNS" \
+    -verify_hostname "$NATIVE_CP_DNS" -verify_return_error \
+    -CAfile gen2-ca.pem -cert gen2-client.pem -key gen2-client-key.pem
+  openssl x509 -noout -serial
+  Verify return code: 0
+  live_serial="${NATIVE_CP_SERVED_SERIAL:-}"
+  outcome="observe_class=${NATIVE_CP_SERVED_CLASS:-}"
+  record_live_assertion sidecar.config.native_subscribe_tls_rotation_reconnects pass
+}
+NATIVE_OBSERVE_PF_PID=""
+NATIVE_CP_SERVED_SERIAL=""
+NATIVE_CP_SERVED_CLASS=""
+NATIVE_SERVER_SERIAL_GEN2=""
+--rotation-count
+--rotation-fresh
+--baseline-cp
+--baseline-client
+native_probe_running_identity capp
+"#;
+    let no_baseline_violations = native_rotation_observation_violations(no_baseline_false_proof);
+    assert!(
+        !no_baseline_violations.is_empty(),
+        "rotation observation contract must reject a post-swap wait without a \
+         pre-swap capp baseline"
+    );
+    assert!(
+        no_baseline_violations.iter().any(|error| {
+            error.contains("baseline") || error.contains("capture_native_rotation_baseline")
+        }),
+        "rotation observation contract must require a pre-swap baseline by name, \
+         got {no_baseline_violations:?}"
+    );
+
     assert!(
         CONTRACT.contains("over-the-wire") && CONTRACT.contains("replacement leaf serial"),
         "ga_contract.yaml must describe the rotation proof as an over-the-wire \
          served leaf serial, not merely a Secret update"
     );
     assert!(
+        CONTRACT.contains("strictly newer than the")
+            && CONTRACT.contains("pre-swap baseline")
+            && CONTRACT.contains("Reload and reconnect-attempt logs are not proof"),
+        "ga_contract.yaml must require a fresh post-swap capp MeshSubscribe accept, \
+         not reload/attempt logs"
+    );
+    assert!(
         README.contains("over-the-wire mTLS handshake")
             && README.contains("replacement leaf serial"),
         "README must describe the rotation proof as an over-the-wire served leaf serial"
+    );
+    assert!(
+        README.contains("strictly newer than the pre-swap baseline")
+            && README.contains("exact pod/node identity"),
+        "README must require identity-correlated pre/post freshness for rotation reconnect"
     );
     assert!(
         !RUN_SH.to_ascii_lowercase().contains("shred"),

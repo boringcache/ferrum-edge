@@ -87,7 +87,7 @@ shared schema from `tests/k8s/lib/live_assertions.sh` (suite
 | `sidecar.config.native_subscribe_tls_untrusted_server_ca_rejected` | dedicated probe DP trusts the wrong server CA; no slice accepted |
 | `sidecar.config.native_subscribe_tls_wrong_san_rejected` | dedicated probe DP dials `ferrum-cp-wrong-san.<ns>.svc.cluster.local`, a hostname absent from the CP server SAN; no slice accepted |
 | `sidecar.config.native_subscribe_jwt_rejected` | dedicated probe DP completes mTLS then presents an invalid JWT; no slice accepted |
-| `sidecar.config.native_subscribe_tls_rotation_reconnects` | projected Secret generation swap of CP/DP gRPC TLS material reconnects the native stream without a pod restart; an over-the-wire mTLS handshake to the running CP (Service DNS SAN, gen2 server CA, gen2 DP client cert) observes the replacement leaf serial, and a gen-1 client is then rejected |
+| `sidecar.config.native_subscribe_tls_rotation_reconnects` | projected Secret generation swap of CP/DP gRPC TLS material reconnects the native stream without a pod restart; the production `capp` DP completes a generation-2 TLS handshake and a valid-JWT native MeshSubscribe the CP accepts for that exact pod/node identity, strictly newer than the pre-swap baseline; an over-the-wire mTLS handshake to the running CP (Service DNS SAN, gen2 server CA, gen2 DP client cert) observes the replacement leaf serial, and a gen-1 client is then rejected |
 
 Every assertion backs a GA-contract capability row in
 `tests/conformance/ga_contract.yaml` — STRICT mTLS, AuthorizationPolicy

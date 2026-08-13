@@ -13,6 +13,12 @@ handshake or tenant subscription. Classification therefore consumes:
 
 Generic CP-log greps are rejected: kubelet TCP readiness and other probes can
 produce unrelated handshake or tenant-subscription lines.
+
+Rotation reconnect proof (`--rotation-count` / `--rotation-fresh`) counts the
+structured CP `Tenant subscription accepted` audit (MeshConfigSync.MeshSubscribe,
+result=success, exact node_id) and the client Connected-to-CP marker with that
+same node_id. A later observation is fresh only when both counts strictly
+exceed the pre-swap baseline. Reload and reconnect-attempt logs are ignored.
 """
 
 from __future__ import annotations
@@ -33,6 +39,13 @@ CP_TLS_MESSAGE = "CP gRPC TLS handshake failed"
 CP_JWT_MESSAGE = "Tenant subscription rejected"
 CP_JWT_REASON = "Invalid token: authentication failed"
 CP_JWT_SURFACE = "MeshConfigSync.MeshSubscribe"
+# Structured CP success audit from MeshGrpcServer::mesh_subscribe after a
+# valid-JWT MeshSubscribe is admitted (CpGrpcServer::audit_tenant_subscription
+# with result="success"). Distinct from the client Connected-to-CP marker,
+# which is only a post-TLS, pre-RPC transport signal.
+CP_SUBSCRIBE_ACCEPTED_MESSAGE = "Tenant subscription accepted"
+CP_SUBSCRIBE_ACCEPTED_RESULT = "success"
+CP_SUBSCRIBE_AUDIT_EVENT = "tenant_subscription"
 LEAKED_MATERIAL = re.compile(
     r"BEGIN ([A-Z0-9 ]*CERTIFICATE|PRIVATE KEY|RSA PRIVATE KEY|EC PRIVATE KEY)"
 )
@@ -71,6 +84,18 @@ CONTROL_EVIDENCE = {
         "cp_tls_rejected ip=",
         "reason=invalid peer certificate: UnknownIssuer",
     ),
+}
+
+# Rotation reconnect proof: both halves plus a strictly increased post-swap
+# count. Reload / reconnect-attempt logs are not accepted evidence.
+ROTATION_ACCEPTED_EVIDENCE = {
+    "cp_subscribe_accepted": (
+        CP_SUBSCRIBE_ACCEPTED_MESSAGE,
+        CP_JWT_SURFACE,
+        CP_SUBSCRIBE_ACCEPTED_RESULT,
+        CP_SUBSCRIBE_AUDIT_EVENT,
+    ),
+    "client_tls_connect": (CONNECTED_MARKER, "node_id"),
 }
 
 FIELD_TERMINATORS = frozenset(' ",}\n\r\t')
@@ -200,6 +225,106 @@ def cp_jwt_rejection_for_node(cp_logs: str, node_id: str) -> bool:
             continue
         return True
     return False
+
+
+def _compact_audit_event_equals(line: str, value: str) -> bool:
+    return exact_field_equals(line, "audit.event", value)
+
+
+def cp_subscribe_accepted_count(cp_logs: str, node_id: str) -> int:
+    """Count CP MeshSubscribe accepts for this exact node_id.
+
+    Requires the structured tenant_subscription success audit bound to
+    MeshConfigSync.MeshSubscribe. Rejects JWT failures, other surfaces, and
+    prefix-overlapping node ids.
+    """
+    if not is_dns1123_label(node_id):
+        return 0
+    count = 0
+    for line in cp_logs.splitlines():
+        fields = json_fields(line)
+        if fields is not None:
+            if fields.get("message") != CP_SUBSCRIBE_ACCEPTED_MESSAGE:
+                continue
+            if fields.get("node_id") != node_id:
+                continue
+            if fields.get("surface") != CP_JWT_SURFACE:
+                continue
+            if fields.get("result") != CP_SUBSCRIBE_ACCEPTED_RESULT:
+                continue
+            event = fields.get("audit.event") or fields.get("event")
+            if event != CP_SUBSCRIBE_AUDIT_EVENT:
+                continue
+            count += 1
+            continue
+        if not exact_field_equals(line, "node_id", node_id):
+            continue
+        if CP_SUBSCRIBE_ACCEPTED_MESSAGE not in line:
+            continue
+        if not exact_field_equals(line, "surface", CP_JWT_SURFACE):
+            continue
+        if not exact_field_equals(line, "result", CP_SUBSCRIBE_ACCEPTED_RESULT):
+            continue
+        if not _compact_audit_event_equals(line, CP_SUBSCRIBE_AUDIT_EVENT):
+            continue
+        count += 1
+    return count
+
+
+def client_tls_connected_count(client_logs: str, node_id: str) -> int:
+    """Count post-TLS native MeshSubscribe connect markers for this node_id.
+
+    The Connected-to-CP line is emitted after endpoint.connect() succeeds and
+    before mesh_subscribe is accepted. It is one half of rotation proof only
+    when correlated to the exact pod/node identity.
+    """
+    if not is_dns1123_label(node_id):
+        return 0
+    count = 0
+    for line in client_logs.splitlines():
+        fields = json_fields(line)
+        if fields is not None:
+            if fields.get("message") != CONNECTED_MARKER:
+                continue
+            if fields.get("node_id") != node_id:
+                continue
+            count += 1
+            continue
+        if CONNECTED_MARKER not in line:
+            continue
+        if exact_field_equals(line, "node_id", node_id):
+            count += 1
+    return count
+
+
+def rotation_observation_counts(
+    client_logs: str, cp_logs: str, node_id: str
+) -> tuple[int, int]:
+    return (
+        cp_subscribe_accepted_count(cp_logs, node_id),
+        client_tls_connected_count(client_logs, node_id),
+    )
+
+
+def rotation_fresh_evidence(
+    client_logs: str,
+    cp_logs: str,
+    node_id: str,
+    baseline_cp: int,
+    baseline_client: int,
+) -> tuple[bool, str]:
+    """True only when both halves strictly increased after the baseline."""
+    if not is_dns1123_label(node_id):
+        return False, "invalid-node-id"
+    if baseline_cp < 0 or baseline_client < 0:
+        return False, "invalid-baseline"
+    cp_after, client_after = rotation_observation_counts(client_logs, cp_logs, node_id)
+    evidence = (
+        f"cp_subscribe_accepted node_id={node_id} before={baseline_cp} after={cp_after} "
+        f"client_tls_connect before={baseline_client} after={client_after}"
+    )
+    ok = cp_after > baseline_cp and client_after > baseline_client
+    return ok, evidence
 
 
 def client_has_slice(client_logs: str) -> bool:
@@ -407,6 +532,40 @@ def _json_jwt_line(node_id: str, reason: str = CP_JWT_REASON) -> str:
                 "namespace": "ferrum",
                 "result": "failure",
                 "reason": reason,
+            },
+        }
+    )
+
+
+def _json_subscribe_accepted_line(node_id: str) -> str:
+    return json.dumps(
+        {
+            "timestamp": "2026-08-13T13:12:02Z",
+            "level": "INFO",
+            "target": "ferrum_edge::grpc::cp_server",
+            "fields": {
+                "message": CP_SUBSCRIBE_ACCEPTED_MESSAGE,
+                "audit.event": CP_SUBSCRIBE_AUDIT_EVENT,
+                "surface": CP_JWT_SURFACE,
+                "node_id": node_id,
+                "namespace": "ferrum",
+                "result": CP_SUBSCRIBE_ACCEPTED_RESULT,
+            },
+        }
+    )
+
+
+def _json_client_connected_line(node_id: str) -> str:
+    return json.dumps(
+        {
+            "timestamp": "2026-08-13T13:12:02Z",
+            "level": "INFO",
+            "target": "ferrum_edge::modes::mesh::config_consumer::native_client",
+            "fields": {
+                "message": CONNECTED_MARKER,
+                "node_id": node_id,
+                "namespace": "ferrum",
+                "cp_url": "https://ferrum-cp.ferrum.svc.cluster.local:50051",
             },
         }
     )
@@ -727,6 +886,84 @@ def self_test() -> None:
     else:
         raise AssertionError("empty pod list must fail closed")
 
+    capp_name = "capp-7b8c9d6f5e-klmno"
+    other_name = "capp-7b8c9d6f5e-klmnp"
+    prefix_name = "capp-7b8c9d6f5e-klmnoextra"
+    accepted = _json_subscribe_accepted_line(capp_name)
+    connected_json = _json_client_connected_line(capp_name)
+    compact_accepted = (
+        f"audit.event={CP_SUBSCRIBE_AUDIT_EVENT} surface={CP_JWT_SURFACE} "
+        f"node_id={capp_name} namespace=ferrum result={CP_SUBSCRIBE_ACCEPTED_RESULT} "
+        f"{CP_SUBSCRIBE_ACCEPTED_MESSAGE}\n"
+    )
+    compact_connected = f"node_id={capp_name} namespace=ferrum {CONNECTED_MARKER}\n"
+    reconnect_attempt = (
+        "Mesh gRPC TLS source changed; reconnecting native MeshSubscribe stream\n"
+    )
+    reload_log = (
+        "TLS material sources reloaded; new handshakes/connections will use rotated material\n"
+    )
+
+    if cp_subscribe_accepted_count(accepted, capp_name) != 1:
+        raise AssertionError("exact-capp-node-id-accepted")
+    if cp_subscribe_accepted_count(accepted, other_name) != 0:
+        raise AssertionError("exact-capp-node-id-accepted other node")
+    if cp_subscribe_accepted_count(accepted, prefix_name) != 0:
+        raise AssertionError("prefix-node-id-is-not-accepted-proof")
+    if cp_subscribe_accepted_count(_json_jwt_line(capp_name), capp_name) != 0:
+        raise AssertionError("jwt-reject-is-not-accepted-proof")
+    if cp_subscribe_accepted_count(reconnect_attempt + reload_log, capp_name) != 0:
+        raise AssertionError("reconnect-attempt-is-not-accepted-proof")
+    if client_tls_connected_count(reconnect_attempt + reload_log, capp_name) != 0:
+        raise AssertionError("reload-log-is-not-accepted-proof")
+    if client_tls_connected_count(f"info: {CONNECTED_MARKER}\n", capp_name) != 0:
+        raise AssertionError("connected-without-node-id-is-not-tls-connect-proof")
+    if client_tls_connected_count(connected_json, capp_name) != 1:
+        raise AssertionError("connected json node_id")
+
+    missing_surface = json.loads(accepted)
+    del missing_surface["fields"]["surface"]
+    if cp_subscribe_accepted_count(json.dumps(missing_surface), capp_name) != 0:
+        raise AssertionError("accepted-without-meshsubscribe-surface-is-not-proof")
+
+    if cp_subscribe_accepted_count(compact_accepted, capp_name) != 1:
+        raise AssertionError("compact-subscribe-accepted-counts")
+    if client_tls_connected_count(compact_connected, capp_name) != 1:
+        raise AssertionError("compact-client-tls-connect-counts")
+
+    pre_client = connected_json + "\n"
+    pre_cp = accepted + "\n"
+    ok, evidence = rotation_fresh_evidence(pre_client, pre_cp, capp_name, 1, 1)
+    if ok:
+        raise AssertionError("pre-rotation-count-is-not-post-proof")
+    if "before=1 after=1" not in evidence:
+        raise AssertionError(f"freshness evidence missing baseline compare: {evidence!r}")
+
+    post_client = pre_client + _json_client_connected_line(capp_name) + "\n"
+    post_cp = pre_cp + _json_subscribe_accepted_line(capp_name) + "\n"
+    ok, evidence = rotation_fresh_evidence(post_client, post_cp, capp_name, 1, 1)
+    if not ok:
+        raise AssertionError(f"post-swap increase must pass: {evidence!r}")
+    if "before=1 after=2" not in evidence:
+        raise AssertionError(f"post-swap evidence must show increase: {evidence!r}")
+
+    ok, _ = rotation_fresh_evidence(post_client, pre_cp, capp_name, 1, 1)
+    if ok:
+        raise AssertionError("one-half-increase-is-not-fresh-proof client-only")
+    ok, _ = rotation_fresh_evidence(pre_client, post_cp, capp_name, 1, 1)
+    if ok:
+        raise AssertionError("one-half-increase-is-not-fresh-proof cp-only")
+
+    ok, _ = rotation_fresh_evidence(
+        post_client + reconnect_attempt,
+        post_cp + reload_log,
+        capp_name,
+        1,
+        1,
+    )
+    if not ok:
+        raise AssertionError("reload lines must not hide a real post-swap increase")
+
     print("native_probe_classify.py --self-test: ok")
 
 
@@ -735,12 +972,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--running-identity", action="store_true")
     parser.add_argument("--classify", action="store_true")
+    parser.add_argument("--rotation-count", action="store_true")
+    parser.add_argument("--rotation-fresh", action="store_true")
     parser.add_argument("--deploy")
     parser.add_argument("--pod-name", default="")
     parser.add_argument("--pod-ip", default="")
     parser.add_argument("--client-log")
     parser.add_argument("--cp-log")
     parser.add_argument("--evidence-out")
+    parser.add_argument("--baseline-cp", type=int)
+    parser.add_argument("--baseline-client", type=int)
     args = parser.parse_args(argv)
 
     if args.self_test:
@@ -772,7 +1013,38 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.write(cls)
         return 0
 
-    parser.error("one of --self-test, --running-identity, or --classify is required")
+    if args.rotation_count or args.rotation_fresh:
+        if not args.client_log or not args.cp_log:
+            parser.error("--client-log and --cp-log are required with rotation modes")
+        if not is_dns1123_label(args.pod_name):
+            print("native rotation identity: pod-name is not a DNS-1123 label", file=sys.stderr)
+            return 1
+        client_logs = Path(args.client_log).read_text(encoding="utf-8", errors="replace")
+        cp_logs = Path(args.cp_log).read_text(encoding="utf-8", errors="replace")
+        if args.rotation_count:
+            cp_count, client_count = rotation_observation_counts(
+                client_logs, cp_logs, args.pod_name
+            )
+            sys.stdout.write(f"{cp_count}\t{client_count}\n")
+            return 0
+        if args.baseline_cp is None or args.baseline_client is None:
+            parser.error("--baseline-cp and --baseline-client are required with --rotation-fresh")
+        ok, evidence = rotation_fresh_evidence(
+            client_logs,
+            cp_logs,
+            args.pod_name,
+            args.baseline_cp,
+            args.baseline_client,
+        )
+        if args.evidence_out:
+            Path(args.evidence_out).write_text(evidence + "\n", encoding="utf-8")
+        sys.stdout.write(evidence)
+        return 0 if ok else 1
+
+    parser.error(
+        "one of --self-test, --running-identity, --classify, "
+        "--rotation-count, or --rotation-fresh is required"
+    )
     return 2
 
 

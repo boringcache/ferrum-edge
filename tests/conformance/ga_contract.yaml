@@ -242,6 +242,10 @@ capabilities:
     # no slice accepted. A projected Secret generation swap proves CP/DP
     # gRPC TLS watchers reconnect without a pod restart, and an over-the-wire
     # mTLS handshake to the running CP observes the replacement leaf serial.
+    # The production capp DP must complete a generation-2 TLS handshake and a
+    # valid-JWT MeshSubscribe that the CP accepts for that exact pod/node
+    # identity; the accepted-connect count must be strictly newer than the
+    # pre-swap baseline. Reload and reconnect-attempt logs are not proof.
     live_assertions:
       - sidecar.config.native_subscribe_delivered
       - sidecar.config.native_subscribe_mtls_omitted_client_rejected

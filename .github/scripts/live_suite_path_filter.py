@@ -362,7 +362,6 @@ def native_mtls_fixture_contract_errors(root: Path) -> list[str]:
         errors.append("run.sh dropped ephemeral native MeshSubscribe PKI minting")
     if "apply_native_mtls_secrets gen2" not in run_text:
         errors.append("run.sh dropped the projected Secret generation swap")
-    errors.extend(native_mtls_rotation_observation_errors(run_text))
     if "serviceAccountName: native-mtls-probe" not in run_text:
         errors.append("run.sh native mTLS probes must not share sa/capp")
     if "native_probe_classify.py" not in run_text:
@@ -380,6 +379,7 @@ def native_mtls_fixture_contract_errors(root: Path) -> list[str]:
     helper_text = (
         helper_path.read_text(encoding="utf-8") if helper_path.is_file() else ""
     )
+    errors.extend(native_mtls_rotation_observation_errors(run_text, helper_text))
     errors.extend(native_mtls_negative_control_contract_errors(run_text, helper_text))
 
     required_ids = (
@@ -481,6 +481,14 @@ def native_mtls_negative_control_contract_errors(run_text: str, helper_text: str
             "rotation gate requires CP UnknownIssuer evidence for gen1 stale client",
         ),
         (
+            'printf \'%s\' "$reconnect_ev" | grep -Fq "cp_subscribe_accepted node_id="',
+            "rotation gate requires helper cp_subscribe_accepted evidence for capp",
+        ),
+        (
+            'printf \'%s\' "$reconnect_ev" | grep -Fq "client_tls_connect before="',
+            "rotation gate requires helper client_tls_connect freshness evidence",
+        ),
+        (
             'wait_for_native_probe_class "$deploy" "$want_pattern" "$want_evidence"',
             "negative wait loop must gate on classifier evidence, not class alone",
         ),
@@ -509,6 +517,50 @@ def native_mtls_negative_control_contract_errors(run_text: str, helper_text: str
         (
             "flattened-tonic-error-is-not-client-verify-proof",
             "classifier self-test that flattened tonic errors stay handshake",
+        ),
+        (
+            "ROTATION_ACCEPTED_EVIDENCE",
+            "classifier pins rotation accepted-connect evidence",
+        ),
+        (
+            "Tenant subscription accepted",
+            "exact CP MeshSubscribe success audit message",
+        ),
+        (
+            "cp_subscribe_accepted_count",
+            "CP MeshSubscribe accept count correlated to exact node_id",
+        ),
+        (
+            "client_tls_connected_count",
+            "capp post-TLS connect count correlated to exact node_id",
+        ),
+        (
+            "rotation_fresh_evidence",
+            "pre/post freshness comparison for rotation reconnect",
+        ),
+        (
+            "reconnect-attempt-is-not-accepted-proof",
+            "classifier self-test that reconnect-attempt logs are not accepts",
+        ),
+        (
+            "reload-log-is-not-accepted-proof",
+            "classifier self-test that TLS reload logs are not accepts",
+        ),
+        (
+            "pre-rotation-count-is-not-post-proof",
+            "classifier self-test that the pre-swap count cannot satisfy post-swap",
+        ),
+        (
+            "one-half-increase-is-not-fresh-proof",
+            "classifier self-test that one half of the rotation proof is not enough",
+        ),
+        (
+            "exact-capp-node-id-accepted",
+            "classifier self-test that MeshSubscribe accepts use exact node_id",
+        ),
+        (
+            "connected-without-node-id-is-not-tls-connect-proof",
+            "classifier self-test that Connected-to-CP without node_id is not proof",
         ),
     ):
         if needle not in helper_text:
@@ -543,6 +595,40 @@ stale_class="$(wait_for_native_probe_class native-stale-client 'tls-handshake|tl
 
 
 _BASH_FUNC_DEF_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\(\)\s*\{")
+
+
+def _bash_function_body(source: str, name: str) -> str:
+    """Return the named bash function including its definition line."""
+
+    lines = source.splitlines()
+    start = None
+    pattern = re.compile(rf"^{re.escape(name)}\(\)\s*\{{")
+    for idx, line in enumerate(lines):
+        if pattern.match(line.strip()):
+            start = idx
+            break
+    if start is None:
+        return ""
+    collected: list[str] = []
+    depth = 0
+    started = False
+    for line in lines[start:]:
+        for char in line:
+            if char == "{":
+                depth += 1
+                started = True
+            elif char == "}":
+                depth -= 1
+        collected.append(line)
+        if started and depth <= 0:
+            break
+    return "\n".join(collected)
+
+
+def _non_comment_lines(source: str) -> str:
+    return "\n".join(
+        line for line in source.splitlines() if not line.strip().startswith("#")
+    )
 
 
 def _bash_functions_publishing_observe_pid(run_text: str) -> set[str]:
@@ -612,7 +698,9 @@ def _live_serial_captured_from_command_substitution(run_text: str) -> bool:
     return False
 
 
-def native_mtls_rotation_observation_errors(run_text: str) -> list[str]:
+def native_mtls_rotation_observation_errors(
+    run_text: str, helper_text: str = ""
+) -> list[str]:
     """Reject a rotation gate that treats Secret.data.server.pem as live.
 
     The served serial must come from a verified openssl s_client handshake to
@@ -620,6 +708,10 @@ def native_mtls_rotation_observation_errors(run_text: str) -> list[str]:
     cert). Function names may change; the handshake/verify/serial markers and
     the Secret-decode prohibition are the contract. The stateful observe helper
     that publishes NATIVE_OBSERVE_PF_PID must run in the parent shell.
+
+    Rotation reconnect proof must capture a pre-swap baseline for the running
+    capp identity, then require a strictly increased CP MeshSubscribe accept
+    and capp post-TLS connect. Reload / reconnect-attempt logs are not proof.
     """
 
     errors: list[str] = []
@@ -669,7 +761,33 @@ def native_mtls_rotation_observation_errors(run_text: str) -> list[str]:
         ("NATIVE_CP_SERVED_CLASS", "parent-shell observe class channel"),
         ("NATIVE_OBSERVE_PF_PID", "parent-shell port-forward PID for EXIT cleanup"),
         ("Verify return code: 0", "verified-handshake success check"),
-        ("wait_for_native_rotation_evidence", "CP/DP reload-log evidence"),
+        (
+            "wait_for_native_rotation_evidence",
+            "fresh capp MeshSubscribe accept evidence",
+        ),
+        (
+            "capture_native_rotation_baseline",
+            "pre-swap accepted-connect baseline for capp",
+        ),
+        ("--rotation-count", "helper pre-swap accepted-connect count"),
+        ("--rotation-fresh", "helper post-swap freshness comparison"),
+        (
+            "NATIVE_ROTATION_BASELINE_CAPTURED",
+            "rotation wait must require a captured baseline",
+        ),
+        (
+            "native_probe_running_identity capp",
+            "rotation baseline must use capp's running pod/node identity",
+        ),
+        ("--baseline-cp", "CP accept baseline passed into freshness comparison"),
+        (
+            "--baseline-client",
+            "capp TLS-connect baseline passed into freshness comparison",
+        ),
+        (
+            "--tail=-1",
+            "full current-container logs so pre-swap lines cannot slide out of a tail window",
+        ),
     )
     for needle, desc in required:
         if needle not in run_text:
@@ -733,6 +851,63 @@ def native_mtls_rotation_observation_errors(run_text: str) -> list[str]:
         errors.append(
             "rotation outcome must read NATIVE_CP_SERVED_CLASS from the parent shell"
         )
+
+    wait_body = _non_comment_lines(
+        _bash_function_body(run_text, "wait_for_native_rotation_evidence")
+    )
+    if wait_body:
+        if "reconnecting native MeshSubscribe stream" in wait_body:
+            errors.append(
+                "wait_for_native_rotation_evidence must not treat reconnect-attempt "
+                "logs as rotation proof"
+            )
+        if "TLS material sources reloaded" in wait_body:
+            errors.append(
+                "wait_for_native_rotation_evidence must not treat TLS reload logs "
+                "as rotation proof"
+            )
+        if "--rotation-fresh" not in wait_body and "native_rotation_fresh_now" not in wait_body:
+            errors.append(
+                "wait_for_native_rotation_evidence must require helper freshness "
+                "comparison, not reload/attempt greps"
+            )
+        if "NATIVE_ROTATION_BASELINE_CAPTURED" not in wait_body:
+            errors.append(
+                "wait_for_native_rotation_evidence must refuse to pass without a "
+                "captured pre-swap baseline"
+            )
+
+    probe_body = _bash_function_body(run_text, "probe_native_mtls_rotation")
+    if probe_body:
+        idx_base = probe_body.find("capture_native_rotation_baseline")
+        idx_gen2 = probe_body.find("apply_native_mtls_secrets gen2")
+        idx_wait = probe_body.find("wait_for_native_rotation_evidence")
+        if not (0 <= idx_base < idx_gen2 < idx_wait):
+            errors.append(
+                "probe_native_mtls_rotation must capture the capp baseline, apply "
+                "gen2, then wait for a strictly newer accepted MeshSubscribe"
+            )
+
+    if helper_text:
+        for needle, desc in (
+            ("Tenant subscription accepted", "CP MeshSubscribe success audit"),
+            ("cp_subscribe_accepted_count", "exact-node CP accept counting"),
+            ("client_tls_connected_count", "exact-node capp TLS-connect counting"),
+            ("rotation_fresh_evidence", "pre/post freshness comparison"),
+            (
+                "reconnect-attempt-is-not-accepted-proof",
+                "self-test rejecting reconnect-attempt logs",
+            ),
+            (
+                "pre-rotation-count-is-not-post-proof",
+                "self-test rejecting pre-swap counts as post-swap proof",
+            ),
+        ):
+            if needle not in helper_text:
+                errors.append(
+                    f"native rotation helper missing {desc} (`{needle}`)"
+                )
+
     return errors
 
 
@@ -795,6 +970,98 @@ NATIVE_SERVER_SERIAL_GEN2
         failures.append(
             "rotation observation contract must reject observe-helper command "
             f"substitution by name, got {subshell_errors!r}"
+        )
+
+    reload_false_proof = r"""
+capture_native_rotation_baseline() { return 0; }
+wait_for_native_rotation_evidence() {
+  grep -Fq 'TLS material sources reloaded; new handshakes/connections will use rotated material'
+  grep -Fq 'Mesh gRPC TLS source changed; reconnecting native MeshSubscribe stream'
+  return 0
+}
+probe_native_mtls_rotation() {
+  capture_native_rotation_baseline
+  apply_native_mtls_secrets gen2
+  wait_for_native_rotation_evidence
+  kubectl port-forward svc/ferrum-cp "${port}:50051"
+  openssl s_client -connect 127.0.0.1:${port} -servername "$NATIVE_CP_DNS" \
+    -verify_hostname "$NATIVE_CP_DNS" -verify_return_error \
+    -CAfile gen2-ca.pem -cert gen2-client.pem -key gen2-client-key.pem
+  openssl x509 -noout -serial
+  Verify return code: 0
+  live_serial="${NATIVE_CP_SERVED_SERIAL:-}"
+  outcome="observe_class=${NATIVE_CP_SERVED_CLASS:-}"
+  record_live_assertion sidecar.config.native_subscribe_tls_rotation_reconnects pass
+}
+NATIVE_OBSERVE_PF_PID=""
+NATIVE_CP_SERVED_SERIAL=""
+NATIVE_CP_SERVED_CLASS=""
+NATIVE_SERVER_SERIAL_GEN2=""
+NATIVE_ROTATION_BASELINE_CAPTURED=true
+--rotation-count
+--rotation-fresh
+--baseline-cp
+--baseline-client
+native_probe_running_identity capp
+"""
+    reload_errors = native_mtls_rotation_observation_errors(reload_false_proof)
+    if not reload_errors:
+        failures.append(
+            "rotation observation contract accepted reload/reconnect-attempt logs "
+            "as MeshSubscribe accept proof"
+        )
+    elif not any(
+        "reconnect-attempt" in error or "TLS reload" in error or "freshness" in error
+        for error in reload_errors
+    ):
+        failures.append(
+            "rotation observation contract must reject reload/attempt-only evidence "
+            f"by name, got {reload_errors!r}"
+        )
+
+    no_baseline_false_proof = r"""
+wait_for_native_rotation_evidence() {
+  python3 helper --rotation-fresh --pod-name "$pod"
+  return 0
+}
+probe_native_mtls_rotation() {
+  apply_native_mtls_secrets gen2
+  wait_for_native_rotation_evidence
+  kubectl port-forward svc/ferrum-cp "${port}:50051"
+  openssl s_client -connect 127.0.0.1:${port} -servername "$NATIVE_CP_DNS" \
+    -verify_hostname "$NATIVE_CP_DNS" -verify_return_error \
+    -CAfile gen2-ca.pem -cert gen2-client.pem -key gen2-client-key.pem
+  openssl x509 -noout -serial
+  Verify return code: 0
+  live_serial="${NATIVE_CP_SERVED_SERIAL:-}"
+  outcome="observe_class=${NATIVE_CP_SERVED_CLASS:-}"
+  record_live_assertion sidecar.config.native_subscribe_tls_rotation_reconnects pass
+}
+NATIVE_OBSERVE_PF_PID=""
+NATIVE_CP_SERVED_SERIAL=""
+NATIVE_CP_SERVED_CLASS=""
+NATIVE_SERVER_SERIAL_GEN2=""
+--rotation-count
+--rotation-fresh
+--baseline-cp
+--baseline-client
+native_probe_running_identity capp
+"""
+    no_baseline_errors = native_mtls_rotation_observation_errors(
+        no_baseline_false_proof
+    )
+    if not no_baseline_errors:
+        failures.append(
+            "rotation observation contract accepted a post-swap wait without a "
+            "pre-swap capp baseline"
+        )
+    elif not any(
+        "baseline" in error or "capture_native_rotation_baseline" in error
+        for error in no_baseline_errors
+    ):
+        failures.append(
+            "rotation observation contract must require a pre-swap baseline "
+            f"by name, got {no_baseline_errors!r}"
         )
     return failures
 
