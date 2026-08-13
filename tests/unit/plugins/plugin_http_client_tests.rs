@@ -994,6 +994,20 @@ fn plugin_http_client_terminal_fallback_is_fail_closed_no_proxy_no_redirect() {
         uncommented_terminal.contains("reqwest::redirect::Policy::none()"),
         "terminal fallback must keep redirects disabled"
     );
+    let preconfigured = function_region(
+        production,
+        "fn try_build_preconfigured_fail_closed_plugin_client(",
+        "/// Bounded fail-closed construction:",
+    );
+    let uncommented_preconfigured = uncommented_lines(preconfigured).join("\n");
+    assert!(
+        uncommented_preconfigured.contains("attach_plugin_client_dns"),
+        "preconfigured terminal fallback must retain the supplied gateway DNS resolver"
+    );
+    assert!(
+        uncommented_preconfigured.contains("attach_plugin_client_http2"),
+        "preconfigured terminal fallback must retain HTTP/2 prior knowledge"
+    );
     assert!(
         uncommented_terminal.contains("apply_terminal_fail_closed_tls"),
         "terminal fallback must apply fail-closed empty-trust TLS"
@@ -1081,15 +1095,26 @@ fn plugin_http_client_terminal_fallback_is_fail_closed_no_proxy_no_redirect() {
         "fn build_fail_closed_plugin_client(",
         "fn build_dns_cached_fallback_client(",
     );
-    let uncommented_fail_closed_builder = uncommented_lines(fail_closed_builder).join("\n");
+    let uncommented_fail_closed_builder = uncommented_lines(fail_closed_builder)
+        .join("\n")
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>();
     assert!(
-        !uncommented_fail_closed_builder.contains("try_build_plugin_client(None, false"),
-        "HTTP/2 terminal fallback must not accept an HTTP/1-capable replacement client"
+        uncommented_fail_closed_builder
+            .contains("try_build_plugin_client(dns_cache,http2_prior_knowledge"),
+        "terminal empty-trust construction must keep the caller's DNS resolver"
     );
     assert!(
         !uncommented_fail_closed_builder
-            .contains("try_build_preconfigured_fail_closed_plugin_client(false"),
-        "HTTP/2 preconfigured fallback must preserve prior-knowledge posture or stay unavailable"
+            .contains("try_build_plugin_client(None,http2_prior_knowledge"),
+        "terminal fallback must not drop a supplied DNS resolver"
+    );
+    assert!(
+        uncommented_fail_closed_builder.contains(
+            "try_build_preconfigured_fail_closed_plugin_client(dns_cache,http2_prior_knowledge"
+        ),
+        "preconfigured reconstruction must inherit DNS and HTTP/2 posture"
     );
 }
 

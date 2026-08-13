@@ -518,17 +518,20 @@ fn fail_closed_rustls_client_config(
 }
 
 fn try_build_preconfigured_fail_closed_plugin_client(
+    dns_cache: Option<&DnsCache>,
     http2_prior_knowledge: bool,
     provider_mismatch: bool,
 ) -> Result<reqwest::Client, PluginHttpClientBuildError> {
     let tls = fail_closed_rustls_client_config(http2_prior_knowledge)
         .map_err(PluginHttpClientBuildError::from_rustls)?;
-    let mut builder = plugin_client_no_proxy_no_redirect()
+    let builder = attach_plugin_client_dns(plugin_client_no_proxy_no_redirect(), dns_cache);
+    let mut builder = builder
         .use_preconfigured_tls(tls)
         .tls_danger_accept_invalid_certs(false);
     if provider_mismatch {
         builder = builder.https_only(true);
     }
+    builder = attach_plugin_client_http2(builder, http2_prior_knowledge);
     builder
         .build()
         .map_err(PluginHttpClientBuildError::from_reqwest)
@@ -544,33 +547,24 @@ fn build_fail_closed_plugin_client(
     http2_prior_knowledge: bool,
     provider_mismatch: bool,
 ) -> Result<reqwest::Client, PluginHttpClientBuildError> {
-    if let Some(dns_cache) = dns_cache {
-        match try_build_plugin_client(Some(dns_cache), http2_prior_knowledge, |builder| {
-            PluginTlsPosture::apply_terminal_fail_closed_tls(builder, provider_mismatch)
-        }) {
-            Ok(client) => return Ok(client),
-            Err(error) => tracing::error!(
-                error = %error,
-                http2_prior_knowledge,
-                "Fail-closed empty-trust plugin HTTP client failed; \
-                 retrying without a custom DNS resolver"
-            ),
-        }
-    }
-
-    match try_build_plugin_client(None, http2_prior_knowledge, |builder| {
+    match try_build_plugin_client(dns_cache, http2_prior_knowledge, |builder| {
         PluginTlsPosture::apply_terminal_fail_closed_tls(builder, provider_mismatch)
     }) {
         Ok(client) => return Ok(client),
         Err(error) => tracing::error!(
             error = %error,
             http2_prior_knowledge,
-            "Fail-closed plugin HTTP client without DNS failed; using a \
-             preconfigured empty rustls root store with the same protocol posture"
+            has_gateway_dns_resolver = dns_cache.is_some(),
+            "Fail-closed empty-trust plugin HTTP client failed; using a preconfigured \
+             empty rustls root store with the same DNS and protocol posture"
         ),
     }
 
-    try_build_preconfigured_fail_closed_plugin_client(http2_prior_knowledge, provider_mismatch)
+    try_build_preconfigured_fail_closed_plugin_client(
+        dns_cache,
+        http2_prior_knowledge,
+        provider_mismatch,
+    )
 }
 
 /// Build a minimal `reqwest::Client` that still uses the gateway's DNS cache
@@ -591,12 +585,12 @@ fn build_fail_closed_plugin_client(
 /// negotiation (h2c / ALPN h2) so a degraded build path cannot silently
 /// downgrade native gRPC mirror traffic to HTTP/1.1.
 ///
-/// If even this minimal builder fails, retry without the DNS cache while
-/// keeping redirects and ambient proxies disabled and applying the caller's
-/// TLS posture. If host/native roots are the failure surface, construct a
-/// fail-closed empty-trust client rather than aborting the process. Terminal
-/// construction is a bounded `Result`: it never panics, never retries without
-/// a limit, and never restores ambient proxy, redirects, or weakened TLS.
+/// If even this minimal builder fails, construct a fail-closed empty-trust
+/// client rather than aborting the process. A supplied gateway DNS resolver is
+/// retained on every attempt so fallback cannot bypass hostname egress policy.
+/// Terminal construction is a bounded `Result`: it never panics, never retries
+/// without a limit, and never restores ambient proxy, redirects, weakened TLS,
+/// system-DNS egress, or a downgraded HTTP/2 companion.
 fn build_dns_cached_fallback_client(
     dns_cache: Option<DnsCache>,
     tls_posture: &PluginTlsPosture,
@@ -625,29 +619,11 @@ fn build_dns_cached_fallback_client(
         ),
     }
 
-    match try_build_plugin_client(dns_cache.as_ref(), http2_prior_knowledge, |builder| {
-        PluginTlsPosture::apply_terminal_fail_closed_tls(builder, provider_mismatch)
-    }) {
-        Ok(client) => return Ok(client),
-        Err(error) => tracing::error!(
-            error = %error,
-            "Failed to build fail-closed DNS-cached plugin client; \
-             retrying without the DNS cache while keeping the configured TLS posture"
-        ),
-    }
-
-    match try_build_plugin_client(None, http2_prior_knowledge, |builder| {
-        tls_posture.apply_or_inert(builder, provider_mismatch)
-    }) {
-        Ok(client) => return Ok(client),
-        Err(error) => tracing::error!(
-            error = %error,
-            "Failed to build fallback plugin client with redirect and TLS policy set; \
-             constructing a fail-closed empty-trust client"
-        ),
-    }
-
-    build_fail_closed_plugin_client(None, http2_prior_knowledge, provider_mismatch)
+    build_fail_closed_plugin_client(
+        dns_cache.as_ref(),
+        http2_prior_knowledge,
+        provider_mismatch,
+    )
 }
 
 fn accept_plugin_http_client(
@@ -1708,9 +1684,9 @@ mod fallback_tests {
 
     #[test]
     fn fail_closed_preconfigured_client_is_constructible() {
-        try_build_preconfigured_fail_closed_plugin_client(false, false)
+        try_build_preconfigured_fail_closed_plugin_client(None, false, false)
             .expect("empty rustls root store client must be constructible");
-        try_build_preconfigured_fail_closed_plugin_client(true, true)
+        try_build_preconfigured_fail_closed_plugin_client(None, true, true)
             .expect("HTTPS-only empty rustls root store client must be constructible");
     }
 
