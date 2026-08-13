@@ -552,10 +552,10 @@ async fn mesh_peer_auth_live_reload_dtls_swap_noop_without_dtls_listeners() {
     assert_eq!(
         build_invocations.load(std::sync::atomic::Ordering::Relaxed),
         1,
-        "the build closure runs once to publish the accepted generation for later listeners"
+        "the active-only build closure runs exactly once"
     );
     assert!(
-        manager.snapshot_frontend_dtls_generation().is_some(),
-        "generation must be published even when no DTLS listeners are bound yet"
+        manager.snapshot_frontend_dtls_generation().is_none(),
+        "mesh TLS material must not seed the ordinary DTLS listener generation"
     );
 }

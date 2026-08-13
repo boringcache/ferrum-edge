@@ -2016,11 +2016,10 @@ async fn swap_frontend_tls_config_replaces_slot_without_reconcile() {
     );
 }
 
-/// `swap_active_dtls_frontend_configs` validates the candidate once and
-/// publishes it as the accepted generation even when no DTLS listeners are
-/// active yet, so a later-started listener converges on the same material.
+/// Mesh's active-only DTLS swap must not publish its TLS-derived material into
+/// the dedicated DTLS generation used by listeners created later.
 #[tokio::test]
-async fn swap_active_dtls_frontend_configs_publishes_generation_without_listeners() {
+async fn swap_active_dtls_frontend_configs_does_not_publish_generation_without_listeners() {
     let manager = create_manager(empty_config());
     let calls = std::sync::atomic::AtomicUsize::new(0);
     let swapped = manager
@@ -2033,18 +2032,18 @@ async fn swap_active_dtls_frontend_configs_publishes_generation_without_listener
     assert_eq!(
         calls.load(std::sync::atomic::Ordering::Relaxed),
         1,
-        "build_config must run exactly once so the accepted generation is published"
+        "build_config must run exactly once"
     );
-    let generation = manager
-        .snapshot_frontend_dtls_generation()
-        .expect("generation published with zero listeners");
-    assert_eq!(generation.generation, 1);
+    assert!(
+        manager.snapshot_frontend_dtls_generation().is_none(),
+        "an active-only mesh swap must not seed the ordinary DTLS generation"
+    );
     let status = manager.frontend_dtls_reload_status();
-    assert_eq!(status.last_outcome, "accepted");
-    assert_eq!(status.generation, 1);
+    assert_eq!(status.last_outcome, "none");
+    assert_eq!(status.generation, 0);
     let overload = manager.overload_snapshot();
-    assert_eq!(overload.frontend_dtls_reload.generation, 1);
-    assert_eq!(overload.frontend_dtls_reload.last_outcome, "accepted");
+    assert_eq!(overload.frontend_dtls_reload.generation, 0);
+    assert_eq!(overload.frontend_dtls_reload.last_outcome, "none");
 }
 
 #[tokio::test]

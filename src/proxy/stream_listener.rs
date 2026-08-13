@@ -1409,8 +1409,8 @@ impl StreamListenerManager {
     /// the config only at handshake time). New accepts use the swapped
     /// config on the next handshake.
     ///
-    /// Used by mesh PeerAuthentication live reload alongside
-    /// [`Self::publish_frontend_dtls_generation`]; ordinary HTTPS / non-mesh
+    /// Used by mesh PeerAuthentication live reload alongside an active-only
+    /// DTLS config swap; ordinary HTTPS / non-mesh
     /// modes continue to use [`Self::set_frontend_tls_config`] at startup
     /// (followed by a static lifetime — those modes do not call swap).
     pub fn swap_frontend_tls_config(&self, tls_config: Option<Arc<rustls::ServerConfig>>) {
@@ -1542,16 +1542,19 @@ impl StreamListenerManager {
         swapped
     }
 
-    /// Build one validated `FrontendDtlsConfig` and publish it as the accepted
-    /// generation across every active DTLS server.
+    /// Build one validated `FrontendDtlsConfig` and swap it onto every active
+    /// DTLS server without publishing it as the ordinary frontend generation.
     ///
     /// `build_config` is invoked **once** before any listener is touched so a
     /// transient source race cannot create mixed generations. Existing
     /// in-flight DTLS sessions keep the snapshot they handshake with; new
-    /// sessions pick up the published generation on the next ClientHello.
+    /// sessions pick up the replacement config on the next ClientHello.
+    /// Keeping this path active-only prevents mesh PeerAuthentication material
+    /// from being reused by later ordinary UDP listeners, whose generation is
+    /// sourced from the dedicated DTLS configuration.
     ///
     /// Returns the number of listeners whose DTLS server was swapped. On
-    /// build failure every listener retains the complete prior generation and
+    /// build failure every listener retains its complete prior config and
     /// this returns `0`.
     pub async fn swap_active_dtls_frontend_configs<F>(&self, mut build_config: F) -> usize
     where
@@ -1562,15 +1565,14 @@ impl StreamListenerManager {
             Err(err) => {
                 warn!(
                     "Failed to rebuild frontend DTLS config for live swap: {}; \
-                     keeping previous DTLS generation on every listener",
+                     keeping previous DTLS config on every listener",
                     err
                 );
                 self.record_frontend_dtls_candidate_failure();
                 return 0;
             }
         };
-        let (_published, swapped) = self.publish_frontend_dtls_generation(config).await;
-        swapped
+        self.swap_active_dtls_frontend_config(&config).await
     }
 
     /// Reconcile active listeners against the current config.
