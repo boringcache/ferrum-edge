@@ -36,6 +36,9 @@ async fn isolated() -> tokio::sync::MutexGuard<'static, ()> {
     health::reset_for_test();
     // The publication-preparation hold is process-global too; a test that
     // panicked while holding one must not block the next test's publications.
+    // This blanket clear is panic-cleanup at the start of a serialized
+    // lifecycle test. Holder Drop uses the generation-scoped clear so a stale
+    // holder cannot steal a newer test's slot.
     ferrum_edge::service_discovery::clear_discovery_publication_preparation_hold_for_test();
     guard
 }
@@ -1856,6 +1859,8 @@ async fn a_crash_looping_poller_still_expires_and_withdraws_during_restart_backo
 // virtual time rather than seconds of real sleeping.
 
 /// RAII wrapper: the hold is process-global, so it must not outlive its test.
+/// Drop releases *this* generation only — a stale holder must not clear or
+/// release a newer test's hold.
 struct PreparationHold(Arc<ferrum_edge::service_discovery::PublicationPreparationHold>);
 
 impl PreparationHold {
@@ -1863,15 +1868,50 @@ impl PreparationHold {
         Self(ferrum_edge::service_discovery::hold_discovery_publication_preparation_for_test())
     }
 
+    fn inner(&self) -> Arc<ferrum_edge::service_discovery::PublicationPreparationHold> {
+        Arc::clone(&self.0)
+    }
+
+    fn generation(&self) -> u64 {
+        self.0.generation()
+    }
+
     /// How many publication preparations have parked on this hold.
     fn entered(&self) -> u64 {
         self.0.entered()
+    }
+
+    fn passed(&self) -> u64 {
+        self.0.passed()
+    }
+
+    fn is_released(&self) -> bool {
+        self.0.is_released()
+    }
+
+    fn is_installed(&self) -> bool {
+        self.0.is_installed()
+    }
+
+    /// Release this generation, wait until parked waiters observe it, then let
+    /// Drop clear the slot if we still own it. Required under paused time:
+    /// dropping the hold without this handshake lets `wait_for_within` auto-
+    /// advance to exhaustion while the poller is still parked.
+    async fn release_and_observe(self) {
+        self.0.release();
+        assert!(
+            self.0.wait_until_release_observed().await,
+            "parked publication preparation must observe this hold generation's release"
+        );
     }
 }
 
 impl Drop for PreparationHold {
     fn drop(&mut self) {
-        ferrum_edge::service_discovery::clear_discovery_publication_preparation_hold_for_test();
+        self.0.release();
+        ferrum_edge::service_discovery::clear_discovery_publication_preparation_hold_generation_for_test(
+            self.0.generation(),
+        );
     }
 }
 
@@ -1974,7 +2014,7 @@ async fn expiry_withdraws_on_time_while_publication_preparation_is_blocked() {
 
     // Recovery: release preparation and a later poll republishes normally,
     // clearing stale/withdrawn state without a config reload.
-    drop(hold);
+    hold.release_and_observe().await;
 
     let republished = wait_for_within(2000, || {
         lb_has_host(&lb_cache, "blocked-warmup", "discovered.local")
@@ -2102,7 +2142,7 @@ async fn a_retain_policy_expiry_keeps_a_pending_publication_alive() {
          parked rather than being discarded and re-prepared"
     );
 
-    drop(hold);
+    hold.release_and_observe().await;
     let published = wait_for_within(2000, || {
         lb_has_host(&lb_cache, "retain-warmup", "discovered.local")
     })
@@ -2114,6 +2154,109 @@ async fn a_retain_policy_expiry_keeps_a_pending_publication_alive() {
 
     let _ = task.cancel_tx.send(true);
     let _ = task.handle.await;
+}
+
+// ── Preparation-hold generation ownership and paused-clock release ────
+
+/// A stale holder whose slot was replaced must not clear or release the newer
+/// generation. Hosted shards run other tests in the same process; Drop and the
+/// generation-scoped clear have to be no-ops against a slot they no longer own.
+#[tokio::test(start_paused = true)]
+async fn a_stale_holder_does_not_clear_or_release_a_newer_preparation_hold() {
+    let _guard = isolated().await;
+    let first = PreparationHold::install();
+    let first_generation = first.generation();
+    let second = PreparationHold::install();
+
+    assert_ne!(first_generation, second.generation());
+    assert!(
+        second.is_installed(),
+        "installing a replacement must occupy the process-global slot"
+    );
+    assert!(
+        !second.is_released(),
+        "replacing the slot must not release the newer generation"
+    );
+
+    drop(first);
+    assert!(
+        second.is_installed(),
+        "a stale Drop must not take a newer test's hold"
+    );
+    assert!(
+        !second.is_released(),
+        "a stale Drop must not release a newer test's waiters"
+    );
+
+    ferrum_edge::service_discovery::clear_discovery_publication_preparation_hold_generation_for_test(
+        first_generation,
+    );
+    assert!(
+        second.is_installed(),
+        "clearing a stale generation must leave the current hold installed"
+    );
+    assert!(
+        !second.is_released(),
+        "clearing a stale generation must not release the current hold"
+    );
+
+    second.release_and_observe().await;
+}
+
+/// Replacing the process-global hold must unblock waiters parked on the
+/// previous generation without releasing the replacement.
+#[tokio::test(start_paused = true)]
+async fn replacing_a_preparation_hold_releases_the_previous_generation_only() {
+    let _guard = isolated().await;
+    let first = PreparationHold::install();
+    let first_hold = first.inner();
+    let parked = tokio::spawn(async move {
+        first_hold.park().await;
+    });
+    assert!(
+        wait_for_within(2000, || first.entered() >= 1).await,
+        "the previous generation never parked"
+    );
+
+    let second = PreparationHold::install();
+    assert!(
+        first.inner().wait_until_release_observed().await,
+        "installing a replacement must release waiters parked on the previous generation"
+    );
+    parked.await.expect("previous waiter");
+    assert!(
+        first.passed() >= 1,
+        "the previous waiter must have observed replacement-release"
+    );
+    assert!(
+        !second.is_released(),
+        "the replacement hold must still block"
+    );
+    assert!(second.is_installed());
+
+    second.release_and_observe().await;
+}
+
+/// Under `start_paused`, releasing the owned generation must let a parked
+/// waiter observe the flag without relying on `wait_for_within` sleep
+/// exhaustion. A semaphore close is invisible to the paused clock; this seam
+/// keeps the waiter on the timer wheel and handshakes `waiting == 0`.
+#[tokio::test(start_paused = true)]
+async fn releasing_a_preparation_hold_is_observed_under_paused_time() {
+    let _guard = isolated().await;
+    let hold = PreparationHold::install();
+    let parked_hold = hold.inner();
+    let parked = tokio::spawn(async move {
+        parked_hold.park().await;
+    });
+    assert!(
+        wait_for_within(2000, || hold.entered() >= 1).await,
+        "the waiter never parked"
+    );
+    assert_eq!(hold.passed(), 0, "release has not happened yet");
+
+    hold.release_and_observe().await;
+    parked.await.expect("parked waiter");
 }
 
 // ── #3717: the refused unbounded-retention request is reported once ───
