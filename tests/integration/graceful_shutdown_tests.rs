@@ -141,6 +141,7 @@ fn create_test_proxy_state(proxies: Vec<Proxy>) -> ProxyState {
         http_tls_listen_ports: Default::default(),
         mesh_revision: None,
         node_waypoint_udp_steer_destinations: Vec::new(),
+        node_waypoint_udp_destination_routes: Vec::new(),
         k8s_mesh_overlay: Default::default(),
     };
     ProxyState::new(config, dns_cache, create_test_env_config(), None, None)
@@ -546,6 +547,7 @@ fn create_test_proxy_state_with_env(
         http_tls_listen_ports: Default::default(),
         mesh_revision: None,
         node_waypoint_udp_steer_destinations: Vec::new(),
+        node_waypoint_udp_destination_routes: Vec::new(),
         k8s_mesh_overlay: Default::default(),
     };
     ProxyState::new(config, dns_cache, env_config, None, None)
