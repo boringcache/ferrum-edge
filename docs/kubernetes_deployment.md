@@ -193,9 +193,14 @@ This is intentional. `FERRUM_MODE=cp` cannot start without all of:
 - `FERRUM_CP_DP_GRPC_JWT_SECRET`
 
 The chart validates these requirements during `helm template` and `helm
-install` when `controlPlane.enabled=true` or `ca.enabled=true`. Do not put these
-reserved variables under `controlPlane.env`; use the first-class chart values so
-the rendered Deployment has a clear secret contract:
+install` when `controlPlane.enabled=true` or `ca.enabled=true`. When
+`controlPlane.enabled=true` and Gateway API RBAC is enabled, the chart also
+creates the cluster-scoped `GatewayClass` Ferrum owns (`gatewayClass.create`,
+default name `ferrum`, `controllerName: ferrum.io/gateway-controller`). Ferrum
+does not infer controller ownership from the class name spelling; disable
+`gatewayClass.create` only when you manage that object out of band. Do not put
+the reserved DB/JWT variables under `controlPlane.env`; use the first-class
+chart values so the rendered Deployment has a clear secret contract:
 
 ```yaml
 controlPlane:

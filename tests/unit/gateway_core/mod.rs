@@ -34,6 +34,7 @@ mod error_classifier_tests;
 mod forwarded_ownership_parity_tests;
 mod gateway_backend_lb_policy_tests;
 mod gateway_backend_ref_kinds_tests;
+mod gatewayclass_helm_tests;
 mod gateway_listener_plan_tests;
 mod gateway_listener_status_tests;
 mod grpc_proxy_tests;

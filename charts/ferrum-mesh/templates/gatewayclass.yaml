@@ -1,0 +1,27 @@
+{{- if and .Values.controlPlane.enabled .Values.controlPlane.rbac.gatewayApi }}
+{{- $gc := .Values.gatewayClass | default dict }}
+{{- $create := true }}
+{{- if hasKey $gc "create" }}
+{{- $create = $gc.create }}
+{{- end }}
+{{- if $create }}
+{{- $name := $gc.name | default "ferrum" }}
+{{- $controller := $gc.controllerName | default "ferrum.io/gateway-controller" }}
+{{- if not $name }}
+{{- fail "gatewayClass.name must be a non-empty GatewayClass resource name" }}
+{{- end }}
+{{- if ne $controller "ferrum.io/gateway-controller" }}
+{{- fail "gatewayClass.controllerName must be ferrum.io/gateway-controller; Ferrum does not infer ownership from the class name" }}
+{{- end }}
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: {{ $name | quote }}
+  labels:
+    app.kubernetes.io/name: ferrum-mesh
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: gateway-api
+spec:
+  controllerName: ferrum.io/gateway-controller
+{{- end }}
+{{- end }}

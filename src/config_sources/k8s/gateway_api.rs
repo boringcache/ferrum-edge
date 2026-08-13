@@ -14,19 +14,19 @@ use crate::modes::mesh::config::{
 use crate::plugins::utils::route_header_transform::route_header_transform_rules_to_json;
 
 use super::{
-    GatewayApiAllowedRoutesNamespaces, GatewayApiListenerConflict, GatewayApiListenerKey,
-    GatewayApiListenerParentKind, GatewayApiListenerPolicy, GatewayApiListenerValidationError,
-    GatewayApiNamespaceSelector, GatewayApiNamespaceSelectorExpression,
-    GatewayApiNamespaceSelectorOperator, GatewayApiRouteConflict, GatewayApiRouteConflictKey,
-    GatewayApiRouteSlot, GatewaySessionPersistence, K8sAccumulator, K8sObject, K8sResourceKey,
-    K8sTranslateError, K8sTranslationOptions, MeshRouteDispatchDestination, RouteBackend,
-    RouteProxySpec, SourceKind, UNSUPPORTED_SHAPE_MARKER, attach_route_plugins_to_proxy,
-    exact_path_listen_path, invalid_resource, mesh_route_dispatch_plugin_from_rules,
-    namespaced_resource_key, optional_port_field, optional_target_weight_field,
-    parse_istio_duration_ms, port_from_u64, proxy_for_route, resource_id,
-    route_backends_require_node_waypoint_authz, route_request_transformer_plugin_for_proxy,
-    service_dns_name, string_array, string_field, upstream_for_route,
-    upstream_for_route_with_session,
+    FERRUM_GATEWAY_CONTROLLER_NAME, GatewayApiAllowedRoutesNamespaces, GatewayApiListenerConflict,
+    GatewayApiListenerKey, GatewayApiListenerParentKind, GatewayApiListenerPolicy,
+    GatewayApiListenerValidationError, GatewayApiNamespaceSelector,
+    GatewayApiNamespaceSelectorExpression, GatewayApiNamespaceSelectorOperator,
+    GatewayApiRouteConflict, GatewayApiRouteConflictKey, GatewayApiRouteSlot,
+    GatewaySessionPersistence, K8sAccumulator, K8sObject, K8sResourceKey, K8sTranslateError,
+    K8sTranslationOptions, MeshRouteDispatchDestination, RouteBackend, RouteProxySpec, SourceKind,
+    UNSUPPORTED_SHAPE_MARKER, attach_route_plugins_to_proxy, exact_path_listen_path,
+    invalid_resource, mesh_route_dispatch_plugin_from_rules, namespaced_resource_key,
+    optional_port_field, optional_target_weight_field, parse_istio_duration_ms, port_from_u64,
+    proxy_for_route, resource_id, route_backends_require_node_waypoint_authz,
+    route_request_transformer_plugin_for_proxy, service_dns_name, string_array, string_field,
+    upstream_for_route, upstream_for_route_with_session,
 };
 use crate::config::db_backend::NamespacedResourceId;
 use crate::config::types::{HashOnCookieConfig, PluginConfig, Proxy};
@@ -963,9 +963,6 @@ fn scope_cookie_session_to_route(
 const BACKEND_LB_POLICY_CONFLICTED_MESSAGE: &str = "Another BackendLBPolicy or XBackendTrafficPolicy already targets one or more of the same Services and merging is not supported";
 
 /// Controller name stamped on every `status.ancestors` entry Ferrum owns.
-const FERRUM_GATEWAY_CONTROLLER_NAME: &str = "ferrum.io/gateway-controller";
-
-/// Gateway API `PolicyStatus.ancestors` upper bound (`+kubebuilder:validation:MaxItems=16`).
 ///
 /// The spec forbids adding another entry when the shared list is full. This
 /// limit is only an output constraint for the status writer; status owned by
@@ -7876,8 +7873,9 @@ fn listener_allowed_route_kind<'a>(kind: &Value, protocol_kinds: &'a [&str]) -> 
 mod tests {
     use super::*;
     use crate::config_sources::k8s::{
-        K8sMetadata, K8sTranslationOptions, gateway_api_status_conflict_context,
-        translate_k8s_objects,
+        K8sMetadata, K8sTranslation,
+        gateway_api_status_conflict_context as gateway_api_status_conflict_context_raw,
+        translate_k8s_objects as translate_k8s_objects_raw,
     };
     use crate::identity::spiffe::TrustDomain;
 
@@ -7886,6 +7884,48 @@ mod tests {
             "default".to_string(),
             TrustDomain::new("cluster.local").expect("test trust domain"),
         )
+    }
+
+    fn ferrum_owned_gateway_class() -> K8sObject {
+        let mut class = object(
+            "GatewayClass",
+            json!({ "controllerName": FERRUM_GATEWAY_CONTROLLER_NAME }),
+        );
+        class.metadata.name = "ferrum".to_string();
+        class.metadata.namespace.clear();
+        class
+    }
+
+    /// Fixtures historically omitted `GatewayClass/ferrum` because translation
+    /// inferred ownership from the class name. Inject the owned object unless
+    /// the snapshot already contains that cluster-scoped name (owned or foreign).
+    fn with_observed_ferrum_class(objects: &[K8sObject]) -> Vec<K8sObject> {
+        if objects
+            .iter()
+            .any(|object| object.kind == "GatewayClass" && object.metadata.name == "ferrum")
+        {
+            return objects.to_vec();
+        }
+        let mut snapshot = Vec::with_capacity(objects.len() + 1);
+        snapshot.push(ferrum_owned_gateway_class());
+        snapshot.extend_from_slice(objects);
+        snapshot
+    }
+
+    fn translate_k8s_objects(
+        objects: &[K8sObject],
+        options: K8sTranslationOptions,
+    ) -> Result<K8sTranslation, K8sTranslateError> {
+        let snapshot = with_observed_ferrum_class(objects);
+        translate_k8s_objects_raw(&snapshot, options)
+    }
+
+    fn gateway_api_status_conflict_context(
+        objects: &[K8sObject],
+        options: K8sTranslationOptions,
+    ) -> K8sAccumulator {
+        let snapshot = with_observed_ferrum_class(objects);
+        gateway_api_status_conflict_context_raw(&snapshot, options)
     }
 
     fn object(kind: &str, spec: Value) -> K8sObject {

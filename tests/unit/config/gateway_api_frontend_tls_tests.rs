@@ -105,6 +105,15 @@ fn https_listener(name: &str, port: u64, hostname: Option<&str>, secrets: &[&str
     listener
 }
 
+fn gateway_class() -> K8sObject {
+    object(
+        "GatewayClass",
+        "",
+        "ferrum",
+        json!({"controllerName": "ferrum.io/gateway-controller"}),
+    )
+}
+
 fn gateway(namespace: &str, name: &str, listeners: Vec<Value>) -> K8sObject {
     object(
         "Gateway",
@@ -130,7 +139,10 @@ fn route(namespace: &str, name: &str, gateway: &str, section: &str, path: &str) 
 }
 
 fn translate(objects: &[K8sObject]) -> K8sTranslation {
-    translate_k8s_objects(objects, options()).expect("translation succeeds")
+    let mut snapshot = Vec::with_capacity(objects.len() + 1);
+    snapshot.push(gateway_class());
+    snapshot.extend(objects.iter().cloned());
+    translate_k8s_objects(&snapshot, options()).expect("translation succeeds")
 }
 
 fn cert_paths(config: &GatewayConfig) -> Vec<String> {
