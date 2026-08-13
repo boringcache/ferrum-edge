@@ -595,8 +595,7 @@ pub fn credential_lifetime(
     // next attempt then sees remaining == 0 and fail-closed refuses the same
     // still-current token, so no second RPC is ever opened. Pull the deadline
     // forward only when there is slack to spend; do not refuse a shorter JWT.
-    let scheduled = if policy.refresh_skew.is_zero() && before_exp > JWT_ZERO_SKEW_RECONNECT_SLACK
-    {
+    let scheduled = if policy.refresh_skew.is_zero() && before_exp > JWT_ZERO_SKEW_RECONNECT_SLACK {
         before_exp - JWT_ZERO_SKEW_RECONNECT_SLACK
     } else {
         before_exp
