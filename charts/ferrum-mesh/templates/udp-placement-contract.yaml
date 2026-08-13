@@ -48,6 +48,67 @@
 {{- $existing := lookup "v1" "ConfigMap" .Release.Namespace $contractName -}}
 {{- if $existing -}}{{- $previous = default dict $existing.data -}}{{- end -}}
 {{- end -}}
+{{- /* Node-proof era (issue #3809).
+
+       The node-scoped cleanup attestation must be bound to a generation that
+       cannot RECUR, or a proof written for one placement era authorizes a later
+       one. A token derived from the release's observable shape — `<target>-<phase>`
+       — repeats the moment a target and phase recur: an old settled host era
+       writes `host-netns-stable`, the cluster migrates host -> pod and back, and
+       that same token names the NEW host era, so a same-boot node that missed the
+       later cleanup/finalize rollout could replay its stale proof into it.
+
+       The era is therefore a monotonic ordinal this contract INCREMENTS when a
+       migration starts and then carries forward, unchanged, through finalize and
+       every settled release after it. `nodeProofGeneration` is the era-qualified
+       token both DaemonSets and the runtime bind proofs to; the operator's own
+       migration generation rides along so a proof stays traceable to the
+       transition that produced it. An installed contract predating this field
+       carries no node-proof generation at all, which is fail-closed: the settled
+       host DaemonSet refuses to render until an explicit cleanup/finalize pair
+       has stamped one.
+
+       A PRESENT era/generation pair is one authority boundary. Treating a
+       malformed or out-of-range `nodeProofEra` as zero, or carrying a
+       `nodeProofGeneration` that does not name that era, would let the next
+       cleanup emit `e1.*` again and recreate a token an earlier placement era
+       already used. Both fields are therefore validated as one pair: they must
+       both be absent (the pre-contract cleanup entry that stamps era 1) or both
+       be well-formed, in bounds, and consistent. There is no compatibility
+       fallback for a partial or malformed pair. */ -}}
+{{- $previousEra := 0 -}}
+{{- $previousNodeProofGeneration := "" -}}
+{{- $hasPreviousEra := false -}}
+{{- $hasPreviousGeneration := false -}}
+{{- $rawEra := "" -}}
+{{- if $previous -}}
+{{- if hasKey $previous "nodeProofEra" -}}
+{{- $hasPreviousEra = true -}}
+{{- $rawEra = trim (toString (index $previous "nodeProofEra")) -}}
+{{- end -}}
+{{- if hasKey $previous "nodeProofGeneration" -}}
+{{- $hasPreviousGeneration = true -}}
+{{- $previousNodeProofGeneration = trim (toString (index $previous "nodeProofGeneration")) -}}
+{{- end -}}
+{{- end -}}
+{{- if or $hasPreviousEra $hasPreviousGeneration -}}
+{{- if or (not $hasPreviousEra) (not $hasPreviousGeneration) -}}
+{{- fail "installed Ambient UDP nodeProofEra/nodeProofGeneration pair is incomplete; both must be present and consistent, or both must be absent so cleanup can stamp era 1" -}}
+{{- end -}}
+{{- if not (regexMatch "^[1-9][0-9]{0,9}$" $rawEra) -}}
+{{- fail "installed Ambient UDP nodeProofEra is malformed or out of supported bounds; it must be a 1..=10 digit ordinal with no leading zero" -}}
+{{- end -}}
+{{- if not (regexMatch "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" $previousNodeProofGeneration) -}}
+{{- fail "installed Ambient UDP nodeProofGeneration is malformed or out of supported bounds; it must be an era-qualified e<era>.<generation> token of 1..=64 ASCII alphanumeric/./_/- characters" -}}
+{{- end -}}
+{{- $generationPrefix := printf "e%s." $rawEra -}}
+{{- if or (not (hasPrefix $generationPrefix $previousNodeProofGeneration)) (eq $previousNodeProofGeneration $generationPrefix) -}}
+{{- fail "installed Ambient UDP nodeProofGeneration is not the era-qualified e<era>.<generation> token bound to the installed nodeProofEra" -}}
+{{- end -}}
+{{- $previousEra = atoi $rawEra -}}
+{{- end -}}
+{{- $nodeProofEra := $previousEra -}}
+{{- $nodeProofGeneration := $previousNodeProofGeneration -}}
 {{- if eq $phase "stable" -}}
 {{- if and (not .Release.IsUpgrade) (eq $target "host-netns") -}}
 {{- fail "initial host-netns Ambient UDP placement requires an explicit cleanup phase so runtime can establish durable predecessor proof" -}}
@@ -65,6 +126,7 @@
 {{- end -}}
 {{- end -}}
 {{- else if eq $phase "cleanup" -}}
+{{- $resumeCleanup := false -}}
 {{- if and .Release.IsUpgrade $previous -}}
 {{- $previousPhase := toString (index $previous "phase") -}}
 {{- $resume := and (eq $previousPhase "cleanup") (eq (toString (index $previous "generation")) $generation) (eq (toString (index $previous "from")) $from) (eq (toString (index $previous "to")) $to) -}}
@@ -72,6 +134,19 @@
 {{- if not (or $resume $start) -}}
 {{- fail "Ambient UDP cleanup predecessor/generation does not match the installed placement contract" -}}
 {{- end -}}
+{{- $resumeCleanup = $resume -}}
+{{- end -}}
+{{- /* Starting a migration opens a NEW placement era; re-rendering the same
+       cleanup release resumes the one already open, so the ordinal is stable
+       across retries but strictly increasing across transitions. */ -}}
+{{- if not (and $resumeCleanup $nodeProofGeneration) -}}
+{{- $nextEra := add1 $previousEra -}}
+{{- $nextEraStr := $nextEra | toString -}}
+{{- if not (regexMatch "^[1-9][0-9]{0,9}$" $nextEraStr) -}}
+{{- fail "Ambient UDP nodeProofEra cannot increment without overflowing the supported 1..=10 digit ordinal" -}}
+{{- end -}}
+{{- $nodeProofEra = $nextEra -}}
+{{- $nodeProofGeneration = printf "e%d.%s" $nodeProofEra $generation | trunc 64 -}}
 {{- end -}}
 {{- else -}}
 {{- if not .Release.IsUpgrade -}}
@@ -98,5 +173,18 @@ data:
   generation: {{ $generation | quote }}
   from: {{ $from | quote }}
   to: {{ $to | quote }}
+  # Migration-era provenance for the node-scoped placement proof (issue #3809).
+  # Both keys stay absent until cleanup stamps a non-empty era-qualified token;
+  # once stamped they are carried unchanged through cleanup retry, finalize, and
+  # every settled release after it.
+  #
+  # The generation gate must NOT right-chomp (`-}}`). A right-chomp after YAML
+  # comments concatenates `nodeProofEra` onto the preceding comment, so an
+  # unstamped contract is fine but a stamped one would emit only
+  # `nodeProofGeneration` as a real data key.
+{{- if $nodeProofGeneration }}
+  nodeProofEra: {{ $nodeProofEra | toString | quote }}
+  nodeProofGeneration: {{ $nodeProofGeneration | quote }}
+{{- end }}
 {{- end -}}
 {{- end -}}
