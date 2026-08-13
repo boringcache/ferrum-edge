@@ -12101,7 +12101,7 @@ components:
     CpDpTrustReloadSnapshot:
       type: object
       description: |
-        Control-plane mode only, authenticated detail. Published health of the
+        Control-plane mode only, detailed observability. Published health of the
         CP/DP verification trust-bundle reload worker and the bounded window in
         which an unrevalidatable verifier may keep authorizing (issue #3813).
 
@@ -12117,7 +12117,8 @@ components:
         value; it does not reveal the HMAC key. The private fingerprint, an
         unkeyed digest of it, bundle paths, key material, JWTs, `kid`s, and
         namespace inventories are never published. Prometheus, logs, error
-        messages, and unauthenticated `/health`/`/status` never carry
+        messages, metrics bearer/CIDR-authorized health responses, and
+        unauthenticated `/health`/`/status` never carry a non-null
         `active_generation`.
 
         Ages are measured on a monotonic clock, so a wall-clock/NTP step can
@@ -12271,9 +12272,10 @@ components:
             "ferrum-cp-dp-trust-status-id-v1\0" || private fingerprint).
             Identical across replicas that share the accepted bundle and HMAC
             key; incomparable if HMAC keys differ. Null when no bundle is
-            watched. Authenticated `/health`/`/status` only — never Prometheus,
-            logs, errors, or unauthenticated output. Does not reveal the HMAC
-            key.
+            watched. Admin-JWT-authenticated `/health`/`/status` only — metrics
+            bearer tokens and metrics-allowlisted source addresses receive
+            null, as do unauthenticated callers. Never emitted to Prometheus,
+            logs, or errors. Does not reveal the HMAC key.
 
     ServiceDiscoveryHealthSnapshot:
       type: object
