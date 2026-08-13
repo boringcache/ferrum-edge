@@ -97,7 +97,7 @@ fn is_ferrum_owned_udp_teardown_chain(chain: &str) -> bool {
 /// The chain argument of a whitespace-delimited `-F` / `-X`, if that flag is
 /// present. A missing operand (table-wide flush) is the empty string, which
 /// the closed inventory rejects.
-fn chain_named_by_flush_or_delete(line: &str, token: &str) -> Option<&str> {
+fn chain_named_by_flush_or_delete<'a>(line: &'a str, token: &str) -> Option<&'a str> {
     let mut args = line.split_whitespace();
     args.find(|&arg| arg == token)?;
     Some(args.next().unwrap_or(""))
