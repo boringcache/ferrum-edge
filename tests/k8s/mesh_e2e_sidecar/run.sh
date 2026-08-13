@@ -205,6 +205,7 @@ NATIVE_CLIENT_SERIAL_GEN1=""
 NATIVE_CLIENT_SERIAL_GEN2=""
 NATIVE_CP_SERVED_CLASS=""
 NATIVE_CP_SERVED_REASON=""
+NATIVE_CP_SERVED_SERIAL=""
 
 LIVE_ASSERTIONS_INITIALIZED=false
 REQUIRED_LIVE_ASSERTIONS=(
@@ -1863,6 +1864,7 @@ write_native_observe_evidence() {
   local class="$1" reason="$2" serial="${3:-}"
   NATIVE_CP_SERVED_CLASS="$class"
   NATIVE_CP_SERVED_REASON="$reason"
+  NATIVE_CP_SERVED_SERIAL="$serial"
   printf 'class=%s\nreason=%s\nserved_serial=%s\nwant_serial=%s\n' \
     "$class" "$reason" "$serial" "${NATIVE_SERVER_SERIAL_GEN2:-}" \
     > "$RESULTS_DIR/native-mtls-served-serial.txt"
@@ -1897,14 +1899,18 @@ classify_native_observe_error() {
 # ferrum-cp Service listener (not Secret.data, not a mounted file, not the
 # controller-local expected server cert). Verifies TLS against the gen2
 # server CA, the Kubernetes Service DNS SAN, and presents the gen2 DP client
-# cert because the CP requires mTLS. Prints the peer leaf serial on success.
-# Raw openssl transcripts stay in NATIVE_MTLS_DIR; RESULTS_DIR gets only
-# class/reason/serial evidence.
+# cert because the CP requires mTLS. Publishes the verified peer leaf serial
+# on NATIVE_CP_SERVED_SERIAL in this shell; callers must invoke this helper
+# directly (never via command substitution) so NATIVE_OBSERVE_PF_PID,
+# NATIVE_CP_SERVED_CLASS, and NATIVE_CP_SERVED_SERIAL propagate to the EXIT
+# trap and the rotation probe. Raw openssl transcripts stay in
+# NATIVE_MTLS_DIR; RESULTS_DIR gets only class/reason/serial evidence.
 observe_native_cp_served_serial() {
   local port="" pf_pid=0 pf_log="" out_file="" err_file="" serial="" attempt \
     hs_rc=0 verify_ok=false class reason
   NATIVE_CP_SERVED_CLASS=""
   NATIVE_CP_SERVED_REASON=""
+  NATIVE_CP_SERVED_SERIAL=""
 
   if [[ -z "${NATIVE_MTLS_DIR:-}" || -z "${NATIVE_CP_DNS:-}" \
     || ! -f "$NATIVE_MTLS_DIR/gen2-ca.pem" \
@@ -2008,7 +2014,6 @@ PY
   fi
 
   write_native_observe_evidence ok "peer-leaf-serial-observed" "$serial"
-  printf '%s\n' "$serial"
 }
 
 probe_native_mtls_rotation() {
@@ -2019,8 +2024,9 @@ probe_native_mtls_rotation() {
     rotated=true
   fi
   local live_serial="" observe_ok=false
-  if live_serial="$(observe_native_cp_served_serial)"; then
+  if observe_native_cp_served_serial; then
     observe_ok=true
+    live_serial="${NATIVE_CP_SERVED_SERIAL:-}"
   else
     live_serial=""
   fi

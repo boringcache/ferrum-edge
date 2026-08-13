@@ -844,10 +844,141 @@ fn live_contract_sidecar_native_subscribe_fixture_is_mtls_jwt() {
     );
 }
 
+fn bash_function_name(trimmed: &str) -> Option<&str> {
+    let idx = trimmed.find("()")?;
+    let name = trimmed[..idx].trim();
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    if trimmed[idx + 2..].trim_start().starts_with('{') {
+        Some(name)
+    } else {
+        None
+    }
+}
+
+fn bash_functions_publishing_observe_pid(source: &str) -> Vec<&str> {
+    let mut names = Vec::new();
+    let mut current = None;
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if let Some(name) = bash_function_name(trimmed) {
+            current = Some(name);
+            continue;
+        }
+        let Some(name) = current else {
+            continue;
+        };
+        if trimmed.starts_with('#') || !line.contains("NATIVE_OBSERVE_PF_PID=\"$") {
+            continue;
+        }
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names
+}
+
+fn command_word_is(s: &str, name: &str) -> bool {
+    s.starts_with(name)
+        && s[name.len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_'))
+}
+
+fn substitution_contains_command(source: &str, open: &str, close: &str, name: &str) -> bool {
+    let mut rest = source;
+    while let Some(idx) = rest.find(open) {
+        let after_open = &rest[idx + open.len()..];
+        let body = match after_open.find(close) {
+            Some(end) => &after_open[..end],
+            None => after_open,
+        };
+        if command_word_is(body.trim_start(), name) {
+            return true;
+        }
+        rest = &rest[idx + open.len()..];
+    }
+    false
+}
+
+fn command_substitution_invokes_observe_helper(source: &str, names: &[&str]) -> bool {
+    if names.is_empty() {
+        return false;
+    }
+    let mut filtered = String::new();
+    for line in source.lines() {
+        if line.trim().starts_with('#') {
+            continue;
+        }
+        filtered.push_str(line);
+        filtered.push('\n');
+    }
+    names.iter().any(|name| {
+        substitution_contains_command(&filtered, "$(", ")", name)
+            || substitution_contains_command(&filtered, "`", "`", name)
+    })
+}
+
+fn parent_shell_helper_call(trimmed: &str, name: &str) -> bool {
+    let call = if let Some(rest) = trimmed.strip_prefix("if ") {
+        rest.trim_start()
+    } else {
+        trimmed
+    };
+    if !call.starts_with(name) {
+        return false;
+    }
+    match call[name.len()..].chars().next() {
+        None => true,
+        Some(c) if c == ';' || c.is_whitespace() => true,
+        Some(_) => false,
+    }
+}
+
+fn observe_helper_invoked_in_parent_shell(source: &str, names: &[&str]) -> bool {
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') || trimmed.contains("$(") || trimmed.contains('`') {
+            continue;
+        }
+        if names
+            .iter()
+            .any(|name| parent_shell_helper_call(trimmed, name))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn live_serial_copied_from_parent_channel(source: &str) -> bool {
+    source.lines().any(|line| {
+        let trimmed = line.trim();
+        !trimmed.starts_with('#')
+            && (trimmed.contains("live_serial=\"${NATIVE_CP_SERVED_SERIAL")
+                || trimmed.contains("live_serial=\"$NATIVE_CP_SERVED_SERIAL"))
+    })
+}
+
+fn live_serial_captured_from_command_substitution(source: &str) -> bool {
+    source.lines().any(|line| {
+        let trimmed = line.trim();
+        !trimmed.starts_with('#')
+            && (trimmed.contains("live_serial=\"$(")
+                || trimmed.contains("live_serial=$(")
+                || trimmed.contains("live_serial=\"`")
+                || trimmed.contains("live_serial=`"))
+    })
+}
+
 /// Issue #3855 rotation gate: the live serial must come from the leaf
 /// certificate served by the running CP over a verified mTLS handshake.
 /// Decoding `Secret.data.server.pem` (or a mounted/expected server cert)
 /// only proves the object store changed, not that ferrum-cp reloaded.
+/// The helper that publishes `NATIVE_OBSERVE_PF_PID` must run in the parent
+/// shell so EXIT cleanup and `NATIVE_CP_SERVED_CLASS`/`SERIAL` propagate.
 fn native_rotation_observation_violations(source: &str) -> Vec<String> {
     let mut errors = Vec::new();
 
@@ -920,6 +1051,18 @@ fn native_rotation_observation_violations(source: &str) -> Vec<String> {
             "gate success on the gen2 server serial",
         ),
         (
+            "NATIVE_CP_SERVED_SERIAL",
+            "parent-shell served serial result channel",
+        ),
+        (
+            "NATIVE_CP_SERVED_CLASS",
+            "parent-shell observe class channel",
+        ),
+        (
+            "NATIVE_OBSERVE_PF_PID",
+            "parent-shell port-forward PID for EXIT cleanup",
+        ),
+        (
             "apply_native_mtls_secrets gen2",
             "projected Secret generation swap",
         ),
@@ -965,6 +1108,48 @@ fn native_rotation_observation_violations(source: &str) -> Vec<String> {
         errors.push(
             "peer leaf serial must be extracted from the openssl s_client handshake \
              output (openssl x509 -noout -serial), not from a local expected cert"
+                .into(),
+        );
+    }
+
+    let observe_helpers = bash_functions_publishing_observe_pid(source);
+    if command_substitution_invokes_observe_helper(source, &observe_helpers) {
+        errors.push(
+            "stateful native CP observe helper must run in the parent shell, not \
+             via command substitution (NATIVE_OBSERVE_PF_PID / NATIVE_CP_SERVED_CLASS \
+             / NATIVE_CP_SERVED_SERIAL would not propagate)"
+                .into(),
+        );
+    }
+    if !observe_helpers.is_empty()
+        && !observe_helper_invoked_in_parent_shell(source, &observe_helpers)
+    {
+        errors.push(
+            "rotation probe must invoke the stateful observe helper directly in \
+             the parent shell"
+                .into(),
+        );
+    }
+    if live_serial_captured_from_command_substitution(source) {
+        errors.push(
+            "live_serial must be copied from NATIVE_CP_SERVED_SERIAL after a \
+             direct helper call; do not capture the observe helper via command \
+             substitution"
+                .into(),
+        );
+    }
+    if !live_serial_copied_from_parent_channel(source) {
+        errors.push(
+            "probe must read live_serial from NATIVE_CP_SERVED_SERIAL after a \
+             direct helper call"
+                .into(),
+        );
+    }
+    if !source.contains("observe_class=${NATIVE_CP_SERVED_CLASS")
+        && !source.contains("observe_class=$NATIVE_CP_SERVED_CLASS")
+    {
+        errors.push(
+            "rotation outcome must read NATIVE_CP_SERVED_CLASS from the parent shell"
                 .into(),
         );
     }
@@ -1025,6 +1210,45 @@ NATIVE_SERVER_SERIAL_GEN2
                 || error.contains("expected server cert")),
         "rotation observation contract must reject using the controller-local \
          gen2-server.pem as live_serial, got {expected_cert_violations:?}"
+    );
+
+    let subshell_false_proof = r#"
+apply_native_mtls_secrets gen2
+wait_for_native_rotation_evidence
+NATIVE_CP_SERVED_SERIAL=""
+NATIVE_CP_SERVED_CLASS=""
+NATIVE_OBSERVE_PF_PID=""
+observe_native_cp_served_serial() {
+  NATIVE_OBSERVE_PF_PID="$pf_pid"
+  kubectl port-forward svc/ferrum-cp "${port}:50051"
+  openssl s_client -connect 127.0.0.1:${port} -servername "$NATIVE_CP_DNS" \
+    -verify_hostname "$NATIVE_CP_DNS" -verify_return_error \
+    -CAfile gen2-ca.pem -cert gen2-client.pem -key gen2-client-key.pem
+  openssl x509 -noout -serial
+  Verify return code: 0
+  NATIVE_CP_SERVED_SERIAL="$serial"
+  NATIVE_CP_SERVED_CLASS=ok
+  printf '%s\n' "$serial"
+}
+if live_serial="$(observe_native_cp_served_serial)"; then
+  live_serial="${NATIVE_CP_SERVED_SERIAL:-}"
+fi
+outcome="live_serial=$live_serial observe_class=${NATIVE_CP_SERVED_CLASS:-}"
+record_live_assertion sidecar.config.native_subscribe_tls_rotation_reconnects pass
+NATIVE_SERVER_SERIAL_GEN2
+"#;
+    let subshell_violations = native_rotation_observation_violations(subshell_false_proof);
+    assert!(
+        !subshell_violations.is_empty(),
+        "rotation observation contract must reject invoking the observe helper \
+         through command substitution"
+    );
+    assert!(
+        subshell_violations.iter().any(|error| {
+            error.contains("command substitution") || error.contains("parent shell")
+        }),
+        "rotation observation contract must name command substitution / parent \
+         shell when the observe helper is captured via $(), got {subshell_violations:?}"
     );
 
     assert!(

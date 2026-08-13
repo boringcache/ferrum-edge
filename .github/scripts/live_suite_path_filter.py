@@ -398,13 +398,84 @@ def native_mtls_fixture_contract_errors(root: Path) -> list[str]:
     return errors
 
 
+_BASH_FUNC_DEF_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\(\)\s*\{")
+
+
+def _bash_functions_publishing_observe_pid(run_text: str) -> set[str]:
+    """Functions that publish NATIVE_OBSERVE_PF_PID=$... (must run in this shell)."""
+
+    names: set[str] = set()
+    current: str | None = None
+    for line in run_text.splitlines():
+        stripped = line.strip()
+        match = _BASH_FUNC_DEF_RE.match(stripped)
+        if match:
+            current = match.group(1)
+            continue
+        if (
+            current
+            and not stripped.startswith("#")
+            and 'NATIVE_OBSERVE_PF_PID="$' in line
+        ):
+            names.add(current)
+    return names
+
+
+def _command_substitution_invokes_observe_helper(run_text: str, names: set[str]) -> bool:
+    if not names:
+        return False
+    text = "\n".join(
+        line for line in run_text.splitlines() if not line.strip().startswith("#")
+    )
+    for name in names:
+        if re.search(rf"\$\(\s*{re.escape(name)}\b", text):
+            return True
+        if re.search(rf"`\s*{re.escape(name)}\b", text):
+            return True
+    return False
+
+
+def _observe_helper_invoked_in_parent_shell(run_text: str, names: set[str]) -> bool:
+    for line in run_text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#") or "$(" in stripped or "`" in stripped:
+            continue
+        for name in names:
+            if re.search(rf"(?:^|[\s;]){re.escape(name)}(?:\s|;|$)", stripped):
+                return True
+    return False
+
+
+def _live_serial_copied_from_parent_channel(run_text: str) -> bool:
+    for line in run_text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            continue
+        if re.search(r'\blive_serial="\$\{?NATIVE_CP_SERVED_SERIAL\b', stripped):
+            return True
+    return False
+
+
+def _live_serial_captured_from_command_substitution(run_text: str) -> bool:
+    for line in run_text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            continue
+        if re.search(r'\blive_serial="?\$\(', stripped) or re.search(
+            r"\blive_serial=`", stripped
+        ):
+            return True
+    return False
+
+
 def native_mtls_rotation_observation_errors(run_text: str) -> list[str]:
     """Reject a rotation gate that treats Secret.data.server.pem as live.
 
     The served serial must come from a verified openssl s_client handshake to
     the running ferrum-cp listener (Service DNS SAN, gen2 CA, gen2 DP client
     cert). Function names may change; the handshake/verify/serial markers and
-    the Secret-decode prohibition are the contract.
+    the Secret-decode prohibition are the contract. The stateful observe helper
+    that publishes NATIVE_OBSERVE_PF_PID must run in the parent shell.
     """
 
     errors: list[str] = []
@@ -450,6 +521,9 @@ def native_mtls_rotation_observation_errors(run_text: str) -> list[str]:
         ("port-forward", "kubectl port-forward to the live CP"),
         ("NATIVE_CP_DNS", "Kubernetes Service DNS name"),
         ("NATIVE_SERVER_SERIAL_GEN2", "gen2 served-serial gate"),
+        ("NATIVE_CP_SERVED_SERIAL", "parent-shell served serial result channel"),
+        ("NATIVE_CP_SERVED_CLASS", "parent-shell observe class channel"),
+        ("NATIVE_OBSERVE_PF_PID", "parent-shell port-forward PID for EXIT cleanup"),
         ("Verify return code: 0", "verified-handshake success check"),
         ("wait_for_native_rotation_evidence", "CP/DP reload-log evidence"),
     )
@@ -483,6 +557,38 @@ def native_mtls_rotation_observation_errors(run_text: str) -> list[str]:
         errors.append(
             "run.sh must not claim keys are shredded unless the fixture shreds them"
         )
+
+    observe_helpers = _bash_functions_publishing_observe_pid(run_text)
+    if _command_substitution_invokes_observe_helper(run_text, observe_helpers):
+        errors.append(
+            "stateful native CP observe helper must run in the parent shell, not "
+            "via command substitution (NATIVE_OBSERVE_PF_PID / NATIVE_CP_SERVED_CLASS "
+            "/ NATIVE_CP_SERVED_SERIAL would not propagate)"
+        )
+    if observe_helpers and not _observe_helper_invoked_in_parent_shell(
+        run_text, observe_helpers
+    ):
+        errors.append(
+            "rotation probe must invoke the stateful observe helper directly in "
+            "the parent shell"
+        )
+    if _live_serial_captured_from_command_substitution(run_text):
+        errors.append(
+            "live_serial must be copied from NATIVE_CP_SERVED_SERIAL after a "
+            "direct helper call; do not capture the observe helper via command "
+            "substitution"
+        )
+    if not _live_serial_copied_from_parent_channel(run_text):
+        errors.append(
+            "probe must read live_serial from NATIVE_CP_SERVED_SERIAL after a "
+            "direct helper call"
+        )
+    if "observe_class=${NATIVE_CP_SERVED_CLASS" not in run_text and (
+        "observe_class=$NATIVE_CP_SERVED_CLASS" not in run_text
+    ):
+        errors.append(
+            "rotation outcome must read NATIVE_CP_SERVED_CLASS from the parent shell"
+        )
     return errors
 
 
@@ -505,6 +611,46 @@ record_live_assertion sidecar.config.native_subscribe_tls_rotation_reconnects pa
     elif not any("Secret.data.server.pem" in error for error in secret_errors):
         failures.append(
             "rotation observation contract must name Secret decoding in the rejection"
+        )
+
+    subshell_false_proof = r"""
+apply_native_mtls_secrets gen2
+wait_for_native_rotation_evidence
+NATIVE_CP_SERVED_SERIAL=""
+NATIVE_CP_SERVED_CLASS=""
+NATIVE_OBSERVE_PF_PID=""
+observe_native_cp_served_serial() {
+  NATIVE_OBSERVE_PF_PID="$pf_pid"
+  kubectl port-forward svc/ferrum-cp "${port}:50051"
+  openssl s_client -connect 127.0.0.1:${port} -servername "$NATIVE_CP_DNS" \
+    -verify_hostname "$NATIVE_CP_DNS" -verify_return_error \
+    -CAfile gen2-ca.pem -cert gen2-client.pem -key gen2-client-key.pem
+  openssl x509 -noout -serial
+  Verify return code: 0
+  NATIVE_CP_SERVED_SERIAL="$serial"
+  NATIVE_CP_SERVED_CLASS=ok
+  printf '%s\n' "$serial"
+}
+if live_serial="$(observe_native_cp_served_serial)"; then
+  live_serial="${NATIVE_CP_SERVED_SERIAL:-}"
+fi
+outcome="live_serial=$live_serial observe_class=${NATIVE_CP_SERVED_CLASS:-}"
+record_live_assertion sidecar.config.native_subscribe_tls_rotation_reconnects pass
+NATIVE_SERVER_SERIAL_GEN2
+"""
+    subshell_errors = native_mtls_rotation_observation_errors(subshell_false_proof)
+    if not subshell_errors:
+        failures.append(
+            "rotation observation contract accepted invoking the observe helper "
+            "through command substitution"
+        )
+    elif not any(
+        "command substitution" in error or "parent shell" in error
+        for error in subshell_errors
+    ):
+        failures.append(
+            "rotation observation contract must reject observe-helper command "
+            f"substitution by name, got {subshell_errors!r}"
         )
     return failures
 
