@@ -3,6 +3,7 @@ use std::time::Duration;
 use tonic::transport::{Certificate, Identity};
 
 use crate::grpc::dp_client::{DpGrpcTlsConfig, DpGrpcTlsReload, build_dp_grpc_tls_config};
+pub use crate::grpc::dp_client::wait_optional_tls_reload;
 pub use crate::util::backoff::{BACKOFF_INITIAL_SECS, jittered_backoff, next_backoff_secs};
 #[cfg(test)]
 pub(crate) use crate::util::backoff::{BACKOFF_MAX_SECS, jittered_backoff_with_entropy};
@@ -52,17 +53,6 @@ pub async fn wait_for_shutdown(shutdown_rx: &mut tokio::sync::watch::Receiver<bo
         if shutdown_rx.changed().await.is_err() {
             return;
         }
-    }
-}
-
-pub async fn wait_optional_tls_reload(mut revision_rx: Option<tokio::sync::watch::Receiver<u64>>) {
-    let changed = if let Some(revision_rx) = revision_rx.as_mut() {
-        revision_rx.changed().await.is_ok()
-    } else {
-        false
-    };
-    if !changed {
-        std::future::pending::<()>().await;
     }
 }
 

@@ -148,7 +148,10 @@ pub async fn start_native_mesh_client_with_shutdown(
                     info!("Native mesh client shutting down");
                     return;
                 }
-                _ = wait_optional_tls_reload(tls_reload.as_ref().map(|reload| reload.revision_rx.clone())) => {
+                _ = wait_optional_tls_reload(
+                    tls_reload.as_ref().map(|reload| reload.revision_rx.clone()),
+                    last_tls_revision,
+                ) => {
                     info!("Mesh gRPC TLS source changed; reconnecting native MeshSubscribe stream");
                     backoff_secs = BACKOFF_INITIAL_SECS;
                     continue;
@@ -167,7 +170,10 @@ pub async fn start_native_mesh_client_with_shutdown(
                     info!("Native mesh client shutting down");
                     return;
                 }
-                _ = wait_optional_tls_reload(tls_reload.as_ref().map(|reload| reload.revision_rx.clone())) => {
+                _ = wait_optional_tls_reload(
+                    tls_reload.as_ref().map(|reload| reload.revision_rx.clone()),
+                    last_tls_revision,
+                ) => {
                     info!("Mesh gRPC TLS source changed; reconnecting native MeshSubscribe stream");
                     backoff_secs = BACKOFF_INITIAL_SECS;
                     continue;
@@ -216,7 +222,10 @@ pub async fn start_native_mesh_client_with_shutdown(
                 info!("Native mesh client shutting down");
                 return;
             }
-            _ = wait_optional_tls_reload(tls_reload.as_ref().map(|reload| reload.revision_rx.clone())) => {
+            _ = wait_optional_tls_reload(
+                tls_reload.as_ref().map(|reload| reload.revision_rx.clone()),
+                last_tls_revision,
+            ) => {
                 backoff_secs = BACKOFF_INITIAL_SECS;
                 continue;
             }

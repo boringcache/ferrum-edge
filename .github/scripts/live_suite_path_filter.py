@@ -943,6 +943,16 @@ def native_mtls_rotation_observation_errors(
                 "wait_for_native_rotation_evidence must refuse to pass without a "
                 "captured pre-swap baseline"
             )
+        if "seq 1 120" not in wait_body or "sleep 2" not in wait_body:
+            errors.append(
+                "wait_for_native_rotation_evidence must poll for at least 240s of "
+                "projected-volume evidence (seq 1 120 * sleep 2)"
+            )
+        if "seq 1 45" in wait_body:
+            errors.append(
+                "wait_for_native_rotation_evidence must not use the 90s projected-volume "
+                "window; hosted Kind kubelet projection can exceed it"
+            )
 
     probe_body = _bash_function_body(run_text, "probe_native_mtls_rotation")
     if probe_body:

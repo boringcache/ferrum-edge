@@ -1881,6 +1881,20 @@ fn native_rotation_observation_violations(source: &str) -> Vec<String> {
                     .into(),
             );
         }
+        if !wait_body.contains("seq 1 120") || !wait_body.contains("sleep 2") {
+            errors.push(
+                "wait_for_native_rotation_evidence must poll for at least 240s of \
+                 projected-volume evidence (seq 1 120 * sleep 2)"
+                    .into(),
+            );
+        }
+        if wait_body.contains("seq 1 45") {
+            errors.push(
+                "wait_for_native_rotation_evidence must not use the 90s projected-volume \
+                 window; hosted Kind kubelet projection can exceed it"
+                    .into(),
+            );
+        }
     }
 
     let probe_body = bash_function_body(source, "probe_native_mtls_rotation");

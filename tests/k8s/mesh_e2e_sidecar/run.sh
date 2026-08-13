@@ -1965,7 +1965,10 @@ wait_for_native_rotation_evidence() {
     return 1
   fi
   # kubelet projected-volume propagation plus FERRUM_BACKEND_TLS_WATCH_INTERVAL_SECONDS=2.
-  for _ in $(seq 1 45); do
+  # Hosted Kind has observed DP gen2 revision publication past 150s, so 90s is
+  # not a defensible evidence window. Poll every 2s for 240s; keep exact
+  # post-anchor Connected-to-CP / Tenant-accepted proof.
+  for _ in $(seq 1 120); do
     if native_rotation_fresh_now; then
       return 0
     fi
