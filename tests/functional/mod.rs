@@ -1,3 +1,4 @@
+mod destination_active_requests_helpers;
 mod functional_a2a_gateway_grpc_card_test;
 mod functional_admin_connection_limit_test;
 mod functional_admin_crud_resources_test;
@@ -34,6 +35,9 @@ mod functional_db_failover_test;
 mod functional_db_outage_test;
 mod functional_db_tls_test;
 mod functional_db_upstream_test;
+mod functional_destination_active_requests_grpc_test;
+mod functional_destination_active_requests_h3_test;
+mod functional_destination_active_requests_test;
 mod functional_dns_cache_test;
 mod functional_early_data_test;
 mod functional_early_upload_deadline_test;

@@ -6145,6 +6145,20 @@ pub struct ProxyState {
     /// #3775's future active-request breaker). See `docs/mesh.md` and
     /// `src/backend_pending_limit.rs`.
     pub backend_pending_limit: Arc<crate::backend_pending_limit::BackendPendingLimiter>,
+    /// Destination-wide **active-request** breaker enforcing DestinationRule
+    /// `connectionPool.http.http2MaxRequests` across HTTP/1.1 AND HTTP/2 — every
+    /// transport, every connection, every pool shard. Keyed by the effective
+    /// policy identity (`namespace`, logical destination, DestinationRule policy
+    /// port, selected subset), never by a socket address, so
+    /// one destination has ONE budget and two Services sharing endpoints keep
+    /// their own. The permit is taken during backend admission (before any dial)
+    /// and released only when the client-visible response body reaches a
+    /// terminal state, so streaming and long-lived gRPC responses stay counted.
+    /// Istio's separate per-connection `maxConcurrentStreams` remains the
+    /// transport knob (`pool_http2_max_concurrent_streams`). See
+    /// `docs/mesh.md` and `src/backend_active_request_limit.rs`.
+    pub backend_active_request_limit:
+        Arc<crate::backend_active_request_limit::BackendActiveRequestLimiter>,
 }
 
 #[inline]
@@ -7926,6 +7940,11 @@ impl ProxyState {
             reqwest_conn_admission,
             backend_pending_limit: Arc::new(
                 crate::backend_pending_limit::BackendPendingLimiter::with_shard_amount(
+                    pool_shard_amount,
+                ),
+            ),
+            backend_active_request_limit: Arc::new(
+                crate::backend_active_request_limit::BackendActiveRequestLimiter::with_shard_amount(
                     pool_shard_amount,
                 ),
             ),
@@ -12175,6 +12194,7 @@ async fn handle_websocket_request_authenticated(
 
         backend_admission_start = Instant::now();
         backend_admission_permits = match backend_dispatch::run_backend_admission_plugins(
+            &state,
             backend_admission_plugins.as_ref(),
             &ctx,
             &proxy,
@@ -28304,6 +28324,7 @@ async fn handle_proxy_request_inner(
             let admission_proxy =
                 resolve_effective_proxy_for_target(&proxy, upstream_target.as_deref());
             let permits = match backend_dispatch::run_backend_admission_plugins(
+                &state,
                 backend_admission_plugins.as_ref(),
                 &ctx,
                 admission_proxy.as_ref(),
@@ -29400,6 +29421,7 @@ async fn handle_proxy_request_inner(
             // `retry_on_connect_failure` enabled. Mirrors the same
             // single-return contract used by the buffered-request gRPC path.
             backend_admission_permits = match backend_dispatch::run_backend_admission_plugins(
+                &state,
                 backend_admission_plugins.as_ref(),
                 &ctx,
                 &proxy,
@@ -29572,6 +29594,7 @@ async fn handle_proxy_request_inner(
                         None => None,
                     };
                 backend_admission_permits = match backend_dispatch::run_backend_admission_plugins(
+                    &state,
                     backend_admission_plugins.as_ref(),
                     &ctx,
                     &proxy,
@@ -29683,6 +29706,7 @@ async fn handle_proxy_request_inner(
                         );
                         backend_admission_permits =
                             match backend_dispatch::run_backend_admission_plugins(
+                                &state,
                                 backend_admission_plugins.as_ref(),
                                 &ctx,
                                 &proxy,
@@ -30149,6 +30173,7 @@ async fn handle_proxy_request_inner(
                 }
 
                 backend_admission_permits = match backend_dispatch::run_backend_admission_plugins(
+                    &state,
                     backend_admission_plugins.as_ref(),
                     &ctx,
                     &proxy,
@@ -32979,6 +33004,7 @@ async fn handle_proxy_request_inner(
             }
 
             backend_admission_permits = match backend_dispatch::run_backend_admission_plugins(
+                &state,
                 backend_admission_plugins.as_ref(),
                 &ctx,
                 &proxy,
@@ -35130,7 +35156,8 @@ pub(crate) fn resolve_effective_proxy_for_target<'a>(
     // are FIELD-MERGED, not wholesale-replaced: a per-port `connectionPool.http`
     // field wins when set, otherwise the selected-subset/top-level value is inherited —
     // so an unrelated per-port field (`connectTimeout`/`tls`) no longer wipes the
-    // inherited top-level `idleTimeout`/`http2MaxRequests`/`maxRetries`. This
+    // inherited top-level `idleTimeout`/`http2MaxRequests`/
+    // `maxConcurrentStreams`/`maxRetries`. This
     // matches the cold-path tiering exactly (inherited fallback, then a partial
     // per-port overlay; see `apply_connection_pool_http_to_port_override` in
     // `src/modes/mesh/mod.rs`). Resolve each field through borrowed references:
@@ -35510,6 +35537,60 @@ pub(crate) fn resolve_backend_http1_max_pending_requests(
                 .as_ref()
                 .and_then(|fallback| fallback.http1_max_pending_requests)
         })
+}
+
+/// Resolve the DestinationRule `connectionPool.http.http2MaxRequests` cap — the
+/// destination-wide ACTIVE-REQUEST budget — for the destination port a backend
+/// attempt will target.
+///
+/// Returns `None` (no cap) in the common case: the proxy has no
+/// `dispatch_port_overrides`, the resolved port has no override, and the
+/// inherited top-level/selected-subset fallback carries no
+/// `http2_max_requests`. Hot-path discipline and FIELD-level fallback semantics
+/// match [`resolve_backend_http1_max_pending_requests`] exactly: one field read
+/// on the precomputed `Proxy.dispatch_port_overrides` map, no `ArcSwap` load,
+/// and a per-port entry that sets an unrelated field does not wipe the
+/// inherited cap.
+///
+/// `dispatch_port` is the DestinationRule policy key, always derived through
+/// [`dispatch_policy_port_for_target`]. Unlike the H1 pending gate this cap is
+/// transport-agnostic: it applies to HTTP/1.1 and HTTP/2 alike, exactly as
+/// Istio specifies.
+pub(crate) fn resolve_backend_http2_max_requests(
+    proxy: &Proxy,
+    dispatch_policy_port: u16,
+) -> Option<u32> {
+    proxy
+        .dispatch_port_overrides
+        .as_ref()
+        .and_then(|overrides| overrides.get(&dispatch_policy_port))
+        .and_then(|override_config| override_config.http2_max_requests)
+        .or_else(|| {
+            proxy
+                .dispatch_port_override_fallback
+                .as_ref()
+                .and_then(|fallback| fallback.http2_max_requests)
+        })
+}
+
+/// The logical destination identity one backend attempt is admitted against for
+/// the `http2MaxRequests` breaker.
+///
+/// The referenced upstream id is the DestinationRule cluster: every endpoint of
+/// one Service shares one budget (so connection count, pool sharding, and LB
+/// rotation cannot multiply the ceiling), while two Services that resolve to the
+/// same pods keep independent budgets. A direct-backend proxy with no upstream
+/// falls back to its own route id, which is that route's logical destination.
+pub(crate) fn destination_active_request_scope<'a>(
+    proxy: &'a Proxy,
+    policy_port: u16,
+) -> crate::backend_active_request_limit::DestinationScope<'a> {
+    crate::backend_active_request_limit::DestinationScope {
+        namespace: proxy.namespace.as_str(),
+        destination: proxy.upstream_id.as_deref().unwrap_or(proxy.id.as_str()),
+        policy_port,
+        subset: proxy.upstream_subset.as_deref(),
+    }
 }
 
 /// Whether the reqwest-backed backend client for this (effective) proxy is
@@ -36559,6 +36640,7 @@ impl PreacquiredBackendAdmission {
 
     fn take_or_run(
         &mut self,
+        state: &ProxyState,
         plugins: &[Arc<dyn crate::plugins::Plugin>],
         ctx: &RequestContext,
         proxy: &Proxy,
@@ -36570,6 +36652,7 @@ impl PreacquiredBackendAdmission {
             Ok(permits)
         } else {
             backend_dispatch::run_backend_admission_plugins(
+                state,
                 plugins,
                 ctx,
                 proxy,
@@ -37601,6 +37684,7 @@ async fn proxy_to_backend(
             Err(response) => return backend_dispatch_response(response, None, None),
         };
         backend_admission_permits = match preacquired_backend_admission.take_or_run(
+            state,
             backend_admission_plugins,
             request_ctx,
             proxy,
@@ -37706,6 +37790,7 @@ async fn proxy_to_backend(
             Err(response) => return backend_dispatch_response(response, None, None),
         };
         backend_admission_permits = match preacquired_backend_admission.take_or_run(
+            state,
             backend_admission_plugins,
             request_ctx,
             proxy,
@@ -37835,6 +37920,7 @@ async fn proxy_to_backend(
             Err(response) => return backend_dispatch_response(response, None, None),
         };
         backend_admission_permits = match preacquired_backend_admission.take_or_run(
+            state,
             backend_admission_plugins,
             request_ctx,
             proxy,
@@ -37912,6 +37998,7 @@ async fn proxy_to_backend(
             return reject;
         }
         backend_admission_permits = match preacquired_backend_admission.take_or_run(
+            state,
             backend_admission_plugins,
             request_ctx,
             proxy,
@@ -38086,6 +38173,7 @@ async fn proxy_to_backend(
             // let a capacity-rejected request still create a connection and
             // would hide get_sender connect failures from the limiter.
             let mut h2_admission_permits = match preacquired_backend_admission.take_or_run(
+                state,
                 backend_admission_plugins,
                 request_ctx,
                 proxy,
@@ -38881,8 +38969,10 @@ async fn proxy_to_backend(
     // (`enable_http2 && (retain_request_body || requires_request_body_buffering)`);
     // an H2 backend must not be capped by an `http1*` knob, so the slot is taken
     // only when the reqwest client is forced/known HTTP/1.1
-    // (`reqwest_dispatch_is_http1_only`). Their concurrency is instead governed
-    // by `http2MaxRequests` → `h2_max_concurrent_streams`.
+    // (`reqwest_dispatch_is_http1_only`). Every transport — this one included —
+    // is separately bounded by the destination-wide `http2MaxRequests`
+    // active-request breaker acquired during backend admission
+    // (`src/backend_active_request_limit.rs`).
     //
     // In-flight reinterpretation (codex r3, finding 3): reqwest's `send()`
     // resolves when RESPONSE HEADERS arrive, not when a connection slot is
@@ -38995,6 +39085,7 @@ async fn proxy_to_backend(
         )
     });
     backend_admission_permits = match preacquired_backend_admission.take_or_run(
+        state,
         backend_admission_plugins,
         request_ctx,
         proxy,
@@ -57945,7 +58036,7 @@ mod tests {
     #[test]
     fn resolve_effective_proxy_applies_sd_fallback_by_selected_port() {
         // SD top-level overlay only: any selected port with no explicit per-port
-        // entry picks up the fallback (here `http2MaxRequests` →
+        // entry picks up the fallback (here `maxConcurrentStreams` →
         // `pool_http2_max_concurrent_streams`).
         let mut proxy = proxy_with_port_overrides_for_test(5000, &[]);
         assert!(proxy.dispatch_port_overrides.is_none());
@@ -58042,7 +58133,8 @@ mod tests {
         // codex r1 #1806: a partial per-port `portLevelSettings` entry that sets
         // ONLY an unrelated field (here `connectTimeout`) must NOT wipe the
         // inherited top-level `connectionPool.http` overlay
-        // (`idleTimeout`/`http2MaxRequests`/`maxRetries`/`http1MaxPendingRequests`).
+        // (`idleTimeout`/`http2MaxRequests`/`maxConcurrentStreams`/`maxRetries`/
+        // `http1MaxPendingRequests`).
         // The per-port field wins where set; otherwise the fallback is inherited —
         // exactly the non-SD apply-time layering
         // (`apply_connection_pool_http_to_port_override`).
@@ -58069,11 +58161,11 @@ mod tests {
         let effective = resolve_effective_proxy_for_target(&proxy, Some(&target));
         // Per-port connectTimeout applied.
         assert_eq!(effective.backend_connect_timeout_ms, 750);
-        // Per-port http2MaxRequests wins over the fallback (10, not 64).
+        // Per-port maxConcurrentStreams wins over the fallback (10, not 64).
         assert_eq!(
             effective.pool_http2_max_concurrent_streams,
             Some(10),
-            "per-port http2MaxRequests must win over the inherited fallback"
+            "per-port maxConcurrentStreams must win over the inherited fallback"
         );
         // idleTimeout NOT set per-port → inherited from the fallback (120s).
         assert_eq!(

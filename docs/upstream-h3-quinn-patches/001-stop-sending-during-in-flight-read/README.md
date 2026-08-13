@@ -138,14 +138,16 @@ Once `hyperium/h3` releases an `h3-quinn` whose `stop_sending` is correct while 
 read is in flight:
 
 1. Bump the workspace `h3-quinn` dependency to that release.
-2. Remove the `h3-quinn` `[patch.crates-io]` entry from `Cargo.toml` and the
+2. Keep the vendored crate until patch 002 is also retired (they share one vendor directory).
+3. When both active h3-quinn patches are available upstream, remove the
+   `h3-quinn` `[patch.crates-io]` entry from `Cargo.toml` and the
    mirrored entry in `tests/performance/mesh/Cargo.toml`.
-3. Delete `vendor/h3-quinn-0.0.10-ferrum-patched/` and regenerate
+4. Delete `vendor/h3-quinn-0.0.10-ferrum-patched/` and regenerate
    `vendor/VENDOR_INTEGRITY.sha256` with `scripts/update_vendor_integrity.sh`.
-4. Drop this patch's row from `docs/dependency-policy.md` and its entry from
+5. Drop this patch's row from `docs/dependency-policy.md` and its entry from
    `docs/vendored-patch-lifecycle.json`.
-5. Move this directory under
+6. Move this directory under
    `docs/upstream-h3-quinn-patches/_retired/001-stop-sending-during-in-flight-read/`
    with a `STATUS.md` noting the upstream merge and release.
-6. Keep the Ferrum behavioral regression tests above, minus the vendored-shape
+7. Keep the Ferrum behavioral regression tests above, minus the vendored-shape
    contract test, which retires with the vendor copy.
