@@ -83,6 +83,8 @@ The gRPC channel supports three security modes:
 
 **Mutual TLS (recommended for production)**: In addition to server verification, the CP requires a client certificate from the DP (`FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH` + `_KEY_PATH`), verified against a trusted CA (`FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH`). This adds certificate-based DP identity on top of JWT authentication, so a leaked JWT secret alone cannot impersonate a DP.
 
+The release-blocking `mesh-e2e-sidecar` native `MeshSubscribe` assertion proves this production posture end to end: the DP dials `https://ferrum-cp.<namespace>.svc.cluster.local:50051` so hostname/SAN verification is real Kubernetes Service DNS, the CP requires a client certificate, JWT remains required on the same stream, dedicated probe Deployments fail closed for omit-client / foreign-client / untrusted-server-CA / wrong-SAN / invalid-JWT, and a projected Secret generation swap proves the watched CP/DP gRPC TLS sources reconnect without a pod restart. That gate does not permit plaintext gRPC and does not skip server certificate verification.
+
 > **`FERRUM_DP_GRPC_TLS_NO_VERIFY` is not supported** and is rejected at startup when `true`: the tonic-managed gRPC client exposes no hook to skip server certificate verification, so the flag only ever provided false confidence. To test against a CP with a self-signed certificate, pin its CA via `FERRUM_DP_GRPC_TLS_CA_CERT_PATH`.
 
 ### Pre-authentication connection admission

@@ -30,16 +30,26 @@ cluster runs SPIRE plus the hand-crafted sidecar workloads (and, since issue
   watching disabled) whose K8s controller builds the mesh model from the
   cluster's **real** Services/Pods/EndpointSlices — the only path that
   populates a CP's mesh block — and serves it over the native
-  `MeshConfigSync.MeshSubscribe` gRPC stream on `:50051` (in-cluster
-  plaintext h2c, JWT-authenticated via the per-run `ferrum-mesh-e2e-secrets`
-  Secret run.sh mints).
+  `MeshConfigSync.MeshSubscribe` gRPC stream on `:50051` with production
+  **mTLS + JWT**. The CP server certificate SAN is the Kubernetes Service
+  DNS hostname the DP dials (`https://ferrum-cp.<ns>.svc.cluster.local:50051`);
+  `FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH` requires a DP client certificate; JWT
+  remains required on the same stream. Ephemeral PKI is minted per run into
+  projected Secrets (`ferrum-native-mtls-cp` / `ferrum-native-mtls-dp`).
+  The release-blocking native leg does not permit plaintext gRPC and does
+  not skip server certificate verification.
 - **capp** — a third destination pod shaped like `svc` (inbound REDIRECT
   `8080 -> :15006`, SPIRE identity `sa/capp`, python echo answering a
   distinct `-native` marker) whose sidecar runs
-  `FERRUM_MESH_CONFIG_PROTOCOL=native` subscribing to `ferrum-cp` — **no
-  ConfigMap**: its inbound routes exist only if the CP-delivered
-  MeshSubscribe slice materialized, which is the live proof for the native
-  config-transport GA row (issue #2002).
+  `FERRUM_MESH_CONFIG_PROTOCOL=native` subscribing to `ferrum-cp` over that
+  mTLS+JWT channel — **no ConfigMap**: its inbound routes exist only if the
+  CP-delivered MeshSubscribe slice materialized, which is the live proof for
+  the native config-transport GA row (issues #2002 / #3855). Dedicated probe
+  Deployments use `sa/native-mtls-probe` (not capp) so omit-client,
+  foreign-client, untrusted-server-CA, wrong-SAN, and invalid-JWT negatives
+  cannot make capp's inbound resolution ambiguous. A projected Secret
+  generation swap proves watched CP/DP gRPC TLS rotation reconnects without
+  a pod restart.
 - **drsvc-a / drsvc-b** — DestinationRule visibility destinations: two
   sidecar-backed workloads (`sa/drsvc-a`, `sa/drsvc-b`, inbound REDIRECT
   `8080 -> :15006`, SPIRE, STRICT) behind MeshService `drsvc` owned by
@@ -68,7 +78,13 @@ shared schema from `tests/k8s/lib/live_assertions.sh` (suite
 | `sidecar.destination_rule.tcp_connect_timeout` | two-phase timing: the black-holed mesh-mTLS dial fails at ~8s under `connect_timeout_ms: 8000`, then ~2s after a re-render + rollout restart to `2000` — the observed time must **track** the configured value (both windows exclude the built-in 5000ms default) |
 | `sidecar.virtual_service.cors_policy` | VS-derived CORS on the client sidecar: allowed `Origin` → backend 200 with the origin reflected, allowed `OPTIONS` preflight → **200 by the sidecar** with `access-control-allow-methods`, and unmatched actual/preflight requests → backend 200 with the app marker and no gateway-added `access-control-allow-origin` (Istio omitted/FORWARD semantics) |
 | `sidecar.destination_rule.tcp_max_connections` | WebSocket flow (`wssvc`, maxConnections=1): one **held** WS session admitted (101), a concurrent second upgrade rejected **503** by the client sidecar's `BackendConnectionGuard` before dialing, and a fresh upgrade admitted after the held session closes — cap enforcement **and** release |
-| `sidecar.config.native_subscribe_delivered` | native MeshSubscribe delivery (issue #2002): a captured client request to `capp` answers 200 with the `-native` marker — capp's inbound routes exist **only** if the ferrum-cp MeshSubscribe stream delivered a slice whose K8s-built `sa/capp` workload resolved locally — **and** capp's JWT-authenticated `GET /mesh/config-drift` reports a received slice with `source_protocol=native` from the ferrum-cp URL and ≥1 service |
+| `sidecar.config.native_subscribe_delivered` | native MeshSubscribe delivery over production mTLS + JWT (issues #2002 / #3855): a captured client request to `capp` answers 200 with the `-native` marker — capp's inbound routes exist **only** if the ferrum-cp MeshSubscribe stream delivered a slice whose K8s-built `sa/capp` workload resolved locally — **and** capp's JWT-authenticated `GET /mesh/config-drift` reports a received slice with `source_protocol=native` from the `https://ferrum-cp...` URL and ≥1 service |
+| `sidecar.config.native_subscribe_mtls_omitted_client_rejected` | dedicated probe DP omits its client certificate; MeshSubscribe never accepts a slice |
+| `sidecar.config.native_subscribe_mtls_foreign_client_rejected` | dedicated probe DP presents a client certificate from a foreign CA; no slice accepted |
+| `sidecar.config.native_subscribe_tls_untrusted_server_ca_rejected` | dedicated probe DP trusts the wrong server CA; no slice accepted |
+| `sidecar.config.native_subscribe_tls_wrong_san_rejected` | dedicated probe DP dials `ferrum-cp-wrong-san.<ns>.svc.cluster.local`, a hostname absent from the CP server SAN; no slice accepted |
+| `sidecar.config.native_subscribe_jwt_rejected` | dedicated probe DP completes mTLS then presents an invalid JWT; no slice accepted |
+| `sidecar.config.native_subscribe_tls_rotation_reconnects` | projected Secret generation swap of CP/DP gRPC TLS material reconnects the native stream without a pod restart; the replacement serial is live and a gen-1 client is then rejected |
 
 Every assertion backs a GA-contract capability row in
 `tests/conformance/ga_contract.yaml` — STRICT mTLS, AuthorizationPolicy
@@ -79,7 +95,8 @@ VirtualService CORS, SPIFFE identity plumbing
 `sidecar.peer_auth.strict_mtls_authenticated` positive, which that row shares
 with the PeerAuthentication row), and the native MeshSubscribe config
 transport (`mesh.config_transport.native_subscribe`, backed by
-`sidecar.config.native_subscribe_delivered`); the artifact is validated
+`sidecar.config.native_subscribe_delivered` plus the mTLS/JWT/SAN negatives
+and projected-Secret rotation assertions); the artifact is validated
 against the contract by `tests/conformance/live_contract.rs` (the live
 workflow runs it right after the fixture). No contract row remains
 `live_deferred`: VS CORS closed with issue #1973 (the mesh slice's

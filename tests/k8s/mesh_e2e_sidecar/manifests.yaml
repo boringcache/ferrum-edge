@@ -30,18 +30,29 @@
 #     pods — the only path that populates `GatewayConfig.mesh` on a CP
 #     (src/config_sources/k8s/mod.rs) — and serves it over the native
 #     `MeshConfigSync.MeshSubscribe` gRPC stream (src/grpc/mesh_server.rs) on
-#     :50051. In-cluster plaintext h2c with JWT auth
-#     (FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true): CP-DP gRPC TLS is an
-#     orthogonal, documented knob this fixture does not exercise.
+#     :50051. In-cluster mTLS + JWT: the CP presents a server certificate
+#     whose SAN is the Kubernetes Service DNS hostname the DP dials
+#     (`https://ferrum-cp.<ns>.svc.cluster.local:50051`), verifies the DP
+#     client certificate against FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH, and still
+#     requires the shared CP/DP JWT. The DP verifies that SAN against
+#     FERRUM_DP_GRPC_TLS_CA_CERT_PATH and presents FERRUM_DP_GRPC_TLS_CLIENT_*.
+#     Material is minted per run and mounted through projected Secrets. The
+#     release-blocking native leg does not permit plaintext gRPC and does
+#     not skip server certificate verification.
+#     File/provider/Kubernetes-backed CP/DP gRPC TLS sources are watched, so
+#     a projected Secret generation swap is the rotation proof.
 #   - `capp` — a destination workload shaped exactly like `svc` (inbound
 #     iptables REDIRECT 8080 -> :15006, SPIRE identity, python echo) whose
-#     sidecar runs FERRUM_MESH_CONFIG_PROTOCOL=native subscribing to the CP.
-#     Its inbound routes exist ONLY if the CP-delivered native slice
-#     materialized, so client traffic reaching its app is the live
-#     MeshSubscribe proof (`sidecar.config.native_subscribe_delivered`).
-#     Config-drift diagnostics ride the sidecar's JWT-authenticated
-#     `GET /mesh/config-drift` (FERRUM_ADMIN_JWT_SECRET from the shared
-#     Secret; run.sh mints the HS256 token).
+#     sidecar runs FERRUM_MESH_CONFIG_PROTOCOL=native subscribing to the CP
+#     over that mTLS+JWT channel. Its inbound routes exist ONLY if the
+#     CP-delivered native slice materialized, so client traffic reaching its
+#     app is the live MeshSubscribe proof
+#     (`sidecar.config.native_subscribe_delivered`). Config-drift diagnostics
+#     ride the sidecar's JWT-authenticated `GET /mesh/config-drift`
+#     (FERRUM_ADMIN_JWT_SECRET from the shared Secret; run.sh mints the
+#     HS256 token). Dedicated probe Deployments (not capp) cover the
+#     fail-closed negatives and must never inherit a previously accepted
+#     slice.
 #
 # JWT secrets come from the `ferrum-mesh-e2e-secrets` Secret run.sh mints per
 # run (openssl rand), so this manifest references but does not define it.
@@ -68,6 +79,10 @@
 #              workload SPIFFE ID spiffe://<td>/ns/<ns>/sa/capp must equal the
 #              sidecar's FERRUM_MESH_WORKLOAD_SPIFFE_ID for
 #              resolve_local_workloads to anchor inbound routes)
+#   sa/native-mtls-probe
+#              dedicated identity for fail-closed native mTLS/JWT probes so
+#              they cannot share sa/capp and make capp's inbound resolution
+#              ambiguous while negatives run
 #   sa/drsvc-a / sa/drsvc-b
 #              DestinationRule visibility backends (beta-owned MeshService
 #              `drsvc`; each SA backs exactly one local service attachment)
@@ -652,11 +667,29 @@ subjects:
     name: ferrum-cp
     namespace: __NAMESPACE__
 ---
-# The FQDN the native DP dials: ferrum-cp.<ns>.svc.cluster.local:50051.
+# The FQDN the native DP dials: https://ferrum-cp.<ns>.svc.cluster.local:50051.
+# The CP server certificate SAN is exactly that hostname so verification is
+# real Service DNS, not a skip-verify or IP-only handshake.
 apiVersion: v1
 kind: Service
 metadata:
   name: ferrum-cp
+  namespace: __NAMESPACE__
+spec:
+  selector:
+    app: ferrum-cp
+  ports:
+    - name: grpc
+      port: 50051
+      targetPort: 50051
+---
+# Distinct Service DNS name selecting the same CP pods. The server certificate
+# SAN does NOT include this hostname; the wrong-SAN negative dials it over
+# https:// so rustls hostname verification is the failing control.
+apiVersion: v1
+kind: Service
+metadata:
+  name: ferrum-cp-wrong-san
   namespace: __NAMESPACE__
 spec:
   selector:
@@ -731,11 +764,19 @@ spec:
                   key: cp-dp-grpc-jwt-secret
             - name: FERRUM_CP_GRPC_LISTEN_ADDR
               value: 0.0.0.0:50051
-            # In-cluster plaintext h2c, explicitly acknowledged (EnvConfig
-            # validation refuses a non-loopback plaintext CP bind otherwise).
-            # The MeshSubscribe stream is still JWT-authenticated.
-            - name: FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT
-              value: "true"
+            # Production CP gRPC mTLS: server cert SAN matches the Service DNS
+            # hostname the DP dials; client CA requires a DP client certificate.
+            # JWT remains required on the same stream. Projected Secret mounts
+            # are watched (FERRUM_BACKEND_TLS_WATCH_INTERVAL_SECONDS) so a
+            # generation swap reconnects without a pod restart.
+            - name: FERRUM_CP_GRPC_TLS_CERT_PATH
+              value: /transport/server.pem
+            - name: FERRUM_CP_GRPC_TLS_KEY_PATH
+              value: /transport/server-key.pem
+            - name: FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH
+              value: /transport/client-ca.pem
+            - name: FERRUM_BACKEND_TLS_WATCH_INTERVAL_SECONDS
+              value: "2"
             # Explicit (defaults are in-cluster-on anyway) so the fixture does
             # not depend on the KUBERNETES_SERVICE_HOST heuristic.
             - name: FERRUM_K8S_CONTROLLER_ENABLED
@@ -767,9 +808,25 @@ spec:
           volumeMounts:
             - name: cp-data
               mountPath: /data
+            - name: transport
+              mountPath: /transport
+              readOnly: true
       volumes:
         - name: cp-data
           emptyDir: {}
+        - name: transport
+          projected:
+            defaultMode: 0440
+            sources:
+              - secret:
+                  name: ferrum-native-mtls-cp
+                  items:
+                    - key: server.pem
+                      path: server.pem
+                    - key: server-key.pem
+                      path: server-key.pem
+                    - key: client-ca.pem
+                      path: client-ca.pem
 ---
 # ── Native-MeshSubscribe destination pod (capp) ─────────────────────────────
 # Shaped exactly like `svc` (inbound iptables REDIRECT 8080 -> :15006, SPIRE
@@ -788,6 +845,15 @@ apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: capp
+  namespace: __NAMESPACE__
+---
+# Dedicated identity for native MeshSubscribe transport negatives/rotation
+# probes. Must not share sa/capp: a second pod with capp's SPIFFE would make
+# resolve_local_workloads fail closed on the live destination.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: native-mtls-probe
   namespace: __NAMESPACE__
 ---
 apiVersion: v1
@@ -821,6 +887,8 @@ spec:
         ferrum.io/mesh: enabled
     spec:
       serviceAccountName: capp
+      securityContext:
+        fsGroup: 1337
       initContainers:
         - name: ferrum-edge-init
           image: alpine:3.21
@@ -866,7 +934,15 @@ spec:
             - name: FERRUM_MESH_CONFIG_PROTOCOL
               value: native
             - name: FERRUM_DP_CP_GRPC_URLS
-              value: http://ferrum-cp.__NAMESPACE__.svc.cluster.local:50051
+              value: https://ferrum-cp.__NAMESPACE__.svc.cluster.local:50051
+            - name: FERRUM_DP_GRPC_TLS_CA_CERT_PATH
+              value: /transport/ca.pem
+            - name: FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH
+              value: /transport/client.pem
+            - name: FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH
+              value: /transport/client-key.pem
+            - name: FERRUM_BACKEND_TLS_WATCH_INTERVAL_SECONDS
+              value: "2"
             - name: FERRUM_CP_DP_GRPC_JWT_SECRET
               valueFrom:
                 secretKeyRef:
@@ -901,6 +977,9 @@ spec:
           volumeMounts:
             - name: spire-agent-socket
               mountPath: /run/spire/sockets
+              readOnly: true
+            - name: transport
+              mountPath: /transport
               readOnly: true
         - name: app
           image: python:3.12-alpine
@@ -956,6 +1035,19 @@ spec:
           hostPath:
             path: /run/spire/sockets
             type: DirectoryOrCreate
+        - name: transport
+          projected:
+            defaultMode: 0440
+            sources:
+              - secret:
+                  name: ferrum-native-mtls-dp
+                  items:
+                    - key: ca.pem
+                      path: ca.pem
+                    - key: client.pem
+                      path: client.pem
+                    - key: client-key.pem
+                      path: client-key.pem
 ---
 # ── DestinationRule visibility destinations (beta-owned MeshService) ───────
 # Two sidecar-backed workloads behind MeshService `drsvc` owned by namespace

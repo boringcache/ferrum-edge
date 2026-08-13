@@ -224,16 +224,32 @@ capabilities:
       - category: mesh_config_transport
         feature: native slice apply + malformed-update fail-closed
     live_suite: mesh-e2e-sidecar
-    # Live backing (issue #2002): the fixture deploys a Ferrum CP (cp mode,
-    # sqlite, K8s pod discovery building the mesh model from the cluster's
-    # real Services/pods) and a sidecar DP on
-    # FERRUM_MESH_CONFIG_PROTOCOL=native. Captured client traffic reaching
-    # the capp app proves the CP-delivered slice materialized the inbound
-    # datapath (those routes exist ONLY via MeshSubscribe delivery), and the
-    # DP's JWT-authenticated /mesh/config-drift must attribute the slice to
-    # source_protocol=native from the ferrum-cp URL.
+    # Live backing (issues #2002 / #3855): the fixture deploys a Ferrum CP
+    # (cp mode, sqlite, K8s pod discovery) and a sidecar DP on
+    # FERRUM_MESH_CONFIG_PROTOCOL=native. The release-blocking channel is
+    # production mTLS + JWT through Kubernetes Service DNS:
+    # https://ferrum-cp.<ns>.svc.cluster.local:50051 with a CP server
+    # certificate SAN matching that hostname, FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH,
+    # and FERRUM_DP_GRPC_TLS_{CA_CERT,CLIENT_CERT,CLIENT_KEY}_PATH. The
+    # release-blocking native leg does not permit plaintext gRPC and does
+    # not skip server certificate verification.
+    # Captured client traffic reaching the capp app proves the CP-delivered
+    # slice materialized the inbound datapath, and the DP's JWT-authenticated
+    # /mesh/config-drift must attribute the slice to source_protocol=native
+    # from that https ferrum-cp URL. Dedicated probe Deployments (never the
+    # already-converged capp pod) prove omit-client, foreign-client,
+    # untrusted-server-CA, wrong-SAN, and invalid-JWT each fail closed with
+    # no slice accepted. A projected Secret generation swap proves CP/DP
+    # gRPC TLS watchers reconnect without a pod restart and that the
+    # replacement generation is the one that serves.
     live_assertions:
       - sidecar.config.native_subscribe_delivered
+      - sidecar.config.native_subscribe_mtls_omitted_client_rejected
+      - sidecar.config.native_subscribe_mtls_foreign_client_rejected
+      - sidecar.config.native_subscribe_tls_untrusted_server_ca_rejected
+      - sidecar.config.native_subscribe_tls_wrong_san_rejected
+      - sidecar.config.native_subscribe_jwt_rejected
+      - sidecar.config.native_subscribe_tls_rotation_reconnects
     platform_profile: kind-spire-sidecar
     docs_anchor: docs/mesh.md#native-meshsubscribe-default
     owner: mesh
@@ -241,7 +257,7 @@ capabilities:
       - NodeWaypoint topology remains Experimental and is excluded from this sidecar GA contract.
       - Cross-cluster endpoint discovery is Beta and remains excluded from this sidecar GA contract.
       - The xDS ADS transport is a separate surface and is not covered by this row.
-      - The live fixture exercises the transport over in-cluster plaintext h2c with JWT auth (FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true); CP-DP gRPC TLS is an orthogonal, documented deployment knob not exercised by this row.
+      - Omitting FERRUM_CP_DP_GRPC_JWT_SECRET fails mesh startup before the TLS handshake, which is an unrelated config-validation failure; the live JWT class is an invalid token after a successful mTLS handshake, proving both controls are required together.
 
   # ── Multicluster federation (issue #2459) ────────────────────────────────
   # Live-proven two-cluster SPIRE federation + east-west SNI datapath. Poller-

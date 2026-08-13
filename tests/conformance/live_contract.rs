@@ -622,6 +622,12 @@ fn live_contract_real_contract_declares_the_sidecar_suite_rows() {
         "sidecar.destination_rule.tcp_max_connections",
         "sidecar.virtual_service.cors_policy",
         "sidecar.config.native_subscribe_delivered",
+        "sidecar.config.native_subscribe_mtls_omitted_client_rejected",
+        "sidecar.config.native_subscribe_mtls_foreign_client_rejected",
+        "sidecar.config.native_subscribe_tls_untrusted_server_ca_rejected",
+        "sidecar.config.native_subscribe_tls_wrong_san_rejected",
+        "sidecar.config.native_subscribe_jwt_rejected",
+        "sidecar.config.native_subscribe_tls_rotation_reconnects",
     ] {
         assert!(
             enforced_ids.contains(&required),
@@ -649,6 +655,152 @@ fn live_contract_real_contract_declares_the_sidecar_suite_rows() {
     assert!(
         matches!(contract.ga_capabilities().first(), Some(first) if first.maturity == ContractMaturity::Ga),
         "ga_capabilities must return GA rows"
+    );
+}
+
+/// Bind the sidecar fixture's `REQUIRED_LIVE_ASSERTIONS` to the enforced
+/// `mesh-e2e-sidecar` GA-contract ids (same shape as the multicluster
+/// fixture/gate tests). Dropping a native mTLS/JWT/SAN/rotation negative from
+/// the array, or adding an enforced contract row the fixture never requires,
+/// fails ordinary conformance CI.
+#[test]
+fn live_contract_sidecar_fixture_requires_exactly_the_enforced_rows() {
+    const RUN_SH: &str = include_str!("../k8s/mesh_e2e_sidecar/run.sh");
+
+    let mut lines = RUN_SH.lines();
+    assert!(
+        lines.any(|line| line.trim_end() == "REQUIRED_LIVE_ASSERTIONS=("),
+        "tests/k8s/mesh_e2e_sidecar/run.sh must declare REQUIRED_LIVE_ASSERTIONS=( \
+         on its own line — the fixture's fail-closed gate is what this test binds \
+         to the GA contract"
+    );
+    let mut fixture_required: BTreeSet<&str> = BTreeSet::new();
+    let mut closed = false;
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed == ")" {
+            closed = true;
+            break;
+        }
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        assert!(
+            fixture_required.insert(trimmed),
+            "run.sh REQUIRED_LIVE_ASSERTIONS lists `{trimmed}` more than once"
+        );
+    }
+    assert!(
+        closed,
+        "run.sh REQUIRED_LIVE_ASSERTIONS array is unterminated — refusing to \
+         validate a partially parsed required set"
+    );
+
+    let contract = load_contract().expect("real contract loads");
+    let contract_required: BTreeSet<&str> = contract
+        .ga_capabilities()
+        .into_iter()
+        .filter(|capability| {
+            capability.live_suite == "mesh-e2e-sidecar" && capability.live_deferred.is_none()
+        })
+        .flat_map(|capability| capability.live_assertions.iter().map(String::as_str))
+        .collect();
+    assert!(
+        !contract_required.is_empty(),
+        "the mesh-e2e-sidecar suite must have enforced GA contract rows"
+    );
+
+    let missing_in_fixture: Vec<&&str> = contract_required.difference(&fixture_required).collect();
+    assert!(
+        missing_in_fixture.is_empty(),
+        "GA-contract assertions the live fixture does not REQUIRE (they could be \
+         skipped or absent without failing the live job): {missing_in_fixture:?}"
+    );
+    let missing_in_contract: Vec<&&str> = fixture_required.difference(&contract_required).collect();
+    assert!(
+        missing_in_contract.is_empty(),
+        "live fixture requires assertions with no enforced GA-contract row \
+         (add the row, or drop the id from REQUIRED_LIVE_ASSERTIONS): \
+         {missing_in_contract:?}"
+    );
+}
+
+/// Issue #3855: the release-blocking native MeshSubscribe deployments must
+/// keep the production mTLS + JWT + Service-DNS posture. A PR that silently
+/// restores plaintext h2c, TLS_NO_VERIFY, or drops client-CA/client-cert
+/// controls fails this hosted conformance pin even if the live job is skipped.
+#[test]
+fn live_contract_sidecar_native_subscribe_fixture_is_mtls_jwt() {
+    const MANIFESTS: &str = include_str!("../k8s/mesh_e2e_sidecar/manifests.yaml");
+    const RUN_SH: &str = include_str!("../k8s/mesh_e2e_sidecar/run.sh");
+    const CONTRACT: &str = include_str!("ga_contract.yaml");
+
+    for required in [
+        "FERRUM_CP_GRPC_TLS_CERT_PATH",
+        "FERRUM_CP_GRPC_TLS_KEY_PATH",
+        "FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH",
+        "FERRUM_DP_GRPC_TLS_CA_CERT_PATH",
+        "FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH",
+        "FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH",
+        "https://ferrum-cp.__NAMESPACE__.svc.cluster.local:50051",
+        "ferrum-native-mtls-cp",
+        "ferrum-native-mtls-dp",
+        "projected:",
+        "native-mtls-probe",
+        "FERRUM_CP_DP_GRPC_JWT_SECRET",
+    ] {
+        assert!(
+            MANIFESTS.contains(required),
+            "mesh-e2e-sidecar manifests must keep `{required}` on the native MeshSubscribe leg"
+        );
+    }
+    assert!(
+        !MANIFESTS.contains("FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT"),
+        "release-blocking native MeshSubscribe manifests must not enable plaintext"
+    );
+    assert!(
+        !MANIFESTS.contains("FERRUM_DP_GRPC_TLS_NO_VERIFY"),
+        "release-blocking native MeshSubscribe manifests must not skip TLS verify"
+    );
+    assert!(
+        !MANIFESTS.contains("http://ferrum-cp."),
+        "release-blocking native MeshSubscribe DP URL must not be plaintext h2c"
+    );
+    assert!(
+        !RUN_SH.contains("FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT"),
+        "run.sh must not restore the plaintext CP/DP gRPC override"
+    );
+    assert!(
+        !RUN_SH.contains("FERRUM_DP_GRPC_TLS_NO_VERIFY"),
+        "run.sh must not restore TLS_NO_VERIFY"
+    );
+    assert!(
+        !RUN_SH.contains("http://ferrum-cp."),
+        "run.sh must not restore a plaintext h2c ferrum-cp URL"
+    );
+    assert!(
+        RUN_SH.contains("mint_native_mtls_pki"),
+        "run.sh must mint ephemeral native MeshSubscribe PKI at run time"
+    );
+    assert!(
+        RUN_SH.contains("apply_native_mtls_secrets gen2"),
+        "run.sh must swap projected Secret generations for the rotation proof"
+    );
+    assert!(
+        RUN_SH.contains("sidecar.config.native_subscribe_mtls_omitted_client_rejected"),
+        "run.sh must emit the omitted-client negative"
+    );
+    assert!(
+        RUN_SH.contains("sidecar.config.native_subscribe_tls_rotation_reconnects"),
+        "run.sh must emit the projected-Secret rotation assertion"
+    );
+    assert!(
+        !CONTRACT.contains("plaintext h2c with JWT"),
+        "ga_contract.yaml must not describe the native transport row as plaintext-only"
+    );
+    assert!(
+        !CONTRACT.contains("CP-DP gRPC TLS is an orthogonal"),
+        "ga_contract.yaml must not describe CP/DP TLS as orthogonal to the native live row"
     );
 }
 

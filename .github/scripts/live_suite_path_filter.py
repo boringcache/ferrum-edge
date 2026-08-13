@@ -21,6 +21,7 @@ MESH_FEDERATION_DOCUMENTATION_PATHS = frozenset(
 MESH_E2E_SIDECAR_DOCUMENTATION_PATHS = frozenset(
     {
         "docs/configuration.md",
+        "docs/cp_dp_mode.md",
         "docs/mesh.md",
         "docs/spire_deployment.md",
     }
@@ -168,11 +169,15 @@ SUITE_PATTERNS: dict[str, list[str]] = {
         # subscribers. Kept to the one mode file — dp mode (data_plane.rs) is
         # the gateway ConfigSync consumer, which the mesh DP never uses.
         r"^src/modes/control_plane\.rs$",
+        # CP/DP gRPC TLS watchers used by the native MeshSubscribe mTLS
+        # rotation assertion (projected Secret generation swap).
+        r"^src/modes/grpc_tls_reload\.rs$",
+        r"^src/modes/tls_source_util\.rs$",
         # CP-side MeshSubscribe surface only: mesh_server.rs serves the
         # MeshConfigSync.MeshSubscribe stream (namespace-scoped snapshot
         # build + content_eq dedupe), mesh_registry.rs tracks the subscribed
         # nodes the reconcile broadcasts converge through, auth.rs is the
-        # DP<->CP JWT verification the fixture's plaintext-h2c stream still
+        # DP<->CP JWT verification the fixture's mTLS+JWT stream still
         # relies on, and cp_server.rs owns the shared CP scope/namespace
         # filtering helpers mesh_server.rs calls when serving native slices;
         # dp_client.rs owns shared DP gRPC JWT/TLS/version helpers imported by
@@ -293,6 +298,105 @@ def write_summary(suite: str, relevant: bool, changed: list[str], matched: list[
         print("(none)")
 
 
+def native_mtls_fixture_contract_errors(root: Path) -> list[str]:
+    """Fail closed if the release-blocking native MeshSubscribe leg is weakened.
+
+    The trusted live-suite filter runs this against the checkout so a PR cannot
+    silently restore plaintext h2c, drop client-CA/client-cert controls, enable
+    TLS_NO_VERIFY, or drop a required negative/rotation assertion id.
+    """
+
+    errors: list[str] = []
+    manifests = root / "tests/k8s/mesh_e2e_sidecar/manifests.yaml"
+    run_sh = root / "tests/k8s/mesh_e2e_sidecar/run.sh"
+    contract = root / "tests/conformance/ga_contract.yaml"
+    for path in (manifests, run_sh, contract):
+        if not path.is_file():
+            errors.append(f"native mTLS live contract missing {path}")
+            return errors
+
+    manifests_text = manifests.read_text(encoding="utf-8")
+    run_text = run_sh.read_text(encoding="utf-8")
+    contract_text = contract.read_text(encoding="utf-8")
+
+    for required in (
+        "FERRUM_CP_GRPC_TLS_CERT_PATH",
+        "FERRUM_CP_GRPC_TLS_KEY_PATH",
+        "FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH",
+        "FERRUM_DP_GRPC_TLS_CA_CERT_PATH",
+        "FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH",
+        "FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH",
+        "https://ferrum-cp.__NAMESPACE__.svc.cluster.local:50051",
+        "ferrum-native-mtls-cp",
+        "ferrum-native-mtls-dp",
+        "projected:",
+        "FERRUM_CP_DP_GRPC_JWT_SECRET",
+        "native-mtls-probe",
+    ):
+        if required not in manifests_text:
+            errors.append(
+                f"mesh-e2e-sidecar manifests dropped required native mTLS marker `{required}`"
+            )
+
+    if "FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT" in manifests_text:
+        errors.append("release-blocking native MeshSubscribe manifests enable plaintext")
+    if "FERRUM_DP_GRPC_TLS_NO_VERIFY" in manifests_text:
+        errors.append("release-blocking native MeshSubscribe manifests skip TLS verify")
+    if "http://ferrum-cp." in manifests_text:
+        errors.append("release-blocking native MeshSubscribe DP URL is plaintext h2c")
+    if "FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT" in run_text:
+        errors.append("run.sh restored the plaintext CP/DP gRPC override on the native leg")
+    if "FERRUM_DP_GRPC_TLS_NO_VERIFY" in run_text:
+        errors.append("run.sh restored TLS_NO_VERIFY on the native MeshSubscribe leg")
+    if "http://ferrum-cp." in run_text:
+        errors.append("run.sh restored a plaintext h2c ferrum-cp URL")
+    if "mint_native_mtls_pki" not in run_text:
+        errors.append("run.sh dropped ephemeral native MeshSubscribe PKI minting")
+    if "apply_native_mtls_secrets gen2" not in run_text:
+        errors.append("run.sh dropped the projected Secret generation swap")
+    if "serviceAccountName: native-mtls-probe" not in run_text:
+        errors.append("run.sh native mTLS probes must not share sa/capp")
+
+    required_ids = (
+        "sidecar.config.native_subscribe_delivered",
+        "sidecar.config.native_subscribe_mtls_omitted_client_rejected",
+        "sidecar.config.native_subscribe_mtls_foreign_client_rejected",
+        "sidecar.config.native_subscribe_tls_untrusted_server_ca_rejected",
+        "sidecar.config.native_subscribe_tls_wrong_san_rejected",
+        "sidecar.config.native_subscribe_jwt_rejected",
+        "sidecar.config.native_subscribe_tls_rotation_reconnects",
+    )
+    native_row_start = contract_text.find("id: mesh.config_transport.native_subscribe")
+    if native_row_start < 0:
+        errors.append("ga_contract.yaml is missing mesh.config_transport.native_subscribe")
+        native_row = ""
+    else:
+        native_row = contract_text[native_row_start:]
+        next_row = native_row.find("\n  - id: ", 1)
+        if next_row > 0:
+            native_row = native_row[:next_row]
+    for assertion_id in required_ids:
+        if assertion_id not in run_text:
+            errors.append(f"run.sh dropped required live assertion `{assertion_id}`")
+        if assertion_id not in native_row:
+            errors.append(
+                f"ga_contract.yaml native_subscribe row dropped `{assertion_id}`"
+            )
+        if (
+            f"record_live_assertion {assertion_id}" not in run_text
+            and f"record_native_negative {assertion_id}" not in run_text
+        ):
+            errors.append(
+                f"run.sh never records `{assertion_id}` (a skipped negative would leave the gate green)"
+            )
+
+    if "plaintext h2c with JWT" in contract_text:
+        errors.append("ga_contract.yaml still describes the native row as plaintext-only")
+    if "CP-DP gRPC TLS is an orthogonal" in contract_text:
+        errors.append("ga_contract.yaml still treats CP/DP TLS as orthogonal")
+    return errors
+
+
 def self_test() -> int:
     cases = [
         ("gateway-api", ["src/tls/frontend.rs"], True),
@@ -325,6 +429,9 @@ def self_test() -> int:
         ("mesh-e2e-sidecar", ["tests/conformance/mod.rs"], True),
         ("mesh-e2e-sidecar", ["tests/conformance_tests.rs"], True),
         ("mesh-e2e-sidecar", ["src/modes/control_plane.rs"], True),
+        ("mesh-e2e-sidecar", ["src/modes/grpc_tls_reload.rs"], True),
+        ("mesh-e2e-sidecar", ["src/modes/tls_source_util.rs"], True),
+        ("mesh-e2e-sidecar", ["docs/cp_dp_mode.md"], True),
         ("mesh-e2e-sidecar", ["src/grpc/mesh_server.rs"], True),
         ("mesh-e2e-sidecar", ["src/grpc/mesh_registry.rs"], True),
         ("mesh-e2e-sidecar", ["src/grpc/auth.rs"], True),
@@ -376,6 +483,7 @@ def self_test() -> int:
             failures.append(
                 f"{suite} {changed!r}: expected relevant={expected}, got {relevant}"
             )
+    failures.extend(native_mtls_fixture_contract_errors(Path.cwd()))
     for failure in failures:
         print(f"::error::{failure}", file=sys.stderr)
     return 1 if failures else 0
