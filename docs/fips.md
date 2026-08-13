@@ -126,10 +126,13 @@ settings file that early would pin `CONF_FILE_CACHE` to the wrong path — see
 `.claude/rules/tls-security.md`). A FIPS request therefore has to arrive through
 the CLI flag or the process environment.
 
-A request that appears **only** in `ferrum.conf` is not ignored: after `EnvConfig`
-resolution, `fips::verify_resolved_mode` detects the mismatch and fails the
-command with an explicit message telling the operator to move the setting. It
-never serves under a provider chosen from a stale view of the request.
+A request that appears **only** in `ferrum.conf` is not ignored: after secret
+resolution (and `EnvConfig` on `run` / `validate`), `fips::verify_resolved_mode`
+detects the mismatch and fails the command with an explicit message telling the
+operator to move the setting. The one-shot `ambient-udp-preflight` command takes
+the same late-request gate after secrets and before any Kubernetes TLS client is
+built, even though it never parses serving `EnvConfig`. It never serves under a
+provider chosen from a stale view of the request.
 
 **The resolved mode is immutable for the life of the process.** The rustls
 process-default provider can be installed exactly once, so a reload cannot turn
