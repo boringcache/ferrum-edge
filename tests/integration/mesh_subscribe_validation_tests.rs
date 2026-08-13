@@ -560,6 +560,10 @@ fn spawn_client_with_timings(
     (shutdown_tx, handle)
 }
 
+fn spawn_client(cp_urls: Vec<String>, state: MeshRuntimeState) -> ClientHandle {
+    spawn_client_with_timings(cp_urls, state, MeshStreamTimings::production())
+}
+
 async fn wait_for_native_outcome(
     state: &MeshRuntimeState,
     expected: &'static str,
