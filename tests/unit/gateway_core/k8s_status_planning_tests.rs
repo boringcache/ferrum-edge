@@ -541,6 +541,34 @@ fn istio_budgeted_planning_reuses_shared_translation_path() {
 }
 
 #[test]
+fn istio_status_planning_skips_objects_without_watch_snapshot_uid() {
+    let objects = vec![K8sObject {
+        api_version: "security.istio.io/v1".to_string(),
+        kind: "AuthorizationPolicy".to_string(),
+        metadata: K8sMetadata {
+            name: "no-uid".to_string(),
+            uid: String::new(),
+            namespace: "default".to_string(),
+            generation: Some(1),
+            labels: HashMap::new(),
+            annotations: HashMap::new(),
+            creation_timestamp: None,
+            deletion_timestamp: None,
+        },
+        spec: json!({ "action": "ALLOW" }),
+        status: Value::Object(serde_json::Map::new()),
+    }];
+    let outcome =
+        plan_istio_status_updates_budgeted(&objects, options(), None, StatusPlanBudget::new(1, 0));
+    assert_eq!(outcome.eligible_candidates, 0);
+    assert_eq!(outcome.planned_candidates, 0);
+    assert!(
+        outcome.updates.is_empty(),
+        "production plans must not emit identity-less Istio status writes"
+    );
+}
+
+#[test]
 fn status_indexes_and_borrowed_eligibility_are_wired() {
     assert!(
         STATUS_SRC.contains("namespaces_by_name"),

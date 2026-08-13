@@ -625,10 +625,33 @@ fn runtime_plugin_file_dependency_validation_runs_off_async_workers() {
         assert!(source.contains(".await?"));
     }
 
+    // The DP FULL_SNAPSHOT apply stays on an off-thread entry point. Since
+    // issue #3727 it carries the CP gateway-trust decision WITH the snapshot,
+    // so the awaited call is the `_with_gateway_trust` variant rather than the
+    // bare one; applying the config and the trust side channel separately would
+    // publish the accepted snapshot beside the previous trust roots.
     let dp_client = include_str!("../../../src/grpc/dp_client.rs");
-    assert!(dp_client.contains("update_config_off_thread(config).await"));
+    let dp_apply = "update_config_off_thread_with_gateway_trust(config, gateway_trust_commit)";
+    assert!(
+        dp_client.contains(dp_apply),
+        "DP full-snapshot apply must go through the off-thread gateway-trust entry point"
+    );
 
     let proxy = include_str!("../../../src/proxy/mod.rs");
+    // ...and that entry point is what actually hands the blocking plugin-file
+    // validation to the blocking pool, so the guard above is not satisfied by a
+    // name alone.
+    let off_thread_start = proxy
+        .find("pub async fn update_config_off_thread_with_gateway_trust(")
+        .expect("off-thread gateway-trust apply entry point");
+    let off_thread_end = proxy[off_thread_start..]
+        .find("\n    }\n")
+        .map(|offset| off_thread_start + offset)
+        .expect("off-thread entry point body terminates");
+    assert!(
+        proxy[off_thread_start..off_thread_end].contains("tokio::task::spawn_blocking"),
+        "the DP apply entry point must run the snapshot apply on the blocking pool"
+    );
     let plugin_cache = include_str!("../../../src/plugin_cache.rs");
     assert!(proxy.contains("country_mmdb_preload_required("));
     assert!(proxy.contains("body_validator_descriptor_preload_required("));

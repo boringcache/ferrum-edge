@@ -176,10 +176,17 @@ pub(crate) async fn handle_mesh_tcp_egress(
     // A loaded gateway SVID is required for either transport — never dial a
     // mesh peer identity-less. (The pools re-check this; the early gate just
     // gives a clean close + log.)
-    if state.gateway_svid_bundle.load().is_none() {
+    //
+    // The predicate is the ADMITTED generation's gateway trust, not the live
+    // SVID slot: during an accepted trust rotation or revocation the slot still
+    // holds the generation this session's configuration replaced, so a slot
+    // read would authenticate a peer the accepted generation withdrew
+    // (issue #3727). A fenced generation closes the session instead.
+    if !state.admits_gateway_mesh_identity() {
         warn!(
             service = %entry.service_fqdn,
-            "Raw-TCP mesh egress requires a loaded gateway SVID; closing captured connection"
+            "Raw-TCP mesh egress requires a live gateway trust generation; closing captured \
+             connection"
         );
         return;
     }

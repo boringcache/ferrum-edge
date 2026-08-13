@@ -2741,6 +2741,12 @@ pub enum GrpcTransportDiagnostic {
     /// dispatch surface has no transport for (issue #3261). The tag NAME only —
     /// the configured socket path is never part of a diagnostic.
     MeshUnixSocket,
+    /// The gateway's OWN mesh identity is not authenticating for the request's
+    /// admitted configuration generation (issue #3727): either no gateway SVID
+    /// is loaded at all, or an accepted trust rotation/revocation is still
+    /// being published and the generation is fenced. A contract id, not a tag —
+    /// it says nothing about the target.
+    GatewayTrustNotLive,
 }
 
 impl GrpcTransportDiagnostic {
@@ -2756,9 +2762,18 @@ impl GrpcTransportDiagnostic {
             Self::ConflictingMeshTransports => "conflicting_mesh_transports",
             Self::CrossClusterMissingTransport => "cross_cluster_missing_transport",
             Self::MeshUnixSocket => crate::proxy::unix_backend::MESH_UNIX_SOCKET_TAG,
+            Self::GatewayTrustNotLive => "gateway_trust_not_live",
         }
     }
 }
+
+/// Client-visible refusal for a mesh-tagged gRPC dispatch attempted while the
+/// admitted configuration generation has no live gateway mesh identity.
+///
+/// Fixed and metadata-free like every other transport refusal: it names
+/// neither the gateway's SPIFFE ID nor the target's identity metadata.
+pub(crate) const GATEWAY_MESH_IDENTITY_NOT_LIVE: &str = "mesh transport is unavailable: the gateway has no live mesh identity for this configuration \
+     generation";
 
 /// Why a gRPC dispatch could not materialize a transport for its selected
 /// target. Every variant is FAIL CLOSED — the caller answers with a gRPC

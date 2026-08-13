@@ -288,7 +288,12 @@ pub struct TrustBundle {
 }
 
 /// A JWKS-style entry used to validate JWT-SVIDs.
-#[derive(Debug, Clone)]
+///
+/// `PartialEq` is the "is this the same authority" predicate the gateway trust
+/// publication uses to tell an ADDED root from a WITHDRAWN one
+/// (`proxy::mesh_trust_registry::trust_withdrawal_reason`), so it must stay a
+/// comparison of the material itself, never of the key id alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JwtAuthority {
     pub key_id: String,
     pub public_key_pem: String,

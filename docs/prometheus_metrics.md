@@ -148,6 +148,22 @@ stay admitted; `class_flip_deferred` means a frontend TLS-class change is waitin
 change. No action clears these manually — the supervisor retries on its own,
 and the metrics clear when it succeeds.
 
+### Istio status CAS
+
+Emitted after `FERRUM_K8S_CONTROLLER_ENABLED=true` starts the Kubernetes controller and registers its shared `ControllerMetrics` `Arc` with the Prometheus registry. These families have no labels. Object names, UIDs, resourceVersions, condition text, and API error strings are never labels.
+
+| Family | Type | Labels | Guidance |
+|--------|------|--------|----------|
+| `ferrum_k8s_controller_istio_status_conflicts_total` | counter | — | JSON Merge Patch 409s while applying Ferrum-owned Istio conditions. A rise during reconcile is expected when another controller writes status concurrently. |
+| `ferrum_k8s_controller_istio_status_retries_total` | counter | — | Writes that succeeded after at least one resourceVersion conflict retry. Pair with conflicts: retries should track resolved races. |
+| `ferrum_k8s_controller_istio_status_retry_exhausted_total` | counter | — | Bounded retry budget exhausted with no unversioned fallback. The newer foreign status is left intact. Alert on any sustained increase. |
+| `ferrum_k8s_controller_istio_status_recreated_total` | counter | — | Live UID no longer matched the watch-snapshot plan (delete/recreate under the same name). The stale plan is abandoned. |
+| `ferrum_k8s_controller_istio_status_missing_uid_total` | counter | — | Planned watch-snapshot UID was empty, so the write was refused before GET/PATCH. Production planning filters identity-less objects before constructing an update; a non-zero value indicates a direct invalid writer input or invariant violation. |
+| `ferrum_k8s_controller_istio_status_not_found_total` | counter | — | The status read or write returned HTTP 404. Kubernetes answers a CRD that declares no `status` subresource with the same ordinary object-not-found response it uses for a deleted object, so a steady rise on resources that still exist means the CRD manifest is missing `subresources: { status: {} }` — it does **not** appear under `unsupported`. |
+| `ferrum_k8s_controller_istio_status_unsupported_total` | counter | — | The API server does not serve the resource at all: HTTP 405, or a 404 whose body says the requested resource could not be found (Istio CRDs absent or the watched version no longer served). |
+
+**Suggested alert:** `increase(ferrum_k8s_controller_istio_status_retry_exhausted_total[15m]) > 0`. Confirm a competing status writer and that Ferrum still merges only `Ferrum*` conditions. See [Istio CRD Status](mesh.md#istio-crd-status).
+
 ## Complete family inventory
 
 Sorted by family name. Optional namespace labels are listed when the emitter supports them.
@@ -298,6 +314,10 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_gateway_listeners_desired` | gauge | `namespace` | `gateway_listener` | `documented_only` | `when_process_initialized` | Dynamic Gateway API listener ports the published configuration asks this process to bind. |
 | `ferrum_gateway_trust_accepted_generation` | gauge | `namespace` | `gateway_trust` | `documented_only` | `always` | Monotonic accepted gateway-to-mesh trust generation. It advances only when an accepted publication withdraws an authority. |
 | `ferrum_gateway_trust_admission_refusals_total` | counter | `transport`, `namespace` | `gateway_trust` | `documented_only` | `always` | Gateway-to-mesh connections refused because the accepted trust generation advanced while they were being established, by transport class. |
+| `ferrum_gateway_trust_bundle_ambiguous_authority_total` | counter | — | `gateway_trust` | `documented_only` | `always` | Publications that found both a database record and a file-sourced trust value and kept the previously accepted trust. |
+| `ferrum_gateway_trust_bundle_last_published_unix_seconds` | gauge | — | `gateway_trust` | `documented_only` | `always` | Unix time of the most recently published gateway trust-bundle generation; 0 when none. |
+| `ferrum_gateway_trust_bundle_load_rejections_total` | counter | — | `gateway_trust` | `documented_only` | `always` | Gateway trust-bundle candidates refused before the live swap; the previous valid generation stays active. |
+| `ferrum_gateway_trust_bundle_published_generations_total` | counter | — | `gateway_trust` | `documented_only` | `always` | Gateway trust-bundle generations carrying a database-sourced record that reached the live configuration swap; a generation refused by the ambiguous-authority rule is not counted. |
 | `ferrum_gateway_trust_retired_transports_total` | counter | `transport`, `namespace` | `gateway_trust` | `documented_only` | `always` | Live gateway-to-mesh transports terminated by a trust withdrawal, by transport class. Counts connections, not requests or streams. |
 | `ferrum_gateway_trust_withdrawals_total` | counter | `reason`, `namespace` | `gateway_trust` | `documented_only` | `always` | Accepted gateway trust publications that removed an authority and retired the outgoing generation, by closed reason. |
 | `ferrum_grpc_config_stream_terminations_total` | counter | `surface`, `reason`, `gateway_namespace` | `grpc_config` | `documented_only` | `always` | Authenticated configuration streams ended by fixed surface and reason. |
@@ -305,6 +325,13 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_jwks_refresh_failures_total` | counter | `class` | `jwks` | `documented_only` | `always` | Remote JWKS refresh failures by fixed failure class. |
 | `ferrum_jwks_trust_age_seconds` | gauge | `state` | `jwks` | `documented_only` | `always` | Maximum age of the last validated non-empty JWKS among active remote stores in each trust state. |
 | `ferrum_jwks_trust_stores` | gauge | `state` | `jwks` | `documented_only` | `always` | Active remote JWKS stores by bounded trust state. |
+| `ferrum_k8s_controller_istio_status_conflicts_total` | counter | — | `k8s_controller` | `documented_only` | `conditional` | Istio status JSON Merge Patch 409 conflicts observed while applying Ferrum-owned conditions. |
+| `ferrum_k8s_controller_istio_status_missing_uid_total` | counter | — | `k8s_controller` | `documented_only` | `conditional` | Istio status writes refused because the planned watch-snapshot UID was missing. |
+| `ferrum_k8s_controller_istio_status_not_found_total` | counter | — | `k8s_controller` | `documented_only` | `conditional` | Istio status writes aborted because the status read or write returned HTTP 404. |
+| `ferrum_k8s_controller_istio_status_recreated_total` | counter | — | `k8s_controller` | `documented_only` | `conditional` | Istio status writes aborted because the live UID no longer matched the planned object. |
+| `ferrum_k8s_controller_istio_status_retries_total` | counter | — | `k8s_controller` | `documented_only` | `conditional` | Istio status writes that succeeded after at least one resourceVersion conflict retry. |
+| `ferrum_k8s_controller_istio_status_retry_exhausted_total` | counter | — | `k8s_controller` | `documented_only` | `conditional` | Istio status writes that exhausted the bounded conflict retry budget without an unversioned fallback. |
+| `ferrum_k8s_controller_istio_status_unsupported_total` | counter | — | `k8s_controller` | `documented_only` | `conditional` | Istio status writes aborted because the API server does not serve the Istio resource or its status subresource. |
 | `ferrum_kafka_logging_accepting` | gauge | `generation` | `kafka_logging` | `documented_only` | `when_plugin_enabled` | Whether the Kafka logging generation still admits new records. |
 | `ferrum_kafka_logging_healthy` | gauge | `generation` | `kafka_logging` | `documented_only` | `when_plugin_enabled` | Whether the Kafka logging generation recovered from its latest failure. |
 | `ferrum_kafka_logging_in_flight` | gauge | `generation` | `kafka_logging` | `documented_only` | `when_plugin_enabled` | Records waiting in librdkafka for terminal delivery. |

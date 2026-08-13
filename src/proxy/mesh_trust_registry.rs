@@ -25,7 +25,13 @@
 //! 2. publish the next accepted generation;
 //! 3. mark the outgoing generation retired;
 //! 4. synchronously signal every registered transport at or below it;
-//! 5. release the fence, reopening admission for the new generation.
+//! 5. release the registry fence, allowing registrations for the new ownership
+//!    generation.
+//!
+//! The outer gateway-trust publication fence is separate and remains closed
+//! while the accepted verifier is installed and the backend TLS caches and pool
+//! maps are retired. Releasing this registry fence therefore does not reopen
+//! request admission early.
 //!
 //! Signalling is synchronous — the gate flag is set and the driver is notified
 //! before the fence is released — so no transport can be admitted, returned to
@@ -466,9 +472,10 @@ impl MeshTrustRegistry {
 
     /// Retire every transport authenticated under the outgoing generation.
     ///
-    /// Fence, publish, mark retired, signal, reopen — in that order. See the
+    /// Fence, publish, mark retired, signal, release — in that order. See the
     /// module docs for why the order is the security property rather than an
-    /// implementation detail.
+    /// implementation detail, and how this composes with the outer request
+    /// admission fence.
     pub fn retire_for_trust_withdrawal(
         self: &Arc<Self>,
         reason: TrustWithdrawalReason,

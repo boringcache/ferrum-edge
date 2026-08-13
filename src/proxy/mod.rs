@@ -178,7 +178,9 @@ use crate::plugins::{
     mesh_route_dispatch::MeshRouteDispatchConfig,
 };
 use crate::proxy::headers as headers_mod;
-use crate::request_epoch::{RequestEpoch, RequestEpochStore, StagedRequestEpoch};
+use crate::request_epoch::{
+    GatewayTrustEpoch, GatewayTrustStaging, RequestEpoch, RequestEpochStore, StagedRequestEpoch,
+};
 use crate::retry;
 use crate::retry::ResponseBody;
 use crate::router_cache::RouterCache;
@@ -1036,6 +1038,8 @@ fn config_empty_ignoring_gateway_managed_plugins(config: &GatewayConfig, namespa
     config.proxies.is_empty()
         && config.consumers.is_empty()
         && config.upstreams.is_empty()
+        && config.gateway_trust_bundles.is_empty()
+        && config.trust_bundles.is_none()
         && config.plugin_configs.iter().all(|plugin| {
             plugin.namespace == namespace
                 && plugin.id == GATEWAY_WORKLOAD_METRICS_PLUGIN_ID
@@ -3252,7 +3256,10 @@ fn supports_mesh_mtls_backend(
     // mesh egress routes.
     proxy_can_dispatch_hbone(proxy)
         && mesh_mtls_pool::target_mesh_mtls_enabled(target)
-        && state.gateway_svid_bundle.load().is_some()
+        // Read the ADMITTED generation's trust, not the live slot: the slot
+        // answers "is some identity loaded", which during a trust publication
+        // is the generation this request's configuration replaced (issue #3727).
+        && state.admits_gateway_mesh_identity()
 }
 
 fn should_fallback_to_reqwest_after_http2_pool_error(err: &http2_pool::Http2PoolError) -> bool {
@@ -6016,12 +6023,24 @@ pub struct ProxyState {
     /// cookies and are authenticated by the HBONE/TLS path instead.
     pub node_waypoint_identity_resolver: Option<Arc<NodeWaypointIdentityResolver>>,
     /// Gateway SPIFFE identity for gateway/sidecar-to-mesh outbound HBONE.
-    /// This is live, not staged: `can_attempt_hbone_backend` gates HBONE
-    /// dispatch on this slot being loaded (see `current_dispatch_hbone` →
-    /// `proxy_to_backend_hbone`), and `build_spiffe_outbound_config` consumes
-    /// it to originate peer mTLS automatically. The slot shape matches mesh
-    /// SVID rotation so trust-bundle updates hot-swap without blocking proxy
-    /// readers.
+    ///
+    /// This is the MATERIAL slot: `build_spiffe_outbound_config`, the inbound
+    /// `SvidServerCertResolver`, and the mesh pools originate and verify peer
+    /// mTLS from it, and it hot-swaps without blocking proxy readers so a
+    /// rotation reaches the next handshake.
+    ///
+    /// It is NOT the admission predicate. Whether a request may authenticate a
+    /// mesh peer at all is `RequestEpoch::gateway_trust`
+    /// (`ProxyState::admits_gateway_mesh_identity`), which is published with the
+    /// configuration generation that accepted the material. Gating dispatch on
+    /// "is this slot loaded" instead pairs whatever trust is installed with
+    /// whatever configuration the caller holds, which is the mixed generation
+    /// issue #3727 removes. All writers here go through
+    /// `update_gateway_trust_bundles` / `clear_gateway_trust_bundles` /
+    /// `install_gateway_runtime_svid_bundle`, whose complete publications share
+    /// one outer mutex. Trust replacement/clear fences around the store; source
+    /// rotation atomically replaces its SVID and commits the epoch without
+    /// allowing another publisher to interleave.
     pub gateway_svid_bundle: SharedSvidBundle,
     /// Latest SVID bundle loaded from configured or runtime sources.
     /// CP-delivered trust bundles are an override; when a CP snapshot removes
@@ -6030,9 +6049,52 @@ pub struct ProxyState {
     /// Latest CP-delivered gateway trust bundles, stored even when this DP has
     /// no local SVID so later bridge phases can verify mesh peers from CP state.
     pub gateway_trust_bundles: SharedGatewayTrustBundles,
-    /// Serializes the cold-path gateway SVID writers:
-    /// CP-delivered trust-bundle apply, CP trust clear, and source SVID reload.
+    /// Serializes the two material-slot writes inside one gateway-trust
+    /// publication. Always acquired AFTER `gateway_trust_publication_lock` and
+    /// released before the request-epoch writer is entered again.
     pub gateway_svid_update_lock: Arc<std::sync::Mutex<()>>,
+    /// Serializes EVERY cold-path gateway SVID/trust writer across its complete
+    /// publication: configuration/mesh stage→fence→install→commit, standalone
+    /// trust replace/clear, and source/CA SVID rotation. A writer can therefore
+    /// never lift another writer's fence or preserve an override that changed
+    /// underneath it (issue #3727).
+    ///
+    /// Held only across the synchronous publication region, never across an
+    /// `.await`. Lock order is publication → request epoch (fence, then
+    /// release) → SVID material (install, then release) → request epoch
+    /// (commit). No helper called inside this boundary reacquires publication.
+    pub gateway_trust_publication_lock: Arc<std::sync::Mutex<()>>,
+    /// Whether this process cannot know its namespace's AUTHORITATIVE gateway
+    /// trust state (issue #3727).
+    ///
+    /// Set by exactly one situation: database-mode startup fell back to the
+    /// on-disk config backup (`FERRUM_DB_CONFIG_BACKUP_PATH`) because the
+    /// database was unreachable or returned an unusable snapshot.
+    /// `GatewayConfig.gateway_trust_bundles` is `#[serde(skip)]` — it must never
+    /// ride the ConfigSync `config_json` wire, where a multi-namespace control
+    /// plane would leak every served namespace's trust material to one
+    /// subscriber — so a backup-sourced snapshot deserializes with an EMPTY
+    /// trust vector no matter what the committed database generation held.
+    ///
+    /// Without this flag `resolve_trust_authority` cannot tell that absence
+    /// apart from an operator's explicit revocation, and the process quietly
+    /// falls back to the source-loaded SVID trust: a root the committed
+    /// generation WITHDREW would authenticate gateway-to-mesh peers again for
+    /// as long as the outage lasted. Reading trust out of the backup file
+    /// instead would not fix it either — the file is arbitrarily old, so
+    /// trusting its trust section re-enables a stale root by another route. The
+    /// only sound state is "unknown", and the only sound behaviour for an
+    /// unknown trust anchor is to refuse until an authoritative database load
+    /// settles it.
+    ///
+    /// This is NOT part of the request epoch: the epoch describes the trust an
+    /// accepted generation carried, and this describes the absence of an
+    /// authority to accept one from. It is written at most twice in a process
+    /// (once at backup bootstrap, once at the first authoritative full load)
+    /// and read with an acquire load, so it costs one uncontended atomic read
+    /// on the gateway-to-mesh admission path and shares no cache line with a
+    /// hot mutable counter.
+    pub gateway_trust_authority_unresolved: Arc<AtomicBool>,
     /// Ownership registry for every gateway-to-mesh TLS transport (issue
     /// #3859). Both mesh pools register into it; an accepted authority-removing
     /// trust publication retires the outgoing generation through it, which is
@@ -6081,9 +6143,19 @@ pub struct ProxyState {
     /// `SvidFetchHandle::with_revision_tx`. Until at least one producer is
     /// bound, the channel stays at generation 0 — pool keys carry `|svidg=0`
     /// and no rotation drain fires.
+    ///
+    /// A committed gateway trust change is the one producer that does NOT wait
+    /// for the consumer: [`ProxyState::advance_backend_security_generation`]
+    /// sends here AND stores into `backend_svid_generation` itself, because the
+    /// publication fence lifts before the consumer task can be scheduled.
     #[allow(dead_code)]
     pub backend_svid_rotation_tx: tokio::sync::watch::Sender<u64>,
     /// Current backend client SVID generation shared by backend pools.
+    ///
+    /// Written by [`spawn_backend_svid_rotation_task`] and, synchronously,
+    /// by [`ProxyState::advance_backend_security_generation`]. Both use
+    /// `fetch_max`, so the generation is monotonic under any interleaving of
+    /// the two writers.
     #[allow(dead_code)] // Observability/test surface; runtime pools hold their own Arc clone.
     pub backend_svid_generation: BackendSvidGeneration,
     /// Shared SOCK_OPS metrics state populated by the kernel ringbuf
@@ -6254,6 +6326,72 @@ fn clone_svid_bundle_slot(slot: &SharedSvidBundle) -> SharedSvidBundle {
 
 pub type SharedGatewayTrustBundles = Arc<ArcSwap<Option<RuntimeTrustBundleSet>>>;
 pub type SharedMeshInboundTls = Arc<ArcSwap<Option<Arc<rustls::ServerConfig>>>>;
+
+/// What an accepted configuration generation did to the live gateway trust
+/// override in database serving mode.
+///
+/// Returned by [`ProxyState::install_database_gateway_trust`] so the caller
+/// (and status/observability) can distinguish "this generation is live" from
+/// "the previous generation is still what peers are validated against".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatabaseGatewayTrustInstall {
+    /// This mode does not own database trust publication. The CP→DP side
+    /// channel, the mesh apply loop, and file mode are untouched.
+    NotApplicable,
+    /// The namespace's database record is now the live gateway trust.
+    Installed,
+    /// A previously installed database override was withdrawn; the
+    /// source-loaded gateway SVID trust is live again.
+    Cleared,
+    /// No database override was installed and none is due — nothing changed.
+    Absent,
+    /// Ambiguous authority: the last-known-good trust stays live.
+    KeptPrevious,
+    /// Stored material could not be converted. Fail closed: last-known-good
+    /// trust stays live and the generation must not be advertised.
+    Failed,
+}
+
+/// The gateway trust material one accepted configuration generation installs.
+///
+/// Staged BEFORE the configuration is published so an unusable candidate
+/// rejects the whole apply — the previous complete generation (configuration
+/// AND trust) stays live — instead of publishing the candidate configuration
+/// beside the previous trust and calling it live (issue #3727).
+#[derive(Clone)]
+pub enum GatewayTrustCommit {
+    /// This generation changes no gateway trust material.
+    Unchanged,
+    /// Install this database- or CP-delivered override.
+    Replace(RuntimeTrustBundleSet),
+    /// Withdraw the override; the source-loaded gateway SVID trust is live again.
+    Clear,
+}
+
+impl GatewayTrustCommit {
+    /// Whether committing this decision changes the live verifier, and
+    /// therefore whether the configuration publication must fence.
+    #[inline]
+    pub fn changes_live_trust(&self) -> bool {
+        !matches!(self, Self::Unchanged)
+    }
+}
+
+impl std::fmt::Debug for GatewayTrustCommit {
+    /// Renders the decision and the bounded trust-domain identity only — never
+    /// PEM/JWKS material.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unchanged => f.write_str("Unchanged"),
+            Self::Clear => f.write_str("Clear"),
+            Self::Replace(bundles) => f
+                .debug_struct("Replace")
+                .field("trust_domain", &bundles.local.trust_domain.as_str())
+                .field("federated_count", &bundles.federated.len())
+                .finish(),
+        }
+    }
+}
 
 pub struct MeshInboundTlsPolicy {
     pub default: Option<Arc<rustls::ServerConfig>>,
@@ -6616,6 +6754,68 @@ impl BackendPoolFamily {
         self.hbone_pool.force_drain_all();
         self.mesh_mtls_pool.force_drain_all();
     }
+
+    /// Remove every pooled entry a committed gateway trust change could
+    /// otherwise leave discoverable for reuse under the roots that change
+    /// WITHDREW.
+    ///
+    /// Called synchronously from the trust publication (see
+    /// [`ProxyState::retire_backend_transports_for_committed_trust`]), never
+    /// from the rotation consumer: the operator's
+    /// `FERRUM_MESH_SVID_ROTATION_DRAIN_SECONDS` window is a grace period for an
+    /// ordinary identity rotation, and its documented default of `0` means "no
+    /// forced drain at all". A withdrawn trust root cannot be left to that
+    /// window, so this path does not consult it.
+    ///
+    /// The two pool halves need different treatment because they key
+    /// differently:
+    ///
+    /// - `connection_pool` / `http2_pool` / `grpc_pool` / `h3_pool` stamp the
+    ///   backend security generation into the key itself (`|svidg=<n>`) and
+    ///   match it EXACTLY. The publication already advanced the live counter, so
+    ///   entries in `outgoing` are unreachable for reuse before this runs;
+    ///   draining them (with their generation-keyed backend TLS configs)
+    ///   releases the sockets and the cached `ClientConfig`s now instead of
+    ///   leaving them to idle pruning. `outgoing` is half-open and excludes the
+    ///   generation just accepted, so a concurrent publisher's newer generation
+    ///   is never drained.
+    /// - `hbone_pool` / `mesh_mtls_pool` key on the leaf SVID *fingerprint*, not
+    ///   the generation. A trust-only `Replace`/`Clear` keeps the same leaf, so
+    ///   every one of their keys is byte-identical before and after the commit:
+    ///   there is NO key partition separating a pooled checkout verified against
+    ///   the withdrawn roots from one verified against the accepted roots, and a
+    ///   generation-scoped drain cannot express the distinction. Their pool maps
+    ///   are therefore cleared WHOLE.
+    ///
+    /// That whole-pool retirement is a deliberate security tradeoff. It costs a
+    /// one-time reconnect wave on the mesh pools for every committed trust
+    /// change, including entries a request opened moments earlier. It is
+    /// necessary because the alternative — resolving the outgoing generation
+    /// through each pool's `retired_svid_fingerprints` registry — would (a)
+    /// resolve to the SAME fingerprint that is still current, so it removes the
+    /// same keys anyway, and (b) make a revocation bound depend on best-effort
+    /// bookkeeping that is lazily populated on the next dial, capped per
+    /// generation and in total, and can misfile a record under a raced
+    /// generation. A bound on revoked trust may not rest on any of that.
+    ///
+    /// Nothing legitimate is lost to the extra breadth: the caller runs this
+    /// while the request epoch is FENCED, so `admits_gateway_mesh_identity` is
+    /// false and no gateway-to-mesh dispatch can add an entry under the accepted
+    /// generation. An entry raced in by a dial admitted BEFORE the fence is
+    /// precisely a pooled checkout that may have been authenticated under the
+    /// withdrawn roots, so removing it from the pool map is the intent rather
+    /// than collateral.
+    fn retire_withdrawn_trust(&self, outgoing: std::ops::Range<u64>) {
+        for generation in outgoing {
+            self.drain_tls_config_cache(generation);
+            self.connection_pool.force_drain_svid_generation(generation);
+            self.http2_pool.force_drain_svid_generation(generation);
+            self.grpc_pool.force_drain_svid_generation(generation);
+            self.h3_pool.force_drain_svid_generation(generation);
+        }
+        self.hbone_pool.force_drain_all();
+        self.mesh_mtls_pool.force_drain_all();
+    }
 }
 
 struct BackendSvidRotationConsumer {
@@ -6633,6 +6833,68 @@ impl BackendSvidRotationConsumer {
     }
 }
 
+/// Upper bound on how many coalesced generations one rotation wake-up retires.
+///
+/// Each retired generation costs one `retain` pass per pool, so an arbitrarily
+/// long span would let a starved consumer turn a single wake-up into unbounded
+/// sweep work on the pools' hot `DashMap`s.
+const MAX_COALESCED_ROTATION_DRAIN_GENERATIONS: u64 = 8;
+
+/// The half-open span of generations that advancing `old` → `next` retires.
+///
+/// Normally `old + 1 == next` and this is the single generation `old..next`,
+/// exactly what the pre-coalescing drain targeted. When the watch coalesced
+/// several publications — publishers advance the shared counter synchronously,
+/// so requests can be served under a generation this task never observed
+/// individually — every generation in `[old, next)` was live at some point and
+/// can hold pool entries, so all of them retire together.
+///
+/// Clamped to the newest [`MAX_COALESCED_ROTATION_DRAIN_GENERATIONS`]. The clamp
+/// bounds WORK, not withdrawal, and the distinction is exact rather than
+/// approximate: an exact-match pool builds `|svidg=<n>` from the live counter,
+/// which only ever moves forward (`fetch_max`), so an entry stamped below `next`
+/// can never be named by a future lookup again. It is already unreachable for
+/// reuse when the generation advances; all the clamped tail decides is how
+/// promptly its memory and socket are released, and idle pruning does that.
+/// Nothing here is claimed about the tail's reuse window because there is no
+/// reuse window to bound. The HBONE / mesh-mTLS pools are the ones whose keys do
+/// NOT carry the generation, and they sweep `<= generation`, so the span's
+/// highest call covers their clamped tail too.
+///
+/// A non-advancing `next` (a test that replaces the revision downward) yields
+/// an empty span and retires nothing.
+fn outgoing_generation_span(old: u64, next: u64) -> std::ops::Range<u64> {
+    let oldest = next.saturating_sub(MAX_COALESCED_ROTATION_DRAIN_GENERATIONS);
+    oldest.max(old)..next
+}
+
+fn runtime_trust_bundle_eq(
+    left: &crate::identity::TrustBundle,
+    right: &crate::identity::TrustBundle,
+) -> bool {
+    left.trust_domain == right.trust_domain
+        && left.x509_authorities == right.x509_authorities
+        && left.jwt_authorities == right.jwt_authorities
+        && left.refresh_hint_seconds == right.refresh_hint_seconds
+}
+
+/// Exact equality for the runtime trust override. `TrustBundleSet` deliberately
+/// has no blanket `PartialEq`, so publication compares every material field and
+/// performs domain lookup rather than relying on `HashMap` iteration order.
+fn runtime_trust_bundle_sets_equal(
+    left: &RuntimeTrustBundleSet,
+    right: &RuntimeTrustBundleSet,
+) -> bool {
+    runtime_trust_bundle_eq(&left.local, &right.local)
+        && left.federated.len() == right.federated.len()
+        && left.federated.iter().all(|(domain, bundle)| {
+            right
+                .federated
+                .get(domain)
+                .is_some_and(|candidate| runtime_trust_bundle_eq(bundle, candidate))
+        })
+}
+
 fn spawn_backend_svid_rotation_task(
     mut revision_rx: tokio::sync::watch::Receiver<u64>,
     generation: BackendSvidGeneration,
@@ -6642,7 +6904,12 @@ fn spawn_backend_svid_rotation_task(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut current_generation = *revision_rx.borrow();
-        generation.store(current_generation, Ordering::Release);
+        // `fetch_max`, never `store`: a synchronous publisher
+        // (`ProxyState::advance_backend_security_generation`) advances the
+        // counter on its own thread before this task is first scheduled, so a
+        // plain store here could walk the live generation backwards onto one
+        // whose pool entries are already being drained.
+        generation.fetch_max(current_generation, Ordering::AcqRel);
         let mut shutdown_rx = shutdown_rx;
 
         // Each rotation spawns its own delayed force-drain task targeting the
@@ -6695,13 +6962,30 @@ fn spawn_backend_svid_rotation_task(
 
             let old_generation = current_generation;
             current_generation = next_generation;
-            generation.store(next_generation, Ordering::Release);
-            consumer.pools.drain_tls_config_cache(old_generation);
+            generation.fetch_max(next_generation, Ordering::AcqRel);
+            // The watch coalesces, and publishers now advance the counter
+            // synchronously, so several generations can retire between two
+            // wake-ups and each of them can have carried live pool entries.
+            // The HTTP/H2/gRPC/H3 pools match their `|svidg=` key field
+            // EXACTLY (`SvidGenerationMatcher`), so draining only
+            // `old_generation` would leave every skipped generation's entries
+            // and cached TLS configs sitting until idle pruning. Those entries
+            // are already unreachable — the live counter never revisits a
+            // generation — so this is a release, not a withdrawal bound (see
+            // `outgoing_generation_span`); retiring the whole outgoing span just
+            // frees them now. The HBONE and mesh-mTLS pools sweep
+            // `<= generation`, so the repeated calls are cheap no-ops for them
+            // after the first.
+            let retiring = outgoing_generation_span(old_generation, next_generation);
+            for outgoing in retiring.clone() {
+                consumer.pools.drain_tls_config_cache(outgoing);
+            }
             consumer.restart_health_checks();
 
             info!(
                 old_svid_generation = old_generation,
                 new_svid_generation = next_generation,
+                retiring_from = retiring.start,
                 drain_seconds,
                 "Backend client SVID rotation observed; new backend TLS connections will use fresh identity"
             );
@@ -6720,9 +7004,12 @@ fn spawn_backend_svid_rotation_task(
                     } else {
                         sleep.as_mut().await;
                     }
-                    pools_for_drain.force_drain(old_generation);
+                    for outgoing in retiring.clone() {
+                        pools_for_drain.force_drain(outgoing);
+                    }
                     info!(
                         old_svid_generation = old_generation,
+                        retiring_from = retiring.start,
                         "Forced drain of backend pool entries from previous SVID generation completed"
                     );
                 }));
@@ -6732,12 +7019,28 @@ fn spawn_backend_svid_rotation_task(
 }
 
 impl ProxyState {
-    /// Apply a full snapshot on Tokio's blocking pool. DP snapshots cannot
-    /// carry a CP-side node-local MMDB handoff, so their plugin-cache build may
-    /// synchronously hash, verify, and scan the configured database.
-    pub async fn update_config_off_thread(&self, new_config: GatewayConfig) -> ConfigApplyOutcome {
+    /// Apply a full snapshot on Tokio's blocking pool, carrying the CP-delivered
+    /// gateway trust decision for this snapshot.
+    ///
+    /// DP snapshots cannot carry a CP-side node-local MMDB handoff, so their
+    /// plugin-cache build may synchronously hash, verify, and scan the configured
+    /// database.
+    ///
+    /// The DP FULL_SNAPSHOT path must use this rather than applying the config
+    /// and then the side channel: two applies leave the accepted snapshot live
+    /// beside the previous CP trust roots, which is exactly the mixed
+    /// config/trust generation issue #3727 forbids.
+    pub async fn update_config_off_thread_with_gateway_trust(
+        &self,
+        new_config: GatewayConfig,
+        trust: GatewayTrustCommit,
+    ) -> ConfigApplyOutcome {
         let proxy_state = self.clone();
-        match tokio::task::spawn_blocking(move || proxy_state.update_config(new_config)).await {
+        match tokio::task::spawn_blocking(move || {
+            proxy_state.update_config_with_gateway_trust(new_config, trust)
+        })
+        .await
+        {
             Ok(outcome) => outcome,
             Err(error) => {
                 let message = format!("configuration update worker failed: {error}");
@@ -6810,100 +7113,48 @@ impl ProxyState {
     /// same lock-free slot. If there is no SVID, keep the bundles separately
     /// for future gateway-mesh features.
     ///
-    /// This is called from the DP config-apply loop, which is single-writer for
-    /// CP-delivered gateway trust. The gateway SVID source watcher can also swap
-    /// the SVID bundle, so all gateway SVID slot writes are serialized by
-    /// `gateway_svid_update_lock`.
+    /// Standalone compatibility entrypoint. Configuration, DP, and mesh apply
+    /// paths stage a [`GatewayTrustCommit`] into the request-epoch publication
+    /// instead. Every writer, including this one and source rotation, is totally
+    /// ordered by `gateway_trust_publication_lock`; the nested material lock is
+    /// never the outer publication boundary.
     ///
-    /// # Live withdrawal (issue #3859)
+    /// The live verifier changes across two slots, so the request-facing
+    /// generation is FENCED first and republished live afterwards: for the
+    /// whole interval `RequestEpoch::gateway_trust` refuses gateway-to-mesh
+    /// admission instead of authenticating peers against half of the change
+    /// (issue #3727).
     ///
-    /// A publication that no longer carries an authority the effective gateway
-    /// trust previously accepted is a **withdrawal**, and a withdrawal must
-    /// terminate live sessions, not merely stop future lookups from finding
-    /// them. When [`mesh_trust_registry::trust_withdrawal_reason`] reports one,
-    /// this fences new gateway-to-mesh admission, publishes the next accepted
-    /// trust generation, marks the outgoing one retired, synchronously signals
-    /// every transport registered under it, reopens admission, and only then
-    /// clears the mesh pool maps.
-    ///
-    /// Every no-churn shape is left completely alone: an identical `Replace`, an
-    /// additive overlap, an `Unchanged` side channel (which never reaches this
-    /// method), and a rejected candidate (which is refused before publication)
-    /// keep their generation, their pooled connections, and their live sessions.
+    /// An accepted authority-removing decision also advances and sweeps the
+    /// live-transport ownership registry while this publication is fenced, so
+    /// already-issued HBONE and mesh-mTLS transports cannot outlive withdrawn
+    /// trust (issue #3859). Identical and additive decisions do not churn them.
     pub fn update_gateway_trust_bundles(&self, trust_bundles: RuntimeTrustBundleSet) {
-        let _guard = self
-            .gateway_svid_update_lock
+        let _publication = self
+            .gateway_trust_publication_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        let withdrawal = mesh_trust_registry::trust_withdrawal_reason(
-            self.effective_gateway_trust_bundles().as_ref(),
-            Some(&trust_bundles),
-            false,
-        );
-        let retirement = withdrawal.map(|reason| {
-            // FENCE + PUBLISH + RETIRE + SIGNAL, then reopen admission. Taken
-            // BEFORE the slots are swapped so no dial in flight can be admitted
-            // against material this publication is removing.
-            (
-                reason,
-                self.mesh_trust_registry.retire_for_trust_withdrawal(reason),
-            )
-        });
-
-        self.gateway_trust_bundles
-            .store(Arc::new(Some(trust_bundles.clone())));
-
-        let current = self.gateway_svid_bundle.load_full();
-        if let Some(mut bundle) = current.as_ref().clone() {
-            bundle.trust_bundles = trust_bundles;
-            self.gateway_svid_bundle.store(Arc::new(Some(bundle)));
-        }
-
-        self.finish_gateway_trust_withdrawal(retirement);
+        self.commit_gateway_trust_generation_locked(GatewayTrustCommit::Replace(trust_bundles));
     }
 
     /// Clear CP-delivered trust bundles and restore the latest source-loaded SVID.
     ///
-    /// A `Clear` with no installed override, or one whose restored startup
-    /// material still carries every authority, is a no-op for live sessions. A
-    /// `Clear` that actually withdraws an authority runs the same fence /
-    /// publish / retire / signal sequence as [`Self::update_gateway_trust_bundles`].
+    /// Fenced and republished exactly like [`Self::update_gateway_trust_bundles`]:
+    /// a withdrawal is the rotation direction where an un-fenced boundary would
+    /// keep authenticating a peer the accepted generation revoked. A `Clear`
+    /// whose restored source trust still carries every accepted authority is a
+    /// no-op for live transport retirement.
     pub fn clear_gateway_trust_bundles(&self) {
-        let _guard = self
-            .gateway_svid_update_lock
+        let _publication = self
+            .gateway_trust_publication_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        let restored = self.gateway_file_svid_bundle.load_full();
-        let withdrawal = mesh_trust_registry::trust_withdrawal_reason(
-            self.effective_gateway_trust_bundles().as_ref(),
-            restored
-                .as_ref()
-                .as_ref()
-                .map(|bundle| &bundle.trust_bundles),
-            true,
-        );
-        let retirement = withdrawal.map(|reason| {
-            (
-                reason,
-                self.mesh_trust_registry.retire_for_trust_withdrawal(reason),
-            )
-        });
-
-        self.gateway_trust_bundles.store(Arc::new(None));
-        self.gateway_svid_bundle.store(restored);
-
-        self.finish_gateway_trust_withdrawal(retirement);
+        self.commit_gateway_trust_generation_locked(GatewayTrustCommit::Clear);
     }
 
     /// The trust view gateway-to-mesh TLS actually verifies peers against right
     /// now: the live SVID bundle's trust material when an SVID is installed,
     /// otherwise the standalone CP override slot.
-    ///
-    /// Comparing against this rather than against the raw CP override is what
-    /// makes a `Clear` judged against the startup material it restores, so a
-    /// redundant `Clear` cannot look like a withdrawal.
     fn effective_gateway_trust_bundles(&self) -> Option<RuntimeTrustBundleSet> {
         let svid = self.gateway_svid_bundle.load_full();
         if let Some(bundle) = svid.as_ref().as_ref() {
@@ -6912,26 +7163,44 @@ impl ProxyState {
         self.gateway_trust_bundles.load_full().as_ref().clone()
     }
 
-    /// Complete an accepted withdrawal: clear the mesh pool maps so no later
-    /// lookup can rediscover a retired connection, then log fixed-cardinality
-    /// counts. Ownership was already retired synchronously under the fence; this
-    /// is the bookkeeping half.
-    ///
-    /// No trust material, trust domain, subject, key id, fingerprint, source
-    /// path, or peer identity appears here — only the closed reason label and
-    /// counts.
-    fn finish_gateway_trust_withdrawal(
+    /// Classify an accepted decision against the effective verifier before its
+    /// material is installed. `Clear` is compared with the source trust it will
+    /// restore, so overlap-only changes never terminate live transports.
+    fn gateway_trust_withdrawal_reason(
         &self,
-        retirement: Option<(
-            mesh_trust_registry::TrustWithdrawalReason,
-            mesh_trust_registry::MeshTrustRetirementOutcome,
-        )>,
+        commit: &GatewayTrustCommit,
+    ) -> Option<mesh_trust_registry::TrustWithdrawalReason> {
+        let before = self.effective_gateway_trust_bundles();
+        let before = before.as_ref()?;
+        match commit {
+            GatewayTrustCommit::Unchanged => None,
+            GatewayTrustCommit::Replace(next) => mesh_trust_registry::trust_withdrawal_reason(
+                Some(before),
+                Some(next),
+                false,
+            ),
+            GatewayTrustCommit::Clear => {
+                let restored = self.gateway_file_svid_bundle.load_full();
+                mesh_trust_registry::trust_withdrawal_reason(
+                    Some(before),
+                    restored
+                        .as_ref()
+                        .as_ref()
+                        .map(|bundle| &bundle.trust_bundles),
+                    true,
+                )
+            }
+        }
+    }
+
+    /// Log the bounded result of the registry sweep. Pool-map retirement is
+    /// owned by `retire_backend_transports_for_committed_trust` in the same
+    /// fenced publication, so it is deliberately not repeated here.
+    fn log_gateway_trust_withdrawal(
+        &self,
+        reason: mesh_trust_registry::TrustWithdrawalReason,
+        outcome: mesh_trust_registry::MeshTrustRetirementOutcome,
     ) {
-        let Some((reason, outcome)) = retirement else {
-            return;
-        };
-        self.hbone_pool.force_drain_all();
-        self.mesh_mtls_pool.force_drain_all();
         warn!(
             reason = reason.as_str(),
             retired_trust_generation = outcome.retired_generation,
@@ -6943,22 +7212,719 @@ impl ProxyState {
         );
     }
 
-    pub(crate) fn install_gateway_runtime_svid_bundle(&self, bundle: SvidBundle) {
+    /// Write one gateway trust decision into the two live slots it spans.
+    ///
+    /// SLOT WRITES ONLY: this neither fences, nor republishes the admission,
+    /// nor advances the backend security generation. Owning those three steps
+    /// is the caller's job, which is exactly what lets
+    /// [`Self::commit_gateway_trust_generation`] install the material, advance
+    /// the backend security generation, and re-open gateway-to-mesh admission
+    /// as ONE fenced transaction rather than as three independently observable
+    /// ones (issue #3727).
+    ///
+    /// `Some(bundles)` installs the database/CP override; `None` withdraws it
+    /// and restores the latest source-loaded SVID. Both are serialized by
+    /// `gateway_svid_update_lock` against the gateway SVID source watcher,
+    /// which is the other writer of `gateway_svid_bundle`.
+    fn store_gateway_trust_material(&self, trust_bundles: Option<RuntimeTrustBundleSet>) {
         let _guard = self
             .gateway_svid_update_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match trust_bundles {
+            Some(trust_bundles) => {
+                self.gateway_trust_bundles
+                    .store(Arc::new(Some(trust_bundles.clone())));
 
-        self.gateway_file_svid_bundle
-            .store(Arc::new(Some(bundle.clone())));
-
-        let mut active_bundle = bundle;
-        let trust_snapshot = self.gateway_trust_bundles.load_full();
-        if let Some(trust_bundles) = trust_snapshot.as_ref() {
-            active_bundle.trust_bundles = trust_bundles.clone();
+                let current = self.gateway_svid_bundle.load_full();
+                if let Some(mut bundle) = current.as_ref().clone() {
+                    bundle.trust_bundles = trust_bundles;
+                    self.gateway_svid_bundle.store(Arc::new(Some(bundle)));
+                }
+            }
+            None => {
+                self.gateway_trust_bundles.store(Arc::new(None));
+                self.gateway_svid_bundle
+                    .store(self.gateway_file_svid_bundle.load_full());
+            }
         }
-        self.gateway_svid_bundle
-            .store(Arc::new(Some(active_bundle)));
+    }
+
+    /// Advance the shared backend security (SVID) generation for a gateway
+    /// trust change this publication has just committed, and hand the pool
+    /// follow-through to the existing rotation consumer.
+    ///
+    /// Replacing or withdrawing gateway trust roots removes every pooled backend
+    /// and mesh entry authenticated under the outgoing roots from the pool maps,
+    /// exactly as a gateway SVID rotation does. Without this the accepted
+    /// generation would install a new verifier while an HBONE / mesh-mTLS /
+    /// backend-TLS pooled entry authenticated under a root the same generation
+    /// WITHDREW stayed discoverable for reuse until idle pruning — unbounded
+    /// checkout of revoked trust, which is precisely what issue #3727's
+    /// rotation/revocation criterion forbids.
+    ///
+    /// The counter is advanced SYNCHRONOUSLY, on the publishing thread, while
+    /// the request epoch is still fenced. Publishing only on the watch channel
+    /// and leaving the store to [`spawn_backend_svid_rotation_task`] would let
+    /// the fence lift before the consumer task was scheduled, and every request
+    /// admitted in that window would key its pool and backend-TLS-config
+    /// lookups on the WITHDRAWN generation and check out its pooled entries. The watch
+    /// send still happens — it is what drives the outgoing generation's TLS
+    /// config-cache invalidation, the health-check restart, and the bounded
+    /// force-drain — but no request-visible decision depends on when the
+    /// consumer observes it.
+    ///
+    /// `fetch_max`, not `store`: a concurrent gateway SVID rotation can publish
+    /// a higher revision between the modify below and the write, and the
+    /// rotation consumer may already have adopted it. The generation is
+    /// monotonic, so never walk it back onto a generation whose drain is
+    /// already scheduled.
+    ///
+    /// Returns the half-open span of generations this advance retired, so the
+    /// caller can clear their pooled entries without re-reading a counter a
+    /// concurrent publisher may have moved again.
+    fn advance_backend_security_generation(&self) -> std::ops::Range<u64> {
+        let previous = self.backend_svid_generation.load(Ordering::Acquire);
+        // Same publish shape the gateway SVID rotation paths use: bump the
+        // revision, then read the published value back. A concurrent producer
+        // can only make that read HIGHER, never lower, which the monotonic
+        // store below is already built for.
+        self.backend_svid_rotation_tx
+            .send_modify(|revision| *revision = revision.saturating_add(1));
+        let advanced = *self.backend_svid_rotation_tx.borrow();
+        let live = self
+            .backend_svid_generation
+            .fetch_max(advanced, Ordering::AcqRel)
+            .max(advanced);
+        info!(
+            backend_svid_generation = live,
+            namespace = %self.env_config.namespace,
+            "Advanced the backend security generation for a committed gateway trust change; \
+             new backend and mesh transports build from the accepted trust and pooled entries \
+             keyed under the withdrawn generation are cleared so future pool lookups cannot reuse them"
+        );
+        // `previous` was read before the send, so a concurrent publisher can
+        // only widen this span at its OLD end, never past `live`. The span is
+        // half-open, so the generation just accepted is never retired.
+        outgoing_generation_span(previous, live)
+    }
+
+    /// Clear the pooled entries a committed gateway trust change withdrew,
+    /// synchronously and independently of the SVID rotation drain window.
+    ///
+    /// This is the step that makes issue #3727's bounded-withdrawal requirement
+    /// hold under the DEFAULT configuration. Advancing the backend security
+    /// generation re-partitions the generation-keyed pools, but the HBONE and
+    /// mesh-mTLS pools key on the leaf SVID fingerprint, which a trust-only
+    /// change does not touch — so their entries keep matching. The rotation
+    /// consumer's `force_drain` is the only thing that used to remove them, and
+    /// it is skipped entirely when `FERRUM_MESH_SVID_ROTATION_DRAIN_SECONDS` is
+    /// `0`, which is both the default and what the documentation recommends for
+    /// ordinary rotations. Documentation cannot make that safe: a pooled entry
+    /// authenticated under a root the accepted generation withdrew would stay
+    /// discoverable for reuse until idle pruning, with no bound.
+    ///
+    /// Run on the publishing thread while the epoch is still FENCED, before
+    /// [`Self::publish_live_gateway_trust`] re-opens gateway-to-mesh admission.
+    /// The guarantee is therefore not "eventually, when a task is scheduled":
+    /// the first request that can be admitted under the accepted generation
+    /// already finds no discoverable pooled entry from the withdrawn one. Nothing
+    /// about it can be missed or coalesced by a watch channel. The ownership
+    /// registry has already marked and signalled every already-issued HBONE and
+    /// mesh-mTLS transport earlier in the same fenced commit; this helper owns
+    /// the separate cache and pool-discoverability half of retirement.
+    ///
+    /// Ordinary SVID rotation semantics are untouched. This path is reached only
+    /// from a committed `GatewayTrustCommit::Replace`/`::Clear`; a source SVID
+    /// rotation still publishes on the watch and still honours the operator's
+    /// drain window, and `Unchanged` never gets here at all.
+    ///
+    /// See [`BackendPoolFamily::retire_withdrawn_trust`] for why the two
+    /// fingerprint-keyed pools are retired whole.
+    fn retire_backend_transports_for_committed_trust(&self, outgoing: std::ops::Range<u64>) {
+        let retiring_from = outgoing.start;
+        let retiring_before = outgoing.end;
+        self.backend_pool_family().retire_withdrawn_trust(outgoing);
+        info!(
+            retiring_from,
+            retiring_before,
+            namespace = %self.env_config.namespace,
+            "Cleared pooled backend and mesh entries a committed gateway trust change withdrew; \
+             the mesh (HBONE / mesh-mTLS) pool maps are cleared whole because their keys carry the \
+             leaf SVID fingerprint, which a trust-only change leaves unchanged"
+        );
+    }
+
+    /// The backend pools whose entries are partitioned by SVID generation.
+    fn backend_pool_family(&self) -> BackendPoolFamily {
+        BackendPoolFamily {
+            connection_pool: self.connection_pool.clone(),
+            http2_pool: self.http2_pool.clone(),
+            grpc_pool: self.grpc_pool.clone(),
+            h3_pool: self.h3_pool.clone(),
+            hbone_pool: self.hbone_pool.clone(),
+            mesh_mtls_pool: self.mesh_mtls_pool.clone(),
+        }
+    }
+
+    /// Close gateway-to-mesh admission for the published configuration
+    /// generation while its trust material is installed.
+    ///
+    /// Idempotent: a generation that already published fenced (because the
+    /// configuration publication staged a trust change) stays fenced without a
+    /// second store, and an already-fenced generation is not re-fenced.
+    pub fn fence_gateway_trust_generation(&self) {
+        let _fenced = self.request_epoch.update_gateway_trust(|current| {
+            current
+                .gateway_trust()
+                .is_live()
+                .then(|| current.gateway_trust().fenced())
+        });
+    }
+
+    /// Republish the current epoch with the live gateway SVID/verifier snapshot
+    /// as the accepted generation's trust.
+    ///
+    /// Idempotent: when the published admission is already live and already
+    /// carries this exact snapshot, nothing is stored and the trust generation
+    /// does not advance, so ordinary reloads and repeated commits are free.
+    fn publish_live_gateway_trust(&self) {
+        let svid = self.gateway_svid_bundle.load_full();
+        let _committed = self.request_epoch.update_gateway_trust(|current| {
+            let published = current.gateway_trust();
+            if published.is_live() && Arc::ptr_eq(published.svid(), &svid) {
+                return None;
+            }
+            Some(published.committed(Arc::clone(&svid)))
+        });
+    }
+
+    /// Whether request paths may authenticate gateway-to-mesh peers right now.
+    ///
+    /// Reads the published request epoch, not a live slot: a slot read pairs
+    /// whatever trust happens to be installed with whatever configuration the
+    /// caller holds, which is the mixed generation this gate exists to refuse.
+    /// False while a gateway has no workload identity AND for the whole
+    /// publication boundary of an accepted trust change.
+    ///
+    /// It is also false while this process cannot know its namespace's
+    /// authoritative database trust state — the backup bootstrap described on
+    /// the `gateway_trust_authority_unresolved` field. That condition cannot be
+    /// expressed in the epoch: the epoch describes the trust an accepted
+    /// generation carried, and a backup-sourced generation carries no
+    /// `gateway_trust_bundles` at all. Publishing it as a live generation would
+    /// silently re-enable the source-loaded roots, including one the committed
+    /// database generation withdrew. The extra read is one uncontended atomic
+    /// load on an otherwise cold flag.
+    #[inline]
+    pub fn admits_gateway_mesh_identity(&self) -> bool {
+        self.request_epoch.admits_gateway_identity()
+            && !self.gateway_trust_authority_is_unresolved()
+    }
+
+    /// Whether gateway-to-mesh identity is refused because the authoritative
+    /// database trust state is still unknown. Named distinctly from the field
+    /// it reads so call sites and doc links stay unambiguous.
+    #[inline]
+    pub fn gateway_trust_authority_is_unresolved(&self) -> bool {
+        self.gateway_trust_authority_unresolved
+            .load(Ordering::Acquire)
+    }
+
+    /// Mark the namespace trust authority unknown because this process
+    /// bootstrapped from the on-disk config backup instead of the database.
+    /// Fails CLOSED until [`Self::resolve_gateway_trust_authority`] reports an
+    /// authoritative load.
+    pub fn mark_gateway_trust_authority_unresolved(&self) {
+        self.gateway_trust_authority_unresolved
+            .store(true, Ordering::Release);
+    }
+
+    /// Report that an AUTHORITATIVE database load settled the namespace trust
+    /// state, re-opening gateway-to-mesh admission.
+    ///
+    /// Only a FULL load read from the database may call this. An incremental
+    /// delta may not: it describes a change to a base this process never read,
+    /// so it cannot establish whether a trust record exists. Returns `true`
+    /// when this call is the one that lifted the refusal, so the caller can log
+    /// the transition exactly once.
+    pub fn resolve_gateway_trust_authority(&self) -> bool {
+        self.gateway_trust_authority_unresolved
+            .swap(false, Ordering::AcqRel)
+    }
+
+    /// Install the database-sourced gateway trust generation for this process's
+    /// configured namespace into the live gateway SVID verifier.
+    ///
+    /// Database serving mode is the only mode that owns this publication. The
+    /// CP→DP side channel (`update_gateway_trust_bundles` /
+    /// `clear_gateway_trust_bundles` from `dp_client`) and the mesh slice apply
+    /// loop already own the same slot for their modes, and a DP's config never
+    /// carries `gateway_trust_bundles` at all (the CP strips it), so the mode
+    /// gate is what keeps a single writer per deployment shape.
+    ///
+    /// Authority precedence is NOT re-decided here: it is
+    /// [`crate::config::gateway_trust::resolve_trust_authority`], the same
+    /// resolver the CP publication path uses.
+    /// - `Ambiguous` (database record AND an unpartitioned file/overlay value)
+    ///   keeps the last-known-good verifier state, matching the CP's
+    ///   `NamespaceTrustProjection::KeepPrevious` refusal.
+    /// - `File` leaves the file/overlay authority to the ordinary gateway SVID
+    ///   source loader — but a database override installed by an EARLIER
+    ///   generation is still withdrawn, because the database record that
+    ///   justified it is gone.
+    /// - `Database` installs the namespace singleton, or withdraws the override
+    ///   when the record was revoked.
+    ///
+    /// Conversion failure is fail-closed WITHOUT panicking: admission validates
+    /// the material before it can be stored, so a bundle that cannot convert
+    /// means that invariant was broken. The previous verifier state is retained
+    /// and the caller must not advertise this generation as live.
+    pub fn install_database_gateway_trust(
+        &self,
+        config: &GatewayConfig,
+    ) -> DatabaseGatewayTrustInstall {
+        use crate::config::gateway_trust::{
+            GatewayTrustFailureReason, TrustAuthorityResolution, record_trust_load_rejection,
+            resolve_trust_authority,
+        };
+
+        if !matches!(
+            self.env_config.mode,
+            crate::config::env_config::OperatingMode::Database
+        ) {
+            return DatabaseGatewayTrustInstall::NotApplicable;
+        }
+
+        // Namespace selection is the process's own configured namespace and the
+        // namespace singleton — never a scan that could pick another tenant's
+        // record.
+        let record = config.gateway_trust_bundle_for(&self.env_config.namespace);
+        let authority = resolve_trust_authority(record, config.trust_bundles.as_deref());
+        let install = match (authority, record) {
+            (TrustAuthorityResolution::Ambiguous, _) => {
+                return DatabaseGatewayTrustInstall::KeptPrevious;
+            }
+            (TrustAuthorityResolution::Database, Some(record)) => Some(record),
+            // Database authority with no record (explicit revocation), or file
+            // authority: either way no database override may remain installed.
+            _ => None,
+        };
+
+        match install {
+            Some(record) => match record.bundle.to_runtime() {
+                Ok(runtime) => {
+                    let trust_domain = runtime.local.trust_domain.clone();
+                    let federated_count = runtime.federated.len();
+                    self.update_gateway_trust_bundles(runtime);
+                    info!(
+                        %trust_domain,
+                        federated_count,
+                        namespace = %self.env_config.namespace,
+                        revision = record.revision,
+                        "Installed database gateway SPIFFE trust bundles into the live verifier"
+                    );
+                    DatabaseGatewayTrustInstall::Installed
+                }
+                Err(error) => {
+                    record_trust_load_rejection(GatewayTrustFailureReason::InvalidMaterial);
+                    warn!(
+                        %error,
+                        namespace = %self.env_config.namespace,
+                        revision = record.revision,
+                        "Stored gateway trust bundle did not convert to runtime trust material; \
+                         keeping the previously active gateway trust and refusing to publish \
+                         this generation"
+                    );
+                    DatabaseGatewayTrustInstall::Failed
+                }
+            },
+            None => {
+                if self.gateway_trust_bundles.load().is_some() {
+                    self.clear_gateway_trust_bundles();
+                    info!(
+                        namespace = %self.env_config.namespace,
+                        "Withdrew database gateway SPIFFE trust bundles; restored source-loaded \
+                         gateway trust"
+                    );
+                    DatabaseGatewayTrustInstall::Cleared
+                } else {
+                    DatabaseGatewayTrustInstall::Absent
+                }
+            }
+        }
+    }
+
+    /// Publish one accepted configuration generation's gateway trust state.
+    ///
+    /// The runtime verifier update comes FIRST so status/observability can
+    /// never report a database generation as live before the live verifier
+    /// actually validates peers with it. A conversion failure retains the last
+    /// known good generation on both surfaces.
+    pub fn publish_gateway_trust_generation(
+        &self,
+        config: &GatewayConfig,
+    ) -> DatabaseGatewayTrustInstall {
+        let outcome = self.install_database_gateway_trust(config);
+        if outcome == DatabaseGatewayTrustInstall::Failed {
+            return outcome;
+        }
+        crate::config::gateway_trust::record_trust_generation_published(
+            &config.gateway_trust_bundles,
+            config.trust_bundles.as_deref(),
+            chrono::Utc::now().timestamp().max(0) as u64,
+        );
+        outcome
+    }
+
+    /// Stage — validate and convert — the gateway trust a candidate database
+    /// configuration generation would make live, WITHOUT touching a live slot.
+    ///
+    /// This runs before the request-epoch swap, so an unconvertible candidate
+    /// is a rejected configuration apply rather than a published generation
+    /// with somebody else's trust. Authority precedence is NOT re-decided here;
+    /// it is [`crate::config::gateway_trust::resolve_trust_authority`], the
+    /// same resolver the CP publication path uses:
+    /// - `Ambiguous` (database record AND an unpartitioned file/overlay value)
+    ///   stages `Unchanged`, which keeps the complete previous live generation
+    ///   and matches the CP's `NamespaceTrustProjection::KeepPrevious` refusal.
+    /// - `File` leaves the file/overlay authority to the gateway SVID source
+    ///   loader, but withdraws a database override an EARLIER generation
+    ///   installed, because the record that justified it is gone.
+    /// - `Database` installs the namespace singleton, or withdraws the override
+    ///   when the record was revoked.
+    ///
+    /// A candidate whose trust inputs are byte-identical to the published
+    /// configuration's stages `Unchanged`, so an ordinary resource reload on a
+    /// gateway that has a trust record never fences the mesh admission gate.
+    /// The comparison is against the published configuration, which
+    /// `gateway_trust_publication_lock` pins for the whole publication.
+    pub fn stage_database_gateway_trust(
+        &self,
+        candidate: &GatewayConfig,
+    ) -> Result<GatewayTrustCommit, String> {
+        use crate::config::gateway_trust::{
+            GatewayTrustFailureReason, TrustAuthorityResolution, record_trust_load_rejection,
+            resolve_trust_authority,
+        };
+
+        if !matches!(
+            self.env_config.mode,
+            crate::config::env_config::OperatingMode::Database
+        ) {
+            return Ok(GatewayTrustCommit::Unchanged);
+        }
+
+        let namespace = self.env_config.namespace.as_str();
+        // Namespace selection is the process's own configured namespace and the
+        // namespace singleton — never a scan that could pick another tenant's
+        // record.
+        let record = candidate.gateway_trust_bundle_for(namespace);
+        let live = self.config.load();
+        // Byte-identical trust inputs AND a runtime override that already
+        // agrees with them: nothing to install, so an ordinary resource reload
+        // on a gateway that HAS a trust record never fences the mesh admission
+        // gate. The runtime half of the test is load-bearing — a record that
+        // was never installed (startup publication refused, or a previous
+        // candidate failed) must still be retried rather than declared
+        // unchanged forever.
+        if live.gateway_trust_bundle_for(namespace) == record
+            && live.trust_bundles == candidate.trust_bundles
+            && record.is_some() == self.gateway_trust_bundles.load().is_some()
+        {
+            return Ok(GatewayTrustCommit::Unchanged);
+        }
+
+        let authority = resolve_trust_authority(record, candidate.trust_bundles.as_deref());
+        match (authority, record) {
+            (TrustAuthorityResolution::Ambiguous, _) => Ok(GatewayTrustCommit::Unchanged),
+            (TrustAuthorityResolution::Database, Some(record)) => {
+                match record.bundle.to_runtime() {
+                    Ok(runtime) => Ok(GatewayTrustCommit::Replace(runtime)),
+                    Err(error) => {
+                        record_trust_load_rejection(GatewayTrustFailureReason::InvalidMaterial);
+                        Err(format!(
+                            "stored gateway trust bundle for namespace '{namespace}' revision {} did \
+                             not convert to runtime trust material: {error}",
+                            record.revision
+                        ))
+                    }
+                }
+            }
+            // Database authority with no record (explicit revocation), or file
+            // authority: either way no database override may remain installed.
+            _ => Ok(if self.gateway_trust_bundles.load().is_some() {
+                GatewayTrustCommit::Clear
+            } else {
+                GatewayTrustCommit::Unchanged
+            }),
+        }
+    }
+
+    /// Turn a fully validated runtime trust candidate into an authoritative
+    /// prepared Replace/Clear. Exact `Unchanged` reduction is deliberately
+    /// deferred to [`Self::normalize_gateway_trust_commit_locked`], where a
+    /// concurrent writer cannot invalidate the comparison.
+    pub(crate) fn stage_runtime_gateway_trust(
+        &self,
+        candidate: Option<RuntimeTrustBundleSet>,
+    ) -> GatewayTrustCommit {
+        match candidate {
+            Some(candidate) => GatewayTrustCommit::Replace(candidate),
+            None => GatewayTrustCommit::Clear,
+        }
+    }
+
+    /// Resolve an authoritative prepared decision against the live override
+    /// while the complete publication mutex is held. This is the only safe
+    /// place to derive `Unchanged`: doing so during off-lock staging lets a
+    /// second writer change the override before publication and turns the
+    /// first publisher's no-op into a lost authoritative update.
+    fn normalize_gateway_trust_commit_locked(
+        &self,
+        commit: GatewayTrustCommit,
+    ) -> GatewayTrustCommit {
+        let current = self.gateway_trust_bundles.load_full();
+        match commit {
+            GatewayTrustCommit::Replace(candidate)
+                if current.as_ref().as_ref().is_some_and(|installed| {
+                    runtime_trust_bundle_sets_equal(installed, &candidate)
+                }) =>
+            {
+                GatewayTrustCommit::Unchanged
+            }
+            GatewayTrustCommit::Clear if current.is_none() => GatewayTrustCommit::Unchanged,
+            commit => commit,
+        }
+    }
+
+    /// Install a staged trust decision and republish the accepted generation's
+    /// gateway-to-mesh admission as live.
+    ///
+    /// The caller has already published the configuration fenced when the
+    /// decision changes the live verifier, so this is the second half of ONE
+    /// publication rather than an independent one. `Unchanged` still calls
+    /// through: it is what re-opens admission for a generation that inherited a
+    /// fence, and it is a no-op in the steady state.
+    ///
+    /// Status/metrics are recorded LAST — after the verifier a request path can
+    /// actually select is live — so no surface ever claims a generation whose
+    /// trust is not yet authenticating.
+    ///
+    /// A decision that WITHDRAWS a currently trusted authority
+    /// ([`Self::gateway_trust_withdrawal_reason`]) also advances the backend
+    /// security generation EXACTLY ONCE, clears the pooled entries that trust
+    /// authenticated, and retires every already-issued HBONE / mesh-mTLS
+    /// transport registered under the outgoing trust generation. All of that
+    /// happens before admission reopens, including in the default
+    /// `FERRUM_MESH_SVID_ROTATION_DRAIN_SECONDS=0` configuration. A purely
+    /// additive `Replace` still fences and installs but retires nothing: it
+    /// removes no root, so there is no reuse or live session to revoke. Exact
+    /// duplicate Replace and redundant Clear decisions normalize to `Unchanged`
+    /// under the outer publication lock.
+    ///
+    /// The steps run against the slot writer directly rather than through
+    /// [`Self::update_gateway_trust_bundles`] / [`Self::clear_gateway_trust_bundles`]
+    /// precisely so the fence spans all of them: those two fence and republish
+    /// internally, so routing the commit through them would lift the fence
+    /// before the generation advanced and would make the advance observable as
+    /// a second, independent rotation.
+    pub fn commit_gateway_trust_generation(&self, commit: GatewayTrustCommit) {
+        let _publication = self
+            .gateway_trust_publication_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.commit_gateway_trust_generation_locked(commit);
+    }
+
+    /// Commit while the caller already owns `gateway_trust_publication_lock`.
+    /// Keeping this separate is load-bearing: publication helpers must never
+    /// recursively acquire the non-reentrant mutex they use as their complete
+    /// stage→fence→install→commit boundary.
+    fn commit_gateway_trust_generation_locked(&self, commit: GatewayTrustCommit) {
+        let commit = self.normalize_gateway_trust_commit_locked(commit);
+        // `Unchanged` changes no material and must never churn the backend
+        // pools: an ordinary resource reload on a gateway that HAS a trust
+        // record stages `Unchanged`, and rotating every pooled transport on
+        // each such reload would be a self-inflicted reconnect storm.
+        let changes_live_trust = commit.changes_live_trust();
+        // Read BEFORE the material is stored, and narrower than the fence
+        // predicate: only a decision that actually removes a currently trusted
+        // authority may pay the pool and live-transport retirement cost.
+        let withdrawal_reason = changes_live_trust
+            .then(|| self.gateway_trust_withdrawal_reason(&commit))
+            .flatten();
+        if changes_live_trust {
+            // Idempotent. A configuration publication that staged this decision
+            // already published FENCED; a trust-only commit (empty resource
+            // delta, or a gateway serving no resources at all) has no
+            // configuration publication to inherit a fence from and fences
+            // here.
+            self.fence_gateway_trust_generation();
+        }
+        // The request epoch is fenced before the registry generation advances.
+        // Old in-flight dials are either present in this sweep or fail their
+        // admission ticket when they complete; no new gateway-to-mesh dial can
+        // begin until the accepted material is published live below.
+        let retirement = withdrawal_reason.map(|reason| {
+            (
+                reason,
+                self.mesh_trust_registry.retire_for_trust_withdrawal(reason),
+            )
+        });
+        match commit {
+            GatewayTrustCommit::Unchanged => {}
+            GatewayTrustCommit::Replace(trust_bundles) => {
+                let trust_domain = trust_bundles.local.trust_domain.clone();
+                let federated_count = trust_bundles.federated.len();
+                self.store_gateway_trust_material(Some(trust_bundles));
+                info!(
+                    %trust_domain,
+                    federated_count,
+                    namespace = %self.env_config.namespace,
+                    "Committed gateway SPIFFE trust bundles with the accepted configuration \
+                     generation"
+                );
+            }
+            GatewayTrustCommit::Clear => {
+                self.store_gateway_trust_material(None);
+                info!(
+                    namespace = %self.env_config.namespace,
+                    "Withdrew gateway SPIFFE trust bundles with the accepted configuration \
+                     generation; restored source-loaded gateway trust"
+                );
+            }
+        }
+        if retirement.is_some() {
+            // Still fenced: gateway-to-mesh admission is refused for the whole
+            // of install → advance → retire, so the generation a request
+            // observes when the fence lifts below is already the accepted one
+            // AND no transport the withdrawn trust authenticated is left
+            // reusable for it to select.
+            let outgoing = self.advance_backend_security_generation();
+            self.retire_backend_transports_for_committed_trust(outgoing);
+        }
+        if let Some((reason, outcome)) = retirement {
+            self.log_gateway_trust_withdrawal(reason, outcome);
+        }
+        // Re-open admission for a generation that published fenced. Idempotent,
+        // so an unchanged commit and a repeated commit cost nothing.
+        self.publish_live_gateway_trust();
+        let published = self.config.load();
+        crate::config::gateway_trust::record_trust_generation_published(
+            &published.gateway_trust_bundles,
+            published.trust_bundles.as_deref(),
+            chrono::Utc::now().timestamp().max(0) as u64,
+        );
+    }
+
+    /// Publish one request epoch and the gateway trust it accepts as ONE
+    /// coherent, request-facing generation (issue #3727).
+    ///
+    /// Ordering, all under `gateway_trust_publication_lock`:
+    /// 1. stage the trust (or take the caller's CP-delivered decision). A
+    ///    staging failure returns `Err` before anything is published, so the
+    ///    complete previous generation stays live.
+    /// 2. publish the request epoch, FENCED when the decision changes the live
+    ///    verifier. Gateway-to-mesh admission is refused from here.
+    /// 3. install the material, advance the backend security generation, and
+    ///    republish the admission live.
+    ///
+    /// There is therefore no interval in which a request pairs this
+    /// generation's configuration with the previous generation's trust roots:
+    /// for the whole of step 2→3 the epoch refuses gateway-to-mesh
+    /// authentication outright. Trust material is only ever advanced after the
+    /// fence, so a request admitted under an older generation can at worst use
+    /// trust the operator has already committed, never trust this generation
+    /// withdrew.
+    ///
+    /// A decision that changes the verifier is committed even when the epoch
+    /// reports no change (`Ok(None)`): a CP trust-only update carries no
+    /// resource delta at all.
+    fn publish_request_epoch_with_gateway_trust(
+        &self,
+        candidate: &GatewayConfig,
+        explicit_trust: Option<GatewayTrustCommit>,
+        build: impl FnOnce(&RequestEpoch) -> Result<Option<StagedRequestEpoch>, String>,
+        mirror: impl FnOnce(&RequestEpoch),
+    ) -> Result<Option<Arc<RequestEpoch>>, String> {
+        let _publication = self
+            .gateway_trust_publication_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let commit = match explicit_trust {
+            Some(commit) => commit,
+            None => self.stage_database_gateway_trust(candidate)?,
+        };
+        let commit = self.normalize_gateway_trust_commit_locked(commit);
+        let fenced = commit.changes_live_trust();
+        let staging = if fenced {
+            GatewayTrustStaging::Fence
+        } else {
+            GatewayTrustStaging::Carry
+        };
+        let published = self
+            .request_epoch
+            .update_config_with_trust(staging, build, mirror)?;
+        if published.is_some() || fenced {
+            self.commit_gateway_trust_generation_locked(commit);
+        } else {
+            // Nothing was published and no material changed, so this is not a
+            // generation and must not be counted as one. Still re-open a fence
+            // an interleaved publication could have left standing.
+            self.publish_live_gateway_trust();
+        }
+        if fenced {
+            // Bounded operator diagnostic: two counters, no material, no
+            // namespace-derived identity.
+            let epoch = self.request_epoch.load();
+            debug!(
+                config_generation = epoch.config_generation(),
+                gateway_trust_generation = epoch.gateway_trust().generation(),
+                trust_live = epoch.gateway_trust().is_live(),
+                "Published an accepted configuration generation and the gateway trust it \
+                 accepted as one coherent request-facing generation"
+            );
+        }
+        Ok(published)
+    }
+
+    /// Install a freshly loaded source/CA-backed gateway SVID as the live
+    /// identity and publish it into the request epoch.
+    ///
+    /// This is the ONE way a rotated SVID becomes both the material the mesh
+    /// pools originate from and the identity the published generation admits;
+    /// storing into `gateway_svid_bundle` directly leaves the two disagreeing.
+    pub fn install_gateway_runtime_svid_bundle(&self, bundle: SvidBundle) {
+        let _publication = self
+            .gateway_trust_publication_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        {
+            let _guard = self
+                .gateway_svid_update_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+            self.gateway_file_svid_bundle
+                .store(Arc::new(Some(bundle.clone())));
+
+            let mut active_bundle = bundle;
+            let trust_snapshot = self.gateway_trust_bundles.load_full();
+            if let Some(trust_bundles) = trust_snapshot.as_ref() {
+                active_bundle.trust_bundles = trust_bundles.clone();
+            }
+            self.gateway_svid_bundle
+                .store(Arc::new(Some(active_bundle)));
+        }
+        // A source rotation replaces the whole SVID (leaf, key, and its trust
+        // roots) in ONE store, so there is nothing to fence. The OUTER
+        // publication lock nevertheless remains held until the epoch adopts
+        // the new snapshot: a config/trust publisher can be entirely before or
+        // entirely after this rotation, never between its material store and
+        // live admission commit. Published after the SVID guard is released so
+        // the epoch writer lock is never nested inside `gateway_svid_update_lock`.
+        self.publish_live_gateway_trust();
     }
 
     fn install_gateway_file_svid_bundle(&self, file_bundle: SvidBundle) {
@@ -7130,14 +8096,7 @@ impl ProxyState {
         let active_crls = crate::tls::load_crls(self.env_config.tls_crl_file_path.as_deref())?;
         let validated = self.validate_backend_tls_material(active_crls.as_ref().as_slice())?;
         self.shared_crls.store(active_crls);
-        let pools = BackendPoolFamily {
-            connection_pool: self.connection_pool.clone(),
-            http2_pool: self.http2_pool.clone(),
-            grpc_pool: self.grpc_pool.clone(),
-            h3_pool: self.h3_pool.clone(),
-            hbone_pool: self.hbone_pool.clone(),
-            mesh_mtls_pool: self.mesh_mtls_pool.clone(),
-        };
+        let pools = self.backend_pool_family();
         pools.clear_tls_config_caches();
         pools.force_drain_all();
         // UDP/DTLS listeners keep listener-local backend DTLS config caches
@@ -7726,6 +8685,10 @@ impl ProxyState {
             consumer_index: consumer_index.load_inner(),
             load_balancer: load_balancer_cache.load_inner(),
             gateway_listener_admission: crate::router_cache::GatewayListenerAdmission::pending(),
+            // The startup SVID load is this process's first live gateway trust
+            // generation. Every later change publishes through
+            // `fence_gateway_trust_generation` / `commit_gateway_trust_generation`.
+            gateway_trust: GatewayTrustEpoch::initial(gateway_svid_bundle.load_full()),
             config_generation: 1,
             route_generation: 1,
             lb_generation: 1,
@@ -8052,6 +9015,8 @@ impl ProxyState {
             gateway_file_svid_bundle,
             gateway_trust_bundles,
             gateway_svid_update_lock: Arc::new(std::sync::Mutex::new(())),
+            gateway_trust_publication_lock: Arc::new(std::sync::Mutex::new(())),
+            gateway_trust_authority_unresolved: Arc::new(AtomicBool::new(false)),
             mesh_trust_registry,
             mesh_inbound_tls,
             mesh_inbound_tls_policy,
@@ -8906,10 +9871,11 @@ impl ProxyState {
         let dial_host = target.dial_host;
         let port = target.port;
         let hbone_port = target.hbone_port;
-        if self.gateway_svid_bundle.load().is_none() {
+        if !self.admits_gateway_mesh_identity() {
             record.hbone = ProtocolSupport::Unknown;
             debug!(
-                "HBONE probe for {}:{} skipped: gateway SVID is not configured",
+                "HBONE probe for {}:{} skipped: the published generation admits no gateway \
+                 mesh identity",
                 host, port
             );
             return;
@@ -10445,6 +11411,13 @@ impl ProxyState {
             self.env_config.http3_idle_timeout,
         );
         self.config.store(Arc::clone(&published.config));
+        // Gateway trust is NOT installed here. This mirror runs while the
+        // request-epoch writer lock is held, and the trust install has to
+        // happen between the fenced publication and the live republication —
+        // both of which take that same lock (issue #3727). The install and the
+        // acceptance accounting are owned by
+        // `publish_request_epoch_with_gateway_trust`, which wraps this whole
+        // publication; see `commit_gateway_trust_generation`.
         // Config publications can add, remove, or repoint certificate-family
         // sources without producing a TLS source-watcher event. Invalidate the
         // metrics-safe snapshot only after the validated epoch is published so
@@ -10476,8 +11449,31 @@ impl ProxyState {
     }
 
     /// Update the proxy configuration.
+    ///
+    /// Gateway trust is derived from the candidate itself (database serving
+    /// mode owns its namespace record) and published with it as one coherent
+    /// generation. Use [`Self::update_config_with_gateway_trust`] when the
+    /// trust decision arrives out of band, as it does on the CP→DP side
+    /// channel.
     pub fn update_config(&self, new_config: GatewayConfig) -> ConfigApplyOutcome {
-        self.update_config_with_mesh_ids(new_config, None)
+        self.update_config_with_mesh_ids(new_config, None, None)
+    }
+
+    /// [`Self::update_config`] for a generation whose gateway trust decision is
+    /// delivered beside the configuration rather than inside it.
+    ///
+    /// The CP strips `gateway_trust_bundles` from every namespace-scoped
+    /// ConfigSync slice, so a DP's trust arrives on the update's side channel.
+    /// Passing it here is what makes the DP snapshot/delta apply publish
+    /// configuration and trust as ONE generation instead of two stores apart.
+    /// `GatewayTrustCommit::Unchanged` is exactly the `Unchanged` side channel
+    /// and changes nothing.
+    pub fn update_config_with_gateway_trust(
+        &self,
+        new_config: GatewayConfig,
+        trust: GatewayTrustCommit,
+    ) -> ConfigApplyOutcome {
+        self.update_config_with_mesh_ids(new_config, None, Some(trust))
     }
 
     /// Mesh-only update path carrying the exact identities emitted by the
@@ -10488,14 +11484,16 @@ impl ProxyState {
         &self,
         new_config: GatewayConfig,
         trusted_mesh_ids: &TrustedMeshGeneratedResourceIds,
+        trust: GatewayTrustCommit,
     ) -> ConfigApplyOutcome {
-        self.update_config_with_mesh_ids(new_config, Some(trusted_mesh_ids))
+        self.update_config_with_mesh_ids(new_config, Some(trusted_mesh_ids), Some(trust))
     }
 
     fn update_config_with_mesh_ids(
         &self,
         mut new_config: GatewayConfig,
         trusted_mesh_ids: Option<&TrustedMeshGeneratedResourceIds>,
+        explicit_trust: Option<GatewayTrustCommit>,
     ) -> ConfigApplyOutcome {
         use crate::config_delta::ConfigDelta;
 
@@ -10576,7 +11574,9 @@ impl ProxyState {
             let consumer_inner = ConsumerIndex::build_inner(&new_config.consumers);
             let lb_inner = LoadBalancerCache::build_inner(&new_config);
             let staged_config = Arc::new(new_config.clone());
-            let published = match self.request_epoch.update_config(
+            let published = match self.publish_request_epoch_with_gateway_trust(
+                &new_config,
+                explicit_trust,
                 |_| {
                     Ok(Some(StagedRequestEpoch {
                         config: Arc::clone(&staged_config),
@@ -10692,8 +11692,21 @@ impl ProxyState {
             return ConfigApplyOutcome::Applied;
         }
 
-        // Both empty — nothing to do
+        // Both empty — no resource generation to publish, but an explicit
+        // CP-delivered trust decision still has to be committed: a rotation or
+        // revocation is authoritative even for a gateway that currently serves
+        // no resources (issue #3727).
         if old_is_empty && new_is_empty {
+            if let Some(commit) = explicit_trust.filter(GatewayTrustCommit::changes_live_trust) {
+                let _publication = self
+                    .gateway_trust_publication_lock
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let commit = self.normalize_gateway_trust_commit_locked(commit);
+                if commit.changes_live_trust() {
+                    self.commit_gateway_trust_generation_locked(commit);
+                }
+            }
             return ConfigApplyOutcome::Unchanged;
         }
 
@@ -10705,7 +11718,9 @@ impl ProxyState {
         let route_changed = std::cell::Cell::new(false);
         let proxy_plugin_rebuild_count = std::cell::Cell::new(0usize);
         let staged_config = Arc::new(new_config.clone());
-        let publish_result = self.request_epoch.update_config(
+        let publish_result = self.publish_request_epoch_with_gateway_trust(
+            &new_config,
+            explicit_trust,
             |current| {
                 let delta = ConfigDelta::compute(&current.config, &new_config);
                 if delta.is_empty() {
@@ -10725,6 +11740,16 @@ impl ProxyState {
                             ),
                         )?;
                     let mesh_changed = current.config.mesh != new_config.mesh;
+                    // Namespace-scoped database trust and the unpartitioned
+                    // file/overlay authority are both intentionally absent
+                    // from ConfigDelta: neither belongs on the ordinary
+                    // resource-delta wire contract. They still decide live
+                    // gateway verification, so a trust-only rotation,
+                    // revocation, or authority-precedence change must publish
+                    // a fresh request epoch rather than taking the no-op path.
+                    let gateway_trust_changed = current.config.gateway_trust_bundles
+                        != new_config.gateway_trust_bundles
+                        || current.config.trust_bundles != new_config.trust_bundles;
                     // DestinationRule-derived projections
                     // (`dispatch_port_overrides`, `dispatch_port_override_fallback`,
                     // `resolved_tls`, stream-relay dispatch maps) and the
@@ -10742,6 +11767,7 @@ impl ProxyState {
                         Self::projected_dr_dispatch_changed_upstreams(&current.config, &new_config);
                     let projected_lb_changed = !projected_lb_modified.is_empty();
                     if !mesh_changed
+                        && !gateway_trust_changed
                         && !projected_routes_changed
                         && !projected_lb_changed
                         && country_mmdb_plugin_cache.is_none()
@@ -10835,11 +11861,8 @@ impl ProxyState {
                 return ConfigApplyOutcome::Unchanged;
             }
             Err(e) => {
-                let message = format!("security plugin validation failed: {e}");
-                error!(
-                    "Config reload rejected — security plugin validation failed: {}",
-                    e
-                );
+                let message = format!("configuration publication refused: {e}");
+                error!("Config reload rejected — {}", e);
                 return ConfigApplyOutcome::rejected_one(message);
             }
         };
@@ -10880,7 +11903,7 @@ impl ProxyState {
         // carries the new mesh config and/or geo plugin snapshot, and
         // `mirror_request_epoch_wrappers` published its wrapper views above.
         let Some(delta) = applied_delta else {
-            debug!("Config update: out-of-band mesh/MMDB generation republished");
+            debug!("Config update: out-of-band mesh/trust/MMDB generation republished");
             return ConfigApplyOutcome::Applied;
         };
         let proxy_plugin_rebuild_count = proxy_plugin_rebuild_count.get();
@@ -11107,7 +12130,36 @@ impl ProxyState {
         &self,
         result: crate::config::db_loader::IncrementalResult,
     ) -> ConfigApplyOutcome {
+        self.apply_incremental_with_gateway_trust(result, None)
+            .await
+    }
+
+    /// [`Self::apply_incremental`] carrying an out-of-band gateway trust
+    /// decision (the CP→DP side channel) so the resource delta and the trust it
+    /// accompanies publish as ONE generation.
+    ///
+    /// A `GatewayTrustBundleUpdate::Unchanged` side channel maps to `None`
+    /// here, which stages from the configuration exactly as an ordinary
+    /// incremental apply does — on a DP that is always `Unchanged`, because the
+    /// CP strips `gateway_trust_bundles` from namespace-scoped slices.
+    pub async fn apply_incremental_with_gateway_trust(
+        &self,
+        result: crate::config::db_loader::IncrementalResult,
+        explicit_trust: Option<GatewayTrustCommit>,
+    ) -> ConfigApplyOutcome {
         if result.is_empty() {
+            // An empty resource delta still has to commit an explicit trust
+            // decision: a CP trust-only update carries no resources at all.
+            if let Some(commit) = explicit_trust.filter(GatewayTrustCommit::changes_live_trust) {
+                let _publication = self
+                    .gateway_trust_publication_lock
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let commit = self.normalize_gateway_trust_commit_locked(commit);
+                if commit.changes_live_trust() {
+                    self.commit_gateway_trust_generation_locked(commit);
+                }
+            }
             return ConfigApplyOutcome::Unchanged;
         }
 
@@ -11339,7 +12391,9 @@ impl ProxyState {
         // a plain `let mut bool`.
         let route_changed = std::cell::Cell::new(false);
         let staged_config = Arc::new(new_config.clone());
-        let publish_result = self.request_epoch.update_config(
+        let publish_result = self.publish_request_epoch_with_gateway_trust(
+            &new_config,
+            explicit_trust,
             |current| {
                 let delta = crate::config_delta::ConfigDelta::compute(&current.config, &new_config);
                 if delta.is_empty() {
@@ -11399,7 +12453,7 @@ impl ProxyState {
             Ok(Some(epoch)) => epoch,
             Ok(None) => return ConfigApplyOutcome::Unchanged,
             Err(e) => {
-                let message = format!("security plugin validation failed: {e}");
+                let message = format!("configuration publication refused: {e}");
                 return ConfigApplyOutcome::rejected_one(message);
             }
         };
@@ -32494,14 +33548,19 @@ async fn handle_proxy_request_inner(
     let hbone_required = upstream_target
         .as_deref()
         .is_some_and(hbone_pool::target_hbone_enabled);
+    // Admitted-generation gateway trust, not the live SVID slot: an accepted
+    // trust rotation/revocation is fenced until its material is the live
+    // verifier, and HBONE egress must refuse rather than authenticate the peer
+    // with the generation this request's configuration replaced (issue #3727).
+    let gateway_mesh_identity_admitted = state.admits_gateway_mesh_identity();
     let current_dispatch_hbone = can_attempt_hbone_backend(
         state.backend_capabilities.as_ref(),
         &proxy,
         upstream_target.as_deref(),
-        state.gateway_svid_bundle.load().is_some(),
+        gateway_mesh_identity_admitted,
     );
     if hbone_required && !current_dispatch_hbone {
-        let block_reason = if state.gateway_svid_bundle.load().is_none() {
+        let block_reason = if !gateway_mesh_identity_admitted {
             "gateway workload identity is unavailable"
         } else {
             "HBONE backend capability is not available"
@@ -33066,7 +34125,9 @@ async fn handle_proxy_request_inner(
                     state.backend_capabilities.as_ref(),
                     &proxy,
                     current_target.as_deref(),
-                    state.gateway_svid_bundle.load().is_some(),
+                    // Re-read the admitted generation: a trust publication can
+                    // fence (and re-open) between retry attempts.
+                    state.admits_gateway_mesh_identity(),
                 );
             let retry_dispatch_mesh_mtls = retry_mesh_mtls_required
                 && supports_mesh_mtls_backend(&state, &proxy, current_target.as_deref());
@@ -40547,6 +41608,22 @@ pub(crate) fn resolve_grpc_dispatch_transport<'a>(
     target: Option<&'a UpstreamTarget>,
     asserted_source_identity: Option<&crate::identity::SpiffeId>,
 ) -> Result<grpc_proxy::GrpcDispatchTransport<'a>, grpc_proxy::GrpcTransportError> {
+    // A mesh-tagged gRPC target is authenticated with the gateway's own SVID
+    // and trust roots, so it is admissible only while the published generation
+    // says that material is live. During an accepted trust rotation or
+    // revocation the pools still hold the previous material, and dialing with
+    // it would authenticate a peer the accepted generation withdrew
+    // (issue #3727). Fail closed with a fixed, metadata-free UNAVAILABLE.
+    if let Some(target) = target
+        && (mesh_mtls_pool::target_mesh_mtls_enabled(target)
+            || hbone_pool::target_hbone_enabled(target))
+        && !state.admits_gateway_mesh_identity()
+    {
+        return Err(grpc_proxy::GrpcTransportError::Unsupported {
+            message: grpc_proxy::GATEWAY_MESH_IDENTITY_NOT_LIVE,
+            diagnostic: grpc_proxy::GrpcTransportDiagnostic::GatewayTrustNotLive,
+        });
+    }
     grpc_proxy::GrpcDispatchTransport::for_target_with_hbone_context(
         &state.grpc_pool,
         &state.mesh_mtls_pool,
@@ -56016,6 +57093,7 @@ mod tests {
             http_tls_listen_ports: Default::default(),
             mesh_revision: None,
             k8s_mesh_overlay: Default::default(),
+            gateway_trust_bundles: Vec::new(),
         }
     }
 

@@ -187,6 +187,43 @@ impl JwkPublicKey {
     }
 }
 
+/// True when `material` is a public key this stack can actually verify with,
+/// in either encoding a `jwt_authorities[].public_key_pem` field legitimately
+/// carries:
+///
+/// - an SPKI `PUBLIC KEY` PEM (what Ferrum's own authority publishes), or
+/// - a bare JWK JSON object, which is what
+///   [`federation`](crate::modes::mesh::federation) preserves verbatim from a
+///   SPIFFE JWKS document.
+///
+/// Both encodings are proved by running the real parser, so a PRIVATE KEY
+/// paste, a truncated body, trailing material, or an unsupported key type /
+/// off-curve point is refused rather than stored and published. The error is
+/// intentionally not returned: callers on the configuration-admission path
+/// report their own field/index-only message.
+///
+/// The JWK arm goes through [`strict_public_jwk`] — the SAME policy
+/// [`authorities_from_jwks`] enforces on an externally supplied JWKS — rather
+/// than through the re-encoder alone. That is load-bearing here in a way it is
+/// not there: `authorities_from_jwks` stores the *re-encoded* SPKI PEM and so
+/// drops whatever else the JWK carried, while this admission path stores and
+/// redistributes the ORIGINAL JSON verbatim in `public_key_pem`. A valid public
+/// coordinate set with a `d` (or RSA `p`/`q`/`dp`/`dq`/`qi`/`oth`) member
+/// re-encodes into a perfectly good public SPKI, so checking only the
+/// re-encoding would persist and publish private key material; a contradictory
+/// `use`/`key_ops`, or an `alg` the key type cannot produce, would survive the
+/// same way.
+pub fn is_usable_public_key_material(material: &str) -> bool {
+    if published_authority_key_id(material).is_ok() {
+        return true;
+    }
+    // The duplicate-key-rejecting parser, not `serde_json::from_str`: a JWK that
+    // repeats a member is ambiguous about which value the policy checks saw.
+    super::parse_strict_json_object(material.as_bytes())
+        .ok()
+        .is_some_and(|jwk| strict_public_jwk(&jwk).is_ok())
+}
+
 /// Compute the RFC 7638 JWK thumbprint (base64url, unpadded SHA-256) of an
 /// SPKI PEM public key. Used as the `kid` for Ferrum-minted JWT-SVIDs so the
 /// key id is derived from the key itself rather than a counter that could
@@ -312,7 +349,12 @@ pub fn jwks_document(authorities: &[PublishedJwtAuthority]) -> Result<Vec<u8>, J
 ///
 /// Unknown JWK members are ignored (JWKS is an extensible document), but a
 /// *known policy member* is never ignored, and a malformed one is never treated
-/// as absent:
+/// as absent. The policy is [`strict_public_jwk`], shared verbatim with the
+/// configuration-admission probe [`is_usable_public_key_material`] so the two
+/// cannot drift:
+///
+/// - a member that carries PRIVATE or symmetric secret key material is a
+///   rejection, never a member to be dropped during re-encoding;
 ///
 /// - `use`, if present, must be the string `sig`. A non-string `use` is a
 ///   rejection, not an unspecified key.
@@ -378,9 +420,7 @@ pub fn authorities_from_jwks(
             }
         };
         validate_key_id(&key_id)?;
-        check_jwk_key_policy(jwk)?;
-        let declared_alg = jwk_declared_alg(jwk)?;
-        let public_key_pem = spki_pem_from_jwk(jwk)?;
+        let (public_key_pem, declared_alg) = strict_public_jwk(jwk)?;
         authorities.push(PublishedJwtAuthority {
             trust_domain: trust_domain.clone(),
             key_id,
@@ -398,6 +438,64 @@ pub fn authorities_from_jwks(
 /// Operations RFC 7517 §4.3 admits alongside `use: "sig"`. Anything else in
 /// `key_ops` contradicts a signature key and is refused rather than reconciled.
 const SIGNATURE_KEY_OPS: &[&str] = &["sign", "verify"];
+
+/// JWK members that carry PRIVATE or symmetric secret key material.
+///
+/// RFC 7518 §6.2.2.1 (EC `d`), §6.3.2 (RSA `d`, and the CRT / multi-prime
+/// members `p`, `q`, `dp`, `dq`, `qi`, `oth`), and §6.4.1 (symmetric `k`).
+///
+/// A public-key admission path refuses the whole JWK rather than dropping these
+/// members while re-encoding the public half: an admitted JWK is stored and
+/// redistributed as the original JSON, so tolerating a private member would
+/// persist and publish a private key that happens to carry a valid public
+/// coordinate set.
+const PRIVATE_JWK_MEMBERS: &[&str] = &["d", "p", "q", "dp", "dq", "qi", "oth", "k"];
+
+/// The ONE strict public-JWK policy: prove a JWK is a usable *public* signature
+/// key and return its SPKI PEM re-encoding plus any declared algorithm.
+///
+/// Every admission path for externally supplied JWK material goes through this
+/// so there is a single implementation of the policy:
+///
+/// 1. no private/symmetric secret member is present
+///    ([`PRIVATE_JWK_MEMBERS`]);
+/// 2. `use` / `key_ops` are type-checked, value-checked, and mutually
+///    consistent ([`check_jwk_key_policy`]);
+/// 3. `alg`, if present, is a string naming an algorithm this validator
+///    supports ([`jwk_declared_alg`]);
+/// 4. the key re-encodes into a supported public SPKI ([`spki_pem_from_jwk`],
+///    which re-parses its own output);
+/// 5. a declared algorithm is one the PARSED key type can actually produce — a
+///    key type/algorithm contradiction is refused here rather than deferred,
+///    because a caller that only wants a yes/no answer never reaches
+///    [`validate_published_authorities`].
+///
+/// Errors are fixed strings and never echo the material.
+fn strict_public_jwk(
+    jwk: &Map<String, Value>,
+) -> Result<(String, Option<Algorithm>), JwtSvidError> {
+    if PRIVATE_JWK_MEMBERS
+        .iter()
+        .any(|member| jwk.contains_key(*member))
+    {
+        return Err(JwtSvidError::InvalidAuthority(
+            "JWT bundle JWKS key entry carries private or symmetric key material",
+        ));
+    }
+    check_jwk_key_policy(jwk)?;
+    let declared_alg = jwk_declared_alg(jwk)?;
+    let public_key_pem = spki_pem_from_jwk(jwk)?;
+    if let Some(declared) = declared_alg {
+        let spki_der = spki_der_from_pem(&public_key_pem)?;
+        let key = jwk_public_key(&spki_der)?;
+        if !key.allowed_algs.contains(&declared) {
+            return Err(JwtSvidError::InvalidAuthority(
+                "a JWT authority declares a signature algorithm its key type cannot produce",
+            ));
+        }
+    }
+    Ok((public_key_pem, declared_alg))
+}
 
 /// Validate the `use` / `key_ops` policy members of an externally supplied JWK.
 ///
@@ -467,8 +565,9 @@ fn check_jwk_key_policy(jwk: &Map<String, Value>) -> Result<(), JwtSvidError> {
 /// verify with. An unknown or symmetric name is refused rather than dropped:
 /// dropping it would silently promote an `HS256`-declared key to the whole
 /// asymmetric family its SPKI happens to support. Compatibility with the key's
-/// actual type is enforced later, in [`validate_published_authorities`], which
-/// is the single gate both publication and validation pass through.
+/// actual type is enforced immediately by [`strict_public_jwk`] and rechecked
+/// by [`validate_published_authorities`], the shared publication/validation
+/// gate.
 fn jwk_declared_alg(jwk: &Map<String, Value>) -> Result<Option<Algorithm>, JwtSvidError> {
     let raw = match jwk.get("alg") {
         None => return Ok(None),
