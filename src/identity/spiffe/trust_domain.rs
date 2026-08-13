@@ -86,8 +86,8 @@ pub enum TrustDomainError {
     NotLowercase(String),
     #[error("trust domain '{0}' contains '/' — trust domains do not have a path component")]
     HasPath(String),
-    #[error("trust domain '{0}' is too long (max {1}, got {2})")]
-    TooLong(String, usize, usize),
+    #[error("trust domain is too long (max {0}, got {1})")]
+    TooLong(usize, usize),
     #[error("trust domain '{0}' contains invalid character '{1}'")]
     InvalidChar(String, char),
     #[error("trust domain '{0}' must not begin or end with '.', '-', or '_'")]
@@ -106,11 +106,7 @@ fn validate(raw: &str) -> Result<(), TrustDomainError> {
         return Err(TrustDomainError::Empty);
     }
     if raw.len() > MAX_TRUST_DOMAIN_LEN {
-        return Err(TrustDomainError::TooLong(
-            raw.to_string(),
-            MAX_TRUST_DOMAIN_LEN,
-            raw.len(),
-        ));
+        return Err(TrustDomainError::TooLong(MAX_TRUST_DOMAIN_LEN, raw.len()));
     }
     if raw.contains('/') {
         return Err(TrustDomainError::HasPath(raw.to_string()));

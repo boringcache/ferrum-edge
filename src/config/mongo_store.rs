@@ -60,14 +60,16 @@ mod inner {
         TcpConnectionThrottleAttachmentConflict,
     };
     use crate::config::db_loader::{
-        credential_value_hash, mark_row_decode_rejection, proxy_route_key_hash,
+        GATEWAY_TRUST_BUNDLE_RESOURCE_TYPE, credential_value_hash, mark_row_decode_rejection,
+        proxy_route_key_hash,
     };
+    use crate::config::gateway_trust::{GatewayTrustBundleIdentity, GatewayTrustBundleRecord};
     use crate::config::types::{
         ApiSpec, Consumer, GatewayConfig, PluginAssociation, PluginConfig, PluginScope, Proxy,
         Upstream,
     };
     use crate::config::validation_pipeline::{
-        ValidationAction, collect_rejecting_runtime_config_errors,
+        ConfigValidationRejection, ValidationAction, collect_rejecting_runtime_config_errors,
         validate_plugin_file_dependencies_off_thread,
     };
     use crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig;
@@ -2754,6 +2756,13 @@ mod inner {
             self.collection("api_specs")
         }
 
+        /// Namespace-keyed gateway trust bundles (issue #3727). `_id` is the
+        /// namespace, which makes the singleton rule a property of the document
+        /// key rather than an application check that could race.
+        fn gateway_trust_bundles(&self) -> MongoCollectionHandle {
+            self.collection("gateway_trust_bundles")
+        }
+
         fn audit_events(&self) -> MongoCollectionHandle {
             self.collection("audit_events")
         }
@@ -3169,12 +3178,43 @@ mod inner {
             resource_id: &str,
             operation: &str,
         ) -> Result<(), anyhow::Error> {
+            self.record_config_change_returning_sequence(
+                namespace,
+                resource_type,
+                resource_id,
+                operation,
+            )
+            .await?;
+            Ok(())
+        }
+
+        /// Record a config change and return the durable sequence assigned to
+        /// it (issue #3727).
+        ///
+        /// `config_change_counters._id = "global"` is a monotonic counter
+        /// advanced by an atomic `findAndModify`, so the value returned here is
+        /// unique for the whole deployment and is never reused — including
+        /// across a delete followed by a recreate. That is the property gateway
+        /// trust-bundle revisions need: a per-record counter restarting at 1
+        /// would let a stale pre-delete expectation match a new incarnation.
+        async fn record_config_change_returning_sequence(
+            &self,
+            namespace: &str,
+            resource_type: &str,
+            resource_id: &str,
+            operation: &str,
+        ) -> Result<u64, anyhow::Error> {
             let sequence = self.next_config_change_sequence().await?;
             let doc =
                 Self::config_change_doc(sequence, namespace, resource_type, resource_id, operation);
             self.config_changes().insert_one(doc).await?;
             self.compact_config_changes(namespace).await?;
-            Ok(())
+            // Checked, never defaulted: a zero sequence is not the monotonic
+            // key the revision contract assumes.
+            if sequence == 0 {
+                anyhow::bail!("MongoDB config change sequence is out of range");
+            }
+            Ok(sequence)
         }
 
         async fn record_config_changes_batch(
@@ -3225,6 +3265,27 @@ mod inner {
             resource_id: &str,
             operation: &str,
         ) -> mongodb::error::Result<()> {
+            self.record_config_change_in_session_returning_sequence(
+                session,
+                namespace,
+                resource_type,
+                resource_id,
+                operation,
+            )
+            .await?;
+            Ok(())
+        }
+
+        /// In-session variant of
+        /// [`Self::record_config_change_returning_sequence`] (issue #3727).
+        async fn record_config_change_in_session_returning_sequence(
+            &self,
+            session: &mut ClientSession,
+            namespace: &str,
+            resource_type: &str,
+            resource_id: &str,
+            operation: &str,
+        ) -> mongodb::error::Result<u64> {
             let sequence = self.next_config_change_sequence_in_session(session).await?;
             let doc =
                 Self::config_change_doc(sequence, namespace, resource_type, resource_id, operation);
@@ -3232,7 +3293,12 @@ mod inner {
                 .insert_one(doc)
                 .session(&mut *session)
                 .await?;
-            Ok(())
+            if sequence == 0 {
+                return Err(mongodb::error::Error::custom(
+                    "MongoDB config change sequence is out of range",
+                ));
+            }
+            Ok(sequence)
         }
 
         async fn compact_config_changes_best_effort(&self, namespace: &str) {
@@ -5373,6 +5439,100 @@ mod inner {
         Ok(mongodb::bson::from_document(doc)?)
     }
 
+    /// Encode a gateway trust-bundle record (issue #3727).
+    ///
+    /// `_id` is the namespace, not the resource id: MongoDB's `_id` uniqueness
+    /// is what enforces one record per namespace, so a concurrent create in the
+    /// same namespace fails on a duplicate key instead of silently replacing
+    /// another writer's roots. `revision` is stored as a signed 64-bit integer
+    /// because BSON has no unsigned integer type.
+    ///
+    /// `assigned_revision` is the BACKEND-assigned value from the config-change
+    /// sequence; `record.revision` is deliberately overwritten rather than
+    /// persisted, so no caller, payload, or previous incarnation can steer the
+    /// stored counter. The conversion is checked and never clamped: an
+    /// unrepresentable revision is an error, because a clamp would write a
+    /// revision the compare-and-set contract cannot rely on.
+    fn gateway_trust_bundle_to_doc(
+        record: &GatewayTrustBundleRecord,
+        assigned_revision: u64,
+    ) -> Result<Document, anyhow::Error> {
+        let mut doc = mongodb::bson::to_document(record)?;
+        doc.insert("_id", record.namespace.as_str());
+        let revision = i64::try_from(assigned_revision).map_err(|_| {
+            anyhow::anyhow!("gateway trust bundle revision exceeds BSON Int64 range")
+        })?;
+        if revision < 1 {
+            anyhow::bail!("gateway trust bundle revision is out of range");
+        }
+        doc.insert("revision", revision);
+        Ok(doc)
+    }
+
+    fn doc_to_gateway_trust_bundle(
+        mut doc: Document,
+    ) -> Result<GatewayTrustBundleRecord, anyhow::Error> {
+        doc.remove("_id");
+        // Fail closed on the security-relevant revision before anything else:
+        // BSON would happily deserialize a missing/negative value through
+        // serde's `#[serde(default)]`, and a record whose monotonic counter is
+        // not a positive integer is not the record the optimistic-concurrency
+        // contract assumes.
+        strict_stored_revision(&doc)?;
+        // Never surface the BSON error text: it can quote the stored material.
+        mongodb::bson::from_document(doc).map_err(|_| {
+            crate::config::gateway_trust::record_trust_load_rejection(
+                crate::config::gateway_trust::GatewayTrustFailureReason::Undecodable,
+            );
+            anyhow::anyhow!("gateway trust bundle stored material is not decodable")
+        })
+    }
+
+    /// Strictly decode a stored gateway trust-bundle string identity field.
+    ///
+    /// Missing or non-string values are corrupt security metadata and are
+    /// refused rather than defaulted; the diagnostic names the field only and
+    /// drives the bounded `undecodable` failure reason.
+    fn strict_stored_str_field(
+        doc: &Document,
+        field: &'static str,
+    ) -> Result<String, anyhow::Error> {
+        match doc.get_str(field) {
+            Ok(value) => Ok(value.to_string()),
+            Err(_) => {
+                crate::config::gateway_trust::record_trust_load_rejection(
+                    crate::config::gateway_trust::GatewayTrustFailureReason::Undecodable,
+                );
+                anyhow::bail!("gateway trust bundle {field} field is unreadable");
+            }
+        }
+    }
+
+    /// Strictly decode a stored gateway trust-bundle `revision`.
+    ///
+    /// Missing, non-integer, or non-positive values are corrupt security
+    /// metadata and are refused rather than defaulted; the diagnostic names the
+    /// field only and drives the bounded `undecodable` failure reason.
+    fn strict_stored_revision(doc: &Document) -> Result<u64, anyhow::Error> {
+        let value = match doc.get("revision") {
+            Some(Bson::Int64(value)) => *value,
+            Some(Bson::Int32(value)) => i64::from(*value),
+            _ => {
+                crate::config::gateway_trust::record_trust_load_rejection(
+                    crate::config::gateway_trust::GatewayTrustFailureReason::Undecodable,
+                );
+                anyhow::bail!("gateway trust bundle revision field is unreadable");
+            }
+        };
+        if value < 1 {
+            crate::config::gateway_trust::record_trust_load_rejection(
+                crate::config::gateway_trust::GatewayTrustFailureReason::Undecodable,
+            );
+            anyhow::bail!("gateway trust bundle revision field is out of range");
+        }
+        Ok(value as u64)
+    }
+
     fn map_snapshot_document_error(
         snapshot: bool,
         resource_type: &'static str,
@@ -5998,7 +6158,7 @@ mod inner {
         ) -> Result<GatewayConfig, anyhow::Error> {
             let start = std::time::Instant::now();
             let loaded_at = Utc::now();
-            let (proxies, consumers, plugin_configs, upstreams) =
+            let (proxies, consumers, plugin_configs, upstreams, gateway_trust_bundles) =
                 if self.replica_set_configured.load(Ordering::Acquire) {
                     let connection = self.connection();
                     let mut session = connection.client.start_session().await?;
@@ -6037,7 +6197,23 @@ mod inner {
                                 false,
                             )
                             .await?;
-                        Ok::<_, anyhow::Error>((proxies, consumers, plugin_configs, upstreams))
+                        // Same snapshot/session as the resources so a rotation
+                        // committed mid-load cannot split configuration from
+                        // trust material (issue #3727).
+                        let gateway_trust_bundles = self
+                            .load_gateway_trust_bundle_opt_session(
+                                namespace,
+                                Some((connection.as_ref(), &mut session)),
+                                false,
+                            )
+                            .await?;
+                        Ok::<_, anyhow::Error>((
+                            proxies,
+                            consumers,
+                            plugin_configs,
+                            upstreams,
+                            gateway_trust_bundles,
+                        ))
                     }
                     .await;
 
@@ -6061,6 +6237,8 @@ mod inner {
                             .await?,
                         self.load_full_upstreams_opt_session(namespace, None, false)
                             .await?,
+                        self.load_gateway_trust_bundle_opt_session(namespace, None, false)
+                            .await?,
                     )
                 };
 
@@ -6081,10 +6259,38 @@ mod inner {
                 consumers,
                 plugin_configs,
                 upstreams,
+                gateway_trust_bundles,
                 loaded_at,
                 known_namespaces: Vec::new(),
                 ..Default::default()
             };
+            // Validate the complete trust candidate before the snapshot can be
+            // published (issue #3727). A stored bundle that no longer passes
+            // admission rejects the load, so the caller keeps its previous valid
+            // generation rather than swapping in unverifiable roots. Messages
+            // are already redacted — field names, indices, and sizes only.
+            let trust_errors: Vec<String> = config
+                .gateway_trust_bundles
+                .iter()
+                .filter_map(|record| record.validate_fields().err())
+                .flatten()
+                .collect();
+            if !trust_errors.is_empty() {
+                for message in &trust_errors {
+                    error!("MongoDB gateway trust bundle rejected — {}", message);
+                }
+                crate::config::gateway_trust::record_trust_load_rejection(
+                    crate::config::gateway_trust::GatewayTrustFailureReason::InvalidMaterial,
+                );
+                return Err(ConfigValidationRejection {
+                    backend: "MongoDB",
+                    errors: trust_errors,
+                }
+                .into_anyhow());
+            }
+            // Acceptance is NOT recorded here: this candidate still has the
+            // atomic swap and broadcast ahead of it. See
+            // `record_trust_generation_published`.
             config.normalize_fields();
             config.resolve_upstream_tls();
 
@@ -6172,7 +6378,7 @@ mod inner {
             // reads directly from the primary.
             let start = std::time::Instant::now();
             let loaded_at = Utc::now();
-            let (proxies, consumers, plugin_configs, upstreams) =
+            let (proxies, consumers, plugin_configs, upstreams, gateway_trust_bundles) =
                 if self.replica_set_configured.load(Ordering::Acquire) {
                     let connection = self.connection();
                     let mut session = connection.client.start_session().await?;
@@ -6211,7 +6417,23 @@ mod inner {
                                 true,
                             )
                             .await?;
-                        Ok::<_, anyhow::Error>((proxies, consumers, plugin_configs, upstreams))
+                        // Same snapshot/session as the resources so a rotation
+                        // committed mid-load cannot split configuration from
+                        // trust material (issue #3727).
+                        let gateway_trust_bundles = self
+                            .load_gateway_trust_bundle_opt_session(
+                                namespace,
+                                Some((connection.as_ref(), &mut session)),
+                                true,
+                            )
+                            .await?;
+                        Ok::<_, anyhow::Error>((
+                            proxies,
+                            consumers,
+                            plugin_configs,
+                            upstreams,
+                            gateway_trust_bundles,
+                        ))
                     }
                     .await;
 
@@ -6235,6 +6457,8 @@ mod inner {
                             .await?,
                         self.load_full_upstreams_opt_session(namespace, None, true)
                             .await?,
+                        self.load_gateway_trust_bundle_opt_session(namespace, None, true)
+                            .await?,
                     )
                 };
 
@@ -6246,6 +6470,7 @@ mod inner {
                 consumers,
                 plugin_configs,
                 upstreams,
+                gateway_trust_bundles,
                 loaded_at,
                 known_namespaces: Vec::new(),
                 ..Default::default()
@@ -6386,6 +6611,7 @@ mod inner {
             let mut consumer_ops = std::collections::HashMap::new();
             let mut plugin_config_ops = std::collections::HashMap::new();
             let mut upstream_ops = std::collections::HashMap::new();
+            let mut gateway_trust_bundle_changed = false;
             let mut change_count = 0_usize;
             while cursor.advance().await? {
                 change_count += 1;
@@ -6415,6 +6641,9 @@ mod inner {
                     "upstream" => {
                         upstream_ops.insert(resource_id, operation);
                     }
+                    GATEWAY_TRUST_BUNDLE_RESOURCE_TYPE => {
+                        gateway_trust_bundle_changed = true;
+                    }
                     _ => {}
                 }
             }
@@ -6431,6 +6660,17 @@ mod inner {
             if !consumer_ops.is_empty() {
                 return Err(anyhow::Error::new(
                     crate::config::db_backend::IncrementalFullReloadRequired::for_consumer_changes(
+                        namespace,
+                    ),
+                ));
+            }
+
+            // Trust rotations/revocations escalate to a full reload so the
+            // snapshot and its `trust_bundles_json` side channel are published
+            // from one authoritative read (issue #3727).
+            if gateway_trust_bundle_changed {
+                return Err(anyhow::Error::new(
+                    crate::config::db_backend::IncrementalFullReloadRequired::for_gateway_trust_bundle_changes(
                         namespace,
                     ),
                 ));
@@ -8952,6 +9192,469 @@ mod inner {
         }
 
         // -------------------------------------------------------------------
+        // Gateway trust bundles (issue #3727)
+        //
+        // Every filter carries the namespace, and `_id` IS the namespace, so a
+        // read or write can never be widened to another tenant's document. On a
+        // replica set the document write and its `config_changes` record share
+        // one transaction; on standalone MongoDB (no multi-document
+        // transactions) the flow is ordered so a failure is recoverable and
+        // idempotent rather than silently partial — the same trade-off the
+        // other resources already make.
+        // -------------------------------------------------------------------
+
+        async fn get_gateway_trust_bundle(
+            &self,
+            namespace: &str,
+            id: &str,
+        ) -> Result<Option<GatewayTrustBundleRecord>, anyhow::Error> {
+            let start = std::time::Instant::now();
+            let doc = self
+                .gateway_trust_bundles()
+                .find_one(doc! { "_id": namespace, "namespace": namespace, "id": id })
+                .await?;
+            self.check_slow_query("get_gateway_trust_bundle", start);
+            doc.map(doc_to_gateway_trust_bundle).transpose()
+        }
+
+        async fn get_namespace_gateway_trust_bundle(
+            &self,
+            namespace: &str,
+        ) -> Result<Option<GatewayTrustBundleRecord>, anyhow::Error> {
+            let start = std::time::Instant::now();
+            let doc = self
+                .gateway_trust_bundles()
+                .find_one(doc! { "_id": namespace, "namespace": namespace })
+                .await?;
+            self.check_slow_query("get_namespace_gateway_trust_bundle", start);
+            doc.map(doc_to_gateway_trust_bundle).transpose()
+        }
+
+        /// Standalone mongod has no multi-document transaction, so a trust
+        /// document mutation and its `config_changes` signal are two separate
+        /// commits and NO ordering of them proves visibility to a live poller
+        /// (see `create_gateway_trust_bundle`). Report that honestly so the
+        /// poll path runs the authoritative reader-side drift check. A
+        /// replica set commits both in one transaction and needs nothing.
+        fn gateway_trust_writes_are_atomic_with_change_log(&self) -> bool {
+            self.replica_set_configured()
+        }
+
+        /// Identity-only read for the poll-path drift check.
+        ///
+        /// Projected to the three identity fields, so a visibility check never
+        /// pulls the bundle out of the store; the `_id` is suppressed because
+        /// it duplicates the namespace this call already carries. The
+        /// namespace is in the filter, so the read cannot observe another
+        /// tenant's document even if the collection held one under a
+        /// mismatched `_id`.
+        async fn gateway_trust_bundle_identity(
+            &self,
+            namespace: &str,
+        ) -> Result<Option<GatewayTrustBundleIdentity>, anyhow::Error> {
+            let start = std::time::Instant::now();
+            let doc = self
+                .gateway_trust_bundles()
+                .find_one(doc! { "_id": namespace, "namespace": namespace })
+                .projection(doc! { "_id": 0, "id": 1, "trust_domain": 1, "revision": 1 })
+                .await?;
+            self.check_slow_query("gateway_trust_bundle_identity", start);
+            let Some(doc) = doc else {
+                return Ok(None);
+            };
+            // Same strictness as a full load: a revision that is missing or
+            // non-positive is corrupt security metadata, and treating it as a
+            // usable identity would let a corrupt document masquerade as the
+            // published one and suppress the reload that reports it.
+            let revision = strict_stored_revision(&doc)?;
+            Ok(Some(GatewayTrustBundleIdentity {
+                id: strict_stored_str_field(&doc, "id")?,
+                trust_domain: strict_stored_str_field(&doc, "trust_domain")?,
+                revision,
+            }))
+        }
+
+        async fn list_gateway_trust_bundles_paginated(
+            &self,
+            namespace: &str,
+            limit: i64,
+            offset: i64,
+        ) -> Result<PaginatedResult<GatewayTrustBundleRecord>, anyhow::Error> {
+            let start = std::time::Instant::now();
+            let ns_filter = doc! { "namespace": namespace };
+            let collection = self.gateway_trust_bundles();
+            let total = collection.count_documents(ns_filter.clone()).await? as i64;
+            let options = FindOptions::builder()
+                .sort(doc! { "_id": 1 })
+                .skip(Some(mongo_skip(offset)))
+                .limit(Some(limit))
+                .build();
+            let mut cursor = collection.find(ns_filter).with_options(options).await?;
+            let mut items = Vec::new();
+            while cursor.advance().await? {
+                let doc = cursor.deserialize_current()?;
+                items.push(doc_to_gateway_trust_bundle(doc)?);
+            }
+            self.check_slow_query("list_gateway_trust_bundles_paginated", start);
+            Ok(PaginatedResult { items, total })
+        }
+
+        async fn create_gateway_trust_bundle(
+            &self,
+            record: &GatewayTrustBundleRecord,
+        ) -> Result<(), anyhow::Error> {
+            let start = std::time::Instant::now();
+            if self.replica_set_configured() {
+                let connection = self.connection();
+                let mut session = connection.client.start_session().await?;
+                session
+                    .start_transaction()
+                    .and_run(
+                        (
+                            self,
+                            record.clone(),
+                            record.namespace.clone(),
+                            record.id.clone(),
+                        ),
+                        |s, (this, record, namespace, id)| {
+                            Box::pin(async move {
+                                // The change row is written first so its
+                                // sequence can BE the stored revision. Inside a
+                                // transaction the order is invisible to
+                                // readers, and the revision is therefore
+                                // backend-assigned even for the very first
+                                // incarnation of the namespace singleton.
+                                let revision = this
+                                    .record_config_change_in_session_returning_sequence(
+                                        &mut *s,
+                                        namespace.as_str(),
+                                        GATEWAY_TRUST_BUNDLE_RESOURCE_TYPE,
+                                        id.as_str(),
+                                        "upsert",
+                                    )
+                                    .await?;
+                                let doc = gateway_trust_bundle_to_doc(record, revision).map_err(
+                                    |error| mongodb::error::Error::custom(error.to_string()),
+                                )?;
+                                this.gateway_trust_bundles()
+                                    .insert_one(doc)
+                                    .session(&mut *s)
+                                    .await?;
+                                Ok(())
+                            })
+                        },
+                    )
+                    .await
+                    .map_err(anyhow::Error::new)
+                    .context("create_gateway_trust_bundle transaction failed")?;
+                self.compact_config_changes_best_effort(&record.namespace)
+                    .await;
+            } else {
+                // Standalone MongoDB has no multi-document transaction, so the
+                // signal and the document are two separate commits.
+                //
+                // The signal is written FIRST for two reasons, and NEITHER of
+                // them is a visibility proof:
+                //
+                // 1. Failure containment. If the change record fails, nothing
+                //    was mutated at all. If the document write then fails, a
+                //    redundant change row costs one wasted full reload that
+                //    re-reads unchanged state.
+                // 2. The revision source. The change sequence this write
+                //    returns IS the stored revision, so the monotonic,
+                //    incarnation-safe revision and the poll signal are the
+                //    same durable write.
+                //
+                // Ordering ALONE does not make a committed mutation visible to
+                // a running poller, and this code does not claim it does. A
+                // poller can read sequence N, escalate to a full reload that
+                // still reads the OLD document, advance its cursor past N, and
+                // only then does the document below commit — with no later
+                // signal to announce it. Reversing the order trades that for a
+                // crash between the document and the signal, and writing a
+                // second trailing signal still loses to a crash after the
+                // document. Visibility on this topology is therefore
+                // established by the authoritative reader-side drift check
+                // (`gateway_trust_writes_are_atomic_with_change_log` +
+                // `crate::config::gateway_trust::detect_gateway_trust_drift`),
+                // which compares the stored document against the published
+                // trust state on every poll and depends on neither ordering nor
+                // process survival.
+                let revision = self
+                    .record_config_change_returning_sequence(
+                        &record.namespace,
+                        GATEWAY_TRUST_BUNDLE_RESOURCE_TYPE,
+                        &record.id,
+                        "upsert",
+                    )
+                    .await?;
+                let doc = gateway_trust_bundle_to_doc(record, revision)?;
+                self.gateway_trust_bundles().insert_one(doc).await?;
+            }
+            self.check_slow_query("create_gateway_trust_bundle", start);
+            Ok(())
+        }
+
+        async fn update_gateway_trust_bundle(
+            &self,
+            record: &GatewayTrustBundleRecord,
+            expected_revision: Option<u64>,
+        ) -> Result<bool, anyhow::Error> {
+            let start = std::time::Instant::now();
+            let addressed = doc! {
+                "_id": &record.namespace,
+                "namespace": &record.namespace,
+                "id": &record.id,
+            };
+            let existing = self.gateway_trust_bundles().find_one(addressed).await?;
+            let Some(existing) = existing else {
+                // Phantom update: no document in this namespace, so no
+                // config-change record (DB-M4).
+                self.check_slow_query("update_gateway_trust_bundle", start);
+                return Ok(false);
+            };
+            let current_revision = strict_stored_revision(&existing)?;
+            if let Some(expected) = expected_revision
+                && expected != current_revision
+            {
+                self.check_slow_query("update_gateway_trust_bundle", start);
+                return Err(anyhow::Error::new(
+                    crate::config::db_backend::GatewayTrustBundleRevisionConflict {
+                        expected,
+                        current: current_revision,
+                    },
+                ));
+            }
+            // Checked, never clamped: the observed revision has to be
+            // representable before it can be asserted as a CAS predicate at
+            // all. Silently substituting `i64::MAX` would turn an
+            // unrepresentable revision into a predicate that matches the wrong
+            // document (or no document) instead of surfacing an error.
+            let Ok(current_revision_sql) = i64::try_from(current_revision) else {
+                return Err(anyhow::anyhow!(
+                    "gateway trust bundle revision exceeds Int64 range"
+                ));
+            };
+            // The replacement filter re-asserts the observed revision, so on a
+            // replica set the compare-and-set is atomic and on standalone the
+            // single-document replace is still atomic: a racing writer that
+            // already bumped the revision matches zero documents and this call
+            // reports the conflict instead of overwriting.
+            let filter = doc! {
+                "_id": &record.namespace,
+                "namespace": &record.namespace,
+                "id": &record.id,
+                "revision": current_revision_sql,
+            };
+            let matched = if self.replica_set_configured() {
+                let connection = self.connection();
+                let mut session = connection.client.start_session().await?;
+                let matched = session
+                    .start_transaction()
+                    .and_run(
+                        (self, filter, record.clone(), current_revision),
+                        |s, (this, filter, record, current_revision)| {
+                            Box::pin(async move {
+                                // The next revision comes from the change
+                                // sequence, not from `current + 1`: only a
+                                // source that keeps advancing across a
+                                // delete/recreate stops a stale pre-delete
+                                // expectation from matching a new incarnation.
+                                // Recorded first so the replacement can carry
+                                // it; a lost compare-and-set aborts the whole
+                                // transaction, change row included.
+                                let next_revision = this
+                                    .record_config_change_in_session_returning_sequence(
+                                        &mut *s,
+                                        record.namespace.as_str(),
+                                        GATEWAY_TRUST_BUNDLE_RESOURCE_TYPE,
+                                        record.id.as_str(),
+                                        "upsert",
+                                    )
+                                    .await?;
+                                if next_revision <= *current_revision {
+                                    return Err(mongodb::error::Error::custom(
+                                        "gateway trust bundle revision source is not monotonic",
+                                    ));
+                                }
+                                let doc = gateway_trust_bundle_to_doc(record, next_revision)
+                                    .map_err(|error| {
+                                        mongodb::error::Error::custom(error.to_string())
+                                    })?;
+                                let replaced = this
+                                    .gateway_trust_bundles()
+                                    .replace_one(filter.clone(), doc)
+                                    .session(&mut *s)
+                                    .await?;
+                                if replaced.matched_count == 0 {
+                                    // The change row this attempt already wrote
+                                    // commits with the (empty) transaction. That
+                                    // is the same harmless trade-off standalone
+                                    // makes: one redundant full reload that
+                                    // re-reads unchanged state. Aborting to drop
+                                    // it would be indistinguishable from a real
+                                    // transaction failure at this seam.
+                                    return Ok(false);
+                                }
+                                Ok(true)
+                            })
+                        },
+                    )
+                    .await
+                    .map_err(anyhow::Error::new)
+                    .context("update_gateway_trust_bundle transaction failed")?;
+                if matched {
+                    self.compact_config_changes_best_effort(&record.namespace)
+                        .await;
+                }
+                matched
+            } else {
+                // Standalone: signal first, mutation second (see
+                // `create_gateway_trust_bundle` for why that order is about
+                // failure containment and the revision source, NOT visibility).
+                // A change record for a compare-and-set that then loses its
+                // race costs one redundant full reload. A rotation that commits
+                // after a poller already consumed this signal is caught by the
+                // poll-path drift check, not by this ordering.
+                let next_revision = self
+                    .record_config_change_returning_sequence(
+                        &record.namespace,
+                        GATEWAY_TRUST_BUNDLE_RESOURCE_TYPE,
+                        &record.id,
+                        "upsert",
+                    )
+                    .await?;
+                // Fail closed rather than clamp: a source that did not advance
+                // past the revision being replaced is not monotonic, and
+                // writing a non-increasing revision would reopen the reuse
+                // window a stale expectation exploits.
+                if next_revision <= current_revision {
+                    anyhow::bail!("gateway trust bundle revision source is not monotonic");
+                }
+                let doc = gateway_trust_bundle_to_doc(record, next_revision)?;
+                let replaced = self
+                    .gateway_trust_bundles()
+                    .replace_one(filter, doc)
+                    .await?;
+                replaced.matched_count != 0
+            };
+            if !matched {
+                // Lost the compare-and-set. The pre-race read above is NOT the
+                // answer: zero matched documents means either a competing
+                // writer bumped the revision past the one we asserted (so the
+                // real current revision is newer than what we read) or a
+                // competing delete removed the document entirely (so this is a
+                // not-found, not a conflict). Reporting the stale revision
+                // would hand the client `current == expected`, which reads as a
+                // fabricated conflict, and would assert existence for a record
+                // that had just been revoked.
+                //
+                // Re-read authoritatively instead, keeping every namespace/id
+                // predicate so the observation stays inside this tenant. The
+                // transaction, if there was one, has already ended, so this
+                // read is not serving that transaction's snapshot. It is still
+                // a best-effort report — a third writer may commit in between —
+                // but the single-document CAS is what protects the data; this
+                // read only decides what to tell the caller.
+                let readdressed = doc! {
+                    "_id": &record.namespace,
+                    "namespace": &record.namespace,
+                    "id": &record.id,
+                };
+                let observed = self.gateway_trust_bundles().find_one(readdressed).await?;
+                let conflict = match observed {
+                    Some(document) => Some(strict_stored_revision(&document)?),
+                    None => None,
+                };
+                self.check_slow_query("update_gateway_trust_bundle", start);
+                return match conflict {
+                    Some(current) => Err(anyhow::Error::new(
+                        crate::config::db_backend::GatewayTrustBundleRevisionConflict {
+                            expected: expected_revision.unwrap_or(current_revision),
+                            current,
+                        },
+                    )),
+                    // Concurrent revocation: a PUT racing a DELETE is a
+                    // not-found, exactly as it is on the pre-read path above.
+                    None => Ok(false),
+                };
+            }
+            self.check_slow_query("update_gateway_trust_bundle", start);
+            Ok(true)
+        }
+
+        async fn delete_gateway_trust_bundle(
+            &self,
+            namespace: &str,
+            id: &str,
+        ) -> Result<bool, anyhow::Error> {
+            let start = std::time::Instant::now();
+            let filter = doc! { "_id": namespace, "namespace": namespace, "id": id };
+            let deleted = if self.replica_set_configured() {
+                let connection = self.connection();
+                let mut session = connection.client.start_session().await?;
+                let deleted = session
+                    .start_transaction()
+                    .and_run(
+                        (self, filter, namespace.to_string(), id.to_string()),
+                        |s, (this, filter, namespace, id)| {
+                            Box::pin(async move {
+                                let result = this
+                                    .gateway_trust_bundles()
+                                    .delete_one(filter.clone())
+                                    .session(&mut *s)
+                                    .await?;
+                                if result.deleted_count == 0 {
+                                    return Ok(false);
+                                }
+                                this.record_config_change_in_session(
+                                    &mut *s,
+                                    namespace.as_str(),
+                                    "gateway_trust_bundle",
+                                    id.as_str(),
+                                    "delete",
+                                )
+                                .await?;
+                                Ok(true)
+                            })
+                        },
+                    )
+                    .await
+                    .map_err(anyhow::Error::new)
+                    .context("delete_gateway_trust_bundle transaction failed")?;
+                if deleted {
+                    self.compact_config_changes_best_effort(namespace).await;
+                }
+                deleted
+            } else {
+                // Standalone: the revocation's signal is written BEFORE the
+                // document is removed, for the same failure-containment reason
+                // as create/update. A change row for a delete that then fails
+                // (or matched nothing) is harmless: the next poll escalates to
+                // a full reload and reads the document that is still there.
+                //
+                // Revocation carries the same interleaving exposure as a
+                // rotation and is the more dangerous direction — a delete that
+                // lands after a poller consumed this signal would leave
+                // subscribers validating with roots the operator revoked. That
+                // case is closed by the poll-path drift check, which treats a
+                // published record with no stored document as drift; ordering
+                // alone does not close it.
+                self.record_config_change(
+                    namespace,
+                    GATEWAY_TRUST_BUNDLE_RESOURCE_TYPE,
+                    id,
+                    "delete",
+                )
+                .await?;
+                let result = self.gateway_trust_bundles().delete_one(filter).await?;
+                result.deleted_count != 0
+            };
+            self.check_slow_query("delete_gateway_trust_bundle", start);
+            Ok(deleted)
+        }
+
+        // -------------------------------------------------------------------
         // Validation queries
         // -------------------------------------------------------------------
 
@@ -10516,7 +11219,9 @@ mod inner {
         async fn list_namespaces(&self) -> Result<Vec<String>, anyhow::Error> {
             let mut all_namespaces = HashSet::new();
 
-            // Collect distinct namespaces from all 4 collections
+            // Collect distinct namespaces from every namespaced config
+            // collection, including gateway_trust_bundles so a trust-only
+            // namespace still appears in CP/admin enumeration.
             for ns in self.distinct_namespaces("proxies").await? {
                 all_namespaces.insert(ns);
             }
@@ -10527,6 +11232,9 @@ mod inner {
                 all_namespaces.insert(ns);
             }
             for ns in self.distinct_namespaces("upstreams").await? {
+                all_namespaces.insert(ns);
+            }
+            for ns in self.distinct_namespaces("gateway_trust_bundles").await? {
                 all_namespaces.insert(ns);
             }
 
@@ -12940,6 +13648,54 @@ mod inner {
             }
 
             Ok(upstreams)
+        }
+
+        /// Load the namespace's gateway trust-bundle document (issue #3727),
+        /// optionally on the caller's snapshot session so a full load reads
+        /// configuration and trust material from one consistent point in time.
+        async fn load_gateway_trust_bundle_opt_session(
+            &self,
+            namespace: &str,
+            session: Option<(&MongoConnectionBundle, &mut ClientSession)>,
+            snapshot: bool,
+        ) -> Result<Vec<GatewayTrustBundleRecord>, anyhow::Error> {
+            // `_id` IS the namespace, so the filter is the tenant boundary: a
+            // caller cannot widen it into another namespace's document.
+            let filter = doc! { "_id": namespace, "namespace": namespace };
+            let mut records = Vec::new();
+
+            if let Some((connection, s)) = session {
+                let collection: Collection<Document> =
+                    connection.db.collection("gateway_trust_bundles");
+                let mut cursor = collection.find(filter).session(&mut *s).await?;
+                while cursor.advance(&mut *s).await? {
+                    let doc = cursor.deserialize_current().map_err(|error| {
+                        map_snapshot_document_error(snapshot, "gateway_trust_bundle", None, error)
+                    })?;
+                    records.push(decode_loaded_document(
+                        doc,
+                        snapshot,
+                        "gateway_trust_bundle",
+                        doc_to_gateway_trust_bundle,
+                    )?);
+                }
+            } else {
+                let collection = self.gateway_trust_bundles();
+                let mut cursor = collection.find(filter).await?;
+                while cursor.advance().await? {
+                    let doc = cursor.deserialize_current().map_err(|error| {
+                        map_snapshot_document_error(snapshot, "gateway_trust_bundle", None, error)
+                    })?;
+                    records.push(decode_loaded_document(
+                        doc,
+                        snapshot,
+                        "gateway_trust_bundle",
+                        doc_to_gateway_trust_bundle,
+                    )?);
+                }
+            }
+
+            Ok(records)
         }
 
         /// Load all `_id` values from a collection for cold-path bulk operations.
