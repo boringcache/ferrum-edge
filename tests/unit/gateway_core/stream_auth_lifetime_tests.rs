@@ -4168,9 +4168,8 @@ fn ready_ok_h3_upload(
 }
 
 fn ready_unit(
-    polled: &Arc<std::sync::atomic::AtomicUsize>,
+    polled: Arc<std::sync::atomic::AtomicUsize>,
 ) -> impl std::future::Future<Output = ()> {
-    let polled = Arc::clone(polled);
     std::future::poll_fn(move |_cx| {
         polled.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         std::task::Poll::Ready(())
@@ -4663,7 +4662,7 @@ fn ready_poll_counter() -> (
     impl std::future::Future<Output = ()>,
 ) {
     let polled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    (Arc::clone(&polled), ready_unit(&polled))
+    (Arc::clone(&polled), ready_unit(Arc::clone(&polled)))
 }
 
 #[tokio::test(start_paused = true)]
