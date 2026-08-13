@@ -1,10 +1,12 @@
-//! Bounded YAML alias/anchor admission for file-backed config documents.
+//! Bounded YAML alias/anchor admission for file-backed config documents and
+//! the Kubernetes MeshConfig ConfigMap `data.mesh` parser.
 //!
 //! `serde_yaml` 0.9.34 materializes aliases by replaying events (`jump`) and
 //! only caps the number of jumps at `events.len() * 100`. That is not a
 //! memory budget: a small source document can still expand far past the 64 MiB
 //! read ceiling before the jump cap fires. This module is the YAML trust
-//! boundary for gateway, mesh, and config-migration file documents.
+//! boundary for gateway, mesh, and config-migration file documents, plus the
+//! Kubernetes MeshConfig parser.
 //!
 //! Admission first walks the complete libyaml event stream (so comments,
 //! quoted scalars, tags, and escaped text cannot be confused with
@@ -128,7 +130,8 @@ impl YamlAliasBudgetError {
     }
 }
 
-/// Admit `content` as YAML at the file-config trust boundary.
+/// Admit `content` as YAML at the file-config and Kubernetes MeshConfig trust
+/// boundary.
 ///
 /// A malformed stream with no observed alias is left to `serde_yaml` so its
 /// ordinary syntax diagnostic remains authoritative. Once an alias event has
