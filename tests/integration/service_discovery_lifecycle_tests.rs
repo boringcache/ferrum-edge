@@ -1753,6 +1753,20 @@ async fn wait_for_within(polls: u32, mut predicate: impl FnMut() -> bool) -> boo
     predicate()
 }
 
+/// Yield until `predicate` holds. Used in `start_paused` tests after releasing a
+/// [`PreparationHold`]: virtual time cannot advance while the spawned discovery
+/// task is runnable, so timer-based [`wait_for_within`] can spin without ever
+/// scheduling the publication that must complete.
+async fn wait_for_yielding(polls: u32, mut predicate: impl FnMut() -> bool) -> bool {
+    for _ in 0..polls {
+        if predicate() {
+            return true;
+        }
+        tokio::task::yield_now().await;
+    }
+    predicate()
+}
+
 #[tokio::test]
 async fn a_crash_looping_poller_still_expires_and_withdraws_during_restart_backoff() {
     let _guard = isolated().await;
@@ -1976,7 +1990,7 @@ async fn expiry_withdraws_on_time_while_publication_preparation_is_blocked() {
     // clearing stale/withdrawn state without a config reload.
     drop(hold);
 
-    let republished = wait_for_within(2000, || {
+    let republished = wait_for_yielding(2000, || {
         lb_has_host(&lb_cache, "blocked-warmup", "discovered.local")
     })
     .await;
@@ -1984,7 +1998,7 @@ async fn expiry_withdraws_on_time_while_publication_preparation_is_blocked() {
         republished,
         "a later fresh poll must recover once preparation can complete"
     );
-    let recovered = wait_for_within(2000, || {
+    let recovered = wait_for_yielding(2000, || {
         task_status(&task.key).is_some_and(|status| !status.withdrawn && !status.stale)
     })
     .await;
@@ -2103,7 +2117,7 @@ async fn a_retain_policy_expiry_keeps_a_pending_publication_alive() {
     );
 
     drop(hold);
-    let published = wait_for_within(2000, || {
+    let published = wait_for_yielding(2000, || {
         lb_has_host(&lb_cache, "retain-warmup", "discovered.local")
     })
     .await;
