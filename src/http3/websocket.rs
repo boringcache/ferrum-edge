@@ -1715,7 +1715,6 @@ pub(crate) async fn handle_h3_websocket(
                 proxy_id = %proxy_id_for_relay,
                 "H3 WebSocket: refusing Unix socket backend relay (no H3 Unix dialer)"
             );
-            drop(handshake.conn_lease);
             Err("Unix socket dispatch required for this backend target".into())
         }
     };
