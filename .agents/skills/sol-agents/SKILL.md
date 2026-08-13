@@ -7,8 +7,9 @@ description: Dispatch and orchestrate external GPT-5.6 Sol Codex CLI agents for 
 
 Act as the Codex orchestrator. Treat external GPT-5.6 Sol Codex CLI processes as implementation
 workers. Own task decomposition, worktree isolation, effort selection, liveness, independent diff
-review, and the final merge recommendation. Never accept a worker's report without checking the
-repository and GitHub state yourself.
+review, and the final merge recommendation. Require each worker to carry its assigned scope through
+the stopping point in the prompt. Never accept a worker's report without checking the repository
+and GitHub state yourself.
 
 **Guard: do not use this skill when you are yourself a dispatched worker.** If the session prompt
 references this skill's `agent-brief.md` or `continuation-brief.md`, says "YOU are the implementer,"
@@ -93,9 +94,12 @@ cap.
 Every prompt must contain this role instruction even though the briefs repeat it:
 
 ```text
-YOU are the implementer. Write, commit, and push the changes yourself in this session. Do not
-invoke agent-dispatch skills or scripts (including sol-agents, opus-agents, fable-agents,
-grok-agents, or any .agents/skills/*/scripts/dispatch-agent.sh), and do not spawn nested workers.
+YOU are the implementer. Complete every task and validation the controller assigns before ending.
+Do not stop at analysis, partial implementation, or a handoff for someone else to finish. Perform
+commit, push, PR, review, and CI actions only when the prompt assigns them. Do not request or wait
+for a separate Codex review-bot pass unless explicitly assigned. Do not invoke agent-dispatch
+skills or scripts (including sol-agents, opus-agents, fable-agents, grok-agents, or any
+.agents/skills/*/scripts/dispatch-agent.sh), and do not spawn nested workers.
 ```
 
 This prevents a worker from replacing the selected model or effort through nested delegation.
@@ -105,8 +109,10 @@ This prevents a worker from replacing the selected model or effort through neste
 ### Implementer
 
 Include the issue number, worktree, branch, distilled acceptance criteria, relevant repository
-invariants, expected validation, and boundaries against neighboring work. Tell the worker whether
-to open a PR or stop after pushing the branch.
+invariants, expected validation, and boundaries against neighboring work. State the exact stopping
+point. By default, require complete implementation and assigned validation, the requested commit,
+push, or PR actions, and a final report before exit. Do not append a review trigger, review-bot
+wait, CI-wait, or shepherding work that the controller did not request.
 
 ### Fix round
 
@@ -118,38 +124,33 @@ that need an evidence-backed rebuttal. Put externally authored text in a clearly
 ### Shepherd
 
 Use only when the user asks to babysit or drive a PR to completion. Include the fix-round state and
-require reconstruction of review and CI state until the current head is review-clean and green.
-Because Ferrum Edge CI can take 20-30 minutes, prefer this cadence override unless continuous
-waiting is explicitly useful:
-
-```text
-CADENCE OVERRIDE: do not wait for in-progress CI. Reconstruct state, fix unresolved findings and
-red checks, format, push, post one review trigger, then exit with a report. The orchestrator will
-handle the next round.
-```
+the exact completion condition. Require the worker to reconstruct and handle only the review and
+CI work the controller assigns, and to remain responsible through that stopping point. Do not add
+a review trigger or an early-exit cadence unless the controller explicitly requests it.
 
 ## Control and verify the fleet
 
 1. Poll retained execution sessions separately and keep the user updated at least once a minute
    while workers are active.
-2. On completion, verify the branch, pushed head, PR, review trigger, thread replies, and checks
-   directly through git and GitHub.
+2. On completion, verify the claims relevant to the prompt, such as the branch, pushed head, PR,
+   requested validation, and any explicitly assigned review or CI actions.
 3. Fetch `origin/main` and independently inspect `git diff origin/main...HEAD` in the worker's
    worktree. Use a three-dot diff. Review fail-closed behavior, hot paths, docs/spec parity,
    production panics, tests, and scope creep.
-4. Fetch all review threads; findings may not appear in the top-level review body. Verify the
-   active review bot and trigger before posting exactly one trigger after a push.
-5. Diagnose every red CI check from logs. Rerun only demonstrated infrastructure failures or
-   repository-known flakes; fix deterministic failures.
+4. For an explicitly assigned review, fix-round, or shepherd task, fetch all review threads;
+   findings may not appear in the top-level review body. Verify the active review bot before
+   posting a trigger that the prompt specifically requests.
+5. Diagnose red CI checks from logs when CI repair or shepherding is assigned. Rerun only
+   demonstrated infrastructure failures or repository-known flakes; fix deterministic failures.
 6. If a worker dies, inspect its worktree, local commits, upstream, and remote branch before
    relaunching. Preserve useful work and launch a continuation round at the same effort unless the
    evidence justifies escalation.
-7. Merge only when the user authorized it, the review applies to the current head, CI is green,
-   findings are fixed or accepted as rebutted, and your own review is complete.
+7. Merge only when the user authorized it, your independent review is complete, and every
+   completion gate the user assigned is satisfied.
 
-A worker's rebuttal is not by itself a clean review. Require a recognized clean verdict on the
-current head, reviewer acceptance, resolved threads, or an explicit repository policy permitting
-the orchestrator to close a proven false positive.
+When review handling is explicitly in scope, a worker's rebuttal is not by itself a clean review.
+Require a recognized clean verdict on the current head, reviewer acceptance, resolved threads, or
+an explicit repository policy permitting the orchestrator to close a proven false positive.
 
 Treat the model context window as headroom, not a reason to paste the repository or whole CI logs
 into prompts. Never put credentials, tokens, cookies, or secrets in prompts or worker logs.
@@ -158,10 +159,10 @@ into prompts. Never put credentials, tokens, cookies, or secrets in prompts or w
 
 - Capacity or transport failure: verify local and remote state before retrying; useful work may
   already be committed or pushed.
-- Worker claims it is waiting on a monitor: treat process completion as end-of-turn and continue
-  orchestration yourself.
-- No review response: verify the trigger, bot identity, availability, and head SHA before posting
-  another trigger.
+- Worker exits before the assigned stopping point while claiming a monitor will continue: inspect
+  the state and launch a continuation round; do not accept unfinished work as complete.
+- An explicitly requested review receives no response: verify the trigger, bot identity,
+  availability, and head SHA before posting another trigger.
 - Model or effort mismatch: stop the worker, record the exact diagnostic, correct the launch
   contract, and relaunch. Never claim `medium`, `high`, `xhigh`, or `gpt-5.6-sol` without launch
   evidence.
