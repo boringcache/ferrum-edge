@@ -2063,10 +2063,8 @@ async fn expiry_withdraws_on_time_while_publication_preparation_is_blocked() {
     let released_at = tokio::time::Instant::now();
     hold.release_and_observe().await;
 
-    let republished = wait_for_progress(|| {
-        lb_has_host(&lb_cache, "blocked-warmup", "discovered.local")
-    })
-    .await;
+    let republished =
+        wait_for_progress(|| lb_has_host(&lb_cache, "blocked-warmup", "discovered.local")).await;
     assert!(
         republished,
         "a later fresh poll must recover once preparation can complete"
@@ -2195,10 +2193,8 @@ async fn a_retain_policy_expiry_keeps_a_pending_publication_alive() {
 
     let released_at = tokio::time::Instant::now();
     hold.release_and_observe().await;
-    let published = wait_for_progress(|| {
-        lb_has_host(&lb_cache, "retain-warmup", "discovered.local")
-    })
-    .await;
+    let published =
+        wait_for_progress(|| lb_has_host(&lb_cache, "retain-warmup", "discovered.local")).await;
     assert!(
         published,
         "the retained pending publication must complete once preparation is released"
