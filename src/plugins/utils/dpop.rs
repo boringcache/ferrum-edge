@@ -266,6 +266,8 @@ mod tests {
         // A proof is acceptable only inside `iat ± clock_skew`, so the widest
         // window any admissible provider (or any later reload that widens the
         // skew) can open is `2 * MAX_DPOP_CLOCK_SKEW_SECS`.
-        assert!(DPOP_MARKER_RETENTION_SECONDS > 2 * MAX_DPOP_CLOCK_SKEW_SECS);
+        const {
+            assert!(DPOP_MARKER_RETENTION_SECONDS > 2 * MAX_DPOP_CLOCK_SKEW_SECS);
+        }
     }
 }

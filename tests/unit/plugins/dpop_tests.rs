@@ -444,10 +444,12 @@ fn marker_fields_are_length_framed_against_delimiter_forgery() {
 /// `dpop_clock_skew_secs` — can open for one unchanged proof.
 #[test]
 fn retention_horizon_dominates_the_widest_admissible_clock_skew() {
-    assert!(
-        DPOP_MARKER_RETENTION_SECONDS > 2 * MAX_DPOP_CLOCK_SKEW_SECS,
-        "a proof stays acceptable across `iat ± skew`, so retention must exceed 2 * max skew"
-    );
+    const {
+        assert!(
+            DPOP_MARKER_RETENTION_SECONDS > 2 * MAX_DPOP_CLOCK_SKEW_SECS,
+            "a proof stays acceptable across `iat ± skew`, so retention must exceed 2 * max skew"
+        );
+    }
     assert_eq!(MAX_DPOP_CLOCK_SKEW_SECS, 300);
     assert_eq!(DPOP_MARKER_RETENTION_SECONDS, 601);
 }
