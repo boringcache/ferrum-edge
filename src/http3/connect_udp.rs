@@ -982,13 +982,14 @@ pub fn encode_udp_datagram_capsule(out: &mut BytesMut, payload: &[u8]) -> Bytes 
 pub enum UdpSendFault {
     /// Drop this datagram and keep relaying. Either the datagram was too large
     /// for the path (RFC 9298 §3.1 forbids fragmenting it, so dropping is the
-    /// required behaviour) or the error is an ICMP-derived / transient
-    /// condition reported for an earlier datagram on a connected socket. UDP is
-    /// lossy by design; the tunnel is not.
+    /// required behaviour) or the error is a genuinely transient local
+    /// condition (`EINTR`, `ENOBUFS`, `WouldBlock`). UDP is lossy by design;
+    /// the tunnel is not. ICMP destination-unreachable is not this arm.
     DropDatagram,
     /// The socket itself is unusable. Continuing would present a live tunnel
     /// that silently discards everything the client sends, so the request
-    /// stream is torn down instead.
+    /// stream is torn down instead. RFC 9298 §3.1 requires this when the OS
+    /// reports ICMP Destination Unreachable on the connected UDP socket.
     Terminal,
 }
 
@@ -1006,57 +1007,44 @@ impl UdpSendFault {
 ///
 /// This is the ONE shared judgement behind both direction classifiers, so the
 /// two can never disagree about what an ICMP-derived condition means. On a
-/// connected UDP socket the kernel reports ICMP errors — port unreachable
-/// (`ECONNREFUSED`), protocol unreachable (`ENOPROTOOPT` on Linux), host and
-/// network unreachable, network/host down — to the application, and it does so
-/// on whichever syscall happens to run next: `send` OR `recv`. None of them
-/// says the socket is unusable; they say one earlier datagram did not arrive,
-/// which is ordinary UDP loss.
+/// connected UDP socket the kernel reports ICMP Destination Unreachable — port
+/// unreachable (`ECONNREFUSED`; `WSAECONNRESET` on Windows), protocol
+/// unreachable (`ENOPROTOOPT` on Linux), host and network unreachable, and
+/// network/host down — on whichever syscall happens to run next: `send` OR
+/// `recv`. RFC 9298 §3.1 requires the proxy to close the request stream when
+/// the OS reports that connected socket unusable, and names ICMP Destination
+/// Unreachable as the example. Those conditions are therefore **not** in this
+/// set: they fall through to [`UdpSendFault::Terminal`] /
+/// [`UdpRecvFault::Terminal`].
 ///
-/// `EMSGSIZE` (and its Windows spelling `WSAEMSGSIZE`) is included for the same
-/// reason from the other side: with the do-not-fragment policy installed by
-/// [`bind_tunnel_socket`], an over-MTU datagram is *supposed* to fail this way,
-/// and treating it as a dead socket would let one oversized payload kill a
-/// healthy tunnel.
+/// `EMSGSIZE` (and its Windows spelling `WSAEMSGSIZE`) stays here even though
+/// Linux maps ICMP Fragmentation Needed / Packet Too Big onto it: with the
+/// do-not-fragment policy installed by [`bind_tunnel_socket`], an over-MTU
+/// datagram is *supposed* to fail this way, and RFC 9298 §3.1 independently
+/// requires dropping that datagram rather than fragmenting. Treating it as a
+/// dead socket would let one oversized payload kill a healthy tunnel.
 fn is_transient_udp_datagram_error(error: &std::io::Error) -> bool {
     #[cfg(unix)]
     if let Some(code) = error.raw_os_error() {
         return matches!(
             code,
-            libc::EMSGSIZE
-                | libc::EAGAIN
-                | libc::ENOBUFS
-                | libc::EINTR
-                | libc::ECONNREFUSED
-                | libc::ECONNRESET
-                | libc::EHOSTUNREACH
-                | libc::ENETUNREACH
-                | libc::ENETDOWN
-                | libc::EHOSTDOWN
-                | libc::ENOPROTOOPT
+            libc::EMSGSIZE | libc::EAGAIN | libc::ENOBUFS | libc::EINTR
         );
     }
-    // Windows links no `libc` here, so the Winsock codes are spelled out:
-    // `WSAEINTR`, `WSAEWOULDBLOCK`, `WSAEMSGSIZE`, `WSAENETDOWN`,
-    // `WSAENETUNREACH`, `WSAENETRESET`, `WSAECONNRESET` (the Windows spelling
-    // of an ICMP port-unreachable on a connected datagram socket), `WSAENOBUFS`
-    // and `WSAEHOSTUNREACH`.
+    // Windows links no `libc` here, so the Winsock codes are spelled out.
+    // Only genuinely transient local conditions belong here: `WSAEINTR`
+    // (10004), `WSAEWOULDBLOCK` (10035), `WSAEMSGSIZE` (10040), `WSAENOBUFS`
+    // (10055). ICMP-derived / socket-unusable codes — `WSAENETDOWN` (10050),
+    // `WSAENETUNREACH` (10051), `WSAENETRESET` (10052), `WSAECONNRESET` (10054,
+    // the Windows spelling of ICMP port-unreachable on a connected datagram
+    // socket), `WSAEHOSTUNREACH` (10065) — must NOT match; they terminate.
     #[cfg(windows)]
     if let Some(code) = error.raw_os_error() {
-        return matches!(
-            code,
-            10004 | 10035 | 10040 | 10050 | 10051 | 10052 | 10054 | 10055 | 10065
-        );
+        return matches!(code, 10004 | 10035 | 10040 | 10055);
     }
     matches!(
         error.kind(),
-        std::io::ErrorKind::WouldBlock
-            | std::io::ErrorKind::Interrupted
-            | std::io::ErrorKind::ConnectionRefused
-            | std::io::ErrorKind::ConnectionReset
-            | std::io::ErrorKind::HostUnreachable
-            | std::io::ErrorKind::NetworkUnreachable
-            | std::io::ErrorKind::NetworkDown
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
     )
 }
 
@@ -1077,17 +1065,19 @@ pub fn classify_udp_send_error(error: &std::io::Error) -> UdpSendFault {
 /// readiness, never retry immediately.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UdpRecvFault {
-    /// A datagram was lost, or an ICMP error for an EARLIER datagram surfaced
-    /// on this `recv`. On a connected UDP socket both are ordinary,
-    /// per-datagram conditions — the socket is still usable, and tearing the
-    /// tunnel down would turn one unreachable probe into a session reset.
+    /// A datagram was lost to a transient local condition (`EINTR`, `ENOBUFS`,
+    /// or the DF/PMTU `EMSGSIZE` drop). The socket is still usable. ICMP
+    /// destination-unreachable is not this arm: RFC 9298 §3.1 requires closing
+    /// the request stream when the OS reports the connected socket unusable.
     DropDatagram,
     /// The socket said it is not ready. Tokio's `UdpSocket::recv` resolves
     /// readiness internally and does not normally surface this, so it is
     /// handled defensively: the relay awaits readability again rather than
     /// spinning on the syscall.
     AwaitReadable,
-    /// The socket itself is unusable, so the tunnel cannot be honoured.
+    /// The socket itself is unusable, so the tunnel cannot be honoured. This
+    /// includes ICMP Destination Unreachable (RFC 9298 §3.1) and the refused /
+    /// reset / unreachable / down / protocol-unreachable mappings it surfaces.
     Terminal,
 }
 
@@ -1104,11 +1094,11 @@ impl UdpRecvFault {
 /// Whether an `io::Error` from a connected UDP `recv` means the tunnel socket
 /// is unusable, or merely that one datagram was lost.
 ///
-/// The target-to-client direction used to treat EVERY `recv` error as a dead
-/// socket, which reset a live tunnel the first time the target's host replied
-/// with an ICMP port-unreachable — exactly the condition the send-side
-/// classifier has always treated as per-datagram loss. Both directions now read
-/// the same [`is_transient_udp_datagram_error`] judgement.
+/// Both directions read the same [`is_transient_udp_datagram_error`] judgement,
+/// so ICMP destination-unreachable cannot be a drop in one direction and a
+/// terminal close in the other. `WouldBlock` / `EAGAIN` is the one recv-only
+/// outcome: re-await readability rather than dropping a datagram or treating a
+/// not-ready socket as dead.
 pub fn classify_udp_recv_error(error: &std::io::Error) -> UdpRecvFault {
     if error.kind() == std::io::ErrorKind::WouldBlock {
         return UdpRecvFault::AwaitReadable;
@@ -2144,11 +2134,10 @@ async fn relay(
                     }
                 }
                 Err(error) => match classify_udp_recv_error(&error) {
-                    // An ICMP-derived or otherwise transient condition for one
-                    // datagram. On a CONNECTED socket the kernel surfaces these
-                    // on whichever syscall runs next, so the same conditions the
-                    // send side drops arrive here too; the socket is still
-                    // usable and the tunnel keeps running.
+                    // A transient local condition for one datagram (`EMSGSIZE`,
+                    // `EINTR`, `ENOBUFS`). ICMP destination-unreachable is
+                    // Terminal below: RFC 9298 §3.1 closes the request stream
+                    // when the OS reports the connected socket unusable.
                     UdpRecvFault::DropDatagram => {
                         not_ready_rounds = 0;
                         debug!(

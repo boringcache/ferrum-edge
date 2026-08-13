@@ -1014,17 +1014,24 @@ socket the kernel reports an ICMP error for an earlier datagram on whichever
 syscall runs next — `send` or `recv`:
 
 - `EMSGSIZE` (the expected result of the DF policy for an over-path datagram)
-  and ICMP-derived or transient conditions (`ECONNREFUSED`, `ECONNRESET`,
-  `EHOSTUNREACH`, `ENETUNREACH`, `ENETDOWN`, `EHOSTDOWN`, `EINTR`, …) drop that
-  datagram and keep the tunnel. A single ICMP port-unreachable from the target
-  host is ordinary UDP loss, not a dead tunnel.
+  and genuinely transient local conditions (`EINTR`, `ENOBUFS`, send-side
+  `WouldBlock`) drop that datagram and keep the tunnel. ICMP Fragmentation
+  Needed / Packet Too Big is the one Destination Unreachable code that maps
+  here: RFC 9298 §3.1 independently requires dropping the oversized datagram
+  rather than fragmenting.
+- ICMP-derived destination-unreachable, refused, reset, unreachable, down, and
+  protocol-unreachable conditions (`ECONNREFUSED`, `ECONNRESET` /
+  Windows `WSAECONNRESET`, `EHOSTUNREACH`, `ENETUNREACH`, `ENETDOWN`,
+  `EHOSTDOWN`, Linux `ENOPROTOOPT`) mean the OS has reported the connected
+  socket unusable. RFC 9298 §3.1 requires closing the request stream; they are
+  not ordinary per-datagram loss.
 - A `recv` reporting "not ready" sends the relay back to awaiting readability
   rather than retrying the syscall; Tokio resolves readiness internally so this
   is defensive, and a bounded run of consecutive not-ready rounds ends the
   tunnel instead of spinning.
-- Anything indicating the socket itself is unusable tears the request stream
-  down with `H3_INTERNAL_ERROR` rather than presenting a live tunnel that
-  silently discards traffic.
+- Anything else indicating the socket itself is unusable tears the request
+  stream down with `H3_INTERNAL_ERROR` rather than presenting a live tunnel
+  that silently discards traffic.
 
 A tunnel ends — sockets closed, both relay tasks **joined**, and only then the
 session permit and connection guard released — on any of: client FIN or stream
@@ -1111,14 +1118,15 @@ closed. This is deliberately not general policy reauthentication.
   varint — each proving zero retained bytes and exact resumption at the next
   capsule, while the DATAGRAM ceiling still refuses an over-size Context ID 0
   capsule), capsule encoding, `:protocol` classification, the UDP send-error
-  **and** receive-error classifiers (including that both directions agree about
-  the same ICMP errno), the do-not-fragment socket option installing on a real
-  UDP socket and failing closed where it does not exist, the session-end →
-  stream-close classification (which outcomes may FIN and which must reset, over
-  the closed set of session ends), the relay-join classification (a cancelled
-  task — induced without any panic — is an internal failure, and a completed
-  relay keeps its own verdict), and the live re-check's effective-`dns_override`
-  address-pin comparison.
+  **and** receive-error classifiers (including that ICMP destination-unreachable
+  is terminal in both directions while `EMSGSIZE` remains a one-datagram drop
+  and `WouldBlock` on recv awaits readability), the do-not-fragment socket
+  option installing on a real UDP socket and failing closed where it does not
+  exist, the session-end → stream-close classification (which outcomes may FIN
+  and which must reset, over the closed set of session ends), the relay-join
+  classification (a cancelled task — induced without any panic — is an internal
+  failure, and a completed relay keeps its own verdict), and the live re-check's
+  effective-`dns_override` address-pin comparison.
 - `tests/unit/gateway_core/dns_tests.rs` — the fresh all-candidates dial path
   honouring a per-proxy `dns_override` and still screening a denied one.
 - `tests/unit/config/cp_grpc_conn_limit_tests.rs` — the CONNECT-UDP session cap

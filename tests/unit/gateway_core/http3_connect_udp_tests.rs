@@ -1118,18 +1118,19 @@ fn an_oversized_datagram_is_dropped_but_an_unusable_socket_is_terminal() {
     for kind in [
         std::io::ErrorKind::WouldBlock,
         std::io::ErrorKind::Interrupted,
-        std::io::ErrorKind::ConnectionRefused,
-        std::io::ErrorKind::HostUnreachable,
-        std::io::ErrorKind::NetworkUnreachable,
-        std::io::ErrorKind::NetworkDown,
     ] {
         assert_eq!(
             classify_udp_send_error(&std::io::Error::from(kind)),
             UdpSendFault::DropDatagram,
-            "{kind:?} is per-datagram loss on a lossy-by-design transport"
+            "{kind:?} is a transient local condition, not a dead socket"
         );
     }
     for kind in [
+        std::io::ErrorKind::ConnectionRefused,
+        std::io::ErrorKind::ConnectionReset,
+        std::io::ErrorKind::HostUnreachable,
+        std::io::ErrorKind::NetworkUnreachable,
+        std::io::ErrorKind::NetworkDown,
         std::io::ErrorKind::PermissionDenied,
         std::io::ErrorKind::BrokenPipe,
         std::io::ErrorKind::NotConnected,
@@ -1169,26 +1170,137 @@ fn an_oversized_datagram_is_dropped_but_an_unusable_socket_is_terminal() {
 }
 
 #[test]
-fn an_icmp_error_surfacing_on_recv_is_per_datagram_loss_not_a_dead_socket() {
-    // On a CONNECTED UDP socket the kernel reports ICMP errors to the
-    // application on whichever syscall runs next — `send` OR `recv`. The
-    // target-to-client relay used to treat every `recv` error as an unusable
-    // socket, so a single ICMP port-unreachable from the target host reset a
-    // healthy tunnel that the send side would have kept alive.
+fn icmp_destination_unreachable_is_terminal_in_both_directions() {
+    // RFC 9298 §3.1: when the OS reports the connected UDP socket unusable,
+    // the proxy MUST close the request stream. ICMP Destination Unreachable is
+    // the named example. The kernel surfaces that condition on whichever
+    // syscall runs next, so send and recv must agree it is Terminal — never a
+    // silent per-datagram drop that leaves a dead tunnel looking healthy.
     for kind in [
         std::io::ErrorKind::ConnectionRefused,
         std::io::ErrorKind::ConnectionReset,
         std::io::ErrorKind::HostUnreachable,
         std::io::ErrorKind::NetworkUnreachable,
         std::io::ErrorKind::NetworkDown,
-        std::io::ErrorKind::Interrupted,
     ] {
         assert_eq!(
             classify_udp_recv_error(&std::io::Error::from(kind)),
-            UdpRecvFault::DropDatagram,
-            "{kind:?} on recv is per-datagram loss, exactly as it is on send"
+            UdpRecvFault::Terminal,
+            "{kind:?} on recv is ICMP/destination-unreachable: close the stream"
+        );
+        assert_eq!(
+            classify_udp_send_error(&std::io::Error::from(kind)),
+            UdpSendFault::Terminal,
+            "{kind:?} on send is ICMP/destination-unreachable: close the stream"
         );
     }
+
+    // errno arms. Spelled numerically because the test crate does not link
+    // `libc`. Linux icmp_err_convert maps dest-unreach onto ECONNREFUSED
+    // (port), ENOPROTOOPT (protocol), EHOSTUNREACH / ENETUNREACH (host/net).
+    // ENETDOWN / EHOSTDOWN / ECONNRESET are the remaining dest-unreach /
+    // refused / reset / down spellings the classifier must not swallow.
+    #[cfg(target_os = "linux")]
+    const ICMP_UNUSABLE: [i32; 7] = [
+        111, // ECONNREFUSED
+        104, // ECONNRESET
+        113, // EHOSTUNREACH
+        101, // ENETUNREACH
+        100, // ENETDOWN
+        112, // EHOSTDOWN
+        92, // ENOPROTOOPT (ICMP protocol unreachable)
+    ];
+    #[cfg(target_vendor = "apple")]
+    const ICMP_UNUSABLE: [i32; 7] = [
+        61, // ECONNREFUSED
+        54, // ECONNRESET
+        65, // EHOSTUNREACH
+        51, // ENETUNREACH
+        50, // ENETDOWN
+        64, // EHOSTDOWN
+        42, // ENOPROTOOPT
+    ];
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    {
+        for code in ICMP_UNUSABLE {
+            assert_eq!(
+                classify_udp_recv_error(&std::io::Error::from_raw_os_error(code)),
+                UdpRecvFault::Terminal,
+                "errno {code} is ICMP/destination-unreachable: recv must terminate"
+            );
+            assert_eq!(
+                classify_udp_send_error(&std::io::Error::from_raw_os_error(code)),
+                UdpSendFault::Terminal,
+                "errno {code} is ICMP/destination-unreachable: send must terminate"
+            );
+        }
+        // EBADF is 9 on both: a closed descriptor is not per-datagram loss.
+        assert_eq!(
+            classify_udp_recv_error(&std::io::Error::from_raw_os_error(9)),
+            UdpRecvFault::Terminal
+        );
+    }
+
+    // Windows ICMP/socket-unusable spellings. WSAECONNRESET (10054) is the
+    // ICMP port-unreachable report on a connected datagram socket.
+    #[cfg(windows)]
+    {
+        for code in [
+            10050, // WSAENETDOWN
+            10051, // WSAENETUNREACH
+            10052, // WSAENETRESET
+            10054, // WSAECONNRESET
+            10061, // WSAECONNREFUSED
+            10064, // WSAEHOSTDOWN
+            10065, // WSAEHOSTUNREACH
+        ] {
+            assert_eq!(
+                classify_udp_recv_error(&std::io::Error::from_raw_os_error(code)),
+                UdpRecvFault::Terminal,
+                "WSA {code} is destination-unreachable/unusable: recv must terminate"
+            );
+            assert_eq!(
+                classify_udp_send_error(&std::io::Error::from_raw_os_error(code)),
+                UdpSendFault::Terminal,
+                "WSA {code} is destination-unreachable/unusable: send must terminate"
+            );
+        }
+    }
+
+    assert_eq!(UdpRecvFault::DropDatagram.as_str(), "datagram_dropped");
+    assert_eq!(UdpRecvFault::AwaitReadable.as_str(), "socket_not_ready");
+    assert_eq!(UdpRecvFault::Terminal.as_str(), "socket_unusable");
+}
+
+#[test]
+fn recv_wouldblock_awaits_readability_and_emsgsize_remains_a_datagram_drop() {
+    // Interrupted is still per-datagram loss in both directions.
+    assert_eq!(
+        classify_udp_recv_error(&std::io::Error::from(std::io::ErrorKind::Interrupted)),
+        UdpRecvFault::DropDatagram,
+        "EINTR/Interrupted on recv drops one attempt, never the tunnel"
+    );
+    assert_eq!(
+        classify_udp_send_error(&std::io::Error::from(std::io::ErrorKind::Interrupted)),
+        UdpSendFault::DropDatagram,
+        "EINTR/Interrupted on send drops one datagram, never the tunnel"
+    );
+
+    // `WouldBlock` is recv's own arm: retrying the syscall immediately would
+    // spin, so the relay awaits readability again instead. It is never a drop
+    // and never terminal. Send has no AwaitReadable arm; not-ready there is a
+    // dropped datagram.
+    assert_eq!(
+        classify_udp_recv_error(&std::io::Error::from(std::io::ErrorKind::WouldBlock)),
+        UdpRecvFault::AwaitReadable,
+        "a not-ready socket must send the relay back to awaiting readiness"
+    );
+    assert_eq!(
+        classify_udp_send_error(&std::io::Error::from(std::io::ErrorKind::WouldBlock)),
+        UdpSendFault::DropDatagram,
+        "WouldBlock on send is a transient local drop, not a dead socket"
+    );
+
     for kind in [
         std::io::ErrorKind::PermissionDenied,
         std::io::ErrorKind::BrokenPipe,
@@ -1202,49 +1314,96 @@ fn an_icmp_error_surfacing_on_recv_is_per_datagram_loss_not_a_dead_socket() {
         );
     }
 
-    // `WouldBlock` is its own arm: retrying the syscall immediately would spin,
-    // so the relay awaits readability again instead. It is never a drop and
-    // never terminal.
-    assert_eq!(
-        classify_udp_recv_error(&std::io::Error::from(std::io::ErrorKind::WouldBlock)),
-        UdpRecvFault::AwaitReadable,
-        "a not-ready socket must send the relay back to awaiting readiness"
-    );
-
     // errno arms. Spelled numerically because the test crate does not link
-    // `libc`; these are the values Linux and Apple share for these names.
+    // `libc`.
     #[cfg(target_os = "linux")]
-    const ECONNREFUSED: i32 = 111;
+    const EMSGSIZE: i32 = 90;
     #[cfg(target_vendor = "apple")]
-    const ECONNREFUSED: i32 = 61;
+    const EMSGSIZE: i32 = 40;
     #[cfg(target_os = "linux")]
-    const EHOSTUNREACH: i32 = 113;
+    const EAGAIN: i32 = 11;
     #[cfg(target_vendor = "apple")]
-    const EHOSTUNREACH: i32 = 65;
+    const EAGAIN: i32 = 35;
+    #[cfg(target_os = "linux")]
+    const ENOBUFS: i32 = 105;
+    #[cfg(target_vendor = "apple")]
+    const ENOBUFS: i32 = 55;
     #[cfg(any(target_os = "linux", target_vendor = "apple"))]
     {
-        for code in [ECONNREFUSED, EHOSTUNREACH] {
-            assert_eq!(
-                classify_udp_recv_error(&std::io::Error::from_raw_os_error(code)),
-                UdpRecvFault::DropDatagram,
-                "errno {code} is an ICMP-derived per-datagram condition on a connected socket"
-            );
-            assert_eq!(
-                classify_udp_send_error(&std::io::Error::from_raw_os_error(code)),
-                UdpSendFault::DropDatagram,
-                "the two directions must agree about errno {code}"
-            );
-        }
-        // EBADF is 9 on both: a closed descriptor is not per-datagram loss.
         assert_eq!(
-            classify_udp_recv_error(&std::io::Error::from_raw_os_error(9)),
-            UdpRecvFault::Terminal
+            classify_udp_recv_error(&std::io::Error::from_raw_os_error(EMSGSIZE)),
+            UdpRecvFault::DropDatagram,
+            "EMSGSIZE on recv is the DF/PMTU one-datagram drop"
+        );
+        assert_eq!(
+            classify_udp_send_error(&std::io::Error::from_raw_os_error(EMSGSIZE)),
+            UdpSendFault::DropDatagram,
+            "EMSGSIZE on send is the DF/PMTU one-datagram drop"
+        );
+        assert_eq!(
+            classify_udp_recv_error(&std::io::Error::from_raw_os_error(EAGAIN)),
+            UdpRecvFault::AwaitReadable,
+            "EAGAIN on recv must await readability, never spin and never terminate"
+        );
+        assert_eq!(
+            classify_udp_send_error(&std::io::Error::from_raw_os_error(EAGAIN)),
+            UdpSendFault::DropDatagram,
+            "EAGAIN on send is a transient local drop"
+        );
+        // EINTR is 4 on both.
+        assert_eq!(
+            classify_udp_recv_error(&std::io::Error::from_raw_os_error(4)),
+            UdpRecvFault::DropDatagram
+        );
+        assert_eq!(
+            classify_udp_send_error(&std::io::Error::from_raw_os_error(4)),
+            UdpSendFault::DropDatagram
+        );
+        assert_eq!(
+            classify_udp_recv_error(&std::io::Error::from_raw_os_error(ENOBUFS)),
+            UdpRecvFault::DropDatagram,
+            "ENOBUFS is transient local buffer pressure, not a dead socket"
+        );
+        assert_eq!(
+            classify_udp_send_error(&std::io::Error::from_raw_os_error(ENOBUFS)),
+            UdpSendFault::DropDatagram,
+            "ENOBUFS is transient local buffer pressure, not a dead socket"
         );
     }
 
-    assert_eq!(UdpRecvFault::DropDatagram.as_str(), "datagram_dropped");
-    assert_eq!(UdpRecvFault::AwaitReadable.as_str(), "socket_not_ready");
-    assert_eq!(UdpRecvFault::Terminal.as_str(), "socket_unusable");
+    #[cfg(windows)]
+    {
+        assert_eq!(
+            classify_udp_recv_error(&std::io::Error::from_raw_os_error(10040)),
+            UdpRecvFault::DropDatagram,
+            "WSAEMSGSIZE is the DF/PMTU one-datagram drop"
+        );
+        assert_eq!(
+            classify_udp_send_error(&std::io::Error::from_raw_os_error(10040)),
+            UdpSendFault::DropDatagram,
+            "WSAEMSGSIZE is the DF/PMTU one-datagram drop"
+        );
+        assert_eq!(
+            classify_udp_recv_error(&std::io::Error::from_raw_os_error(10035)),
+            UdpRecvFault::AwaitReadable,
+            "WSAEWOULDBLOCK on recv must await readability"
+        );
+        assert_eq!(
+            classify_udp_send_error(&std::io::Error::from_raw_os_error(10035)),
+            UdpSendFault::DropDatagram,
+            "WSAEWOULDBLOCK on send is a transient local drop"
+        );
+        assert_eq!(
+            classify_udp_recv_error(&std::io::Error::from_raw_os_error(10004)),
+            UdpRecvFault::DropDatagram,
+            "WSAEINTR is interruption, not a dead socket"
+        );
+        assert_eq!(
+            classify_udp_send_error(&std::io::Error::from_raw_os_error(10055)),
+            UdpSendFault::DropDatagram,
+            "WSAENOBUFS is transient local buffer pressure"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
