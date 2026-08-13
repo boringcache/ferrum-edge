@@ -619,11 +619,7 @@ fn build_dns_cached_fallback_client(
         ),
     }
 
-    build_fail_closed_plugin_client(
-        dns_cache.as_ref(),
-        http2_prior_knowledge,
-        provider_mismatch,
-    )
+    build_fail_closed_plugin_client(dns_cache.as_ref(), http2_prior_knowledge, provider_mismatch)
 }
 
 fn accept_plugin_http_client(
