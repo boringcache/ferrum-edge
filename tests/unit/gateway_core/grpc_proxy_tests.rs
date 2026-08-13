@@ -2776,6 +2776,22 @@ impl TransportTestPools {
             target,
         )
     }
+
+    fn resolve_with_hbone_context<'a>(
+        &'a self,
+        target: Option<&'a ferrum_edge::config::types::UpstreamTarget>,
+        asserted_source_identity: Option<&ferrum_edge::identity::SpiffeId>,
+        baggage_strip_prefixes: &'a [String],
+    ) -> Result<grpc_proxy::GrpcDispatchTransport<'a>, grpc_proxy::GrpcTransportError> {
+        grpc_proxy::GrpcDispatchTransport::for_target_with_hbone_context(
+            &self.grpc,
+            &self.mesh_mtls,
+            &self.hbone,
+            target,
+            asserted_source_identity,
+            baggage_strip_prefixes,
+        )
+    }
 }
 
 #[tokio::test]
@@ -3323,7 +3339,7 @@ async fn grpc_transport_mesh_mtls_cross_cluster_dial_plan_failures_are_field_spe
 /// validation, identity enforcement, and error mapping for the same route.
 #[test]
 fn standard_grpc_frontend_and_h3_bridge_share_one_mesh_transport_resolver() {
-    const FOR_TARGET: &str = "GrpcDispatchTransport::for_target(";
+    const FOR_TARGET: &str = "GrpcDispatchTransport::for_target_with_hbone_context(";
     const SHARED_RESOLVER: &str = "resolve_grpc_dispatch_transport(";
     let proxy_src = include_str!("../../../src/proxy/mod.rs");
     let h3_src = include_str!("../../../src/http3/cross_protocol.rs");
@@ -3339,7 +3355,14 @@ fn standard_grpc_frontend_and_h3_bridge_share_one_mesh_transport_resolver() {
          proxy/mod.rs — a second one is the drift this resolver exists to prevent"
     );
     assert!(
-        h3_src.contains("crate::proxy::resolve_grpc_dispatch_transport(state, target)"),
+        !proxy_src.contains("grpc_proxy::GrpcDispatchTransport::for_target("),
+        "the shared resolver must bind HBONE identity context; the identity-less \
+         for_target() convenience is test-only and must not be a production path"
+    );
+    assert!(
+        h3_src.contains(
+            "crate::proxy::resolve_grpc_dispatch_transport(state, target, asserted_source_identity)"
+        ),
         "the H3 gRPC bridge must delegate to the SHARED resolver, not re-implement it"
     );
     assert_eq!(
@@ -3360,6 +3383,194 @@ fn standard_grpc_frontend_and_h3_bridge_share_one_mesh_transport_resolver() {
         !proxy_src.contains("grpc_proxy::GrpcDispatchTransport::Direct(&state.grpc_pool)"),
         "the native-gRPC dispatch sites must use the materialized transport, never \
          a hard-wired direct pool that would bypass a mesh target's secured hop"
+    );
+}
+
+fn same_cluster_hbone_target() -> ferrum_edge::config::types::UpstreamTarget {
+    target_with_tags(&[
+        (ferrum_edge::proxy::hbone_pool::HBONE_TARGET_TAG, "true"),
+        (
+            ferrum_edge::proxy::hbone_pool::MESH_SPIFFE_ID_TAG,
+            "spiffe://cluster.local/ns/default/sa/orders",
+        ),
+    ])
+}
+
+fn same_cluster_mesh_mtls_target() -> ferrum_edge::config::types::UpstreamTarget {
+    target_with_tags(&[
+        (
+            ferrum_edge::proxy::mesh_mtls_pool::MESH_MTLS_TARGET_TAG,
+            "true",
+        ),
+        (
+            ferrum_edge::proxy::hbone_pool::MESH_SPIFFE_ID_TAG,
+            "spiffe://cluster.local/ns/default/sa/orders",
+        ),
+    ])
+}
+
+fn identity_spoof_baggage_headers() -> HashMap<String, String> {
+    HashMap::from([(
+        "baggage".to_string(),
+        concat!(
+            "trace_id=abc,",
+            "source.principal=spiffe://attacker.example/ns/evil/sa/forged,",
+            "destination.principal=spiffe://cluster.local/ns/default/sa/orders,",
+            "custom.token=secret",
+        )
+        .to_string(),
+    )])
+}
+
+/// HBONE CONNECT must assert the authenticated frontend workload SPIFFE, not a
+/// caller header and not the gateway SVID. The identity is owned by the
+/// transport so later `RequestContext` mutations cannot invalidate it.
+#[tokio::test]
+async fn native_grpc_hbone_asserts_authenticated_frontend_identity_not_caller_headers() {
+    let pools = TransportTestPools::new();
+    let target = same_cluster_hbone_target();
+    let frontend =
+        ferrum_edge::identity::SpiffeId::new("spiffe://cluster.local/ns/src/sa/frontend")
+            .expect("valid frontend SPIFFE");
+    let transport = pools
+        .resolve_with_hbone_context(Some(&target), Some(&frontend), &[])
+        .expect("same-cluster mesh.hbone must resolve");
+    assert_eq!(transport.label(), "hbone");
+
+    let expected = frontend.as_str().to_string();
+    drop(frontend);
+    assert_eq!(
+        transport
+            .asserted_source_identity()
+            .map(ferrum_edge::identity::SpiffeId::as_str),
+        Some(expected.as_str()),
+        "HBONE must keep the authenticated frontend identity after the input borrow ends"
+    );
+
+    // A forged identity in inner-request baggage must not become the asserted
+    // source: stripping happens on dispatch headers, and CONNECT identity is
+    // the resolver argument, not a header.
+    let spoof_headers = identity_spoof_baggage_headers();
+    let filtered = transport.proxy_headers_for_dispatch(&spoof_headers);
+    assert_eq!(
+        filtered.get("baggage").map(String::as_str),
+        Some("trace_id=abc,custom.token=secret"),
+        "reserved identity baggage must be stripped before the inner HBONE request"
+    );
+}
+
+#[tokio::test]
+async fn native_grpc_hbone_strips_configured_and_reserved_baggage_once_per_dispatch() {
+    let pools = TransportTestPools::new();
+    let target = same_cluster_hbone_target();
+    let prefixes = ["custom.".to_string()];
+    let transport = pools
+        .resolve_with_hbone_context(Some(&target), None, &prefixes)
+        .expect("same-cluster mesh.hbone must resolve");
+
+    let spoof_headers = identity_spoof_baggage_headers();
+    let filtered = transport.proxy_headers_for_dispatch(&spoof_headers);
+    assert_eq!(
+        filtered.get("baggage").map(String::as_str),
+        Some("trace_id=abc"),
+        "configured prefixes plus reserved identity prefixes must both be stripped"
+    );
+
+    let no_baggage = HashMap::from([("x-request-id".to_string(), "abc".to_string())]);
+    let borrowed = transport.proxy_headers_for_dispatch(&no_baggage);
+    assert!(
+        std::ptr::eq(borrowed.as_ref(), &no_baggage),
+        "absent baggage must not clone headers on the dispatch path"
+    );
+}
+
+#[tokio::test]
+async fn native_grpc_direct_transport_preserves_baggage_and_does_not_assert_identity() {
+    let pools = TransportTestPools::new();
+    let frontend =
+        ferrum_edge::identity::SpiffeId::new("spiffe://cluster.local/ns/src/sa/frontend")
+            .expect("valid frontend SPIFFE");
+    let prefixes = ["custom.".to_string()];
+    let headers = identity_spoof_baggage_headers();
+
+    let direct = pools
+        .resolve_with_hbone_context(None, Some(&frontend), &prefixes)
+        .expect("no selected target keeps the direct pool");
+    assert_eq!(direct.label(), "direct");
+    assert!(direct.asserted_source_identity().is_none());
+    let direct_headers = direct.proxy_headers_for_dispatch(&headers);
+    assert_eq!(
+        direct_headers.get("baggage"),
+        headers.get("baggage"),
+        "direct gRPC dispatch must not inherit secured-mesh identity-baggage stripping"
+    );
+    assert!(
+        std::ptr::eq(direct_headers.as_ref(), &headers),
+        "direct dispatch must borrow the input header map"
+    );
+}
+
+/// Native gRPC mesh-mTLS is a secured mesh boundary, same as HBONE: hostile
+/// client-supplied reserved identity baggage and configured prefixes must be
+/// stripped before trusted proxy headers are merged. CONNECT identity remains
+/// HBONE-only.
+#[tokio::test]
+async fn native_grpc_mesh_mtls_strips_identity_and_configured_baggage_without_hbone_identity() {
+    let pools = TransportTestPools::new();
+    let frontend =
+        ferrum_edge::identity::SpiffeId::new("spiffe://cluster.local/ns/src/sa/frontend")
+            .expect("valid frontend SPIFFE");
+    let prefixes = ["custom.".to_string()];
+    let headers = identity_spoof_baggage_headers();
+    let mtls_target = same_cluster_mesh_mtls_target();
+
+    let mtls = pools
+        .resolve_with_hbone_context(Some(&mtls_target), Some(&frontend), &prefixes)
+        .expect("same-cluster mesh.mtls must resolve");
+    assert_eq!(mtls.label(), "mesh_mtls");
+    assert!(
+        mtls.asserted_source_identity().is_none(),
+        "mesh-mTLS gRPC must not stamp HBONE CONNECT identity"
+    );
+
+    let mtls_headers = mtls.proxy_headers_for_dispatch(&headers);
+    assert_eq!(
+        mtls_headers.get("baggage").map(String::as_str),
+        Some("trace_id=abc"),
+        "mesh-mTLS must strip reserved identity baggage and configured prefixes"
+    );
+
+    let reserved_only = pools
+        .resolve_with_hbone_context(Some(&mtls_target), None, &[])
+        .expect("same-cluster mesh.mtls must resolve with empty configured prefixes");
+    let spoof_headers = identity_spoof_baggage_headers();
+    let reserved_only_headers = reserved_only.proxy_headers_for_dispatch(&spoof_headers);
+    assert_eq!(
+        reserved_only_headers.get("baggage").map(String::as_str),
+        Some("trace_id=abc,custom.token=secret"),
+        "empty configured prefixes must still strip reserved identity baggage on mesh-mTLS"
+    );
+
+    let mixed_case = HashMap::from([(
+        "Baggage".to_string(),
+        concat!(
+            "source_principal=spiffe://attacker.example/ns/evil/sa/forged,",
+            "trace_id=abc",
+        )
+        .to_string(),
+    )]);
+    let mixed_filtered = mtls.proxy_headers_for_dispatch(&mixed_case);
+    assert_eq!(
+        mixed_filtered.get("Baggage").map(String::as_str),
+        Some("trace_id=abc"),
+        "mesh-mTLS must strip reserved identity aliases on mixed-case baggage headers"
+    );
+
+    let no_baggage = HashMap::from([("x-request-id".to_string(), "abc".to_string())]);
+    let borrowed = mtls.proxy_headers_for_dispatch(&no_baggage);
+    assert!(
+        std::ptr::eq(borrowed.as_ref(), &no_baggage),
+        "absent baggage must not clone headers on the mesh-mTLS dispatch path"
     );
 }
 
