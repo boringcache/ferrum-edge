@@ -355,6 +355,16 @@
         "captureMode": {
           "type": "string"
         },
+        "udpNodePreflight": {
+          "type": "object",
+          "description": "Privileged one-shot Ambient UDP node preflight init stage for the settled host-netns placement. Disabling it never relaxes the runtime proof boundary.",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            }
+          }
+        },
         "spire": {
           "type": "object",
           "additionalProperties": false,

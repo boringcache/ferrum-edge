@@ -35,6 +35,17 @@ pub enum Command {
     Version(VersionArgs),
     /// Check if the gateway is healthy (for Docker HEALTHCHECK in distroless images).
     Health(HealthArgs),
+    /// Retire Ambient UDP predecessor placements on this node and publish the
+    /// node-scoped cleanup proof the steady-state host producer requires.
+    ///
+    /// Runs as a privileged init stage beside the Ambient DaemonSet's
+    /// unprivileged steady-state container (issue #3809): a node with no
+    /// durable placement record cannot tell a fresh/rebooted node from a
+    /// pre-contract node whose running workloads still redirect UDP to a
+    /// retired listener, so it proves the distinction by doing the retirement
+    /// rather than by trusting release-level desired state. Exits non-zero
+    /// without publishing anything when it cannot prove completion.
+    AmbientUdpPreflight(AmbientUdpPreflightArgs),
 }
 
 #[derive(clap::Args)]
@@ -320,6 +331,23 @@ pub fn apply_validate_overrides(args: &ValidateArgs) {
     }
 }
 
+/// Materialize the Ambient UDP node preflight's `--settings` and `-v` overrides
+/// before any config read and before worker threads exist, matching `run` /
+/// `validate`. Does not set a serving mode or parse `EnvConfig`.
+pub fn apply_ambient_udp_preflight_overrides(args: &AmbientUdpPreflightArgs) {
+    apply_common_overrides(args.settings.as_deref(), None);
+
+    if args.verbose > 0 {
+        let level = match args.verbose {
+            1 => "info",
+            2 => "debug",
+            _ => "trace",
+        };
+        // SAFETY: single-threaded context, before tokio runtime.
+        unsafe { std::env::set_var("FERRUM_LOG_LEVEL", level) };
+    }
+}
+
 /// Infer file mode when a spec is available but no mode is configured anywhere.
 ///
 /// **`--spec` / `-c` interaction:** `apply_common_overrides` may install
@@ -420,7 +448,263 @@ fn format_host_port(host: &str, port: u16) -> String {
     }
 }
 
+#[derive(clap::Args)]
+pub struct AmbientUdpPreflightArgs {
+    /// Path to ferrum.conf (operational settings).
+    #[arg(short = 's', long = "settings")]
+    pub settings: Option<PathBuf>,
+
+    /// Maximum seconds to spend proving predecessor retirement before failing
+    /// closed. The init stage must fail rather than block pod creation forever.
+    #[arg(long = "timeout-seconds", default_value_t = 300)]
+    pub timeout_seconds: u64,
+
+    /// Increase log verbosity (-v=info, -vv=debug, -vvv=trace).
+    #[arg(short = 'v', long = "verbose", action = ArgAction::Count)]
+    pub verbose: u8,
+}
+
 // ── Subcommand executors ────────────────────────────────────────────────────
+
+/// Retire both Ambient UDP predecessor placements on this node and publish the
+/// node-scoped cleanup attestation.
+///
+/// This is deliberately the ONLY producer of that attestation. Every invocation
+/// retracts any leftover proof and re-runs predecessor retirement; an existing
+/// attestation is never treated as authority to skip the work. Cleanup itself is
+/// ownership-safe to repeat. The command publishes nothing it could not prove
+/// under one continuous node-agent registry publication, and it never writes
+/// durable placement ownership — the steady-state process still decides that
+/// from its own guard.
+///
+/// `--timeout-seconds` is a hard wall-clock ceiling: stalled `sh`/iptables/ip
+/// children are killed with their process group before this process reports
+/// timeout, stderr collection is bounded so an orphaned grandchild cannot pin
+/// the caller, process-group cleanup failure is reported rather than claimed as
+/// success, and no usable attestation remains after the deadline wins.
+///
+/// Node identity is resolved AUTHORITATIVELY here from a validated explicit
+/// `FERRUM_K8S_NODE_UID`, or otherwise from this node's own Kubernetes object,
+/// and never from the node-agent's published `.node-identity-v1.json`. That file
+/// records the CURRENT boot id even when it was written by a PREVIOUS Kubernetes
+/// Node object on this same boot, so no reader can tell a stale publication from
+/// a live one — and the two DaemonSets have no startup ordering between them, so
+/// the replacement node-agent may not have retracted it yet when this stage
+/// runs. Consuming it would let a stale identity and the stale cleanup proof
+/// written under it agree and authorize node-name reuse under the wrong
+/// immutable UID. When no explicit UID is supplied, one bounded `get` on this
+/// node's own object, bound to the node name the downward API gave this pod,
+/// settles it. In either case the resolver retracts the publication before it
+/// reads the boot id or resolves the UID, and republishes only what it proved,
+/// so every failure after entry leaves no identity and the steady-state
+/// container that starts next reads an identity this pod established.
+pub fn execute_ambient_udp_preflight(args: &AmbientUdpPreflightArgs) -> Result<(), String> {
+    use crate::config::conf_file::resolve_ferrum_var;
+    use crate::proxy::owned_shell::OwnedShellError;
+    use crate::proxy::udp_placement_migration::{
+        UdpMigrationContext, UdpPlacement, node_proof_generation_from_env,
+        parse_explicit_k8s_node_uid, resolve_authoritative_node_identity,
+        retract_node_cleanup_proof,
+    };
+
+    let settings = crate::capture::udp_capture_settings_from_env()
+        .map_err(|error| format!("invalid Ambient UDP capture settings: {error}"))?;
+    let target = UdpPlacement::from_capture_settings(
+        settings.udp_capture_enabled,
+        settings.udp_host_netns_enabled,
+    );
+    if target != UdpPlacement::HostNetns {
+        // Only the host placement drops the setns privileges that would let the
+        // steady-state process inspect a pod netns, so only it needs an
+        // out-of-band node proof. Every other placement proves predecessor
+        // retirement from its own runtime path.
+        println!(
+            "ambient-udp-preflight: nothing to prove for placement {}",
+            target.as_str()
+        );
+        return Ok(());
+    }
+
+    let registry_dir = resolve_ferrum_var("FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR")
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            "FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR is required by the Ambient UDP node preflight"
+                .to_string()
+        })?;
+    let registry_dir = PathBuf::from(registry_dir.trim());
+    let generation = node_proof_generation_from_env()?.ok_or_else(|| {
+        "FERRUM_MESH_CAPTURE_UDP_NODE_PROOF_GENERATION is required by the Ambient UDP node preflight"
+            .to_string()
+    })?;
+    let explicit_node_uid =
+        parse_explicit_k8s_node_uid(resolve_ferrum_var("FERRUM_K8S_NODE_UID").as_deref())?;
+    let node_name = resolve_ferrum_var("FERRUM_K8S_NODE_NAME")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+
+    let source = std::sync::Arc::new(crate::proxy::netns_capture::DirectoryCaptureSource::new(
+        registry_dir.clone(),
+    ));
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("could not build the preflight runtime: {error}"))?;
+    let timeout_seconds = args.timeout_seconds.clamp(1, 3600);
+    let std_deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_seconds);
+    let outcome = runtime.block_on(async move {
+        if crate::proxy::owned_shell::deadline_elapsed(Some(std_deadline)) {
+            return Ok(crate::proxy::udp_placement_cleanup::UdpCleanupOutcome::DeadlineElapsed);
+        }
+        let lookup_timeout = std::time::Duration::from_secs(NODE_UID_LOOKUP_TIMEOUT_SECONDS).min(
+            crate::proxy::owned_shell::remaining(Some(std_deadline))
+                .unwrap_or(std::time::Duration::from_secs(0)),
+        );
+        let node = resolve_authoritative_node_identity(
+            &registry_dir,
+            explicit_node_uid.as_deref(),
+            node_name.as_deref(),
+            |name| fetch_this_node_uid(name, lookup_timeout),
+        )
+        .await?;
+
+        // A leftover proof is not authority for this pod. A Helm rollback, a
+        // re-applied historical manifest, or a restored ConfigMap can recreate
+        // an earlier era's generation token, and a mutable monotonic counter
+        // cannot prove that did not happen. Retract whatever is present and run
+        // predecessor retirement on every invocation; publish only after this
+        // pod's own authoritative lookup and two complete passes succeed.
+        retract_node_cleanup_proof(&registry_dir)?;
+        if crate::proxy::owned_shell::deadline_elapsed(Some(std_deadline)) {
+            return Ok(crate::proxy::udp_placement_cleanup::UdpCleanupOutcome::DeadlineElapsed);
+        }
+
+        match crate::proxy::netns_udp_capture::preflight_capture_tools_until(
+            true,
+            Some(std_deadline),
+        ) {
+            Ok(()) => {}
+            Err(error) if error.is_deadline_elapsed() => {
+                if let Some(reason) = error.deadline_operator_reason() {
+                    tracing::warn!("{reason}");
+                }
+                return Ok(
+                    crate::proxy::udp_placement_cleanup::UdpCleanupOutcome::DeadlineElapsed,
+                );
+            }
+            Err(OwnedShellError::DeadlineUnsupported { .. }) => {
+                return Err(
+                    "the Ambient UDP node preflight could not establish a bounded command collector; no proof was published"
+                        .to_string(),
+                );
+            }
+            Err(OwnedShellError::Io(error)) => {
+                return Err(format!(
+                    "the Ambient UDP node preflight image cannot run the required tooling: Ambient UDP capture is enabled but `sh` is not available in the runtime image \
+                     (the producer runs in-netns `sh -c` scripts that call `ip`/`iptables`): {error}. Use a \
+                     runtime image that ships a shell + iproute2 + iptables, or unset \
+                     FERRUM_MESH_CAPTURE_UDP_ENABLED."
+                ));
+            }
+            Err(OwnedShellError::Failed { .. }) => {
+                return Err(
+                    "the Ambient UDP node preflight image cannot run the required tooling: Ambient UDP capture is enabled but `ip`, `iptables` with the mangle table, and `ip6tables` with the mangle table \
+                     (IPv6 UDP capture is set to `required`) are not available in the runtime image; \
+                     the per-pod-netns producer needs them to install UDP TPROXY rules. Use a runtime \
+                     image that ships iproute2 + iptables (the distroless default lacks them), or unset \
+                     FERRUM_MESH_CAPTURE_UDP_ENABLED."
+                        .to_string(),
+                );
+            }
+            Err(error) => {
+                return Err(format!(
+                    "the Ambient UDP node preflight image cannot run the required tooling: {}",
+                    error
+                        .deadline_operator_reason()
+                        .unwrap_or("unexpected tool probe failure")
+                ));
+            }
+        }
+
+        let context =
+            UdpMigrationContext::for_node_preflight(&registry_dir, target, node, &generation)?;
+        let remaining = crate::proxy::owned_shell::remaining(Some(std_deadline))
+            .unwrap_or(std::time::Duration::from_secs(0));
+        let deadline = tokio::time::Instant::now() + remaining;
+        let outcome = crate::proxy::udp_placement_cleanup::run_udp_placement_cleanup(
+            context,
+            source,
+            shutdown_rx,
+            Some(deadline),
+        )
+        .await;
+        Ok::<_, String>(outcome)
+    })?;
+    match outcome {
+        crate::proxy::udp_placement_cleanup::UdpCleanupOutcome::Complete => {
+            println!("ambient-udp-preflight: predecessor placements retired and proof published");
+            Ok(())
+        }
+        crate::proxy::udp_placement_cleanup::UdpCleanupOutcome::DeadlineElapsed => Err(
+            "the Ambient UDP node preflight could not prove predecessor retirement within its timeout; no proof was published"
+                .to_string(),
+        ),
+        crate::proxy::udp_placement_cleanup::UdpCleanupOutcome::ShuttingDown => Err(
+            "the Ambient UDP node preflight was interrupted; no proof was published".to_string(),
+        ),
+    }
+}
+
+/// Read THIS node's immutable `Node.metadata.uid` with one bounded, named,
+/// timeout-guarded `get`.
+///
+/// The request is bound to the node name the downward API stamped on this pod
+/// (`FERRUM_K8S_NODE_NAME` from `spec.nodeName`), so this process only ever
+/// asks for the machine it is running on. Authority is the in-cluster
+/// service-account config: a missing in-cluster config fails closed unless
+/// `FERRUM_K8S_NODE_UID` was supplied (that path never reaches this lookup).
+/// The RBAC the chart grants alongside it is a read-only `nodes: get` — no
+/// list, no watch, no write. That cannot enumerate or mutate nodes, but a
+/// `get` without `resourceNames` is not a single-object restriction:
+/// Kubernetes permits a named GET for any node whose name the caller already
+/// knows. The runtime request is the binding, not the Role. Nothing from the
+/// returned object other than the UID is read. The UID itself is never logged:
+/// it is an identity binding, not diagnostics. Lookup failures are
+/// material-free so kube diagnostics cannot leak names, URLs, or tokens.
+async fn fetch_this_node_uid(
+    node_name: String,
+    timeout: std::time::Duration,
+) -> Result<String, String> {
+    use k8s_openapi::api::core::v1::Node;
+    use kube::Api;
+
+    let config = kube::Config::incluster().map_err(|_| {
+        "could not build an in-cluster Kubernetes client to resolve this node's UID; \
+         supply FERRUM_K8S_NODE_UID or run this command inside a Kubernetes pod"
+            .to_string()
+    })?;
+    let client = kube::Client::try_from(config).map_err(|_| {
+        "could not build an in-cluster Kubernetes client to resolve this node's UID; \
+         supply FERRUM_K8S_NODE_UID or run this command inside a Kubernetes pod"
+            .to_string()
+    })?;
+    let nodes: Api<Node> = Api::all(client);
+    let node = match tokio::time::timeout(timeout, nodes.get(&node_name)).await {
+        Ok(Ok(node)) => node,
+        Ok(Err(_)) => {
+            return Err("could not read this node's Kubernetes object".to_string());
+        }
+        Err(_) => return Err("timed out reading this node's Kubernetes object".to_string()),
+    };
+    node.metadata
+        .uid
+        .filter(|uid| !uid.trim().is_empty())
+        .ok_or_else(|| "this node's Kubernetes object carries no UID".to_string())
+}
+
+/// Matches the node-agent's own bounded node lookup, so both authorities fail in
+/// the same window rather than one masking the other's outage.
+const NODE_UID_LOOKUP_TIMEOUT_SECONDS: u64 = 10;
 
 /// Print version information and exit.
 pub fn execute_version(args: &VersionArgs) {

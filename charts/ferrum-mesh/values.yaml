@@ -221,6 +221,46 @@ ambient:
   outboundPort: 15001
   hbonePort: 15008
   captureMode: iptables
+  # Privileged one-shot preflight init stage for the SETTLED host-netns UDP
+  # placement (issue #3809). The installed placement ConfigMap is release
+  # desired state and records no node identity, node incarnation, or per-node
+  # cleanup result, so it cannot prove that a recordless node is fresh/rebooted
+  # rather than a pre-contract node whose running workloads still redirect UDP
+  # to a retired listener. The preflight retires BOTH predecessor placements
+  # (IPv4 and IPv6, host netns and every enrolled pod netns) by exact
+  # Ferrum-owned name, then publishes an attestation bound to this node's
+  # Kubernetes UID, current boot id, target, and node-proof generation.
+  # Kubernetes hostPID is pod-scoped, not container-scoped: enabling the
+  # preflight therefore gives both the init container and the steady-state
+  # producer host PID namespace visibility. hostPID does not grant setns.
+  # SYS_ADMIN and SYS_PTRACE remain confined to the init container; the
+  # steady-state producer keeps its narrow NET_ADMIN/NET_RAW pair. Clusters
+  # that refuse hostPID or those init capabilities cannot use this default
+  # unchanged.
+  #
+  # The preflight is also the pod's own node-identity boundary: it resolves this
+  # node's Node.metadata.uid with one bounded read-only `get` (bound to the node
+  # name the downward API supplies) and republishes it immediately before the
+  # steady-state container starts, so the identity that container reads was
+  # proven by its OWN pod rather than inherited from whatever the node-agent last
+  # left on the shared registry path. When the preflight is enabled the chart owns
+  # FERRUM_K8S_NODE_NAME from spec.nodeName; ambient.env.FERRUM_K8S_NODE_NAME
+  # fails rendering. Supply FERRUM_K8S_NODE_UID instead to skip the API lookup.
+  #
+  # Disabling it does NOT relax the runtime boundary: a node with no durable
+  # record and no attestation stays fail-closed as `migration_required`. Use it
+  # only on clusters that will not grant hostPID (pod-wide) or the init stage's
+  # SYS_ADMIN/SYS_PTRACE capabilities, together with the documented per-node
+  # operator exemption marker in docs/mesh.md.
+  # Understand the trade-off first: with the preflight off, nothing in the
+  # ambient pod republishes the node identity, so a node whose Kubernetes Node
+  # object was deleted and recreated on the SAME boot depends on the replacement
+  # node-agent retracting the previous object's publication. Clear
+  # `.udp-node-cleanup-proof-v1.json` from the registry directory when you turn
+  # this off, and drive adoption through the explicit cleanup/finalize pair or a
+  # freshly written per-node exemption.
+  udpNodePreflight:
+    enabled: true
   spire:
     # Mount a SPIRE Agent Workload API socket and configure mesh mode to fetch
     # its runtime X.509-SVID from SPIRE. Requires workloadSpiffeId; NodeWaypoint
