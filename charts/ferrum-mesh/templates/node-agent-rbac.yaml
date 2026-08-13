@@ -28,7 +28,8 @@ rules:
   {{- $naAmbientEnv := default dict .Values.ambient.env }}
   {{- $naAmbientTopology := replace "-" "_" (lower (trim (toString (index $naAmbientEnv "FERRUM_MESH_TOPOLOGY")))) }}
   {{- $naAmbientUdpLifecycle := and .Values.ambient.enabled (eq $naAmbientTopology "ambient") }}
-  {{- if and $naAmbientUdpLifecycle (not .Values.nodeAgent.ingressRedirectIfaces) }}
+  {{- $naHasExplicitNodeUid := hasKey $naAmbientEnv "FERRUM_K8S_NODE_UID" }}
+  {{- if and $naAmbientUdpLifecycle (not $naHasExplicitNodeUid) (not .Values.nodeAgent.ingressRedirectIfaces) }}
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get"]

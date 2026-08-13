@@ -185,6 +185,8 @@
   "FERRUM_MESH_CAPTURE_UDP_MIGRATION_FROM"
   "FERRUM_MESH_CAPTURE_UDP_MIGRATION_TO"
   "FERRUM_MESH_CAPTURE_UDP_NODE_PROOF_GENERATION"
+  "FERRUM_K8S_NODE_UID"
+  "FERRUM_MESH_CAPTURE_UDP_NODE_BOOT_ID_PATH"
   "FERRUM_MESH_TOPOLOGY"
   "FERRUM_NODE_AGENT_ADMIN_ENABLED"
   "FERRUM_ADMIN_BIND_ADDRESS"
@@ -429,6 +431,20 @@ spec:
             {{- else if and $ambientUdpLifecycle $ambientUdpNodeProofGeneration }}
             - name: FERRUM_MESH_CAPTURE_UDP_NODE_PROOF_GENERATION
               value: {{ $ambientUdpNodeProofGeneration | quote }}
+            {{- end }}
+            {{- /* GitOps/client-render pipelines may already know this node's
+                   immutable UID and/or a non-default boot-id path. Propagate
+                   the ambient values so the node-agent publishes identity under
+                   the same UID and incarnation the preflight requires, and treat
+                   both as chart-managed so a conflicting nodeAgent.env override
+                   cannot silently diverge. */}}
+            {{- if hasKey $ambientEnv "FERRUM_K8S_NODE_UID" }}
+            - name: FERRUM_K8S_NODE_UID
+              value: {{ index $ambientEnv "FERRUM_K8S_NODE_UID" | quote }}
+            {{- end }}
+            {{- if hasKey $ambientEnv "FERRUM_MESH_CAPTURE_UDP_NODE_BOOT_ID_PATH" }}
+            - name: FERRUM_MESH_CAPTURE_UDP_NODE_BOOT_ID_PATH
+              value: {{ index $ambientEnv "FERRUM_MESH_CAPTURE_UDP_NODE_BOOT_ID_PATH" | quote }}
             {{- end }}
             {{- if .Values.nodeAgent.admin.enabled }}
             - name: FERRUM_NODE_AGENT_ADMIN_ENABLED

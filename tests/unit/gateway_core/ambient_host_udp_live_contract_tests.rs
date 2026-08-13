@@ -965,14 +965,67 @@ fn ambient_udp_production_entry_points_are_scheduled_by_the_trusted_classifier()
     let main = read("src/main.rs");
     assert!(
         main.contains("cli::Command::AmbientUdpPreflight(args)")
-            && main.contains("cli::execute_ambient_udp_preflight(args)"),
+            && main.contains("cli::execute_ambient_udp_preflight(args)")
+            && main.contains("cli::apply_ambient_udp_preflight_overrides(args)")
+            && main.contains("fn run_ambient_udp_preflight"),
         "src/main.rs must still route the preflight subcommand"
+    );
+    let crypto_at = main
+        .find("fips::install_crypto_provider()")
+        .expect("crypto provider install");
+    let early_exit_health = main
+        .find("cli::Command::Health(args)")
+        .expect("health remains an early-exit command");
+    let preflight_overrides = main
+        .find("apply_ambient_udp_preflight_overrides")
+        .expect("preflight settings override");
+    let preflight_run = main
+        .find("fn run_ambient_udp_preflight")
+        .expect("preflight bootstrap path");
+    assert!(
+        early_exit_health < crypto_at
+            && preflight_overrides < crypto_at
+            && crypto_at < preflight_run,
+        "version/reload/health must stay early-exit; the preflight must materialize \
+         --settings before the FIPS gate and execute only after it"
+    );
+    assert!(
+        !main.contains(".with_writer(std::io::stderr)"),
+        "the preflight must not install an ad-hoc tracing subscriber that bypasses \
+         the lifecycle-owned logging drain"
+    );
+    let preflight_fn = &main[preflight_run..];
+    assert!(
+        preflight_fn.contains("resolve_startup_secrets()")
+            && preflight_fn.contains("init_logging()")
+            && preflight_fn.contains("fips::verify_resolved_mode")
+            && preflight_fn.contains("cli::execute_ambient_udp_preflight(args)")
+            && !preflight_fn.contains("EnvConfig::from_env()"),
+        "the preflight bootstrap must resolve secrets, install lifecycle logging, \
+         verify the fully resolved FIPS posture, and must not parse serving EnvConfig"
+    );
+    let execute_at = cli
+        .find("pub fn execute_ambient_udp_preflight")
+        .expect("execute_ambient_udp_preflight");
+    let execute_end = cli[execute_at + 1..]
+        .find("\n/// Read THIS node's immutable")
+        .map(|offset| execute_at + 1 + offset)
+        .unwrap_or(cli.len());
+    let execute_fn = &cli[execute_at..execute_end];
+    assert!(
+        !execute_fn.contains("std::env::set_var")
+            && !execute_fn.contains("set_var(")
+            && cli.contains("pub fn apply_ambient_udp_preflight_overrides"),
+        "the preflight executor must not mutate the environment after logging/runtime \
+         threads exist; --settings is materialized before worker threads"
     );
     let node_agent = read("src/modes/node_agent.rs");
     assert!(
         node_agent.contains("udp_placement_migration::publish_node_identity(registry_dir, uid)")
             && node_agent.contains("udp_placement_migration::retract_node_identity(registry_dir)")
             && node_agent.contains("refresh_node_identity_binding")
+            && node_agent.contains("resolve_this_node_uid")
+            && node_agent.contains("parse_explicit_k8s_node_uid")
             && node_agent.contains("POD_ENROLLMENT_RETRY_BACKOFF"),
         "src/modes/node_agent.rs must still publish node identity, retract it \
          before a lookup can fail, and retry/revalidate on the existing enrollment cadence"
@@ -984,7 +1037,9 @@ fn ambient_udp_production_entry_points_are_scheduled_by_the_trusted_classifier()
     assert!(
         cli.contains("resolve_authoritative_node_identity")
             && cli.contains("async fn fetch_this_node_uid")
-            && cli.contains("nodes.get(&node_name)"),
+            && cli.contains("nodes.get(&node_name)")
+            && cli.contains("kube::Config::incluster()")
+            && !cli.contains("Config::infer"),
         "the preflight must resolve this node's UID from its own bounded, \
          node-name-bound Kubernetes lookup"
     );
@@ -1013,7 +1068,11 @@ fn ambient_udp_production_entry_points_are_scheduled_by_the_trusted_classifier()
     assert!(
         cli.contains("preflight_capture_tools_until")
             && cli.contains("owned_shell::deadline_elapsed")
-            && cli.contains("bounded command collector")
+            && cli.contains("OwnedShellError::DeadlineUnsupported")
+            && cli.contains("deadline_operator_reason")
+            && !cli.contains("error.contains(\"within its timeout\")")
+            && !cli.contains("error.contains(\"exceeded its deadline\")")
+            && !cli.contains("error.contains(\"bounded command collector\")")
             && !cli.contains("short-circuits"),
         "the preflight must bound tool/cleanup work by the wall-clock deadline, fail closed when \
          a bounded collector cannot be established, and must not short-circuit on leftover proof"
@@ -1037,12 +1096,30 @@ fn ambient_udp_production_entry_points_are_scheduled_by_the_trusted_classifier()
         owned_shell.contains("drain_stderr_until")
             && owned_shell.contains("terminate_owned_tree")
             && owned_shell.contains("DeadlineCleanupFailed")
+            && owned_shell.contains("fn is_deadline_cleanup_unproven")
+            && owned_shell.contains("fn deadline_operator_reason")
             && owned_shell.contains("DeadlineUnsupported")
             && owned_shell.contains("O_NONBLOCK")
             && owned_shell.contains("set_stderr_nonblocking")
             && !owned_shell.contains("let _ = libc::fcntl"),
         "deadline-owned shells must fail closed unless a nonblocking stderr collector is proven, \
          bound stderr collection, and report process-group cleanup failure"
+    );
+    let netns = read("src/proxy/netns_udp_capture.rs");
+    assert!(
+        netns.contains("Err(OwnedShellError::DeadlineCleanupFailed { .. })")
+            && netns.contains("owned descendants could not be proven terminated")
+            && netns.contains("in-netns script exceeded its deadline\""),
+        "in-netns deadline mapping must keep the unproven-reap distinction observable \
+         before returning TimedOut"
+    );
+    let host = read("src/proxy/host_udp_capture.rs");
+    assert!(
+        host.contains("error.is_deadline_cleanup_unproven()")
+            && host.contains("OwnedShellError::DeadlineCleanupFailed { .. }")
+            && host.contains("owned descendants could not be proven terminated"),
+        "host-path deadline mapping must warn on unproven descendant cleanup without \
+         collapsing it into an undifferentiated string match"
     );
 
     let migration = read("src/proxy/udp_placement_migration.rs");

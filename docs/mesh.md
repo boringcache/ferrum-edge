@@ -4307,7 +4307,9 @@ default `true`). It runs `ferrum-edge ambient-udp-preflight` from the same
    publication first, **then** reads this incarnation's boot id, then performs
    one bounded read-only `get` bound to the node name the downward API stamped
    on this pod (`FERRUM_K8S_NODE_NAME` from `spec.nodeName`; an explicit
-   `FERRUM_K8S_NODE_UID` skips the API lookup). The chart's `nodes: get` grant
+   `FERRUM_K8S_NODE_UID` skips the API lookup). The lookup uses in-cluster
+   config only; a missing in-cluster config fails closed unless the explicit
+   UID is set. The chart's `nodes: get` grant
    has no list/watch/write and no `resourceNames`; Kubernetes therefore permits
    a named GET for any node whose name is already known, and the **runtime
    request** is what binds the lookup to this pod. It republishes only what it
@@ -4381,10 +4383,19 @@ specifies:
 ```
 
 **Node identity.** The Kubernetes downward API exposes `spec.nodeName` but not
-the node UID, and the mesh proxy holds no Kubernetes client, so the node-agent
-resolves `Node.metadata.uid` with a bounded `get nodes` and publishes
-`.node-identity-v1.json` beside the pod registry; the chart grants that
-read-only verb for Ambient releases. A published record is honoured only while
+the node UID, and the mesh proxy holds no Kubernetes client. A validated
+`FERRUM_K8S_NODE_UID` is first-precedence for both the privileged preflight and
+the node-agent and skips the Node API — that is the GitOps/client-render path
+when node GET RBAC is unavailable. An empty or malformed value fails closed
+without a GET and without publishing identity or a UID-bound
+`.udp-registry-synced` proof. Only when the variable is unset does the
+node-agent resolve `Node.metadata.uid` with a bounded `get nodes` and publish
+`.node-identity-v1.json` beside the pod registry. The chart injects the same
+`ambient.env` UID (and `FERRUM_MESH_CAPTURE_UDP_NODE_BOOT_ID_PATH`, when set)
+into both DaemonSets and fails rendering if `nodeAgent.env` tries to override
+either; it grants the identity `nodes: get` only when Ambient UDP needs the API
+and an explicit UID is absent (ingress-topology monitoring retains its own
+broader read verbs when independently required). A published record is honoured only while
 the boot id it recorded is this incarnation's. A transient API, RBAC, or
 publication failure does not freeze that absence for the life of the process:
 the node-agent retries and revalidates on its existing enrollment-retry cadence
@@ -4416,7 +4427,7 @@ That is a publisher-side mitigation, and the two DaemonSets have no startup
 ordering between them, so it cannot by itself close the window in which the
 replacement node-agent has not started yet. The **privileged preflight therefore
 does not consume that publication at all**: it performs its own bounded,
-node-name-bound `get` (step 1 above) and republishes what it proved, immediately
+node-name-bound `get` from in-cluster config only (step 1 above) and republishes what it proved, immediately
 before the steady-state container starts in the same pod. Because deleting a Node
 object also deletes the pods bound to it, the ambient pod that runs the producer
 always carries a fresh init stage, so the identity its steady-state container
@@ -4489,7 +4500,11 @@ authorizes nothing on its own. Such a pipeline must render the equivalent
 privileged preflight init stage (or supply node-bound exemptions) and must carry
 an era-qualified `FERRUM_MESH_CAPTURE_UDP_NODE_PROOF_GENERATION` on the ambient
 pod, the preflight, and the node-agent, plus `FERRUM_K8S_NODE_NAME` (or
-`FERRUM_K8S_NODE_UID`) on the preflight so it can bind its own node lookup.
+`FERRUM_K8S_NODE_UID`) on **both** the preflight and the node-agent so they
+share the same identity binding. When a client-render pipeline overrides the
+boot-id path, it must set `FERRUM_MESH_CAPTURE_UDP_NODE_BOOT_ID_PATH` on both
+processes as well. The preflight's Kubernetes client is in-cluster only; a
+missing in-cluster config fails closed unless the explicit UID is used.
 Omitting any of it is fail-closed but costly:
 affected nodes keep readiness false with a bounded refusal reason until the
 proof exists.

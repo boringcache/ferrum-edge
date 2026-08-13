@@ -1581,27 +1581,8 @@ impl<B: NetnsUdpCleanupBackend> NetnsUdpCleanupManager<B> {
 /// Non-`cfg`-gated so the `cfg!(target_os = "linux")` runtime gate at the call
 /// site compiles on every platform; it only runs on Linux.
 pub fn preflight_capture_tools(require_ip6tables: bool) -> Result<(), String> {
-    preflight_capture_tools_until(require_ip6tables, None)
-}
-
-/// Same tool probe as [`preflight_capture_tools`], bounded by the one-shot
-/// preflight's wall-clock deadline when supplied.
-pub fn preflight_capture_tools_until(
-    require_ip6tables: bool,
-    deadline: Option<std::time::Instant>,
-) -> Result<(), String> {
-    let probe = preflight_capture_tools_probe(require_ip6tables);
-    match owned_shell::run_sh_c(&probe, deadline) {
+    match preflight_capture_tools_until(require_ip6tables, None) {
         Ok(()) => Ok(()),
-        Err(
-            error @ (OwnedShellError::DeadlineElapsed
-            | OwnedShellError::DeadlineCleanupFailed { .. }),
-        ) => Err(format!(
-            "the Ambient UDP node preflight could not prove predecessor retirement within its timeout; no proof was published ({error})"
-        )),
-        Err(OwnedShellError::DeadlineUnsupported { error }) => Err(format!(
-            "the Ambient UDP node preflight could not establish a bounded command collector ({error}); no proof was published"
-        )),
         Err(OwnedShellError::Io(e)) => Err(format!(
             "Ambient UDP capture is enabled but `sh` is not available in the runtime image \
              (the producer runs in-netns `sh -c` scripts that call `ip`/`iptables`): {e}. Use a \
@@ -1622,7 +1603,26 @@ pub fn preflight_capture_tools_until(
                  FERRUM_MESH_CAPTURE_UDP_ENABLED."
             ))
         }
+        Err(error) => Err(format!(
+            "Ambient UDP capture tool probe failed: {}",
+            error
+                .deadline_operator_reason()
+                .unwrap_or("unexpected tool probe failure")
+        )),
     }
+}
+
+/// Same tool probe as [`preflight_capture_tools`], bounded by the one-shot
+/// preflight's wall-clock deadline when supplied.
+///
+/// Returns the typed [`OwnedShellError`] so callers can distinguish a reaped
+/// deadline from one whose owned descendants could not be proven terminated
+/// without classifying formatted strings.
+pub fn preflight_capture_tools_until(
+    require_ip6tables: bool,
+    deadline: Option<std::time::Instant>,
+) -> Result<(), OwnedShellError> {
+    owned_shell::run_sh_c(&preflight_capture_tools_probe(require_ip6tables), deadline)
 }
 
 fn preflight_capture_tools_probe(require_ip6tables: bool) -> String {
@@ -2379,16 +2379,22 @@ fn run_shell_script_until(
 ) -> std::io::Result<()> {
     match owned_shell::run_sh_c(script, deadline) {
         Ok(()) => Ok(()),
-        Err(
-            error @ (OwnedShellError::DeadlineElapsed
-            | OwnedShellError::DeadlineCleanupFailed { .. }),
-        ) => Err(std::io::Error::new(
+        Err(OwnedShellError::DeadlineCleanupFailed { .. }) => {
+            tracing::warn!(
+                "in-netns script exceeded its deadline and owned descendants could not be proven terminated"
+            );
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "in-netns script exceeded its deadline and owned descendants could not be proven terminated",
+            ))
+        }
+        Err(OwnedShellError::DeadlineElapsed) => Err(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
-            format!("in-netns script exceeded its deadline ({error})"),
+            "in-netns script exceeded its deadline",
         )),
-        Err(OwnedShellError::DeadlineUnsupported { error }) => Err(std::io::Error::other(format!(
-            "in-netns script cannot be run under a hard deadline: {error}"
-        ))),
+        Err(OwnedShellError::DeadlineUnsupported { .. }) => Err(std::io::Error::other(
+            "in-netns script cannot be run under a hard deadline",
+        )),
         Err(OwnedShellError::Io(error)) => Err(error),
         Err(OwnedShellError::Failed { status, stderr }) => Err(std::io::Error::other(format!(
             "in-netns script failed (exit {:?}): {}",

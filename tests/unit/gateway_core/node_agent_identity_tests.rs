@@ -246,3 +246,46 @@ async fn shutdown_during_lookup_keeps_the_loop_responsive() {
     );
     let _ = release_tx.send(());
 }
+
+#[test]
+fn explicit_k8s_node_uid_is_first_precedence_and_fail_closed_without_echoing_the_value() {
+    use ferrum_edge::proxy::udp_placement_migration::parse_explicit_k8s_node_uid;
+
+    assert_eq!(parse_explicit_k8s_node_uid(None).expect("unset"), None);
+
+    let empty = parse_explicit_k8s_node_uid(Some("")).expect_err("empty");
+    assert!(
+        empty.contains("FERRUM_K8S_NODE_UID") && empty.contains("empty"),
+        "{empty}"
+    );
+
+    let whitespace = parse_explicit_k8s_node_uid(Some(" \t\n")).expect_err("whitespace");
+    assert!(
+        whitespace.contains("FERRUM_K8S_NODE_UID") && whitespace.contains("empty"),
+        "{whitespace}"
+    );
+    assert!(
+        !whitespace.contains('\t') && !whitespace.contains('\n'),
+        "the error must not echo the supplied value: {whitespace}"
+    );
+
+    let malformed_value = "!!not-a-uid!!";
+    let malformed = parse_explicit_k8s_node_uid(Some(malformed_value)).expect_err("malformed");
+    assert!(
+        malformed.contains("Kubernetes node UID") && !malformed.contains(malformed_value),
+        "malformed UID errors must stay material-free, got {malformed}"
+    );
+
+    let too_long = "a".repeat(129);
+    let oversized = parse_explicit_k8s_node_uid(Some(&too_long)).expect_err("oversized");
+    assert!(
+        !oversized.contains(&too_long),
+        "oversized UID errors must not echo the value"
+    );
+
+    let parsed = parse_explicit_k8s_node_uid(Some(NODE_A)).expect("valid");
+    assert_eq!(parsed.as_deref(), Some(NODE_A));
+    let padded = format!("  {NODE_A}  ");
+    let trimmed = parse_explicit_k8s_node_uid(Some(&padded)).expect("trimmed valid");
+    assert_eq!(trimmed.as_deref(), Some(NODE_A));
+}

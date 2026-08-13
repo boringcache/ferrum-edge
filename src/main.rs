@@ -218,35 +218,6 @@ fn main() {
             }
             return;
         }
-        Some(cli::Command::AmbientUdpPreflight(args)) => {
-            // A privileged one-shot init stage: it owns no listeners, no config
-            // load, and no mode dispatch. Failure must be loud and non-zero so
-            // the unprivileged steady-state container never starts on a node
-            // whose predecessor retirement could not be proven.
-            let _ = tracing_subscriber::fmt()
-                .with_writer(std::io::stderr)
-                .with_max_level(match args.verbose {
-                    0 => tracing::Level::WARN,
-                    1 => tracing::Level::INFO,
-                    2 => tracing::Level::DEBUG,
-                    _ => tracing::Level::TRACE,
-                })
-                .try_init();
-            match cli::execute_ambient_udp_preflight(args) {
-                Ok(()) => {}
-                Err(e) => {
-                    emit_bootstrap_error(
-                        "Ambient UDP node preflight failed",
-                        &[
-                            ("command", "ambient-udp-preflight".to_string()),
-                            ("error", e.to_string()),
-                        ],
-                    );
-                    std::process::exit(1);
-                }
-            }
-            return;
-        }
         Some(cli::Command::Health(args)) => {
             match cli::execute_health(args) {
                 Ok(()) => {}
@@ -267,6 +238,9 @@ fn main() {
     match &cli.command {
         Some(cli::Command::Run(args)) => cli::apply_run_overrides(args),
         Some(cli::Command::Validate(args)) => cli::apply_validate_overrides(args),
+        Some(cli::Command::AmbientUdpPreflight(args)) => {
+            cli::apply_ambient_udp_preflight_overrides(args)
+        }
         _ => {}
     }
 
@@ -682,6 +656,56 @@ fn print_resolved_secret_sources(resolved: &secrets::ResolvedEnvSecrets) {
     );
 }
 
+/// One-shot Ambient UDP node preflight: secrets, lifecycle-owned logging, FIPS
+/// verification from the fully resolved settings, then predecessor retirement.
+///
+/// Does not parse serving `EnvConfig` or start gateway/listener infrastructure.
+fn run_ambient_udp_preflight(args: &cli::AmbientUdpPreflightArgs) -> i32 {
+    let resolved = match resolve_startup_secrets() {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            emit_bootstrap_error("secret resolution failed", &[("error", error)]);
+            return 1;
+        }
+    };
+    let _logging_guards = match init_logging() {
+        Ok(guards) => guards,
+        Err(error) => {
+            emit_bootstrap_error("logging initialization failed", &[("error", error)]);
+            return 1;
+        }
+    };
+    log_resolved_secret_sources(&resolved);
+
+    // An enforce request that arrives only through ferrum.conf or an external
+    // secret is not visible when the process-default provider is installed.
+    // Fail closed here, before any Kubernetes TLS client is built, rather than
+    // using a provider chosen from that stale view.
+    let fips_raw = config::conf_file::resolve_ferrum_var(fips::FIPS_MODE_ENV)
+        .unwrap_or_else(|| "off".to_string());
+    match fips::FipsMode::parse(&fips_raw).and_then(fips::verify_resolved_mode) {
+        Ok(()) => {}
+        Err(error) => {
+            error!(
+                "FIPS verification failed: {}",
+                secrets::redact_external_secret_values(&error)
+            );
+            return 1;
+        }
+    }
+
+    match cli::execute_ambient_udp_preflight(args) {
+        Ok(()) => 0,
+        Err(error) => {
+            error!(
+                "Ambient UDP node preflight failed: {}",
+                secrets::redact_external_secret_values(&error)
+            );
+            1
+        }
+    }
+}
+
 /// Runs startup secret resolution, logging init, env-config parsing, and the
 /// gateway runtime. Returns the process exit code.
 ///
@@ -692,6 +716,15 @@ fn print_resolved_secret_sources(resolved: &secrets::ResolvedEnvSecrets) {
 /// these worker threads exist so the temporary runtime can fully shut down
 /// before unsafe env mutation.
 fn run_gateway(cli: &cli::Cli) -> i32 {
+    // A privileged one-shot init stage: it owns no listeners, no EnvConfig
+    // parse, and no mode dispatch. It still takes the same crypto / secret /
+    // logging bootstrap as `validate` so a Kubernetes TLS client cannot bypass
+    // the process-default rustls provider or mutate env after worker threads
+    // exist.
+    if let Some(cli::Command::AmbientUdpPreflight(args)) = &cli.command {
+        return run_ambient_udp_preflight(args);
+    }
+
     // Handle validate subcommand: resolve secrets, load config, validate, exit.
     // Runs after crypto init so TLS cert checks work, but before the
     // multi-threaded runtime. External secret suffixes resolve with the same

@@ -2079,6 +2079,13 @@ pub(crate) async fn recover_and_reap_until(
                 HostUdpRecoverOnce::Reaped
             }
         }
+        Err(error) if error.is_deadline_cleanup_unproven() => {
+            warn!(
+                "Host UDP capture: stale host-namespace UDP state reap exceeded its deadline and \
+                 owned descendants could not be proven terminated"
+            );
+            HostUdpRecoverOnce::DeadlineElapsed
+        }
         Err(error) if error.is_deadline_elapsed() => HostUdpRecoverOnce::DeadlineElapsed,
         Err(error) => {
             // A reap that cannot complete is retried, not logged once: leaving a
@@ -2105,7 +2112,17 @@ fn run_host_script(script: &str, deadline: Option<std::time::Instant>) -> Result
             let detail: String = stderr.trim().chars().take(512).collect();
             format!("host capture script failed with status {status}: {detail}")
         }
-        other => format!("could not run the host capture script: {other}"),
+        OwnedShellError::DeadlineElapsed => "host capture script exceeded its deadline".to_string(),
+        OwnedShellError::DeadlineCleanupFailed { .. } => {
+            "host capture script exceeded its deadline and owned descendants could not be proven terminated"
+                .to_string()
+        }
+        other => format!(
+            "could not run the host capture script: {}",
+            other
+                .deadline_operator_reason()
+                .map_or_else(|| other.to_string(), str::to_string)
+        ),
     })
 }
 

@@ -331,6 +331,23 @@ pub fn apply_validate_overrides(args: &ValidateArgs) {
     }
 }
 
+/// Materialize the Ambient UDP node preflight's `--settings` and `-v` overrides
+/// before any config read and before worker threads exist, matching `run` /
+/// `validate`. Does not set a serving mode or parse `EnvConfig`.
+pub fn apply_ambient_udp_preflight_overrides(args: &AmbientUdpPreflightArgs) {
+    apply_common_overrides(args.settings.as_deref(), None);
+
+    if args.verbose > 0 {
+        let level = match args.verbose {
+            1 => "info",
+            2 => "debug",
+            _ => "trace",
+        };
+        // SAFETY: single-threaded context, before tokio runtime.
+        unsafe { std::env::set_var("FERRUM_LOG_LEVEL", level) };
+    }
+}
+
 /// Infer file mode when a spec is available but no mode is configured anywhere.
 ///
 /// **`--spec` / `-c` interaction:** `apply_common_overrides` may install
@@ -482,15 +499,12 @@ pub struct AmbientUdpPreflightArgs {
 /// starts next reads an identity this pod established.
 pub fn execute_ambient_udp_preflight(args: &AmbientUdpPreflightArgs) -> Result<(), String> {
     use crate::config::conf_file::resolve_ferrum_var;
+    use crate::proxy::owned_shell::OwnedShellError;
     use crate::proxy::udp_placement_migration::{
         UdpMigrationContext, UdpPlacement, node_proof_generation_from_env,
-        resolve_authoritative_node_identity, retract_node_cleanup_proof,
+        parse_explicit_k8s_node_uid, resolve_authoritative_node_identity,
+        retract_node_cleanup_proof,
     };
-
-    if let Some(path) = resolve_settings_path(args.settings.as_deref()) {
-        // SAFETY: single-threaded context, before the tokio runtime exists.
-        unsafe { std::env::set_var("FERRUM_CONF_PATH", path) };
-    }
 
     let settings = crate::capture::udp_capture_settings_from_env()
         .map_err(|error| format!("invalid Ambient UDP capture settings: {error}"))?;
@@ -521,9 +535,9 @@ pub fn execute_ambient_udp_preflight(args: &AmbientUdpPreflightArgs) -> Result<(
         "FERRUM_MESH_CAPTURE_UDP_NODE_PROOF_GENERATION is required by the Ambient UDP node preflight"
             .to_string()
     })?;
-    let explicit_node_uid = resolve_ferrum_var("FERRUM_K8S_NODE_UID")
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
+    let explicit_node_uid = parse_explicit_k8s_node_uid(
+        resolve_ferrum_var("FERRUM_K8S_NODE_UID").as_deref(),
+    )?;
     let node_name = resolve_ferrum_var("FERRUM_K8S_NODE_NAME")
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
@@ -570,18 +584,44 @@ pub fn execute_ambient_udp_preflight(args: &AmbientUdpPreflightArgs) -> Result<(
             Some(std_deadline),
         ) {
             Ok(()) => {}
-            Err(error)
-                if error.contains("within its timeout")
-                    || error.contains("exceeded its deadline") =>
-            {
-                return Ok(crate::proxy::udp_placement_cleanup::UdpCleanupOutcome::DeadlineElapsed);
+            Err(error) if error.is_deadline_elapsed() => {
+                if let Some(reason) = error.deadline_operator_reason() {
+                    tracing::warn!("{reason}");
+                }
+                return Ok(
+                    crate::proxy::udp_placement_cleanup::UdpCleanupOutcome::DeadlineElapsed,
+                );
             }
-            Err(error) if error.contains("bounded command collector") => {
-                return Err(error);
+            Err(OwnedShellError::DeadlineUnsupported { .. }) => {
+                return Err(
+                    "the Ambient UDP node preflight could not establish a bounded command collector; no proof was published"
+                        .to_string(),
+                );
+            }
+            Err(OwnedShellError::Io(error)) => {
+                return Err(format!(
+                    "the Ambient UDP node preflight image cannot run the required tooling: Ambient UDP capture is enabled but `sh` is not available in the runtime image \
+                     (the producer runs in-netns `sh -c` scripts that call `ip`/`iptables`): {error}. Use a \
+                     runtime image that ships a shell + iproute2 + iptables, or unset \
+                     FERRUM_MESH_CAPTURE_UDP_ENABLED."
+                ));
+            }
+            Err(OwnedShellError::Failed { .. }) => {
+                return Err(
+                    "the Ambient UDP node preflight image cannot run the required tooling: Ambient UDP capture is enabled but `ip`, `iptables` with the mangle table, and `ip6tables` with the mangle table \
+                     (IPv6 UDP capture is set to `required`) are not available in the runtime image; \
+                     the per-pod-netns producer needs them to install UDP TPROXY rules. Use a runtime \
+                     image that ships iproute2 + iptables (the distroless default lacks them), or unset \
+                     FERRUM_MESH_CAPTURE_UDP_ENABLED."
+                        .to_string(),
+                );
             }
             Err(error) => {
                 return Err(format!(
-                    "the Ambient UDP node preflight image cannot run the required tooling: {error}"
+                    "the Ambient UDP node preflight image cannot run the required tooling: {}",
+                    error
+                        .deadline_operator_reason()
+                        .unwrap_or("unexpected tool probe failure")
                 ));
             }
         }
@@ -620,13 +660,17 @@ pub fn execute_ambient_udp_preflight(args: &AmbientUdpPreflightArgs) -> Result<(
 ///
 /// The request is bound to the node name the downward API stamped on this pod
 /// (`FERRUM_K8S_NODE_NAME` from `spec.nodeName`), so this process only ever
-/// asks for the machine it is running on. The RBAC the chart grants alongside
-/// it is a read-only `nodes: get` — no list, no watch, no write. That cannot
-/// enumerate or mutate nodes, but a `get` without `resourceNames` is not a
-/// single-object restriction: Kubernetes permits a named GET for any node whose
-/// name the caller already knows. The runtime request is the binding, not the
-/// Role. Nothing from the returned object other than the UID is read. The UID
-/// itself is never logged: it is an identity binding, not diagnostics.
+/// asks for the machine it is running on. Authority is the in-cluster
+/// service-account config: a missing in-cluster config fails closed unless
+/// `FERRUM_K8S_NODE_UID` was supplied (that path never reaches this lookup).
+/// The RBAC the chart grants alongside it is a read-only `nodes: get` — no
+/// list, no watch, no write. That cannot enumerate or mutate nodes, but a
+/// `get` without `resourceNames` is not a single-object restriction:
+/// Kubernetes permits a named GET for any node whose name the caller already
+/// knows. The runtime request is the binding, not the Role. Nothing from the
+/// returned object other than the UID is read. The UID itself is never logged:
+/// it is an identity binding, not diagnostics. Lookup failures are
+/// material-free so kube diagnostics cannot leak names, URLs, or tokens.
 async fn fetch_this_node_uid(
     node_name: String,
     timeout: std::time::Duration,
@@ -634,24 +678,21 @@ async fn fetch_this_node_uid(
     use k8s_openapi::api::core::v1::Node;
     use kube::Api;
 
-    let config = match kube::Config::incluster() {
-        Ok(config) => config,
-        Err(in_cluster_error) => kube::Config::infer().await.map_err(|inferred_error| {
-            format!(
-                "could not build a Kubernetes client to resolve this node's UID: \
-                 incluster={in_cluster_error}; inferred={inferred_error}"
-            )
-        })?,
-    };
-    let client = kube::Client::try_from(config)
-        .map_err(|error| format!("could not build a Kubernetes client: {error}"))?;
+    let config = kube::Config::incluster().map_err(|_| {
+        "could not build an in-cluster Kubernetes client to resolve this node's UID; \
+         supply FERRUM_K8S_NODE_UID or run this command inside a Kubernetes pod"
+            .to_string()
+    })?;
+    let client = kube::Client::try_from(config).map_err(|_| {
+        "could not build an in-cluster Kubernetes client to resolve this node's UID; \
+         supply FERRUM_K8S_NODE_UID or run this command inside a Kubernetes pod"
+            .to_string()
+    })?;
     let nodes: Api<Node> = Api::all(client);
     let node = match tokio::time::timeout(timeout, nodes.get(&node_name)).await {
         Ok(Ok(node)) => node,
-        Ok(Err(error)) => {
-            return Err(format!(
-                "could not read this node's Kubernetes object: {error}"
-            ));
+        Ok(Err(_)) => {
+            return Err("could not read this node's Kubernetes object".to_string());
         }
         Err(_) => return Err("timed out reading this node's Kubernetes object".to_string()),
     };

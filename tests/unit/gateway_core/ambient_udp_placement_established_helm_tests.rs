@@ -235,9 +235,10 @@ fn the_node_proof_generation_is_derived_from_the_installed_contract_for_both_dae
     }
     assert!(
         node_agent.contains(
-            "\"FERRUM_MESH_CAPTURE_UDP_NODE_PROOF_GENERATION\"\n  \"FERRUM_MESH_TOPOLOGY\""
+            "\"FERRUM_MESH_CAPTURE_UDP_NODE_PROOF_GENERATION\"\n  \"FERRUM_K8S_NODE_UID\"\n  \"FERRUM_MESH_CAPTURE_UDP_NODE_BOOT_ID_PATH\"\n  \"FERRUM_MESH_TOPOLOGY\""
         ),
-        "the node-agent must treat the node-proof generation as chart-managed"
+        "the node-agent must treat the node-proof generation, explicit node UID, \
+         and boot-id path as chart-managed"
     );
 
     // Fail closed rather than rendering a preflight that can prove nothing.
@@ -284,6 +285,12 @@ fn client_render_parity_keeps_an_explicit_env_value_under_the_same_boundary() {
 fn the_node_agent_can_read_its_own_node_object_for_the_uid_binding() {
     let rbac = read("templates/node-agent-rbac.yaml");
     assert!(
+        rbac.contains("and $naAmbientUdpLifecycle (not $naHasExplicitNodeUid) (not .Values.nodeAgent.ingressRedirectIfaces)")
+            && rbac.contains("$naHasExplicitNodeUid := hasKey $naAmbientEnv \"FERRUM_K8S_NODE_UID\""),
+        "the node-agent identity GET must render only when Ambient UDP needs the API \
+         and an explicit UID is absent"
+    );
+    assert!(
         rbac.contains("resources: [\"nodes\"]") && rbac.contains("verbs: [\"get\"]"),
         "the node-agent needs a read-only nodes grant to resolve Node.metadata.uid"
     );
@@ -302,11 +309,13 @@ fn the_placement_contract_persists_a_non_recurring_node_proof_era() {
     let contract = read("templates/udp-placement-contract.yaml");
 
     assert!(
-        contract.contains("{{- if $nodeProofGeneration -}}")
+        contract.contains("{{- if $nodeProofGeneration }}")
+            && !contract.contains("{{- if $nodeProofGeneration -}}")
             && contract.contains("nodeProofEra: {{ $nodeProofEra | toString | quote }}")
             && contract.contains("nodeProofGeneration: {{ $nodeProofGeneration | quote }}"),
-        "a stamped era-qualified token must emit both node-proof keys; pre-contract \
-         installs omit them until cleanup stamps era 1"
+        "a stamped era-qualified token must emit both node-proof keys on their own \
+         YAML lines; a right-chomp on the generation gate concatenates nodeProofEra \
+         onto the preceding comment"
     );
     // Starting a migration opens a NEW era; resuming the same cleanup release
     // keeps the one already open, so retries are idempotent while transitions
@@ -453,11 +462,12 @@ fn the_placement_contract_omits_node_proof_keys_until_cleanup_stamps_era_one() {
     let contract = read("templates/udp-placement-contract.yaml");
 
     assert!(
-        contract.contains("{{- if $nodeProofGeneration -}}")
+        contract.contains("{{- if $nodeProofGeneration }}")
+            && !contract.contains("{{- if $nodeProofGeneration -}}")
             && contract.contains("nodeProofEra: {{ $nodeProofEra | toString | quote }}")
             && contract.contains("nodeProofGeneration: {{ $nodeProofGeneration | quote }}"),
         "both node-proof keys must be emitted only once a non-empty era-qualified \
-         generation exists"
+         generation exists, and the gate must not right-chomp onto the preceding comment"
     );
     assert!(
         contract.contains("both must be absent so cleanup can stamp era 1"),
@@ -465,14 +475,26 @@ fn the_placement_contract_omits_node_proof_keys_until_cleanup_stamps_era_one() {
          cleanup entry"
     );
     let gate = contract
-        .find("{{- if $nodeProofGeneration -}}")
+        .find("{{- if $nodeProofGeneration }}")
         .expect("node-proof generation gate");
     let era_line = contract
         .find("nodeProofEra: {{ $nodeProofEra | toString | quote }}")
         .expect("nodeProofEra emission");
+    let generation_line = contract
+        .find("nodeProofGeneration: {{ $nodeProofGeneration | quote }}")
+        .expect("nodeProofGeneration emission");
+    let end_gate = contract[gate..]
+        .find("{{- end }}")
+        .map(|offset| gate + offset)
+        .expect("node-proof generation gate end");
     assert!(
-        gate < era_line,
-        "nodeProofEra must render only inside the non-empty generation gate"
+        gate < era_line && era_line < generation_line && generation_line < end_gate,
+        "both node-proof keys must render on their own lines inside the non-empty generation gate"
+    );
+    assert!(
+        !contract.contains("{{- if $nodeProofGeneration -}}"),
+        "a right-chomp on the generation gate concatenates nodeProofEra onto the \
+         preceding YAML comment, leaving only nodeProofGeneration as a real data key"
     );
     assert!(
         contract.contains("{{- $previousEra := 0 -}}")
@@ -530,6 +552,14 @@ fn the_preflight_binds_its_node_lookup_to_this_pods_node_name() {
     );
 
     assert!(
+        rbac.contains("$ambientUdpRunNodePreflight := and $ambientUdpLifecycle $ambientUdpHostNetns (eq $ambientUdpMigrationPhase \"stable\") $ambientUdpNodePreflightEnabled")
+            && rbac.contains("$hasExplicitNodeUid := hasKey $ambientEnv \"FERRUM_K8S_NODE_UID\"")
+            && rbac.contains("if and $ambientUdpRunNodePreflight (not $hasExplicitNodeUid)"),
+        "the ambient nodes:get grant must render only when the settled host-netns \
+         preflight will run and an explicit UID is absent"
+    );
+
+    assert!(
         rbac.contains("resources: [\"nodes\"]") && rbac.contains("verbs: [\"get\"]"),
         "the ambient service account needs a read-only nodes grant for the preflight lookup"
     );
@@ -565,5 +595,38 @@ fn the_preflight_binds_its_node_lookup_to_this_pods_node_name() {
             && rbac.contains("runtime request is what binds the lookup"),
         "the Role comment must not claim an enforcement boundary Kubernetes RBAC \
          does not provide"
+    );
+}
+
+#[test]
+fn the_node_agent_receives_the_explicit_uid_and_boot_id_path_from_ambient_env() {
+    let node_agent = read("templates/node-agent-daemonset.yaml");
+    let rbac = read("templates/node-agent-rbac.yaml");
+
+    assert!(
+        node_agent.contains("hasKey $ambientEnv \"FERRUM_K8S_NODE_UID\"")
+            && node_agent.contains("- name: FERRUM_K8S_NODE_UID")
+            && node_agent.contains("index $ambientEnv \"FERRUM_K8S_NODE_UID\""),
+        "the node-agent must receive ambient.env FERRUM_K8S_NODE_UID so it publishes \
+         the same UID-bound registry proof the preflight requires"
+    );
+    assert!(
+        node_agent.contains("hasKey $ambientEnv \"FERRUM_MESH_CAPTURE_UDP_NODE_BOOT_ID_PATH\"")
+            && node_agent.contains("- name: FERRUM_MESH_CAPTURE_UDP_NODE_BOOT_ID_PATH")
+            && node_agent.contains("index $ambientEnv \"FERRUM_MESH_CAPTURE_UDP_NODE_BOOT_ID_PATH\""),
+        "the node-agent must receive ambient.env FERRUM_MESH_CAPTURE_UDP_NODE_BOOT_ID_PATH \
+         so it stamps .node-identity-v1.json under the same incarnation the preflight reads"
+    );
+    assert!(
+        node_agent.contains("\"FERRUM_K8S_NODE_UID\"")
+            && node_agent.contains("\"FERRUM_MESH_CAPTURE_UDP_NODE_BOOT_ID_PATH\"")
+            && node_agent.contains(
+                "fail (printf \"nodeAgent.env.%s is chart-managed; set the corresponding nodeAgent value instead of overriding the rendered environment\" $name)"
+            ),
+        "conflicting nodeAgent.env overrides of the explicit UID or boot-id path must fail rendering"
+    );
+    assert!(
+        rbac.contains("verbs: [\"get\", \"list\", \"watch\"]"),
+        "ingress-topology monitoring must keep its independently required broader read verbs"
     );
 }

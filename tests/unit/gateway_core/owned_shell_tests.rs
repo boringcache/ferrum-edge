@@ -220,3 +220,47 @@ fn a_silent_stalled_child_still_returns_by_the_deadline_without_stderr() {
         "a silent child must not pin the deadline path on a blocking stderr read, took {elapsed:?}"
     );
 }
+
+#[test]
+fn deadline_cleanup_failed_is_observable_without_leaking_inner_detail() {
+    let leaked = "/tmp/secret-script.sh env=NODE_UID=abc stderr=1.2.3.4";
+    let unproven = OwnedShellError::DeadlineCleanupFailed {
+        error: leaked.to_string(),
+    };
+    let elapsed = OwnedShellError::DeadlineElapsed;
+
+    assert!(elapsed.is_deadline_elapsed());
+    assert!(!elapsed.is_deadline_cleanup_unproven());
+    assert_eq!(
+        elapsed.deadline_operator_reason(),
+        Some("owned command exceeded its deadline and was terminated")
+    );
+    assert_eq!(elapsed.to_string(), "script exceeded its deadline and was terminated");
+
+    assert!(unproven.is_deadline_elapsed(), "callers must still fail closed");
+    assert!(unproven.is_deadline_cleanup_unproven());
+    assert_eq!(
+        unproven.deadline_operator_reason(),
+        Some(
+            "owned command exceeded its deadline and owned descendants could not be proven terminated"
+        )
+    );
+    assert_ne!(
+        elapsed.deadline_operator_reason(),
+        unproven.deadline_operator_reason()
+    );
+    let displayed = unproven.to_string();
+    assert_eq!(
+        displayed,
+        "script exceeded its deadline and owned descendants could not be proven terminated"
+    );
+    assert!(
+        !displayed.contains(leaked)
+            && !displayed.contains("/tmp")
+            && !displayed.contains("secret-script")
+            && !displayed.contains("NODE_UID")
+            && !displayed.contains("1.2.3.4"),
+        "Display must not interpolate the inner cleanup error: {displayed}"
+    );
+    assert_eq!(unproven.deadline_cleanup_error(), Some(leaked));
+}

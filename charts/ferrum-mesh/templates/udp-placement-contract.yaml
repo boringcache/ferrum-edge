@@ -177,9 +177,14 @@ data:
   # Both keys stay absent until cleanup stamps a non-empty era-qualified token;
   # once stamped they are carried unchanged through cleanup retry, finalize, and
   # every settled release after it.
-{{- if $nodeProofGeneration -}}
+  #
+  # The generation gate must NOT right-chomp (`-}}`). A right-chomp after YAML
+  # comments concatenates `nodeProofEra` onto the preceding comment, so an
+  # unstamped contract is fine but a stamped one would emit only
+  # `nodeProofGeneration` as a real data key.
+{{- if $nodeProofGeneration }}
   nodeProofEra: {{ $nodeProofEra | toString | quote }}
   nodeProofGeneration: {{ $nodeProofGeneration | quote }}
-{{- end -}}
+{{- end }}
 {{- end -}}
 {{- end -}}

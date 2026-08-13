@@ -1708,17 +1708,19 @@ async fn run_with_backend(
         "startup",
     );
     // Publish this node's immutable Kubernetes UID beside the pod registry
-    // (issue #3809). The downward API exposes `spec.nodeName` but NOT the node
-    // UID, and the Ambient proxy has no Kubernetes client of its own, so the
-    // node-agent — which already holds a scoped client for this exact node — is
-    // the only place that can bind node-local UDP placement proof to an
-    // identifier a rebuilt machine cannot inherit. A missing RBAC grant or an
-    // unavailable API is NOT fatal here: the publisher retracts the previous
-    // publication before it can fail, so a failure leaves the proxy with NO
-    // node identity — not with a predecessor Node object's UID — and the
-    // proxy's own guard treats an absent identity as a fail-closed refusal.
-    // Adoption stays fail-closed until a later maintenance-lane retry can read
-    // this Node object; a same-name Node recreation that resolves to a
+    // (issue #3809). A validated `FERRUM_K8S_NODE_UID` is first-precedence and
+    // skips the Node API; only when that variable is unset does the node-agent
+    // perform its bounded node-name GET. A present empty or malformed explicit
+    // UID publishes neither identity nor a bound registry proof. The downward
+    // API exposes `spec.nodeName` but NOT the node UID, and the Ambient proxy
+    // has no Kubernetes client of its own, so this agent is the publisher the
+    // mesh proxy consults. A missing RBAC grant or an unavailable API is NOT
+    // fatal here: the publisher retracts the previous publication before it can
+    // fail, so a failure leaves the proxy with NO node identity — not with a
+    // predecessor Node object's UID — and the proxy's own guard treats an
+    // absent identity as a fail-closed refusal. Adoption stays fail-closed
+    // until a later maintenance-lane retry can read this Node object (or the
+    // explicit UID is restored); a same-name Node recreation that resolves to a
     // different UID never keeps using the old one.
     //
     // The resolved UID also BINDS this incarnation's registry-synchronization
@@ -2538,7 +2540,7 @@ where
                     let refresh = refresh_node_identity_binding(
                         udp_node_uid.as_deref(),
                         &mut shutdown_rx,
-                        || lookup_this_node_uid(client, config.node_name.as_str()),
+                        || resolve_this_node_uid(client, config.node_name.as_str()),
                         || {
                             match crate::proxy::udp_placement_migration::clear_registry_sync_marker(
                                 registry_dir,
@@ -2972,10 +2974,12 @@ impl NodeIdentityRefresh {
     }
 }
 
-/// Resolve this node's `Node.metadata.uid` with one bounded GET and publish it
-/// into the shared pod-registry directory for the Ambient proxy's UDP placement
-/// proof. Returns the resolved UID only when this incarnation both proved it
-/// against the API server and durably published it.
+/// Resolve this node's `Node.metadata.uid` and publish it into the shared
+/// pod-registry directory for the Ambient proxy's UDP placement proof. A
+/// validated `FERRUM_K8S_NODE_UID` is first-precedence and skips the Node API;
+/// only when that variable is unset does this perform a bounded GET. Returns
+/// the resolved UID only when this incarnation both proved it and durably
+/// published it.
 ///
 /// The publication is RETRACTED first, before anything that can fail, and again
 /// after any failure. A failure is not merely "no new evidence": an identity
@@ -3006,13 +3010,27 @@ async fn publish_node_identity(
     let refresh = refresh_node_identity_binding(
         None,
         &mut shutdown,
-        || lookup_this_node_uid(client, node_name),
+        || resolve_this_node_uid(client, node_name),
         || crate::proxy::udp_placement_migration::clear_registry_sync_marker(registry_dir),
         || crate::proxy::udp_placement_migration::retract_node_identity(registry_dir),
         |uid| crate::proxy::udp_placement_migration::publish_node_identity(registry_dir, uid),
     )
     .await;
     refresh.uid().map(str::to_string)
+}
+
+/// Authoritative first-precedence node UID for identity publication.
+///
+/// A validated `FERRUM_K8S_NODE_UID` wins and skips the Node API. A present
+/// empty or malformed value fails closed without a GET and without publishing.
+/// Only when the variable is unset does this perform the bounded node-name GET.
+async fn resolve_this_node_uid(client: &Client, node_name: &str) -> Result<String, String> {
+    match crate::proxy::udp_placement_migration::parse_explicit_k8s_node_uid(
+        crate::config::conf_file::resolve_ferrum_var("FERRUM_K8S_NODE_UID").as_deref(),
+    )? {
+        Some(uid) => Ok(uid),
+        None => lookup_this_node_uid(client, node_name).await,
+    }
 }
 
 async fn lookup_this_node_uid(client: &Client, node_name: &str) -> Result<String, String> {

@@ -2,8 +2,8 @@
 
 use clap::Parser;
 use ferrum_edge::cli::{
-    Cli, Command, HealthArgs, ReloadArgs, RunArgs, ValidateArgs, VersionArgs, execute_health,
-    resolve_settings_path, resolve_spec_path, select_gateway_pid,
+    AmbientUdpPreflightArgs, Cli, Command, HealthArgs, ReloadArgs, RunArgs, ValidateArgs,
+    VersionArgs, execute_health, resolve_settings_path, resolve_spec_path, select_gateway_pid,
 };
 use std::path::Path;
 use tempfile::TempDir;
@@ -261,6 +261,44 @@ fn test_parse_reload_no_pid() {
     match cli.command {
         Some(Command::Reload(args)) => assert!(args.pid.is_none()),
         _ => panic!("Expected Reload command"),
+    }
+}
+
+#[test]
+fn test_parse_ambient_udp_preflight_defaults() {
+    let cli = Cli::try_parse_from(["ferrum-edge", "ambient-udp-preflight"]).unwrap();
+    match cli.command {
+        Some(Command::AmbientUdpPreflight(args)) => {
+            assert!(args.settings.is_none());
+            assert_eq!(args.timeout_seconds, 300);
+            assert_eq!(args.verbose, 0);
+        }
+        _ => panic!("Expected AmbientUdpPreflight command"),
+    }
+}
+
+#[test]
+fn test_parse_ambient_udp_preflight_settings_and_verbose() {
+    let cli = Cli::try_parse_from([
+        "ferrum-edge",
+        "ambient-udp-preflight",
+        "--settings",
+        "/etc/ferrum.conf",
+        "--timeout-seconds",
+        "45",
+        "-vv",
+    ])
+    .unwrap();
+    match cli.command {
+        Some(Command::AmbientUdpPreflight(args)) => {
+            assert_eq!(
+                args.settings.as_deref().and_then(std::path::Path::to_str),
+                Some("/etc/ferrum.conf")
+            );
+            assert_eq!(args.timeout_seconds, 45);
+            assert_eq!(args.verbose, 2);
+        }
+        _ => panic!("Expected AmbientUdpPreflight command"),
     }
 }
 
@@ -1053,6 +1091,88 @@ fn test_apply_validate_overrides_verbose_wins_over_env() {
                 "CLI -vv must overwrite a pre-existing FERRUM_LOG_LEVEL env value"
             );
             unsafe { std::env::remove_var("FERRUM_LOG_LEVEL") };
+        },
+    );
+}
+
+// ── apply_ambient_udp_preflight_overrides tests ─────────────────────────────
+
+#[test]
+fn test_apply_ambient_udp_preflight_overrides_sets_settings_path() {
+    without_env_vars(
+        &[
+            "FERRUM_MODE",
+            "FERRUM_LOG_LEVEL",
+            "FERRUM_CONF_PATH",
+            "FERRUM_FILE_CONFIG_PATH",
+        ],
+        || {
+            let args = AmbientUdpPreflightArgs {
+                settings: Some("/etc/ferrum/preflight.conf".into()),
+                timeout_seconds: 300,
+                verbose: 0,
+            };
+            ferrum_edge::cli::apply_ambient_udp_preflight_overrides(&args);
+            assert_eq!(
+                std::env::var("FERRUM_CONF_PATH").unwrap(),
+                "/etc/ferrum/preflight.conf"
+            );
+            assert!(
+                std::env::var("FERRUM_MODE").is_err(),
+                "the preflight must not parse or inject a serving mode"
+            );
+            unsafe { std::env::remove_var("FERRUM_CONF_PATH") };
+        },
+    );
+}
+
+#[test]
+fn test_apply_ambient_udp_preflight_overrides_verbose_levels() {
+    without_env_vars(
+        &[
+            "FERRUM_MODE",
+            "FERRUM_LOG_LEVEL",
+            "FERRUM_CONF_PATH",
+            "FERRUM_FILE_CONFIG_PATH",
+        ],
+        || {
+            for (level, expected) in [(1, "info"), (2, "debug"), (3, "trace"), (4, "trace")] {
+                let args = AmbientUdpPreflightArgs {
+                    settings: None,
+                    timeout_seconds: 300,
+                    verbose: level,
+                };
+                ferrum_edge::cli::apply_ambient_udp_preflight_overrides(&args);
+                assert_eq!(std::env::var("FERRUM_LOG_LEVEL").unwrap(), expected);
+                unsafe {
+                    std::env::remove_var("FERRUM_LOG_LEVEL");
+                };
+            }
+        },
+    );
+}
+
+#[test]
+fn test_apply_ambient_udp_preflight_overrides_no_verbose_does_not_set_log_level() {
+    without_env_vars(
+        &[
+            "FERRUM_MODE",
+            "FERRUM_LOG_LEVEL",
+            "FERRUM_CONF_PATH",
+            "FERRUM_FILE_CONFIG_PATH",
+        ],
+        || {
+            let args = AmbientUdpPreflightArgs {
+                settings: None,
+                timeout_seconds: 300,
+                verbose: 0,
+            };
+            ferrum_edge::cli::apply_ambient_udp_preflight_overrides(&args);
+            assert!(std::env::var("FERRUM_LOG_LEVEL").is_err());
+            assert!(
+                std::env::var("FERRUM_MODE").is_err(),
+                "the preflight must not inject FERRUM_MODE"
+            );
         },
     );
 }

@@ -74,6 +74,30 @@ impl OwnedShellError {
         )
     }
 
+    /// True when SIGKILL/reap of owned descendants could not be proven.
+    ///
+    /// Callers must still fail closed and withhold proof; this distinguishes
+    /// that outcome from a deadline whose owned tree *was* reaped.
+    pub fn is_deadline_cleanup_unproven(&self) -> bool {
+        matches!(self, Self::DeadlineCleanupFailed { .. })
+    }
+
+    /// Closed-set, material-free diagnostic for a deadline outcome.
+    ///
+    /// Does not include command scripts, environment values, paths, node IDs,
+    /// pod IDs, addresses, or stderr — only which deadline variant occurred.
+    pub fn deadline_operator_reason(&self) -> Option<&'static str> {
+        match self {
+            Self::DeadlineElapsed => {
+                Some("owned command exceeded its deadline and was terminated")
+            }
+            Self::DeadlineCleanupFailed { .. } => Some(
+                "owned command exceeded its deadline and owned descendants could not be proven terminated",
+            ),
+            _ => None,
+        }
+    }
+
     /// When process-group cleanup could not be proven after the deadline.
     #[allow(dead_code)] // Public library API exercised by the external unit-test crate; unused by the binary target.
     pub fn deadline_cleanup_error(&self) -> Option<&str> {
@@ -118,10 +142,10 @@ impl std::fmt::Display for OwnedShellError {
             Self::DeadlineElapsed => {
                 write!(f, "script exceeded its deadline and was terminated")
             }
-            Self::DeadlineCleanupFailed { error } => {
+            Self::DeadlineCleanupFailed { .. } => {
                 write!(
                     f,
-                    "script exceeded its deadline; owned descendants could not be proven terminated: {error}"
+                    "script exceeded its deadline and owned descendants could not be proven terminated"
                 )
             }
             Self::DeadlineUnsupported { error } => {

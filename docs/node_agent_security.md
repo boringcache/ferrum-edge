@@ -203,7 +203,9 @@ lifetime, and clusters that will not grant it at all can set
 node-bound exemption markers instead.
 
 That init stage also carries one **read-only** Kubernetes grant: `nodes: get` on
-the `ferrum-mesh` service account, with no list, watch, or write verb. That
+the `ferrum-mesh` service account, with no list, watch, or write verb, and only
+when the settled host-netns node preflight will actually run **and** an explicit
+`FERRUM_K8S_NODE_UID` is absent. That
 cannot enumerate or mutate nodes, but Kubernetes RBAC does **not** treat a `get`
 without `resourceNames` as a single-object restriction — a named GET is
 permitted for any node whose name the caller already knows. The **runtime

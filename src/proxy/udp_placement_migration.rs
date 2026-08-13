@@ -480,11 +480,8 @@ fn resolve_authoritative_node_uid(
     explicit_node_uid: Option<&str>,
     node_name: Option<&str>,
 ) -> Result<NodeUidSource, String> {
-    if let Some(node_uid) = explicit_node_uid
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        return Ok(NodeUidSource::Explicit(node_uid.to_string()));
+    if let Some(node_uid) = parse_explicit_k8s_node_uid(explicit_node_uid)? {
+        return Ok(NodeUidSource::Explicit(node_uid));
     }
     node_name
         .map(str::trim)
@@ -494,6 +491,26 @@ fn resolve_authoritative_node_uid(
             "resolving this node's Kubernetes UID requires its node name; set FERRUM_K8S_NODE_NAME from the downward API `spec.nodeName` (or supply FERRUM_K8S_NODE_UID directly)"
                 .to_string()
         })
+}
+
+/// Parse an operator-supplied `FERRUM_K8S_NODE_UID`.
+///
+/// `None` means the variable is unset (callers may fall back to a bounded node
+/// GET). A present empty or malformed value is fail-closed: it is not treated
+/// as absent, and the returned error never includes the supplied value.
+pub fn parse_explicit_k8s_node_uid(raw: Option<&str>) -> Result<Option<String>, String> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(
+            "FERRUM_K8S_NODE_UID is set but empty; refusing to resolve a node identity without a valid UID"
+                .to_string(),
+        );
+    }
+    validate_node_identifier(trimmed, "Kubernetes node UID")?;
+    Ok(Some(trimmed.to_string()))
 }
 
 fn validate_node_identifier(value: &str, description: &str) -> Result<(), String> {
