@@ -1667,9 +1667,7 @@ async fn drain_gso_to_sendmmsg_or_direct(
         }
         if send_batch.is_empty() {
             // Stuck on an oversized front segment — escape via direct-send.
-            let Some(dgram) = gso_batch.take_front_datagram() else {
-                return None;
-            };
+            let dgram = gso_batch.take_front_datagram()?;
             if let Some(termination) = direct_send_reply_or_drop(
                 frontend,
                 &dgram,
@@ -4158,9 +4156,7 @@ pub(crate) enum UdpReplyDatagramCommit {
 pub(crate) fn udp_reply_expired_at_commit(
     plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
 ) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
-    let Some(plan) = plan else {
-        return None;
-    };
+    let plan = plan?;
     (tokio::time::Instant::now() >= plan.at).then_some(plan.termination)
 }
 

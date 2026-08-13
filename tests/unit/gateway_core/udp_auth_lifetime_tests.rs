@@ -879,19 +879,18 @@ async fn a_pending_writable_retry_is_dropped_at_the_authorization_deadline() {
     tokio::task::yield_now().await;
     tokio::time::advance(Duration::from_millis(20)).await;
     let _ = release_tx.send(());
-    assert_eq!(
-        raced.await.expect("join"),
+    match raced.await.expect("join") {
         UdpFrontendSendOutcomeForTest::AuthorizationExpired(
-            StreamAuthTermination::AuthenticatedStreamMaxLifetime
-        )
-    );
+            StreamAuthTermination::AuthenticatedStreamMaxLifetime,
+        ) => {}
+        other => panic!("expected authorization expiry at max lifetime, got {other:?}"),
+    }
     assert!(
         !ready.load(Ordering::SeqCst),
         "writable readiness after the deadline must not reach the pktinfo syscall"
     );
 }
 
-#[tokio::test(start_paused = true)]
 #[tokio::test(start_paused = true)]
 async fn an_already_elapsed_writable_wait_never_reaches_the_syscall() {
     // An elapsed plan must refuse before polling writable, so a ready socket
@@ -908,12 +907,12 @@ async fn an_already_elapsed_writable_wait_never_reaches_the_syscall() {
         }),
     )
     .await;
-    assert_eq!(
-        outcome,
+    match outcome {
         UdpFrontendSendOutcomeForTest::AuthorizationExpired(
-            StreamAuthTermination::CredentialExpired
-        )
-    );
+            StreamAuthTermination::CredentialExpired,
+        ) => {}
+        other => panic!("expected authorization expiry for credential expiry, got {other:?}"),
+    }
     assert!(
         !polled.load(Ordering::SeqCst),
         "an elapsed plan must not poll writable or issue the client-facing syscall"
