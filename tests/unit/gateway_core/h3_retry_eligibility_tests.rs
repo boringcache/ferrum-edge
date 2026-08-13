@@ -326,7 +326,7 @@ async fn h3_eligible_retry_strict_locality_vec_lane_skips_unix_scope_fallback() 
     targets.push(original.clone());
     targets.push(unix_target(2));
     for i in 0..150 {
-        targets.push(remote_plain_target(&format!("10.0.1.{i}"), 8080));
+        targets.push(unix_target(i + 3));
     }
     let remote_hbone = remote_hbone_target("10.0.0.200", 8080);
     targets.push(remote_hbone.clone());
@@ -376,7 +376,7 @@ fn ordinary_retry_exclusion_without_eligibility_unchanged_under_strict_locality(
     // Soft retry exclusion must still fail closed to the configured-local target
     // even when remote endpoints remain eligible.
     let local = {
-        let mut tags = HashMap::new();
+        let tags = HashMap::new();
         UpstreamTarget {
             host: "local-a.local".to_string(),
             port: 8080,
