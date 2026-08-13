@@ -467,7 +467,10 @@ failover. There is deliberately **no** cross-type version-coherence gate: a
 stock CP versions each type independently and carries no Ferrum security
 carriers a skew could leave stale. Warming waits for CDS, and for EDS only when
 some accepted cluster actually needs it. Convergence is visible on the
-JWT-gated `GET /mesh/config-drift`.
+JWT-gated `GET /mesh/config-drift`. Stock xDS reports closed-set type
+presence (`cds=received`, …) there rather than remote `version_info`: a
+third-party CP can copy the bearer into that field, and truncation is not
+redaction.
 
 **Deletion follows the SotW rule for each type, not the response contents.**
 `Cluster` and `Listener` are the two types a state-of-the-world server must send
@@ -496,8 +499,10 @@ legitimately programs Envoy features Ferrum has no counterpart for and NACKing
 would leave the data plane permanently unconverged. A refusal always narrows:
 it contributes no route, no endpoint, and no identity, so the worst case is
 traffic that is not routed. Refusals are logged (bounded, and only when the set
-changes) with a stable reason code and the offending field path — never a
-resource payload.
+changes) with a stable reason code, a short type label, and counts — never a
+resource name, field path, version, nonce, or other CP-authored string.
+Truncation is not redaction: those values can carry a bearer the control plane
+echoed from the authenticated request.
 
 **The extension-escape closure.** Every field through which an Envoy extension,
 a filesystem path, credential material, an enforcement filter, or a second
@@ -719,7 +724,14 @@ bearer-authenticated stream a finite **local** authorization lifetime:
   authors `Status::message()`, so echoing it could write the bearer straight
   into Ferrum's own logs. Transport errors are reported as `connect_failed` /
   `tls_config_rejected` / `endpoint_uri_invalid` rather than rendered, because
-  tonic's transport error can echo the configured URI or host.
+  tonic's transport error can echo the configured URI or host. The same rule
+  covers every other ADS response field: remote `type_url`, `version_info`,
+  `nonce`, resource names, NACK error text, and refusal detail are omitted from
+  Ferrum logs. Operators see closed-set type labels (`cds`/`eds`/`lds`/`rds`/
+  `sds`/`unsolicited`), reason codes, counts, booleans, and endpoint indexes.
+  Truncating an arbitrary CP string is not redaction. The control plane may
+  still receive its own bounded NACK `error_detail`; that echo is not a Ferrum
+  log disclosure.
 
 **Where the code lives.** `src/xds/stock.rs` (decode, capability classification,
 projection onto the typed mesh model),

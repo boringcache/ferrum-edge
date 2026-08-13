@@ -155,7 +155,8 @@ const RESERVED_ENVOY_CLUSTERS: [&str; 9] = [
 // ── refusal vocabulary ───────────────────────────────────────────────────
 
 /// Stable, operator-facing reason codes for a refused stock resource. These
-/// appear verbatim in logs, so they are treated as a compatibility surface.
+/// are a closed set and appear verbatim in logs, so they are treated as a
+/// compatibility surface. Resource names and field details are not.
 pub mod refusal {
     pub const CLUSTER_EXTENSION_ESCAPE: &str = "cluster_extension_escape";
     pub const UNSUPPORTED_DISCOVERY_TYPE: &str = "unsupported_cluster_discovery_type";
@@ -188,14 +189,16 @@ pub mod refusal {
     pub const SDS_SECRET_REFUSED: &str = "sds_secret_refused";
 }
 
-/// Render a control-plane-supplied value for a log line: control characters
-/// stripped (no log-line forgery) and truncated.
+/// Bound a control-plane-supplied string for the NACK `error_detail` echoed
+/// back to **that same** control plane: control characters replaced (no
+/// log-line forgery on the wire) and truncated.
 ///
-/// A resource name, an extension key, and a filter name are all chosen by the
-/// control plane and bounded only by [`StockXdsLimits::max_resource_bytes`] —
-/// up to a mebibyte of arbitrary text per default bound. They are diagnostics,
-/// never comparison keys, so bounding them here costs nothing: the accumulator
-/// keeps every raw value it actually matches on.
+/// Truncation is **not** redaction. A third-party ADS server sees the
+/// bearer-authenticated request and can copy that bearer into `type_url`,
+/// `version_info`, `nonce`, a resource name, or an extension key. A prefix of
+/// those bytes is still credential material. This helper exists so the CP can
+/// recognize its own rejected response; the bounded string must not be written
+/// to a Ferrum log or any other operator-facing diagnostic sink.
 pub fn diagnostic_value(value: &str) -> String {
     const MAX_CHARS: usize = 160;
     let mut rendered = String::with_capacity(value.len().min(MAX_CHARS) + 12);
@@ -213,19 +216,31 @@ pub fn diagnostic_value(value: &str) -> String {
     rendered
 }
 
-/// One refused stock resource. Both string fields are rendered through
-/// [`diagnostic_value`] at construction, so a refusal carries no payload bytes
-/// and no unbounded or control-character-bearing control-plane value, and is
-/// safe to log verbatim.
+/// Closed-set marker stored in lieu of remote ADS `version_info`.
+///
+/// Per-type versions are observability only on this profile (no cross-type
+/// coherence gate). Storing a truncated copy of the CP's version would still
+/// put credential-derived bytes on `GET /mesh/config-drift` and in
+/// `MeshSlice.version`.
+pub const STOCK_RECEIVED_VERSION: &str = "received";
+
+/// One refused stock resource.
+///
+/// `type_label` and `reason` are a closed set and are the only fields that
+/// may be logged. `resource` and `detail` can still carry truncated
+/// control-plane-authored bytes (a resource name, an extension key) after
+/// [`diagnostic_value`]; they are kept for set-equality and tests, never for
+/// operator-facing diagnostics.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StockRefusal {
-    /// Short xDS type label (`cds` / `eds` / `lds` / `rds`).
+    /// Short xDS type label (`cds` / `eds` / `lds` / `rds` / `sds`).
     pub type_label: &'static str,
-    /// The control-plane resource name that was refused.
+    /// The control-plane resource name that was refused. Not log-safe.
     pub resource: String,
     /// Stable reason code from [`refusal`].
     pub reason: &'static str,
-    /// Field-specific detail — a field path or extension name, never a value.
+    /// Field-specific detail — a field path or a CP-chosen extension name.
+    /// Not log-safe.
     pub detail: String,
 }
 
@@ -447,9 +462,10 @@ impl StockXdsAccumulator {
         version: &str,
     ) -> Result<(), String> {
         let limits = self.limits;
-        // Every diagnostic below is echoed back to the control plane in
-        // `error_detail` AND logged locally, so the control-plane-supplied
-        // halves go through `diagnostic_value` first.
+        // Structural `Err` strings are echoed back to the same control plane
+        // as NACK `error_detail`. Bound the CP-authored halves so a hostile
+        // name cannot forge lines on that wire. Ferrum logs must not include
+        // these strings — truncation is not redaction.
         let safe_url = diagnostic_value(type_url);
         let label = stock_type_label(type_url)
             .ok_or_else(|| format!("unsupported xDS type_url '{safe_url}' on the stock profile"))?;
@@ -645,10 +661,10 @@ impl StockXdsAccumulator {
         }
 
         // Versions are opaque protocol tokens. The stream state retains the
-        // raw value needed for ACK/NACK, but the accumulator uses versions only
-        // for diagnostics and slice observability, so never retain an
-        // unbounded/control-character-bearing control-plane value here.
-        self.versions.insert(label, diagnostic_value(version));
+        // raw value needed for ACK/NACK; the accumulator's copy is only
+        // operator-facing observability (config-drift / slice.version), so it
+        // stores a closed-set presence marker rather than any CP bytes.
+        self.versions.insert(label, STOCK_RECEIVED_VERSION.to_string());
         self.refusals.insert(label, refusals);
         Ok(())
     }
@@ -725,7 +741,9 @@ impl StockXdsAccumulator {
     }
 
     /// Observability-only composite version. `MeshSlice::content_eq` ignores
-    /// `version`, so this never participates in change detection.
+    /// `version`, so this never participates in change detection. Values are
+    /// the closed-set [`STOCK_RECEIVED_VERSION`] marker, never remote
+    /// `version_info`.
     pub fn composite_version(&self) -> String {
         self.versions
             .iter()

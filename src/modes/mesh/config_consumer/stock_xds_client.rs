@@ -59,11 +59,23 @@
 //!
 //! Attempt classification, endpoint rotation, backoff, and transport keepalive
 //! are the shared [`super::stream_lifecycle`] policy (issue #3854).
+//!
+//! ## Log redaction
+//!
+//! A bearer-authenticated stock control plane sees the Authorization metadata
+//! and can copy that bearer into any ADS response field. Ferrum logs on this
+//! path therefore carry only closed-set type labels (`cds`/`eds`/`lds`/`rds`/
+//! `sds`/`unsolicited`/`policy_reload`), fixed reason codes, counts, booleans,
+//! endpoint indexes, and local node/namespace fields. Remote `type_url`,
+//! `version_info`, `nonce`, resource names, NACK error text, and refusal
+//! detail are omitted. Truncation is not redaction; NACK `error_detail` may
+//! still return a bounded copy of the CP's own fields to that same CP.
 
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use prost::Message;
@@ -103,10 +115,7 @@ use crate::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
 use crate::xds::proto::aggregated_discovery_service_client::AggregatedDiscoveryServiceClient;
 use crate::xds::proto::{self, DiscoveryRequest, Node, Status};
 use crate::xds::runtime_proto;
-use crate::xds::stock::{
-    StockDiscovery, StockRefusal, StockXdsAccumulator, StockXdsLimits, diagnostic_value,
-    refuse_stock_secret,
-};
+use crate::xds::stock::{StockDiscovery, StockRefusal, StockXdsAccumulator, StockXdsLimits};
 use crate::xds::translator::{
     CDS_TYPE_URL, EDS_TYPE_URL, LDS_TYPE_URL, RDS_TYPE_URL, SDS_TYPE_URL,
 };
@@ -1635,10 +1644,10 @@ async fn run_stock_ads_stream(
                             ));
                             debounce_active = true;
                         }
-                        Err(e) => {
+                        Err(_) => {
                             warn!(
                                 node_id = %config.node_id,
-                                error = %e,
+                                type_url = stock_log_type_label("policy-reload"),
                                 "Reloaded mesh policy document failed slice construction; keeping \
                                  the last good slice and raising config_rejected"
                             );
@@ -1752,65 +1761,44 @@ async fn handle_stock_response(
     stream_state: &mut StockStreamState,
 ) -> Result<StockResponseOutcome, StockResponseError> {
     let type_url = response.type_url.clone();
+    let type_label = stock_log_type_label(&type_url);
 
     // Unsubscribed / unsupported types fail closed by terminating the stream.
     // Sending a NACK DiscoveryRequest for a type the client never requested
     // would itself create a wildcard subscription to that type under SotW
-    // semantics. SDS gets a dedicated diagnostic because a stock CP
-    // volunteering key material is a security-relevant event, and Ferrum
-    // refuses it WITHOUT decoding the key fields or logging any payload.
+    // semantics. SDS gets a dedicated closed-set reason because a stock CP
+    // volunteering key material is a security-relevant event. Ferrum refuses
+    // it without decoding key fields and without logging any CP-authored
+    // name, type URL, or payload.
     if !is_stock_type_url(&type_url) {
-        // `type_url` is a control-plane-supplied string bounded only by the
-        // gRPC message size, and it lands in both a log line and the
-        // `error_detail` echoed back, so it is rendered before either use.
-        let safe_url = diagnostic_value(&type_url);
         let reason = if type_url == SDS_TYPE_URL {
-            // Bounded exactly like `log_refusals`: one volunteered SDS response
-            // must not be able to amplify into an unbounded burst of log lines.
-            for resource in response.resources.iter().take(STOCK_REFUSAL_LOG_LIMIT) {
-                let refusal = refuse_stock_secret(&resource.value);
-                warn!(
-                    node_id = %config.node_id,
-                    namespace = %config.namespace,
-                    resource = %refusal.resource,
-                    reason = refusal.reason,
-                    detail = %refusal.detail,
-                    "Refused an SDS secret pushed by the stock control plane; Ferrum never \
-                     ingests control-plane-delivered key or trust material"
-                );
-            }
-            if response.resources.len() > STOCK_REFUSAL_LOG_LIMIT {
-                warn!(
-                    node_id = %config.node_id,
-                    suppressed = response.resources.len() - STOCK_REFUSAL_LOG_LIMIT,
-                    "Additional refused SDS secrets suppressed by the per-response log bound"
-                );
-            }
-            format!(
-                "type_url '{safe_url}' is not consumed by the Ferrum stock xDS profile; workload \
-                 identity and trust anchors come from Ferrum's own SPIFFE configuration"
-            )
-        } else {
-            format!("type_url '{safe_url}' is not subscribed by the Ferrum stock xDS profile")
-        };
-        warn!(
-            node_id = %config.node_id,
-            type_url = %safe_url,
-            reason = %reason,
-            "Closing stock xDS stream after an unsolicited unsupported resource type"
-        );
-        return Err(StockResponseError::Policy(if type_url == SDS_TYPE_URL {
             "unsolicited_sds"
         } else {
             "unsolicited_type_url"
-        }));
+        };
+        if type_url == SDS_TYPE_URL {
+            warn!(
+                node_id = %config.node_id,
+                namespace = %config.namespace,
+                type_url = type_label,
+                reason,
+                refused_resources = response.resources.len(),
+                "Refused SDS secrets pushed by the stock control plane; Ferrum never \
+                 ingests control-plane-delivered key or trust material"
+            );
+        }
+        warn!(
+            node_id = %config.node_id,
+            type_url = type_label,
+            reason,
+            "Closing stock xDS stream after an unsolicited unsupported resource type"
+        );
+        return Err(StockResponseError::Policy(reason));
     }
 
     debug!(
         node_id = %config.node_id,
-        type_url = %type_url,
-        version = %diagnostic_value(&response.version_info),
-        nonce = %diagnostic_value(&response.nonce),
+        type_url = type_label,
         resources = response.resources.len(),
         "Received stock xDS ADS response"
     );
@@ -1825,7 +1813,7 @@ async fn handle_stock_response(
     ) {
         debug!(
             node_id = %config.node_id,
-            type_url = %type_url,
+            type_url = type_label,
             "Ignoring stale/duplicate stock xDS response (nonce already processed)"
         );
         return Ok(StockResponseOutcome::Acked);
@@ -1857,10 +1845,9 @@ async fn handle_stock_response(
         warn!(
             node_id = %config.node_id,
             namespace = %config.namespace,
-            type_url = %type_url,
+            type_url = type_label,
             consecutive_nacks = consecutive,
             blocking_first_slice,
-            error = %e,
             "NACKing invalid stock xDS ADS response"
         );
         if blocking_first_slice {
@@ -1872,7 +1859,7 @@ async fn handle_stock_response(
         if consecutive >= STOCK_CONSECUTIVE_NACK_LIMIT {
             warn!(
                 node_id = %config.node_id,
-                type_url = %type_url,
+                type_url = type_label,
                 consecutive_nacks = consecutive,
                 "Stock xDS NACK circuit breaker tripped; closing the stream to trigger \
                  reconnect/failover"
@@ -1907,6 +1894,7 @@ async fn handle_stock_response(
         let names = stream_state.subscriptions.resource_names(EDS_TYPE_URL);
         debug!(
             node_id = %config.node_id,
+            type_url = "eds",
             resources = names.len(),
             "Updating dependency-ordered EDS subscription after CDS update"
         );
@@ -1926,6 +1914,7 @@ async fn handle_stock_response(
         let names = stream_state.subscriptions.resource_names(RDS_TYPE_URL);
         debug!(
             node_id = %config.node_id,
+            type_url = "rds",
             resources = names.len(),
             "Updating dependency-ordered RDS subscription after LDS update"
         );
@@ -1941,7 +1930,7 @@ async fn handle_stock_response(
     if !accumulator.ready() {
         debug!(
             node_id = %config.node_id,
-            type_url = %type_url,
+            type_url = type_label,
             pending = ?accumulator.pending_types(),
             "ACKed stock xDS response while waiting for the remaining gating types"
         );
@@ -1961,15 +1950,15 @@ async fn handle_stock_response(
             refusals: discovery.refusals,
             policy_recovery_epoch,
         }))),
-        Err(e) => {
+        Err(_) => {
             // The discovery half validated structurally; a failure here means
             // the merged document is invalid. Keep the last good slice and
-            // surface it rather than tearing the stream down.
+            // surface it rather than tearing the stream down. The validation
+            // error can echo remote resource names, so it is omitted from logs.
             warn!(
                 node_id = %config.node_id,
                 namespace = %config.namespace,
-                type_url = %type_url,
-                error = %e,
+                type_url = type_label,
                 "Stock xDS discovery did not produce a valid mesh slice; keeping the last good slice"
             );
             Ok(StockResponseOutcome::Acked)
@@ -2013,7 +2002,6 @@ fn apply_pending(
         refusals,
         policy_recovery_epoch,
     } = *pending;
-    let version = slice.version.clone();
     let services = slice.services.len();
     let workloads = slice.workloads.len();
     // Bind the exact policy generation before `install_slice` wakes the proxy
@@ -2045,8 +2033,7 @@ fn apply_pending(
     info!(
         node_id = %config.node_id,
         namespace = %config.namespace,
-        version = %version,
-        type_url = %type_url,
+        type_url = stock_log_type_label(&type_url),
         services,
         workloads,
         refused_resources = refusals.len(),
@@ -2058,7 +2045,8 @@ fn apply_pending(
 /// Emit the capability refusals for this apply, but only when the refusal set
 /// CHANGED. A stock control plane re-sends the same unsupported resources on
 /// every update, so logging unconditionally would flood the operator's log with
-/// a static list.
+/// a static list. Only closed-set type labels, reason codes, and counts are
+/// emitted — resource names and field details can carry CP-authored bytes.
 fn log_refusals(
     config: &StockXdsClientConfig,
     refusals: &[StockRefusal],
@@ -2089,9 +2077,7 @@ fn log_refusals(
         warn!(
             node_id = %config.node_id,
             type_url = refusal.type_label,
-            resource = %refusal.resource,
             reason = refusal.reason,
-            field = %refusal.detail,
             "Refused a stock xDS resource"
         );
     }
@@ -2125,6 +2111,20 @@ fn is_stock_type_url(type_url: &str) -> bool {
         type_url,
         CDS_TYPE_URL | EDS_TYPE_URL | LDS_TYPE_URL | RDS_TYPE_URL
     )
+}
+
+/// Closed-set type label for stock ADS diagnostics. Arbitrary remote
+/// `type_url` strings collapse to `unsolicited`.
+fn stock_log_type_label(type_url: &str) -> &'static str {
+    match type_url {
+        CDS_TYPE_URL => "cds",
+        EDS_TYPE_URL => "eds",
+        LDS_TYPE_URL => "lds",
+        RDS_TYPE_URL => "rds",
+        SDS_TYPE_URL => "sds",
+        "policy-reload" => "policy_reload",
+        _ => "unsolicited",
+    }
 }
 
 /// Race one ADS RPC-open (response-headers) future against the credential
@@ -2365,6 +2365,99 @@ pub fn run_under_stock_credential_commit_admission_for_test<R>(
     let fence = StockCredentialFence::bind(watch, opened_generation, deadline, configured);
     let _admission = fence.admit_commit()?;
     Ok(commit())
+}
+
+/// Closed-set outcome of admitting one stock `DiscoveryResponse` through the
+/// production handler. Used by external tests to capture log output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StockResponseAdmission {
+    Acked,
+    Nacked,
+    Applied,
+    Closed(&'static str),
+}
+
+/// Drive the production stock ADS response path (admit, ACK/NACK, apply) so
+/// tests can capture tracing output without standing up a control plane.
+pub struct StockAdsAdmissionProbe {
+    accumulator: StockXdsAccumulator,
+    stream_state: StockStreamState,
+    last_logged_refusals: Option<Vec<StockRefusal>>,
+    state: MeshRuntimeState,
+}
+
+impl Default for StockAdsAdmissionProbe {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl StockAdsAdmissionProbe {
+    pub fn new() -> Self {
+        Self {
+            accumulator: StockXdsAccumulator::default(),
+            stream_state: StockStreamState::default(),
+            last_logged_refusals: None,
+            state: MeshRuntimeState::new(),
+        }
+    }
+
+    pub fn accumulator(&self) -> &StockXdsAccumulator {
+        &self.accumulator
+    }
+
+    pub async fn admit(
+        &mut self,
+        response: proto::DiscoveryResponse,
+        config: &StockXdsClientConfig,
+        baseline: &MeshConfig,
+        request: &MeshSliceRequest,
+    ) -> StockResponseAdmission {
+        let watch = StockCredentialWatch::new(StockCredentialState::NotConfigured);
+        let mut credential_rx = watch.receiver();
+        let fence = StockCredentialFence::bind(&watch, watch.latest().generation, None, false);
+        let (tx, mut rx) = mpsc::channel(32);
+        let mut outbound = StockOutbound {
+            tx: &tx,
+            bound: Duration::from_secs(5),
+            fence: &fence,
+            credential_rx: &mut credential_rx,
+        };
+        let recovery = MeshLocalSourceRecovery::new(Arc::new(AtomicBool::new(false)));
+        let result = handle_stock_response(
+            response,
+            config,
+            baseline,
+            None,
+            request,
+            &mut outbound,
+            &mut self.accumulator,
+            &mut self.stream_state,
+        )
+        .await;
+        drop(outbound);
+        drop(tx);
+        while rx.try_recv().is_ok() {}
+        match result {
+            Ok(StockResponseOutcome::Acked) => StockResponseAdmission::Acked,
+            Ok(StockResponseOutcome::Nacked) => StockResponseAdmission::Nacked,
+            Ok(StockResponseOutcome::Pending(pending)) => {
+                match apply_pending(
+                    config,
+                    &self.state,
+                    pending,
+                    &mut self.last_logged_refusals,
+                    recovery.as_ref(),
+                ) {
+                    Ok(()) => StockResponseAdmission::Applied,
+                    Err(reason) => StockResponseAdmission::Closed(reason),
+                }
+            }
+            Err(StockResponseError::Policy(reason)) => StockResponseAdmission::Closed(reason),
+            Err(StockResponseError::Transport(reason)) => StockResponseAdmission::Closed(reason),
+            Err(StockResponseError::Retirement(_)) => StockResponseAdmission::Closed("retired"),
+        }
+    }
 }
 
 // ── policy document watcher ──────────────────────────────────────────────
