@@ -10,11 +10,13 @@
 //!
 //! See RFC 9114 §8.1 (H3 error codes) and RFC 9000 §4.5 (STOP_SENDING).
 
+use std::future::Future;
+use std::pin::Pin;
 use std::time::Duration;
 
 use bytes::Bytes;
 use h3::error::Code;
-use h3::quic::{RecvStream, SendStream};
+use h3::quic::{RecvStream, SendStream, SendStreamStopped};
 use h3::server::RequestStream;
 
 /// Fixed gateway grace for writing an already-selected post-deadline /
@@ -169,6 +171,28 @@ where
     // as RESET_STREAM(0x0) on the wire and clients log
     // "Remote reset: 0x0" + a truncated response.
     stream.stop_sending(Code::H3_NO_ERROR);
+}
+
+/// Watch peer cancellation of this H3 request's response (send) direction.
+///
+/// Quinn's `SendStream::stopped` is `&self` and `'static`, so this future does
+/// not borrow `stream` and can race a backend header wait while the receive
+/// half is still polled or the send half is later used to write a response.
+/// Completes on peer `STOP_SENDING` or a connection-level failure. A clean
+/// local finish acknowledgement (`Ok(None)`) is not cancellation.
+pub(crate) fn peer_response_cancelled<S>(
+    stream: &RequestStream<S, Bytes>,
+) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>>
+where
+    S: SendStreamStopped,
+{
+    let stopped = stream.stopped();
+    Box::pin(async move {
+        match stopped.await {
+            Ok(Some(_)) | Err(_) => {}
+            Ok(None) => std::future::pending::<()>().await,
+        }
+    })
 }
 
 /// Abort the response send half for a gateway-originated streaming failure.

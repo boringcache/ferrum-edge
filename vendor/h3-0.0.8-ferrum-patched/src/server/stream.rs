@@ -115,6 +115,29 @@ where
     }
 }
 
+impl<S, B> crate::quic::SendStreamStopped for RequestStream<S, B>
+where
+    S: crate::quic::SendStreamStopped,
+{
+    /// Observe peer `STOP_SENDING` on the response (send) direction.
+    ///
+    /// The future is `'static` and does not borrow this stream, so a server can
+    /// race it against a backend wait while still using the receive half or a
+    /// later response write on the same send half.
+    fn stopped(
+        &self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<Option<u64>, crate::quic::StreamErrorIncoming>,
+                > + Send
+                + 'static,
+        >,
+    > {
+        crate::quic::SendStreamStopped::stopped(&self.inner)
+    }
+}
+
 impl<S, B> RequestStream<S, B>
 where
     S: quic::SendStream<B>,

@@ -96,7 +96,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::{Buf, Bytes, BytesMut};
-use h3::quic::{RecvStream, SendStream};
+use h3::quic::{RecvStream, SendStream, SendStreamStopped};
 use h3::server::RequestStream;
 use http::{Response, StatusCode};
 use http_body_util::BodyExt;
@@ -212,7 +212,7 @@ impl CoalesceConfig {
 
 pub(crate) struct CrossProtocolRequest<'a, S>
 where
-    S: RecvStream + SendStream<Bytes>,
+    S: RecvStream + SendStream<Bytes> + SendStreamStopped,
 {
     pub state: &'a ProxyState,
     pub epoch: &'a RequestEpoch,
@@ -339,18 +339,20 @@ enum H3BackendOrPeer<T> {
     PeerGone,
 }
 
-/// Race a backend wait against the H3 client's QUIC connection close and an
-/// optional gRPC-Web deadline.
+/// Race a backend wait against per-stream H3 cancellation, whole-connection
+/// close, and an optional gRPC-Web deadline.
 ///
 /// After the request body is complete the request task is blocked on reqwest
-/// `send()` and is not polling the H3 stream, so a per-stream STOP_SENDING is
-/// not observable through the public `h3` API. `PeerConnectionSignal` watches
-/// the QUIC connection itself; dropping the client endpoint is therefore the
-/// signal that must release destination-admission permits instead of holding
-/// them until the backend answers.
+/// `send()` and is not polling H3 frames. Peer `STOP_SENDING` on the gateway
+/// response direction is still observable through the vendored
+/// [`h3::quic::SendStreamStopped`] primitive (`&self`, `'static`), so a client
+/// can cancel one multiplexed stream without closing the QUIC connection and
+/// still release destination-admission permits. `PeerConnectionSignal` remains
+/// the whole-connection close path.
 async fn await_h3_backend_or_peer<F, T>(
     deadline: Option<tokio::time::Instant>,
     peer: Option<&crate::plugins::PeerConnectionSignal>,
+    stream_cancelled: impl std::future::Future<Output = ()>,
     future: F,
 ) -> H3BackendOrPeer<T>
 where
@@ -360,22 +362,28 @@ where
         return H3BackendOrPeer::PeerGone;
     }
     tokio::pin!(future);
-    match (deadline, peer) {
-        (None, None) => H3BackendOrPeer::Ready(future.await),
-        (Some(deadline), None) => match tokio::time::timeout_at(deadline, future).await {
-            Ok(value) => H3BackendOrPeer::Ready(value),
-            Err(_) => H3BackendOrPeer::Deadline,
-        },
-        (None, Some(peer)) => {
+    tokio::pin!(stream_cancelled);
+    let peer_closed = async {
+        if let Some(signal) = peer {
+            signal.closed().await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+    tokio::pin!(peer_closed);
+    match deadline {
+        None => {
             tokio::select! {
                 value = &mut future => H3BackendOrPeer::Ready(value),
-                _ = peer.closed() => H3BackendOrPeer::PeerGone,
+                _ = &mut stream_cancelled => H3BackendOrPeer::PeerGone,
+                _ = &mut peer_closed => H3BackendOrPeer::PeerGone,
             }
         }
-        (Some(deadline), Some(peer)) => {
+        Some(deadline) => {
             tokio::select! {
                 value = &mut future => H3BackendOrPeer::Ready(value),
-                _ = peer.closed() => H3BackendOrPeer::PeerGone,
+                _ = &mut stream_cancelled => H3BackendOrPeer::PeerGone,
+                _ = &mut peer_closed => H3BackendOrPeer::PeerGone,
                 _ = tokio::time::sleep_until(deadline) => H3BackendOrPeer::Deadline,
             }
         }
@@ -728,7 +736,7 @@ pub(crate) async fn run<S>(
     request: CrossProtocolRequest<'_, S>,
 ) -> Result<CrossProtocolOutcome, anyhow::Error>
 where
-    S: RecvStream + SendStream<Bytes>,
+    S: RecvStream + SendStream<Bytes> + SendStreamStopped,
 {
     let CrossProtocolRequest {
         state,
@@ -1811,7 +1819,7 @@ async fn dispatch_plain<S>(
     request_authority: Option<&str>,
 ) -> Result<CrossProtocolOutcome, anyhow::Error>
 where
-    S: RecvStream + SendStream<Bytes>,
+    S: RecvStream + SendStream<Bytes> + SendStreamStopped,
 {
     // Effective client-facing ceilings for this request: each global knob
     // narrowed by any active route ceiling, `0` still meaning unlimited. The H3
@@ -2070,6 +2078,7 @@ where
                     let send_result = match await_h3_backend_or_peer(
                         grpc_web_deadline_at,
                         ctx.peer_connection.as_ref(),
+                        crate::http3::stream_util::peer_response_cancelled(stream),
                         build_plain_request_builder(
                             &client,
                             state,
@@ -2117,6 +2126,7 @@ where
                         }
                         H3BackendOrPeer::PeerGone => {
                             drop(pending_slot);
+                            crate::http3::stream_util::halt_request_body(stream);
                             return Ok(plain_peer_gone_before_response_headers(
                                 state,
                                 proxy,
@@ -2661,6 +2671,13 @@ where
                 // final safety net for any await that remains uncancellable.
                 let reader_finished_for_reader = Arc::clone(&reader_finished);
                 let reader_done_notify_for_reader = Arc::clone(&reader_done_notify);
+                // Capture STOP_SENDING before the reader borrows the stream.
+                // The future is `'static` and does not hold `&mut` on either
+                // half, so the upload pump can keep polling recv_data.
+                let stream_cancelled =
+                    crate::http3::stream_util::peer_response_cancelled(stream);
+                let reader_peer_reset = Arc::new(AtomicBool::new(false));
+                let reader_reset_flag = Arc::clone(&reader_peer_reset);
                 let reader_future = async {
                     let finish_reader = || {
                         reader_finished_for_reader.store(true, Ordering::Release);
@@ -2719,15 +2736,12 @@ where
                                         finish_reader();
                                         return;
                                     }
-                                    Err(e) => {
-                                        tokio::select! {
-                                            biased;
-                                            _ = reader_halt.notified() => {}
-                                            _ = tx.send(Err(std::io::Error::other(format!(
-                                                "H3 recv_data failed: {}",
-                                                e
-                                            )))) => {}
-                                        }
+                                    Err(_e) => {
+                                        // Request-stream reset/termination while
+                                        // headers are still outstanding is
+                                        // downstream cancellation, not a
+                                        // backend body error.
+                                        reader_reset_flag.store(true, Ordering::Release);
                                         finish_reader();
                                         return;
                                     }
@@ -2767,6 +2781,7 @@ where
                             tokio::time::Instant::now() + Duration::from_secs(86_400)
                         }));
                     tokio::pin!(grpc_web_deadline);
+                    tokio::pin!(stream_cancelled);
                     let peer_closed = async {
                         if let Some(signal) = peer_signal.as_ref() {
                             signal.closed().await;
@@ -2787,6 +2802,17 @@ where
                                 // unconditional STOP_SENDING below closes the H3
                                 // receive half without delaying the status-4 writer.
                                 drop(pending_slot.take());
+                                break None;
+                            }
+                            _ = &mut stream_cancelled => {
+                                drop(pending_slot.take());
+                                peer_gone = true;
+                                if !reader_done {
+                                    halt_notify.notify_one();
+                                    let halt_deadline = Duration::from_millis(100);
+                                    let _ = tokio::time::timeout(halt_deadline, &mut reader_future)
+                                        .await;
+                                }
                                 break None;
                             }
                             _ = &mut peer_closed => {
@@ -2818,6 +2844,11 @@ where
                             }
                             _ = &mut reader_future, if !reader_done => {
                                 reader_done = true;
+                                if reader_peer_reset.load(Ordering::Acquire) {
+                                    drop(pending_slot.take());
+                                    peer_gone = true;
+                                    break None;
+                                }
                             }
                         }
                     }

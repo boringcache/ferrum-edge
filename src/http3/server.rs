@@ -1269,10 +1269,10 @@ async fn handle_h3_connection(
 /// (graceful or error), idle timeout, or path failure — and on local close.
 /// It deliberately observes only connection state: the request stream stays
 /// exclusively owned by the request task, so this never competes for request
-/// bytes and never suppresses a stream-accounting error. A per-stream
-/// RESET_STREAM that leaves the connection open is not observable through the
-/// public `h3` API and is therefore bounded by the fault-delay ceiling and the
-/// process-wide delayed-work budget instead.
+/// bytes and never suppresses a stream-accounting error. Per-stream
+/// `STOP_SENDING` / reset while the gateway waits for backend headers is
+/// observed separately through [`h3::quic::SendStreamStopped`] on that
+/// request task, not through this connection watch.
 struct QuicPeerConnectionWatch {
     connection: quinn::Connection,
 }

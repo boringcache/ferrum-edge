@@ -10,7 +10,7 @@
 //! an H3 request that is holding a backend exchange keeps the destination
 //! budget, the next H3 request is shed before any backend dial, and the budget
 //! comes back when the relay ends — both on a clean completion and when the
-//! client goes away mid-exchange.
+//! client cancels one multiplexed stream without closing the QUIC connection.
 //!
 //! Run: `cargo build --bin ferrum-edge && cargo test --test functional_tests \
 //!   functional_destination_active_requests_h3 -- --ignored --nocapture`
@@ -19,7 +19,7 @@ use super::destination_active_requests_helpers::{
     HoldBehavior, HoldingHttp1Backend, NS, OVERFLOW_BODY, UPSTREAM_ID,
     assert_projected_active_request_cap, prepare_for_assertions, start_gateway,
 };
-use crate::scaffolding::clients::{GetOptions, Http3Client, Http3Response, Http3ResponseStream};
+use crate::scaffolding::clients::{GetOptions, Http3Client, Http3Connection, Http3Response};
 
 use ferrum_edge::config::types::GatewayConfig;
 use http::StatusCode;
@@ -97,11 +97,8 @@ async fn functional_destination_active_requests_h3_release_on_client_cancellatio
 
     let hold_client = Http3Client::insecure().expect("hold h3 client");
     let hold_url = format!("https://localhost:{https_port}/h3/hold");
-    // Own the H3 stream (and its QUIC driver) so cancellation is a real
-    // STOP_SENDING + driver abort. Aborting a `get()` task leaks the inner
-    // driver, the gateway never sees the client go away, and the permit stays
-    // held — which is a fixture bug, not a still-held production permit.
-    let mut hold_stream = open_h3_hold_stream(&hold_client, &hold_url).await;
+    let mut session = connect_h3_session(&hold_client, &hold_url).await;
+    let mut hold_stream = open_finished_hold_stream(&mut session, &hold_url).await;
     backend.wait_for_hits(1, Duration::from_secs(20)).await;
 
     let probe_client = Http3Client::insecure().expect("probe h3 client");
@@ -117,23 +114,20 @@ async fn functional_destination_active_requests_h3_release_on_client_cancellatio
     );
     backend.assert_hits_eq(1, SETTLE).await;
 
+    // Cancel only this stream's response direction (peer STOP_SENDING on the
+    // gateway send half). The session (and its QUIC connection) stays open so a
+    // follow-up on the same connection cannot be explained by CONNECTION_CLOSE.
     hold_stream.cancel_response_download();
-    hold_stream.cancel_request_upload();
     drop(hold_stream);
-    // The H3 request task is blocked on backend headers and is not polling the
-    // stream, so STOP_SENDING alone is not observed. Closing the QUIC endpoint
-    // is the signal `PeerConnectionSignal` watches; that drops the destination
-    // permit instead of holding it until the backend answers.
-    hold_client.close();
-    drop(hold_client);
 
-    let after_client = Http3Client::insecure().expect("post-cancel h3 client");
-    let after = tokio::spawn({
-        let url = format!("https://localhost:{https_port}/h3/after-cancel");
-        async move { retry_h3_get(&after_client, &url).await }
+    let after_url = format!("https://localhost:{https_port}/h3/after-cancel");
+    let after = tokio::spawn(async move {
+        retry_h3_session_until_admitted(&mut session, &after_url).await
     });
-    // Reaching the fixture at all proves the permit was released; the fixture
-    // still holds the exchange until the release below.
+    // Reaching the fixture at all proves the permit was released while the
+    // first backend exchange is still held. If only whole-connection close
+    // were observed, this request would stay shed at 503 and never increment
+    // hits.
     backend.wait_for_hits(2, Duration::from_secs(25)).await;
 
     backend.release();
@@ -141,7 +135,65 @@ async fn functional_destination_active_requests_h3_release_on_client_cancellatio
     assert_eq!(
         after.status,
         StatusCode::OK,
-        "an H3 request admitted after a cancellation must complete: {after:?}"
+        "an H3 request admitted after a per-stream cancellation must complete: {after:?}"
+    );
+    assert_ne!(
+        after.body_text(),
+        OVERFLOW_BODY,
+        "the post-cancellation request must not be a destination shed"
+    );
+
+    gateway.shutdown().await;
+    backend.shutdown().await;
+}
+
+#[ignore]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn functional_destination_active_requests_h3_release_on_streaming_upload_cancellation() {
+    let backend = HoldingHttp1Backend::spawn(HoldBehavior::RespondOk).await;
+    let gateway = start_gateway(h3_destination_config(backend.port), true)
+        .await
+        .expect("start h3 gateway");
+    let https_port = gateway.https_port;
+
+    let hold_client = Http3Client::insecure().expect("hold h3 client");
+    let hold_url = format!("https://localhost:{https_port}/h3/hold");
+    let mut session = connect_h3_session(&hold_client, &hold_url).await;
+    let mut hold_stream = open_streaming_hold_stream(&mut session, &hold_url).await;
+    hold_stream
+        .send_data(bytes::Bytes::from_static(b"partial-upload"))
+        .await
+        .expect("send streaming hold body");
+    backend.wait_for_hits(1, Duration::from_secs(20)).await;
+
+    let probe_client = Http3Client::insecure().expect("probe h3 client");
+    let shed = retry_h3_get(
+        &probe_client,
+        &format!("https://localhost:{https_port}/h3/shed"),
+    )
+    .await;
+    assert_eq!(
+        shed.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "the destination must be saturated before streaming cancellation: {shed:?}"
+    );
+    backend.assert_hits_eq(1, SETTLE).await;
+
+    hold_stream.cancel_response_download();
+    drop(hold_stream);
+
+    let after_url = format!("https://localhost:{https_port}/h3/after-cancel");
+    let after = tokio::spawn(async move {
+        retry_h3_session_until_admitted(&mut session, &after_url).await
+    });
+    backend.wait_for_hits(2, Duration::from_secs(25)).await;
+
+    backend.release();
+    let after = after.await.expect("post-cancel streaming H3 task");
+    assert_eq!(
+        after.status,
+        StatusCode::OK,
+        "an H3 request admitted after streaming-upload cancellation must complete: {after:?}"
     );
     assert_ne!(
         after.body_text(),
@@ -170,14 +222,86 @@ async fn retry_h3_get(client: &Http3Client, url: &str) -> Http3Response {
     }
 }
 
-async fn open_h3_hold_stream(client: &Http3Client, url: &str) -> Http3ResponseStream {
+async fn retry_h3_session_until_admitted(
+    session: &mut Http3Connection,
+    url: &str,
+) -> Http3Response {
+    let deadline = Instant::now() + Duration::from_secs(25);
+    let mut last_status = None;
+    let mut last_err = None;
+    loop {
+        match session.get(url).await {
+            Ok(response)
+                if response.status == StatusCode::SERVICE_UNAVAILABLE
+                    && response.body_text() == OVERFLOW_BODY
+                    && Instant::now() < deadline =>
+            {
+                last_status = Some(response.status);
+                last_err = None;
+                sleep(Duration::from_millis(100)).await;
+            }
+            Ok(response) => return response,
+            Err(err) if Instant::now() < deadline => {
+                last_err = Some(err.to_string());
+                sleep(Duration::from_millis(100)).await;
+            }
+            Err(err) => panic!(
+                "H3 session request to {url} did not complete; last shed status={last_status:?}; last error={last_err:?}; final error={err}"
+            ),
+        }
+    }
+}
+
+async fn connect_h3_session(client: &Http3Client, url: &str) -> Http3Connection {
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut last_err = None;
     loop {
-        match client
-            .open_response_stream(url, GetOptions::default())
-            .await
-        {
+        match client.connect(url).await {
+            Ok(session) => return session,
+            Err(err) if Instant::now() < deadline => {
+                last_err = Some(err.to_string());
+                sleep(Duration::from_millis(100)).await;
+            }
+            Err(err) => panic!(
+                "H3 session to {url} did not connect; last startup error={last_err:?}; final error={err}"
+            ),
+        }
+    }
+}
+
+async fn open_finished_hold_stream(
+    session: &mut Http3Connection,
+    url: &str,
+) -> crate::scaffolding::clients::Http3ConnectionStream {
+    open_hold_stream(session, url, true).await
+}
+
+async fn open_streaming_hold_stream(
+    session: &mut Http3Connection,
+    url: &str,
+) -> crate::scaffolding::clients::Http3ConnectionStream {
+    let options = GetOptions::default().method(http::Method::POST);
+    open_hold_stream_with_options(session, url, options, false).await
+}
+
+async fn open_hold_stream(
+    session: &mut Http3Connection,
+    url: &str,
+    finish_body: bool,
+) -> crate::scaffolding::clients::Http3ConnectionStream {
+    open_hold_stream_with_options(session, url, GetOptions::default(), finish_body).await
+}
+
+async fn open_hold_stream_with_options(
+    session: &mut Http3Connection,
+    url: &str,
+    options: GetOptions,
+    finish_body: bool,
+) -> crate::scaffolding::clients::Http3ConnectionStream {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut last_err = None;
+    loop {
+        match session.open_stream(url, options.clone(), finish_body).await {
             Ok(stream) => return stream,
             Err(err) if Instant::now() < deadline => {
                 last_err = Some(err.to_string());

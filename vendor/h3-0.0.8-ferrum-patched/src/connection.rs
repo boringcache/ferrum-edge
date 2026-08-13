@@ -837,6 +837,24 @@ impl<S, B> RequestStream<S, B> {
     }
 }
 
+impl<S, B> crate::quic::SendStreamStopped for RequestStream<S, B>
+where
+    S: crate::quic::SendStreamStopped,
+{
+    fn stopped(
+        &self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<Option<u64>, crate::quic::StreamErrorIncoming>,
+                > + Send
+                + 'static,
+        >,
+    > {
+        self.stream.stopped()
+    }
+}
+
 impl<S, B> ConnectionState for RequestStream<S, B> {
     fn shared_state(&self) -> &SharedState {
         &self.conn_state

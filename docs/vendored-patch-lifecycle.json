@@ -12,11 +12,20 @@
   "co_retirement_groups": [
     {
       "id": "h3-all",
-      "description": "All three logical h3 patches share vendor/h3-0.0.8-ferrum-patched and must retire together.",
+      "description": "All four logical h3 patches share vendor/h3-0.0.8-ferrum-patched and must retire together.",
       "patch_ids": [
         "h3-001-recv-frame-drain-on-quic-close",
         "h3-002-extended-connect-websocket-protocol",
-        "h3-003-peek-buffered-trailers-before-fin"
+        "h3-003-peek-buffered-trailers-before-fin",
+        "h3-004-send-stream-stopped-watch"
+      ]
+    },
+    {
+      "id": "h3-quinn-all",
+      "description": "Both logical h3-quinn patches share vendor/h3-quinn-0.0.10-ferrum-patched and must retire together.",
+      "patch_ids": [
+        "h3-quinn-001-stop-sending-during-in-flight-read",
+        "h3-quinn-002-send-stream-stopped-watch"
       ]
     },
     {
@@ -153,7 +162,7 @@
       },
       "reaffirmation": null,
       "retirement": {
-        "trigger": "Fix ships in an h3 release and patches 002/003 are also retired.",
+        "trigger": "Fix ships in an h3 release and patches 002/003/004 are also retired.",
         "co_retirement_group": "h3-all",
         "compatible_release_test": {
           "status": "not_started",
@@ -187,7 +196,7 @@
       },
       "reaffirmation": null,
       "retirement": {
-        "trigger": "Upstream files and merges the variant and patches 001/003 are also retired.",
+        "trigger": "Upstream files and merges the variant and patches 001/003/004 are also retired.",
         "co_retirement_group": "h3-all",
         "compatible_release_test": {
           "status": "not_started",
@@ -217,7 +226,7 @@
       },
       "reaffirmation": null,
       "retirement": {
-        "trigger": "Upstream files and merges the API and patches 001/002 are also retired.",
+        "trigger": "Upstream files and merges the API and patches 001/002/004 are also retired.",
         "co_retirement_group": "h3-all",
         "compatible_release_test": {
           "status": "not_started",
@@ -226,6 +235,39 @@
       },
       "regression_tests": [
         "tests/integration/http3_integration_tests.rs (delayed-FIN trailer preservation)"
+      ]
+    },
+    {
+      "id": "h3-004-send-stream-stopped-watch",
+      "label": "h3 SendStreamStopped watch",
+      "crate": "h3",
+      "vendored_version": "0.0.8",
+      "vendor_path": "vendor/h3-0.0.8-ferrum-patched",
+      "docs_path": "docs/upstream-h3-patches/004-send-stream-stopped-watch/",
+      "owner": "Ferrum Edge maintainers",
+      "owner_github": null,
+      "reason": "After request HEADERS the gateway may block on backend headers without polling H3 frames; a client can STOP_SENDING one multiplexed stream and leave destination http2MaxRequests held until the backend answers. Stock h3 0.0.8 has no &self + 'static watch for that signal.",
+      "upstream": {
+        "filing": "deliberate_fork_unfiled",
+        "github_repo": "hyperium/h3",
+        "pr_number": null,
+        "issue_number": null,
+        "fork_ref": "jeremyjpj0916/h3@feat/send-stream-stopped-watch"
+      },
+      "reaffirmation": null,
+      "retirement": {
+        "trigger": "Upstream files and merges the API and patches 001/002/003 are also retired.",
+        "co_retirement_group": "h3-all",
+        "compatible_release_test": {
+          "status": "not_started",
+          "notes": null
+        }
+      },
+      "regression_tests": [
+        "tests/unit/gateway_core/http3_server_dispatch_tests.rs::h3_plain_header_wait_races_per_stream_stop_sending_not_only_connection_close",
+        "tests/unit/gateway_core/http3_server_dispatch_tests.rs::h3_quinn_vendored_send_stream_stopped_is_shared_and_static",
+        "tests/functional/functional_destination_active_requests_h3_test.rs::functional_destination_active_requests_h3_release_on_client_cancellation",
+        "tests/functional/functional_destination_active_requests_h3_test.rs::functional_destination_active_requests_h3_release_on_streaming_upload_cancellation"
       ]
     },
     {
@@ -247,8 +289,8 @@
       },
       "reaffirmation": null,
       "retirement": {
-        "trigger": "h3-quinn ships a release whose stop_sending is correct while a read is in flight.",
-        "co_retirement_group": null,
+        "trigger": "h3-quinn ships a release whose stop_sending is correct while a read is in flight and patch 002 is also retired.",
+        "co_retirement_group": "h3-quinn-all",
         "compatible_release_test": {
           "status": "not_started",
           "notes": null
@@ -258,6 +300,38 @@
         "tests/unit/gateway_core/http3_server_dispatch_tests.rs::h3_quinn_vendored_recv_stream_can_stop_sending_during_an_in_flight_read",
         "tests/unit/gateway_core/http3_server_dispatch_tests.rs::h3_native_grpc_upload_pump_halts_the_frontend_receive_half_gracefully",
         "tests/functional/scripted_backend_h3_tests.rs::h3_native_grpc_bidi_server_responds_before_client_half_close"
+      ]
+    },
+    {
+      "id": "h3-quinn-002-send-stream-stopped-watch",
+      "label": "h3-quinn SendStream::stopped watch",
+      "crate": "h3-quinn",
+      "vendored_version": "0.0.10",
+      "vendor_path": "vendor/h3-quinn-0.0.10-ferrum-patched",
+      "docs_path": "docs/upstream-h3-quinn-patches/002-send-stream-stopped-watch/",
+      "owner": "Ferrum Edge maintainers",
+      "owner_github": null,
+      "reason": "Stock h3-quinn 0.0.10 does not forward Quinn's SendStream::stopped (&self, 'static), so a header wait cannot observe per-stream STOP_SENDING without exclusive send-stream access.",
+      "upstream": {
+        "filing": "deliberate_fork_unfiled",
+        "github_repo": "hyperium/h3",
+        "pr_number": null,
+        "issue_number": null,
+        "fork_ref": null
+      },
+      "reaffirmation": null,
+      "retirement": {
+        "trigger": "h3-quinn ships a release with an equivalent watch and patch 001 is also retired.",
+        "co_retirement_group": "h3-quinn-all",
+        "compatible_release_test": {
+          "status": "not_started",
+          "notes": null
+        }
+      },
+      "regression_tests": [
+        "tests/unit/gateway_core/http3_server_dispatch_tests.rs::h3_quinn_vendored_send_stream_stopped_is_shared_and_static",
+        "tests/functional/functional_destination_active_requests_h3_test.rs::functional_destination_active_requests_h3_release_on_client_cancellation",
+        "tests/functional/functional_destination_active_requests_h3_test.rs::functional_destination_active_requests_h3_release_on_streaming_upload_cancellation"
       ]
     },
     {
