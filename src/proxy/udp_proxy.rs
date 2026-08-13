@@ -246,9 +246,11 @@ impl UdpSession {
     fn authorization_expired_now(
         &self,
     ) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
-        let authorization = self.authorization.as_ref()?;
-        (tokio::time::Instant::now() >= authorization.plan.at)
-            .then_some(authorization.plan.termination)
+        udp_reply_expired_at_commit(
+            self.authorization
+                .as_ref()
+                .map(|authorization| authorization.plan),
+        )
     }
 
     /// Settle this session's authorization expiry exactly once.
@@ -1484,7 +1486,12 @@ fn flush_sendmmsg_best_effort(
 
 /// Direct-send a reply datagram that the batched paths cannot represent
 /// (GSO-incompatible, sendmmsg-oversized, or post-flush refusal).
+///
+/// Rechecks the admitted absolute authorization plan immediately before the
+/// client send so a prior `await` (writable, hook) cannot smuggle a payload
+/// past expiry. Returns the bounded termination when the send must not happen.
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
 async fn direct_send_reply_or_drop(
     frontend: &Arc<UdpSocket>,
     data: &[u8],
@@ -1493,7 +1500,11 @@ async fn direct_send_reply_or_drop(
     proxy_id: &str,
     reason: &str,
     send_drops: &mut UdpReplySendDrops,
-) {
+    authorization: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
+    if let Some(termination) = udp_reply_expired_at_commit(authorization) {
+        return Some(termination);
+    }
     debug!(
         proxy_id = %proxy_id,
         client = %udp_client_log_addr(client_addr),
@@ -1511,12 +1522,18 @@ async fn direct_send_reply_or_drop(
             "UDP fallback direct-send failed; datagram lost"
         );
     }
+    None
 }
 
 /// Queue into `send_batch`, flushing once on `Full` and direct-sending on
 /// `Oversized` (datagram larger than the lazy sendmmsg slot) or a stubborn
 /// post-flush `Full`.
+///
+/// Rechecks the admitted absolute plan immediately before every flush or
+/// fallback send. Returns the bounded termination when queued payloads must
+/// be discarded rather than sent.
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
 async fn enqueue_sendmmsg_or_direct(
     send_batch: &mut super::udp_batch::SendMmsgBatch,
     frontend: &Arc<UdpSocket>,
@@ -1525,16 +1542,24 @@ async fn enqueue_sendmmsg_or_direct(
     local_ip: Option<crate::socket_opts::PktinfoLocal>,
     proxy_id: &str,
     send_drops: &mut UdpReplySendDrops,
-) {
+    authorization: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
     use super::udp_batch::SendMmsgPushResult;
     use std::os::unix::io::AsRawFd;
 
+    if let Some(termination) = udp_reply_expired_at_commit(authorization) {
+        return Some(termination);
+    }
+
     match send_batch.push_with_local(data, client_addr, local_ip) {
-        SendMmsgPushResult::Queued => {}
+        SendMmsgPushResult::Queued => None,
         SendMmsgPushResult::Oversized => {
             // Preserve backend reply order: an oversized direct send must not
             // overtake ordinary datagrams already queued in sendmmsg.
             while !send_batch.is_empty() {
+                if let Some(termination) = udp_reply_expired_at_commit(authorization) {
+                    return Some(termination);
+                }
                 if flush_sendmmsg_best_effort(send_batch, frontend.as_raw_fd(), send_drops).is_err()
                 {
                     break;
@@ -1548,13 +1573,17 @@ async fn enqueue_sendmmsg_or_direct(
                 proxy_id,
                 "sendmmsg_oversized",
                 send_drops,
+                authorization,
             )
-            .await;
+            .await
         }
         SendMmsgPushResult::Full => {
+            if let Some(termination) = udp_reply_expired_at_commit(authorization) {
+                return Some(termination);
+            }
             let _ = flush_sendmmsg_best_effort(send_batch, frontend.as_raw_fd(), send_drops);
             match send_batch.push_with_local(data, client_addr, local_ip) {
-                SendMmsgPushResult::Queued => {}
+                SendMmsgPushResult::Queued => None,
                 SendMmsgPushResult::Oversized => {
                     direct_send_reply_or_drop(
                         frontend,
@@ -1564,8 +1593,9 @@ async fn enqueue_sendmmsg_or_direct(
                         proxy_id,
                         "sendmmsg_oversized",
                         send_drops,
+                        authorization,
                     )
-                    .await;
+                    .await
                 }
                 SendMmsgPushResult::Full => {
                     // Still full after flush (socket likely congested / flush
@@ -1578,8 +1608,9 @@ async fn enqueue_sendmmsg_or_direct(
                         proxy_id,
                         "sendmmsg_post_flush_full",
                         send_drops,
+                        authorization,
                     )
-                    .await;
+                    .await
                 }
             }
         }
@@ -1589,6 +1620,7 @@ async fn enqueue_sendmmsg_or_direct(
 /// Drain a GSO buffer into sendmmsg, flushing when the batch fills and
 /// direct-sending when a segment exceeds the sendmmsg slot size.
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
 async fn drain_gso_to_sendmmsg_or_direct(
     gso_batch: &mut super::udp_batch::GsoBatchBuf,
     send_batch: &mut super::udp_batch::SendMmsgBatch,
@@ -1597,20 +1629,24 @@ async fn drain_gso_to_sendmmsg_or_direct(
     local_ip: Option<crate::socket_opts::PktinfoLocal>,
     proxy_id: &str,
     send_drops: &mut UdpReplySendDrops,
-) {
+    authorization: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
     use std::os::unix::io::AsRawFd;
 
     loop {
+        if let Some(termination) = udp_reply_expired_at_commit(authorization) {
+            return Some(termination);
+        }
         gso_batch.drain_to_sendmmsg(send_batch, client_addr, local_ip);
         if gso_batch.is_empty() {
-            break;
+            return None;
         }
         if send_batch.is_empty() {
             // Stuck on an oversized front segment — escape via direct-send.
             let Some(dgram) = gso_batch.take_front_datagram() else {
-                break;
+                return None;
             };
-            direct_send_reply_or_drop(
+            if let Some(termination) = direct_send_reply_or_drop(
                 frontend,
                 &dgram,
                 client_addr,
@@ -1618,9 +1654,16 @@ async fn drain_gso_to_sendmmsg_or_direct(
                 proxy_id,
                 "gso_drain_sendmmsg_oversized",
                 send_drops,
+                authorization,
             )
-            .await;
+            .await
+            {
+                return Some(termination);
+            }
             continue;
+        }
+        if let Some(termination) = udp_reply_expired_at_commit(authorization) {
+            return Some(termination);
         }
         let _ = flush_sendmmsg_best_effort(send_batch, frontend.as_raw_fd(), send_drops);
     }
@@ -1638,6 +1681,11 @@ async fn drain_gso_to_sendmmsg_or_direct(
 /// `gso_failed` is set to `true` if we have to abandon GSO for this session.
 /// The caller must stop calling this helper after that and drive `send_batch`
 /// directly.
+///
+/// Rechecks the admitted absolute plan immediately before every flush or
+/// fallback send so a payload queued before expiry is discarded rather than
+/// flushed afterwards. Returns the bounded termination when the caller must
+/// abandon the reply loop.
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 async fn try_gso_send_or_fallback(
@@ -1650,11 +1698,18 @@ async fn try_gso_send_or_fallback(
     proxy_id: &str,
     local_ip: Option<crate::socket_opts::PktinfoLocal>,
     send_drops: &mut UdpReplySendDrops,
-) {
+    authorization: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
+    if let Some(termination) = udp_reply_expired_at_commit(authorization) {
+        return Some(termination);
+    }
     if gso_batch.push(data) {
-        return;
+        return None;
     }
     // Batch full or size-mismatch — flush current batch and try once more.
+    if let Some(termination) = udp_reply_expired_at_commit(authorization) {
+        return Some(termination);
+    }
     match flush_gso_batch(gso_batch, frontend, client_addr, local_ip) {
         Ok(_) => {
             if !gso_batch.push(data) {
@@ -1662,7 +1717,7 @@ async fn try_gso_send_or_fallback(
                 // >max_bytes — GSO cannot represent either). Send it directly
                 // as a single datagram through the pktinfo-aware path so the
                 // reply still leaves with the captured source address.
-                direct_send_reply_or_drop(
+                return direct_send_reply_or_drop(
                     frontend,
                     data,
                     client_addr,
@@ -1670,9 +1725,11 @@ async fn try_gso_send_or_fallback(
                     proxy_id,
                     "gso_post_flush_refused",
                     send_drops,
+                    authorization,
                 )
                 .await;
             }
+            None
         }
         Err(e) => {
             // GSO sendmsg itself failed — abandon GSO for this session.
@@ -1683,7 +1740,7 @@ async fn try_gso_send_or_fallback(
                 e
             );
             *gso_failed = true;
-            drain_gso_to_sendmmsg_or_direct(
+            if let Some(termination) = drain_gso_to_sendmmsg_or_direct(
                 gso_batch,
                 send_batch,
                 frontend,
@@ -1691,8 +1748,12 @@ async fn try_gso_send_or_fallback(
                 local_ip,
                 proxy_id,
                 send_drops,
+                authorization,
             )
-            .await;
+            .await
+            {
+                return Some(termination);
+            }
             // Now push the current datagram (or direct-send if oversized/full).
             enqueue_sendmmsg_or_direct(
                 send_batch,
@@ -1702,8 +1763,9 @@ async fn try_gso_send_or_fallback(
                 local_ip,
                 proxy_id,
                 send_drops,
+                authorization,
             )
-            .await;
+            .await
         }
     }
 }
@@ -4042,6 +4104,64 @@ pub(crate) enum UdpReplyRecvOutcome<T> {
     AuthorizationExpired(crate::proxy::auth_lifetime::StreamAuthTermination),
 }
 
+/// Outcome of one backend→client datagram after the awaitable hook chain and
+/// the post-hook authorization re-check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UdpReplyDatagramCommit {
+    /// The datagram may be sent or enqueued for the client.
+    Commit,
+    /// A plugin dropped it; continue receiving. The session is still authorized.
+    Drop,
+    /// The absolute plan elapsed during or after the hook chain. The datagram
+    /// must not be sent or enqueued, and the reply task must tear down.
+    AuthorizationExpired(crate::proxy::auth_lifetime::StreamAuthTermination),
+}
+
+/// Recheck the admitted absolute authorization plan at a backend→client
+/// post-receive commitment boundary (issue #3816).
+///
+/// Unauthenticated sessions (`None`) take the `Option` miss only — no clock,
+/// timer, lock, or allocation. Authenticated sessions pay one monotonic
+/// comparison against the SAME absolute plan armed outside the receive loop.
+/// Relayed datagrams never refresh it.
+#[inline]
+pub(crate) fn udp_reply_expired_at_commit(
+    plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
+    let Some(plan) = plan else {
+        return None;
+    };
+    (tokio::time::Instant::now() >= plan.at).then_some(plan.termination)
+}
+
+/// Run the backend→client `on_udp_datagram` chain, then re-check the admitted
+/// absolute authorization plan before the caller may send or enqueue.
+///
+/// A plugin `Drop` is honored only when the session is still authorized:
+/// expiry during a slow hook wins, so a dropped payload cannot keep an
+/// unauthorized session alive. Unauthenticated sessions (`plan == None`) skip
+/// the clock after the hook chain.
+pub(crate) async fn udp_reply_commit_after_backend_hooks(
+    datagram_plugins: &[Arc<dyn Plugin>],
+    ctx: &UdpDatagramContext<'_>,
+    plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+) -> UdpReplyDatagramCommit {
+    let mut drop = false;
+    for plugin in datagram_plugins {
+        if matches!(plugin.on_udp_datagram(ctx).await, UdpDatagramVerdict::Drop) {
+            drop = true;
+            break;
+        }
+    }
+    if let Some(termination) = udp_reply_expired_at_commit(plan) {
+        return UdpReplyDatagramCommit::AuthorizationExpired(termination);
+    }
+    if drop {
+        return UdpReplyDatagramCommit::Drop;
+    }
+    UdpReplyDatagramCommit::Commit
+}
+
 /// Race one backend-reply receive against the session's absolute authorization
 /// deadline, the per-session stop signal, and listener/global shutdown.
 ///
@@ -5075,7 +5195,7 @@ async fn create_session(
         // Track whether GSO send has failed, to avoid retrying on kernels that don't support it.
         #[cfg(target_os = "linux")]
         let mut gso_failed = false;
-        loop {
+        'reply: loop {
             // Listener/global shutdown may already be set; borrow() also
             // advances each watch "seen" version so the cancel future's
             // changed() waits for a subsequent change.
@@ -5109,13 +5229,19 @@ async fn create_session(
                 match recv_result {
                     UdpReplyRecvOutcome::Stopped => break,
                     UdpReplyRecvOutcome::AuthorizationExpired(termination) => {
-                        // Settle once, then fall through to the shared exit
+                        // Settle once, discard any payload that never reached
+                        // the client, then fall through to the shared exit
                         // path: it closes the backend connection, marks this
                         // generation expired, closes the hook-ingress channel,
                         // removes only this exact generation, and releases the
                         // overload guard and active-session count.
                         reply_session.settle_authorization_expiry(termination);
-                        break;
+                        #[cfg(target_os = "linux")]
+                        {
+                            gso_batch.discard();
+                            send_batch.discard();
+                        }
+                        break 'reply;
                     }
                     UdpReplyRecvOutcome::Received(Ok(d)) => {
                         len = d.len();
@@ -5159,7 +5285,12 @@ async fn create_session(
                     UdpReplyRecvOutcome::AuthorizationExpired(termination) => {
                         // Same shared exit path as the DTLS-backend arm above.
                         reply_session.settle_authorization_expiry(termination);
-                        break;
+                        #[cfg(target_os = "linux")]
+                        {
+                            gso_batch.discard();
+                            send_batch.discard();
+                        }
+                        break 'reply;
                     }
                     UdpReplyRecvOutcome::Received(Ok(n)) => {
                         len = n;
@@ -5197,6 +5328,20 @@ async fn create_session(
                 break;
             };
 
+            // Recheck immediately after the receive returns, before any
+            // processing or client send: a datagram that won the receive race
+            // just before expiry must not be forwarded once the credential no
+            // longer authorizes the session.
+            if let Some(termination) = udp_reply_expired_at_commit(reply_authorization_plan) {
+                reply_session.settle_authorization_expiry(termination);
+                #[cfg(target_os = "linux")]
+                {
+                    gso_batch.discard();
+                    send_batch.discard();
+                }
+                break 'reply;
+            }
+
             // Amplification factor check: drop backend responses that exceed
             // the configured ratio relative to the last client request size.
             if let Some(factor) = reply_amplification_factor {
@@ -5215,7 +5360,9 @@ async fn create_session(
                 }
             }
 
-            // Run backend→client per-datagram plugin hooks.
+            // Run backend→client per-datagram plugin hooks, then re-check the
+            // absolute plan before any send or batch enqueue. A slow hook that
+            // crosses the deadline must not deliver the payload afterwards.
             if !reply_datagram_plugins.is_empty() {
                 let ctx = UdpDatagramContext {
                     client_ip: reply_dgram_client_ip.clone(),
@@ -5228,16 +5375,35 @@ async fn create_session(
                     payload_kind: reply_session.datagram_payload_kind,
                     metadata_sink: Some(UdpMetadataSink::new(&reply_session.metadata)),
                 };
-                let mut drop = false;
-                for plugin in reply_datagram_plugins.iter() {
-                    if matches!(plugin.on_udp_datagram(&ctx).await, UdpDatagramVerdict::Drop) {
-                        drop = true;
-                        break;
+                match udp_reply_commit_after_backend_hooks(
+                    reply_datagram_plugins.as_ref(),
+                    &ctx,
+                    reply_authorization_plan,
+                )
+                .await
+                {
+                    UdpReplyDatagramCommit::Drop => continue, // Silent drop
+                    UdpReplyDatagramCommit::AuthorizationExpired(termination) => {
+                        reply_session.settle_authorization_expiry(termination);
+                        #[cfg(target_os = "linux")]
+                        {
+                            gso_batch.discard();
+                            send_batch.discard();
+                        }
+                        break 'reply;
                     }
+                    UdpReplyDatagramCommit::Commit => {}
                 }
-                if drop {
-                    continue; // Silent drop
+            } else if let Some(termination) =
+                udp_reply_expired_at_commit(reply_authorization_plan)
+            {
+                reply_session.settle_authorization_expiry(termination);
+                #[cfg(target_os = "linux")]
+                {
+                    gso_batch.discard();
+                    send_batch.discard();
                 }
+                break 'reply;
             }
 
             // Batch-local counters for this recv burst.
@@ -5269,7 +5435,7 @@ async fn create_session(
                 #[cfg(target_os = "linux")]
                 {
                     if reply_udp_gso && !gso_failed {
-                        try_gso_send_or_fallback(
+                        if let Some(termination) = try_gso_send_or_fallback(
                             &mut gso_batch,
                             &mut send_batch,
                             &frontend,
@@ -5279,38 +5445,61 @@ async fn create_session(
                             &reply_proxy_id,
                             session_local_ip,
                             &mut send_drops,
+                            reply_authorization_plan,
                         )
-                        .await;
-                    } else {
-                        enqueue_sendmmsg_or_direct(
-                            &mut send_batch,
-                            &frontend,
-                            client_addr,
-                            send_data,
-                            session_local_ip,
-                            &reply_proxy_id,
-                            &mut send_drops,
-                        )
-                        .await;
+                        .await
+                        {
+                            reply_session.settle_authorization_expiry(termination);
+                            gso_batch.discard();
+                            send_batch.discard();
+                            break 'reply;
+                        }
+                    } else if let Some(termination) = enqueue_sendmmsg_or_direct(
+                        &mut send_batch,
+                        &frontend,
+                        client_addr,
+                        send_data,
+                        session_local_ip,
+                        &reply_proxy_id,
+                        &mut send_drops,
+                        reply_authorization_plan,
+                    )
+                    .await
+                    {
+                        reply_session.settle_authorization_expiry(termination);
+                        gso_batch.discard();
+                        send_batch.discard();
+                        break 'reply;
                     }
                 }
-            } else if let Err(e) = frontend.send_to(send_data, client_addr).await {
-                debug!(
-                    proxy_id = %reply_proxy_id,
-                    client = %udp_client_log_addr(client_addr),
-                    "UDP send to client failed: {}",
-                    e
-                );
-                let error_message = e.to_string();
-                // Client-facing send failure — the backend is healthy, so
-                // attribute the session teardown to the client recv path.
-                disconnect_error = Some((
-                    error_message.clone(),
-                    crate::retry::classify_boxed_error(anyhow::anyhow!(error_message).as_ref()),
-                    crate::plugins::DisconnectCause::RecvError,
-                    crate::plugins::Direction::BackendToClient,
-                ));
-                break;
+            } else {
+                if let Some(termination) = udp_reply_expired_at_commit(reply_authorization_plan) {
+                    reply_session.settle_authorization_expiry(termination);
+                    #[cfg(target_os = "linux")]
+                    {
+                        gso_batch.discard();
+                        send_batch.discard();
+                    }
+                    break 'reply;
+                }
+                if let Err(e) = frontend.send_to(send_data, client_addr).await {
+                    debug!(
+                        proxy_id = %reply_proxy_id,
+                        client = %udp_client_log_addr(client_addr),
+                        "UDP send to client failed: {}",
+                        e
+                    );
+                    let error_message = e.to_string();
+                    // Client-facing send failure — the backend is healthy, so
+                    // attribute the session teardown to the client recv path.
+                    disconnect_error = Some((
+                        error_message.clone(),
+                        crate::retry::classify_boxed_error(anyhow::anyhow!(error_message).as_ref()),
+                        crate::plugins::DisconnectCause::RecvError,
+                        crate::plugins::Direction::BackendToClient,
+                    ));
+                    break;
+                }
             }
 
             // For plain UDP, drain additional pending replies without yielding.
@@ -5322,6 +5511,20 @@ async fn create_session(
                 let batch_limit =
                     reply_adaptive_buffer.get_batch_limit(&reply_proxy_namespace, &reply_proxy_id);
                 for _ in 0..batch_limit {
+                    // Expiry during/among try_recv processing must stop accepting
+                    // further backend payloads; already-queued client datagrams
+                    // are discarded rather than flushed.
+                    if let Some(termination) =
+                        udp_reply_expired_at_commit(reply_authorization_plan)
+                    {
+                        reply_session.settle_authorization_expiry(termination);
+                        #[cfg(target_os = "linux")]
+                        {
+                            gso_batch.discard();
+                            send_batch.discard();
+                        }
+                        break 'reply;
+                    }
                     match sock.try_recv(&mut buf) {
                         Ok(len2) => {
                             // Amplification check on batched response datagram
@@ -5334,7 +5537,8 @@ async fn create_session(
                                     continue; // Drop oversized response
                                 }
                             }
-                            // Backend→client plugin hooks on batched datagram
+                            // Backend→client plugin hooks on batched datagram,
+                            // then re-check before send/enqueue.
                             if !reply_datagram_plugins.is_empty() {
                                 let ctx = UdpDatagramContext {
                                     client_ip: reply_dgram_client_ip.clone(),
@@ -5349,19 +5553,35 @@ async fn create_session(
                                         &reply_session.metadata,
                                     )),
                                 };
-                                let mut drop = false;
-                                for plugin in reply_datagram_plugins.iter() {
-                                    if matches!(
-                                        plugin.on_udp_datagram(&ctx).await,
-                                        UdpDatagramVerdict::Drop
-                                    ) {
-                                        drop = true;
-                                        break;
+                                match udp_reply_commit_after_backend_hooks(
+                                    reply_datagram_plugins.as_ref(),
+                                    &ctx,
+                                    reply_authorization_plan,
+                                )
+                                .await
+                                {
+                                    UdpReplyDatagramCommit::Drop => continue,
+                                    UdpReplyDatagramCommit::AuthorizationExpired(termination) => {
+                                        reply_session.settle_authorization_expiry(termination);
+                                        #[cfg(target_os = "linux")]
+                                        {
+                                            gso_batch.discard();
+                                            send_batch.discard();
+                                        }
+                                        break 'reply;
                                     }
+                                    UdpReplyDatagramCommit::Commit => {}
                                 }
-                                if drop {
-                                    continue;
+                            } else if let Some(termination) =
+                                udp_reply_expired_at_commit(reply_authorization_plan)
+                            {
+                                reply_session.settle_authorization_expiry(termination);
+                                #[cfg(target_os = "linux")]
+                                {
+                                    gso_batch.discard();
+                                    send_batch.discard();
                                 }
+                                break 'reply;
                             }
 
                             batch_dgrams += 1;
@@ -5372,7 +5592,7 @@ async fn create_session(
                                 #[cfg(target_os = "linux")]
                                 {
                                     if reply_udp_gso && !gso_failed {
-                                        try_gso_send_or_fallback(
+                                        if let Some(termination) = try_gso_send_or_fallback(
                                             &mut gso_batch,
                                             &mut send_batch,
                                             &frontend,
@@ -5382,19 +5602,31 @@ async fn create_session(
                                             &reply_proxy_id,
                                             session_local_ip,
                                             &mut send_drops,
+                                            reply_authorization_plan,
                                         )
-                                        .await;
-                                    } else {
-                                        enqueue_sendmmsg_or_direct(
-                                            &mut send_batch,
-                                            &frontend,
-                                            client_addr,
-                                            &buf[..len2],
-                                            session_local_ip,
-                                            &reply_proxy_id,
-                                            &mut send_drops,
-                                        )
-                                        .await;
+                                        .await
+                                        {
+                                            reply_session.settle_authorization_expiry(termination);
+                                            gso_batch.discard();
+                                            send_batch.discard();
+                                            break 'reply;
+                                        }
+                                    } else if let Some(termination) = enqueue_sendmmsg_or_direct(
+                                        &mut send_batch,
+                                        &frontend,
+                                        client_addr,
+                                        &buf[..len2],
+                                        session_local_ip,
+                                        &reply_proxy_id,
+                                        &mut send_drops,
+                                        reply_authorization_plan,
+                                    )
+                                    .await
+                                    {
+                                        reply_session.settle_authorization_expiry(termination);
+                                        gso_batch.discard();
+                                        send_batch.discard();
+                                        break 'reply;
                                     }
                                 }
                             } else if let Err(e) = frontend.send_to(&buf[..len2], client_addr).await
@@ -5481,6 +5713,14 @@ async fn create_session(
             // Flush batched sends after draining all pending replies.
             #[cfg(target_os = "linux")]
             if send_batched {
+                // Recheck immediately before any GSO/sendmmsg flush so a payload
+                // queued before expiry is discarded rather than sent.
+                if let Some(termination) = udp_reply_expired_at_commit(reply_authorization_plan) {
+                    reply_session.settle_authorization_expiry(termination);
+                    gso_batch.discard();
+                    send_batch.discard();
+                    break 'reply;
+                }
                 // Flush GSO batch first (if used).
                 if reply_udp_gso && !gso_failed && !gso_batch.is_empty() {
                     let flush_result =
@@ -5495,7 +5735,7 @@ async fn create_session(
                         gso_failed = true;
                         // Replay all buffered datagrams through sendmmsg /
                         // direct-send for segments that exceed the slot size.
-                        drain_gso_to_sendmmsg_or_direct(
+                        if let Some(termination) = drain_gso_to_sendmmsg_or_direct(
                             &mut gso_batch,
                             &mut send_batch,
                             &frontend,
@@ -5503,15 +5743,38 @@ async fn create_session(
                             session_local_ip,
                             &reply_proxy_id,
                             &mut send_drops,
+                            reply_authorization_plan,
                         )
-                        .await;
+                        .await
+                        {
+                            reply_session.settle_authorization_expiry(termination);
+                            gso_batch.discard();
+                            send_batch.discard();
+                            break 'reply;
+                        }
                     }
                 }
                 // Flush sendmmsg batch (used when GSO is disabled/failed, or GSO drain).
                 if !send_batch.is_empty() {
+                    if let Some(termination) =
+                        udp_reply_expired_at_commit(reply_authorization_plan)
+                    {
+                        reply_session.settle_authorization_expiry(termination);
+                        gso_batch.discard();
+                        send_batch.discard();
+                        break 'reply;
+                    }
                     use std::os::unix::io::AsRawFd;
                     let fd = frontend.as_raw_fd();
                     loop {
+                        if let Some(termination) =
+                            udp_reply_expired_at_commit(reply_authorization_plan)
+                        {
+                            reply_session.settle_authorization_expiry(termination);
+                            gso_batch.discard();
+                            send_batch.discard();
+                            break 'reply;
+                        }
                         match flush_sendmmsg_best_effort(&mut send_batch, fd, &mut send_drops) {
                             Ok(_) if send_batch.is_empty() => break,
                             Ok(_) => continue, // partial send — retry remaining

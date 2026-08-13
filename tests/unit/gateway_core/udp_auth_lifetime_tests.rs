@@ -642,6 +642,199 @@ async fn an_authorized_session_still_observes_idle_and_drain_stops() {
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn a_reply_held_in_a_slow_backend_hook_is_not_committed_after_expiry() {
+    // The receive can win just before expiry; the subsequent awaitable
+    // backend→client hook is what used to smuggle the payload past the
+    // deadline. The production post-hook commitment seam must refuse send.
+    struct SlowBackendToClientHook {
+        delay: Duration,
+        ran: Arc<AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl ferrum_edge::plugins::Plugin for SlowBackendToClientHook {
+        fn name(&self) -> &str {
+            "test_slow_backend_to_client_udp_datagram"
+        }
+        async fn on_udp_datagram(
+            &self,
+            _ctx: &ferrum_edge::plugins::UdpDatagramContext<'_>,
+        ) -> ferrum_edge::plugins::UdpDatagramVerdict {
+            self.ran.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(self.delay).await;
+            ferrum_edge::plugins::UdpDatagramVerdict::Forward
+        }
+    }
+
+    let ran = Arc::new(AtomicUsize::new(0));
+    let plugin = Arc::new(SlowBackendToClientHook {
+        delay: Duration::from_millis(80),
+        ran: Arc::clone(&ran),
+    });
+    let plugins: Vec<Arc<dyn ferrum_edge::plugins::Plugin>> = vec![plugin];
+    let plan = future_plan(
+        Duration::from_millis(20),
+        StreamAuthTermination::CredentialExpired,
+    );
+
+    let commit = tokio::spawn(async move {
+        ferrum_edge::_test_support::udp_reply_commit_after_backend_hooks_for_test(
+            &plugins,
+            b"held-until-after-expiry",
+            Some(plan),
+        )
+        .await
+    });
+    tokio::time::advance(Duration::from_millis(80)).await;
+    assert_eq!(
+        commit.await.expect("join"),
+        ferrum_edge::_test_support::UdpReplyDatagramCommitForTest::AuthorizationExpired(
+            StreamAuthTermination::CredentialExpired
+        ),
+        "a datagram received before expiry but held in a slow hook must not be committed afterwards"
+    );
+    assert_eq!(ran.load(Ordering::SeqCst), 1, "the hook did run");
+}
+
+#[tokio::test(start_paused = true)]
+async fn expiry_during_a_dropping_hook_still_terminates_the_session() {
+    // A plugin Drop after the deadline must not keep the unauthorized session
+    // alive by returning Drop instead of AuthorizationExpired.
+    struct SlowDropHook;
+    #[async_trait::async_trait]
+    impl ferrum_edge::plugins::Plugin for SlowDropHook {
+        fn name(&self) -> &str {
+            "test_slow_drop_backend_to_client_udp_datagram"
+        }
+        async fn on_udp_datagram(
+            &self,
+            _ctx: &ferrum_edge::plugins::UdpDatagramContext<'_>,
+        ) -> ferrum_edge::plugins::UdpDatagramVerdict {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            ferrum_edge::plugins::UdpDatagramVerdict::Drop
+        }
+    }
+
+    let plugins: Vec<Arc<dyn ferrum_edge::plugins::Plugin>> = vec![Arc::new(SlowDropHook)];
+    let plan = future_plan(
+        Duration::from_millis(20),
+        StreamAuthTermination::AuthenticatedStreamMaxLifetime,
+    );
+    let commit = tokio::spawn(async move {
+        ferrum_edge::_test_support::udp_reply_commit_after_backend_hooks_for_test(
+            &plugins,
+            b"drop-after-expiry",
+            Some(plan),
+        )
+        .await
+    });
+    tokio::time::advance(Duration::from_millis(80)).await;
+    assert_eq!(
+        commit.await.expect("join"),
+        ferrum_edge::_test_support::UdpReplyDatagramCommitForTest::AuthorizationExpired(
+            StreamAuthTermination::AuthenticatedStreamMaxLifetime
+        )
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn expiry_among_try_recv_batch_processing_stops_later_replies() {
+    // Each drain step re-reads the same absolute plan. The first payload is
+    // still authorized; after the deadline elapses the drain must refuse
+    // further backend payloads rather than continue try_recv.
+    let plan = future_plan(
+        Duration::from_millis(40),
+        StreamAuthTermination::AuthenticatedStreamMaxLifetime,
+    );
+    assert_eq!(
+        ferrum_edge::_test_support::udp_reply_expired_at_commit_for_test(Some(plan)),
+        None,
+        "the first drain step is still inside the lifetime"
+    );
+
+    tokio::time::advance(Duration::from_millis(40)).await;
+    assert_eq!(
+        ferrum_edge::_test_support::udp_reply_expired_at_commit_for_test(Some(plan)),
+        Some(StreamAuthTermination::AuthenticatedStreamMaxLifetime),
+        "a later try_recv step must stop accepting backend payloads"
+    );
+    // Relayed traffic must not have moved the deadline.
+    assert_eq!(
+        ferrum_edge::_test_support::udp_reply_expired_at_commit_for_test(Some(plan)),
+        Some(StreamAuthTermination::AuthenticatedStreamMaxLifetime)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn unauthenticated_commitment_checks_never_expire() {
+    assert_eq!(
+        ferrum_edge::_test_support::udp_reply_expired_at_commit_for_test(None),
+        None
+    );
+    tokio::time::advance(Duration::from_secs(86_400)).await;
+    assert_eq!(
+        ferrum_edge::_test_support::udp_reply_expired_at_commit_for_test(None),
+        None,
+        "an unauthenticated session has no plan, so commitment checks stay a miss"
+    );
+
+    assert_eq!(
+        ferrum_edge::_test_support::udp_reply_commit_after_backend_hooks_for_test(
+            &[],
+            b"unauthenticated-reply",
+            None,
+        )
+        .await,
+        ferrum_edge::_test_support::UdpReplyDatagramCommitForTest::Commit
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn post_hook_expiry_settles_once_and_uses_the_shared_teardown() {
+    // The new post-receive / post-hook / try_recv / flush checks settle
+    // through the same latch the receive-arm expiry used, then the existing
+    // identity-aware teardown runs exactly once.
+    let latch = StreamAuthTerminationLatch::default();
+    let before = stream_udp_terminations();
+    let session = probe(
+        Some(elapsed_plan(StreamAuthTermination::CredentialExpired)),
+        latch.clone(),
+        false,
+    )
+    .await;
+
+    assert_eq!(
+        ferrum_edge::_test_support::udp_reply_expired_at_commit_for_test(Some(elapsed_plan(
+            StreamAuthTermination::CredentialExpired
+        ))),
+        Some(StreamAuthTermination::CredentialExpired)
+    );
+    assert!(session.forward(b"post-expiry").await.is_err());
+    assert_eq!(
+        session.observed_termination(),
+        Some(StreamAuthTermination::CredentialExpired)
+    );
+
+    let summary = session
+        .run_reply_task_exit_teardown()
+        .expect("this generation owns the removal");
+    assert!(summary.connection_error.is_some());
+    assert!(
+        stream_udp_terminations().0 >= before.0 + 1,
+        "the reply-path expiry still records the stream_udp counter once"
+    );
+    assert!(
+        !latch.record_once(
+            StreamAuthTermination::CredentialExpired,
+            StreamAuthProtocolFamily::StreamUdp,
+        ),
+        "settlement remains exactly once"
+    );
+    assert!(session.run_reply_task_exit_teardown().is_none());
+    assert_eq!(session.overload_active_connections(), 0);
+    assert_eq!(session.active_sessions(), 0);
+}
+
 // ── Teardown, generation identity, and accounting ───────────────────────
 
 #[tokio::test(start_paused = true)]
@@ -919,17 +1112,36 @@ fn the_client_to_backend_authorization_gate_stays_on_the_hot_path_budget() {
         .next()
         .expect("the expiry predicate body");
     assert!(
-        expired_now.contains("self.authorization.as_ref()?"),
+        expired_now.contains("self.authorization.as_ref()"),
         "an unauthenticated session must short-circuit before any clock read"
     );
     assert!(
-        expired_now.contains("tokio::time::Instant::now() >= authorization.plan.at"),
-        "the gate is a monotonic instant comparison"
+        expired_now.contains("udp_reply_expired_at_commit("),
+        "the client→backend gate shares the reply-path commitment predicate"
     );
     for forbidden in ["lock()", "format!(", "Vec::", "String::"] {
         assert!(
             !expired_now.contains(forbidden),
             "the per-datagram expiry predicate must not use `{forbidden}`"
+        );
+    }
+
+    let commit = body_of("pub(crate) fn udp_reply_expired_at_commit")
+        .split("\n}\n")
+        .next()
+        .expect("the commitment predicate body");
+    assert!(
+        commit.contains("let Some(plan) = plan else"),
+        "an unauthenticated session must return before any clock read"
+    );
+    assert!(
+        commit.contains("tokio::time::Instant::now() >= plan.at"),
+        "an authenticated check is one monotonic instant comparison"
+    );
+    for forbidden in ["lock()", "format!(", "sleep", "spawn"] {
+        assert!(
+            !commit.contains(forbidden),
+            "the commitment predicate must not use `{forbidden}`"
         );
     }
 }
@@ -942,8 +1154,8 @@ fn the_reply_task_arms_its_authorization_timer_once() {
         .find("let mut reply_authorization_deadline")
         .expect("the reply task's authorization arm");
     let loop_at = create_session[arm_at..]
-        .find("\n        loop {")
-        .expect("the reply receive loop");
+        .find("\n        'reply: loop {")
+        .expect("the labeled reply receive loop");
     assert!(
         loop_at > 0,
         "the deadline must be armed BEFORE the receive loop, so no per-datagram timer is \
@@ -1091,5 +1303,84 @@ fn every_client_to_backend_path_is_gated() {
     assert!(
         !enqueue[..enqueue_gate].contains("record_hook_ingress_drop"),
         "a policy refusal must not be recorded as gateway backpressure"
+    );
+}
+
+/// Backend→client expiry is re-checked at every post-receive commitment
+/// boundary, and queued GSO/sendmmsg payloads are discarded — not flushed.
+#[test]
+fn the_reply_task_rechecks_and_discards_at_every_commitment_boundary() {
+    let create_session = body_of("async fn create_session(");
+    let reply_loop = create_session
+        .split("'reply: loop {")
+        .nth(1)
+        .expect("the labeled reply loop");
+
+    assert!(
+        reply_loop.contains("udp_reply_expired_at_commit(reply_authorization_plan)"),
+        "the reply loop rechecks the admitted absolute plan at commitment boundaries"
+    );
+    assert!(
+        reply_loop.contains("udp_reply_commit_after_backend_hooks("),
+        "awaitable backend→client hooks recheck before send or enqueue"
+    );
+    assert!(
+        reply_loop.contains("gso_batch.discard()"),
+        "expiry discards queued GSO datagrams rather than flushing them"
+    );
+    assert!(
+        reply_loop.contains("send_batch.discard()"),
+        "expiry discards queued sendmmsg datagrams rather than flushing them"
+    );
+
+    let after_recv = reply_loop
+        .find("let send_data =")
+        .expect("post-receive send_data");
+    let after_recv_check = reply_loop[after_recv..]
+        .find("udp_reply_expired_at_commit(reply_authorization_plan)")
+        .expect("post-receive commitment check");
+    let hooks = reply_loop
+        .find("udp_reply_commit_after_backend_hooks(")
+        .expect("post-hook commitment");
+    assert!(
+        after_recv_check < hooks - after_recv,
+        "the plan is rechecked after recv returns, before the hook chain"
+    );
+
+    let try_recv_for = reply_loop
+        .find("for _ in 0..batch_limit {")
+        .expect("the try_recv drain");
+    let drain = &reply_loop[try_recv_for..];
+    let drain_check = drain
+        .find("udp_reply_expired_at_commit(reply_authorization_plan)")
+        .expect("try_recv drain commitment check");
+    let try_recv = drain.find("sock.try_recv(").expect("try_recv");
+    assert!(
+        drain_check < try_recv,
+        "expiry at the top of the try_recv drain must stop accepting more backend payloads"
+    );
+
+    let flush_section = reply_loop
+        .find("// Flush batched sends after draining all pending replies.")
+        .expect("the flush section");
+    let flush = &reply_loop[flush_section..];
+    let flush_check = flush
+        .find("udp_reply_expired_at_commit(reply_authorization_plan)")
+        .expect("pre-flush commitment check");
+    let flush_gso = flush.find("flush_gso_batch(").expect("GSO flush");
+    assert!(
+        flush_check < flush_gso,
+        "queued GSO/sendmmsg payloads must be rechecked before any client flush"
+    );
+
+    let expire_breaks = reply_loop.matches("break 'reply;").count();
+    assert!(
+        expire_breaks >= 6,
+        "expiry must exit the entire reply loop (got {expire_breaks} labeled breaks), so the \
+         shared identity-aware teardown runs exactly once"
+    );
+    assert!(
+        !reply_loop.contains("tokio::time::sleep_until("),
+        "commitment rechecks must not arm a per-datagram timer"
     );
 }

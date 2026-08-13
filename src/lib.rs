@@ -7716,6 +7716,59 @@ pub mod _test_support {
         }
     }
 
+    /// Recheck the admitted absolute authorization plan at a backend→client
+    /// post-receive commitment boundary — the exact predicate the reply task
+    /// uses after recv, after hooks, at the top of `try_recv` drain, and
+    /// immediately before GSO/sendmmsg flush.
+    #[must_use]
+    pub fn udp_reply_expired_at_commit_for_test(
+        plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+    ) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
+        crate::proxy::udp_proxy::udp_reply_expired_at_commit(plan)
+    }
+
+    /// Outcome of one backend→client datagram after the awaitable hook chain
+    /// and the post-hook authorization re-check.
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum UdpReplyDatagramCommitForTest {
+        Commit,
+        Drop,
+        AuthorizationExpired(crate::proxy::auth_lifetime::StreamAuthTermination),
+    }
+
+    /// Run the production backend→client hook chain then re-check the absolute
+    /// authorization plan before any client send or batch enqueue.
+    pub async fn udp_reply_commit_after_backend_hooks_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        payload: &[u8],
+        plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+    ) -> UdpReplyDatagramCommitForTest {
+        let ctx = crate::plugins::UdpDatagramContext {
+            client_ip: Arc::from("127.0.0.1"),
+            proxy_id: Arc::from("udp-proxy"),
+            proxy_name: None,
+            listen_port: 5300,
+            datagram_size: payload.len(),
+            direction: crate::plugins::UdpDatagramDirection::BackendToClient,
+            payload,
+            payload_kind: crate::plugins::StreamBytesKind::PlaintextWire,
+            metadata_sink: None,
+        };
+        match crate::proxy::udp_proxy::udp_reply_commit_after_backend_hooks(plugins, &ctx, plan)
+            .await
+        {
+            crate::proxy::udp_proxy::UdpReplyDatagramCommit::Commit => {
+                UdpReplyDatagramCommitForTest::Commit
+            }
+            crate::proxy::udp_proxy::UdpReplyDatagramCommit::Drop => {
+                UdpReplyDatagramCommitForTest::Drop
+            }
+            crate::proxy::udp_proxy::UdpReplyDatagramCommit::AuthorizationExpired(termination) => {
+                UdpReplyDatagramCommitForTest::AuthorizationExpired(termination)
+            }
+        }
+    }
+
     /// A real plain-UDP session (real backend socket, real overload guard, real
     /// hook-ingress channel) that external coverage drives through the
     /// production datagram paths.
