@@ -1905,11 +1905,11 @@ plugin_configs: []
 }
 
 // ============================================================================
-// Unknown Extension Fallback Test
+// Extension-only format selection tests
 // ============================================================================
 
 #[test]
-fn test_unknown_extension_fallback_to_yaml() {
+fn test_unknown_extension_selects_yaml() {
     let yaml = r#"
 version: "1"
 proxies:
@@ -1934,7 +1934,7 @@ plugin_configs: []
 }
 
 #[test]
-fn test_unknown_extension_fallback_to_json() {
+fn test_unknown_extension_accepts_json_through_yaml_superset() {
     let json = r#"{
   "version": "1",
   "proxies": [{
@@ -2781,4 +2781,127 @@ plugin_configs:
         ]
     );
     assert_eq!(config.plugin_configs[0].proxy_id, None);
+}
+
+#[test]
+fn yaml_alias_bomb_is_rejected_without_echoing_payload() {
+    let yaml = concat!(
+        "version: \"1\"\n",
+        "a: &a [1,2,3,4,5,6,7,8]\n",
+        "b: &b [*a,*a,*a,*a,*a,*a,*a,*a]\n",
+        "c: &c [*b,*b,*b,*b,*b,*b,*b,*b]\n",
+        "d: &d [*c,*c,*c,*c,*c,*c,*c,*c]\n",
+        "e: &e [*d,*d,*d,*d,*d,*d,*d,*d]\n",
+        "f: &f [*e,*e,*e,*e,*e,*e,*e,*e]\n",
+        "g: &g [*f,*f,*f,*f,*f,*f,*f,*f]\n",
+        "proxies:\n",
+        "  - id: bomb\n",
+        "    listen_path: /x\n",
+        "    backend_scheme: http\n",
+        "    backend_host: *g\n",
+        "    backend_port: 80\n",
+        "consumers: []\n",
+        "plugin_configs: []\n",
+    );
+    let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
+    write!(file, "{yaml}").unwrap();
+    let err = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        "ferrum",
+    )
+    .expect_err("alias bomb must fail closed");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("exceeds") || msg.contains("limit"),
+        "got {msg}"
+    );
+    assert!(
+        !msg.contains("[1,2,3") && !msg.contains("*g"),
+        "file-loader diagnostics must not echo the hostile graph: {msg}"
+    );
+}
+
+#[test]
+fn yaml_comments_with_ampersands_and_stars_do_not_trip_alias_admission() {
+    let yaml = r#"
+# operator note: reuse &host and *host only as documentation
+version: "1"
+proxies:
+  - id: "proxy-1"
+    listen_path: "/api/v1"
+    backend_scheme: http
+    backend_host: "localhost"
+    backend_port: 3000
+consumers: []
+plugin_configs: []
+"#;
+    let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
+    write!(file, "{yaml}").unwrap();
+    let config = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        "ferrum",
+    )
+    .expect("comment text must not fail alias admission");
+    assert_eq!(config.proxies[0].backend_host, "localhost");
+}
+
+#[test]
+fn yaml_modest_anchor_reuse_still_loads() {
+    let yaml = r#"
+version: "1"
+proxies:
+  - id: "proxy-1"
+    listen_path: "/api/v1"
+    backend_scheme: http
+    backend_host: &host "localhost"
+    backend_port: 3000
+  - id: "proxy-2"
+    listen_path: "/api/v2"
+    backend_scheme: http
+    backend_host: *host
+    backend_port: 3001
+consumers: []
+plugin_configs: []
+"#;
+    let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
+    write!(file, "{yaml}").unwrap();
+    let config = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        "ferrum",
+    )
+    .expect("finite alias reuse is in budget");
+    assert_eq!(config.proxies.len(), 2);
+    assert_eq!(config.proxies[0].backend_host, "localhost");
+    assert_eq!(config.proxies[1].backend_host, "localhost");
+}
+
+#[test]
+fn unknown_extension_loader_rejects_alias_before_later_malformation() {
+    let yaml = concat!(
+        "version: &private-version \"1\"\n",
+        "copy: *private-version\n",
+        "broken: [loader-secret\n",
+    );
+    let mut file = NamedTempFile::with_suffix(".conf").unwrap();
+    write!(file, "{yaml}").unwrap();
+    let err = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        "ferrum",
+    )
+    .expect_err("unknown extensions must use guarded YAML without fallback");
+    let rendered = err.to_string();
+    assert_eq!(
+        rendered,
+        "YAML document containing aliases is malformed or unsupported"
+    );
+    assert!(!rendered.contains("private-version"));
+    assert!(!rendered.contains("loader-secret"));
 }

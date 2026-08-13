@@ -1238,6 +1238,7 @@ pub mod _test_support {
             consumer_index: std::sync::Arc::clone(&current.consumer_index),
             load_balancer: std::sync::Arc::clone(&current.load_balancer),
             gateway_listener_admission: std::sync::Arc::clone(&current.gateway_listener_admission),
+            gateway_trust: std::sync::Arc::clone(&current.gateway_trust),
             config_generation: current.config_generation,
             route_generation: current.route_generation,
             lb_generation,
@@ -8508,6 +8509,22 @@ pub mod _test_support {
         )
     }
 
+    /// One-shot GET/PATCH intercept for the live Istio status competing-writer
+    /// lane. After the first identity-matching GET, Ferrum waits until `resume`
+    /// is completed before PATCHing.
+    pub fn install_istio_status_write_intercept_for_test(
+        after_get: tokio::sync::oneshot::Sender<()>,
+        resume: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        crate::k8s_controller::istio_status::install_istio_status_write_intercept_for_test(
+            after_get, resume,
+        )
+    }
+
+    pub fn clear_istio_status_write_intercept_for_test() {
+        crate::k8s_controller::istio_status::clear_istio_status_write_intercept_for_test()
+    }
+
     // ── K8s controller shutdown supervision (#3220) ─────────────────────────
 
     pub use crate::k8s_controller::{
@@ -8869,6 +8886,7 @@ pub mod _test_support {
         overlay_slot: &K8sOverlaySlot,
         db_config: crate::config::types::GatewayConfig,
         refreshed_namespaces: &[String],
+        trust_scope: crate::config::gateway_trust::TrustPublicationScope,
         broadcasts: &crate::grpc::cp_server::NamespaceBroadcasts,
         dp_registry: &crate::grpc::cp_server::DpNodeRegistry,
         cp_scope: &crate::grpc::cp_server::CpScope,
@@ -8883,6 +8901,7 @@ pub mod _test_support {
             overlay_slot,
             db_config,
             refreshed_namespaces,
+            trust_scope,
             broadcasts,
             dp_registry,
             cp_scope,

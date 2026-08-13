@@ -1692,6 +1692,46 @@
     "emission": "when_process_initialized"
   },
   {
+    "name": "ferrum_gateway_trust_bundle_ambiguous_authority_total",
+    "type": "counter",
+    "help": "Publications that found both a database record and a file-sourced trust value and kept the previously accepted trust.",
+    "labels": [],
+    "subsystem": "gateway_trust",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_gateway_trust_bundle_last_published_unix_seconds",
+    "type": "gauge",
+    "help": "Unix time of the most recently published gateway trust-bundle generation; 0 when none.",
+    "labels": [],
+    "subsystem": "gateway_trust",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_gateway_trust_bundle_load_rejections_total",
+    "type": "counter",
+    "help": "Gateway trust-bundle candidates refused before the live swap; the previous valid generation stays active.",
+    "labels": [],
+    "subsystem": "gateway_trust",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_gateway_trust_bundle_published_generations_total",
+    "type": "counter",
+    "help": "Gateway trust-bundle generations carrying a database-sourced record that reached the live configuration swap; a generation refused by the ambiguous-authority rule is not counted.",
+    "labels": [],
+    "subsystem": "gateway_trust",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
     "name": "ferrum_grpc_config_stream_terminations_total",
     "type": "counter",
     "help": "Authenticated configuration streams ended by fixed surface and reason.",
@@ -1752,6 +1792,76 @@
     "export_surface": "/metrics",
     "bundled": "documented_only",
     "emission": "always"
+  },
+  {
+    "name": "ferrum_k8s_controller_istio_status_conflicts_total",
+    "type": "counter",
+    "help": "Istio status JSON Merge Patch 409 conflicts observed while applying Ferrum-owned conditions.",
+    "labels": [],
+    "subsystem": "k8s_controller",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_k8s_controller_istio_status_missing_uid_total",
+    "type": "counter",
+    "help": "Istio status writes refused because the planned watch-snapshot UID was missing.",
+    "labels": [],
+    "subsystem": "k8s_controller",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_k8s_controller_istio_status_not_found_total",
+    "type": "counter",
+    "help": "Istio status writes aborted because the status read or write returned HTTP 404.",
+    "labels": [],
+    "subsystem": "k8s_controller",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_k8s_controller_istio_status_recreated_total",
+    "type": "counter",
+    "help": "Istio status writes aborted because the live UID no longer matched the planned object.",
+    "labels": [],
+    "subsystem": "k8s_controller",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_k8s_controller_istio_status_retries_total",
+    "type": "counter",
+    "help": "Istio status writes that succeeded after at least one resourceVersion conflict retry.",
+    "labels": [],
+    "subsystem": "k8s_controller",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_k8s_controller_istio_status_retry_exhausted_total",
+    "type": "counter",
+    "help": "Istio status writes that exhausted the bounded conflict retry budget without an unversioned fallback.",
+    "labels": [],
+    "subsystem": "k8s_controller",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_k8s_controller_istio_status_unsupported_total",
+    "type": "counter",
+    "help": "Istio status writes aborted because the API server does not serve the Istio resource or its status subresource.",
+    "labels": [],
+    "subsystem": "k8s_controller",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
   },
   {
     "name": "ferrum_kafka_logging_accepting",

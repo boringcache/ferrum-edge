@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use ferrum_edge::k8s_controller::metrics::ControllerMetrics;
 use ferrum_edge::modes::database::DatabaseDeltaPollMetrics;
 use ferrum_edge::plugins::api_chargeback::{
     ChargebackRegistry, DEFAULT_MAX_ENTRIES, DEFAULT_MAX_RETAINED_BYTES, InstanceScope,
@@ -728,6 +729,9 @@ fn representative_exposition() -> String {
     delta.record_poll_completed();
     registry.set_database_delta_poll_metrics(delta);
 
+    let k8s_metrics = Arc::new(ControllerMetrics::new());
+    registry.set_k8s_controller_metrics(k8s_metrics);
+
     let suffix = format!("{}-{}", std::process::id(), line!());
     let cluster = format!("remote-{suffix}");
     let trust_domain = format!("td-{suffix}.example");
@@ -947,6 +951,7 @@ fn prometheus_metrics_reference_documents_every_contract_family() {
         "Raw-TCP mesh egress",
         "Endpoint-age runbook",
         "Poll-failure runbook",
+        "Istio status CAS",
     ] {
         assert!(
             doc.contains(section),
@@ -1011,6 +1016,9 @@ fn representative_metrics_exposition_matches_contract() {
         "ferrum_api_bandwidth_charges_total",
         "ferrum_api_chargeback_registry_entries",
         "ferrum_database_delta_backoff_bucket",
+        "ferrum_k8s_controller_istio_status_conflicts_total",
+        "ferrum_k8s_controller_istio_status_missing_uid_total",
+        "ferrum_k8s_controller_istio_status_retries_total",
     ] {
         assert!(
             emitted.contains_key(required),

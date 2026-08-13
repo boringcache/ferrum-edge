@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::Value;
 
+use crate::config::yaml_alias_budget::admit_yaml_alias_expansion;
 use crate::modes::mesh::config::{
     MAX_MESH_EXT_AUTHZ_PROVIDERS, MESH_EXT_AUTHZ_DEFAULT_TIMEOUT_MS,
     MESH_EXT_AUTHZ_MAX_REQUEST_BODY_BYTES, MESH_EXT_AUTHZ_MAX_TIMEOUT_MS, MeshExtAuthzBodyCheck,
@@ -143,6 +144,9 @@ fn mesh_config_yaml(object: &K8sObject) -> Option<&str> {
 }
 
 fn parse_mesh_config(raw: &str) -> Result<ParsedMeshConfig, String> {
+    // Bound alias expansion before serde_yaml materializes ConfigMap data.mesh.
+    // A small Kubernetes API object can otherwise induce unbounded expansion.
+    admit_yaml_alias_expansion(raw).map_err(|error| error.to_string())?;
     let value: Value = serde_yaml::from_str(raw)
         .map_err(|error| format!("ConfigMap data.mesh is not valid MeshConfig YAML: {error}"))?;
     let mut parsed = ParsedMeshConfig::default();
