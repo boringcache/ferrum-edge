@@ -427,9 +427,7 @@ pub(crate) fn finalize_listenerset_conflicts(acc: &mut K8sAccumulator, objects: 
             } else if quic_conflict {
                 conflicted.insert(
                     candidate.key.clone(),
-                    ListenerConflictReason::ProtocolConflict(
-                        ListenerProtocolConflictKind::QuicUdp,
-                    ),
+                    ListenerConflictReason::ProtocolConflict(ListenerProtocolConflictKind::QuicUdp),
                 );
             }
         }

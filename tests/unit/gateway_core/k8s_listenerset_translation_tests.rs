@@ -1590,11 +1590,8 @@ fn secure_http_udp_and_tcp_protocol_conflicts_are_candidate_accurate() {
             }
             let mut gateway = http_gateway("edge", Some("Same"));
             gateway.spec["listeners"] = Value::Array(listeners);
-            let translation = translate_k8s_objects(
-                &[gateway_class(), secret, gateway],
-                options(),
-            )
-            .expect("translate");
+            let translation = translate_k8s_objects(&[gateway_class(), secret, gateway], options())
+                .expect("translate");
 
             let gateway_key = GatewayApiListenerKey {
                 namespace: "default".to_string(),
