@@ -12328,6 +12328,15 @@ async fn handle_websocket_request_authenticated(
         // loopback authority.
         let ws_dial_result: Result<WsBackendHandshake, Box<dyn std::error::Error + Send + Sync>> =
             if let Some(unix_dispatch) = ws_unix_dispatch {
+                // Match ordinary Unix HTTP dispatch: preserve the authenticated
+                // client's Host only when the route explicitly opts in.
+                // Otherwise the target-effective backend authority owns the
+                // local application's virtual-host selection.
+                let ws_unix_backend_host = unix_websocket_backend_authority(
+                    proxy.preserve_host_header,
+                    ws_client_host.as_deref(),
+                    &current_backend_url,
+                );
                 match unix_dispatch {
                     // Boxed: this dial future (admission gate + hyper/tungstenite
                     // H1 upgrade + framer construction) would otherwise be stored
@@ -12343,7 +12352,7 @@ async fn handle_websocket_request_authenticated(
                         ws_dial_proxy,
                         &env_config,
                         socket_path,
-                        ws_client_host.as_deref().unwrap_or_default(),
+                        &ws_unix_backend_host,
                         ws_path_and_query.as_ref(),
                         &client_headers,
                         ws_size_limits.max_frame_bytes,
@@ -14544,6 +14553,30 @@ fn websocket_mesh_egress(target: &UpstreamTarget) -> Option<MeshWsEgress> {
     } else {
         None
     }
+}
+
+/// Select the Host sent by an RFC 6455 upgrade over a Unix backend socket.
+///
+/// This deliberately mirrors the ordinary Unix HTTP/1.1 path: the inbound
+/// Host is used only for an explicit `preserve_host_header` route; otherwise
+/// the authority from the target-effective backend URL replaces it.
+pub(crate) fn unix_websocket_backend_authority(
+    preserve_host_header: bool,
+    client_host: Option<&str>,
+    backend_url: &str,
+) -> String {
+    if preserve_host_header && let Some(host) = client_host.filter(|host| !host.is_empty()) {
+        return host.to_string();
+    }
+
+    backend_url
+        .parse::<hyper::Uri>()
+        .ok()
+        .and_then(|uri| {
+            uri.authority()
+                .map(|authority| authority.as_str().to_string())
+        })
+        .unwrap_or_else(|| "localhost".to_string())
 }
 
 /// Open a backend WebSocket transport over a mesh egress tunnel for a

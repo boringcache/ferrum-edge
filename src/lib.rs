@@ -99,6 +99,19 @@ pub mod _test_support {
     use crate::modes::node_agent::startup_cleanup_test_seams as node_agent_cleanup_seams;
     use crate::plugins::Plugin;
 
+    /// Exercise Unix WebSocket Host selection without opening a socket.
+    pub fn unix_websocket_backend_authority_for_test(
+        preserve_host_header: bool,
+        client_host: Option<&str>,
+        backend_url: &str,
+    ) -> String {
+        crate::proxy::unix_websocket_backend_authority(
+            preserve_host_header,
+            client_host,
+            backend_url,
+        )
+    }
+
     /// Release an xDS node permit through the production last-stream cleanup
     /// fence. The closure runs while same-key registration is excluded, which
     /// lets external tests prove a departing generation cannot delete its

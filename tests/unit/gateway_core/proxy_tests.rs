@@ -4925,3 +4925,29 @@ fn cross_cluster_hbone_identity_bypasses_only_the_reqwest_dns_preflight() {
         "the synthetic identity must carry no fabricated resolved IP into HBONE dispatch"
     );
 }
+
+#[test]
+fn unix_websocket_host_honors_preserve_host_header_policy() {
+    use ferrum_edge::_test_support::unix_websocket_backend_authority_for_test;
+
+    let backend_url = "http://backend.service.local:8080/chat";
+    assert_eq!(
+        unix_websocket_backend_authority_for_test(
+            false,
+            Some("attacker-vhost.example"),
+            backend_url,
+        ),
+        "backend.service.local:8080",
+        "the default policy must replace the untrusted client Host"
+    );
+    assert_eq!(
+        unix_websocket_backend_authority_for_test(true, Some("client.example:8443"), backend_url,),
+        "client.example:8443",
+        "an explicit preserve-host route must retain existing behavior"
+    );
+    assert_eq!(
+        unix_websocket_backend_authority_for_test(true, None, backend_url),
+        "backend.service.local:8080",
+        "a missing client Host must still use the backend authority"
+    );
+}
