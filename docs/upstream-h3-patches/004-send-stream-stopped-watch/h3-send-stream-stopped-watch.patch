@@ -2,7 +2,7 @@ diff --git a/h3/src/connection.rs b/h3/src/connection.rs
 index c90eb0fcc..a593d084d 100644
 --- a/h3/src/connection.rs
 +++ b/h3/src/connection.rs
-@@ -837,6 +837,24 @@ impl<S, B> RequestStream<S, B> {
+@@ -837,6 +837,16 @@ impl<S, B> RequestStream<S, B> {
      }
  }
  
@@ -10,16 +10,9 @@ index c90eb0fcc..a593d084d 100644
 +where
 +    S: crate::quic::SendStreamStopped,
 +{
-+    fn stopped(
-+        &self,
-+    ) -> std::pin::Pin<
-+        Box<
-+            dyn std::future::Future<
-+                    Output = Result<Option<u64>, crate::quic::StreamErrorIncoming>,
-+                > + Send
-+                + 'static,
-+        >,
-+    > {
++    type Stopped = S::Stopped;
++
++    fn stopped(&self) -> Self::Stopped {
 +        self.stream.stopped()
 +    }
 +}
@@ -31,7 +24,7 @@ diff --git a/h3/src/frame.rs b/h3/src/frame.rs
 index 107e98abb..bb86f25a8 100644
 --- a/h3/src/frame.rs
 +++ b/h3/src/frame.rs
-@@ -43,6 +43,24 @@ impl<S, B> FrameStream<S, B> {
+@@ -43,6 +43,16 @@ impl<S, B> FrameStream<S, B> {
      }
  }
  
@@ -39,16 +32,9 @@ index 107e98abb..bb86f25a8 100644
 +where
 +    S: crate::quic::SendStreamStopped,
 +{
-+    fn stopped(
-+        &self,
-+    ) -> std::pin::Pin<
-+        Box<
-+            dyn std::future::Future<
-+                    Output = Result<Option<u64>, crate::quic::StreamErrorIncoming>,
-+                > + Send
-+                + 'static,
-+        >,
-+    > {
++    type Stopped = S::Stopped;
++
++    fn stopped(&self) -> Self::Stopped {
 +        self.stream.stopped()
 +    }
 +}
@@ -60,16 +46,15 @@ diff --git a/h3/src/quic.rs b/h3/src/quic.rs
 index f8e57035a..6447fe047 100644
 --- a/h3/src/quic.rs
 +++ b/h3/src/quic.rs
-@@ -4,6 +4,8 @@
+@@ -4,6 +4,7 @@
  //! QUIC implementation.
  
  use std::fmt::{Debug, Display};
 +use std::future::Future;
-+use std::pin::Pin;
  use std::sync::Arc;
  use std::task::{self, Poll};
  
-@@ -185,6 +187,26 @@ pub trait SendStream<B: Buf> {
+@@ -185,6 +186,33 @@ pub trait SendStream<B: Buf> {
      fn send_id(&self) -> StreamId;
  }
  
@@ -81,16 +66,20 @@ index f8e57035a..6447fe047 100644
 +/// remains available for a later response write. Implementations must not take
 +/// `&mut self` on the send stream: that would conflict with a concurrent
 +/// receive-half poll on an unsplit bidi stream.
++///
++/// The associated future is statically dispatched and `'static`: it must not
++/// borrow the send stream and must not box a trait object per call.
 +pub trait SendStreamStopped {
++    /// `'static` future returned by [`SendStreamStopped::stopped`].
++    type Stopped: Future<Output = Result<Option<u64>, StreamErrorIncoming>> + Send + 'static;
++
 +    /// Completes when the peer stops this send stream or the connection is lost.
 +    ///
 +    /// `Ok(Some(code))` is a peer `STOP_SENDING`. `Ok(None)` means the local
 +    /// side already finished and the peer acknowledged the stream, after which
 +    /// `STOP_SENDING` is no longer meaningful. `Err` is a connection-level
 +    /// failure.
-+    fn stopped(
-+        &self,
-+    ) -> Pin<Box<dyn Future<Output = Result<Option<u64>, StreamErrorIncoming>> + Send + 'static>>;
++    fn stopped(&self) -> Self::Stopped;
 +}
 +
  /// Allows sending unframed pure bytes to a stream. Similar to [`AsyncWrite`](https://docs.rs/tokio/latest/tokio/io/trait.AsyncWrite.html)
@@ -100,7 +89,7 @@ diff --git a/h3/src/server/stream.rs b/h3/src/server/stream.rs
 index d0b3b38cb..ab59b650c 100644
 --- a/h3/src/server/stream.rs
 +++ b/h3/src/server/stream.rs
-@@ -115,6 +115,29 @@ where
+@@ -115,6 +115,22 @@ where
      }
  }
  
@@ -113,16 +102,9 @@ index d0b3b38cb..ab59b650c 100644
 +    /// The future is `'static` and does not borrow this stream, so a server can
 +    /// race it against a backend wait while still using the receive half or a
 +    /// later response write on the same send half.
-+    fn stopped(
-+        &self,
-+    ) -> std::pin::Pin<
-+        Box<
-+            dyn std::future::Future<
-+                    Output = Result<Option<u64>, crate::quic::StreamErrorIncoming>,
-+                > + Send
-+                + 'static,
-+        >,
-+    > {
++    type Stopped = S::Stopped;
++
++    fn stopped(&self) -> Self::Stopped {
 +        crate::quic::SendStreamStopped::stopped(&self.inner)
 +    }
 +}
@@ -134,13 +116,7 @@ diff --git a/h3/src/stream.rs b/h3/src/stream.rs
 index fc9cea58f..86e68087d 100644
 --- a/h3/src/stream.rs
 +++ b/h3/src/stream.rs
-@@ -1,4 +1,5 @@
- use std::{
-+    future::Future,
-     marker::PhantomData,
-     pin::Pin,
-     task::{Context, Poll},
-@@ -543,6 +544,19 @@ where
+@@ -543,6 +543,17 @@ where
      }
  }
  
@@ -148,11 +124,9 @@ index fc9cea58f..86e68087d 100644
 +where
 +    S: crate::quic::SendStreamStopped,
 +{
-+    fn stopped(
-+        &self,
-+    ) -> Pin<
-+        Box<dyn Future<Output = Result<Option<u64>, StreamErrorIncoming>> + Send + 'static>,
-+    > {
++    type Stopped = S::Stopped;
++
++    fn stopped(&self) -> Self::Stopped {
 +        self.stream.stopped()
 +    }
 +}

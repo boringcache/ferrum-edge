@@ -27,15 +27,16 @@ Add an optional trait such as:
 
 ```rust
 pub trait SendStreamStopped {
-    fn stopped(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<u64>, StreamErrorIncoming>> + Send + 'static>>;
+    type Stopped: Future<Output = Result<Option<u64>, StreamErrorIncoming>> + Send + 'static;
+
+    fn stopped(&self) -> Self::Stopped;
 }
 ```
 
 Forward it through `BufRecvStream`, `FrameStream`, and server/client
 `RequestStream`. Implementations must take `&self` (not `&mut self`) so the
-future can be `'static` and must not borrow the send stream.
+future can be `'static` and must not borrow the send stream. Return a
+statically dispatched associated future, not a boxed trait object.
 
 `Ok(Some(code))` is peer `STOP_SENDING`. `Ok(None)` means the local side
 already finished and the peer acknowledged the stream. `Err` is connection

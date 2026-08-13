@@ -2491,6 +2491,25 @@ fn h3_plain_header_wait_races_per_stream_stop_sending_not_only_connection_close(
         dispatch.contains("reader_peer_reset"),
         "streaming-upload request-stream reset must be treated as downstream cancellation"
     );
+    let send_arm = dispatch
+        .split("result = &mut send_future =>")
+        .nth(1)
+        .expect("streaming send_future arm")
+        .split("_ = &mut reader_future, if !reader_done =>")
+        .next()
+        .expect("bounded streaming send_future arm");
+    assert!(
+        send_arm.contains("reader_peer_reset.load(Ordering::Acquire)"),
+        "biased send_future readiness must honor an already-acquired request reset: {send_arm}"
+    );
+    assert!(
+        send_arm.contains("peer_gone = true"),
+        "a request reset observed on send() readiness must take the client-disconnect path: {send_arm}"
+    );
+    assert!(
+        send_arm.contains("break None"),
+        "a request reset must not classify send() as a backend outcome: {send_arm}"
+    );
     assert!(
         !dispatch.contains("hold_client.close()"),
         "production dispatch must not depend on whole-client close"
@@ -2511,12 +2530,16 @@ fn h3_quinn_vendored_send_stream_stopped_is_shared_and_static() {
         .next()
         .expect("bounded SendStreamStopped");
     assert!(
-        trait_src.contains("fn stopped(\n        &self,"),
+        trait_src.contains("fn stopped(&self) -> Self::Stopped"),
         "stopped must take &self, not &mut self: {trait_src}"
     );
     assert!(
-        trait_src.contains("+ 'static"),
-        "the stopped future must be 'static so it does not borrow the stream: {trait_src}"
+        trait_src.contains("type Stopped:") && trait_src.contains("+ 'static"),
+        "Stopped must be a 'static associated future so it does not borrow the stream: {trait_src}"
+    );
+    assert!(
+        !trait_src.contains("Pin<Box") && !trait_src.contains("dyn Future"),
+        "stopped must not return a boxed trait-object future: {trait_src}"
     );
 
     let h3_quinn = include_str!("../../../vendor/h3-quinn-0.0.10-ferrum-patched/src/lib.rs");
@@ -2532,6 +2555,12 @@ fn h3_quinn_vendored_send_stream_stopped_is_shared_and_static() {
         "the impl must forward to quinn::SendStream::stopped (&self, 'static): {send}"
     );
     assert!(
+        send.contains("type Stopped = impl Future")
+            && !send.contains("Box::pin")
+            && !send.contains("dyn Future"),
+        "the impl must return a statically dispatched future, not a boxed trait object: {send}"
+    );
+    assert!(
         h3_quinn.contains("impl<B> h3::quic::SendStreamStopped for BidiStream<B>"),
         "unsplit bidi streams must expose the same STOP_SENDING watch"
     );
@@ -2544,6 +2573,14 @@ fn h3_quinn_vendored_send_stream_stopped_is_shared_and_static() {
         .split("\npub(crate) fn abort_response_stream<")
         .next()
         .expect("bounded peer_response_cancelled");
+    assert!(
+        watch.contains("impl Future<Output = ()> + Send + 'static"),
+        "peer_response_cancelled must return a statically dispatched 'static future: {watch}"
+    );
+    assert!(
+        !watch.contains("Box::pin") && !watch.contains("Pin<Box") && !watch.contains("dyn Future"),
+        "peer_response_cancelled must not box a trait-object future: {watch}"
+    );
     assert!(
         watch.contains("Ok(Some(_)) | Err(_) => {}"),
         "STOP_SENDING and connection loss must complete the cancel watch: {watch}"

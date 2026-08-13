@@ -22,9 +22,10 @@ observe that signal without taking `&mut` on the send stream, which would
 conflict with a concurrent receive-half poll on an unsplit bidi stream.
 
 This patch adds `quic::SendStreamStopped`: a `&self` method that returns a
-`'static` future. Quinn's `SendStream::stopped` already has that shape; h3
-needs the trait so `server::RequestStream` can forward it through
-`FrameStream` / `BufRecvStream` without exclusive send-stream access.
+`'static` associated future. Quinn's `SendStream::stopped` already has that
+shape; h3 needs the trait so `server::RequestStream` can forward it through
+`FrameStream` / `BufRecvStream` without exclusive send-stream access or a
+per-call boxed trait object.
 
 ## Files
 

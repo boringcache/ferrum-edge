@@ -20,7 +20,8 @@ the sibling h3 patch 004), so a server cannot observe peer `STOP_SENDING` on
 the response direction without exclusive send-stream access.
 
 This patch implements `h3::quic::SendStreamStopped` for `SendStream` and
-`BidiStream` by forwarding to `quinn::SendStream::stopped`.
+`BidiStream` by forwarding to `quinn::SendStream::stopped` as a statically
+dispatched associated future.
 
 ## Files
 

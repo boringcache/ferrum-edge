@@ -334,17 +334,11 @@ where
 
 impl<B> h3::quic::SendStreamStopped for BidiStream<B>
 where
-    B: Buf,
+    B: Buf + 'static,
 {
-    fn stopped(
-        &self,
-    ) -> Pin<
-        Box<
-            dyn Future<Output = Result<Option<u64>, h3::quic::StreamErrorIncoming>>
-                + Send
-                + 'static,
-        >,
-    > {
+    type Stopped = <SendStream<B> as h3::quic::SendStreamStopped>::Stopped;
+
+    fn stopped(&self) -> Self::Stopped {
         h3::quic::SendStreamStopped::stopped(&self.send)
     }
 }
@@ -538,26 +532,22 @@ where
 
 impl<B> h3::quic::SendStreamStopped for SendStream<B>
 where
-    B: Buf,
+    B: Buf + 'static,
 {
     /// FERRUM PATCH: expose Quinn's `&self` + `'static` `stopped()` so a server
     /// can observe peer STOP_SENDING without exclusive send-stream access.
-    fn stopped(
-        &self,
-    ) -> Pin<
-        Box<
-            dyn Future<Output = Result<Option<u64>, h3::quic::StreamErrorIncoming>>
-                + Send
-                + 'static,
-        >,
-    > {
+    type Stopped = impl Future<Output = Result<Option<u64>, h3::quic::StreamErrorIncoming>>
+        + Send
+        + 'static;
+
+    fn stopped(&self) -> Self::Stopped {
         let stopped = self.stream.stopped();
-        Box::pin(async move {
+        async move {
             match stopped.await {
                 Ok(code) => Ok(code.map(|v| v.into_inner())),
                 Err(error) => Err(convert_stopped_error(error)),
             }
-        })
+        }
     }
 }
 

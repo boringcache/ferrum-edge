@@ -246,7 +246,7 @@
       "docs_path": "docs/upstream-h3-patches/004-send-stream-stopped-watch/",
       "owner": "Ferrum Edge maintainers",
       "owner_github": null,
-      "reason": "After request HEADERS the gateway may block on backend headers without polling H3 frames; a client can STOP_SENDING one multiplexed stream and leave destination http2MaxRequests held until the backend answers. Stock h3 0.0.8 has no &self + 'static watch for that signal.",
+      "reason": "After request HEADERS the gateway may block on backend headers without polling H3 frames; a client can STOP_SENDING one multiplexed stream and leave destination http2MaxRequests held until the backend answers. Stock h3 0.0.8 has no &self + 'static associated-future watch for that signal.",
       "upstream": {
         "filing": "deliberate_fork_unfiled",
         "github_repo": "hyperium/h3",
@@ -267,7 +267,8 @@
         "tests/unit/gateway_core/http3_server_dispatch_tests.rs::h3_plain_header_wait_races_per_stream_stop_sending_not_only_connection_close",
         "tests/unit/gateway_core/http3_server_dispatch_tests.rs::h3_quinn_vendored_send_stream_stopped_is_shared_and_static",
         "tests/functional/functional_destination_active_requests_h3_test.rs::functional_destination_active_requests_h3_release_on_client_cancellation",
-        "tests/functional/functional_destination_active_requests_h3_test.rs::functional_destination_active_requests_h3_release_on_streaming_upload_cancellation"
+        "tests/functional/functional_destination_active_requests_h3_test.rs::functional_destination_active_requests_h3_release_on_streaming_upload_cancellation",
+        "tests/functional/functional_destination_active_requests_h3_test.rs::functional_destination_active_requests_h3_release_on_streaming_request_reset"
       ]
     },
     {
@@ -311,7 +312,7 @@
       "docs_path": "docs/upstream-h3-quinn-patches/002-send-stream-stopped-watch/",
       "owner": "Ferrum Edge maintainers",
       "owner_github": null,
-      "reason": "Stock h3-quinn 0.0.10 does not forward Quinn's SendStream::stopped (&self, 'static), so a header wait cannot observe per-stream STOP_SENDING without exclusive send-stream access.",
+      "reason": "Stock h3-quinn 0.0.10 does not forward Quinn's SendStream::stopped (&self, 'static) as an allocation-free associated future, so a header wait cannot observe per-stream STOP_SENDING without exclusive send-stream access.",
       "upstream": {
         "filing": "deliberate_fork_unfiled",
         "github_repo": "hyperium/h3",
@@ -331,7 +332,8 @@
       "regression_tests": [
         "tests/unit/gateway_core/http3_server_dispatch_tests.rs::h3_quinn_vendored_send_stream_stopped_is_shared_and_static",
         "tests/functional/functional_destination_active_requests_h3_test.rs::functional_destination_active_requests_h3_release_on_client_cancellation",
-        "tests/functional/functional_destination_active_requests_h3_test.rs::functional_destination_active_requests_h3_release_on_streaming_upload_cancellation"
+        "tests/functional/functional_destination_active_requests_h3_test.rs::functional_destination_active_requests_h3_release_on_streaming_upload_cancellation",
+        "tests/functional/functional_destination_active_requests_h3_test.rs::functional_destination_active_requests_h3_release_on_streaming_request_reset"
       ]
     },
     {

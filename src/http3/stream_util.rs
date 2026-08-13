@@ -11,7 +11,6 @@
 //! See RFC 9114 §8.1 (H3 error codes) and RFC 9000 §4.5 (STOP_SENDING).
 
 use std::future::Future;
-use std::pin::Pin;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -182,17 +181,17 @@ where
 /// local finish acknowledgement (`Ok(None)`) is not cancellation.
 pub(crate) fn peer_response_cancelled<S>(
     stream: &RequestStream<S, Bytes>,
-) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>>
+) -> impl Future<Output = ()> + Send + 'static
 where
     S: SendStreamStopped,
 {
     let stopped = stream.stopped();
-    Box::pin(async move {
+    async move {
         match stopped.await {
             Ok(Some(_)) | Err(_) => {}
             Ok(None) => std::future::pending::<()>().await,
         }
-    })
+    }
 }
 
 /// Abort the response send half for a gateway-originated streaming failure.

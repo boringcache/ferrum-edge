@@ -124,16 +124,9 @@ where
     /// The future is `'static` and does not borrow this stream, so a server can
     /// race it against a backend wait while still using the receive half or a
     /// later response write on the same send half.
-    fn stopped(
-        &self,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<Option<u64>, crate::quic::StreamErrorIncoming>,
-                > + Send
-                + 'static,
-        >,
-    > {
+    type Stopped = S::Stopped;
+
+    fn stopped(&self) -> Self::Stopped {
         crate::quic::SendStreamStopped::stopped(&self.inner)
     }
 }

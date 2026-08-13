@@ -47,16 +47,9 @@ impl<S, B> crate::quic::SendStreamStopped for FrameStream<S, B>
 where
     S: crate::quic::SendStreamStopped,
 {
-    fn stopped(
-        &self,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<Option<u64>, crate::quic::StreamErrorIncoming>,
-                > + Send
-                + 'static,
-        >,
-    > {
+    type Stopped = S::Stopped;
+
+    fn stopped(&self) -> Self::Stopped {
         self.stream.stopped()
     }
 }

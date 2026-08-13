@@ -2840,6 +2840,16 @@ where
                                             .await;
                                     }
                                 }
+                                // Biased select checks send_future before
+                                // reader_future. A recv_data() error sets
+                                // reader_peer_reset and drops the body sender,
+                                // which can make send() ready (error or early
+                                // backend response) in the same poll. Honor the
+                                // flag before classifying a backend outcome.
+                                if reader_peer_reset.load(Ordering::Acquire) {
+                                    peer_gone = true;
+                                    break None;
+                                }
                                 break Some(result);
                             }
                             _ = &mut reader_future, if !reader_done => {

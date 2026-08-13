@@ -10,7 +10,9 @@
 //! an H3 request that is holding a backend exchange keeps the destination
 //! budget, the next H3 request is shed before any backend dial, and the budget
 //! comes back when the relay ends — both on a clean completion and when the
-//! client cancels one multiplexed stream without closing the QUIC connection.
+//! client cancels one multiplexed stream without closing the QUIC connection
+//! (response-direction STOP_SENDING, or request-upload RESET_STREAM while
+//! backend headers are still held).
 //!
 //! Run: `cargo build --bin ferrum-edge && cargo test --test functional_tests \
 //!   functional_destination_active_requests_h3 -- --ignored --nocapture`
@@ -179,6 +181,9 @@ async fn functional_destination_active_requests_h3_release_on_streaming_upload_c
     );
     backend.assert_hits_eq(1, SETTLE).await;
 
+    // Cancel only this stream's response direction (peer STOP_SENDING on the
+    // gateway send half) while a streaming upload is still open. A separate
+    // test covers request-upload RESET_STREAM / recv_data() error.
     hold_stream.cancel_response_download();
     drop(hold_stream);
 
@@ -200,6 +205,70 @@ async fn functional_destination_active_requests_h3_release_on_streaming_upload_c
         OVERFLOW_BODY,
         "the post-cancellation request must not be a destination shed"
     );
+
+    gateway.shutdown().await;
+    backend.shutdown().await;
+}
+
+#[ignore]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn functional_destination_active_requests_h3_release_on_streaming_request_reset() {
+    let backend = HoldingHttp1Backend::spawn(HoldBehavior::RespondOk).await;
+    let gateway = start_gateway(h3_destination_config(backend.port), true)
+        .await
+        .expect("start h3 gateway");
+    let https_port = gateway.https_port;
+
+    let hold_client = Http3Client::insecure().expect("hold h3 client");
+    let hold_url = format!("https://localhost:{https_port}/h3/hold");
+    let mut session = connect_h3_session(&hold_client, &hold_url).await;
+    let mut hold_stream = open_streaming_hold_stream(&mut session, &hold_url).await;
+    hold_stream
+        .send_data(bytes::Bytes::from_static(b"partial-upload"))
+        .await
+        .expect("send streaming hold body");
+    backend.wait_for_hits(1, Duration::from_secs(20)).await;
+
+    let probe_client = Http3Client::insecure().expect("probe h3 client");
+    let shed = retry_h3_get(
+        &probe_client,
+        &format!("https://localhost:{https_port}/h3/shed"),
+    )
+    .await;
+    assert_eq!(
+        shed.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "the destination must be saturated before request-upload reset: {shed:?}"
+    );
+    backend.assert_hits_eq(1, SETTLE).await;
+
+    // Reset only the request-upload direction (gateway recv_data() error /
+    // reader_peer_reset). Keep the stream alive so Drop cannot also STOP_SENDING
+    // the response half and take the already-covered path. The session stays
+    // open so a follow-up cannot be explained by CONNECTION_CLOSE.
+    hold_stream.cancel_request_upload();
+
+    let after_url = format!("https://localhost:{https_port}/h3/after-reset");
+    let after = tokio::spawn(async move {
+        retry_h3_session_until_admitted(&mut session, &after_url).await
+    });
+    // Reaching the fixture before backend.release() proves the permit was
+    // released by the upload reset, not by waiting for the held backend.
+    backend.wait_for_hits(2, Duration::from_secs(25)).await;
+
+    backend.release();
+    let after = after.await.expect("post-reset streaming H3 task");
+    assert_eq!(
+        after.status,
+        StatusCode::OK,
+        "an H3 request admitted after request-upload reset must complete: {after:?}"
+    );
+    assert_ne!(
+        after.body_text(),
+        OVERFLOW_BODY,
+        "the post-reset request must not be a destination shed"
+    );
+    drop(hold_stream);
 
     gateway.shutdown().await;
     backend.shutdown().await;

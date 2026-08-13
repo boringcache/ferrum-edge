@@ -5,7 +5,6 @@
 
 use std::fmt::{Debug, Display};
 use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{self, Poll};
 
@@ -195,16 +194,20 @@ pub trait SendStream<B: Buf> {
 /// remains available for a later response write. Implementations must not take
 /// `&mut self` on the send stream: that would conflict with a concurrent
 /// receive-half poll on an unsplit bidi stream.
+///
+/// The associated future is statically dispatched and `'static`: it must not
+/// borrow the send stream and must not box a trait object per call.
 pub trait SendStreamStopped {
+    /// `'static` future returned by [`SendStreamStopped::stopped`].
+    type Stopped: Future<Output = Result<Option<u64>, StreamErrorIncoming>> + Send + 'static;
+
     /// Completes when the peer stops this send stream or the connection is lost.
     ///
     /// `Ok(Some(code))` is a peer `STOP_SENDING`. `Ok(None)` means the local
     /// side already finished and the peer acknowledged the stream, after which
     /// `STOP_SENDING` is no longer meaningful. `Err` is a connection-level
     /// failure.
-    fn stopped(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<u64>, StreamErrorIncoming>> + Send + 'static>>;
+    fn stopped(&self) -> Self::Stopped;
 }
 
 /// Allows sending unframed pure bytes to a stream. Similar to [`AsyncWrite`](https://docs.rs/tokio/latest/tokio/io/trait.AsyncWrite.html)

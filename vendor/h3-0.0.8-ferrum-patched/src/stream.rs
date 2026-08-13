@@ -1,5 +1,4 @@
 use std::{
-    future::Future,
     marker::PhantomData,
     pin::Pin,
     task::{Context, Poll},
@@ -548,11 +547,9 @@ impl<S, B> crate::quic::SendStreamStopped for BufRecvStream<S, B>
 where
     S: crate::quic::SendStreamStopped,
 {
-    fn stopped(
-        &self,
-    ) -> Pin<
-        Box<dyn Future<Output = Result<Option<u64>, StreamErrorIncoming>> + Send + 'static>,
-    > {
+    type Stopped = S::Stopped;
+
+    fn stopped(&self) -> Self::Stopped {
         self.stream.stopped()
     }
 }

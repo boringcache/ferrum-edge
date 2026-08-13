@@ -1,7 +1,7 @@
 # Summary
 
 - implement `h3::quic::SendStreamStopped` for `SendStream` and `BidiStream`
-- forward to Quinn's `&self` + `'static` `SendStream::stopped`
+- forward to Quinn's `&self` + `'static` `SendStream::stopped` without boxing
 - map connection-lost / 0-RTT-rejected errors into `StreamErrorIncoming`
 
 Fixes #NNN.
