@@ -4167,16 +4167,19 @@ pub(crate) enum UdpReplyRecvOutcome<T> {
     AuthorizationExpired(crate::proxy::auth_lifetime::StreamAuthTermination),
 }
 
-/// Outcome of one backend→client datagram after the awaitable hook chain and
-/// the post-hook authorization re-check.
+/// Outcome of one backend→client datagram after the awaitable hook chain is
+/// raced against the admitted absolute authorization plan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UdpReplyDatagramCommit {
     /// The datagram may be sent or enqueued for the client.
     Commit,
-    /// A plugin dropped it; continue receiving. The session is still authorized.
+    /// A plugin dropped it while the session was still authorized; continue
+    /// receiving.
     Drop,
-    /// The absolute plan elapsed during or after the hook chain. The datagram
-    /// must not be sent or enqueued, and the reply task must tear down.
+    /// The absolute plan elapsed while a hook was pending, or was already
+    /// elapsed before the chain was polled. The still-pending hook future is
+    /// dropped. The datagram must not be sent or enqueued, and the reply task
+    /// must tear down.
     AuthorizationExpired(crate::proxy::auth_lifetime::StreamAuthTermination),
 }
 
@@ -4315,32 +4318,44 @@ where
     }
 }
 
-/// Run the backend→client `on_udp_datagram` chain, then re-check the admitted
-/// absolute authorization plan before the caller may send or enqueue.
+/// Run the backend→client `on_udp_datagram` chain raced against the admitted
+/// absolute authorization plan (issue #3816 / #3820).
 ///
-/// A plugin `Drop` is honored only when the session is still authorized:
-/// expiry during a slow hook wins, so a dropped payload cannot keep an
-/// unauthorized session alive. Unauthenticated sessions (`plan == None`) skip
-/// the clock after the hook chain.
+/// A post-hook clock recheck is not enough: if a hook stays pending, the
+/// reply task no longer polls the session deadline and the authenticated
+/// session, backend socket, guards, retained payload, and hook future can
+/// survive indefinitely. This helper owns the hook-chain future for the whole
+/// wait. When expiry wins, that future is dropped immediately — it is not
+/// detached and cannot complete afterwards.
+///
+/// Authenticated sessions: an already-elapsed plan never polls a hook.
+/// Otherwise the chain is raced with the SAME absolute `StreamAuthDeadline`
+/// (never refreshed per hook or datagram) through
+/// [`udp_frontend_send_until_expiry`], so an exact-deadline tie is expiry-first
+/// (`biased`). A plugin `Drop` is honored only when it becomes ready strictly
+/// before expiry; if expiry and Drop are ready together, expiry wins.
+///
+/// Unauthenticated sessions (`plan == None`) await the chain with no timer,
+/// lock, or clock read — the previous fast path.
 pub(crate) async fn udp_reply_commit_after_backend_hooks(
     datagram_plugins: &[Arc<dyn Plugin>],
     ctx: &UdpDatagramContext<'_>,
     plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
 ) -> UdpReplyDatagramCommit {
-    let mut drop = false;
-    for plugin in datagram_plugins {
-        if matches!(plugin.on_udp_datagram(ctx).await, UdpDatagramVerdict::Drop) {
-            drop = true;
-            break;
+    let chain = async {
+        for plugin in datagram_plugins {
+            if matches!(plugin.on_udp_datagram(ctx).await, UdpDatagramVerdict::Drop) {
+                return UdpReplyDatagramCommit::Drop;
+            }
         }
+        UdpReplyDatagramCommit::Commit
+    };
+    match udp_frontend_send_until_expiry(plan, chain).await {
+        UdpFrontendSendOutcome::AuthorizationExpired(termination) => {
+            UdpReplyDatagramCommit::AuthorizationExpired(termination)
+        }
+        UdpFrontendSendOutcome::Sent(commit) => commit,
     }
-    if let Some(termination) = udp_reply_expired_at_commit(plan) {
-        return UdpReplyDatagramCommit::AuthorizationExpired(termination);
-    }
-    if drop {
-        return UdpReplyDatagramCommit::Drop;
-    }
-    UdpReplyDatagramCommit::Commit
 }
 
 /// Race one backend-reply receive against the session's absolute authorization
@@ -4901,7 +4916,9 @@ async fn handle_dtls_client_inner(
                 }
             }
 
-            // Backend→client plugin hooks for DTLS path
+            // Backend→client plugin hooks share the raced helper: a pending
+            // hook is cancelled at the absolute plan, and settlement goes
+            // through the shared latch exactly once.
             if !dgram_plugins_rev.is_empty() {
                 let ctx = UdpDatagramContext {
                     client_ip: dgram_client_ip_rev.clone(),
@@ -4915,15 +4932,23 @@ async fn handle_dtls_client_inner(
                     payload_kind: StreamBytesKind::DecryptedApp,
                     metadata_sink: Some(UdpMetadataSink::new(dgram_metadata_rev.as_ref())),
                 };
-                let mut drop = false;
-                for plugin in dgram_plugins_rev.iter() {
-                    if matches!(plugin.on_udp_datagram(&ctx).await, UdpDatagramVerdict::Drop) {
-                        drop = true;
+                match udp_reply_commit_after_backend_hooks(
+                    dgram_plugins_rev.as_ref(),
+                    &ctx,
+                    reply_auth_plan,
+                )
+                .await
+                {
+                    UdpReplyDatagramCommit::Drop => continue,
+                    UdpReplyDatagramCommit::AuthorizationExpired(termination) => {
+                        settle_dtls_auth_expiry(
+                            termination,
+                            &reply_auth_latch,
+                            dgram_metadata_rev.as_ref(),
+                        );
                         break;
                     }
-                }
-                if drop {
-                    continue;
+                    UdpReplyDatagramCommit::Commit => {}
                 }
             }
 
@@ -5625,9 +5650,9 @@ async fn create_session(
                 }
             }
 
-            // Run backend→client per-datagram plugin hooks, then re-check the
-            // absolute plan before any send or batch enqueue. A slow hook that
-            // crosses the deadline must not deliver the payload afterwards.
+            // Run backend→client per-datagram plugin hooks raced against the
+            // same absolute plan. A hook that stays pending past the deadline
+            // is cancelled immediately; the payload is not delivered.
             if !reply_datagram_plugins.is_empty() {
                 let ctx = UdpDatagramContext {
                     client_ip: reply_dgram_client_ip.clone(),
@@ -5815,7 +5840,7 @@ async fn create_session(
                                 }
                             }
                             // Backend→client plugin hooks on batched datagram,
-                            // then re-check before send/enqueue.
+                            // raced against the same absolute plan.
                             if !reply_datagram_plugins.is_empty() {
                                 let ctx = UdpDatagramContext {
                                     client_ip: reply_dgram_client_ip.clone(),

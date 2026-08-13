@@ -7953,7 +7953,7 @@ pub mod _test_support {
     }
 
     /// Outcome of one backend→client datagram after the awaitable hook chain
-    /// and the post-hook authorization re-check.
+    /// raced against the admitted absolute authorization plan.
     #[derive(Debug, PartialEq, Eq)]
     pub enum UdpReplyDatagramCommitForTest {
         Commit,
@@ -7961,8 +7961,8 @@ pub mod _test_support {
         AuthorizationExpired(crate::proxy::auth_lifetime::StreamAuthTermination),
     }
 
-    /// Run the production backend→client hook chain then re-check the absolute
-    /// authorization plan before any client send or batch enqueue.
+    /// Run the production backend→client hook chain raced against the absolute
+    /// authorization plan. A still-pending hook is dropped when expiry wins.
     pub async fn udp_reply_commit_after_backend_hooks_for_test(
         plugins: &[Arc<dyn Plugin>],
         payload: &[u8],

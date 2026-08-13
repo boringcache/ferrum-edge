@@ -16,8 +16,8 @@
 //! connected backend socket, a real overload connection guard, and a real
 //! bounded hook-ingress channel.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ferrum_edge::_test_support::{
@@ -686,7 +686,8 @@ async fn an_authorized_session_still_observes_idle_and_drain_stops() {
 async fn a_reply_held_in_a_slow_backend_hook_is_not_committed_after_expiry() {
     // The receive can win just before expiry; the subsequent awaitable
     // backend→client hook is what used to smuggle the payload past the
-    // deadline. The production post-hook commitment seam must refuse send.
+    // deadline. The production hook-chain race must refuse send and cancel
+    // the still-pending hook.
     struct SlowBackendToClientHook {
         delay: Duration,
         ran: Arc<AtomicUsize>,
@@ -777,6 +778,243 @@ async fn expiry_during_a_dropping_hook_still_terminates_the_session() {
     );
 }
 
+/// A backend→client hook whose future never completes, and which reports
+/// when that future is dropped.
+struct NeverCompletingBackendToClientHook {
+    entered: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    dropped: Arc<AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl ferrum_edge::plugins::Plugin for NeverCompletingBackendToClientHook {
+    fn name(&self) -> &str {
+        "test_never_completing_backend_to_client_udp_datagram"
+    }
+    async fn on_udp_datagram(
+        &self,
+        _ctx: &ferrum_edge::plugins::UdpDatagramContext<'_>,
+    ) -> ferrum_edge::plugins::UdpDatagramVerdict {
+        struct HookFutureGuard(Arc<AtomicBool>);
+
+        impl Drop for HookFutureGuard {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let _guard = HookFutureGuard(Arc::clone(&self.dropped));
+        if let Some(entered) = self
+            .entered
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            let _ = entered.send(());
+        }
+        std::future::pending::<()>().await;
+        unreachable!("the pending backend→client hook never completes")
+    }
+}
+
+struct PollCountingBackendToClientHook {
+    polled: Arc<AtomicBool>,
+    verdict: ferrum_edge::plugins::UdpDatagramVerdict,
+}
+
+#[async_trait::async_trait]
+impl ferrum_edge::plugins::Plugin for PollCountingBackendToClientHook {
+    fn name(&self) -> &str {
+        "test_poll_counting_backend_to_client_udp_datagram"
+    }
+    async fn on_udp_datagram(
+        &self,
+        _ctx: &ferrum_edge::plugins::UdpDatagramContext<'_>,
+    ) -> ferrum_edge::plugins::UdpDatagramVerdict {
+        self.polled.store(true, Ordering::SeqCst);
+        self.verdict
+    }
+}
+
+struct ImmediateDropBackendToClientHook;
+
+#[async_trait::async_trait]
+impl ferrum_edge::plugins::Plugin for ImmediateDropBackendToClientHook {
+    fn name(&self) -> &str {
+        "test_immediate_drop_backend_to_client_udp_datagram"
+    }
+    async fn on_udp_datagram(
+        &self,
+        _ctx: &ferrum_edge::plugins::UdpDatagramContext<'_>,
+    ) -> ferrum_edge::plugins::UdpDatagramVerdict {
+        ferrum_edge::plugins::UdpDatagramVerdict::Drop
+    }
+}
+
+struct ParkedUnauthenticatedHook {
+    entered: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    dropped: Arc<AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl ferrum_edge::plugins::Plugin for ParkedUnauthenticatedHook {
+    fn name(&self) -> &str {
+        "test_parked_unauthenticated_backend_to_client_udp_datagram"
+    }
+    async fn on_udp_datagram(
+        &self,
+        _ctx: &ferrum_edge::plugins::UdpDatagramContext<'_>,
+    ) -> ferrum_edge::plugins::UdpDatagramVerdict {
+        struct HookFutureGuard(Arc<AtomicBool>);
+
+        impl Drop for HookFutureGuard {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let _guard = HookFutureGuard(Arc::clone(&self.dropped));
+        if let Some(entered) = self
+            .entered
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            let _ = entered.send(());
+        }
+        if let Some(release) = self
+            .release
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            let _ = release.await;
+        }
+        ferrum_edge::plugins::UdpDatagramVerdict::Forward
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_never_completing_backend_hook_is_dropped_at_the_authorization_deadline() {
+    // A hook future that NEVER completes used to pin the reply task past the
+    // credential deadline because the timer was only polled while awaiting
+    // the next backend receive. Expiry must win without a later wake.
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let dropped = Arc::new(AtomicBool::new(false));
+    let plugin = Arc::new(NeverCompletingBackendToClientHook {
+        entered: Mutex::new(Some(entered_tx)),
+        dropped: Arc::clone(&dropped),
+    });
+    let plugins: Vec<Arc<dyn ferrum_edge::plugins::Plugin>> = vec![plugin];
+    let plan = future_plan(
+        Duration::from_millis(20),
+        StreamAuthTermination::CredentialExpired,
+    );
+
+    let commit = tokio::spawn(async move {
+        ferrum_edge::_test_support::udp_reply_commit_after_backend_hooks_for_test(
+            &plugins,
+            b"never-completing-hook",
+            Some(plan),
+        )
+        .await
+    });
+    entered_rx.await.expect("the hook future must start");
+    assert!(
+        !dropped.load(Ordering::SeqCst),
+        "the hook must still be pending before the deadline"
+    );
+
+    tokio::time::advance(Duration::from_millis(20)).await;
+    assert_eq!(
+        commit.await.expect("join"),
+        ferrum_edge::_test_support::UdpReplyDatagramCommitForTest::AuthorizationExpired(
+            StreamAuthTermination::CredentialExpired
+        ),
+        "expiry must complete the race without waiting for the hook to finish"
+    );
+    assert!(
+        dropped.load(Ordering::SeqCst),
+        "the still-pending hook future must be dropped at the absolute deadline"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_already_elapsed_plan_never_polls_a_backend_to_client_hook() {
+    let polled = Arc::new(AtomicBool::new(false));
+    let plugin = Arc::new(PollCountingBackendToClientHook {
+        polled: Arc::clone(&polled),
+        verdict: ferrum_edge::plugins::UdpDatagramVerdict::Forward,
+    });
+    let plugins: Vec<Arc<dyn ferrum_edge::plugins::Plugin>> = vec![plugin];
+    assert_eq!(
+        ferrum_edge::_test_support::udp_reply_commit_after_backend_hooks_for_test(
+            &plugins,
+            b"already-elapsed",
+            Some(elapsed_plan(StreamAuthTermination::CredentialExpired)),
+        )
+        .await,
+        ferrum_edge::_test_support::UdpReplyDatagramCommitForTest::AuthorizationExpired(
+            StreamAuthTermination::CredentialExpired
+        )
+    );
+    assert!(
+        !polled.load(Ordering::SeqCst),
+        "an already-elapsed plan must refuse before polling any hook"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn expiry_and_drop_ready_together_is_expiry_first() {
+    // `future_plan(0)` is an exact-boundary plan: the already-elapsed precheck
+    // treats `now >= plan.at` as expiry and never polls the Drop hook.
+    let polled = Arc::new(AtomicBool::new(false));
+    let plugin = Arc::new(PollCountingBackendToClientHook {
+        polled: Arc::clone(&polled),
+        verdict: ferrum_edge::plugins::UdpDatagramVerdict::Drop,
+    });
+    let plugins: Vec<Arc<dyn ferrum_edge::plugins::Plugin>> = vec![plugin];
+    let plan = future_plan(
+        Duration::from_millis(0),
+        StreamAuthTermination::AuthenticatedStreamMaxLifetime,
+    );
+    assert_eq!(
+        ferrum_edge::_test_support::udp_reply_commit_after_backend_hooks_for_test(
+            &plugins,
+            b"exact-tie-drop",
+            Some(plan),
+        )
+        .await,
+        ferrum_edge::_test_support::UdpReplyDatagramCommitForTest::AuthorizationExpired(
+            StreamAuthTermination::AuthenticatedStreamMaxLifetime
+        )
+    );
+    assert!(
+        !polled.load(Ordering::SeqCst),
+        "an exact-deadline tie must not poll a simultaneously-ready Drop hook"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_plugin_drop_before_the_deadline_is_honored() {
+    let plugins: Vec<Arc<dyn ferrum_edge::plugins::Plugin>> =
+        vec![Arc::new(ImmediateDropBackendToClientHook)];
+    let plan = future_plan(
+        Duration::from_secs(30),
+        StreamAuthTermination::CredentialExpired,
+    );
+    assert_eq!(
+        ferrum_edge::_test_support::udp_reply_commit_after_backend_hooks_for_test(
+            &plugins,
+            b"drop-while-authorized",
+            Some(plan),
+        )
+        .await,
+        ferrum_edge::_test_support::UdpReplyDatagramCommitForTest::Drop,
+        "a Drop that becomes ready strictly before expiry must not terminate the session"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn expiry_among_try_recv_batch_processing_stops_later_replies() {
     // Each drain step re-reads the same absolute plan. The first payload is
@@ -825,6 +1063,48 @@ async fn unauthenticated_commitment_checks_never_expire() {
             None,
         )
         .await,
+        ferrum_edge::_test_support::UdpReplyDatagramCommitForTest::Commit
+    );
+
+    let plugins: Vec<Arc<dyn ferrum_edge::plugins::Plugin>> =
+        vec![Arc::new(ImmediateDropBackendToClientHook)];
+    assert_eq!(
+        ferrum_edge::_test_support::udp_reply_commit_after_backend_hooks_for_test(
+            &plugins,
+            b"unauthenticated-drop",
+            None,
+        )
+        .await,
+        ferrum_edge::_test_support::UdpReplyDatagramCommitForTest::Drop,
+        "unauthenticated sessions still honor plugin Drop with no timer or clock"
+    );
+
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let dropped = Arc::new(AtomicBool::new(false));
+    let plugin = Arc::new(ParkedUnauthenticatedHook {
+        entered: Mutex::new(Some(entered_tx)),
+        release: Mutex::new(Some(release_rx)),
+        dropped: Arc::clone(&dropped),
+    });
+    let plugins: Vec<Arc<dyn ferrum_edge::plugins::Plugin>> = vec![plugin];
+    let commit = tokio::spawn(async move {
+        ferrum_edge::_test_support::udp_reply_commit_after_backend_hooks_for_test(
+            &plugins,
+            b"unauthenticated-parked",
+            None,
+        )
+        .await
+    });
+    entered_rx.await.expect("the unauthenticated hook must start");
+    tokio::time::advance(Duration::from_secs(86_400)).await;
+    assert!(
+        !dropped.load(Ordering::SeqCst),
+        "an unauthenticated hook must not be cancelled by a timer that does not exist"
+    );
+    let _ = release_tx.send(());
+    assert_eq!(
+        commit.await.expect("join"),
         ferrum_edge::_test_support::UdpReplyDatagramCommitForTest::Commit
     );
 }
@@ -1547,7 +1827,8 @@ fn every_client_to_backend_path_is_gated() {
 }
 
 /// Backend→client expiry is re-checked at every post-receive commitment
-/// boundary, and queued GSO/sendmmsg payloads are discarded — not flushed.
+/// boundary, awaitable hooks are raced against the same plan, and queued
+/// GSO/sendmmsg payloads are discarded — not flushed.
 #[test]
 fn the_reply_task_rechecks_and_discards_at_every_commitment_boundary() {
     let create_session = body_of("async fn create_session(");
@@ -1562,7 +1843,7 @@ fn the_reply_task_rechecks_and_discards_at_every_commitment_boundary() {
     );
     assert!(
         reply_loop.contains("udp_reply_commit_after_backend_hooks("),
-        "awaitable backend→client hooks recheck before send or enqueue"
+        "awaitable backend→client hooks race the absolute plan before send or enqueue"
     );
     assert!(
         reply_loop.contains("gso_batch.discard()"),
@@ -1770,6 +2051,52 @@ fn client_facing_sends_are_raced_against_the_authorization_plan() {
     assert!(
         !dtls_inner.contains("if client_sender.send(&data).await.is_err()"),
         "the DTLS frontend send must not await unguarded"
+    );
+
+    let dtls_b2c = dtls_inner
+        .split("let backend_to_client = tokio::spawn(async move {")
+        .nth(1)
+        .expect("the terminating-DTLS backend→client task")
+        .split("client_sender.send_committed(")
+        .next()
+        .expect("DTLS B2C hooks precede the client send race");
+    assert!(
+        dtls_b2c.contains("udp_reply_commit_after_backend_hooks("),
+        "terminating-DTLS backend→client hooks share the raced helper"
+    );
+    assert!(
+        !dtls_b2c.contains("plugin.on_udp_datagram(&ctx).await"),
+        "DTLS backend→client hooks must not await unguarded"
+    );
+}
+
+/// A post-hook clock recheck is not sufficient: the hook-chain future itself
+/// must be owned by the same expiry-first race as client-facing sends.
+#[test]
+fn backend_to_client_hooks_race_the_authorization_plan() {
+    let body = body_of("pub(crate) async fn udp_reply_commit_after_backend_hooks")
+        .split("\n}\n")
+        .next()
+        .expect("the backend→client hook helper body");
+    assert!(
+        body.contains("udp_frontend_send_until_expiry(plan, chain)"),
+        "the hook chain must be owned by the expiry-first race, not awaited then rechecked"
+    );
+    assert!(
+        !body.contains("udp_reply_expired_at_commit("),
+        "a post-hook clock recheck cannot cancel a still-pending hook future"
+    );
+    assert!(
+        body.contains("plugin.on_udp_datagram(ctx).await"),
+        "plugin order is preserved inside the raced chain"
+    );
+    let none_path = body_of("pub(crate) async fn udp_frontend_send_until_expiry")
+        .split("\n}\n")
+        .next()
+        .expect("the shared race body");
+    assert!(
+        none_path.contains("return UdpFrontendSendOutcome::Sent(send.await)"),
+        "unauthenticated sessions still take the no-timer fast path"
     );
 }
 
