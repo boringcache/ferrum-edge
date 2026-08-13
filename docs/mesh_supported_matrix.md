@@ -162,7 +162,14 @@ need them, or because they are blocked upstream / architecturally:
   does consume standard v3 CDS/EDS/LDS/RDS from a third-party control plane, but
   for **discovery only**: enforcement policy always comes from the mandatory
   local `FERRUM_MESH_FILE_CONFIG_PATH` document, and traffic shaping, subsets,
-  external DNS clusters, SDS, ECDS/RTDS, and delta xDS stay out of scope. See
+  external DNS clusters, SDS, ECDS/RTDS, and delta xDS stay out of scope. That
+  discovery half — including update, deletion, NACK, and capability-refusal
+  behaviour — is proven on the live data path against a scripted third-party ADS
+  server in `tests/functional/functional_mesh_stock_xds_test.rs` (unpinned-peer
+  and subset refusals as reachability transitions; foreign-namespace narrowing
+  and RBAC / weighted-route capability refusals as exact ACK + diagnostic +
+  accepted-service continuity, with semantic unit/integration coverage that
+  those constructs contribute no route). See
   `docs/mesh.md` → "Stock Envoy / third-party Istio xDS interoperability".
 - **`EnvoyFilter` / `WasmPlugin`** — use Ferrum custom plugins (`custom_plugins/`).
 - **`AuthorizationPolicy` `when: experimental.envoy.filters.*`** — the key is
