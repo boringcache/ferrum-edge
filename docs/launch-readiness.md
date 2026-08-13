@@ -666,10 +666,17 @@ launch/release gate must be byte-identical to the trusted base:
 | `.github/workflows/launch-advisory-trust.yml` | once the trusted base carries it (issue #3802) |
 | `.github/scripts/verify_launch_advisory_trust.py` | once the trusted base carries it (issue #3802) |
 
-The two optional rows are treated as absent only while the trusted base also
-lacks them; the moment the base carries one, deleting it or changing a byte
-fails. A trusted base that is missing a *required* anchor is a broken or
-tampered extraction and fails closed rather than skipping enforcement.
+The two optional rows are unfrozen only while the trusted base also lacks them;
+both roots may omit either file in that state. Once
+`.github/scripts/verify_launch_integrity.py` exists on the trusted base, a
+candidate that introduces either optional file before the trusted base carries
+reviewed bytes for it is rejected rather than receiving a filename-based
+exception; legitimate first adoption lands on protected `main` through the
+auditable administrative bypass described in the contributor guidance below,
+followed immediately by hosted runs on the new `main` tip. The moment the base
+carries one, deleting it or changing a byte fails. A trusted base that is
+missing a *required* anchor is a broken or tampered extraction and fails closed
+rather than skipping enforcement.
 
 This is a deliberate replacement for a semantic contract. An earlier revision of
 this verifier tried to *permit* checker edits that "still looked fail-closed":
@@ -697,10 +704,14 @@ is the enforced property and the heuristics are gone.
   fixtures in the isolated `trusted-policy-candidate.yml` lane, which produces
   nothing another job reads — the same posture as `Trusted Cross Build Policy`.
 
-On the single adoption commit the trusted base carries no verifier at all, so
-there is no protected contract to preserve and nothing trustworthy to execute:
-that run reports success with an explicit `::notice::` instead of pretending to
-have enforced anything. Every later revision takes the enforcing path.
+On the single adoption commit for this verifier itself the trusted base carries
+no `.github/scripts/verify_launch_integrity.py` at all, so there is no
+protected contract to preserve and nothing trustworthy to execute: that run
+reports success with an explicit `::notice::` instead of pretending to have
+enforced anything. Every later revision — including any pull request once this
+verifier exists on the trusted base — takes the enforcing path; optional
+advisory-trust anchors do not have a workflow short-circuit and must land
+through the same administrative bypass.
 
 ### What the verifier enforces
 
