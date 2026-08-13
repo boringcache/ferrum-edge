@@ -20,6 +20,7 @@ use super::{
     StreamConnectionContext, StreamTransactionSummary, TransactionSummary, WsDisconnectContext,
 };
 use crate::ebpf::NodeAgentMetrics;
+use crate::k8s_controller::metrics::ControllerMetrics;
 use crate::retry::ErrorClass;
 
 /// Global metrics registry (singleton per process).
@@ -862,6 +863,10 @@ pub struct MetricsRegistry {
     tls_store_pruned_total: AtomicU64,
     /// Node-agent metrics registered by `FERRUM_MODE=node_agent`.
     node_agent_metrics: ArcSwap<Option<Arc<NodeAgentMetrics>>>,
+    /// Kubernetes controller metrics registered while the CRD controller runs.
+    /// Shared `Arc` so `/metrics` keeps the counters after `K8sControllerHandle`
+    /// is dropped.
+    k8s_controller_metrics: ArcSwap<Option<Arc<ControllerMetrics>>>,
     /// Admin/management-plane connection limiter, registered when an admin
     /// listener starts. Rendered as gauge/counter so operators can observe
     /// management-plane connection pressure and rejections.
@@ -998,6 +1003,7 @@ impl MetricsRegistry {
             }),
             tls_store_pruned_total: AtomicU64::new(0),
             node_agent_metrics: ArcSwap::from_pointee(None),
+            k8s_controller_metrics: ArcSwap::from_pointee(None),
             admin_conn_metrics: ArcSwap::from_pointee(None),
             cp_grpc_conn_metrics: ArcSwap::from_pointee(None),
             database_delta_poll_metrics: ArcSwap::from_pointee(None),
@@ -1739,6 +1745,14 @@ impl MetricsRegistry {
 
     pub fn set_node_agent_metrics(&self, metrics: Arc<NodeAgentMetrics>) {
         self.node_agent_metrics.store(Arc::new(Some(metrics)));
+        self.render_cache.store(Arc::new(None));
+    }
+
+    /// Register the Kubernetes controller counters so `/metrics` exports the
+    /// unlabeled Istio status CAS outcomes. The registry retains the `Arc`, so
+    /// handle shutdown does not withdraw the families.
+    pub fn set_k8s_controller_metrics(&self, metrics: Arc<ControllerMetrics>) {
+        self.k8s_controller_metrics.store(Arc::new(Some(metrics)));
         self.render_cache.store(Arc::new(None));
     }
 
@@ -2717,6 +2731,7 @@ impl MetricsRegistry {
         self.append_cp_dp_trust_reload_prometheus(&mut output);
         self.append_frontend_client_trust_prometheus(&mut output);
         self.append_gateway_listener_status_prometheus(&mut output);
+        self.append_k8s_controller_prometheus(&mut output);
         output
     }
 
@@ -2797,6 +2812,88 @@ impl MetricsRegistry {
             output,
             &ns_label,
             crate::proxy::gateway_listener_status::global().map(|status| &**status),
+        );
+    }
+
+    /// Append unlabeled Istio status CAS counters from the live controller
+    /// `Arc`. Kept off the render cache so conflict/retry outcomes are visible
+    /// on the next scrape even though the atomics live outside this registry.
+    fn append_k8s_controller_prometheus(&self, output: &mut String) {
+        let metrics = self.k8s_controller_metrics.load_full();
+        let Some(metrics) = metrics.as_ref() else {
+            return;
+        };
+        let snapshot = metrics.snapshot();
+        output.push_str(
+            "# HELP ferrum_k8s_controller_istio_status_conflicts_total Istio status JSON Merge Patch 409 conflicts observed while applying Ferrum-owned conditions.\n",
+        );
+        output.push_str("# TYPE ferrum_k8s_controller_istio_status_conflicts_total counter\n");
+        render_process_counter(
+            output,
+            "ferrum_k8s_controller_istio_status_conflicts_total",
+            snapshot.istio_status_conflicts,
+            "",
+        );
+        output.push_str(
+            "# HELP ferrum_k8s_controller_istio_status_missing_uid_total Istio status writes refused because the planned watch-snapshot UID was missing.\n",
+        );
+        output.push_str("# TYPE ferrum_k8s_controller_istio_status_missing_uid_total counter\n");
+        render_process_counter(
+            output,
+            "ferrum_k8s_controller_istio_status_missing_uid_total",
+            snapshot.istio_status_missing_uid,
+            "",
+        );
+        output.push_str(
+            "# HELP ferrum_k8s_controller_istio_status_not_found_total Istio status writes aborted because the status read or write returned HTTP 404.\n",
+        );
+        output.push_str("# TYPE ferrum_k8s_controller_istio_status_not_found_total counter\n");
+        render_process_counter(
+            output,
+            "ferrum_k8s_controller_istio_status_not_found_total",
+            snapshot.istio_status_not_found,
+            "",
+        );
+        output.push_str(
+            "# HELP ferrum_k8s_controller_istio_status_recreated_total Istio status writes aborted because the live UID no longer matched the planned object.\n",
+        );
+        output.push_str("# TYPE ferrum_k8s_controller_istio_status_recreated_total counter\n");
+        render_process_counter(
+            output,
+            "ferrum_k8s_controller_istio_status_recreated_total",
+            snapshot.istio_status_recreated,
+            "",
+        );
+        output.push_str(
+            "# HELP ferrum_k8s_controller_istio_status_retries_total Istio status writes that succeeded after at least one resourceVersion conflict retry.\n",
+        );
+        output.push_str("# TYPE ferrum_k8s_controller_istio_status_retries_total counter\n");
+        render_process_counter(
+            output,
+            "ferrum_k8s_controller_istio_status_retries_total",
+            snapshot.istio_status_retries,
+            "",
+        );
+        output.push_str(
+            "# HELP ferrum_k8s_controller_istio_status_retry_exhausted_total Istio status writes that exhausted the bounded conflict retry budget without an unversioned fallback.\n",
+        );
+        output
+            .push_str("# TYPE ferrum_k8s_controller_istio_status_retry_exhausted_total counter\n");
+        render_process_counter(
+            output,
+            "ferrum_k8s_controller_istio_status_retry_exhausted_total",
+            snapshot.istio_status_retry_exhausted,
+            "",
+        );
+        output.push_str(
+            "# HELP ferrum_k8s_controller_istio_status_unsupported_total Istio status writes aborted because the API server does not serve the Istio resource or its status subresource.\n",
+        );
+        output.push_str("# TYPE ferrum_k8s_controller_istio_status_unsupported_total counter\n");
+        render_process_counter(
+            output,
+            "ferrum_k8s_controller_istio_status_unsupported_total",
+            snapshot.istio_status_unsupported,
+            "",
         );
     }
 
@@ -2897,6 +2994,7 @@ impl MetricsRegistry {
         self.append_cp_dp_trust_reload_prometheus(&mut output);
         self.append_frontend_client_trust_prometheus(&mut output);
         self.append_gateway_listener_status_prometheus(&mut output);
+        self.append_k8s_controller_prometheus(&mut output);
         output
     }
 
