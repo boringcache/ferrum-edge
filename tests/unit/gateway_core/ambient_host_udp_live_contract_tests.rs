@@ -605,6 +605,11 @@ fn dockerfile_publishes_a_tools_capable_runtime_without_weakening_ebpf() {
          distroless staging closure"
     );
     assert!(
+        tools_base.contains("ca-certificates"),
+        "the tool base must install the Debian platform CA bundle for plugin \
+         reqwest TLS verification"
+    );
+    assert!(
         tools_base.contains("for tool in ip iptables ip6tables iptables-save ip6tables-save; do"),
         "the tool base must assert the complete production tool set at build \
          time, so a missing tool fails the build instead of a node"
@@ -612,6 +617,10 @@ fn dockerfile_publishes_a_tools_capable_runtime_without_weakening_ebpf() {
     assert!(
         tools_base.contains("test -x /bin/sh"),
         "the tool base must assert a usable shell at build time"
+    );
+    assert!(
+        tools_base.contains("test -s /etc/ssl/certs/ca-certificates.crt"),
+        "the tool base must assert the Debian platform CA bundle at build time"
     );
 
     let tools_runtime = dockerfile_stage_body(&dockerfile, "runtime-ebpf-tools");

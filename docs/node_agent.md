@@ -178,8 +178,11 @@ BPF map read are gated behind `#[cfg(all(feature = "ebpf", target_os = "linux"))
 >   using the root `Dockerfile` target `runtime-ebpf-tools`. It is a strict
 >   **superset** of
 >   `-ebpf` (identical binaries and BPF ELF) on a Debian 13 base that also ships
->   `/bin/sh`, `ip`, `iptables`, `ip6tables`, `iptables-save`, and
->   `ip6tables-save`. Use it for the two paths that shell out: the Ambient UDP
+>   `/bin/sh`, `ip`, `iptables`, `ip6tables`, `iptables-save`,
+>   `ip6tables-save`, and the Debian platform CA bundle at
+>   `/etc/ssl/certs/ca-certificates.crt` (required for plugin `reqwest` TLS
+>   verification; the distroless `-ebpf` base already carries a CA store). Use it
+>   for the two paths that shell out: the Ambient UDP
 >   capture lifecycle (the mesh chart selects this tag automatically) and
 >   `FERRUM_NODE_AGENT_FALLBACK_MODE=iptables`. It is **not distroless**, has a
 >   package manager, and runs as **root**, so prefer `-ebpf` wherever the tool

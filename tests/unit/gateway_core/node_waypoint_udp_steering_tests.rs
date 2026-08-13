@@ -1715,8 +1715,17 @@ fn node_waypoint_ebpf_live_job_packages_and_loads_the_tools_image() {
 
     let layer = repo_file("Dockerfile.ebpf-tools-layer");
     assert!(
+        layer.contains("ca-certificates"),
+        "the tools layer must install the Debian platform CA bundle for plugin \
+         reqwest TLS verification"
+    );
+    assert!(
         layer.contains("test -x /bin/sh"),
         "the tools layer must fail the build if /bin/sh is missing"
+    );
+    assert!(
+        layer.contains("test -s /etc/ssl/certs/ca-certificates.crt"),
+        "the tools layer must fail the build if the Debian platform CA bundle is missing"
     );
     assert!(
         layer.contains("iptables"),
