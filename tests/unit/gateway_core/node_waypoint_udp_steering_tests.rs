@@ -293,28 +293,136 @@ fn teardown_is_strict_for_both_families_and_verifies_exact_absence() {
 #[test]
 fn teardown_probes_jump_target_chain_before_rule_check() {
     let script = node_waypoint_udp_steer_teardown_script();
+    let helper = xtables_rule_helper(&script);
+    let jump_probe = jump_target_probe_block(&helper);
 
-    let chain_probe = script
+    let chain_probe = helper
         .find("-S \"$ferrum_jump_target\"")
         .expect("jump-target chain existence must be probed with -S");
-    let rule_check = script
+    let rule_check = helper
         .find("-C \"$@\"")
         .expect("the jump itself is still checked with -C when the chain exists");
     assert!(
         chain_probe < rule_check,
-        "chain existence must be established before the jump probe:\n{script}"
+        "chain existence must be established before the jump probe:\n{helper}"
     );
     assert!(
         script.contains("jump-target chain inspection failed")
             && script.contains("rule inspection failed")
-            && script.contains("[ \"$ferrum_status\" -ne 1 ]"),
-        "absent chains stay success via -S status 1; other statuses stay fail-closed:\n{script}"
+            && jump_probe.contains("[ \"$ferrum_status\" -ne 1 ]"),
+        "absent chains stay success via -S status 1; other statuses stay fail-closed:\n{jump_probe}"
     );
     assert!(
         !script.contains("[ \"$ferrum_status\" -eq 2 ]")
             && !script.contains("-eq 1 -o")
             && !script.contains("-eq 1] || [ \"$ferrum_status\" -eq 2"),
         "status 2 must not be reclassified as absence:\n{script}"
+    );
+
+    assert_no_bang_inverted_status_capture(&script);
+    assert_jump_target_probe_retains_original_status(&jump_probe);
+    assert!(
+        helper[rule_check..].contains("-D \"$@\""),
+        "a present jump-target chain must still delete via -C/-D:\n{helper}"
+    );
+}
+
+fn xtables_rule_helper(script: &str) -> &str {
+    let start = script
+        .find("ferrum_delete_xtables_rule() {")
+        .expect("xtables rule helper must be rendered");
+    let rest = &script[start..];
+    let end = rest
+        .find("ferrum_delete_xtables_chain() {")
+        .expect("xtables chain helper must follow the rule helper");
+    rest[..end].trim_end()
+}
+
+fn jump_target_probe_block(helper: &str) -> &str {
+    let start = helper
+        .find("if [ -n \"$ferrum_jump_target\" ]")
+        .expect("jump-target presence must gate the -S probe");
+    let rest = &helper[start..];
+    let end = rest
+        .find("-C \"$@\"")
+        .expect("successful -S must fall through to -C");
+    &rest[..end]
+}
+
+/// POSIX `if ! cmd; then status=$?` records the inverted compound status (0),
+/// not `cmd`'s status. Status capture must happen in an `else` (or an
+/// uninverted `||`) so lock/permission/resource failures stay fail-closed.
+fn assert_no_bang_inverted_status_capture(script: &str) {
+    let lines: Vec<&str> = script.lines().map(str::trim).collect();
+    for (index, line) in lines.iter().enumerate() {
+        if !line.starts_with("if !") {
+            continue;
+        }
+        assert!(
+            !line.contains("ferrum_status=$?") && !line.contains("status=$?"),
+            "POSIX `if ! cmd; then status=$?` captures 0, not cmd:\n{script}"
+        );
+        let mut in_then = line.contains("then");
+        for follow in &lines[index + 1..] {
+            if !in_then {
+                if *follow == "then" || follow.starts_with("then ") {
+                    in_then = true;
+                }
+                continue;
+            }
+            if follow.starts_with("else") || *follow == "fi" || follow.starts_with("fi ") {
+                break;
+            }
+            assert!(
+                !follow.contains("ferrum_status=$?") && !follow.contains("status=$?"),
+                "POSIX `if ! cmd; then status=$?` captures 0, not cmd:\n{script}"
+            );
+        }
+    }
+}
+
+fn assert_jump_target_probe_retains_original_status(jump_probe: &str) {
+    assert!(
+        !jump_probe.contains("if !"),
+        "the -S probe must not invert the iptables status:\n{jump_probe}"
+    );
+    assert!(
+        jump_probe.contains(
+            "if \"$ferrum_binary\" -t \"$ferrum_table\" -w 5 -S \"$ferrum_jump_target\""
+        ),
+        "the -S probe must be the non-inverted if-condition:\n{jump_probe}"
+    );
+
+    let then_at = jump_probe
+        .find("; then")
+        .expect("the -S probe must be an if-condition");
+    // Skip the outer `if [ -n ... ]; then` and require the inner -S then/else.
+    let inner = &jump_probe[then_at + "; then".len()..];
+    let inner_then_at = inner
+        .find("; then")
+        .expect("inner -S if must keep then/else status capture");
+    let capture = inner[inner_then_at + "; then".len()..].trim_start();
+    assert!(
+        capture.starts_with("ferrum_status=0"),
+        "successful -S must record status 0 before falling through to -C:\n{jump_probe}"
+    );
+    let else_at = capture
+        .find("else")
+        .expect("failed -S must capture status in else");
+    let else_body = capture[else_at + "else".len()..].trim_start();
+    assert!(
+        else_body.starts_with("ferrum_status=$?"),
+        "failed -S must retain the original iptables status in else:\n{jump_probe}"
+    );
+    assert!(
+        else_body.contains("[ \"$ferrum_status\" -ne 1 ]")
+            && else_body.contains("return \"$ferrum_status\"")
+            && else_body.contains("return 0"),
+        "status 1 is the only absent-chain success; other nonzeros fail closed:\n{jump_probe}"
+    );
+    assert!(
+        !capture[..else_at].contains("return"),
+        "successful -S must fall through to -C/-D, not return:\n{jump_probe}"
     );
 }
 

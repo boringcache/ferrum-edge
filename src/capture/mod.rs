@@ -548,7 +548,10 @@ pub fn node_waypoint_udp_steer_setup_script(
 /// #2084); treating that as a resource error left first-pass teardown failing
 /// forever and blocked every subsequent setup. `-S` returns 1 for an absent
 /// chain on both legacy and nft backends, so absence stays portable without
-/// accepting lock or permission failures as success.
+/// accepting lock or permission failures as success. The `-S` status is
+/// captured from a non-inverted `if`/`else`: POSIX `if ! cmd; then status=$?`
+/// records 0 (the inverted compound status) and would treat lock and
+/// permission failures as absence.
 pub fn node_waypoint_udp_steer_teardown_script() -> String {
     let helpers = format!(
         "set -e\n\
@@ -565,7 +568,9 @@ pub fn node_waypoint_udp_steer_teardown_script() -> String {
              ferrum_prev=\"$ferrum_arg\"\n\
            done\n\
            if [ -n \"$ferrum_jump_target\" ]; then\n\
-             if ! \"$ferrum_binary\" -t \"$ferrum_table\" -w {XTABLES_LOCK_WAIT_SECONDS} -S \"$ferrum_jump_target\" >/dev/null 2>&1; then\n\
+             if \"$ferrum_binary\" -t \"$ferrum_table\" -w {XTABLES_LOCK_WAIT_SECONDS} -S \"$ferrum_jump_target\" >/dev/null 2>&1; then\n\
+               ferrum_status=0\n\
+             else\n\
                ferrum_status=$?\n\
                if [ \"$ferrum_status\" -ne 1 ]; then\n\
                  echo 'Ferrum NodeWaypoint UDP steering jump-target chain inspection failed' >&2\n\
