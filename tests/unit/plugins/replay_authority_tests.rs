@@ -23,8 +23,9 @@ use std::time::Duration;
 use ferrum_edge::plugins::utils::redis_rate_limiter::{RedisConfig, RedisRateLimitClient};
 use ferrum_edge::plugins::utils::replay_authority::{
     MAX_PROCESS_REPLAY_LANES, ReplayAdmission, ReplayAuthority, ReplayDomain, ReplayScope,
-    admit_process_at, counters, monotonic_millis, process_lane, process_lane_registered_for_tests,
-    process_max_entries, shared_authority_degraded, shared_health_snapshot, validate_scope_backend,
+    admit_process_at, counters, monotonic_millis, poison_shared_authorities_for_tests,
+    process_lane, process_lane_registered_for_tests, process_max_entries,
+    shared_authority_degraded, shared_health_snapshot, validate_scope_backend,
 };
 
 const PROFILE: &str = "ferrum-replay-authority-tests-v1";
@@ -734,7 +735,7 @@ async fn a_shared_authority_with_an_unreachable_backend_fails_closed() {
     .expect("redis config parses")
     .expect("sync_mode redis yields a config");
 
-    let client = Arc::new(RedisRateLimitClient::new(config, None, false, None));
+    let client = Arc::new(RedisRateLimitClient::for_replay_authority(config, None, false, None));
     let authority = ReplayAuthority::shared(client, RETENTION);
     assert_eq!(authority.mode(), "shared");
 
@@ -771,7 +772,7 @@ async fn an_unavailable_shared_authority_is_visible_in_the_counters() {
     .expect("redis config parses")
     .expect("sync_mode redis yields a config");
 
-    let client = Arc::new(RedisRateLimitClient::new(config, None, false, None));
+    let client = Arc::new(RedisRateLimitClient::for_replay_authority(config, None, false, None));
     client.mark_unavailable_for_test();
     let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
 
@@ -823,7 +824,7 @@ fn unreachable_shared_client(prefix: &str) -> Arc<RedisRateLimitClient> {
     )
     .expect("redis config parses")
     .expect("sync_mode redis yields a config");
-    Arc::new(RedisRateLimitClient::new(config, None, false, None))
+    Arc::new(RedisRateLimitClient::for_replay_authority(config, None, false, None))
 }
 
 /// The bounded aggregate readiness consumes: an unavailable shared authority is
@@ -1023,7 +1024,7 @@ fn claim_client(port: u16, prefix: &str) -> Arc<RedisRateLimitClient> {
     )
     .expect("redis config parses")
     .expect("sync_mode redis yields a config");
-    Arc::new(RedisRateLimitClient::new(config, None, false, None))
+    Arc::new(RedisRateLimitClient::for_replay_authority(config, None, false, None))
 }
 
 /// A connected backend that never answers the claim must produce a fixed
@@ -1081,7 +1082,7 @@ async fn the_shared_claim_primitive_publishes_no_backend_or_key_material() {
     assert!(!redacted.contains("claim-user"));
     assert!(!redacted.contains("claim-password"));
 
-    let client = Arc::new(RedisRateLimitClient::new(config, None, false, None));
+    let client = Arc::new(RedisRateLimitClient::for_replay_authority(config, None, false, None));
     let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
     let marker = domain("shared-redaction").marker(&[b"consumer-1", b"nonce-1"]);
 
@@ -1212,5 +1213,373 @@ async fn a_claim_whose_reply_was_lost_stays_fail_closed_on_retry() {
 
     drop(authority);
     drop(client);
+    let _ = shutdown.send(());
+}
+
+/// Poison recovery must keep retained live authorities countable. Dropping the
+/// registration or returning the default empty/healthy snapshot would hide an
+/// unavailable shared backend from readiness.
+#[test]
+fn shared_authority_health_recovers_a_poisoned_registry() {
+    let _serialized = shared_health_guard();
+    let baseline = shared_health_snapshot();
+
+    let client = unreachable_shared_client("ferrum:replay_authority_tests:poison");
+    client.mark_unavailable_for_test();
+    let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
+    let before = shared_health_snapshot();
+    assert_eq!(
+        before.shared_authorities,
+        baseline.shared_authorities + 1,
+        "the live authority must be registered before poison"
+    );
+    assert_eq!(
+        before.shared_authorities_unavailable,
+        baseline.shared_authorities_unavailable + 1,
+        "unavailable state must be visible before poison"
+    );
+
+    poison_shared_authorities_for_tests();
+
+    let recovered = shared_health_snapshot();
+    assert_eq!(
+        recovered.shared_authorities, before.shared_authorities,
+        "poison recovery must keep retained live authorities countable"
+    );
+    assert_eq!(
+        recovered.shared_authorities_unavailable, before.shared_authorities_unavailable,
+        "poison recovery must not make unavailable state disappear"
+    );
+    assert!(recovered.unavailable());
+
+    let extra = unreachable_shared_client("ferrum:replay_authority_tests:poison-extra");
+    extra.mark_unavailable_for_test();
+    let extra_authority = ReplayAuthority::shared(Arc::clone(&extra), RETENTION);
+    let after_register = shared_health_snapshot();
+    assert_eq!(
+        after_register.shared_authorities,
+        before.shared_authorities + 1,
+        "registration after poison must still join the recovered registry"
+    );
+
+    drop(extra_authority);
+    drop(extra);
+    drop(authority);
+    drop(client);
+    assert_eq!(
+        shared_health_snapshot().shared_authorities,
+        baseline.shared_authorities
+    );
+}
+
+/// Parse the `EX` TTL out of a RESP `SET … NX EX <ttl>` command.
+fn parse_set_ex_ttl(chunk: &[u8]) -> Option<u64> {
+    const EX: &[u8] = b"$2\r\nEX\r\n";
+    let idx = chunk.windows(EX.len()).position(|window| window == EX)?;
+    let rest = &chunk[idx + EX.len()..];
+    if rest.first() == Some(&b':') {
+        let end = rest.iter().position(|&byte| byte == b'\r')?;
+        return std::str::from_utf8(rest.get(1..end)?).ok()?.parse().ok();
+    }
+    if rest.first() == Some(&b'$') {
+        let header_end = rest.windows(2).position(|window| window == b"\r\n")?;
+        let start = header_end + 2;
+        let value_end = rest[start..]
+            .windows(2)
+            .position(|window| window == b"\r\n")?;
+        return std::str::from_utf8(rest.get(start..start + value_end)?)
+            .ok()?
+            .parse()
+            .ok();
+    }
+    None
+}
+
+/// Handshake + topology screen, then record the `EX` argument of every `SET`.
+async fn spawn_ttl_observing_redis_server() -> (
+    u16,
+    tokio::sync::oneshot::Sender<()>,
+    Arc<std::sync::Mutex<Vec<u64>>>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake redis");
+    let port = listener.local_addr().expect("local addr").port();
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed_for_server = Arc::clone(&observed);
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => break,
+                accepted = listener.accept() => {
+                    let Ok((mut stream, _)) = accepted else { break };
+                    let observed = Arc::clone(&observed_for_server);
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 16 * 1024];
+                        loop {
+                            let read = match stream.read(&mut buf).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(read) => read,
+                            };
+                            let chunk = &buf[..read];
+                            let contains = |needle: &[u8]| {
+                                chunk.windows(needle.len()).any(|window| window == needle)
+                            };
+                            let reply: Vec<u8> = if contains(b"SET") {
+                                if let Some(ttl) = parse_set_ex_ttl(chunk) {
+                                    observed
+                                        .lock()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                        .push(ttl);
+                                }
+                                b"+OK\r\n".to_vec()
+                            } else if contains(b"INFO") {
+                                let text = "# Cluster\r\ncluster_enabled:0\r\n";
+                                format!("${}\r\n{text}\r\n", text.len()).into_bytes()
+                            } else {
+                                let commands =
+                                    chunk.iter().filter(|&&byte| byte == b'*').count().max(1);
+                                b"+OK\r\n".repeat(commands)
+                            };
+                            if stream.write_all(&reply).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    });
+
+    (port, shutdown_tx, observed)
+}
+
+/// The shared claim writes the exact Redis `EX` TTL: integral retentions stay
+/// exact, a fractional remainder rounds up, and zero still becomes a positive
+/// Redis-valid TTL. Observed on the command that `admit` actually sends.
+#[tokio::test]
+async fn shared_claim_writes_the_exact_ceil_ttl_on_the_set_command() {
+    let _serialized = shared_health_guard_async().await;
+    let (port, shutdown, observed) = spawn_ttl_observing_redis_server().await;
+    let client = claim_client(port, "ferrum:replay_authority_tests:ttl");
+
+    for (label, retention, expected) in [
+        ("integral", Duration::from_secs(601), 601u64),
+        ("fractional", Duration::from_millis(600_500), 601u64),
+        ("zero", Duration::ZERO, 1u64),
+    ] {
+        let authority = ReplayAuthority::shared(Arc::clone(&client), retention);
+        let marker = domain("shared-ttl").marker(&[b"c", label.as_bytes()]);
+        assert_eq!(
+            authority.admit(&marker).await,
+            ReplayAdmission::Admitted,
+            "{label}: the observing backend must accept the claim"
+        );
+        drop(authority);
+
+        let ttl = observed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .pop()
+            .unwrap_or_else(|| panic!("{label}: SET NX EX must have been observed"));
+        assert_eq!(ttl, expected, "{label}: Redis EX ttl");
+    }
+
+    drop(client);
+    let _ = shutdown.send(());
+}
+
+const SENTINEL_USER: &str = "SENTINEL-REDIS-USER-r149";
+const SENTINEL_PASS: &str = "SENTINEL-REDIS-PASS-r149";
+const SENTINEL_PREFIX: &str = "SENTINEL-KEY-PREFIX-r149";
+const SENTINEL_AUTH_ERR: &str = "SENTINEL-AUTH-ERR-r149";
+const SENTINEL_CMD_ERR: &str = "SENTINEL-CMD-ERR-r149";
+const SENTINEL_MOVED_HOST: &str = "SENTINEL-MOVED-HOST-r149";
+
+#[derive(Clone, Copy)]
+enum LoggingShape {
+    AuthReject,
+    CommandError,
+    ClusterInfo,
+    ClusterMoved,
+}
+
+async fn spawn_logging_redis_server(shape: LoggingShape) -> (u16, tokio::sync::oneshot::Sender<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake redis");
+    let port = listener.local_addr().expect("local addr").port();
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => break,
+                accepted = listener.accept() => {
+                    let Ok((mut stream, _)) = accepted else { break };
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 16 * 1024];
+                        loop {
+                            let read = match stream.read(&mut buf).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(read) => read,
+                            };
+                            let chunk = &buf[..read];
+                            let contains = |needle: &[u8]| {
+                                chunk.windows(needle.len()).any(|window| window == needle)
+                            };
+                            let reply: Vec<u8> = match shape {
+                                LoggingShape::AuthReject => {
+                                    format!("-WRONGPASS {SENTINEL_AUTH_ERR}\r\n").into_bytes()
+                                }
+                                LoggingShape::ClusterInfo if contains(b"INFO") => {
+                                    let text = "# Cluster\r\ncluster_enabled:1\r\n";
+                                    format!("${}\r\n{text}\r\n", text.len()).into_bytes()
+                                }
+                                LoggingShape::ClusterMoved if contains(b"SET") => {
+                                    format!("-MOVED 1 {SENTINEL_MOVED_HOST}:7000\r\n").into_bytes()
+                                }
+                                LoggingShape::CommandError if contains(b"SET") => {
+                                    format!("-ERR {SENTINEL_CMD_ERR}\r\n").into_bytes()
+                                }
+                                _ if contains(b"INFO") => {
+                                    let text = "# Cluster\r\ncluster_enabled:0\r\n";
+                                    format!("${}\r\n{text}\r\n", text.len()).into_bytes()
+                                }
+                                _ => {
+                                    let commands =
+                                        chunk.iter().filter(|&&byte| byte == b'*').count().max(1);
+                                    b"+OK\r\n".repeat(commands)
+                                }
+                            };
+                            if stream.write_all(&reply).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    });
+
+    (port, shutdown_tx)
+}
+
+fn sentinel_replay_config(port: u16) -> RedisConfig {
+    RedisConfig::from_plugin_config(
+        &serde_json::json!({
+            "sync_mode": "redis",
+            "redis_url": format!(
+                "redis://{SENTINEL_USER}:{SENTINEL_PASS}@127.0.0.1:{port}/0"
+            ),
+            "redis_username": SENTINEL_USER,
+            "redis_password": SENTINEL_PASS,
+            "redis_key_prefix": SENTINEL_PREFIX,
+            "redis_connect_timeout_seconds": 1,
+            "redis_health_check_interval_seconds": 3600,
+        }),
+        SENTINEL_PREFIX,
+    )
+    .expect("redis config parses")
+    .expect("sync_mode redis yields a config")
+}
+
+fn assert_sentinels_absent(logs: &str, context: &str) {
+    for sentinel in [
+        SENTINEL_USER,
+        SENTINEL_PASS,
+        SENTINEL_PREFIX,
+        SENTINEL_AUTH_ERR,
+        SENTINEL_CMD_ERR,
+        SENTINEL_MOVED_HOST,
+    ] {
+        assert!(
+            !logs.contains(sentinel),
+            "{context} leaked {sentinel:?}: {logs}"
+        );
+    }
+}
+
+/// Replay-backend failures publish only a fixed classification beside the
+/// redacted endpoint. Connection/authentication, command, and topology paths
+/// are driven through a real RESP peer so the assertion is on emitted tracing,
+/// not on source text.
+#[tokio::test(flavor = "current_thread")]
+async fn replay_client_logs_only_classification_and_redacted_endpoint() {
+    let _serialized = shared_health_guard_async().await;
+
+    for (label, shape, expected_class) in [
+        ("authentication", LoggingShape::AuthReject, "connection_failed"),
+        ("command", LoggingShape::CommandError, "command_failed"),
+        (
+            "topology_probe",
+            LoggingShape::ClusterInfo,
+            "unsupported_topology",
+        ),
+        (
+            "topology_command",
+            LoggingShape::ClusterMoved,
+            "unsupported_topology",
+        ),
+    ] {
+        let (port, shutdown) = spawn_logging_redis_server(shape).await;
+        let config = sentinel_replay_config(port);
+        let redacted = config.redacted_url();
+        assert!(
+            !redacted.contains(SENTINEL_USER) && !redacted.contains(SENTINEL_PASS),
+            "{label}: redacted endpoint must strip userinfo: {redacted}"
+        );
+
+        let (logs, guard) = super::plugin_utils::capture_logs();
+        let client = Arc::new(RedisRateLimitClient::for_replay_authority(
+            config, None, false, None,
+        ));
+        let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
+        let marker = domain("shared-logging").marker(&[b"c", label.as_bytes()]);
+        assert_eq!(
+            authority.admit(&marker).await,
+            ReplayAdmission::AuthorityUnavailable,
+            "{label}: sentinel backend must fail closed"
+        );
+        drop(guard);
+        let captured = logs.contents();
+
+        assert!(
+            captured.contains(expected_class),
+            "{label}: expected classification {expected_class:?} in {captured}"
+        );
+        assert!(
+            captured.contains(&redacted),
+            "{label}: redacted endpoint must be present in {captured}"
+        );
+        assert_sentinels_absent(&captured, label);
+
+        drop(authority);
+        drop(client);
+        let _ = shutdown.send(());
+    }
+}
+
+/// Generic rate-limiter clients keep publishing backend error text. The replay
+/// policy must not leak onto them.
+#[tokio::test(flavor = "current_thread")]
+async fn generic_redis_client_still_logs_backend_error_text() {
+    let (port, shutdown) = spawn_logging_redis_server(LoggingShape::AuthReject).await;
+    let config = sentinel_replay_config(port);
+    let (logs, guard) = super::plugin_utils::capture_logs();
+    let client = RedisRateLimitClient::new(config, None, false, None);
+    let _ = client.connect_cached_for_test().await;
+    drop(guard);
+    let captured = logs.contents();
+    assert!(
+        captured.contains(SENTINEL_AUTH_ERR),
+        "operational Redis clients must still log backend error text: {captured}"
+    );
     let _ = shutdown.send(());
 }

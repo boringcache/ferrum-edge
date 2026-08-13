@@ -860,8 +860,10 @@ impl HmacAuth {
                      'redis_url'"
                         .to_string()
                 })?;
+                // Classification-only diagnostics: never raw RedisError text or
+                // the operator key prefix.
                 Some(Arc::new(ReplayAuthority::shared(
-                    Arc::new(RedisRateLimitClient::new(
+                    Arc::new(RedisRateLimitClient::for_replay_authority(
                         redis_config,
                         http_client.and_then(|client| client.dns_cache().cloned()),
                         http_client.is_some_and(|client| client.tls_no_verify()),

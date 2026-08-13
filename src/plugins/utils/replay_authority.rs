@@ -652,10 +652,20 @@ impl SharedReplayAuthorityHealth {
     }
 }
 
+/// Recover a poisoned registry guard rather than dropping live authorities.
+///
+/// Poison means a previous holder panicked; the map itself is still the set of
+/// weak handles that readiness aggregates. Returning the default empty/healthy
+/// snapshot, or skipping registration, would hide an unavailable shared backend.
+fn shared_authorities_lock()
+-> std::sync::MutexGuard<'static, Vec<std::sync::Weak<RedisRateLimitClient>>> {
+    SHARED_AUTHORITIES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn register_shared_authority(client: &Arc<RedisRateLimitClient>) {
-    let Ok(mut registry) = SHARED_AUTHORITIES.lock() else {
-        return;
-    };
+    let mut registry = shared_authorities_lock();
     // Prune retired generations first: the registry is weak precisely so a
     // rebuilt plugin cache cannot keep an old generation's client, connections,
     // or credentials alive, and a stale entry must not keep being aggregated.
@@ -675,9 +685,7 @@ fn register_shared_authority(client: &Arc<RedisRateLimitClient>) {
 
 /// Bounded aggregate over every live shared replay authority.
 pub fn shared_health_snapshot() -> SharedReplayAuthorityHealth {
-    let Ok(registry) = SHARED_AUTHORITIES.lock() else {
-        return SharedReplayAuthorityHealth::default();
-    };
+    let registry = shared_authorities_lock();
     let mut health = SharedReplayAuthorityHealth::default();
     for client in registry.iter().filter_map(std::sync::Weak::upgrade) {
         health.shared_authorities += 1;
@@ -759,6 +767,12 @@ impl ReplayAuthority {
     }
 
     /// Build a shared authority over an existing Redis client.
+    ///
+    /// Callers must pass a client from
+    /// [`RedisRateLimitClient::for_replay_authority`] so connection,
+    /// authentication, command, topology, and recovery diagnostics stay
+    /// classification-only. Generic rate-limiter clients retain
+    /// [`RedisRateLimitClient::new`].
     pub fn shared(client: Arc<RedisRateLimitClient>, retention: Duration) -> Self {
         register_shared_authority(&client);
         Self::Shared { client, retention }
@@ -808,6 +822,18 @@ impl ReplayAuthority {
     }
 }
 
+/// Saturating ceil of `retention` to a Redis-valid positive whole-second TTL.
+/// Integral durations stay exact; a fractional remainder rounds up; zero becomes
+/// 1 so `EX` cannot delete the marker it just wrote.
+fn redis_claim_ttl_seconds(retention: Duration) -> u64 {
+    let ceil = if retention.subsec_nanos() == 0 {
+        retention.as_secs()
+    } else {
+        retention.as_secs().saturating_add(1)
+    };
+    ceil.max(1)
+}
+
 /// Cross-replica claim: one atomic Redis `SET key value NX EX ttl`.
 ///
 /// A single server-side operation, so among any number of concurrent requests
@@ -821,12 +847,15 @@ impl ReplayAuthority {
 /// flag and rejects the protected request. There is no local fallback.
 ///
 /// The claim runs through the **bounded** primitive
-/// ([`RedisRateLimitClient::set_bytes_nx_with_expire_bounded`]): a connected
-/// blackhole that accepts the command and never answers must return a fixed
-/// fail-closed result rather than hold a protected request open for as long as
-/// the peer keeps the socket. That primitive also logs only a fixed
+/// ([`RedisRateLimitClient::set_bytes_nx_with_expire_bounded`]) on a Redis
+/// client constructed with [`RedisRateLimitClient::for_replay_authority`]: a
+/// connected blackhole that accepts the command and never answers must return a
+/// fixed fail-closed result rather than hold a protected request open for as
+/// long as the peer keeps the socket. Connection, authentication, command,
+/// topology, and recovery diagnostics on that client publish only a fixed
 /// classification plus the redacted endpoint, so no key, marker, nonce, proof,
-/// signature, identity, or backend error text can reach a log line from here.
+/// signature, identity, credential, operator key prefix, or backend error text
+/// can reach a log line from here.
 ///
 /// A command that Redis executed but whose reply was lost still fails closed:
 /// the marker exists, so the retry observes `Ok(false)` (`Replay`). Losing the
@@ -840,9 +869,11 @@ async fn admit_shared(
         return ReplayAdmission::AuthorityUnavailable;
     }
     let key = client.make_key(&[SHARED_KEY_COMPONENT, marker.hex().as_str()]);
-    // Ceil to whole seconds so a sub-second remainder can never shorten the
-    // protection interval below the declared horizon.
-    let ttl_seconds = retention.as_secs().saturating_add(1);
+    // Exact whole seconds stay exact; a fractional remainder rounds up so Redis
+    // `EX` (integral seconds) can never shorten the declared horizon. Zero still
+    // becomes 1: Redis treats `EX 0` as an immediate delete, which would admit
+    // an unprotected marker.
+    let ttl_seconds = redis_claim_ttl_seconds(retention);
     match client
         .set_bytes_nx_with_expire_bounded(&key, SHARED_MARKER_RECORD, ttl_seconds)
         .await
@@ -937,4 +968,17 @@ pub fn process_lane(authority: &ReplayAuthority) -> Option<&Arc<ProcessReplayLan
         ReplayAuthority::Process { lane, .. } => Some(lane),
         ReplayAuthority::Shared { .. } => None,
     }
+}
+
+/// Poison the shared-authority health registry (test support).
+///
+/// Production recovers the guard with `into_inner` so a panic in one
+/// snapshot/register cannot hide retained live authorities. This helper
+/// carries no production behavior.
+#[allow(dead_code)] // exercised by external unit tests
+pub fn poison_shared_authorities_for_tests() {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = SHARED_AUTHORITIES.lock().expect("lock before poison");
+        panic!("replay_authority: intentional shared-authorities registry poison for tests");
+    }));
 }

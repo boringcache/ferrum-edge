@@ -750,6 +750,7 @@ fn push_slot_tag_component(key: &mut String, value: &str) {
 async fn screen_redis_endpoint(
     config: &RedisConfig,
     dns_cache: Option<&DnsCache>,
+    log_policy: RedisClientLogPolicy,
 ) -> RedisEndpoint {
     if let Some(dns_cache) = dns_cache
         && let Some(hostname) = config.hostname()
@@ -758,23 +759,45 @@ async fn screen_redis_endpoint(
             Ok(ip) => return RedisEndpoint::Url(config.url_with_resolved_ip(ip)),
             Err(e) => {
                 if crate::dns::is_egress_policy_denial(&e) {
-                    warn!(
-                        hostname = %hostname,
-                        error = %e,
-                        "Redis hostname currently resolves to an address blocked by backend egress \
-                         policy — centralized Redis unavailable; will re-screen"
-                    );
+                    match log_policy {
+                        RedisClientLogPolicy::Operational => {
+                            warn!(
+                                hostname = %hostname,
+                                error = %e,
+                                "Redis hostname currently resolves to an address blocked by backend egress \
+                                 policy — centralized Redis unavailable; will re-screen"
+                            );
+                        }
+                        RedisClientLogPolicy::ClassificationOnly => {
+                            warn_replay_backend(
+                                &config.redacted_url(),
+                                "connection_failed",
+                                "Redis single-use claim backend failed",
+                            );
+                        }
+                    }
                     return RedisEndpoint::HostnameEgressDenied;
                 }
                 // Fail CLOSED on ANY screen failure (resolver outage / misconfigured
                 // gateway DNS), not just policy denials: handing the unscreened
                 // hostname to the Redis client would let it re-resolve outside the
                 // egress policy and possibly dial a denied address.
-                warn!(
-                    hostname = %hostname,
-                    error = %e,
-                    "DNS cache resolution failed for Redis host — centralized Redis unavailable; will retry"
-                );
+                match log_policy {
+                    RedisClientLogPolicy::Operational => {
+                        warn!(
+                            hostname = %hostname,
+                            error = %e,
+                            "DNS cache resolution failed for Redis host — centralized Redis unavailable; will retry"
+                        );
+                    }
+                    RedisClientLogPolicy::ClassificationOnly => {
+                        warn_replay_backend(
+                            &config.redacted_url(),
+                            "connection_failed",
+                            "Redis single-use claim backend failed",
+                        );
+                    }
+                }
                 return RedisEndpoint::ResolveFailed;
             }
         }
@@ -786,12 +809,23 @@ async fn screen_redis_endpoint(
         && let Some(ip) = config.literal_host_ip()
         && let Some(reason) = dns_cache.backend_allow_ips().deny_reason(&ip)
     {
-        warn!(
-            redis_ip = %ip,
-            reason,
-            "Redis literal host blocked by backend egress policy — centralized Redis unavailable \
-             until configuration changes"
-        );
+        match log_policy {
+            RedisClientLogPolicy::Operational => {
+                warn!(
+                    redis_ip = %ip,
+                    reason,
+                    "Redis literal host blocked by backend egress policy — centralized Redis unavailable \
+                     until configuration changes"
+                );
+            }
+            RedisClientLogPolicy::ClassificationOnly => {
+                warn_replay_backend(
+                    &config.redacted_url(),
+                    "connection_failed",
+                    "Redis single-use claim backend failed",
+                );
+            }
+        }
         return RedisEndpoint::LiteralIpEgressDenied;
     }
     RedisEndpoint::Url(config.effective_url())
@@ -1151,6 +1185,62 @@ pub struct RedisRateLimitClient {
     /// Pre-read CA bundle PEM bytes from `FERRUM_TLS_CA_BUNDLE_PATH`.
     /// Loaded once at construction to avoid filesystem reads on every connection.
     tls_ca_bundle_pem: Option<Vec<u8>>,
+    /// How this client publishes operational diagnostics.
+    ///
+    /// Rate-limit / cache / dedup consumers keep historical fields (`error`,
+    /// `key_prefix`). Replay-authority clients publish only a fixed
+    /// classification beside the already-redacted endpoint.
+    log_policy: RedisClientLogPolicy,
+}
+
+/// Logging policy for one Redis client.
+///
+/// The single-use replay authority must never publish raw backend text, key
+/// material, marker material, credentials, or the operator key prefix. Generic
+/// rate-limiter clients retain their existing operational diagnostics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RedisClientLogPolicy {
+    Operational,
+    ClassificationOnly,
+}
+
+/// Classification-only diagnostic for a Redis client owned by the replay
+/// authority. Never interpolates backend text, keys, prefixes, or credentials.
+fn warn_replay_backend(redacted_url: &str, classification: &'static str, message: &'static str) {
+    warn!(
+        redis_url = %redacted_url,
+        classification,
+        "{message}"
+    );
+}
+
+/// Terminal Cluster rejection. Operational clients keep the historical
+/// `key_prefix` + `reason` fields; replay clients publish only the fixed
+/// classification beside the redacted endpoint.
+fn warn_topology_unsupported(
+    redacted_url: &str,
+    key_prefix: &str,
+    reason: &str,
+    log_policy: RedisClientLogPolicy,
+) {
+    match log_policy {
+        RedisClientLogPolicy::Operational => {
+            warn!(
+                redis_url = %redacted_url,
+                key_prefix = %key_prefix,
+                reason,
+                "Redis endpoint reports an unsupported topology (Redis Cluster is not supported) \
+                 — centralized Redis access is disabled for this configuration until it is changed"
+            );
+        }
+        RedisClientLogPolicy::ClassificationOnly => {
+            warn_replay_backend(
+                redacted_url,
+                "unsupported_topology",
+                "Redis single-use claim failed",
+            );
+        }
+    }
 }
 
 /// Pure floor-at-zero decision for [`RedisRateLimitClient::incrby_with_expire_floor_zero`].
@@ -1197,6 +1287,44 @@ impl RedisRateLimitClient {
         tls_no_verify: bool,
         tls_ca_bundle_path: Option<&str>,
     ) -> Self {
+        Self::construct(
+            config,
+            dns_cache,
+            tls_no_verify,
+            tls_ca_bundle_path,
+            RedisClientLogPolicy::Operational,
+        )
+    }
+
+    /// Redis client owned by the single-use replay authority.
+    ///
+    /// Connection, authentication, command, topology, and recovery diagnostics
+    /// publish only a fixed classification beside the already-redacted endpoint
+    /// — never raw backend text, key material, marker material, credentials, or
+    /// the operator key prefix. Generic rate-limiter clients must keep
+    /// [`Self::new`].
+    pub fn for_replay_authority(
+        config: RedisConfig,
+        dns_cache: Option<DnsCache>,
+        tls_no_verify: bool,
+        tls_ca_bundle_path: Option<&str>,
+    ) -> Self {
+        Self::construct(
+            config,
+            dns_cache,
+            tls_no_verify,
+            tls_ca_bundle_path,
+            RedisClientLogPolicy::ClassificationOnly,
+        )
+    }
+
+    fn construct(
+        config: RedisConfig,
+        dns_cache: Option<DnsCache>,
+        tls_no_verify: bool,
+        tls_ca_bundle_path: Option<&str>,
+        log_policy: RedisClientLogPolicy,
+    ) -> Self {
         let tls_ca_bundle_pem = if !tls_no_verify {
             tls_ca_bundle_path.and_then(|path| {
                 let source = CertSource::parse(path, MaterialKind::CaBundle);
@@ -1224,7 +1352,92 @@ impl RedisRateLimitClient {
             health_checker_abort: Mutex::new(None),
             tls_no_verify,
             tls_ca_bundle_pem,
+            log_policy,
         }
+    }
+
+    fn classification_only(&self) -> bool {
+        matches!(self.log_policy, RedisClientLogPolicy::ClassificationOnly)
+    }
+
+    fn warn_connect_failure(
+        &self,
+        pool_slot: Option<usize>,
+        error: &redis::RedisError,
+        operational_message: &'static str,
+    ) {
+        if self.classification_only() {
+            warn_replay_backend(
+                &self.config.redacted_url(),
+                "connection_failed",
+                "Redis single-use claim backend failed",
+            );
+            return;
+        }
+        match pool_slot {
+            Some(idx) => {
+                warn!(
+                    redis_url = %self.config.redacted_url(),
+                    pool_slot = idx,
+                    error = %error,
+                    "{operational_message}"
+                );
+            }
+            None => {
+                warn!(
+                    redis_url = %self.config.redacted_url(),
+                    error = %error,
+                    "{operational_message}"
+                );
+            }
+        }
+    }
+
+    fn warn_connect_timeout(&self, pool_slot: Option<usize>) {
+        if self.classification_only() {
+            warn_replay_backend(
+                &self.config.redacted_url(),
+                "connection_timeout",
+                "Redis single-use claim backend failed",
+            );
+            return;
+        }
+        match pool_slot {
+            Some(idx) => {
+                warn!(
+                    redis_url = %self.config.redacted_url(),
+                    pool_slot = idx,
+                    timeout_seconds = self.config.connect_timeout_seconds,
+                    "Timed out connecting to Redis for rate limiting"
+                );
+            }
+            None => {
+                warn!(
+                    redis_url = %self.config.redacted_url(),
+                    timeout_seconds = self.config.connect_timeout_seconds,
+                    "Timed out connecting dedicated Redis client"
+                );
+            }
+        }
+    }
+
+    fn info_connected(&self, pool_slot: usize) {
+        if self.classification_only() {
+            info!(
+                redis_url = %self.config.redacted_url(),
+                pool_slot,
+                pool_size = self.pool.len(),
+                "Redis single-use claim backend connected"
+            );
+            return;
+        }
+        info!(
+            redis_url = %self.config.redacted_url(),
+            key_prefix = %self.config.key_prefix,
+            pool_slot,
+            pool_size = self.pool.len(),
+            "Redis rate limiting connected"
+        );
     }
 
     /// Whether Redis is currently available.
@@ -1428,7 +1641,7 @@ impl RedisRateLimitClient {
     /// failures remain distinct unavailable outcomes so neither can fall back to
     /// the Redis crate's unscreened resolver.
     async fn resolve_url(&self) -> RedisEndpoint {
-        screen_redis_endpoint(&self.config, self.dns_cache.as_ref()).await
+        screen_redis_endpoint(&self.config, self.dns_cache.as_ref(), self.log_policy).await
     }
 
     /// Build a Redis client with proper TLS configuration.
@@ -1601,11 +1814,10 @@ impl RedisRateLimitClient {
         let client = match self.build_client(&url) {
             Ok(c) => c,
             Err(e) => {
-                warn!(
-                    redis_url = %self.config.redacted_url(),
-                    pool_slot = idx,
-                    error = %e,
-                    "Failed to create Redis client for rate limiting"
+                self.warn_connect_failure(
+                    Some(idx),
+                    &e,
+                    "Failed to create Redis client for rate limiting",
                 );
                 self.mark_unavailable();
                 return None;
@@ -1626,13 +1838,7 @@ impl RedisRateLimitClient {
                 if !self.availability.publish_reachable() {
                     return None;
                 }
-                info!(
-                    redis_url = %self.config.redacted_url(),
-                    key_prefix = %self.config.key_prefix,
-                    pool_slot = idx,
-                    pool_size = self.pool.len(),
-                    "Redis rate limiting connected"
-                );
+                self.info_connected(idx);
                 self.start_health_checker_if_needed();
                 slot.connection.store(Arc::new(Some(conn.clone())));
                 // Publication race, other direction: a rejection proven between
@@ -1647,22 +1853,16 @@ impl RedisRateLimitClient {
                 Some(conn)
             }
             Err(ConnectAttemptError::Redis(e)) => {
-                warn!(
-                    redis_url = %self.config.redacted_url(),
-                    pool_slot = idx,
-                    error = %e,
-                    "Failed to connect to Redis for rate limiting"
+                self.warn_connect_failure(
+                    Some(idx),
+                    &e,
+                    "Failed to connect to Redis for rate limiting",
                 );
                 self.note_command_failure(&e);
                 None
             }
             Err(ConnectAttemptError::Timeout) => {
-                warn!(
-                    redis_url = %self.config.redacted_url(),
-                    pool_slot = idx,
-                    timeout_seconds = self.config.connect_timeout_seconds,
-                    "Timed out connecting to Redis for rate limiting"
-                );
+                self.warn_connect_timeout(Some(idx));
                 self.mark_unavailable();
                 None
             }
@@ -1723,11 +1923,7 @@ impl RedisRateLimitClient {
         let client = match self.build_client(&url) {
             Ok(client) => client,
             Err(e) => {
-                warn!(
-                    redis_url = %self.config.redacted_url(),
-                    error = %e,
-                    "Failed to create dedicated Redis client"
-                );
+                self.warn_connect_failure(None, &e, "Failed to create dedicated Redis client");
                 self.mark_unavailable();
                 return None;
             }
@@ -1747,20 +1943,12 @@ impl RedisRateLimitClient {
                 Some(conn)
             }
             Err(ConnectAttemptError::Redis(e)) => {
-                warn!(
-                    redis_url = %self.config.redacted_url(),
-                    error = %e,
-                    "Failed to connect dedicated Redis client"
-                );
+                self.warn_connect_failure(None, &e, "Failed to connect dedicated Redis client");
                 self.note_command_failure(&e);
                 None
             }
             Err(ConnectAttemptError::Timeout) => {
-                warn!(
-                    redis_url = %self.config.redacted_url(),
-                    timeout_seconds = self.config.connect_timeout_seconds,
-                    "Timed out connecting dedicated Redis client"
-                );
+                self.warn_connect_timeout(None);
                 self.mark_unavailable();
                 None
             }
@@ -1832,12 +2020,11 @@ impl RedisRateLimitClient {
         // cannot be downgraded back to a plain outage.
         self.clear_connection();
         if first {
-            warn!(
-                redis_url = %self.config.redacted_url(),
-                key_prefix = %self.config.key_prefix,
+            warn_topology_unsupported(
+                &self.config.redacted_url(),
+                &self.config.key_prefix,
                 reason,
-                "Redis endpoint reports an unsupported topology (Redis Cluster is not supported) \
-                 — centralized Redis access is disabled for this configuration until it is changed"
+                self.log_policy,
             );
         }
     }
@@ -1883,12 +2070,20 @@ impl RedisRateLimitClient {
                 // Bounded by the configured connect timeout. Never proof of
                 // Cluster topology, and never a licence to run a policy command
                 // on the unscreened connection — an ordinary retryable outage.
-                warn!(
-                    redis_url = %self.config.redacted_url(),
-                    timeout_seconds = self.config.connect_timeout_seconds,
-                    "Redis topology screen did not complete — centralized Redis unavailable; \
-                     will retry"
-                );
+                if self.classification_only() {
+                    warn_replay_backend(
+                        &self.config.redacted_url(),
+                        "connection_timeout",
+                        "Redis single-use claim backend failed",
+                    );
+                } else {
+                    warn!(
+                        redis_url = %self.config.redacted_url(),
+                        timeout_seconds = self.config.connect_timeout_seconds,
+                        "Redis topology screen did not complete — centralized Redis unavailable; \
+                         will retry"
+                    );
+                }
                 self.mark_unavailable();
                 false
             }
@@ -1916,6 +2111,7 @@ impl RedisRateLimitClient {
         let connect_timeout = self.connect_timeout();
         let tls_no_verify = self.tls_no_verify;
         let tls_ca_bundle_pem = self.tls_ca_bundle_pem.clone();
+        let log_policy = self.log_policy;
 
         let handle = tokio::spawn(async move {
             loop {
@@ -1934,7 +2130,8 @@ impl RedisRateLimitClient {
                 // recovery checker must NOT hand an unscreened host to the Redis
                 // client either (a DNS-cache outage or a later rebind/policy denial
                 // would otherwise let the background ping dial a denied address).
-                let url = match screen_redis_endpoint(&config, dns_cache.as_ref()).await {
+                let url =
+                    match screen_redis_endpoint(&config, dns_cache.as_ref(), log_policy).await {
                     RedisEndpoint::Url(url) => url,
                     // Still denied or unresolvable this interval — skip the ping
                     // and re-screen next interval (including hostname egress
@@ -2021,13 +2218,11 @@ impl RedisRateLimitClient {
                                 pool.clear();
                             }
                             if first {
-                                warn!(
-                                    redis_url = %config.redacted_url(),
-                                    key_prefix = %config.key_prefix,
-                                    reason = "server reported cluster topology during recovery",
-                                    "Redis endpoint reports an unsupported topology (Redis Cluster \
-                                     is not supported) — centralized Redis access is disabled for \
-                                     this configuration until it is changed"
+                                warn_topology_unsupported(
+                                    &config.redacted_url(),
+                                    &config.key_prefix,
+                                    "server reported cluster topology during recovery",
+                                    log_policy,
                                 );
                             }
                             Err(cluster_topology_probe_error())
@@ -2045,12 +2240,37 @@ impl RedisRateLimitClient {
                         // successful PING/INFO can neither restore availability
                         // nor advertise a recovery an observer would relay.
                         if availability.publish_reachable() && !was_available {
-                            info!("Redis connection recovered — centralized Redis access restored");
+                            match log_policy {
+                                RedisClientLogPolicy::Operational => {
+                                    info!(
+                                        "Redis connection recovered — centralized Redis access restored"
+                                    );
+                                }
+                                RedisClientLogPolicy::ClassificationOnly => {
+                                    info!(
+                                        redis_url = %config.redacted_url(),
+                                        "Redis single-use claim backend recovered"
+                                    );
+                                }
+                            }
                         }
                     }
                     Err(_) => {
                         if was_available && !availability.is_topology_terminal() {
-                            warn!("Redis health check failed — centralized Redis unavailable");
+                            match log_policy {
+                                RedisClientLogPolicy::Operational => {
+                                    warn!(
+                                        "Redis health check failed — centralized Redis unavailable"
+                                    );
+                                }
+                                RedisClientLogPolicy::ClassificationOnly => {
+                                    warn_replay_backend(
+                                        &config.redacted_url(),
+                                        "connection_failed",
+                                        "Redis single-use claim backend failed",
+                                    );
+                                }
+                            }
                         }
                         availability.mark_unreachable();
                     }
