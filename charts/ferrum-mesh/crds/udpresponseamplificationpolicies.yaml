@@ -77,7 +77,8 @@ spec:
                   enum: ["Finite", "Unlimited"]
                 maxResponseAmplificationFactor:
                   type: number
-                  exclusiveMinimum: 0
+                  minimum: 0
+                  exclusiveMinimum: true
                   maximum: 1024
                   description: Required when mode is Finite. Rejected if zero, negative, non-finite, or greater than 1024.
                 acknowledgeUnsafeAmplification:
