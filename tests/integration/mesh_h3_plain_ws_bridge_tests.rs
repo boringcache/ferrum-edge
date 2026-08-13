@@ -76,7 +76,18 @@ fn h3_plain_bridge_source_routes_mesh_through_shared_helper() {
         .next()
         .expect("bounded plain dispatcher");
     assert!(
-        plain.contains("h3_bridge_transport_refusal("),
+        plain.contains("run_plain_attempt_local_policy_or_reject("),
+        "every plain attempt must pass through the local transport-policy gate"
+    );
+    let policy_gate = source
+        .split("async fn run_plain_attempt_local_policy_or_reject")
+        .nth(1)
+        .expect("plain attempt local-policy gate must remain present")
+        .split("fn record_plain_grpc_web_client_deadline(")
+        .next()
+        .expect("bounded plain attempt local-policy gate");
+    assert!(
+        policy_gate.contains("h3_bridge_transport_refusal("),
         "plain bridge must refuse Unix, not all mesh tags"
     );
     assert!(
@@ -84,7 +95,18 @@ fn h3_plain_bridge_source_routes_mesh_through_shared_helper() {
         "mesh-tagged plain attempts must share the H1/H2 mesh helper"
     );
     assert!(
-        plain.contains("select_next_h3_eligible_retry_target("),
+        plain.contains("select_next_cross_protocol_retry_target("),
+        "mixed-upstream retry must go through the shared cross-protocol selector"
+    );
+    let retry_selector = source
+        .split("fn select_next_cross_protocol_retry_target(")
+        .nth(1)
+        .expect("cross-protocol retry selector must remain present")
+        .split("async fn resolve_cross_protocol_backend_ip(")
+        .next()
+        .expect("bounded cross-protocol retry selector");
+    assert!(
+        retry_selector.contains("select_next_h3_eligible_retry_target("),
         "mixed-upstream retry must filter H3-ineligible candidates via the shared helper"
     );
     assert!(
@@ -218,8 +240,10 @@ fn h3_plain_bridge_preserves_mesh_outcomes_across_client_terminals() {
          accounting and the cross-protocol outcome"
     );
     assert!(
-        plain.contains("terminal_error_class.or_else(|| {")
-            && plain.contains("then_some(ErrorClass::ClientDisconnect)"),
+        plain.contains("let admission_error_class = terminal_error_class")
+            && plain.contains(
+                ".or_else(|| (!body_completed).then_some(ErrorClass::ClientDisconnect))"
+            ),
         "a downstream body failure may supply the admission fallback only when \
          no backend classification already exists"
     );

@@ -61,7 +61,18 @@ fn h3_plain_bridge_dispatches_mesh_through_shared_pools() {
         "mesh-tagged plain attempts must dial through the shared mesh helper"
     );
     assert!(
-        plain.contains("select_next_h3_eligible_retry_target("),
+        plain.contains("select_next_cross_protocol_retry_target("),
+        "mixed-upstream retry rotation must go through the shared cross-protocol selector"
+    );
+    let retry_selector = source
+        .split("fn select_next_cross_protocol_retry_target(")
+        .nth(1)
+        .expect("cross-protocol retry selector must remain present")
+        .split("async fn resolve_cross_protocol_backend_ip(")
+        .next()
+        .expect("bounded cross-protocol retry selector");
+    assert!(
+        retry_selector.contains("select_next_h3_eligible_retry_target("),
         "mixed-upstream retry rotation must filter H3-ineligible candidates via the shared helper"
     );
     assert!(
