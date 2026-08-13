@@ -1776,7 +1776,7 @@
   {
     "name": "ferrum_k8s_controller_istio_status_not_found_total",
     "type": "counter",
-    "help": "Istio status writes aborted because the object was not found.",
+    "help": "Istio status writes aborted because the status read or write returned HTTP 404.",
     "labels": [],
     "subsystem": "k8s_controller",
     "export_surface": "/metrics",
@@ -1816,7 +1816,7 @@
   {
     "name": "ferrum_k8s_controller_istio_status_unsupported_total",
     "type": "counter",
-    "help": "Istio status writes aborted because the CRD has no status subresource.",
+    "help": "Istio status writes aborted because the API server does not serve the Istio resource or its status subresource.",
     "labels": [],
     "subsystem": "k8s_controller",
     "export_surface": "/metrics",

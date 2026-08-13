@@ -2827,7 +2827,7 @@ impl MetricsRegistry {
             "",
         );
         output.push_str(
-            "# HELP ferrum_k8s_controller_istio_status_not_found_total Istio status writes aborted because the object was not found.\n",
+            "# HELP ferrum_k8s_controller_istio_status_not_found_total Istio status writes aborted because the status read or write returned HTTP 404.\n",
         );
         output.push_str("# TYPE ferrum_k8s_controller_istio_status_not_found_total counter\n");
         render_process_counter(
@@ -2868,7 +2868,7 @@ impl MetricsRegistry {
             "",
         );
         output.push_str(
-            "# HELP ferrum_k8s_controller_istio_status_unsupported_total Istio status writes aborted because the CRD has no status subresource.\n",
+            "# HELP ferrum_k8s_controller_istio_status_unsupported_total Istio status writes aborted because the API server does not serve the Istio resource or its status subresource.\n",
         );
         output.push_str("# TYPE ferrum_k8s_controller_istio_status_unsupported_total counter\n");
         render_process_counter(

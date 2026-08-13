@@ -280,7 +280,7 @@ async fn patch_istio_status_with_retry(
                     kind = %update.kind,
                     namespace = %update.namespace,
                     name = %update.name,
-                    "Istio status subresource is unsupported; skipping write"
+                    "Istio status resource or subresource is not served; skipping write"
                 );
                 return Ok(());
             }
@@ -378,7 +378,7 @@ async fn patch_istio_status_with_retry(
                     kind = %update.kind,
                     namespace = %update.namespace,
                     name = %update.name,
-                    "Istio status subresource is unsupported; skipping write"
+                    "Istio status resource or subresource is not served; skipping write"
                 );
                 return Ok(());
             }
@@ -411,11 +411,24 @@ fn kube_error_is_conflict(error: &kube::Error) -> bool {
     matches!(error, kube::Error::Api(response) if response.code == 409)
 }
 
+/// Any other 404 on the status subresource.
+///
+/// This covers a deleted object **and** a CRD served without
+/// `subresources: { status: {} }`: the apiserver's CRD handler answers an
+/// unhandled subresource with the ordinary `NewNotFound` response for the named
+/// object, so the two are indistinguishable on the wire. That is why the
+/// stripped-subresource case is counted here rather than under
+/// `istio_status_unsupported`; both outcomes skip the write either way.
 fn kube_error_is_not_found(error: &kube::Error) -> bool {
     matches!(error, kube::Error::Api(response) if response.code == 404)
         && !kube_error_is_unsupported_status(error)
 }
 
+/// The API server does not serve this resource at all.
+///
+/// HTTP 405, or a 404 whose body says the requested *resource* could not be
+/// found (the Istio CRD or the watched version is gone). It is **not** the
+/// stripped-`status`-subresource signal — see [`kube_error_is_not_found`].
 fn kube_error_is_unsupported_status(error: &kube::Error) -> bool {
     match error {
         kube::Error::Api(response) if response.code == 405 => true,

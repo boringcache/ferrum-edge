@@ -25,8 +25,9 @@ concurrency:
   group: istio-status-cas-live-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  KIND_CLUSTER: ferrum-istio-status-cas
+# The kind cluster name is spelled literally in each step below rather than
+# through a workflow-level `env:`, so no step body depends on a rewritten
+# context value.
 
 jobs:
   istio-status-cas-live:

@@ -33,9 +33,15 @@ pub struct ControllerMetrics {
     /// Istio status writes aborted because the live UID no longer matched the
     /// planned object (delete/recreate under the same name).
     pub istio_status_recreated: AtomicU64,
-    /// Istio status writes aborted because the object was not found.
+    /// Istio status writes aborted because the status read or write returned
+    /// HTTP 404. Kubernetes answers a CRD that declares no `status` subresource
+    /// with the same ordinary object-not-found response it uses for a deleted
+    /// object, so that case lands here rather than under
+    /// [`Self::istio_status_unsupported`].
     pub istio_status_not_found: AtomicU64,
-    /// Istio status writes aborted because the CRD has no status subresource.
+    /// Istio status writes aborted because the API server does not serve the
+    /// resource at all: HTTP 405, or a 404 whose body says the requested
+    /// resource could not be found.
     pub istio_status_unsupported: AtomicU64,
     /// Istio status writes refused because the planned watch-snapshot UID was
     /// missing, so the write could not bind object identity.
