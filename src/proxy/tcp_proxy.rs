@@ -525,12 +525,9 @@ fn publish_stream_tcp_auth_termination(
     }
 }
 
-/// Userspace TCP relay wrapped with the admitted session's authorization
-/// deadline. Used whenever [`tcp_plain_splice_eligible`] is false — both the
-/// terminating plaintext path and authenticated passthrough.
-async fn bidirectional_copy_with_stream_auth<C, B>(
-    client: C,
-    backend: B,
+/// Copy timeouts, buffer size, and the admitted session's authorization
+/// deadline for [`bidirectional_copy_with_stream_auth`].
+struct StreamAuthCopyParams {
     idle_timeout: Option<Duration>,
     half_close_cap: Option<Duration>,
     backend_read_timeout: Option<Duration>,
@@ -538,11 +535,29 @@ async fn bidirectional_copy_with_stream_auth<C, B>(
     buf_size: usize,
     plan: crate::proxy::auth_lifetime::StreamAuthDeadline,
     expired: Arc<AtomicBool>,
+}
+
+/// Userspace TCP relay wrapped with the admitted session's authorization
+/// deadline. Used whenever [`tcp_plain_splice_eligible`] is false — both the
+/// terminating plaintext path and authenticated passthrough.
+async fn bidirectional_copy_with_stream_auth<C, B>(
+    client: C,
+    backend: B,
+    params: StreamAuthCopyParams,
 ) -> StreamCopyResult
 where
     C: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
 {
+    let StreamAuthCopyParams {
+        idle_timeout,
+        half_close_cap,
+        backend_read_timeout,
+        backend_write_timeout,
+        buf_size,
+        plan,
+        expired,
+    } = params;
     let bound = AuthorizationCopyBound {
         at: plan.at,
         expired: Arc::clone(&expired),
@@ -3697,13 +3712,15 @@ async fn handle_tcp_connection_inner(
             bidirectional_copy_with_stream_auth(
                 client_stream,
                 backend_stream,
-                idle_timeout,
-                half_close_cap,
-                backend_read_timeout,
-                backend_write_timeout,
-                buf_size,
-                plan,
-                Arc::clone(&stream_auth_expired),
+                StreamAuthCopyParams {
+                    idle_timeout,
+                    half_close_cap,
+                    backend_read_timeout,
+                    backend_write_timeout,
+                    buf_size,
+                    plan,
+                    expired: Arc::clone(&stream_auth_expired),
+                },
             )
             .await
         } else {
@@ -4790,13 +4807,15 @@ async fn handle_tcp_connection_inner(
                     bidirectional_copy_with_stream_auth(
                         client_stream,
                         bs,
-                        idle_timeout,
-                        half_close_cap,
-                        backend_read_timeout,
-                        backend_write_timeout,
-                        buf_size,
-                        plan,
-                        Arc::clone(&stream_auth_expired),
+                        StreamAuthCopyParams {
+                            idle_timeout,
+                            half_close_cap,
+                            backend_read_timeout,
+                            backend_write_timeout,
+                            buf_size,
+                            plan,
+                            expired: Arc::clone(&stream_auth_expired),
+                        },
                     )
                     .await
                 }
@@ -4808,13 +4827,15 @@ async fn handle_tcp_connection_inner(
                     bidirectional_copy_with_stream_auth(
                         client_stream,
                         bs,
-                        idle_timeout,
-                        half_close_cap,
-                        backend_read_timeout,
-                        backend_write_timeout,
-                        buf_size,
-                        plan,
-                        Arc::clone(&stream_auth_expired),
+                        StreamAuthCopyParams {
+                            idle_timeout,
+                            half_close_cap,
+                            backend_read_timeout,
+                            backend_write_timeout,
+                            buf_size,
+                            plan,
+                            expired: Arc::clone(&stream_auth_expired),
+                        },
                     )
                     .await
                 }

@@ -10599,6 +10599,24 @@ impl H3UploadPumpExit {
     }
 }
 
+/// Non-stream inputs for [`run_h3_grpc_upload_pump`].
+///
+/// Bundled rather than threaded field by field so the pump stays under clippy's
+/// `too_many_arguments` limit without a suppression, while the two stream halves
+/// remain explicit owned arguments.
+struct H3GrpcUploadPumpParams {
+    upload: Arc<H3GrpcUploadState>,
+    max_request_body_size: usize,
+    /// `GRPC_REQUEST_MESSAGES` accounting. The pump owns the only copy of the
+    /// backend-visible request DATA on this path, so the length-prefixed message
+    /// scan lives here — exactly where the drain-then-read
+    /// `do_request_streaming_body` used to keep it.
+    grpc_messages: Option<Arc<std::sync::atomic::AtomicU64>>,
+    shutdown: Arc<tokio::sync::Notify>,
+    auth_deadline_plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+    auth_latch: crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+}
+
 /// Forward the client's gRPC request direction to a native-H3 backend,
 /// concurrently with the response relay.
 ///
@@ -10614,17 +10632,16 @@ impl H3UploadPumpExit {
 async fn run_h3_grpc_upload_pump(
     mut frontend_recv: RequestStream<h3_quinn::RecvStream, Bytes>,
     mut backend_send: crate::http3::client::H3BackendSendStream,
-    upload: Arc<H3GrpcUploadState>,
-    max_request_body_size: usize,
-    // `GRPC_REQUEST_MESSAGES` accounting. The pump owns the only copy of the
-    // backend-visible request DATA on this path, so the length-prefixed message
-    // scan lives here — exactly where the drain-then-read
-    // `do_request_streaming_body` used to keep it.
-    grpc_messages: Option<Arc<std::sync::atomic::AtomicU64>>,
-    shutdown: Arc<tokio::sync::Notify>,
-    auth_deadline_plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
-    auth_latch: crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+    params: H3GrpcUploadPumpParams,
 ) {
+    let H3GrpcUploadPumpParams {
+        upload,
+        max_request_body_size,
+        grpc_messages,
+        shutdown,
+        auth_deadline_plan,
+        auth_latch,
+    } = params;
     let settle_upload_auth = |termination: crate::proxy::auth_lifetime::StreamAuthTermination| {
         auth_latch.record_once(
             termination,
@@ -11613,12 +11630,14 @@ async fn dispatch_grpc_native_h3(
         tokio::spawn(run_h3_grpc_upload_pump(
             frontend_recv,
             backend.send,
-            Arc::clone(&upload),
-            effective_max_grpc_recv_size_bytes,
-            grpc_request_messages,
-            pump_shutdown,
-            auth_deadline_plan,
-            ctx.authorization_termination_latch(),
+            H3GrpcUploadPumpParams {
+                upload: Arc::clone(&upload),
+                max_request_body_size: effective_max_grpc_recv_size_bytes,
+                grpc_messages: grpc_request_messages,
+                shutdown: pump_shutdown,
+                auth_deadline_plan,
+                auth_latch: ctx.authorization_termination_latch(),
+            },
         )),
     );
     let mut backend_recv = backend.recv;
