@@ -160,7 +160,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::Weak;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::task::AbortHandle;
 use tracing::{info, warn};
@@ -958,6 +958,24 @@ static SHARED_REPLAY_HEALTH: AtomicU64 = AtomicU64::new(0);
 const SHARED_REPLAY_COUNT_SHIFT: u64 = 32;
 const SHARED_REPLAY_COUNT_MASK: u64 = 0xFFFF_FFFF;
 
+/// Packed `(epoch << 8) | state` for availability and for the health
+/// registration word. One acquire-load returns a consistent generation and
+/// semantic state, so a stale registration sample cannot tear across a
+/// concurrent transition.
+const SHARED_REPLAY_EPOCH_SHIFT: u64 = 8;
+const SHARED_REPLAY_STATE_MASK: u64 = 0xFF;
+
+fn pack_epoch_state(state: u8, epoch: u64) -> u64 {
+    (epoch << SHARED_REPLAY_EPOCH_SHIFT) | u64::from(state)
+}
+
+fn unpack_epoch_state(raw: u64) -> (u8, u64) {
+    (
+        (raw & SHARED_REPLAY_STATE_MASK) as u8,
+        raw >> SHARED_REPLAY_EPOCH_SHIFT,
+    )
+}
+
 fn pack_shared_replay_health(authorities: u64, unavailable: u64) -> u64 {
     (authorities << SHARED_REPLAY_COUNT_SHIFT) | (unavailable & SHARED_REPLAY_COUNT_MASK)
 }
@@ -1001,10 +1019,12 @@ fn bump_shared_replay_health(authorities_delta: i8, unavailable_delta: i8) {
 /// [`SHARED_REPLAY_HEALTH`]. It does not retain the Redis client, cached
 /// connections, endpoints, credentials, or any other secret-bearing data.
 /// Drop retires this generation's contribution immediately. Concurrent
-/// availability transitions use a single atomic CAS so a drop cannot
-/// underflow, double-count, or resurrect a retired generation.
+/// availability transitions CAS a packed `(epoch, state)` word so a stale
+/// registration sample cannot overwrite a newer notification, and a drop
+/// cannot underflow, double-count, or resurrect a retired generation.
 struct SharedReplayHealthRegistration {
-    state: AtomicU8,
+    /// Packed `(applied_epoch << 8) | state`.
+    word: AtomicU64,
 }
 
 impl SharedReplayHealthRegistration {
@@ -1015,71 +1035,68 @@ impl SharedReplayHealthRegistration {
 
     fn new() -> Self {
         Self {
-            state: AtomicU8::new(Self::UNREGISTERED),
+            word: AtomicU64::new(pack_epoch_state(Self::UNREGISTERED, 0)),
         }
     }
 
-    /// First registration of this distinct client. Idempotent for additional
-    /// equivalent `jwks_auth` providers that share the same client Arc.
-    /// `currently_available` is sampled by the caller; a later `on_available` /
-    /// `on_unavailable` reconciles a transition that raced this CAS.
-    fn activate(&self, currently_available: bool) {
-        let target = if currently_available {
+    /// Publish `available` at `epoch` if this is the first count or `epoch` is
+    /// strictly newer than the last applied generation.
+    ///
+    /// Linearizability: [`EnforcementAvailability`] increments `epoch` in the
+    /// same CAS that changes semantic state, and notifies with that new epoch
+    /// after the health `Weak` is attached. A sample taken before a transition
+    /// therefore carries a smaller epoch than the notification, and this CAS
+    /// rejects it. Equivalent-provider re-registration is idempotent: the same
+    /// epoch is a no-op. No resample loop is required, and this path never
+    /// waits on backend flapping — a stale apply returns, a newer notify wins.
+    fn apply_availability(&self, available: bool, epoch: u64) {
+        let target = if available {
             Self::AVAILABLE
         } else {
             Self::UNAVAILABLE
         };
-        if self
-            .state
-            .compare_exchange(
-                Self::UNREGISTERED,
-                target,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-        {
-            bump_shared_replay_health(1, if currently_available { 0 } else { 1 });
-        }
-    }
-
-    fn on_available(&self) {
-        if self
-            .state
-            .compare_exchange(
-                Self::UNAVAILABLE,
-                Self::AVAILABLE,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-        {
-            bump_shared_replay_health(0, -1);
-        }
-    }
-
-    fn on_unavailable(&self) {
-        if self
-            .state
-            .compare_exchange(
-                Self::AVAILABLE,
-                Self::UNAVAILABLE,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-        {
-            bump_shared_replay_health(0, 1);
+        loop {
+            let raw = self.word.load(Ordering::Acquire);
+            let (current_state, current_epoch) = unpack_epoch_state(raw);
+            if current_state == Self::RETIRED {
+                return;
+            }
+            if current_state != Self::UNREGISTERED && epoch <= current_epoch {
+                return;
+            }
+            if self
+                .word
+                .compare_exchange(
+                    raw,
+                    pack_epoch_state(target, epoch),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                continue;
+            }
+            match (current_state, target) {
+                (Self::UNREGISTERED, Self::AVAILABLE) => bump_shared_replay_health(1, 0),
+                (Self::UNREGISTERED, Self::UNAVAILABLE) => bump_shared_replay_health(1, 1),
+                (Self::AVAILABLE, Self::UNAVAILABLE) => bump_shared_replay_health(0, 1),
+                (Self::UNAVAILABLE, Self::AVAILABLE) => bump_shared_replay_health(0, -1),
+                _ => {}
+            }
+            return;
         }
     }
 }
 
 impl Drop for SharedReplayHealthRegistration {
     fn drop(&mut self) {
-        // Swap to RETIRED first so a concurrent transition's CAS cannot land
-        // after we have already subtracted, and cannot resurrect this
-        // generation.
-        match self.state.swap(Self::RETIRED, Ordering::AcqRel) {
+        // Swap to RETIRED first so a concurrent apply's CAS cannot land after
+        // we have already subtracted, and cannot resurrect this generation.
+        let (previous, _) = unpack_epoch_state(
+            self.word
+                .swap(pack_epoch_state(Self::RETIRED, 0), Ordering::AcqRel),
+        );
+        match previous {
             Self::AVAILABLE => bump_shared_replay_health(-1, 0),
             Self::UNAVAILABLE => bump_shared_replay_health(-1, -1),
             _ => {}
@@ -1090,8 +1107,8 @@ impl Drop for SharedReplayHealthRegistration {
 /// Availability of centralized enforcement for one Redis client generation,
 /// shared with the client's recovery checker and with failover health observers.
 ///
-/// Deliberately **one** atomic rather than an `available: AtomicBool` plus a
-/// separate `topology_unsupported: AtomicBool`. With two flags, every
+/// Deliberately **one** packed atomic rather than an `available: AtomicBool`
+/// plus a separate `topology_unsupported: AtomicBool`. With two flags, every
 /// "reachable" publication is a check-then-store: a connection, command, or
 /// recovery probe that completed successfully can observe a not-yet-terminal
 /// topology, then store `available = true` after another task proved Cluster
@@ -1100,12 +1117,20 @@ impl Drop for SharedReplayHealthRegistration {
 /// makes publishing "reachable" a single read-modify-write that simply cannot
 /// win against a rejection, so terminal really is terminal.
 ///
+/// The same word also carries a monotonic epoch, incremented in the CAS that
+/// changes semantic state. Shared-replay registration samples that pair in one
+/// load and fences stale applies against notifications of a later epoch, so a
+/// bounded resample loop cannot leave `/health` permanently inconsistent with
+/// this word.
+///
 /// Every read is one atomic load, so hot-path callers keep their O(1) check with
 /// no locks. Shared-replay health is notified only on a real state change, via
 /// a `Weak` handle that cannot keep a retired client (or its credentials)
 /// alive.
 pub(crate) struct EnforcementAvailability {
-    state: AtomicU8,
+    /// Packed `(epoch << 8) | state`. Hot-path [`Self::is_available`] masks
+    /// the low byte of one acquire-load.
+    state: AtomicU64,
     /// Weak: the recovery checker holds this `Arc<EnforcementAvailability>`,
     /// and must not retain a retired generation's health contribution.
     shared_replay_health: OnceLock<Weak<SharedReplayHealthRegistration>>,
@@ -1121,50 +1146,76 @@ impl EnforcementAvailability {
 
     fn new() -> Self {
         Self {
-            state: AtomicU8::new(Self::REACHABLE),
+            state: AtomicU64::new(pack_epoch_state(Self::REACHABLE, 0)),
             shared_replay_health: OnceLock::new(),
         }
     }
 
-    fn notify_shared_replay_health(&self, available: bool) {
+    fn semantic_state(raw: u64) -> u8 {
+        unpack_epoch_state(raw).0
+    }
+
+    fn notify_shared_replay_health(&self, available: bool, epoch: u64) {
         let Some(weak) = self.shared_replay_health.get() else {
             return;
         };
         let Some(registration) = weak.upgrade() else {
             return;
         };
-        if available {
-            registration.on_available();
-        } else {
-            registration.on_unavailable();
-        }
+        registration.apply_availability(available, epoch);
     }
 
     /// Semantic availability: enforcement may be consulted. False whenever the
     /// topology is terminal, by construction — a caller cannot forget to pair
     /// this load with a separate terminal check.
     pub(crate) fn is_available(&self) -> bool {
-        self.state.load(Ordering::Acquire) == Self::REACHABLE
+        Self::semantic_state(self.state.load(Ordering::Acquire)) == Self::REACHABLE
     }
 
     /// Whether the endpoint was rejected as an unsupported topology.
     fn is_topology_terminal(&self) -> bool {
-        self.state.load(Ordering::Acquire) == Self::TOPOLOGY_TERMINAL
+        Self::semantic_state(self.state.load(Ordering::Acquire)) == Self::TOPOLOGY_TERMINAL
+    }
+
+    /// One acquire-load of `(is_available, epoch)` for shared-replay
+    /// registration. The pair is consistent because epoch and semantic state
+    /// live in the same word.
+    fn health_snapshot(&self) -> (bool, u64) {
+        let (state, epoch) = unpack_epoch_state(self.state.load(Ordering::Acquire));
+        (state == Self::REACHABLE, epoch)
     }
 
     /// Atomically move to `target` unless the topology is already terminal.
     ///
-    /// Returns the previous state on success. A single read-modify-write is
-    /// what makes the terminal state actually terminal: there is no window
-    /// between "check the flag" and "store availability" for a rejection to slip
-    /// into. `None` means the topology is (or concurrently became) terminal and
-    /// nothing was written.
-    fn transition_unless_terminal(&self, target: u8) -> Option<u8> {
-        self.state
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                (current != Self::TOPOLOGY_TERMINAL).then_some(target)
-            })
-            .ok()
+    /// Returns the previous semantic state and the epoch stored in the word
+    /// afterwards. A real change increments the epoch in the same CAS that
+    /// writes `target`, which is what makes a later registration sample of the
+    /// old state strictly stale against the notification. `None` means the
+    /// topology is (or concurrently became) terminal and nothing was written.
+    fn transition_unless_terminal(&self, target: u8) -> Option<(u8, u64)> {
+        loop {
+            let raw = self.state.load(Ordering::Acquire);
+            let (current, epoch) = unpack_epoch_state(raw);
+            if current == Self::TOPOLOGY_TERMINAL {
+                return None;
+            }
+            if current == target {
+                return Some((current, epoch));
+            }
+            let new_epoch = epoch.wrapping_add(1);
+            if self
+                .state
+                .compare_exchange(
+                    raw,
+                    pack_epoch_state(target, new_epoch),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return Some((current, new_epoch));
+            }
+        }
     }
 
     /// Publish "reachable" — but only if the topology is not terminal.
@@ -1178,9 +1229,9 @@ impl EnforcementAvailability {
     /// health: this path never notifies "available" after a topology rejection.
     fn publish_reachable(&self) -> bool {
         match self.transition_unless_terminal(Self::REACHABLE) {
-            Some(previous) => {
+            Some((previous, epoch)) => {
                 if previous != Self::REACHABLE {
-                    self.notify_shared_replay_health(true);
+                    self.notify_shared_replay_health(true, epoch);
                 }
                 true
             }
@@ -1190,29 +1241,47 @@ impl EnforcementAvailability {
 
     /// Mark enforcement unreachable, preserving a terminal topology rejection.
     fn mark_unreachable(&self) {
-        if self.transition_unless_terminal(Self::UNREACHABLE) == Some(Self::REACHABLE) {
-            self.notify_shared_replay_health(false);
+        if let Some((Self::REACHABLE, epoch)) = self.transition_unless_terminal(Self::UNREACHABLE) {
+            self.notify_shared_replay_health(false, epoch);
         }
     }
 
     /// Reject the endpoint permanently. Returns `true` the first time only, so
     /// the operator diagnostic is emitted once per client generation rather than
     /// once per request. Reachable → terminal publishes unavailable exactly
-    /// once; an already-unavailable generation is already counted.
+    /// once; an already-unavailable generation is already counted. The epoch
+    /// still advances from unreachable so a stale reachable sample cannot
+    /// overwrite the terminal word.
     fn reject_topology(&self) -> bool {
-        let previous = self.state.swap(Self::TOPOLOGY_TERMINAL, Ordering::AcqRel);
-        if previous == Self::TOPOLOGY_TERMINAL {
-            return false;
+        loop {
+            let raw = self.state.load(Ordering::Acquire);
+            let (previous, epoch) = unpack_epoch_state(raw);
+            if previous == Self::TOPOLOGY_TERMINAL {
+                return false;
+            }
+            let new_epoch = epoch.wrapping_add(1);
+            if self
+                .state
+                .compare_exchange(
+                    raw,
+                    pack_epoch_state(Self::TOPOLOGY_TERMINAL, new_epoch),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                continue;
+            }
+            if previous == Self::REACHABLE {
+                self.notify_shared_replay_health(false, new_epoch);
+            }
+            return true;
         }
-        if previous == Self::REACHABLE {
-            self.notify_shared_replay_health(false);
-        }
-        true
     }
 
     /// Log-safe rendering for `Debug` (never carries endpoint or credentials).
     fn describe(&self) -> &'static str {
-        match self.state.load(Ordering::Acquire) {
+        match Self::semantic_state(self.state.load(Ordering::Acquire)) {
             Self::REACHABLE => "reachable",
             Self::TOPOLOGY_TERMINAL => "topology_unsupported",
             _ => "unreachable",
@@ -1455,6 +1524,26 @@ fn clamp_floored_total(floored: i64) -> i64 {
     floored.max(0)
 }
 
+/// Captured `(available, epoch)` pair from
+/// [`RedisRateLimitClient::capture_shared_replay_registration_sample_for_test`].
+///
+/// Used to deterministically replay a stale registration apply after a newer
+/// availability notification. The epoch is opaque so tests cannot forge a
+/// newer generation than the one they sampled.
+#[derive(Clone, Copy, Debug)]
+pub struct SharedReplayRegistrationSample {
+    available: bool,
+    epoch: u64,
+}
+
+impl SharedReplayRegistrationSample {
+    /// Whether this sample observed a reachable backend.
+    #[allow(dead_code)] // public support used by the external unit-test target
+    pub fn available(self) -> bool {
+        self.available
+    }
+}
+
 impl RedisRateLimitClient {
     /// Create a new Redis rate limit client.
     ///
@@ -1549,33 +1638,32 @@ impl RedisRateLimitClient {
     /// Arc register once. HMAC and JWKS clients remain distinct authorities
     /// where they are distinct clients. Generic rate-limiter clients never
     /// call this, so their availability transitions do not move replay health.
+    ///
+    /// The health `Weak` is attached before the first count so a concurrent
+    /// outage, recovery, or terminal topology notifies with a strictly newer
+    /// epoch than the sample taken here. The registration then publishes the
+    /// newest epoch; a stale sampled apply cannot overwrite that notification,
+    /// so the packed `/health` word cannot remain permanently inconsistent with
+    /// [`EnforcementAvailability`] after the race settles.
     pub(crate) fn register_as_shared_replay_authority(&self) {
-        let registration = Arc::clone(
+        let registration = self.ensure_shared_replay_health();
+        self.attach_shared_replay_health(&registration);
+        let (available, epoch) = self.availability.health_snapshot();
+        registration.apply_availability(available, epoch);
+    }
+
+    fn ensure_shared_replay_health(&self) -> Arc<SharedReplayHealthRegistration> {
+        Arc::clone(
             self.shared_replay_health
                 .get_or_init(|| Arc::new(SharedReplayHealthRegistration::new())),
-        );
-        // Attach the Weak before the first count so a concurrent outage or
-        // recovery notifies rather than racing an unregistered handle.
+        )
+    }
+
+    fn attach_shared_replay_health(&self, registration: &Arc<SharedReplayHealthRegistration>) {
         let _ = self
             .availability
             .shared_replay_health
-            .set(Arc::downgrade(&registration));
-        // Re-sample availability until the published state matches a fresh
-        // load. A stale boolean would otherwise resurrect a reachable count
-        // after a concurrent mark_unreachable (or hide a recovery). Transitions
-        // that land after this loop still publish through the Weak.
-        for _ in 0..8 {
-            let available = self.is_available();
-            registration.activate(available);
-            if available {
-                registration.on_available();
-            } else {
-                registration.on_unavailable();
-            }
-            if self.is_available() == available {
-                break;
-            }
-        }
+            .set(Arc::downgrade(registration));
     }
 
     fn classification_only(&self) -> bool {
@@ -1709,6 +1797,40 @@ impl RedisRateLimitClient {
     #[allow(dead_code)] // public support used by the external unit-test target
     pub fn publish_reachable_for_test(&self) -> bool {
         self.availability.publish_reachable()
+    }
+
+    /// Attach the shared-replay health handle and capture the current
+    /// `(available, epoch)` pair **without** publishing it (test support).
+    ///
+    /// Reproduces the registration window where a concurrent transition can
+    /// notify first and a stale sampled apply would otherwise overwrite it.
+    /// Attaching does not move the packed health word; only a later
+    /// [`Self::publish_shared_replay_registration_sample_for_test`] or a
+    /// transition notify publishes counts.
+    #[allow(dead_code)] // public support used by the external unit-test target
+    pub fn capture_shared_replay_registration_sample_for_test(
+        &self,
+    ) -> SharedReplayRegistrationSample {
+        let registration = self.ensure_shared_replay_health();
+        self.attach_shared_replay_health(&registration);
+        let (available, epoch) = self.availability.health_snapshot();
+        SharedReplayRegistrationSample { available, epoch }
+    }
+
+    /// Apply a previously captured registration sample (test support).
+    ///
+    /// A sample whose epoch is older than a notification that already landed
+    /// is rejected, which is the proof that the packed health word cannot stay
+    /// permanently stale after the last registration/availability race settles.
+    #[allow(dead_code)] // public support used by the external unit-test target
+    pub fn publish_shared_replay_registration_sample_for_test(
+        &self,
+        sample: SharedReplayRegistrationSample,
+    ) {
+        let Some(registration) = self.shared_replay_health.get() else {
+            return;
+        };
+        registration.apply_availability(sample.available, sample.epoch);
     }
 
     /// What a failover health observer reads from this client's shared

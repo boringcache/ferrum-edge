@@ -1203,6 +1203,154 @@ fn concurrent_registration_and_outage_publish_exact_counts() {
     assert_eq!(shared_health_snapshot(), baseline);
 }
 
+/// A stale reachable registration sample must not overwrite a later unavailable
+/// notification. The previous bounded resample loop could apply the sampled
+/// `on_available` after the eighth iteration even though a newer outage had
+/// already notified — leaving `/health` permanently ready while the client is
+/// unreachable.
+#[test]
+fn stale_reachable_registration_sample_cannot_overwrite_later_unavailable() {
+    let _serialized = shared_health_guard();
+    let baseline = shared_health_snapshot();
+
+    let client = unreachable_shared_client("ferrum:replay_authority_tests:stale-ready");
+    let stale = client.capture_shared_replay_registration_sample_for_test();
+    assert!(
+        stale.available(),
+        "a fresh client is reachable until an outage is proven"
+    );
+    assert_eq!(
+        shared_health_snapshot(),
+        baseline,
+        "attaching the health handle must not publish counts before apply"
+    );
+
+    client.mark_unavailable_for_test();
+    let after_notify = shared_health_snapshot();
+    assert_eq!(
+        after_notify.shared_authorities,
+        baseline.shared_authorities + 1
+    );
+    assert_eq!(
+        after_notify.shared_authorities_unavailable,
+        baseline.shared_authorities_unavailable + 1,
+        "the outage notify is the first publish when apply has not run yet"
+    );
+    assert!(after_notify.unavailable());
+    assert!(!client.is_available());
+
+    client.publish_shared_replay_registration_sample_for_test(stale);
+    let settled = shared_health_snapshot();
+    assert_eq!(
+        settled, after_notify,
+        "stale reachable sample must not resurrect readiness after the outage settles"
+    );
+    assert!(settled.unavailable());
+    assert!(!client.is_available());
+
+    let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
+    assert_eq!(
+        shared_health_snapshot(),
+        settled,
+        "production register remains exactly-once after the stale-sample race"
+    );
+
+    drop(authority);
+    drop(client);
+    assert_eq!(shared_health_snapshot(), baseline);
+}
+
+/// A stale unavailable registration sample must not overwrite a later recovery
+/// notification, which would leave `/health` permanently unready while the
+/// client is reachable.
+#[test]
+fn stale_unavailable_registration_sample_cannot_overwrite_later_recovery() {
+    let _serialized = shared_health_guard();
+    let baseline = shared_health_snapshot();
+
+    let client = unreachable_shared_client("ferrum:replay_authority_tests:stale-down");
+    client.mark_unavailable_for_test();
+    let stale = client.capture_shared_replay_registration_sample_for_test();
+    assert!(
+        !stale.available(),
+        "the sample is the proven outage, captured before recovery"
+    );
+    assert_eq!(
+        shared_health_snapshot(),
+        baseline,
+        "attaching after an unregistered outage must not publish until apply or notify"
+    );
+
+    assert!(client.publish_reachable_for_test());
+    let recovered = shared_health_snapshot();
+    assert_eq!(
+        recovered.shared_authorities,
+        baseline.shared_authorities + 1
+    );
+    assert_eq!(
+        recovered.shared_authorities_unavailable, baseline.shared_authorities_unavailable,
+        "recovery notify is the first publish and must clear unreadiness"
+    );
+    assert!(!recovered.unavailable());
+    assert!(client.is_available());
+
+    client.publish_shared_replay_registration_sample_for_test(stale);
+    assert_eq!(
+        shared_health_snapshot(),
+        recovered,
+        "stale unavailable sample must not hide the settled recovery"
+    );
+    assert!(client.is_available());
+
+    let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
+    assert_eq!(shared_health_snapshot(), recovered);
+
+    drop(authority);
+    drop(client);
+    assert_eq!(shared_health_snapshot(), baseline);
+}
+
+/// Terminal topology is sticky against a stale reachable registration sample:
+/// the packed word must stay unavailable and reachable publication must keep
+/// failing after the stale apply.
+#[test]
+fn stale_reachable_registration_sample_cannot_overwrite_terminal_topology() {
+    let _serialized = shared_health_guard();
+    let baseline = shared_health_snapshot();
+
+    let client = unreachable_shared_client("ferrum:replay_authority_tests:stale-terminal");
+    let stale = client.capture_shared_replay_registration_sample_for_test();
+    assert!(stale.available());
+
+    client.mark_topology_unsupported_for_test();
+    let terminal = shared_health_snapshot();
+    assert_eq!(
+        terminal.shared_authorities,
+        baseline.shared_authorities + 1
+    );
+    assert_eq!(
+        terminal.shared_authorities_unavailable,
+        baseline.shared_authorities_unavailable + 1
+    );
+    assert!(!client.publish_reachable_for_test());
+
+    client.publish_shared_replay_registration_sample_for_test(stale);
+    assert_eq!(
+        shared_health_snapshot(),
+        terminal,
+        "stale reachable sample must not resurrect a terminal generation"
+    );
+    assert!(!client.is_available());
+    assert!(!client.publish_reachable_for_test());
+
+    let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
+    assert_eq!(shared_health_snapshot(), terminal);
+
+    drop(authority);
+    drop(client);
+    assert_eq!(shared_health_snapshot(), baseline);
+}
+
 // ── bounded, redacted shared claim ──────────────────────────────────
 
 /// How the fake backend answers the `SET` that carries a replay claim.
