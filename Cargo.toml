@@ -572,9 +572,10 @@ tokio = { version = "1", features = ["net", "io-util", "time", "rt", "test-util"
 # it per poll is equivalent — and allocation-free.
 #
 # Retirement plan: when h3-quinn ships a release whose `stop_sending` is
-# correct while a read is in flight, remove the `[patch.crates-io]` line, drop
-# `vendor/h3-quinn-0.0.10-ferrum-patched/`, and bump the `h3-quinn` floor. See
-# `docs/upstream-h3-quinn-patches/001-stop-sending-during-in-flight-read/README.md`.
+# correct while a read is in flight *and* whose `SendStream`/`BidiStream`
+# expose an equivalent `&self` + `'static` `stopped` watch, remove the
+# `[patch.crates-io]` line, drop `vendor/h3-quinn-0.0.10-ferrum-patched/`,
+# and bump the `h3-quinn` floor. See `docs/upstream-h3-quinn-patches/`.
 [patch.crates-io]
 reqwest = { path = "vendor/reqwest-0.13.3-ferrum-patched" }
 h3 = { path = "vendor/h3-0.0.8-ferrum-patched" }

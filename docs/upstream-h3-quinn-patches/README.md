@@ -15,6 +15,7 @@ the patch when it merges.
 | ID | Title | Crate | Status | Tracked by |
 |---|---|---|---|---|
 | [001](001-stop-sending-during-in-flight-read/) | `RecvStream::stop_sending` must work while a read is in flight | `h3-quinn` | Applied (vendored at [`vendor/h3-quinn-0.0.10-ferrum-patched/`](../../vendor/h3-quinn-0.0.10-ferrum-patched/)) | Ferrum Edge full-duplex native-H3 gRPC (#3283) |
+| [002](002-send-stream-stopped-watch/) | Expose Quinn `SendStream::stopped` (`&self`, `'static`) through h3-quinn | `h3-quinn` | Applied (vendored at [`vendor/h3-quinn-0.0.10-ferrum-patched/`](../../vendor/h3-quinn-0.0.10-ferrum-patched/)) | Ferrum Edge H3 destination-permit release on per-stream cancel (#3775) |
 
 ## Conventions
 
