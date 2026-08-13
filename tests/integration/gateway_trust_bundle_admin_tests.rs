@@ -312,7 +312,10 @@ async fn an_overlong_jwt_subject_is_rejected_on_create_and_restore_without_trunc
         create_body.clone(),
     )
     .await;
-    assert_eq!(status, 201, "a 255-character subject must be admitted: {created}");
+    assert_eq!(
+        status, 201,
+        "a 255-character subject must be admitted: {created}"
+    );
     assert_eq!(
         created["updated_by"].as_str(),
         Some(at_cap.as_str()),
@@ -331,7 +334,10 @@ async fn an_overlong_jwt_subject_is_rejected_on_create_and_restore_without_trunc
         }),
     )
     .await;
-    assert_eq!(status, 400, "an overlong JWT subject must be refused: {body}");
+    assert_eq!(
+        status, 400,
+        "an overlong JWT subject must be refused: {body}"
+    );
     let rendered = body.to_string();
     assert!(
         rendered.contains("updated_by exceeds"),
@@ -381,14 +387,8 @@ async fn an_overlong_jwt_subject_is_rejected_on_create_and_restore_without_trunc
     let (status, backup) = get_json(&base, "/backup", "ferrum").await;
     assert_eq!(status, 200);
 
-    let (status, body) = post_json_as(
-        &base,
-        "/restore?confirm=true",
-        "ferrum",
-        &overlong,
-        backup,
-    )
-    .await;
+    let (status, body) =
+        post_json_as(&base, "/restore?confirm=true", "ferrum", &overlong, backup).await;
     assert_eq!(
         status, 400,
         "an overlong restoring subject must be refused: {body}"

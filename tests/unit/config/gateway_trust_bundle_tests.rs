@@ -504,7 +504,11 @@ fn json_escaping_overhead_counts_against_the_whole_bundle_cap() {
 
     let local = &record.bundle.local;
     let raw = local.trust_domain.as_str().len()
-        + local.x509_authorities.iter().map(String::len).sum::<usize>()
+        + local
+            .x509_authorities
+            .iter()
+            .map(String::len)
+            .sum::<usize>()
         + local
             .jwt_authorities
             .iter()
