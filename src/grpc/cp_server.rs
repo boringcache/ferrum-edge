@@ -2231,13 +2231,13 @@ impl ConfigSync for CpGrpcServer {
         let (filtered, trust_bundles_json) =
             Self::filter_config_and_trust_for_scope(config.as_ref(), &req.namespace, &self.scope)
                 .map_err(|failure_class| {
-                    error!(
-                        namespace = %req.namespace,
-                        failure_class,
-                        "Refusing GetFullConfig snapshot because gateway trust is unusable"
-                    );
-                    Status::internal("Failed to prepare configuration snapshot")
-                })?;
+                error!(
+                    namespace = %req.namespace,
+                    failure_class,
+                    "Refusing GetFullConfig snapshot because gateway trust is unusable"
+                );
+                Status::internal("Failed to prepare configuration snapshot")
+            })?;
         let config_json = Self::config_json_for_dp(&filtered).map_err(|e| {
             error!(
                 "Refusing to publish configuration in get_full_config: {}",
