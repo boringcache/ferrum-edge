@@ -24,6 +24,7 @@ use chrono::Utc;
 use futures_util::{Stream, StreamExt, stream};
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::Frame;
+use hyper::server::conn::http1::Builder as Http1ServerBuilder;
 use hyper::server::conn::http2::Builder as Http2ServerBuilder;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -18262,11 +18263,7 @@ async fn serve_h3_mesh_http_echo<T>(
         let client_cert_der = client_cert_der.clone();
         async move {
             let scheme = req.uri().scheme_str().unwrap_or("https").to_string();
-            let authority = req
-                .uri()
-                .authority()
-                .map(|a| a.to_string())
-                .unwrap_or_default();
+            let authority = h3_mesh_observed_http_authority(&req);
             let path = req.uri().path().to_string();
             let method = req.method().as_str().to_string();
             let body = req.collect().await?.to_bytes().to_vec();
@@ -18292,6 +18289,66 @@ async fn serve_h3_mesh_http_echo<T>(
         }
     });
     let _ = Http2ServerBuilder::new(TokioExecutor::new())
+        .serve_connection(TokioIo::new(io), service)
+        .await;
+}
+
+/// HTTP/1.1 origin-form has no URI authority; the inner HBONE client puts the
+/// app `host:port` on `Host` (`proxy_to_backend_hbone`). HTTP/2 `:authority`
+/// stays on the URI.
+fn h3_mesh_observed_http_authority(req: &hyper::Request<hyper::body::Incoming>) -> String {
+    req.uri()
+        .authority()
+        .map(|a| a.to_string())
+        .or_else(|| {
+            req.headers()
+                .get(hyper::header::HOST)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_default()
+}
+
+/// Cleartext HTTP/1.1 echo behind an Ambient HBONE relay. Plain HTTP over
+/// HBONE speaks HTTP/1.1 *inside* the CONNECT byte tunnel (the same inner
+/// client as H1/H2 `proxy_to_backend_hbone`); an h2c-only app cannot
+/// handshake and surfaces `{"error":"HBONE backend unavailable"}`.
+async fn serve_h3_mesh_http1_echo<T>(
+    io: T,
+    observations: Arc<Mutex<Vec<H3MeshObservedHttp>>>,
+) where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let service = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+        let observations = Arc::clone(&observations);
+        async move {
+            let scheme = req.uri().scheme_str().unwrap_or("https").to_string();
+            let authority = h3_mesh_observed_http_authority(&req);
+            let path = req.uri().path().to_string();
+            let method = req.method().as_str().to_string();
+            let body = req.collect().await?.to_bytes().to_vec();
+            observations
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(H3MeshObservedHttp {
+                    scheme,
+                    authority,
+                    path: path.clone(),
+                    method,
+                    body: body.clone(),
+                    client_cert_der: Vec::new(),
+                });
+            Ok::<_, hyper::Error>(
+                hyper::Response::builder()
+                    .status(200)
+                    .header("content-type", "application/octet-stream")
+                    .header("x-mesh-plain", "ok")
+                    .body(Full::new(Bytes::from(body)))
+                    .expect("build plain mesh echo"),
+            )
+        }
+    });
+    let _ = Http1ServerBuilder::new()
         .serve_connection(TokioIo::new(io), service)
         .await;
 }
@@ -18337,11 +18394,14 @@ async fn start_h3_mesh_mtls_http_peer(svid: &GeneratedGatewaySvid) -> H3MeshHttp
     peer
 }
 
-async fn start_h3_mesh_h2c_http_app() -> H3MeshHttpPeer {
+/// Cleartext HTTP/1.1 app the Ambient HBONE relay byte-copies onto. Named
+/// apart from `start_h3_mesh_h2c_app` (gRPC) because plain HTTP over HBONE
+/// is an inner HTTP/1.1 client, not nested h2c.
+async fn start_h3_mesh_http1_http_app() -> H3MeshHttpPeer {
     let listener = bind_fixture_listener(loopback_ephemeral())
         .await
-        .expect("bind H3 mesh h2c HTTP app");
-    let port = listener.local_addr().expect("h2c http app addr").port();
+        .expect("bind H3 mesh HTTP/1.1 app");
+    let port = listener.local_addr().expect("http1 app addr").port();
     let observations: Arc<Mutex<Vec<H3MeshObservedHttp>>> = Arc::new(Mutex::new(Vec::new()));
     let accepts = Arc::new(AtomicUsize::new(0));
     let peer = H3MeshHttpPeer {
@@ -18358,7 +18418,7 @@ async fn start_h3_mesh_h2c_http_app() -> H3MeshHttpPeer {
             let _ = tcp.set_nodelay(true);
             let observations = Arc::clone(&observations);
             tokio::spawn(async move {
-                serve_h3_mesh_http_echo(tcp, Vec::new(), observations).await;
+                serve_h3_mesh_http1_echo(tcp, observations).await;
             });
         }
     });
@@ -18543,7 +18603,41 @@ async fn functional_h3_plain_dispatches_over_same_cluster_sidecar_mesh_mtls() {
     gateway.shutdown().await;
 }
 
+/// Source guard: Ambient HBONE plain HTTP is an inner HTTP/1.1 client
+/// (`proxy_to_backend_hbone`). Serving the destination app as h2c-only
+/// yields 502 `{"error":"HBONE backend unavailable"}` after CONNECT succeeds.
+#[test]
+fn h3_plain_ambient_hbone_inner_app_is_http1_not_h2c() {
+    let test = mesh_test_fn_body(
+        "functional_h3_plain_dispatches_over_same_cluster_ambient_hbone",
+    );
+    assert!(
+        test.contains("start_h3_mesh_http1_http_app("),
+        "plain Ambient HBONE must reach an HTTP/1.1 app through the byte tunnel"
+    );
+    assert!(
+        !test.contains("start_h3_mesh_h2c_http_app(")
+            && !test.contains("start_h3_mesh_h2c_app("),
+        "gRPC h2c fixtures cannot handshake the HTTP/1.1 inner HBONE client"
+    );
+    let app = mesh_test_fn_body("start_h3_mesh_http1_http_app");
+    assert!(
+        app.contains("serve_h3_mesh_http1_echo("),
+        "HBONE inner app must use the HTTP/1.1 echo, not the sidecar mTLS h2 helper"
+    );
+    assert!(
+        MESH_MODE_TEST_SOURCE.contains("async fn serve_h3_mesh_http1_echo<T>("),
+        "HBONE inner echo helper must remain a distinct HTTP/1.1 server"
+    );
+    assert!(
+        MESH_MODE_TEST_SOURCE.contains("Http1ServerBuilder::new()"),
+        "HBONE inner echo must be hyper HTTP/1.1"
+    );
+}
+
 /// Plain HTTP over same-cluster Ambient HBONE through the H3 frontend.
+/// Inner tunnel traffic is HTTP/1.1 (same as H1/H2 `proxy_to_backend_hbone`),
+/// not nested h2c.
 #[ignore]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn functional_h3_plain_dispatches_over_same_cluster_ambient_hbone() {
@@ -18552,7 +18646,7 @@ async fn functional_h3_plain_dispatches_over_same_cluster_ambient_hbone() {
         identities.path(),
         &[H3_MESH_GATEWAY_SPIFFE, H3_MESH_PEER_SPIFFE],
     );
-    let app = start_h3_mesh_h2c_http_app().await;
+    let app = start_h3_mesh_http1_http_app().await;
     let relay = start_h3_mesh_hbone_relay(&svids[1]).await;
     let dead_backend_port = reserve_unique_mesh_port().await;
     let frontend = h3_mesh_frontend_certs();
@@ -18579,6 +18673,13 @@ async fn functional_h3_plain_dispatches_over_same_cluster_ambient_hbone() {
         result.headers
     );
     assert_eq!(result.body_bytes.as_ref(), payload);
+    assert_eq!(
+        result
+            .headers
+            .get("x-mesh-plain")
+            .and_then(|v| v.to_str().ok()),
+        Some("ok")
+    );
 
     let connects = relay.observed_connects();
     assert!(
@@ -18589,7 +18690,11 @@ async fn functional_h3_plain_dispatches_over_same_cluster_ambient_hbone() {
     );
     let observed = app.wait_for_http(Duration::from_secs(10)).await;
     assert_eq!(observed.method, "POST");
-    assert_eq!(observed.scheme, "http");
+    assert_eq!(
+        observed.authority,
+        format!("127.0.0.1:{}", app.port),
+        "inner HTTP/1.1 Host must name the real app, not the dead backend"
+    );
     assert_eq!(observed.path, H3_MESH_PLAIN_BACKEND_PATH);
     assert_eq!(observed.body, payload);
 
