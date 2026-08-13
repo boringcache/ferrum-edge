@@ -796,6 +796,11 @@ pub(crate) async fn handle_h3_websocket(
         state.max_websocket_frame_size_bytes,
         &ws_size_limit_plugins,
     );
+    // Mesh WS client Host: same source as H1/H2 — the materialized
+    // `ctx.headers` map, which already back-fills a missing Host from the H3
+    // `:authority` (including an explicit port). `request_host` is the
+    // port-stripped routing key and must not be substituted here.
+    let ws_client_host = ctx.headers.get("host").cloned();
     let mut current_backend_url = backend_url;
     // The target selection bound this request to, retained across the retry
     // loop's rotations so the successful upgrade response can tell "the honored
@@ -1056,7 +1061,7 @@ pub(crate) async fn handle_h3_websocket(
                     ws_dial_proxy,
                     target,
                     egress,
-                    request_host.as_deref(),
+                    ws_client_host.as_deref(),
                     path_and_query,
                     &client_headers,
                     ws_size_limits.max_frame_bytes,

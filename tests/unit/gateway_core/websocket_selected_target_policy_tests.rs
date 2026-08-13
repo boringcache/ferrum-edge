@@ -710,3 +710,125 @@ fn websocket_retry_rotation_rechecks_destination_rule_max_retries() {
         );
     }
 }
+
+/// Bounded source of `handle_h3_websocket` so rustfmt wrapping and the inline
+/// test module cannot satisfy the Host/authority parity needles below.
+fn h3_ws_handler() -> &'static str {
+    let start = H3_WS_SOURCE
+        .find("pub(crate) async fn handle_h3_websocket(")
+        .expect("H3 WebSocket handler must remain present");
+    let end = H3_WS_SOURCE[start..]
+        .find("#[cfg(test)]")
+        .map(|offset| start + offset)
+        .unwrap_or(H3_WS_SOURCE.len());
+    &H3_WS_SOURCE[start..end]
+}
+
+fn h1_h2_ws_handler() -> &'static str {
+    let start = PROXY_SOURCE
+        .find("async fn handle_websocket_request_authenticated(")
+        .expect("H1/H2 WebSocket handler must remain present");
+    let end = PROXY_SOURCE[start..]
+        .find("\nasync fn ")
+        .map(|offset| start + offset)
+        .unwrap_or(PROXY_SOURCE.len());
+    &PROXY_SOURCE[start..end]
+}
+
+fn mesh_ws_connector() -> &'static str {
+    let start = PROXY_SOURCE
+        .find("pub(crate) async fn connect_mesh_websocket_backend(")
+        .expect("shared mesh WebSocket connector must remain present");
+    let end = PROXY_SOURCE[start..]
+        .find("\npub(crate) async fn ")
+        .map(|offset| start + offset)
+        .unwrap_or(PROXY_SOURCE.len());
+    &PROXY_SOURCE[start..end]
+}
+
+/// H3 WebSocket mesh egress must pass the materialized client Host (including
+/// an explicit port such as `Example.COM:8443`) into the shared connector, just
+/// as H1/H2 does. The normalized `request_host` stays the routing / retry key.
+#[test]
+fn h3_websocket_mesh_egress_uses_materialized_host_not_routing_host() {
+    const MATERIALIZED_HOST: &str = "Example.COM:8443";
+
+    // Routing / retry hashing is intentionally portless and lowercased.
+    assert_eq!(
+        ferrum_edge::proxy::normalize_request_host_for_routing(MATERIALIZED_HOST).as_deref(),
+        Some("example.com"),
+        "retry selection and wildcard concretization keep the normalized routing host"
+    );
+
+    let h1_body = squeeze(h1_h2_ws_handler());
+    let h3_body = squeeze(h3_ws_handler());
+
+    const HOST_CAPTURE: &str = "letws_client_host=ctx.headers.get(\"host\").cloned();";
+    assert!(
+        h1_body.contains(HOST_CAPTURE),
+        "H1/H2 WebSocket mesh egress must read the client Host from the materialized header map"
+    );
+    assert!(
+        h3_body.contains(HOST_CAPTURE),
+        "H3 WebSocket mesh egress must read the client Host from the materialized header map, \
+         matching H1/H2 (including an H3 `:authority` back-fill such as `{MATERIALIZED_HOST}`)"
+    );
+
+    const MESH_WITH_CLIENT_HOST: &str =
+        "connect_mesh_websocket_backend(&state,ws_dial_proxy,target,egress,ws_client_host.as_deref(),";
+    const MESH_WITH_ROUTING_HOST: &str =
+        "connect_mesh_websocket_backend(&state,ws_dial_proxy,target,egress,request_host.as_deref(),";
+    assert!(
+        h1_body.contains(MESH_WITH_CLIENT_HOST),
+        "H1/H2 must pass the materialized Host verbatim to the shared mesh WS connector"
+    );
+    assert!(
+        h3_body.contains(MESH_WITH_CLIENT_HOST),
+        "H3 must pass the materialized Host (e.g. `{MATERIALIZED_HOST}`) verbatim to the \
+         shared mesh WS connector"
+    );
+    assert!(
+        !h3_body.contains(MESH_WITH_ROUTING_HOST),
+        "H3 must not substitute the port-stripped routing host into the mesh WS connector"
+    );
+    assert!(
+        h3_body.contains("request_authority:request_host.as_deref()"),
+        "H3 WebSocket retry selection must keep using the normalized routing host"
+    );
+
+    // H3 synthesizes a missing Host from `:authority` without stripping the
+    // explicit port or lowercasing, so `{MATERIALIZED_HOST}` survives into
+    // `ctx.headers["host"]` for the capture above.
+    let h3_server = squeeze(include_str!("../../../src/http3/server.rs"));
+    assert!(
+        h3_server.contains(
+            "ctx.headers.insert(\"host\".to_string(),authority.as_str().to_string());"
+        ),
+        "H3 must materialize a missing Host from `:authority` verbatim, including an explicit port"
+    );
+
+    // Service-authority-tag branch: when `mesh.mtls_authority_host` replaces
+    // Host, the shared connector stamps `x-forwarded-host` from `client_host`.
+    // H3 must not duplicate that rewrite; passing the materialized Host is
+    // enough for `{MATERIALIZED_HOST}` to appear on `x-forwarded-host`.
+    let connector = squeeze(mesh_ws_connector());
+    let service_tag = connector
+        .find("target_mesh_mtls_authority_host(target)")
+        .expect("sidecar service-authority tag must still select the peer :authority");
+    let xfh = connector[service_tag..]
+        .find("augmented.push((\"x-forwarded-host\".to_string(),host.to_string()));")
+        .expect(
+            "service-authority tag must stamp x-forwarded-host from the connector's client_host",
+        );
+    let host_from_client = connector[service_tag..]
+        .find("client_host.filter(|host|!host.is_empty())")
+        .expect("x-forwarded-host must be sourced from the connector client_host argument");
+    assert!(
+        host_from_client < xfh,
+        "x-forwarded-host must be copied from client_host before the service-authority rewrite"
+    );
+    assert!(
+        !h3_body.contains("x-forwarded-host"),
+        "H3 must not duplicate the shared connector's x-forwarded-host rewrite"
+    );
+}
