@@ -1380,10 +1380,11 @@ impl DtlsServer {
             let mut peer_cert_der: Option<Arc<Vec<u8>>> = None;
             let mut peer_cert_chain_der: Option<Arc<Vec<Vec<u8>>>> = None;
             // Frontend client-trust registration for this session (issue #3857).
-            // Established only once a client certificate has actually been
-            // verified; dropping the guard on any exit path deregisters it.
+            // The Option is the live owner from spawn start to teardown: `None`
+            // means "not yet admitted" and is observed every select iteration,
+            // then replaced once by the guard after a verified client
+            // certificate. Dropping the guard on any exit path deregisters it.
             let mut client_trust_guard: Option<crate::tls::ClientTrustSessionGuard> = None;
-            let mut client_trust_retired: Option<tokio_util::sync::CancellationToken> = None;
             // Whether a client certificate was actually presented AND verified
             // against the configured client CA during the handshake. dimpl's
             // `require_client_certificate(true)` only makes the server SEND a
@@ -1471,9 +1472,12 @@ impl DtlsServer {
                     // the active-session counter and its mirror all release
                     // exactly once. No reply drain: the peer is no longer
                     // authorized, so queued application data must not be sent.
+                    // Observing the guard Option here (including the initial
+                    // `None`) is what keeps it a live owner for the whole
+                    // session rather than a dummy assignment overwritten later.
                     _ = async {
-                        match client_trust_retired.as_ref() {
-                            Some(token) => token.cancelled().await,
+                        match client_trust_guard.as_ref() {
+                            Some(guard) => guard.session().retired().await,
                             None => std::future::pending().await,
                         }
                     } => {
@@ -1596,11 +1600,10 @@ impl DtlsServer {
                                 // retires the session immediately instead of
                                 // letting it repopulate the domain behind the
                                 // sweep.
-                                client_trust_guard = client_trust_admission
-                                    .and_then(|admission| admission.register(true));
-                                client_trust_retired = client_trust_guard
-                                    .as_ref()
-                                    .map(|guard| guard.session().cancellation_token());
+                                if client_trust_guard.is_none() {
+                                    client_trust_guard = client_trust_admission
+                                        .and_then(|admission| admission.register(true));
+                                }
                             }
                             peer_cert_chain_der =
                                 (chain.len() > 1).then(|| Arc::new(chain[1..].to_vec()));

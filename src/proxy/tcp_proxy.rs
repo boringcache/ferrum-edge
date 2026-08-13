@@ -3312,8 +3312,10 @@ async fn handle_tcp_connection_inner(
     } else {
         None
     };
-    let mut client_trust_guard: Option<crate::tls::ClientTrustSessionGuard> = None;
-    let client_stream = 'frontend_tls: {
+    // Produced by the frontend-TLS setup block below and held for the
+    // entire relay so a successful admission deregisters exactly once on
+    // teardown (issue #3857). Plaintext and kTLS paths yield `None`.
+    let (client_stream, client_trust_guard) = 'frontend_tls: {
         let Some(tls_config) = frontend_tls_config else {
             // Plaintext client: peek (non-destructively) the opening bytes. These are
             // the application bytes on the wire, so they are fully L7-inspectable and
@@ -3339,7 +3341,7 @@ async fn handle_tcp_connection_inner(
                 )
                 .await?;
             }
-            break 'frontend_tls ClientRelayStream::Plain(client_stream);
+            break 'frontend_tls (ClientRelayStream::Plain(client_stream), None);
         };
         // Linux kTLS handoff eligibility, decided before the handshake starts.
         // A plain backend is required (splice needs both ends raw), and a
@@ -3435,7 +3437,7 @@ async fn handle_tcp_connection_inner(
                 }
 
                 let policy = accepted.confidentiality;
-                break 'frontend_tls ClientRelayStream::Ktls(accepted.stream, policy);
+                break 'frontend_tls (ClientRelayStream::Ktls(accepted.stream, policy), None);
             }
         };
 
@@ -3514,13 +3516,13 @@ async fn handle_tcp_connection_inner(
         // and the stream summary all complete exactly once through paths that
         // already exist. A connection with no verified client certificate
         // registers nothing and the wrapper is a pass-through.
-        client_trust_guard = client_trust_admission
+        let client_trust_guard = client_trust_admission
             .and_then(|admission| admission.register(stream_ctx.tls_client_cert_der.is_some()));
         let fenced = crate::tls::TrustFencedStream::new(
             tls_stream,
             client_trust_guard.as_ref().map(|guard| guard.session()),
         );
-        ClientRelayStream::Tls(Box::new(fenced))
+        (ClientRelayStream::Tls(Box::new(fenced)), client_trust_guard)
     };
 
     // Helper: record circuit breaker failure for the current target.

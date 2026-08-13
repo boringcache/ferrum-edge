@@ -16,8 +16,8 @@ use crate::tls::source::subscription::{
     source_is_refreshable, spawn_material_set_reload_task,
 };
 use crate::tls::{
-    self, CrlList, FrontendTlsReloadConfig, SharedFrontendTls, TlsPolicy, frontend_tls_slot_with,
-    spawn_frontend_tls_reload_task,
+    self, CrlList, FrontendTlsRebuilt, FrontendTlsReloadConfig, SharedFrontendTls, TlsPolicy,
+    frontend_tls_slot_with, spawn_frontend_tls_reload_task,
 };
 
 pub const CP_GRPC_SURFACE: &str = "cp_grpc";
@@ -102,13 +102,23 @@ pub fn prepare_cp_grpc_server_tls_reload(
             interval,
             revision_tx,
             max_material_bytes: env_config.tls_max_material_size_bytes,
-            rebuild: Box::new(move || {
-                build_cp_grpc_server_tls_config(
-                    &env_for_rebuild,
-                    &policy_for_rebuild,
-                    &crls_for_rebuild,
-                )
+            rebuild: Box::new(move || -> Result<FrontendTlsRebuilt, anyhow::Error> {
+                // CP/DP gRPC is outside the closed frontend client-trust domain
+                // set (proxy HTTPS/H2 + TCP+TLS, proxy H3, admin HTTPS, frontend
+                // DTLS). Wrap the existing verifier rebuild so the shared
+                // frontend reload watcher can swap the slot, but leave the
+                // candidate unarmed so a CRL/client-CA rotation here cannot
+                // retire frontend transports.
+                Ok(FrontendTlsRebuilt {
+                    config: build_cp_grpc_server_tls_config(
+                        &env_for_rebuild,
+                        &policy_for_rebuild,
+                        &crls_for_rebuild,
+                    )?,
+                    client_trust: None,
+                })
             }),
+            client_trust_scopes: Vec::new(),
         },
         shutdown_rx,
     );
