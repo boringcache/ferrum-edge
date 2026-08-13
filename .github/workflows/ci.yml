@@ -2029,6 +2029,7 @@ jobs:
     timeout-minutes: 45
     env:
       FERRUM_IMAGE: ferrum-edge:helm-chart-ci
+      GATEWAY_API_VERSION: v1.5.1
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
@@ -3961,6 +3962,20 @@ jobs:
           chmod +x target/debug/ferrum-edge
           kind create cluster --name ferrum-helm --wait 120s
           kind load docker-image "$FERRUM_IMAGE" --name ferrum-helm
+
+      - name: Install Gateway API CRDs
+        run: |
+          set -euo pipefail
+          kubectl apply --server-side=true \
+            -f "https://github.com/kubernetes-sigs/gateway-api/releases/download/${GATEWAY_API_VERSION}/standard-install.yaml"
+          for crd in \
+            gatewayclasses.gateway.networking.k8s.io \
+            gateways.gateway.networking.k8s.io \
+            httproutes.gateway.networking.k8s.io \
+            grpcroutes.gateway.networking.k8s.io \
+            referencegrants.gateway.networking.k8s.io; do
+            kubectl wait --for=condition=Established "crd/${crd}" --timeout=120s
+          done
 
       - name: Validate external migrate Job examples
         run: |
