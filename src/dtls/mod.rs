@@ -201,6 +201,38 @@ struct FrontendSessionAuthDeadline {
 }
 
 const FRONTEND_SESSION_AUTH_DEADLINE_UNSET: u64 = u64::MAX;
+const FRONTEND_SESSION_AUTH_DEADLINE_MAX_ENCODED: u64 = FRONTEND_SESSION_AUTH_DEADLINE_UNSET - 1;
+
+fn encode_frontend_session_auth_deadline_offset(offset_nanos: u128) -> u64 {
+    match u64::try_from(offset_nanos) {
+        Ok(encoded) if encoded < FRONTEND_SESSION_AUTH_DEADLINE_UNSET => encoded,
+        _ => FRONTEND_SESSION_AUTH_DEADLINE_MAX_ENCODED,
+    }
+}
+
+fn encode_frontend_session_auth_deadline(
+    anchor: tokio::time::Instant,
+    at: tokio::time::Instant,
+) -> u64 {
+    encode_frontend_session_auth_deadline_offset(at.saturating_duration_since(anchor).as_nanos())
+}
+
+fn reconstruct_frontend_session_auth_deadline_from_duration(
+    anchor: tokio::time::Instant,
+    offset: Duration,
+) -> tokio::time::Instant {
+    anchor.checked_add(offset).unwrap_or(anchor)
+}
+
+fn reconstruct_frontend_session_auth_deadline(
+    anchor: tokio::time::Instant,
+    encoded: u64,
+) -> tokio::time::Instant {
+    reconstruct_frontend_session_auth_deadline_from_duration(
+        anchor,
+        Duration::from_nanos(encoded),
+    )
+}
 
 impl FrontendSessionAuthDeadline {
     fn new() -> Self {
@@ -211,7 +243,7 @@ impl FrontendSessionAuthDeadline {
     }
 
     fn publish(&self, at: tokio::time::Instant) {
-        let encoded = at.saturating_duration_since(self.anchor).as_nanos() as u64;
+        let encoded = encode_frontend_session_auth_deadline(self.anchor, at);
         let mut current = self.earliest_ns.load(Ordering::Acquire);
         loop {
             if current != FRONTEND_SESSION_AUTH_DEADLINE_UNSET && encoded >= current {
@@ -234,7 +266,7 @@ impl FrontendSessionAuthDeadline {
         if encoded == FRONTEND_SESSION_AUTH_DEADLINE_UNSET {
             None
         } else {
-            Some(self.anchor + Duration::from_nanos(encoded))
+            Some(reconstruct_frontend_session_auth_deadline(self.anchor, encoded))
         }
     }
 }
@@ -444,6 +476,32 @@ pub(crate) fn read_frontend_session_auth_deadline_for_test(
     auth_deadline: &FrontendSessionAuthDeadlineForTest,
 ) -> Option<tokio::time::Instant> {
     auth_deadline.0.get()
+}
+
+/// Encode a nanosecond offset from the session anchor for external tests.
+#[allow(dead_code)] // used through library `_test_support`
+pub(crate) fn encode_frontend_session_auth_deadline_offset_for_test(
+    offset_nanos: u128,
+) -> u64 {
+    encode_frontend_session_auth_deadline_offset(offset_nanos)
+}
+
+/// Reconstruct a deadline instant from anchor + encoded offset for external tests.
+#[allow(dead_code)] // used through library `_test_support`
+pub(crate) fn reconstruct_frontend_session_auth_deadline_for_test(
+    anchor: tokio::time::Instant,
+    encoded: u64,
+) -> tokio::time::Instant {
+    reconstruct_frontend_session_auth_deadline(anchor, encoded)
+}
+
+/// Reconstruct a deadline instant from anchor + duration offset for external tests.
+#[allow(dead_code)] // used through library `_test_support`
+pub(crate) fn reconstruct_frontend_session_auth_deadline_from_duration_for_test(
+    anchor: tokio::time::Instant,
+    offset: Duration,
+) -> tokio::time::Instant {
+    reconstruct_frontend_session_auth_deadline_from_duration(anchor, offset)
 }
 
 // ============================================================================

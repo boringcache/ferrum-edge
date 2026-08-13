@@ -8913,6 +8913,29 @@ pub mod _test_support {
         crate::dtls::read_frontend_session_auth_deadline_for_test(auth_deadline)
     }
 
+    /// Encode a nanosecond offset from the session anchor for external tests.
+    pub fn encode_frontend_session_auth_deadline_offset_for_test(offset_nanos: u128) -> u64 {
+        crate::dtls::encode_frontend_session_auth_deadline_offset_for_test(offset_nanos)
+    }
+
+    /// Reconstruct a deadline instant from anchor + encoded offset for external tests.
+    pub fn reconstruct_frontend_session_auth_deadline_for_test(
+        anchor: tokio::time::Instant,
+        encoded: u64,
+    ) -> tokio::time::Instant {
+        crate::dtls::reconstruct_frontend_session_auth_deadline_for_test(anchor, encoded)
+    }
+
+    /// Reconstruct a deadline instant from anchor + duration offset for external tests.
+    pub fn reconstruct_frontend_session_auth_deadline_from_duration_for_test(
+        anchor: tokio::time::Instant,
+        offset: Duration,
+    ) -> tokio::time::Instant {
+        crate::dtls::reconstruct_frontend_session_auth_deadline_from_duration_for_test(
+            anchor, offset,
+        )
+    }
+
     /// Observe Ferrum-managed DTLS loader key DER after zeroization and before
     /// the backing allocation is released (issue #3224 loader ownership path).
     pub fn load_dtls_certificate_with_rustls_key_drop_hook_for_test(

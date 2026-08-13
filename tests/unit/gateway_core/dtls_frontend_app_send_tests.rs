@@ -13,10 +13,13 @@ use std::time::Duration;
 
 use ferrum_edge::_test_support::{
     FrontendAppSendAdmitForTest, FrontendAppSendRejectForTest, admit_frontend_app_send_for_test,
-    earliest_frontend_app_send_deadline_for_test, frontend_app_ciphertext_send_until_expiry_for_test,
-    frontend_app_send_cancel_fired_for_test, frontend_app_send_reject_as_str_for_test,
-    frontend_session_auth_deadline_for_test, publish_frontend_session_auth_deadline_for_test,
-    read_frontend_session_auth_deadline_for_test, shutdown_queued_frontend_app_send_for_test,
+    earliest_frontend_app_send_deadline_for_test, encode_frontend_session_auth_deadline_offset_for_test,
+    frontend_app_ciphertext_send_until_expiry_for_test, frontend_app_send_cancel_fired_for_test,
+    frontend_app_send_reject_as_str_for_test, frontend_session_auth_deadline_for_test,
+    publish_frontend_session_auth_deadline_for_test, read_frontend_session_auth_deadline_for_test,
+    reconstruct_frontend_session_auth_deadline_for_test,
+    reconstruct_frontend_session_auth_deadline_from_duration_for_test,
+    shutdown_queued_frontend_app_send_for_test,
 };
 
 const DTLS_SOURCE: &str = include_str!("../../../src/dtls/mod.rs");
@@ -51,6 +54,63 @@ fn later_per_call_publication_then_earlier_bind_tightens_session() {
         read_frontend_session_auth_deadline_for_test(&auth),
         Some(earlier),
         "an explicit earlier bind must tighten the shared session deadline"
+    );
+}
+
+#[test]
+fn encode_clamps_overflow_and_avoids_unset_sentinel() {
+    const UNSET: u64 = u64::MAX;
+    const MAX_ENCODED: u64 = u64::MAX - 1;
+
+    assert_eq!(encode_frontend_session_auth_deadline_offset_for_test(0), 0);
+    assert_eq!(
+        encode_frontend_session_auth_deadline_offset_for_test(1_500),
+        1_500
+    );
+    assert_eq!(
+        encode_frontend_session_auth_deadline_offset_for_test(u64::MAX as u128),
+        MAX_ENCODED,
+        "exactly u64::MAX nanoseconds must not collide with the unset sentinel"
+    );
+    assert_eq!(
+        encode_frontend_session_auth_deadline_offset_for_test(u128::from(u64::MAX) + 1),
+        MAX_ENCODED,
+        "offsets above u64::MAX must clamp instead of wrapping"
+    );
+    assert_eq!(
+        encode_frontend_session_auth_deadline_offset_for_test(u128::MAX),
+        MAX_ENCODED,
+        "extreme offsets must clamp to the largest representable encoded value"
+    );
+    assert_ne!(
+        encode_frontend_session_auth_deadline_offset_for_test(u128::MAX),
+        UNSET
+    );
+}
+
+#[test]
+fn reconstruct_fails_closed_when_offset_is_unrepresentable() {
+    let anchor = tokio::time::Instant::now();
+    assert_eq!(
+        reconstruct_frontend_session_auth_deadline_for_test(anchor, 0),
+        anchor,
+        "zero offset reconstructs to the anchor"
+    );
+    assert_eq!(
+        reconstruct_frontend_session_auth_deadline_from_duration_for_test(anchor, Duration::MAX),
+        anchor,
+        "an unrepresentable reconstruction must fail closed to the anchor"
+    );
+}
+
+#[test]
+fn publish_already_expired_bind_encodes_zero_and_reads_anchor() {
+    let auth = frontend_session_auth_deadline_for_test();
+    publish_frontend_session_auth_deadline_for_test(&auth, elapsed_deadline());
+    let read = read_frontend_session_auth_deadline_for_test(&auth).expect("published");
+    assert!(
+        read <= tokio::time::Instant::now(),
+        "an already-expired bind must read as immediately expired"
     );
 }
 
