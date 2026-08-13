@@ -74,15 +74,16 @@
 //! 4. writes a merge patch that includes those optimistic-concurrency
 //!    preconditions.
 //!
-//! HTTP 409 triggers a bounded re-read/re-merge/retry. UID change,
+//! HTTP 409 triggers a bounded re-read/re-merge/retry. A plan without a
+//! watch-snapshot UID is refused before GET/PATCH. UID change,
 //! delete/recreate, not-found, unsupported status subresource, or
 //! exhausted retries abort without falling back to an unversioned write.
 //! `field_manager = "ferrum.io/istio-controller"` remains an identity
 //! string on the merge patch (distinct from the Gateway API writer), not
 //! an apply-conflict detector.
 
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures_util::future::join_all;
@@ -125,11 +126,10 @@ pub struct IstioStatusUpdate {
     pub kind: String,
     pub namespace: String,
     pub name: String,
-    /// Planned object UID from the watch-cache snapshot. A live GET with
-    /// a different UID is treated as delete/recreate and aborts the write.
-    /// Empty when the snapshot omitted UID (legacy/test objects); the
-    /// writer still requires a live UID on the GET for the patch
-    /// precondition.
+    /// Planned object UID from the watch-cache snapshot. Required for every
+    /// production plan: an empty UID cannot bind object identity, so the
+    /// writer refuses the write before GET/PATCH. A live GET with a
+    /// different UID is treated as delete/recreate and aborts the write.
     pub uid: String,
     /// Desired `status` sub-object. The writer extracts
     /// `status.conditions[]` from this and merges it into the live status.
@@ -258,6 +258,17 @@ async fn patch_istio_status_with_retry(
     update: &IstioStatusUpdate,
     metrics: Option<&ControllerMetrics>,
 ) -> Result<(), kube::Error> {
+    if update.uid.is_empty() {
+        bump_istio_status_metric(metrics, |m| &m.istio_status_missing_uid);
+        warn!(
+            api_version = %update.api_version,
+            kind = %update.kind,
+            namespace = %update.namespace,
+            name = %update.name,
+            "Istio status plan omitted object UID; refusing write"
+        );
+        return Ok(());
+    }
     let deadline = Instant::now() + ISTIO_STATUS_PATCH_RETRY_DEADLINE;
     let params = istio_status_patch_params();
     for attempt in 1..=ISTIO_STATUS_PATCH_MAX_ATTEMPTS {
@@ -318,7 +329,7 @@ async fn patch_istio_status_with_retry(
             );
             return Ok(());
         };
-        if !update.uid.is_empty() && update.uid != uid {
+        if update.uid != uid {
             bump_istio_status_metric(metrics, |m| &m.istio_status_recreated);
             warn!(
                 api_version = %update.api_version,
@@ -329,6 +340,8 @@ async fn patch_istio_status_with_retry(
             );
             return Ok(());
         }
+
+        maybe_intercept_after_live_get(attempt).await;
 
         let patch = istio_status_patch(update, live.data.get("status"), resource_version, uid);
         match api
@@ -437,6 +450,47 @@ fn bump_istio_status_metric(
     }
 }
 
+static WRITE_INTERCEPT_PAIR: Mutex<
+    Option<(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
+> = Mutex::new(None);
+
+/// Install a one-shot GET/PATCH intercept for live competing-writer tests.
+///
+/// After the first live GET that still matches the planned UID, the writer
+/// signals `after_get` and waits for `resume` before issuing PATCH. Production
+/// never installs a pair.
+pub(crate) fn install_istio_status_write_intercept_for_test(
+    after_get: tokio::sync::oneshot::Sender<()>,
+    resume: tokio::sync::oneshot::Receiver<()>,
+) {
+    if let Ok(mut slot) = WRITE_INTERCEPT_PAIR.lock() {
+        *slot = Some((after_get, resume));
+    }
+}
+
+pub(crate) fn clear_istio_status_write_intercept_for_test() {
+    if let Ok(mut slot) = WRITE_INTERCEPT_PAIR.lock() {
+        *slot = None;
+    }
+}
+
+async fn maybe_intercept_after_live_get(attempt: usize) {
+    if attempt != 1 {
+        return;
+    }
+    let pair = WRITE_INTERCEPT_PAIR
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take());
+    if let Some((after_get, resume)) = pair {
+        let _ = after_get.send(());
+        let _ = resume.await;
+    }
+}
+
 /// Plan a batch of [`IstioStatusUpdate`]s for the supported Istio CRDs in
 /// `objects`.
 ///
@@ -490,7 +544,9 @@ pub fn plan_istio_status_updates_budgeted(
 
     let mut eligible: Vec<&K8sObject> = objects
         .iter()
-        .filter(|object| is_supported_istio_kind(&object.kind))
+        .filter(|object| {
+            is_supported_istio_kind(&object.kind) && !object.metadata.uid.is_empty()
+        })
         .collect();
     eligible.sort_by(|left, right| {
         (
@@ -2228,7 +2284,7 @@ mod tests {
             kind: kind.to_string(),
             metadata: K8sMetadata {
                 name: name.to_string(),
-                uid: String::new(),
+                uid: format!("uid-{name}"),
                 namespace: "default".to_string(),
                 generation: Some(11),
                 labels: Default::default(),

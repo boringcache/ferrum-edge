@@ -595,6 +595,8 @@ pub async fn start_k8s_controller(
 
     let store_set = Arc::new(tokio::sync::Mutex::new(ResourceStoreSet::new()));
     let metrics = Arc::new(ControllerMetrics::new());
+    crate::plugins::prometheus_metrics::global_registry()
+        .set_k8s_controller_metrics(metrics.clone());
     // Shared by every watch scope (evidence producers) and the reconciler
     // (the single consumer that stamps a published snapshot) — issue #3611.
     let revision = Arc::new(K8sConfigRevisionTracker::new(

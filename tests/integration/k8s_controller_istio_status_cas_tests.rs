@@ -631,6 +631,50 @@ async fn delete_recreate_same_name_aborts_stale_plan() {
 }
 
 #[tokio::test]
+async fn identity_less_plan_issues_no_get_or_patch_and_cannot_land_on_replacement() {
+    let state = Arc::new(Mutex::new(CasState::default()));
+    {
+        let mut locked = state.lock().expect("seed");
+        seed_policy(
+            &mut locked,
+            json!({
+                "conditions": [initial_foreign_condition()]
+            }),
+        );
+        if let Some(object) = locked.objects.get_mut("authorizationpolicies/policy") {
+            object.uid = RECREATED_UID.to_string();
+        }
+    }
+    let (writer, metrics) = writer_with_metrics(mock_cas_client(state.clone()));
+    writer
+        .patch_updates(vec![ferrum_update(
+            "security.istio.io/v1",
+            "AuthorizationPolicy",
+            "policy",
+            "",
+        )])
+        .await
+        .expect("missing planned UID is a refused skip, not a batch failure");
+
+    let state = state.lock().expect("lock CAS state");
+    assert_eq!(state.get_count, 0, "identity-less plan must not GET");
+    assert!(
+        state.patch_bodies.is_empty(),
+        "identity-less plan must not PATCH"
+    );
+    let object = state
+        .objects
+        .get("authorizationpolicies/policy")
+        .expect("replacement object");
+    assert_eq!(object.uid, RECREATED_UID);
+    assert!(
+        condition_by_type(&object.status, "FerrumAccepted").is_none(),
+        "stale identity-less plan must not land on the replacement UID"
+    );
+    assert_eq!(metrics.snapshot().istio_status_missing_uid, 1);
+}
+
+#[tokio::test]
 async fn not_found_and_unsupported_abort_without_unversioned_write() {
     let not_found_state = Arc::new(Mutex::new(CasState {
         not_found: true,

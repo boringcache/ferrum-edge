@@ -37,6 +37,9 @@ pub struct ControllerMetrics {
     pub istio_status_not_found: AtomicU64,
     /// Istio status writes aborted because the CRD has no status subresource.
     pub istio_status_unsupported: AtomicU64,
+    /// Istio status writes refused because the planned watch-snapshot UID was
+    /// missing, so the write could not bind object identity.
+    pub istio_status_missing_uid: AtomicU64,
 }
 
 impl Default for ControllerMetrics {
@@ -60,6 +63,7 @@ impl ControllerMetrics {
             istio_status_recreated: AtomicU64::new(0),
             istio_status_not_found: AtomicU64::new(0),
             istio_status_unsupported: AtomicU64::new(0),
+            istio_status_missing_uid: AtomicU64::new(0),
         }
     }
 
@@ -94,6 +98,9 @@ impl ControllerMetrics {
             istio_status_unsupported: self
                 .istio_status_unsupported
                 .load(std::sync::atomic::Ordering::Relaxed),
+            istio_status_missing_uid: self
+                .istio_status_missing_uid
+                .load(std::sync::atomic::Ordering::Relaxed),
         }
     }
 }
@@ -111,4 +118,5 @@ pub struct MetricsSnapshot {
     pub istio_status_recreated: u64,
     pub istio_status_not_found: u64,
     pub istio_status_unsupported: u64,
+    pub istio_status_missing_uid: u64,
 }
