@@ -61,10 +61,6 @@ fn live(client: &PluginHttpClient) -> &reqwest::Client {
     client.get().expect("test plugin HTTP client")
 }
 
-fn live_http2(client: &PluginHttpClient) -> &reqwest::Client {
-    client.get_http2().expect("test plugin HTTP/2 client")
-}
-
 #[tokio::test(flavor = "current_thread")]
 async fn plugin_http_client_ignores_ambient_proxy_environment() {
     let proxy = MockServer::start().await;
