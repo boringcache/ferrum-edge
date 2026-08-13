@@ -553,11 +553,13 @@ continuously. Issue #3816 tracks that gap.
   HTTP/3 memoizes the expensive X.509 parse, path verification, and identity
   extraction once per plugin instance and transport connection. What is cached
   is the certificate-*invariant* result — the identity plus the validity window
-  — never "this was valid". Every request performs two integer comparisons
-  against the current time before the cached identity is used, so a cached
-  success becomes a fixed `401` the moment the certificate expires. `ConsumerIndex`
-  lookup likewise stays per request, so a consumer removed by a config reload
-  stops being authorized immediately.
+  — never "this was valid". Every request re-checks the Unix window, and the
+  first successful evaluation converts `notAfter` once to a monotonic Instant
+  that later cache hits must return unchanged, so a wall-clock rollback cannot
+  recreate a later deadline. A cached success becomes a fixed `401` the moment
+  that retained Instant elapses. `ConsumerIndex` lookup likewise stays per
+  request, so a consumer removed by a config reload stops being authorized
+  immediately.
 - **The client learns nothing.** The rejection body is a fixed
   `{"error":"Client certificate is not currently valid"}`. `notBefore`,
   `notAfter`, the observed time, the subject, the SAN, the serial, the
@@ -576,9 +578,10 @@ protocol-neutral contract. That single value is what bounds:
 - TCP+TLS and UDP+DTLS stream sessions, whose `on_stream_connect` admission runs
   exactly once and would otherwise leave a continuously active relay unbounded.
 
-The deadline is converted to a **monotonic** instant at validation time, so a
-wall-clock rollback cannot lengthen an already-admitted stream. Relayed traffic
-never refreshes it.
+The deadline is converted to a **monotonic** instant once, at the first
+successful evaluation, and that Instant is retained on the cached evaluation so
+a wall-clock rollback cannot lengthen a later request on the same connection.
+Relay traffic never refreshes it.
 
 #### Kernel TLS and the stream authorization deadline
 

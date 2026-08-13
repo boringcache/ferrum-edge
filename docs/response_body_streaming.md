@@ -339,7 +339,7 @@ deadline**, anchored when the request was admitted. It is the **earliest** of:
 
 | Bound | Source |
 |-------|--------|
-| The accepted credential's authoritative expiry | JWT / JWKS `exp` plus that provider's configured leeway; OIDC session expiry; OAuth2 introspection `exp` / `active_until` / `expires_in`, converted once at validation so a cache hit cannot slide it; the `mtls_auth` leaf certificate's `notAfter` |
+| The accepted credential's authoritative expiry | JWT / JWKS `exp` plus that provider's configured leeway; OIDC session expiry; OAuth2 introspection `exp` / `active_until` / `expires_in`, converted once at validation so a cache hit cannot slide it; the `mtls_auth` leaf certificate's `notAfter`, converted once at first successful evaluation so a connection-cache hit cannot slide it |
 | The finite fallback maximum | `FERRUM_AUTHENTICATED_STREAM_MAX_LIFETIME_SECONDS` (default `3600`, valid `1`–`86400`) |
 
 That deadline then composes with every other bound the protocol already

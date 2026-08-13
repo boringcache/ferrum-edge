@@ -3563,8 +3563,9 @@ impl RequestContext {
     /// them completely unbounded for an ordinary HTTP request, so a slow hook
     /// could carry an admitted credential past its own expiry and then commit a
     /// PROTECTED response head. Composing the authorization deadline here means
-    /// the phase is cancelled instead, and the authoritative gate immediately
-    /// before head commitment turns that into the fixed pre-commitment terminal.
+    /// the phase is cancelled instead, and the authoritative gates before
+    /// logging and immediately after the last pre-commitment await turn that
+    /// into the fixed pre-commitment terminal.
     ///
     /// The maximum comes from the process-wide value `EnvConfig::validate`
     /// publishes after its `1..=86400` range check, so this needs no config

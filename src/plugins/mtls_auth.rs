@@ -89,15 +89,19 @@ impl CertValidityWindow {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum CertificateEvaluation {
     /// Certificate-invariant result: the extracted identity plus the leaf's
-    /// authoritative validity window. Deliberately does NOT record "was valid
-    /// when evaluated" — that is a time-dependent fact and is re-decided on
-    /// every request from the retained window.
+    /// authoritative validity window, and — once the first successful
+    /// evaluation converts `notAfter` — the monotonic expiry that every later
+    /// cache hit must return unchanged (issue #3816). Deliberately does NOT
+    /// record "was valid when evaluated": the Unix window is re-checked on
+    /// every request, but the monotonic Instant is captured once so a
+    /// wall-clock rollback cannot recreate a later deadline.
     Identity {
         identity: String,
         validity: CertValidityWindow,
+        monotonic_expiry: OnceLock<tokio::time::Instant>,
     },
     InvalidCertificate,
     Forbidden(String),
@@ -736,7 +740,11 @@ impl MtlsAuth {
             }
         };
 
-        CertificateEvaluation::Identity { identity, validity }
+        CertificateEvaluation::Identity {
+            identity,
+            validity,
+            monotonic_expiry: OnceLock::new(),
+        }
     }
 
     fn evaluation_outcome(
@@ -744,8 +752,12 @@ impl MtlsAuth {
         evaluation: &CertificateEvaluation,
         consumer_index: &ConsumerIndex,
     ) -> VerifyOutcome {
-        let (identity, validity) = match evaluation {
-            CertificateEvaluation::Identity { identity, validity } => (identity, validity),
+        let (identity, validity, monotonic_expiry) = match evaluation {
+            CertificateEvaluation::Identity {
+                identity,
+                validity,
+                monotonic_expiry,
+            } => (identity, validity, monotonic_expiry),
             CertificateEvaluation::InvalidCertificate => {
                 return VerifyOutcome::Invalid(r#"{"error":"Invalid client certificate"}"#.into());
             }
@@ -762,11 +774,11 @@ impl MtlsAuth {
         // repeating the TLS handshake, and an H1 connection is reused for
         // keep-alive requests. Two integer comparisons per request.
         //
-        // X.509 validity is defined against wall-clock time, so the comparison
-        // has to read wall clock. The monotonic deadline attached below is what
-        // bounds an ALREADY-ADMITTED stream, so a wall-clock rollback cannot
-        // extend a running relay even though it can make a fresh request look
-        // in-window again.
+        // X.509 validity is defined against wall-clock time, so the first
+        // successful evaluation still rejects an invalid or not-yet-valid leaf
+        // here. The monotonic Instant captured below is what later cache hits
+        // admit against: a wall-clock rollback cannot recreate a later deadline
+        // from the retained Unix `notAfter`.
         let now_unix = x509_parser::time::ASN1Time::now().timestamp();
         if !validity.contains(now_unix) {
             // Fixed body. `notBefore`, `notAfter`, the observed time, the
@@ -777,6 +789,37 @@ impl MtlsAuth {
             );
         }
 
+        let credential_deadline = if let Some(&deadline) = monotonic_expiry.get() {
+            // Cache hit: admit against the Instant captured at first success.
+            // An already-elapsed bound is a fixed 401 — never a fresh conversion
+            // that could land later after wall-clock rollback.
+            if tokio::time::Instant::now() >= deadline {
+                debug!("mtls_auth: client certificate is outside its validity interval");
+                return VerifyOutcome::Invalid(
+                    r#"{"error":"Client certificate is not currently valid"}"#.into(),
+                );
+            }
+            deadline
+        } else {
+            // First successful evaluation: convert `notAfter` once. An
+            // unrepresentable conversion fails closed and does not populate the
+            // slot, so a later request retries rather than caching a bogus Instant.
+            let Some(converted) =
+                auth_flow::try_credential_deadline_from_unix_seconds(validity.not_after_unix, 0)
+            else {
+                debug!(
+                    "mtls_auth: certificate expiry is not representable as a monotonic deadline"
+                );
+                return VerifyOutcome::Invalid(
+                    r#"{"error":"Invalid client certificate"}"#.into(),
+                );
+            };
+            match monotonic_expiry.set(converted) {
+                Ok(()) => converted,
+                Err(_) => monotonic_expiry.get().copied().unwrap_or(converted),
+            }
+        };
+
         let consumer = if matches!(self.cert_field, CertField::SanDns) {
             consumer_index.find_by_mtls_dns_identity(identity)
         } else {
@@ -784,14 +827,11 @@ impl MtlsAuth {
         };
         match consumer {
             // The authoritative certificate bound published on the shared
-            // protocol-neutral contract. `credential_deadline_from_unix_seconds`
-            // converts it to a monotonic instant with zero leeway (mTLS has no
-            // configurable clock skew allowance) and saturates rather than
-            // overflowing, so a pathological `notAfter` cannot panic the
-            // authentication path.
-            Some(consumer) => VerifyOutcome::consumer(consumer).with_credential_deadline(Some(
-                auth_flow::credential_deadline_from_unix_seconds(validity.not_after_unix, 0),
-            )),
+            // protocol-neutral contract. Cache hits return the Instant captured
+            // above, never a newly derived later value.
+            Some(consumer) => {
+                VerifyOutcome::consumer(consumer).with_credential_deadline(Some(credential_deadline))
+            }
             None => VerifyOutcome::ConsumerNotFound(
                 r#"{"error":"No consumer found for client certificate"}"#.into(),
             ),

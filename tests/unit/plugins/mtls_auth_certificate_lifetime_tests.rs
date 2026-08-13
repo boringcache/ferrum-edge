@@ -7,7 +7,10 @@
 //! per-connection evaluation cache used by HTTP/3 still re-decides validity on
 //! every request while performing the expensive parse exactly once.
 
-use ferrum_edge::_test_support::request_credential_deadline_remaining;
+use ferrum_edge::_test_support::{
+    request_credential_deadline_at, request_credential_deadline_remaining,
+    try_credential_deadline_from_unix_seconds_at_for_test,
+};
 use ferrum_edge::config::types::Consumer;
 use ferrum_edge::consumer_index::ConsumerIndex;
 use ferrum_edge::plugins::mtls_auth::{MtlsAuth, MtlsAuthConnectionCache};
@@ -231,8 +234,8 @@ async fn the_connection_cache_reevaluates_validity_without_reparsing_the_certifi
         let mut ctx = ctx_with_cert(valid.clone());
         ctx.mtls_auth_connection_cache = Some(Arc::clone(&cache));
         assert_continue(plugin.authenticate(&mut ctx, &index).await);
-        // Re-decided per request, so the deadline is republished every time.
-        assert!(request_credential_deadline_remaining(&ctx).is_some());
+        // Re-decided per request against the captured monotonic Instant.
+        assert!(request_credential_deadline_at(&ctx).is_some());
     }
 
     assert_eq!(
@@ -270,6 +273,109 @@ async fn a_cached_success_becomes_a_fixed_401_once_the_certificate_expires() {
         cache.evaluation_count(),
         1,
         "expiry must be decided from the cached window, not by re-parsing"
+    );
+}
+
+#[tokio::test]
+async fn a_cache_hit_returns_the_identical_monotonic_deadline_captured_at_first_success() {
+    // The expensive evaluation runs once. Every later request on that cached
+    // evaluation must return the SAME Instant — not a freshly converted one
+    // that would land later after monotonic time (or wall-clock rollback)
+    // advanced. Sleeping between the two authentications would make a
+    // re-derived Instant strictly later if the Unix remaining seconds have
+    // not yet ticked down.
+    let valid = cert_with_validity("client.example.com", -60, 3_600);
+    let index = ConsumerIndex::new(&[mtls_consumer("alice", "client.example.com")]);
+    let plugin = default_plugin();
+    let cache = Arc::new(MtlsAuthConnectionCache::new());
+
+    let mut first = ctx_with_cert(valid.clone());
+    first.mtls_auth_connection_cache = Some(Arc::clone(&cache));
+    assert_continue(plugin.authenticate(&mut first, &index).await);
+    let first_deadline = request_credential_deadline_at(&first)
+        .expect("first successful evaluation must capture the monotonic notAfter");
+
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+    let mut second = ctx_with_cert(valid);
+    second.mtls_auth_connection_cache = Some(Arc::clone(&cache));
+    assert_continue(plugin.authenticate(&mut second, &index).await);
+    let second_deadline = request_credential_deadline_at(&second)
+        .expect("cache hit must republish the captured monotonic deadline");
+
+    assert_eq!(
+        first_deadline, second_deadline,
+        "cache-hit rollback/time-passage must not extend admission: the returned \
+         credential deadline is the cached monotonic identity"
+    );
+    assert_eq!(cache.evaluation_count(), 1);
+}
+
+#[test]
+fn a_fresh_unix_conversion_after_wall_clock_rollback_would_extend_the_instant() {
+    // Evidence that converting `notAfter` again from a rolled-back wall clock
+    // produces a LATER Instant — which is why the connection cache must retain
+    // the first successful conversion instead of calling this on every request.
+    let now = tokio::time::Instant::now();
+    let original = try_credential_deadline_from_unix_seconds_at_for_test(
+        2_000_000,
+        0,
+        2_000_000 - 120,
+        now,
+    )
+    .expect("representable original conversion");
+    let after_rollback = try_credential_deadline_from_unix_seconds_at_for_test(
+        2_000_000,
+        0,
+        2_000_000 - 3_600,
+        now,
+    )
+    .expect("representable rolled-back conversion");
+    assert!(
+        after_rollback > original,
+        "a fresh conversion after wall-clock rollback must land later; the cache \
+         path is what prevents that extension"
+    );
+}
+
+#[test]
+fn an_unrepresentable_unix_to_monotonic_conversion_fails_closed() {
+    let now = tokio::time::Instant::now();
+    assert!(
+        try_credential_deadline_from_unix_seconds_at_for_test(-1, 0, 100, now).is_none(),
+        "a negative expiry is not a monotonic deadline"
+    );
+    assert!(
+        try_credential_deadline_from_unix_seconds_at_for_test(i64::MAX, 1, 0, now).is_none(),
+        "an overflowing expiry+leeway must fail closed, not saturate into now"
+    );
+}
+
+#[test]
+fn the_cached_identity_retains_a_monotonic_expiry_converted_once() {
+    let source = include_str!("../../../src/plugins/mtls_auth.rs");
+    assert!(
+        source.contains("monotonic_expiry: OnceLock<tokio::time::Instant>"),
+        "the connection-cached identity must retain the first successful monotonic expiry"
+    );
+    let outcome = source
+        .split("fn evaluation_outcome(")
+        .nth(1)
+        .expect("evaluation_outcome")
+        .split("\n    fn verify_client_cert(")
+        .next()
+        .expect("bounded evaluation_outcome");
+    assert!(
+        !outcome.contains("auth_flow::credential_deadline_from_unix_seconds("),
+        "cache hits must not derive a fresh Instant from Unix notAfter"
+    );
+    assert!(
+        outcome.contains("auth_flow::try_credential_deadline_from_unix_seconds("),
+        "the first successful evaluation must fail closed on an unrepresentable conversion"
+    );
+    assert!(
+        outcome.contains("monotonic_expiry.get()"),
+        "later requests must admit against the retained Instant"
     );
 }
 

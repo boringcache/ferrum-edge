@@ -7136,6 +7136,32 @@ pub mod _test_support {
             .map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()))
     }
 
+    /// The accepted request credential's monotonic deadline Instant, if any.
+    /// Used to prove cache hits return the identical captured Instant rather
+    /// than a freshly converted later value (issue #3816).
+    pub fn request_credential_deadline_at(
+        ctx: &crate::plugins::RequestContext,
+    ) -> Option<tokio::time::Instant> {
+        ctx.credential_deadline_at
+    }
+
+    /// Fallible Unix-to-monotonic conversion with injected clocks, so external
+    /// tests can prove a wall-clock rollback would extend a *fresh* conversion
+    /// and that unrepresentable inputs fail closed.
+    pub fn try_credential_deadline_from_unix_seconds_at_for_test(
+        expires_at_unix: i64,
+        leeway_seconds: u64,
+        now_unix: u64,
+        now_mono: tokio::time::Instant,
+    ) -> Option<tokio::time::Instant> {
+        crate::plugins::utils::auth_flow::try_credential_deadline_from_unix_seconds_at(
+            expires_at_unix,
+            leeway_seconds,
+            now_unix,
+            now_mono,
+        )
+    }
+
     /// Set a request's credential deadline directly so external tests can drive
     /// the protocol-neutral authorization-lifetime arbiter without minting a
     /// real token. Carries no credential material.

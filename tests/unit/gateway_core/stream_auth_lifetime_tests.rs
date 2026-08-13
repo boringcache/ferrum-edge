@@ -1719,21 +1719,23 @@ fn every_buffered_response_collect_is_authorization_bounded() {
     }
 }
 
-/// The final authoritative gate immediately before response-head commitment.
+/// The pre-log authorization gate immediately before transaction logging.
 ///
 /// The earlier pre-commitment check runs where backend dispatch converges;
 /// every awaited response phase after it can still consume time up to the
-/// deadline, so a protected head must not be committed without one last check.
+/// deadline, so a protected or streaming head must not be logged or deferred
+/// without this check. It is not the last check before commitment: the
+/// buffered path still awaits logging afterwards.
 #[test]
 fn a_final_authorization_gate_precedes_response_head_commitment() {
     let gate = PROXY_SOURCE
         .split("let final_precommit_authorization_terminal =")
         .nth(1)
-        .expect("the final pre-commitment authorization gate");
+        .expect("the pre-log pre-commitment authorization gate");
     let gate = gate
         .split("let total_ms =")
         .next()
-        .expect("bounded final gate");
+        .expect("bounded pre-log gate");
     // The decision, the once-only latch record, and the fixed terminal all live
     // in the shared out-of-line applier (asserted in
     // `the_precommit_authorization_terminal_is_applied_out_of_line`), so the gate
@@ -1756,6 +1758,65 @@ fn a_final_authorization_gate_precedes_response_head_commitment() {
     );
 }
 
+/// The buffered-response logging await is the last await before commitment,
+/// and an authoritative gate runs immediately after it with no further await
+/// before the response builder (issue #3815).
+#[test]
+fn buffered_logging_is_bounded_and_followed_by_the_commitment_gate() {
+    let commitment_marker =
+        "let commitment_authorization_terminal = apply_precommit_authorization_terminal(";
+    let commitment_at = PROXY_SOURCE
+        .find(commitment_marker)
+        .expect("commitment gate present");
+    let builder_at = PROXY_SOURCE
+        .find("    // Build final response\n    let mut resp_builder = Response::builder()")
+        .expect("response builder present");
+    assert!(
+        commitment_at < builder_at,
+        "the commitment gate must run BEFORE the response head is built"
+    );
+
+    // Walk back from the commitment gate to the buffered-path `} else {` that
+    // owns the logging await, so other `log_with_mirror_before_buffered_response`
+    // call sites cannot satisfy this guard.
+    let before_gate = &PROXY_SOURCE[..commitment_at];
+    let else_at = before_gate
+        .rfind("            } else {\n                // Bound the logging wait by the admitted authorization")
+        .expect("buffered logging else-arm");
+    let logging_arm = &PROXY_SOURCE[else_at..commitment_at];
+    assert!(
+        logging_arm.contains("ctx.precommit_response_phase_bound()"),
+        "the buffered logging wait must run under the composed authorization bound"
+    );
+    assert!(
+        logging_arm.contains("await_precommit_response_phase("),
+        "expiry during logging must cancel the wait rather than commit a protected head"
+    );
+    assert!(
+        logging_arm.contains("log_with_mirror_before_buffered_response("),
+        "the bounded wait is the buffered-response logger"
+    );
+    assert!(
+        logging_arm.contains("PrecommitPhaseResult::Expired(Some(termination))"),
+        "an authorization expiry during logging must latch so the commitment gate can apply it"
+    );
+    assert!(
+        logging_arm.contains("record_authorization_termination_once(termination, family)"),
+        "the shared latch must record the class exactly once"
+    );
+    assert_eq!(
+        logging_arm.matches(".await").count(),
+        1,
+        "the only await in the logging-to-gate window is the bounded logging wait itself"
+    );
+
+    let after_gate = &PROXY_SOURCE[commitment_at..builder_at];
+    assert!(
+        !after_gate.contains(".await"),
+        "there must be no await between the last authorization gate and protected response construction"
+    );
+}
+
 /// Every awaited pre-commitment RESPONSE phase runs under the composed bound.
 ///
 /// `grpc_deadline_at()` alone is `None` for an ordinary HTTP request, which left
@@ -1770,7 +1831,7 @@ fn every_precommit_response_phase_composes_the_authorization_lifetime() {
         PROXY_SOURCE
             .matches("ctx.precommit_response_phase_bound()")
             .count(),
-        7,
+        8,
         "a pre-commitment response phase lost its authorization bound"
     );
     assert!(
@@ -2276,7 +2337,7 @@ fn the_authorization_expired_rejection_future_is_built_out_of_line() {
 #[test]
 fn the_precommit_authorization_terminal_is_applied_out_of_line() {
     for (callee, expected_calls) in [
-        ("apply_precommit_authorization_terminal(", 2),
+        ("apply_precommit_authorization_terminal(", 3),
         ("install_response_authorization_deadline(", 2),
         ("authorization_expired_backend_dispatch(", 7),
     ] {

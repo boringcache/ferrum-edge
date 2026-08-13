@@ -35096,7 +35096,7 @@ async fn handle_proxy_request_inner(
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     }
 
-    // ── Final authoritative authorization gate (#3815) ──────────────────────
+    // ── Pre-log authorization gate (#3815) ──────────────────────────────────
     //
     // The earlier pre-commitment check ran where backend dispatch converged.
     // Every awaited response phase since then — `after_proxy`, the buffered
@@ -35106,8 +35106,13 @@ async fn handle_proxy_request_inner(
     // it, and a buffered response collection may itself have ended at the
     // deadline.
     //
-    // This is the LAST point at which nothing has been written downstream, so
-    // it is where the decision has to be final. Two failures it closes:
+    // This gate runs BEFORE transaction logging and before `body_will_stream`
+    // is computed, so an already-expired credential cannot be logged or
+    // deferred as a protected/streaming response. It is NOT the last check
+    // before head commitment: the buffered path still awaits
+    // `log_with_mirror_before_buffered_response` below, and that wait is
+    // bounded and followed by the commitment gate. Two failures this gate
+    // closes on its own:
     //
     // * a PROTECTED response head committed on a credential that expired while
     //   the response phases were running;
@@ -35294,8 +35299,42 @@ async fn handle_proxy_request_inner(
                     ),
                 )
             } else {
-                crate::plugins::log_with_mirror_before_buffered_response(&plugins, summary, &ctx)
-                    .await;
+                // Bound the logging wait by the admitted authorization
+                // deadline. A blocked sink must not carry a still-protected
+                // buffered response past credential expiry (issue #3815).
+                let bound = ctx.precommit_response_phase_bound();
+                match crate::plugins::await_precommit_response_phase(
+                    bound,
+                    crate::plugins::log_with_mirror_before_buffered_response(
+                        &plugins, summary, &ctx,
+                    ),
+                )
+                .await
+                {
+                    crate::plugins::PrecommitPhaseResult::Completed(()) => {}
+                    crate::plugins::PrecommitPhaseResult::Expired(Some(termination)) => {
+                        let family = request_upload_auth_family(&ctx);
+                        ctx.record_authorization_termination_once(termination, family);
+                    }
+                    crate::plugins::PrecommitPhaseResult::Expired(None) => {}
+                }
+                // Authoritative commitment gate. The logging await above is the
+                // last await before the protected response is built; there is
+                // no await between this gate and `resp_builder`. Expiry during
+                // logging wins over protected commitment. The latch is
+                // consulted first, so a timeout-attributed termination is
+                // applied exactly once and is not logged a second time.
+                let commitment_authorization_terminal = apply_precommit_authorization_terminal(
+                    &mut ctx,
+                    state.env_config.authenticated_stream_max_lifetime_seconds,
+                    request_uses_grpc_content_type,
+                    &mut response_status,
+                    &mut response_headers,
+                    &mut response_body,
+                );
+                if commitment_authorization_terminal.is_some() {
+                    is_streaming_response = false;
+                }
                 None
             }
         } else {
@@ -42837,7 +42876,7 @@ pub(crate) fn authorization_expired_pre_commitment_response(
 /// Decide, record, and APPLY the fixed pre-commitment authorization terminal —
 /// entirely out of line (issues #3815 / #3764).
 ///
-/// `handle_proxy_request_inner` runs both pre-commitment gates through this one
+/// `handle_proxy_request_inner` runs every pre-commitment gate through this one
 /// function for a stack-budget reason, not a stylistic one. At the coverage
 /// profile's `opt-level = 0` every temporary in that coroutine's `poll` body is
 /// a fixed frame slot allocated on entry, whether or not the branch that needs
