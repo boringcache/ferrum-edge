@@ -2015,18 +2015,15 @@ fn materialize_node_waypoint_udp_listeners(
                 steer_destinations
                     .push(crate::capture::NodeWaypointUdpSteerDestination { ip: *ip, port });
                 destination_routes.push(
-                    crate::proxy::node_waypoint_udp_destination::NodeWaypointUdpDestinationRoute {
-                        destination:
-                            crate::proxy::node_waypoint_udp_destination::canonical_destination_ip(
-                                *ip,
-                            ),
-                        listen_port: port,
-                        proxy: crate::config::db_backend::NamespacedResourceId::new(
+                    crate::proxy::node_waypoint_udp_destination::NodeWaypointUdpDestinationRoute::new(
+                        *ip,
+                        port,
+                        crate::config::db_backend::NamespacedResourceId::new(
                             candidate.proxy.namespace.clone(),
                             candidate.proxy.id.clone(),
                         ),
-                        terminates_dtls: candidate.terminates_dtls,
-                    },
+                        candidate.terminates_dtls,
+                    ),
                 );
             }
             let upstream = candidate.upstream;

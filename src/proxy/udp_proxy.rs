@@ -413,11 +413,11 @@ where
 #[allow(dead_code)] // also reached via `_test_support`
 pub(crate) fn take_udp_last_client_if_live<T>(
     last_client: &mut Option<(UdpSessionKey, Arc<T>)>,
-    client_addr: UdpSessionKey,
+    client_addr: &UdpSessionKey,
     is_expired: impl FnOnce(&T) -> bool,
 ) -> Option<Arc<T>> {
     match last_client {
-        Some((cached_addr, cached)) if *cached_addr == client_addr => {
+        Some((cached_addr, cached)) if cached_addr == client_addr => {
             if is_expired(cached.as_ref()) {
                 *last_client = None;
                 None
@@ -439,22 +439,75 @@ pub(crate) fn take_udp_last_client_if_live<T>(
 /// alone would collide them and let one Service's session serve the other's
 /// traffic.
 ///
+/// Destination IP alone is also not enough. The route table can republish in
+/// place without restarting the listener; if exact destination X changes
+/// ownership from namespaced Service A to namespaced Service B, B's datagram
+/// must not hit A's established session, pending setup, or last-client cache.
+/// The whole destination-table generation is also not the identity: adding or
+/// removing unrelated route B must not change A's owner key, and an equivalent
+/// republication of A must remain equal.
+///
 /// The key therefore carries:
 ///
 /// * `client` — the source tuple (forgeable; never an authorization input),
-/// * `destination` — the canonical exact destination route identity selected
-///   from the kernel-reported local address, `None` on listeners that do no
-///   destination routing (every ordinary UDP listener, and a single-claimant
-///   NodeWaypoint listener serving the direct-node-address boundary),
+/// * `destination` — the canonical local destination IP selected from the
+///   kernel-reported address, `None` on listeners that do no destination
+///   routing (every ordinary UDP listener, and a single-claimant NodeWaypoint
+///   listener serving the direct-node-address boundary),
+/// * `destination_owner` — the authoritative `NamespacedResourceId` of the
+///   selected route (`Arc`-cloned from the immutable table; never a datagram
+///   field, port-only inference, pointer equality, or a digest). `None` on
+///   the same undestined listeners as `destination`. Namespace is part of
+///   the identity.
 /// * `listener_generation` — the spawn generation of the bound socket that owns
 ///   this session. It is constant for a listener's lifetime, so a destination
-///   table republication (adding or removing a same-port Service) does NOT
-///   invalidate established sessions; a rebind does.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+///   table republication does NOT invalidate established sessions of an
+///   unchanged owner; a rebind does.
+///
+/// Hash and equality compare the inner namespaced identity, not the `Arc`
+/// pointer, so hasher collisions cannot alias tenants and equivalent
+/// republications remain equal. Not `Copy`: clone the key at every insert,
+/// remove, pending-gate, and teardown site so lifecycle accounting cannot
+/// drop a stale key.
+#[derive(Clone, Debug)]
 pub struct UdpSessionKey {
     pub client: SocketAddr,
     pub destination: Option<IpAddr>,
+    pub destination_owner: Option<Arc<NamespacedResourceId>>,
     pub listener_generation: u64,
+}
+
+impl PartialEq for UdpSessionKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.client == other.client
+            && self.destination == other.destination
+            && self.listener_generation == other.listener_generation
+            && match (
+                self.destination_owner.as_deref(),
+                other.destination_owner.as_deref(),
+            ) {
+                (None, None) => true,
+                (Some(left), Some(right)) => left == right,
+                _ => false,
+            }
+    }
+}
+
+impl Eq for UdpSessionKey {}
+
+impl Hash for UdpSessionKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.client.hash(state);
+        self.destination.hash(state);
+        self.listener_generation.hash(state);
+        match self.destination_owner.as_deref() {
+            Some(owner) => {
+                true.hash(state);
+                owner.hash(state);
+            }
+            None => false.hash(state),
+        }
+    }
 }
 
 impl UdpSessionKey {
@@ -464,6 +517,25 @@ impl UdpSessionKey {
         Self {
             client,
             destination: None,
+            destination_owner: None,
+            listener_generation,
+        }
+    }
+
+    /// Key for a datagram that selected an exact destination route.
+    ///
+    /// Clones the precomputed owner `Arc` from the immutable route; does not
+    /// rebuild a runtime-key String or clone namespace/id Strings.
+    #[inline]
+    pub fn for_route(
+        client: SocketAddr,
+        route: &crate::proxy::node_waypoint_udp_destination::NodeWaypointUdpDestinationRoute,
+        listener_generation: u64,
+    ) -> Self {
+        Self {
+            client,
+            destination: Some(route.destination),
+            destination_owner: Some(route.owner_arc()),
             listener_generation,
         }
     }
@@ -1021,7 +1093,7 @@ async fn connect_udp_backend_candidates(
 /// checks and mesh destination enforcement admit the flow.
 fn try_insert_pending_session_gate(
     pending_sessions: &PendingSessionMap,
-    session_key: UdpSessionKey,
+    session_key: &UdpSessionKey,
     max_sessions: usize,
 ) -> Result<bool, anyhow::Error> {
     if pending_sessions.len() >= max_sessions {
@@ -1030,7 +1102,7 @@ fn try_insert_pending_session_gate(
             max_sessions
         ));
     }
-    match pending_sessions.entry(session_key) {
+    match pending_sessions.entry(session_key.clone()) {
         dashmap::mapref::entry::Entry::Occupied(_) => Ok(false),
         dashmap::mapref::entry::Entry::Vacant(vacant) => {
             vacant.insert(PendingDatagramQueue::default());
@@ -1087,9 +1159,9 @@ fn refuse_new_udp_source(overload: &crate::overload::OverloadState) -> bool {
 /// backend sends.
 fn take_pending_datagrams(
     pending_sessions: &PendingSessionMap,
-    session_key: UdpSessionKey,
+    session_key: &UdpSessionKey,
 ) -> Option<Vec<PendingDatagram>> {
-    match pending_sessions.entry(session_key) {
+    match pending_sessions.entry(session_key.clone()) {
         dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
             if occupied.get().datagrams.is_empty() {
                 occupied.remove();
@@ -1956,11 +2028,11 @@ fn udp_source_has_established_session(
         return sessions.contains_key(&UdpSessionKey::undestined(client_addr, listener_generation));
     };
     match router.resolve(local_addr.map(|local| local.ip)) {
-        Ok((route, _)) => sessions.contains_key(&UdpSessionKey {
-            client: client_addr,
-            destination: Some(route.destination),
+        Ok((route, _)) => sessions.contains_key(&UdpSessionKey::for_route(
+            client_addr,
+            route.as_ref(),
             listener_generation,
-        }),
+        )),
         Err(_) => false,
     }
 }
@@ -1992,11 +2064,7 @@ fn resolve_udp_session_route(
     };
     match router.resolve(local_addr.map(|local| local.ip)) {
         Ok((route, _generation)) => Some((
-            UdpSessionKey {
-                client: client_addr,
-                destination: Some(route.destination),
-                listener_generation,
-            },
+            UdpSessionKey::for_route(client_addr, route.as_ref(), listener_generation),
             Some(route),
         )),
         Err((refusal, _generation)) => {
@@ -2327,14 +2395,15 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
     #[cfg(not(target_os = "linux"))]
     let _ = recvmmsg_batch_size; // suppress unused variable warning
 
-    // Hot-path cache: skip DashMap lookup when consecutive datagrams come from the
-    // same client address and destination route (very common in streaming UDP
-    // protocols).
+    // Hot-path cache: skip DashMap lookup when consecutive datagrams share the
+    // same client, destination, namespaced owner, and listener generation
+    // (very common in streaming UDP protocols).
     let mut last_client: Option<(UdpSessionKey, Arc<UdpSession>)> = None;
     // Spawn generation of THIS bound socket. Folded into every session key so a
-    // session can never outlive the listener that created it, while a
-    // destination-table republication (a same-port Service added or removed)
-    // leaves established sessions untouched.
+    // session can never outlive the listener that created it. Adding or removing
+    // an unrelated same-port Service republishes the route table without
+    // rebinding, so those sessions keep an equivalent owner key; a destination
+    // that changes namespaced owner is a different session identity.
     let listener_generation = next_udp_listener_generation();
     let destinations = node_waypoint_udp_destinations.as_ref();
 
@@ -2866,7 +2935,8 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
 /// Process a single datagram: resolve session, forward to backend, update batch counters.
 ///
 /// Uses `last_client` as a hot-path cache to avoid DashMap lookups when consecutive
-/// datagrams arrive from the same client address.
+/// datagrams share the same client, destination, namespaced owner, and listener
+/// generation.
 #[allow(clippy::too_many_arguments)]
 async fn process_datagram(
     data: &[u8],
@@ -2951,7 +3021,7 @@ async fn process_datagram(
     // we'd pin the backend socket/session on a quiet listener and keep
     // forwarding through a session the cleanup task already declared dead.
     let existing_session =
-        take_udp_last_client_if_live(last_client, session_key, |cached_session| {
+        take_udp_last_client_if_live(last_client, &session_key, |cached_session| {
             cached_session
                 .expired
                 .load(std::sync::atomic::Ordering::Acquire)
@@ -2977,7 +3047,7 @@ async fn process_datagram(
                 max_sessions
             ));
         }
-        if !try_insert_pending_session_gate(pending_sessions, session_key, max_sessions)? {
+        if !try_insert_pending_session_gate(pending_sessions, &session_key, max_sessions)? {
             // Defensive: a gate appeared after the check at the top of this
             // function (not expected — the recv loop is a single task). Treat
             // this datagram as a follow-up for the in-flight setup.
@@ -3136,7 +3206,7 @@ fn spawn_new_session_datagram(
         // inside `take_pending_datagrams` and disarms the gate.
         let gate = PendingSessionGate {
             pending_sessions: Arc::clone(&pending_sessions),
-            session_key,
+            session_key: session_key.clone(),
             armed: true,
         };
         let result = process_new_session_datagram(
@@ -3368,7 +3438,7 @@ async fn process_new_session_datagram(
         dns_cache,
         frontend_socket,
         client_addr,
-        session_key,
+        session_key.clone(),
         sessions,
         metrics,
         tls_no_verify,
@@ -3441,11 +3511,12 @@ async fn process_new_session_datagram(
     // order, then atomically remove the pending gate. Each drained datagram
     // goes through the same per-datagram plugin hooks and debug-level
     // packet-error handling as the established-session path.
-    while let Some(batch) = take_pending_datagrams(pending_sessions, session_key) {
+    while let Some(batch) = take_pending_datagrams(pending_sessions, &session_key) {
         for dgram in batch {
-            // Pending entries are keyed only by the spoofable source tuple.
-            // Re-authorize the actual ingress interface retained with every
-            // datagram before any plugin side effect. A queued datagram from a
+            // The pending gate is keyed by the full session identity, but the
+            // client tuple inside that key is still forgeable. Re-authorize
+            // the actual ingress interface retained with every datagram
+            // before any plugin side effect. A queued datagram from a
             // different interface is exactly the forged-tuple case, so it is
             // dropped on its own rather than ending the admitted session.
             if let Some(source) = session.node_waypoint_source.as_ref()
@@ -3595,7 +3666,7 @@ fn spawn_session_cleanup(
                             // a session re-created at the same client address
                             // between this scan and the remove must NOT be
                             // evicted by us (it is a newer, still-live session).
-                            expired.push((*entry.key(), entry.value().clone()));
+                            expired.push((entry.key().clone(), entry.value().clone()));
                         }
                     }
 
@@ -5071,8 +5142,9 @@ async fn create_session(
     frontend_socket: &Arc<UdpSocket>,
     client_addr: SocketAddr,
     /// Exact identity of this session on this listener: the client tuple, the
-    /// selected destination route (issue #3861), and the bound socket's spawn
-    /// generation. Every map insertion and identity-aware removal uses it.
+    /// selected destination IP, the exact namespaced route owner (issue #3861),
+    /// and the bound socket's spawn generation. Every map insertion and
+    /// identity-aware removal uses this same key.
     session_key: UdpSessionKey,
     sessions: &SessionMap,
     metrics: &Arc<UdpProxyMetrics>,
@@ -5340,7 +5412,7 @@ async fn create_session(
         );
     }
 
-    sessions.insert(session_key, session.clone());
+    sessions.insert(session_key.clone(), session.clone());
     // Note: active_sessions is reserved by the receive loop before the
     // background setup task calls create_session, avoiding TOCTOU races.
     metrics.total_sessions.fetch_add(1, Ordering::Relaxed);
@@ -7402,10 +7474,10 @@ backend_tls_verify_server_cert: false
         let addr = test_session_key();
 
         // Absent entry: nothing to drain, nothing inserted.
-        assert!(super::take_pending_datagrams(&pending, addr).is_none());
+        assert!(super::take_pending_datagrams(&pending, &addr).is_none());
         assert!(!pending.contains_key(&addr));
 
-        pending.insert(addr, super::PendingDatagramQueue::default());
+        pending.insert(addr.clone(), super::PendingDatagramQueue::default());
         {
             let mut entry = pending.get_mut(&addr).expect("gate present");
             assert!(entry.push_bounded(&[1], Some(7)));
@@ -7414,7 +7486,7 @@ backend_tls_verify_server_cert: false
 
         // First take hands off the queued batch in arrival order and leaves
         // the gate in place so concurrent arrivals keep queueing.
-        let batch = super::take_pending_datagrams(&pending, addr).expect("queued batch");
+        let batch = super::take_pending_datagrams(&pending, &addr).expect("queued batch");
         assert_eq!(
             batch,
             vec![
@@ -7440,7 +7512,7 @@ backend_tls_verify_server_cert: false
             assert_eq!(entry.queued_bytes, 0, "take must reset byte accounting");
             assert!(entry.push_bounded(&[3], None));
         }
-        let batch = super::take_pending_datagrams(&pending, addr).expect("late batch");
+        let batch = super::take_pending_datagrams(&pending, &addr).expect("late batch");
         assert_eq!(
             batch,
             vec![super::PendingDatagram {
@@ -7450,7 +7522,7 @@ backend_tls_verify_server_cert: false
         );
 
         // Empty queue: the gate is removed atomically and the drain ends.
-        assert!(super::take_pending_datagrams(&pending, addr).is_none());
+        assert!(super::take_pending_datagrams(&pending, &addr).is_none());
         assert!(
             !pending.contains_key(&addr),
             "empty take must remove the pending gate"
@@ -7463,11 +7535,11 @@ backend_tls_verify_server_cert: false
         let addr = test_session_key();
 
         // Armed gate (setup failure path): entry and queued datagrams removed.
-        pending.insert(addr, super::PendingDatagramQueue::default());
+        pending.insert(addr.clone(), super::PendingDatagramQueue::default());
         {
             let _gate = super::PendingSessionGate {
                 pending_sessions: Arc::clone(&pending),
-                session_key: addr,
+                session_key: addr.clone(),
                 armed: true,
             };
         }
@@ -7477,11 +7549,11 @@ backend_tls_verify_server_cert: false
         );
 
         // Disarmed gate (successful handoff): entry left alone.
-        pending.insert(addr, super::PendingDatagramQueue::default());
+        pending.insert(addr.clone(), super::PendingDatagramQueue::default());
         {
             let mut gate = super::PendingSessionGate {
                 pending_sessions: Arc::clone(&pending),
-                session_key: addr,
+                session_key: addr.clone(),
                 armed: true,
             };
             gate.disarm();
@@ -7502,8 +7574,8 @@ backend_tls_verify_server_cert: false
             1,
         );
 
-        assert!(super::try_insert_pending_session_gate(&pending, first, 1).unwrap());
-        let err = super::try_insert_pending_session_gate(&pending, second, 1)
+        assert!(super::try_insert_pending_session_gate(&pending, &first, 1).unwrap());
+        let err = super::try_insert_pending_session_gate(&pending, &second, 1)
             .expect_err("second pending gate should hit pending limit");
 
         assert!(

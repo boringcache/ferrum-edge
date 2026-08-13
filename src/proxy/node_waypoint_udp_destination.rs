@@ -33,6 +33,11 @@
 //!   `ArcSwap`. Adding or removing a Service republishes a complete new table
 //!   without restarting the listener, so a second claimant entering the slice
 //!   never withdraws the first one's socket.
+//! * **Owner identity.** Each route stores its `NamespacedResourceId` as an
+//!   `Arc` so the receive path can clone that exact namespaced owner into the
+//!   UDP session key without allocating. A destination that changes owner is a
+//!   different session; an equivalent republication of the same owner remains
+//!   equal. The destination-table generation is not the session identity.
 //! * **Bounded diagnostics.** Refusals are a closed `&'static str` enum with
 //!   rate-limited warns. Service names never become metric labels.
 
@@ -91,11 +96,40 @@ pub struct NodeWaypointUdpDestinationRoute {
     /// The generated `__mesh-nw-udp-*` listener proxy that owns this
     /// destination — its upstream, policy scope, plugin decisions, accounting
     /// and reply source. Never inferred from the port.
-    pub proxy: NamespacedResourceId,
+    ///
+    /// Stored as `Arc` so the receive hot path can clone this exact
+    /// namespaced identity into `UdpSessionKey` without allocating or
+    /// cloning namespace/id Strings per datagram. Hash/equality of the
+    /// session key compare the inner `(namespace, id)`, not this pointer.
+    pub proxy: Arc<NamespacedResourceId>,
     /// Frontend posture of the owning route. Every route sharing one listener
     /// must agree (a shared socket is built from one posture before any route
     /// can be selected), which materialization enforces fail-closed.
     pub terminates_dtls: bool,
+}
+
+impl NodeWaypointUdpDestinationRoute {
+    /// Build a route whose owner identity is already `Arc`-backed for the
+    /// receive hot path.
+    pub fn new(
+        destination: IpAddr,
+        listen_port: u16,
+        proxy: NamespacedResourceId,
+        terminates_dtls: bool,
+    ) -> Self {
+        Self {
+            destination: canonical_destination_ip(destination),
+            listen_port,
+            proxy: Arc::new(proxy),
+            terminates_dtls,
+        }
+    }
+
+    /// Clone the precomputed owner identity for session-key construction.
+    #[inline]
+    pub fn owner_arc(&self) -> Arc<NamespacedResourceId> {
+        Arc::clone(&self.proxy)
+    }
 }
 
 /// Why a datagram could not be attributed to an exact destination route.
@@ -159,7 +193,7 @@ impl NodeWaypointUdpDestinationTable {
         let mut owners: Vec<NamespacedResourceId> = self
             .routes
             .values()
-            .map(|route| route.proxy.clone())
+            .map(|route| route.proxy.as_ref().clone())
             .collect();
         owners.sort_by(|a, b| (&a.namespace, &a.id).cmp(&(&b.namespace, &b.id)));
         owners.dedup_by(|a, b| a == b);

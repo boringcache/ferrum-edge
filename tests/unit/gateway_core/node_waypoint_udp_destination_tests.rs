@@ -23,12 +23,21 @@ fn ip(text: &str) -> IpAddr {
 }
 
 fn route(destination: &str, port: u16, proxy: &str) -> NodeWaypointUdpDestinationRoute {
-    NodeWaypointUdpDestinationRoute {
-        destination: ip(destination),
-        listen_port: port,
-        proxy: NamespacedResourceId::new("ferrum", proxy),
-        terminates_dtls: false,
-    }
+    route_in("ferrum", destination, port, proxy)
+}
+
+fn route_in(
+    namespace: &str,
+    destination: &str,
+    port: u16,
+    proxy: &str,
+) -> NodeWaypointUdpDestinationRoute {
+    NodeWaypointUdpDestinationRoute::new(
+        ip(destination),
+        port,
+        NamespacedResourceId::new(namespace, proxy),
+        false,
+    )
 }
 
 #[test]
@@ -259,21 +268,31 @@ fn unspecified_loopback_multicast_and_broadcast_are_never_destinations() {
 #[test]
 fn one_client_tuple_addressing_two_destinations_yields_two_session_identities() {
     let client: SocketAddr = "10.244.3.99:41000".parse().expect("client addr");
+    let owner_a = Arc::new(NamespacedResourceId::new(
+        "ferrum",
+        "__mesh-nw-udp-team-a-dns-a-5353",
+    ));
+    let owner_b = Arc::new(NamespacedResourceId::new(
+        "ferrum",
+        "__mesh-nw-udp-team-b-dns-b-5353",
+    ));
     let to_a = UdpSessionKey {
         client,
         destination: Some(ip("10.96.0.10")),
+        destination_owner: Some(Arc::clone(&owner_a)),
         listener_generation: 7,
     };
     let to_b = UdpSessionKey {
         client,
         destination: Some(ip("10.96.0.11")),
+        destination_owner: Some(Arc::clone(&owner_b)),
         listener_generation: 7,
     };
     assert_ne!(to_a, to_b);
 
     let mut map = std::collections::HashMap::new();
-    map.insert(to_a, "service-a");
-    map.insert(to_b, "service-b");
+    map.insert(to_a.clone(), "service-a");
+    map.insert(to_b.clone(), "service-b");
     assert_eq!(map.len(), 2, "the two destinations must not collide");
     assert_eq!(map.get(&to_a), Some(&"service-a"));
     assert_eq!(map.get(&to_b), Some(&"service-b"));
@@ -284,14 +303,184 @@ fn one_client_tuple_addressing_two_destinations_yields_two_session_identities() 
     let undestined = UdpSessionKey::undestined(client, 7);
     assert_ne!(undestined, to_a);
     assert_ne!(undestined, to_b);
+    assert!(undestined.destination_owner.is_none());
 
     // The listener generation is part of the identity, so a session can never
     // outlive the bound socket that created it.
     let rebound = UdpSessionKey {
         listener_generation: 8,
-        ..to_a
+        ..to_a.clone()
     };
     assert_ne!(rebound, to_a);
+}
+
+/// If exact destination X changes ownership from namespaced Service A to
+/// namespaced Service B without restarting the listener, the same
+/// `(client, destination, listener generation)` MUST be a distinct pending,
+/// session, and last-client identity. Otherwise B's datagram would reuse A's
+/// upstream, policy, plugins, accounting, and reply context.
+#[test]
+fn same_destination_under_distinct_owners_cannot_share_session_identity() {
+    let client: SocketAddr = "10.244.3.99:41000".parse().expect("client addr");
+    let destination = ip("10.96.0.10");
+    let owner_a = Arc::new(NamespacedResourceId::new(
+        "ferrum",
+        "__mesh-nw-udp-team-a-dns-a-5353",
+    ));
+    let owner_b = Arc::new(NamespacedResourceId::new(
+        "ferrum",
+        "__mesh-nw-udp-team-b-dns-b-5353",
+    ));
+    let key_a = UdpSessionKey {
+        client,
+        destination: Some(destination),
+        destination_owner: Some(Arc::clone(&owner_a)),
+        listener_generation: 7,
+    };
+    let key_b = UdpSessionKey {
+        client,
+        destination: Some(destination),
+        destination_owner: Some(Arc::clone(&owner_b)),
+        listener_generation: 7,
+    };
+    assert_ne!(
+        key_a, key_b,
+        "owner A and owner B must not share a session identity"
+    );
+
+    let mut pending = std::collections::HashMap::new();
+    pending.insert(key_a.clone(), "pending-a");
+    pending.insert(key_b.clone(), "pending-b");
+    assert_eq!(pending.len(), 2);
+    assert_eq!(pending.get(&key_a), Some(&"pending-a"));
+    assert_eq!(pending.get(&key_b), Some(&"pending-b"));
+
+    let mut sessions = std::collections::HashMap::new();
+    sessions.insert(key_a.clone(), "session-a");
+    sessions.insert(key_b.clone(), "session-b");
+    assert_eq!(sessions.get(&key_a), Some(&"session-a"));
+    assert_eq!(sessions.get(&key_b), Some(&"session-b"));
+
+    let mut last_client = Some((key_a.clone(), Arc::new("session-a")));
+    assert!(
+        ferrum_edge::_test_support::take_udp_last_client_if_live_keyed_for_test(
+            &mut last_client,
+            key_b.clone(),
+            |_| false,
+        )
+        .is_none(),
+        "owner B must not hit owner A's last-client cache"
+    );
+    assert!(
+        ferrum_edge::_test_support::take_udp_last_client_if_live_keyed_for_test(
+            &mut last_client,
+            key_a,
+            |_| false,
+        )
+        .is_some(),
+        "owner A's last-client cache remains keyed to A"
+    );
+}
+
+/// Adding or removing an unrelated route republishes the table under a new
+/// generation, but the surviving owner's session key must remain equal.
+/// Equality compares the namespaced identity, not Arc pointer identity, so
+/// a fresh publication of the same owner cannot miss the previous key.
+#[test]
+fn equivalent_owner_identity_survives_route_table_republication() {
+    let router = NodeWaypointUdpDestinationRouter::new(5353);
+    router
+        .publish(vec![route(
+            "10.96.0.10",
+            5353,
+            "__mesh-nw-udp-team-a-dns-a-5353",
+        )])
+        .expect("first generation");
+    let (first, first_generation) = router
+        .resolve(Some(ip("10.96.0.10")))
+        .expect("A resolves before republish");
+
+    let second_generation = router
+        .publish(vec![
+            route("10.96.0.10", 5353, "__mesh-nw-udp-team-a-dns-a-5353"),
+            route("10.96.0.11", 5353, "__mesh-nw-udp-team-b-dns-b-5353"),
+        ])
+        .expect("second generation");
+    assert!(second_generation > first_generation);
+    let (second, _) = router
+        .resolve(Some(ip("10.96.0.10")))
+        .expect("A still resolves after B is added");
+
+    assert!(
+        !Arc::ptr_eq(&first.proxy, &second.proxy),
+        "a republication allocates a new owner Arc; equality must not depend on the pointer"
+    );
+
+    let client: SocketAddr = "10.244.3.99:41000".parse().expect("client addr");
+    let key_before = UdpSessionKey::for_route(client, first.as_ref(), 7);
+    let key_after = UdpSessionKey::for_route(client, second.as_ref(), 7);
+    assert_eq!(
+        key_before, key_after,
+        "an equivalent namespaced owner must remain equal across republication"
+    );
+
+    let mut map = std::collections::HashMap::new();
+    map.insert(key_before, "session-a");
+    assert_eq!(
+        map.get(&key_after),
+        Some(&"session-a"),
+        "the republished owner must hit the same session/pending/cache slot"
+    );
+}
+
+/// Namespace is part of owner identity: the same proxy id in two namespaces
+/// must never share a session, pending, or last-client key.
+#[test]
+fn destination_owner_identity_includes_namespace() {
+    let client: SocketAddr = "10.244.3.99:41000".parse().expect("client addr");
+    let destination = ip("10.96.0.10");
+    let same_id = "__mesh-nw-udp-dns-5353";
+    let team_a = UdpSessionKey {
+        client,
+        destination: Some(destination),
+        destination_owner: Some(Arc::new(NamespacedResourceId::new("team-a", same_id))),
+        listener_generation: 7,
+    };
+    let team_b = UdpSessionKey {
+        client,
+        destination: Some(destination),
+        destination_owner: Some(Arc::new(NamespacedResourceId::new("team-b", same_id))),
+        listener_generation: 7,
+    };
+    assert_ne!(team_a, team_b);
+
+    let mut map = std::collections::HashMap::new();
+    map.insert(team_a.clone(), "team-a");
+    map.insert(team_b.clone(), "team-b");
+    assert_eq!(map.len(), 2);
+    assert_eq!(map.get(&team_a), Some(&"team-a"));
+    assert_eq!(map.get(&team_b), Some(&"team-b"));
+
+    let router = NodeWaypointUdpDestinationRouter::new(5353);
+    router
+        .publish(vec![
+            route_in("team-a", "10.96.0.10", 5353, same_id),
+            route_in("team-b", "10.96.0.11", 5353, same_id),
+        ])
+        .expect("same id in two namespaces publishes as two owners");
+    let (resolved_a, _) = router
+        .resolve(Some(ip("10.96.0.10")))
+        .expect("team-a destination");
+    let (resolved_b, _) = router
+        .resolve(Some(ip("10.96.0.11")))
+        .expect("team-b destination");
+    assert_eq!(resolved_a.proxy.namespace, "team-a");
+    assert_eq!(resolved_b.proxy.namespace, "team-b");
+    assert_eq!(resolved_a.proxy.id, resolved_b.proxy.id);
+    assert_ne!(
+        UdpSessionKey::for_route(client, resolved_a.as_ref(), 7),
+        UdpSessionKey::for_route(client, resolved_b.as_ref(), 7)
+    );
 }
 
 /// Refusals are bounded and label-free: a closed reason string plus a counter,
