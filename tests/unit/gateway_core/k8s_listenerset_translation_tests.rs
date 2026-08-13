@@ -1350,13 +1350,12 @@ fn secure_http_without_tls_is_not_quic_capable_so_udp_may_share_the_port() {
 }
 
 /// HTTPS/GRPCS with admitted frontend TLS is QUIC-capable. UDP on that numeric
-/// port must ProtocolConflict both sides, independent of listener order, with
-/// bounded status wording and no route materialization on the withdrawn
-/// HTTPS listener.
+/// port must refuse only UDP, independent of listener order, while preserving
+/// the secure HTTP listener and its routes.
 #[test]
 fn secure_http_and_udp_gateway_listeners_fail_closed_on_quic_port() {
-    let expected_message = "Port 9443 is claimed by secure HTTP/QUIC and a UDP stream, so every \
-         conflicting claim on this port is refused (Conflicted).";
+    let expected_message = "Port 9443 is claimed by secure HTTP/QUIC and a UDP stream, so the UDP \
+         claim is refused (Conflicted).";
     let orders: [[&str; 2]; 2] = [["secure-http", "udp"], ["udp", "secure-http"]];
     for secure_protocol in ["HTTPS", "GRPCS"] {
         for listener_order in orders {
@@ -1405,43 +1404,50 @@ fn secure_http_and_udp_gateway_listeners_fail_closed_on_quic_port() {
             }
             let translation = translate_k8s_objects(&objects, options()).expect("translate");
 
-            for listener in ["secure-http", "udp"] {
-                let key = GatewayApiListenerKey {
-                    namespace: "default".to_string(),
-                    parent_kind: GatewayApiListenerParentKind::Gateway,
-                    gateway: "edge".to_string(),
-                    listener: listener.to_string(),
-                };
-                let conflict = translation.listener_conflicts.get(&key).unwrap_or_else(|| {
+            let secure_key = GatewayApiListenerKey {
+                namespace: "default".to_string(),
+                parent_kind: GatewayApiListenerParentKind::Gateway,
+                gateway: "edge".to_string(),
+                listener: "secure-http".to_string(),
+            };
+            assert!(
+                !translation.listener_conflicts.contains_key(&secure_key),
+                "{secure_protocol}+UDP must preserve secure HTTP: {:?}",
+                translation.listener_conflicts
+            );
+            let udp_key = GatewayApiListenerKey {
+                listener: "udp".to_string(),
+                ..secure_key
+            };
+            let conflict = translation
+                .listener_conflicts
+                .get(&udp_key)
+                .unwrap_or_else(|| {
                     panic!(
-                        "{secure_protocol}+UDP order {:?} must ProtocolConflict {listener}: {:?}",
+                        "{secure_protocol}+UDP order {:?} must ProtocolConflict UDP: {:?}",
                         listener_order, translation.listener_conflicts
                     )
                 });
-                assert_eq!(conflict.reason, "ProtocolConflict");
-                assert_eq!(
-                    conflict.message, expected_message,
-                    "{secure_protocol}+UDP status wording must stay bounded"
-                );
-                assert!(
-                    !conflict.message.contains("secure-http")
-                        && !conflict.message.contains("edge-cert")
-                        && !conflict.message.contains("secure.example.com")
-                        && !conflict.message.contains("secure-api"),
-                    "ProtocolConflict must not leak object identifiers: {}",
-                    conflict.message
-                );
-            }
+            assert_eq!(conflict.reason, "ProtocolConflict");
+            assert_eq!(conflict.message, expected_message);
+            assert!(
+                !conflict.message.contains("secure-http")
+                    && !conflict.message.contains("edge-cert")
+                    && !conflict.message.contains("secure.example.com")
+                    && !conflict.message.contains("secure-api"),
+                "ProtocolConflict must not leak object identifiers: {}",
+                conflict.message
+            );
             if secure_protocol == "HTTPS" {
                 assert!(
-                    !translation.config.proxies.iter().any(|proxy| {
+                    translation.config.proxies.iter().any(|proxy| {
                         proxy.hosts.iter().any(|host| host == "secure.example.com")
                             && proxy
                                 .listen_path
                                 .as_deref()
                                 .is_some_and(|path| path.contains("/tls"))
                     }),
-                    "HTTPS+UDP must not materialize the withdrawn HTTPS route: {:?}",
+                    "HTTPS+UDP must preserve the HTTPS route: {:?}",
                     translation
                         .config
                         .proxies
@@ -1452,6 +1458,73 @@ fn secure_http_and_udp_gateway_listeners_fail_closed_on_quic_port() {
             }
         }
     }
+}
+
+#[test]
+fn delegated_udp_listenerset_cannot_withdraw_parent_secure_http_listener() {
+    let mut gateway = http_gateway("edge", Some("All"));
+    gateway.metadata.namespace = "platform".to_string();
+    gateway.spec["listeners"] = json!([{
+        "name": "https",
+        "port": 9443,
+        "protocol": "HTTPS",
+        "hostname": "secure.example.com",
+        "tls": {
+            "mode": "Terminate",
+            "certificateRefs": [{ "name": "edge-cert" }]
+        },
+        "allowedRoutes": { "namespaces": { "from": "Same" } }
+    }]);
+    let mut delegated = listenerset(
+        "tenant-udp",
+        "edge",
+        json!([{
+            "name": "udp",
+            "port": 9443,
+            "protocol": "UDP",
+            "allowedRoutes": {
+                "kinds": [{ "kind": "UDPRoute" }],
+                "namespaces": { "from": "Same" }
+            }
+        }]),
+    );
+    delegated.metadata.namespace = "tenant".to_string();
+    delegated.spec["parentRef"]["namespace"] = json!("platform");
+
+    let translation = translate_k8s_objects(
+        &[
+            gateway_class(),
+            tls_secret("edge-cert", "platform"),
+            gateway,
+            delegated,
+        ],
+        options(),
+    )
+    .expect("translate");
+    let secure_key = GatewayApiListenerKey {
+        namespace: "platform".to_string(),
+        parent_kind: GatewayApiListenerParentKind::Gateway,
+        gateway: "edge".to_string(),
+        listener: "https".to_string(),
+    };
+    assert!(
+        !translation.listener_conflicts.contains_key(&secure_key),
+        "delegated UDP must not withdraw the parent secure HTTP listener: {:?}",
+        translation.listener_conflicts
+    );
+    let udp_key = GatewayApiListenerKey {
+        namespace: "tenant".to_string(),
+        parent_kind: GatewayApiListenerParentKind::ListenerSet,
+        gateway: "tenant-udp".to_string(),
+        listener: "udp".to_string(),
+    };
+    assert_eq!(
+        translation
+            .listener_conflicts
+            .get(&udp_key)
+            .map(|conflict| conflict.reason),
+        Some("ProtocolConflict")
+    );
 }
 
 /// Black-box shape: HTTP:80 plus HTTPS:443 must still attach and materialize

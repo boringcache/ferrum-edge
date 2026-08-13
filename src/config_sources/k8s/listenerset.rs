@@ -360,8 +360,10 @@ pub(crate) fn finalize_listenerset_conflicts(acc: &mut K8sAccumulator, objects: 
     // Secure HTTP (HTTPS/GRPCS with admitted frontend TLS) is the same QUIC
     // eligibility the runtime uses: HTTP/3 binds a UDP socket on that numeric
     // port. Translation does not observe `FERRUM_ENABLE_HTTP3`, so a
-    // materializable Secure HTTP claim plus a UDP stream on that port fail
-    // closed on both sides. Plain HTTP/GRPC is not QUIC-capable and still
+    // materializable Secure HTTP claim takes precedence over a UDP stream on
+    // that port. Refusing only the UDP claim preserves the independent HTTPS
+    // TCP socket (and prevents a delegated ListenerSet from withdrawing it).
+    // Plain HTTP/GRPC is not QUIC-capable and still
     // coexists with UDP. Unresolved HTTPS/GRPCS (no TLS material) never
     // become Tls-class listeners, so they do not reserve the UDP port. A
     // sequential accept/remove walk is wrong for 3+ claims (HTTP, TCP, HTTP):
@@ -415,11 +417,7 @@ pub(crate) fn finalize_listenerset_conflicts(acc: &mut K8sAccumulator, objects: 
                             | ListenerPortFamily::TcpStream
                     )
                 );
-            let quic_conflict = quic_udp_conflict
-                && matches!(
-                    family,
-                    Some(ListenerPortFamily::SecureHttp | ListenerPortFamily::Udp)
-                );
+            let quic_conflict = quic_udp_conflict && family == Some(ListenerPortFamily::Udp);
             if tcp_conflict || quic_conflict {
                 conflicted.insert(candidate.key.clone(), "ProtocolConflict");
             }
@@ -506,8 +504,8 @@ pub(crate) fn finalize_listenerset_conflicts(acc: &mut K8sAccumulator, objects: 
                 // TCP-family ProtocolConflict as a QUIC/UDP collision.
                 if quic_udp_conflict_ports.contains(&port) {
                     format!(
-                        "Port {port} is claimed by secure HTTP/QUIC and a UDP stream, so every \
-                         conflicting claim on this port is refused (Conflicted)."
+                        "Port {port} is claimed by secure HTTP/QUIC and a UDP stream, so the UDP \
+                         claim is refused (Conflicted)."
                     )
                 } else {
                     format!(
