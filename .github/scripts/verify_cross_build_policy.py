@@ -9155,32 +9155,59 @@ def opaque_word_starts_command(
     if not shell_evaluated:
         return False
     original_prefix = line[:start]
-    prefix = original_prefix.replace("\\`", "").replace("\\$", "")
-    original_match = EXPLICIT_COMMAND_WORD_PREFIX.search(original_prefix)
-    had_original_match = original_match is not None
-    while original_match is not None:
-        # A separator inside `"data; more"` is not a statement boundary. The
-        # same character inside `$(...)`, backticks, or an unquoted command
-        # remains a real slot because `shell_quote_at` restores those interiors.
-        if shell_quote_at(line, original_match.start()) is None:
-            return True
-        # The expression is suffix-anchored, so matches from different command
-        # separators overlap all the way to the opaque word. A normal
-        # `finditer` therefore yields only the first one. Resume one character
-        # after its start so an earlier quoted `;` cannot conceal a later real
-        # separator that opens the executable slot.
-        original_match = EXPLICIT_COMMAND_WORD_PREFIX.search(
-            original_prefix,
-            original_match.start() + 1,
-        )
-    if (
-        not had_original_match
-        and EXPLICIT_COMMAND_WORD_PREFIX.search(prefix) is not None
+    rendered_prefix: list[str] = []
+    rendered_positions: list[int] = []
+    index = 0
+    while index < len(original_prefix):
+        if (
+            original_prefix[index] == "\\"
+            and index + 1 < len(original_prefix)
+            and original_prefix[index + 1] in "`$"
+        ):
+            index += 2
+            continue
+        rendered_prefix.append(original_prefix[index])
+        rendered_positions.append(index)
+        index += 1
+    prefix = "".join(rendered_prefix)
+
+    def has_unquoted_explicit_prefix(
+        candidate: str,
+        original_positions: list[int] | range,
+    ) -> bool:
+        search_from = 0
+        candidate_match = EXPLICIT_COMMAND_WORD_PREFIX.search(candidate)
+        while candidate_match is not None:
+            match_start = candidate_match.start()
+            original_start = (
+                original_positions[match_start]
+                if match_start < len(original_positions)
+                else len(original_prefix)
+            )
+            # A separator inside `"data; more"` is not a statement boundary.
+            # The same character inside `$(...)`, backticks, or an unquoted
+            # command remains a real slot because `shell_quote_at` restores
+            # those interiors.
+            if shell_quote_at(line, original_start) is None:
+                return True
+            # The expression is suffix-anchored, so matches from different
+            # command separators overlap all the way to the opaque word. A
+            # normal `finditer` therefore yields only the first one.
+            search_from = match_start + 1
+            candidate_match = EXPLICIT_COMMAND_WORD_PREFIX.search(
+                candidate,
+                search_from,
+            )
+        return False
+
+    if has_unquoted_explicit_prefix(
+        original_prefix,
+        range(len(original_prefix)),
+    ) or (
+        prefix != original_prefix
+        and has_unquoted_explicit_prefix(prefix, rendered_positions)
     ):
-        # Escaped-backtick stripping can reveal a slot the raw prefix hides.
-        # Honor it only when the opaque word itself is not quoted data.
-        if shell_quote_at(line, start) is None:
-            return True
+        return True
     return starts_command and BARE_COMMAND_WORD_PREFIX.fullmatch(prefix) is not None
 
 
