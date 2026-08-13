@@ -1208,7 +1208,7 @@ fn icmp_destination_unreachable_is_terminal_in_both_directions() {
         101, // ENETUNREACH
         100, // ENETDOWN
         112, // EHOSTDOWN
-        92, // ENOPROTOOPT (ICMP protocol unreachable)
+        92,  // ENOPROTOOPT (ICMP protocol unreachable)
     ];
     #[cfg(target_vendor = "apple")]
     const ICMP_UNUSABLE: [i32; 7] = [
