@@ -599,12 +599,16 @@ fn native_h3_client_deadlines_remain_health_neutral() {
          terminal grpc-status (it would train the adaptive-concurrency limiter)"
     );
 
+    // Trailer-wait timeout is `timeout_at` → `Err(_)` → `expired_authorization()`.
+    // Client-owned gRPC deadline completion is the `None if trailer_timeout_is_deadline`
+    // arm; the following `None =>` arm is a backend read-timeout and must stay out
+    // of this health-neutral region.
     let trailer_deadline = source
-        .find("Err(_) if trailer_timeout_is_deadline =>")
+        .find("None if trailer_timeout_is_deadline =>")
         .expect("native H3 trailer deadline branch must remain present");
     let trailer_deadline = &source[trailer_deadline..];
     let trailer_end = trailer_deadline
-        .find("Err(_) =>")
+        .find("None =>")
         .expect("native H3 trailer deadline branch must remain bounded");
     let trailer_deadline = &trailer_deadline[..trailer_end];
     assert_h3_arm_health_neutral(trailer_deadline, 3, "native H3 gRPC trailer-deadline arm");
@@ -3108,9 +3112,14 @@ fn native_h3_grpc_upload_pump_source() -> &'static str {
 
 fn native_h3_grpc_upload_await_helper_source() -> &'static str {
     let src = include_str!("../../../src/http3/server.rs");
-    src.split("pub(crate) async fn h3_grpc_upload_await_until_authorization(")
-        .nth(1)
-        .expect("native H3 gRPC upload-pump authorization helper")
+    // Match the helper by name, then take the item through the next type
+    // boundary. The signature may be generic (`<F>(...)`) or not (`(...)`);
+    // pinning `name(` would miss a generic declaration the way `name<` would
+    // miss a non-generic one.
+    let Some(name_at) = src.find("fn h3_grpc_upload_await_until_authorization") else {
+        panic!("native H3 gRPC upload-pump authorization helper");
+    };
+    src[name_at..]
         .split("impl H3UploadPumpExit")
         .next()
         .expect("bounded native H3 gRPC upload-pump authorization helper")
@@ -4011,8 +4020,15 @@ async fn a_parked_h3_grpc_trailer_write_expires_under_authorization() {
 #[test]
 fn h3_native_grpc_zero_data_trailer_uses_the_message_safe_rule() {
     let util = include_str!("../../../src/http3/stream_util.rs");
+    let helper = util
+        .split("fn grpc_deadline_can_send_terminal_status")
+        .nth(1)
+        .expect("shared message-safe rule helper must remain present")
+        .split("\npub(crate) async fn await_response_write_before_deadline")
+        .next()
+        .expect("bounded message-safe rule helper");
     assert!(
-        util.contains("pub(crate) const fn grpc_deadline_can_send_terminal_status"),
+        helper.contains("bytes_streamed == 0"),
         "zero-DATA vs post-DATA trailer termination stays on the shared message-safe rule"
     );
     let relay = native_h3_grpc_relay_source();

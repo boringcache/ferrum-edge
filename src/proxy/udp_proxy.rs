@@ -6445,6 +6445,37 @@ impl UdpAuthorizationSessionProbe {
         latch: crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
         with_datagram_hooks: bool,
     ) -> Result<Self, String> {
+        Self::assemble(latch, with_datagram_hooks, || plan).await
+    }
+
+    /// Bind the probe sockets, then anchor `remaining` from that instant.
+    ///
+    /// Loopback bind/connect are real awaits. Under a paused test clock the
+    /// hosted coverage scheduler can auto-advance to a plan captured *before*
+    /// those awaits, so the first production forward already sees an elapsed
+    /// lifetime. Setup-expiry is covered by the dedicated setup-stage tests;
+    /// this constructor is for post-commit relay contracts that need a live
+    /// remaining budget that starts after fixture I/O has finished.
+    pub async fn with_lifetime_after_setup(
+        remaining: Duration,
+        termination: crate::proxy::auth_lifetime::StreamAuthTermination,
+        latch: crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+        with_datagram_hooks: bool,
+    ) -> Result<Self, String> {
+        Self::assemble(latch, with_datagram_hooks, || {
+            Some(crate::proxy::auth_lifetime::StreamAuthDeadline {
+                at: tokio::time::Instant::now() + remaining,
+                termination,
+            })
+        })
+        .await
+    }
+
+    async fn assemble(
+        latch: crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+        with_datagram_hooks: bool,
+        plan: impl FnOnce() -> Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+    ) -> Result<Self, String> {
         let backend_peer = Arc::new(
             UdpSocket::bind("127.0.0.1:0")
                 .await
@@ -6513,7 +6544,7 @@ impl UdpAuthorizationSessionProbe {
             hook_ingress_tx: std::sync::Mutex::new(hook_ingress_tx),
             hook_ingress_queued_bytes: Arc::new(AtomicUsize::new(0)),
             hook_ingress_stop_notify: Arc::new(tokio::sync::Notify::new()),
-            authorization: plan.map(|plan| UdpSessionAuthorization { plan, latch }),
+            authorization: plan().map(|plan| UdpSessionAuthorization { plan, latch }),
         });
         let sessions: SessionMap = Arc::new(DashMap::with_hasher_and_shard_amount(
             ahash::RandomState::new(),

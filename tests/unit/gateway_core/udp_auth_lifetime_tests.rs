@@ -381,15 +381,18 @@ async fn an_elapsed_deadline_refuses_the_next_client_datagram_immediately() {
 #[tokio::test(start_paused = true)]
 async fn continuous_traffic_does_not_refresh_the_authorization_deadline() {
     let latch = StreamAuthTerminationLatch::default();
-    let session = probe(
-        Some(future_plan(
-            Duration::from_millis(300),
-            StreamAuthTermination::AuthenticatedStreamMaxLifetime,
-        )),
+    // Anchor AFTER fixture bind/connect. A plan captured before
+    // `UdpAuthorizationSessionProbe::new` can already be elapsed by the first
+    // forward under the hosted coverage scheduler; setup-expiry is covered
+    // elsewhere and must not consume this relay budget.
+    let session = UdpAuthorizationSessionProbe::with_lifetime_after_setup(
+        Duration::from_millis(300),
+        StreamAuthTermination::AuthenticatedStreamMaxLifetime,
         latch.clone(),
         false,
     )
-    .await;
+    .await
+    .expect("probe session binds loopback UDP sockets");
 
     for round in 0..3u8 {
         session
