@@ -294,9 +294,21 @@ impl ClientTrustMaterial {
         let mut anchors = BTreeSet::new();
         if let Some(pem) = client_ca_pem {
             let mut reader = pem;
+            let mut parsed_any = false;
             for cert in rustls_pemfile::certs(&mut reader) {
                 let cert = cert.map_err(|_| ClientTrustMaterialError)?;
+                parsed_any = true;
                 anchors.insert(digest_of(&[cert.as_ref()]));
+            }
+            // `rustls_pemfile::certs` skips PEM sections it cannot recognize.
+            // A configured client-CA source containing only malformed material
+            // can therefore yield an empty successful iterator rather than an
+            // item-level parse error. Treating that as an empty trust set would
+            // summarize and publish material the verifier rejected. `Some`
+            // means client authentication was configured, so at least one
+            // parseable certificate is mandatory.
+            if !parsed_any {
+                return Err(ClientTrustMaterialError);
             }
         }
 
