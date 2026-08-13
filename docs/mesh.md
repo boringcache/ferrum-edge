@@ -680,15 +680,17 @@ bearer-authenticated stream a finite **local** authorization lifetime:
   local decode, used only to schedule a reconnect
   `FERRUM_MESH_STOCK_XDS_TOKEN_REFRESH_SKEW_SECONDS` early. Locally decoded
   claims are never authorization proof — but they are also never allowed to
-  schedule *past* `exp`. A token that is already expired — including a
-  syntactically valid integer `exp` of zero or a negative NumericDate (Unix
-  epoch zero and earlier are plainly expired, not "no hint") — or whose
-  remaining lifetime cannot leave a positive window once the skew is
-  subtracted, is **refused**: it becomes an invalid credential source
-  (`token_expired` / `token_expires_within_skew`) rather than being clamped up
-  to some reconnect floor. Recovery is the operator replacing the material,
-  which the watcher observes; the bounded invalid-source retry is what prevents
-  a hot loop.
+  schedule *past* `exp`. RFC 7519 NumericDate may be a non-integer JSON
+  number; a present numeric `exp` is floored to whole seconds so the deadline
+  cannot fall after the mathematical expiration. A token that is already
+  expired — including a syntactically valid NumericDate of zero, a negative
+  value, or a fractional value that floors to Unix epoch zero or earlier
+  (those are plainly expired, not "no hint") — or whose remaining lifetime
+  cannot leave a positive window once the skew is subtracted, is **refused**:
+  it becomes an invalid credential source (`token_expired` /
+  `token_expires_within_skew`) rather than being clamped up to some reconnect
+  floor. Recovery is the operator replacing the material, which the watcher
+  observes; the bounded invalid-source retry is what prevents a hot loop.
 - An opaque token gets
   `FERRUM_MESH_STOCK_XDS_TOKEN_MAX_STREAM_LIFETIME_SECONDS`, which also caps any
   JWT-derived deadline.

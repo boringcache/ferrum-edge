@@ -25,9 +25,12 @@
 //! 2. **A local authorization deadline.** A JWT-shaped token contributes its
 //!    `exp` as a *reconnect scheduling hint only*, after a bounded, non-verifying
 //!    local decode. It is never treated as proof of anything — but it is also
-//!    never allowed to schedule *past* `exp`. A token that is already expired
-//!    — including a syntactically valid integer `exp` of zero or a negative
-//!    NumericDate (Unix epoch zero and earlier are plainly expired, not "no
+//!    never allowed to schedule *past* `exp`. RFC 7519 NumericDate may be a
+//!    non-integer JSON number; a present numeric `exp` is floored to whole
+//!    seconds so the deadline cannot fall after the mathematical expiration.
+//!    A token that is already expired — including a syntactically valid
+//!    NumericDate of zero, a negative value, or a fractional value that floors
+//!    to Unix epoch zero or earlier (those are plainly expired, not "no
 //!    hint") — or whose remaining lifetime cannot leave a positive window once
 //!    the configured skew is subtracted, is **refused**: it becomes an invalid
 //!    credential source rather than being clamped up to some floor. An opaque
@@ -558,7 +561,7 @@ pub fn credential_lifetime(
 ) -> Result<(Duration, StockCredentialDeadlineBasis), StockCredentialInvalidReason> {
     let opaque = clamp_max_stream_lifetime(policy.max_stream_lifetime);
     let Some(exp) = jwt_expiration_hint(raw_token) else {
-        // Opaque (or non-JWS, or `exp`-less / non-integer `exp`) material:
+        // Opaque (or non-JWS, or `exp`-less / non-numeric `exp`) material:
         // there is no local hint at all, so the operator-visible finite
         // maximum is the whole policy.
         return Ok((opaque, StockCredentialDeadlineBasis::MaxStreamLifetime));
@@ -622,8 +625,10 @@ fn clamp_max_stream_lifetime(configured: Duration) -> Duration {
 
 #[derive(serde::Deserialize)]
 struct JwtExpClaim {
-    /// Seconds since the Unix epoch. Any other shape is simply "no hint".
-    exp: Option<i64>,
+    /// RFC 7519 NumericDate as the exact JSON lexeme. A present JSON number —
+    /// integer, fractional, or exponent form — is floored to whole seconds.
+    /// Any other shape is simply "no hint".
+    exp: Option<Box<serde_json::value::RawValue>>,
 }
 
 /// Bounded, **non-verifying** local decode of a JWT-shaped token's `exp`.
@@ -632,14 +637,18 @@ struct JwtExpClaim {
 /// the issuer/audience are not checked, and no other claim is read or retained.
 ///
 /// `None` means the token is not a three-segment JWS or the payload has no
-/// usable integer `exp` (malformed, oversized, missing, or a non-integer
-/// shape). [`credential_lifetime`] treats that as opaque.
+/// usable NumericDate `exp` (malformed, oversized, missing, a non-number
+/// shape, or a positive value that cannot be represented as `i64`).
+/// [`credential_lifetime`] treats that as opaque.
 ///
-/// `Some(n)` is the payload's NumericDate, including zero and negative values.
-/// Those are already expired (Unix epoch zero and earlier) and must never be
-/// collapsed into "no hint". This function does not convert the NumericDate
-/// into a `SystemTime` or a `Duration`, so a negative value cannot wrap or
-/// panic here.
+/// `Some(n)` is the conservative whole-second floor of the payload's
+/// NumericDate, including zero, negative, and fractional values. A fractional
+/// JSON number is floored (never rounded up) so the scheduled deadline cannot
+/// fall after the mathematical expiration. Zero, negative, and negative
+/// fractional values are already expired (Unix epoch zero and earlier) and
+/// must never be collapsed into "no hint". This function does not convert the
+/// NumericDate into a `SystemTime` or a `Duration`, so a negative value cannot
+/// wrap or panic here.
 pub fn jwt_expiration_hint(raw_token: &str) -> Option<i64> {
     use base64::Engine as _;
 
@@ -661,7 +670,280 @@ pub fn jwt_expiration_hint(raw_token: &str) -> Option<i64> {
         return None;
     }
     let claim: JwtExpClaim = serde_json::from_slice(&decoded).ok()?;
-    claim.exp
+    numeric_date_floor_secs(claim.exp?.get())
+}
+
+/// Conservative whole-second floor of an RFC 7519 NumericDate JSON number.
+///
+/// The lexeme is preserved (via [`serde_json::value::RawValue`]) so this never
+/// parses through `f64`, which cannot represent every integer above 2^53 and
+/// can round a fraction upward across a second boundary. In-range integers
+/// keep their exact value. Unrepresentable positive magnitudes yield `None`
+/// (the opaque cap still applies). Unrepresentable negative magnitudes yield
+/// [`i64::MIN`], which remains expired rather than opaque.
+fn numeric_date_floor_secs(lexeme: &str) -> Option<i64> {
+    let first = *lexeme.as_bytes().first()?;
+    if first != b'-' && !first.is_ascii_digit() {
+        return None;
+    }
+    if is_json_integer_lexeme(lexeme) {
+        return match lexeme.parse::<i64>() {
+            Ok(value) => Some(value),
+            Err(_) if first == b'-' => Some(i64::MIN),
+            Err(_) => None,
+        };
+    }
+    floor_json_number_to_i64(parse_json_number_lexeme(lexeme)?)
+}
+
+fn is_json_integer_lexeme(lexeme: &str) -> bool {
+    let bytes = lexeme.as_bytes();
+    if bytes.is_empty() {
+        return false;
+    }
+    let digits = match bytes[0] {
+        b'-' => {
+            if bytes.len() == 1 {
+                return false;
+            }
+            &bytes[1..]
+        }
+        _ => bytes,
+    };
+    digits.iter().all(u8::is_ascii_digit)
+}
+
+struct JsonNumber<'a> {
+    negative: bool,
+    int_digits: &'a [u8],
+    frac_digits: &'a [u8],
+    exponent: i32,
+}
+
+fn parse_json_number_lexeme(lexeme: &str) -> Option<JsonNumber<'_>> {
+    let bytes = lexeme.as_bytes();
+    let mut i = 0usize;
+    let negative = if bytes.first().copied() == Some(b'-') {
+        i = 1;
+        true
+    } else {
+        false
+    };
+    if i >= bytes.len() {
+        return None;
+    }
+
+    let int_start = i;
+    if bytes[i] == b'0' {
+        i += 1;
+    } else if bytes[i].is_ascii_digit() {
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+    } else {
+        return None;
+    }
+    let int_digits = &bytes[int_start..i];
+    if int_digits.is_empty() {
+        return None;
+    }
+
+    let frac_digits = if i < bytes.len() && bytes[i] == b'.' {
+        i += 1;
+        let frac_start = i;
+        if i >= bytes.len() || !bytes[i].is_ascii_digit() {
+            return None;
+        }
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        &bytes[frac_start..i]
+    } else {
+        &[]
+    };
+
+    let mut exponent = 0i32;
+    if i < bytes.len() && (bytes[i] == b'e' || bytes[i] == b'E') {
+        i += 1;
+        if i >= bytes.len() {
+            return None;
+        }
+        let exp_negative = match bytes[i] {
+            b'-' => {
+                i += 1;
+                true
+            }
+            b'+' => {
+                i += 1;
+                false
+            }
+            _ => false,
+        };
+        if i >= bytes.len() || !bytes[i].is_ascii_digit() {
+            return None;
+        }
+        let exp_start = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        exponent = parse_json_exponent(&bytes[exp_start..i], exp_negative)?;
+    }
+
+    if i != bytes.len() {
+        return None;
+    }
+
+    Some(JsonNumber {
+        negative,
+        int_digits,
+        frac_digits,
+        exponent,
+    })
+}
+
+fn parse_json_exponent(digits: &[u8], negative: bool) -> Option<i32> {
+    if digits.is_empty() {
+        return None;
+    }
+    // Nine digits always fit in i32. Longer exponents are saturated to a
+    // magnitude that already overflows any i64 second count.
+    if digits.len() > 9 {
+        return Some(if negative {
+            -1_000_000_000
+        } else {
+            1_000_000_000
+        });
+    }
+    let mut value = 0i32;
+    for &digit in digits {
+        value = value
+            .checked_mul(10)?
+            .checked_add(i32::from(digit - b'0'))?;
+    }
+    if negative {
+        Some(-value)
+    } else {
+        Some(value)
+    }
+}
+
+fn floor_json_number_to_i64(number: JsonNumber<'_>) -> Option<i64> {
+    let JsonNumber {
+        negative,
+        int_digits,
+        frac_digits,
+        exponent,
+    } = number;
+
+    if digits_all_zero(int_digits) && digits_all_zero(frac_digits) {
+        return Some(0);
+    }
+
+    let int_len = i64::try_from(int_digits.len()).ok()?;
+    let point = int_len.checked_add(i64::from(exponent))?;
+    if point <= 0 {
+        return Some(if negative { -1 } else { 0 });
+    }
+
+    let sig_len = int_digits.len() + frac_digits.len();
+    let Ok(point_us) = usize::try_from(point) else {
+        return overflow_numeric_date_hint(negative);
+    };
+
+    let (prefix_len, trailing_zeros, has_remainder) = if point_us >= sig_len {
+        (sig_len, point_us - sig_len, false)
+    } else {
+        (
+            point_us,
+            0,
+            significand_has_nonzero(int_digits, frac_digits, point_us),
+        )
+    };
+
+    let Some(magnitude) = parse_u64_significand_prefix(
+        int_digits,
+        frac_digits,
+        prefix_len,
+        trailing_zeros,
+    ) else {
+        return overflow_numeric_date_hint(negative);
+    };
+    signed_floor(negative, magnitude, has_remainder)
+}
+
+fn overflow_numeric_date_hint(negative: bool) -> Option<i64> {
+    if negative {
+        Some(i64::MIN)
+    } else {
+        None
+    }
+}
+
+fn digits_all_zero(digits: &[u8]) -> bool {
+    digits.iter().all(|&digit| digit == b'0')
+}
+
+fn significand_digit(int_digits: &[u8], frac_digits: &[u8], index: usize) -> Option<u8> {
+    if index < int_digits.len() {
+        Some(int_digits[index])
+    } else {
+        frac_digits.get(index - int_digits.len()).copied()
+    }
+}
+
+fn significand_has_nonzero(int_digits: &[u8], frac_digits: &[u8], from: usize) -> bool {
+    let len = int_digits.len() + frac_digits.len();
+    (from..len).any(|index| significand_digit(int_digits, frac_digits, index) != Some(b'0'))
+}
+
+fn parse_u64_significand_prefix(
+    int_digits: &[u8],
+    frac_digits: &[u8],
+    prefix_len: usize,
+    trailing_zeros: usize,
+) -> Option<u64> {
+    // 10^20 already overflows u64 for any non-zero prefix.
+    if trailing_zeros > 20 {
+        return None;
+    }
+    let mut value = 0u64;
+    let mut saw_nonzero = false;
+    for index in 0..prefix_len {
+        let digit = significand_digit(int_digits, frac_digits, index)?;
+        if digit == b'0' && !saw_nonzero {
+            continue;
+        }
+        saw_nonzero = true;
+        value = value
+            .checked_mul(10)?
+            .checked_add(u64::from(digit - b'0'))?;
+    }
+    if !saw_nonzero {
+        return Some(0);
+    }
+    for _ in 0..trailing_zeros {
+        value = value.checked_mul(10)?;
+    }
+    Some(value)
+}
+
+fn signed_floor(negative: bool, magnitude: u64, has_remainder: bool) -> Option<i64> {
+    if !negative {
+        return i64::try_from(magnitude).ok();
+    }
+    if magnitude == 0 {
+        return Some(if has_remainder { -1 } else { 0 });
+    }
+    let Ok(positive) = i64::try_from(magnitude) else {
+        // Includes 2^63 (i64::MIN) and every more-negative overflow.
+        return Some(i64::MIN);
+    };
+    let negated = -positive;
+    if has_remainder {
+        Some(negated.saturating_sub(1))
+    } else {
+        Some(negated)
+    }
 }
 
 /// Read the raw bearer token through the shared hardened credential boundary.

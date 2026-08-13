@@ -806,9 +806,13 @@ fn the_authorization_insertion_boundary_refuses_a_non_tls_transport() {
 // ── issue #3852: credential lifetime ────────────────────────────────────
 
 fn jwt_with_exp(exp_epoch_secs: i64) -> String {
+    jwt_with_exp_lexeme(&exp_epoch_secs.to_string())
+}
+
+fn jwt_with_exp_lexeme(exp_lexeme: &str) -> String {
     let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256"}"#);
     let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!(
-        r#"{{"exp":{exp_epoch_secs},"sub":"system:serviceaccount:x:y"}}"#
+        r#"{{"exp":{exp_lexeme},"sub":"system:serviceaccount:x:y"}}"#
     ));
     format!("{header}.{payload}.c2ln")
 }
@@ -1064,9 +1068,9 @@ fn jwt_expiration_hint_is_bounded_and_refuses_non_jws_shapes() {
     // Valid base64url that is not JSON.
     let not_json = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"plain text");
     assert!(jwt_expiration_hint(&format!("a.{not_json}.c")).is_none());
-    // JSON without `exp` is no hint. A syntactically valid integer `exp` of
-    // zero or a negative NumericDate is a hint that the token is already
-    // expired, not "no hint".
+    // JSON without `exp` is no hint. A syntactically valid NumericDate `exp`
+    // of zero or a negative value is a hint that the token is already
+    // expired, not "no hint". Fractional forms are covered below.
     let no_exp = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"sub":"x"}"#);
     assert!(jwt_expiration_hint(&format!("a.{no_exp}.c")).is_none());
     let zero_exp = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"exp":0}"#);
@@ -1110,6 +1114,182 @@ fn jwt_shaped_tokens_with_zero_or_negative_exp_are_refused_at_admission() {
             .expect_err("zero/negative NumericDate must not be admitted");
         assert_eq!(reason, StockCredentialInvalidReason::Expired, "exp={exp}");
     }
+}
+
+/// RFC 7519 NumericDate permits non-integer JSON numbers. A present valid
+/// number must never become "no hint": that used to grant the opaque maximum
+/// and could hold a stock-xDS stream past authoritative `exp`.
+#[test]
+fn jwt_expiration_hint_floors_a_fractional_numeric_date() {
+    assert_eq!(
+        jwt_expiration_hint(&jwt_with_exp_lexeme("1000000.9")),
+        Some(1_000_000)
+    );
+    assert_eq!(
+        jwt_expiration_hint(&jwt_with_exp_lexeme("1000000.1")),
+        Some(1_000_000)
+    );
+    assert_eq!(
+        jwt_expiration_hint(&jwt_with_exp_lexeme("1000000.0")),
+        Some(1_000_000)
+    );
+    // Immediately below the next integer: must not round up.
+    assert_eq!(
+        jwt_expiration_hint(&jwt_with_exp_lexeme("1000000.999")),
+        Some(1_000_000)
+    );
+    assert_eq!(
+        jwt_expiration_hint(&jwt_with_exp_lexeme("1000000.999999999")),
+        Some(1_000_000)
+    );
+    // Integer-valued fractions stay pinned to the integer.
+    assert_eq!(
+        jwt_expiration_hint(&jwt_with_exp_lexeme("1000600.0")),
+        Some(1_000_600)
+    );
+    assert_eq!(
+        jwt_expiration_hint(&jwt_with_exp(1_000_600)),
+        Some(1_000_600)
+    );
+}
+
+#[test]
+fn jwt_expiration_hint_accepts_json_exponent_notation() {
+    assert_eq!(
+        jwt_expiration_hint(&jwt_with_exp_lexeme("1e6")),
+        Some(1_000_000)
+    );
+    assert_eq!(
+        jwt_expiration_hint(&jwt_with_exp_lexeme("1E6")),
+        Some(1_000_000)
+    );
+    assert_eq!(
+        jwt_expiration_hint(&jwt_with_exp_lexeme("1.0006009e6")),
+        Some(1_000_600)
+    );
+    assert_eq!(
+        jwt_expiration_hint(&jwt_with_exp_lexeme("1.0006e+6")),
+        Some(1_000_600)
+    );
+    assert_eq!(
+        jwt_expiration_hint(&jwt_with_exp_lexeme("10000000e-1")),
+        Some(1_000_000)
+    );
+}
+
+#[test]
+fn jwt_shaped_tokens_with_zero_or_negative_fractional_exp_are_expired_not_opaque() {
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    for lexeme in ["0.0", "0.9", "-0.1", "-1.5", "-1e-1", "-1.0"] {
+        let token = jwt_with_exp_lexeme(lexeme);
+        let hint = jwt_expiration_hint(&token).expect("a present JSON-number exp is a hint");
+        assert!(hint <= 0, "lexeme={lexeme} hint={hint}");
+        let reason = credential_lifetime(&token, lifetime_policy(3600, 0), now)
+            .expect_err("zero/negative fractional NumericDate must never yield a lifetime");
+        assert_eq!(
+            reason,
+            StockCredentialInvalidReason::Expired,
+            "lexeme={lexeme} must not be treated as opaque"
+        );
+    }
+}
+
+/// Issue #3852 follow-up: a fractional `exp` used to fail `JwtExpClaim { exp:
+/// Option<i64> }` as a shape mismatch, so `credential_lifetime` granted the
+/// opaque maximum and could hold the stream past authoritative expiry.
+#[test]
+fn a_fractional_jwt_exp_cannot_fall_through_to_the_opaque_maximum() {
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    let token = jwt_with_exp_lexeme("1000600.9");
+    let (lifetime, basis) = credential_lifetime(&token, lifetime_policy(3600, 60), now)
+        .expect("a fractional exp with a positive post-skew window is admissible");
+    assert_eq!(basis, StockCredentialDeadlineBasis::JwtExpirationHint);
+    assert_eq!(
+        lifetime,
+        Duration::from_secs(540),
+        "floor(1000600.9)=1000600 → 600s minus 60s skew, not the 3600s opaque max"
+    );
+    assert!(
+        lifetime < Duration::from_secs(3600),
+        "the opaque maximum must not win past a present fractional exp"
+    );
+
+    let (lifetime, basis) = credential_lifetime(
+        &jwt_with_exp_lexeme("1.0006009e6"),
+        lifetime_policy(3600, 0),
+        now,
+    )
+    .expect("exponent-notation fractional exp is a JWT hint");
+    assert_eq!(basis, StockCredentialDeadlineBasis::JwtExpirationHint);
+    assert!(
+        lifetime < Duration::from_secs(601),
+        "scheduled lifetime must be no later than the floored exp: {lifetime:?}"
+    );
+    assert!(
+        lifetime < Duration::from_secs(3600),
+        "exponent notation must not fall through to the opaque maximum"
+    );
+}
+
+#[test]
+fn a_fractional_exp_immediately_below_now_is_expired_not_opaque() {
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    // 1000000.999 floors to 1000000, remaining 0 → Expired. An f64 round-up
+    // would have scheduled a 1s lifetime.
+    let reason = credential_lifetime(
+        &jwt_with_exp_lexeme("1000000.999"),
+        lifetime_policy(3600, 0),
+        now,
+    )
+    .expect_err("a fractional exp that floors to now is already expired");
+    assert_eq!(reason, StockCredentialInvalidReason::Expired);
+}
+
+#[test]
+fn huge_numeric_date_hints_do_not_overflow_or_become_a_negative_deadline() {
+    assert!(jwt_expiration_hint(&jwt_with_exp_lexeme("1e30")).is_none());
+    assert!(jwt_expiration_hint(&jwt_with_exp_lexeme("1.5e30")).is_none());
+    assert!(jwt_expiration_hint(&jwt_with_exp_lexeme("9223372036854775808")).is_none());
+    assert_eq!(
+        jwt_expiration_hint(&jwt_with_exp_lexeme("9223372036854775807")),
+        Some(i64::MAX)
+    );
+
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    let (lifetime, basis) = credential_lifetime(
+        &jwt_with_exp_lexeme("1e30"),
+        lifetime_policy(3600, 0),
+        now,
+    )
+    .expect("an unrepresentable positive hint is admissible as the opaque cap");
+    assert_eq!(lifetime, Duration::from_secs(3600));
+    assert_eq!(basis, StockCredentialDeadlineBasis::MaxStreamLifetime);
+
+    let hint = jwt_expiration_hint(&jwt_with_exp_lexeme("-1e30")).expect("negative hint");
+    assert!(hint < 0);
+    let reason = credential_lifetime(
+        &jwt_with_exp_lexeme("-1e30"),
+        lifetime_policy(3600, 0),
+        now,
+    )
+    .expect_err("a huge negative NumericDate is expired");
+    assert_eq!(reason, StockCredentialInvalidReason::Expired);
+}
+
+#[test]
+fn non_number_exp_shapes_remain_opaque() {
+    assert!(jwt_expiration_hint(&jwt_with_exp_lexeme(r#""soon""#)).is_none());
+    assert!(jwt_expiration_hint(&jwt_with_exp_lexeme("true")).is_none());
+    assert!(jwt_expiration_hint(&jwt_with_exp_lexeme("[]")).is_none());
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    let (lifetime, basis) = credential_lifetime(
+        &jwt_with_exp_lexeme(r#""soon""#),
+        lifetime_policy(3600, 0),
+        now,
+    )
+    .expect("a non-number exp stays opaque");
+    assert_eq!(lifetime, Duration::from_secs(3600));
+    assert_eq!(basis, StockCredentialDeadlineBasis::MaxStreamLifetime);
 }
 
 #[test]
