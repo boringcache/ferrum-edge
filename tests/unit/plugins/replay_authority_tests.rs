@@ -864,7 +864,10 @@ fn shared_authority_health_tracks_outage_recovery_and_retirement() {
         recovered.shared_authorities_unavailable, baseline.shared_authorities_unavailable,
         "a recovered backend must stop failing readiness"
     );
-    assert_eq!(recovered.shared_authorities, baseline.shared_authorities + 1);
+    assert_eq!(
+        recovered.shared_authorities,
+        baseline.shared_authorities + 1
+    );
 
     // Retiring the generation drops it from the aggregate: the registry holds
     // weak handles precisely so an old generation can neither hold readiness

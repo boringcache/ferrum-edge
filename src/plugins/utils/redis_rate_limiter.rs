@@ -2625,26 +2625,29 @@ impl RedisRateLimitClient {
             .arg("NX")
             .arg("EX")
             .arg(expire_seconds(ttl_seconds));
-        let response: Result<Option<String>, redis::RedisError> =
-            match tokio::time::timeout(self.connect_timeout(), command.query_async(&mut conn)).await
-            {
-                Ok(result) => result,
-                Err(_) => {
-                    // Connected but unanswered. Never a licence to admit: an
-                    // executed-but-unacknowledged `SET NX` leaves the marker in
-                    // place, so the retry sees the existing key and stays
-                    // fail-closed.
-                    warn!(
-                        redis_url = %self.config.redacted_url(),
-                        operation = "SET NX EX",
-                        classification = "response_timeout",
-                        timeout_seconds = self.config.connect_timeout_seconds,
-                        "Redis single-use claim did not answer within the bounded deadline"
-                    );
-                    self.mark_unavailable();
-                    return Err(());
-                }
-            };
+        let response: Result<Option<String>, redis::RedisError> = match tokio::time::timeout(
+            self.connect_timeout(),
+            command.query_async(&mut conn),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                // Connected but unanswered. Never a licence to admit: an
+                // executed-but-unacknowledged `SET NX` leaves the marker in
+                // place, so the retry sees the existing key and stays
+                // fail-closed.
+                warn!(
+                    redis_url = %self.config.redacted_url(),
+                    operation = "SET NX EX",
+                    classification = "response_timeout",
+                    timeout_seconds = self.config.connect_timeout_seconds,
+                    "Redis single-use claim did not answer within the bounded deadline"
+                );
+                self.mark_unavailable();
+                return Err(());
+            }
+        };
 
         match response {
             Ok(value) => {

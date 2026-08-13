@@ -179,7 +179,10 @@ async fn a_shared_replay_authority_outage_fails_readiness_and_recovery_restores_
     assert_eq!(code, 200);
     assert_eq!(body["ready"], true);
     assert_eq!(body["replay_authority"]["shared_authorities"], 1);
-    assert_eq!(body["replay_authority"]["shared_authorities_unavailable"], 0);
+    assert_eq!(
+        body["replay_authority"]["shared_authorities_unavailable"],
+        0
+    );
 
     // The backend goes away. Protected requests on that policy now fail closed,
     // so the replica must withdraw itself.
@@ -192,7 +195,10 @@ async fn a_shared_replay_authority_outage_fails_readiness_and_recovery_restores_
         "a `shared` policy has no fallback, so this is a lost dependency"
     );
     assert_eq!(body["replay_authority"]["shared_authorities"], 1);
-    assert_eq!(body["replay_authority"]["shared_authorities_unavailable"], 1);
+    assert_eq!(
+        body["replay_authority"]["shared_authorities_unavailable"],
+        1
+    );
 
     // `/status` is the same handler and must agree.
     let (code, status_body) = get(&base, "/status", Some(METRICS_TOKEN)).await;
@@ -211,7 +217,10 @@ async fn a_shared_replay_authority_outage_fails_readiness_and_recovery_restores_
     assert_eq!(code, 200);
     assert_eq!(body["ready"], true);
     assert_eq!(body["status"], "ok");
-    assert_eq!(body["replay_authority"]["shared_authorities_unavailable"], 0);
+    assert_eq!(
+        body["replay_authority"]["shared_authorities_unavailable"],
+        0
+    );
 
     // A retired plugin generation stops counting entirely — including a retired
     // generation whose backend was unavailable, which must not hold readiness

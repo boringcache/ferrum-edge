@@ -3984,10 +3984,8 @@ async fn duplicate_equivalent_providers_with_matching_capacity_share_one_lane() 
     let mut provider = dpop_provider(&jwks);
     provider["dpop_replay_max_entries"] = json!(8);
 
-    let duplicated = dpop_plugin_with_providers(
-        json!([provider.clone(), provider]),
-        "dpop-cap-dup-match",
-    );
+    let duplicated =
+        dpop_plugin_with_providers(json!([provider.clone(), provider]), "dpop-cap-dup-match");
     assert_eq!(
         duplicated.dpop_replay_lane_capacities(),
         vec![Some(8), Some(8)]

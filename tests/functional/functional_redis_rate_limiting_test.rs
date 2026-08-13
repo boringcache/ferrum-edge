@@ -3924,9 +3924,9 @@ async fn test_shared_replay_authority_live_redis_admits_exactly_one_winner() {
     let mut attempts = Vec::new();
     for index in 0..16 {
         let authority = Arc::clone(&authorities[index % authorities.len()]);
-        attempts.push(tokio::spawn(async move {
-            authority.admit(&contested).await
-        }));
+        attempts.push(tokio::spawn(
+            async move { authority.admit(&contested).await },
+        ));
     }
     let mut admitted = 0usize;
     for attempt in attempts {

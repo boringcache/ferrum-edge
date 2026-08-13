@@ -868,12 +868,8 @@ impl HmacAuth {
             _ => None,
         };
 
-        let prebuffer_owner = HmacPrebufferOwner::new(
-            namespace,
-            policy_config_id,
-            profile,
-            replay_domain.as_ref(),
-        );
+        let prebuffer_owner =
+            HmacPrebufferOwner::new(namespace, policy_config_id, profile, replay_domain.as_ref());
 
         Ok(Self {
             clock_skew_seconds,
