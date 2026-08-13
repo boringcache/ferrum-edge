@@ -7174,11 +7174,9 @@ impl ProxyState {
         let before = before.as_ref()?;
         match commit {
             GatewayTrustCommit::Unchanged => None,
-            GatewayTrustCommit::Replace(next) => mesh_trust_registry::trust_withdrawal_reason(
-                Some(before),
-                Some(next),
-                false,
-            ),
+            GatewayTrustCommit::Replace(next) => {
+                mesh_trust_registry::trust_withdrawal_reason(Some(before), Some(next), false)
+            }
             GatewayTrustCommit::Clear => {
                 let restored = self.gateway_file_svid_bundle.load_full();
                 mesh_trust_registry::trust_withdrawal_reason(
