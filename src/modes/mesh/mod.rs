@@ -16670,60 +16670,13 @@ async fn apply_mesh_inbound_tls_reload(
             proxy_state
                 .stream_listener_manager
                 .swap_frontend_tls_config(tls_config);
-            // And the same for UDP+DTLS: rebuild a `FrontendDtlsConfig`
-            // from the current env-config inputs and have every active
-            // `DtlsServer` swap atomically. Existing DTLS sessions keep
-            // the crypto material they handshake with; new sessions pick
-            // up the swap on the next ClientHello.
-            //
-            // The DTLS rebuild reuses operator-supplied cert/key/client-CA
-            // paths because PeerAuth live reload, per the operating
-            // invariant, never rotates cert/key paths — those remain
-            // static restart-required inputs. What changes here is the
-            // *mode* (Permissive ↔ Strict) and whether the client CA bundle
-            // is required for mTLS verification.
-            //
-            // Skip the DTLS rebuild entirely on `Disable`: TCP+TLS goes to
-            // plaintext via the cleared slot above, but DTLS cannot speak
-            // plaintext (it is encryption by definition). On topologies
-            // where `Disable` is allowed (Sidecar / EastWestGateway), an
-            // operator with UDP+DTLS listeners is expected to remove
-            // them from the proxy config rather than rely on a PeerAuth
-            // flip; the existing DtlsServer keeps its startup material
-            // so in-flight sessions and any pre-existing handshake
-            // contract remain intact until the listener is reconciled
-            // away.
-            if mtls_mode != config::MtlsMode::Disable {
-                let env = &proxy_state.env_config;
-                let crls = proxy_state.crls.clone();
-                let dtls_cert_key = env
-                    .frontend_tls_cert_path
-                    .as_deref()
-                    .zip(env.frontend_tls_key_path.as_deref())
-                    .map(|(c, k)| (c.to_string(), k.to_string()));
-                let dtls_client_ca = env.frontend_tls_client_ca_bundle_path.clone();
-                if let Some((cert_path, key_path)) = dtls_cert_key {
-                    let swapped = proxy_state
-                        .stream_listener_manager
-                        .swap_active_dtls_frontend_configs(|| {
-                            crate::dtls::build_frontend_dtls_config(
-                                &cert_path,
-                                &key_path,
-                                dtls_client_ca.as_deref(),
-                                &crls,
-                            )
-                        })
-                        .await;
-                    if swapped > 0 {
-                        info!(
-                            mesh_slice_version = %slice.version,
-                            ?mtls_mode,
-                            dtls_listeners = swapped,
-                            "Mesh inbound PeerAuthentication DTLS configs reloaded"
-                        );
-                    }
-                }
-            }
+            // Mesh never materializes a terminating UDP+DTLS stream listener.
+            // In-mesh / egress UDP stays an opaque datagram-over-mesh CONNECT
+            // (`mesh_udp_frame`); ServiceEntry UDP ports bind no DTLS frontend.
+            // PeerAuthentication therefore must not live-swap `DtlsServer`
+            // configs or publish into the ordinary `FERRUM_DTLS_*` generation:
+            // any UDP+DTLS listener in this process is operator-owned and keeps
+            // its dedicated identity and client-CA policy across this reload.
             *last_snapshot = Some(snapshot);
             info!(
                 mesh_slice_version = %slice.version,
@@ -30723,11 +30676,217 @@ mod tests {
         .await
         .expect("stream-listener slot should clear when PeerAuth flips to Disable");
 
+        assert!(
+            proxy_state
+                .stream_listener_manager
+                .snapshot_frontend_dtls_generation()
+                .is_none(),
+            "PeerAuthentication reload must not seed the ordinary DTLS generation"
+        );
+        assert!(
+            proxy_state
+                .stream_listener_manager
+                .active_dtls_frontend_identities_for_test()
+                .await
+                .is_empty(),
+            "PeerAuthentication reload must not invent a DTLS listener"
+        );
+
         let _ = shutdown_tx.send(true);
         tokio::time::timeout(Duration::from_secs(2), apply_task)
             .await
             .expect("apply task should stop")
             .expect("apply task should join");
+    }
+
+    fn write_ecdsa_pem_pair(dir: &std::path::Path, name: &str) -> (String, String) {
+        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
+            .expect("generate ecdsa key");
+        let params =
+            rcgen::CertificateParams::new(vec![format!("{name}.example")]).expect("params");
+        let cert = params.self_signed(&key_pair).expect("self-sign");
+        let cert_path = dir.join(format!("{name}.crt"));
+        let key_path = dir.join(format!("{name}.key"));
+        std::fs::write(&cert_path, cert.pem()).expect("write cert");
+        std::fs::write(&key_path, key_pair.serialize_pem()).expect("write key");
+        (
+            cert_path.to_str().expect("utf8").to_string(),
+            key_path.to_str().expect("utf8").to_string(),
+        )
+    }
+
+    /// Mesh does not own a terminating UDP+DTLS listener. PeerAuthentication
+    /// live reload must not overwrite an already-active ordinary
+    /// `FERRUM_DTLS_*` server, even when `FERRUM_FRONTEND_TLS_*` material
+    /// would be a valid DTLS candidate.
+    ///
+    /// Drive `plan_mesh_inbound_tls_reload` + `apply_mesh_inbound_tls_reload`
+    /// directly. A full `start_mesh_slice_apply_task` also reconciles gateway
+    /// config and would tear down this operator-owned listener, which is
+    /// unrelated to the PeerAuthentication TLS isolation invariant.
+    #[tokio::test(flavor = "current_thread")]
+    async fn mesh_peer_auth_reload_does_not_mutate_active_ordinary_dtls_listener() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mesh_cert, mesh_key) = write_ecdsa_pem_pair(dir.path(), "mesh-frontend");
+        let (dtls_cert, dtls_key) = write_ecdsa_pem_pair(dir.path(), "dtls-dedicated");
+        let (dtls_ca, _) = write_ecdsa_pem_pair(dir.path(), "dtls-client-ca");
+
+        let holder = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("udp holder");
+        let port = holder.local_addr().expect("addr").port();
+        drop(holder);
+
+        let mut proxy: Proxy = serde_json::from_value(serde_json::json!({
+            "id": "udp-dtls-ordinary",
+            "namespace": "default",
+            "backend_scheme": "udp",
+            "backend_host": "127.0.0.1",
+            "backend_port": 9,
+            "listen_port": port,
+            "frontend_tls": true,
+            "passthrough": false,
+        }))
+        .expect("udp dtls proxy");
+        proxy.dispatch_kind = DispatchKind::from(BackendScheme::Udp);
+
+        let mut runtime = test_mesh_runtime_config();
+        runtime.inbound_listen_addr = "127.0.0.1:15006".parse().unwrap();
+        let env = EnvConfig {
+            mesh_peer_auth_live_reload_enabled: true,
+            frontend_tls_cert_path: Some(mesh_cert.clone()),
+            frontend_tls_key_path: Some(mesh_key.clone()),
+            frontend_tls_client_ca_bundle_path: Some(mesh_cert.clone()),
+            pool_warmup_enabled: false,
+            shutdown_drain_seconds: 0,
+            ..EnvConfig::default()
+        };
+        let proxy_state = make_test_proxy_state_with_env(
+            GatewayConfig {
+                proxies: vec![proxy],
+                ..GatewayConfig::default()
+            },
+            env.clone(),
+        );
+        proxy_state
+            .stream_listener_manager
+            .set_frontend_dtls_cert_key(dtls_cert, dtls_key, Some(dtls_ca))
+            .await;
+        proxy_state
+            .stream_listener_manager
+            .wait_until_started(Duration::from_secs(2))
+            .await
+            .expect("ordinary DTLS listener should start");
+
+        let before_gen = proxy_state
+            .stream_listener_manager
+            .snapshot_frontend_dtls_generation()
+            .expect("ordinary generation published");
+        let before_ids = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let ids = proxy_state
+                    .stream_listener_manager
+                    .active_dtls_frontend_identities_for_test()
+                    .await;
+                if !ids.is_empty() {
+                    return ids;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("DTLS server should publish into the listener slot");
+        assert_eq!(before_ids.len(), 1);
+        assert!(
+            before_ids[0].1,
+            "dedicated DTLS listener must require a client certificate"
+        );
+
+        let mesh_frontend_identity =
+            load_mesh_frontend_server_identity(&env, &test_svid_slot_from_env(&env))
+                .expect("mesh frontend identity");
+        let mut last_snapshot = Some(
+            mesh_inbound_tls_reload_snapshot(
+                &env,
+                config::MtlsMode::Disable,
+                std::collections::BTreeMap::new(),
+            )
+            .expect("initial snapshot"),
+        );
+        let has_termination_listener = runtime.has_inbound_tls_termination_listener();
+        let slice = MeshSlice {
+            version: "strict-dtls-isolation".to_string(),
+            ..slice_with_peer_auths(vec![peer_auth_with_workload_mode(config::MtlsMode::Strict)])
+        };
+        let plan = plan_mesh_inbound_tls_reload(
+            &proxy_state,
+            &runtime,
+            &slice,
+            config::MtlsMode::Strict,
+            mesh_frontend_identity.as_deref(),
+            last_snapshot.as_ref(),
+            None,
+            None,
+            false,
+            has_termination_listener,
+        )
+        .expect("Strict PeerAuthentication reload must produce a TLS plan");
+        assert!(
+            matches!(plan, MeshInboundTlsReloadPlan::Swap { .. }),
+            "Disable → Strict must swap inbound TLS, not skip the reload"
+        );
+
+        apply_mesh_inbound_tls_reload(
+            &proxy_state,
+            &slice,
+            config::MtlsMode::Strict,
+            plan,
+            &mut last_snapshot,
+            MeshInboundTlsReloadCtx {
+                has_termination_listener,
+                spiffe_bundle_slot_configured: false,
+                topology: runtime.topology,
+                production: false,
+            },
+        )
+        .await;
+
+        assert!(
+            proxy_state
+                .stream_listener_manager
+                .snapshot_frontend_tls_config()
+                .is_some(),
+            "TCP+TLS slot should be populated so the reload actually ran"
+        );
+        assert!(
+            proxy_state.mesh_inbound_tls.load_full().is_some(),
+            "HBONE inbound TLS slot should be populated by the same Swap"
+        );
+
+        let after_gen = proxy_state
+            .stream_listener_manager
+            .snapshot_frontend_dtls_generation()
+            .expect("ordinary generation retained");
+        assert_eq!(after_gen.generation, before_gen.generation);
+        assert!(
+            Arc::ptr_eq(&after_gen, &before_gen),
+            "mesh PeerAuthentication reload must not replace the ordinary DTLS generation"
+        );
+        let after_ids = proxy_state
+            .stream_listener_manager
+            .active_dtls_frontend_identities_for_test()
+            .await;
+        assert_eq!(
+            after_ids, before_ids,
+            "active ordinary DTLS server must retain exact dedicated config/security policy"
+        );
+        let status = proxy_state
+            .stream_listener_manager
+            .frontend_dtls_reload_status();
+        assert_eq!(status.last_outcome, "accepted");
+        assert_eq!(status.generation, before_gen.generation);
+
+        proxy_state.stream_listener_manager.shutdown_all().await;
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -30793,6 +30952,13 @@ mod tests {
             mesh_authz_label(&proxy_state, "app").as_deref(),
             Some("good-baseline"),
             "failed TLS rebuild should keep the previous proxy config"
+        );
+        assert!(
+            proxy_state
+                .stream_listener_manager
+                .snapshot_frontend_dtls_generation()
+                .is_none(),
+            "a rejected PeerAuthentication slice must not seed or reject ordinary DTLS generation"
         );
 
         let _ = shutdown_tx.send(true);
