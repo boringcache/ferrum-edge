@@ -60,6 +60,38 @@ pub fn frontend_tls_slot_with(initial: Arc<ServerConfig>) -> SharedFrontendTls {
     Arc::new(ArcSwap::new(Arc::new(Some(initial))))
 }
 
+/// One accepted frontend TLS publication, as a single indivisible value
+/// (issue #3857).
+///
+/// A listener family that applies a reload **asynchronously** — the QUIC/HTTP-3
+/// endpoint is the only one — cannot reconstruct the accepted generation from
+/// parts. Reading the `ServerConfig` from one slot, re-reading the client-CA
+/// source, reusing a startup CRL clone, and then fetching "the latest" trust
+/// material from another scope gives four values from four instants: the
+/// verifier it installs and the generation it publishes can describe different
+/// material, and coalesced revisions make it worse. Everything such a consumer
+/// needs is therefore published here as one `Arc`, taken with one atomic load.
+pub struct AcceptedFrontendTls {
+    /// The `ServerConfig` swapped into the plain slot for this same candidate,
+    /// including the surface's post-load opt-ins.
+    pub config: Arc<ServerConfig>,
+    /// The client-certificate verifier compiled into `config`, paired with the
+    /// semantic identity of the exact client-CA bytes and CRLs behind it.
+    pub client_trust: crate::tls::AcceptedClientTrust,
+}
+
+/// Shared accepted-candidate slot. Published by the reload task and consumed by
+/// the HTTP/3 listener, which applies its config out of band.
+pub type SharedAcceptedFrontendTls = Arc<ArcSwap<Option<Arc<AcceptedFrontendTls>>>>;
+
+/// Build a `SharedAcceptedFrontendTls` slot pre-populated with the
+/// startup-accepted candidate.
+pub fn accepted_frontend_tls_slot_with(
+    initial: Arc<AcceptedFrontendTls>,
+) -> SharedAcceptedFrontendTls {
+    Arc::new(ArcSwap::new(Arc::new(Some(initial))))
+}
+
 /// Configuration for [`spawn_frontend_tls_reload_task`].
 pub struct FrontendTlsReloadConfig {
     /// Human-readable identifier for logs ("proxy https", "admin https",
@@ -85,26 +117,37 @@ pub struct FrontendTlsReloadConfig {
     /// CA verification, session tickets). A returned `Err` keeps the previous
     /// config and emits a `warn!`.
     pub rebuild: FrontendTlsRebuildFn,
-    /// Client-trust scope this surface owns (issue #3857). When `Some`, a
+    /// Client-trust scope this surface owns (issue #3857). When non-empty, a
     /// successful rebuild publishes the accompanying
-    /// [`crate::tls::ClientTrustMaterial`] into the scope **after** the slot
-    /// swap, and a refused candidate is recorded against the scope while the
+    /// [`crate::tls::ClientTrustMaterial`] into each scope **after** the slot
+    /// swap, and a refused candidate is recorded against each scope while the
     /// last accepted generation, verifier and sessions are all retained.
+    ///
+    /// The HTTP/3 scope is deliberately absent: that endpoint applies its
+    /// config out of band and publishes its own generation from
+    /// [`accepted_slot`](Self::accepted_slot).
     pub client_trust_scopes: Vec<crate::tls::ClientTrustScope>,
+    /// Optional accepted-candidate slot for a consumer that applies the reload
+    /// asynchronously (the HTTP/3 endpoint). The task republishes the whole
+    /// [`AcceptedFrontendTls`] here on every accepted candidate, so that
+    /// consumer never has to reassemble one from independently read parts.
+    pub accepted_slot: Option<SharedAcceptedFrontendTls>,
 }
 
 /// One accepted frontend TLS candidate.
 ///
-/// Carries the semantic client-trust identity alongside the rebuilt
-/// `ServerConfig` so the generation published for an established transport can
-/// never describe material other than the material actually swapped in. Deriving
-/// it by re-reading the sources after the swap would race the next rotation.
+/// Carries the client-certificate verifier and semantic client-trust identity
+/// alongside the rebuilt `ServerConfig` so the generation published for an
+/// established transport can never describe material other than the material
+/// actually swapped in. Deriving either by re-reading the sources after the
+/// swap would race the next rotation.
 pub struct FrontendTlsRebuilt {
     /// The rebuilt server configuration to publish into the slot.
     pub config: Arc<ServerConfig>,
-    /// Semantic client-CA / CRL identity of this same candidate. `None` when
-    /// the surface does not participate in client-trust generations.
-    pub client_trust: Option<crate::tls::ClientTrustMaterial>,
+    /// Verifier + semantic client-CA / CRL identity of this same candidate.
+    /// `None` when the surface does not participate in client-trust
+    /// generations.
+    pub client_trust: Option<crate::tls::AcceptedClientTrust>,
 }
 
 /// Surface-specific rebuild closure.
@@ -133,6 +176,7 @@ pub fn spawn_frontend_tls_reload_task(
         max_material_bytes,
         rebuild,
         client_trust_scopes,
+        accepted_slot,
     } = config;
 
     let publish_rebuild = Box::new(move || {
@@ -140,9 +184,10 @@ pub fn spawn_frontend_tls_reload_task(
             Ok(rebuilt) => rebuilt,
             Err(error) => {
                 // A refused candidate keeps the last-good verifier, generation
-                // and every live session. Recording it here (rather than at the
-                // load site) is what makes "retained, not silently ignored"
-                // observable per scope.
+                // and every live session — including the HTTP/3 endpoint's,
+                // whose accepted slot is left untouched here. Recording it (
+                // rather than at the load site) is what makes "retained, not
+                // silently ignored" observable per scope.
                 for scope in &client_trust_scopes {
                     crate::tls::client_trust::record_rejected_candidate(*scope);
                 }
@@ -153,15 +198,30 @@ pub fn spawn_frontend_tls_reload_task(
             config: new_config,
             client_trust,
         } = rebuilt;
+        // Publish the whole accepted candidate before the plain slot, so a
+        // consumer that observes the new `ServerConfig` can also observe the
+        // verifier and identity that belong to it. The HTTP/3 endpoint reads
+        // only this slot, so what it installs and what it publishes are always
+        // one value — even when several revisions coalesce into one wakeup.
+        if let (Some(accepted_slot), Some(client_trust)) =
+            (accepted_slot.as_ref(), client_trust.as_ref())
+        {
+            accepted_slot.store(Arc::new(Some(Arc::new(AcceptedFrontendTls {
+                config: new_config.clone(),
+                client_trust: client_trust.clone(),
+            }))));
+        }
         // Order is load-bearing (issue #3857): the material must be observable
         // to a new handshake BEFORE the generation advances, so a listener that
         // reads the generation first and the config second can never capture a
         // generation newer than the material it actually handshakes with.
         slot.store(Arc::new(Some(new_config)));
-        if let Some(material) = client_trust {
+        if let Some(client_trust) = client_trust {
             for scope in &client_trust_scopes {
-                let publication =
-                    crate::tls::client_trust::publish_accepted_material(*scope, material.clone());
+                let publication = crate::tls::client_trust::publish_accepted_material(
+                    *scope,
+                    client_trust.material.clone(),
+                );
                 if publication.withdrew() {
                     tracing::warn!(
                         scope = publication.scope.label(),
@@ -265,6 +325,7 @@ mod tests {
                 revision_tx,
                 rebuild,
                 client_trust_scopes: Vec::new(),
+                accepted_slot: None,
             },
             Some(shutdown_rx),
         );

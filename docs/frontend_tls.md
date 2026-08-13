@@ -500,6 +500,17 @@ QUIC endpoint applies a reload asynchronously (`Endpoint::set_server_config`
 after the revision watch fires), so only the HTTP/3 listener can publish a
 generation that is not already ahead of the verifier QUIC is handshaking with.
 
+Because it applies reloads out of band, the HTTP/3 listener adopts **one whole
+accepted candidate**: the reload pipeline publishes the `rustls::ServerConfig`,
+the client-certificate verifier compiled into it, and the semantic identity of
+exactly the client-CA bytes and CRLs behind that verifier as a single value, and
+the listener installs and publishes both halves of it. The generation HTTP/3
+reports therefore always describes the anchors and revocations its endpoint is
+actually enforcing: an accepted CRL addition both retires the established HTTP/3
+connections *and* is present in the verifier a reconnecting client meets. The
+startup baseline works the same way — it is the identity of the load whose
+config the endpoint was built with, not of a later re-read of the same sources.
+
 Mesh inbound mTLS is deliberately **out of scope**. Its verifier is owned by
 PeerAuthentication / SPIFFE trust-bundle reload, which is a separate trust plane
 with its own rotation contract.
@@ -576,6 +587,13 @@ unnecessary retirement for a connection handshaking exactly across a withdrawal
 registered while a publication sweeps is caught by a post-registration re-check
 against the same fence, so it can neither escape nor repopulate the registry
 after the sweep.
+
+The HTTP/3 revision channel is a wakeup, not a queue: several accepted
+candidates can coalesce into one notification, and the sources can rotate again
+between the wakeup and the rebuild. Neither can desynchronize what that endpoint
+enforces from what it reports, because the candidate is taken as one value —
+whichever candidate is installed is the candidate whose identity is published,
+and one that arrives afterwards simply wakes the listener again.
 
 #### Observability
 

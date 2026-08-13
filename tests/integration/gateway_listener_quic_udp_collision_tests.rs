@@ -262,6 +262,7 @@ fn build_manager(state: ProxyState, bind_addr: IpAddr) -> GatewayListenerManager
         client_ca_bundle_path: None,
         client_crls: Arc::new(Vec::new()),
         tls_slot: None,
+        tls_accepted_slot: None,
         tls_revision_rx: None,
     })
 }
@@ -616,6 +617,7 @@ async fn plaintext_listener_ignores_udp_same_port_with_http3_enabled() {
         client_ca_bundle_path: None,
         client_crls: Arc::new(Vec::new()),
         tls_slot: None,
+        tls_accepted_slot: None,
         tls_revision_rx: None,
     });
     let failures = manager.reconcile().await;

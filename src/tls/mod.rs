@@ -52,7 +52,8 @@ pub use client_trust::{
     ClientTrustSession, ClientTrustSessionGuard, TrustFencedStream,
 };
 pub use frontend_reload::{
-    FrontendTlsRebuildFn, FrontendTlsRebuilt, FrontendTlsReloadConfig, SharedFrontendTls,
+    AcceptedFrontendTls, FrontendTlsRebuildFn, FrontendTlsRebuilt, FrontendTlsReloadConfig,
+    SharedAcceptedFrontendTls, SharedFrontendTls, accepted_frontend_tls_slot_with,
     empty_frontend_tls_slot, frontend_tls_slot_with, spawn_frontend_tls_reload_task,
 };
 
@@ -877,6 +878,38 @@ pub fn load_tls_config_with_client_auth_and_ocsp(
     cert_expiry_warning_days: u64,
     crls: &[CertificateRevocationListDer<'static>],
 ) -> Result<Arc<ServerConfig>, anyhow::Error> {
+    load_frontend_tls_candidate_from_paths(
+        cert_path,
+        key_path,
+        client_ca_bundle_path,
+        ocsp_response_source,
+        no_verify,
+        tls_policy,
+        cert_expiry_warning_days,
+        crls,
+    )
+    .map(|candidate| candidate.config)
+}
+
+/// [`load_tls_config_with_client_auth_and_ocsp`] that also returns the accepted
+/// candidate's client-certificate verifier and trust identity (issue #3857).
+///
+/// Startup callers that later arm a client-trust scope must use this rather
+/// than re-reading the client-CA source afterwards: a re-read can observe a
+/// *different* generation than the `ServerConfig` the listener actually serves,
+/// which understates the baseline and lets the first real withdrawal compare
+/// equal and escape.
+#[allow(clippy::too_many_arguments)]
+pub fn load_frontend_tls_candidate_from_paths(
+    cert_path: &str,
+    key_path: &str,
+    client_ca_bundle_path: Option<&str>,
+    ocsp_response_source: Option<&str>,
+    no_verify: bool,
+    tls_policy: &TlsPolicy,
+    cert_expiry_warning_days: u64,
+    crls: &[CertificateRevocationListDer<'static>],
+) -> Result<FrontendTlsCandidate, anyhow::Error> {
     let cert_source = CertSource::parse(cert_path, MaterialKind::Cert);
     let key_source = CertSource::parse(key_path, MaterialKind::Key);
     let client_ca_source =
@@ -884,7 +917,7 @@ pub fn load_tls_config_with_client_auth_and_ocsp(
     let ocsp_source =
         ocsp_response_source.map(|source| CertSource::parse(source, MaterialKind::Ocsp));
 
-    load_tls_config_with_client_auth_from_sources_and_ocsp(
+    load_frontend_tls_candidate(
         &cert_source,
         &key_source,
         client_ca_source.as_ref(),
@@ -924,6 +957,10 @@ pub fn load_tls_config_with_client_auth_from_sources(
     )
 }
 
+// Retained as the source-typed projection of the frontend loader. Live callers
+// go through `load_frontend_tls_candidate`, so the bin target sees this only
+// from `tests/`.
+#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 pub fn load_tls_config_with_client_auth_from_sources_and_ocsp(
     cert_source: &CertSource,
@@ -948,8 +985,38 @@ pub fn load_tls_config_with_client_auth_from_sources_and_ocsp(
     .map(|candidate| candidate.config)
 }
 
+/// The client-certificate verifier of one accepted frontend candidate, paired
+/// with the semantic trust identity of **the exact bytes it was compiled from**
+/// (issue #3857).
+///
+/// The pairing is the whole point: a listener that installs `verifier` and
+/// publishes `material` cannot describe a generation it is not actually
+/// enforcing. Any consumer that would otherwise re-read the client-CA source or
+/// reuse a startup CRL clone must take both halves from one value of this type.
+#[derive(Clone)]
+pub struct AcceptedClientTrust {
+    /// The verifier installed for this candidate, or `None` when the surface
+    /// performs no client-certificate authentication (no client-CA source, or
+    /// verification explicitly disabled).
+    pub verifier: Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>,
+    /// Semantic client-CA / CRL identity of exactly the material `verifier` was
+    /// built from.
+    pub material: client_trust::ClientTrustMaterial,
+}
+
+impl std::fmt::Debug for AcceptedClientTrust {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // No certificate field, path, or digest — only whether client
+        // authentication is armed at all.
+        f.debug_struct("AcceptedClientTrust")
+            .field("client_auth", &self.verifier.is_some())
+            .finish()
+    }
+}
+
 /// One accepted frontend TLS candidate: the rebuilt `ServerConfig` plus the
-/// semantic client-CA / CRL identity of **the same load** (issue #3857).
+/// client-certificate verifier and semantic client-CA / CRL identity of **the
+/// same load** (issue #3857).
 ///
 /// The trust identity is captured from the bytes this call actually verified, so
 /// the generation an established transport is fenced against can never describe
@@ -959,8 +1026,8 @@ pub fn load_tls_config_with_client_auth_from_sources_and_ocsp(
 pub struct FrontendTlsCandidate {
     /// The rebuilt server configuration.
     pub config: Arc<ServerConfig>,
-    /// Semantic client-trust identity of the same accepted material.
-    pub client_trust: client_trust::ClientTrustMaterial,
+    /// Verifier + semantic identity of the same accepted material.
+    pub client_trust: AcceptedClientTrust,
 }
 
 /// [`load_tls_config_with_client_auth_from_sources_and_ocsp`] that also returns
@@ -1078,11 +1145,15 @@ pub(crate) fn finish_frontend_server_config(
 }
 
 /// [`finish_frontend_server_config`] with an optional out-parameter for the
-/// accepted candidate's client-trust identity (issue #3857).
+/// accepted candidate's client-certificate verifier and trust identity
+/// (issue #3857).
 ///
-/// The identity is derived from the exact client-CA bytes this call loaded and
+/// Both halves are derived from the exact client-CA bytes this call loaded and
 /// verified, together with the exact CRL list compiled into the verifier — the
-/// only point where both are known to belong to one accepted generation.
+/// only point where they are known to belong to one accepted generation. The
+/// captured verifier is the very object installed in the returned
+/// `ServerConfig`, so a second listener family (HTTP/3) can adopt it instead of
+/// rebuilding one from an independently re-read source.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn finish_frontend_server_config_capturing_trust(
     cert_resolver: Arc<dyn rustls::server::ResolvesServerCert>,
@@ -1093,7 +1164,7 @@ pub(crate) fn finish_frontend_server_config_capturing_trust(
     crls: &[CertificateRevocationListDer<'static>],
     cert_source_display: &str,
     key_source_display: &str,
-    client_trust_out: Option<&mut Option<client_trust::ClientTrustMaterial>>,
+    client_trust_out: Option<&mut Option<AcceptedClientTrust>>,
 ) -> Result<Arc<ServerConfig>, anyhow::Error> {
     let builder = ServerConfig::builder_with_provider(tls_policy.crypto_provider.clone())
         .with_protocol_versions(&tls_policy.protocol_versions)
@@ -1120,6 +1191,46 @@ pub(crate) fn finish_frontend_server_config_capturing_trust(
         })
         .transpose()?;
 
+    // Build the client-certificate verifier BEFORE the `ServerConfig`, so the
+    // exact object installed below is also the object handed to
+    // `client_trust_out`. A second family that adopts it (the HTTP/3 endpoint)
+    // then enforces the same anchors and the same CRLs the identity describes,
+    // instead of a set re-read at some later instant.
+    let (client_ca_material, client_auth_roots) = match client_ca {
+        Some((ca_material, roots)) => (Some(ca_material), Some(roots)),
+        None => (None, None),
+    };
+    let client_cert_verifier = match (no_verify, client_auth_roots) {
+        (false, Some(client_auth_roots)) => {
+            info!(
+                "TLS configuration loaded with client certificate verification from cert source: {}, key source: {}, client CA source: {} (roots: {})",
+                cert_source_display,
+                key_source_display,
+                client_ca_material
+                    .as_ref()
+                    .map_or("<none>", |material| material.display_source_id.as_str()),
+                client_auth_roots.len()
+            );
+
+            let mut verifier_builder =
+                rustls::server::WebPkiClientVerifier::builder(Arc::new(client_auth_roots));
+            if !crls.is_empty() {
+                verifier_builder = verifier_builder
+                    .with_crls(crls.iter().cloned())
+                    .allow_unknown_revocation_status()
+                    .only_check_end_entity_revocation();
+                info!(
+                    "Client certificate CRL checking enabled ({} CRL(s))",
+                    crls.len()
+                );
+            }
+            Some(verifier_builder.build().map_err(|e| {
+                anyhow::anyhow!("Failed to build client certificate verifier: {}", e)
+            })?)
+        }
+        _ => None,
+    };
+
     if let Some(out) = client_trust_out {
         // `no_verify` disables client authentication outright, so no transport
         // on this listener can hold a client-certificate trust decision and the
@@ -1129,14 +1240,17 @@ pub(crate) fn finish_frontend_server_config_capturing_trust(
             client_trust::ClientTrustMaterial::default()
         } else {
             client_trust::ClientTrustMaterial::from_parts(
-                client_ca
+                client_ca_material
                     .as_ref()
-                    .map(|(ca_material, _)| ca_material.bytes.expose_secret()),
+                    .map(|material| material.bytes.expose_secret()),
                 crls,
             )
             .map_err(|error| anyhow::anyhow!("{error}"))?
         };
-        *out = Some(material);
+        *out = Some(AcceptedClientTrust {
+            verifier: client_cert_verifier.clone(),
+            material,
+        });
     }
 
     let mut config = if no_verify {
@@ -1149,31 +1263,7 @@ pub(crate) fn finish_frontend_server_config_capturing_trust(
         builder
             .with_no_client_auth()
             .with_cert_resolver(cert_resolver)
-    } else if let Some((ca_material, client_auth_roots)) = client_ca {
-        info!(
-            "TLS configuration loaded with client certificate verification from cert source: {}, key source: {}, client CA source: {} (roots: {})",
-            cert_source_display,
-            key_source_display,
-            ca_material.display_source_id,
-            client_auth_roots.len()
-        );
-
-        let mut verifier_builder =
-            rustls::server::WebPkiClientVerifier::builder(Arc::new(client_auth_roots));
-        if !crls.is_empty() {
-            verifier_builder = verifier_builder
-                .with_crls(crls.iter().cloned())
-                .allow_unknown_revocation_status()
-                .only_check_end_entity_revocation();
-            info!(
-                "Client certificate CRL checking enabled ({} CRL(s))",
-                crls.len()
-            );
-        }
-        let client_cert_verifier = verifier_builder
-            .build()
-            .map_err(|e| anyhow::anyhow!("Failed to build client certificate verifier: {}", e))?;
-
+    } else if let Some(client_cert_verifier) = client_cert_verifier {
         builder
             .with_client_cert_verifier(client_cert_verifier)
             .with_cert_resolver(cert_resolver)
@@ -1993,10 +2083,37 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
 /// When `crls` is non-empty, CRL revocation checking is enabled with the same
 /// policy used by H1/H2 frontend mTLS and DTLS:
 /// `allow_unknown_revocation_status` + `only_check_end_entity_revocation`.
+// Verifier-only projection. Production callers need the paired trust identity
+// and use `build_client_cert_verifier_candidate`, so the bin target sees this
+// only from `tests/`.
+#[allow(dead_code)]
 pub fn build_client_cert_verifier(
     ca_bundle_path: &str,
     crls: &[CertificateRevocationListDer<'static>],
 ) -> Result<Arc<dyn rustls::server::danger::ClientCertVerifier>, anyhow::Error> {
+    build_client_cert_verifier_candidate(ca_bundle_path, crls).map(|accepted| accepted.verifier)
+}
+
+/// One coherently loaded client-certificate verifier and the semantic identity
+/// of the exact bytes it was built from (issue #3857).
+///
+/// The client-CA source is read **once** and both the verifier and the identity
+/// come out of that single read, together with the CRL list handed in. A caller
+/// that installs the verifier may therefore publish the identity without ever
+/// describing material it is not enforcing.
+pub struct ClientCertVerifierCandidate {
+    /// The verifier to install.
+    pub verifier: Arc<dyn rustls::server::danger::ClientCertVerifier>,
+    /// Semantic identity of the same anchors and CRLs.
+    pub material: client_trust::ClientTrustMaterial,
+}
+
+/// [`build_client_cert_verifier`] that also returns the trust identity of the
+/// exact material the verifier was compiled from.
+pub fn build_client_cert_verifier_candidate(
+    ca_bundle_path: &str,
+    crls: &[CertificateRevocationListDer<'static>],
+) -> Result<ClientCertVerifierCandidate, anyhow::Error> {
     let ca_source = CertSource::parse(ca_bundle_path, MaterialKind::CaBundle);
     let ca_material = load_material_blocking(&ca_source, MaterialKind::CaBundle)?;
     let client_auth_roots = root_cert_store_from_pem_bundle(
@@ -2004,6 +2121,11 @@ pub fn build_client_cert_verifier(
         "client CA bundle",
         &ca_material.display_source_id,
     )?;
+    // Summarized from the same bytes the roots were parsed from, before the
+    // buffer is dropped — not from a second read of the source.
+    let material =
+        client_trust::ClientTrustMaterial::from_parts(Some(ca_material.bytes.expose_secret()), crls)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
 
     let mut verifier_builder =
         rustls::server::WebPkiClientVerifier::builder(Arc::new(client_auth_roots));
@@ -2018,9 +2140,10 @@ pub fn build_client_cert_verifier(
         );
     }
 
-    verifier_builder
+    let verifier = verifier_builder
         .build()
-        .map_err(|e| anyhow::anyhow!("Failed to build client certificate verifier: {}", e))
+        .map_err(|e| anyhow::anyhow!("Failed to build client certificate verifier: {}", e))?;
+    Ok(ClientCertVerifierCandidate { verifier, material })
 }
 
 /// Check X.509 certificate expiration for a PEM certificate file.

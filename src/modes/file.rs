@@ -947,15 +947,22 @@ pub async fn serve(
 
     // Validate frontend TLS config if provided (paths, expiry, key match).
     // Shared loader with `ferrum-edge validate` (issue #2976).
-    let tls_config = match startup_security::try_load_frontend_tls(&env_config, &tls_policy, &crls)
-    {
-        Ok(Some(mut config)) => {
+    // The candidate carries the client-certificate verifier and trust identity
+    // of this same load, so the client-trust baseline armed below describes
+    // exactly the material these listeners serve (issue #3857).
+    let tls_startup = match startup_security::try_load_frontend_tls_candidate(
+        &env_config,
+        &tls_policy,
+        &crls,
+    ) {
+        Ok(Some(candidate)) => {
+            let mut config = candidate.config;
             info!("Loading TLS configuration with client certificate verification...");
             tls::enable_early_data(&mut config, &tls_policy);
             if env_config.ktls_enabled.could_be_enabled() {
                 tls::enable_secret_extraction_for_ktls(&mut config);
             }
-            Some(config)
+            Some((config, candidate.client_trust))
         }
         Ok(None) => None,
         Err(e) => {
@@ -970,9 +977,14 @@ pub async fn serve(
     // rationale). File-mode listeners participate identically: live reload is
     // opt-in via FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED and disabled by
     // default.
+    let (tls_config, frontend_startup_client_trust) = match tls_startup {
+        Some((config, client_trust)) => (Some(config), Some(client_trust)),
+        None => (None, None),
+    };
     let mut proxy_frontend_reload_handles = tls_config.as_ref().map(|cfg| {
         crate::modes::tls_reload::prepare_proxy_frontend_tls(
             cfg.clone(),
+            frontend_startup_client_trust.clone(),
             &env_config,
             &tls_policy,
             &crls,
@@ -1135,13 +1147,13 @@ pub async fn serve(
         && env_config.admin_tls_cert_path.is_some()
         && env_config.admin_tls_key_path.is_some()
     {
-        let admin_tls_config = match startup_security::load_admin_tls_material(
+        let admin_tls_candidate = match startup_security::load_admin_tls_candidate(
             &env_config,
             &tls_policy,
             &crls,
             "Invalid admin TLS configuration",
         ) {
-            Ok(config) => config,
+            Ok(candidate) => candidate,
             Err(e) => {
                 error!("Admin TLS configuration failed: {:#}", e);
                 shutdown_file_background_startup_tasks(
@@ -1153,8 +1165,12 @@ pub async fn serve(
                 return Err(e);
             }
         };
+        let admin_tls_config = admin_tls_candidate.config;
         let mut admin_reload_handles = crate::modes::tls_reload::prepare_admin_frontend_tls(
             admin_tls_config.clone(),
+            // Baseline from the exact load that produced `admin_tls_config`
+            // (issue #3857), never from a second read of the client-CA source.
+            Some(admin_tls_candidate.client_trust),
             &env_config,
             &tls_policy,
             &crls,
@@ -1457,6 +1473,9 @@ pub async fn serve(
             tls_slot: proxy_frontend_reload_handles
                 .as_ref()
                 .and_then(|h| h.slot.clone()),
+            tls_accepted_slot: proxy_frontend_reload_handles
+                .as_ref()
+                .and_then(|h| h.accepted_slot.clone()),
             tls_revision_rx: proxy_frontend_reload_handles
                 .as_ref()
                 .and_then(|h| h.revision_rx.clone()),

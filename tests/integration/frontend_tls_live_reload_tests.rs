@@ -230,3 +230,212 @@ async fn dynamic_tls_listener_serves_rotated_cert_after_slot_swap() {
         .expect("listener task should join")
         .expect("listener should return cleanly");
 }
+
+// ---------------------------------------------------------------------------
+// HTTP/3 accepted-candidate binding (issue #3857)
+// ---------------------------------------------------------------------------
+
+/// Materials for a frontend surface that terminates client certificates.
+struct ClientAuthMaterials {
+    _dir: tempfile::TempDir,
+    cert_path: String,
+    key_path: String,
+    ca_path: String,
+    crl_path: String,
+    client_der: Vec<u8>,
+}
+
+/// Write a server identity, a client CA, one client certificate under that CA,
+/// and a CRL that already revokes it. The revocation is in the STARTUP CRL on
+/// purpose: it is what proves the accepted candidate's verifier is compiled
+/// from the CRLs of the same load, rather than from an unrelated list.
+fn write_client_auth_materials() -> ClientAuthMaterials {
+    ensure_crypto_provider();
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("CA key");
+    let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("CA params");
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    ca_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "Frontend Client CA");
+    ca_params.key_usages.push(rcgen::KeyUsagePurpose::KeyCertSign);
+    ca_params.key_usages.push(rcgen::KeyUsagePurpose::CrlSign);
+    let ca_cert = ca_params.self_signed(&ca_key).expect("self-signed CA");
+    let issuer = rcgen::Issuer::new(ca_params, ca_key);
+
+    let client_serial = 0x3857u64;
+    let client_key =
+        rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("client key");
+    let mut client_params =
+        rcgen::CertificateParams::new(Vec::<String>::new()).expect("client params");
+    client_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "frontend-client");
+    client_params
+        .extended_key_usages
+        .push(rcgen::ExtendedKeyUsagePurpose::ClientAuth);
+    client_params
+        .key_usages
+        .push(rcgen::KeyUsagePurpose::DigitalSignature);
+    client_params.serial_number = Some(rcgen::SerialNumber::from(client_serial));
+    let client_cert = client_params
+        .signed_by(&client_key, &issuer)
+        .expect("client cert");
+
+    let now = time::OffsetDateTime::now_utc();
+    let crl_pem = rcgen::CertificateRevocationListParams {
+        this_update: now,
+        next_update: now + time::Duration::days(30),
+        crl_number: rcgen::SerialNumber::from(1u64),
+        issuing_distribution_point: None,
+        revoked_certs: vec![rcgen::RevokedCertParams {
+            serial_number: rcgen::SerialNumber::from(client_serial),
+            revocation_time: now,
+            reason_code: Some(rcgen::RevocationReason::KeyCompromise),
+            invalidity_date: None,
+        }],
+        key_identifier_method: rcgen::KeyIdMethod::Sha256,
+    }
+    .signed_by(&issuer)
+    .expect("sign CRL")
+    .pem()
+    .expect("CRL PEM");
+
+    let server_key =
+        rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("server key");
+    let server_params =
+        rcgen::CertificateParams::new(vec!["localhost".to_string()]).expect("server params");
+    let server_cert = server_params
+        .self_signed(&server_key)
+        .expect("self-signed server cert");
+
+    let cert_path = dir.path().join("server-cert.pem");
+    let key_path = dir.path().join("server-key.pem");
+    let ca_path = dir.path().join("client-ca.pem");
+    let crl_path = dir.path().join("revocations.pem");
+    std::fs::write(&cert_path, server_cert.pem()).expect("write server cert");
+    std::fs::write(&key_path, server_key.serialize_pem()).expect("write server key");
+    std::fs::write(&ca_path, ca_cert.pem()).expect("write client CA");
+    std::fs::write(&crl_path, &crl_pem).expect("write CRL");
+
+    ClientAuthMaterials {
+        cert_path: cert_path.to_string_lossy().into_owned(),
+        key_path: key_path.to_string_lossy().into_owned(),
+        ca_path: ca_path.to_string_lossy().into_owned(),
+        crl_path: crl_path.to_string_lossy().into_owned(),
+        client_der: client_cert.der().to_vec(),
+        _dir: dir,
+    }
+}
+
+/// The proxy frontend reload wiring must hand the HTTP/3 listener ONE accepted
+/// candidate (issue #3857), and arm the proxy client-trust baseline from that
+/// same load.
+///
+/// The H3 endpoint applies its config asynchronously, so before this it rebuilt
+/// a verifier from a re-read client-CA source plus the startup CRL clone and
+/// then published the proxy scope's latest material as its own generation —
+/// three different instants, one published generation. Here the config in the
+/// serving slot, the verifier, and the identity are asserted to be one value:
+/// the accepted candidate's `config` is the very `Arc` the listeners serve, its
+/// verifier enforces the CRLs of that load, and its identity is what the proxy
+/// scope was armed with.
+#[tokio::test]
+async fn proxy_frontend_reload_publishes_one_accepted_candidate_for_http3() {
+    ensure_crypto_provider();
+    let materials = write_client_auth_materials();
+
+    let env = EnvConfig {
+        frontend_tls_live_reload_enabled: true,
+        frontend_tls_cert_path: Some(materials.cert_path.clone()),
+        frontend_tls_key_path: Some(materials.key_path.clone()),
+        frontend_tls_client_ca_bundle_path: Some(materials.ca_path.clone()),
+        tls_crl_file_path: Some(materials.crl_path.clone()),
+        // Long enough that no background poll can interleave with the
+        // assertions below; every assertion is on the startup publication.
+        frontend_tls_watch_interval_seconds: 3600,
+        ..EnvConfig::default()
+    };
+    let tls_policy = ferrum_edge::tls::TlsPolicy::from_env_config(&env).expect("tls policy");
+    let crls = ferrum_edge::tls::load_crls(env.tls_crl_file_path.as_deref()).expect("load CRLs");
+    assert!(!crls.is_empty(), "the startup CRL must parse");
+
+    let candidate = ferrum_edge::modes::startup_security::try_load_frontend_tls_candidate(
+        &env,
+        &tls_policy,
+        &crls,
+    )
+    .expect("startup frontend TLS load")
+    .expect("cert and key are configured");
+    let startup_material = candidate.client_trust.material.clone();
+
+    // The registry is process-global; this is the only integration test that
+    // publishes into it.
+    ferrum_edge::tls::client_trust::reset_for_test();
+
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let mut handles = ferrum_edge::modes::tls_reload::prepare_proxy_frontend_tls(
+        candidate.config.clone(),
+        Some(candidate.client_trust),
+        &env,
+        &tls_policy,
+        &crls,
+        Some(shutdown_rx),
+    );
+
+    let slot = handles.slot.clone().expect("live reload publishes a slot");
+    let accepted_slot = handles
+        .accepted_slot
+        .clone()
+        .expect("live reload publishes an accepted candidate for the H3 listener");
+    let accepted = accepted_slot
+        .load_full()
+        .as_ref()
+        .clone()
+        .expect("the accepted slot is pre-populated at startup");
+
+    let served = slot.load_full().as_ref().clone().expect("slot config");
+    assert!(
+        Arc::ptr_eq(&accepted.config, &served),
+        "the accepted candidate must carry the very ServerConfig the listeners serve, not a \
+         separately loaded one"
+    );
+
+    // The verifier the H3 endpoint would install enforces the CRLs of this same
+    // load: the client certificate the startup CRL revokes is refused.
+    let verifier = accepted
+        .client_trust
+        .verifier
+        .as_ref()
+        .expect("a configured client CA must yield a verifier");
+    assert!(
+        verifier
+            .verify_client_cert(
+                &rustls::pki_types::CertificateDer::from(materials.client_der.clone()),
+                &[],
+                rustls::pki_types::UnixTime::now(),
+            )
+            .is_err(),
+        "the accepted candidate's verifier must enforce the CRLs of its own load"
+    );
+
+    // ...and the identity published alongside it is the identity of exactly
+    // that material, which is also the proxy scope's armed baseline. A baseline
+    // re-read from the client-CA source could describe a different generation.
+    assert_eq!(
+        accepted.client_trust.material, startup_material,
+        "the accepted candidate's identity must be the startup load's identity"
+    );
+    assert_eq!(
+        ferrum_edge::tls::client_trust::current_material(
+            ferrum_edge::tls::ClientTrustScope::ProxyFrontend
+        ),
+        Some(startup_material),
+        "the proxy client-trust baseline must be armed from the served load, not a re-read"
+    );
+
+    if let Some(watcher) = handles.watcher_handle.take() {
+        watcher.abort();
+    }
+}

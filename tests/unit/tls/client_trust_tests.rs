@@ -23,7 +23,11 @@ use rcgen::{
 };
 use rustls::pki_types::CertificateRevocationListDer;
 
-fn registry_lock() -> MutexGuard<'static, ()> {
+/// The one lock every test in this binary that touches the process-global trust
+/// registry must hold. `frontend_trust_binding_tests` shares it, because
+/// `reset_for_test` clears every scope: two files with private locks would reset
+/// each other mid-test.
+pub(crate) fn registry_lock() -> MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
         .lock()
@@ -31,7 +35,7 @@ fn registry_lock() -> MutexGuard<'static, ()> {
 }
 
 /// Take the registry lock and reset every scope. Held for the test body.
-fn isolated_registry() -> MutexGuard<'static, ()> {
+pub(crate) fn isolated_registry() -> MutexGuard<'static, ()> {
     let guard = registry_lock();
     client_trust::reset_for_test();
     guard

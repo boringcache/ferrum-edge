@@ -278,9 +278,25 @@ pub struct Http3ListenerOptions {
 pub struct Http3FrontendTlsReload {
     /// Shared frontend TLS slot. The proxy HTTPS / H2 / H3 listeners read
     /// from the same slot so they observe the same rotated cert/key pair.
+    ///
+    /// Used only when [`Self::accepted_slot`] is absent — a slot fed by some
+    /// other publisher (the DP's CP-delivered Gateway TLS overlay) carries the
+    /// server config alone.
     pub tls_slot: crate::tls::SharedFrontendTls,
+    /// Accepted-candidate slot published by the frontend reload pipeline
+    /// (issue #3857). When present this is the ONLY thing the reload arm reads:
+    /// one atomic load yields the `ServerConfig`, the client-certificate
+    /// verifier compiled into it, and the trust identity of exactly the
+    /// client-CA bytes and CRLs behind that verifier. Reassembling those from
+    /// separate reads is what let this listener install one verifier and
+    /// publish a generation describing another.
+    pub accepted_slot: Option<crate::tls::SharedAcceptedFrontendTls>,
     /// Revision counter bumped by the file-watch task after every successful
     /// reload. The H3 listener subscribes so it doesn't poll the slot.
+    ///
+    /// The counter is only a wakeup: several accepted revisions may coalesce
+    /// into one notification, so the arm always adopts whatever the accepted
+    /// slot holds *at that moment* and publishes that same value's identity.
     pub revision_rx: tokio::sync::watch::Receiver<u64>,
 }
 
@@ -318,6 +334,64 @@ pub async fn start_http3_listener(
     .await
 }
 
+/// Load the configured client-CA bundle and CRLs into one coherent
+/// [`crate::tls::AcceptedClientTrust`] (issue #3857).
+///
+/// Used only when no accepted candidate is published for this listener (H3
+/// startup, and a slot fed by the DP's CP-delivered overlay). The client-CA
+/// source is read once and the verifier and the identity both come out of that
+/// single read, so what this listener installs and what it publishes always
+/// describe the same anchors and the same revocations.
+fn load_configured_h3_client_trust(
+    client_ca_bundle_path: Option<&str>,
+    client_crls: &CrlList,
+) -> Result<crate::tls::AcceptedClientTrust, anyhow::Error> {
+    match client_ca_bundle_path {
+        // Do NOT interpolate the source into the error: a client CA bundle can
+        // be configured as inline PEM (`CertSource::InlinePem`), so the "path"
+        // may itself be secret material. The inner error already carries the
+        // redacted source id.
+        Some(ca_path) => crate::tls::build_client_cert_verifier_candidate(ca_path, client_crls)
+            .map(|candidate| crate::tls::AcceptedClientTrust {
+                verifier: Some(candidate.verifier),
+                material: candidate.material,
+            })
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "HTTP/3 mTLS is configured but the client certificate verifier could not \
+                     be built: {}. Refusing to serve HTTP/3 without client authentication.",
+                    e
+                )
+            }),
+        None => Ok(crate::tls::AcceptedClientTrust {
+            verifier: None,
+            material: crate::tls::ClientTrustMaterial::from_parts(None, client_crls)
+                .map_err(|error| anyhow::anyhow!("{error}"))?,
+        }),
+    }
+}
+
+/// Resolve the candidate a reload wakeup should adopt on a listener that has no
+/// accepted-candidate slot (the DP's CP-delivered frontend TLS overlay writes
+/// the config slot directly).
+///
+/// The client-CA bundle and CRLs are loaded here, once, so the verifier this
+/// listener installs and the identity it publishes still come from a single
+/// read. `Ok(None)` means the slot holds no config and the endpoint should be
+/// disabled; an `Err` means the configured client trust is unusable and the
+/// previous config must be retained.
+fn configured_h3_reload_candidate(
+    slot: Option<&crate::tls::SharedFrontendTls>,
+    client_ca_bundle_path: Option<&str>,
+    client_crls: &CrlList,
+) -> Result<Option<(Arc<rustls::ServerConfig>, crate::tls::AcceptedClientTrust)>, anyhow::Error> {
+    let Some(new_tls) = slot.and_then(|slot| slot.load_full().as_ref().clone()) else {
+        return Ok(None);
+    };
+    let client_trust = load_configured_h3_client_trust(client_ca_bundle_path, client_crls)?;
+    Ok(Some((new_tls, client_trust)))
+}
+
 /// Build a fresh `quinn::ServerConfig` from a rustls server config, the
 /// shared TLS policy, and the H3 transport tuning. Used at startup AND on
 /// every successful frontend TLS cert/key reload.
@@ -325,11 +399,15 @@ pub async fn start_http3_listener(
 /// Forces TLS 1.3 (RFC 9001), carries forward client-cert mTLS if configured,
 /// applies 0-RTT and session-ticket resumption from the gateway policy, and
 /// stamps the H3-only ALPN advertisement.
+///
+/// `client_trust` is the verifier this endpoint will enforce together with the
+/// identity of the material behind it; the caller publishes exactly that
+/// identity once quinn has adopted the returned config.
 fn build_h3_quinn_server_config(
     tls_config: &Arc<rustls::ServerConfig>,
     tls_policy: &TlsPolicy,
-    client_ca_bundle_path: Option<&str>,
-    client_crls: &CrlList,
+    client_trust: &crate::tls::AcceptedClientTrust,
+    client_auth_configured: bool,
     h3_config: &Http3ServerConfig,
 ) -> Result<quinn::ServerConfig, anyhow::Error> {
     // HTTP/3 (QUIC) requires TLS 1.3 — rebuild the server config with TLS 1.3 forced.
@@ -393,40 +471,32 @@ fn build_h3_quinn_server_config(
     // Reuse the cert chain and key from the original config.
     // Carry forward mTLS (client cert verification) if configured.
     //
-    // FAIL CLOSED: when a client CA bundle IS configured but the client-cert
-    // verifier cannot be built (missing / unreadable / invalid / empty CA
-    // bundle, or a transient read fault), return an error instead of silently
-    // downgrading to `with_no_client_auth()`. Silently dropping client auth
-    // would let HTTP/3 clients present no certificate to a listener the
-    // operator configured for mTLS. At startup the error aborts the H3
-    // listener; on a frontend TLS reload the caller keeps the previous,
+    // FAIL CLOSED: when a client CA bundle IS configured but the candidate
+    // carries no verifier (missing / unreadable / invalid / empty CA bundle, a
+    // transient read fault, or a snapshot that somehow lost it), return an error
+    // instead of silently downgrading to `with_no_client_auth()`. Silently
+    // dropping client auth would let HTTP/3 clients present no certificate to a
+    // listener the operator configured for mTLS. At startup the error aborts the
+    // H3 listener; on a frontend TLS reload the caller keeps the previous,
     // still-mTLS-protected server config (see the `Err` arm of the reload
     // handler). This mirrors the fail-closed contract of the H1/H2 frontend
     // path (`crate::tls::load_tls_config_with_client_auth*`) and the mesh
-    // inbound verifier — only an explicitly *unconfigured* client CA (the
-    // `else` branch) yields no client auth.
-    let mut server_tls_config = if let Some(ca_path) = client_ca_bundle_path {
-        // Do NOT interpolate `ca_path` into the error: a client CA bundle can be
-        // configured as inline PEM (`CertSource::InlinePem`), so the "path" may
-        // itself be secret material (e.g. a pasted private key in a malformed
-        // bundle). `build_client_cert_verifier` already surfaces the redacted
-        // source id (`CertSource::source_id()` -> `inline-pem:<redacted>`) in
-        // `e`, so the wrapper only adds operator-facing context.
-        let verifier =
-            crate::tls::build_client_cert_verifier(ca_path, client_crls).map_err(|e| {
-                anyhow::anyhow!(
-                    "HTTP/3 mTLS is configured but the client certificate verifier could not \
-                     be built: {}. Refusing to serve HTTP/3 without client authentication.",
-                    e
-                )
-            })?;
-        h3_builder
+    // inbound verifier — only an explicitly *unconfigured* client CA yields no
+    // client auth.
+    let mut server_tls_config = match (client_auth_configured, client_trust.verifier.clone()) {
+        (_, Some(verifier)) => h3_builder
             .with_client_cert_verifier(verifier)
-            .with_cert_resolver(tls_config.cert_resolver.clone())
-    } else {
-        h3_builder
+            .with_cert_resolver(tls_config.cert_resolver.clone()),
+        (true, None) => {
+            return Err(anyhow::anyhow!(
+                "HTTP/3 mTLS is configured but the accepted frontend TLS candidate carries no \
+                 client certificate verifier. Refusing to serve HTTP/3 without client \
+                 authentication."
+            ));
+        }
+        (false, None) => h3_builder
             .with_no_client_auth()
-            .with_cert_resolver(tls_config.cert_resolver.clone())
+            .with_cert_resolver(tls_config.cert_resolver.clone()),
     };
 
     server_tls_config.alpn_protocols = vec![b"h3".to_vec()];
@@ -442,10 +512,8 @@ fn build_h3_quinn_server_config(
     // and the 0.5-RTT application accept path are both disabled. Mapping here
     // keeps startup and live reload fail-closed: quinn rejects any other size,
     // so we never pass the policy's finite aspirational value through.
-    server_tls_config.max_early_data_size = quic_max_early_data_size(
-        tls_policy.early_data_max_size > 0,
-        client_ca_bundle_path.is_some(),
-    );
+    server_tls_config.max_early_data_size =
+        quic_max_early_data_size(tls_policy.early_data_max_size > 0, client_auth_configured);
 
     // Rustls accepts server early data only with stateful resumption, because
     // the stored session record carries the freshness/anti-replay inputs. Keep
@@ -659,6 +727,24 @@ pub async fn start_http3_listener_with_signal(
         .as_ref()
         .is_some_and(|reload| reload.tls_slot.load_full().as_ref().is_none());
 
+    // Frontend client-certificate authentication is a property of the listener,
+    // not of an individual connection: a client-CA bundle is either configured
+    // for this listener or it is not, at startup and on every reload alike.
+    let client_auth_configured = client_ca_bundle_path.is_some();
+
+    // The client trust the STARTUP endpoint config enforces, loaded coherently
+    // (issue #3857): one read of the client-CA source produces both the verifier
+    // installed below and the identity published for it. `None` in the disabled
+    // branch — nothing is installed there, so there is nothing to describe.
+    let startup_client_trust = if start_disabled {
+        None
+    } else {
+        Some(load_configured_h3_client_trust(
+            client_ca_bundle_path.as_deref(),
+            &client_crls,
+        )?)
+    };
+
     let endpoint = if start_disabled {
         let socket = std::net::UdpSocket::bind(addr)?;
         socket.set_nonblocking(true)?;
@@ -669,11 +755,14 @@ pub async fn start_http3_listener_with_signal(
         info!("HTTP/3 listener started disabled until frontend TLS material is available");
         endpoint
     } else {
+        let startup_client_trust = startup_client_trust
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("internal error: HTTP/3 startup client trust missing"))?;
         let server_config = build_h3_quinn_server_config(
             &tls_config,
             tls_policy,
-            client_ca_bundle_path.as_deref(),
-            &client_crls,
+            startup_client_trust,
+            client_auth_configured,
             &h3_config,
         )?;
         // Quinn's `Endpoint::server` convenience constructor is gated on its
@@ -716,13 +805,9 @@ pub async fn start_http3_listener_with_signal(
     // the same QUIC handshake bound without reading `state.env_config` per-conn.
     // `Duration::ZERO` preserves the documented "0 disables" semantic.
     let handshake_timeout = h3_config.handshake_timeout;
-    // Frontend client-certificate authentication is a property of the listener,
-    // not of an individual connection: `build_h3_quinn_server_config` installs a
-    // client-cert verifier exactly when `client_ca_bundle_path` is set, and the
-    // reload path rebuilds with the same path. When it is set, the 0.5-RTT
-    // accept path is refused for every connection so peer identity is only ever
-    // read after handshake completion (issue #2938).
-    let client_auth_configured = client_ca_bundle_path.is_some();
+    // When client authentication is configured the 0.5-RTT accept path is
+    // refused for every connection so peer identity is only ever read after
+    // handshake completion (issue #2938).
     if client_auth_configured && !state.early_data_methods.is_empty() {
         warn!(
             "HTTP/3 0-RTT is disabled on this listener because frontend mTLS \
@@ -752,16 +837,35 @@ pub async fn start_http3_listener_with_signal(
     // never wakes — combined with the `reload_active=false` gate the branch
     // is effectively dead.
     let (sentinel_tx, sentinel_rx) = tokio::sync::watch::channel(0u64);
-    let (mut reload_rx, reload_slot, reload_active) = match frontend_tls_reload {
+    let (mut reload_rx, reload_slot, reload_accepted, reload_active) = match frontend_tls_reload {
         Some(Http3FrontendTlsReload {
             tls_slot,
+            accepted_slot,
             revision_rx,
-        }) => (revision_rx, Some(tls_slot), true),
-        None => (sentinel_rx, None, false),
+        }) => (revision_rx, Some(tls_slot), accepted_slot, true),
+        None => (sentinel_rx, None, None, false),
     };
     // Tie the sentinel sender's lifetime to the loop so a `None` reload
     // input cannot accidentally trigger `.changed()` via channel close.
     let _sentinel_tx_keep_alive = sentinel_tx;
+
+    // Arm the H3 client-trust scope from the material the endpoint config built
+    // above actually enforces (issue #3857), before the accept loop admits its
+    // first Initial. `ProxyH3` is deliberately armed HERE and nowhere else: the
+    // proxy HTTPS family advances its own generation the moment the shared slot
+    // is swapped, which can be long before this endpoint applies the same
+    // candidate, so a baseline inherited from that scope would already describe
+    // material QUIC is not handshaking with.
+    //
+    // Only when a reload channel exists: without one no generation can ever
+    // advance, so arming would make every accepted connection register a
+    // session that nothing could ever retire.
+    if reload_active && let Some(startup_client_trust) = startup_client_trust.as_ref() {
+        crate::tls::client_trust::publish_accepted_material(
+            crate::tls::ClientTrustScope::ProxyH3,
+            startup_client_trust.material.clone(),
+        );
+    }
 
     loop {
         tokio::select! {
@@ -806,11 +910,48 @@ pub async fn start_http3_listener_with_signal(
                     continue;
                 }
                 let revision = *reload_rx.borrow();
-                let Some(slot) = reload_slot.as_ref() else {
-                    continue;
+                // Resolve ONE candidate: the `ServerConfig` this endpoint is
+                // about to adopt and the client trust it will enforce, as a
+                // single value (issue #3857).
+                //
+                // With an accepted slot this is one atomic load of one `Arc`,
+                // which is what makes the pairing exact under every race the
+                // old code lost: the revision counter can coalesce several
+                // accepted candidates into one wakeup, and the client-CA source
+                // can rotate again between this wakeup and the rebuild. Both are
+                // now harmless — whatever candidate is adopted is the candidate
+                // whose identity is published, and a candidate that arrives
+                // after this load simply wakes the arm again.
+                let adopted = match reload_accepted.as_ref() {
+                    Some(accepted_slot) => accepted_slot
+                        .load_full()
+                        .as_ref()
+                        .clone()
+                        .map(|accepted| (accepted.config.clone(), accepted.client_trust.clone())),
+                    // No accepted candidate is published for this listener; the
+                    // fallback loads the configured client trust coherently.
+                    None => match configured_h3_reload_candidate(
+                        reload_slot.as_ref(),
+                        reload_client_ca_bundle_path.as_deref(),
+                        &reload_client_crls,
+                    ) {
+                        Ok(candidate) => candidate,
+                        Err(error) => {
+                            // Retain the last-good verifier, material,
+                            // generation and sessions.
+                            crate::tls::client_trust::record_rejected_candidate(
+                                crate::tls::ClientTrustScope::ProxyH3,
+                            );
+                            warn!(
+                                revision,
+                                error = %error,
+                                "HTTP/3 listener could not load the configured client-certificate trust after frontend TLS reload; keeping previous config"
+                            );
+                            continue;
+                        }
+                    },
                 };
-                let new_tls = slot.load_full().as_ref().clone();
-                let Some(new_tls) = new_tls else {
+                let Some((new_tls, client_trust)) = adopted else {
                     endpoint.set_server_config(None);
                     info!(
                         revision,
@@ -821,8 +962,8 @@ pub async fn start_http3_listener_with_signal(
                 match build_h3_quinn_server_config(
                     &new_tls,
                     &reload_policy,
-                    reload_client_ca_bundle_path.as_deref(),
-                    &reload_client_crls,
+                    &client_trust,
+                    client_auth_configured,
                     &reload_h3_config,
                 ) {
                     Ok(server_config) => {
@@ -831,39 +972,35 @@ pub async fn start_http3_listener_with_signal(
                             revision,
                             "HTTP/3 listener server config swapped after frontend TLS reload"
                         );
-                        // Issue #3857. Publish the H3 scope's own generation
-                        // only now, AFTER quinn has actually adopted the
-                        // rebuilt config. The proxy HTTPS scope advanced when
-                        // the shared slot was swapped, which can be well before
-                        // this endpoint applies it; inheriting that generation
-                        // would let a QUIC connection that still handshakes
-                        // against the withdrawn verifier claim a
-                        // post-withdrawal generation and escape the fence.
-                        //
-                        // The material republished here is the one the proxy
-                        // frontend accepted — the same operator sources feed
-                        // both — so the semantic diff and therefore the
-                        // withdrawal decision are identical; only the instant
-                        // of the fence differs.
-                        if let Some(material) = crate::tls::client_trust::current_material(
-                            crate::tls::ClientTrustScope::ProxyFrontend,
-                        ) {
-                            let publication = crate::tls::client_trust::publish_accepted_material(
-                                crate::tls::ClientTrustScope::ProxyH3,
-                                material,
+                        // Publish the H3 scope's own generation only now, AFTER
+                        // quinn has actually adopted this config, and publish
+                        // the identity of THIS candidate — the one whose
+                        // verifier the endpoint just installed. Publishing the
+                        // proxy scope's latest material instead would describe
+                        // anchors and revocations this endpoint may not be
+                        // enforcing yet, falsely advancing the H3 generation
+                        // while a revoked certificate could still reconnect.
+                        let publication = crate::tls::client_trust::publish_accepted_material(
+                            crate::tls::ClientTrustScope::ProxyH3,
+                            client_trust.material.clone(),
+                        );
+                        if publication.withdrew() {
+                            warn!(
+                                revision,
+                                generation = publication.generation,
+                                reason = publication.reason.map(|reason| reason.label()),
+                                retired_connections = publication.retired_sessions,
+                                "Frontend client-certificate trust was withdrawn; established HTTP/3 client-certificate connections were retired"
                             );
-                            if publication.withdrew() {
-                                warn!(
-                                    revision,
-                                    generation = publication.generation,
-                                    reason = publication.reason.map(|reason| reason.label()),
-                                    retired_connections = publication.retired_sessions,
-                                    "Frontend client-certificate trust was withdrawn; established HTTP/3 client-certificate connections were retired"
-                                );
-                            }
                         }
                     }
                     Err(error) => {
+                        // A refused candidate keeps the last-good H3 verifier,
+                        // material, generation and sessions. mTLS is never
+                        // downgraded on this path.
+                        crate::tls::client_trust::record_rejected_candidate(
+                            crate::tls::ClientTrustScope::ProxyH3,
+                        );
                         warn!(
                             revision,
                             error = %error,
@@ -16442,14 +16579,22 @@ mod build_h3_quinn_server_config_mtls_tests {
         ca_path.to_string_lossy().into_owned()
     }
 
-    /// Drive `build_h3_quinn_server_config` with the given client CA bundle.
+    /// Drive the H3 startup path (coherent client-trust load, then config
+    /// build) with the given client CA bundle.
     fn build(client_ca: Option<&str>) -> Result<quinn::ServerConfig, anyhow::Error> {
         ensure_crypto_provider();
         let tls_config = test_server_config();
         let tls_policy = TlsPolicy::from_env_config(&EnvConfig::default()).expect("tls policy");
         let crls: CrlList = Arc::new(Vec::new());
         let h3_config = Http3ServerConfig::default();
-        build_h3_quinn_server_config(&tls_config, &tls_policy, client_ca, &crls, &h3_config)
+        let client_trust = super::load_configured_h3_client_trust(client_ca, &crls)?;
+        build_h3_quinn_server_config(
+            &tls_config,
+            &tls_policy,
+            &client_trust,
+            client_ca.is_some(),
+            &h3_config,
+        )
     }
 
     #[test]

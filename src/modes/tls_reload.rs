@@ -24,14 +24,15 @@ use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use crate::config::EnvConfig;
-use crate::tls::client_trust::{self, ClientTrustMaterial, ClientTrustScope};
+use crate::tls::client_trust::{self, ClientTrustScope};
 use crate::tls::source::subscription::{
     WatchedMaterialSource, material_set_poll_interval, source_is_refreshable,
 };
 use crate::tls::source::{CertSource, MaterialKind};
 use crate::tls::{
-    self, CrlList, FrontendTlsRebuildFn, FrontendTlsRebuilt, FrontendTlsReloadConfig,
-    SharedFrontendTls, TlsPolicy, empty_frontend_tls_slot, frontend_tls_slot_with,
+    self, AcceptedClientTrust, AcceptedFrontendTls, CrlList, FrontendTlsRebuildFn,
+    FrontendTlsRebuilt, FrontendTlsReloadConfig, SharedAcceptedFrontendTls, SharedFrontendTls,
+    TlsPolicy, accepted_frontend_tls_slot_with, empty_frontend_tls_slot, frontend_tls_slot_with,
     spawn_frontend_tls_reload_task,
 };
 
@@ -42,6 +43,11 @@ pub struct ProxyFrontendTlsReloadHandles {
     /// Pre-populated shared slot the HTTPS / H2 listeners load on each
     /// accept. `Some` only when live reload is enabled.
     pub slot: Option<SharedFrontendTls>,
+    /// Pre-populated accepted-candidate slot the H3 listener adopts wholesale
+    /// (issue #3857). `Some` only when live reload is enabled **and** the
+    /// startup candidate's client-trust identity is known, because a partial
+    /// snapshot is exactly what this slot exists to prevent.
+    pub accepted_slot: Option<SharedAcceptedFrontendTls>,
     /// Subscribe-able revision channel the H3 listener observes. `Some` only
     /// when live reload is enabled.
     pub revision_rx: Option<watch::Receiver<u64>>,
@@ -64,6 +70,7 @@ pub struct ProxyFrontendTlsReloadHandles {
 /// keep the previous config — never serving a known-bad TLS config.
 pub fn prepare_proxy_frontend_tls(
     tls_config: Arc<ServerConfig>,
+    startup_client_trust: Option<AcceptedClientTrust>,
     env_config: &EnvConfig,
     tls_policy: &TlsPolicy,
     crls: &CrlList,
@@ -72,6 +79,7 @@ pub fn prepare_proxy_frontend_tls(
     if !env_config.frontend_tls_live_reload_enabled {
         return ProxyFrontendTlsReloadHandles {
             slot: None,
+            accepted_slot: None,
             revision_rx: None,
             watcher_handle: None,
         };
@@ -89,6 +97,7 @@ pub fn prepare_proxy_frontend_tls(
         );
         return ProxyFrontendTlsReloadHandles {
             slot: None,
+            accepted_slot: None,
             revision_rx: None,
             watcher_handle: None,
         };
@@ -123,50 +132,55 @@ pub fn prepare_proxy_frontend_tls(
         );
         return ProxyFrontendTlsReloadHandles {
             slot: None,
+            accepted_slot: None,
             revision_rx: None,
             watcher_handle: None,
         };
     };
 
-    // Arm the client-trust generations for this listener family from the
-    // startup-accepted material BEFORE the slot is published (issue #3857).
-    // Until a scope is armed, `client_trust::capture` returns `None` and the
-    // accept paths pay nothing — which is exactly the default, live-reload
-    // disabled posture. Arming here (rather than lazily on the first reload)
-    // means the very first accepted connection already carries a generation the
-    // first reload can fence it against.
+    // Arm this listener family's client-trust generation from the material the
+    // caller's `tls_config` was ACTUALLY built from (issue #3857), before the
+    // slot is published. Until a scope is armed, `client_trust::capture` returns
+    // `None` and the accept paths pay nothing — which is exactly the default,
+    // live-reload disabled posture. Arming here (rather than lazily on the first
+    // reload) means the very first accepted connection already carries a
+    // generation the first reload can fence it against.
     //
-    // Both the HTTPS/H2 + TCP+TLS family and the H3 listener are armed from one
-    // baseline: they serve the same operator material. They keep SEPARATE
-    // generations because the H3 endpoint applies a reload asynchronously, so
-    // only the H3 listener itself can publish a generation that is not ahead of
-    // the material QUIC is actually handshaking with.
-    let startup_trust = frontend_startup_trust_material(
-        client_ca_source.as_ref(),
-        crls,
-        false,
-        env_config.tls_max_material_size_bytes,
-    );
-    let client_trust_scopes = match startup_trust {
-        Some(material) => {
+    // `startup_client_trust` must come from the same load that produced
+    // `tls_config`; re-reading the client-CA source here to summarize it would
+    // observe whatever the file holds *now*. A source narrowed between the
+    // startup load and that read would be recorded as the baseline while the
+    // wider set is what is being served, so the first real withdrawal compares
+    // equal to the baseline, publishes `Unchanged`, and never retires anything.
+    //
+    // Only the HTTPS/H2 + TCP+TLS family is armed here. The H3 endpoint owns
+    // `ProxyH3` and arms it from the exact verifier it installs on its own
+    // endpoint, because it applies a reload asynchronously.
+    let client_trust_scopes = match startup_client_trust.as_ref() {
+        Some(startup_client_trust) => {
             client_trust::publish_accepted_material(
                 ClientTrustScope::ProxyFrontend,
-                material.clone(),
+                startup_client_trust.material.clone(),
             );
-            // The H3 baseline is the same material; the H3 listener republishes
-            // it into its own scope after `Endpoint::set_server_config`
-            // succeeds. Arming it here means an H3 connection accepted before
-            // the first reload already carries generation 1.
-            client_trust::publish_accepted_material(ClientTrustScope::ProxyH3, material);
             vec![ClientTrustScope::ProxyFrontend]
         }
         None => {
             warn!(
-                "Frontend TLS live reload is enabled but the startup client-CA/CRL material could not be summarized; established-transport trust retirement is disabled for proxy HTTPS"
+                "Frontend TLS live reload is enabled but the caller supplied no startup client-CA/CRL identity for the served TLS configuration; established-transport trust retirement is disabled for proxy HTTPS"
             );
             Vec::new()
         }
     };
+    // The H3 endpoint adopts whole accepted candidates. A startup candidate
+    // whose trust identity is unknown cannot form one, so the slot stays absent
+    // and the H3 listener falls back to its own coherent load rather than
+    // pairing a config with an identity that did not come from it.
+    let accepted_slot = startup_client_trust.map(|client_trust| {
+        accepted_frontend_tls_slot_with(Arc::new(AcceptedFrontendTls {
+            config: tls_config.clone(),
+            client_trust,
+        }))
+    });
 
     let slot = frontend_tls_slot_with(tls_config);
     let (revision_tx, revision_rx) = watch::channel(0u64);
@@ -197,12 +211,14 @@ pub fn prepare_proxy_frontend_tls(
             rebuild,
             max_material_bytes: env_config.tls_max_material_size_bytes,
             client_trust_scopes,
+            accepted_slot: accepted_slot.clone(),
         },
         shutdown_rx,
     );
 
     ProxyFrontendTlsReloadHandles {
         slot: Some(slot),
+        accepted_slot,
         revision_rx: Some(revision_rx),
         watcher_handle: Some(handle),
     }
@@ -251,45 +267,6 @@ fn build_proxy_rebuild_fn(
             client_trust: Some(candidate.client_trust),
         })
     })
-}
-
-/// Summarize the startup-accepted client-CA + CRL material for a frontend
-/// surface, so its client-trust scope can be armed at the same generation the
-/// listener starts serving.
-///
-/// Returns `None` when the client-CA source cannot be read; the caller then
-/// leaves the scope unarmed rather than arming it with an under-stated identity
-/// that a later, correct load would read as a withdrawal and use to retire every
-/// live session.
-fn frontend_startup_trust_material(
-    client_ca_source: Option<&CertSource>,
-    crls: &CrlList,
-    no_verify: bool,
-    max_material_bytes: usize,
-) -> Option<ClientTrustMaterial> {
-    if no_verify {
-        return Some(ClientTrustMaterial::default());
-    }
-    let ca_bytes = match client_ca_source {
-        Some(source) => {
-            match crate::tls::source::load_material_blocking_with(
-                source,
-                MaterialKind::CaBundle,
-                max_material_bytes,
-            ) {
-                Ok(material) => Some(material),
-                Err(_) => return None,
-            }
-        }
-        None => None,
-    };
-    ClientTrustMaterial::from_parts(
-        ca_bytes
-            .as_ref()
-            .map(|material| material.bytes.expose_secret()),
-        crls.as_slice(),
-    )
-    .ok()
 }
 
 fn frontend_watched_sources(
@@ -347,6 +324,7 @@ pub struct AdminFrontendTlsReloadHandles {
 /// admin TLS load.
 pub fn prepare_admin_frontend_tls(
     tls_config: Arc<ServerConfig>,
+    startup_client_trust: Option<AcceptedClientTrust>,
     env_config: &EnvConfig,
     tls_policy: &TlsPolicy,
     crls: &CrlList,
@@ -403,21 +381,20 @@ pub fn prepare_admin_frontend_tls(
     };
 
     // Same arming contract as the proxy surface, on the admin trust domain
-    // (`FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH` + the shared CRL source).
-    let startup_trust = frontend_startup_trust_material(
-        client_ca_source.as_ref(),
-        crls,
-        env_config.admin_tls_no_verify,
-        env_config.tls_max_material_size_bytes,
-    );
-    let client_trust_scopes = match startup_trust {
-        Some(material) => {
-            client_trust::publish_accepted_material(ClientTrustScope::AdminHttps, material);
+    // (`FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH` + the shared CRL source): the
+    // baseline is the identity of the load that produced `tls_config`, never a
+    // later re-read of the same source.
+    let client_trust_scopes = match startup_client_trust {
+        Some(startup_client_trust) => {
+            client_trust::publish_accepted_material(
+                ClientTrustScope::AdminHttps,
+                startup_client_trust.material,
+            );
             vec![ClientTrustScope::AdminHttps]
         }
         None => {
             warn!(
-                "Frontend TLS live reload is enabled but the startup admin client-CA/CRL material could not be summarized; established-transport trust retirement is disabled for admin HTTPS"
+                "Frontend TLS live reload is enabled but the caller supplied no startup client-CA/CRL identity for the served admin TLS configuration; established-transport trust retirement is disabled for admin HTTPS"
             );
             Vec::new()
         }
@@ -452,6 +429,9 @@ pub fn prepare_admin_frontend_tls(
             rebuild,
             max_material_bytes: env_config.tls_max_material_size_bytes,
             client_trust_scopes,
+            // No asynchronous second consumer on the admin surface: the admin
+            // listener reads the slot on each accept.
+            accepted_slot: None,
         },
         shutdown_rx,
     );
@@ -510,9 +490,9 @@ fn _ensure_slot_import_is_live() -> SharedFrontendTls {
 
 /// Build the H3-listener-side reload subscription from the proxy reload
 /// handles, returning `None` when live reload is disabled. Hands the H3
-/// listener both the shared slot (for `Endpoint::set_server_config`
-/// rebuilds) and the revision channel (so it wakes on each successful
-/// reload).
+/// listener the revision channel (so it wakes on each successful reload), the
+/// accepted-candidate slot it adopts wholesale, and the shared config slot it
+/// falls back to when no accepted candidate is published.
 pub fn build_h3_frontend_tls_reload(
     handles: Option<&ProxyFrontendTlsReloadHandles>,
 ) -> Option<crate::http3::server::Http3FrontendTlsReload> {
@@ -521,6 +501,7 @@ pub fn build_h3_frontend_tls_reload(
     let revision_rx = handles.revision_rx.clone()?;
     Some(crate::http3::server::Http3FrontendTlsReload {
         tls_slot: slot,
+        accepted_slot: handles.accepted_slot.clone(),
         revision_rx,
     })
 }
@@ -583,7 +564,7 @@ mod tests {
         let crls = Arc::new(Vec::new());
         let tls_config = dummy_server_config();
 
-        let handles = prepare_proxy_frontend_tls(tls_config, &cfg, &policy, &crls, None);
+        let handles = prepare_proxy_frontend_tls(tls_config, None, &cfg, &policy, &crls, None);
 
         assert!(
             handles.slot.is_none(),
@@ -608,7 +589,7 @@ mod tests {
         let crls = Arc::new(Vec::new());
         let tls_config = dummy_server_config();
 
-        let handles = prepare_proxy_frontend_tls(tls_config, &cfg, &policy, &crls, None);
+        let handles = prepare_proxy_frontend_tls(tls_config, None, &cfg, &policy, &crls, None);
 
         assert!(handles.slot.is_none());
         assert!(handles.watcher_handle.is_none());
@@ -639,7 +620,7 @@ mod tests {
 
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let handles =
-            prepare_proxy_frontend_tls(tls_config, &cfg, &policy, &crls, Some(shutdown_rx));
+            prepare_proxy_frontend_tls(tls_config, None, &cfg, &policy, &crls, Some(shutdown_rx));
 
         let slot = handles.slot.expect("slot present when live reload opt-in");
         assert!(slot.load().is_some(), "slot should be pre-populated");
@@ -678,7 +659,7 @@ mod tests {
         let crls = Arc::new(Vec::new());
         let tls_config = dummy_server_config();
 
-        let handles = prepare_admin_frontend_tls(tls_config, &cfg, &policy, &crls, None);
+        let handles = prepare_admin_frontend_tls(tls_config, None, &cfg, &policy, &crls, None);
 
         assert!(handles.slot.is_none());
         assert!(handles.watcher_handle.is_none());

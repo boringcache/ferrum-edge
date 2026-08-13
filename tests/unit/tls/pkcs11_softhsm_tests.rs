@@ -209,6 +209,7 @@ async fn a_rejected_reload_leaves_the_matching_identity_loadable() {
             max_material_bytes:
                 ferrum_edge::config::env_config::DEFAULT_TLS_MAX_MATERIAL_SIZE_BYTES,
             client_trust_scopes: Vec::new(),
+            accepted_slot: None,
         },
         Some(shutdown_rx),
     );

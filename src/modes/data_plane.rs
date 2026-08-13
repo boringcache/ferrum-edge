@@ -255,9 +255,16 @@ pub async fn run(
         };
 
     // Load TLS configuration if provided (shared with validate, issue #2976).
-    let tls_config = match startup_security::try_load_frontend_tls(&env_config, &tls_policy, &crls)
-    {
-        Ok(Some(mut config)) => {
+    // The candidate carries the client-certificate verifier and trust identity
+    // of this same load, so the client-trust baseline armed below describes
+    // exactly the material these listeners serve (issue #3857).
+    let tls_startup = match startup_security::try_load_frontend_tls_candidate(
+        &env_config,
+        &tls_policy,
+        &crls,
+    ) {
+        Ok(Some(candidate)) => {
+            let mut config = candidate.config;
             info!("Loading TLS configuration...");
             // Enable 0-RTT on the proxy frontend only (not admin).
             tls::enable_early_data(&mut config, &tls_policy);
@@ -276,7 +283,7 @@ pub async fn run(
                     "TLS configuration loaded without client certificate verification (HTTPS available)"
                 );
             }
-            Some(config)
+            Some((config, candidate.client_trust))
         }
         Ok(None) => {
             info!("No TLS configuration provided (HTTP only)");
@@ -287,6 +294,10 @@ pub async fn run(
             return Err(e);
         }
     };
+    let (tls_config, frontend_startup_client_trust) = match tls_startup {
+        Some((config, client_trust)) => (Some(config), Some(client_trust)),
+        None => (None, None),
+    };
 
     // Wire opt-in frontend TLS live reload (see modes/database.rs for full
     // rationale). DP-mode listeners participate identically: live reload is
@@ -295,6 +306,7 @@ pub async fn run(
     let proxy_frontend_reload_handles = tls_config.as_ref().map(|cfg| {
         crate::modes::tls_reload::prepare_proxy_frontend_tls(
             cfg.clone(),
+            frontend_startup_client_trust.clone(),
             &env_config,
             &tls_policy,
             &crls,
@@ -548,6 +560,10 @@ pub async fn run(
             client_ca_bundle_path: env_config.frontend_tls_client_ca_bundle_path.clone(),
             client_crls: crls.clone(),
             tls_slot: proxy_frontend_tls_slot.clone(),
+            // The DP listener slot is fed by the CP frontend-TLS overlay, not by
+            // the operator reload pipeline, so there is no accepted candidate to
+            // adopt; the H3 listener falls back to its own coherent load.
+            tls_accepted_slot: None,
             tls_revision_rx: proxy_frontend_tls_slot
                 .as_ref()
                 .map(|_| proxy_frontend_tls_revision_rx.clone()),
@@ -589,6 +605,12 @@ pub async fn run(
             let h3_reload = proxy_frontend_tls_slot.clone().map(|tls_slot| {
                 crate::http3::server::Http3FrontendTlsReload {
                     tls_slot,
+                    // This slot is fed by the CP frontend-TLS overlay, which
+                    // publishes a `ServerConfig` alone, so there is no accepted
+                    // candidate to adopt (issue #3857). The H3 listener loads
+                    // the configured client-CA bundle and CRLs coherently
+                    // itself, and publishes the identity of that same load.
+                    accepted_slot: None,
                     revision_rx: proxy_frontend_tls_revision_rx.clone(),
                 }
             });
@@ -771,13 +793,13 @@ pub async fn run(
         let admin_https_shutdown = shutdown_tx.subscribe();
 
         // Load admin TLS configuration (shared with validate, issue #2976).
-        let admin_tls_config = match startup_security::load_admin_tls_material(
+        let admin_tls_candidate = match startup_security::load_admin_tls_candidate(
             &env_config,
             &tls_policy,
             &crls,
             "Invalid admin TLS configuration",
         ) {
-            Ok(config) => {
+            Ok(candidate) => {
                 if env_config.admin_tls_client_ca_bundle_path.is_some() {
                     info!(
                         "Admin TLS configuration loaded with client certificate verification (HTTPS with mTLS available)"
@@ -791,7 +813,7 @@ pub async fn run(
                         "Admin TLS configuration loaded without client certificate verification (HTTPS available)"
                     );
                 }
-                config
+                candidate
             }
             Err(e) => {
                 error!("Failed to load admin TLS configuration: {:#}", e);
@@ -799,8 +821,12 @@ pub async fn run(
             }
         };
 
+        let admin_tls_config = admin_tls_candidate.config;
         let admin_reload_handles = crate::modes::tls_reload::prepare_admin_frontend_tls(
             admin_tls_config.clone(),
+            // Baseline from the exact load that produced `admin_tls_config`
+            // (issue #3857), never from a second read of the client-CA source.
+            Some(admin_tls_candidate.client_trust),
             &env_config,
             &tls_policy,
             &crls,

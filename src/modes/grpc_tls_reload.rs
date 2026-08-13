@@ -119,6 +119,7 @@ pub fn prepare_cp_grpc_server_tls_reload(
                 })
             }),
             client_trust_scopes: Vec::new(),
+            accepted_slot: None,
         },
         shutdown_rx,
     );

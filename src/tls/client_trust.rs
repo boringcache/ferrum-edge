@@ -103,10 +103,12 @@ pub enum ClientTrustScope {
     /// trust domain.
     ProxyFrontend,
     /// The QUIC / HTTP-3 listener. Separate from [`Self::ProxyFrontend`] even
-    /// though the material is identical, because the H3 endpoint applies a
-    /// reload asynchronously (`Endpoint::set_server_config` after the revision
-    /// watch fires). Publishing its generation from the H3 listener itself is
-    /// what keeps "captured generation ≤ material actually used" true there.
+    /// though the same operator sources feed both, because the H3 endpoint
+    /// applies a reload asynchronously (`Endpoint::set_server_config` after the
+    /// revision watch fires). Publishing its generation from the H3 listener
+    /// itself is what keeps "captured generation ≤ material actually used" true
+    /// there — and the material it publishes is the identity carried by the
+    /// exact accepted candidate it installed, never `ProxyFrontend`'s latest.
     ProxyH3,
     /// The admin HTTPS listener (`FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH`).
     AdminHttps,
@@ -558,11 +560,17 @@ pub fn publish_accepted_material(
 
 /// The last accepted semantic material for `scope`, when the scope is armed.
 ///
-/// Used by the HTTP/3 listener to republish the proxy frontend's accepted
-/// identity into its own scope after `Endpoint::set_server_config` has actually
-/// applied it — the H3 endpoint is the only consumer that applies a reload
-/// asynchronously, so it must publish its own generation rather than inherit
-/// one that is already ahead of the material QUIC is handshaking with.
+/// Introspection only. A publisher must **never** take its material from here:
+/// the whole point of the model is that every scope publishes the identity of
+/// the material it itself installed. The HTTP/3 listener used to republish
+/// `ProxyFrontend`'s latest material into [`ClientTrustScope::ProxyH3`] after
+/// `Endpoint::set_server_config`, which advanced the H3 generation to describe
+/// CRLs and anchors that endpoint was not yet enforcing — a revoked client
+/// could be retired and then reconnect successfully. It now publishes the
+/// identity carried by the exact candidate it adopted.
+// Introspection surface for external tests; the bin target re-declares the
+// module tree, so an item used only from `tests/` is dead there.
+#[allow(dead_code)]
 pub fn current_material(scope: ClientTrustScope) -> Option<ClientTrustMaterial> {
     domain(scope).material.load_full().as_ref().clone()
 }
