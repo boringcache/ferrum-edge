@@ -633,8 +633,9 @@ fn ambient_udp_lifecycle_selects_the_tools_capable_published_runtime() {
          promoting an explicit `-ebpf` tag rather than double-suffixing it"
     );
     assert!(
-        chart.contains("{{- if $ambientUdpLifecycle -}}"),
-        "the tools variant must be selected by the UDP lifecycle predicate"
+        chart.contains("{{- if or $ambientUdpLifecycle $nodeWaypointUdpListeners -}}"),
+        "the tools variant must be selected by the Ambient UDP lifecycle AND \
+         NodeWaypoint UDP listener predicates"
     );
     assert!(
         !chart.contains(

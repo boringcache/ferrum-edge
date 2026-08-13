@@ -9,10 +9,11 @@
 #                            it adds the eBPF ELF and a staged `ip` closure and
 #                            deliberately has NO `/bin/sh` and NO iptables.
 #   * `runtime-ebpf-tools` — a strict superset of `runtime-ebpf` for the Ambient
-#                            host/pod-netns UDP lifecycle, which drives generated
-#                            `sh -c` iptables/ip6tables scripts and therefore
-#                            cannot run on a distroless image. Debian-based, so
-#                            it is NOT distroless by construction.
+#                            host/pod-netns UDP lifecycle and NodeWaypoint UDP/DTLS
+#                            Service-path steering, which drive generated `sh -c`
+#                            iptables/ip6tables scripts and therefore cannot run
+#                            on a distroless image. Debian-based, so it is NOT
+#                            distroless by construction.
 #
 # Build the eBPF targets with `FEATURES=cloud-secrets,ebpf`; hosted CI exercises
 # all three contracts.

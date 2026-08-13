@@ -356,8 +356,9 @@ nodeAgent:
   # captureMode=ebpf, the template automatically appends "-ebpf" to the
   # resolved tag unless it is already present, selecting the real capture image
   # instead of the default mock/no-op image. The node-agent always uses the
-  # DISTROLESS "-ebpf" variant; only the ambient proxy's UDP lifecycle selects
-  # the tools-capable "-ebpf-tools" superset (see ambient-daemonset.yaml).
+  # DISTROLESS "-ebpf" variant; only the ambient proxy's UDP lifecycle and
+  # NodeWaypoint UDP/DTLS Service-path steering select the tools-capable
+  # "-ebpf-tools" superset (see ambient-daemonset.yaml).
   image:
     repository: ""
     tag: ""

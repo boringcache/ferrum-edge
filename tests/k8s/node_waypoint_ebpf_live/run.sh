@@ -297,6 +297,41 @@ render_chart_assertions() {
     grep -n 'image:' <<<"$rendered" >&2 || true
     exit 1
   fi
+  if grep -q "image: \"$IMAGE_REPOSITORY:$IMAGE_TAG-ebpf-tools\"" <<<"$rendered"; then
+    echo "TCP-only NodeWaypoint unexpectedly selected the tools-capable -ebpf-tools image" >&2
+    grep -n 'image:' <<<"$rendered" >&2 || true
+    exit 1
+  fi
+
+  rendered="$(helm template "$RELEASE" "$CHART_DIR" \
+    --namespace "$MESH_NS" \
+    --set image.repository="$IMAGE_REPOSITORY" \
+    --set image.tag="$IMAGE_TAG" \
+    --set ambient.enabled=true \
+    --set ambient.captureMode=ebpf \
+    --set ambient.env.FERRUM_MESH_TOPOLOGY=node_waypoint \
+    --set-string "ambient.env.FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32" \
+    --set-string "ambient.env.FERRUM_ADMIN_HTTP_PORT=$AMBIENT_ADMIN_PORT" \
+    --set ambient.env.FERRUM_MESH_NODE_WAYPOINT_UDP_LISTENERS_ENABLED=true \
+    --set nodeAgent.enabled=true \
+    --set-string "nodeAgent.env.FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32" \
+    --set nodeAgent.captureMode=ebpf \
+    --set nodeAgent.proxyMode=node_waypoint \
+    --set-string "nodeAgent.admin.port=$NODE_AGENT_ADMIN_PORT" \
+    --set-string "nodeAgent.podRegistryDir=$NODE_WAYPOINT_REGISTRY_DIR")"
+  local udp_tools_count udp_ebpf_exact
+  udp_tools_count="$(grep -c "image: \"$IMAGE_REPOSITORY:$IMAGE_TAG-ebpf-tools\"" <<<"$rendered" || true)"
+  udp_ebpf_exact="$(grep -E "image: \"$IMAGE_REPOSITORY:$IMAGE_TAG-ebpf\"[[:space:]]*$" <<<"$rendered" | grep -c . || true)"
+  if [[ "$udp_tools_count" -ne 1 ]]; then
+    echo "NodeWaypoint UDP listeners did not select exactly one -ebpf-tools ambient image" >&2
+    grep -n 'image:' <<<"$rendered" >&2 || true
+    exit 1
+  fi
+  if [[ "$udp_ebpf_exact" -lt 1 ]]; then
+    echo "NodeWaypoint UDP listeners did not keep the distroless -ebpf node-agent image" >&2
+    grep -n 'image:' <<<"$rendered" >&2 || true
+    exit 1
+  fi
   if [[ "$(grep -c "name: node-waypoint-pod-registry" <<<"$rendered" || true)" -lt 4 ]] ||
     ! grep -q "FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR" <<<"$rendered" ||
     ! grep -q "path: $NODE_WAYPOINT_REGISTRY_DIR" <<<"$rendered"; then

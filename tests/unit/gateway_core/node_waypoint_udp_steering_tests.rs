@@ -1619,3 +1619,125 @@ fn shutdown_withdraws_every_authorized_reply_source() {
     );
     forget(steering);
 }
+
+// ── Service-path tools image (hosted live gate, issue #3286) ───────────────
+//
+// Direct NodeWaypoint listener probes bind a host UDP socket and do not need
+// iptables. The Service/ClusterIP path does: HostNamespaceSteerBackend runs
+// `sh -c` scripts. The distroless `-ebpf` image has neither `sh` nor iptables,
+// so a NodeWaypoint that enables UDP listeners on that image materializes the
+// listener (direct probes pass) and then never steers ClusterIP traffic
+// (backend_hits=0). These tests pin the chart/workflow contract that would
+// have caught that hosted failure without executing cargo or the live fixture.
+
+fn repo_file(rel: &str) -> String {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel);
+    std::fs::read_to_string(&path).unwrap_or_else(|error| {
+        panic!("failed to read {}: {error}", path.display());
+    })
+}
+
+/// The production backend is a `sh -c` of generated iptables/ip scripts. An
+/// image without `/bin/sh` fails every teardown with ENOENT and never installs
+/// steering — the exact hosted Service-path failure.
+#[test]
+fn production_steer_backend_executes_generated_scripts_through_sh() {
+    let source = repo_file("src/proxy/node_waypoint_udp_steering.rs");
+    assert!(
+        source.contains("Command::new(\"sh\")"),
+        "HostNamespaceSteerBackend must exec the generated script through sh"
+    );
+    assert!(
+        source.contains(".arg(\"-c\")"),
+        "HostNamespaceSteerBackend must pass the generated script as sh -c"
+    );
+}
+
+/// Helm must promote the ambient proxy to `-ebpf-tools` when NodeWaypoint UDP
+/// listeners are enabled, and must leave TCP-only NodeWaypoint plus the
+/// node-agent on distroless `-ebpf`.
+#[test]
+fn node_waypoint_udp_listeners_select_the_tools_capable_runtime() {
+    let chart = repo_file("charts/ferrum-mesh/templates/ambient-daemonset.yaml");
+    assert!(
+        chart.contains("$nodeWaypointUdpListeners"),
+        "the chart must parse FERRUM_MESH_NODE_WAYPOINT_UDP_LISTENERS_ENABLED"
+    );
+    assert!(
+        chart.contains("FERRUM_MESH_NODE_WAYPOINT_UDP_LISTENERS_ENABLED"),
+        "the chart must read the UDP listener enablement env from ambient.env"
+    );
+    assert!(
+        chart.contains("{{- if or $ambientUdpLifecycle $nodeWaypointUdpListeners -}}"),
+        "enabling NodeWaypoint UDP listeners must select the tools-capable image"
+    );
+    assert!(
+        chart.contains(
+            "{{- $ambientImageTag = printf \"%s-ebpf-tools\" \
+             (trimSuffix \"-ebpf\" $ambientImageTag) -}}"
+        ),
+        "an explicit -ebpf tag must be promoted, not double-suffixed, when tools \
+         are required"
+    );
+
+    let node_agent = repo_file("charts/ferrum-mesh/templates/node-agent-daemonset.yaml");
+    assert!(
+        !node_agent.contains("-ebpf-tools"),
+        "the node-agent must not adopt the tools-capable image; only the pod \
+         that shells out receives that attack surface"
+    );
+}
+
+/// The hosted live job must package and load the tools image the chart names
+/// when UDP listeners are enabled. Packaging only `-ebpf` leaves kind with
+/// ImagePullBackOff (or, before helm selected tools, ENOENT on `sh`).
+#[test]
+fn node_waypoint_ebpf_live_job_packages_and_loads_the_tools_image() {
+    let workflow = repo_file(".github/workflows/node-waypoint-ebpf-live.yml");
+    assert!(
+        workflow.contains("Dockerfile.ebpf-tools-layer"),
+        "the live job must build the tools-capable image the chart selects"
+    );
+    assert!(
+        workflow.contains("${{ env.FERRUM_IMAGE_TAG }}-ebpf-tools"),
+        "the live job must tag the tools image with the chart's -ebpf-tools suffix"
+    );
+    assert!(
+        workflow.contains(
+            "kind load docker-image \"${FERRUM_IMAGE_REPOSITORY}:${FERRUM_IMAGE_TAG}-ebpf-tools\""
+        ),
+        "kind must receive the tools image before helm install"
+    );
+    assert!(
+        workflow.contains("for tool in ip iptables ip6tables iptables-save ip6tables-save; do"),
+        "the live job must prove the packaged tools image can execute steering tools"
+    );
+
+    let layer = repo_file("Dockerfile.ebpf-tools-layer");
+    assert!(
+        layer.contains("test -x /bin/sh"),
+        "the tools layer must fail the build if /bin/sh is missing"
+    );
+    assert!(
+        layer.contains("iptables"),
+        "the tools layer must install iptables for Service-path steering"
+    );
+    assert!(
+        layer.contains("FROM ${TOOLS_BASE}"),
+        "the tools layer is a separate Debian image, not a weakening of distroless -ebpf"
+    );
+
+    let harness = repo_file("tests/k8s/node_waypoint_ebpf_live/run.sh");
+    assert!(
+        harness.contains("FERRUM_MESH_NODE_WAYPOINT_UDP_LISTENERS_ENABLED=true"),
+        "the live harness must enable UDP listeners so the chart selects -ebpf-tools"
+    );
+    assert!(
+        harness.contains("IMAGE_TAG-ebpf-tools"),
+        "the live harness must assert the UDP-listeners render selects -ebpf-tools"
+    );
+    assert!(
+        harness.contains("TCP-only NodeWaypoint unexpectedly selected the tools-capable"),
+        "the live harness must keep TCP-only NodeWaypoint on distroless -ebpf"
+    );
+}
