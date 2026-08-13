@@ -250,9 +250,8 @@ fn collect_one(
     let parsed_body = parse_policy_body(object);
 
     let (body, targets, error) = match (parsed_body, parsed_targets) {
-        (Err(error), targets) | (Ok(_), Err(error)) => {
-            (None, targets.unwrap_or_default(), Some(error))
-        }
+        (Err(error), targets) => (None, targets.unwrap_or_default(), Some(error)),
+        (Ok(_), Err(error)) => (None, Vec::new(), Some(error)),
         (Ok(body), Ok(targets)) => (Some(body), targets, None),
     };
 
