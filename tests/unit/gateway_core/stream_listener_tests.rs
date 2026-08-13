@@ -2017,127 +2017,97 @@ async fn swap_frontend_tls_config_replaces_slot_without_reconcile() {
     );
 }
 
-/// Mesh's active-only DTLS swap must not publish its TLS-derived material into
-/// the dedicated DTLS generation used by listeners created later, and must not
-/// evaluate the rebuild when no DTLS server is bound.
+/// Mesh PeerAuthentication live reload still swaps the shared TCP+TLS slot, but
+/// that path must not seed the ordinary `FERRUM_DTLS_*` generation when no DTLS
+/// listener exists.
 #[tokio::test]
-async fn swap_active_dtls_frontend_configs_does_not_publish_generation_without_listeners() {
+async fn mesh_tcp_tls_swap_does_not_seed_ordinary_dtls_generation_without_listeners() {
     let manager = create_manager(empty_config());
-    let calls = std::sync::atomic::AtomicUsize::new(0);
-    let swapped = manager
-        .swap_active_dtls_frontend_configs(|| {
-            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Err(anyhow::anyhow!(
-                "no-active-listener mesh swap must not evaluate the DTLS build closure"
-            ))
-        })
-        .await;
-    assert_eq!(swapped, 0, "no listeners should mean no live swaps");
-    assert_eq!(
-        calls.load(std::sync::atomic::Ordering::Relaxed),
-        0,
-        "build_config must not run when no DTLS listener is active"
-    );
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    manager.swap_frontend_tls_config(Some(dummy_server_config()));
+
     assert!(
         manager.snapshot_frontend_dtls_generation().is_none(),
-        "an active-only mesh swap must not seed the ordinary DTLS generation"
+        "mesh TCP+TLS swap must not seed the ordinary DTLS generation"
+    );
+    assert!(
+        manager
+            .active_dtls_frontend_identities_for_test()
+            .await
+            .is_empty(),
+        "no DTLS listener should be present"
     );
     let status = manager.frontend_dtls_reload_status();
     assert_eq!(status.last_outcome, "none");
     assert_eq!(status.generation, 0);
-    let overload = manager.overload_snapshot();
-    assert_eq!(overload.frontend_dtls_reload.generation, 0);
-    assert_eq!(overload.frontend_dtls_reload.last_outcome, "none");
 }
 
-/// An ordinary FERRUM_DTLS_* publish must keep last-good generation status
-/// distinct from a no-listener mesh overlay, which must not evaluate a rebuild
-/// or advance/reject that generation.
+/// An ordinary UDP+DTLS listener keeps its dedicated generation and client-CA
+/// policy when mesh PeerAuthentication reloads the TCP+TLS slot.
 #[tokio::test]
-async fn mesh_active_only_dtls_swap_does_not_seed_or_advance_ordinary_generation() {
-    let manager = create_manager(empty_config());
-    let (_gen, swapped) = manager
-        .publish_frontend_dtls_generation(ephemeral_frontend_dtls_config())
+async fn ordinary_dtls_listener_keeps_dedicated_policy_across_mesh_tcp_tls_swap() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (cert_path, key_path) = write_ecdsa_pem_pair(dir.path(), "dtls-dedicated");
+    let (ca_path, _) = write_ecdsa_pem_pair(dir.path(), "dtls-client-ca");
+
+    let holder = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("udp holder");
+    let port = holder.local_addr().unwrap().port();
+    drop(holder);
+
+    let mut proxy = create_stream_proxy("udp-dtls-ordinary", BackendScheme::Udp, port);
+    proxy.frontend_tls = true;
+    let manager = create_manager(GatewayConfig {
+        proxies: vec![proxy],
+        ..empty_config()
+    });
+    manager
+        .set_frontend_dtls_cert_key(cert_path, key_path, Some(ca_path))
         .await;
-    assert_eq!(swapped, 0);
-    let before = manager
+    manager
+        .wait_until_started(Duration::from_secs(2))
+        .await
+        .expect("ordinary DTLS listener should start");
+
+    let before_gen = manager
         .snapshot_frontend_dtls_generation()
         .expect("ordinary generation published");
-    assert_eq!(before.generation, 1);
-    assert_eq!(manager.frontend_dtls_reload_status().last_outcome, "accepted");
-
-    let calls = std::sync::atomic::AtomicUsize::new(0);
-    let swapped = manager
-        .swap_active_dtls_frontend_configs(|| {
-            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Err(anyhow::anyhow!(
-                "no-active-listener mesh swap must not evaluate the DTLS build closure"
-            ))
-        })
-        .await;
-    assert_eq!(swapped, 0);
-    assert_eq!(
-        calls.load(std::sync::atomic::Ordering::Relaxed),
-        0,
-        "mesh overlay must not evaluate a DTLS rebuild when no listener is active"
+    let before_ids = wait_for_active_dtls_identities(&manager).await;
+    assert_eq!(before_ids.len(), 1);
+    assert!(
+        before_ids[0].1,
+        "dedicated DTLS listener must require a client certificate"
     );
-    let after = manager
+
+    manager.swap_frontend_tls_config(Some(dummy_server_config()));
+
+    let after_gen = manager
         .snapshot_frontend_dtls_generation()
         .expect("ordinary generation retained");
-    assert_eq!(after.generation, before.generation);
+    assert_eq!(after_gen.generation, before_gen.generation);
     assert!(
-        Arc::ptr_eq(&after, &before),
-        "mesh active-only swap must not replace the ordinary DTLS generation slot"
+        Arc::ptr_eq(&after_gen, &before_gen),
+        "mesh TCP+TLS swap must not replace the ordinary DTLS generation slot"
+    );
+    let after_ids = manager.active_dtls_frontend_identities_for_test().await;
+    assert_eq!(
+        after_ids, before_ids,
+        "active ordinary DTLS server must retain exact dedicated config/security policy"
     );
     let status = manager.frontend_dtls_reload_status();
     assert_eq!(status.last_outcome, "accepted");
-    assert_eq!(status.generation, before.generation);
+    assert_eq!(status.generation, before_gen.generation);
+
+    manager.shutdown_all().await;
 }
 
-/// With an active DTLS server, mesh overlay must rebuild once, swap that
-/// listener, and still leave the ordinary FERRUM_DTLS_* generation unpublished.
+/// Failed ordinary DTLS candidate evaluation keeps last-known-good generation
+/// status even when a mesh TCP+TLS swap also runs.
 #[tokio::test]
-async fn mesh_active_only_dtls_swap_updates_active_listener_without_publishing_generation() {
-    let manager = create_manager(empty_config());
-    let server = Arc::new(
-        ferrum_edge::dtls::DtlsServer::bind(
-            "127.0.0.1:0".parse().expect("addr"),
-            ephemeral_frontend_dtls_config(),
-        )
-        .await
-        .expect("bind test DTLS server"),
-    );
-    manager
-        .install_active_dtls_server_for_test(Arc::clone(&server))
-        .await;
-
-    let calls = std::sync::atomic::AtomicUsize::new(0);
-    let swapped = manager
-        .swap_active_dtls_frontend_configs(|| {
-            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Ok(ephemeral_frontend_dtls_config())
-        })
-        .await;
-    assert_eq!(swapped, 1, "the bound DTLS server must be live-swapped");
-    assert_eq!(
-        calls.load(std::sync::atomic::Ordering::Relaxed),
-        1,
-        "build_config must run exactly once when an active DTLS server exists"
-    );
-    assert!(
-        manager.snapshot_frontend_dtls_generation().is_none(),
-        "active-only mesh swap must not publish the ordinary DTLS generation"
-    );
-    let status = manager.frontend_dtls_reload_status();
-    assert_eq!(status.last_outcome, "none");
-    assert_eq!(status.generation, 0);
-    server.close().await;
-}
-
-/// A failed mesh overlay against an active listener must keep last-good
-/// listener config and must not mark the ordinary DTLS generation rejected.
-#[tokio::test]
-async fn mesh_active_only_dtls_swap_failure_does_not_reject_ordinary_generation() {
+async fn ordinary_dtls_build_failure_keeps_last_good_across_mesh_tcp_tls_swap() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let manager = create_manager(empty_config());
     let (_gen, _) = manager
         .publish_frontend_dtls_generation(ephemeral_frontend_dtls_config())
@@ -2146,40 +2116,18 @@ async fn mesh_active_only_dtls_swap_failure_does_not_reject_ordinary_generation(
         .snapshot_frontend_dtls_generation()
         .expect("ordinary generation published");
 
-    let server = Arc::new(
-        ferrum_edge::dtls::DtlsServer::bind(
-            "127.0.0.1:0".parse().expect("addr"),
-            ephemeral_frontend_dtls_config(),
-        )
-        .await
-        .expect("bind test DTLS server"),
-    );
-    manager
-        .install_active_dtls_server_for_test(Arc::clone(&server))
-        .await;
+    manager.record_frontend_dtls_candidate_failure();
+    manager.swap_frontend_tls_config(Some(dummy_server_config()));
 
-    let calls = std::sync::atomic::AtomicUsize::new(0);
-    let swapped = manager
-        .swap_active_dtls_frontend_configs(|| {
-            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Err(anyhow::anyhow!("simulated mesh DTLS rebuild failure"))
-        })
-        .await;
-    assert_eq!(swapped, 0);
-    assert_eq!(
-        calls.load(std::sync::atomic::Ordering::Relaxed),
-        1,
-        "build_config must run once so last-good listener retention is fail-closed"
-    );
     let after = manager
         .snapshot_frontend_dtls_generation()
         .expect("ordinary generation retained");
     assert_eq!(after.generation, before.generation);
     assert!(Arc::ptr_eq(&after, &before));
     let status = manager.frontend_dtls_reload_status();
-    assert_eq!(status.last_outcome, "accepted");
+    assert_eq!(status.last_outcome, "rejected");
     assert_eq!(status.generation, before.generation);
-    server.close().await;
+    assert!(status.last_failure_unix.is_some());
 }
 
 #[tokio::test]
@@ -2295,6 +2243,46 @@ impl rustls::server::ResolvesServerCert for NoopCertResolver {
     ) -> Option<Arc<rustls::sign::CertifiedKey>> {
         None
     }
+}
+
+fn dummy_server_config() -> Arc<rustls::ServerConfig> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    Arc::new(
+        rustls::ServerConfig::builder_with_provider(provider)
+            .with_protocol_versions(rustls::ALL_VERSIONS)
+            .expect("server-side protocol versions")
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(NoopCertResolver)),
+    )
+}
+
+fn write_ecdsa_pem_pair(dir: &std::path::Path, name: &str) -> (String, String) {
+    let key_pair =
+        rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("generate key");
+    let params = rcgen::CertificateParams::new(vec![format!("{name}.example")]).expect("params");
+    let cert = params.self_signed(&key_pair).expect("self-sign");
+    let cert_path = dir.join(format!("{name}.crt"));
+    let key_path = dir.join(format!("{name}.key"));
+    std::fs::write(&cert_path, cert.pem()).expect("write cert");
+    std::fs::write(&key_path, key_pair.serialize_pem()).expect("write key");
+    (
+        cert_path.to_str().expect("utf8").to_string(),
+        key_path.to_str().expect("utf8").to_string(),
+    )
+}
+
+async fn wait_for_active_dtls_identities(manager: &StreamListenerManager) -> Vec<(usize, bool)> {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let ids = manager.active_dtls_frontend_identities_for_test().await;
+            if !ids.is_empty() {
+                return ids;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("DTLS server should publish into the listener slot")
 }
 
 fn config_with_sidecar_bind(proxy: Proxy, port: u16, bind: IpAddr) -> GatewayConfig {
