@@ -369,6 +369,12 @@ pub const MAX_HTTP2_MAX_FRAME_SIZE: u32 = 1_048_576;
 pub const MAX_POOL_SQL_INTEGER_VALUE: u64 = i32::MAX as u64;
 /// Maximum HTTP/3 connections per backend (reasonable operational limit).
 pub const MAX_HTTP3_CONNECTIONS_PER_BACKEND: usize = 256;
+/// Inclusive ceiling for a finite UDP response-amplification factor. Values
+/// above this, and any non-finite value, are rejected at admission. Protocols
+/// that need a larger ratio must use an explicit unlimited override on the
+/// Gateway API policy surface; hand-authored proxies omit the field.
+pub const MAX_UDP_AMPLIFICATION_FACTOR: f32 =
+    crate::udp_amplification::MAX_UDP_AMPLIFICATION_FACTOR;
 
 /// Valid HTTP methods for allowed_methods and retryable_methods validation.
 pub const VALID_HTTP_METHODS: &[&str] = &[
@@ -2707,10 +2713,14 @@ pub struct Proxy {
     #[serde(default = "default_udp_idle_timeout")]
     pub udp_idle_timeout_seconds: u64,
     /// Maximum allowed response amplification factor for UDP proxies.
-    /// When set, backend→client datagrams are dropped if their size exceeds
-    /// `payload_size * factor`. A zero-length request receives a one-byte reply
-    /// allowance so it cannot black-hole the session; nonempty requests retain
-    /// the exact configured payload ratio. `None` (default) = no limit.
+    /// When set, backend→client datagrams share one remaining byte budget per
+    /// admitted client request (`payload_size * factor`, cumulative across
+    /// replies). A zero-length request receives a one-byte reply allowance so
+    /// it cannot black-hole the session; nonempty requests retain the exact
+    /// configured payload ratio. `None` (default for hand-authored proxies) =
+    /// no limit. Gateway API `UDPRoute` translation never leaves this unset:
+    /// it projects a finite controller default unless an explicit unsafe
+    /// override is attached.
     #[serde(default)]
     pub udp_max_response_amplification_factor: Option<f32>,
     /// TCP stream idle timeout in seconds. After this duration of no data
@@ -7867,11 +7877,14 @@ impl Proxy {
             }
         }
 
-        // UDP amplification factor validation
+        // UDP amplification factor validation. `<= 0.0` does not catch NaN;
+        // non-finite and oversized values fail closed before listener bind.
         if let Some(factor) = self.udp_max_response_amplification_factor
-            && factor <= 0.0
+            && !crate::udp_amplification::factor_is_valid(factor)
         {
-            errors.push("udp_max_response_amplification_factor must be positive".to_string());
+            errors.push(format!(
+                "udp_max_response_amplification_factor must be a finite number greater than 0 and at most {MAX_UDP_AMPLIFICATION_FACTOR}"
+            ));
         }
 
         // Allowed WebSocket origins validation

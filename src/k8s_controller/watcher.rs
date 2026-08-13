@@ -238,6 +238,16 @@ pub const GATEWAY_API_CRDS: &[CrdSpec] = &[
         plural: "backendtlspolicies",
         namespaced: true,
     },
+    // Ferrum-owned UDP response-amplification Direct Policy Attachment.
+    // Discovery skips cleanly when the CRD is absent; translation still
+    // projects the finite controller default onto every UDPRoute.
+    CrdSpec {
+        group: "gateway.ferrum.io",
+        version: "v1alpha1",
+        kind: "UDPResponseAmplificationPolicy",
+        plural: "udpresponseamplificationpolicies",
+        namespaced: true,
+    },
     // BackendLBPolicy was removed from the Gateway API experimental channel in
     // v1.3+ (replaced by XBackendTrafficPolicy). Keep watching the historical
     // v1alpha2 shape so clusters that still install the older CRD get sticky
@@ -1736,6 +1746,17 @@ mod tests {
             resource.kind == "BackendTLSPolicy"
                 && resource.version == "v1alpha3"
                 && resource.plural == "backendtlspolicies"
+                && resource.namespaced
+        }));
+    }
+
+    #[test]
+    fn gateway_api_watches_udp_response_amplification_policy() {
+        assert!(GATEWAY_API_CRDS.iter().any(|resource| {
+            resource.kind == "UDPResponseAmplificationPolicy"
+                && resource.group == "gateway.ferrum.io"
+                && resource.version == "v1alpha1"
+                && resource.plural == "udpresponseamplificationpolicies"
                 && resource.namespaced
         }));
     }

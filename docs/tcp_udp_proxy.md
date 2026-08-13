@@ -76,7 +76,7 @@ proxies:
 | `tcp_idle_timeout_seconds` | `u64` | (global) | TCP idle timeout override. When omitted, uses `FERRUM_TCP_IDLE_TIMEOUT_SECONDS` (default 300s). 0 = disabled |
 | `stream_proxy_protocol` | `bool` | `false` | Enable inbound PROXY protocol (v1 or v2) on this `tcp`/`tcp_tls` listener. See [Inbound PROXY Protocol](#inbound-proxy-protocol) below. |
 | `udp_idle_timeout_seconds` | `u64` | `60` | UDP session idle timeout before cleanup |
-| `udp_max_response_amplification_factor` | `f32` | unset | Drop backend response datagrams larger than `request_payload_size × factor`. A zero-length request receives only a one-byte response allowance; nonempty requests retain the exact configured payload ratio. |
+| `udp_max_response_amplification_factor` | `f32` | unset (hand-authored) / `8.0` (Gateway API UDPRoute) | Cumulative per-request backend→client byte budget of `request_payload_size × factor`. A zero-length request receives only a one-byte response allowance; nonempty requests retain the exact configured payload ratio. Finite values must be `> 0` and `≤ 1024`. `None` disables the guard (hand-authored only, or an explicit Gateway API unsafe override). |
 
 ### Synthetic `listen_path`
 
@@ -783,7 +783,7 @@ UDP is connectionless, so the gateway tracks sessions by client source address (
 - **Reply routing**: Each session spawns a receiver task that forwards backend replies back to the correct client
 - **Datagram hook concurrency / backpressure**: When any plugin opts into `on_udp_datagram`, each established session gets one bounded client→backend ingress worker (not one task per datagram). The shared listener recv/drain loop only enqueues onto that per-session FIFO and never awaits potentially I/O-bound hooks (for example Redis-backed `udp_rate_limiting` or `fault_injection` delays). Per-session ordering is preserved. Queue depth is capped at 256 datagrams and retained payload is capped at 256 KiB per session, with an additional 16 MiB retained-payload cap across the listener; both byte budgets remain charged while a dequeued payload is held by an in-flight hook/forward future, so one slow hook per session cannot escape the aggregate limit. Overload **fails closed** by dropping the datagram (it is never forwarded without running required hooks). Drops increment the listener's `hook_ingress_drops` counter and emit a rate-limited warning (first drop, then every 100th) without per-client label cardinality. Session stop/expiry wakes an idle worker by dropping the ingress sender, cancels an in-flight hook through a dedicated notification, and drains any residual queue without running hooks or forwarding. It also re-checks stop/expired after each receive and after the hook await so a late plugin return cannot forward into an expired session. Sessions without datagram hooks keep the inline forward path. Backend→client hooks remain on the existing per-session reply task.
 - **Reply send buffers (Linux)**: Each plain-UDP session keeps a `sendmmsg` fallback batch and an optional GSO accumulator. `sendmmsg` slot buffers are allocated lazily at a 2 KiB preferred size (`SEND_MMSG_SLOT_SIZE`) instead of eagerly reserving `64 × 65535` (~4.2 MiB) per session. Datagrams larger than the slot size — including the full valid UDP maximum — use the existing pktinfo-aware direct-send path; GSO same-size batching and sendmmsg fallback remain unchanged for ordinary traffic.
-- **Response amplification guard**: When `udp_max_response_amplification_factor` is set, each backend datagram is limited to the latest client request payload size multiplied by the factor. A legal zero-length request gets an explicit one-byte reply allowance instead of an unusable zero budget; positive-length requests receive no floor or extra allowance.
+- **Response amplification guard**: When `udp_max_response_amplification_factor` is set, every backend→client datagram **charges** a remaining byte budget established by the latest admitted client request (`request_payload_size × factor`). Several replies that are each under that product still fail closed once their **sum** exceeds it. A legal zero-length request gets an explicit one-byte reply allowance instead of an unusable zero budget; positive-length requests receive no floor or extra allowance. The budget lives on the UDP session (not the selected backend), so weighted multi-backend selection cannot reset or multiply it. Invalid, zero, negative, non-finite, and factors above 1024 are rejected at config admission. `None` means unlimited and is valid only for hand-authored proxies or an explicit Gateway API unsafe override.
 - **Reply-source selection (`FERRUM_UDP_PKTINFO_ENABLED=auto`, Linux)**: On wildcard / multi-homed binds, `IP_PKTINFO` / `IPV6_PKTINFO` captures the per-datagram local destination address (and interface index) on recv and reuses it as the reply source on send. This saves one kernel routing lookup per `sendmsg` flush (combined with `UDP_SEGMENT`/GSO in a single cmsg buffer) and ensures replies exit the same interface the client targeted — important for NAT-sensitive middleboxes, anycast, and scoped IPv6 (link-local `fe80::/10`, where the ifindex is required to disambiguate the source zone). The captured address is stored per-session via `OnceLock` on the first datagram that exposes pktinfo; subsequent datagrams reuse it lock-free. When pktinfo is active, the recv loop uses `readable() + recvmmsg` instead of `recv_from`, so the first datagram of each wakeup also surfaces cmsg — one-shot UDP flows (e.g. DNS) get the correct reply source even when the drain loop never fires.
 
 ### Mesh UDP capture is a separate datapath
@@ -827,12 +827,29 @@ on this page — session management, idle timeout, stream plugins, metrics —
 applies unchanged to those generated proxies; the route only decides the listen
 port and the backend.
 
-The one exception is the response amplification guard. It is opt-in through the
-per-proxy `udp_max_response_amplification_factor` above, Gateway API defines no
-field that maps onto it, and the translator leaves it unset — so a generated
-`UDPRoute` proxy runs without a response-size ceiling, and a hand-applied
-override cannot survive, because the proxy is regenerated from the route on
-every reconcile.
+The response amplification guard is always engaged for a generated `UDPRoute`
+proxy. Ferrum projects a finite controller default of `8.0` unless a Ferrum
+`UDPResponseAmplificationPolicy` (`gateway.ferrum.io/v1alpha1`) wins:
+
+1. UDPRoute-targeted policy
+2. Gateway listener (`sectionName`) policy
+3. Gateway-targeted policy
+4. `GatewayClass.spec.parametersRef` pointing at this CRD
+5. Controller default `8.0`
+
+Same attachment level uses GEP-713 oldest-wins (`creationTimestamp`, then
+`{namespace}/{name}`). Cross-namespace `targetRefs` require a `ReferenceGrant`
+from `gateway.ferrum.io`/`UDPResponseAmplificationPolicy`. Invalid, zero,
+negative, non-finite, or factors above 1024 never program the listener; the
+route still materializes with the next valid precedence (ultimately the finite
+default). Unlimited is available only with `mode: Unlimited` **and**
+`acknowledgeUnsafeAmplification: true`. Deleting the policy returns the
+listener to the finite default on the next reconcile without a process restart.
+
+`UDPRoute.status.parents[].conditions` includes Ferrum
+`UDPAmplificationProtection` (`FiniteDefault` / `FinitePolicy` /
+`ExplicitUnlimited`) without echoing the numeric factor. Runtime accounting is
+cumulative per admitted request; see [`docs/tcp_udp_proxy.md`](tcp_udp_proxy.md).
 
 For a `UDPRoute` the rule's `backendRefs` is a weighted **set**. A single
 serviceable leg becomes a direct backend

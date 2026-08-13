@@ -86,7 +86,25 @@ Follow-up validation on branch `codex/gateway-api-data-plane-conformance` reache
 | Selectorless/headless Services | Yes | With pod discovery enabled, backends resolve ready EndpointSlice addresses directly; a named Service `targetPort` resolves against EndpointSlice port names, but the `backendRef.port` itself is numeric-only — see [backendRef port and zero-weight semantics](#backendref-port-and-zero-weight-semantics) |
 | Backend failure | Yes | Traffic to unavailable generated backends must return an error response rather than falling through |
 | Route update and deletion | Yes | Reconciliation regenerates live proxy/upstream/plugin config; deletion removes the route from live config |
-| `UDPRoute` | Yes, via unit translation/status tests **and** a live UDP data-path integration suite (not upstream `GATEWAY-UDP`; no `kind` black-box step) | A `UDPRoute` attached to a `protocol: UDP` Gateway listener materializes a Ferrum UDP stream proxy on the listener port, preserving datagram semantics from the existing UDP data path (per-client sessions, idle expiry). The opt-in response-amplification guard is **not** engaged — Gateway API has no field for it and the translator leaves `udp_max_response_amplification_factor` unset. CI **Unit** Tests cover parent/listener attachment, ReferenceGrant cross-namespace authorization, weighted multi-backend materialization, zero-weight withdrawal, mixed valid/invalid weighted blackhole legs, missing/unpermitted backend fail-closed behavior, parent status (`Accepted`/`ResolvedRefs`/`Programmed`), live backendRef and weight-only updates, and deletion withdrawal — see [UDPRoute translation](#udproute-translation) and `tests/unit/gateway_core/k8s_udproute_translation_tests.rs`. CI **Integration** Tests then run that translated config through the real UDP runtime (`tests/integration/gateway_api_udproute_datapath_tests.rs`): the translator's own listener port is bound by `start_udp_listener`, a client datagram traverses the generated stream proxy and is answered by the backend the route named, two `UDPRoute`s on two UDP listeners do not cross-talk, a weighted `backendRefs` set is served from its generated upstream with per-session leg stability, and a leg naming an absent `Service` drops the datagram instead of answering it. The Gateway API conformance lab does **not** run a UDPRoute black-box step (Trusted Cross Build Policy freezes adding that executable automation), so the live evidence rides the required `Tests` aggregate instead. Upstream profile/features remain `GATEWAY-HTTP,GATEWAY-GRPC` / `Gateway,ReferenceGrant,HTTPRoute,GRPCRoute`; `GATEWAY-UDP` is **not** claimed on this pin. |
+| `UDPRoute` | Yes, via unit translation/status tests **and** a live UDP data-path integration suite (not upstream `GATEWAY-UDP`; no `kind` black-box step) | A `UDPRoute` attached to a `protocol: UDP` Gateway listener materializes a Ferrum UDP stream proxy on the listener port, preserving datagram semantics from the existing UDP data path (per-client sessions, idle expiry). Response-amplification protection is always engaged: the translator projects a finite controller default of `8.0` unless a Ferrum `UDPResponseAmplificationPolicy` wins (UDPRoute > Gateway listener `sectionName` > Gateway > `GatewayClass.parametersRef` > default). Unlimited requires `mode: Unlimited` and `acknowledgeUnsafeAmplification: true`. Invalid or unauthorized policy never programs an unlimited relay. CI **Unit** Tests cover parent/listener attachment, ReferenceGrant cross-namespace
+authorization, weighted multi-backend materialization, zero-weight withdrawal,
+mixed valid/invalid weighted blackhole legs, missing/unpermitted backend
+fail-closed behavior, parent status (`Accepted`/`ResolvedRefs`/`Programmed` /
+`UDPAmplificationProtection`), live backendRef and weight-only updates, deletion
+withdrawal, and UDP amplification policy precedence/authorization/update/delete
+— see [UDPRoute translation](#udproute-translation),
+`tests/unit/gateway_core/k8s_udproute_translation_tests.rs`, and
+`tests/unit/gateway_core/k8s_udp_amplification_policy_tests.rs`. CI
+**Integration** Tests then run that translated config through the real UDP
+runtime (`tests/integration/gateway_api_udproute_datapath_tests.rs`): the
+translator's own listener port is bound by `start_udp_listener`, a client
+datagram traverses the generated stream proxy and is answered by the backend the
+route named, two `UDPRoute`s on two UDP listeners do not cross-talk, a weighted
+`backendRefs` set is served from its generated upstream with per-session leg
+stability, a leg naming an absent `Service` drops the datagram instead of
+answering it, in-budget replies are forwarded, over-budget and cumulative
+multi-datagram replies are dropped, and deleting the amplification policy
+returns the listener to the finite default. The Gateway API conformance lab does **not** run a UDPRoute black-box step (Trusted Cross Build Policy freezes adding that executable automation), so the live evidence rides the required `Tests` aggregate instead. Upstream profile/features remain `GATEWAY-HTTP,GATEWAY-GRPC` / `Gateway,ReferenceGrant,HTTPRoute,GRPCRoute`; `GATEWAY-UDP` is **not** claimed on this pin. |
 | `BackendTLSPolicy` | Not claimed by upstream conformance profiles | Watched and translated for Service-backed `HTTPRoute`/`GRPCRoute` backends: `validation.hostname` → upstream SNI, `caCertificateRefs` (ConfigMap inline PEM or Secret `k8s://…#ca.crt`) or `wellKnownCACertificates: System` (projected as the first-class `system://` trust source, which pins built-in webpki roots and never falls back to `FERRUM_TLS_CA_BUNDLE_PATH` or inherits `FERRUM_TLS_NO_VERIFY`), optional `subjectAltNames` → SAN allow-list, `backend_scheme: https`. Exactly one `targetRefs` entry is supported per the v1.5.1 implementation guidance; non-empty `spec.options` and malformed optional shapes are rejected. Invalid, conflicting, or partially-covering policies fail closed with an HTTP 500 fault abort — including a rule whose `backendRefs` mix policy-covered and uncovered Services, which Ferrum cannot represent in one upstream. Policy `status.ancestors` names the **targeted Service** as the single Ferrum ancestor (Ferrum's verdict takes no Gateway as input, so it cannot vary per Gateway) and carries `Accepted` / `ResolvedRefs` conditions; precedence losers report `Accepted=False, reason=Conflicted`. Ferrum's own contribution is therefore one entry regardless of how many Gateways route to the Service. `targetRefs[].sectionName` is resolved against the Service's actual `spec.ports[].name`: a `sectionName` that names no port makes the policy fail to attach and reports `Accepted=False, reason=TargetNotFound` with a field-specific message, and — because the intended port cannot be inferred — it neither applies to nor faults the Service's other, valid ports. Per GEP-1897, BackendTLSPolicy applies only to TCP traffic, and eligibility is decided on the port's **transport**: a port qualifies only when `spec.ports[].protocol` is proven `TCP` (omitted counts as TCP, matching the Kubernetes default; the comparison is case-insensitive). `UDP`, `SCTP`, and any unrecognized protocol value are all ineligible — GEP-1897 names UDP in its examples, but the rule it states is that the policy configures TLS for TCP traffic, and no TLS handshake can be originated on an SCTP or unknown-transport port. A policy that explicitly attaches to an ineligible port (a `sectionName` naming a `UDP`, `SCTP`, or unrecognized-protocol port) reports `Accepted=False, reason=Invalid` scoped to that port, leaving sibling TCP ports alone; a Service-wide policy on a Service with no TCP port at all is rejected the same way because it would govern nothing. Route traffic that actually selects a rejected policy fails closed with the HTTP 500 fault rather than originating TLS over a non-TCP transport or dropping to plaintext. A Service that mixes TCP and non-TCP ports is accepted with a warning carried in the `Accepted` condition message and the policy is effective only for the TCP ports; the non-TCP ports keep their pre-policy behaviour. Condition messages name the transport from a fixed set (`TCP` / `UDP` / `SCTP` / "not a recognized Kubernetes protocol") and never echo the raw cluster-supplied `protocol` string. A Service declaring more than 64 ports exceeds Ferrum's bounded port index, so the port transport cannot be proven and every policy targeting it is rejected fail closed. When third-party controllers have filled the CRD's 16-entry `ancestors` limit, Ferrum adds no entry (the spec forbids exceeding it), but translation is unaffected: the policy still applies and covered backends still originate TLS. `status.ancestors` is mutable state owned by other controllers, so letting it gate translation would let any controller with status-write access disable backend TLS origination and fault covered traffic. The consequence of a full ancestor map is therefore a reporting gap for that policy, never a traffic outage and never a drop to plaintext. |
 | `ListenerSet` | Yes, via Ferrum unit/integration tests **and** a live black-box lab step (not an upstream feature claim) | Watched optionally (`gateway.networking.k8s.io/v1`, discovery skips when the CRD is absent) and bounded by the same configured source-namespace scope as Gateways and Routes. A `ListenerSet` attaches only when its `parentRef` selects a Ferrum-managed Gateway **and** that Gateway's `spec.allowedListeners.namespaces` permits the ListenerSet namespace (`Same` / `Selector` / `All`; default `None` → `Accepted=False` / `NotAllowed`). Accepted listeners merge into the parent Gateway's programming with precedence Gateway → oldest ListenerSet → `{namespace}/{name}`; hostname/protocol collisions on the same port mark the loser `Conflicted=True` (`HostnameConflict` / `ProtocolConflict`) and never materialize traffic. Routes parentRef the ListenerSet (optionally selecting a listener by `sectionName` or `port`) and reuse the same HTTP/L4 translation engine as Gateway listeners. A cross-namespace ListenerSet remains namespaced to its own resource for identity, route attachment, status, and Secret/ReferenceGrant resolution, while its physical frontend-TLS claim joins the attached Gateway namespace's serving plan. It retains its complete admitted listener-owned certificate set, but cannot mint a process-global default certificate from a namespace with no managed Gateway or make a disjoint-hostname parent listener conflicted merely by naming a different credential. Cross-namespace `certificateRefs` require a ReferenceGrant `from.kind=ListenerSet` (Gateway grants are not inherited). Status emits ListenerSet `Accepted`/`Programmed` plus per-listener conditions, and Gateway `status.attachedListenerSets` counts successfully attached sets. Update/delete withdraws mesh listeners and routes. Upstream profile/features remain `GATEWAY-HTTP,GATEWAY-GRPC` / `Gateway,ReferenceGrant,HTTPRoute,GRPCRoute` — `ListenerSet` is **not** advertised as a supported upstream feature on this pin. Evidence: `tests/unit/gateway_core/k8s_listenerset_translation_tests.rs`, `tests/integration/gateway_api_listenerset_tests.rs`, and `scripts/gateway_api_listenerset_conformance.sh`. |
 | `GRPCRoute` | Yes, via upstream `GATEWAY-GRPC` | Watched and translated — see [GRPCRoute predicate translation](#grpcroute-predicate-translation). CI advertises `GRPCRoute` and runs the pinned upstream `GATEWAY-GRPC` core suite (exact method, header, listener hostname, weight, and core status) against a live Ferrum listener. Extended `GRPCRouteNamedRouteRule` is **not** claimed. Native gRPC route misses and `reject_unmatched` refusals map HTTP 404 → gRPC `UNIMPLEMENTED` (official HTTP↔gRPC table / Gateway API `GRPCExactMethodMatching`). |
@@ -126,23 +144,50 @@ set.
 | Cross-namespace `backendRefs` | Requires an exact `ReferenceGrant` (`from` `gateway.networking.k8s.io`/`UDPRoute`, `to` core `Service`); a missing or mismatched grant fails the **whole rule** closed (the strongest fail-closed outcome) and reports `ResolvedRefs=False` |
 | Cross-namespace `parentRefs` | Rejected, matching `TCPRoute`/`TLSRoute` — Ferrum has no L4 cross-namespace parent materialization yet |
 | `spec.hostnames` | Not a Gateway API `UDPRoute` field, and a datagram carries no name to match on. A hostname supplied through a non-Kubernetes config source is rejected fail closed rather than silently ignored |
-| Status | `status.parents[]` carries Ferrum-authored `Accepted`, `ResolvedRefs`, `Programmed`, and `Conflicted`, written through the same read-modify-write path as every other route kind. A fully shadowed same-listener UDPRoute loser stays `Accepted=True` / reason `Accepted` (attached) and reports `Programmed=False` with conflict evidence plus `Conflicted=True`; it is not flipped to `Accepted=False` for losing traffic ownership |
+| Status | `status.parents[]` carries Ferrum-authored `Accepted`, `ResolvedRefs`, `Programmed`, `Conflicted`, and `UDPAmplificationProtection` (`FiniteDefault` / `FinitePolicy` / `ExplicitUnlimited`, without echoing the numeric factor), written through the same read-modify-write path as every other route kind. A fully shadowed same-listener UDPRoute loser stays `Accepted=True` / reason `Accepted` (attached) and reports `Programmed=False` with conflict evidence plus `Conflicted=True`; it is not flipped to `Accepted=False` for losing traffic ownership |
 | Update / delete | Reconciliation regenerates live stream listeners and upstreams from the full snapshot; a changed `backendRefs` or a weight-only change replaces the upstream's target set under the same deterministic id, a deleted `UDPRoute` withdraws both the listener and its upstream, and deleting a conflict winner lets a previously suppressed loser materialize on the next reconcile |
 
 Datagram semantics come from the existing Ferrum UDP data path and are not
 re-implemented for Gateway API: sessions are keyed by client address with an
 idle timeout.
 
-The response-amplification guard is **not** engaged for a generated `UDPRoute`
-proxy. That guard is the opt-in per-proxy `udp_max_response_amplification_factor`
-(default unset — see
-[`docs/tcp_udp_proxy.md`](tcp_udp_proxy.md)), Gateway API defines no field that
-maps onto it, and the translator leaves it unset, exactly as a hand-authored UDP
-proxy that does not set it. An internet-facing `UDPRoute` relay therefore has no
-response-size ceiling relative to the request that triggered it; operators who
-need one must front the listener with their own control, because a
-Kubernetes-managed proxy is regenerated from the route on every reconcile and
-cannot carry a hand-applied override.
+The response-amplification guard is **always** engaged for a generated `UDPRoute`
+proxy. Ferrum projects a finite controller default of `8.0` onto every
+materialized UDP listener. Operators override that default with the Ferrum
+`UDPResponseAmplificationPolicy` CRD (`gateway.ferrum.io/v1alpha1`), using
+GEP-713 Direct Policy Attachment:
+
+1. UDPRoute `targetRefs` (highest)
+2. Gateway + `sectionName` (one listener)
+3. Gateway (all UDP listeners on that Gateway)
+4. `GatewayClass.spec.parametersRef` naming this CRD
+5. Controller default `8.0`
+
+Same attachment level is oldest-wins (`creationTimestamp`, then
+`{namespace}/{name}`). Cross-namespace `targetRefs` require a `ReferenceGrant`
+from `gateway.ferrum.io`/`UDPResponseAmplificationPolicy` to `Gateway` or
+`UDPRoute`. A missing, invalid, unauthorized, or deleted policy never programs
+unlimited amplification — the next precedence level, ultimately the finite
+default, applies. `mode: Unlimited` is accepted only together with
+`acknowledgeUnsafeAmplification: true`. Factors must be finite, greater than
+zero, and at most 1024; rejected values do not unprogram the route.
+
+Runtime accounting is **cumulative per admitted client request**. Several
+backend replies that are each under `request_size × factor` still fail closed
+once their sum exceeds the remaining budget. The budget is stored on the UDP
+session, so weighted multi-backend selection cannot reset or multiply it.
+Idle cleanup and listener/route deletion tear the session map down with the
+existing idle-timeout path; no extra maps keyed by client or route are added.
+
+`UDPRoute.status.parents[].conditions` includes Ferrum
+`UDPAmplificationProtection` with reasons `FiniteDefault`, `FinitePolicy`, or
+`ExplicitUnlimited`. Condition messages do not echo the numeric factor.
+Process-wide unlabeled counters
+`ferrum_udp_amplification_responses_allowed_total`,
+`ferrum_udp_amplification_responses_dropped_total`,
+`ferrum_udp_amplification_policy_invalid_total`, and
+`ferrum_udp_amplification_unlimited_total` never carry route, backend, source,
+factor, or error-text labels.
 
 Support boundary, stated exactly: Ferrum implements Gateway API `UDPRoute` with
 a **single** rule, a weighted `backendRefs` set of up to 16 core `Service`
