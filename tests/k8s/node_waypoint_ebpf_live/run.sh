@@ -3134,7 +3134,7 @@ expect_attributed_forged_assertion_blocked() {
   local family="${4:-4}"
   local from_record from_uid from_node from_pod destination_record dst_uid dst_node dst_pod expected_assertor
   local out_dir before_file after_file output code body err status before_count after_count attempt
-  local dispatch_not_ready_body
+  local dispatch_not_ready_body route_not_found_body
   from_record="$(workload_pod_record_for_app "$from")"
   IFS=$'\t' read -r from_uid from_node from_pod <<<"$from_record"
   destination_record="$(workload_pod_record_for_app "$destination")"
@@ -3158,6 +3158,12 @@ expect_attributed_forged_assertion_blocked() {
   before_count="$(policy_deny_count_for_source_and_reasons "$before_file" "$expected_assertor" scope_missing untrusted_assertor)"
 
   dispatch_not_ready_body='{"error":"Bad Gateway","message":"HBONE dispatch required for this backend target"}'
+  # Exact Ferrum HTTP route-miss body. A rolling NodeWaypoint restart can
+  # accept the slice and report ready before outbound HTTP routes rematerialize;
+  # captured traffic then hits the source waypoint and 404s instead of reaching
+  # destination HBONE policy. This is the same post-rollout window as the 502
+  # HBONE-tag miss below — wait through it, never treat 404 as a policy deny.
+  route_not_found_body='{"error":"Not Found"}'
   for attempt in $(seq 1 120); do
     set +e
     output="$(curl_for_family_from "$family" "$from" "$url" 2>"$err")"
@@ -3172,13 +3178,20 @@ expect_attributed_forged_assertion_blocked() {
     fi
 
     # A hosted DaemonSet rollout can report ready after accepting the slice but
-    # before the restarted source NodeWaypoint has materialized its per-workload
-    # HBONE target tags. Retry only that exact fail-closed convergence response;
-    # every other transport/HTTP outcome still fails immediately, and success
-    # still requires a destination-policy rejection plus the deny counter below.
-    if [[ "$status" -eq 0 && "$code" == "502" && "$body" == "$dispatch_not_ready_body" && "$attempt" -lt 120 ]]; then
-      sleep 0.5
-      continue
+    # before the restarted source NodeWaypoint has rematerialized outbound HTTP
+    # routes or per-workload HBONE target tags. Retry only those two exact
+    # fail-closed convergence responses; every other transport/HTTP outcome
+    # still fails immediately, and success still requires a destination-policy
+    # rejection plus the deny counter below. A 404 is never a policy pass.
+    if [[ "$attempt" -lt 120 ]]; then
+      if [[ "$status" -eq 0 && "$code" == "502" && "$body" == "$dispatch_not_ready_body" ]]; then
+        sleep 0.5
+        continue
+      fi
+      if [[ "$status" -eq 0 && "$code" == "404" && "$body" == "$route_not_found_body" ]]; then
+        sleep 0.5
+        continue
+      fi
     fi
 
     echo "expected forged assertion request to fail via destination HBONE policy rejection, got curl status=$status HTTP ${code:-<none>} body '${body:-<empty>}'" >&2
