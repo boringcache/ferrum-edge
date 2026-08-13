@@ -2023,25 +2023,16 @@ async fn swap_frontend_tls_config_replaces_slot_without_reconcile() {
     );
 }
 
-/// `swap_active_dtls_frontend_configs` validates the candidate once and
-/// publishes it as the accepted generation even when no DTLS listeners are
-/// active yet, so a later-started listener converges on the same material.
+/// The ordinary `FERRUM_DTLS_*` publish records an accepted generation even
+/// when no DTLS listeners are active yet, so a later-started listener converges
+/// on the same material.
 #[tokio::test]
-async fn swap_active_dtls_frontend_configs_publishes_generation_without_listeners() {
+async fn frontend_dtls_publish_records_generation_without_listeners() {
     let manager = create_manager(empty_config());
-    let calls = std::sync::atomic::AtomicUsize::new(0);
-    let swapped = manager
-        .swap_active_dtls_frontend_configs(|| {
-            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Ok(ephemeral_frontend_dtls_config())
-        })
+    let (_generation, swapped) = manager
+        .publish_frontend_dtls_generation(ephemeral_frontend_dtls_config())
         .await;
     assert_eq!(swapped, 0, "no listeners should mean no live swaps");
-    assert_eq!(
-        calls.load(std::sync::atomic::Ordering::Relaxed),
-        1,
-        "build_config must run exactly once so the accepted generation is published"
-    );
     let generation = manager
         .snapshot_frontend_dtls_generation()
         .expect("generation published with zero listeners");
@@ -2052,6 +2043,99 @@ async fn swap_active_dtls_frontend_configs_publishes_generation_without_listener
     let overload = manager.overload_snapshot();
     assert_eq!(overload.frontend_dtls_reload.generation, 1);
     assert_eq!(overload.frontend_dtls_reload.last_outcome, "accepted");
+}
+
+/// Issue #3858 composition contract: the two DTLS ownership classes have
+/// SEPARATE generation slots and separate publish entry points. An owner-scoped
+/// mesh publication must never seed, advance, or overwrite the ordinary
+/// operator `FERRUM_DTLS_*` generation, and the reverse must hold too. There is
+/// no process-wide DTLS fanout for either owner to reach the other through.
+#[tokio::test]
+async fn mesh_node_waypoint_dtls_publish_never_touches_the_ordinary_generation() {
+    let manager = create_manager(empty_config());
+    let (_generation, _swapped) = manager
+        .publish_frontend_dtls_generation(ephemeral_frontend_dtls_config())
+        .await;
+    let ordinary_before = manager
+        .snapshot_frontend_dtls_generation()
+        .expect("ordinary generation published");
+
+    let mut configs = std::collections::BTreeMap::new();
+    configs.insert(
+        "ferrum|__mesh-nw-udp-team-a-dns-a-5353".to_string(),
+        ephemeral_frontend_dtls_config(),
+    );
+    let (mesh_generation, swapped) = manager
+        .publish_mesh_node_waypoint_dtls_generation(configs)
+        .await;
+    assert_eq!(mesh_generation, 1);
+    assert_eq!(swapped, 0, "no generated listener is bound in this test");
+
+    let ordinary_after = manager
+        .snapshot_frontend_dtls_generation()
+        .expect("ordinary generation retained");
+    assert!(
+        std::sync::Arc::ptr_eq(&ordinary_before, &ordinary_after),
+        "an owner-scoped mesh publish must not replace the ordinary DTLS generation"
+    );
+    assert_eq!(
+        manager.frontend_dtls_reload_status().generation,
+        ordinary_before.generation,
+        "the ordinary reload status must not move on a mesh publish"
+    );
+    let mesh_status = manager.mesh_node_waypoint_dtls_reload_status();
+    assert_eq!(mesh_status.last_outcome, "accepted");
+    assert_eq!(mesh_status.generation, 1);
+
+    // ... and the reverse direction: an ordinary rotation leaves the accepted
+    // owner-scoped generation exactly where it was.
+    let mesh_before = manager
+        .snapshot_mesh_node_waypoint_dtls_generation()
+        .expect("mesh generation published");
+    let (_generation, _swapped) = manager
+        .publish_frontend_dtls_generation(ephemeral_frontend_dtls_config())
+        .await;
+    let mesh_after = manager
+        .snapshot_mesh_node_waypoint_dtls_generation()
+        .expect("mesh generation retained");
+    assert!(
+        std::sync::Arc::ptr_eq(&mesh_before, &mesh_after),
+        "an ordinary DTLS rotation must not replace the owner-scoped mesh generation"
+    );
+}
+
+/// A generated listener is covered ONLY by its own exact key. A generation that
+/// does not name it leaves it uncovered — it never borrows another owner's (or
+/// another route's) material.
+#[tokio::test]
+async fn mesh_node_waypoint_dtls_generation_covers_only_its_named_listeners() {
+    let manager = create_manager(empty_config());
+    let mut configs = std::collections::BTreeMap::new();
+    configs.insert(
+        "ferrum|__mesh-nw-udp-team-a-dns-a-5353".to_string(),
+        ephemeral_frontend_dtls_config(),
+    );
+    manager
+        .publish_mesh_node_waypoint_dtls_generation(configs)
+        .await;
+    let generation = manager
+        .snapshot_mesh_node_waypoint_dtls_generation()
+        .expect("mesh generation published");
+    assert_eq!(
+        generation.covered_listener_keys(),
+        vec!["ferrum|__mesh-nw-udp-team-a-dns-a-5353".to_string()]
+    );
+
+    // Withdraw: an EMPTY accepted generation is a positive statement, so a
+    // re-added listener cannot resurrect the previous owner-scoped config.
+    manager
+        .publish_mesh_node_waypoint_dtls_generation(std::collections::BTreeMap::new())
+        .await;
+    let withdrawn = manager
+        .snapshot_mesh_node_waypoint_dtls_generation()
+        .expect("empty generation is still an accepted generation");
+    assert!(withdrawn.covered_listener_keys().is_empty());
+    assert_eq!(withdrawn.generation(), 2);
 }
 
 #[tokio::test]
@@ -2133,10 +2217,7 @@ async fn rejected_dtls_candidate_retains_previous_generation() {
         .snapshot_frontend_dtls_generation()
         .expect("initial generation");
 
-    let swapped = manager
-        .swap_active_dtls_frontend_configs(|| Err(anyhow::anyhow!("simulated bad candidate")))
-        .await;
-    assert_eq!(swapped, 0);
+    manager.record_frontend_dtls_candidate_failure();
     let after = manager
         .snapshot_frontend_dtls_generation()
         .expect("previous generation retained");

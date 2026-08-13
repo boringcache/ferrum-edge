@@ -9445,6 +9445,7 @@ mod tests {
             http_tls_listen_ports: Default::default(),
             mesh_revision: None,
             node_waypoint_udp_steer_destinations: Vec::new(),
+            node_waypoint_udp_destination_routes: Vec::new(),
             k8s_mesh_overlay: Default::default(),
         };
         ProxyState::new(config, dns_cache, EnvConfig::default(), None, None)

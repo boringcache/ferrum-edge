@@ -303,6 +303,7 @@ async fn try_spawn_dtls_gateway(
         udp_pktinfo_enabled: false,
         mesh_outbound_enforcement: empty_slot(),
         node_waypoint_udp_source_scoping: None,
+        node_waypoint_udp_destinations: None,
     };
     let join = tokio::spawn(async move {
         let _ = start_udp_listener(cfg).await;

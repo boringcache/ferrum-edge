@@ -100,6 +100,7 @@ pub mod mesh_udp_frame;
 pub mod netns_capture;
 pub mod netns_udp_capture;
 pub(crate) mod node_waypoint_ingress_capture;
+pub mod node_waypoint_udp_destination;
 pub mod node_waypoint_udp_identity;
 pub mod node_waypoint_udp_reply_source;
 pub mod node_waypoint_udp_steering;
@@ -55737,6 +55738,7 @@ mod tests {
             http_tls_listen_ports: Default::default(),
             mesh_revision: None,
             node_waypoint_udp_steer_destinations: Vec::new(),
+            node_waypoint_udp_destination_routes: Vec::new(),
             k8s_mesh_overlay: Default::default(),
         }
     }

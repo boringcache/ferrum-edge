@@ -3050,6 +3050,22 @@ pub struct GatewayConfig {
     /// without a serving socket.
     #[serde(skip)]
     pub node_waypoint_udp_steer_destinations: Vec<crate::capture::NodeWaypointUdpSteerDestination>,
+    /// Exact NodeWaypoint UDP/DTLS destination routes derived during mesh
+    /// materialization (issue #3861).
+    ///
+    /// Runtime-only (`serde(skip)`), same contract as
+    /// [`Self::node_waypoint_udp_steer_destinations`]: never operator input and
+    /// never on the ConfigSync `config_json` wire. Each entry binds one
+    /// canonical `(local destination IP, listen port)` to the generated
+    /// `__mesh-nw-udp-*` listener proxy that exclusively owns it. Several
+    /// Services may share one numeric port; the shared datagram listener
+    /// selects the owning route from the kernel-reported local destination
+    /// before any session, plugin, backend or accounting work happens.
+    /// `StreamListenerManager` publishes only the routes whose listener is
+    /// actually bound on the accepted serving generation.
+    #[serde(skip)]
+    pub node_waypoint_udp_destination_routes:
+        Vec<crate::proxy::node_waypoint_udp_destination::NodeWaypointUdpDestinationRoute>,
     /// Kubernetes mesh-overlay ownership marker (issue #2452).
     ///
     /// DERIVED, CP-in-memory only (`#[serde(skip)]`, same contract as
@@ -5086,6 +5102,25 @@ impl GatewayConfig {
             }) && proxies_on_port
                 .iter()
                 .any(|p| p.stream_match.as_ref().is_some_and(|m| !m.is_empty()));
+            // NodeWaypoint UDP destination group (issue #3861): every candidate
+            // is a Ferrum-generated plain-UDP Service listener, and the shared
+            // socket demultiplexes by the kernel-reported local destination
+            // address. Membership is homogeneous by construction — the
+            // materializer refuses a port that mixes UDP and DTLS postures, and
+            // a hand-authored proxy can never carry the reserved id prefix.
+            let node_waypoint_udp_group = proxies_on_port
+                .iter()
+                .all(|p| p.joins_node_waypoint_udp_destination_plane());
+
+            if node_waypoint_udp_group {
+                // The remaining shared-listener checks below are written for
+                // the TCP planes (PROXY protocol, backend TLS, SNI tiers) and
+                // none of them applies to a generated datagram group: UDP
+                // carries no PROXY header, these listeners never originate
+                // backend TLS, and they declare no `hosts`. Their exactness
+                // comes from the destination route table instead.
+                continue;
+            }
 
             if !all_passthrough && !opaque_sni_group && !stream_match_group {
                 let mixed_passthrough = proxies_on_port.iter().any(|p| p.passthrough);
@@ -7238,6 +7273,33 @@ impl Proxy {
     #[inline]
     pub fn joins_opaque_tls_sni_plane(&self) -> bool {
         self.passthrough || (!self.frontend_tls && self.effective_scheme() == BackendScheme::Tcp)
+    }
+
+    /// Whether this proxy belongs to the **NodeWaypoint UDP destination
+    /// routing plane** (issue #3861): a Ferrum-generated
+    /// `__mesh-nw-udp-*` plain-UDP listener whose route is selected from the
+    /// kernel-reported local destination address rather than from the numeric
+    /// port.
+    ///
+    /// Several such proxies may legitimately share one `listen_port`: a
+    /// `hostNetwork` NodeWaypoint can bind a port only once, but the
+    /// Service-path steering rules rewrite nothing, so each datagram still
+    /// carries the original ClusterIP as its local destination and selects
+    /// exactly one owning route.
+    ///
+    /// DTLS listeners are deliberately excluded. A `DtlsServer` owns its socket
+    /// and carries ONE frontend config, and it allocates handshake state per
+    /// peer before any route could be chosen, so two DTLS Services on one port
+    /// cannot be given exact per-route posture — materialization refuses that
+    /// shape fail-closed instead of letting one claimant win.
+    #[inline]
+    pub fn joins_node_waypoint_udp_destination_plane(&self) -> bool {
+        !self.passthrough
+            && !self.frontend_tls
+            && self.dispatch_kind.is_udp()
+            && self
+                .id
+                .starts_with(crate::modes::mesh::MESH_NODE_WAYPOINT_UDP_PROXY_ID_PREFIX)
     }
 }
 

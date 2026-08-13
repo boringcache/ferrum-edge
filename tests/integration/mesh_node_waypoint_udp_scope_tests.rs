@@ -1207,8 +1207,13 @@ fn only_the_node_waypoint_topology_materializes_udp_listeners() {
     }
 }
 
+/// Issue #3861: two plain-UDP Services with distinct ClusterIPs on ONE port
+/// both materialize and both publish an exact destination route. A `hostNetwork`
+/// NodeWaypoint binds the port once, but the steering rules rewrite nothing, so
+/// every datagram still carries the ClusterIP its sender addressed and selects
+/// exactly one Service.
 #[test]
-fn two_services_claiming_one_udp_port_materialize_no_listener() {
+fn two_plain_udp_services_sharing_one_port_both_materialize_exact_routes() {
     let _env = UdpListenerEnvGuard::set(Some("true"));
     let runtime = node_waypoint_runtime();
     let a = workload_for(
@@ -1223,18 +1228,360 @@ fn two_services_claiming_one_udp_port_materialize_no_listener() {
         [("app", "udp")],
         ["10.244.3.12"],
     );
-    let config = prepare(
-        &runtime,
-        vec![
-            udp_service("dns-a", 5353, AppProtocol::Udp, &[&a]),
-            udp_service("dns-b", 5353, AppProtocol::Udp, &[&b]),
-        ],
-        vec![a, b],
+    let mut service_a = udp_service("dns-a", 5353, AppProtocol::Udp, &[&a]);
+    service_a.cluster_ips = vec!["10.96.0.10".to_string()];
+    let mut service_b = udp_service("dns-b", 5353, AppProtocol::Udp, &[&b]);
+    service_b.cluster_ips = vec!["10.96.0.11".to_string()];
+    let config = prepare(&runtime, vec![service_a, service_b], vec![a, b]);
+
+    let listeners = udp_listeners(&config);
+    assert_eq!(
+        listeners.len(),
+        2,
+        "both compatible same-port claimants must serve; one Service entering the slice must \
+         never withdraw the other"
     );
     assert!(
+        listeners.iter().all(|proxy| proxy.listen_port == Some(5353)),
+        "both routes share the one bound port"
+    );
+
+    let mut routes: Vec<(String, String)> = config
+        .node_waypoint_udp_destination_routes
+        .iter()
+        .map(|route| (route.destination.to_string(), route.proxy.id.clone()))
+        .collect();
+    routes.sort();
+    assert_eq!(routes.len(), 2, "one exact route per Service ClusterIP");
+    assert_eq!(routes[0].0, "10.96.0.10");
+    assert_eq!(routes[1].0, "10.96.0.11");
+    assert_ne!(
+        routes[0].1, routes[1].1,
+        "each destination must be owned by its OWN Service listener proxy — the owner decides \
+         upstream, policy scope, plugins, accounting and reply source"
+    );
+    assert!(
+        config
+            .node_waypoint_udp_destination_routes
+            .iter()
+            .all(|route| route.listen_port == 5353 && !route.terminates_dtls)
+    );
+
+    // Backend isolation: each generated upstream carries only its own Service's
+    // same-node endpoint.
+    for (destination, proxy_id) in &routes {
+        let proxy = listeners
+            .iter()
+            .find(|proxy| &proxy.id == proxy_id)
+            .expect("route owner is materialized");
+        let upstream_id = proxy.upstream_id.as_deref().expect("listener upstream");
+        let upstream = config
+            .upstreams
+            .iter()
+            .find(|upstream| upstream.id == upstream_id)
+            .expect("upstream materialized");
+        let hosts: Vec<&str> = upstream
+            .targets
+            .iter()
+            .map(|target| target.host.as_str())
+            .collect();
+        let expected = if destination == "10.96.0.10" {
+            "10.244.3.11"
+        } else {
+            "10.244.3.12"
+        };
+        assert_eq!(
+            hosts,
+            vec![expected],
+            "destination {destination} must reach only its own Service's backend"
+        );
+    }
+}
+
+/// Adding a second compatible claimant must not withdraw the first, and removing
+/// one must retract only that one's route.
+#[test]
+fn same_port_claimants_are_added_and_removed_independently() {
+    let _env = UdpListenerEnvGuard::set(Some("true"));
+    let runtime = node_waypoint_runtime();
+    let a = workload_for(
+        "dns-a",
+        DEFAULT_NAMESPACE,
+        [("app", "udp")],
+        ["10.244.3.11"],
+    );
+    let b = workload_for(
+        "dns-b",
+        DEFAULT_NAMESPACE,
+        [("app", "udp")],
+        ["10.244.3.12"],
+    );
+    let mut service_a = udp_service("dns-a", 5353, AppProtocol::Udp, &[&a]);
+    service_a.cluster_ips = vec!["10.96.0.10".to_string()];
+    let mut service_b = udp_service("dns-b", 5353, AppProtocol::Udp, &[&b]);
+    service_b.cluster_ips = vec!["10.96.0.11".to_string()];
+
+    let only_a = prepare(&runtime, vec![service_a.clone()], vec![a.clone()]);
+    assert_eq!(udp_listeners(&only_a).len(), 1);
+    assert_eq!(only_a.node_waypoint_udp_destination_routes.len(), 1);
+
+    let both = prepare(
+        &runtime,
+        vec![service_a.clone(), service_b.clone()],
+        vec![a.clone(), b.clone()],
+    );
+    assert_eq!(
+        udp_listeners(&both).len(),
+        2,
+        "adding a second same-port Service must not withdraw the first"
+    );
+
+    let only_b = prepare(&runtime, vec![service_b], vec![b]);
+    assert_eq!(udp_listeners(&only_b).len(), 1);
+    let remaining: Vec<&str> = only_b
+        .node_waypoint_udp_destination_routes
+        .iter()
+        .map(|route| route.proxy.id.as_str())
+        .collect();
+    assert_eq!(remaining.len(), 1);
+    assert!(
+        remaining[0].contains("dns-b"),
+        "removing Service A retracts only A's route; B keeps serving"
+    );
+}
+
+/// Two Services publishing the SAME exact ClusterIP on one port are ambiguous:
+/// a received datagram's local destination cannot name one owner, so BOTH are
+/// refused. An unrelated third claimant on the same port keeps serving.
+#[test]
+fn duplicate_exact_destination_claims_refuse_every_ambiguous_claimant() {
+    let _env = UdpListenerEnvGuard::set(Some("true"));
+    let runtime = node_waypoint_runtime();
+    let a = workload_for(
+        "dns-a",
+        DEFAULT_NAMESPACE,
+        [("app", "udp")],
+        ["10.244.3.11"],
+    );
+    let b = workload_for(
+        "dns-b",
+        DEFAULT_NAMESPACE,
+        [("app", "udp")],
+        ["10.244.3.12"],
+    );
+    let c = workload_for(
+        "dns-c",
+        DEFAULT_NAMESPACE,
+        [("app", "udp")],
+        ["10.244.3.13"],
+    );
+    let mut service_a = udp_service("dns-a", 5353, AppProtocol::Udp, &[&a]);
+    service_a.cluster_ips = vec!["10.96.0.10".to_string()];
+    let mut service_b = udp_service("dns-b", 5353, AppProtocol::Udp, &[&b]);
+    service_b.cluster_ips = vec!["10.96.0.10".to_string()];
+    let mut service_c = udp_service("dns-c", 5353, AppProtocol::Udp, &[&c]);
+    service_c.cluster_ips = vec!["10.96.0.12".to_string()];
+
+    let config = prepare(
+        &runtime,
+        vec![service_a, service_b, service_c],
+        vec![a, b, c],
+    );
+    let ids: Vec<&str> = udp_listeners(&config)
+        .iter()
+        .map(|proxy| proxy.id.as_str())
+        .collect();
+    assert_eq!(
+        ids.len(),
+        1,
+        "both claimants of the duplicated exact destination are refused: {ids:?}"
+    );
+    assert!(ids[0].contains("dns-c"));
+    assert_eq!(
+        config
+            .node_waypoint_udp_destination_routes
+            .iter()
+            .map(|route| route.destination.to_string())
+            .collect::<Vec<_>>(),
+        vec!["10.96.0.12".to_string()]
+    );
+}
+
+/// A headless (ClusterIP-less) Service has no exact destination to demultiplex
+/// on. It stays reachable over the direct-node-address boundary ONLY while the
+/// port has a single claimant; on a shared port it is refused and the
+/// VIP-bearing claimants keep serving.
+#[test]
+fn headless_service_is_unique_port_only_and_never_withdraws_its_neighbours() {
+    let _env = UdpListenerEnvGuard::set(Some("true"));
+    let runtime = node_waypoint_runtime();
+    let headless_backend = workload_for(
+        "syslog",
+        DEFAULT_NAMESPACE,
+        [("app", "udp")],
+        ["10.244.3.21"],
+    );
+    let mut headless = udp_service("syslog", 5140, AppProtocol::Udp, &[&headless_backend]);
+    headless.cluster_ips = Vec::new();
+
+    // Sole claimant: served, with no steerable destination.
+    let alone = prepare(
+        &runtime,
+        vec![headless.clone()],
+        vec![headless_backend.clone()],
+    );
+    assert_eq!(
+        udp_listeners(&alone).len(),
+        1,
+        "a headless Service on a unique port keeps the direct-node-address lane"
+    );
+    assert!(
+        alone.node_waypoint_udp_destination_routes.is_empty(),
+        "a headless Service publishes no exact destination route"
+    );
+
+    // Shared port: refused, and the VIP-bearing claimant is untouched.
+    let vip_backend = workload_for(
+        "logs",
+        DEFAULT_NAMESPACE,
+        [("app", "udp")],
+        ["10.244.3.22"],
+    );
+    let mut vip = udp_service("logs", 5140, AppProtocol::Udp, &[&vip_backend]);
+    vip.cluster_ips = vec!["10.96.0.20".to_string()];
+    let shared = prepare(
+        &runtime,
+        vec![headless, vip],
+        vec![headless_backend, vip_backend],
+    );
+    let ids: Vec<&str> = udp_listeners(&shared)
+        .iter()
+        .map(|proxy| proxy.id.as_str())
+        .collect();
+    assert_eq!(ids.len(), 1, "expected only the VIP-bearing claimant: {ids:?}");
+    assert!(ids[0].contains("logs"));
+}
+
+/// A port whose claimants disagree on frontend posture (plain `udp` beside
+/// terminating `dtls`) has no representable answer: one bound socket speaks one
+/// protocol, chosen before any datagram's destination can select a route. EVERY
+/// claimant on that port is refused, deterministically and order-independently;
+/// compatible claimants on other ports are untouched.
+#[test]
+fn a_port_mixing_udp_and_dtls_refuses_every_claimant() {
+    let _env = UdpListenerEnvGuard::set(Some("true"));
+    let runtime = node_waypoint_runtime();
+    let plain = workload_for(
+        "plain",
+        DEFAULT_NAMESPACE,
+        [("app", "udp")],
+        ["10.244.3.31"],
+    );
+    let secure = workload_for(
+        "secure",
+        DEFAULT_NAMESPACE,
+        [("app", "udp")],
+        ["10.244.3.32"],
+    );
+    let elsewhere = workload_for(
+        "other",
+        DEFAULT_NAMESPACE,
+        [("app", "udp")],
+        ["10.244.3.33"],
+    );
+    let mut plain_service = udp_service("plain", 5353, AppProtocol::Udp, &[&plain]);
+    plain_service.cluster_ips = vec!["10.96.0.10".to_string()];
+    let mut secure_service = udp_service("secure", 5353, AppProtocol::Dtls, &[&secure]);
+    secure_service.cluster_ips = vec!["10.96.0.11".to_string()];
+    let mut other_service = udp_service("other", 5354, AppProtocol::Udp, &[&elsewhere]);
+    other_service.cluster_ips = vec!["10.96.0.12".to_string()];
+
+    // Both materialization orders must produce the same refusal.
+    for services in [
+        vec![
+            plain_service.clone(),
+            secure_service.clone(),
+            other_service.clone(),
+        ],
+        vec![
+            secure_service.clone(),
+            plain_service.clone(),
+            other_service.clone(),
+        ],
+    ] {
+        let config = prepare(
+            &runtime,
+            services,
+            vec![plain.clone(), secure.clone(), elsewhere.clone()],
+        );
+        let ids: Vec<&str> = udp_listeners(&config)
+            .iter()
+            .map(|proxy| proxy.id.as_str())
+            .collect();
+        assert_eq!(
+            ids.len(),
+            1,
+            "the mixed-posture port refuses both claimants; the unrelated port keeps serving: \
+             {ids:?}"
+        );
+        assert!(ids[0].contains("other"));
+    }
+}
+
+/// More than one terminating-DTLS claimant on one port is likewise
+/// unrepresentable: a `DtlsServer` owns its socket and carries exactly one
+/// frontend identity + client verifier, chosen before any handshake state
+/// exists. Every claimant is refused.
+#[test]
+fn a_port_with_two_dtls_services_refuses_every_claimant() {
+    let _env = UdpListenerEnvGuard::set(Some("true"));
+    let runtime = node_waypoint_runtime();
+    let a = workload_for("dtls-a", DEFAULT_NAMESPACE, [("app", "udp")], ["10.244.3.41"]);
+    let b = workload_for("dtls-b", DEFAULT_NAMESPACE, [("app", "udp")], ["10.244.3.42"]);
+    let mut service_a = udp_service("dtls-a", 6000, AppProtocol::Dtls, &[&a]);
+    service_a.cluster_ips = vec!["10.96.0.30".to_string()];
+    let mut service_b = udp_service("dtls-b", 6000, AppProtocol::Dtls, &[&b]);
+    service_b.cluster_ips = vec!["10.96.0.31".to_string()];
+
+    let config = prepare(&runtime, vec![service_a, service_b], vec![a, b]);
+    assert!(
         udp_listeners(&config).is_empty(),
-        "a datagram carries no host or SNI, so a contested port must refuse BOTH claimants \
-         rather than let materialization order pick a winner"
+        "one DTLS server cannot carry two Services' postures, so both are refused"
+    );
+    assert!(config.node_waypoint_udp_destination_routes.is_empty());
+}
+
+/// IPv6 and dual-stack ClusterIPs are canonical exact destinations too, and an
+/// IPv4-mapped spelling folds onto its IPv4 form so a dual-stack bind and a
+/// dedicated v4 bind cannot disagree.
+#[test]
+fn same_port_destination_routes_cover_ipv4_ipv6_and_dual_stack() {
+    let _env = UdpListenerEnvGuard::set(Some("true"));
+    let runtime = node_waypoint_runtime();
+    let a = workload_for("v4", DEFAULT_NAMESPACE, [("app", "udp")], ["10.244.3.51"]);
+    let b = workload_for("v6", DEFAULT_NAMESPACE, [("app", "udp")], ["fd00::51"]);
+    let mut service_a = udp_service("v4", 5353, AppProtocol::Udp, &[&a]);
+    service_a.cluster_ips = vec!["10.96.0.40".to_string(), "fd00:96::40".to_string()];
+    let mut service_b = udp_service("v6", 5353, AppProtocol::Udp, &[&b]);
+    service_b.cluster_ips = vec!["::ffff:10.96.0.41".to_string()];
+
+    let config = prepare(&runtime, vec![service_a, service_b], vec![a, b]);
+    assert_eq!(udp_listeners(&config).len(), 2);
+    let mut destinations: Vec<String> = config
+        .node_waypoint_udp_destination_routes
+        .iter()
+        .map(|route| route.destination.to_string())
+        .collect();
+    destinations.sort();
+    assert_eq!(
+        destinations,
+        vec![
+            "10.96.0.40".to_string(),
+            "10.96.0.41".to_string(),
+            "fd00:96::40".to_string(),
+        ],
+        "a dual-stack Service publishes both families, and an IPv4-mapped ClusterIP is \
+         canonicalized onto its IPv4 form"
     );
 }
 

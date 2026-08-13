@@ -471,11 +471,12 @@ async fn mesh_peer_auth_live_reload_tcp_tls_swap_takes_effect_on_next_accept() {
     manager.shutdown_all().await;
 }
 
-/// Live-reload swap of the DTLS frontend config is a no-op when there are
-/// no active DTLS listeners (e.g. PeerAuth flips on a sidecar topology that
-/// has only HTTP/HBONE listeners). `build_config` must never be invoked.
+/// Owner-scoped DTLS publication (issue #3858) records an accepted generation
+/// even with no active DTLS listeners, so a listener created or restarted after
+/// the slice converges on exactly that generation — and it never seeds the
+/// ordinary operator `FERRUM_DTLS_*` slot.
 #[tokio::test]
-async fn mesh_peer_auth_live_reload_dtls_swap_noop_without_dtls_listeners() {
+async fn mesh_owner_scoped_dtls_publish_without_dtls_listeners() {
     use ferrum_edge::circuit_breaker::CircuitBreakerCache;
     use ferrum_edge::config::types::GatewayConfig;
     use ferrum_edge::consumer_index::ConsumerIndex;
@@ -533,29 +534,32 @@ async fn mesh_peer_auth_live_reload_dtls_swap_noop_without_dtls_listeners() {
         Arc::new(TrustedProxies::none()),
     );
 
-    let build_invocations = std::sync::atomic::AtomicUsize::new(0);
-    let swapped = manager
-        .swap_active_dtls_frontend_configs(|| {
-            build_invocations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let certificate =
-                ferrum_edge::dtls::generate_ephemeral_cert_public().expect("ephemeral cert");
-            let config = dimpl::Config::builder().build().expect("dtls config");
-            Ok(ferrum_edge::dtls::FrontendDtlsConfig {
-                dimpl_config: std::sync::Arc::new(config),
-                certificate,
-                client_cert_verifier: None,
-            })
-        })
+    let certificate =
+        ferrum_edge::dtls::generate_ephemeral_cert_public().expect("ephemeral cert");
+    let dtls_config = dimpl::Config::builder().build().expect("dtls config");
+    let mut configs = std::collections::BTreeMap::new();
+    configs.insert(
+        "ferrum|__mesh-nw-udp-team-a-dns-a-5353".to_string(),
+        ferrum_edge::dtls::FrontendDtlsConfig {
+            dimpl_config: std::sync::Arc::new(dtls_config),
+            certificate,
+            client_cert_verifier: None,
+        },
+    );
+    let (generation, swapped) = manager
+        .publish_mesh_node_waypoint_dtls_generation(configs)
         .await;
 
     assert_eq!(swapped, 0, "no active DTLS listeners means no live swaps");
-    assert_eq!(
-        build_invocations.load(std::sync::atomic::Ordering::Relaxed),
-        1,
-        "the build closure runs once to publish the accepted generation for later listeners"
+    assert_eq!(generation, 1);
+    assert!(
+        manager
+            .snapshot_mesh_node_waypoint_dtls_generation()
+            .is_some(),
+        "the owner-scoped generation must be published even when no DTLS listeners are bound yet"
     );
     assert!(
-        manager.snapshot_frontend_dtls_generation().is_some(),
-        "generation must be published even when no DTLS listeners are bound yet"
+        manager.snapshot_frontend_dtls_generation().is_none(),
+        "a mesh publish must never seed the ordinary FERRUM_DTLS_* generation"
     );
 }

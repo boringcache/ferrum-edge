@@ -128,6 +128,100 @@ async fn with_current_frontend_dtls_generation<T>(
     consume(generation.as_ref().as_ref())
 }
 
+/// Explicit ownership class of a terminating DTLS frontend listener (issue
+/// #3858).
+///
+/// DTLS frontend configuration and reload are **listener- and owner-scoped**.
+/// Mesh `PeerAuthentication`, client-CA, CRL and identity updates may reach
+/// [`Self::MeshNodeWaypoint`] listeners only; an ordinary operator
+/// `FERRUM_DTLS_*` listener sharing the process keeps byte-identical identity
+/// and verifier state across every mesh slice apply. There is deliberately no
+/// process-wide DTLS fanout: the two owners have separate generation slots and
+/// separate publish entry points, so neither can seed or overwrite the other.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DtlsListenerOwner {
+    /// Ordinary operator/gateway listener configured from `FERRUM_DTLS_*`.
+    Operator,
+    /// Ferrum-generated NodeWaypoint Service listener. Its accepted config is
+    /// keyed by the generated listener's stable namespaced identity, so a
+    /// listener created or restarted after a successful slice apply receives
+    /// exactly the generation already live on its peers.
+    MeshNodeWaypoint { listener_key: String },
+}
+
+impl DtlsListenerOwner {
+    #[inline]
+    fn from_node_waypoint_flag(
+        identity: &NamespacedResourceId,
+        node_waypoint_udp_owner: bool,
+    ) -> Self {
+        if node_waypoint_udp_owner {
+            Self::MeshNodeWaypoint {
+                listener_key: identity.runtime_key(),
+            }
+        } else {
+            Self::Operator
+        }
+    }
+
+    #[inline]
+    fn is_mesh_node_waypoint(&self) -> bool {
+        matches!(self, Self::MeshNodeWaypoint { .. })
+    }
+}
+
+/// One accepted owner-scoped DTLS generation for generated `MeshNodeWaypoint`
+/// listeners (issue #3858).
+///
+/// Carries the COMPLETE candidate set for one accepted mesh slice: every
+/// generated DTLS route's frontend config, derived from the dedicated DTLS
+/// server identity plus that route's effective `PeerAuthentication` workload /
+/// service scope and the accepted client-CA + CRL snapshot. Publication is
+/// all-or-nothing — the mesh builds and validates every required candidate
+/// BEFORE the slice is accepted, so a malformed CA/CRL or a failed verifier
+/// build rejects the whole slice and both owners retain their complete
+/// last-good serving generation.
+///
+/// A listener whose key is absent from the accepted map is NOT covered by this
+/// generation and stays deferred rather than falling back to another owner's
+/// material.
+pub struct MeshNodeWaypointDtlsGeneration {
+    generation: u64,
+    configs: std::collections::BTreeMap<String, crate::dtls::FrontendDtlsConfig>,
+}
+
+impl MeshNodeWaypointDtlsGeneration {
+    #[inline]
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    #[inline]
+    fn config_for(&self, listener_key: &str) -> Option<&crate::dtls::FrontendDtlsConfig> {
+        self.configs.get(listener_key)
+    }
+
+    /// Sorted listener keys covered by this generation (diagnostics / tests).
+    #[allow(dead_code)] // Test / introspection surface.
+    pub fn covered_listener_keys(&self) -> Vec<String> {
+        self.configs.keys().cloned().collect()
+    }
+}
+
+/// Owner-scoped analogue of [`with_current_frontend_dtls_generation`] for
+/// generated NodeWaypoint listeners. Shares the same publish lock so a
+/// collector cannot expose a handle between an owner-scoped publish's slot
+/// store and its live swap.
+async fn with_current_mesh_node_waypoint_dtls_generation<T>(
+    publish_lock: &Arc<tokio::sync::Mutex<()>>,
+    generation_slot: &Arc<arc_swap::ArcSwap<Option<Arc<MeshNodeWaypointDtlsGeneration>>>>,
+    consume: impl FnOnce(Option<&Arc<MeshNodeWaypointDtlsGeneration>>) -> T,
+) -> T {
+    let _publish_guard = publish_lock.lock().await;
+    let generation = generation_slot.load_full();
+    consume(generation.as_ref().as_ref())
+}
+
 /// Handle for a running stream listener — keeps the shutdown channel and task handle.
 struct ListenerHandle {
     shutdown_tx: watch::Sender<bool>,
@@ -172,6 +266,18 @@ struct ListenerHandle {
     /// [`NamespacedResourceId`] at spawn. Never re-derived from a runtime-key
     /// substring.
     node_waypoint_udp_owner: bool,
+    /// Live exact destination route table for a shared `__nwudp_{port}`
+    /// listener (issue #3861). `None` for every other listener. Held so a
+    /// reconcile can republish routes under the running socket and retract
+    /// them before the socket leaves service.
+    node_waypoint_udp_destinations: Option<
+        Arc<crate::proxy::node_waypoint_udp_destination::NodeWaypointUdpDestinationRouter>,
+    >,
+    /// Explicit DTLS ownership class (issue #3858), carried from the accepted
+    /// identity at spawn. Decides which generation slot may ever reach this
+    /// listener's `DtlsServer`. `Operator` for every non-generated listener,
+    /// including TCP listeners (which hold no DTLS server at all).
+    dtls_owner: DtlsListenerOwner,
 }
 
 /// Reload key for the cached backend TLS `ClientConfig` a TCP+TLS listener
@@ -801,6 +907,10 @@ struct DesiredStreamProxy {
     /// Whether the proxy carries compiled L4 stream_match predicates. Shared
     /// non-passthrough ports with stream_match form an L4 match group.
     has_stream_match: bool,
+    /// Whether this is a Ferrum-generated plain-UDP NodeWaypoint Service
+    /// listener (issue #3861). Several may share one numeric port; the shared
+    /// socket demultiplexes by exact local destination address.
+    node_waypoint_udp_destination_member: bool,
     backend_tls_reload_key: Option<BackendTlsReloadKey>,
 }
 
@@ -844,6 +954,20 @@ struct DesiredStreamListener {
     passthrough: bool,
     backend_tls_reload_key: Option<BackendTlsReloadKey>,
     sni_ids: Option<Vec<NamespacedResourceId>>,
+    /// Members of a shared `__nwudp_{port}` NodeWaypoint UDP destination group
+    /// (issue #3861), sorted for determinism. `None` for every other listener,
+    /// including a single-claimant NodeWaypoint UDP listener (which keeps the
+    /// direct-node-address boundary).
+    ///
+    /// Deliberately excluded from the listener restart key: a membership change
+    /// republishes the exact destination table under the running socket.
+    node_waypoint_udp_ids: Option<Vec<NamespacedResourceId>>,
+}
+
+/// Runtime key for a shared NodeWaypoint UDP destination listener.
+#[inline]
+fn node_waypoint_udp_listener_key(port: u16) -> String {
+    format!("__nwudp_{port}")
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -919,6 +1043,35 @@ pub struct StreamListenerManager {
     frontend_dtls_publish: Arc<tokio::sync::Mutex<()>>,
     /// Redacted reload status for admin/metrics (no PEM, keys, or secret URIs).
     frontend_dtls_reload_status: arc_swap::ArcSwap<FrontendDtlsReloadStatus>,
+    /// Last accepted **owner-scoped** DTLS generation for generated
+    /// `MeshNodeWaypoint` listeners (issue #3858).
+    ///
+    /// Deliberately a SEPARATE slot from [`Self::frontend_dtls_generation`]:
+    /// a mesh `PeerAuthentication` / client-CA / CRL change may only reach
+    /// listeners the mesh itself generated. Ordinary operator `FERRUM_DTLS_*`
+    /// listeners keep byte-identical identity and verifier state across every
+    /// mesh slice apply, and no mesh generation may seed or overwrite the
+    /// ordinary slot. Both publications share
+    /// [`Self::frontend_dtls_publish`], so a collector can never pair one
+    /// owner's handle with another owner's generation.
+    mesh_node_waypoint_dtls_generation:
+        Arc<arc_swap::ArcSwap<Option<Arc<MeshNodeWaypointDtlsGeneration>>>>,
+    /// Monotonic counter backing [`MeshNodeWaypointDtlsGeneration::generation`].
+    mesh_node_waypoint_dtls_generation_counter: AtomicU64,
+    /// Redacted owner-scoped DTLS reload status (no PEM, keys, or source paths).
+    mesh_node_waypoint_dtls_reload_status: arc_swap::ArcSwap<FrontendDtlsReloadStatus>,
+    /// Live exact destination route tables for shared `__nwudp_{port}`
+    /// NodeWaypoint UDP listeners (issue #3861), keyed by listen port.
+    ///
+    /// Only touched on the cold reconcile path (never awaited across), so a
+    /// plain `std::sync::Mutex` is correct here; the datagram hot path reads
+    /// the router's own `ArcSwap` snapshot lock-free.
+    node_waypoint_udp_routers: std::sync::Mutex<
+        std::collections::HashMap<
+            u16,
+            Arc<crate::proxy::node_waypoint_udp_destination::NodeWaypointUdpDestinationRouter>,
+        >,
+    >,
     /// Global override to disable backend TLS certificate verification.
     tls_no_verify: bool,
     /// Global CA bundle path for outbound TLS verification (fallback when proxy has no per-proxy CA).
@@ -1281,6 +1434,12 @@ impl StreamListenerManager {
             frontend_dtls_reload_status: arc_swap::ArcSwap::new(Arc::new(
                 FrontendDtlsReloadStatus::default(),
             )),
+            mesh_node_waypoint_dtls_generation: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
+            mesh_node_waypoint_dtls_generation_counter: AtomicU64::new(0),
+            mesh_node_waypoint_dtls_reload_status: arc_swap::ArcSwap::new(Arc::new(
+                FrontendDtlsReloadStatus::default(),
+            )),
+            node_waypoint_udp_routers: std::sync::Mutex::new(std::collections::HashMap::new()),
             tls_no_verify,
             tls_ca_bundle_path,
             tcp_idle_timeout_seconds,
@@ -1709,9 +1868,14 @@ impl StreamListenerManager {
         ((*accepted).clone(), swapped)
     }
 
-    /// Live-swap a prevalidated `FrontendDtlsConfig` onto every active DTLS
-    /// server held by this manager (does not publish the shared generation
-    /// slot — prefer [`Self::publish_frontend_dtls_generation`]).
+    /// Live-swap a prevalidated `FrontendDtlsConfig` onto every active
+    /// **operator-owned** DTLS server held by this manager (does not publish the
+    /// shared generation slot — prefer
+    /// [`Self::publish_frontend_dtls_generation`]).
+    ///
+    /// Generated `MeshNodeWaypoint` listeners are deliberately skipped: their
+    /// posture is owned by the mesh slice, not by the `FERRUM_DTLS_*`
+    /// generation (issue #3858).
     async fn swap_active_dtls_frontend_config(
         &self,
         config: &crate::dtls::FrontendDtlsConfig,
@@ -1719,6 +1883,9 @@ impl StreamListenerManager {
         let mut swapped = 0usize;
         let listeners = self.listeners.lock().await;
         for handle in listeners.values() {
+            if handle.dtls_owner.is_mesh_node_waypoint() {
+                continue;
+            }
             let Some(slot) = handle.dtls_server.as_ref() else {
                 continue;
             };
@@ -1735,35 +1902,111 @@ impl StreamListenerManager {
         swapped
     }
 
-    /// Build one validated `FrontendDtlsConfig` and publish it as the accepted
-    /// generation across every active DTLS server.
+    /// Publish one complete prevalidated **owner-scoped** DTLS generation for
+    /// generated `MeshNodeWaypoint` listeners (issue #3858).
     ///
-    /// `build_config` is invoked **once** before any listener is touched so a
-    /// transient source race cannot create mixed generations. Existing
-    /// in-flight DTLS sessions keep the snapshot they handshake with; new
-    /// sessions pick up the published generation on the next ClientHello.
+    /// `configs` is the whole accepted candidate set for one mesh slice, keyed
+    /// by generated listener runtime key. It is stored first, so a listener
+    /// created or restarted after this call receives exactly the same
+    /// generation as its already-active peers, then swapped into the matching
+    /// active servers. Ordinary operator listeners are never touched, and the
+    /// ordinary `FERRUM_DTLS_*` generation slot is never written.
     ///
-    /// Returns the number of listeners whose DTLS server was swapped. On
-    /// build failure every listener retains the complete prior generation and
-    /// this returns `0`.
-    pub async fn swap_active_dtls_frontend_configs<F>(&self, mut build_config: F) -> usize
-    where
-        F: FnMut() -> Result<crate::dtls::FrontendDtlsConfig, anyhow::Error>,
-    {
-        let config = match build_config() {
-            Ok(cfg) => cfg,
-            Err(err) => {
-                warn!(
-                    "Failed to rebuild frontend DTLS config for live swap: {}; \
-                     keeping previous DTLS generation on every listener",
-                    err
-                );
-                self.record_frontend_dtls_candidate_failure();
-                return 0;
+    /// Callers MUST have built and validated every candidate before invoking
+    /// this: a failed build rejects the whole mesh slice upstream so both
+    /// owners keep their complete last-good state.
+    ///
+    /// Returns `(generation, swapped_listener_count)`.
+    pub async fn publish_mesh_node_waypoint_dtls_generation(
+        &self,
+        configs: std::collections::BTreeMap<String, crate::dtls::FrontendDtlsConfig>,
+    ) -> (u64, usize) {
+        let _publish_guard = self.frontend_dtls_publish.lock().await;
+        let generation = self
+            .mesh_node_waypoint_dtls_generation_counter
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
+        let accepted = Arc::new(MeshNodeWaypointDtlsGeneration {
+            generation,
+            configs,
+        });
+        self.mesh_node_waypoint_dtls_generation
+            .store(Arc::new(Some(Arc::clone(&accepted))));
+        let mut swapped = 0usize;
+        {
+            let listeners = self.listeners.lock().await;
+            for handle in listeners.values() {
+                let DtlsListenerOwner::MeshNodeWaypoint { listener_key } = &handle.dtls_owner
+                else {
+                    continue;
+                };
+                let Some(config) = accepted.config_for(listener_key) else {
+                    continue;
+                };
+                let Some(slot) = handle.dtls_server.as_ref() else {
+                    continue;
+                };
+                let snapshot = slot.load();
+                let Some(server) = snapshot.as_ref().clone() else {
+                    // The collector has not published this server yet; it
+                    // applies the accepted owner-scoped generation itself under
+                    // this same publish lock when the server arrives.
+                    continue;
+                };
+                server.swap_frontend_config(config.clone());
+                swapped += 1;
             }
-        };
-        let (_published, swapped) = self.publish_frontend_dtls_generation(config).await;
-        swapped
+        }
+        self.mesh_node_waypoint_dtls_reload_status
+            .store(Arc::new(FrontendDtlsReloadStatus {
+                generation,
+                last_swapped_listeners: swapped as u64,
+                last_success_unix: unix_now_secs(),
+                last_failure_unix: self
+                    .mesh_node_waypoint_dtls_reload_status
+                    .load()
+                    .last_failure_unix,
+                last_outcome: "accepted",
+            }));
+        info!(
+            mesh_node_waypoint_dtls_generation = generation,
+            covered_listeners = accepted.configs.len(),
+            swapped_dtls_listeners = swapped,
+            "Published owner-scoped NodeWaypoint DTLS generation; ordinary operator DTLS \
+             listeners are untouched"
+        );
+        (generation, swapped)
+    }
+
+    /// Snapshot of the last accepted owner-scoped NodeWaypoint DTLS generation.
+    #[allow(dead_code)] // Test / introspection surface.
+    pub fn snapshot_mesh_node_waypoint_dtls_generation(
+        &self,
+    ) -> Option<Arc<MeshNodeWaypointDtlsGeneration>> {
+        self.mesh_node_waypoint_dtls_generation
+            .load_full()
+            .as_ref()
+            .clone()
+    }
+
+    /// Bounded redacted owner-scoped DTLS reload status.
+    #[allow(dead_code)] // Test / introspection surface.
+    pub fn mesh_node_waypoint_dtls_reload_status(&self) -> FrontendDtlsReloadStatus {
+        (**self.mesh_node_waypoint_dtls_reload_status.load()).clone()
+    }
+
+    /// Record a rejected owner-scoped DTLS candidate without replacing the
+    /// accepted generation.
+    pub fn record_mesh_node_waypoint_dtls_candidate_failure(&self) {
+        self.mesh_node_waypoint_dtls_reload_status.rcu(|current| {
+            Arc::new(FrontendDtlsReloadStatus {
+                generation: current.generation,
+                last_swapped_listeners: current.last_swapped_listeners,
+                last_success_unix: current.last_success_unix,
+                last_failure_unix: unix_now_secs(),
+                last_outcome: "rejected",
+            })
+        });
     }
 
     /// Reconcile active listeners against the current config.
@@ -1840,6 +2083,8 @@ impl StreamListenerManager {
                                     .stream_match
                                     .as_ref()
                                     .is_some_and(|m| !m.is_empty()),
+                                node_waypoint_udp_destination_member: p
+                                    .joins_node_waypoint_udp_destination_plane(),
                                 backend_tls_reload_key,
                             },
                         )
@@ -1980,11 +2225,47 @@ impl StreamListenerManager {
             });
         }
 
+        // NodeWaypoint UDP destination groups (issue #3861): several generated
+        // plain-UDP Service listeners legitimately share one numeric port on a
+        // `hostNetwork` node. They form one shared `__nwudp_{port}` listener and
+        // are demultiplexed by exact local destination address.
+        //
+        // A port with exactly ONE claimant deliberately stays an individual
+        // listener: that is the documented direct-node-address boundary, where a
+        // datagram addressed to a node IP (not to a ClusterIP) is still served
+        // because the port names exactly one Service. Grouping it would refuse
+        // that traffic for lack of an exact Service destination.
+        let mut node_waypoint_udp_groups: std::collections::HashMap<
+            u16,
+            Vec<NamespacedResourceId>,
+        > = std::collections::HashMap::new();
+        for (identity, entry) in &desired {
+            if entry.node_waypoint_udp_destination_member {
+                node_waypoint_udp_groups
+                    .entry(entry.port)
+                    .or_default()
+                    .push(identity.clone());
+            }
+        }
+        node_waypoint_udp_groups.retain(|port, ids| {
+            ids.len() > 1
+                && !sni_groups.contains_key(port)
+                && !l4_match_groups.contains_key(port)
+                && listener_candidates_compatible(ids)
+        });
+        for ids in node_waypoint_udp_groups.values_mut() {
+            // Deterministic, order-independent membership: the representative is
+            // only a label and a bind-address source. Every datagram's owner is
+            // decided by the destination table, never by this ordering.
+            ids.sort_by(|a, b| (&a.namespace, &a.id).cmp(&(&b.namespace, &b.id)));
+        }
+
         // Build the effective desired map: individual proxies + SNI/L4 group entries.
         // Proxies in a group are replaced by a single shared-port entry.
         let grouped_proxy_ids: std::collections::HashSet<&NamespacedResourceId> = sni_groups
             .values()
             .chain(l4_match_groups.values())
+            .chain(node_waypoint_udp_groups.values())
             .flatten()
             .chain(incompatible_shared_ids.iter())
             .collect();
@@ -2018,8 +2299,35 @@ impl StreamListenerManager {
                     passthrough: entry.passthrough,
                     backend_tls_reload_key: entry.backend_tls_reload_key.clone(),
                     sni_ids: None,
+                    node_waypoint_udp_ids: None,
                 },
             );
+        }
+        for (port, ids) in &node_waypoint_udp_groups {
+            let key = node_waypoint_udp_listener_key(*port);
+            let Some(representative) = ids.first() else {
+                continue;
+            };
+            if let Some(entry) = desired.get(representative) {
+                effective_desired.insert(
+                    key,
+                    DesiredStreamListener {
+                        identity: representative.clone(),
+                        port: entry.port,
+                        bind_addr: self.resolve_bind_addr(&current_config, entry.port),
+                        scheme: entry.scheme,
+                        frontend_tls: entry.frontend_tls,
+                        passthrough: false,
+                        backend_tls_reload_key: entry.backend_tls_reload_key.clone(),
+                        sni_ids: None,
+                        // Deliberately NOT part of the restart key: membership
+                        // changes republish the destination table in place, so
+                        // adding Service B never withdraws Service A's socket
+                        // and removing A never interrupts B.
+                        node_waypoint_udp_ids: Some(ids.clone()),
+                    },
+                );
+            }
         }
         for (port, ids) in &sni_groups {
             let key = format!("__sni_{}", port);
@@ -2041,6 +2349,7 @@ impl StreamListenerManager {
                         passthrough: entry.passthrough,
                         backend_tls_reload_key: entry.backend_tls_reload_key.clone(),
                         sni_ids: Some(ids.clone()),
+                        node_waypoint_udp_ids: None,
                     },
                 );
             }
@@ -2070,9 +2379,31 @@ impl StreamListenerManager {
                         // so "any candidate is passthrough or declares hosts"
                         // is exactly the SNI-group predicate.
                         sni_ids: Some(ids.clone()),
+                        node_waypoint_udp_ids: None,
                     },
                 );
             }
+        }
+
+        // Exact destination routes for shared same-port NodeWaypoint UDP
+        // listeners (issue #3861). Published BEFORE any listener is started,
+        // stopped or restarted, so a socket is never briefly serving from an
+        // unpublished or stale table, and so an already-running listener picks
+        // up an added/removed/updated Service by table republication instead of
+        // a rebind. Ports that stopped being shared groups are retracted and
+        // their routers dropped.
+        let shared_node_waypoint_udp_ports: std::collections::HashSet<u16> = effective_desired
+            .values()
+            .filter(|entry| entry.node_waypoint_udp_ids.is_some())
+            .map(|entry| entry.port)
+            .collect();
+        self.retire_unused_node_waypoint_udp_routers(&shared_node_waypoint_udp_ports);
+        for entry in effective_desired.values() {
+            let Some(ids) = entry.node_waypoint_udp_ids.as_ref() else {
+                continue;
+            };
+            let router = self.node_waypoint_udp_router(entry.port);
+            self.publish_node_waypoint_udp_routes(&router, &current_config, ids);
         }
 
         // Drop durable task failures only when their configured proxy has
@@ -2129,6 +2460,11 @@ impl StreamListenerManager {
                 passthrough,
                 backend_tls_reload_key,
                 sni_ids,
+                // Membership of a shared NodeWaypoint UDP destination group is
+                // NOT part of the restart key (issue #3861): adding or removing
+                // a same-port Service republishes the exact destination table
+                // under the running socket instead of rebinding it.
+                node_waypoint_udp_ids: _,
             }) = effective_desired.get(key)
             else {
                 to_remove.push(key.clone());
@@ -2264,11 +2600,24 @@ impl StreamListenerManager {
                 passthrough,
                 backend_tls_reload_key,
                 sni_ids,
+                node_waypoint_udp_ids,
             } = desired_listener;
             // Exact owning identity for this listener, carried from the config
             // entry that produced it (first SNI candidate for a shared group).
             // Never re-derived by scanning and never defaulted.
             let proxy_id = &identity.id;
+            // Exact generated-listener ownership, decided from the accepted
+            // identity before ANY DTLS material decision, so an operator and a
+            // generated listener can never consult the other's generation
+            // (issue #3858).
+            let node_waypoint_udp_owner = node_waypoint_udp_listener_owner(
+                identity,
+                *scheme,
+                sni_ids.as_ref(),
+                node_waypoint_udp_ids.as_ref(),
+            );
+            let dtls_owner =
+                DtlsListenerOwner::from_node_waypoint_flag(identity, node_waypoint_udp_owner);
 
             // Skip frontend_tls proxies when the required encryption config is not yet loaded.
             // For TCP: needs rustls ServerConfig. For UDP: needs DTLS cert/key paths.
@@ -2278,8 +2627,25 @@ impl StreamListenerManager {
             // Passthrough proxies never terminate TLS, so they skip this check entirely.
             if *frontend_tls && !*passthrough {
                 if scheme.is_udp() {
-                    let has_generation = self.frontend_dtls_generation.load().is_some();
-                    let has_sources = self.frontend_dtls_material.load().is_some();
+                    // A generated NodeWaypoint DTLS listener is covered ONLY by
+                    // the owner-scoped generation the accepted mesh slice
+                    // published for its exact listener key. It must never fall
+                    // back to the ordinary `FERRUM_DTLS_*` generation or
+                    // sources: that would serve mesh traffic under an operator
+                    // posture the mesh never accepted.
+                    let (has_generation, has_sources) = match &dtls_owner {
+                        DtlsListenerOwner::MeshNodeWaypoint { listener_key } => {
+                            let accepted = self.mesh_node_waypoint_dtls_generation.load_full();
+                            let covered = accepted.as_ref().as_ref().is_some_and(|generation| {
+                                generation.config_for(listener_key).is_some()
+                            });
+                            (covered, false)
+                        }
+                        DtlsListenerOwner::Operator => (
+                            self.frontend_dtls_generation.load().is_some(),
+                            self.frontend_dtls_material.load().is_some(),
+                        ),
+                    };
                     if !has_generation && !has_sources {
                         info!(
                             proxy_id = %proxy_id,
@@ -2392,18 +2758,48 @@ impl StreamListenerManager {
             let generation = self
                 .node_waypoint_udp_listener_generation
                 .fetch_add(1, Ordering::Relaxed);
-            let node_waypoint_udp_owner =
-                node_waypoint_udp_listener_owner(identity, *scheme, sni_ids.as_ref());
             // Clone the global shutdown receiver (if injected) so the spawned
             // listener observes both per-listener removal AND global SIGTERM.
             let global_shutdown = self.global_shutdown_rx.load().as_ref().clone();
 
-            let (join_handle, tcp_metrics, udp_metrics, dtls_server) = if scheme.is_udp() {
+            let (
+                join_handle,
+                tcp_metrics,
+                udp_metrics,
+                dtls_server,
+                node_waypoint_udp_destinations,
+            ) = if scheme.is_udp() {
                 let started_for_listener = started.clone();
                 // UDP or DTLS listener
                 // Passthrough proxies forward raw encrypted datagrams — no DTLS termination.
                 let frontend_dtls_config = if *frontend_tls && !*passthrough {
-                    if let Some(generation) = self.frontend_dtls_generation.load_full().as_ref() {
+                    if let DtlsListenerOwner::MeshNodeWaypoint { listener_key } = &dtls_owner {
+                        // Owner-scoped: the accepted mesh generation is the
+                        // ONLY source for a generated listener. The deferral
+                        // gate above already proved an entry exists; a race
+                        // that removes it defers rather than borrowing the
+                        // operator generation.
+                        let accepted = self.mesh_node_waypoint_dtls_generation.load_full();
+                        let owner_config = accepted
+                            .as_ref()
+                            .as_ref()
+                            .and_then(|generation| generation.config_for(listener_key).cloned());
+                        match owner_config {
+                            Some(config) => Some(config),
+                            None => {
+                                degraded.push(StreamBindFailure::new(
+                                    identity,
+                                    *port,
+                                    "Deferred: no accepted mesh NodeWaypoint DTLS generation \
+                                     covers this generated listener",
+                                    StreamListenerDegradation::FrontendDtlsDeferred,
+                                ));
+                                continue;
+                            }
+                        }
+                    } else if let Some(generation) =
+                        self.frontend_dtls_generation.load_full().as_ref()
+                    {
                         // Prefer the last accepted immutable generation so a
                         // listener created/restarted after rotation converges
                         // on the same material already live-swapped into
@@ -2494,11 +2890,22 @@ impl StreamListenerManager {
                     });
                 let node_waypoint_udp_steering =
                     self.node_waypoint_udp_steering.load_full().as_ref().clone();
+                // Shared same-port Service demultiplexing (issue #3861). The
+                // router is created (or reused across a listener restart) and
+                // seeded with THIS generation's exact routes before the socket
+                // binds, so the very first datagram is already attributable and
+                // nothing is ever served from an unpublished table.
+                let node_waypoint_udp_destinations = node_waypoint_udp_ids
+                    .as_ref()
+                    .map(|_| self.node_waypoint_udp_router(*port));
+                let node_waypoint_udp_destinations_for_listener =
+                    node_waypoint_udp_destinations.clone();
                 let bind_failures = Arc::clone(&self.bind_failures);
                 let async_bind_failures = Arc::clone(&self.async_bind_failures);
                 let async_failure_tx = async_failure_tx.clone();
                 let failure_proxy_ids = sni_ids
                     .clone()
+                    .or_else(|| node_waypoint_udp_ids.clone())
                     .unwrap_or_else(|| vec![listener_identity.clone()]);
                 // Reserve a oneshot so the listener can publish the live
                 // `Arc<DtlsServer>` back here once it has bound. Only meaningful
@@ -2552,6 +2959,8 @@ impl StreamListenerManager {
                         udp_pktinfo_enabled,
                         mesh_outbound_enforcement,
                         node_waypoint_udp_source_scoping,
+                        node_waypoint_udp_destinations:
+                            node_waypoint_udp_destinations_for_listener,
                     })
                     .await;
                     started_for_exit.store(false, Ordering::Release);
@@ -2606,7 +3015,10 @@ impl StreamListenerManager {
                     Arc::new(arc_swap::ArcSwap::from_pointee(None));
                 let dtls_server_slot_for_collector = Arc::clone(&dtls_server_slot);
                 let generation_slot_for_collector = self.frontend_dtls_generation.clone();
+                let mesh_generation_slot_for_collector =
+                    self.mesh_node_waypoint_dtls_generation.clone();
                 let publish_lock_for_collector = Arc::clone(&self.frontend_dtls_publish);
+                let dtls_owner_for_collector = dtls_owner.clone();
                 tokio::spawn(async move {
                     if let Ok(server) = dtls_server_rx.await {
                         // Converge a server that bound during a publish race and
@@ -2615,17 +3027,46 @@ impl StreamListenerManager {
                         // generation A, a publisher could install B while the
                         // handle was still absent, and the collector could then
                         // expose the server after restoring stale A.
-                        with_current_frontend_dtls_generation(
-                            &publish_lock_for_collector,
-                            &generation_slot_for_collector,
-                            |generation| {
-                                if let Some(generation) = generation {
-                                    server.swap_frontend_config(generation.config.clone());
-                                }
-                                dtls_server_slot_for_collector.store(Arc::new(Some(server)));
-                            },
-                        )
-                        .await;
+                        //
+                        // The generation consulted is the one belonging to THIS
+                        // listener's owner. A generated NodeWaypoint listener
+                        // never reads the ordinary `FERRUM_DTLS_*` generation,
+                        // and an operator listener never reads the mesh one.
+                        match &dtls_owner_for_collector {
+                            DtlsListenerOwner::MeshNodeWaypoint { listener_key } => {
+                                let listener_key = listener_key.clone();
+                                with_current_mesh_node_waypoint_dtls_generation(
+                                    &publish_lock_for_collector,
+                                    &mesh_generation_slot_for_collector,
+                                    move |generation| {
+                                        if let Some(config) = generation
+                                            .and_then(|generation| {
+                                                generation.config_for(&listener_key)
+                                            })
+                                        {
+                                            server.swap_frontend_config(config.clone());
+                                        }
+                                        dtls_server_slot_for_collector
+                                            .store(Arc::new(Some(server)));
+                                    },
+                                )
+                                .await;
+                            }
+                            DtlsListenerOwner::Operator => {
+                                with_current_frontend_dtls_generation(
+                                    &publish_lock_for_collector,
+                                    &generation_slot_for_collector,
+                                    |generation| {
+                                        if let Some(generation) = generation {
+                                            server.swap_frontend_config(generation.config.clone());
+                                        }
+                                        dtls_server_slot_for_collector
+                                            .store(Arc::new(Some(server)));
+                                    },
+                                )
+                                .await;
+                            }
+                        }
                     }
                 });
                 (
@@ -2633,6 +3074,7 @@ impl StreamListenerManager {
                     None,
                     listener_udp_metrics,
                     Some(dtls_server_slot),
+                    node_waypoint_udp_destinations,
                 )
             } else {
                 let started_for_listener = started.clone();
@@ -2756,7 +3198,7 @@ impl StreamListenerManager {
                         }
                     }
                 });
-                (join_handle, listener_tcp_metrics, None, None)
+                (join_handle, listener_tcp_metrics, None, None, None)
             };
 
             info!(
@@ -2810,6 +3252,8 @@ impl StreamListenerManager {
                     dtls_server,
                     generation,
                     node_waypoint_udp_owner,
+                    node_waypoint_udp_destinations,
+                    dtls_owner,
                 },
             );
             if let Some((steering, started_for_watch, shutdown_rx_for_watch)) = steer_bind_watch {
@@ -2896,6 +3340,97 @@ impl StreamListenerManager {
         }
 
         bind_failures
+    }
+
+    /// Get (or create) the exact destination router for one shared
+    /// `__nwudp_{port}` listener (issue #3861).
+    ///
+    /// The router outlives an individual listener restart so a rebind cannot
+    /// momentarily serve from an empty table; a port that stops being a shared
+    /// group has its router retracted and dropped by
+    /// [`Self::retire_unused_node_waypoint_udp_routers`].
+    fn node_waypoint_udp_router(
+        &self,
+        port: u16,
+    ) -> Arc<crate::proxy::node_waypoint_udp_destination::NodeWaypointUdpDestinationRouter> {
+        let mut routers = self
+            .node_waypoint_udp_routers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Arc::clone(routers.entry(port).or_insert_with(|| {
+            crate::proxy::node_waypoint_udp_destination::NodeWaypointUdpDestinationRouter::new(port)
+        }))
+    }
+
+    /// Publish this generation's exact destination routes for one shared
+    /// listener.
+    ///
+    /// Only routes whose owning proxy is an accepted member of THIS listener's
+    /// group are installed, so a candidate that materialization refused (mixed
+    /// posture, duplicate exact claim, headless on a shared port) can never
+    /// reach the datapath. A refused publication retains the previous accepted
+    /// table — never a partially installed one.
+    fn publish_node_waypoint_udp_routes(
+        &self,
+        router: &crate::proxy::node_waypoint_udp_destination::NodeWaypointUdpDestinationRouter,
+        current_config: &GatewayConfig,
+        members: &[NamespacedResourceId],
+    ) {
+        let port = router.listen_port();
+        let member_set: std::collections::HashSet<(&str, &str)> =
+            members.iter().map(|id| id.as_key()).collect();
+        let routes: Vec<_> = current_config
+            .node_waypoint_udp_destination_routes
+            .iter()
+            .filter(|route| {
+                route.listen_port == port && member_set.contains(&route.proxy.as_key())
+            })
+            .cloned()
+            .collect();
+        let route_count = routes.len();
+        match router.publish(routes) {
+            Ok(generation) => {
+                info!(
+                    listen_port = port,
+                    destination_generation = generation,
+                    destination_routes = route_count,
+                    services = member_set.len(),
+                    "Published exact NodeWaypoint UDP destination routes for a shared same-port \
+                     listener; each datagram selects its owning Service from the kernel-reported \
+                     local destination before any session, plugin or backend work"
+                );
+            }
+            Err(err) => {
+                // Materialization already refuses every ambiguous claimant, so
+                // reaching this is a defect rather than operator input. Retain
+                // the previous accepted table rather than installing a
+                // partially-exact one.
+                error!(
+                    listen_port = port,
+                    "Refusing a NodeWaypoint UDP destination publication and retaining the \
+                     previous accepted routes: {}",
+                    err
+                );
+            }
+        }
+    }
+
+    /// Retract and drop routers for ports that are no longer shared groups.
+    ///
+    /// Retraction happens BEFORE the router is forgotten, so any listener still
+    /// holding it fails closed instead of serving a withdrawn generation.
+    fn retire_unused_node_waypoint_udp_routers(&self, live_ports: &std::collections::HashSet<u16>) {
+        let mut routers = self
+            .node_waypoint_udp_routers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        routers.retain(|port, router| {
+            if live_ports.contains(port) {
+                return true;
+            }
+            router.retract();
+            false
+        });
     }
 
     /// Publish desired ∩ actually-bound NodeWaypoint UDP destinations into the
@@ -3116,6 +3651,10 @@ impl StreamListenerManager {
         if let Some(steering) = self.node_waypoint_udp_steering.load_full().as_ref() {
             steering.shutdown();
         }
+        // Retract every exact destination table before the sockets drop, so a
+        // datagram racing shutdown cannot still select a route whose serving
+        // generation is gone (issue #3861).
+        self.retire_unused_node_waypoint_udp_routers(&std::collections::HashSet::new());
         for (listener_key, handle) in listeners.drain() {
             info!(
                 listener_key = %listener_key,
@@ -3130,10 +3669,19 @@ fn node_waypoint_udp_listener_owner(
     identity: &NamespacedResourceId,
     scheme: BackendScheme,
     sni_ids: Option<&Vec<NamespacedResourceId>>,
+    node_waypoint_udp_ids: Option<&Vec<NamespacedResourceId>>,
 ) -> bool {
-    sni_ids.is_none()
-        && scheme.is_udp()
-        && crate::modes::mesh::is_node_waypoint_udp_listener_id(&identity.id)
+    if !scheme.is_udp() {
+        return false;
+    }
+    // A shared `__nwudp_{port}` group is generated ownership by construction:
+    // membership is derived from the reserved id prefix. An individual listener
+    // proves ownership from its own identity, exactly as before. An SNI group
+    // is never NodeWaypoint-generated.
+    if node_waypoint_udp_ids.is_some() {
+        return sni_ids.is_none();
+    }
+    sni_ids.is_none() && crate::modes::mesh::is_node_waypoint_udp_listener_id(&identity.id)
 }
 
 fn node_waypoint_udp_published_ifaces(

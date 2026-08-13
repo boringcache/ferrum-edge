@@ -668,7 +668,35 @@ pub mod _test_support {
         client_addr: std::net::SocketAddr,
         is_expired: impl FnOnce(&T) -> bool,
     ) -> Option<std::sync::Arc<T>> {
-        crate::proxy::udp_proxy::take_udp_last_client_if_live(last_client, client_addr, is_expired)
+        // The production cache is keyed by the full session identity (client
+        // tuple + selected destination route + listener generation). This seam
+        // keeps the historical client-tuple shape by projecting onto the
+        // route-less key; `take_udp_last_client_if_live_keyed_for_test` covers
+        // the destination-routed case.
+        let mut keyed = last_client.take().map(|(addr, session)| {
+            (
+                crate::proxy::udp_proxy::UdpSessionKey::undestined(addr, 0),
+                session,
+            )
+        });
+        let result = crate::proxy::udp_proxy::take_udp_last_client_if_live(
+            &mut keyed,
+            crate::proxy::udp_proxy::UdpSessionKey::undestined(client_addr, 0),
+            is_expired,
+        );
+        *last_client = keyed.map(|(key, session)| (key.client, session));
+        result
+    }
+
+    /// Same seam over the full production session key, so a test can prove that
+    /// one client tuple addressing two same-port Service destinations resolves
+    /// to two independent cache entries (issue #3861).
+    pub fn take_udp_last_client_if_live_keyed_for_test<T>(
+        last_client: &mut Option<(crate::proxy::udp_proxy::UdpSessionKey, std::sync::Arc<T>)>,
+        key: crate::proxy::udp_proxy::UdpSessionKey,
+        is_expired: impl FnOnce(&T) -> bool,
+    ) -> Option<std::sync::Arc<T>> {
+        crate::proxy::udp_proxy::take_udp_last_client_if_live(last_client, key, is_expired)
     }
 
     /// Frontend-DTLS / UDP idle-expiry predicate on virtual monotonic timestamps.
