@@ -1106,6 +1106,14 @@ fn native_mtls_negative_control_contract_violations(run_sh: &str, helper: &str) 
             "wait_for_native_probe_class \"$deploy\" \"$want_pattern\" \"$want_evidence\"",
             "negative wait loop must gate on classifier evidence, not class alone",
         ),
+        (
+            "normalize_native_evidence_file",
+            "server evidence must strip tr newline trailing space before anchored grep",
+        ),
+        (
+            "normalize_native_evidence_file \"$RESULTS_DIR/${deploy}.server-evidence.txt\"",
+            "negative wait/record loops must normalize classifier evidence before grep",
+        ),
     ] {
         if !run_sh.contains(needle) {
             errors.push(format!("run.sh missing {desc} (`{needle}`)"));

@@ -1598,6 +1598,18 @@ native_probe_running_identity() {
 # (pre-subscribe TLS) or pod/node name (tenant-subscription JWT reject).
 # Client-side untrusted-CA / wrong-SAN require native_tls_class
 # client_tls_verify / client_tls_name; a generic handshake is not proof.
+# Classifier --evidence-out writes one line plus newline; joining with tr '\n' ' '
+# leaves a trailing space that breaks anchored evidence greps (^token$).
+normalize_native_evidence_file() {
+  local path="$1"
+  local normalized=""
+  if [[ -f "$path" ]]; then
+    normalized="$(tr '\n' ' ' < "$path")"
+    normalized="${normalized%"${normalized##*[![:space:]]}"}"
+  fi
+  printf '%s' "$normalized"
+}
+
 classify_native_probe() {
   local deploy="$1"
   local logs identity pod_name="" pod_ip="" client_file cp_file evidence_file st
@@ -1646,10 +1658,7 @@ wait_for_native_probe_class() {
         printf '%s' "$class"
         return 0
       fi
-      server_ev=""
-      if [[ -f "$RESULTS_DIR/${deploy}.server-evidence.txt" ]]; then
-        server_ev="$(tr '\n' ' ' < "$RESULTS_DIR/${deploy}.server-evidence.txt")"
-      fi
+      server_ev="$(normalize_native_evidence_file "$RESULTS_DIR/${deploy}.server-evidence.txt")"
       if [[ -n "$want" ]]; then
         if printf '%s' "$class" | grep -Eq "^($want)$"; then
           if [[ -z "$want_evidence" ]] \
@@ -1795,9 +1804,7 @@ record_native_negative() {
   local assertion_id="$1" deploy="$2" want_pattern="$3" want_evidence="${4:-}"
   local class evidence server_ev=""
   class="$(wait_for_native_probe_class "$deploy" "$want_pattern" "$want_evidence")"
-  if [[ -f "$RESULTS_DIR/${deploy}.server-evidence.txt" ]]; then
-    server_ev="$(tr '\n' ' ' < "$RESULTS_DIR/${deploy}.server-evidence.txt")"
-  fi
+  server_ev="$(normalize_native_evidence_file "$RESULTS_DIR/${deploy}.server-evidence.txt")"
   evidence="$(native_probe_logs "$deploy" | redact_native_transport_evidence | tr '\n' ' ')"
   printf 'class=%s\nserver=%s\nclient=%s\n' "$class" "$server_ev" "$evidence" \
     > "$RESULTS_DIR/${deploy}.txt"
@@ -2121,9 +2128,7 @@ else:
   local stale_class stale_ev=""
   stale_class="$(wait_for_native_probe_class native-stale-client tls-verify \
     "$NATIVE_EVID_CP_UNKNOWN_ISSUER")"
-  if [[ -f "$RESULTS_DIR/native-stale-client.server-evidence.txt" ]]; then
-    stale_ev="$(tr '\n' ' ' < "$RESULTS_DIR/native-stale-client.server-evidence.txt")"
-  fi
+  stale_ev="$(normalize_native_evidence_file "$RESULTS_DIR/native-stale-client.server-evidence.txt")"
   kubectl --context "$CONTEXT" -n "$NS" delete deploy native-stale-client \
     --wait=true --timeout=60s >/dev/null 2>&1 || true
   kubectl --context "$CONTEXT" -n "$NS" delete secret ferrum-native-mtls-stale-client \
