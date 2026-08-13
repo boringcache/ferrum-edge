@@ -407,10 +407,10 @@ fn node_waypoint_udp_steer_commands_for_family(
 /// exists and it can never disturb the pod-netns TPROXY objects, the tc
 /// ingress-redirect routing, or a co-resident CNI's policy routing.
 fn node_waypoint_udp_steer_teardown_for_family(binary: &str, ipv6: bool) -> Vec<String> {
-    let (ip, local_route) = if ipv6 {
-        ("ip -6", "local ::/0 dev lo")
+    let (ip, local_route, cidr) = if ipv6 {
+        ("ip -6", "local ::/0 dev lo", "::/0")
     } else {
-        ("ip", "local 0.0.0.0/0 dev lo")
+        ("ip", "local 0.0.0.0/0 dev lo", "0.0.0.0/0")
     };
     let priority = NODE_WAYPOINT_UDP_STEER_RULE_PRIORITY;
     let table = NODE_WAYPOINT_UDP_STEER_TABLE;
@@ -421,10 +421,13 @@ fn node_waypoint_udp_steer_teardown_for_family(binary: &str, ipv6: bool) -> Vec<
     let rule_pattern = format!("fwmark {mark_arg} lookup {table}");
     let rule_pattern_without_mask =
         format!("fwmark 0x{NODE_WAYPOINT_UDP_STEER_MARK:x} lookup {table}");
-    let route_pattern = local_route
-        .strip_prefix("local ")
-        .and_then(|route| route.strip_suffix(" dev lo"))
-        .unwrap_or(local_route);
+    // iproute2 commonly renders a zero-prefix as `default` (`local default
+    // dev lo scope host`) rather than `0.0.0.0/0` / `::/0`. Matching only the
+    // CIDR spelling skips deletion AND the post-delete check, so teardown
+    // would return success while the Ferrum-owned route remained. Both
+    // spellings are the same prefix; the match still requires this table,
+    // `type local`, and `dev lo`.
+    let route_case = format!("*'local {cidr} dev lo'*|*'local default dev lo'*");
     vec![
         // STOP MARKING FIRST, then remove the now-unreferenced chain.
         format!(
@@ -454,13 +457,13 @@ fn node_waypoint_udp_steer_teardown_for_family(binary: &str, ipv6: bool) -> Vec<
         format!(
             "ferrum_route_state=\"$({ip} route show table {table} type local)\"\n\
              case \"$ferrum_route_state\" in\n\
-               *'local {route_pattern} dev lo'*)\n\
+               {route_case})\n\
                  {ip} route del {local_route} table {table}\n\
                  ;;\n\
              esac\n\
              ferrum_route_state=\"$({ip} route show table {table} type local)\"\n\
              case \"$ferrum_route_state\" in\n\
-               *'local {route_pattern} dev lo'*)\n\
+               {route_case})\n\
                  echo 'Ferrum NodeWaypoint UDP steering route remains after deletion' >&2\n\
                  exit 1\n\
                  ;;\n\

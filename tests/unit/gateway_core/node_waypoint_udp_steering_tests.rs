@@ -286,6 +286,224 @@ fn teardown_is_strict_for_both_families_and_verifies_exact_absence() {
     );
 }
 
+/// POSIX `case` glob (`*` any sequence, `?` any byte). Used to evaluate the
+/// rendered teardown arms the same way `sh` will, without executing the script.
+fn posix_case_glob(text: &str, pattern: &str) -> bool {
+    fn rec(text: &[u8], pattern: &[u8]) -> bool {
+        let Some((&pc, prest)) = pattern.split_first() else {
+            return text.is_empty();
+        };
+        if pc == b'*' {
+            if rec(text, prest) {
+                return true;
+            }
+            let Some((_, trest)) = text.split_first() else {
+                return false;
+            };
+            return rec(trest, pattern);
+        }
+        let Some((&tc, trest)) = text.split_first() else {
+            return false;
+        };
+        (pc == b'?' || pc == tc) && rec(trest, prest)
+    }
+    rec(text.as_bytes(), pattern.as_bytes())
+}
+
+fn posix_case_any(text: &str, patterns: &[String]) -> bool {
+    patterns.iter().any(|pattern| posix_case_glob(text, pattern))
+}
+
+/// Unquote one POSIX `case` alternative (`*'local default dev lo'*` →
+/// `*local default dev lo*`) so the glob can be evaluated against `ip route show`
+/// fixtures.
+fn unquote_case_pattern(raw: &str) -> String {
+    raw.replace('\'', "")
+}
+
+fn parse_case_globs(pattern_line: &str) -> Vec<String> {
+    let trimmed = pattern_line.trim();
+    let trimmed = trimmed
+        .strip_suffix(')')
+        .unwrap_or_else(|| panic!("case arm must close with `)`: {pattern_line}"));
+    trimmed
+        .split('|')
+        .map(|alt| unquote_case_pattern(alt.trim()))
+        .filter(|pattern| !pattern.is_empty())
+        .collect()
+}
+
+struct FamilyRouteTeardown {
+    inspect_globs: Vec<String>,
+    verify_globs: Vec<String>,
+}
+
+fn case_globs_after_show(script: &str, show_at: usize) -> Vec<String> {
+    let rest = &script[show_at..];
+    let case_at = rest
+        .find("case \"$ferrum_route_state\" in")
+        .unwrap_or_else(|| panic!("route inspect/verify case missing after show:\n{rest}"));
+    let pattern_line = rest[case_at..]
+        .lines()
+        .nth(1)
+        .unwrap_or_else(|| panic!("case pattern line missing after show:\n{rest}"));
+    parse_case_globs(pattern_line)
+}
+
+fn parse_family_route_teardown(script: &str, ipv6: bool) -> FamilyRouteTeardown {
+    let show_cmd = if ipv6 {
+        "ip -6 route show table 33136 type local"
+    } else {
+        "ip route show table 33136 type local"
+    };
+    let delete_cmd = if ipv6 {
+        "ip -6 route del local ::/0 dev lo table 33136"
+    } else {
+        "ip route del local 0.0.0.0/0 dev lo table 33136"
+    };
+
+    let mut positions = Vec::new();
+    let mut search_from = 0;
+    while let Some(rel) = script[search_from..].find(show_cmd) {
+        let at = search_from + rel;
+        positions.push(at);
+        search_from = at + show_cmd.len();
+    }
+    assert_eq!(
+        positions.len(),
+        2,
+        "inspect and verify must each show this family's table once:\n{script}"
+    );
+
+    let between = &script[positions[0]..positions[1]];
+    assert!(
+        between.contains(delete_cmd),
+        "delete must follow inspect and use the Ferrum add spelling `{delete_cmd}`:\n{between}"
+    );
+    assert!(
+        !script[positions[1]..].contains(delete_cmd),
+        "verify must not issue a second delete:\n{}",
+        &script[positions[1]..]
+    );
+
+    FamilyRouteTeardown {
+        inspect_globs: case_globs_after_show(script, positions[0]),
+        verify_globs: case_globs_after_show(script, positions[1]),
+    }
+}
+
+/// The regression this exists for: iproute2 commonly renders the Ferrum-owned
+/// zero-prefix as `local default dev lo …` rather than `local 0.0.0.0/0` /
+/// `local ::/0`. Matching only the CIDR form skipped deletion and then skipped
+/// the post-delete check, so teardown returned success while the route remained.
+/// This evaluates the rendered `case` arms against live and absent dumps — it
+/// is not a substring hunt for the word `default`.
+#[test]
+fn teardown_matches_both_iproute2_spellings_of_the_owned_local_default() {
+    let script = node_waypoint_udp_steer_teardown_script();
+    let v4 = parse_family_route_teardown(&script, false);
+    let v6 = parse_family_route_teardown(&script, true);
+
+    assert_eq!(
+        v4.inspect_globs, v4.verify_globs,
+        "inspect/verify glob drift would false-succeed on a still-live route:\n{script}"
+    );
+    assert_eq!(
+        v6.inspect_globs, v6.verify_globs,
+        "inspect/verify glob drift would false-succeed on a still-live route:\n{script}"
+    );
+    assert!(
+        v4.inspect_globs.iter().any(|glob| glob.contains("0.0.0.0/0"))
+            && v4.inspect_globs.iter().any(|glob| glob.contains("local default dev lo")),
+        "IPv4 must accept both CIDR and `default` spellings: {:?}",
+        v4.inspect_globs
+    );
+    assert!(
+        v6.inspect_globs.iter().any(|glob| glob.contains("::/0"))
+            && v6.inspect_globs.iter().any(|glob| glob.contains("local default dev lo")),
+        "IPv6 must accept both CIDR and `default` spellings: {:?}",
+        v6.inspect_globs
+    );
+
+    let leftover_v4 =
+        "local 127.0.0.1 dev lo proto kernel scope host\nlocal 10.96.0.10 dev lo scope host";
+    let leftover_v6 =
+        "local ::1 dev lo proto kernel metric 1024 pref medium\nlocal fd00::10 dev lo metric 1024";
+    let default_v4 = "local default dev lo proto kernel scope host";
+    let cidr_v4 = "local 0.0.0.0/0 dev lo proto kernel scope host";
+    let default_v6 = "local default dev lo proto kernel metric 1024 pref medium";
+    let cidr_v6 = "local ::/0 dev lo proto kernel metric 1024 pref medium";
+
+    for dump in [
+        default_v4,
+        cidr_v4,
+        &format!("{leftover_v4}\n{default_v4}"),
+        &format!("{leftover_v4}\n{cidr_v4}"),
+    ] {
+        assert!(
+            posix_case_any(dump, &v4.inspect_globs),
+            "IPv4 live Ferrum route must match and be deleted:\n{dump}\n{:?}",
+            v4.inspect_globs
+        );
+        assert!(
+            posix_case_any(dump, &v4.verify_globs),
+            "IPv4 live Ferrum route must fail the post-delete check:\n{dump}"
+        );
+    }
+    for dump in [
+        default_v6,
+        cidr_v6,
+        &format!("{leftover_v6}\n{default_v6}"),
+        &format!("{leftover_v6}\n{cidr_v6}"),
+    ] {
+        assert!(
+            posix_case_any(dump, &v6.inspect_globs),
+            "IPv6 live Ferrum route must match and be deleted:\n{dump}\n{:?}",
+            v6.inspect_globs
+        );
+        assert!(
+            posix_case_any(dump, &v6.verify_globs),
+            "IPv6 live Ferrum route must fail the post-delete check:\n{dump}"
+        );
+    }
+
+    for dump in ["", leftover_v4, "local default dev eth0 scope host", cidr_v6] {
+        assert!(
+            !posix_case_any(dump, &v4.inspect_globs),
+            "IPv4 must treat this as absence / not-ours and not delete:\n{dump}"
+        );
+        assert!(
+            !posix_case_any(dump, &v4.verify_globs),
+            "IPv4 post-delete check must succeed for absence / not-ours:\n{dump}"
+        );
+    }
+    for dump in ["", leftover_v6, "local default dev eth0 metric 1024", cidr_v4] {
+        assert!(
+            !posix_case_any(dump, &v6.inspect_globs),
+            "IPv6 must treat this as absence / not-ours and not delete:\n{dump}"
+        );
+        assert!(
+            !posix_case_any(dump, &v6.verify_globs),
+            "IPv6 post-delete check must succeed for absence / not-ours:\n{dump}"
+        );
+    }
+
+    let v4_rule = line_index(&script, |line| {
+        line.contains("ip -o rule show priority") && !line.contains("ip -6")
+    });
+    let v4_route = line_index(&script, |line| {
+        line.contains("ip route show table 33136 type local")
+    });
+    let v6_rule = line_index(&script, |line| line.contains("ip -6 -o rule show priority"));
+    let v6_route = line_index(&script, |line| {
+        line.contains("ip -6 route show table 33136 type local")
+    });
+    assert!(
+        v4_rule < v4_route && v6_rule < v6_route,
+        "each family must delete the policy rule before the local route:\n{script}"
+    );
+}
+
 /// The update-order contract (issue #3286 root review). During a generation
 /// change the OLD mangle mark rules must stop matching BEFORE the raw notrack
 /// chain is repopulated. Otherwise a datagram to an old-generation destination
