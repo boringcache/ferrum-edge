@@ -1244,6 +1244,9 @@ jobs:
               functional_h3_authority_validation_test
               functional_h3_local_policy_test
               functional_subset_http_policy_test
+              functional_destination_active_requests_test
+              functional_destination_active_requests_grpc_test
+              functional_destination_active_requests_h3_test
               functional_h3_grpc_web_test
               functional_h3_grpc_streaming_test
               functional_h3_mtls_early_data_test
@@ -4913,6 +4916,15 @@ jobs:
           python3 .github/scripts/verify_protocol_perf_regression_workflow.py
           python3 tests/performance/multi_protocol/evaluate_protocol_perf_budgets.py --self-test
           python3 -m py_compile tests/performance/multi_protocol/run_protocol_regression_scenarios.py
+
+      # Lightweight mesh-baseline workflow contracts (no collection): keep
+      # acceptance/runner-pin/interval-evidence wiring on required full-mode PR
+      # CI. helm-chart is path-gated on charts/ and would skip this surface.
+      - name: Verify mesh performance baselines workflow contract
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/verify_mesh_performance_baselines_workflow.py --self-test
+          python3 .github/scripts/verify_mesh_performance_baselines_workflow.py
 
       - name: Detect performance-sensitive changes
         id: perf_changes

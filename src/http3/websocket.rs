@@ -966,6 +966,7 @@ pub(crate) async fn handle_h3_websocket(
         backend_admission_start = Instant::now();
         backend_admission_permits =
             match crate::proxy::backend_dispatch::run_backend_admission_plugins(
+                &state,
                 backend_admission_plugins.as_ref(),
                 &ctx,
                 &proxy,

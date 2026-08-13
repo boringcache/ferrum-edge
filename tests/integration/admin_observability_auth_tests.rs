@@ -22,6 +22,7 @@ use serde_json::{Value, json};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 const JWT_SECRET: &str = "observability-auth-test-secret-key-000000";
 const JWT_ISSUER: &str = "ferrum-edge-obs-test";
@@ -420,5 +421,65 @@ async fn metrics_allows_allowlisted_cidr_unauthenticated() {
         resp.status().as_u16(),
         200,
         "allowlisted loopback should scrape without a credential"
+    );
+}
+
+#[tokio::test]
+async fn trust_generation_requires_admin_jwt_not_metrics_only_auth() {
+    let status = Arc::new(
+        ferrum_edge::grpc::cp_trust_health::CpDpTrustReloadStatus::watching(
+            Duration::from_secs(900),
+            false,
+            Duration::from_secs(60),
+            b"observability-auth-test-status-hmac-key",
+            &[7; 32],
+        ),
+    );
+    ferrum_edge::grpc::cp_trust_health::install(status);
+
+    let bearer_policy = MetricsAuthPolicy {
+        allowed_cidrs: TrustedProxies::none(),
+        bearer_token: Some("health-scrape-token".to_string()),
+    };
+    let (bearer_base, _bearer_sd) = start_admin(admin_state(bearer_policy)).await;
+    let cidr_policy = MetricsAuthPolicy {
+        allowed_cidrs: TrustedProxies::parse_strict("127.0.0.1/32,::1", "test")
+            .expect("valid metrics CIDR list"),
+        bearer_token: None,
+    };
+    let (cidr_base, _cidr_sd) = start_admin(admin_state(cidr_policy)).await;
+    let client = reqwest::Client::new();
+
+    for (base, authorization) in [
+        (&cidr_base, None),
+        (&bearer_base, Some("Bearer health-scrape-token")),
+    ] {
+        let mut request = client.get(format!("{base}/health"));
+        if let Some(value) = authorization {
+            request = request.header("Authorization", value);
+        }
+        let body: Value = request.send().await.unwrap().json().await.unwrap();
+        assert!(body["cp_dp_trust"].is_object());
+        assert!(
+            body["cp_dp_trust"]["active_generation"].is_null(),
+            "metrics-only auth must not expose the admin-secret HMAC: {body}"
+        );
+    }
+
+    let body: Value = client
+        .get(format!("{bearer_base}/health"))
+        .header("Authorization", format!("Bearer {}", admin_token()))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        body["cp_dp_trust"]["active_generation"]
+            .as_str()
+            .map(str::len),
+        Some(64),
+        "an Admin API JWT retains the replica convergence identifier: {body}"
     );
 }
