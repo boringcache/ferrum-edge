@@ -30704,6 +30704,11 @@ mod tests {
     /// live reload must not overwrite an already-active ordinary
     /// `FERRUM_DTLS_*` server, even when `FERRUM_FRONTEND_TLS_*` material
     /// would be a valid DTLS candidate.
+    ///
+    /// Drive `plan_mesh_inbound_tls_reload` + `apply_mesh_inbound_tls_reload`
+    /// directly. A full `start_mesh_slice_apply_task` also reconciles gateway
+    /// config and would tear down this operator-owned listener, which is
+    /// unrelated to the PeerAuthentication TLS isolation invariant.
     #[tokio::test(flavor = "current_thread")]
     async fn mesh_peer_auth_reload_does_not_mutate_active_ordinary_dtls_listener() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -30785,51 +30790,63 @@ mod tests {
         let mesh_frontend_identity =
             load_mesh_frontend_server_identity(&env, &test_svid_slot_from_env(&env))
                 .expect("mesh frontend identity");
-        let initial_snapshot = mesh_inbound_tls_reload_snapshot(
-            &env,
-            config::MtlsMode::Disable,
-            std::collections::BTreeMap::new(),
-        )
-        .expect("initial snapshot");
-        let mesh_state = MeshRuntimeState::new();
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let apply_task = start_mesh_slice_apply_task(
-            mesh_state.clone(),
-            proxy_state.clone(),
-            runtime,
-            None,
-            MeshInboundTlsReloadState {
-                server_identity: mesh_frontend_identity,
-                last_snapshot: Some(initial_snapshot),
-                spiffe_bundle_slot: None,
-                runtime_trust_overlay_slot: None,
-                production: false,
-            },
-            shutdown_rx,
-            None,
-            None,
+        let mut last_snapshot = Some(
+            mesh_inbound_tls_reload_snapshot(
+                &env,
+                config::MtlsMode::Disable,
+                std::collections::BTreeMap::new(),
+            )
+            .expect("initial snapshot"),
         );
-
-        mesh_state.install_slice(MeshSlice {
+        let has_termination_listener = runtime.has_inbound_tls_termination_listener();
+        let slice = MeshSlice {
             version: "strict-dtls-isolation".to_string(),
             ..slice_with_peer_auths(vec![peer_auth_with_workload_mode(config::MtlsMode::Strict)])
-        });
-        wait_for_mesh_inbound_tls(&proxy_state, true).await;
+        };
+        let plan = plan_mesh_inbound_tls_reload(
+            &proxy_state,
+            &runtime,
+            &slice,
+            config::MtlsMode::Strict,
+            mesh_frontend_identity.as_deref(),
+            last_snapshot.as_ref(),
+            None,
+            None,
+            false,
+            has_termination_listener,
+        )
+        .expect("Strict PeerAuthentication reload must produce a TLS plan");
+        assert!(
+            matches!(plan, MeshInboundTlsReloadPlan::Swap { .. }),
+            "Disable → Strict must swap inbound TLS, not skip the reload"
+        );
 
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if proxy_state
-                    .stream_listener_manager
-                    .snapshot_frontend_tls_config()
-                    .is_some()
-                {
-                    return;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("TCP+TLS slot should be populated so the reload actually ran");
+        apply_mesh_inbound_tls_reload(
+            &proxy_state,
+            &slice,
+            config::MtlsMode::Strict,
+            plan,
+            &mut last_snapshot,
+            MeshInboundTlsReloadCtx {
+                has_termination_listener,
+                spiffe_bundle_slot_configured: false,
+                topology: runtime.topology,
+                production: false,
+            },
+        )
+        .await;
+
+        assert!(
+            proxy_state
+                .stream_listener_manager
+                .snapshot_frontend_tls_config()
+                .is_some(),
+            "TCP+TLS slot should be populated so the reload actually ran"
+        );
+        assert!(
+            proxy_state.mesh_inbound_tls.load_full().is_some(),
+            "HBONE inbound TLS slot should be populated by the same Swap"
+        );
 
         let after_gen = proxy_state
             .stream_listener_manager
@@ -30854,11 +30871,6 @@ mod tests {
         assert_eq!(status.last_outcome, "accepted");
         assert_eq!(status.generation, before_gen.generation);
 
-        let _ = shutdown_tx.send(true);
-        tokio::time::timeout(Duration::from_secs(2), apply_task)
-            .await
-            .expect("apply task should stop")
-            .expect("apply task should join");
         proxy_state.stream_listener_manager.shutdown_all().await;
     }
 
