@@ -102,6 +102,7 @@ mod sticky_session_binding_tests;
 mod stock_xds_tests;
 mod stream_auth_body_termination_tests;
 mod stream_auth_lifetime_tests;
+mod udp_auth_lifetime_tests;
 mod stream_health_check_tests;
 mod stream_listener_tests;
 mod stream_match_tests;

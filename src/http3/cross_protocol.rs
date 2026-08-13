@@ -7128,7 +7128,7 @@ where
                     false
                 }
                 crate::http3::stream_util::H3AuthorizedWrite::AuthorizationExpired(termination) => {
-                    warn!(
+                    debug!(
                         "cross-protocol H3 streaming response reached its authorization \
                          lifetime while the client was not consuming; resetting the stream"
                     );
@@ -7222,7 +7222,7 @@ where
                 let termination = auth_deadline
                     .map(|plan| plan.termination)
                     .unwrap_or(crate::proxy::auth_lifetime::StreamAuthTermination::CredentialExpired);
-                warn!(
+                debug!(
                     "cross-protocol H3 streaming response reached its authorization lifetime; \
                      resetting the stream"
                 );
@@ -7347,7 +7347,7 @@ where
                     false
                 }
                 crate::http3::stream_util::H3AuthorizedWrite::AuthorizationExpired(termination) => {
-                    warn!(
+                    debug!(
                         "inspected cross-protocol H3 streaming response reached its \
                          authorization lifetime while the client was not consuming; \
                          resetting the stream"
@@ -7379,7 +7379,7 @@ where
                         .unwrap_or(
                             crate::proxy::auth_lifetime::StreamAuthTermination::CredentialExpired,
                         );
-                    warn!(
+                    debug!(
                         "inspected cross-protocol H3 streaming response reached its \
                          authorization lifetime; resetting the stream"
                     );
@@ -7667,7 +7667,7 @@ where
                 Ok(()) => true,
                 Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
                     if let Some(termination) = downstream_write_bound.expired_authorization() {
-                        warn!(
+                        debug!(
                             "cross-protocol H3 gRPC response reached its authorization lifetime \
                              while the client was not consuming; resetting the stream"
                         );

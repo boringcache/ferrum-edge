@@ -7449,11 +7449,31 @@ pub mod _test_support {
         crate::proxy::DETACHED_REJECTION_CLEANUP_TIMEOUT
     }
 
-    /// Publish the validated authenticated-stream maximum, as
-    /// `EnvConfig::validate` does, so a test can control the process-wide value
+    /// Publish the validated authenticated-stream maximum directly, so a test
+    /// can control the process-wide value
     /// [`precommit_response_phase_deadline_for_test`] reads.
+    ///
+    /// Callers MUST hold the shared test lock (`unit::env_lock`) and restore
+    /// the previous value: this scalar is process-wide, and the unit-test
+    /// binary runs in parallel.
     pub fn publish_authenticated_stream_max_lifetime_seconds_for_test(seconds: u64) {
         crate::proxy::auth_lifetime::publish_authenticated_stream_max_lifetime_seconds(seconds);
+    }
+
+    /// Read the published process-wide authenticated-stream maximum.
+    #[must_use]
+    pub fn authenticated_stream_max_lifetime_seconds_for_test() -> u64 {
+        crate::proxy::auth_lifetime::authenticated_stream_max_lifetime_seconds()
+    }
+
+    /// Publish the process-wide stream settings from an ACCEPTED startup
+    /// configuration — the exact seam `main.rs` calls once after
+    /// `EnvConfig::from_env()` succeeds and before any listener binds.
+    ///
+    /// `EnvConfig::validate` deliberately does NOT do this, so a candidate
+    /// configuration rejected by a later check cannot mutate the live scalar.
+    pub fn publish_accepted_startup_env_config_for_test(env_config: &crate::config::EnvConfig) {
+        env_config.publish_process_wide_stream_settings();
     }
 
     /// Run one post-admission TCP setup stage under the admitted stream's
@@ -7582,6 +7602,124 @@ pub mod _test_support {
     ) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
         crate::proxy::udp_proxy::dtls_authorization_expired_before_relay(plan, now)
     }
+
+    // ── Plain-UDP authorization lifetime (issue #3816) ──────────────────
+
+    /// Whether an admitted plain-UDP session may still be COMMITTED — inserted
+    /// into the session map, counted as a backend success, given a reply task,
+    /// and handed its first backend send (issue #3816).
+    #[must_use]
+    pub fn udp_authorization_expired_before_commit_for_test(
+        plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+        now: tokio::time::Instant,
+    ) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
+        crate::proxy::udp_proxy::udp_authorization_expired_before_commit(plan, now)
+    }
+
+    /// Run one awaitable post-admission PLAIN-UDP setup stage (first-datagram
+    /// policy hooks, DNS resolution, backend connect) under the admitted
+    /// session's absolute authorization deadline, exactly as
+    /// `process_new_session_datagram` / `create_session` bound them.
+    pub async fn udp_setup_stage_under_authorization_for_test<S, F>(
+        plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+        stage: S,
+    ) -> Result<F::Output, DtlsAuthorizationExpiryForTest>
+    where
+        S: FnOnce() -> F,
+        F: std::future::Future,
+    {
+        let latch = crate::proxy::auth_lifetime::StreamAuthTerminationLatch::default();
+        let metadata = std::sync::Mutex::new(HashMap::new());
+        let releases = std::sync::atomic::AtomicUsize::new(0);
+        let outcome = crate::proxy::udp_proxy::stream_udp_setup_stage_under_authorization(
+            plan,
+            &latch,
+            &metadata,
+            crate::proxy::udp_proxy::UDP_SESSION_SETUP_CONTEXT,
+            || {
+                releases.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            },
+            stage,
+        )
+        .await;
+        match outcome {
+            Ok(output) => Ok(output),
+            Err(error) => Err(classify_dtls_session_failure_for_test(
+                &error,
+                releases.load(std::sync::atomic::Ordering::Relaxed),
+                metadata
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone(),
+            )),
+        }
+    }
+
+    /// Fixed disconnect attribution for a plain-UDP session the authorization
+    /// contract terminated: `(connection_error, error_class, cause, direction)`.
+    #[must_use]
+    pub fn udp_authorization_disconnect_classification_for_test() -> (
+        String,
+        crate::retry::ErrorClass,
+        crate::plugins::DisconnectCause,
+        crate::plugins::Direction,
+    ) {
+        crate::proxy::udp_proxy::udp_authorization_disconnect_classification()
+    }
+
+    /// Outcome of one authorization-bounded backend-reply receive.
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum UdpReplyRecvOutcomeForTest<T> {
+        Received(T),
+        Stopped,
+        AuthorizationExpired(crate::proxy::auth_lifetime::StreamAuthTermination),
+    }
+
+    /// Race a backend-reply receive against the session's absolute
+    /// authorization deadline, the per-session stop signal, and shutdown —
+    /// the exact seam the plain-UDP reply task uses.
+    pub async fn udp_reply_recv_until_stop_or_expiry_for_test<F, C, T>(
+        stop_flag: &std::sync::atomic::AtomicBool,
+        stop_notify: &tokio::sync::Notify,
+        authorization: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+        recv: F,
+        cancel: C,
+    ) -> UdpReplyRecvOutcomeForTest<T>
+    where
+        F: std::future::Future<Output = T>,
+        C: std::future::Future<Output = ()>,
+    {
+        // Armed once by the production caller outside its receive loop; the
+        // instant is irrelevant when `authorization` is `None`.
+        let mut deadline = Box::pin(tokio::time::sleep_until(
+            authorization.map_or_else(tokio::time::Instant::now, |plan| plan.at),
+        ));
+        match crate::proxy::udp_proxy::udp_reply_recv_until_stop_or_expiry(
+            stop_flag,
+            stop_notify,
+            authorization,
+            &mut deadline,
+            recv,
+            cancel,
+        )
+        .await
+        {
+            crate::proxy::udp_proxy::UdpReplyRecvOutcome::Received(value) => {
+                UdpReplyRecvOutcomeForTest::Received(value)
+            }
+            crate::proxy::udp_proxy::UdpReplyRecvOutcome::Stopped => {
+                UdpReplyRecvOutcomeForTest::Stopped
+            }
+            crate::proxy::udp_proxy::UdpReplyRecvOutcome::AuthorizationExpired(termination) => {
+                UdpReplyRecvOutcomeForTest::AuthorizationExpired(termination)
+            }
+        }
+    }
+
+    /// A real plain-UDP session (real backend socket, real overload guard, real
+    /// hook-ingress channel) that external coverage drives through the
+    /// production datagram paths.
+    pub use crate::proxy::udp_proxy::UdpAuthorizationSessionProbe;
 
     /// The fixed PRE-COMMITMENT terminal the H1/H2 dispatch funnel substitutes
     /// when a request-upload authorization expiry cancelled the backend

@@ -24367,7 +24367,7 @@ pub(crate) fn spawn_detached_response_committed_hooks(
         {
             // A compiled-in literal: no expiry instant, claim, subject,
             // certificate field, or provider detail.
-            warn!(
+            debug!(
                 "detached committed-response cleanup was refused: the admitted stream's \
                  authorization lifetime had already elapsed when it was scheduled"
             );
@@ -24416,7 +24416,7 @@ pub(crate) fn spawn_detached_response_committed_hooks(
         };
         if !completed {
             if authorization_at.is_some() {
-                warn!(
+                debug!(
                     "detached committed-response cleanup was cancelled at the admitted stream's \
                      authorization lifetime"
                 );

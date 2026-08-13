@@ -6161,6 +6161,27 @@ impl EnvConfig {
         Ok(())
     }
 
+    /// Publish the process-wide settings that serving paths read without an
+    /// `EnvConfig` reference, from the ACCEPTED startup configuration.
+    ///
+    /// Called exactly once from `main.rs`, immediately after
+    /// `EnvConfig::from_env()` succeeds and before any serving mode, listener,
+    /// or accept loop can start — the same seam the discovery body ceilings and
+    /// staleness policy already use. It is deliberately not reachable from
+    /// `validate`: a configuration that passes one field's range check can
+    /// still be rejected by a later check, and the non-serving
+    /// `ferrum-edge validate` command must not touch the live process at all.
+    ///
+    /// Currently one setting: the finite authenticated-stream maximum that
+    /// bounds every admitted authenticated non-WebSocket stream
+    /// (`FERRUM_AUTHENTICATED_STREAM_MAX_LIFETIME_SECONDS`). `validate` has
+    /// already constrained it to `1..=86400`.
+    pub(crate) fn publish_process_wide_stream_settings(&self) {
+        crate::proxy::auth_lifetime::publish_authenticated_stream_max_lifetime_seconds(
+            self.authenticated_stream_max_lifetime_seconds,
+        );
+    }
+
     fn validate(&mut self) -> Result<(), String> {
         if !(1..=86_400).contains(&self.websocket_max_lifetime_seconds) {
             return Err(
@@ -6177,13 +6198,14 @@ impl EnvConfig {
                     .into(),
             );
         }
-        // Stream listeners accept connections far from any `EnvConfig`
-        // reference. Publish the validated value once so the TCP/TLS and
-        // UDP/DTLS session lifecycles can read it without threading a scalar
-        // through every accept-loop signature.
-        crate::proxy::auth_lifetime::publish_authenticated_stream_max_lifetime_seconds(
-            self.authenticated_stream_max_lifetime_seconds,
-        );
+        // NOTE: the validated value is NOT published to the process-wide
+        // stream-lifetime cell here. `validate` runs on candidate
+        // configurations — many later checks in this function can still return
+        // `Err`, and the non-serving `ferrum-edge validate` command runs it too
+        // — so publishing from validation let a REJECTED configuration mutate
+        // the live scalar that bounds admitted authenticated streams.
+        // Publication happens exactly once from the ACCEPTED startup
+        // configuration; see `publish_process_wide_stream_settings`.
         if let Some(gateway_ref) = self.stream_gateway_ref.as_deref() {
             crate::proxy::stream_match::validate_canonical_gateway_ref(gateway_ref)
                 .map_err(|e| format!("FERRUM_STREAM_GATEWAY_REF: {e}"))?;

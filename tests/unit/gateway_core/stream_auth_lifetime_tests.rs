@@ -3122,7 +3122,11 @@ async fn a_response_phase_is_bounded_by_the_authorization_deadline_alone() {
     // has no `grpc-timeout` at all, so before this composition every one of
     // them could run past the credential that admitted the stream and then
     // commit a protected response head.
-    ferrum_edge::_test_support::publish_authenticated_stream_max_lifetime_seconds_for_test(120);
+    // The maximum is a PROCESS-WIDE scalar and this binary runs tests in
+    // parallel, so every writer serializes through the one shared test lock and
+    // restores the prior value on drop.
+    let lifetime_guard = crate::unit::env_lock::StreamAuthMaxLifetimeGuard::new();
+    lifetime_guard.publish(120);
     let ctx = authenticated_ctx();
     let bound = ferrum_edge::_test_support::precommit_response_phase_deadline_for_test(&ctx)
         .expect("an admitted authenticated request must bound every pre-commitment phase");
@@ -3137,8 +3141,8 @@ async fn a_response_phase_is_bounded_by_the_authorization_deadline_alone() {
         None
     );
 
-    // Restore the documented default: this value is process-wide.
-    ferrum_edge::_test_support::publish_authenticated_stream_max_lifetime_seconds_for_test(3_600);
+    // `lifetime_guard` restores the previous process-wide value on drop.
+    drop(lifetime_guard);
 }
 
 /// Native-H3 gRPC dispatch composes the authorization deadline over BOTH
@@ -4474,7 +4478,8 @@ async fn the_detached_bound_carries_the_credential_lifetime_even_when_the_client
     // The seam that produces the detached bound is the same composed
     // pre-commitment bound the synchronous phase used, so a client `grpc-timeout`
     // winning the phase must NOT erase the credential's absolute deadline.
-    ferrum_edge::_test_support::publish_authenticated_stream_max_lifetime_seconds_for_test(120);
+    let lifetime_guard = crate::unit::env_lock::StreamAuthMaxLifetimeGuard::new();
+    lifetime_guard.publish(120);
     let ctx = authenticated_ctx();
     let authorization_at =
         ferrum_edge::_test_support::detached_response_committed_authorization_bound_for_test(&ctx)
@@ -4490,7 +4495,7 @@ async fn the_detached_bound_carries_the_credential_lifetime_even_when_the_client
         None,
         "an unauthenticated request carries no authorization bound"
     );
-    ferrum_edge::_test_support::publish_authenticated_stream_max_lifetime_seconds_for_test(3_600);
+    drop(lifetime_guard);
 }
 
 /// Every detached committed-response handoff carries the bound (issue #3815).
@@ -4585,4 +4590,169 @@ fn every_detached_committed_hook_handoff_carries_the_authorization_bound() {
         biased_at < sleep_at && sleep_at < chain_at,
         "the authorization bound must be the FIRST select arm"
     );
+}
+
+/// Normalize a collected `tracing` macro invocation for phrase matching.
+///
+/// Rust string continuations split a message across source lines with a
+/// trailing backslash and leading indentation, so the raw source text of a
+/// wrapped "reached its authorization lifetime" message does not contain that
+/// phrase at all. Dropping backslashes and collapsing whitespace runs is what
+/// makes the contract below match the message an operator actually sees —
+/// without it, wrapping a line would silently exempt a site.
+fn normalize_log_message(invocation: &str) -> String {
+    let mut normalized = String::with_capacity(invocation.len());
+    let mut last_was_space = false;
+    for ch in invocation.chars() {
+        if ch == '\\' {
+            continue;
+        }
+        if ch.is_whitespace() {
+            if !last_was_space {
+                normalized.push(' ');
+                last_was_space = true;
+            }
+            continue;
+        }
+        last_was_space = false;
+        normalized.extend(ch.to_lowercase());
+    }
+    normalized
+}
+
+/// Ordinary authorization expiry must never be a warning-log amplification
+/// surface (root review of PR #3820).
+///
+/// An expiry is expected lifecycle AND client-triggerable: any client holding a
+/// short-TTL credential produces one on every stream it opens, and a single
+/// request can reach several of these sites across the H3 relays, the
+/// cross-protocol relays, and the detached committed-response cleanup. At
+/// `warn!` that is an unbounded, client-driven flood of a severity operators
+/// page on.
+///
+/// The observable record of an expiry is the fixed-cardinality
+/// `authorization_lifetime` counter pair and the bounded
+/// `authorization.termination_reason` transaction-summary metadata — neither
+/// depends on a log line — so the messages are `debug!`. `warn!`/`error!`
+/// stays for genuinely anomalous cleanup, write, or invariant failures, which
+/// is why this contract keys on the MESSAGE naming the authorization lifetime
+/// rather than on a site list.
+#[test]
+fn ordinary_authorization_expiry_is_never_logged_at_warning_level() {
+    const SOURCES: &[(&str, &str)] = &[
+        ("proxy/mod.rs", include_str!("../../../src/proxy/mod.rs")),
+        ("proxy/body.rs", include_str!("../../../src/proxy/body.rs")),
+        (
+            "proxy/tcp_proxy.rs",
+            include_str!("../../../src/proxy/tcp_proxy.rs"),
+        ),
+        (
+            "proxy/udp_proxy.rs",
+            include_str!("../../../src/proxy/udp_proxy.rs"),
+        ),
+        (
+            "proxy/upload_pump.rs",
+            include_str!("../../../src/proxy/upload_pump.rs"),
+        ),
+        (
+            "proxy/response_watchdog.rs",
+            include_str!("../../../src/proxy/response_watchdog.rs"),
+        ),
+        (
+            "proxy/grpc_proxy.rs",
+            include_str!("../../../src/proxy/grpc_proxy.rs"),
+        ),
+        ("http3/server.rs", H3_SERVER_SOURCE),
+        (
+            "http3/cross_protocol.rs",
+            include_str!("../../../src/http3/cross_protocol.rs"),
+        ),
+        (
+            "http3/stream_util.rs",
+            include_str!("../../../src/http3/stream_util.rs"),
+        ),
+    ];
+    // Phrases that only an ORDINARY expiry message carries. A genuinely
+    // anomalous failure describes the failure ("cleanup exceeded its
+    // post-response bound"), not the lifetime.
+    const EXPIRY_PHRASES: &[&str] = &[
+        "authorization lifetime",
+        "credential expired",
+        "authenticated stream lifetime",
+    ];
+
+    let mut offenders: Vec<String> = Vec::new();
+    for (name, source) in SOURCES {
+        for (index, line) in source.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if !(trimmed.starts_with("warn!(") || trimmed.starts_with("error!(")) {
+                continue;
+            }
+            // Collect the whole macro invocation by paren balance.
+            let mut depth = 0i32;
+            let mut invocation = String::new();
+            for candidate in source.lines().skip(index) {
+                invocation.push(' ');
+                invocation.push_str(candidate);
+                depth += candidate.matches('(').count() as i32;
+                depth -= candidate.matches(')').count() as i32;
+                if depth <= 0 {
+                    break;
+                }
+            }
+            if EXPIRY_PHRASES
+                .iter()
+                .any(|phrase| normalize_log_message(&invocation).contains(phrase))
+            {
+                offenders.push(format!("{name}:{}", index + 1));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "ordinary authorization-lifetime expiry must be logged at debug!, not warn!/error! \
+         (offending sites: {offenders:?}); see the `Log level` section of \
+         src/proxy/auth_lifetime.rs"
+    );
+}
+
+/// The downgrade must not have deleted the messages: they stay compiled in, at
+/// `debug!`, so an operator can still turn them on for one investigation
+/// without also arming a client-triggerable warning flood.
+#[test]
+fn authorization_expiry_messages_are_still_compiled_in_at_debug_level() {
+    for (name, source) in [
+        ("http3/server.rs", H3_SERVER_SOURCE),
+        (
+            "http3/cross_protocol.rs",
+            include_str!("../../../src/http3/cross_protocol.rs"),
+        ),
+        ("proxy/mod.rs", include_str!("../../../src/proxy/mod.rs")),
+    ] {
+        let mut debug_expiry_sites = 0usize;
+        let lines: Vec<&str> = source.lines().collect();
+        for (index, line) in lines.iter().enumerate() {
+            if !line.trim_start().starts_with("debug!(") {
+                continue;
+            }
+            let mut depth = 0i32;
+            let mut invocation = String::new();
+            for candidate in lines.iter().skip(index) {
+                invocation.push(' ');
+                invocation.push_str(candidate);
+                depth += candidate.matches('(').count() as i32;
+                depth -= candidate.matches(')').count() as i32;
+                if depth <= 0 {
+                    break;
+                }
+            }
+            if normalize_log_message(&invocation).contains("authorization lifetime") {
+                debug_expiry_sites += 1;
+            }
+        }
+        assert!(
+            debug_expiry_sites > 0,
+            "{name} must still carry its authorization-lifetime expiry messages, at debug level"
+        );
+    }
 }

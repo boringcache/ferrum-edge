@@ -654,7 +654,8 @@ The `grpc-message` and the internal termination text are compiled-in literals.
 | Inspected / latency-tracked streaming bodies | Yes |
 | WebSocket over H1, H2 Extended CONNECT, and H3 Extended CONNECT | Yes, through the pre-existing WebSocket deadline arbiter (issue #3738), which uses the same `credential_deadline_at`. Its absolute maximum is `FERRUM_WEBSOCKET_MAX_LIFETIME_SECONDS`, a different knob from `FERRUM_AUTHENTICATED_STREAM_MAX_LIFETIME_SECONDS`, and it reports through `websocket.termination_reason` — so it is deliberately **not** a family of the `authorization_lifetime` counters |
 | TCP+TLS stream sessions on the userspace relay | Yes — armed at `on_stream_connect` admission and enforced across every post-admission setup stage (DNS resolution, retry backoff, backend connect and TLS handshake, the outbound PROXY v2 header, and the inspected first-bytes forward) as well as the relay itself, so no backend or application byte is written on an expired credential |
-| UDP+DTLS stream sessions | Yes — raced against relay completion, the idle watchdog, and drain; both directions are closed and the backend connection is torn down |
+| DTLS-terminating stream sessions | Yes — armed at accept-time admission and composed over every post-admission setup stage (DNS resolution, backend connect, backend DTLS handshake), then raced against relay completion, the idle watchdog, and drain; both directions are closed and the backend connection is torn down |
+| Plain-UDP stream sessions | Yes — a plain-UDP listener runs the same `on_stream_connect` admission chain, so it can admit a Consumer, an external identity, and a credential deadline exactly like DTLS. The maximum is anchored at **first-datagram session admission**, before the epoch resolve, the mesh egress decision, and the admission chain, so a slow stream-connect plugin cannot buy extra authorized lifetime. Every post-admission setup stage that awaits is bounded (the first-datagram `on_udp_datagram` policy hooks, DNS resolution, the backend bind/connect and backend DTLS handshake), and the plan is re-read before the session is committed — before any backend success is recorded, before the session map insert, before the reply task exists, and before the first backend send. Both directions are then enforced: the client→backend forward (inline path, `last_client` fast path, and the bounded hook-ingress worker) and the backend reply task's deadline arm. See the note below |
 | CP/DP configuration streams | Yes, through the separate control-plane lifetime enforcement |
 
 The native HTTP/3 frontend and the H3 cross-protocol bridge own the QUIC
@@ -679,6 +680,30 @@ Deliberate scope notes:
   [Kernel TLS and the stream authorization deadline](frontend_tls.md#kernel-tls-and-the-stream-authorization-deadline).
 - **Plaintext TCP** stream sessions carry no gateway-verified credential from a
   built-in mechanism, so no deadline is derived for them.
+- A **plain-UDP** session is bounded whenever its `on_stream_connect` chain
+  admitted a principal, and is otherwise untouched: an unauthenticated session
+  has no plan at all, so its datagram path reads no clock, takes no lock,
+  registers no timer, and behaves byte for byte as it did before. The
+  authenticated path costs one additional monotonic instant comparison per
+  datagram — deliberately not a per-datagram timer, mutex, map walk,
+  allocation, or formatted string. An elapsed deadline **refuses the datagram
+  inline** rather than waiting for the reply task's timer to be scheduled, and
+  the first observer wakes the reply task, which owns the single teardown:
+  the generation is marked expired before any cache or map reuse, only that
+  exact generation is removed, the backend socket / DTLS connection and the
+  hook-ingress channel are closed (which cancels an in-flight datagram hook),
+  and the overload connection guard and the listener's active-session slot are
+  released exactly once. A setup-phase expiry releases a claimed HALF_OPEN
+  circuit-breaker probe slot **neutrally** and records no backend outcome. The
+  disconnect summary reports a client-side, backend-health-neutral decision
+  (`RecvError` / `ClientToBackend` / `RequestError`) carrying only the bounded
+  `authorization.termination_reason` class — no identity, credential,
+  certificate field, expiry instant, or source address.
+- **Ordinary expiry is logged at `debug!`, never `warn!`.** It is expected
+  lifecycle and client-triggerable, and the counters plus the transaction
+  summary already carry it, so warning-level logging would only give a client a
+  log-amplification lever. Warning and error levels stay for genuinely
+  anomalous cleanup, write, and invariant failures.
 - A TCP setup-phase expiry is a **client-side, health-neutral** refusal
   (`StreamSetupKind::AuthorizationExpired`): the half-open circuit-breaker probe
   slot and the per-target backend-inflight slot are released without recording a

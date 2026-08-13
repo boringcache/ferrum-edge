@@ -149,6 +149,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   records through the request's shared latch, so concurrent upload, response,
   and terminal paths cannot double count one stream.
 
+- **Plain UDP** sessions are bounded by the same authorization lifetime as
+  DTLS ones (issue #3816). A plain-UDP listener runs the full
+  `on_stream_connect` admission chain, so it can admit a Consumer, an external
+  identity, and a credential deadline exactly like the DTLS frontend — and
+  because `on_stream_connect` runs once and is never repeated, an admitted
+  plain-UDP session was previously authorized indefinitely, which also left any
+  custom or future stream-auth plugin able to create one. The fallback maximum
+  is anchored at **first-datagram session admission**, before the epoch resolve,
+  the mesh egress decision, and the admission chain, so slow admission work
+  consumes the session's own lifetime instead of extending it. Every awaitable
+  post-admission setup stage runs under the bound (first-datagram
+  `on_udp_datagram` policy hooks, DNS resolution, backend bind/connect, backend
+  DTLS handshake), and the plan is re-read before the session is committed —
+  before any backend success is recorded, before the session map insert, before
+  the reply task exists, and before the first backend send. Both directions are
+  enforced afterwards: the client→backend forward (inline path, `last_client`
+  fast path, and the bounded hook-ingress worker) and the backend reply task's
+  arm, which is armed once outside its receive loop. An already-elapsed deadline
+  refuses the datagram inline rather than waiting for that timer to be
+  scheduled. At expiry the generation is marked expired before any cache or map
+  reuse, only that exact generation is removed, sockets/tasks/channels are
+  closed (cancelling an in-flight datagram hook), and the overload guard,
+  active-session slot, and any claimed HALF_OPEN circuit-breaker probe are
+  released exactly once and health-neutrally. The bounded class is settled once
+  through one shared latch onto the fixed-cardinality `stream_udp` counters and
+  the transaction summary, whose cause/direction identify a client-side,
+  backend-health-neutral decision carrying no identity, credential, certificate
+  field, expiry instant, or source address. Unauthenticated UDP is unchanged:
+  no plan exists, so the datagram path reads no clock, takes no lock, and
+  registers no timer.
+
+- Ordinary authorization-lifetime expiry is logged at `debug!` rather than
+  `warn!`. Expiry is expected lifecycle and is client-triggerable — a client
+  holding a short-TTL credential can produce one on every stream it opens, and
+  a single request can reach several such sites across the HTTP/3 relays, the
+  cross-protocol relays, and detached committed-response cleanup — so
+  warning-level logging was a log-amplification lever with no diagnostic value
+  the fixed-cardinality counters and the bounded
+  `authorization.termination_reason` metadata do not already carry. Every
+  message stays compiled in and redacted; `warn!`/`error!` is retained for
+  genuinely anomalous cleanup, write, and invariant failures.
+
+- `EnvConfig::validate()` no longer publishes the process-wide
+  `FERRUM_AUTHENTICATED_STREAM_MAX_LIFETIME_SECONDS` scalar. Validation ran that
+  publication immediately after the field's own range check, ahead of a dozen
+  later checks that can still reject the candidate, so a **rejected** parse
+  could re-bound every authenticated stream in a running process — and the
+  non-serving `ferrum-edge validate` command did the same. Validation is now
+  pure with respect to that global; the accepted startup configuration publishes
+  it exactly once, before any serving mode or listener can start, and the stored
+  value is always inside `1..=86400`.
+
 - TCP/TLS stream connect-**retry backoff** is bounded by the admitted session's
   authorization lifetime (issue #3816). `retry_delay` grows with the attempt
   number, so a chain of failing candidates could hold an admitted authenticated

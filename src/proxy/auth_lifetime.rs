@@ -30,6 +30,28 @@
 //! counters below carry no labels beyond a bounded protocol family. No route,
 //! identity, subject, token, claim, certificate field, provider name, or
 //! absolute expiry can reach either surface.
+//!
+//! # Log level
+//!
+//! An authorization-lifetime expiry is **expected, ordinary lifecycle** — and
+//! it is client-triggerable: any client holding a short-TTL credential can
+//! produce one on demand, on every stream it opens. Emitting it at `warn!`
+//! turned one credential's natural expiry into an unbounded warning-log
+//! amplification surface, on paths (H3 relays, cross-protocol relays, detached
+//! cleanup) where a single request can reach several such sites.
+//!
+//! So every ordinary credential/max-lifetime lifecycle message is `debug!`.
+//! `warn!`/`error!` is reserved for genuinely anomalous conditions — a cleanup
+//! that overran a bound the gateway itself set, a write/invariant failure, a
+//! resource that could not be released. The observable record of an expiry is
+//! the fixed-cardinality counter pair below plus the bounded
+//! [`STREAM_AUTH_TERMINATION_METADATA_KEY`] metadata on the transaction
+//! summary; neither depends on a log line, so nothing is lost by the
+//! downgrade. Every message stays compiled in and redacted.
+//!
+//! `tests/unit/gateway_core/stream_auth_lifetime_tests.rs` pins this: a
+//! `warn!`/`error!` whose message names the authorization lifetime fails the
+//! build's contract test.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
@@ -384,16 +406,46 @@ pub fn counters() -> StreamAuthLifetimeCounters {
 /// Stream listeners (TCP/TLS, UDP/DTLS) accept connections far from any
 /// `EnvConfig` reference, and threading one validated scalar through every
 /// accept-loop signature would add a parameter to a dozen hot-path functions
-/// for no behavioral benefit. `EnvConfig::validate` publishes it once, after
-/// range validation, so the value read here is always inside `1..=86400`.
-/// The seeded default matches the documented default, so a stream admitted
-/// before publication is bounded rather than unbounded.
+/// for no behavioral benefit. The ACCEPTED startup configuration publishes it
+/// once — `EnvConfig::publish_process_wide_stream_settings`, called from
+/// `main.rs` immediately after `EnvConfig::from_env()` succeeds and before any
+/// serving mode or listener can start — so the value read here is always inside
+/// `1..=86400`. The seeded default matches the documented default, so a stream
+/// admitted before publication is bounded rather than unbounded.
+///
+/// Publication is deliberately NOT performed by `EnvConfig::validate`.
+/// Validation runs on candidate configurations that may still be rejected by a
+/// later check (and runs at all on the non-serving `ferrum-edge validate`
+/// path), so publishing there let a REJECTED parse mutate the live process
+/// scalar. Validation is pure with respect to this global.
 static AUTHENTICATED_STREAM_MAX_LIFETIME_SECONDS: AtomicU64 = AtomicU64::new(3_600);
 
-/// Publish the validated authenticated-stream maximum. Called from
-/// `EnvConfig::validate` after the `1..=86400` range check.
-pub fn publish_authenticated_stream_max_lifetime_seconds(seconds: u64) {
-    AUTHENTICATED_STREAM_MAX_LIFETIME_SECONDS.store(seconds, Ordering::Relaxed);
+/// Lowest representable authenticated-stream maximum. `0`/unbounded is
+/// deliberately not configurable in any mode.
+const AUTHENTICATED_STREAM_MAX_LIFETIME_MIN_SECONDS: u64 = 1;
+/// Highest representable authenticated-stream maximum (24 hours).
+const AUTHENTICATED_STREAM_MAX_LIFETIME_MAX_SECONDS: u64 = 86_400;
+
+/// Publish the validated authenticated-stream maximum.
+///
+/// Crate-private on purpose: the only production caller is the accepted
+/// startup-configuration seam, so a serving path cannot publish a value the
+/// operator's configuration never accepted.
+///
+/// `EnvConfig::validate` has already rejected anything outside `1..=86400`, so
+/// the clamp below never changes an accepted value. It exists so the STORED
+/// invariant ("always inside `1..=86400`") holds by construction rather than by
+/// the caller's discipline — a bound of `0` read from this cell would mean an
+/// authenticated stream anchored at `now` with a deadline of `now`, and a
+/// `u64::MAX` bound would saturate the anchor arithmetic.
+pub(crate) fn publish_authenticated_stream_max_lifetime_seconds(seconds: u64) {
+    AUTHENTICATED_STREAM_MAX_LIFETIME_SECONDS.store(
+        seconds.clamp(
+            AUTHENTICATED_STREAM_MAX_LIFETIME_MIN_SECONDS,
+            AUTHENTICATED_STREAM_MAX_LIFETIME_MAX_SECONDS,
+        ),
+        Ordering::Relaxed,
+    );
 }
 
 /// Read the published authenticated-stream maximum.

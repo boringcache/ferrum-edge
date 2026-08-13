@@ -6175,7 +6175,7 @@ async fn handle_h3_request(
                 body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
             }
             crate::http3::stream_util::H3AuthorizedHeadersWrite::AuthorizationExpired(_) => {
-                warn!(
+                debug!(
                     "HTTP/3 streaming response reached its authorization lifetime before \
                      response headers committed; resetting the stream"
                 );
@@ -6264,7 +6264,7 @@ async fn handle_h3_request(
                     crate::http3::stream_util::H3AuthorizedWrite::AuthorizationExpired(
                         termination,
                     ) => {
-                        warn!(
+                        debug!(
                             "HTTP/3 streaming response reached its authorization lifetime \
                              while the client was not consuming; resetting the stream"
                         );
@@ -6475,7 +6475,7 @@ async fn handle_h3_request(
                         .unwrap_or(
                             crate::proxy::auth_lifetime::StreamAuthTermination::CredentialExpired,
                         );
-                    warn!(
+                    debug!(
                         "HTTP/3 streaming response reached its authorization lifetime; \
                          resetting the stream"
                     );
@@ -6555,7 +6555,7 @@ async fn handle_h3_request(
                 match finish_result {
                     Ok(_) => body_completed = true,
                     Err(H3TrailerFinishError::AuthorizationExpired(termination)) => {
-                        warn!(
+                        debug!(
                             "HTTP/3 streaming response reached its authorization lifetime while \
                              the client was not consuming the terminal trailers; resetting"
                         );
@@ -9869,7 +9869,7 @@ async fn stream_h3_open_response_to_client(
             });
         }
         crate::http3::stream_util::H3AuthorizedHeadersWrite::AuthorizationExpired(_) => {
-            warn!(
+            debug!(
                 "HTTP/3 streaming response reached its authorization lifetime before \
                  response headers committed; resetting the stream"
             );
@@ -9960,7 +9960,7 @@ async fn stream_h3_open_response_to_client(
                     false
                 }
                 crate::http3::stream_util::H3AuthorizedWrite::AuthorizationExpired(termination) => {
-                    warn!(
+                    debug!(
                         "HTTP/3 streaming response reached its authorization lifetime while the \
                          client was not consuming; resetting the stream"
                     );
@@ -10099,7 +10099,7 @@ async fn stream_h3_open_response_to_client(
                     .unwrap_or(
                         crate::proxy::auth_lifetime::StreamAuthTermination::CredentialExpired,
                     );
-                warn!(
+                debug!(
                     "HTTP/3 streaming response reached its authorization lifetime; \
                      resetting the stream"
                 );
@@ -10145,7 +10145,7 @@ async fn stream_h3_open_response_to_client(
             {
                 Ok(_) => body_completed = true,
                 Err(H3TrailerFinishError::AuthorizationExpired(termination)) => {
-                    warn!(
+                    debug!(
                         "HTTP/3 streaming response reached its authorization lifetime while the \
                          client was not consuming the terminal trailers; resetting"
                     );
@@ -11745,7 +11745,7 @@ async fn dispatch_grpc_native_h3(
     if let Some(termination) =
         crate::proxy::auth_lifetime::expired_authorization(auth_deadline_plan)
     {
-        warn!(
+        debug!(
             "native H3 gRPC response reached its authorization lifetime before any response-header \
              phase ran; emitting the fixed trailers-only UNAUTHENTICATED terminal"
         );
@@ -11864,7 +11864,7 @@ async fn dispatch_grpc_native_h3(
         if let Some(termination) =
             crate::proxy::auth_lifetime::expired_authorization(auth_deadline_plan)
         {
-            warn!(
+            debug!(
                 "native H3 gRPC response reached its authorization lifetime during the \
                  response-header phases; emitting the fixed trailers-only UNAUTHENTICATED \
                  terminal instead of the hook rejection"
@@ -12053,7 +12053,7 @@ async fn dispatch_grpc_native_h3(
     if let Some(termination) =
         crate::proxy::auth_lifetime::expired_authorization(auth_deadline_plan)
     {
-        warn!(
+        debug!(
             "native H3 gRPC response reached its authorization lifetime before the response head \
              was committed; emitting the fixed trailers-only UNAUTHENTICATED terminal"
         );
@@ -12093,7 +12093,7 @@ async fn dispatch_grpc_native_h3(
         Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded)
     ) && let Some(termination) = response_header_write_bound.expired_authorization()
     {
-        warn!(
+        debug!(
             "native H3 gRPC response head could not be written before the authorization lifetime \
              elapsed; resetting the stream"
         );
@@ -12302,7 +12302,7 @@ async fn dispatch_grpc_native_h3(
                     let termination = expiry.unwrap_or(
                         crate::proxy::auth_lifetime::StreamAuthTermination::CredentialExpired,
                     );
-                    warn!(
+                    debug!(
                         "native H3 gRPC stream reached its authorization lifetime while the \
                          client was not consuming; resetting the stream"
                     );
@@ -12425,7 +12425,7 @@ async fn dispatch_grpc_native_h3(
                 if crate::http3::stream_util::grpc_deadline_can_send_terminal_status(
                     bytes_streamed,
                 ) {
-                    warn!(
+                    debug!(
                         "native H3 gRPC stream reached its authorization lifetime before any \
                          response body; completing with grpc-status UNAUTHENTICATED"
                     );
@@ -12453,7 +12453,7 @@ async fn dispatch_grpc_native_h3(
                         body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
                     }
                 } else {
-                    warn!(
+                    debug!(
                         "native H3 gRPC stream reached its authorization lifetime mid-body; \
                          resetting the stream (synthesized trailers would truncate a message)"
                     );
@@ -13516,7 +13516,7 @@ async fn proxy_to_backend_h3_streaming(
             });
         }
         crate::http3::stream_util::H3AuthorizedHeadersWrite::AuthorizationExpired(_) => {
-            warn!(
+            debug!(
                 "HTTP/3 streaming response reached its authorization lifetime before \
                  response headers committed; resetting the stream"
             );
@@ -13610,7 +13610,7 @@ async fn proxy_to_backend_h3_streaming(
                     false
                 }
                 crate::http3::stream_util::H3AuthorizedWrite::AuthorizationExpired(termination) => {
-                    warn!(
+                    debug!(
                         "HTTP/3 streaming response reached its authorization lifetime while the \
                          client was not consuming; resetting the stream"
                     );
@@ -13763,7 +13763,7 @@ async fn proxy_to_backend_h3_streaming(
                     .unwrap_or(
                         crate::proxy::auth_lifetime::StreamAuthTermination::CredentialExpired,
                     );
-                warn!(
+                debug!(
                     "HTTP/3 streaming response reached its authorization lifetime; \
                      resetting the stream"
                 );
@@ -13810,7 +13810,7 @@ async fn proxy_to_backend_h3_streaming(
             {
                 Ok(_) => body_completed = true,
                 Err(H3TrailerFinishError::AuthorizationExpired(termination)) => {
-                    warn!(
+                    debug!(
                         "HTTP/3 streaming response reached its authorization lifetime while the \
                          client was not consuming the terminal trailers; resetting"
                     );
