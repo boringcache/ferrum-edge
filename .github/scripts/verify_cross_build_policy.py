@@ -2459,9 +2459,9 @@ LIVE_SUITE_RELEVANCE_CONTRACTS = {
     ),
 }
 
-# The Ambient Host UDP required check is security-sensitive beyond relevance:
-# freeze the privileged kernel test step and the final required-check job so a
-# pull request cannot replace execution with a no-op or report a false success.
+# The Ambient Host UDP required check is security-sensitive beyond relevance.
+# The privileged step remains a named component of the complete live-job
+# contract below; neither it nor any surrounding execution control may move.
 AMBIENT_HOST_UDP_LIVE_STEP = r"""      - name: Run ambient host-UDP live gate as root
         env:
           FERRUM_LIVE_TESTS_REQUIRED: "1"
@@ -2485,6 +2485,194 @@ AMBIENT_HOST_UDP_LIVE_STEP = r"""      - name: Run ambient host-UDP live gate as
             ip -6 link set lo up 2>/dev/null || true
             exec "$1"
           ' bash tests/k8s/ambient_host_udp_live/run.sh
+"""
+AMBIENT_HOST_UDP_LIVE_JOB = (
+    r"""  ambient-host-udp-live:
+    name: Ambient host-network UDP live-kernel
+    needs: changes
+    if: needs.changes.outputs.relevant == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout Ferrum Edge
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          shared-key: "ci-ambient-host-udp-live"
+
+      - name: Build live test binaries
+        id: build_test_bin
+        run: |
+          set -euo pipefail
+          mapfile -t bins < <(
+            cargo test --lib --no-run --message-format=json-render-diagnostics \
+              | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null and (.target.kind | index("lib"))) | .executable'
+          )
+          if [ "${#bins[@]}" -ne 1 ]; then
+            printf 'Expected exactly one lib test binary, found %s:\n' "${#bins[@]}" >&2
+            printf '%s\n' "${bins[@]}" >&2
+            exit 1
+          fi
+          echo "lib_test_bin=${bins[0]}" >> "$GITHUB_OUTPUT"
+
+          cargo build --bin ferrum-edge
+          mapfile -t functional_bins < <(
+            cargo test --test functional_tests --no-run --message-format=json-render-diagnostics \
+              | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null and (.target.kind | index("test"))) | .executable'
+          )
+          if [ "${#functional_bins[@]}" -ne 1 ]; then
+            printf 'Expected exactly one functional test binary, found %s:\n' "${#functional_bins[@]}" >&2
+            printf '%s\n' "${functional_bins[@]}" >&2
+            exit 1
+          fi
+          echo "functional_test_bin=${functional_bins[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Preflight privileged host-UDP primitives
+        run: |
+          set -euo pipefail
+          sudo -n true
+          for bin in unshare nsenter setpriv timeout ip iptables ip6tables iptables-save ip6tables-save; do
+            command -v "$bin" >/dev/null 2>&1 || {
+              echo "::error::$bin is required for ambient host-UDP live tests"
+              exit 1
+            }
+          done
+          sudo unshare --net -- ip link set lo up
+          sudo unshare --net -- iptables -t mangle -L >/dev/null
+          sudo unshare --net -- ip6tables -t mangle -L >/dev/null
+
+"""
+    + AMBIENT_HOST_UDP_LIVE_STEP
+    + r"""
+      - name: Upload bounded diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ambient-host-udp-live-results
+          path: target/ambient-host-udp-live
+          if-no-files-found: warn
+          retention-days: 14
+"""
+)
+AMBIENT_HOST_UDP_IMAGE_JOB = r"""  ambient-host-udp-image:
+    name: Ambient host-UDP production image contract
+    needs: changes
+    if: needs.changes.outputs.relevant == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout Ferrum Edge
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+
+      # Cheap, deterministic half: the tool-provisioning stage the production
+      # runtime is built FROM. This alone would not prove the shipped image, so
+      # the full target is smoked below; running it first surfaces a broken tool
+      # closure in ~1 minute instead of after the Rust + nightly eBPF builds.
+      - name: Build the capture tool base stage
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: Dockerfile
+          target: capture-tools-base
+          load: true
+          tags: ferrum-edge-capture-tools-base:ci
+          cache-from: type=gha,scope=ambient-host-udp-images
+          cache-to: type=gha,mode=max,scope=ambient-host-udp-images
+          provenance: false
+
+      # The exact target the mesh chart's `-ebpf-tools` tag publishes.
+      - name: Build the production Ambient UDP lifecycle runtime
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: Dockerfile
+          target: runtime-ebpf-tools
+          build-args: |
+            FEATURES=cloud-secrets,ebpf
+          load: true
+          tags: ferrum-edge-ebpf-tools:ci
+          cache-from: type=gha,scope=ambient-host-udp-images
+          cache-to: type=gha,mode=max,scope=ambient-host-udp-images
+          provenance: false
+
+      - name: Prove the published runtime can execute the production tool set
+        run: |
+          set -euo pipefail
+
+          # Every tool the generated host/pod-netns UDP setup and teardown
+          # scripts invoke. `preflight_capture_tools` refuses startup without
+          # them, so an image failing here crash-loops the Ambient UDP producer.
+          docker run --rm --entrypoint /bin/sh ferrum-edge-ebpf-tools:ci -c '
+            set -eu
+            for tool in ip iptables ip6tables iptables-save ip6tables-save; do
+              command -v "$tool" >/dev/null 2>&1 || {
+                echo "missing required tool: $tool" >&2
+                exit 1
+              }
+            done
+            ip -V >/dev/null
+            iptables --version >/dev/null
+            ip6tables --version >/dev/null
+            iptables-save --version >/dev/null
+            ip6tables-save --version >/dev/null
+          '
+
+          # The image must still be a working Ferrum runtime, and must carry the
+          # eBPF ELF that makes it a strict superset of the `-ebpf` variant.
+          docker run --rm ferrum-edge-ebpf-tools:ci version >/dev/null
+          docker run --rm --entrypoint /bin/sh ferrum-edge-ebpf-tools:ci -c \
+            'test -s /app/bpf/ferrum-ebpf'
+
+      # The complementary half of the contract: the ordinary `-ebpf` image the
+      # chart still selects for eBPF capture / NodeWaypoint must REMAIN
+      # distroless. Proving the tools image alone would let a later change
+      # "fix" this finding by quietly adding a shell to `-ebpf` instead.
+      - name: Build the distroless eBPF runtime
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: Dockerfile
+          target: runtime-ebpf
+          build-args: |
+            FEATURES=cloud-secrets,ebpf
+          load: true
+          tags: ferrum-edge-ebpf:ci
+          cache-from: type=gha,scope=ambient-host-udp-images
+          cache-to: type=gha,mode=max,scope=ambient-host-udp-images
+          provenance: false
+
+      - name: Prove the `-ebpf` image keeps its distroless contract
+        run: |
+          set -euo pipefail
+          container="$(docker create ferrum-edge-ebpf:ci)"
+          trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
+          listing="$RUNNER_TEMP/ebpf-image-files.txt"
+          # Normalize exactly like the production Dockerfile smoke so the
+          # exact-path assertions below cannot be defeated by a `./` prefix.
+          docker export "$container" | tar -tf - \
+            | sed -e 's#^\./##' -e 's#^/##' > "$listing"
+
+          # Positive control: prove the exact-path assertion is live before
+          # asserting absences against the same inventory.
+          grep -Fxq app/ferrum-edge "$listing"
+          # `ip` IS expected: NodeWaypoint owns an exact policy rule/route.
+          grep -Fxq usr/sbin/ip "$listing"
+
+          for forbidden in \
+            bin/sh usr/bin/sh bin/bash usr/bin/bash bin/dash usr/bin/dash \
+            bin/busybox usr/bin/busybox usr/bin/apt usr/bin/apt-get \
+            usr/bin/dpkg usr/sbin/iptables usr/sbin/ip6tables usr/sbin/nft; do
+            if grep -Fxq "$forbidden" "$listing"; then
+              echo "::error::the distroless -ebpf image must not ship /$forbidden" >&2
+              exit 1
+            fi
+          done
 """
 AMBIENT_HOST_UDP_GATE_JOB = r"""  gate:
     name: Ambient Host UDP Live
@@ -2529,6 +2717,10 @@ AMBIENT_HOST_UDP_GATE_JOB = r"""  gate:
 
           echo "Live-kernel validation and production image contract passed." >> "$GITHUB_STEP_SUMMARY"
 """
+AMBIENT_HOST_UDP_TOP_LEVEL_PERMISSIONS = "permissions:\n  contents: read\n"
+AMBIENT_HOST_UDP_FORBIDDEN_INHERITED_KEYS = ("defaults", "env")
+AMBIENT_HOST_UDP_REQUIRED_CHECK_NAME = "Ambient Host UDP Live"
+AMBIENT_HOST_UDP_REQUIRED_CHECK_OWNER = ("ambient-host-udp-live.yml", "gate")
 
 # Freezing the relevance job alone is not sufficient. A pull request that left
 # the frozen block untouched but rewrote the live job's `needs`/`if` would skip
@@ -4459,6 +4651,39 @@ def extract_job_block(
     return block, []
 
 
+def extract_job_contract_block(
+    contents: str,
+    source: str,
+    job_name: str,
+    *,
+    required: bool,
+) -> tuple[str | None, list[str]]:
+    """Extract a complete job without comments that introduce the next job.
+
+    A comment at the two-space `jobs:` scope belongs to the space between jobs,
+    but `extract_job_block` deliberately carries it with the preceding job for
+    existing digest contracts. The Ambient host-UDP freeze is an execution
+    contract, so only those trailing inter-job comments are removed; every byte
+    from the job key through its last field remains protected.
+    """
+
+    block, failures = extract_job_block(
+        contents,
+        source,
+        job_name,
+        required=required,
+    )
+    if failures or block is None:
+        return block, failures
+
+    lines = block.splitlines(keepends=True)
+    while len(lines) > 1 and (
+        not lines[-1].strip() or lines[-1].startswith("  #")
+    ):
+        lines.pop()
+    return "".join(lines).rstrip() + "\n", []
+
+
 def extract_job_field_block(
     contents: str,
     source: str,
@@ -4572,6 +4797,173 @@ def workflow_job_ranges(lines: list[str]) -> tuple[tuple[str, int, int], ...]:
         )
         for position, (name, start) in enumerate(starts)
     )
+
+
+def yaml_scalar_without_comment(raw: str) -> str:
+    """Remove a plain-scalar YAML comment without cutting quoted `#` data."""
+
+    quote: str | None = None
+    index = 0
+    while index < len(raw):
+        character = raw[index]
+        if quote == '"' and character == "\\" and index + 1 < len(raw):
+            index += 2
+            continue
+        if quote is not None:
+            if character == quote:
+                if quote == "'" and index + 1 < len(raw) and raw[index + 1] == "'":
+                    index += 2
+                    continue
+                quote = None
+            index += 1
+            continue
+        if character in "'\"":
+            quote = character
+        elif character == "#" and (index == 0 or raw[index - 1].isspace()):
+            return raw[:index].rstrip()
+        index += 1
+    return raw.strip()
+
+
+def job_display_name_can_equal(
+    lines: list[str],
+    field_index: int,
+    raw_value: str,
+    required_name: str,
+    *,
+    has_continuation: bool,
+) -> bool:
+    """Return whether a direct job `name` can publish `required_name`.
+
+    Static expressions are expanded from the enclosing matrix/env/input
+    declarations. An indirect scalar, block scalar, or unresolved expression
+    is treated as ambiguous whenever its literal fragments could still assemble
+    the protected name. This is deliberately fail closed: GitHub's emitted
+    check name, not a best-effort source spelling, owns branch protection.
+    """
+
+    if has_continuation:
+        return True
+
+    value = yaml_scalar_without_comment(raw_value)
+    if not value or YAML_INDIRECT_SCALAR.match(value):
+        return True
+    if BLOCK_SCALAR_HEADER.fullmatch(value) is not None:
+        return True
+    if value[0] in "'\"" and (len(value) < 2 or value[-1] != value[0]):
+        return True
+
+    value = decode_yaml_scalar(value)
+    expressions = list(WORKFLOW_EXPRESSION.finditer(value))
+    if not expressions:
+        return value == required_name
+
+    definitions = workflow_scope_definitions(lines, field_index)
+    candidates = {""}
+    cursor = 0
+    for expression in expressions:
+        prefix = value[cursor : expression.start()]
+        resolved = expression_candidates(expression.group("body"), definitions)
+        if resolved is None:
+            literal_parts = [
+                value[: expressions[0].start()],
+                *(
+                    value[current.end() : following.start()]
+                    for current, following in zip(expressions, expressions[1:])
+                ),
+                value[expressions[-1].end() :],
+            ]
+            pattern = ".*".join(re.escape(part) for part in literal_parts)
+            return re.fullmatch(pattern, required_name) is not None
+        if len(candidates) * max(len(resolved), 1) > EXPRESSION_COMBINATION_LIMIT:
+            return True
+        candidates = {
+            existing + prefix + replacement
+            for existing in candidates
+            for replacement in resolved
+        }
+        cursor = expression.end()
+    suffix = value[cursor:]
+    return required_name in {candidate + suffix for candidate in candidates}
+
+
+def required_check_name_ownership_errors(
+    workflows: dict[str, str],
+    source: str,
+) -> list[str]:
+    """Require exactly one parsed owner of the Ambient Host UDP check name."""
+
+    owners: list[tuple[str, str]] = []
+    errors: list[str] = []
+    for filename, contents in sorted(workflows.items()):
+        normalized, _mapping, flow_failures = flow_normalized_workflow(
+            contents,
+            f"{source}/{filename}",
+        )
+        errors.extend(flow_failures)
+        inspected = normalized if normalized is not None else contents
+        lines = inspected.splitlines()
+        for job_name, start, end in workflow_job_ranges(lines):
+            name_fields: list[tuple[int, str, bool]] = []
+            for index in range(start + 1, end):
+                field = YAML_MAPPING_FIELD.match(lines[index])
+                if field is None or field.group("dash"):
+                    continue
+                if len(field.group("lead")) != 4:
+                    continue
+                if decode_yaml_scalar(field.group("key")) != "name":
+                    continue
+                field_end = next(
+                    (
+                        probe
+                        for probe in range(index + 1, end)
+                        if lines[probe].strip()
+                        and not lines[probe].lstrip().startswith("#")
+                        and (
+                            (decoded := decode_simple_yaml_key(lines[probe]))
+                            is not None
+                            and decoded[0] <= 4
+                        )
+                    ),
+                    end,
+                )
+                has_continuation = any(
+                    lines[probe].strip()
+                    and not lines[probe].lstrip().startswith("#")
+                    for probe in range(index + 1, field_end)
+                )
+                name_fields.append((index, field.group("value"), has_continuation))
+            matching_fields = [
+                index
+                for index, value, has_continuation in name_fields
+                if job_display_name_can_equal(
+                    lines,
+                    index,
+                    value,
+                    AMBIENT_HOST_UDP_REQUIRED_CHECK_NAME,
+                    has_continuation=has_continuation,
+                )
+            ]
+            if len(name_fields) > 1 and matching_fields:
+                errors.append(
+                    f"{source}/{filename} job {job_name!r} has ambiguous duplicate "
+                    "direct name fields and could own the protected Ambient Host "
+                    "UDP required check"
+                )
+            owners.extend((filename, job_name) for _ in matching_fields)
+
+    if owners != [AMBIENT_HOST_UDP_REQUIRED_CHECK_OWNER]:
+        described = ", ".join(
+            f"{filename}:jobs.{job}" for filename, job in owners[:4]
+        ) or "none"
+        if len(owners) > 4:
+            described += f", and {len(owners) - 4} more"
+        errors.append(
+            f"{source} must have exactly one parsed direct job owner for required "
+            f"check {AMBIENT_HOST_UDP_REQUIRED_CHECK_NAME!r}: "
+            "ambient-host-udp-live.yml:jobs.gate; observed " + described
+        )
+    return list(dict.fromkeys(errors))
 
 
 def artifact_name_can_match(name: str, prefix: str) -> bool:
@@ -10515,32 +10907,55 @@ def live_suite_relevance_errors(
                 )
 
         if name == "ambient-host-udp-live.yml":
-            actual_step, step_failures = extract_job_step_block(
+            protected_jobs = (
+                (live_job, AMBIENT_HOST_UDP_LIVE_JOB),
+                ("ambient-host-udp-image", AMBIENT_HOST_UDP_IMAGE_JOB),
+                ("gate", AMBIENT_HOST_UDP_GATE_JOB),
+            )
+            for protected_job, expected_job in protected_jobs:
+                actual_job, job_failures = extract_job_contract_block(
+                    contents,
+                    located,
+                    protected_job,
+                    required=True,
+                )
+                errors.extend(job_failures)
+                if not job_failures and actual_job != expected_job:
+                    errors.append(
+                        f"{located} must keep complete job {protected_job!r} "
+                        "exactly frozen; runner, failure, environment, step, and "
+                        "dependency semantics are one closed execution contract"
+                    )
+
+            permissions, permission_failures = extract_top_level_block(
                 contents,
                 located,
-                live_job,
-                "Run ambient host-UDP live gate as root",
+                "permissions",
                 required=True,
             )
-            errors.extend(step_failures)
-            if not step_failures and actual_step != AMBIENT_HOST_UDP_LIVE_STEP:
+            errors.extend(permission_failures)
+            if (
+                not permission_failures
+                and permissions != AMBIENT_HOST_UDP_TOP_LEVEL_PERMISSIONS
+            ):
                 errors.append(
-                    f"{located} must keep the privileged ambient host-UDP live "
-                    "execution step exactly frozen"
+                    f"{located} must keep exact read-only top-level permissions "
+                    "for every protected Ambient host-UDP job"
                 )
 
-            actual_gate, gate_failures = extract_job_block(
-                contents,
-                located,
-                "gate",
-                required=True,
-            )
-            errors.extend(gate_failures)
-            if not gate_failures and actual_gate != AMBIENT_HOST_UDP_GATE_JOB:
-                errors.append(
-                    f"{located} must keep the Ambient Host UDP Live final gate "
-                    "exactly frozen"
+            for inherited_key in AMBIENT_HOST_UDP_FORBIDDEN_INHERITED_KEYS:
+                inherited, inherited_failures = extract_top_level_block(
+                    contents,
+                    located,
+                    inherited_key,
+                    required=False,
                 )
+                errors.extend(inherited_failures)
+                if inherited is not None:
+                    errors.append(
+                        f"{located} must not define top-level {inherited_key!r}; "
+                        "it would alter inherited execution of the frozen jobs"
+                    )
     return errors
 
 
@@ -10872,9 +11287,9 @@ def validate_workflow_collection(
     workflows: dict[str, str],
     source: str,
 ) -> list[str]:
-    """Validate a complete workflow collection: relevance contract plus Cross.
+    """Validate complete relevance, required-name ownership, and Cross policy.
 
-    Both halves are mandatory here and neither is selectable. A workflow
+    All checks are mandatory here and none is selectable. A workflow
     directory that omits a governed live gate is rejected before its Cross
     surfaces are even considered, because a required check that never runs is
     indistinguishable from a passing one.
@@ -10882,6 +11297,7 @@ def validate_workflow_collection(
 
     return [
         *live_suite_relevance_errors(workflows, source),
+        *required_check_name_ownership_errors(workflows, source),
         *scan_workflow_collection_cross_surfaces(workflows, source),
     ]
 
@@ -10974,7 +11390,7 @@ def compare_pr_workflow_collection(
     proposed_workflows: dict[str, str],
     source: str,
 ) -> list[str]:
-    """Compare a complete proposed collection: relevance contract plus Cross.
+    """Compare complete relevance, required-name ownership, and Cross policy.
 
     The relevance half is absolute, not comparative: the trusted-base relevance
     contract is what a required live gate must look like after the pull
@@ -10983,6 +11399,10 @@ def compare_pr_workflow_collection(
 
     return [
         *live_suite_relevance_errors(proposed_workflows, f"proposed {source}"),
+        *required_check_name_ownership_errors(
+            proposed_workflows,
+            f"proposed {source}",
+        ),
         *scan_pr_workflow_collection_cross_surfaces(
             merge_base_workflows,
             proposed_workflows,
@@ -24621,16 +25041,24 @@ pre_build = []
         )
 
     def relevance_workflow(display: str, live_job: str, body: str) -> str:
-        live_step = (
-            AMBIENT_HOST_UDP_LIVE_STEP
-            if live_job == "ambient-host-udp-live"
-            else "      - run: echo live\n"
-        )
-        final_gate = (
-            "\n" + AMBIENT_HOST_UDP_GATE_JOB
-            if live_job == "ambient-host-udp-live"
-            else ""
-        )
+        if live_job == "ambient-host-udp-live":
+            execution_jobs = (
+                AMBIENT_HOST_UDP_LIVE_JOB
+                + "\n"
+                + AMBIENT_HOST_UDP_IMAGE_JOB
+                + "\n"
+                + AMBIENT_HOST_UDP_GATE_JOB
+            )
+        else:
+            execution_jobs = (
+                f"  {live_job}:\n"
+                f"    name: {display} live\n"
+                "    needs: changes\n"
+                "    if: needs.changes.outputs.relevant == 'true'\n"
+                "    runs-on: ubuntu-latest\n"
+                "    steps:\n"
+                "      - run: echo live\n"
+            )
         return (
             "name: Self-test live suite\n"
             "on:\n"
@@ -24640,14 +25068,7 @@ pre_build = []
             "jobs:\n"
             + body
             + "\n"
-            + f"  {live_job}:\n"
-            + f"    name: {display} live\n"
-            + "    needs: changes\n"
-            + "    if: needs.changes.outputs.relevant == 'true'\n"
-            + "    runs-on: ubuntu-latest\n"
-            + "    steps:\n"
-            + live_step
-            + final_gate
+            + execution_jobs
         )
 
     relevance_workflows = {
@@ -24788,6 +25209,28 @@ pre_build = []
     # already satisfies the contract, or the repair would have traded a false
     # failure for a permanent one.
     complete_collection = {**relevance_workflows, **isolated_fixture}
+    ownership_prose_collection = {
+        **complete_collection,
+        "required-name-prose.yml": (
+            "name: Required-name prose control\n"
+            "# name: Ambient Host UDP Live\n"
+            "jobs:\n"
+            "  prose:\n"
+            "    name: Prose control\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps:\n"
+            "      - run: |\n"
+            "          echo 'name: Ambient Host UDP Live'\n"
+        ),
+    }
+    if required_check_name_ownership_errors(
+        ownership_prose_collection,
+        relevance_selftest_source,
+    ):
+        failures.append(
+            "required-check ownership treated comment or block-scalar prose as "
+            "a direct job name"
+        )
     if validate_workflow_collection(
         complete_collection,
         relevance_selftest_source,
@@ -24812,6 +25255,104 @@ pre_build = []
             "a complete conforming workflow collection comparison was charged "
             "a live-suite relevance error"
         )
+
+    # Every mutation below preserves the exact privileged step and final gate.
+    # Only whole-job and inherited-control freezing can reject them. Exercise
+    # the same complete-collection entry point production uses, and prove the
+    # rejection is additional to the generic Cross scanner's verdict.
+    ambient_fixture = complete_collection["ambient-host-udp-live.yml"]
+    ambient_mutated_workflows: dict[str, dict[str, str]] = {}
+
+    def ambient_mutation(label: str, original: str, replacement: str) -> None:
+        mutated = ambient_fixture.replace(original, replacement, 1)
+        if mutated == ambient_fixture:
+            failures.append(f"the {label} ambient live mutation is stale")
+            return
+        ambient_mutated_workflows[label] = {
+            **complete_collection,
+            "ambient-host-udp-live.yml": mutated,
+        }
+
+    ambient_mutation(
+        "job-level continue-on-error",
+        "    runs-on: ubuntu-24.04\n    timeout-minutes: 45\n",
+        "    runs-on: ubuntu-24.04\n"
+        "    continue-on-error: true\n"
+        "    timeout-minutes: 45\n",
+    )
+    ambient_mutation(
+        "live-job runner replacement",
+        "    runs-on: ubuntu-24.04\n    timeout-minutes: 45\n",
+        "    runs-on: self-hosted\n    timeout-minutes: 45\n",
+    )
+    ambient_mutation(
+        "inherited default shell",
+        "permissions:\n  contents: read\njobs:\n",
+        "permissions:\n"
+        "  contents: read\n"
+        "defaults:\n"
+        "  run:\n"
+        "    shell: python\n"
+        "jobs:\n",
+    )
+    ambient_mutation(
+        "inherited PATH control",
+        "permissions:\n  contents: read\njobs:\n",
+        "permissions:\n"
+        "  contents: read\n"
+        "env:\n"
+        "  PATH: /tmp/ambient-host-udp-shadow\n"
+        "jobs:\n",
+    )
+    ambient_mutation(
+        "preceding PATH-tampering step",
+        "      - name: Run ambient host-UDP live gate as root\n",
+        "      - name: Tamper with the following command lookup\n"
+        "        run: echo /tmp/ambient-host-udp-shadow >> \"$GITHUB_PATH\"\n"
+        "\n"
+        "      - name: Run ambient host-UDP live gate as root\n",
+    )
+    ambient_mutation(
+        "removed production-image contract job",
+        "\n" + AMBIENT_HOST_UDP_IMAGE_JOB,
+        "",
+    )
+
+    duplicate_owner_collection = dict(complete_collection)
+    duplicate_owner_collection["duplicate-required-owner.yml"] = (
+        "name: Duplicate required owner\n"
+        "on:\n"
+        "  pull_request:\n"
+        "jobs:\n"
+        "  counterfeit:\n"
+        "    name: Ambient Host UDP Live\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - run: echo counterfeit\n"
+    )
+    if duplicate_owner_collection == complete_collection:
+        failures.append(
+            "the duplicate required display-name owner mutation is stale"
+        )
+    else:
+        ambient_mutated_workflows[
+            "duplicate required display-name owner"
+        ] = duplicate_owner_collection
+
+    for mutation_name, mutated_collection in ambient_mutated_workflows.items():
+        production_errors = validate_workflow_collection(
+            mutated_collection,
+            relevance_selftest_source,
+        )
+        scanner_errors = scan_workflow_collection_cross_surfaces(
+            mutated_collection,
+            relevance_selftest_source,
+        )
+        if not production_errors or production_errors == scanner_errors:
+            failures.append(
+                f"production workflow validation accepted a {mutation_name} "
+                "ambient live bypass"
+            )
 
     # Tampering with the contract inside an otherwise complete collection, and
     # deleting a governed live workflow outright, are both invisible to the
