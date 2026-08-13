@@ -352,6 +352,21 @@ pub fn read_stable_file(
     path: &Path,
     options: StableFileReadOptions<'_>,
 ) -> Result<String, StableFileError> {
+    read_stable_file_with_between_probes(path, options, |_| {})
+}
+
+/// Same contract as [`read_stable_file`], with a hook after the first probe of
+/// each attempt and before the inter-probe settle sleep.
+///
+/// Production [`read_stable_file`] is this function with an empty closure.
+/// External tests use the hook to observe the first-probe bytes and publish a
+/// successor generation in the settle window without racing the scheduler
+/// (issue #3881).
+pub(crate) fn read_stable_file_with_between_probes(
+    path: &Path,
+    options: StableFileReadOptions<'_>,
+    mut between_probes: impl FnMut(&[u8]),
+) -> Result<String, StableFileError> {
     let display_path = path.display();
     let mut last_reason = "unknown instability";
 
@@ -360,7 +375,10 @@ pub fn read_stable_file(
             let (first_identity, first_bytes) = read_snapshot(path, options.max_bytes)?;
             // Consecutive probes must span the settle interval. Back-to-back
             // reads can both complete inside one torn publication window and
-            // accept identical partial bytes as a "stable" generation.
+            // accept identical partial bytes as a "stable" generation. The
+            // hook runs inside that window so tests can publish without a
+            // wall-clock race against the first probe.
+            between_probes(&first_bytes);
             sleep_settle(options.retry_delay);
             // The first probe already proved the path exists, so a second-probe
             // absence is a replacement window, not a terminal `NotFound`.

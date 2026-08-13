@@ -230,84 +230,81 @@ fn zero_retry_delay_is_well_defined_and_still_admits_a_stable_file() {
 fn held_torn_window_is_not_published_and_complete_generation_converges() {
     // Issue #3881: back-to-back probes can both complete inside the empty
     // window `std::fs::write` opens between create/truncate and write. Hold
-    // that truncated generation, start the reader on this thread so the first
-    // probe runs immediately, then publish the complete body during the settle
-    // interval. A single attempt must not return the torn bytes; a later read
-    // must converge to the complete generation.
+    // that truncated generation, prove the first probe observed it, then
+    // publish the complete body in the inter-probe settle. A single attempt
+    // must not return the torn bytes; a later read must converge to the
+    // complete generation. Coordination is a between-probes hook, not a
+    // wall-clock sleep that can lose the first probe on a saturated runner.
     use std::io::Write;
     use std::thread;
+
+    use ferrum_edge::_test_support::read_stable_file_with_between_probes_for_test;
 
     let dir = tempfile::tempdir().unwrap();
     let live = dir.path().join("torn.conf");
 
-    let mut saw_straddle = false;
-    for _ in 0..8 {
-        let (window_held_tx, window_held_rx) = std::sync::mpsc::sync_channel(1);
-        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
-        let (published_tx, published_rx) = std::sync::mpsc::sync_channel(1);
+    let (window_held_tx, window_held_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    let (published_tx, published_rx) = std::sync::mpsc::sync_channel(1);
 
-        let writer_path = live.clone();
-        let writer = thread::spawn(move || {
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&writer_path)
-                .unwrap();
-            window_held_tx.send(()).unwrap();
-            if release_rx.recv_timeout(Duration::from_secs(5)).is_err() {
-                return;
-            }
-            let _ = file.write_all(b"AAAA");
-            let _ = file.sync_all();
-            drop(file);
-            let _ = published_tx.send(());
-        });
-
-        window_held_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("writer must publish the held empty window");
-
-        let settle = Duration::from_millis(100);
-        let release = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(30));
-            let _ = release_tx.send(());
-        });
-
-        let outcome = read_stable_file(
-            &live,
-            StableFileReadOptions {
-                max_bytes: TEST_LIMIT,
-                source_name: "test config",
-                max_attempts: 1,
-                retry_delay: settle,
-            },
-        );
-        let _ = release.join();
-        let _ = published_rx.recv_timeout(Duration::from_secs(5));
-        let _ = writer.join();
-
-        match outcome {
-            Ok(content) => {
-                assert_eq!(
-                    content, "AAAA",
-                    "must never publish partial content from a held torn window, got {content:?}"
-                );
-                // First probe ran after the writer finished; retry to straddle.
-            }
-            Err(StableFileError::Unstable(_)) => {
-                saw_straddle = true;
-                break;
-            }
-            Err(other) => panic!(
-                "expected instability across the settle window or the complete generation, got {other}"
-            ),
+    let writer_path = live.clone();
+    let writer = thread::spawn(move || {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&writer_path)
+            .unwrap();
+        window_held_tx.send(()).unwrap();
+        if release_rx.recv_timeout(Duration::from_secs(5)).is_err() {
+            return;
         }
-    }
-    assert!(
-        saw_straddle,
-        "reader must observe the held empty window on one side of the settle interval"
+        let _ = file.write_all(b"AAAA");
+        let _ = file.sync_all();
+        drop(file);
+        let _ = published_tx.send(());
+    });
+
+    window_held_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("writer must publish the held empty window");
+
+    let mut first_probe_saw_torn = false;
+    let outcome = read_stable_file_with_between_probes_for_test(
+        &live,
+        StableFileReadOptions {
+            max_bytes: TEST_LIMIT,
+            source_name: "test config",
+            max_attempts: 1,
+            retry_delay: Duration::from_millis(1),
+        },
+        |first_probe| {
+            assert!(
+                first_probe.is_empty(),
+                "first probe must observe the held torn window, got {first_probe:?}"
+            );
+            first_probe_saw_torn = true;
+            release_tx
+                .send(())
+                .expect("writer must still be waiting to publish");
+            published_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("complete generation must publish during the inter-probe settle");
+        },
     );
+    let _ = writer.join();
+
+    assert!(
+        first_probe_saw_torn,
+        "reader must complete the first probe against the held torn window"
+    );
+    match outcome {
+        Err(StableFileError::Unstable(_)) => {}
+        Ok(content) => panic!(
+            "must not publish the held torn window from a single straddle attempt, got {content:?}"
+        ),
+        Err(other) => panic!("expected instability across the settle window, got {other}"),
+    }
 
     let loaded = read_stable_file(
         &live,
