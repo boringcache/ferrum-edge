@@ -2212,6 +2212,11 @@ async fn relay(
                         proxy_id = %from_target_proxy_id,
                         "H3 CONNECT-UDP target relay: finish failed: {error}"
                     );
+                    // Match the existing `send_data` failure classification:
+                    // the downstream send half is already gone, so the
+                    // supervisor's pending idle/drain/withdrawal reason is no
+                    // longer the outcome this task observed.
+                    return SessionEnd::ClientClosed;
                 }
             }
             // RFC 9297 §3.3/§3.5 malformed capsule stream, or a tunnel the
