@@ -1389,22 +1389,21 @@ fn secure_http_and_udp_gateway_listeners_fail_closed_on_quic_port() {
             }
             let mut gateway = http_gateway("edge", Some("Same"));
             gateway.spec["listeners"] = Value::Array(listeners);
-            let route = http_route(
-                "secure-api",
-                json!([{
-                    "kind": "Gateway",
-                    "name": "edge",
-                    "namespace": "default",
-                    "sectionName": "secure-http"
-                }]),
-                "secure.example.com",
-                "/tls",
-            );
-            let translation = translate_k8s_objects(
-                &[gateway_class(), secret, gateway, service("backend"), route],
-                options(),
-            )
-            .expect("translate");
+            let mut objects = vec![gateway_class(), secret, gateway, service("backend")];
+            // QUIC/UDP arbitration is listener-shape coverage; only HTTPS admits
+            // HTTPRoute on the secure-http section (GRPCS listeners accept GRPCRoute).
+            if secure_protocol == "HTTPS" {
+                objects.push(http_route(
+                    "secure-api",
+                    json!([{
+                        "name": "edge",
+                        "sectionName": "secure-http"
+                    }]),
+                    "secure.example.com",
+                    "/tls",
+                ));
+            }
+            let translation = translate_k8s_objects(&objects, options()).expect("translate");
 
             for listener in ["secure-http", "udp"] {
                 let key = GatewayApiListenerKey {
@@ -1433,22 +1432,24 @@ fn secure_http_and_udp_gateway_listeners_fail_closed_on_quic_port() {
                     conflict.message
                 );
             }
-            assert!(
-                !translation.config.proxies.iter().any(|proxy| {
-                    proxy.hosts.iter().any(|host| host == "secure.example.com")
-                        && proxy
-                            .listen_path
-                            .as_deref()
-                            .is_some_and(|path| path.contains("/tls"))
-                }),
-                "{secure_protocol}+UDP must not materialize the withdrawn HTTPS route: {:?}",
-                translation
-                    .config
-                    .proxies
-                    .iter()
-                    .map(|proxy| (&proxy.hosts, &proxy.listen_path, proxy.listen_port))
-                    .collect::<Vec<_>>()
-            );
+            if secure_protocol == "HTTPS" {
+                assert!(
+                    !translation.config.proxies.iter().any(|proxy| {
+                        proxy.hosts.iter().any(|host| host == "secure.example.com")
+                            && proxy
+                                .listen_path
+                                .as_deref()
+                                .is_some_and(|path| path.contains("/tls"))
+                    }),
+                    "HTTPS+UDP must not materialize the withdrawn HTTPS route: {:?}",
+                    translation
+                        .config
+                        .proxies
+                        .iter()
+                        .map(|proxy| (&proxy.hosts, &proxy.listen_path, proxy.listen_port))
+                        .collect::<Vec<_>>()
+                );
+            }
         }
     }
 }
