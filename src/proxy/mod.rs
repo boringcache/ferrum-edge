@@ -25209,15 +25209,17 @@ fn boxed_finalize_reject_response<'a>(
     is_grpc_request: bool,
     invoke_response_committed: bool,
 ) -> BoxedNormalizedRejectFuture<'a> {
-    Box::pin(finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
-        plugins,
-        ctx,
-        status,
-        body,
-        headers,
-        is_grpc_request,
-        invoke_response_committed,
-    ))
+    Box::pin(
+        finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
+            plugins,
+            ctx,
+            status,
+            body,
+            headers,
+            is_grpc_request,
+            invoke_response_committed,
+        ),
+    )
 }
 
 /// The client-RPC-deadline upload rejection future, constructed out of line and
@@ -28999,17 +29001,16 @@ async fn handle_proxy_request_inner(
                         };
                         let status = StatusCode::from_u16(reject.status_code)
                             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                        let normalized =
-                            boxed_finalize_reject_response(
-                                &plugins,
-                                &mut ctx,
-                                status,
-                                reject.body.clone(),
-                                reject.headers,
-                                is_grpc_request,
-                                grpc_web_response_content_type.is_none(),
-                            )
-                            .await;
+                        let normalized = boxed_finalize_reject_response(
+                            &plugins,
+                            &mut ctx,
+                            status,
+                            reject.body.clone(),
+                            reject.headers,
+                            is_grpc_request,
+                            grpc_web_response_content_type.is_none(),
+                        )
+                        .await;
                         apply_grpc_reject_metadata(&mut ctx, &normalized);
                         let grpc_web_response = boxed_build_grpc_web_reject_response(
                             &plugins,
@@ -29452,17 +29453,16 @@ async fn handle_proxy_request_inner(
                         };
                         let status = StatusCode::from_u16(reject.status_code)
                             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                        let normalized =
-                            boxed_finalize_reject_response(
-                                &plugins,
-                                &mut ctx,
-                                status,
-                                reject.body.clone(),
-                                reject.headers,
-                                is_grpc_request,
-                                grpc_web_response_content_type.is_none(),
-                            )
-                            .await;
+                        let normalized = boxed_finalize_reject_response(
+                            &plugins,
+                            &mut ctx,
+                            status,
+                            reject.body.clone(),
+                            reject.headers,
+                            is_grpc_request,
+                            grpc_web_response_content_type.is_none(),
+                        )
+                        .await;
                         apply_grpc_reject_metadata(&mut ctx, &normalized);
                         let grpc_web_response = boxed_build_grpc_web_reject_response(
                             &plugins,
@@ -30324,17 +30324,16 @@ async fn handle_proxy_request_inner(
                     };
                     let status = StatusCode::from_u16(reject.status_code)
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                    let normalized =
-                        boxed_finalize_reject_response(
-                            &plugins,
-                            &mut ctx,
-                            status,
-                            reject.body.clone(),
-                            reject.headers,
-                            true,
-                            grpc_web_response_content_type.is_none(),
-                        )
-                        .await;
+                    let normalized = boxed_finalize_reject_response(
+                        &plugins,
+                        &mut ctx,
+                        status,
+                        reject.body.clone(),
+                        reject.headers,
+                        true,
+                        grpc_web_response_content_type.is_none(),
+                    )
+                    .await;
                     apply_grpc_reject_metadata(&mut ctx, &normalized);
                     let grpc_web_response = boxed_build_grpc_web_reject_response(
                         &plugins,

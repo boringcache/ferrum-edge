@@ -810,9 +810,7 @@ impl MtlsAuth {
                 debug!(
                     "mtls_auth: certificate expiry is not representable as a monotonic deadline"
                 );
-                return VerifyOutcome::Invalid(
-                    r#"{"error":"Invalid client certificate"}"#.into(),
-                );
+                return VerifyOutcome::Invalid(r#"{"error":"Invalid client certificate"}"#.into());
             };
             match monotonic_expiry.set(converted) {
                 Ok(()) => converted,
@@ -829,9 +827,8 @@ impl MtlsAuth {
             // The authoritative certificate bound published on the shared
             // protocol-neutral contract. Cache hits return the Instant captured
             // above, never a newly derived later value.
-            Some(consumer) => {
-                VerifyOutcome::consumer(consumer).with_credential_deadline(Some(credential_deadline))
-            }
+            Some(consumer) => VerifyOutcome::consumer(consumer)
+                .with_credential_deadline(Some(credential_deadline)),
             None => VerifyOutcome::ConsumerNotFound(
                 r#"{"error":"No consumer found for client certificate"}"#.into(),
             ),

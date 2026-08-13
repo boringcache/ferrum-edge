@@ -317,20 +317,12 @@ fn a_fresh_unix_conversion_after_wall_clock_rollback_would_extend_the_instant() 
     // produces a LATER Instant — which is why the connection cache must retain
     // the first successful conversion instead of calling this on every request.
     let now = tokio::time::Instant::now();
-    let original = try_credential_deadline_from_unix_seconds_at_for_test(
-        2_000_000,
-        0,
-        2_000_000 - 120,
-        now,
-    )
-    .expect("representable original conversion");
-    let after_rollback = try_credential_deadline_from_unix_seconds_at_for_test(
-        2_000_000,
-        0,
-        2_000_000 - 3_600,
-        now,
-    )
-    .expect("representable rolled-back conversion");
+    let original =
+        try_credential_deadline_from_unix_seconds_at_for_test(2_000_000, 0, 2_000_000 - 120, now)
+            .expect("representable original conversion");
+    let after_rollback =
+        try_credential_deadline_from_unix_seconds_at_for_test(2_000_000, 0, 2_000_000 - 3_600, now)
+            .expect("representable rolled-back conversion");
     assert!(
         after_rollback > original,
         "a fresh conversion after wall-clock rollback must land later; the cache \
