@@ -2131,8 +2131,8 @@ else:
   if [[ "$rotated" == "true" && "$observe_ok" == "true" \
     && -n "$live_serial" && "$live_serial" == "$NATIVE_SERVER_SERIAL_GEN2" \
     && "$traffic_ok" == "true" && "$drift_verdict" == native-slice-received* \
-    && "$stale_class" == tls-verify \
-    && printf '%s' "$stale_ev" | grep -Eq "$NATIVE_EVID_CP_UNKNOWN_ISSUER" ]]; then
+    && "$stale_class" == tls-verify ]] \
+    && printf '%s' "$stale_ev" | grep -Eq "$NATIVE_EVID_CP_UNKNOWN_ISSUER"; then
     record_live_assertion sidecar.config.native_subscribe_tls_rotation_reconnects pass \
       capp ferrum-cp "$outcome" "native-mtls-rotation.txt"
     return 0
