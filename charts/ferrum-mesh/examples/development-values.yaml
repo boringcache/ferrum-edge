@@ -1,5 +1,9 @@
 # Development control-plane install for kind/minikube.
 #
+# GatewayClass is cluster-scoped (default name `ferrum`). A second independent
+# ferrum-mesh release in the same cluster must set a unique gatewayClass.name;
+# Helm will not import another release's GatewayClass.
+#
 # Create the referenced Secret with random values before installing:
 #   kubectl -n ferrum create secret generic ferrum-mesh-dev-credentials \
 #     --from-literal=admin-jwt-secret="$(openssl rand -hex 32)" \

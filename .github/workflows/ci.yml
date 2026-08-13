@@ -4110,7 +4110,8 @@ jobs:
             -f ./charts/ferrum-mesh/examples/development-values.yaml \
             --set image.repository=ferrum-edge \
             --set image.tag=helm-chart-ci \
-            --set image.pullPolicy=IfNotPresent
+            --set image.pullPolicy=IfNotPresent \
+            --set gatewayClass.name=ferrum-dev
           kubectl -n ferrum-dev rollout status deployment/ferrum-mesh-control-plane --timeout=180s
           kubectl -n ferrum-dev get pods -o wide > "$RUNNER_TEMP/ferrum-helm-results/development-pods.txt"
           kubectl -n ferrum-dev describe deployment/ferrum-mesh-control-plane > "$RUNNER_TEMP/ferrum-helm-results/development-control-plane-deployment.txt"
@@ -4231,7 +4232,8 @@ jobs:
             --set image.repository=ferrum-edge \
             --set image.tag=helm-chart-ci \
             --set image.pullPolicy=IfNotPresent \
-            --set controlPlane.env.FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true
+            --set controlPlane.env.FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true \
+            --set gatewayClass.name=ferrum-prod
           set +e
           kubectl -n ferrum-prod rollout status deployment/ferrum-mesh-control-plane --timeout=180s
           rollout_rc=$?

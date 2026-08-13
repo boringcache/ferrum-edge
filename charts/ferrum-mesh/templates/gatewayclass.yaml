@@ -13,6 +13,8 @@
 {{- if ne $controller "ferrum.io/gateway-controller" }}
 {{- fail "gatewayClass.controllerName must be ferrum.io/gateway-controller; Ferrum does not infer ownership from the class name" }}
 {{- end }}
+{{/* Cluster-scoped: a second independent release must set a unique
+     gatewayClass.name rather than sharing another release's object. */}}
 apiVersion: gateway.networking.k8s.io/v1
 kind: GatewayClass
 metadata:

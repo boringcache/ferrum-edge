@@ -32,7 +32,7 @@
     },
     "gatewayClass": {
       "type": "object",
-      "description": "Cluster-scoped GatewayClass Ferrum owns. Create is the install-time authority object; Ferrum never infers ownership from the class name spelling.",
+      "description": "Cluster-scoped GatewayClass Ferrum owns. Create is the install-time authority object; Ferrum never infers ownership from the class name spelling. Independent releases in one cluster must use unique names; Helm will not import another release's GatewayClass.",
       "additionalProperties": false,
       "properties": {
         "create": {

@@ -198,9 +198,13 @@ install` when `controlPlane.enabled=true` or `ca.enabled=true`. When
 creates the cluster-scoped `GatewayClass` Ferrum owns (`gatewayClass.create`,
 default name `ferrum`, `controllerName: ferrum.io/gateway-controller`). Ferrum
 does not infer controller ownership from the class name spelling; disable
-`gatewayClass.create` only when you manage that object out of band. Do not put
-the reserved DB/JWT variables under `controlPlane.env`; use the first-class
-chart values so the rendered Deployment has a clear secret contract:
+`gatewayClass.create` only when you manage that object out of band. A second
+independent `ferrum-mesh` release in the same cluster must set a unique
+`gatewayClass.name`; Helm ownership of the cluster-scoped object is
+intentional, and a later release must not force-import or skip-create to share
+another release's class. Do not put the reserved DB/JWT variables under
+`controlPlane.env`; use the first-class chart values so the rendered Deployment
+has a clear secret contract:
 
 ```yaml
 controlPlane:
