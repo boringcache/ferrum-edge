@@ -131,10 +131,11 @@ PROTECTED_PATHS = (
 # `(slot, required)` / `(workflow filename, required)`. A *required* anchor must
 # exist on the trusted base: a base that cannot supply it is an incomplete
 # extraction, which fails closed rather than silently skipping enforcement. An
-# *optional* anchor is one a sibling change is still landing (issue #3802's
-# advisory-trust lane). The workflow owns the one-time adoption path and
-# short-circuits before this verifier runs; if an unadopted anchor nevertheless
-# reaches this verifier, candidate-supplied executable code is rejected.
+# *optional* anchor is one a sibling change may still be landing (issue #3802's
+# advisory-trust lane). Both roots may omit it only while the trusted base also
+# lacks it; once this verifier exists on the trusted base, a candidate that
+# introduces either optional anchor is rejected. First adoption therefore lands
+# through the auditable protected-main administrative bypass, not a pull request.
 ANCHOR_FILE_SLOTS = (
     ("verifier", True),
     ("checker", True),
@@ -1072,14 +1073,14 @@ def anchor_errors(candidate: Root, base: Root) -> list[str]:
                     "refusing to certify a candidate against an incomplete base"
                 )
             elif candidate_text is not None:
-                # The trusted workflow handles first adoption before invoking
-                # this verifier. Reaching this branch means there are no
-                # reviewed bytes against which candidate executable code can
-                # be authenticated, so fail closed rather than granting a
-                # filename-based exception to privileged workflow secrets.
+                # No reviewed trusted-base bytes exist to authenticate against,
+                # so fail closed rather than granting a filename-based
+                # exception to privileged workflow secrets. First adoption is an
+                # administrative protected-main update, not a pull request.
                 errors.append(
                     f"the candidate introduced the unanchored executable gate file {path}; "
-                    "adopt it through the trusted workflow before certification"
+                    "adopt it on protected main through an auditable administrative bypass, "
+                    "then re-run hosted integrity checks on the new main tip"
                 )
             continue
         if not base_text.strip():
