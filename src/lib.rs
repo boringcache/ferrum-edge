@@ -8819,6 +8819,16 @@ pub mod _test_support {
         }
     }
 
+    /// Compose a per-call frontend application-send deadline with the session's
+    /// admitted authorization deadline. `None` only when both inputs are absent;
+    /// otherwise the earliest instant governs.
+    pub fn earliest_frontend_app_send_deadline_for_test(
+        per_call: Option<tokio::time::Instant>,
+        session: Option<tokio::time::Instant>,
+    ) -> Option<tokio::time::Instant> {
+        crate::dtls::earliest_frontend_app_send_deadline_for_test(per_call, session)
+    }
+
     /// Pin whether a queued frontend DTLS application send may encrypt or
     /// poll `socket.send_to`. An already-elapsed deadline never proceeds;
     /// exact ties fail closed.

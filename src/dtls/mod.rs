@@ -192,6 +192,21 @@ pub(crate) fn shutdown_queued_frontend_app_send(
     }
 }
 
+/// Combine a per-call application-send deadline with the session's admitted
+/// authorization deadline. `None` only when both inputs are absent; otherwise
+/// the earliest instant governs so a later per-call value cannot extend
+/// authorization.
+fn earliest_frontend_app_send_deadline(
+    per_call: Option<tokio::time::Instant>,
+    session: Option<tokio::time::Instant>,
+) -> Option<tokio::time::Instant> {
+    match (per_call, session) {
+        (None, None) => None,
+        (Some(at), None) | (None, Some(at)) => Some(at),
+        (Some(per_call), Some(session)) => Some(per_call.min(session)),
+    }
+}
+
 fn frontend_app_send_cancel_fired(cancel: &mut oneshot::Receiver<()>) -> bool {
     match cancel.try_recv() {
         Ok(()) | Err(oneshot::error::TryRecvError::Closed) => true,
@@ -250,7 +265,8 @@ fn fail_queued_frontend_app_sends(
     let now = tokio::time::Instant::now();
     while let Ok(mut pending) = app_in_rx.try_recv() {
         let cancelled = frontend_app_send_cancel_fired(&mut pending.cancel);
-        let deadline = pending.deadline.or(session_deadline);
+        let deadline =
+            earliest_frontend_app_send_deadline(pending.deadline, session_deadline);
         let reason = shutdown_queued_frontend_app_send(cancelled, deadline, now);
         let _ = pending.completion.send(Err(reason.as_str().to_string()));
     }
@@ -273,7 +289,8 @@ async fn write_connected_frontend_record(
     session_deadline: Option<tokio::time::Instant>,
 ) -> Result<(), FrontendAppSendReject> {
     if let Some(inflight) = in_flight {
-        let deadline = inflight.deadline.or(session_deadline);
+        let deadline =
+            earliest_frontend_app_send_deadline(inflight.deadline, session_deadline);
         match frontend_app_ciphertext_send_until_expiry(
             deadline,
             Some(&mut inflight.cancel),
@@ -298,6 +315,15 @@ async fn write_connected_frontend_record(
             Err(reject) => Err(reject),
         }
     }
+}
+
+/// Pin earliest-deadline composition for external hosted tests.
+#[allow(dead_code)] // used through library `_test_support`
+pub(crate) fn earliest_frontend_app_send_deadline_for_test(
+    per_call: Option<tokio::time::Instant>,
+    session: Option<tokio::time::Instant>,
+) -> Option<tokio::time::Instant> {
+    earliest_frontend_app_send_deadline(per_call, session)
 }
 
 /// Pin frontend application-send admission for external hosted tests.
@@ -1288,8 +1314,10 @@ async fn send_frontend_app_committed(
     if let Some(at) = deadline {
         let _ = auth_deadline.set(at);
     }
+    let effective =
+        earliest_frontend_app_send_deadline(deadline, auth_deadline.get().copied());
     if matches!(
-        admit_frontend_app_send(false, deadline, tokio::time::Instant::now()),
+        admit_frontend_app_send(false, effective, tokio::time::Instant::now()),
         FrontendAppSendAdmit::Reject(FrontendAppSendReject::Expired)
     ) {
         return Err(anyhow::anyhow!(FrontendAppSendReject::Expired.as_str()));
@@ -1735,9 +1763,13 @@ impl DtlsServer {
                         } = pending;
                         let session_deadline = auth_deadline.get().copied();
                         let cancelled = frontend_app_send_cancel_fired(&mut cancel);
+                        let effective = earliest_frontend_app_send_deadline(
+                            deadline,
+                            session_deadline,
+                        );
                         match admit_frontend_app_send(
                             cancelled,
-                            deadline.or(session_deadline),
+                            effective,
                             tokio::time::Instant::now(),
                         ) {
                             FrontendAppSendAdmit::Reject(reason) => {
@@ -1766,7 +1798,7 @@ impl DtlsServer {
                                     in_flight = Some(InFlightFrontendAppSend {
                                         completion,
                                         cancel,
-                                        deadline: deadline.or(session_deadline),
+                                        deadline: effective,
                                     });
                                 }
                             }

@@ -13,8 +13,9 @@ use std::time::Duration;
 
 use ferrum_edge::_test_support::{
     FrontendAppSendAdmitForTest, FrontendAppSendRejectForTest, admit_frontend_app_send_for_test,
-    frontend_app_ciphertext_send_until_expiry_for_test, frontend_app_send_cancel_fired_for_test,
-    frontend_app_send_reject_as_str_for_test, shutdown_queued_frontend_app_send_for_test,
+    earliest_frontend_app_send_deadline_for_test, frontend_app_ciphertext_send_until_expiry_for_test,
+    frontend_app_send_cancel_fired_for_test, frontend_app_send_reject_as_str_for_test,
+    shutdown_queued_frontend_app_send_for_test,
 };
 
 const DTLS_SOURCE: &str = include_str!("../../../src/dtls/mod.rs");
@@ -28,6 +29,69 @@ fn elapsed_deadline() -> tokio::time::Instant {
 
 fn future_deadline(delta: Duration) -> tokio::time::Instant {
     tokio::time::Instant::now() + delta
+}
+
+#[test]
+fn earliest_frontend_app_send_deadline_composition() {
+    assert_eq!(
+        earliest_frontend_app_send_deadline_for_test(None, None),
+        None,
+        "no deadline only when both inputs are absent"
+    );
+
+    let session = future_deadline(Duration::from_secs(10));
+    assert_eq!(
+        earliest_frontend_app_send_deadline_for_test(None, Some(session)),
+        Some(session)
+    );
+    assert_eq!(
+        earliest_frontend_app_send_deadline_for_test(Some(session), None),
+        Some(session)
+    );
+
+    let earlier = future_deadline(Duration::from_secs(5));
+    let later = future_deadline(Duration::from_secs(30));
+    assert_eq!(
+        earliest_frontend_app_send_deadline_for_test(Some(earlier), Some(later)),
+        Some(earlier)
+    );
+    assert_eq!(
+        earliest_frontend_app_send_deadline_for_test(Some(later), Some(earlier)),
+        Some(earlier),
+        "a later per-call deadline must not override an earlier session bound"
+    );
+    assert_eq!(
+        earliest_frontend_app_send_deadline_for_test(Some(session), Some(session)),
+        Some(session),
+        "equal deadlines stay unchanged"
+    );
+}
+
+#[test]
+fn later_per_call_deadline_cannot_extend_session_authorization() {
+    let now = tokio::time::Instant::now();
+    let session = now + Duration::from_secs(5);
+    let later_per_call = now + Duration::from_secs(60);
+    let effective =
+        earliest_frontend_app_send_deadline_for_test(Some(later_per_call), Some(session));
+    assert_eq!(effective, Some(session));
+
+    let after_session = now + Duration::from_secs(10);
+    assert_eq!(
+        admit_frontend_app_send_for_test(false, effective, after_session),
+        FrontendAppSendAdmitForTest::Expired,
+        "effective deadline must honor the earlier session bound"
+    );
+    assert_eq!(
+        admit_frontend_app_send_for_test(false, Some(later_per_call), after_session),
+        FrontendAppSendAdmitForTest::Proceed,
+        "sanity: per-call alone would incorrectly proceed"
+    );
+    assert_eq!(
+        shutdown_queued_frontend_app_send_for_test(false, effective, after_session),
+        FrontendAppSendRejectForTest::Expired,
+        "shutdown classification must use the same earliest bound"
+    );
 }
 
 #[test]
@@ -286,6 +350,14 @@ fn driver_and_proxy_use_the_deadline_aware_actual_commit_api() {
     assert!(
         DTLS_SOURCE.contains("pub async fn send_committed("),
         "the terminating frontend sender must expose the actual-commit API"
+    );
+    assert!(
+        DTLS_SOURCE.contains("earliest_frontend_app_send_deadline("),
+        "per-call and session deadlines must compose with earliest-deadline-wins"
+    );
+    assert!(
+        !DTLS_SOURCE.contains("deadline.or(session_deadline)"),
+        "Option::or prefers the per-call deadline and must not be used"
     );
     assert!(
         DTLS_SOURCE.contains("fail_queued_frontend_app_sends("),
