@@ -12347,42 +12347,40 @@ async fn handle_websocket_request_authenticated(
                     // `proxy_to_backend`: the generic future's size is a
                     // whole-gateway stack budget, not a WS-path cost.
                     #[cfg(unix)]
-                    Ok(socket_path) => {
-                        match unix_websocket_url_authority(&current_backend_url) {
-                            None => {
-                                warn!(
-                                    proxy_id = %proxy.id,
-                                    "Refusing WebSocket upgrade over unix-socket backend: \
-                                     target-effective URL has no safe authority; failing closed \
-                                     rather than substituting a local virtual host"
-                                );
-                                Err(retry::WS_UNIX_BACKEND_AUTHORITY_INVALID.into())
-                            }
-                            Some(url_authority) => {
-                                let host = unix_websocket_backend_host(
-                                    proxy.preserve_host_header,
-                                    ws_client_host.as_deref(),
-                                    &url_authority,
-                                );
-                                Box::pin(connect_unix_websocket_backend(
-                                    &state.unix_backend_pool,
-                                    ws_dial_proxy,
-                                    &env_config,
-                                    socket_path,
-                                    &url_authority,
-                                    host.as_ref(),
-                                    ws_path_and_query.as_ref(),
-                                    &client_headers,
-                                    ws_size_limits.max_frame_bytes,
-                                    ws_size_limits.max_message_bytes,
-                                    state.websocket_write_buffer_size,
-                                    ws_idle_tracker.clone(),
-                                ))
-                                .await
-                                .map(|handshake| WsBackendHandshake::Unix(Box::new(handshake)))
-                            }
+                    Ok(socket_path) => match unix_websocket_url_authority(&current_backend_url) {
+                        None => {
+                            warn!(
+                                proxy_id = %proxy.id,
+                                "Refusing WebSocket upgrade over unix-socket backend: \
+                                 target-effective URL has no safe authority; failing closed \
+                                 rather than substituting a local virtual host"
+                            );
+                            Err(retry::WS_UNIX_BACKEND_AUTHORITY_INVALID.into())
                         }
-                    }
+                        Some(url_authority) => {
+                            let host = unix_websocket_backend_host(
+                                proxy.preserve_host_header,
+                                ws_client_host.as_deref(),
+                                &url_authority,
+                            );
+                            Box::pin(connect_unix_websocket_backend(
+                                &state.unix_backend_pool,
+                                ws_dial_proxy,
+                                &env_config,
+                                socket_path,
+                                &url_authority,
+                                host.as_ref(),
+                                ws_path_and_query.as_ref(),
+                                &client_headers,
+                                ws_size_limits.max_frame_bytes,
+                                ws_size_limits.max_message_bytes,
+                                state.websocket_write_buffer_size,
+                                ws_idle_tracker.clone(),
+                            ))
+                            .await
+                            .map(|handshake| WsBackendHandshake::Unix(Box::new(handshake)))
+                        }
+                    },
                     // Non-Unix builds never produce `Ok` above.
                     #[cfg(not(unix))]
                     Ok(_) => Err(retry::WS_UNIX_SOCKET_INADMISSIBLE.into()),

@@ -4988,12 +4988,9 @@ fn unix_websocket_host_rejects_injection_and_fails_closed_without_authority() {
         "IPv6 backend authority must keep RFC brackets and port"
     );
 
-    let (_, host) = unix_websocket_handshake_authorities_for_test(
-        true,
-        Some("[fd00::1]:8443"),
-        ipv6_backend,
-    )
-    .expect("bracketed IPv6 client Host must be preservable");
+    let (_, host) =
+        unix_websocket_handshake_authorities_for_test(true, Some("[fd00::1]:8443"), ipv6_backend)
+            .expect("bracketed IPv6 client Host must be preservable");
     assert_eq!(
         host, "[fd00::1]:8443",
         "a bracketed IPv6 client Host must be preservable"
@@ -5010,12 +5007,9 @@ fn unix_websocket_host_rejects_injection_and_fails_closed_without_authority() {
     assert_eq!(host, "192.0.2.10:9090");
 
     let dns_backend = "http://backend.service.local/chat";
-    let (url_authority, host) = unix_websocket_handshake_authorities_for_test(
-        true,
-        Some("client.example"),
-        dns_backend,
-    )
-    .expect("DNS backend URL without a port must be a safe authority");
+    let (url_authority, host) =
+        unix_websocket_handshake_authorities_for_test(true, Some("client.example"), dns_backend)
+            .expect("DNS backend URL without a port must be a safe authority");
     assert_eq!(url_authority, "backend.service.local");
     assert_eq!(host, "client.example");
 
@@ -5027,12 +5021,9 @@ fn unix_websocket_host_rejects_injection_and_fails_closed_without_authority() {
         "/var/run/app.sock",
         "",
     ] {
-        let (url_authority, host) = unix_websocket_handshake_authorities_for_test(
-            true,
-            Some(injected),
-            ipv6_backend,
-        )
-        .expect("injected Host must not fail the trusted backend URL");
+        let (url_authority, host) =
+            unix_websocket_handshake_authorities_for_test(true, Some(injected), ipv6_backend)
+                .expect("injected Host must not fail the trusted backend URL");
         assert_eq!(
             url_authority, "[::1]:8080",
             "injected Host {injected:?} must not become the parse-only URI authority"
@@ -5101,12 +5092,9 @@ fn unix_websocket_host_rejects_injection_and_fails_closed_without_authority() {
         );
     }
 
-    let (url_authority, host) = unix_websocket_handshake_authorities_for_test(
-        false,
-        None,
-        "http://localhost:8080/chat",
-    )
-    .expect("an explicit localhost authority in the backend URL remains valid");
+    let (url_authority, host) =
+        unix_websocket_handshake_authorities_for_test(false, None, "http://localhost:8080/chat")
+            .expect("an explicit localhost authority in the backend URL remains valid");
     assert_eq!(url_authority, "localhost:8080");
     assert_eq!(host, "localhost:8080");
 }
@@ -5154,7 +5142,9 @@ fn unix_websocket_dispatch_keeps_trusted_uri_separate_from_policy_host() {
     let authority = src[unix_dispatch..]
         .find("unix_websocket_url_authority(&current_backend_url)")
         .map(|offset| unix_dispatch + offset)
-        .expect("Unix WebSocket URI authority must be parsed from the target-effective backend URL");
+        .expect(
+            "Unix WebSocket URI authority must be parsed from the target-effective backend URL",
+        );
     let refusal = src[authority..]
         .find("WS_UNIX_BACKEND_AUTHORITY_INVALID")
         .map(|offset| authority + offset)

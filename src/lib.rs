@@ -116,7 +116,7 @@ pub mod _test_support {
             client_host,
             &url_authority,
         )
-            .into_owned();
+        .into_owned();
         Some((url_authority, host))
     }
 
