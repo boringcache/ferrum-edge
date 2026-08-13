@@ -40,6 +40,7 @@ pub mod body;
 pub mod client_ip;
 pub mod deferred_log;
 pub mod gateway_listener;
+pub mod gateway_listener_status;
 pub mod grpc_proxy;
 /// Shared h2c (cleartext, prior-knowledge HTTP/2) peer-preface observation.
 /// Hyper's client handshake proves only the client half, so both h2c transports
@@ -8812,7 +8813,8 @@ impl ProxyState {
                 record.hbone = ProtocolSupport::Supported;
             }
             Ok(Err(err)) => {
-                if err.is_capability_failure() {
+                let capability_failure = err.is_capability_failure();
+                if capability_failure {
                     record.hbone = ProtocolSupport::Unsupported;
                 } else if let Some(previous) = target.previous_hbone {
                     record.hbone = previous;
@@ -8821,10 +8823,17 @@ impl ProxyState {
                     record,
                     format!("HBONE probe failed for {host}:{port} via port {hbone_port}: {err}"),
                 );
-                debug!(
-                    "HBONE probe for {}:{} via port {} classified unsupported: {}",
-                    host, port, hbone_port, err
-                );
+                if capability_failure {
+                    debug!(
+                        "HBONE probe for {}:{} via port {} classified unsupported: {}",
+                        host, port, hbone_port, err
+                    );
+                } else {
+                    debug!(
+                        "HBONE probe for {}:{} via port {} hit a transient reachability failure; preserving the prior classification: {}",
+                        host, port, hbone_port, err
+                    );
+                }
             }
             Err(_) => {
                 if let Some(previous) = target.previous_hbone {
@@ -25998,11 +26007,29 @@ async fn handle_proxy_request_inner(
                 && crate::modes::mesh::is_mesh_inbound_route_id(&rm.proxy.id) =>
         {
             let representative_id = Arc::clone(&rm.proxy);
-            match epoch.route_table.select_mesh_inbound_port_route(
-                rm,
-                ctx.orig_dst.map(|addr| addr.port()),
-                authority_port,
-            ) {
+            // A dedicated Sidecar ingress bind has its own OS listener, so the
+            // accepted frontend port is already the authoritative declared
+            // listener port. Its route intentionally has a distinct id from the
+            // shared-:15006 capture sibling and therefore does not participate
+            // in the capture listener's per-service sibling group. Validate the
+            // explicit route/listener identity and stamp that port directly for
+            // mesh authorization. Every shared-capture ingress route continues
+            // through the existing orig-dst/authority selector below.
+            let selected = if crate::modes::mesh::is_mesh_ingress_bind_route_id(&rm.proxy.id) {
+                match (rm.proxy.listen_port, ctx.frontend_listen_port) {
+                    (Some(route_port), Some(frontend_port)) if route_port == frontend_port => {
+                        Ok((rm, Some(route_port)))
+                    }
+                    _ => Err(crate::router_cache::MeshInboundPortSelectError::PortNotMaterialized),
+                }
+            } else {
+                epoch.route_table.select_mesh_inbound_port_route(
+                    rm,
+                    ctx.orig_dst.map(|addr| addr.port()),
+                    authority_port,
+                )
+            };
+            match selected {
                 Ok((rm, ingress_authz_port)) => {
                     // F6 §6.2 (security): for a Sidecar `ingress[]` route, stamp
                     // the DECLARED listener port so `mesh_authz` authorizes on it

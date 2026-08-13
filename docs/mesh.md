@@ -24,6 +24,7 @@ Concepts map directly to the Istio service mesh model: `Workload` corresponds to
   - [PolicyScope Filtering](#policyscope-filtering)
   - [AuthorizationPolicy targetRefs](#authorizationpolicy-targetrefs-issue-3226)
   - [Evaluation Semantics](#evaluation-semantics)
+  - [AuthorizationPolicy action: CUSTOM](#authorizationpolicy-action-custom-issue-3235)
   - [Rule Matching](#rule-matching)
   - [SPIFFE Identity](#spiffe-identity)
   - [HBONE Protocol](#hbone-protocol)
@@ -82,8 +83,8 @@ Ferrum's mesh subsystem is in active build-out. The paths below ship in one bina
 |---|---|---|
 | Native `MeshSubscribe` (Ferrum CP → Ferrum DP) | **Stable** | Default protocol. Full slice (authz, PeerAuth, JWT, ServiceEntry, trust bundles, ProxyConfig, workloads, telemetry, multi-cluster) is pushed directly. The most mature and recommended config path. Enrolled in the conformance GA contract as `mesh.config_transport.native_subscribe` (semantics: `tests/conformance/mesh_config_transport.rs`; live: `sidecar.config.native_subscribe_delivered` via the `mesh-e2e-sidecar` CP + native-subscribe leg). |
 | xDS ADS (Ferrum CP → Ferrum DP) | **Beta** | Functionally equivalent to native via Ferrum-specific ECDS carriers (`ferrum.config.extension.v3.*`), including `ProxyConfig` on `ProxyConfigsCarrier`. **NOT stock-Envoy / third-party-Istio interop** — a non-Ferrum CP emits only name-only CDS/EDS/LDS/RDS and no carriers, so it cannot drive a protected Ferrum mesh and may be NACKed. RTDS layers are authored by the operator's CP (Ferrum's xDS server does not originate Runtime resources). |
-| Localized file source (`FERRUM_MESH_CONFIG_PROTOCOL=file`) | **Beta** | No control plane: the DP builds its slice locally from `FERRUM_MESH_FILE_CONFIG_PATH` through the same materialization path as native/xDS, so enforcement parity is structural. Fail-closed initial load; SIGHUP reload (Unix) keeps the last good slice on error. Sharp edges: reload is signal-driven only (no file watching), and there is no CP heartbeat — `/mesh/config-drift` staleness reflects the last SIGHUP, not a sync failure. |
-| Stock Envoy / third-party Istio xDS interop (`FERRUM_MESH_CONFIG_PROTOCOL=stock_xds`) | **Beta** | Issue #3317. A **separate protocol** from `xds`: consumes standard v3 CDS/EDS/LDS/RDS from a stock Envoy / third-party Istio control plane and projects it onto `MeshService` / `Workload` for **discovery only**. Enforcement policy comes from the mandatory local `FERRUM_MESH_FILE_CONFIG_PATH` document, so a third-party CP can change reachability but never Ferrum's security posture. Everything Ferrum does not model is refused per-resource with a field-specific diagnostic and contributes no route, endpoint, or identity. See [Stock Envoy / third-party Istio xDS interoperability](#stock-envoy--third-party-istio-xds-interoperability). |
+| Localized file source (`FERRUM_MESH_CONFIG_PROTOCOL=file`) | **Beta** | No control plane: the DP builds its slice locally from `FERRUM_MESH_FILE_CONFIG_PATH` through the same materialization path as native/xDS, so enforcement parity is structural. Fail-closed initial load via the shared bounded stable-file reader (64 MiB, regular-file open target, stable dual-read) on a blocking worker. SIGHUP reload (Unix) runs off Tokio core workers, coalesces repeated signals (generation advances when the signal is observed), keeps the last good slice on error, and raises authenticated `/health` `config_rejected` until a later accepted reload. Watcher shutdown stops accepting candidates without awaiting a started (non-cancellable) `spawn_blocking` job. Sharp edges: reload is signal-driven only (no file watching), and there is no CP heartbeat — `/mesh/config-drift` staleness reflects the last SIGHUP, not a sync failure. |
+| Stock Envoy / third-party Istio xDS interop (`FERRUM_MESH_CONFIG_PROTOCOL=stock_xds`) | **Beta** | Issue #3317. A **separate protocol** from `xds`: consumes standard v3 CDS/EDS/LDS/RDS from a stock Envoy / third-party Istio control plane and projects it onto `MeshService` / `Workload` for **discovery only**. Enforcement policy comes from the mandatory local `FERRUM_MESH_FILE_CONFIG_PATH` document, so a third-party CP can change reachability but never Ferrum's security posture. Everything Ferrum does not model is refused per-resource with a field-specific diagnostic and contributes no route, endpoint, or identity. Live data-path coverage (a scripted third-party ADS server driving a real sidecar through update / deletion / NACK / refusal) runs in the hosted `data-plane` functional shard. See [Stock Envoy / third-party Istio xDS interoperability](#stock-envoy--third-party-istio-xds-interoperability). |
 
 ### Topology maturity
 
@@ -258,7 +259,7 @@ Per-pod sidecar proxy deployed alongside application containers. This is the def
 | Outbound capture | `127.0.0.1:15001` | Outbound | Plaintext capture |
 | Inbound mTLS | `0.0.0.0:15006` | Inbound | mTLS termination |
 
-The inbound listener terminates mTLS from peer sidecars and forwards plaintext to the co-located application: for the **local** workload (identified by its SPIFFE identity, `FERRUM_MESH_WORKLOAD_SPIFFE_ID`), Ferrum materializes an inbound route per HTTP-family service port of each Service that both names the workload's service and lists the workload's SPIFFE id in its `workloads[]`, targeting `127.0.0.1:<appPort>`, so an mTLS-terminated request reaches the app after `mesh_authz` admission. The backend (container) port is resolved from the signals the slice carries — a shared port **name**, else an equal port **number**, else the workload's sole container port; a workload that declares no ports defaults to the service port. When a Service uses a numeric `targetPort` that differs from `port` across multiple unnamed container ports the backend is genuinely ambiguous (the model does not yet carry `targetPort` end-to-end), so the route is **skipped with a warning** rather than misrouted — name the ports consistently or supply an explicit proxy. If an explicit proxy already routes the same host/path (overlap evaluated with the same wildcard/catch-all semantics as listen-path validation), the operator's proxy wins. **Multi-port local services materialize one loopback sibling per HTTP-family service port**, disambiguated post-match by, in priority order: the inbound connection's captured original destination (a sidecar-less client's direct dial of the app port that the injector's iptables REDIRECTed to `:15006` — its port is the **container** port), then the request's explicit `Host`/`:authority` port (the **service** port — peer-sidecar `:15006` dials are direct and never NATed, so the authority is the channel a multi-port-aware egress sidecar controls; see the egress bullet below). A multi-port request carrying neither signal — or a signal matching no materialized sibling — is rejected 502, never guessed onto one port's backend; single-port services accept bare-Host clients and older peers exactly as before. Stream-family local service ports (`tcp`, `tls`, and DB protocols) prepare a runtime-only raw-TCP inbound map keyed by the captured original-destination app port; when the effective PeerAuthentication mode admits plaintext and iptables REDIRECT preserves `SO_ORIGINAL_DST`, the accept loop recognizes the stream-family route before HTTP/TLS classification and relays its bytes unchanged, including an application-level TLS ClientHello beginning with `0x16`. It then runs the L4 stream plugin chain (`mesh_authz` and the other `on_stream_connect` hooks) **with the captured app port as the authorization destination** and, only if not rejected, relays those bytes to `127.0.0.1:<appPort>` before Hyper parses the connection — so a `destination.port`-scoped `AuthorizationPolicy` DENY on a Redis/MySQL/etc. port is enforced just as it is for the materialized HTTP routes. The dual-wire one-byte TLS discriminator is therefore confined to HTTP-family inbound traffic; its residual `0x16` ambiguity is harmless for valid plaintext HTTP because no valid HTTP request starts with that control byte, while STRICT is still enforced after routing. A stream-family port that resolves to the **same** container port as an HTTP-family service port installs **no** raw-TCP entry: the HTTP inbound route wins, so the request is parsed and authorized on the HTTP path rather than spliced to loopback as raw bytes. Peer-sidecar raw-TCP traffic still arrives as a mesh-mTLS CONNECT and uses the transparent inbound relay. The outbound listener intercepts application-originated traffic (redirected by iptables or eBPF) and, on Ambient and Sidecar topologies, routes it through per-service egress routes materialized from the slice (see "Implementation status" below for the per-topology transport); multi-port services are disambiguated by the captured connection's original destination (`SO_ORIGINAL_DST`) on those materialized topologies.
+The inbound listener terminates mTLS from peer sidecars and forwards plaintext to the co-located application: for the **local** workload (identified by its SPIFFE identity, `FERRUM_MESH_WORKLOAD_SPIFFE_ID`), Ferrum materializes an inbound route per HTTP-family service port of each Service this local pod backs (the workload record's `service_name` plus namespace, with the Service listing the workload's SPIFFE id in `workloads[]`), targeting `127.0.0.1:<appPort>`, so an mTLS-terminated request reaches the app after `mesh_authz` admission. A single pod selected by multiple Services — same SPIFFE and the same non-empty pod UID on every matching workload record — materializes one inbound Host route per Service. Missing or divergent UIDs remain ambiguous even when endpoint addresses match (hostNetwork pods can share an IP) and materialize no inbound routes. Distinct pods that only share a service-account SPIFFE likewise remain ambiguous. The backend (container) port is resolved from the signals the slice carries — a shared port **name**, else an equal port **number**, else the workload's sole container port; a workload that declares no ports defaults to the service port. When a Service uses a numeric `targetPort` that differs from `port` across multiple unnamed container ports the backend is genuinely ambiguous (the model does not yet carry `targetPort` end-to-end), so the route is **skipped with a warning** rather than misrouted — name the ports consistently or supply an explicit proxy. If an explicit proxy already routes the same host/path (overlap evaluated with the same wildcard/catch-all semantics as listen-path validation), the operator's proxy wins. **Multi-port local services materialize one loopback sibling per HTTP-family service port**, disambiguated post-match by, in priority order: the inbound connection's captured original destination (a sidecar-less client's direct dial of the app port that the injector's iptables REDIRECTed to `:15006` — its port is the **container** port), then the request's explicit `Host`/`:authority` port (the **service** port — peer-sidecar `:15006` dials are direct and never NATed, so the authority is the channel a multi-port-aware egress sidecar controls; see the egress bullet below). A multi-port request carrying neither signal — or a signal matching no materialized sibling — is rejected 502, never guessed onto one port's backend; single-port services accept bare-Host clients and older peers exactly as before. Stream-family local service ports (`tcp`, `tls`, and DB protocols) prepare a runtime-only raw-TCP inbound map keyed by the captured original-destination app port; when the effective PeerAuthentication mode admits plaintext and iptables REDIRECT preserves `SO_ORIGINAL_DST`, the accept loop recognizes the stream-family route before HTTP/TLS classification and relays its bytes unchanged, including an application-level TLS ClientHello beginning with `0x16`. It then runs the L4 stream plugin chain (`mesh_authz` and the other `on_stream_connect` hooks) **with the captured app port as the authorization destination** and, only if not rejected, relays those bytes to `127.0.0.1:<appPort>` before Hyper parses the connection — so a `destination.port`-scoped `AuthorizationPolicy` DENY on a Redis/MySQL/etc. port is enforced just as it is for the materialized HTTP routes. The dual-wire one-byte TLS discriminator is therefore confined to HTTP-family inbound traffic; its residual `0x16` ambiguity is harmless for valid plaintext HTTP because no valid HTTP request starts with that control byte, while STRICT is still enforced after routing. A stream-family port that resolves to the **same** container port as an HTTP-family service port installs **no** raw-TCP entry: the HTTP inbound route wins, so the request is parsed and authorized on the HTTP path rather than spliced to loopback as raw bytes. Peer-sidecar raw-TCP traffic still arrives as a mesh-mTLS CONNECT and uses the transparent inbound relay. The outbound listener intercepts application-originated traffic (redirected by iptables or eBPF) and, on Ambient and Sidecar topologies, routes it through per-service egress routes materialized from the slice (see "Implementation status" below for the per-topology transport); multi-port services are disambiguated by the captured connection's original destination (`SO_ORIGINAL_DST`) on those materialized topologies.
 
 **Implementation status — transport vs. materialization, per topology.** Transport (how a peer is reached on the wire) and materialization (turning the slice into routable proxies) are separate layers, and **the transport differs by topology**: **Ambient / Waypoint** speak HBONE (HTTP/2 CONNECT over mTLS, `:15008`); **Sidecar** speaks plain SVID-mTLS HTTP (`:15006`, no `:15008` listener). HBONE is *not* Sidecar's transport.
 
@@ -415,9 +416,11 @@ remove **reachability**, but it can never author or weaken Ferrum's
 **enforcement posture**. Startup fails closed if the policy document is missing,
 invalid, or declares `services` / `workloads` — those belong to the control
 plane, and two authorities for one field would make "which endpoint is
-reachable" ambiguous. The document is re-read on SIGHUP (Unix); a failed reload
-keeps the last good policy baseline, and a successful one rebuilds the slice
-from the current discovery view.
+reachable" ambiguous. The document is re-read on SIGHUP (Unix) through the same
+off-thread, coalesced stable-file path as `file` mode; a failed reload
+keeps the last good policy baseline and raises authenticated `/health`
+`config_rejected`, and a successful one rebuilds the slice from the current
+discovery view and clears the degraded signal.
 
 Ferrum **never mints a CP/DP JWT for a stock control plane**. The only
 credential it presents is an externally issued bearer token at
@@ -506,7 +509,10 @@ delivery channel could enter is refused:
 - Any transport socket that is not `UpstreamTlsContext` or `RawBuffer`; inline
   `tls_certificates`; a `trusted_ca` `DataSource` naming a `filename` or
   `environment_variable`; `custom_validator_config`; `custom_handshaker`; a
-  non-`exact` (regex/prefix/suffix) peer-identity matcher.
+  non-`exact` (regex/prefix/suffix) peer-identity matcher; and Envoy's
+  deprecated `match_subject_alt_names` (it carries no SAN type, so a peer
+  constraint expressed there is refused **by that field name** rather than
+  silently dropped and reported against the typed field).
 - Listener `api_listener`, `filter_chain_matcher`, `additional_addresses`; any
   listener filter outside `original_dst` / `tls_inspector` / `http_inspector` /
   `workload_metadata` (notably `proxy_protocol` and `original_src`, which
@@ -548,18 +554,85 @@ header/regex matching, retries, timeouts, fault injection, mirroring),
 DestinationRule subsets and traffic policy, external
 `STRICT_DNS` / `LOGICAL_DNS` / `ORIGINAL_DST` clusters (so third-party egress
 still needs a local `ServiceEntry`), inbound listener materialization (Ferrum
-builds its own from the policy document), SDS, ECDS/RTDS, and delta xDS. The
+builds its own inbound routes from the discovered services under the policy
+document's enforcement posture, and never from the control plane's inbound
+`Listener` resources — see "Inbound identity for a multi-Service pod" below for
+the one shape that materializes none), SDS, ECDS/RTDS, and delta xDS. The
 decode surface is a field-exact **projection** of the upstream Envoy v3 messages
 (`proto/envoy/stock/v3/stock_xds.proto`), not the vendored upstream proto tree;
 every field number is taken from Envoy `v1.31.0` and a field that can change
 routing, trust, or identity is either consumed or refused.
+
+**Namespace scope.** Discovery is projected onto the typed mesh model first and
+narrowed to this workload's namespace view second, exactly like every other
+config source. A cluster for a service in ANOTHER namespace is therefore
+published by the projection and then narrowed out of the slice, so it is never
+dialable here — even when its endpoints are genuinely reachable. Its endpoints
+narrow **with** it: when a stock cluster's endpoint carries an identity from
+this namespace, the projection records a cross-namespace attachment, and Ferrum
+admits such an attachment only together with the `MeshService` that authorizes
+it (the target service must list the workload's SPIFFE id). Once narrowing has
+removed that service, the endpoint is dropped rather than retained as an
+unauthorizable attachment — a slice carrying one would be refused at apply, and
+the resulting rollback to the last applied generation would block every LATER
+control-plane change, including a state-of-the-world withdrawal, instead of
+losing just the out-of-view resource. Shared identity/address endpoints are
+projected as **per-service** workload records, so a foreign service that sorts
+first in BTree order cannot stamp itself as the owner of a visible service's
+endpoint and take that reachability with it when it narrows away.
+
+**Inbound identity for a multi-Service pod.** Those per-service workload records
+are also what the local sidecar's own inbound materialization reads, and this
+projection has no pod-identity field to populate: a standard EDS endpoint
+carries no Kubernetes pod UID, so `Workload.pod_uid` is always unset here.
+Sidecar inbound treats several workload records that share the local SPIFFE id
+but name different Services as one pod only when every record carries the same
+non-empty pod UID, so a local pod a stock control plane publishes under **two or
+more Services materializes no inbound routes** on this profile and participates
+in egress only. That is deliberate and fail closed: a shared service-account
+SPIFFE plus a shared endpoint address cannot distinguish one multi-Service pod
+from two distinct pods (hostNetwork pods can share an IP), and guessing would
+relay mesh-authorized traffic to the wrong loopback application. A pod backed by
+a single Service is unaffected. Where a multi-Service pod must also serve mesh
+inbound traffic, drive that workload from native/file config or a Ferrum CP,
+which carry `pod_uid`.
+
+A `TcpProxy` filter chain does classify its port as `AppProtocol::Tcp`, but
+raw-TCP mesh egress matches captured **original destinations** against the
+service VIP (a raw stream carries no `Host`), so a stock-discovered TCP port is
+only routable where the platform actually redirects the connection — the same
+condition as native/file config. The live matrix below therefore drives HTTP;
+raw-TCP egress keeps its coverage in the capture-based mesh suites.
+
+**Live data-path coverage.** `tests/functional/functional_mesh_stock_xds_test.rs`
+drives the profile end to end against a **scripted third-party ADS server** (not
+Ferrum's own `XdsAdsServer`): the production `stock_xds` client feeds a real
+sidecar whose captured plaintext request traverses the materialized egress route
+and SVID-mTLS into a second real sidecar and its backend. The same live fixture
+proves, on that data path, that an endpoint withdrawal and a state-of-the-world
+cluster withdrawal each remove reachability (and a replacement restores it),
+that a structurally invalid response is NACKed with a field-specific
+`error_detail` while the last-good view keeps serving, that an unpinned-peer or
+subset cluster first routes under a representable resource and then loses
+reachability after only the refusal-causing field changes, that a
+foreign-namespace cluster is ACKed into the applied generation without freezing
+a later withdrawal (the namespace itself prevents a same-host representable
+pre-state, so that arm is not a before/after reachability proof), that a
+listener carrying `envoy.filters.http.rbac` and a route using
+`weighted_clusters` are ACKed with field-specific refusal diagnostics while the
+accepted service keeps serving (semantic coverage that those constructs
+contribute no listener or virtual host lives in the unit/integration suites;
+the live phase does not claim a widening proof for a host that was never
+dialable), and that re-pinning the peer identity to an impostor SPIFFE fails
+the dial closed. It runs in the hosted `data-plane` functional shard.
 
 **Where the code lives.** `src/xds/stock.rs` (decode, capability classification,
 projection onto the typed mesh model) and
 `src/modes/mesh/config_consumer/stock_xds_client.rs` (the ADS stream machine and
 the policy/discovery merge). Tests:
 `tests/unit/gateway_core/stock_xds_tests.rs`,
-`tests/integration/mesh_stock_xds_tests.rs`, and
+`tests/integration/mesh_stock_xds_tests.rs`,
+`tests/functional/functional_mesh_stock_xds_test.rs`, and
 `tests/conformance/stock_xds_interop.rs`.
 
 #### Ferrum mesh-slice ECDS carriers (full parity over xDS)
@@ -735,8 +808,8 @@ in `src/modes/mesh/config_consumer/xds_client.rs`.
 `FERRUM_MESH_CONFIG_PROTOCOL=file` runs a mesh data plane with **no control plane at all** — the slice is built locally from a YAML/JSON document at `FERRUM_MESH_FILE_CONFIG_PATH`. This mirrors the gateway's database-vs-file duality for the mesh (cf. Kuma's universal mode): the same `MeshSlice::from_gateway_config` materialization the CP runs is executed DP-side, so authz / PeerAuthentication / JWT / ServiceEntry / DestinationRule / trust-bundle semantics are structurally identical to a CP-delivered slice.
 
 - **Document shape**: an optional `version` stamp (must equal the current config schema version when present) plus the `mesh` section only — `workloads`, `services`, `mesh_policies`, `peer_authentications`, `service_entries`, `request_authentications`, `telemetry_resources`, `destination_rules`, `proxy_configs`, `sidecars`, `trust_bundles`, `multi_cluster`, `outbound_traffic_policy`. Gateway resources (`proxies:`, `upstreams:`, `consumers:`, `plugin_configs:`) are **rejected** at parse — mesh mode materializes its routes from the slice; plain gateway routes belong to `FERRUM_MODE=file`.
-- **Startup is fail-closed**: a missing, unparsable, or mesh-invalid document refuses startup, matching file-mode validation semantics.
-- **Reload**: SIGHUP (Unix; `ferrum-edge reload`). A failed reload logs a warning and keeps the last good slice — identical to how the CP consumers retain the last accepted slice. Reload is signal-driven only; there is no file watcher or poll timer. Non-Unix platforms load once and require a restart.
+- **Startup is fail-closed**: a missing, unparsable, non-regular, oversized (>64 MiB), unstable, or mesh-invalid document refuses startup, matching file-mode validation semantics. Initial load and SIGHUP reload both use the shared bounded stable-file primitive (opened-target regular-file check, Unix `O_NONBLOCK`, streaming `limit + 1`, byte-identical dual read) on `spawn_blocking` so Tokio core workers stay free. **Format is selected from the file extension only — there is no content sniffing and no JSON fallback**, so a large document is never parsed once to classify it and again to deserialize it. `.json` selects the JSON parser; `.yaml`, `.yml`, and every unknown or extensionless path select YAML. YAML is a superset of JSON, so an unknown-extension path holding an ordinary JSON document still loads; but the parser genuinely is YAML, so a JSON-only shape YAML rejects (for example a mapping key past libyaml's 1024-byte simple-key limit) fails closed rather than falling back to the JSON parser. Give JSON documents a `.json` extension.
+- **Reload**: SIGHUP (Unix; `ferrum-edge reload`). Rapid signals are coalesced (one in-flight generation plus at most one follow-up). The requested generation advances when the signal is observed, so an older completed load cannot install before a follow-up. A failed reload (read/parse/validation/join/apply rejection) logs a warning, keeps the last good slice, and raises the shared authenticated `/health` `config_rejected` degraded signal until the proxy apply lifecycle accepts the exact current recovery candidate (Applied, or a content-identical no-op) — a provisional `install_slice` alone never clears it. Every recovery transition (cancel, new candidate, policy-identity bind, proxy accept, proxy reject) is serialized by one transition lock together with the `config_rejected` write, so an older callback can neither clear health after a newer failure nor cancel a newer pending recovery. Last-good retention is identical to CP consumers, with operator-visible degraded status. Watcher shutdown stops accepting candidates immediately: it drops/aborts the in-flight join handle without awaiting a started `spawn_blocking` job (Tokio cannot cancel blocking work once started), and a late completion cannot publish. Reload is signal-driven only; there is no file watcher or poll timer. Non-Unix platforms load once and require a restart.
 - **Not required / not consumed**: `FERRUM_DP_CP_GRPC_URLS`, `FERRUM_CP_DP_GRPC_JWT_SECRET`, DP gRPC TLS vars. Everything else (topology, SVID material, PeerAuthentication posture, plugin injection, slice scoping via `FERRUM_MESH_WORKLOAD_SPIFFE_ID` / `FERRUM_MESH_WORKLOAD_LABELS` / Sidecar egress enforcement) behaves exactly as under native/xDS.
 - **Observability caveat**: there is no CP heartbeat, so `/mesh/config-drift` slice staleness reflects time since the last SIGHUP reload rather than a sync failure.
 
@@ -744,9 +817,9 @@ in `src/modes/mesh/config_consumer/xds_client.rs`.
 
 All three config sources share the same startup contract:
 
-1. The mesh data plane waits for an initial valid slice before serving traffic (the file source loads it synchronously and refuses startup on error).
+1. The mesh data plane waits for an initial valid slice before serving traffic (the file source loads it off-thread and refuses startup on error).
 2. Valid updates are applied atomically via `ArcSwap`.
-3. Invalid updates are logged and ignored; the last accepted configuration continues serving.
+3. Invalid updates are logged and ignored; the last accepted configuration continues serving. Localized file / stock-xDS policy reload failures also raise authenticated `/health` `config_rejected` until a later accepted reload.
 4. On config source unavailability, the gateway keeps serving cached configuration (resilience principle).
 
 ## Mesh Data Model
@@ -1120,14 +1193,291 @@ DP slices reconstruct `MeshConfig` without `waypoint_bindings`, so Gateway prese
 
 ### Evaluation Semantics
 
-`evaluate_mesh_authorization()` processes policies in order:
+`evaluate_mesh_authorization_full()` processes policies in Istio's action order:
 
-1. **DENY rules checked first** -- first match returns `Deny`.
-2. **ALLOW rules** -- if any ALLOW rule exists in the policy set but none matched, the result is **implicit deny** (Istio semantics).
-3. **AUDIT rules** -- matched audit policies are returned for logging.
-4. If no DENY or ALLOW rules exist, the result is `Allow`.
+1. **CUSTOM rules checked first** -- a matching CUSTOM rule delegates the decision to its `meshConfig.extensionProviders` external authorizer *before* any DENY or ALLOW tier can settle the request. See [AuthorizationPolicy `action: CUSTOM`](#authorizationpolicy-action-custom-issue-3235).
+2. **DENY rules** -- first match returns `Deny`. A DENY still refuses a request an external authorizer was willing to admit.
+3. **ALLOW rules** -- if any ALLOW rule exists in the policy set but none matched, the result is **implicit deny** (Istio semantics). A CUSTOM rule does **not** contribute to that implicit-deny floor: it delegates rather than grants.
+4. **AUDIT rules** -- matched audit policies are returned for logging.
+5. If no CUSTOM, DENY, or ALLOW rules exist, the result is `Allow`.
 
-**Istio empty-rule semantics**: `ALLOW` with no rules is allow-nothing (emits a `never_matches` rule so the implicit deny applies). `DENY`/`AUDIT` with no rules are no-ops.
+**Istio empty-rule semantics**: `ALLOW` with no rules is allow-nothing (emits a `never_matches` rule so the implicit deny applies). `DENY`/`AUDIT` with no rules are no-ops. `CUSTOM` with no rules is **rejected** at translation: a ruleless delegation has no matching surface, so admitting it would produce an accepted-but-inert policy.
+
+### AuthorizationPolicy `action: CUSTOM` (issue #3235)
+
+An `AuthorizationPolicy` with `action: CUSTOM` delegates matching requests to an
+external authorization service declared in the **root-namespace**
+`meshConfig.extensionProviders` list:
+
+```yaml
+# istio-system/istio ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: istio
+  namespace: istio-system
+data:
+  mesh: |
+    extensionProviders:
+    - name: sample-ext-authz
+      envoyExtAuthzHttp:
+        service: ext-authz.istio-system.svc.cluster.local
+        port: 8000
+        scheme: https           # Ferrum extension, see "Provider transport"
+        timeout: 0.5s
+        pathPrefix: /check
+        failOpen: false
+        statusOnError: "403"
+        includeRequestHeadersInCheck:
+        - x-request-id
+        includeAdditionalHeadersInCheck:
+          x-ext-authz-caller: "ferrum-mesh"
+        headersToDownstreamOnDeny:
+        - www-authenticate
+---
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: delegate-admin
+  namespace: default
+spec:
+  action: CUSTOM
+  provider:
+    name: sample-ext-authz
+  selector:
+    matchLabels: { app: reviews }
+  rules:
+  - to:
+    - operation:
+        paths: ["/admin/*"]
+```
+
+**Provider resolution is root-namespace only.** `spec.provider.name` is resolved
+against `meshConfig.extensionProviders` in `FERRUM_K8S_ISTIO_ROOT_NAMESPACE`.
+A tenant namespace cannot introduce or shadow a provider, so cross-namespace
+provider resolution is structurally impossible rather than filtered. Each
+failure mode has its own field-shaped diagnostic and **rejects the resource**
+(it is never accepted-but-inert):
+
+| Condition | Outcome |
+| --- | --- |
+| `provider` absent / not an object / unknown field | rejected |
+| `provider.name` empty, non-string, or over 253 bytes | rejected |
+| name not declared in the root-namespace meshConfig | rejected, naming the root namespace |
+| name declared as a tracing (or other non-ext-auth) provider | rejected, "is not an external authorization provider" |
+| name declared as `envoyExtAuthzGrpc` | rejected, "a variant Ferrum does not implement" |
+| `action: CUSTOM` with no `rules` | rejected |
+| `provider` on a non-CUSTOM action | rejected |
+
+**Supported provider shape.** Only `envoyExtAuthzHttp` is implemented: the
+check is a bounded HTTP request. `envoyExtAuthzGrpc` is refused at admission
+rather than approximated — the Envoy gRPC check API carries attributes Ferrum
+does not model, and an approximation would silently change what a policy
+authorizes. The `envoyExtAuthzHttp` key set is **closed**: an unmodelled field
+(including the deprecated `includeHeadersInCheck`) is rejected rather than
+ignored, so an operator can never believe a field is in force when it is not.
+The enclosing extension-provider oneof is closed too: an entry carrying an
+HTTP ext-authz block plus any sibling provider variant or unknown field is
+rejected instead of choosing whichever recognized field appears first.
+
+**Provider transport.** Istio derives the ext-auth transport from the
+destination's own mesh configuration; Ferrum's provider dial does not go
+through that path, so the operator states it with a `scheme: http|https` field
+on the provider block. A **non-loopback** provider must use `https`: an
+unencrypted off-box check (which may carry a forwarded credential) is refused
+at admission. Loopback providers (`127.0.0.1`, `::1`, `localhost`) may use
+plaintext.
+
+**`service` must be a real bare URL host** — a DNS name, an IPv4 literal, or an
+IPv6 literal (bracketed or bare). Userinfo (`@`), an embedded port, a path,
+query, fragment, backslash, percent-encoding, or a bracket imbalance is
+rejected at admission rather than deferred to a per-request URL parse.
+`pathPrefix` is validated as a real path: it must start with a single `/` and
+may not carry `?`, `#`, `\`, percent-encoding, a `.` / `..` segment, or a
+leading `//` — those forms can be normalized or can move the request path into
+a different URL component. The composed base URL is re-parsed at config
+publication and must still carry only scheme, host, port, and path.
+
+> **Deliberate narrowing:** Istio's namespace-qualified
+> `[<namespace>/]<hostname>` service syntax is **not supported** and is
+> rejected with a diagnostic naming it. Ferrum dials the provider directly
+> rather than resolving it through the mesh service registry, so the namespace
+> qualifier has no meaning here — and silently dropping it would dial a
+> different service than the operator named. Declare the fully qualified
+> hostname instead.
+
+**`statusOnError` is an HTTP status.** Upstream Istio documents it as a status
+**string**, so `statusOnError: "403"` is the real operator input shape; a JSON
+integer (`403`) is also accepted for hand-authored Ferrum mesh documents. The
+internal representation is numeric. A value outside 4xx/5xx, an Envoy enum
+*name*, a float, or a non-numeric string is rejected rather than defaulted.
+
+**At most ONE extension provider may apply to a request.** Istio permits one
+extension provider per workload. Several CUSTOM policies naming the **same**
+provider coalesce into one check. Two CUSTOM policies naming **different**
+providers are refused: a workload-scoped conflict is rejected at plugin
+construction (the previous valid generation keeps serving), and a request that
+can see two distinct applicable providers across relay/waypoint destination
+scopes is denied with the stable reason `custom:provider-conflict`. Ferrum
+never picks the first match — that would let policy iteration order choose
+which operator's authorizer enforces. Different providers on **disjoint**
+workloads or destination scopes remain fully supported: the construction-time
+refusal applies only where the generation's policy set really is one workload's,
+so a node-waypoint generation (which serves every enrolled pod on the node from
+one listener) and a waypoint generation (whose `targetRefs` retention spans
+every fronted Service) may each carry one provider per pod / per destination,
+and only a request that can genuinely see two is refused.
+
+**CUSTOM runs before DENY across destination scopes too.** A request that spans
+several destination scopes (a node-waypoint relay serving many backends)
+evaluates **every** applicable scope before applying a decision: a DENY in an
+earlier scope is recorded and the scan continues, so a delegation carried by a
+later scope is still executed and still counted. The first DENY in scope order
+remains the reported policy, and it still refuses the request once the check has
+run — stopping the scan at that DENY would have let scope order decide whether
+an operator's authorizer ever saw a request the scope it protects applied to
+(and would have hidden a two-provider conflict living in a later scope).
+
+**Bounds.** `timeout` is capped at 30s (default 1s), `includeRequestBodyInCheck.maxRequestBytes`
+at 1 MiB, provider response reads at 64 KiB, each header list at 32 exact
+entries (case-insensitively unique), and the admitted provider set at 16 per
+mesh generation. In-flight checks are capped process-wide and are **refused
+immediately** at the ceiling rather than queued, so provider slowness cannot
+become unbounded gateway latency or memory growth.
+
+**Nothing is retried.** The check is dispatched through a dedicated
+single-attempt seam on the shared plugin HTTP client, so it keeps that client's
+no-proxy, redirect-disabled, DNS/egress-policy, TLS posture, redacted logging,
+latency accounting, and typed failure classification while performing **exactly
+one attempt** — `FERRUM_PLUGIN_HTTP_MAX_RETRIES` does not apply. A check is a
+decision, not a report: replaying it would turn one client request into several
+authorization decisions and amplify load onto a struggling authorizer.
+
+**What the check carries.** The HTTP ext-auth protocol's automatic fields are
+all present: the original request **method**, the (prefixed) **path**, the
+original **Host** authority, and **Content-Length** when a body is sent.
+Carrying the original authority is a header only — the connection is always
+dialled at the provider's own configured `service`/`port`, so a client-supplied
+authority can never route the provider connection. The query string is **not**
+forwarded (a credential in it must not reach the provider).
+`includeAdditionalHeadersInCheck` values are **authoritative**: a fixed
+operator header replaces any same-named client header or
+`includeRequestHeadersInCheck` value rather than being appended beside it, and
+case-variant duplicate fixed names are rejected at admission so the winner is
+never iteration-order dependent.
+
+**Outcome classification** follows the Istio/Envoy HTTP ext-auth protocol
+exactly:
+
+| Provider response | Outcome |
+| --- | --- |
+| HTTP `200` | **allow** |
+| HTTP `5xx` | **failed check** — follows `failOpen`; `statusOnError` when fail-closed |
+| communication failure (connect / TLS / timeout, or an unreadable / oversize `200` response) | **failed check** — follows `failOpen`; `statusOnError` when fail-closed |
+| any other status (3xx, 4xx, and any non-`200` 2xx such as `204`) | **explicit denial**, carrying the provider's own status |
+
+The denial Ferrum emits is gateway-authored and carries a fixed JSON error
+body, so a denial status that cannot frame content — `1xx`, a non-`200` `2xx`
+such as `204`/`205`, and `304` — is replaced by a plain `403`. Forwarding one
+verbatim would put `Content-Length` on a response the client is required not to
+read a body for, leaving those bytes to be misparsed as the head of the next
+response on an HTTP/1.1 keep-alive connection. `3xx` (except `304`) and `4xx`
+pass through unchanged, so a redirect-to-login denial paired with
+`headersToDownstreamOnDeny: [location]` still works. Only the unrepresentable
+status is replaced: the decision is still a denial and is still counted as
+`denied_by_provider`.
+
+Ferrum never uses or forwards the provider response body. Once an explicit
+denial status has arrived, that status remains authoritative even if its
+discarded body is oversized or cannot be drained; `failOpen` therefore cannot
+convert a provider denial into an allow through a body-framing failure.
+
+A provider name this generation does not carry, a generation with no executor,
+an unavailable request body for a body-inspecting provider, a concurrency
+refusal, and task cancellation are all failed checks and therefore also honour
+`failOpen`. **Three** refusals are decided **without** contacting a provider and
+are therefore **not** subject to `failOpen`: a provider conflict (above), a
+matched delegation on a connection with no HTTP request to check, and a request
+body over the selected provider's `maxRequestBytes` (below).
+
+**Request body.** `includeRequestBodyInCheck.maxRequestBytes` is folded into
+the proxy's pre-`authorize` body ceiling, so an over-cap request is refused with
+**413 before the check is dispatched**. That shared ceiling is the **maximum**
+`maxRequestBytes` across the generation's providers, because one prebuffer
+serves whichever provider the matched CUSTOM rule selects — it is **not**
+necessarily the selected provider's own cap, so a generation that also carries a
+higher-cap provider lets a body over a lower-cap provider's `maxRequestBytes`
+reach the check. The per-provider cap is re-enforced there as an
+**unconditional client-facing 413**, before any provider I/O and before a
+concurrency permit is taken, and it is **never** subject to `failOpen`: with
+`allowPartialMessage` refused at admission there is no truncated body a strict
+provider could have decided on, so an unrelated provider's larger cap can never
+admit a request the selected provider's cap excluded. (A body that is *missing*
+rather than too large stays an ordinary failed check and still honours
+`failOpen`.) That ceiling and the buffering it implies apply **only** to
+requests a body-inspecting CUSTOM rule could actually reach: the per-request
+predicate is precise on method, path, and host, so an unrelated request on the
+same workload keeps its ordinary accepted body size.
+
+> **Deliberate narrowing:** `includeRequestBodyInCheck.allowPartialMessage:
+> true` is **rejected at every admission boundary** (Kubernetes translation,
+> the native/file mesh document, and the xDS carrier). Envoy's partial-message
+> mode checks a bounded prefix and still forwards the complete original body
+> upstream; Ferrum's authorize-phase buffer *is* the body the proxy forwards, so
+> honouring the flag would mean either truncating the backend-visible request or
+> retaining an unbounded body behind a cap the operator asked for. An
+> accepted-but-unreachable flag would be worse than a visible refusal.
+
+**Mutation is deliberately narrow.** `headersToDownstreamOnDeny` is honoured:
+those headers land on the gateway-authored denial this plugin itself produces.
+`headersToUpstreamOnAllow` and `headersToDownstreamOnAllow` are **rejected at
+admission**. Ferrum runs the check in the `authorize` phase, before route
+dispatch and before every request/response transformer, so a header written
+there would order differently against operator-authored rules on each ingress
+path; a protocol-dependent mutation of an authenticated request is exactly the
+gap this feature must not introduce. Wildcard header entries are refused for
+the same reason a prefix rule cannot be shown to exclude hop-by-hop, routing,
+mesh-identity, or gateway-reserved names. The provider's own response **body**
+is never echoed to the client. Credentials (`authorization`, `cookie`) reach a
+provider only by being named explicitly in `includeRequestHeadersInCheck`; the
+full client header map and the request query string are never forwarded.
+
+**Protocol coverage.** The check runs on every HTTP-family ingress path
+identically — HTTP/1.1, HTTP/2, native gRPC, HTTP/3, and HTTP relayed inside a
+mesh/HBONE CONNECT — because they share one `authorize` ladder. Layer-4
+sessions (raw TCP, TLS passthrough, UDP, DTLS) carry no HTTP request and cannot
+be checked: a CUSTOM rule that **matches** an L4 connection **denies** it rather
+than serving it unchecked. Following Istio, HTTP-only fields are treated as
+**always matched** on a non-HTTP port for `DENY` **and `CUSTOM`** alike, so a
+CUSTOM rule carrying `paths` / `methods` / `headers` / `when: request.auth.*`
+still matches an L4 connection and still closes it — it does not quietly become
+inert. Scope a CUSTOM policy with `to.operation.ports` when the selected
+workload also serves non-HTTP ports.
+
+**Reload and withdrawal.** Providers ride the mesh slice (and their own
+`ExtAuthzProvidersCarrier` ECDS carrier over xDS, re-validated at the ACK
+boundary), and `MeshSlice::content_eq` compares them, so editing only
+`meshConfig.extensionProviders` still republishes. Each slice carries only the
+providers its retained policies actually bind. Deleting a CUSTOM policy retires
+its executor with the generation — there is no background task or detached
+queue to leak. A provider that cannot be prepared rejects the whole plugin
+generation, so the previous valid one keeps serving.
+
+**Observability.** `ferrum_mesh_ext_authz_checks_total{outcome}` and
+`ferrum_mesh_ext_authz_check_failures_total{disposition}` are fixed-cardinality:
+the labels are closed enums plus the gateway namespace, never a provider,
+policy, route, host, principal, or status string. `mesh_authz.ext_authz_outcome`
+request metadata carries the same closed reason token. Every matched
+delegation is counted **exactly once**, including the outcomes decided without
+contacting a provider (`provider_unbound` when no executor or no binding,
+`provider_conflict`, `unexecutable` for an L4 session), so a fail-closed
+denial is never invisible. `outcome` values are `allowed`, `denied_by_provider`,
+`provider_unbound`, `provider_error`, `provider_conflict`, `unexecutable`,
+`timeout`, `transport_error`, `response_refused`, `body_unavailable`,
+`body_too_large`, and `concurrency_exhausted`. `body_unavailable` (a failed
+check `failOpen` may admit) and `body_too_large` (the unconditional over-cap
+refusal) are deliberately separate series. No request body, credential header
+value, provider secret, or resolved provider URL is ever logged.
 
 ### Rule Matching
 
@@ -2175,10 +2525,10 @@ A listener that is edited, replaced, or deleted takes effect on the next slice a
 
 **Fail-closed transport gate.** The socket path rides the reserved `mesh.unix_socket` tag on the materialized upstream's single target — the same mechanism `mesh.hbone` / `mesh.mtls` use, and the same reserved `mesh.` namespace that is stripped from every operator/workload label copy, so a pod label can never forge it. Operator-provided upstream targets are also forbidden from setting any `mesh.*` tag through admin create/update, API-spec import, restore, or file configuration; only Ferrum's trusted mesh projection may stamp those transport markers. A target carrying the tag is dialed over a Unix stream **or the request is refused**; it is never downgraded to the target's placeholder `host:port` (which nothing listens on).
 
-### `bind` and `captureMode` limitations
+### `bind` and `captureMode`
 
-- **`bind`** — Ferrum's capture model funnels all inbound through the shared `:15006` listener (matched by captured original destination = the dialed listener port), so a custom `bind` address does **not** open a separate OS listener; it is preserved on the parsed model for observability. Unix-socket `bind` values are invalid (Istio rejects them too). **Issue #3266** tracks dedicated bind-address socket materialization separately; stream-ingress modeling (#3260) intentionally keeps this capture-listener contract and does not absorb custom-bind behavior.
-- **`captureMode`** — Ferrum assumes `IPTABLES`/`DEFAULT` capture (the sidecar redirect model). `captureMode: NONE` (the app handles capture itself) is not separately honored; the listener-port disambiguation relies on the captured original destination or the request authority port being present.
+- **`bind` (issue #3266)** — Omitted, empty, or unspecified (`0.0.0.0` / `::`) keeps the shared capture-listener contract: inbound traffic still enters through `:15006` and is disambiguated by captured original destination / authority port. A supported **dedicated** bind (`127.0.0.1` / `::1`) is conflict-checked against Gateway/stream/mesh listener ownership and materialized as a real OS listener on `bind:port` (HTTP via `GatewayListenerManager`, stream via `StreamListenerManager`) while the shared capture path remains for mesh peers. The dedicated HTTP accept loop is stamped as mesh inbound, and its configured/accepted listener port is the authoritative AuthorizationPolicy destination port; it never widens onto an ordinary process-global frontend or falls back to the `defaultEndpoint` port for authorization. Dedicated-bind HTTP routes are exact-listener only: they do **not** participate in single-listener Service remap, so a lone loopback bind cannot steal `:15006` / process-global matches from the port-agnostic capture sibling. Unsupported or unrepresentable values (Unix-domain sockets, hostnames, `ip:port`, non-loopback addresses) fail closed with field-specific `deferred_fields` / resolve diagnostics rather than being accepted as inert metadata. A dedicated bind that collides with an already-owned port, or that pairs with a `unix://` `defaultEndpoint`, fails closed for that **whole** ingress entry: it is removed from the prepared `local_ingress_listeners` set as well as bind-proxy / capture-route materialization, so there is no silent shared-capture or authenticated-CONNECT fallback. `sidecar_ingress_declared` and `declared_ingress_http_ports` stay independent of that admission so all-rejected / empty cases still fail closed without restoring default inbound behavior or incorrectly lowering the operator-declared HTTP port count.
+- **`captureMode`** — Ferrum assumes `IPTABLES`/`DEFAULT` capture (the sidecar redirect model). `captureMode: NONE` (the app handles capture itself) is not separately honored; the listener-port disambiguation relies on the captured original destination or the request authority port being present. Dedicated loopback binds still provide direct `bind:port` exposure for local dialers that bypass capture.
 
 ### xDS / file / native parity
 
@@ -4246,7 +4596,7 @@ materialization. Listener status reports `Accepted=False` and
 path. Valid `All`, `Same`, empty-selector, and well-formed selector behavior is
 unchanged, and valid sibling listeners reconcile independently.
 
-Gateway API status writing requires `get/list/watch` on `gatewayclasses`, `gateways`, `listenersets`, `httproutes`, `grpcroutes`, `tcproutes`, `tlsroutes`, `udproutes`, `referencegrants`, and `backendtlspolicies`, plus `get/list/watch` on MCS `serviceimports`, plus `get/list/watch` on core `secrets`/`configmaps`/`services`/`endpointslices` for certificate, BackendTLSPolicy CA, and optional EndpointSlice backend resolution, plus `patch` on Gateway/ListenerSet/route/`backendtlspolicies` `status` subresources. `GatewayClass` is cluster-scoped; route, Gateway, ListenerSet, and ServiceImport watches are namespaced when `FERRUM_K8S_WATCH_NAMESPACES` is set. The Helm chart grants these verbs through `controlPlane.rbac.*`; disable unused watches there when installing a narrower controller.
+Gateway API status writing requires `get/list/watch` on `gatewayclasses`, `gateways`, `listenersets`, `httproutes`, `grpcroutes`, `tcproutes`, `tlsroutes`, `udproutes`, `referencegrants`, `backendtlspolicies`, and `backendlbpolicies`, plus `get/list/watch` on `xbackendtrafficpolicies` in the separate `gateway.networking.x-k8s.io` group (the pinned experimental channel's BackendLBPolicy successor — a grant on `gateway.networking.k8s.io` does not cover it), plus `get/list/watch` on MCS `serviceimports`, plus `get/list/watch` on core `namespaces` (`allowedRoutes.namespaces.from: Selector` is evaluated against the route namespace's own labels, so this watch is part of the route-attachment authorization boundary, not an optimization) and `secrets`/`configmaps`/`services`/`endpointslices` for certificate, BackendTLSPolicy CA, and optional EndpointSlice backend resolution, plus `patch` on Gateway/ListenerSet/route/`backendtlspolicies`/`backendlbpolicies`/`xbackendtrafficpolicies` `status` subresources. A watched kind that is installed but not granted is not a quiet degradation: the watcher starts, every list is rejected `403`, and the reflector retries under backoff for the life of the process, competing with the idle-relist generations every other scope depends on. `GatewayClass` is cluster-scoped; route, Gateway, ListenerSet, and ServiceImport watches are namespaced when `FERRUM_K8S_WATCH_NAMESPACES` is set, while the `Namespace` watch is always cluster-scoped. The Helm chart grants these verbs through `controlPlane.rbac.*`; disable unused watches there when installing a narrower controller.
 
 ### Synthetic Gateway / ListenerSet MeshService names
 
