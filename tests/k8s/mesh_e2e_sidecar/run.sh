@@ -119,6 +119,12 @@ MANIFESTS="$ROOT_DIR/tests/k8s/mesh_e2e_sidecar/manifests.yaml"
 LIVE_ASSERTIONS_HELPER="$ROOT_DIR/tests/k8s/lib/live_assertions.sh"
 SPIRE_HELPER="$ROOT_DIR/tests/k8s/lib/spire.sh"
 NATIVE_PROBE_CLASSIFY_HELPER="$ROOT_DIR/tests/k8s/lib/native_probe_classify.py"
+# Classifier --evidence-out labels each negative must pin (not broad TLS classes).
+NATIVE_EVID_CP_NO_CERT='cp_tls_rejected ip=.* reason=peer sent no certificates'
+NATIVE_EVID_CP_UNKNOWN_ISSUER='cp_tls_rejected ip=.* reason=invalid peer certificate: UnknownIssuer'
+NATIVE_EVID_CLIENT_SERVER_VERIFY='^client_tls_verify$'
+NATIVE_EVID_CLIENT_TLS_NAME='^client_tls_name$'
+NATIVE_EVID_CP_JWT_AUTH_FAILED='cp_jwt_rejected node_id=.* reason=Invalid token: authentication failed'
 # shellcheck source=../lib/live_assertions.sh
 source "$LIVE_ASSERTIONS_HELPER"
 # shellcheck source=../lib/spire.sh
@@ -1621,12 +1627,13 @@ classify_native_probe() {
 }
 
 wait_for_native_probe_class() {
-  local deploy="$1" want="${2:-}"
-  local class="" _
+  local deploy="$1" want="${2:-}" want_evidence="${3:-}"
+  local class="" server_ev="" _
   # Client "Connected to CP" is a transient transport-attempt; the helper may
   # still return connected-without-jwt-class until exact CP evidence for this
-  # probe is visible. Do not treat that as a terminal class when a pattern is
-  # supplied. 30*2s covers image-already-loaded scheduling plus one reconnect.
+  # probe is visible. A matching class alone is not enough when want_evidence
+  # is set — generic client handshake/verify lines may arrive first. 30*2s
+  # covers image-already-loaded scheduling plus one reconnect.
   for _ in $(seq 1 30); do
     if native_probe_container_running "$deploy"; then
       class="$(classify_native_probe "$deploy")"
@@ -1634,10 +1641,17 @@ wait_for_native_probe_class() {
         printf '%s' "$class"
         return 0
       fi
+      server_ev=""
+      if [[ -f "$RESULTS_DIR/${deploy}.server-evidence.txt" ]]; then
+        server_ev="$(tr '\n' ' ' < "$RESULTS_DIR/${deploy}.server-evidence.txt")"
+      fi
       if [[ -n "$want" ]]; then
         if printf '%s' "$class" | grep -Eq "^($want)$"; then
-          printf '%s' "$class"
-          return 0
+          if [[ -z "$want_evidence" ]] \
+            || printf '%s' "$server_ev" | grep -Eq "$want_evidence"; then
+            printf '%s' "$class"
+            return 0
+          fi
         fi
       elif [[ "$class" != "noop" && "$class" != "connected-without-jwt-class" ]]; then
         printf '%s' "$class"
@@ -1773,28 +1787,29 @@ delete_native_mtls_probes() {
 }
 
 record_native_negative() {
-  local assertion_id="$1" deploy="$2" want_pattern="$3"
+  local assertion_id="$1" deploy="$2" want_pattern="$3" want_evidence="${4:-}"
   local class evidence server_ev=""
-  class="$(wait_for_native_probe_class "$deploy" "$want_pattern")"
+  class="$(wait_for_native_probe_class "$deploy" "$want_pattern" "$want_evidence")"
   if [[ -f "$RESULTS_DIR/${deploy}.server-evidence.txt" ]]; then
     server_ev="$(tr '\n' ' ' < "$RESULTS_DIR/${deploy}.server-evidence.txt")"
   fi
   evidence="$(native_probe_logs "$deploy" | redact_native_transport_evidence | tr '\n' ' ')"
   printf 'class=%s\nserver=%s\nclient=%s\n' "$class" "$server_ev" "$evidence" \
     > "$RESULTS_DIR/${deploy}.txt"
-  log "$deploy class=$class (want $want_pattern) server=${server_ev}"
+  log "$deploy class=$class (want $want_pattern evidence=$want_evidence) server=${server_ev}"
   if [[ "$class" == slice-accepted || "$class" == crash || "$class" == leaked-material || "$class" == noop ]]; then
     record_live_assertion "$assertion_id" fail "$deploy" ferrum-cp \
-      "class=$class want=$want_pattern server=${server_ev}" "${deploy}.txt"
+      "class=$class want=$want_pattern evidence=$want_evidence server=${server_ev}" "${deploy}.txt"
     return 1
   fi
-  if printf '%s' "$class" | grep -Eq "^($want_pattern)$"; then
+  if printf '%s' "$class" | grep -Eq "^($want_pattern)$" \
+    && { [[ -z "$want_evidence" ]] || printf '%s' "$server_ev" | grep -Eq "$want_evidence"; }; then
     record_live_assertion "$assertion_id" pass "$deploy" ferrum-cp \
       "class=$class server=${server_ev}" "${deploy}.txt"
     return 0
   fi
   record_live_assertion "$assertion_id" fail "$deploy" ferrum-cp \
-    "class=$class want=$want_pattern server=${server_ev}" "${deploy}.txt"
+    "class=$class want=$want_pattern evidence=$want_evidence server=${server_ev}" "${deploy}.txt"
   return 1
 }
 
@@ -1815,15 +1830,15 @@ probe_native_mtls_negatives() {
     ferrum-native-mtls-dp true
 
   record_native_negative sidecar.config.native_subscribe_mtls_omitted_client_rejected \
-    native-omit-client 'tls-handshake|tls-verify' || failed=true
+    native-omit-client tls-handshake "$NATIVE_EVID_CP_NO_CERT" || failed=true
   record_native_negative sidecar.config.native_subscribe_mtls_foreign_client_rejected \
-    native-foreign-client 'tls-handshake|tls-verify' || failed=true
+    native-foreign-client tls-verify "$NATIVE_EVID_CP_UNKNOWN_ISSUER" || failed=true
   record_native_negative sidecar.config.native_subscribe_tls_untrusted_server_ca_rejected \
-    native-untrusted-ca 'tls-verify|tls-handshake' || failed=true
+    native-untrusted-ca tls-verify "$NATIVE_EVID_CLIENT_SERVER_VERIFY" || failed=true
   record_native_negative sidecar.config.native_subscribe_tls_wrong_san_rejected \
-    native-wrong-san 'tls-name|tls-verify|tls-handshake' || failed=true
+    native-wrong-san tls-name "$NATIVE_EVID_CLIENT_TLS_NAME" || failed=true
   record_native_negative sidecar.config.native_subscribe_jwt_rejected \
-    native-jwt-invalid jwt || failed=true
+    native-jwt-invalid jwt "$NATIVE_EVID_CP_JWT_AUTH_FAILED" || failed=true
 
   delete_native_mtls_probes
   if [[ "$failed" == "true" ]]; then
@@ -2098,21 +2113,26 @@ else:
   apply_native_mtls_probe native-stale-client \
     "https://$NATIVE_CP_DNS:50051" cp-dp-grpc-jwt-secret \
     ferrum-native-mtls-stale-client true
-  local stale_class
-  stale_class="$(wait_for_native_probe_class native-stale-client 'tls-handshake|tls-verify')"
+  local stale_class stale_ev=""
+  stale_class="$(wait_for_native_probe_class native-stale-client tls-verify \
+    "$NATIVE_EVID_CP_UNKNOWN_ISSUER")"
+  if [[ -f "$RESULTS_DIR/native-stale-client.server-evidence.txt" ]]; then
+    stale_ev="$(tr '\n' ' ' < "$RESULTS_DIR/native-stale-client.server-evidence.txt")"
+  fi
   kubectl --context "$CONTEXT" -n "$NS" delete deploy native-stale-client \
     --wait=true --timeout=60s >/dev/null 2>&1 || true
   kubectl --context "$CONTEXT" -n "$NS" delete secret ferrum-native-mtls-stale-client \
     --wait=false >/dev/null 2>&1 || true
 
   local outcome
-  outcome="rotated=$rotated live_serial=$live_serial want_serial=$NATIVE_SERVER_SERIAL_GEN2 observe_class=${NATIVE_CP_SERVED_CLASS:-} traffic=$status stale_class=$stale_class $drift_verdict"
+  outcome="rotated=$rotated live_serial=$live_serial want_serial=$NATIVE_SERVER_SERIAL_GEN2 observe_class=${NATIVE_CP_SERVED_CLASS:-} traffic=$status stale_class=$stale_class stale_evidence=$stale_ev $drift_verdict"
   printf '%s\n' "$outcome" > "$RESULTS_DIR/native-mtls-rotation.txt"
   log "native TLS rotation: $outcome"
   if [[ "$rotated" == "true" && "$observe_ok" == "true" \
     && -n "$live_serial" && "$live_serial" == "$NATIVE_SERVER_SERIAL_GEN2" \
     && "$traffic_ok" == "true" && "$drift_verdict" == native-slice-received* \
-    && "$stale_class" =~ ^(tls-handshake|tls-verify)$ ]]; then
+    && "$stale_class" == tls-verify \
+    && printf '%s' "$stale_ev" | grep -Eq "$NATIVE_EVID_CP_UNKNOWN_ISSUER" ]]; then
     record_live_assertion sidecar.config.native_subscribe_tls_rotation_reconnects pass \
       capp ferrum-cp "$outcome" "native-mtls-rotation.txt"
     return 0

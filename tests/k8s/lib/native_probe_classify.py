@@ -41,6 +41,32 @@ TLS_HANDSHAKE_REASONS = frozenset({"peer sent no certificates"})
 TLS_VERIFY_REASONS = frozenset({"invalid peer certificate: UnknownIssuer"})
 TLS_REASONS = TLS_HANDSHAKE_REASONS | TLS_VERIFY_REASONS
 
+# Per-control evidence labels the live fixture must pin (not broad TLS classes).
+CONTROL_EVIDENCE = {
+    "omit-client": (
+        "tls-handshake",
+        "cp_tls_rejected ip=",
+        "reason=peer sent no certificates",
+    ),
+    "foreign-client": (
+        "tls-verify",
+        "cp_tls_rejected ip=",
+        "reason=invalid peer certificate: UnknownIssuer",
+    ),
+    "untrusted-server-ca": ("tls-verify", "client_tls_verify"),
+    "wrong-san": ("tls-name", "client_tls_name"),
+    "invalid-jwt": (
+        "jwt",
+        "cp_jwt_rejected node_id=",
+        CP_JWT_REASON,
+    ),
+    "stale-client": (
+        "tls-verify",
+        "cp_tls_rejected ip=",
+        "reason=invalid peer certificate: UnknownIssuer",
+    ),
+}
+
 FIELD_TERMINATORS = frozenset(' ",}\n\r\t')
 
 
@@ -387,7 +413,7 @@ def self_test() -> None:
     )
 
     _assert_class(
-        connected + failed,
+        connected,
         "\n".join(
             [
                 _json_tls_line(kubelet_ip, "peer sent no certificates"),
@@ -483,6 +509,40 @@ def self_test() -> None:
         "client_jwt",
         "preserve-client-jwt-negative",
     )
+
+    _assert_class(
+        connected + failed,
+        "",
+        omit_ip,
+        omit_name,
+        "tls-handshake",
+        "client_tls_handshake",
+        "generic-client-handshake-is-not-cp-omit-proof",
+    )
+    _assert_class(
+        connected + failed,
+        "",
+        foreign_ip,
+        "native-foreign-client-5d4c3b2a1e-fghij",
+        "tls-handshake",
+        "client_tls_handshake",
+        "generic-client-handshake-is-not-cp-foreign-proof",
+    )
+    _assert_class(
+        connected + "error: gRPC UNAUTHENTICATED\n",
+        "",
+        "10.244.0.16",
+        jwt_name,
+        "jwt",
+        "client_jwt",
+        "client-jwt-alone-is-not-cp-meshsubscribe-proof",
+    )
+
+    for control, (want_class, *needles) in CONTROL_EVIDENCE.items():
+        if want_class not in {"tls-handshake", "tls-verify", "tls-name", "jwt"}:
+            raise AssertionError(f"{control}: unexpected class {want_class!r}")
+        if not needles:
+            raise AssertionError(f"{control}: missing evidence needles")
 
     compact = (
         f"remote_addr={omit_ip} error=peer sent no certificates "

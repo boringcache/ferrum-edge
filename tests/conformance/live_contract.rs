@@ -1013,6 +1013,109 @@ fn native_probe_classifier_contract_violations(
     errors
 }
 
+fn native_mtls_negative_control_contract_violations(run_sh: &str, helper: &str) -> Vec<String> {
+    let mut errors = Vec::new();
+
+    for banned in [
+        "'tls-handshake|tls-verify'",
+        "'tls-verify|tls-handshake'",
+        "'tls-name|tls-verify|tls-handshake'",
+        "^(tls-handshake|tls-verify)$",
+    ] {
+        if run_sh.contains(banned) {
+            errors.push(format!(
+                "run.sh must not accept broad native negative TLS classes (`{banned}`)"
+            ));
+        }
+    }
+
+    for (needle, desc) in [
+        (
+            "NATIVE_EVID_CP_NO_CERT=",
+            "exact CP omit-client evidence constant",
+        ),
+        (
+            "NATIVE_EVID_CP_UNKNOWN_ISSUER=",
+            "exact CP UnknownIssuer evidence constant",
+        ),
+        (
+            "NATIVE_EVID_CLIENT_SERVER_VERIFY=",
+            "client-side server-verify evidence constant",
+        ),
+        (
+            "NATIVE_EVID_CLIENT_TLS_NAME=",
+            "client-side hostname/SAN evidence constant",
+        ),
+        (
+            "NATIVE_EVID_CP_JWT_AUTH_FAILED=",
+            "exact CP MeshSubscribe JWT rejection evidence constant",
+        ),
+        (
+            "native-omit-client tls-handshake \"$NATIVE_EVID_CP_NO_CERT\"",
+            "omitted-client requires tls-handshake plus CP no-cert evidence",
+        ),
+        (
+            "native-foreign-client tls-verify \"$NATIVE_EVID_CP_UNKNOWN_ISSUER\"",
+            "foreign-client requires tls-verify plus CP UnknownIssuer evidence",
+        ),
+        (
+            "native-untrusted-ca tls-verify \"$NATIVE_EVID_CLIENT_SERVER_VERIFY\"",
+            "untrusted-server-CA requires client-side tls-verify evidence",
+        ),
+        (
+            "native-wrong-san tls-name \"$NATIVE_EVID_CLIENT_TLS_NAME\"",
+            "wrong-SAN requires client-side tls-name evidence",
+        ),
+        (
+            "native-jwt-invalid jwt \"$NATIVE_EVID_CP_JWT_AUTH_FAILED\"",
+            "invalid-JWT requires jwt plus CP MeshSubscribe auth-failure evidence",
+        ),
+        (
+            "wait_for_native_probe_class native-stale-client tls-verify",
+            "post-rotation stale client requires tls-verify (not generic handshake)",
+        ),
+        (
+            "stale_evidence=$stale_ev",
+            "rotation gate records stale-client classifier evidence",
+        ),
+        (
+            "printf '%s' \"$stale_ev\" | grep -Eq \"$NATIVE_EVID_CP_UNKNOWN_ISSUER\"",
+            "rotation gate requires CP UnknownIssuer evidence for gen1 stale client",
+        ),
+        (
+            "wait_for_native_probe_class \"$deploy\" \"$want_pattern\" \"$want_evidence\"",
+            "negative wait loop must gate on classifier evidence, not class alone",
+        ),
+    ] {
+        if !run_sh.contains(needle) {
+            errors.push(format!("run.sh missing {desc} (`{needle}`)"));
+        }
+    }
+
+    for (needle, desc) in [
+        (
+            "CONTROL_EVIDENCE = {",
+            "classifier pins per-control evidence expectations",
+        ),
+        (
+            "generic-client-handshake-is-not-cp-omit-proof",
+            "classifier self-test that generic handshake is not CP omit proof",
+        ),
+        (
+            "client-jwt-alone-is-not-cp-meshsubscribe-proof",
+            "classifier self-test that client UNAUTH alone is not CP JWT proof",
+        ),
+    ] {
+        if !helper.contains(needle) {
+            errors.push(format!(
+                "native probe classifier helper missing {desc} (`{needle}`)"
+            ));
+        }
+    }
+
+    errors
+}
+
 /// Issue #3855 hosted Mesh E2E Sidecar: omit-client, foreign-client, and
 /// invalid-JWT were classified `connected-without-jwt-class` from the client
 /// `Connected to CP` line even though ferrum-cp had already rejected each
@@ -1029,6 +1132,29 @@ fn live_contract_sidecar_native_probe_classifier_correlates_cp_evidence() {
     assert!(
         violations.is_empty(),
         "native probe classifier must correlate exact CP evidence: {violations:?}"
+    );
+
+    let negative_violations = native_mtls_negative_control_contract_violations(RUN_SH, HELPER);
+    assert!(
+        negative_violations.is_empty(),
+        "native negative controls must require control-specific evidence: {negative_violations:?}"
+    );
+
+    let broad_negative_proof = r#"
+record_native_negative sidecar.config.native_subscribe_mtls_omitted_client_rejected \
+  native-omit-client 'tls-handshake|tls-verify' || failed=true
+record_native_negative sidecar.config.native_subscribe_tls_wrong_san_rejected \
+  native-wrong-san 'tls-name|tls-verify|tls-handshake' || failed=true
+stale_class="$(wait_for_native_probe_class native-stale-client 'tls-handshake|tls-verify')"
+"#;
+    let broad_violations = native_mtls_negative_control_contract_violations(broad_negative_proof, HELPER);
+    assert!(
+        !broad_violations.is_empty(),
+        "contract must reject broad native negative TLS class alternation"
+    );
+    assert!(
+        broad_violations.iter().any(|error| error.contains("broad native negative TLS")),
+        "broad-pattern rejection must name the alternation, got {broad_violations:?}"
     );
 
     let generic_cp_grep = r#"

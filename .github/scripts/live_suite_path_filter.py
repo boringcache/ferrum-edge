@@ -376,6 +376,12 @@ def native_mtls_fixture_contract_errors(root: Path) -> list[str]:
             "handshake rejections the classifier correlates by pod IP"
         )
 
+    helper_path = root / "tests/k8s/lib/native_probe_classify.py"
+    helper_text = (
+        helper_path.read_text(encoding="utf-8") if helper_path.is_file() else ""
+    )
+    errors.extend(native_mtls_negative_control_contract_errors(run_text, helper_text))
+
     required_ids = (
         "sidecar.config.native_subscribe_delivered",
         "sidecar.config.native_subscribe_mtls_omitted_client_rejected",
@@ -414,6 +420,114 @@ def native_mtls_fixture_contract_errors(root: Path) -> list[str]:
     if "CP-DP gRPC TLS is an orthogonal" in contract_text:
         errors.append("ga_contract.yaml still treats CP/DP TLS as orthogonal")
     return errors
+
+
+def native_mtls_negative_control_contract_errors(run_text: str, helper_text: str) -> list[str]:
+    """Reject broad native negative TLS classes; pin per-control evidence."""
+
+    errors: list[str] = []
+    for banned in (
+        "'tls-handshake|tls-verify'",
+        "'tls-verify|tls-handshake'",
+        "'tls-name|tls-verify|tls-handshake'",
+        "^(tls-handshake|tls-verify)$",
+    ):
+        if banned in run_text:
+            errors.append(
+                f"run.sh must not accept broad native negative TLS classes (`{banned}`)"
+            )
+
+    for needle, desc in (
+        ("NATIVE_EVID_CP_NO_CERT=", "exact CP omit-client evidence constant"),
+        (
+            "NATIVE_EVID_CP_UNKNOWN_ISSUER=",
+            "exact CP UnknownIssuer evidence constant",
+        ),
+        (
+            "NATIVE_EVID_CLIENT_SERVER_VERIFY=",
+            "client-side server-verify evidence constant",
+        ),
+        ("NATIVE_EVID_CLIENT_TLS_NAME=", "client-side hostname/SAN evidence constant"),
+        (
+            "NATIVE_EVID_CP_JWT_AUTH_FAILED=",
+            "exact CP MeshSubscribe JWT rejection evidence constant",
+        ),
+        (
+            'native-omit-client tls-handshake "$NATIVE_EVID_CP_NO_CERT"',
+            "omitted-client requires tls-handshake plus CP no-cert evidence",
+        ),
+        (
+            'native-foreign-client tls-verify "$NATIVE_EVID_CP_UNKNOWN_ISSUER"',
+            "foreign-client requires tls-verify plus CP UnknownIssuer evidence",
+        ),
+        (
+            'native-untrusted-ca tls-verify "$NATIVE_EVID_CLIENT_SERVER_VERIFY"',
+            "untrusted-server-CA requires client-side tls-verify evidence",
+        ),
+        (
+            'native-wrong-san tls-name "$NATIVE_EVID_CLIENT_TLS_NAME"',
+            "wrong-SAN requires client-side tls-name evidence",
+        ),
+        (
+            'native-jwt-invalid jwt "$NATIVE_EVID_CP_JWT_AUTH_FAILED"',
+            "invalid-JWT requires jwt plus CP MeshSubscribe auth-failure evidence",
+        ),
+        (
+            "wait_for_native_probe_class native-stale-client tls-verify",
+            "post-rotation stale client requires tls-verify (not generic handshake)",
+        ),
+        (
+            'printf \'%s\' "$stale_ev" | grep -Eq "$NATIVE_EVID_CP_UNKNOWN_ISSUER"',
+            "rotation gate requires CP UnknownIssuer evidence for gen1 stale client",
+        ),
+        (
+            'wait_for_native_probe_class "$deploy" "$want_pattern" "$want_evidence"',
+            "negative wait loop must gate on classifier evidence, not class alone",
+        ),
+    ):
+        if needle not in run_text:
+            errors.append(f"run.sh missing {desc} (`{needle}`)")
+
+    for needle, desc in (
+        ("CONTROL_EVIDENCE = {", "classifier pins per-control evidence expectations"),
+        (
+            "generic-client-handshake-is-not-cp-omit-proof",
+            "classifier self-test that generic handshake is not CP omit proof",
+        ),
+        (
+            "client-jwt-alone-is-not-cp-meshsubscribe-proof",
+            "classifier self-test that client UNAUTH alone is not CP JWT proof",
+        ),
+    ):
+        if needle not in helper_text:
+            errors.append(
+                f"native probe classifier helper missing {desc} (`{needle}`)"
+            )
+
+    return errors
+
+
+def native_mtls_negative_control_self_test() -> list[str]:
+    """Pin rejection of broad native negative TLS class alternation."""
+
+    failures: list[str] = []
+    helper_path = Path.cwd() / "tests/k8s/lib/native_probe_classify.py"
+    helper_text = helper_path.read_text(encoding="utf-8") if helper_path.is_file() else ""
+    broad_proof = """
+record_native_negative sidecar.config.native_subscribe_mtls_omitted_client_rejected \\
+  native-omit-client 'tls-handshake|tls-verify' || failed=true
+stale_class="$(wait_for_native_probe_class native-stale-client 'tls-handshake|tls-verify')"
+"""
+    broad_errors = native_mtls_negative_control_contract_errors(broad_proof, helper_text)
+    if not broad_errors:
+        failures.append(
+            "native negative control contract accepted broad TLS class alternation"
+        )
+    elif not any("broad native negative TLS" in error for error in broad_errors):
+        failures.append(
+            "native negative control contract must name broad TLS alternation rejection"
+        )
+    return failures
 
 
 _BASH_FUNC_DEF_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\(\)\s*\{")
@@ -767,6 +881,7 @@ def self_test() -> int:
             )
     failures.extend(native_mtls_fixture_contract_errors(Path.cwd()))
     failures.extend(native_mtls_rotation_observation_self_test())
+    failures.extend(native_mtls_negative_control_self_test())
     for failure in failures:
         print(f"::error::{failure}", file=sys.stderr)
     return 1 if failures else 0
