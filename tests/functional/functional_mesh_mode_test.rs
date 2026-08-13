@@ -18313,10 +18313,8 @@ fn h3_mesh_observed_http_authority(req: &hyper::Request<hyper::body::Incoming>) 
 /// HBONE speaks HTTP/1.1 *inside* the CONNECT byte tunnel (the same inner
 /// client as H1/H2 `proxy_to_backend_hbone`); an h2c-only app cannot
 /// handshake and surfaces `{"error":"HBONE backend unavailable"}`.
-async fn serve_h3_mesh_http1_echo<T>(
-    io: T,
-    observations: Arc<Mutex<Vec<H3MeshObservedHttp>>>,
-) where
+async fn serve_h3_mesh_http1_echo<T>(io: T, observations: Arc<Mutex<Vec<H3MeshObservedHttp>>>)
+where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let service = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
@@ -18608,16 +18606,13 @@ async fn functional_h3_plain_dispatches_over_same_cluster_sidecar_mesh_mtls() {
 /// yields 502 `{"error":"HBONE backend unavailable"}` after CONNECT succeeds.
 #[test]
 fn h3_plain_ambient_hbone_inner_app_is_http1_not_h2c() {
-    let test = mesh_test_fn_body(
-        "functional_h3_plain_dispatches_over_same_cluster_ambient_hbone",
-    );
+    let test = mesh_test_fn_body("functional_h3_plain_dispatches_over_same_cluster_ambient_hbone");
     assert!(
         test.contains("start_h3_mesh_http1_http_app("),
         "plain Ambient HBONE must reach an HTTP/1.1 app through the byte tunnel"
     );
     assert!(
-        !test.contains("start_h3_mesh_h2c_http_app(")
-            && !test.contains("start_h3_mesh_h2c_app("),
+        !test.contains("start_h3_mesh_h2c_http_app(") && !test.contains("start_h3_mesh_h2c_app("),
         "gRPC h2c fixtures cannot handshake the HTTP/1.1 inner HBONE client"
     );
     let app = mesh_test_fn_body("start_h3_mesh_http1_http_app");
