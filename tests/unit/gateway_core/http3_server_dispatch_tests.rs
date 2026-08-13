@@ -2736,6 +2736,20 @@ fn h3_quinn_vendored_send_stream_stopped_is_shared_and_static() {
 /// under PERMISSIVE PeerAuthentication (the RPC succeeds, just without
 /// SVID-mTLS, identity pinning, and mesh authz identity), so it is worth
 /// freezing structurally.
+fn bounded_h3_grpc_transport_resolve_calls(region: &str) -> Vec<&str> {
+    const RESOLVE_H3_GRPC_TRANSPORT: &str = "resolve_h3_grpc_transport(";
+    region
+        .match_indices(RESOLVE_H3_GRPC_TRANSPORT)
+        .map(|(idx, _)| {
+            let tail = &region[idx..];
+            let close = tail
+                .find(") {")
+                .expect("each H3→gRPC transport resolution must close before its match arm");
+            &tail[..close + 3]
+        })
+        .collect()
+}
+
 #[test]
 fn h3_grpc_dispatch_paths_dial_through_the_resolved_mesh_transport() {
     let source = include_str!("../../../src/http3/cross_protocol.rs");
@@ -2747,10 +2761,22 @@ fn h3_grpc_dispatch_paths_dial_through_the_resolved_mesh_transport() {
         .split("pub(crate) async fn dispatch_grpc_streaming(")
         .next()
         .expect("buffered H3→gRPC dispatcher must remain bounded");
-    assert!(
-        buffered.contains("resolve_h3_grpc_transport(state, current_target.as_deref())"),
-        "the buffered path must resolve a transport for its selected target"
+    let buffered_resolves = bounded_h3_grpc_transport_resolve_calls(buffered);
+    assert_eq!(
+        buffered_resolves.len(),
+        2,
+        "the initial target and every rotated retry target must each be resolved"
     );
+    for (i, call) in buffered_resolves.iter().enumerate() {
+        assert!(
+            call.contains("current_target.as_deref()"),
+            "buffered transport resolution #{i} must pass the selected target"
+        );
+        assert!(
+            call.contains("ctx.peer_spiffe_id.as_ref()"),
+            "buffered transport resolution #{i} must preserve the authenticated frontend identity"
+        );
+    }
     assert!(
         buffered.contains("&initial_grpc_transport,"),
         "the initial attempt must dial through the resolved transport"
@@ -2758,13 +2784,6 @@ fn h3_grpc_dispatch_paths_dial_through_the_resolved_mesh_transport() {
     assert!(
         buffered.contains("&grpc_retry_transport,"),
         "a rotated retry target must dial through ITS OWN re-resolved transport"
-    );
-    assert_eq!(
-        buffered
-            .matches("resolve_h3_grpc_transport(state, current_target.as_deref())")
-            .count(),
-        2,
-        "the initial target and every rotated retry target must each be resolved"
     );
     assert_eq!(
         buffered
@@ -2781,9 +2800,20 @@ fn h3_grpc_dispatch_paths_dial_through_the_resolved_mesh_transport() {
         .split("\nasync fn apply_buffered_plain_plugin_reject")
         .next()
         .expect("streaming H3→gRPC dispatcher must remain bounded");
-    assert!(
-        streaming.contains("resolve_h3_grpc_transport(state, current_target.as_deref())"),
+    let streaming_resolves = bounded_h3_grpc_transport_resolve_calls(streaming);
+    assert_eq!(
+        streaming_resolves.len(),
+        1,
         "the streaming path must resolve a transport for its selected target"
+    );
+    let streaming_resolve = streaming_resolves[0];
+    assert!(
+        streaming_resolve.contains("current_target.as_deref()"),
+        "the streaming path must pass the selected target into transport resolution"
+    );
+    assert!(
+        streaming_resolve.contains("ctx.peer_spiffe_id.as_ref()"),
+        "the streaming path must preserve the authenticated frontend identity when resolving transport"
     );
     assert!(
         streaming.contains("&grpc_transport,"),
