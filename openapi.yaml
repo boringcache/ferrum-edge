@@ -193,7 +193,8 @@ paths:
         `cached_config` proxy/consumer counts,
         `database_polling` degradation, `config_rejected`, mesh state,
         `logging`, `kafka_logging`, and `ai_transcript_audit` admitted capture
-        ceilings, fixed-cardinality `jwks_trust` aggregates, and the DP
+        ceilings, fixed-cardinality `jwks_trust` aggregates, the bounded
+        `gateway_listeners` realization status, and the DP
         `dp_config` staleness diagnostic — are
         returned only when the caller presents a valid admin JWT, a matching
         `FERRUM_METRICS_BEARER_TOKEN`, or originates from
@@ -233,6 +234,26 @@ paths:
         traffic and admin listener failures use the
         same sticky state; authenticated responses include a sanitized
         `listener_failures` snapshot.
+
+        **Dynamic Gateway API listener ports** (`file`, `database`, and
+        data-plane modes) are reported separately and are **recoverable**. A
+        Gateway listener port that cannot be bound — occupied, reserved by
+        another Ferrum listener, colliding with a stream proxy, or whose accept
+        loop died after startup — is refused fail closed for routing and retried
+        every 30 seconds while every healthy listener keeps serving. While any
+        such failure is active, `/health` reports `status: "degraded"`;
+        authenticated callers additionally receive the bounded
+        `gateway_listeners` object (affected ports, `tcp`/`quic` protocol half,
+        closed-set reason, admission-vs-runtime origin, config generation,
+        sanitized detail, and first/last observation timestamps). By default the
+        response stays `200` with `ready: true`, because one unbindable port
+        must not withdraw a replica whose other listeners are serving. Setting
+        `FERRUM_GATEWAY_LISTENER_FAILURE_FAILS_READINESS=true` makes the same
+        condition return `503` with `ready: false` while keeping
+        `status: "degraded"` — the outage is partial and clears by itself on the
+        next successful retry. `/live` is never affected, and unauthenticated
+        callers still receive only `status` and `ready`, never a port, error
+        string, or configuration detail.
 
         In **data-plane mode**, readiness is additionally bounded by the age of
         the last validated and successfully applied CP snapshot (issue #3726).
@@ -11757,7 +11778,8 @@ components:
         Tiered: unauthenticated callers receive only `status` and `ready`. The
         remaining detailed fields (`timestamp`, `mode`, `database`,
         `admin_writes_enabled`, `fips`, `cached_config`, `database_polling`,
-        `config_rejected`, `mesh`, `listener_failures`, `logging`,
+        `config_rejected`, `mesh`, `listener_failures`, `gateway_listeners`,
+        `logging`,
         `kafka_logging`, `ai_transcript_audit`, `audit_pipeline`, `jwks_trust`,
         `service_discovery`, `dp_config`) are present only when the caller is
         authenticated (admin JWT, metrics bearer token, or allowlisted CIDR).
@@ -11773,12 +11795,16 @@ components:
             with a healthy DB) — `admin_writes_enabled` is the right signal
             for that, not `status`. With no active remote JWKS the coarse
             status stays `ok` when otherwise healthy.
-            `degraded` — ready but the configured database is currently
-            unavailable (still 200; the gateway continues to serve from
-            cached config), the admin audit pipeline cannot durably record
-            committed mutations (see `audit_pipeline`), or an active remote
-            JWKS store is in grace after its refresh interval. Intentional
-            read-only mode does NOT set `degraded`. A service-discovery task is
+            `degraded` — the configured database is currently unavailable
+            (the gateway continues to serve from cached config), the admin
+            audit pipeline cannot durably record committed mutations (see
+            `audit_pipeline`), an active remote JWKS store is in grace after
+            its refresh interval, or a recoverable dynamic Gateway API listener
+            failure is active. These stay ready with HTTP 200 except when
+            `FERRUM_GATEWAY_LISTENER_FAILURE_FAILS_READINESS=true`, which makes
+            the Gateway-listener case not ready with HTTP 503 while preserving
+            `status: "degraded"`. Intentional read-only mode does NOT set
+            `degraded`. A service-discovery task is
             restarting after an unexpected poller exit, is crash-looping, or has
             a snapshot past its staleness bound (including one whose discovered
             targets the expiry policy withdrew) — see `service_discovery`.
@@ -11808,7 +11834,10 @@ components:
             store is past its maximum-stale deadline AND no service-discovery
             upstream using the `fail_readiness` staleness policy is expired AND
             no expired `withdraw` upstream still has stale targets installed
-            because its withdrawal publication is retrying. While `false`, the
+            because its withdrawal publication is retrying. A recoverable
+            dynamic Gateway API listener failure also sets `ready: false` when
+            `FERRUM_GATEWAY_LISTENER_FAILURE_FAILS_READINESS=true`; it is ready
+            by default. While `false`, the
             endpoint returns `503 Service Unavailable`. In CP/DP/mesh modes a
             post-startup serving-listener failure sets `ready: false` durably
             (sticky) even though internal startup completed. In CP mode an
@@ -12029,6 +12058,8 @@ components:
           $ref: "#/components/schemas/MeshHealthResponse"
         listener_failures:
           $ref: "#/components/schemas/ServingListenerFailureSnapshot"
+        gateway_listeners:
+          $ref: "#/components/schemas/GatewayListenerStatusSnapshot"
         audit_pipeline:
           $ref: "#/components/schemas/AuditPipelineStatus"
         logging:
@@ -12560,6 +12591,200 @@ components:
               kind:
                 type: string
                 enum: [serve_failed]
+
+    GatewayListenerStatusSnapshot:
+      type: object
+      description: |
+        Bounded realization status for dynamic Gateway API listener ports
+        (issue #3810). Present only in the authenticated detailed `/health` +
+        `/status` tier, and only in modes that bind a socket per Gateway API
+        listener port (`file`, `database`, `dp`).
+
+        A Gateway listener that cannot be bound is refused fail closed for
+        routing and retried every 30 seconds; the process stays alive and every
+        healthy listener keeps serving. This snapshot is therefore
+        **recoverable** — entries disappear as soon as a retry succeeds — and is
+        deliberately distinct from the sticky `listener_failures` surface, which
+        records fatal post-start serve-task exits.
+
+        While any entry is present, `/health` reports `status: "degraded"`.
+        Readiness is unaffected unless
+        `FERRUM_GATEWAY_LISTENER_FAILURE_FAILS_READINESS=true`, in which case
+        `ready` is `false` with HTTP `503` and `status` stays `"degraded"`
+        rather than `"unavailable"` — the outage is partial and recoverable.
+        `/live` is never affected.
+
+        Bounded on two separate axes. The `failures` detail vector retains at
+        most 64 entries (`truncated` reports whether the cap dropped any) and
+        each `detail` is sanitized to printable ASCII and truncated to 200
+        characters. Behind it, a private text-free ledger keeps the first-seen
+        time and observation count of every active `(port, protocol half,
+        reason)` identity up to a hard bound of 4096, so `active_failures`,
+        `failed_ports`, the `active_by_category` breakdown, and the cumulative
+        `ferrum_gateway_listener_{failures,recoveries}_total` counters stay exact
+        for every active identity even when its detail was dropped: a retry does
+        not re-count an onset it already counted, and an identity that recovers
+        is counted once whether or not it was ever shown here. If a single pass
+        somehow exceeds the 4096-identity bound, `overflowed` is `true` and
+        previously tracked identities that still appear anywhere in the stream
+        keep their ledger slots while only brand-new identities are evicted in
+        deterministic key order — the snapshot reports the gap instead of
+        publishing figures it cannot stand behind.
+
+        Ports, `detail`, and `config_generation` appear here only — they are
+        never Prometheus labels and never appear in the unauthenticated
+        `/health` body.
+      required:
+        - config_generation
+        - desired_listeners
+        - active_listeners
+        - failed_ports
+        - active_failures
+        - retained_failures
+        - truncated
+        - overflowed
+        - active_by_category
+        - failures
+      properties:
+        config_generation:
+          type: integer
+          format: uint64
+          description: >-
+            Configuration generation this status was decided for. A reconcile
+            pass for an older generation can never replace a newer generation's
+            status.
+        desired_listeners:
+          type: integer
+          description: >-
+            Gateway listener ports this process must bind for this generation.
+            Ports already served by a same-class process-global proxy frontend
+            are excluded.
+        active_listeners:
+          type: integer
+          description: Gateway listener ports with a live accept loop.
+        failed_ports:
+          type: integer
+          description: Distinct ports carrying at least one active failure.
+        active_failures:
+          type: integer
+          description: >-
+            Active failure identities tracked for this generation, including any
+            whose detail was dropped by the 64-entry `failures` cap. Bounded by
+            the 4096-identity ledger; see `overflowed`.
+        retained_failures:
+          type: integer
+          description: Entries actually present in `failures`.
+        truncated:
+          type: boolean
+          description: Whether `failures` was truncated by the 64-entry cap.
+        overflowed:
+          type: boolean
+          description: >-
+            Whether this pass observed more distinct failure identities than the
+            4096-entry ledger can represent. When `true`, `active_failures`,
+            `failed_ports`, `active_by_category`, and the cumulative counters
+            account only for the tracked identities.
+        active_by_category:
+          type: array
+          description: >-
+            Fixed-cardinality active counts by protocol half and bounded
+            reason. Exact for every tracked identity — never reduced by the
+            64-entry `failures` detail cap.
+          items:
+            type: object
+            required: [protocol, category, count]
+            properties:
+              protocol:
+                type: string
+                enum: [tcp, quic]
+              category:
+                type: string
+                enum:
+                  - port_reserved
+                  - process_global_class_mismatch
+                  - stream_port_collision
+                  - udp_stream_collision
+                  - class_conflict
+                  - dedicated_bind_conflict
+                  - dedicated_bind_tls_unsupported
+                  - frontend_tls_missing
+                  - bind_failed
+                  - listener_task_ended
+                  - class_flip_deferred
+                  - retirement_pending
+              count:
+                type: integer
+                format: uint64
+        failures:
+          type: array
+          description: Active failures, bounded to 64 entries.
+          items:
+            type: object
+            required:
+              - port
+              - protocol
+              - category
+              - origin
+              - config_generation
+              - detail
+              - first_observed_unix_ms
+              - last_observed_unix_ms
+              - observations
+            properties:
+              port:
+                type: integer
+                format: uint16
+              protocol:
+                type: string
+                enum: [tcp, quic]
+                description: >-
+                  Which protocol half is not serving. A `quic` entry means
+                  HTTP/1.1 and HTTP/2 are still served on that port and only
+                  HTTP/3 is unavailable.
+              category:
+                type: string
+                enum:
+                  - port_reserved
+                  - process_global_class_mismatch
+                  - stream_port_collision
+                  - udp_stream_collision
+                  - class_conflict
+                  - dedicated_bind_conflict
+                  - dedicated_bind_tls_unsupported
+                  - frontend_tls_missing
+                  - bind_failed
+                  - listener_task_ended
+                  - class_flip_deferred
+                  - retirement_pending
+              origin:
+                type: string
+                enum: [admission, runtime]
+                description: >-
+                  `admission` means the listener was refused before any socket
+                  was attempted (repair the configuration); `runtime` means
+                  realizing it failed (repair the environment).
+              config_generation:
+                type: integer
+                format: uint64
+              detail:
+                type: string
+                maxLength: 203
+                description: >-
+                  Sanitized, bounded diagnostic. Printable ASCII only, capped at
+                  200 characters plus an ellipsis. Never a secret and never a
+                  metric label.
+              first_observed_unix_ms:
+                type: integer
+                format: uint64
+              last_observed_unix_ms:
+                type: integer
+                format: uint64
+              observations:
+                type: integer
+                format: uint64
+                description: >-
+                  Consecutive reconcile/retry passes that have observed this
+                  failure.
 
     AuditPipelineStatus:
       type: object

@@ -2714,6 +2714,7 @@ impl MetricsRegistry {
         self.append_udp_placement_migration_prometheus(&mut output);
         self.append_destination_active_request_prometheus(&mut output);
         self.append_dp_config_freshness_prometheus(&mut output);
+        self.append_gateway_listener_status_prometheus(&mut output);
         output
     }
 
@@ -2735,6 +2736,27 @@ impl MetricsRegistry {
             output,
             &ns_label,
             crate::dp_config_freshness::snapshot().as_ref(),
+        );
+    }
+
+    /// Append the bounded dynamic Gateway API listener realization families.
+    ///
+    /// Kept off the render cache (issue #3810) for the same reason as DP
+    /// configuration freshness: these gauges are the CURRENT bind state, and a
+    /// memoized body would keep reporting a listener as failed for up to the
+    /// cache TTL after a retry bound it — exactly the window an operator is
+    /// watching. Emits nothing outside the modes that bind dynamic Gateway
+    /// listeners.
+    fn append_gateway_listener_status_prometheus(&self, output: &mut String) {
+        let ns_label = self
+            .namespace_label
+            .read()
+            .map(|label| label.clone())
+            .unwrap_or_default();
+        crate::proxy::gateway_listener_status::render_prometheus(
+            output,
+            &ns_label,
+            crate::proxy::gateway_listener_status::global().map(|status| &**status),
         );
     }
 
@@ -2832,6 +2854,7 @@ impl MetricsRegistry {
         self.append_udp_placement_migration_prometheus(&mut output);
         self.append_destination_active_request_prometheus(&mut output);
         self.append_dp_config_freshness_prometheus(&mut output);
+        self.append_gateway_listener_status_prometheus(&mut output);
         output
     }
 
