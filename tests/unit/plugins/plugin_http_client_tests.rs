@@ -918,6 +918,31 @@ fn plugin_http_client_terminal_fallback_is_fail_closed_no_proxy_no_redirect() {
         uncommented_execute.contains("request_reached_wire: false"),
         "unavailable construction must not be treated as a post-wire failure"
     );
+    assert!(
+        !uncommented_execute.contains(".build()"),
+        "unavailable execute must not construct another fallible reqwest client per call"
+    );
+    assert!(
+        !uncommented_execute.contains("tracing::"),
+        "terminal construction is logged once; unavailable execute must not warn per call"
+    );
+
+    let fail_closed_builder = function_region(
+        production,
+        "fn build_fail_closed_plugin_client(",
+        "fn build_dns_cached_fallback_client(",
+    );
+    let uncommented_fail_closed_builder = uncommented_lines(fail_closed_builder).join("\n");
+    assert!(
+        !uncommented_fail_closed_builder
+            .contains("try_build_plugin_client(None, false"),
+        "HTTP/2 terminal fallback must not accept an HTTP/1-capable replacement client"
+    );
+    assert!(
+        !uncommented_fail_closed_builder
+            .contains("try_build_preconfigured_fail_closed_plugin_client(false"),
+        "HTTP/2 preconfigured fallback must preserve prior-knowledge posture or stay unavailable"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]

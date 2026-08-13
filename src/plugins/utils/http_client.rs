@@ -109,33 +109,17 @@ fn unavailable_plugin_http_failure() -> PluginHttpFailure {
     }
 }
 
-/// Surface an unavailable shared client as `Err` when a contradictory TLS
-/// version pair makes reqwest refuse construction. If a future reqwest accepts
-/// that pair, drop the unusable client and return a 502 without dialing.
-fn unavailable_reqwest_execute_result(
-    label: &str,
-    log_url_override: Option<&str>,
-) -> Result<reqwest::Response, reqwest::Error> {
-    tracing::warn!(
-        plugin = label,
-        url = log_url_override.unwrap_or("redacted"),
-        "Plugin HTTP client is unavailable; failing closed without dialing"
-    );
-    match plugin_client_no_proxy_no_redirect()
-        .min_tls_version(reqwest::tls::Version::TLS_1_3)
-        .max_tls_version(reqwest::tls::Version::TLS_1_2)
-        .build()
-    {
-        Err(error) => Err(error),
-        Ok(unused) => {
-            drop(unused);
-            let mut denied = http::Response::new(reqwest::Body::from(
-                r#"{"error":"plugin HTTP client unavailable"}"#,
-            ));
-            *denied.status_mut() = http::StatusCode::BAD_GATEWAY;
-            Ok(reqwest::Response::from(denied))
-        }
-    }
+/// Return an inert local response when no shared client could be constructed.
+///
+/// This path never creates another client, dials, or logs per call. Terminal
+/// construction already emits one diagnostic; traffic must not turn that
+/// condition into repeated fallible builders or a warning storm.
+fn unavailable_reqwest_execute_result() -> Result<reqwest::Response, reqwest::Error> {
+    let mut denied = http::Response::new(reqwest::Body::from(
+        r#"{"error":"plugin HTTP client unavailable"}"#,
+    ));
+    *denied.status_mut() = http::StatusCode::BAD_GATEWAY;
+    Ok(reqwest::Response::from(denied))
 }
 
 /// Whether one execution may use the shared `FERRUM_PLUGIN_HTTP_MAX_RETRIES`
@@ -562,16 +546,18 @@ fn build_fail_closed_plugin_client(
     http2_prior_knowledge: bool,
     provider_mismatch: bool,
 ) -> Result<reqwest::Client, PluginHttpClientBuildError> {
-    match try_build_plugin_client(dns_cache, http2_prior_knowledge, |builder| {
-        PluginTlsPosture::apply_terminal_fail_closed_tls(builder, provider_mismatch)
-    }) {
-        Ok(client) => return Ok(client),
-        Err(error) => tracing::error!(
-            error = %error,
-            http2_prior_knowledge,
-            "Fail-closed empty-trust plugin HTTP client failed; \
-             retrying without a custom DNS resolver"
-        ),
+    if let Some(dns_cache) = dns_cache {
+        match try_build_plugin_client(Some(dns_cache), http2_prior_knowledge, |builder| {
+            PluginTlsPosture::apply_terminal_fail_closed_tls(builder, provider_mismatch)
+        }) {
+            Ok(client) => return Ok(client),
+            Err(error) => tracing::error!(
+                error = %error,
+                http2_prior_knowledge,
+                "Fail-closed empty-trust plugin HTTP client failed; \
+                 retrying without a custom DNS resolver"
+            ),
+        }
     }
 
     match try_build_plugin_client(None, http2_prior_knowledge, |builder| {
@@ -580,34 +566,16 @@ fn build_fail_closed_plugin_client(
         Ok(client) => return Ok(client),
         Err(error) => tracing::error!(
             error = %error,
-            "Fail-closed plugin HTTP client without DNS failed; \
-             retrying without HTTP/2 prior knowledge"
+            http2_prior_knowledge,
+            "Fail-closed plugin HTTP client without DNS failed; using a \
+             preconfigured empty rustls root store with the same protocol posture"
         ),
     }
 
-    match try_build_plugin_client(None, false, |builder| {
-        PluginTlsPosture::apply_terminal_fail_closed_tls(builder, provider_mismatch)
-    }) {
-        Ok(client) => return Ok(client),
-        Err(error) => tracing::error!(
-            error = %error,
-            "Fail-closed tls_certs_only plugin HTTP client was refused; \
-             using a preconfigured empty rustls root store"
-        ),
-    }
-
-    if http2_prior_knowledge {
-        match try_build_preconfigured_fail_closed_plugin_client(true, provider_mismatch) {
-            Ok(client) => return Ok(client),
-            Err(error) => tracing::error!(
-                error = %error,
-                "Preconfigured fail-closed plugin HTTP client failed; \
-                 retrying without HTTP/2 prior knowledge"
-            ),
-        }
-    }
-
-    try_build_preconfigured_fail_closed_plugin_client(false, provider_mismatch)
+    try_build_preconfigured_fail_closed_plugin_client(
+        http2_prior_knowledge,
+        provider_mismatch,
+    )
 }
 
 /// Build a minimal `reqwest::Client` that still uses the gateway's DNS cache
@@ -1374,11 +1342,6 @@ impl PluginHttpClient {
             request_reached_wire: false,
         })?;
         if self.client.is_none() {
-            tracing::warn!(
-                plugin = label,
-                url = %redacted_url,
-                "Plugin HTTP client is unavailable; failing closed without dialing"
-            );
             return Err(unavailable_plugin_http_failure());
         }
         if let Some(reason) = self.denied_literal_ip_reason(&request) {
@@ -1428,11 +1391,6 @@ impl PluginHttpClient {
             request_reached_wire: false,
         })?;
         let Some(client) = self.client.as_ref() else {
-            tracing::warn!(
-                plugin = label,
-                url = %redacted_url,
-                "Plugin HTTP client is unavailable; failing closed without dialing"
-            );
             return Err(unavailable_plugin_http_failure());
         };
         if let Some(reason) = self.denied_literal_ip_reason(&request) {
@@ -1467,7 +1425,7 @@ impl PluginHttpClient {
         log_url_override: Option<&str>,
     ) -> Result<reqwest::Response, reqwest::Error> {
         let Some(client) = self.client.as_ref() else {
-            return unavailable_reqwest_execute_result(label, log_url_override);
+            return unavailable_reqwest_execute_result();
         };
         self.execute_request_with_client(
             client,
