@@ -3300,7 +3300,11 @@ const REPLAY_HMAC_AUTHORITY: &str = "hmac-replay.example.test";
 const REPLAY_DPOP_AUTHORITY: &str = "dpop-replay.example.test";
 const REPLAY_HMAC_SECRET: &str = "shared-replay-hmac-secret-at-least-32-bytes";
 
-/// A backend that counts every non-`/health` request it serves.
+/// A backend that counts mutating application requests.
+///
+/// `/health` and non-mutating methods (`HEAD`/`GET`) are excluded so a
+/// readiness probe, pool warmup, or capability `HEAD /` cannot be mistaken
+/// for an HMAC/DPoP mutation.
 async fn spawn_replay_counting_backend() -> (u16, Arc<AtomicUsize>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -3342,7 +3346,13 @@ async fn spawn_replay_counting_backend() -> (u16, Arc<AtomicUsize>) {
                     let _ = buf_reader.read_exact(&mut body).await;
                 }
                 let is_health = request_line.contains(" /health ");
-                if !is_health {
+                let method = request_line
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .to_ascii_uppercase();
+                let is_mutation = matches!(method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE");
+                if !is_health && is_mutation {
                     counter.fetch_add(1, Ordering::SeqCst);
                 }
                 let body = r#"{"ok":true}"#;

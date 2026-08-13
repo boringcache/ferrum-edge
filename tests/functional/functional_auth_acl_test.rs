@@ -2790,8 +2790,9 @@ async fn test_hmac_auth_plus_acl() {
 /// The load-bearing assertion is the **backend mutation count**, not the
 /// gateway status: "the gateway answered 401" is weaker than "the origin was
 /// contacted exactly once", because only the second rules out a duplicate side
-/// effect. The counting backend excludes `/health`, so a readiness probe or
-/// pool warmup cannot be mistaken for application traffic.
+/// effect. The counting backend excludes `/health` and non-mutating methods
+/// (`HEAD`/`GET`) so a readiness probe, pool warmup, or capability `HEAD /`
+/// cannot be mistaken for application traffic.
 /// Send one `ferrum-hmac-v2` request with the supplied Authorization header.
 async fn send_hmac_v2(
     client: &reqwest::Client,

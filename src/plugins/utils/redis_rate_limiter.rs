@@ -2438,7 +2438,16 @@ impl RedisRateLimitClient {
     ///
     /// The task is aborted when this client is dropped so retired plugin
     /// generations cannot keep dialing obsolete Redis endpoints.
+    ///
+    /// `tokio::spawn` panics without a reactor. Plugin construction, sync
+    /// tests, and test-injected outages on ordinary threads can all reach
+    /// [`Self::mark_unavailable`] outside a runtime. Do not latch the started
+    /// flag until a runtime is present: a later request-path transition must
+    /// still arm recovery so fail-closed consumers are not pinned unavailable.
     fn start_health_checker_if_needed(&self) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
         if self.health_checker_started.swap(true, Ordering::Relaxed) {
             return; // Already started
         }
@@ -2457,7 +2466,7 @@ impl RedisRateLimitClient {
         let tls_ca_bundle_pem = self.tls_ca_bundle_pem.clone();
         let log_policy = self.log_policy;
 
-        let handle = tokio::spawn(async move {
+        let handle = runtime.spawn(async move {
             loop {
                 tokio::time::sleep(interval).await;
 

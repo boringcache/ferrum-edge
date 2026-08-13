@@ -1352,6 +1352,22 @@ fn stale_reachable_registration_sample_cannot_overwrite_terminal_topology() {
 
 // ── bounded, redacted shared claim ──────────────────────────────────
 
+/// RESP wire form of the command-name bulk string. Substring `SET`/`INFO`
+/// also match `CLIENT SETINFO`, so handshake bytes must not be treated as
+/// the replay claim or the topology screen.
+const SET_CMD: &[u8] = b"$3\r\nSET\r\n";
+const INFO_CMD: &[u8] = b"$4\r\nINFO\r\n";
+
+fn resp_contains(chunk: &[u8], command: &[u8]) -> bool {
+    chunk.windows(command.len()).any(|window| window == command)
+}
+
+/// Number of RESP command arrays in one read chunk — the redis crate pipelines
+/// its connection setup, so a single read can carry several commands.
+fn resp_command_count(chunk: &[u8]) -> usize {
+    chunk.iter().filter(|&&byte| byte == b'*').count().max(1)
+}
+
 /// How the fake backend answers the `SET` that carries a replay claim.
 #[derive(Clone, Copy)]
 enum ClaimBehavior {
@@ -1403,10 +1419,7 @@ async fn spawn_claim_redis_server(
                                 Ok(read) => read,
                             };
                             let chunk = &buf[..read];
-                            let contains = |needle: &[u8]| {
-                                chunk.windows(needle.len()).any(|window| window == needle)
-                            };
-                            let reply: Vec<u8> = if contains(b"SET") {
+                            let reply: Vec<u8> = if resp_contains(chunk, SET_CMD) {
                                 match behavior {
                                     ClaimBehavior::Silent => continue,
                                     ClaimBehavior::Disconnect => break,
@@ -1423,15 +1436,13 @@ async fn spawn_claim_redis_server(
                                         }
                                     }
                                 }
-                            } else if contains(b"INFO") {
+                            } else if resp_contains(chunk, INFO_CMD) {
                                 let text = "# Cluster\r\ncluster_enabled:0\r\n";
                                 format!("${}\r\n{text}\r\n", text.len()).into_bytes()
                             } else {
                                 // The redis crate pipelines connection setup, so
                                 // reply once per command array in the chunk.
-                                let commands =
-                                    chunk.iter().filter(|&&byte| byte == b'*').count().max(1);
-                                b"+OK\r\n".repeat(commands)
+                                b"+OK\r\n".repeat(resp_command_count(chunk))
                             };
                             if stream.write_all(&reply).await.is_err() {
                                 break;
@@ -1757,10 +1768,7 @@ async fn spawn_ttl_observing_redis_server() -> (
                                 Ok(read) => read,
                             };
                             let chunk = &buf[..read];
-                            let contains = |needle: &[u8]| {
-                                chunk.windows(needle.len()).any(|window| window == needle)
-                            };
-                            let reply: Vec<u8> = if contains(b"SET") {
+                            let reply: Vec<u8> = if resp_contains(chunk, SET_CMD) {
                                 if let Some(ttl) = parse_set_ex_ttl(chunk) {
                                     observed
                                         .lock()
@@ -1768,13 +1776,11 @@ async fn spawn_ttl_observing_redis_server() -> (
                                         .push(ttl);
                                 }
                                 b"+OK\r\n".to_vec()
-                            } else if contains(b"INFO") {
+                            } else if resp_contains(chunk, INFO_CMD) {
                                 let text = "# Cluster\r\ncluster_enabled:0\r\n";
                                 format!("${}\r\n{text}\r\n", text.len()).into_bytes()
                             } else {
-                                let commands =
-                                    chunk.iter().filter(|&&byte| byte == b'*').count().max(1);
-                                b"+OK\r\n".repeat(commands)
+                                b"+OK\r\n".repeat(resp_command_count(chunk))
                             };
                             if stream.write_all(&reply).await.is_err() {
                                 break;
@@ -1864,32 +1870,27 @@ async fn spawn_logging_redis_server(
                                 Ok(read) => read,
                             };
                             let chunk = &buf[..read];
-                            let contains = |needle: &[u8]| {
-                                chunk.windows(needle.len()).any(|window| window == needle)
-                            };
                             let reply: Vec<u8> = match shape {
                                 LoggingShape::AuthReject => {
-                                    format!("-WRONGPASS {SENTINEL_AUTH_ERR}\r\n").into_bytes()
+                                    format!("-WRONGPASS {SENTINEL_AUTH_ERR}\r\n")
+                                        .repeat(resp_command_count(chunk))
+                                        .into_bytes()
                                 }
-                                LoggingShape::ClusterInfo if contains(b"INFO") => {
+                                LoggingShape::ClusterInfo if resp_contains(chunk, INFO_CMD) => {
                                     let text = "# Cluster\r\ncluster_enabled:1\r\n";
                                     format!("${}\r\n{text}\r\n", text.len()).into_bytes()
                                 }
-                                LoggingShape::ClusterMoved if contains(b"SET") => {
+                                LoggingShape::ClusterMoved if resp_contains(chunk, SET_CMD) => {
                                     format!("-MOVED 1 {SENTINEL_MOVED_HOST}:7000\r\n").into_bytes()
                                 }
-                                LoggingShape::CommandError if contains(b"SET") => {
+                                LoggingShape::CommandError if resp_contains(chunk, SET_CMD) => {
                                     format!("-ERR {SENTINEL_CMD_ERR}\r\n").into_bytes()
                                 }
-                                _ if contains(b"INFO") => {
+                                _ if resp_contains(chunk, INFO_CMD) => {
                                     let text = "# Cluster\r\ncluster_enabled:0\r\n";
                                     format!("${}\r\n{text}\r\n", text.len()).into_bytes()
                                 }
-                                _ => {
-                                    let commands =
-                                        chunk.iter().filter(|&&byte| byte == b'*').count().max(1);
-                                    b"+OK\r\n".repeat(commands)
-                                }
+                                _ => b"+OK\r\n".repeat(resp_command_count(chunk)),
                             };
                             if stream.write_all(&reply).await.is_err() {
                                 break;
