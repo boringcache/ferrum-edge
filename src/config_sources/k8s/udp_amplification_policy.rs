@@ -31,13 +31,13 @@ const MAX_TARGET_REFS: usize = 16;
 
 const ACCEPTED_OK: &str = "Ferrum accepted this UDPResponseAmplificationPolicy";
 const REFS_OK: &str = "All UDPResponseAmplificationPolicy references accepted by Ferrum";
-const CONFLICTED_MESSAGE: &str = "An older UDPResponseAmplificationPolicy already governs one or more of the same targets";
+const CONFLICTED_MESSAGE: &str =
+    "An older UDPResponseAmplificationPolicy already governs one or more of the same targets";
 const REF_NOT_PERMITTED_MESSAGE: &str =
     "Cross-namespace UDPResponseAmplificationPolicy attachment is not permitted by ReferenceGrant";
 const TARGET_NOT_FOUND_MESSAGE: &str =
     "UDPResponseAmplificationPolicy targetRef does not resolve to an observed Gateway or UDPRoute";
-const TARGET_SECTION_NOT_FOUND_MESSAGE: &str =
-    "UDPResponseAmplificationPolicy targetRef sectionName does not name a listener on the observed Gateway";
+const TARGET_SECTION_NOT_FOUND_MESSAGE: &str = "UDPResponseAmplificationPolicy targetRef sectionName does not name a listener on the observed Gateway";
 const DUPLICATE_TARGET_MESSAGE: &str =
     "spec.targetRefs entries must be unique by kind, namespace, name, and sectionName";
 
@@ -130,7 +130,10 @@ struct IndexedPolicy {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum AttachmentKey {
-    Route { namespace: String, name: String },
+    Route {
+        namespace: String,
+        name: String,
+    },
     Gateway {
         namespace: String,
         name: String,
@@ -206,7 +209,12 @@ pub(crate) fn collect_all(
         if object.kind != UDP_AMPLIFICATION_POLICY_KIND {
             continue;
         }
-        collect_one(acc, object, &observed_udproutes, &observed_gateway_listeners);
+        collect_one(
+            acc,
+            object,
+            &observed_udproutes,
+            &observed_gateway_listeners,
+        );
     }
     Ok(())
 }
@@ -436,7 +444,11 @@ fn optional_string_field<'a>(
     }
 }
 
-fn optional_bool_field(value: &Value, field: &str, path: &str) -> Result<Option<bool>, PolicyError> {
+fn optional_bool_field(
+    value: &Value,
+    field: &str,
+    path: &str,
+) -> Result<Option<bool>, PolicyError> {
     match value.get(field) {
         None => Ok(None),
         Some(Value::Bool(value)) => Ok(Some(*value)),
@@ -471,7 +483,9 @@ fn parse_one_target(object: &K8sObject, entry: &Value) -> Result<TargetRef, Poli
         .and_then(Value::as_str)
         .ok_or_else(|| PolicyError::invalid("spec.targetRefs.name is required"))?;
     if name.is_empty() {
-        return Err(PolicyError::invalid("spec.targetRefs.name must not be empty"));
+        return Err(PolicyError::invalid(
+            "spec.targetRefs.name must not be empty",
+        ));
     }
     let target_namespace = optional_string_field(entry, "namespace", "spec.targetRefs.namespace")?
         .unwrap_or(object.metadata.namespace.as_str());
@@ -771,11 +785,7 @@ fn posture_from_body(
     parent_ref: String,
 ) -> (Option<f32>, UdpAmplificationPosture, String) {
     match body.factor {
-        None => (
-            None,
-            UdpAmplificationPosture::ExplicitUnlimited,
-            parent_ref,
-        ),
+        None => (None, UdpAmplificationPosture::ExplicitUnlimited, parent_ref),
         Some(factor) => (
             Some(factor),
             UdpAmplificationPosture::FinitePolicy,

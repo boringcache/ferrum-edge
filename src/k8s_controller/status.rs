@@ -234,10 +234,7 @@ fn route_status_kind(kind: &str) -> bool {
 /// Kinds whose status is a Gateway API `PolicyStatus` (`status.ancestors[]`)
 /// rather than a `RouteStatus` (`status.parents[]`).
 fn policy_status_kind(kind: &str) -> bool {
-    matches!(
-        kind,
-        "BackendTLSPolicy" | "UDPResponseAmplificationPolicy"
-    )
+    matches!(kind, "BackendTLSPolicy" | "UDPResponseAmplificationPolicy")
 }
 
 fn kube_error_is_conflict(error: &kube::Error) -> bool {
@@ -2760,9 +2757,8 @@ fn route_status(
                 ),
                 Err(_) => None,
             };
-            let posture = posture.unwrap_or(
-                crate::config_sources::k8s::UdpAmplificationPosture::FiniteDefault,
-            );
+            let posture = posture
+                .unwrap_or(crate::config_sources::k8s::UdpAmplificationPosture::FiniteDefault);
             conditions.push(condition_at(
                 object,
                 existing_parent_status,

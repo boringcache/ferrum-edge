@@ -1076,7 +1076,8 @@ impl K8sAccumulator {
             gateway_api_materialized_gateway_listeners: HashSet::new(),
             backend_tls_policies: backend_tls_policy::BackendTlsPolicyIndex::default(),
             backend_tls_policy_statuses: Vec::new(),
-            udp_amplification_policies: udp_amplification_policy::UdpAmplificationPolicyIndex::default(),
+            udp_amplification_policies:
+                udp_amplification_policy::UdpAmplificationPolicyIndex::default(),
             udp_amplification_policy_statuses: Vec::new(),
             udp_amplification_route_postures: Vec::new(),
             listenerset_statuses: Vec::new(),

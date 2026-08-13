@@ -450,9 +450,7 @@ fn oldest_policy_wins_and_loser_is_conflicted() {
     let updates = plan_gateway_api_status_updates(&objects, options(), &[]);
     let loser = updates
         .iter()
-        .find(|update| {
-            update.kind == UDP_AMPLIFICATION_POLICY_KIND && update.name == "newer"
-        })
+        .find(|update| update.kind == UDP_AMPLIFICATION_POLICY_KIND && update.name == "newer")
         .expect("loser status");
     let accepted = loser
         .status
@@ -846,7 +844,10 @@ fn conflicted_direct_policy_is_withdrawn_from_gatewayclass_lookup() {
         translated_factor_on_port(&objects, 15354),
         Some(GATEWAY_API_UDP_AMPLIFICATION_DEFAULT_FACTOR)
     );
-    assert_eq!(route_protection_reason_named(&objects, "dns"), "FinitePolicy");
+    assert_eq!(
+        route_protection_reason_named(&objects, "dns"),
+        "FinitePolicy"
+    );
     assert_eq!(
         route_protection_reason_named(&objects, "alt"),
         "FiniteDefault"
