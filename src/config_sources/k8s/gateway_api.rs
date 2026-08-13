@@ -7323,8 +7323,7 @@ fn udp_route_surviving_materialization(
 ) -> (Vec<u16>, Vec<String>) {
     let claims = udp_route_surviving_listener_claims(object, acc);
     let mut ports: Vec<u16> = claims.iter().map(|claim| claim.port).collect();
-    let mut parent_refs: Vec<String> =
-        claims.into_iter().map(|claim| claim.parent_ref).collect();
+    let mut parent_refs: Vec<String> = claims.into_iter().map(|claim| claim.parent_ref).collect();
     ports.sort();
     ports.dedup();
     parent_refs.sort();

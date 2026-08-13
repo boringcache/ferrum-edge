@@ -1496,8 +1496,7 @@ fn assert_shared_port_proxy_factor(objects: &[K8sObject], expected: Option<f32>,
     );
     assert_eq!(proxies[0].listen_port, Some(SHARED_UDP_PORT), "{label}");
     assert_eq!(
-        proxies[0].udp_max_response_amplification_factor,
-        expected,
+        proxies[0].udp_max_response_amplification_factor, expected,
         "{label}"
     );
 }
@@ -1569,7 +1568,11 @@ fn shared_port_unlimited_plus_finite_stays_finite_regardless_of_order() {
 #[test]
 fn shared_port_unlimited_plus_default_stays_finite_default_regardless_of_order() {
     for_each_shared_port_order(
-        || vec![unlimited_named_gateway_section_policy("open", "alpha", "dns")],
+        || {
+            vec![unlimited_named_gateway_section_policy(
+                "open", "alpha", "dns",
+            )]
+        },
         |objects, label| {
             assert_shared_port_proxy_factor(
                 objects,
