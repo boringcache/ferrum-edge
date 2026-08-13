@@ -599,9 +599,10 @@ fn a_retired_lane_is_reclaimed_only_after_every_marker_expires() {
 
 #[test]
 fn the_process_lane_registry_is_bounded() {
-    // The bound is a real cap rather than advisory; asserting the constant is
-    // exported and non-zero keeps a future change from silently unbounding it.
-    assert!(MAX_PROCESS_REPLAY_LANES > 0);
+    // The bound is a real cap rather than advisory; matching the exported
+    // constant keeps a future change from silently unbounding it. `1_024` is
+    // already greater than zero, so a separate constant inequality would trip
+    // `clippy::assertions_on_constants`.
     assert_eq!(MAX_PROCESS_REPLAY_LANES, 1_024);
 }
 

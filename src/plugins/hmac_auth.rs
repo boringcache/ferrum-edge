@@ -543,8 +543,7 @@ type StagedHmacRecords = Vec<(HmacPrebufferOwner, CachedHmacAuthorization)>;
 
 /// Completion of the pre-buffered path: absent, verified consumer + v2 nonce, or
 /// a fixed JSON authentication error.
-type PrebufferedHmacAuthCompletion =
-    Option<Result<(Arc<Consumer>, Option<String>), String>>;
+type PrebufferedHmacAuthCompletion = Option<Result<(Arc<Consumer>, Option<String>), String>>;
 
 /// Request-scoped bridge between HMAC's pre-body signature check and its
 /// post-body digest check, **partitioned by owning plugin instance**.
@@ -649,6 +648,7 @@ impl HmacAuth {
     /// `replay_scope: process` policy then gets a **private** lane keyed by the
     /// standalone placeholder id, so a validation call can neither read,
     /// mutate, nor consume a live proxy's replay history.
+    #[allow(dead_code)] // exercised by external unit tests
     pub fn new(config: &Value) -> Result<Self, String> {
         Self::build(config, None, None)
     }

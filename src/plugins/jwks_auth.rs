@@ -345,6 +345,7 @@ impl JwksAuth {
     /// `dpop_replay_scope: process` provider then gets a **private** lane keyed
     /// by the standalone placeholder id, so a validation call can neither read,
     /// mutate, nor consume a live proxy's replay history.
+    #[allow(dead_code)] // exercised by external unit tests
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
         Self::new_with_config_id(config, http_client, None)
     }

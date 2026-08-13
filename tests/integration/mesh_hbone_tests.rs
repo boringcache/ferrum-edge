@@ -167,7 +167,10 @@ fn hmac_auth_plugin_config() -> PluginConfig {
         id: "hmac-auth".to_string(),
         plugin_name: "hmac_auth".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
-        config: json!({}),
+        config: json!({
+            "signing_profile": "ferrum-hmac-v1",
+            "allow_unsafe_replayable_v1": true
+        }),
         scope: PluginScope::Global,
         proxy_id: None,
         enabled: true,

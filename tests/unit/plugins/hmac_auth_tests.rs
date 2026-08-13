@@ -1978,6 +1978,7 @@ fn v2_is_the_default_profile_and_requires_a_declared_replay_scope() {
     assert_eq!(plugin.replay_mode(), Some("process"));
 
     let error = HmacAuth::new(&json!({}))
+        .map(|_| ())
         .expect_err("the single-use default must not silently pick a replay scope");
     assert!(
         error.contains("replay_scope"),

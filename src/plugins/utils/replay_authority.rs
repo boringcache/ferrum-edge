@@ -381,6 +381,7 @@ pub enum ReplayAdmission {
 }
 
 impl ReplayAdmission {
+    #[allow(dead_code)] // exercised by external unit tests
     pub fn is_admitted(self) -> bool {
         matches!(self, Self::Admitted)
     }
@@ -543,6 +544,7 @@ impl ProcessReplayLane {
 
     /// Retained entry count, including entries whose expiry has passed but
     /// which lazy reclamation has not yet removed (test support).
+    #[allow(dead_code)] // exercised by external unit tests
     pub fn retained_entries(&self) -> usize {
         self.entry_count.load(Ordering::Acquire)
     }
@@ -600,11 +602,13 @@ fn resolve_process_lane(
 }
 
 /// Number of live process replay lanes (test support).
+#[allow(dead_code)] // exercised by external unit tests
 pub fn process_lane_count_for_tests() -> usize {
     process_lane_count()
 }
 
 /// Whether a domain currently owns a registered process lane (test support).
+#[allow(dead_code)] // exercised by external unit tests
 pub fn process_lane_registered_for_tests(domain: &ReplayDomain) -> bool {
     PROCESS_REPLAY_LANES
         .lock()
@@ -698,6 +702,7 @@ fn shared_authority_health() -> (u64, u64) {
 /// Protected requests on those policies are failing closed, which is a
 /// readiness-relevant condition rather than a per-request error. Consumed by
 /// the admin `/health` + `/status` readiness decision.
+#[allow(dead_code)] // exercised by external unit tests
 pub fn shared_authority_degraded() -> bool {
     shared_health_snapshot().unavailable()
 }
@@ -768,6 +773,7 @@ impl ReplayAuthority {
     }
 
     /// Retention horizon written with every marker in this authority.
+    #[allow(dead_code)] // exercised by external unit tests
     pub fn retention(&self) -> Duration {
         match self {
             Self::Process { retention, .. } | Self::Shared { retention, .. } => *retention,
@@ -896,6 +902,7 @@ pub fn validate_scope_backend(
 
 /// Test-support admission against an explicit monotonic instant, so external
 /// tests can pin exact TTL boundaries without sleeping.
+#[allow(dead_code)] // exercised by external unit tests
 pub fn admit_process_at(
     authority: &ReplayAuthority,
     marker: &ReplayMarker,
@@ -924,6 +931,7 @@ pub fn process_max_entries(authority: &ReplayAuthority) -> Option<usize> {
 }
 
 /// The process lane behind a process-scoped authority (test support).
+#[allow(dead_code)] // exercised by external unit tests
 pub fn process_lane(authority: &ReplayAuthority) -> Option<&Arc<ProcessReplayLane>> {
     match authority {
         ReplayAuthority::Process { lane, .. } => Some(lane),

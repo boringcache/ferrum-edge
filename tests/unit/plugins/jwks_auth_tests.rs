@@ -3492,6 +3492,7 @@ fn dpop_requires_an_explicitly_declared_replay_scope() {
         }),
         default_client(),
     )
+    .map(|_| ())
     .expect_err("require_dpop without a replay scope must be refused");
     assert!(
         error.contains("dpop_replay_scope"),
@@ -3965,6 +3966,7 @@ fn duplicate_equivalent_providers_with_incompatible_capacities_are_rejected() {
             default_client(),
             Some("dpop-cap-dup-reject"),
         )
+        .map(|_| ())
         .expect_err("incompatible duplicate capacities must be refused");
         assert!(
             error.contains("dpop_replay_max_entries") && error.contains("incompatible"),
@@ -4029,6 +4031,7 @@ fn equivalent_remote_url_spellings_with_incompatible_capacities_are_rejected() {
         default_client(),
         Some("dpop-cap-url-dup"),
     )
+    .map(|_| ())
     .expect_err("canonical URL duplicates with different caps must be refused");
     assert!(
         error.contains("dpop_replay_max_entries"),
@@ -4053,6 +4056,7 @@ fn removed_dpop_replay_knobs_are_rejected_with_guidance() {
         });
         provider[removed] = json!(300);
         let error = JwksAuth::new(&json!({"providers": [provider]}), default_client())
+            .map(|_| ())
             .expect_err("a removed replay knob must be rejected");
         assert!(
             error.contains(removed) && error.contains(expected),
