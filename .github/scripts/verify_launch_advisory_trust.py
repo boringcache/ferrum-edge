@@ -78,6 +78,14 @@ workflow definitions as text — it executes nothing — and asserts:
 * the trusted anchor is proved fail-closed in the secretless job: derived from
   the literal protected-branch checkout, validated as a 40-hex commit, and
   required to be reachable from protected `main` before it is exported;
+* the `workflow_run.workflows: [Release]` display-name selector is not treated
+  as identity: the secretless job resolves the triggering run ID through the
+  canonical Actions API and requires a closed identity projection — exact ID,
+  attempt, event, head SHA, head branch, and immutable
+  `.github/workflows/release.yml` path — before treating it as the requester;
+* a release target's `.github/workflows/release.yml` blob must be byte-identical
+  to the protected-main anchor's blob, so the trusted publisher refuses to issue
+  a verdict to a historical pre-artifact release consumer;
 * the candidate commit reaches the secret-bearing job only as an inert SHA in an
   environment mapping, never as a checkout ref, and no candidate-derived
   environment variable is ever expanded on an executable line anywhere in that
@@ -90,13 +98,24 @@ workflow definitions as text — it executes nothing — and asserts:
   gate accepts only the name carrying its own `github.run_id` /
   `github.run_attempt`, and then authenticates the owning run's immutable
   workflow path, `workflow_run` event, successful conclusion, and the fixed
-  record. Artifact name alone is never authority. The scheduled default-branch
+  record, including the canonical requester workflow path. Artifact name alone
+  is never authority. A canonical publisher still in `in_progress` is retried
+  because its final job can upload before the owner run is finalized; completed
+  non-success and unknown statuses remain terminal. The scheduled default-branch
   audit uses a name of a different shape. A commit-wide status or an
   attempt-less artifact would be replayable: a daily audit, an earlier tag
   release on the same commit, or an earlier attempt of the same Release run
   would satisfy a later release before its own evaluation finished;
 * the trusted workflow triggers on `workflow_run: in_progress`, because GitHub
   documents that `requested` does not fire for a re-run;
+* the release gate is the first candidate-authored `run:` in its job; the tag
+  tree's checker self-test runs only after authentication, so it cannot poison
+  the gate through `GITHUB_ENV` or `GITHUB_PATH`;
+* JSON, ZIP, redirect, network, and lifecycle handling is explicitly bounded:
+  JSON reads use limit-plus-one, redirects use the handler's real total and
+  repeat limits with HTTPS host/port admission and clean GET reconstruction,
+  and only network/server/rate-limit failures or the authenticated in-progress
+  owner return the bounded retry result;
 * the untrusted standalone gate holds no credential on any event.
 
 `--self-test` runs an adversarial fixture table — a malicious tagged workflow, a
@@ -116,8 +135,12 @@ entry, a workflow-level `env:` or `defaults:` shell/working-directory, an
 anchor/alias/merge-key bypass, either secretless self-test dropped, commented
 out, or relocated into the credential job, a dropped trusted-anchor ancestry
 proof, a missing environment binding, a dropped trust edge, a reintroduced
-commit-status handoff, an omitted run-attempt binding, a `requested`-only
-trigger, a release gate that reuses another run's artifact, a release job that
+commit-status handoff, a spoofed requester workflow path or identity response,
+a dropped release-workflow byte floor, an omitted run-attempt binding, a
+`requested`-only trigger, a release gate that reuses another run's artifact, a
+release job that runs candidate code before authentication, a reordered
+self-test, a dead redirect bound, an unbounded/truncated JSON read, a lifecycle
+race made terminal, a release job that
 stops requiring the trusted verdict, a safe block-form `on:` followed by a
 duplicate `on: [push]` (and the reversed ordering), a duplicate `jobs:`,
 `advisory-verdict`, `needs`, `environment`, `steps`, step key, or checkout input,
@@ -165,6 +188,7 @@ UPLOAD_ARTIFACT_PIN = (
     "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
 )
 TRUSTED_WORKFLOW_PATH = ".github/workflows/launch-advisory-trust.yml"
+REQUESTER_WORKFLOW_PATH = ".github/workflows/release.yml"
 # Retained so a reintroduced forgeable commit-status handoff is still detected.
 STATUS_CONTEXT_PREFIX = "trusted-launch-advisory-gate"
 TRUSTED_CHECKER = "python3 -I scripts/check_launch_readiness.py"
@@ -213,6 +237,10 @@ PUBLISH_ARTIFACT_BINDING = re.compile(
     r"^\s*VERDICT_ARTIFACT:\s*\$\{\{\s*needs\.establish-trust\.outputs\."
     r"verdict_artifact\s*\}\}\s*$"
 )
+PUBLISH_REQUESTER_PATH_BINDING = re.compile(
+    r"^\s*REQUESTER_WORKFLOW_PATH:\s*\$\{\{\s*needs\.establish-trust\.outputs\."
+    r"requester_workflow_path\s*\}\}\s*$"
+)
 
 # The publisher derives the release artifact name from its own shell operands;
 # the release gate derives the identical string from its own run. Both
@@ -235,6 +263,19 @@ RELEASE_ARTIFACT_SHAPE = re.compile(
 AUDIT_ARTIFACT_SHAPE = re.compile(
     re.escape(VERDICT_ARTIFACT_PREFIX)
     + r"-main-audit-[1-9][0-9]{0,17}-attempt-[1-9][0-9]{0,17}$"
+)
+
+# The release-side job is also a closed sequence. A checkout may materialize
+# the tag tree, but the authentication gate must be the first `run:`; only after
+# it succeeds may the candidate checker's consistency self-test execute.
+RELEASE_GATE_JOB_STEP_COUNT = 3
+RELEASE_GATE_CHECKOUT_INPUTS = {
+    "fetch-depth": "0",
+    "persist-credentials": "false",
+}
+RELEASE_GATE_AUTH_MARKER = 'auth_script="$RUNNER_TEMP/authenticate-launch-advisory-verdict.py"'
+RELEASE_GATE_JOB_ALLOWED_KEYS = frozenset(
+    {"name", "needs", "runs-on", "timeout-minutes", "permissions", "steps"}
 )
 
 # ---------------------------------------------------------------------------
@@ -1495,6 +1536,11 @@ def check_trusted_workflow(text: str) -> list[str]:
             f"{TRUSTED_WORKFLOW} job `{TRUST_JOB}` must establish provenance "
             "without any credential"
         )
+    if "actions: read" not in trust_text:
+        errors.append(
+            f"{TRUSTED_WORKFLOW} job `{TRUST_JOB}` must hold `actions: read` so "
+            "the canonical triggering-run identity is resolved from the Actions API"
+        )
 
     # The credential job executes whatever the trusted anchor names, so the
     # anchor itself must be proved here: taken from the literal protected-branch
@@ -1540,11 +1586,74 @@ def check_trusted_workflow(text: str) -> list[str]:
     for expression, detail in (
         ("github.event.workflow_run.id", "the triggering Release run ID"),
         ("github.event.workflow_run.run_attempt", "the triggering Release run attempt"),
+        ("github.event.workflow_run.event", "the triggering Release event"),
+        ("github.event.workflow_run.head_sha", "the triggering Release head SHA"),
+        ("github.event.workflow_run.head_branch", "the triggering Release head branch"),
     ):
         if expression not in trust_text:
             errors.append(
                 f"{TRUSTED_WORKFLOW} job `{TRUST_JOB}` must bind {detail} "
                 f"(`{expression}`) so the published verdict cannot be replayed"
+            )
+
+    # A workflow_run name is only a selector. Resolve the run ID through the
+    # canonical API and compare a closed, exactly typed identity projection.
+    requester_identity_markers = (
+        '"repos/${GITHUB_REPOSITORY}/actions/runs/${release_run_id}"',
+        "MAX_RUN_RESPONSE_BYTES = 1_000_000",
+        "raw = handle.read(MAX_RUN_RESPONSE_BYTES + 1)",
+        "if len(raw) > MAX_RUN_RESPONSE_BYTES:",
+        "if type(payload) is not dict:",
+        '"id": int(sys.argv[2]),',
+        '"run_attempt": int(sys.argv[3]),',
+        '"event": sys.argv[4],',
+        '"head_sha": sys.argv[5],',
+        '"head_branch": sys.argv[6],',
+        f'"path": "{REQUESTER_WORKFLOW_PATH}",',
+        "identity = {key: payload.get(key) for key in expected}",
+        "if any(type(identity[key]) is not type(value) for key, value in expected.items()):",
+        "if identity != expected:",
+        f'requester_workflow_path="{REQUESTER_WORKFLOW_PATH}"',
+    )
+    for marker in requester_identity_markers:
+        if marker not in trust_text:
+            errors.append(
+                f"{TRUSTED_WORKFLOW} job `{TRUST_JOB}` must resolve the triggering "
+                "run through the Actions API and require the exact canonical "
+                f"requester identity with binding {marker!r}; display name "
+                "`Release` is not workflow identity"
+            )
+    requester_order = (
+        '"repos/${GITHUB_REPOSITORY}/actions/runs/${release_run_id}"',
+        "if identity != expected:",
+        f'requester_workflow_path="{REQUESTER_WORKFLOW_PATH}"',
+        'candidate_release_blob="$(git rev-parse "${candidate}:.github/workflows/release.yml")"',
+    )
+    requester_positions = [trust_text.find(marker) for marker in requester_order]
+    if any(position < 0 for position in requester_positions) or requester_positions != sorted(
+        requester_positions
+    ):
+        errors.append(
+            f"{TRUSTED_WORKFLOW} job `{TRUST_JOB}` must authenticate the exact "
+            "canonical requester identity before treating its tag and candidate "
+            "release workflow as a trusted Release request"
+        )
+
+    # This blocks the current trusted publisher from serving a historical
+    # release consumer. It cannot rewrite already-committed old workflows, so
+    # the repository tag-creation control documented for operators remains a
+    # required boundary as well.
+    for marker in (
+        'trusted_release_blob="$(git rev-parse "${trusted_sha}:.github/workflows/release.yml")"',
+        'candidate_release_blob="$(git rev-parse "${candidate}:.github/workflows/release.yml")"',
+        '[ "$candidate_release_blob" = "$trusted_release_blob" ]',
+    ):
+        if marker not in trust_text:
+            errors.append(
+                f"{TRUSTED_WORKFLOW} job `{TRUST_JOB}` must require the candidate "
+                "release workflow blob to equal the protected-main anchor with "
+                f"binding {marker!r}; historical pre-artifact consumers are not "
+                "admitted"
             )
     if "verdict_artifact:" not in trust_text:
         errors.append(
@@ -1683,10 +1792,13 @@ def check_trusted_workflow(text: str) -> list[str]:
         for required in (
             UPLOAD_ARTIFACT_PIN,
             "needs.establish-trust.outputs.verdict_artifact",
+            "needs.establish-trust.outputs.requester_workflow_path",
             "verdict=PASS",
             "release_sha=%s",
             "release_run_id=%s",
             "release_run_attempt=%s",
+            "requester_workflow_path=%s",
+            REQUESTER_WORKFLOW_PATH,
         ):
             if required not in publish_text:
                 errors.append(
@@ -1718,16 +1830,144 @@ def check_trusted_workflow(text: str) -> list[str]:
                 f"{TRUSTED_WORKFLOW} job `{PUBLISH_JOB}` must publish against the "
                 "established candidate SHA"
             )
+        if not any(
+            PUBLISH_REQUESTER_PATH_BINDING.match(line) for line in publish_lines
+        ):
+            errors.append(
+                f"{TRUSTED_WORKFLOW} job `{PUBLISH_JOB}` must consume the "
+                "canonically authenticated requester workflow path"
+            )
+    return errors
+
+
+def check_release_gate_steps(job_lines: list[str]) -> list[str]:
+    """Require checkout, authentication, then the candidate consistency test."""
+
+    errors: list[str] = []
+    where = f"{RELEASE_WORKFLOW} job `{RELEASE_GATE_JOB}`"
+    steps = job_steps(job_lines)
+    if len(steps) != RELEASE_GATE_JOB_STEP_COUNT:
+        errors.append(
+            f"{where} must consist of exactly {RELEASE_GATE_JOB_STEP_COUNT} steps "
+            "in order: pinned checkout, authenticated verdict gate, then the "
+            f"candidate checker self-test (found {len(steps)})"
+        )
+    if not steps:
+        return errors
+
+    checkout_entries = step_entries(steps[0])
+    errors.extend(duplicate_step_key_errors(where, "release checkout", checkout_entries))
+    checkout_keys = {key for key, _, _ in checkout_entries}
+    if not checkout_keys.issubset({"name", "uses", "with"}):
+        errors.append(
+            f"{where} first step must only be the declarative pinned checkout; "
+            "no command, environment, condition, or alternate execution surface "
+            "may precede authentication"
+        )
+    checkout_uses = [
+        inline_value(value) for key, value, _ in checkout_entries if key == "uses"
+    ]
+    if checkout_uses != [CHECKOUT_ACTION_PIN]:
+        errors.append(
+            f"{where} must begin with exactly `uses: {CHECKOUT_ACTION_PIN}`"
+        )
+    checkout_with = [
+        (value, body) for key, value, body in checkout_entries if key == "with"
+    ]
+    if len(checkout_with) != 1 or inline_value(f" {checkout_with[0][0]}"):
+        errors.append(
+            f"{where} release checkout must declare one explicit `with:` mapping"
+        )
+    else:
+        inputs: dict[str, str] = {}
+        malformed = False
+        for line in checkout_with[0][1]:
+            entry = MAPPING_ENTRY.match(line)
+            if entry is None or entry.group("key") in inputs:
+                malformed = True
+                continue
+            inputs[entry.group("key")] = inline_value(entry.group("value"))
+        if malformed or inputs != RELEASE_GATE_CHECKOUT_INPUTS:
+            errors.append(
+                f"{where} release checkout must declare exactly "
+                f"{RELEASE_GATE_CHECKOUT_INPUTS!r}, with no duplicate or "
+                "unparseable input"
+            )
+
+    if len(steps) >= 2:
+        auth_entries = step_entries(steps[1])
+        errors.extend(duplicate_step_key_errors(where, "authentication", auth_entries))
+        auth_keys = {key for key, _, _ in auth_entries}
+        if not auth_keys.issubset({"name", "env", "run"}) or "run" not in auth_keys:
+            errors.append(
+                f"{where} second step must be the plain authenticated verdict "
+                "gate, with only name/env/run"
+            )
+        auth_run = step_run_text(steps[1])
+        if RELEASE_GATE_AUTH_MARKER not in auth_run:
+            errors.append(
+                f"{where} second step must be the authenticated verdict gate; "
+                "no candidate-controlled `run:` may execute before it"
+            )
+        if CHECKER_SELF_TEST_STEP in auth_run:
+            errors.append(
+                f"{where} must not run the candidate checker self-test until "
+                "after the authenticated verdict gate"
+            )
+
+    if len(steps) >= 3:
+        consistency_entries = step_entries(steps[2])
+        errors.extend(
+            duplicate_step_key_errors(where, "candidate consistency", consistency_entries)
+        )
+        if {key for key, _, _ in consistency_entries} - {"name", "run"}:
+            errors.append(
+                f"{where} final candidate consistency step may declare only name/run"
+            )
+        if not job_runs_exact_command([steps[2]], CHECKER_SELF_TEST_STEP):
+            errors.append(
+                f"{where} third and final step must run `{CHECKER_SELF_TEST_STEP}` "
+                "only after authentication succeeds"
+            )
     return errors
 
 
 def check_release_workflow(text: str) -> list[str]:
     errors: list[str] = []
-    jobs = job_blocks(text).blocks
+    jobs_mapping = job_blocks(text)
+    jobs = jobs_mapping.blocks
+    if RELEASE_GATE_JOB in jobs_mapping.duplicates:
+        errors.append(
+            f"{RELEASE_WORKFLOW} declares job `{RELEASE_GATE_JOB}` more than once; "
+            "the authenticated gate job identity is ambiguous"
+        )
     if RELEASE_GATE_JOB not in jobs:
         errors.append(f"{RELEASE_WORKFLOW} is missing job `{RELEASE_GATE_JOB}`")
         return errors
-    gate = "\n".join(code_lines(jobs[RELEASE_GATE_JOB]))
+    release_job_text = "\n".join(jobs[RELEASE_GATE_JOB])
+    errors.extend(
+        structural_ambiguity_errors(
+            release_job_text,
+            f"{RELEASE_WORKFLOW} job `{RELEASE_GATE_JOB}`",
+        )
+    )
+    gate_lines = code_lines(jobs[RELEASE_GATE_JOB])
+    gate = "\n".join(gate_lines)
+    release_job_keys = {
+        match.group("key")
+        for match in (JOB_KEY.match(line) for line in gate_lines)
+        if match
+    }
+    extra_job_keys = sorted(release_job_keys - RELEASE_GATE_JOB_ALLOWED_KEYS)
+    if extra_job_keys:
+        errors.append(
+            f"{RELEASE_WORKFLOW} job `{RELEASE_GATE_JOB}` declares "
+            f"{', '.join(extra_job_keys)}; only "
+            f"{'/'.join(sorted(RELEASE_GATE_JOB_ALLOWED_KEYS))} are admitted, so "
+            "no job-wide environment, defaults, container, services, strategy, "
+            "or reusable workflow can alter the authentication sequence"
+        )
+    errors.extend(check_release_gate_steps(jobs[RELEASE_GATE_JOB]))
     if not RELEASE_GATE_ARTIFACT_DERIVATION.search(gate):
         errors.append(
             f"{RELEASE_WORKFLOW} job `{RELEASE_GATE_JOB}` must require the "
@@ -1740,25 +1980,76 @@ def check_release_workflow(text: str) -> list[str]:
         "pagination truncated",
         "duplicate live verdict artifacts",
         TRUSTED_WORKFLOW_PATH,
-        '!= "workflow_run"',
-        '!= "success"',
-        '!= "completed"',
+        'TRUSTED_PUBLISHER_EVENT = "workflow_run"',
+        f"requester_workflow_path={REQUESTER_WORKFLOW_PATH}",
         "release_sha=%s",
         "release_run_id=%s",
         "release_run_attempt=%s",
+        "requester_workflow_path",
         "verdict=PASS",
         "duplicate zip members",
         "zip traversal",
         "zip symlink",
+        "zip special member",
+        "data = handle.read(MAX_UNCOMPRESSED + 1)",
         "off-origin redirect",
         "api.github.com",
-        "Request(newurl, method=\"GET\")",
+        "port not in (None, 443)",
+        'return urllib.request.Request(newurl, method="GET")',
+        "MAX_REDIRECTS = 5",
+        "MAX_REDIRECT_REPEATS = 2",
+        "max_redirections = MAX_REDIRECTS",
+        "max_repeats = MAX_REDIRECT_REPEATS",
+        "raw = resp.read(MAX_JSON_BYTES + 1)",
+        "if len(raw) > MAX_JSON_BYTES:",
+        "remaining = MAX_ZIP_BYTES + 1 - total",
+        "chunk = resp.read(min(4096, remaining))",
+        "HTTP_TRANSIENT_STATUSES",
+        "500 <= error.code <= 599",
+        'headers.get("X-RateLimit-Remaining") == "0"',
+        'headers.get("Retry-After") is not None',
+        "if http_error_is_transient(error):",
+        'fail("transient API, server, or rate-limit response", EXIT_WAIT)',
+        'fail("API request was rejected")',
+        'fail("transient network failure", EXIT_WAIT)',
+        'if require_str(owner.get("path"), "path") != TRUSTED_WORKFLOW_PATH:',
+        'if require_str(owner.get("event"), "event") != TRUSTED_PUBLISHER_EVENT:',
+        'status = require_str(owner.get("status"), "status")',
+        'if status == "in_progress":',
+        'if "conclusion" not in owner or owner["conclusion"] is not None:',
+        'fail("trusted publisher run is still in progress", EXIT_WAIT)',
+        'if status != "completed":',
+        'conclusion = require_str(owner.get("conclusion"), "conclusion")',
+        'if conclusion != "success":',
     ):
         if required not in gate:
             errors.append(
                 f"{RELEASE_WORKFLOW} job `{RELEASE_GATE_JOB}` must authenticate "
                 f"the trusted artifact with binding {required!r}"
             )
+
+    # Identity must be authenticated before the one admitted lifecycle retry,
+    # and completed-success must be established before any ZIP is downloaded.
+    owner_order = (
+        'if require_str(owner.get("path"), "path") != TRUSTED_WORKFLOW_PATH:',
+        'if require_str(owner.get("event"), "event") != TRUSTED_PUBLISHER_EVENT:',
+        'status = require_str(owner.get("status"), "status")',
+        'if status == "in_progress":',
+        'fail("trusted publisher run is still in progress", EXIT_WAIT)',
+        'if status != "completed":',
+        'conclusion = require_str(owner.get("conclusion"), "conclusion")',
+        'if conclusion != "success":',
+        'blob = download_zip(',
+    )
+    owner_positions = [gate.find(marker) for marker in owner_order]
+    if any(position < 0 for position in owner_positions) or owner_positions != sorted(
+        owner_positions
+    ):
+        errors.append(
+            f"{RELEASE_WORKFLOW} job `{RELEASE_GATE_JOB}` must authenticate the "
+            "publisher path/event before retrying an in-progress owner, and must "
+            "require completed-success before downloading the artifact"
+        )
     if (
         "/commits/${release_sha}/statuses" in gate
         or "/statuses/" in gate
@@ -1854,10 +2145,13 @@ jobs:
   establish-trust:
     name: Establish candidate trust
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
     outputs:
       candidate_sha: ${{ steps.candidate.outputs.candidate_sha }}
       trusted_sha: ${{ steps.candidate.outputs.trusted_sha }}
       verdict_artifact: ${{ steps.candidate.outputs.verdict_artifact }}
+      requester_workflow_path: ${{ steps.candidate.outputs.requester_workflow_path }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
@@ -1871,14 +2165,42 @@ jobs:
         env:
           WORKFLOW_RUN_ID: ${{ github.event.workflow_run.id }}
           WORKFLOW_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          WORKFLOW_RUN_EVENT: ${{ github.event.workflow_run.event }}
+          WORKFLOW_RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          WORKFLOW_RUN_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
         run: |
           trusted_sha="$(git rev-parse HEAD)"
           [[ "$trusted_sha" =~ ^[0-9a-f]{40}$ ]] || exit 1
           git merge-base --is-ancestor "$trusted_sha" "$main_tip" || exit 1
+          gh api --method GET "repos/${GITHUB_REPOSITORY}/actions/runs/${release_run_id}"
+          MAX_RUN_RESPONSE_BYTES = 1_000_000
+          raw = handle.read(MAX_RUN_RESPONSE_BYTES + 1)
+          if len(raw) > MAX_RUN_RESPONSE_BYTES:
+              raise SystemExit(1)
+          expected = {
+              "id": int(sys.argv[2]),
+              "run_attempt": int(sys.argv[3]),
+              "event": sys.argv[4],
+              "head_sha": sys.argv[5],
+              "head_branch": sys.argv[6],
+              "path": ".github/workflows/release.yml",
+          }
+          if type(payload) is not dict:
+              raise SystemExit(1)
+          identity = {key: payload.get(key) for key in expected}
+          if any(type(identity[key]) is not type(value) for key, value in expected.items()):
+              raise SystemExit(1)
+          if identity != expected:
+              raise SystemExit(1)
+          requester_workflow_path=".github/workflows/release.yml"
+          trusted_release_blob="$(git rev-parse "${trusted_sha}:.github/workflows/release.yml")"
+          candidate_release_blob="$(git rev-parse "${candidate}:.github/workflows/release.yml")"
+          [ "$candidate_release_blob" = "$trusted_release_blob" ] || exit 1
           verdict_artifact="trusted-launch-advisory-verdict-main-audit-${GITHUB_RUN_ID}-attempt-${GITHUB_RUN_ATTEMPT}"
           verdict_artifact="trusted-launch-advisory-verdict-release-${release_run_id}-attempt-${release_run_attempt}"
           echo "trusted_sha=${trusted_sha}" >> "$GITHUB_OUTPUT"
           echo "verdict_artifact=${verdict_artifact}" >> "$GITHUB_OUTPUT"
+          echo "requester_workflow_path=${requester_workflow_path}" >> "$GITHUB_OUTPUT"
 
   advisory-verdict:
     name: Evaluate advisories from trusted code
@@ -1915,7 +2237,8 @@ jobs:
         env:
           CANDIDATE_SHA: ${{ needs.establish-trust.outputs.candidate_sha }}
           VERDICT_ARTIFACT: ${{ needs.establish-trust.outputs.verdict_artifact }}
-        run: printf 'release_sha=%s\\nrelease_run_id=%s\\nrelease_run_attempt=%s\\nverdict=PASS\\n' "$CANDIDATE_SHA" "$id" "$attempt" > verdict.txt
+          REQUESTER_WORKFLOW_PATH: ${{ needs.establish-trust.outputs.requester_workflow_path }}
+        run: printf 'release_sha=%s\\nrelease_run_id=%s\\nrelease_run_attempt=%s\\nrequester_workflow_path=%s\\nverdict=PASS\\n' "$CANDIDATE_SHA" "$id" "$attempt" "$REQUESTER_WORKFLOW_PATH" > verdict.txt
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: ${{ needs.establish-trust.outputs.verdict_artifact }}
@@ -1934,27 +2257,70 @@ jobs:
     name: Validate launch readiness
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
       - name: Require the trusted verdict
         env:
           RELEASE_RUN_ID: ${{ github.run_id }}
           RELEASE_RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
+          auth_script="$RUNNER_TEMP/authenticate-launch-advisory-verdict.py"
           artifact_name="trusted-launch-advisory-verdict-release-${RELEASE_RUN_ID}-attempt-${RELEASE_RUN_ATTEMPT}"
           listing="$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=${artifact_name}&per_page=100")"
           total_count=1
           echo pagination truncated
           echo duplicate live verdict artifacts
-          path=".github/workflows/launch-advisory-trust.yml"
-          [ "$event" != "workflow_run" ]
-          [ "$conclusion" != "success" ]
-          [ "$status" != "completed" ]
-          printf 'release_sha=%s\\nrelease_run_id=%s\\nrelease_run_attempt=%s\\nverdict=PASS\\n'
+          MAX_JSON_BYTES = 1_000_000
+          MAX_ZIP_BYTES = 65536
+          MAX_UNCOMPRESSED = 4096
+          MAX_REDIRECTS = 5
+          MAX_REDIRECT_REPEATS = 2
+          TRUSTED_WORKFLOW_PATH = ".github/workflows/launch-advisory-trust.yml"
+          TRUSTED_PUBLISHER_EVENT = "workflow_run"
+          HTTP_TRANSIENT_STATUSES = frozenset({408, 429})
+          500 <= error.code <= 599
+          headers.get("X-RateLimit-Remaining") == "0"
+          headers.get("Retry-After") is not None
+          max_redirections = MAX_REDIRECTS
+          max_repeats = MAX_REDIRECT_REPEATS
+          port not in (None, 443)
+          return urllib.request.Request(newurl, method="GET")
+          raw = resp.read(MAX_JSON_BYTES + 1)
+          if len(raw) > MAX_JSON_BYTES:
+              fail("JSON response too large")
+          remaining = MAX_ZIP_BYTES + 1 - total
+          chunk = resp.read(min(4096, remaining))
+          if http_error_is_transient(error):
+              fail("transient API, server, or rate-limit response", EXIT_WAIT)
+          fail("API request was rejected")
+          fail("transient network failure", EXIT_WAIT)
+          printf 'release_sha=%s\\nrelease_run_id=%s\\nrelease_run_attempt=%s\\nrequester_workflow_path=.github/workflows/release.yml\\nverdict=PASS\\n'
           echo duplicate zip members
           echo zip traversal
           echo zip symlink
+          echo zip special member
+          data = handle.read(MAX_UNCOMPRESSED + 1)
           echo off-origin redirect
           echo https://api.github.com
-          urllib.request.Request(newurl, method="GET")
+          if require_str(owner.get("path"), "path") != TRUSTED_WORKFLOW_PATH:
+              fail("candidate/tag-controlled workflow/run")
+          if require_str(owner.get("event"), "event") != TRUSTED_PUBLISHER_EVENT:
+              fail("candidate/tag-controlled workflow/run")
+          status = require_str(owner.get("status"), "status")
+          if status == "in_progress":
+              if "conclusion" not in owner or owner["conclusion"] is not None:
+                  fail("API/schema errors: in-progress conclusion")
+              fail("trusted publisher run is still in progress", EXIT_WAIT)
+          if status != "completed":
+              fail("candidate/tag-controlled workflow/run")
+          conclusion = require_str(owner.get("conclusion"), "conclusion")
+          if conclusion != "success":
+              fail("candidate/tag-controlled workflow/run")
+          blob = download_zip(path, token)
+      - name: Synthetic policy/checker self-tests
+        run: python3 -I scripts/check_launch_readiness.py --self-test
 """
 
 FIXTURE_STANDALONE = """name: Launch Readiness
@@ -2966,7 +3332,7 @@ def run_self_test() -> int:  # noqa: C901 — a flat fixture table stays readabl
     )
 
     trust_job_tail = (
-        '          echo "verdict_artifact=${verdict_artifact}" >> "$GITHUB_OUTPUT"\n'
+        '          echo "requester_workflow_path=${requester_workflow_path}" >> "$GITHUB_OUTPUT"\n'
         "\n  advisory-verdict:"
     )
     check(
@@ -2981,6 +3347,7 @@ def run_self_test() -> int:  # noqa: C901 — a flat fixture table stays readabl
     duplicate_trust_steps = FIXTURE_TRUSTED.replace(
         trust_job_tail,
         '          echo "verdict_artifact=${verdict_artifact}" >> "$GITHUB_OUTPUT"\n'
+        '          echo "requester_workflow_path=${requester_workflow_path}" >> "$GITHUB_OUTPUT"\n'
         "    steps:\n"
         "      - id: candidate\n"
         '        run: echo "trusted_sha=$(cat ./candidate/sha)" >> "$GITHUB_OUTPUT"\n'
@@ -3023,6 +3390,7 @@ def run_self_test() -> int:  # noqa: C901 — a flat fixture table stays readabl
         "      candidate_sha: ${{ steps.candidate.outputs.candidate_sha }}\n"
         "      trusted_sha: ${{ steps.candidate.outputs.trusted_sha }}\n"
         "      verdict_artifact: ${{ steps.candidate.outputs.verdict_artifact }}\n"
+        "      requester_workflow_path: ${{ steps.candidate.outputs.requester_workflow_path }}\n"
     )
     check(
         "the fixture's trust outputs block is the one the contract reads",
@@ -3119,6 +3487,7 @@ def run_self_test() -> int:  # noqa: C901 — a flat fixture table stays readabl
         not any(
             "must consume the established `verdict_artifact` output" in err
             or "must publish against the established candidate SHA" in err
+            or "canonically authenticated requester workflow path" in err
             or "must not use a forgeable commit status handoff" in err
             or "authenticated verdict artifact with binding" in err
             for err in duplicate_publisher_steps_errors
@@ -3130,6 +3499,7 @@ def run_self_test() -> int:  # noqa: C901 — a flat fixture table stays readabl
         "        env:\n"
         "          CANDIDATE_SHA: ${{ needs.establish-trust.outputs.candidate_sha }}\n"
         "          VERDICT_ARTIFACT: ${{ needs.establish-trust.outputs.verdict_artifact }}\n"
+        "          REQUESTER_WORKFLOW_PATH: ${{ needs.establish-trust.outputs.requester_workflow_path }}\n"
     )
     check(
         "the fixture's publisher env block is the one the contract reads",
@@ -3166,6 +3536,7 @@ def run_self_test() -> int:  # noqa: C901 — a flat fixture table stays readabl
         not any(
             "must consume the established `verdict_artifact` output" in err
             or "must publish against the established candidate SHA" in err
+            or "canonically authenticated requester workflow path" in err
             for err in duplicate_publisher_env_errors
         ),
         str(duplicate_publisher_env_errors),
@@ -3424,6 +3795,189 @@ def run_self_test() -> int:  # noqa: C901 — a flat fixture table stays readabl
         ),
     )
 
+    # ---- Canonical requester identity and historical-workflow floor ---------
+
+    spoofed_requester_path = FIXTURE_TRUSTED.replace(
+        '"path": ".github/workflows/release.yml",',
+        '"path": ".github/workflows/not-release.yml",',
+    )
+    check(
+        "a same-display-name requester with a different workflow path is rejected",
+        any(
+            "exact canonical requester identity" in err
+            for err in evaluate(mutated(TRUSTED_WORKFLOW, spoofed_requester_path))
+        ),
+    )
+
+    spoofed_identity_comparison = FIXTURE_TRUSTED.replace(
+        "          if identity != expected:\n",
+        "          if False and identity != expected:\n",
+    )
+    check(
+        "a fail-open canonical run identity comparison is rejected",
+        any(
+            "exact canonical requester identity" in err
+            for err in evaluate(
+                mutated(TRUSTED_WORKFLOW, spoofed_identity_comparison)
+            )
+        ),
+    )
+
+    wrong_run_endpoint = FIXTURE_TRUSTED.replace(
+        '"repos/${GITHUB_REPOSITORY}/actions/runs/${release_run_id}"',
+        '"repos/${GITHUB_REPOSITORY}/actions/workflows/release.yml/runs"',
+    )
+    check(
+        "dropping the canonical triggering-run ID lookup is rejected",
+        any(
+            "resolve the triggering run through the Actions API" in err
+            for err in evaluate(mutated(TRUSTED_WORKFLOW, wrong_run_endpoint))
+        ),
+    )
+
+    dropped_release_blob_floor = FIXTURE_TRUSTED.replace(
+        '          [ "$candidate_release_blob" = "$trusted_release_blob" ] || exit 1\n',
+        "          true\n",
+    )
+    check(
+        "dropping the protected-main release-workflow byte floor is rejected",
+        any(
+            "historical pre-artifact consumers are not admitted" in err
+            for err in evaluate(mutated(TRUSTED_WORKFLOW, dropped_release_blob_floor))
+        ),
+    )
+
+    # ---- Candidate execution order and bounded artifact authentication ------
+
+    release_checkout_block = (
+        "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6\n"
+        "        with:\n"
+        "          fetch-depth: 0\n"
+        "          persist-credentials: false\n"
+    )
+    preceding_candidate_run = FIXTURE_RELEASE.replace(
+        release_checkout_block,
+        release_checkout_block
+        + "      - name: Poison the later gate\n"
+        + '        run: echo "BASH_ENV=$PWD/payload" >> "$GITHUB_ENV"\n',
+    )
+    check(
+        "a candidate-controlled run before the authentication gate is rejected",
+        any(
+            "must consist of exactly 3 steps" in err
+            for err in evaluate(mutated(RELEASE_WORKFLOW, preceding_candidate_run))
+        ),
+    )
+
+    consistency_step = (
+        "      - name: Synthetic policy/checker self-tests\n"
+        "        run: python3 -I scripts/check_launch_readiness.py --self-test\n"
+    )
+    reordered_self_test = FIXTURE_RELEASE.replace(consistency_step, "").replace(
+        "      - name: Require the trusted verdict\n",
+        consistency_step + "      - name: Require the trusted verdict\n",
+    )
+    check(
+        "moving the candidate self-test before authentication is rejected",
+        any(
+            "no candidate-controlled `run:` may execute before it" in err
+            or "third and final step" in err
+            for err in evaluate(mutated(RELEASE_WORKFLOW, reordered_self_test))
+        ),
+    )
+
+    terminal_in_progress = FIXTURE_RELEASE.replace(
+        '              fail("trusted publisher run is still in progress", EXIT_WAIT)',
+        '              fail("trusted publisher run is still in progress")',
+    )
+    check(
+        "an authenticated in-progress publisher is retried rather than failed",
+        any(
+            "trusted publisher run is still in progress" in err
+            for err in evaluate(mutated(RELEASE_WORKFLOW, terminal_in_progress))
+        ),
+    )
+
+    owner_path_block = (
+        '          if require_str(owner.get("path"), "path") != TRUSTED_WORKFLOW_PATH:\n'
+        '              fail("candidate/tag-controlled workflow/run")\n'
+    )
+    owner_event_block = (
+        '          if require_str(owner.get("event"), "event") != TRUSTED_PUBLISHER_EVENT:\n'
+        '              fail("candidate/tag-controlled workflow/run")\n'
+    )
+    reordered_owner_identity = FIXTURE_RELEASE.replace(
+        owner_path_block + owner_event_block,
+        owner_event_block + owner_path_block,
+    )
+    check(
+        "publisher path and event authentication must precede lifecycle handling",
+        any(
+            "authenticate the publisher path/event before retrying" in err
+            for err in evaluate(mutated(RELEASE_WORKFLOW, reordered_owner_identity))
+        ),
+    )
+
+    dead_redirect_bound = FIXTURE_RELEASE.replace(
+        "          max_redirections = MAX_REDIRECTS\n",
+        "          max_redirs = MAX_REDIRECTS\n",
+    )
+    check(
+        "the redirect bound must use HTTPRedirectHandler's consumed attribute",
+        any(
+            "max_redirections = MAX_REDIRECTS" in err
+            for err in evaluate(mutated(RELEASE_WORKFLOW, dead_redirect_bound))
+        ),
+    )
+
+    dead_repeat_bound = FIXTURE_RELEASE.replace(
+        "          max_repeats = MAX_REDIRECT_REPEATS\n",
+        "          max_repeat = MAX_REDIRECT_REPEATS\n",
+    )
+    check(
+        "the repeated-redirect loop bound must remain live",
+        any(
+            "max_repeats = MAX_REDIRECT_REPEATS" in err
+            for err in evaluate(mutated(RELEASE_WORKFLOW, dead_repeat_bound))
+        ),
+    )
+
+    truncated_json_read = FIXTURE_RELEASE.replace(
+        "          raw = resp.read(MAX_JSON_BYTES + 1)\n",
+        "          raw = resp.read(MAX_JSON_BYTES)\n",
+    )
+    check(
+        "JSON API reads must use limit-plus-one",
+        any(
+            "raw = resp.read(MAX_JSON_BYTES + 1)" in err
+            for err in evaluate(mutated(RELEASE_WORKFLOW, truncated_json_read))
+        ),
+    )
+
+    ignored_json_overflow = FIXTURE_RELEASE.replace(
+        "          if len(raw) > MAX_JSON_BYTES:\n",
+        "          if False and len(raw) > MAX_JSON_BYTES:\n",
+    )
+    check(
+        "JSON API overflow must fail before decoding",
+        any(
+            "if len(raw) > MAX_JSON_BYTES:" in err
+            for err in evaluate(mutated(RELEASE_WORKFLOW, ignored_json_overflow))
+        ),
+    )
+
+    unclassified_5xx = FIXTURE_RELEASE.replace(
+        "          500 <= error.code <= 599\n",
+        "          500 <= error.code <= 499\n",
+    )
+    check(
+        "all 5xx responses must take only the bounded transient path",
+        any(
+            "500 <= error.code <= 599" in err
+            for err in evaluate(mutated(RELEASE_WORKFLOW, unclassified_5xx))
+        ),
+    )
+
     dropped_gate = FIXTURE_RELEASE.replace("trusted-launch-advisory-verdict", "anything")
     check(
         "a release gate that stops requiring the trusted verdict is rejected",
@@ -3436,7 +3990,8 @@ def run_self_test() -> int:  # noqa: C901 — a flat fixture table stays readabl
 
     reevaluating_release = FIXTURE_RELEASE.replace(
         "          printf 'release_sha=%s\\nrelease_run_id=%s\\n"
-        "release_run_attempt=%s\\nverdict=PASS\\n'",
+        "release_run_attempt=%s\\nrequester_workflow_path=.github/workflows/"
+        "release.yml\\nverdict=PASS\\n'",
         "          python3 -I scripts/check_launch_readiness.py --verify",
     )
     check(
@@ -3460,8 +4015,9 @@ def run_self_test() -> int:  # noqa: C901 — a flat fixture table stays readabl
 
     status_handoff = FIXTURE_TRUSTED.replace(
         "        run: printf 'release_sha=%s\\nrelease_run_id=%s\\n"
-        "release_run_attempt=%s\\nverdict=PASS\\n' "
-        '"$CANDIDATE_SHA" "$id" "$attempt" > verdict.txt',
+        "release_run_attempt=%s\\nrequester_workflow_path=%s\\nverdict=PASS\\n' "
+        '"$CANDIDATE_SHA" "$id" "$attempt" "$REQUESTER_WORKFLOW_PATH" '
+        "> verdict.txt",
         '        run: gh api --method POST "repos/x/statuses/$CANDIDATE_SHA" '
         '-f "context=trusted-launch-advisory-gate"',
     )
