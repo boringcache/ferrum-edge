@@ -90,6 +90,30 @@ fn test_detect_version_rejects_absent_version() {
 }
 
 #[test]
+fn test_detect_version_rejects_alias_before_later_malformation_redacted() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.yaml");
+    std::fs::write(
+        &config_path,
+        concat!(
+            "version: &private-version \"1\"\n",
+            "copy: *private-version\n",
+            "broken: [migration-secret\n",
+        ),
+    )
+    .unwrap();
+
+    let err = ConfigMigrator::detect_version(config_path.to_str().unwrap()).unwrap_err();
+    let rendered = err.to_string();
+    assert_eq!(
+        rendered,
+        "YAML document containing aliases is malformed or unsupported"
+    );
+    assert!(!rendered.contains("private-version"));
+    assert!(!rendered.contains("migration-secret"));
+}
+
+#[test]
 fn test_detect_version_rejects_missing_file() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("missing.yaml");

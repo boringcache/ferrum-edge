@@ -8538,6 +8538,22 @@ pub mod _test_support {
         )
     }
 
+    /// One-shot GET/PATCH intercept for the live Istio status competing-writer
+    /// lane. After the first identity-matching GET, Ferrum waits until `resume`
+    /// is completed before PATCHing.
+    pub fn install_istio_status_write_intercept_for_test(
+        after_get: tokio::sync::oneshot::Sender<()>,
+        resume: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        crate::k8s_controller::istio_status::install_istio_status_write_intercept_for_test(
+            after_get, resume,
+        )
+    }
+
+    pub fn clear_istio_status_write_intercept_for_test() {
+        crate::k8s_controller::istio_status::clear_istio_status_write_intercept_for_test()
+    }
+
     // ── K8s controller shutdown supervision (#3220) ─────────────────────────
 
     pub use crate::k8s_controller::{
