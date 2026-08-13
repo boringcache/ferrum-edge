@@ -1349,6 +1349,12 @@ fn require_datagram_transport(transport: u8) -> Result<(), DatagramMetadataError
     }
 }
 
+/// Absolute `[start, end)` byte range of a TLV value within the datagram buffer.
+type TlvValueByteRange = (usize, usize);
+
+/// Located authentication and freshness TLV value ranges from one envelope walk.
+type EnvelopeTlvRanges = (Option<TlvValueByteRange>, Option<TlvValueByteRange>);
+
 /// Walk the TLV region once and locate the single authentication TLV and the
 /// single freshness TLV, if present.
 ///
@@ -1360,10 +1366,10 @@ fn require_datagram_transport(transport: u8) -> Result<(), DatagramMetadataError
 fn walk_envelope_tlvs(
     tlvs: &[u8],
     tlv_base: usize,
-) -> Result<(Option<(usize, usize)>, Option<(usize, usize)>), DatagramMetadataError> {
+) -> Result<EnvelopeTlvRanges, DatagramMetadataError> {
     let mut offset = 0usize;
-    let mut auth: Option<(usize, usize)> = None;
-    let mut freshness: Option<(usize, usize)> = None;
+    let mut auth: Option<TlvValueByteRange> = None;
+    let mut freshness: Option<TlvValueByteRange> = None;
     while offset < tlvs.len() {
         // type (1) + length (2) + value
         if tlvs.len() - offset < 3 {
