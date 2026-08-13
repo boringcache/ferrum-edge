@@ -331,6 +331,19 @@ where
         self.send.send_id()
     }
 }
+
+impl<B> h3::quic::SendStreamStopped for BidiStream<B>
+where
+    B: Buf + 'static,
+{
+    fn stopped(
+        &self,
+    ) -> impl Future<Output = Result<Option<u64>, h3::quic::StreamErrorIncoming>> + Send + 'static
+    {
+        h3::quic::SendStreamStopped::stopped(&self.send)
+    }
+}
+
 impl<B> quic::SendStreamUnframed<B> for BidiStream<B>
 where
     B: Buf,
@@ -515,6 +528,41 @@ where
     fn send_id(&self) -> StreamId {
         let num: u64 = self.stream.id().into();
         num.try_into().expect("invalid stream id")
+    }
+}
+
+impl<B> h3::quic::SendStreamStopped for SendStream<B>
+where
+    B: Buf + 'static,
+{
+    /// FERRUM PATCH: expose Quinn's `&self` + `'static` `stopped()` so a server
+    /// can observe peer STOP_SENDING without exclusive send-stream access.
+    /// Return-position `impl Future` stays on stable Rust; associated-type
+    /// `impl Trait` does not.
+    fn stopped(
+        &self,
+    ) -> impl Future<Output = Result<Option<u64>, h3::quic::StreamErrorIncoming>> + Send + 'static
+    {
+        let stopped = self.stream.stopped();
+        async move {
+            match stopped.await {
+                Ok(code) => Ok(code.map(|v| v.into_inner())),
+                Err(error) => Err(convert_stopped_error(error)),
+            }
+        }
+    }
+}
+
+fn convert_stopped_error(error: quinn::StoppedError) -> h3::quic::StreamErrorIncoming {
+    match error {
+        quinn::StoppedError::ConnectionLost(connection_error) => {
+            h3::quic::StreamErrorIncoming::ConnectionErrorIncoming {
+                connection_error: convert_connection_error(connection_error),
+            }
+        }
+        error @ quinn::StoppedError::ZeroRttRejected => {
+            h3::quic::StreamErrorIncoming::Unknown(Box::new(error))
+        }
     }
 }
 

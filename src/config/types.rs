@@ -494,10 +494,23 @@ pub struct SubsetTrafficPolicy {
     /// `Proxy.pool_idle_timeout_seconds` like the top-level/per-port form.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http_idle_timeout_ms: Option<u64>,
-    /// Subset-scoped HTTP/2 concurrent-streams cap, mapped from DestinationRule
+    /// Subset-scoped destination-wide active-request cap, mapped from
+    /// DestinationRule
     /// `subsets[].trafficPolicy.connectionPool.http.http2MaxRequests`. Overlaid
-    /// onto the selected proxy's inherited dispatch fallback and projected onto
-    /// `Proxy.pool_http2_max_concurrent_streams` like the top-level/per-port form.
+    /// onto the selected proxy's inherited dispatch fallback like the
+    /// top-level/per-port form and enforced for HTTP/1.1 AND HTTP/2 by
+    /// [`crate::backend_active_request_limit::BackendActiveRequestLimiter`]; the
+    /// lane key carries the selected subset name so sibling subsets cannot
+    /// consume one another's budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http2_max_requests: Option<u32>,
+    /// Subset-scoped per-connection HTTP/2 stream cap, mapped from
+    /// DestinationRule
+    /// `subsets[].trafficPolicy.connectionPool.http.maxConcurrentStreams`.
+    /// Overlaid onto the selected proxy's inherited dispatch fallback and
+    /// projected onto `Proxy.pool_http2_max_concurrent_streams` like the
+    /// top-level/per-port form. This is the TRANSPORT knob (one H2 connection's
+    /// SETTINGS), not the destination request budget — see `http2_max_requests`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub h2_max_concurrent_streams: Option<u32>,
     /// Per-subset passive health (Istio `subsets[].trafficPolicy.outlierDetection`),
@@ -667,8 +680,20 @@ pub struct UpstreamPortOverride {
     /// any pool.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http_idle_timeout_ms: Option<u64>,
-    /// Per-port HTTP/2 concurrent-streams cap mapped from DestinationRule
-    /// `connectionPool.http.http2MaxRequests`. Projected onto the per-target
+    /// Per-port destination-wide ACTIVE-REQUEST cap mapped from DestinationRule
+    /// `connectionPool.http.http2MaxRequests` ("maximum number of active
+    /// requests to a destination; applicable to both HTTP1.1 and HTTP2").
+    /// Enforced by
+    /// [`crate::backend_active_request_limit::BackendActiveRequestLimiter`] as a
+    /// shared budget for the logical destination, so it cannot be multiplied by
+    /// connection count or pool shards and cannot be raised by peer SETTINGS.
+    /// The permit is acquired during backend admission — before any backend
+    /// dial — and held until the response exchange terminates; an over-budget
+    /// request is shed with a backend-neutral 503 (gRPC `UNAVAILABLE`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http2_max_requests: Option<u32>,
+    /// Per-port PER-CONNECTION HTTP/2 stream cap mapped from DestinationRule
+    /// `connectionPool.http.maxConcurrentStreams`. Projected onto the per-target
     /// effective proxy's `pool_http2_max_concurrent_streams` and threaded
     /// into the H2/gRPC backend builders via
     /// `http2::Builder::max_concurrent_streams` (peer SETTINGS) and
@@ -677,7 +702,9 @@ pub struct UpstreamPortOverride {
     /// effective value in their base keys (`none` when unset) so update/delete
     /// cannot reuse a connection built under a prior limit. Reqwest's H2 path
     /// does not expose the same builder knob today and therefore does not
-    /// key on it.
+    /// key on it. This is one connection's transport state and is deliberately
+    /// NOT the destination request budget (`http2_max_requests`): a peer's
+    /// SETTINGS frame can replace it, and every connection carries its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub h2_max_concurrent_streams: Option<u32>,
     /// Per-port backend TLS posture, mapped from DestinationRule
@@ -721,8 +748,9 @@ pub struct UpstreamPortOverride {
     /// not per selected endpoint host (issue #3778).
     ///
     /// HTTP/1.1-scoped: the multiplexed transports (direct H2, gRPC, HTTP/3,
-    /// HBONE, mesh-mTLS) do NOT consult this field — their request concurrency
-    /// is governed by `http2MaxRequests` (`h2_max_concurrent_streams`). Always
+    /// HBONE, mesh-mTLS) do NOT consult this field. Request concurrency for
+    /// EVERY HTTP-family transport is separately bounded by the
+    /// destination-wide `http2_max_requests` breaker. Always
     /// positive when set (zero rejected at translate time).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http1_max_pending_requests: Option<u32>,
@@ -779,6 +807,9 @@ pub struct ResolvedPortOverride {
     pub tcp_keepalive: Option<TcpKeepaliveCfg>,
     pub http_max_requests_per_connection: Option<u32>,
     pub http_idle_timeout_ms: Option<u64>,
+    /// Destination-wide active-request cap (`http2MaxRequests`).
+    pub http2_max_requests: Option<u32>,
+    /// Per-connection HTTP/2 stream cap (`maxConcurrentStreams`).
     pub h2_max_concurrent_streams: Option<u32>,
     pub tls: Option<BackendTlsConfig>,
     pub h2_upgrade_policy: Option<H2UpgradePolicy>,
@@ -817,6 +848,7 @@ impl ResolvedPortOverride {
             tcp_keepalive: value.tcp_keepalive.clone(),
             http_max_requests_per_connection: value.http_max_requests_per_connection,
             http_idle_timeout_ms: value.http_idle_timeout_ms,
+            http2_max_requests: value.http2_max_requests,
             h2_max_concurrent_streams: value.h2_max_concurrent_streams,
             tls,
             h2_upgrade_policy: value.h2_upgrade_policy,
@@ -839,6 +871,7 @@ impl ResolvedPortOverride {
             && self.tcp_keepalive.is_none()
             && self.http_max_requests_per_connection.is_none()
             && self.http_idle_timeout_ms.is_none()
+            && self.http2_max_requests.is_none()
             && self.h2_max_concurrent_streams.is_none()
             && self.tls.is_none()
             && self.h2_upgrade_policy.is_none()
@@ -868,6 +901,7 @@ impl ResolvedPortOverride {
             .http_max_requests_per_connection
             .or(fallback.http_max_requests_per_connection);
         self.http_idle_timeout_ms = self.http_idle_timeout_ms.or(fallback.http_idle_timeout_ms);
+        self.http2_max_requests = self.http2_max_requests.or(fallback.http2_max_requests);
         self.h2_max_concurrent_streams = self
             .h2_max_concurrent_streams
             .or(fallback.h2_max_concurrent_streams);
@@ -896,6 +930,9 @@ impl ResolvedPortOverride {
         }
         if let Some(idle_ms) = subset.http_idle_timeout_ms {
             self.http_idle_timeout_ms = Some(idle_ms);
+        }
+        if let Some(max_active) = subset.http2_max_requests {
+            self.http2_max_requests = Some(max_active);
         }
         if let Some(max_streams) = subset.h2_max_concurrent_streams {
             self.h2_max_concurrent_streams = Some(max_streams);
@@ -957,6 +994,7 @@ pub(crate) fn dispatch_port_override_fallback_for_selected_subset(
             || subset_policy.max_retries.is_some()
             || subset_policy.http1_max_pending_requests.is_some()
             || subset_policy.http_idle_timeout_ms.is_some()
+            || subset_policy.http2_max_requests.is_some()
             || subset_policy.h2_max_concurrent_streams.is_some())
     {
         inherited
@@ -1020,32 +1058,18 @@ pub struct ResolvedSubsetTrafficPolicy {
     pub http1_max_pending_requests: Option<u32>,
     /// Subset-scoped HTTP idle timeout (milliseconds).
     pub http_idle_timeout_ms: Option<u64>,
-    /// Subset-scoped HTTP/2 concurrent-streams cap.
+    /// Subset-scoped destination-wide active-request cap (`http2MaxRequests`).
+    pub http2_max_requests: Option<u32>,
+    /// Subset-scoped per-connection HTTP/2 stream cap
+    /// (`maxConcurrentStreams`).
     pub h2_max_concurrent_streams: Option<u32>,
 }
 
 impl ResolvedSubsetTrafficPolicy {
-    /// Build from the fully resolved subset overlays. Returns `None` only when
-    /// every carried field is absent, so callers can skip empty entries.
-    pub fn new(
-        tls: Option<BackendTlsConfig>,
-        passive_health_check: Option<PassiveHealthCheck>,
-        h2_upgrade_policy: Option<H2UpgradePolicy>,
-        max_retries: Option<u32>,
-        http1_max_pending_requests: Option<u32>,
-        http_idle_timeout_ms: Option<u64>,
-        h2_max_concurrent_streams: Option<u32>,
-    ) -> Option<Self> {
-        let resolved = Self {
-            tls,
-            passive_health_check,
-            h2_upgrade_policy,
-            max_retries,
-            http1_max_pending_requests,
-            http_idle_timeout_ms,
-            h2_max_concurrent_streams,
-        };
-        (!resolved.is_empty()).then_some(resolved)
+    /// Return this fully resolved subset overlay unless every carried field is
+    /// absent, so callers can skip empty entries.
+    pub fn into_non_empty(self) -> Option<Self> {
+        (!self.is_empty()).then_some(self)
     }
 
     fn is_empty(&self) -> bool {
@@ -1055,6 +1079,7 @@ impl ResolvedSubsetTrafficPolicy {
             && self.max_retries.is_none()
             && self.http1_max_pending_requests.is_none()
             && self.http_idle_timeout_ms.is_none()
+            && self.http2_max_requests.is_none()
             && self.h2_max_concurrent_streams.is_none()
     }
 }
@@ -1759,9 +1784,10 @@ pub struct Upstream {
     /// `connectionPool.http` overlay.
     ///
     /// This carries the top-level `connectionPool.http` block for every
-    /// upstream (including the five subset-inheritable fields:
+    /// upstream (including the six subset-inheritable fields:
     /// `h2UpgradePolicy`, `maxRetries`, `http1MaxPendingRequests`,
-    /// `idleTimeout`, and `http2MaxRequests`). During proxy projection a
+    /// `idleTimeout`, `http2MaxRequests`, and `maxConcurrentStreams`). During
+    /// proxy projection a
     /// selected subset overlays those fields onto this base. Dispatch
     /// merges an explicit per-port entry first, then this inherited fallback,
     /// giving exact `port-level > subset-level > top-level` field precedence.
@@ -2513,7 +2539,8 @@ pub struct Proxy {
     /// Service-discovery upstreams use this because target ports resolve at
     /// runtime. All upstreams also use it for the subset-inheritable HTTP
     /// fields (`h2UpgradePolicy`, `maxRetries`, `http1MaxPendingRequests`,
-    /// `idleTimeout`, `http2MaxRequests`), after the selected subset has
+    /// `idleTimeout`, `http2MaxRequests`, `maxConcurrentStreams`), after the
+    /// selected subset has
     /// overlaid the top-level values. The
     /// HTTP-family dispatch resolvers
     /// (`resolve_effective_proxy_for_target` / `cap_proxy_retry_for_target`)
@@ -4110,7 +4137,7 @@ impl GatewayConfig {
             .filter(|(_, m)| !m.is_empty())
             .collect();
 
-        // Inherited top-level `connectionPool.http` fallback. All five applied
+        // Inherited top-level `connectionPool.http` fallback. All six applied
         // HTTP fields supported at subset scope are overlaid per proxy via the
         // shared selected-subset helper so admission and runtime stay aligned.
         // The per-port map stays separate and is consulted first at dispatch,
@@ -9094,6 +9121,7 @@ impl Upstream {
                         "http_idle_timeout_ms",
                         policy.http_idle_timeout_ms.is_some(),
                     ),
+                    ("http2_max_requests", policy.http2_max_requests.is_some()),
                     (
                         "h2_max_concurrent_streams",
                         policy.h2_max_concurrent_streams.is_some(),

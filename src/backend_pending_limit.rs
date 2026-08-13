@@ -82,12 +82,18 @@
 //! GET/HEAD and streamed-upload requests are capped alike.
 //!
 //! The multiplexed transports — direct HTTP/2, gRPC, HTTP/3, HBONE, and
-//! mesh-mTLS — do **not** consume this limiter. They are not HTTP/1.1, and
-//! their request concurrency is governed by HTTP/2 stream limits
-//! (`connectionPool.http.http2MaxRequests` → `h2_max_concurrent_streams`), not
-//! a connection-pending queue. A captured DestinationRule that sets both knobs
-//! gets `http2MaxRequests` on its H2/gRPC dispatch and `http1MaxPendingRequests`
-//! on its H1 dispatch, which is the correct per-protocol split.
+//! mesh-mTLS — do **not** consume this limiter. They are not HTTP/1.1, and a
+//! connection-pending queue is not their shape.
+//!
+//! This limiter is NOT the destination request budget. Istio
+//! `connectionPool.http.http2MaxRequests` — "maximum number of active requests
+//! to a destination, applicable to both HTTP1.1 and HTTP2" — is enforced
+//! separately and transport-agnostically by
+//! [`crate::backend_active_request_limit`], so an H1 dispatch is bounded by BOTH
+//! this `http1MaxPendingRequests` gate and that destination-wide breaker, while
+//! the multiplexed transports are bounded by the breaker alone. The
+//! per-connection HTTP/2 stream knob (`maxConcurrentStreams` →
+//! `h2_max_concurrent_streams`) is a third, transport-level control.
 //!
 //! # Hot-path discipline (mirrors [`crate::backend_conn_limit`])
 //!

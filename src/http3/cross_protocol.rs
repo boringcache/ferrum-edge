@@ -96,7 +96,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::{Buf, Bytes, BytesMut};
-use h3::quic::{RecvStream, SendStream};
+use h3::quic::{RecvStream, SendStream, SendStreamStopped};
 use h3::server::RequestStream;
 use http::{Response, StatusCode};
 use http_body_util::BodyExt;
@@ -212,7 +212,7 @@ impl CoalesceConfig {
 
 pub(crate) struct CrossProtocolRequest<'a, S>
 where
-    S: RecvStream + SendStream<Bytes>,
+    S: RecvStream + SendStream<Bytes> + SendStreamStopped,
 {
     pub state: &'a ProxyState,
     pub epoch: &'a RequestEpoch,
@@ -333,6 +333,106 @@ fn record_cross_protocol_header_write_disconnect(
     );
 }
 
+enum H3BackendOrPeer<T> {
+    Ready(T),
+    Deadline,
+    PeerGone,
+}
+
+/// Race a backend wait against per-stream H3 cancellation, whole-connection
+/// close, and an optional gRPC-Web deadline.
+///
+/// After the request body is complete the request task is blocked on reqwest
+/// `send()` and is not polling H3 frames. Peer `STOP_SENDING` on the gateway
+/// response direction is still observable through the vendored
+/// [`h3::quic::SendStreamStopped`] primitive (`&self`, `'static`), so a client
+/// can cancel one multiplexed stream without closing the QUIC connection and
+/// still release destination-admission permits. `PeerConnectionSignal` remains
+/// the whole-connection close path.
+async fn await_h3_backend_or_peer<F, T>(
+    deadline: Option<tokio::time::Instant>,
+    peer: Option<&crate::plugins::PeerConnectionSignal>,
+    stream_cancelled: impl std::future::Future<Output = ()>,
+    future: F,
+) -> H3BackendOrPeer<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    if peer.is_some_and(crate::plugins::PeerConnectionSignal::is_closed) {
+        return H3BackendOrPeer::PeerGone;
+    }
+    tokio::pin!(future);
+    tokio::pin!(stream_cancelled);
+    let peer_closed = async {
+        if let Some(signal) = peer {
+            signal.closed().await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+    tokio::pin!(peer_closed);
+    match deadline {
+        None => {
+            tokio::select! {
+                value = &mut future => H3BackendOrPeer::Ready(value),
+                _ = &mut stream_cancelled => H3BackendOrPeer::PeerGone,
+                _ = &mut peer_closed => H3BackendOrPeer::PeerGone,
+            }
+        }
+        Some(deadline) => {
+            tokio::select! {
+                value = &mut future => H3BackendOrPeer::Ready(value),
+                _ = &mut stream_cancelled => H3BackendOrPeer::PeerGone,
+                _ = &mut peer_closed => H3BackendOrPeer::PeerGone,
+                _ = tokio::time::sleep_until(deadline) => H3BackendOrPeer::Deadline,
+            }
+        }
+    }
+}
+
+struct PlainPeerGoneBeforeResponseHeadersCtx<'a> {
+    state: &'a ProxyState,
+    proxy: &'a Proxy,
+    epoch: &'a RequestEpoch,
+    upstream_balancer: Option<&'a Arc<LoadBalancer>>,
+    current_target: Option<&'a Arc<UpstreamTarget>>,
+    cb_target_key: Option<&'a str>,
+    cb_is_half_open_probe: bool,
+    backend_start: Instant,
+    backend_admission_permits: &'a mut Option<BackendAdmissionPermitSet>,
+    backend_admission_elapsed: Duration,
+    bytes_sent: u64,
+    current_url: &'a str,
+    response_streamed: bool,
+}
+
+fn plain_peer_gone_before_response_headers(
+    ctx: PlainPeerGoneBeforeResponseHeadersCtx<'_>,
+) -> CrossProtocolOutcome {
+    record_cross_protocol_header_write_disconnect(
+        ctx.state,
+        ctx.proxy,
+        ctx.epoch,
+        ctx.upstream_balancer,
+        ctx.current_target,
+        ctx.cb_target_key,
+        0,
+        0,
+        ctx.cb_is_half_open_probe,
+        ctx.backend_start,
+        ctx.backend_admission_permits,
+        ctx.backend_admission_elapsed,
+    );
+    cross_protocol_header_write_disconnect_outcome(
+        0,
+        ctx.response_streamed,
+        ctx.bytes_sent,
+        ctx.backend_start,
+        Some(strip_query_from_backend_url(ctx.current_url)),
+        None,
+    )
+}
+
 fn cross_protocol_header_write_disconnect_outcome(
     response_status: u16,
     response_streamed: bool,
@@ -404,6 +504,7 @@ where
     S: RecvStream + SendStream<Bytes>,
 {
     match crate::proxy::backend_dispatch::run_backend_admission_plugins(
+        state,
         backend_admission_plugins,
         ctx,
         proxy,
@@ -639,7 +740,7 @@ pub(crate) async fn run<S>(
     request: CrossProtocolRequest<'_, S>,
 ) -> Result<CrossProtocolOutcome, anyhow::Error>
 where
-    S: RecvStream + SendStream<Bytes>,
+    S: RecvStream + SendStream<Bytes> + SendStreamStopped,
 {
     let CrossProtocolRequest {
         state,
@@ -1722,7 +1823,7 @@ async fn dispatch_plain<S>(
     request_authority: Option<&str>,
 ) -> Result<CrossProtocolOutcome, anyhow::Error>
 where
-    S: RecvStream + SendStream<Bytes>,
+    S: RecvStream + SendStream<Bytes> + SendStreamStopped,
 {
     // Effective client-facing ceilings for this request: each global knob
     // narrowed by any active route ceiling, `0` still meaning unlimited. The H3
@@ -1738,8 +1839,9 @@ where
     // Honor DestinationRule per-port `connectionPool.http` effective-proxy
     // overrides for the LB-selected target, mirroring the H1/H2 plain dispatch
     // path (`proxy_to_backend` / `proxy_to_backend_retry`). The effective proxy
-    // (per-port `idleTimeout` / `http2MaxRequests` / TLS / `h2UpgradePolicy` /
-    // `connectTimeout`, plus the service-discovery top-level fallback) is
+    // (per-port `idleTimeout` / `http2MaxRequests` / `maxConcurrentStreams` /
+    // TLS / `h2UpgradePolicy` / `connectTimeout`, plus the service-discovery
+    // top-level fallback) is
     // RE-RESOLVED per attempt INSIDE the retry loop below (against the failed
     // attempt's `current_target`), so a retry that rotates to a different port
     // gets THAT port's policy — the shared reqwest client (`get_client`), the
@@ -1977,8 +2079,10 @@ where
                         Err(outcome) => return Ok(outcome),
                     };
 
-                    let send_result = match crate::plugins::await_grpc_deadline(
+                    let send_result = match await_h3_backend_or_peer(
                         grpc_web_deadline_at,
+                        ctx.peer_connection.as_ref(),
+                        crate::http3::stream_util::peer_response_cancelled(stream),
                         build_plain_request_builder(
                             &client,
                             state,
@@ -1997,8 +2101,8 @@ where
                     )
                     .await
                     {
-                        Ok(result) => result,
-                        Err(()) => {
+                        H3BackendOrPeer::Ready(result) => result,
+                        H3BackendOrPeer::Deadline => {
                             drop(pending_slot);
                             record_plain_grpc_web_client_deadline(
                                 state,
@@ -2023,6 +2127,27 @@ where
                                 &current_url,
                             )
                             .await;
+                        }
+                        H3BackendOrPeer::PeerGone => {
+                            drop(pending_slot);
+                            crate::http3::stream_util::halt_request_body(stream);
+                            return Ok(plain_peer_gone_before_response_headers(
+                                PlainPeerGoneBeforeResponseHeadersCtx {
+                                    state,
+                                    proxy,
+                                    epoch,
+                                    upstream_balancer,
+                                    current_target: current_target.as_ref(),
+                                    cb_target_key: current_cb_target_key.as_deref(),
+                                    cb_is_half_open_probe: cb_retry_probe_slot_available,
+                                    backend_start,
+                                    backend_admission_permits: &mut backend_admission_permits,
+                                    backend_admission_elapsed: backend_admission_start.elapsed(),
+                                    bytes_sent,
+                                    current_url: &current_url,
+                                    response_streamed: false,
+                                },
+                            ));
                         }
                     };
                     drop(pending_slot);
@@ -2552,6 +2677,12 @@ where
                 // final safety net for any await that remains uncancellable.
                 let reader_finished_for_reader = Arc::clone(&reader_finished);
                 let reader_done_notify_for_reader = Arc::clone(&reader_done_notify);
+                // Capture STOP_SENDING before the reader borrows the stream.
+                // The future is `'static` and does not hold `&mut` on either
+                // half, so the upload pump can keep polling recv_data.
+                let stream_cancelled = crate::http3::stream_util::peer_response_cancelled(stream);
+                let reader_peer_reset = Arc::new(AtomicBool::new(false));
+                let reader_reset_flag = Arc::clone(&reader_peer_reset);
                 let reader_future = async {
                     let finish_reader = || {
                         reader_finished_for_reader.store(true, Ordering::Release);
@@ -2610,15 +2741,12 @@ where
                                         finish_reader();
                                         return;
                                     }
-                                    Err(e) => {
-                                        tokio::select! {
-                                            biased;
-                                            _ = reader_halt.notified() => {}
-                                            _ = tx.send(Err(std::io::Error::other(format!(
-                                                "H3 recv_data failed: {}",
-                                                e
-                                            )))) => {}
-                                        }
+                                    Err(_e) => {
+                                        // Request-stream reset/termination while
+                                        // headers are still outstanding is
+                                        // downstream cancellation, not a
+                                        // backend body error.
+                                        reader_reset_flag.store(true, Ordering::Release);
                                         finish_reader();
                                         return;
                                     }
@@ -2645,6 +2773,10 @@ where
                 // immediately, matching the explicit ferrum.conf promise
                 // for FERRUM_H3_REQUEST_BODY_DRAIN_MS.
                 let drain_ms = state.env_config.h3_request_body_drain_ms;
+                let peer_signal = ctx.peer_connection.clone();
+                let mut peer_gone = peer_signal
+                    .as_ref()
+                    .is_some_and(crate::plugins::PeerConnectionSignal::is_closed);
                 let send_result = {
                     tokio::pin!(send_future);
                     tokio::pin!(reader_future);
@@ -2654,6 +2786,15 @@ where
                             tokio::time::Instant::now() + Duration::from_secs(86_400)
                         }));
                     tokio::pin!(grpc_web_deadline);
+                    tokio::pin!(stream_cancelled);
+                    let peer_closed = async {
+                        if let Some(signal) = peer_signal.as_ref() {
+                            signal.closed().await;
+                        } else {
+                            std::future::pending::<()>().await;
+                        }
+                    };
+                    tokio::pin!(peer_closed);
                     let mut reader_done = false;
                     loop {
                         tokio::select! {
@@ -2666,6 +2807,22 @@ where
                                 // unconditional STOP_SENDING below closes the H3
                                 // receive half without delaying the status-4 writer.
                                 drop(pending_slot.take());
+                                break None;
+                            }
+                            _ = &mut stream_cancelled => {
+                                drop(pending_slot.take());
+                                peer_gone = true;
+                                if !reader_done {
+                                    halt_notify.notify_one();
+                                    let halt_deadline = Duration::from_millis(100);
+                                    let _ = tokio::time::timeout(halt_deadline, &mut reader_future)
+                                        .await;
+                                }
+                                break None;
+                            }
+                            _ = &mut peer_closed => {
+                                drop(pending_slot.take());
+                                peer_gone = true;
                                 break None;
                             }
                             result = &mut send_future => {
@@ -2688,10 +2845,25 @@ where
                                             .await;
                                     }
                                 }
+                                // Biased select checks send_future before
+                                // reader_future. A recv_data() error sets
+                                // reader_peer_reset and drops the body sender,
+                                // which can make send() ready (error or early
+                                // backend response) in the same poll. Honor the
+                                // flag before classifying a backend outcome.
+                                if reader_peer_reset.load(Ordering::Acquire) {
+                                    peer_gone = true;
+                                    break None;
+                                }
                                 break Some(result);
                             }
                             _ = &mut reader_future, if !reader_done => {
                                 reader_done = true;
+                                if reader_peer_reset.load(Ordering::Acquire) {
+                                    drop(pending_slot.take());
+                                    peer_gone = true;
+                                    break None;
+                                }
                             }
                         }
                     }
@@ -2712,6 +2884,25 @@ where
                 crate::http3::stream_util::halt_request_body(stream);
                 let bytes_sent = bytes_read.load(Ordering::Relaxed);
                 let Some(send_result) = send_result else {
+                    if peer_gone {
+                        return Ok(plain_peer_gone_before_response_headers(
+                            PlainPeerGoneBeforeResponseHeadersCtx {
+                                state,
+                                proxy,
+                                epoch,
+                                upstream_balancer,
+                                current_target: current_target.as_ref(),
+                                cb_target_key: current_cb_target_key.as_deref(),
+                                cb_is_half_open_probe: cb_retry_probe_slot_available,
+                                backend_start,
+                                backend_admission_permits: &mut backend_admission_permits,
+                                backend_admission_elapsed: backend_admission_start.elapsed(),
+                                bytes_sent,
+                                current_url: &current_url,
+                                response_streamed: true,
+                            },
+                        ));
+                    }
                     record_plain_grpc_web_client_deadline(
                         state,
                         epoch,
@@ -4519,11 +4710,12 @@ where
 fn resolve_h3_grpc_transport<'a>(
     state: &'a ProxyState,
     target: Option<&'a UpstreamTarget>,
+    asserted_source_identity: Option<&crate::identity::SpiffeId>,
 ) -> Result<grpc_proxy::GrpcDispatchTransport<'a>, grpc_proxy::GrpcTransportError> {
     // Delegated to the SHARED resolver the standard H1/H2 native-gRPC branch
     // also uses (issue #3728), so the two frontends cannot drift on target
     // validation, dial-plan resolution, or error mapping.
-    crate::proxy::resolve_grpc_dispatch_transport(state, target)
+    crate::proxy::resolve_grpc_dispatch_transport(state, target, asserted_source_identity)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4603,7 +4795,11 @@ where
     // ambiguous-transport, or unmaterializable-identity target is refused here.
     // The probe slot a HALF_OPEN breaker may have admitted is released,
     // mirroring the pre-dispatch rejects below.
-    let initial_grpc_transport = match resolve_h3_grpc_transport(state, current_target.as_deref()) {
+    let initial_grpc_transport = match resolve_h3_grpc_transport(
+        state,
+        current_target.as_deref(),
+        ctx.peer_spiffe_id.as_ref(),
+    ) {
         Ok(transport) => transport,
         Err(transport_error) => {
             let message = transport_error.message();
@@ -5033,37 +5229,40 @@ where
             // rather than direct-dialing past the secured transport. The prior
             // attempt's failure was already recorded and the probe slot
             // released above, so only the refusal is written here.
-            let grpc_retry_transport =
-                match resolve_h3_grpc_transport(state, current_target.as_deref()) {
-                    Ok(transport) => transport,
-                    Err(transport_error) => {
-                        let message = transport_error.message();
-                        let diagnostic = transport_error.diagnostic().as_str();
-                        warn!(
-                            proxy_id = %proxy.id,
-                            target_host = current_target
-                                .as_deref()
-                                .map(|t| t.host.as_str())
-                                .unwrap_or(""),
-                            target_port = current_target.as_deref().map(|t| t.port).unwrap_or(0),
-                            diagnostic,
-                            refusal = ?transport_error,
-                            message,
-                            "cross-protocol H3→gRPC: retry rotated onto a target with no \
-                             dispatchable mesh transport; failing closed with gRPC UNAVAILABLE"
-                        );
-                        return write_grpc_error_for_request(
-                            stream,
-                            ctx,
-                            grpc_proxy::grpc_status::UNAVAILABLE,
-                            message,
-                            backend_start,
-                            bytes_sent,
-                            initial_response_header_policy_plugins,
-                        )
-                        .await;
-                    }
-                };
+            let grpc_retry_transport = match resolve_h3_grpc_transport(
+                state,
+                current_target.as_deref(),
+                ctx.peer_spiffe_id.as_ref(),
+            ) {
+                Ok(transport) => transport,
+                Err(transport_error) => {
+                    let message = transport_error.message();
+                    let diagnostic = transport_error.diagnostic().as_str();
+                    warn!(
+                        proxy_id = %proxy.id,
+                        target_host = current_target
+                            .as_deref()
+                            .map(|t| t.host.as_str())
+                            .unwrap_or(""),
+                        target_port = current_target.as_deref().map(|t| t.port).unwrap_or(0),
+                        diagnostic,
+                        refusal = ?transport_error,
+                        message,
+                        "cross-protocol H3→gRPC: retry rotated onto a target with no \
+                         dispatchable mesh transport; failing closed with gRPC UNAVAILABLE"
+                    );
+                    return write_grpc_error_for_request(
+                        stream,
+                        ctx,
+                        grpc_proxy::grpc_status::UNAVAILABLE,
+                        message,
+                        backend_start,
+                        bytes_sent,
+                        initial_response_header_policy_plugins,
+                    )
+                    .await;
+                }
+            };
 
             warn!(
                 proxy_id = %proxy.id,
@@ -6161,7 +6360,11 @@ pub(crate) async fn dispatch_grpc_streaming(
     // this path, so the single pre-dispatch resolution covers it. The probe slot
     // a HALF_OPEN breaker may have admitted is released, mirroring the buffered
     // path's pre-dispatch rejects.
-    let grpc_transport = match resolve_h3_grpc_transport(state, current_target.as_deref()) {
+    let grpc_transport = match resolve_h3_grpc_transport(
+        state,
+        current_target.as_deref(),
+        ctx.peer_spiffe_id.as_ref(),
+    ) {
         Ok(transport) => transport,
         Err(transport_error) => {
             let message = transport_error.message();

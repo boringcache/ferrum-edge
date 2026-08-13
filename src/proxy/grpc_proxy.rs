@@ -2633,20 +2633,40 @@ pub enum GrpcDispatchTransport<'a> {
 /// A materialized Sidecar mesh-mTLS gRPC transport: the pool, the target it was
 /// resolved for, and the fail-closed dial plan (pinned peer OR trust-domain
 /// scope + destination-FQDN SNI override).
+///
+/// `baggage_strip_prefixes` borrows the configured egress strip list so dispatch
+/// can apply the same reserved-identity + configured-prefix hygiene as HBONE
+/// without cloning the vector on each resolve/attempt. Direct transports never
+/// see this list.
 pub struct MeshMtlsGrpcTransport<'a> {
     pool: &'a crate::proxy::mesh_mtls_pool::MeshMtlsConnectionPool,
     target: &'a crate::config::types::UpstreamTarget,
     plan: crate::proxy::mesh_mtls_pool::MeshMtlsDialPlan<'a>,
+    baggage_strip_prefixes: &'a [String],
 }
 
 /// A materialized Ambient HBONE gRPC transport: the pool, the target it was
 /// resolved for, and the fail-closed dial plan (dial host + CONNECT authority
 /// host + HBONE port, plus either a pinned peer OR a trust-domain scope +
 /// destination-FQDN SNI override).
+///
+/// `asserted_source_identity` is owned so the transport does not borrow
+/// `RequestContext`. Both native-gRPC frontends mutate `ctx` after materializing
+/// the transport (admission, body hooks, deadline selection); a borrow of
+/// `ctx.peer_spiffe_id` would not survive that. Clone is once per attempt, not
+/// per frame. Only the authenticated frontend workload SPIFFE is stored here —
+/// never a caller header and never the gateway SVID (the pool falls back to the
+/// gateway SVID at CONNECT time only when this field is `None`).
+///
+/// `baggage_strip_prefixes` borrows the configured egress list. Reserved
+/// identity prefixes are combined with it during the one dispatch-time filter
+/// pass; they are not cloned into a new vector at resolve time.
 pub struct HboneGrpcTransport<'a> {
     pool: &'a crate::proxy::hbone_pool::HboneConnectionPool,
     target: &'a crate::config::types::UpstreamTarget,
     plan: crate::proxy::hbone_pool::HboneDialPlan<'a>,
+    asserted_source_identity: Option<crate::identity::SpiffeId>,
+    baggage_strip_prefixes: &'a [String],
 }
 
 /// Client-visible refusal when a `mesh.mtls` target's destination identity
@@ -2865,11 +2885,37 @@ impl<'a> GrpcDispatchTransport<'a> {
     ///
     /// `None` (no LB-selected target) keeps the direct pool: the proxy's own
     /// backend host is the destination and no mesh tag exists to honor.
+    #[allow(dead_code)] // External integration tests call this; production uses for_target_with_hbone_context.
     pub fn for_target(
         grpc_pool: &'a GrpcConnectionPool,
         mesh_mtls_pool: &'a crate::proxy::mesh_mtls_pool::MeshMtlsConnectionPool,
         hbone_pool: &'a crate::proxy::hbone_pool::HboneConnectionPool,
         target: Option<&'a crate::config::types::UpstreamTarget>,
+    ) -> Result<Self, GrpcTransportError> {
+        Self::for_target_with_hbone_context(
+            grpc_pool,
+            mesh_mtls_pool,
+            hbone_pool,
+            target,
+            None,
+            &[],
+        )
+    }
+
+    /// Resolve a transport while binding request-scoped secured-mesh identity
+    /// context. The asserted identity is used only by HBONE and is cloned into
+    /// the transport so callers can keep mutating `RequestContext` after
+    /// resolve. The configured strip list is borrowed into HBONE and mesh-mTLS
+    /// transports and combined with reserved identity prefixes at dispatch,
+    /// before trusted proxy headers are merged. Direct transports ignore both
+    /// so they do not inherit secured-mesh semantics.
+    pub fn for_target_with_hbone_context(
+        grpc_pool: &'a GrpcConnectionPool,
+        mesh_mtls_pool: &'a crate::proxy::mesh_mtls_pool::MeshMtlsConnectionPool,
+        hbone_pool: &'a crate::proxy::hbone_pool::HboneConnectionPool,
+        target: Option<&'a crate::config::types::UpstreamTarget>,
+        asserted_source_identity: Option<&crate::identity::SpiffeId>,
+        baggage_strip_prefixes: &'a [String],
     ) -> Result<Self, GrpcTransportError> {
         let Some(target) = target else {
             return Ok(Self::Direct(grpc_pool));
@@ -2891,6 +2937,7 @@ impl<'a> GrpcDispatchTransport<'a> {
                     pool: mesh_mtls_pool,
                     target,
                     plan,
+                    baggage_strip_prefixes,
                 }))
             }
             GrpcMeshDispatch::Hbone | GrpcMeshDispatch::HboneCrossCluster => {
@@ -2918,6 +2965,8 @@ impl<'a> GrpcDispatchTransport<'a> {
                     pool: hbone_pool,
                     target,
                     plan,
+                    asserted_source_identity: asserted_source_identity.cloned(),
+                    baggage_strip_prefixes,
                 }))
             }
             GrpcMeshDispatch::RefuseCrossClusterMalformed => Err(GrpcTransportError::Unsupported {
@@ -2953,6 +3002,45 @@ impl<'a> GrpcDispatchTransport<'a> {
             Self::Direct(_) => "direct",
             Self::MeshMtls(_) => "mesh_mtls",
             Self::Hbone(_) => "hbone",
+        }
+    }
+
+    /// Authenticated frontend workload identity asserted on HBONE CONNECT.
+    /// `None` for non-HBONE transports, and for HBONE when the frontend did not
+    /// authenticate a mesh peer (the pool then falls back to the gateway SVID).
+    #[allow(dead_code)] // External unit/integration tests read this diagnostic; the binary target does not.
+    pub fn asserted_source_identity(&self) -> Option<&crate::identity::SpiffeId> {
+        match self {
+            Self::Hbone(hbone) => hbone.asserted_source_identity.as_ref(),
+            Self::Direct(_) | Self::MeshMtls(_) => None,
+        }
+    }
+
+    /// Sanitize inner-request headers for this transport. Secured mesh
+    /// transports (HBONE and mesh-mTLS) strip reserved identity baggage
+    /// prefixes plus any configured egress prefixes once per dispatch (not per
+    /// frame), combining the borrowed configured slice with the static reserved
+    /// rules in one filtering pass. Direct returns the input unchanged.
+    pub fn proxy_headers_for_dispatch<'b>(
+        &self,
+        headers: &'b HashMap<String, String>,
+    ) -> std::borrow::Cow<'b, HashMap<String, String>> {
+        let Some(configured) = self.secured_mesh_baggage_strip_prefixes() else {
+            return std::borrow::Cow::Borrowed(headers);
+        };
+        if !crate::modes::mesh::hbone::has_baggage_header_in_map(headers) {
+            return std::borrow::Cow::Borrowed(headers);
+        }
+        let mut owned = headers.clone();
+        crate::proxy::strip_secured_mesh_inner_baggage_in_map(&mut owned, configured);
+        std::borrow::Cow::Owned(owned)
+    }
+
+    fn secured_mesh_baggage_strip_prefixes(&self) -> Option<&[String]> {
+        match self {
+            Self::Direct(_) => None,
+            Self::MeshMtls(mesh) => Some(mesh.baggage_strip_prefixes),
+            Self::Hbone(hbone) => Some(hbone.baggage_strip_prefixes),
         }
     }
 
@@ -3158,11 +3246,9 @@ fn hbone_dispatch_authority<'a>(
 /// sender and an app that answers nothing would stall the RPC outside the
 /// connect budget.
 ///
-/// The asserted source identity is left `None`, which makes the CONNECT baggage
-/// carry this gateway's own SVID — the ambient-egress default, and the same
-/// assertion the generic HTTP-family Ambient egress makes. A gRPC request
-/// arriving on a north-south frontend (H1/H2 or H3) is a client, not an
-/// authenticated mesh peer whose principal could be forwarded.
+/// When the frontend authenticated a mesh workload, its identity is asserted
+/// on CONNECT so downstream authorization and telemetry see the caller rather
+/// than this gateway's SVID.
 async fn open_hbone_grpc_sender(
     hbone: &HboneGrpcTransport<'_>,
     proxy: &Proxy,
@@ -3180,7 +3266,7 @@ async fn open_hbone_grpc_sender(
             plan.expected_peer.as_ref(),
             plan.expected_trust_domain.as_ref(),
             plan.sni_override,
-            None,
+            hbone.asserted_source_identity.as_ref(),
         )
         .await
         .map_err(hbone_pool_error_to_grpc)?;
@@ -3765,7 +3851,8 @@ async fn proxy_grpc_streaming_dispatch(
     // can call the steps in the wrong order. See `proxy::headers` for
     // why merging FIRST is required and why `te: trailers` is
     // synthesised at the end.
-    merge_proxy_headers_and_strip_for_grpc(&mut headers, proxy_headers);
+    let proxy_headers = transport.proxy_headers_for_dispatch(proxy_headers);
+    merge_proxy_headers_and_strip_for_grpc(&mut headers, proxy_headers.as_ref());
 
     // Bind the request line to the selected transport BEFORE the Host override,
     // mirroring `proxy_grpc_request_core` (issue #3284). The direct pool parses
@@ -4090,7 +4177,8 @@ pub(crate) async fn proxy_grpc_request_core(
     // Mirrors `proxy_grpc_request_streaming` via the shared helper so
     // the two gRPC dispatch paths cannot drift on header handling. See
     // `proxy::headers` for the rationale.
-    merge_proxy_headers_and_strip_for_grpc(&mut headers, proxy_headers);
+    let proxy_headers = transport.proxy_headers_for_dispatch(proxy_headers);
+    merge_proxy_headers_and_strip_for_grpc(&mut headers, proxy_headers.as_ref());
 
     // Bind the request line to the selected transport BEFORE the Host override
     // below, so a mesh dispatch presents (and, without `preserve_host_header`,

@@ -8,7 +8,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use ferrum_edge::config::EnvConfig;
@@ -144,6 +144,8 @@ async fn dtls_material_watcher_keeps_prior_state_and_retries_same_failed_candida
 
     let attempts = Arc::new(AtomicUsize::new(0));
     let attempts_for_task = attempts.clone();
+    let fail_rebuild = Arc::new(AtomicBool::new(true));
+    let fail_rebuild_for_task = fail_rebuild.clone();
     let (revision_tx, mut revision_rx) = watch::channel(0u64);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (ready_tx, ready_rx) = oneshot::channel();
@@ -168,9 +170,10 @@ async fn dtls_material_watcher_keeps_prior_state_and_retries_same_failed_candida
             ready_tx: Some(ready_tx),
             rebuild: Box::new(move || {
                 let attempts_for_task = attempts_for_task.clone();
+                let fail_rebuild_for_task = fail_rebuild_for_task.clone();
                 Box::pin(async move {
-                    let attempt = attempts_for_task.fetch_add(1, Ordering::SeqCst);
-                    if attempt == 0 {
+                    attempts_for_task.fetch_add(1, Ordering::SeqCst);
+                    if fail_rebuild_for_task.load(Ordering::SeqCst) {
                         Err(anyhow::anyhow!("simulated transient rebuild failure"))
                     } else {
                         Ok(())
@@ -199,6 +202,7 @@ async fn dtls_material_watcher_keeps_prior_state_and_retries_same_failed_candida
         "failed rebuild must not bump the accepted revision"
     );
 
+    fail_rebuild.store(false, Ordering::SeqCst);
     assert!(request_material_set_reload(
         "test_frontend_dtls_reload_fail"
     ));
@@ -207,7 +211,10 @@ async fn dtls_material_watcher_keeps_prior_state_and_retries_same_failed_candida
         .expect("stable failed candidate should be retried")
         .expect("watcher alive");
     assert_eq!(*revision_rx.borrow(), 1);
-    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert!(
+        attempts.load(Ordering::SeqCst) >= 2,
+        "failed candidate must be retried after the rebuild latch is cleared"
+    );
 
     shutdown_tx.send_replace(true);
     tokio::time::timeout(Duration::from_secs(2), task)

@@ -1,4 +1,5 @@
 use std::{
+    future::Future,
     marker::PhantomData,
     pin::Pin,
     task::{Context, Poll},
@@ -540,6 +541,17 @@ where
 
     fn send_data<T: Into<WriteBuf<B>>>(&mut self, data: T) -> Result<(), StreamErrorIncoming> {
         self.stream.send_data(data)
+    }
+}
+
+impl<S, B> crate::quic::SendStreamStopped for BufRecvStream<S, B>
+where
+    S: crate::quic::SendStreamStopped,
+{
+    fn stopped(
+        &self,
+    ) -> impl Future<Output = Result<Option<u64>, StreamErrorIncoming>> + Send + 'static {
+        self.stream.stopped()
     }
 }
 

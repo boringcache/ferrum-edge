@@ -3784,7 +3784,8 @@ pub struct MeshTrafficPolicy {
     /// Optional `DestinationRule.trafficPolicy.connectionPool.http` block.
     /// When present, the K8s translator has parsed at least one supported HTTP
     /// connection-pool knob (`idleTimeout`, `http2MaxRequests`,
-    /// `h2UpgradePolicy`, `maxRetries`, `http1MaxPendingRequests`); the mesh
+    /// `maxConcurrentStreams`, `h2UpgradePolicy`, `maxRetries`,
+    /// `http1MaxPendingRequests`); the mesh
     /// apply layer accumulates top-level values on the upstream's inherited
     /// fallback and stores explicit `portLevelSettings` values separately in
     /// `port_overrides[port]`; dispatch merges them field-by-field with the
@@ -3819,12 +3820,29 @@ pub struct MeshConnectionPoolHttp {
     /// operator's intent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_timeout_ms: Option<u64>,
-    /// Mapped from `http2MaxRequests`. Projects to
-    /// `Proxy.pool_http2_max_concurrent_streams` per port via
-    /// `resolve_effective_proxy_for_target` and threads into the H2/gRPC
-    /// builder knobs.
+    /// Mapped from `http2MaxRequests`: Istio's "maximum number of active
+    /// requests to a destination, applicable to both HTTP1.1 and HTTP2".
+    ///
+    /// Projects onto the inherited/per-port dispatch policy as
+    /// `UpstreamPortOverride.http2_max_requests` and is enforced as a
+    /// DESTINATION-WIDE active-request breaker by
+    /// [`crate::backend_active_request_limit::BackendActiveRequestLimiter`] —
+    /// one shared budget per `(namespace, logical destination, policy port,
+    /// selected subset)` spanning HTTP/1.1, reqwest-
+    /// negotiated H2, direct H2, native gRPC, HBONE/mesh-mTLS, and the HTTP/3
+    /// bridges. It is deliberately NOT an HTTP/2 transport setting; the
+    /// per-connection knob is `max_concurrent_streams` below.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http2_max_requests: Option<u32>,
+    /// Mapped from `maxConcurrentStreams`: Istio's per-HTTP/2-connection stream
+    /// limit. Projects to `Proxy.pool_http2_max_concurrent_streams` per port via
+    /// `resolve_effective_proxy_for_target` and threads into the direct-H2 /
+    /// gRPC hyper builder knobs (`max_concurrent_streams` advertises the local
+    /// SETTINGS value, `initial_max_send_streams` seeds the outbound bound until
+    /// the peer's SETTINGS arrive — a peer may raise or lower it, which is why
+    /// this can never be the destination request budget).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_streams: Option<u32>,
     /// Mapped from `h2UpgradePolicy`. Controls whether plain-HTTP backend
     /// dispatch upgrades to HTTP/2. Projects onto
     /// `Proxy.h2_upgrade_policy` per port and is consulted at the
@@ -3856,8 +3874,9 @@ pub struct MeshConnectionPoolHttp {
     /// overflow" in Envoy terms). The selected endpoint host is not part of
     /// the key.
     /// HTTP/1.1-scoped: it does NOT gate
-    /// direct-H2 / gRPC / HTTP/3 / HBONE / mesh-mTLS dispatch (those use
-    /// `http2MaxRequests` → `h2_max_concurrent_streams` for concurrency).
+    /// direct-H2 / gRPC / HTTP/3 / HBONE / mesh-mTLS dispatch. Every transport,
+    /// including HTTP/1.1, is additionally bounded by the destination-wide
+    /// `http2MaxRequests` active-request breaker.
     /// Always positive when set (zero/negative rejected at translate time).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http1_max_pending_requests: Option<u32>,
@@ -6763,6 +6782,11 @@ fn validate_required_tls_path(context: String, value: Option<&str>, errors: &mut
 /// * `http1MaxPendingRequests` — the
 ///   [`crate::backend_pending_limit::BackendPendingLimiter`] sheds every
 ///   HTTP/1.1 request at `0`.
+/// * `http2MaxRequests` — the
+///   [`crate::backend_active_request_limit::BackendActiveRequestLimiter`] sheds
+///   every request to the destination at `0`, on every HTTP-family transport.
+/// * `maxConcurrentStreams` — a `0` peer-SETTINGS advertisement would stall
+///   every HTTP/2 stream to the destination.
 /// * `tcp.maxConnections` — the
 ///   [`crate::backend_conn_limit::BackendConnectionLimiter`] refuses every
 ///   backend connection at `0`, on every transport (stream, WebSocket, and the
@@ -6791,6 +6815,16 @@ fn validate_dr_connection_pool(
     if http.http1_max_pending_requests == Some(0) {
         errors.push(format!(
             "{context}.connectionPool.http.http1MaxPendingRequests must be positive (0 would shed every HTTP/1.1 request)"
+        ));
+    }
+    if http.http2_max_requests == Some(0) {
+        errors.push(format!(
+            "{context}.connectionPool.http.http2MaxRequests must be positive (0 would shed every request to the destination)"
+        ));
+    }
+    if http.max_concurrent_streams == Some(0) {
+        errors.push(format!(
+            "{context}.connectionPool.http.maxConcurrentStreams must be positive (0 would stall every HTTP/2 stream to the destination)"
         ));
     }
 }

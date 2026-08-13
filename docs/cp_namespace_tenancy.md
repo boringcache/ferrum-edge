@@ -357,16 +357,19 @@ families. Both are fixed-cardinality: booleans, counters, seconds, the closed
 reason set above (plus `reader_unavailable`, `reload_reader_failed`,
 `reload_read_timed_out`, `scope_validation_failed`, and `worker_exited`).
 Nothing more on Prometheus: no path, `kid`, namespace, token, key byte, or
-generation identifier. Authenticated health additionally carries
+generation identifier. Admin-JWT-authenticated health additionally carries
 `active_generation`, a replica-stable HMAC-SHA-256 of the private configuration
 fingerprint under the fleet-shared `FERRUM_ADMIN_JWT_SECRET` (domain
 `ferrum-cp-dp-trust-status-id-v1\0`). Replicas that share the same accepted
 bundle and the same HMAC key publish the same 64-hex value; a semantic bundle
 change mints a new value; an unchanged revalidation keeps it. Replicas that do
 not share the HMAC key are incomparable. An admin JWT lets an operator *see*
-the identifier; it does not reveal the HMAC key. An unkeyed digest of the
-fingerprint is never published — that would be an offline oracle against a
-guessed HS\* secret. The private fingerprint stays inside the reload worker.
+the identifier; it does not reveal the HMAC key. Metrics bearer tokens and
+metrics-allowlisted source addresses receive the detailed object with
+`active_generation: null`, because they are not Admin API principals. An
+unkeyed digest of the fingerprint is never published — that would be an offline
+oracle against a guessed HS\* secret. The private fingerprint stays inside the
+reload worker.
 Unauthenticated probes still receive only the documented coarse `status` /
 `ready` pair.
 

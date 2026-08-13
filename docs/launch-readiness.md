@@ -196,6 +196,11 @@ never evidence that its target came through protected `main`, and a job that
 both runs tag code and holds the advisory credential hands the credential to an
 arbitrary commit before any provenance exists (issue #3802).
 
+Even under the intended release policy, which narrows valid targets to commits
+reachable from protected `main`, a tag can select any historical ancestor. That
+history includes pre-fix workflow bytes and is why ancestry alone is not a
+sufficient release-workflow identity check.
+
 The boundary is drawn by *which code executes*, not by which event fired:
 
 | Surface | Code source | Credential |
@@ -215,9 +220,16 @@ branch or tag ref, so a manual dispatch is not intrinsically trusted code.
 1. A `v*` tag push starts `Release`. That run holds no credential.
 2. The `Release` run's `workflow_run: in_progress` event triggers
    `launch-advisory-trust.yml` from protected `main`, carrying the Release run
-   ID and run attempt. `in_progress` rather than `requested`: GitHub documents
-   that `requested` does not fire when a run is re-run, so a re-run Release
-   attempt would never obtain its own verdict and would fail closed forever.
+   ID and run attempt. The `workflows: [Release]` trigger is only a display-name
+   selector, not identity. Before the event is treated as a release request,
+   the secretless job uses `actions: read` to resolve that exact run ID from the
+   Actions API and requires a closed, exactly typed identity projection: ID,
+   run attempt, `push` event, head SHA, head branch, and immutable path
+   `.github/workflows/release.yml` must all agree with the event. A different
+   workflow named `Release` is rejected. `in_progress` rather than `requested`:
+   GitHub documents that `requested` does not fire when a run is re-run, so a
+   re-run Release attempt would never obtain its own verdict and would fail
+   closed forever.
 3. `establish-trust` holds no secret. It checks out the literal `refs/heads/main`,
    resolves that checkout's `HEAD` to the trusted anchor commit, validates it as
    a 40-hex commit, requires it to be reachable from protected `main`, and
@@ -229,9 +241,12 @@ branch or tag ref, so a manual dispatch is not intrinsically trusted code.
    treats the candidate purely as data: normalized tag format, exactly one
    unambiguous remote tag ref, tag resolution to exactly one commit, agreement
    with the triggering event's head (a tag moved after the event is refused as
-   stale), reachability from protected `main`, and successful **push** `ci.yml` +
-   `coverage.yml` runs for that exact SHA. Anything missing, ambiguous, or stale
-   fails closed.
+   stale), reachability from protected `main`, a
+   `.github/workflows/release.yml` blob byte-identical to the trusted anchor's,
+   and successful **push** `ci.yml` + `coverage.yml` runs for that exact SHA.
+   The byte floor prevents the current trusted publisher from issuing an
+   artifact to a historical pre-artifact release consumer. Anything missing,
+   ambiguous, or stale fails closed.
 4. `advisory-verdict` is a closed two-step job: a pinned `actions/checkout`
    **directly at `trusted_sha`**, immediately followed by the single
    credential-bearing invocation of the default-branch checker with
@@ -242,55 +257,75 @@ branch or tag ref, so a manual dispatch is not intrinsically trusted code.
    credential even if one were somehow present. The candidate reaches this job
    only as `LAUNCH_TARGET_SHA`; no candidate byte is fetched, imported, or run.
    The credential comes from the protected `launch-advisory` environment.
-5. `publish-verdict` holds no secret and posts a fixed-text commit status on the
-   candidate SHA under the context
-   `trusted-launch-advisory-gate/release-<run id>-attempt-<attempt>`. Neither
-   the credential nor any advisory identifier appears in the status, the logs,
-   or any artifact.
-6. `release.yml`'s `validate-launch-readiness` job derives the identical context
-   from its own `github.run_id` and `github.run_attempt`, waits for **only that
-   context** on the commit its tag resolves to, and fails closed if it is
-   absent, `failure`, or `error`. The release still cannot proceed without a
-   computed `PASS`; the decision simply moved to code a tag cannot rewrite.
+5. `publish-verdict` holds no secret and uploads a fixed-text artifact named
+   `trusted-launch-advisory-verdict-release-<run id>-attempt-<attempt>` to the
+   trusted workflow run. The record binds the candidate SHA, Release run ID,
+   run attempt, canonical requester path `.github/workflows/release.yml`, and
+   `PASS`; it contains no credential or advisory identifier.
+6. `release.yml` derives that exact artifact name from its own run identity. It
+   verifies the artifact-owning run used the `workflow_run` event and belongs
+   to `.github/workflows/launch-advisory-trust.yml` before inspecting lifecycle.
+   The publisher's final job can upload the artifact while its owner run still
+   reports `in_progress`, so that one authenticated nonterminal state returns a
+   bounded wait. `completed/success` proceeds; completed non-success,
+   malformed/unknown status, or any other identity is terminal. Only then is
+   the record matched byte-for-byte. A tag-controlled workflow may upload an
+   artifact with the same name, but cannot make its run acquire that trusted
+   workflow identity, so it cannot satisfy the gate.
 
-### Why the verdict is bound to a run attempt
+### Why the verdict is bound to a run attempt and workflow identity
 
-Commit statuses are commit-wide. A single constant
-`trusted-launch-advisory-gate` context would be replayable: the daily audit of
-protected `main`, an earlier tag release on the same commit, or an earlier
-attempt of the same Release run would already have posted a success, and a
-release started afterwards would consume it before its own trusted evaluation
-had run. A blocker opened in between would be invisible.
+The artifact name includes the Release run ID and attempt, preventing an older
+verdict for the same commit from being replayed after advisory state changes.
+The release gate does not trust the name alone: artifact names are repository-
+wide and forgeable. It resolves the artifact's owning Actions run and requires
+the immutable workflow path `.github/workflows/launch-advisory-trust.yml`, the
+`workflow_run` event, a completed `success` conclusion, and then the fixed
+record. The record independently binds the release SHA, run ID, attempt,
+canonical requester path, and `PASS`. Artifact name alone is never authority.
 
-So every release verdict carries a context unique to one Release run **and** one
-run attempt:
-
-| Lane | Context |
-|------|---------|
-| Release (`workflow_run: in_progress`) | `trusted-launch-advisory-gate/release-<run id>-attempt-<attempt>` |
-| Scheduled default-branch audit | `trusted-launch-advisory-gate/main-audit` |
+| Lane | Artifact name |
+|------|----------------|
+| Release (`workflow_run: in_progress`) | `trusted-launch-advisory-verdict-release-<run id>-attempt-<attempt>` |
+| Scheduled default-branch audit | `trusted-launch-advisory-verdict-main-audit-<run id>-attempt-<attempt>` |
 
 Both operands are validated as strict positive decimals (`^[1-9][0-9]{0,17}$`)
-on both sides, and the whole derived context is re-checked against the admitted
-shape before it is published, so no payload or input value can lengthen or
-reshape it. The audit context is not of the release shape, so an audit verdict
-can never satisfy a release gate.
+on both sides, and the whole derived name is re-checked against the admitted
+shape before it is published. The audit name is not of the release shape, so an
+audit verdict can never satisfy a release gate. A tag-controlled workflow may
+upload an artifact with the same name, but cannot make its run acquire that
+trusted workflow identity.
 
-Every one of those preconditions fails closed. If the triggering payload does
-not carry a usable tag name, run ID, or run attempt, if the tag is ambiguous, if
-it moved after the event, or if it is not reachable from protected `main`, no
-credential is released and no verdict is published, so the release times out red
-rather than proceeding.
+The consumer fails closed on ambiguity, duplicates, stale or wrong attempts,
+pagination truncation, missing or expired artifacts, malformed or oversized
+JSON, malformed ZIP, duplicate ZIP members, traversal, symlinks or special
+entries, CRC/decompression/size abuse, off-origin redirects, unauthorized or
+wrong-identity data, or any candidate/tag-controlled workflow or run. JSON reads
+use `limit + 1` and reject overflow before decoding. ZIP download, compressed
+size, member count, uncompressed size, path/type, and CRC work are separately
+bounded. Redirects use Python's actual `max_redirections` and `max_repeats`
+controls, require HTTPS plus an admitted hostname and default/443 port,
+reconstruct a clean GET, and never forward the API Authorization header away
+from `api.github.com`. Network failures, HTTP 408/429/5xx, and explicit rate
+limits return the same bounded wait as an authenticated in-progress owner;
+malformed, unauthorized, or wrong-identity data is terminal and can never
+become `PASS`. A reintroduced commit-status shortcut is refused.
 
-To recover a stuck evaluation, rerun the trusted workflow itself. To reevaluate
-after a Release rerun, rerun the Release workflow; its new run attempt emits a
-fresh `workflow_run: in_progress` event and receives a distinct verdict context.
-There is no manual-dispatch lane because its caller-selected ref would weaken
-the trusted-code proof.
+### The release gate runs before candidate code
 
-Because the policy, the exemptions, and `PRODUCTION_READINESS.md` are all read
-from the trusted anchor, the reviewed snapshot compared against the live verdict
-is protected `main`'s — never the candidate's copy of it.
+`validate-launch-readiness` is a closed three-step sequence: pinned checkout,
+authenticated artifact gate, then the tag tree's checker self-test. Checkout
+materializes the tag bytes but executes none of them. The authenticated gate is
+the first `run:` step.
+
+This order is a security property. A tag-tree self-test run first could append
+`BASH_ENV`, `PATH`, `PYTHONPATH`, `LD_PRELOAD`, or another payload through
+`GITHUB_ENV`/`GITHUB_PATH`; the later shell or Python process would then execute
+under that poisoned environment and could report success without authenticating
+an artifact. The self-test remains a release consistency check, but runs only
+after authentication succeeds, when any job-scoped environment mutation is too
+late to affect the gate. The static verifier rejects an inserted preceding step
+or a reordered self-test.
 
 ### The credential job is a closed step sequence, and the verifier checks the whole sequence
 
@@ -518,10 +553,16 @@ ancestry proof or without coming from the protected-branch checkout, a
 commented-out credential binding, a self-test surviving only as a comment, a
 tag-reachable trust workflow, a tag checkout in the secretless trust job, a
 dropped environment binding, a dropped provenance edge, an unpinned action, a
-constant commit-wide status context, an omitted run-attempt binding, a
-`requested`-only trigger, a default-branch audit sharing the release context
-namespace, a release gate that accepts another run's status, a release gate
-that stops requiring the trusted verdict, a safe block-form `on:` followed by a
+reintroduced commit-status handoff, a spoofed or dropped canonical requester
+path/API identity comparison, a dropped release-workflow byte floor, an omitted
+run-attempt binding, a `requested`-only trigger, a default-branch audit sharing
+the release artifact namespace, a release gate that accepts another run's
+artifact, a release gate that runs candidate code before authentication or
+reorders the self-test, a release gate that makes the authenticated
+`in_progress` transition terminal, a dead total/repeat redirect bound, a
+truncating JSON read or ignored overflow, a release gate that stops requiring
+the trusted verdict, a release gate that skips owning-run authentication,
+pagination, duplicate, ZIP, or redirect fail-closed checks, a safe block-form `on:` followed by a
 duplicate `on: [push]` and the reversed ordering, a duplicate `jobs:`, a
 duplicate `workflow_run` trigger, a duplicate `advisory-verdict` job ID, a
 duplicate `needs`, `environment`, or `steps` on the credential job, a duplicate
@@ -550,6 +591,28 @@ the step that validated it, the duplicate `run:` still shows the boundary
 self-test as a real executable step, and the publisher's duplicates still show
 every established binding as consumed. That absence is the proof the structural
 refusal is what catches the bypass, not an incidental downstream error.
+
+### Historical release workflows are an administrative boundary
+
+Git history is immutable for this purpose. Creating `v*` at a protected-main
+ancestor causes GitHub to load that ancestor's `release.yml`; an old revision
+that consumed the forgeable commit-status context does not acquire the new
+artifact consumer merely because protected `main` now contains it. It can
+therefore ignore the new publisher and continue waiting on its historical
+status path. No edit to the current tree can retroactively change those bytes.
+
+The strongest in-tree control is fail-closed on the current trusted side:
+`establish-trust` compares the candidate's `.github/workflows/release.yml` blob
+with the protected-main anchor's blob and publishes no artifact when they
+differ. The current artifact consumer also binds the canonical requester path
+in the API identity and fixed record. This prevents the current trusted
+publisher from authorizing an old or same-name workflow, but it does **not**
+make an already-committed historical status consumer understand artifacts or
+prevent it from accepting a separately forged status.
+
+Consequently the `refs/tags/v*` creation ruleset and release-principal procedure
+below are part of the security boundary, not defense in depth. Until they are
+active, the historical-status residual is not fully resolved by code alone.
 
 ### Required repository settings (root/admin only, not code)
 
@@ -585,11 +648,19 @@ future provisioning safe rather than exploitable.
    was never handed to an arbitrary tag target — and revoke and reissue it under
    step 2. Absent such evidence, the verified no-secret state means there is
    nothing to rotate.
-4. **Protect release tags.** Create an active ruleset targeting `refs/tags/v*`
-   that restricts creation to a narrow release principal, blocks update and
-   deletion, and audits any bypass. Consider requiring signed annotated tags.
-   Tag protection is defense in depth: trusted-code execution is still required
-   because a privileged release actor can be compromised.
+4. **Protect release tags — mandatory historical-workflow control.** Create an
+   active ruleset targeting exactly `refs/tags/v*` that restricts creation to a
+   narrow, auditable release principal, blocks update and deletion, and grants
+   no broad actor or app bypass. Before that principal creates a tag, it must
+   verify that the target is reachable from protected `main` **and** that
+   `<target>:.github/workflows/release.yml` has the same Git blob ID as
+   `refs/heads/main:.github/workflows/release.yml` at creation time. A mismatch
+   is a hard stop, not an exception path; land or select a target carrying the
+   current workflow first. Require signed annotated tags if the repository can
+   enforce the signing principal. This control is required because GitHub can
+   execute an immutable pre-fix `release.yml` before any current-tree workflow
+   can rewrite it. Every ruleset bypass and every release-tag creation must be
+   audited.
 5. **Keep `main` protected.** The whole boundary rests on `refs/heads/main`
    being a protected default branch whose required checks cannot be bypassed.
 
@@ -609,15 +680,24 @@ future provisioning safe rather than exploitable.
 - `.github/workflows/launch-advisory-trust.yml` — the sole advisory-credential
   holder, reachable only from `workflow_run` (`in_progress`) and `schedule`.
   Its secretless `establish-trust` job runs both self-tests on the trusted tree
-  before the protected environment can release the credential. Its schedule
+  before the protected environment can release the credential, resolves the
+  triggering run's immutable requester path through the Actions API, and
+  requires the candidate release-workflow blob to match the trusted anchor.
+  Its schedule
   publishes the live private-advisory re-audit of protected `main` under the
-  separate `.../main-audit` context.
+  distinct `trusted-launch-advisory-verdict-main-audit-...` artifact, which
+  cannot satisfy a release gate.
 - `.github/workflows/release.yml` — the `validate-launch-readiness` job gates
-  every tag release on the exact trusted
-  `trusted-launch-advisory-gate/release-<run id>-attempt-<attempt>` verdict for
-  the commit its tag resolves to, accepts no other context, and holds no
-  advisory credential. Every other release job is downstream of it, which the
-  integrity verifier re-checks as a `needs` reachability property.
+  every tag release on the authenticated
+  `trusted-launch-advisory-verdict-release-<run id>-attempt-<attempt>` artifact
+  for the commit its tag resolves to. It authenticates the owning run's
+  immutable workflow path and `workflow_run` event before lifecycle handling,
+  retries only the authenticated `in_progress` race, and requires
+  completed-success before matching the fixed record including the requester
+  path. This gate is the job's first `run:`; the candidate checker self-test is
+  after it. The job accepts no other provenance and holds no advisory
+  credential. Every other release job is downstream of it, which the integrity
+  verifier re-checks as a `needs` reachability property.
 - Every checkout on the advisory trust boundary uses
   `persist-credentials: false` and least permissions. This statement is scoped
   to those jobs; the release build, packaging, and publishing jobs remain
@@ -666,10 +746,17 @@ launch/release gate must be byte-identical to the trusted base:
 | `.github/workflows/launch-advisory-trust.yml` | once the trusted base carries it (issue #3802) |
 | `.github/scripts/verify_launch_advisory_trust.py` | once the trusted base carries it (issue #3802) |
 
-The two optional rows are treated as absent only while the trusted base also
-lacks them; the moment the base carries one, deleting it or changing a byte
-fails. A trusted base that is missing a *required* anchor is a broken or
-tampered extraction and fails closed rather than skipping enforcement.
+The two optional rows are unfrozen only while the trusted base also lacks them;
+both roots may omit either file in that state. Once
+`.github/scripts/verify_launch_integrity.py` exists on the trusted base, a
+candidate that introduces either optional file before the trusted base carries
+reviewed bytes for it is rejected rather than receiving a filename-based
+exception; legitimate first adoption lands on protected `main` through the
+auditable administrative bypass described in the contributor guidance below,
+followed immediately by hosted runs on the new `main` tip. The moment the base
+carries one, deleting it or changing a byte fails. A trusted base that is
+missing a *required* anchor is a broken or tampered extraction and fails closed
+rather than skipping enforcement.
 
 This is a deliberate replacement for a semantic contract. An earlier revision of
 this verifier tried to *permit* checker edits that "still looked fail-closed":
@@ -697,10 +784,14 @@ is the enforced property and the heuristics are gone.
   fixtures in the isolated `trusted-policy-candidate.yml` lane, which produces
   nothing another job reads — the same posture as `Trusted Cross Build Policy`.
 
-On the single adoption commit the trusted base carries no verifier at all, so
-there is no protected contract to preserve and nothing trustworthy to execute:
-that run reports success with an explicit `::notice::` instead of pretending to
-have enforced anything. Every later revision takes the enforcing path.
+On the single adoption commit for this verifier itself the trusted base carries
+no `.github/scripts/verify_launch_integrity.py` at all, so there is no
+protected contract to preserve and nothing trustworthy to execute: that run
+reports success with an explicit `::notice::` instead of pretending to have
+enforced anything. Every later revision — including any pull request once this
+verifier exists on the trusted base — takes the enforcing path; optional
+advisory-trust anchors do not have a workflow short-circuit and must land
+through the same administrative bypass.
 
 ### What the verifier enforces
 

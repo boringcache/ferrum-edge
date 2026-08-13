@@ -1,5 +1,6 @@
 use std::{
     convert::TryFrom,
+    future::Future,
     marker::PhantomData,
     sync::Arc,
     task::{Context, Poll},
@@ -834,6 +835,17 @@ impl<S, B> RequestStream<S, B> {
             trailers: None,
             send_grease_frame: grease,
         }
+    }
+}
+
+impl<S, B> crate::quic::SendStreamStopped for RequestStream<S, B>
+where
+    S: crate::quic::SendStreamStopped,
+{
+    fn stopped(
+        &self,
+    ) -> impl Future<Output = Result<Option<u64>, StreamErrorIncoming>> + Send + 'static {
+        self.stream.stopped()
     }
 }
 
