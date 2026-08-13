@@ -10728,7 +10728,7 @@ components:
             Bundle identity. Must equal `bundle.local.trust_domain`; a
             conflicting value is rejected rather than silently corrected.
         bundle:
-          $ref: "#/components/schemas/TrustBundleSet"
+          $ref: "#/components/schemas/GatewayTrustBundleSet"
         revision:
           type: integer
           format: int64
@@ -10767,7 +10767,7 @@ components:
         trust_domain:
           type: string
         bundle:
-          $ref: "#/components/schemas/TrustBundleSet"
+          $ref: "#/components/schemas/GatewayTrustBundleSet"
         revision:
           type: integer
           format: int64
@@ -10776,6 +10776,29 @@ components:
             Expected current revision for optimistic concurrency on update.
             Ignored on create, and never stored — the store assigns the revision
             from its durable change sequence.
+
+    GatewayTrustBundleSet:
+      type: object
+      description: |
+        SPIFFE trust material for gateway trust-bundle resources (issue #3727),
+        in the same shape the mesh configuration model uses. Bounded on
+        admission: at most 16 X.509 authorities and 16 JWT authorities per
+        bundle, at most 256 federated bundles (derived from
+        `MAX_MESH_REMOTE_CLUSTERS`), at most 16 KiB per authority, and at most
+        512 KiB for the encoded value as a whole. Each X.509 authority must
+        parse as a certificate that consumes the complete entry, and each JWT
+        authority's `public_key_pem` must parse as a public key the JWT-SVID
+        validator can actually use (SPKI `PUBLIC KEY` PEM or a SPIFFE-federation
+        JWK object).
+      required: [local]
+      properties:
+        local:
+          $ref: "#/components/schemas/TrustBundle"
+        federated:
+          type: array
+          maxItems: 256
+          items:
+            $ref: "#/components/schemas/TrustBundle"
 
     TrustBundleSet:
       type: object
