@@ -11,6 +11,7 @@ pub const FERRUM_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub mod adaptive_buffer;
 pub mod adaptive_concurrency;
 pub mod admin;
+pub mod backend_active_request_limit;
 pub mod backend_conn_limit;
 pub mod backend_pending_limit;
 pub mod capture;
@@ -98,6 +99,27 @@ pub mod _test_support {
     use crate::modes::mesh::startup_rollback_test_seams as mesh_startup_rollback_seams;
     use crate::modes::node_agent::startup_cleanup_test_seams as node_agent_cleanup_seams;
     use crate::plugins::Plugin;
+
+    /// Parse-only URI authority and Host header a Unix WebSocket handshake uses.
+    ///
+    /// Returns `None` when the target-effective backend URL is malformed,
+    /// authority-less, or unsafe. The URI authority is always that trusted
+    /// backend URL; Host follows `preserve_host_header` only for a valid client
+    /// authority, returned in validated form (surrounding whitespace stripped).
+    pub fn unix_websocket_handshake_authorities_for_test(
+        preserve_host_header: bool,
+        client_host: Option<&str>,
+        backend_url: &str,
+    ) -> Option<(String, String)> {
+        let url_authority = crate::proxy::unix_websocket_url_authority(backend_url)?;
+        let host = crate::proxy::unix_websocket_backend_host(
+            preserve_host_header,
+            client_host,
+            &url_authority,
+        )
+        .into_owned();
+        Some((url_authority, host))
+    }
 
     /// Release an xDS node permit through the production last-stream cleanup
     /// fence. The closure runs while same-key registration is excluded, which

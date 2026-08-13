@@ -460,30 +460,41 @@ async fn functional_stream_listener_startup_bind_failure_fatal() {
 
     // Phase 1: seed a DB with a stream proxy pointing at a known-good port.
     // Start the gateway briefly, insert via admin API, then shut it down.
-    let admin_port_seed = ephemeral_port().await;
-    let proxy_port_seed = ephemeral_port().await;
-
-    let mut seed_gw = Command::new(gateway_binary_path())
-        .env("FERRUM_MODE", "database")
-        .env("FERRUM_ADMIN_JWT_SECRET", JWT_SECRET)
-        .env("FERRUM_ADMIN_JWT_ISSUER", JWT_ISSUER)
-        .env("FERRUM_DB_TYPE", "sqlite")
-        .env("FERRUM_DB_URL", &db_url)
-        .env("FERRUM_DB_POLL_INTERVAL", "2")
-        .env("FERRUM_PROXY_HTTP_PORT", proxy_port_seed.to_string())
-        .env("FERRUM_ADMIN_HTTP_PORT", admin_port_seed.to_string())
-        .env("FERRUM_LOG_LEVEL", "error")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn seed gateway");
-
-    if !wait_for_health(admin_port_seed).await {
-        let _ = seed_gw.kill();
-        let _ = seed_gw.wait();
-        panic!("Seed gateway failed to become healthy");
+    // Retry the seed spawn: `ephemeral_port()` is racy under a busy protocols
+    // shard, and a one-shot health wait is not the fatal-bind assertion.
+    const SEED_ATTEMPTS: u32 = 3;
+    let mut seed_gw = None;
+    let mut admin_port_seed = 0u16;
+    for attempt in 1..=SEED_ATTEMPTS {
+        admin_port_seed = ephemeral_port().await;
+        let proxy_port_seed = ephemeral_port().await;
+        let mut child = Command::new(gateway_binary_path())
+            .env("FERRUM_MODE", "database")
+            .env("FERRUM_ADMIN_JWT_SECRET", JWT_SECRET)
+            .env("FERRUM_ADMIN_JWT_ISSUER", JWT_ISSUER)
+            .env("FERRUM_DB_TYPE", "sqlite")
+            .env("FERRUM_DB_URL", &db_url)
+            .env("FERRUM_DB_POLL_INTERVAL", "2")
+            .env("FERRUM_PROXY_HTTP_PORT", proxy_port_seed.to_string())
+            .env("FERRUM_ADMIN_HTTP_PORT", admin_port_seed.to_string())
+            .env("FERRUM_LOG_LEVEL", "error")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn seed gateway");
+        if wait_for_health(admin_port_seed).await {
+            seed_gw = Some(child);
+            break;
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        if attempt == SEED_ATTEMPTS {
+            panic!("Seed gateway failed to become healthy");
+        }
+        sleep(Duration::from_secs(1)).await;
     }
+    let mut seed_gw = seed_gw.expect("seed gateway");
 
     let stream_listen_port = ephemeral_port().await;
 
