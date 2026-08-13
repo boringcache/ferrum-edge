@@ -1165,10 +1165,16 @@ pub(crate) async fn handle_h3_websocket(
                         (&proxy.upstream_id, &current_target, lb_hash_key.as_deref())
                     {
                         // Shared H3-eligible selection (issue #3620). `Some(next)`
-                        // still runs path + DestinationRule retry-budget gates;
-                        // `None` must fail closed (set the abort flag) rather than
-                        // silently falling through and retrying the original
-                        // failed / H3-ineligible target.
+                        // still runs path + DestinationRule retry-budget gates.
+                        // `None` means "no OTHER candidate survives exclusion +
+                        // H3 eligibility" — including the ordinary single-target
+                        // upstream — NOT "this transport is undispatchable".
+                        // `current_target` was already screened by
+                        // `h3_bridge_transport_refusal` at the loop top and is
+                        // re-screened on re-entry, so retrying it is the same
+                        // fall-through the H1/H2 WebSocket loop, the native-H3
+                        // loop, and the H3 plain bridge
+                        // (`CrossProtocolRetryTarget::Unchanged`) all take.
                         match crate::proxy::backend_dispatch::select_next_h3_eligible_retry_target(
                             &state,
                             &epoch,
@@ -1225,10 +1231,10 @@ pub(crate) async fn handle_h3_websocket(
                                 }
                             }
                             None => {
-                                retry_path_mismatch = true;
-                                warn!(
+                                debug!(
                                     proxy_id = %proxy.id,
-                                    "Aborting H3 WebSocket retry: no H3-eligible candidate remains"
+                                    "No alternative H3-eligible WebSocket retry candidate; \
+                                     retrying the already-screened current target"
                                 );
                             }
                         }

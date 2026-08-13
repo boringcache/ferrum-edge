@@ -167,10 +167,15 @@ fn h3_websocket_relay_rejects_impossible_unix_handshake_without_dispatch() {
     );
 }
 
-/// Helper `None` (no remaining H3-eligible alternative) must abort rather than
-/// leave `retry_path_mismatch` false and retry the original failed target.
+/// Helper `None` means "no OTHER eligible candidate" (the ordinary single-target
+/// upstream), NOT "this transport is undispatchable" — the current target was
+/// already screened by `h3_bridge_transport_refusal` at the connect-loop top.
+/// So `None` must fall through and retry that screened target, exactly as the
+/// H1/H2 WebSocket loop, the native-H3 loop, and the H3 plain bridge do.
+/// Aborting there would silently disable connect-failure retry for every
+/// single-target upstream.
 #[test]
-fn h3_websocket_retry_maps_helper_none_to_fail_closed_abort() {
+fn h3_websocket_retry_maps_helper_none_to_current_target_fallthrough() {
     let src = include_str!("../../../src/http3/websocket.rs");
     let retry_start = src
         .find("let mut retry_backend_url = current_backend_url.clone();")
@@ -184,19 +189,25 @@ fn h3_websocket_retry_maps_helper_none_to_fail_closed_abort() {
     let helper = retry_block
         .find("select_next_h3_eligible_retry_target(")
         .expect("h3_websocket: shared H3-eligible helper call not found");
+
+    // The staged retry identity defaults to the current attempt's, so a helper
+    // `None` retries the already-screened target instead of aborting.
+    let staging = &retry_block[..helper];
+    assert!(
+        staging.contains("let mut retry_target = current_target.clone();")
+            && staging.contains("let mut retry_cb_target_key = current_cb_target_key.clone();")
+            && staging.contains("let mut retry_path_mismatch = false;"),
+        "h3_websocket: retry identity must default to the current attempt's target"
+    );
+
     let none_arm = retry_block[helper..]
         .find("None =>")
         .expect("h3_websocket: helper None arm must be explicit (not if-let Some)");
     let none_slice = &retry_block[helper + none_arm..];
-    let none_warn = none_slice
-        .find("\"Aborting H3 WebSocket retry: no H3-eligible candidate remains\"")
-        .expect("h3_websocket: None arm must warn that no H3-eligible candidate remains");
-    let none_abort = none_slice[..none_warn]
-        .find("retry_path_mismatch = true")
-        .expect("h3_websocket: None arm must set retry_path_mismatch before the warn");
     assert!(
-        none_abort < none_warn,
-        "h3_websocket: fail-closed abort flag must be set before the no-candidate warn"
+        !none_slice.contains("retry_path_mismatch = true"),
+        "h3_websocket: helper None must not abort the retry — the current target is \
+         already H3-eligible and every sibling retry loop retries it"
     );
 
     // `Some(next)` still keeps path + DestinationRule budget gates before dial.
@@ -205,13 +216,18 @@ fn h3_websocket_retry_maps_helper_none_to_fail_closed_abort() {
         .expect("h3_websocket: helper Some(next) arm must remain");
     assert!(
         some_arm < none_arm,
-        "h3_websocket: Some(next) path/budget checks must precede the None abort arm"
+        "h3_websocket: Some(next) path/budget checks must precede the None arm"
     );
     let some_slice = &retry_block[helper + some_arm..helper + none_arm];
     assert!(
         some_slice.contains("retry_target_preserves_backend_path(")
             && some_slice.contains("retry_attempt_allowed_for_target("),
         "h3_websocket: Some(next) must still enforce path + retry-budget checks"
+    );
+    assert_eq!(
+        some_slice.matches("retry_path_mismatch = true").count(),
+        2,
+        "h3_websocket: only the path-change and retry-budget rejections may abort a rotation"
     );
 
     // Abort gate must still prevent sleeping / incrementing / continue-retry.

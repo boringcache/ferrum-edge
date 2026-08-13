@@ -2307,18 +2307,16 @@ where
                                 )
                                 .await
                                 {
-                                    record_plain_grpc_web_client_deadline(
-                                        state,
-                                        epoch,
-                                        proxy,
-                                        upstream_balancer,
-                                        current_target.as_deref(),
-                                        current_cb_target_key.as_deref(),
-                                        cb_retry_probe_slot_available,
-                                        backend_start,
-                                        &mut backend_admission_permits,
-                                        backend_admission_start.elapsed(),
-                                    );
+                                    // This attempt's admission + backend outcome
+                                    // were ALREADY settled just above, and the
+                                    // retry-failure record owns the single
+                                    // least-connections end matching this
+                                    // iteration's connection start. Recording a
+                                    // client deadline here too would end that
+                                    // connection a SECOND time and undercount the
+                                    // target's active connections, so settle only
+                                    // the client-facing write — same as the
+                                    // reqwest retry arms below.
                                     return write_plain_grpc_web_client_deadline(
                                         stream,
                                         plugins,

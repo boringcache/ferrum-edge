@@ -7391,8 +7391,18 @@ async fn handle_h3_request(
                 .await?
                 {
                     Ok(permits) => permits,
+                    // Probe release happens inside the helper, before the reject write.
                     Err(()) => return Ok(()),
                 };
+
+                warn!(
+                    proxy_id = %proxy.id,
+                    attempt = attempt,
+                    max_retries = retry_config.max_retries,
+                    connection_error = h3_connection_error(result.request_on_wire, result.error_class),
+                    native_h3 = current_dispatch_h3,
+                    "Retrying backend request (HTTP/3 frontend)"
+                );
 
                 // Re-resolve the effective proxy for the (possibly rotated)
                 // retry target from the post-selection BASE proxy, so this
