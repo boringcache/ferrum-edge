@@ -805,11 +805,12 @@ fn every_authenticated_envelope_form_is_bound_to_the_receiving_listener() {
     let gate_a = gate_for(binding_a, Some(SECRET));
     let gate_b = gate_for(binding_b, Some(SECRET));
 
-    for label in ALL_FORMS {
+    for (sequence, &label) in ALL_FORMS.iter().enumerate() {
+        let sequence = sequence as u64;
         let form_a = envelope_form(label, LISTENER_PORT);
         let form_b = envelope_form(label, OTHER_LISTENER_PORT);
         let sender = Sender::new(11);
-        let for_a = sender.at(&binding_a, form_a, b"payload", 0);
+        let for_a = sender.at(&binding_a, form_a, b"payload", sequence);
 
         // Admitted on the listener it was minted for.
         gate_a
@@ -833,7 +834,7 @@ fn every_authenticated_envelope_form_is_bound_to_the_receiving_listener() {
         // A correctly minted envelope for B is still admitted, so the refusal
         // above is about the binding and not about listener B being broken.
         let sender_b = Sender::new(12);
-        let for_b = sender_b.at(&binding_b, form_b, b"payload", 0);
+        let for_b = sender_b.at(&binding_b, form_b, b"payload", sequence);
         gate_b
             .decode(&for_b, &peer())
             .unwrap_or_else(|error| panic!("{label} must be admitted on B: {error}"));
