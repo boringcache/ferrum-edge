@@ -2307,15 +2307,19 @@ impl StreamListenerManager {
                 };
                 let metrics = Arc::new(UdpProxyMetrics::default());
                 // Datagram client-address metadata gate (issue #3289), built
-                // once per listener from the process-wide trust boundary and
-                // the optional MAC key. `None` unless this proxy opted in, so
-                // an ordinary udp/dtls listener keeps its exact prior behavior.
+                // once per listener from the process-wide trust boundary, the
+                // optional MAC key, and this listener's exact `listen_port`.
+                // Reload reconstructs the gate so dest-port binding cannot
+                // stick to a previous port. `None` unless this proxy opted in,
+                // so an ordinary udp/dtls listener keeps its exact prior
+                // behavior.
                 let datagram_client_address = datagram_client_address.then(|| {
                     use crate::proxy::datagram_client_address::DatagramClientAddressGate;
                     let secret = self.datagram_client_address_secret.load();
                     let gate = DatagramClientAddressGate::new(
                         self.trusted_proxies.clone(),
                         secret.as_deref().map(String::as_str),
+                        port_val,
                     );
                     Arc::new(gate)
                 });

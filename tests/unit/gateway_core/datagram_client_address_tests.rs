@@ -18,6 +18,8 @@ use ferrum_edge::proxy::datagram_client_address::{
 
 const SIG: &[u8; 12] = b"\r\n\r\n\x00\r\nQUIT\n";
 const SECRET: &str = "0123456789abcdef0123456789abcdef";
+/// Destination port encoded by the unit-test fixtures (`10.0.0.5:5353`).
+const LISTENER_PORT: u16 = 5353;
 
 fn addr(value: &str) -> SocketAddr {
     value.parse().expect("test socket address")
@@ -29,12 +31,12 @@ fn trusted(cidrs: &str) -> Arc<TrustedProxies> {
 
 /// Gate trusting the load balancer at `10.0.0.0/8`, without authentication.
 fn address_trust_gate() -> DatagramClientAddressGate {
-    DatagramClientAddressGate::new(trusted("10.0.0.0/8,127.0.0.1"), None)
+    DatagramClientAddressGate::new(trusted("10.0.0.0/8,127.0.0.1"), None, LISTENER_PORT)
 }
 
 /// Gate trusting the same peers and additionally requiring the MAC tag.
 fn authenticated_gate() -> DatagramClientAddressGate {
-    DatagramClientAddressGate::new(trusted("10.0.0.0/8,127.0.0.1"), Some(SECRET))
+    DatagramClientAddressGate::new(trusted("10.0.0.0/8,127.0.0.1"), Some(SECRET), LISTENER_PORT)
 }
 
 fn key() -> HmacSha256Key {
@@ -477,7 +479,7 @@ fn unauthenticated_gate_does_not_honor_a_supplied_tag_as_proof() {
 
 #[test]
 fn empty_trust_list_admits_nothing() {
-    let gate = DatagramClientAddressGate::new(trusted(""), None);
+    let gate = DatagramClientAddressGate::new(trusted(""), None, LISTENER_PORT);
     assert!(!gate.has_trusted_peers());
     let datagram = encode_datagram_with_metadata(
         addr("203.0.113.9:41234"),
@@ -556,7 +558,8 @@ fn a_configured_secret_is_used_verbatim_and_always_requires_authentication() {
         "\t0123456789abcdef0123456789abcdef\n",
         "                                ",
     ] {
-        let gate = DatagramClientAddressGate::new(trusted("10.0.0.0/8"), Some(secret));
+        let gate =
+            DatagramClientAddressGate::new(trusted("10.0.0.0/8"), Some(secret), LISTENER_PORT);
         assert!(
             gate.requires_authentication(),
             "a nonempty secret must always require authentication: {secret:?}"
@@ -599,7 +602,7 @@ fn a_configured_secret_is_used_verbatim_and_always_requires_authentication() {
 #[test]
 fn only_an_absent_or_empty_secret_leaves_the_unauthenticated_posture() {
     for secret in [None, Some("")] {
-        let gate = DatagramClientAddressGate::new(trusted("10.0.0.0/8"), secret);
+        let gate = DatagramClientAddressGate::new(trusted("10.0.0.0/8"), secret, LISTENER_PORT);
         assert!(
             !gate.requires_authentication(),
             "{secret:?} is the documented address-trust posture"
@@ -688,5 +691,179 @@ fn a_proxy_command_must_declare_the_datagram_transport_even_with_af_unspec() {
             .expect("LOCAL probes remain admitted")
             .forwarded,
         None
+    );
+}
+
+#[test]
+fn identity_bearing_envelope_must_declare_the_receiving_listener_port() {
+    let datagram = encode_datagram_with_metadata(
+        addr("203.0.113.9:41234"),
+        addr("10.0.0.5:5353"),
+        b"payload",
+        None,
+    );
+
+    address_trust_gate()
+        .decode(&datagram, &addr("10.0.0.1:60000"))
+        .expect("matching destination port is admitted");
+
+    let other_listener =
+        DatagramClientAddressGate::new(trusted("10.0.0.0/8,127.0.0.1"), None, 5354);
+    let error = other_listener
+        .decode(&datagram, &addr("10.0.0.1:60000"))
+        .expect_err("a valid envelope for another listener port must be refused");
+    assert_eq!(error, DatagramMetadataError::DestinationPortMismatch);
+    assert_eq!(error.reason(), "destination_port_mismatch");
+}
+
+#[test]
+fn ipv6_destination_port_is_bound_to_the_receiving_listener() {
+    let datagram = encode_datagram_with_metadata(
+        addr("[2001:db8::10]:41234"),
+        addr("[2001:db8::1]:5353"),
+        b"v6",
+        None,
+    );
+
+    address_trust_gate()
+        .decode(&datagram, &addr("10.0.0.1:60000"))
+        .expect("matching IPv6 destination port is admitted");
+
+    let other_listener = DatagramClientAddressGate::new(trusted("10.0.0.0/8,127.0.0.1"), None, 9);
+    assert_eq!(
+        other_listener
+            .decode(&datagram, &addr("10.0.0.1:60000"))
+            .expect_err("IPv6 dest-port mismatch must be refused"),
+        DatagramMetadataError::DestinationPortMismatch
+    );
+}
+
+#[test]
+fn authenticated_envelope_for_another_listener_port_is_refused_after_the_tag_verifies() {
+    let datagram = encode_datagram_with_metadata(
+        addr("203.0.113.9:41234"),
+        addr("10.0.0.5:5353"),
+        b"replay",
+        Some(&key()),
+    );
+
+    authenticated_gate()
+        .decode(&datagram, &addr("10.0.0.1:60000"))
+        .expect("matching dest port still verifies");
+
+    let other_listener =
+        DatagramClientAddressGate::new(trusted("10.0.0.0/8,127.0.0.1"), Some(SECRET), 8080);
+    assert_eq!(
+        other_listener
+            .decode(&datagram, &addr("10.0.0.1:60000"))
+            .expect_err("a portable authenticated envelope must not set identity on another port"),
+        DatagramMetadataError::DestinationPortMismatch
+    );
+}
+
+#[test]
+fn dest_port_mismatch_does_not_mask_an_unauthenticated_tag_failure() {
+    let datagram = encode_datagram_with_metadata(
+        addr("203.0.113.9:41234"),
+        addr("10.0.0.5:9"),
+        b"unsigned",
+        None,
+    );
+    assert_eq!(
+        authenticated_gate()
+            .decode(&datagram, &addr("10.0.0.1:60000"))
+            .expect_err("missing tag is diagnosed before dest-port mismatch"),
+        DatagramMetadataError::MissingAuthenticationTag
+    );
+}
+
+#[test]
+fn local_and_af_unspec_are_not_dest_port_bound() {
+    let gate = DatagramClientAddressGate::new(trusted("10.0.0.0/8,127.0.0.1"), None, 9);
+
+    let local_with_addresses = header(
+        0x20,
+        0x12,
+        &inet_block("203.0.113.9:41234", "10.0.0.5:5353"),
+        b"probe",
+    );
+    let decoded = gate
+        .decode(&local_with_addresses, &addr("10.0.0.1:60000"))
+        .expect("LOCAL ignores the address block, including dest port");
+    assert_eq!(decoded.forwarded, None);
+
+    let unspec = header(0x21, 0x02, &[], b"probe");
+    let decoded = gate
+        .decode(&unspec, &addr("10.0.0.1:60000"))
+        .expect("AF_UNSPEC still confers no identity and needs no dest port");
+    assert_eq!(decoded.forwarded, None);
+}
+
+#[test]
+fn dest_port_mismatch_diagnostic_is_material_free() {
+    let datagram = encode_datagram_with_metadata(
+        addr("203.0.113.9:41234"),
+        addr("10.0.0.5:5353"),
+        b"super-secret-payload",
+        Some(&key()),
+    );
+    let other_listener =
+        DatagramClientAddressGate::new(trusted("10.0.0.0/8,127.0.0.1"), Some(SECRET), 8080);
+    let error = other_listener
+        .decode(&datagram, &addr("10.0.0.1:60000"))
+        .expect_err("wrong dest port");
+    let rendered = error.to_string();
+
+    assert_eq!(error.reason(), "destination_port_mismatch");
+    assert!(
+        rendered.contains("destination port"),
+        "diagnostic must name the field: {rendered}"
+    );
+    assert!(
+        !rendered.contains("5353") && !rendered.contains("8080"),
+        "diagnostic must not echo dest or listener ports: {rendered}"
+    );
+    assert!(
+        !rendered.contains("203.0.113.9") && !rendered.contains("10.0.0.5"),
+        "diagnostic must not echo envelope addresses: {rendered}"
+    );
+    assert!(
+        !rendered.contains("super-secret-payload") && !rendered.contains(SECRET),
+        "diagnostic must not echo payload or secret: {rendered}"
+    );
+}
+
+#[test]
+fn datagram_and_tcp_proxy_v2_parsers_share_spec_constants() {
+    let datagram = include_str!("../../../src/proxy/datagram_client_address.rs");
+    let tcp = include_str!("../../../src/proxy/proxy_protocol.rs");
+
+    let signature = r#"b"\r\n\r\n\x00\r\nQUIT\n""#;
+    assert!(
+        datagram.contains(signature) && tcp.contains(signature),
+        "both parsers must keep the PROXY v2 signature"
+    );
+    assert!(
+        datagram.contains("MAX_ADDR_BLOCK_LEN: u16 = 512")
+            && tcp.contains("V2_MAX_ADDR_LEN: u16 = 512"),
+        "both parsers must keep the 512-byte address-block cap"
+    );
+    assert!(
+        datagram.contains("INET_ADDR_LEN: usize = 12")
+            && tcp.contains("V2_INET_ADDR_LEN: usize = 12"),
+        "both parsers must keep the AF_INET fixed block size"
+    );
+    assert!(
+        datagram.contains("INET6_ADDR_LEN: usize = 36")
+            && tcp.contains("V2_INET6_ADDR_LEN: usize = 36"),
+        "both parsers must keep the AF_INET6 fixed block size"
+    );
+    assert!(
+        datagram.contains("crate::proxy::proxy_protocol"),
+        "datagram parser must cross-reference the TCP parser"
+    );
+    assert!(
+        tcp.contains("datagram_client_address"),
+        "TCP parser must cross-reference the datagram parser"
     );
 }

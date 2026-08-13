@@ -251,6 +251,7 @@ async fn try_spawn_gateway(
     let gate = Arc::new(DatagramClientAddressGate::new(
         trusted_proxies,
         authenticated.then_some(SECRET),
+        listen_port,
     ));
 
     let listener_started = Arc::clone(&started);
@@ -407,38 +408,56 @@ async fn authenticated_envelope_drives_the_live_dtls_demux_and_binds_identity() 
     let _ =
         rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
 
-    let frontend_config = FrontendDtlsConfig {
-        dimpl_config: Arc::new(
-            dimpl::Config::builder()
-                .build()
-                .expect("DTLS server config"),
-        ),
-        certificate: dimpl::certificate::generate_self_signed_certificate()
-            .expect("DTLS server certificate")
-            .into(),
-        client_cert_verifier: None,
-    };
-    let drops = Arc::new(AtomicU64::new(0));
-    let gate = Arc::new(DatagramClientAddressGate::new(
-        Arc::new(TrustedProxies::parse_strict("127.0.0.1", "test").expect("trust list")),
-        Some(SECRET),
-    ));
-    let server = Arc::new(
-        DtlsServer::bind_with_limits(
-            "127.0.0.1:0".parse().expect("DTLS bind addr"),
+    let mut server = None;
+    let mut drops = Arc::new(AtomicU64::new(0));
+    for attempt in 1..=MAX_GATEWAY_ATTEMPTS {
+        let frontend = reserve_udp_port().await.expect("reserve DTLS port");
+        let listen_port = frontend.drop_and_take_port();
+        let frontend_config = FrontendDtlsConfig {
+            dimpl_config: Arc::new(
+                dimpl::Config::builder()
+                    .build()
+                    .expect("DTLS server config"),
+            ),
+            certificate: dimpl::certificate::generate_self_signed_certificate()
+                .expect("DTLS server certificate")
+                .into(),
+            client_cert_verifier: None,
+        };
+        let attempt_drops = Arc::new(AtomicU64::new(0));
+        let gate = Arc::new(DatagramClientAddressGate::new(
+            Arc::new(TrustedProxies::parse_strict("127.0.0.1", "test").expect("trust list")),
+            Some(SECRET),
+            listen_port,
+        ));
+        match DtlsServer::bind_with_limits(
+            SocketAddr::from(([127, 0, 0, 1], listen_port)),
             frontend_config,
             DtlsServerLimits {
                 max_sessions: Some(16),
                 handshake_timeout: Some(Duration::from_secs(15)),
                 datagram_client_address: Some(gate),
-                datagram_client_address_drops: Some(Arc::clone(&drops)),
-                datagram_client_address_listener: Some((Arc::from(PROXY_ID), 0)),
+                datagram_client_address_drops: Some(Arc::clone(&attempt_drops)),
+                datagram_client_address_listener: Some((Arc::from(PROXY_ID), listen_port)),
                 ..Default::default()
             },
         )
         .await
-        .expect("bind gated DTLS server"),
-    );
+        {
+            Ok(bound) => {
+                drops = attempt_drops;
+                server = Some(bound);
+                break;
+            }
+            Err(error) => {
+                eprintln!(
+                    "gated DTLS bind attempt {attempt}/{MAX_GATEWAY_ATTEMPTS} on \
+                     {listen_port} failed: {error}"
+                );
+            }
+        }
+    }
+    let server = Arc::new(server.expect("bind gated DTLS server"));
     let server_addr = server.local_addr();
     let server_runner = Arc::clone(&server);
     let server_task = tokio::spawn(async move {
@@ -469,6 +488,15 @@ async fn authenticated_envelope_drives_the_live_dtls_demux_and_binds_identity() 
             server_addr,
             &client_hello_shaped,
             Some(&foreign_key),
+        ),
+        encode_datagram_with_metadata(
+            forwarded_client,
+            SocketAddr::new(
+                server_addr.ip(),
+                server_addr.port().wrapping_add(1).max(1),
+            ),
+            &client_hello_shaped,
+            Some(&key()),
         ),
     ];
     for datagram in &pre_association_refusals {
@@ -660,6 +688,18 @@ async fn unauthenticated_and_malformed_datagrams_are_dropped_before_the_backend(
             "foreign tag",
             encode_datagram_with_metadata(original_client, gateway_addr, b"query", Some(&foreign)),
         ),
+        (
+            "wrong listener dest port",
+            encode_datagram_with_metadata(
+                original_client,
+                SocketAddr::new(
+                    gateway_addr.ip(),
+                    gateway_addr.port().wrapping_add(1).max(1),
+                ),
+                b"query",
+                Some(&key()),
+            ),
+        ),
         // Truncated header.
         ("truncated header", b"\r\n\r\n\x00\r\nQUI".to_vec()),
     ];
@@ -711,6 +751,77 @@ async fn unauthenticated_and_malformed_datagrams_are_dropped_before_the_backend(
         recv_within(&sender, RECV_TIMEOUT).await.as_deref(),
         Some(&b"ok"[..]),
         "refusals must not wedge the listener"
+    );
+
+    gateway.shutdown().await;
+}
+
+#[tokio::test]
+async fn authenticated_envelope_for_a_different_listener_port_is_dropped_before_session() {
+    let backend = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("backend bind"));
+    let backend_port = backend.local_addr().expect("backend addr").port();
+    let _backend = spawn_udp_echo_backend(Arc::clone(&backend)).await;
+
+    let gateway = spawn_gateway(backend_port, true).await;
+    let gateway_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), gateway.listen_port);
+    let sender = UdpSocket::bind("127.0.0.1:0").await.expect("sender bind");
+    let original_client: SocketAddr = "203.0.113.9:41234".parse().expect("client addr");
+    let wrong_dest = SocketAddr::new(
+        gateway_addr.ip(),
+        gateway_addr.port().wrapping_add(1).max(1),
+    );
+
+    sender
+        .send_to(
+            &encode_datagram_with_metadata(
+                original_client,
+                wrong_dest,
+                b"other-listener",
+                Some(&key()),
+            ),
+            gateway_addr,
+        )
+        .await
+        .expect("send portable envelope");
+
+    assert!(
+        recv_within(&sender, DROP_OBSERVATION_WINDOW)
+            .await
+            .is_none(),
+        "a valid envelope for another listener port must be dropped"
+    );
+    assert!(
+        gateway.recorder.stream.lock().await.is_empty(),
+        "wrong dest port must not admit a session"
+    );
+    assert_eq!(
+        gateway.metrics.active_sessions.load(Ordering::Relaxed),
+        0,
+        "wrong dest port must not allocate a session"
+    );
+    assert_eq!(
+        gateway.recorder.datagram_count.load(Ordering::Relaxed),
+        0,
+        "wrong dest port must not reach plugin hooks"
+    );
+    assert_eq!(
+        gateway
+            .metrics
+            .client_address_metadata_drops
+            .load(Ordering::Relaxed),
+        1,
+        "wrong dest port must be counted before any allocation"
+    );
+
+    let good = encode_datagram_with_metadata(original_client, gateway_addr, b"ok", Some(&key()));
+    sender
+        .send_to(&good, gateway_addr)
+        .await
+        .expect("send matching dest-port envelope");
+    assert_eq!(
+        recv_within(&sender, RECV_TIMEOUT).await.as_deref(),
+        Some(&b"ok"[..]),
+        "matching dest port must still be admitted"
     );
 
     gateway.shutdown().await;

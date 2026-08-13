@@ -11,9 +11,17 @@ only under `fuzz/` — the production `ferrum-edge` binary does not depend on th
 | `traceparent` | W3C `traceparent` parse | 64 KiB input | Fail closed (`None`); accepted values round-trip |
 | `config_decode` | YAML/JSON config decode + validation | 64 MiB doc (loader cap), 64 KiB fuzz input | No panic; validation errors only |
 | `proxy_protocol` | PROXY v1/v2 header parse | 528-byte header cap | Fail closed; bounded address block |
+| `datagram_client_address` | Datagram PROXY v2 DGRAM header + auth-TLV walk | 512-byte address-block cap, 64 KiB fuzz input | Fail closed; bounded TLV walk; no secret/tag/address output |
 | `mesh_udp_frame` | HBONE datagram framing | 64 KiB input, 256 frames/invocation | Length prefix bounded; encode/decode round-trip |
 | `k8s_crd` | Istio/Gateway API JSON → translation | 32 objects, depth 64 | Fail-closed translation errors |
 | `plugin_config` | Representative plugin JSON validation (one selector byte followed by JSON) | depth 64 | `validate_plugin_config` never panics |
+
+The `datagram_client_address` target is locally complete (`fuzz/Cargo.toml`
+`[[bin]]`, `fuzz_targets/datagram_client_address.rs`, synthetic corpus,
+`fuzz_support::fuzz_parse_datagram_header`, and the `cargo test` property
+smoke). It is **not** yet in the byte-frozen `CI_FUZZ_SMOKE_JOB` libFuzzer
+loop (`.github/workflows/ci.yml`) or the `.github/workflows/fuzz.yml`
+matrix; those trusted-base lists can only change on `main` after merge.
 
 Shared budgets and helpers live in `src/fuzz_support.rs`.
 

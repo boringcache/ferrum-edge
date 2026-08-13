@@ -2501,6 +2501,25 @@ async fn udp_stream_proxy_protocol_reload_restarts_listener_and_toggles_gate() {
         .expect("the restarted gated listener must admit an authenticated envelope");
     assert_eq!(reply, b"gated-envelope");
 
+    // The replacement gate captures this listener's port: a valid tag for a
+    // different dest port is refused before a session is allocated.
+    let wrong_dest =
+        SocketAddr::from(([127, 0, 0, 1], frontend_port.wrapping_add(1).max(1)));
+    let portable = encode_datagram_with_metadata(
+        forwarded_client,
+        wrong_dest,
+        b"wrong-port",
+        Some(&datagram_hmac_key()),
+    );
+    client
+        .send_to(&portable, gateway_addr)
+        .await
+        .expect("send portable envelope");
+    assert!(
+        recv_udp_within(&client, UDP_DROP_WINDOW).await.is_none(),
+        "an authenticated envelope for another listener port must be dropped after reload"
+    );
+
     // Clearing the field must restart again and restore bare UDP behavior.
     publish_stream_config(
         &runtime,

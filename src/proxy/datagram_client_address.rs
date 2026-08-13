@@ -44,13 +44,36 @@
 //!   address block, wrong address family, any transport but `DGRAM` on a
 //!   `PROXY` command (`STREAM` — i.e. a TCP header replayed onto the datagram
 //!   path — is refused whatever family it declares, `AF_UNSPEC` included),
-//!   malformed TLVs, a missing or invalid authentication tag. There is no
-//!   fallback to the socket peer, because that would silently downgrade a
-//!   spoofed datagram into an accepted one.
+//!   malformed TLVs, a missing or invalid authentication tag, or a destination
+//!   port that does not match the receiving listener. There is no fallback to
+//!   the socket peer, because that would silently downgrade a spoofed datagram
+//!   into an accepted one.
+//!
+//! The HMAC tag authenticates the destination bytes but is keyed by a
+//! process-global secret, so a valid envelope minted for listener port A would
+//! otherwise verify on listener port B. The gate therefore captures the
+//! receiving `listen_port` at construction and refuses an identity-bearing
+//! `PROXY` envelope whose declared destination port differs, before any
+//! session, demux allocation, plugin hook, or backend send. `LOCAL` and
+//! `AF_UNSPEC` still never set a forwarded identity; they are not dest-port
+//! bound, because they cannot confer one.
 //!
 //! Diagnostics are field-specific but bounded: they name the field and, at
-//! most, the offending numeric code or length. Payload bytes, tag bytes, and
-//! secrets never appear in a log record.
+//! most, the offending numeric code or length. Payload bytes, tag bytes,
+//! secrets, and addresses asserted inside the envelope never appear in a log
+//! record.
+//!
+//! # Relationship to the TCP PROXY parser
+//!
+//! [`crate::proxy::proxy_protocol`] is the connection-borne TCP parser (v1
+//! text and v2 binary, STREAM transport, one header per connection). This
+//! module is a separate per-datagram parser: it requires `DGRAM` transport,
+//! walks the auth-TLV region, binds destination port to the receiving
+//! listener, and never allocates. Signature, version, family codes, and the
+//! 512-byte address-block cap MUST stay aligned with that parser; a spec-level
+//! fix must update both. Do not collapse them into one abstraction — the
+//! datagram path's transport, auth-TLV, dest-port, and hot-path checks would
+//! be lost.
 //!
 //! # Spec references
 //!
@@ -65,15 +88,19 @@ use crate::fips::approved::HmacSha256Key;
 use crate::proxy::client_ip::TrustedProxies;
 
 /// PROXY protocol v2 12-byte signature.
+///
+/// Keep byte-identical to [`crate::proxy::proxy_protocol`]'s `V2_SIG`. The
+/// parsers are deliberately separate; this constant is the shared spec token.
 const V2_SIG: &[u8; 12] = b"\r\n\r\n\x00\r\nQUIT\n";
 /// Signature + `ver_cmd` + `fam_transport` + `addr_len`.
 const FIXED_HEADER_LEN: usize = 16;
 /// Maximum accepted address-block length (fixed addresses plus TLVs). Matches
-/// the TCP parser's cap so one deployment cannot need two different budgets.
+/// the TCP parser's `V2_MAX_ADDR_LEN` so one deployment cannot need two
+/// different budgets.
 const MAX_ADDR_BLOCK_LEN: u16 = 512;
-/// `AF_INET` fixed address block: 4 + 4 + 2 + 2.
+/// `AF_INET` fixed address block: 4 + 4 + 2 + 2. Matches the TCP parser.
 const INET_ADDR_LEN: usize = 12;
-/// `AF_INET6` fixed address block: 16 + 16 + 2 + 2.
+/// `AF_INET6` fixed address block: 16 + 16 + 2 + 2. Matches the TCP parser.
 const INET6_ADDR_LEN: usize = 36;
 
 /// TLV type carrying the HMAC-SHA-256 authentication tag.
@@ -131,6 +158,11 @@ pub enum DatagramMetadataError {
     /// A later datagram on an established session carried a different
     /// forwarded client than the one the session was admitted with.
     ForwardedClientChanged,
+    /// An identity-bearing `PROXY` envelope declared a destination port that
+    /// is not this listener's `listen_port`. Prevents a process-global HMAC
+    /// secret from making a valid envelope for listener A portable onto
+    /// listener B.
+    DestinationPortMismatch,
 }
 
 impl DatagramMetadataError {
@@ -154,6 +186,7 @@ impl DatagramMetadataError {
             Self::AuthenticationTagMismatch => "authentication_tag_mismatch",
             Self::AuthenticationKeyUnavailable => "authentication_key_unavailable",
             Self::ForwardedClientChanged => "forwarded_client_changed",
+            Self::DestinationPortMismatch => "destination_port_mismatch",
         }
     }
 }
@@ -226,6 +259,9 @@ impl std::fmt::Display for DatagramMetadataError {
                 "datagram carried a different forwarded client than the established session was \
                  admitted with",
             ),
+            Self::DestinationPortMismatch => {
+                f.write_str("PROXY v2 destination port does not match the receiving listener")
+            }
         }
     }
 }
@@ -287,9 +323,11 @@ pub struct DecodedDatagram<'a> {
 
 /// Per-listener trust gate for datagram client-address metadata.
 ///
-/// Built once per listener at spawn from the process-wide trust boundary and
-/// the optional shared secret; the receive path only calls [`Self::decode`],
-/// which allocates nothing.
+/// Built once per listener at spawn from the process-wide trust boundary, the
+/// optional shared secret, and the receiving `listen_port`. Reload reconstructs
+/// the gate with the live port rather than inheriting another listener's
+/// binding. The receive path only calls [`Self::decode`], which allocates
+/// nothing.
 pub struct DatagramClientAddressGate {
     trusted_proxies: Arc<TrustedProxies>,
     /// Whether the operator configured a secret. Derived from the exact
@@ -304,6 +342,9 @@ pub struct DatagramClientAddressGate {
     /// key material, which then fails every datagram closed rather than
     /// downgrading the listener to unauthenticated metadata.
     auth_key: Option<HmacSha256Key>,
+    /// Exact receiving listener port captured at construction. Identity-bearing
+    /// `PROXY` envelopes must declare this destination port.
+    listener_port: u16,
 }
 
 impl std::fmt::Debug for DatagramClientAddressGate {
@@ -311,6 +352,7 @@ impl std::fmt::Debug for DatagramClientAddressGate {
         // Never render the key material or anything derived from it.
         f.debug_struct("DatagramClientAddressGate")
             .field("authenticated", &self.authentication_required)
+            .field("listener_port", &self.listener_port)
             .finish()
     }
 }
@@ -322,7 +364,15 @@ impl DatagramClientAddressGate {
     /// secret like any other — trimming it here would silently key the listener
     /// with different bytes than `EnvConfig` validated, or drop the
     /// authentication requirement entirely.
-    pub fn new(trusted_proxies: Arc<TrustedProxies>, secret: Option<&str>) -> Self {
+    ///
+    /// `listener_port` is this listener's exact receiving port. It is captured
+    /// here so decode can refuse a portable envelope without consulting any
+    /// per-datagram caller-supplied identity.
+    pub fn new(
+        trusted_proxies: Arc<TrustedProxies>,
+        secret: Option<&str>,
+        listener_port: u16,
+    ) -> Self {
         let secret = secret.filter(|value| !value.is_empty());
         let auth_key = match secret {
             Some(value) => HmacSha256Key::new_from_slice(value.as_bytes()).ok(),
@@ -332,6 +382,7 @@ impl DatagramClientAddressGate {
             trusted_proxies,
             authentication_required: secret.is_some(),
             auth_key,
+            listener_port,
         }
     }
 
@@ -363,7 +414,7 @@ impl DatagramClientAddressGate {
         if !self.trusted_proxies.contains(&socket_peer.ip()) {
             return Err(DatagramMetadataError::UntrustedPeer);
         }
-        let parsed = parse_datagram_header(datagram)?;
+        let parsed = parse_datagram_header_inner(datagram)?;
         // With no secret configured, a supplied tag is simply not honored:
         // verifying nothing against nothing would present authenticated-looking
         // metadata. The tag bytes stay inside the address block either way and
@@ -377,6 +428,14 @@ impl DatagramClientAddressGate {
             };
             verify_authentication_tag(key, datagram, &parsed)?;
         }
+        // Bind identity-bearing envelopes to this listener before the caller
+        // can allocate a session or demux slot. `LOCAL` / `AF_UNSPEC` leave
+        // `forwarded` unset and are not dest-port bound.
+        if parsed.forwarded.is_some()
+            && parsed.destination_port != Some(self.listener_port)
+        {
+            return Err(DatagramMetadataError::DestinationPortMismatch);
+        }
         Ok(DecodedDatagram {
             payload: &datagram[parsed.header_len..],
             forwarded: parsed.forwarded,
@@ -389,12 +448,25 @@ struct ParsedDatagramHeader {
     /// Total metadata length; the payload starts here.
     header_len: usize,
     forwarded: Option<SocketAddr>,
+    /// Declared destination port from an `AF_INET` / `AF_INET6` address block.
+    /// `None` for `AF_UNSPEC` (no addresses). Not a trust decision; the gate
+    /// compares it to the receiving listener after authentication.
+    destination_port: Option<u16>,
     /// Absolute `[start, end)` of the authentication tag value, when present.
     auth_tag: Option<(usize, usize)>,
 }
 
+/// Parse the metadata header, without any trust, dest-port, or authentication
+/// decision. Hostile-input entry for the fuzz lane: bounded, allocation-free,
+/// and it never returns payload, tag, or secret material.
+pub(crate) fn parse_datagram_header(datagram: &[u8]) -> Result<(), DatagramMetadataError> {
+    parse_datagram_header_inner(datagram).map(|_| ())
+}
+
 /// Parse the metadata header, without any trust or authentication decision.
-fn parse_datagram_header(datagram: &[u8]) -> Result<ParsedDatagramHeader, DatagramMetadataError> {
+fn parse_datagram_header_inner(
+    datagram: &[u8],
+) -> Result<ParsedDatagramHeader, DatagramMetadataError> {
     if datagram.len() < FIXED_HEADER_LEN {
         return Err(DatagramMetadataError::TruncatedHeader {
             len: datagram.len(),
@@ -452,9 +524,9 @@ fn parse_datagram_header(datagram: &[u8]) -> Result<ParsedDatagramHeader, Datagr
         require_datagram_transport(transport)?;
     }
 
-    let (forwarded, fixed_len) = match family {
+    let (forwarded, fixed_len, destination_port) = match family {
         // AF_UNSPEC — no address is carried.
-        0x00 => (None, 0usize),
+        0x00 => (None, 0usize, None),
         0x01 => {
             if block.len() < INET_ADDR_LEN {
                 return Err(DatagramMetadataError::AddressBlockTooShortForFamily {
@@ -464,7 +536,12 @@ fn parse_datagram_header(datagram: &[u8]) -> Result<ParsedDatagramHeader, Datagr
             }
             let src = Ipv4Addr::new(block[0], block[1], block[2], block[3]);
             let port = u16::from_be_bytes([block[8], block[9]]);
-            (Some(SocketAddr::new(IpAddr::V4(src), port)), INET_ADDR_LEN)
+            let dest_port = u16::from_be_bytes([block[10], block[11]]);
+            (
+                Some(SocketAddr::new(IpAddr::V4(src), port)),
+                INET_ADDR_LEN,
+                Some(dest_port),
+            )
         }
         0x02 => {
             if block.len() < INET6_ADDR_LEN {
@@ -476,9 +553,11 @@ fn parse_datagram_header(datagram: &[u8]) -> Result<ParsedDatagramHeader, Datagr
             let mut octets = [0u8; 16];
             octets.copy_from_slice(&block[..16]);
             let port = u16::from_be_bytes([block[32], block[33]]);
+            let dest_port = u16::from_be_bytes([block[34], block[35]]);
             (
                 Some(SocketAddr::new(IpAddr::V6(Ipv6Addr::from(octets)), port)),
                 INET6_ADDR_LEN,
+                Some(dest_port),
             )
         }
         // AF_UNIX (0x03) and anything else cannot address a datagram client.
@@ -496,6 +575,7 @@ fn parse_datagram_header(datagram: &[u8]) -> Result<ParsedDatagramHeader, Datagr
         } else {
             forwarded.map(crate::util::client_identity::canonical_socket_addr)
         },
+        destination_port,
         auth_tag,
     })
 }

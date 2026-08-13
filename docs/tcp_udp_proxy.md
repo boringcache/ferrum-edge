@@ -1036,6 +1036,7 @@ Source addresses are trivially spoofable on UDP. Set `FERRUM_DATAGRAM_PROXY_PROT
 - TLV type `0xE0` (the PROXY v2 application-reserved range), value length 32.
 - The tag is computed over the complete datagram with the 32 tag bytes elided — so the command, family, transport, addresses, every other TLV, and the payload are all bound to it.
 - A datagram with a missing, malformed, duplicated, or non-verifying tag is dropped.
+- An identity-bearing `PROXY` envelope's declared **destination port must equal this listener's `listen_port`**. The HMAC is keyed by a process-global secret, so without this check a valid envelope minted for listener A would verify on listener B and acquire the same authenticated identity. `LOCAL` and `AF_UNSPEC` still never set a forwarded identity and are not dest-port bound. Mismatches are dropped before session, demux, plugin, or backend work, with a fixed-cardinality `destination_port_mismatch` reason that does not echo ports or envelope addresses.
 - The configured value is the key **verbatim** — it is never trimmed or normalized, so leading/trailing whitespace is key material and any nonempty value makes authentication mandatory. Only an unset or empty variable leaves the listener in the address-trust posture, and startup rejects a value shorter than 32 bytes without reporting the value or its length.
 
 The tag binds metadata to payload; it is **not** an anti-replay mechanism. A verbatim replay of a captured datagram remains possible, exactly as it is for plain UDP.
@@ -1052,14 +1053,16 @@ With no secret configured, trust rests on `FERRUM_TRUSTED_PROXIES` alone. That i
 | Any transport but `DGRAM` on a `PROXY` command, `AF_UNSPEC` included (a TCP PROXY header replayed onto the datagram path) | Datagram **dropped** |
 | Unsupported address family (including `AF_UNIX`) | Datagram **dropped** |
 | Missing, duplicated, wrong-length, or invalid authentication tag | Datagram **dropped** |
+| Identity-bearing envelope whose destination port is not this listener's `listen_port` | Datagram **dropped** |
 | Forwarded client differs from the established session's | Datagram **dropped** |
 | `LOCAL` command, or `PROXY` + `AF_UNSPEC` + `DGRAM` (balancer health probe) | `client_ip` = `direct_client_ip` = balancer socket peer |
 
-A drop is silent on the wire (UDP has no reset). Each one increments the listener's client-address-metadata drop counter and emits a rate-limited structured warning naming the failing field; payload bytes, tag material, and rejected forwarded addresses are never logged.
+A drop is silent on the wire (UDP has no reset). Each one increments an internal listener-local `client_address_metadata_drops` counter (shared by the UDP receive path and the DTLS demuxer on that listener) and emits a rate-limited structured warning naming the failing field; payload bytes, tag material, and rejected forwarded addresses are never logged. That counter is **not** an exported Prometheus or admin metric — it is in-process accounting for tests and the listener's own drop path.
 
 ### Session and reply semantics
 
 - Ferrum keys UDP sessions by the **socket peer**, so a balancer must allocate a distinct source port per client flow (ordinary per-flow NAT). All datagrams on one socket peer must therefore carry the same forwarded client; one that does not is dropped rather than attributed to the established session's identity.
+- **Identity pinning is fail-closed and does not refresh activity on mismatch.** Once a 4-tuple is admitted, a later datagram asserting a different forwarded identity is dropped and does not extend the idle watermark. That is the correct security behavior. The availability consequence is that an unauthenticated spoof or an authenticated replay that wins the fresh-flow race can occupy the session slot and **blackhole the genuine flow until the idle window**, after which the association expires and the genuine flow self-heals. Do not weaken the pin to recover faster.
 - **Replies are sent to the socket peer unwrapped.** Ferrum does not emit the envelope on the return path — the balancer demultiplexes by its own 4-tuple.
 - The envelope is stripped before anything else runs: before session lookup, before `on_stream_connect` / `on_udp_datagram` plugins, before the DTLS record layer on a `dtls` listener, and before any backend send. The backend never sees envelope bytes.
 - Backend load-balancer stickiness (`hash_on` ip-hash lanes) follows the resolved client, so one real client keeps one backend across the balancer's ports.
@@ -1071,7 +1074,8 @@ Identical to the TCP path: `client_ip` (mesh authz `remote.ip` / `remoteIpBlocks
 ### Limitations (datagram)
 
 - **Inbound only.** Ferrum never emits the datagram envelope toward a backend; `backend_proxy_protocol` remains TCP-only.
-- **No anti-replay.** See above.
+- **No anti-replay.** See above. Destination-port binding stops a valid envelope from being replayed onto a *different* listener; it does not stop a verbatim replay onto the *same* listener.
+- **Identity-pinning availability.** See [Session and reply semantics](#session-and-reply-semantics): a spoof or replay that wins a fresh-flow race can blackhole the genuine client until idle timeout, then self-heals. The pin is not relaxed.
 - **Not supported on mesh capture paths.** Ambient/sidecar UDP capture carries its own metadata; the envelope applies to configured `udp` / `dtls` stream listeners.
 
 ## Outbound PROXY Protocol

@@ -7695,8 +7695,12 @@ components:
             * udp / dtls: the PROXY protocol v2 DGRAM envelope, present on EVERY datagram
               (a session-scoped header cannot be trusted on an unordered, lossy transport).
               A datagram that does not decode is dropped; nothing is forwarded and no
-              session is created. Ferrum never emits the envelope toward the backend, and
-              replies are sent back to the socket peer unwrapped.
+              session is created. An identity-bearing envelope's declared destination
+              port must match this proxy's listen_port so a process-global HMAC secret
+              cannot make a valid envelope for listener A portable onto listener B.
+              LOCAL and AF_UNSPEC still never set a forwarded identity. Ferrum never
+              emits the envelope toward the backend, and replies are sent back to the
+              socket peer unwrapped.
 
             Trust requirement: the forwarded address is honoured only when the socket peer
             (the load balancer's own IP) belongs to the FERRUM_TRUSTED_PROXIES CIDR set. A

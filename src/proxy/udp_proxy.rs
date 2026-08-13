@@ -130,12 +130,12 @@ pub struct UdpProxyMetrics {
     /// admission budget.
     hook_ingress_queued_bytes: AtomicUsize,
     /// Datagrams dropped by the client-address metadata gate: untrusted peer,
-    /// missing/failed authentication, malformed envelope, or a forwarded client
-    /// that disagreed with the established session. Every one of these is a
-    /// fail-closed refusal, never a fallback to the socket peer.
-    /// Shared with the frontend DTLS demuxer (which validates the envelope
-    /// before any per-peer state exists) so both datagram paths report one
-    /// counter.
+    /// missing/failed authentication, malformed envelope, destination-port
+    /// mismatch, or a forwarded client that disagreed with the established
+    /// session. Every one of these is a fail-closed refusal, never a fallback
+    /// to the socket peer. This is internal listener-local accounting shared
+    /// with the frontend DTLS demuxer so both datagram paths report one
+    /// counter; it is not an exported Prometheus or admin metric.
     pub client_address_metadata_drops: Arc<AtomicU64>,
     /// Bounds the per-listener rate of the metadata-drop warning so a hostile
     /// flood cannot turn one dropped datagram into one log record.

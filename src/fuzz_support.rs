@@ -95,6 +95,16 @@ pub fn fuzz_parse_proxy_protocol(data: &[u8]) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
+/// Parse a datagram PROXY v2 DGRAM header and walk its auth-TLV region.
+///
+/// Bounded, allocation-free, and fail-closed. The `Result` carries only a
+/// fixed-cardinality reason — never payload bytes, tag bytes, secret material,
+/// or addresses asserted inside the envelope.
+pub fn fuzz_parse_datagram_header(data: &[u8]) -> Result<(), String> {
+    crate::proxy::datagram_client_address::parse_datagram_header(data)
+        .map_err(|error| error.reason().to_string())
+}
+
 /// Drain length-prefixed mesh UDP frames from a byte stream with a hard frame cap.
 pub fn fuzz_drain_mesh_udp_frames(data: &[u8]) -> Result<Vec<Bytes>, String> {
     let mut buf = BytesMut::from(data);
@@ -178,6 +188,13 @@ pub fn smoke_invariants() -> Result<(), String> {
     mesh_udp_frame_round_trip(b"smoke")?;
     let proxy_v1 = b"PROXY TCP4 127.0.0.1 10.0.0.1 12345 443\r\n";
     fuzz_parse_proxy_protocol(proxy_v1)?;
+    let mut datagram = Vec::from(*b"\r\n\r\n\x00\r\nQUIT\n");
+    datagram.extend_from_slice(&[0x21, 0x12, 0x00, 0x0c]);
+    datagram.extend_from_slice(&[203, 0, 113, 9, 10, 0, 0, 5]);
+    datagram.extend_from_slice(&41234u16.to_be_bytes());
+    datagram.extend_from_slice(&5353u16.to_be_bytes());
+    datagram.extend_from_slice(b"q");
+    fuzz_parse_datagram_header(&datagram)?;
     let config =
         r#"{"version":"1","proxies":[],"consumers":[],"plugin_configs":[],"upstreams":[]}"#;
     fuzz_decode_config_document(config)?;
