@@ -1083,6 +1083,24 @@ thread_local! {
         std::cell::RefCell::new(String::with_capacity(64));
 }
 
+/// Zero-allocation lookup in a production upstream snapshot keyed by
+/// canonical `namespace|id`.
+///
+/// The returned reference borrows from `map`, not from the thread-local
+/// scratch buffer. Callers must not hold the result across an `await`.
+#[inline]
+pub(crate) fn lookup_namespaced_upstream<'a>(
+    map: &'a HashMap<String, Arc<Upstream>>,
+    namespace: &str,
+    upstream_id: &str,
+) -> Option<&'a Arc<Upstream>> {
+    RUNTIME_KEY_BUF.with(|buf| {
+        let mut key = buf.borrow_mut();
+        crate::config::db_backend::write_namespaced_runtime_key(&mut key, namespace, upstream_id);
+        map.get(key.as_str())
+    })
+}
+
 impl LoadBalancerCacheInner {
     /// Access the balancers map for custom code that needs direct HashMap access.
     ///
@@ -1130,15 +1148,7 @@ impl LoadBalancerCacheInner {
     /// `self`, not from the thread-local scratch buffer.
     #[inline]
     pub(crate) fn upstream(&self, namespace: &str, upstream_id: &str) -> Option<&Arc<Upstream>> {
-        RUNTIME_KEY_BUF.with(|buf| {
-            let mut key = buf.borrow_mut();
-            crate::config::db_backend::write_namespaced_runtime_key(
-                &mut key,
-                namespace,
-                upstream_id,
-            );
-            self.upstreams.get(key.as_str())
-        })
+        lookup_namespaced_upstream(&self.upstreams, namespace, upstream_id)
     }
 
     #[inline]
