@@ -1854,14 +1854,21 @@ fn observability_detail_allowed(
     auth_header: Option<&str>,
     client_ip: &std::net::IpAddr,
 ) -> bool {
+    admin_jwt_detail_allowed(state, auth_header)
+        || state.metrics_auth.token_matches(auth_header)
+        || state.metrics_auth.ip_allowed(client_ip)
+}
+
+/// Whether the caller presented a valid Admin API JWT. Some detailed health
+/// fields are derived using the Admin API signing secret and must not be
+/// exposed through the broader metrics-token/CIDR observability tier.
+fn admin_jwt_detail_allowed(state: &AdminState, auth_header: Option<&str>) -> bool {
     state
         .jwt_manager
         .verify_request(auth_header)
         .ok()
         .and_then(|token_data| AuditActor::from_claims(&token_data.claims).ok())
         .is_some()
-        || state.metrics_auth.token_matches(auth_header)
-        || state.metrics_auth.ip_allowed(client_ip)
 }
 
 /// `401` response for `/metrics` when the caller is not authorized to scrape.
@@ -1952,7 +1959,10 @@ async fn handle_admin_request_inner(
 
     // Health check (unauthenticated)
     if path == "/health" || path == "/status" {
-        let detailed = observability_detail_allowed(&state, auth_header.as_deref(), &client_ip);
+        let admin_jwt_detail = admin_jwt_detail_allowed(&state, auth_header.as_deref());
+        let detailed = admin_jwt_detail
+            || state.metrics_auth.token_matches(auth_header.as_deref())
+            || state.metrics_auth.ip_allowed(&client_ip);
         let mut health_status = json!({
             "status": "ok",
             "timestamp": Utc::now().to_rfc3339(),
@@ -2122,7 +2132,14 @@ async fn handle_admin_request_inner(
         if detailed {
             // Allocates the closed reason map and the keyed generation
             // identifier. Authenticated detail only — never the coarse probe.
-            if let Some(trust) = crate::grpc::cp_trust_health::snapshot() {
+            if let Some(mut trust) = crate::grpc::cp_trust_health::snapshot() {
+                // This identifier is an HMAC under FERRUM_ADMIN_JWT_SECRET.
+                // Metrics-only credentials and CIDR allowlists authorize the
+                // operational counters above, but never an offline verifier
+                // for guesses of the Admin API signing secret.
+                if !admin_jwt_detail {
+                    trust.active_generation = None;
+                }
                 // Booleans, seconds, counters, a closed-set reason, and the
                 // keyed HMAC generation identifier. Never a bundle path, key
                 // material, `kid`, namespace, token, or the private fingerprint.

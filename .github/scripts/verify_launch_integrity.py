@@ -131,10 +131,11 @@ PROTECTED_PATHS = (
 # `(slot, required)` / `(workflow filename, required)`. A *required* anchor must
 # exist on the trusted base: a base that cannot supply it is an incomplete
 # extraction, which fails closed rather than silently skipping enforcement. An
-# *optional* anchor is one a sibling change is still landing (issue #3802's
-# advisory-trust lane); it is unfrozen only while the trusted base also lacks
-# it, and becomes a hard anchor — deletion and byte changes both rejected — the
-# moment the base carries it.
+# *optional* anchor is one a sibling change may still be landing (issue #3802's
+# advisory-trust lane). Both roots may omit it only while the trusted base also
+# lacks it; once this verifier exists on the trusted base, a candidate that
+# introduces either optional anchor is rejected. First adoption therefore lands
+# through the auditable protected-main administrative bypass, not a pull request.
 ANCHOR_FILE_SLOTS = (
     ("verifier", True),
     ("checker", True),
@@ -1071,8 +1072,16 @@ def anchor_errors(candidate: Root, base: Root) -> list[str]:
                     f"the trusted base is missing the governed anchor {path}; "
                     "refusing to certify a candidate against an incomplete base"
                 )
-            # Optional anchor not yet adopted on the trusted base: nothing to
-            # preserve. It freezes as soon as the base carries it.
+            elif candidate_text is not None:
+                # No reviewed trusted-base bytes exist to authenticate against,
+                # so fail closed rather than granting a filename-based
+                # exception to privileged workflow secrets. First adoption is an
+                # administrative protected-main update, not a pull request.
+                errors.append(
+                    f"the candidate introduced the unanchored executable gate file {path}; "
+                    "adopt it on protected main through an auditable administrative bypass, "
+                    "then re-run hosted integrity checks on the new main tip"
+                )
             continue
         if not base_text.strip():
             errors.append(
@@ -1792,10 +1801,27 @@ def run_self_test() -> int:
         "advisory lane absent from both roots",
         evaluate(adopt_advisory_base=False, adopt_advisory_candidate=False),
     )
-    expect_clean(
+    expect_rejected(
         "advisory lane adopted on an un-adopted base",
         evaluate(adopt_advisory_base=False, adopt_advisory_candidate=True),
     )
+
+    def introduce_advisory_workflow(workflows: dict[str, str]) -> None:
+        workflows["launch-advisory-trust.yml"] = _FIXTURE_ADVISORY_WORKFLOW
+
+    expect_rejected(
+        "unanchored advisory workflow introduced alone",
+        evaluate(mutate_workflows=introduce_advisory_workflow),
+    )
+
+    def introduce_advisory_verifier(files: dict[str, str]) -> None:
+        files[SLOT_FILENAMES["advisory_verifier"]] = _FIXTURE_ADVISORY_VERIFIER
+
+    expect_rejected(
+        "unanchored advisory verifier introduced alone",
+        evaluate(mutate_files=introduce_advisory_verifier),
+    )
+
     expect_clean(
         "advisory lane present and unchanged",
         evaluate(adopt_advisory_base=True, adopt_advisory_candidate=True),
