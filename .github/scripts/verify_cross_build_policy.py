@@ -8992,6 +8992,75 @@ def separate_unquoted_shell_newlines(value: str) -> str:
     return "".join(rendered)
 
 
+def quote_stripped_command_scan_text(value: str) -> str:
+    """Strip quotes for split-word Cross scans without exposing quoted separators.
+
+    Split quotes such as `cr"oss" build` and `"cross" build` must still read as
+    a Cross executable, so quote characters are removed after this pass. Quoted
+    command separators are not outer-shell syntax, though:
+    `"note; backend_hits=0" "$(probe src)"` is one data word plus a data
+    substitution. Collapsing every quote first used to turn that `;` into a new
+    command, so `backend_hits=0` looked like an assignment prefix and the
+    substitution was reported as an opaque / generated executable.
+
+    Separators inside `$(...)`, backticks, subshells, and process substitutions
+    stay real: those interiors are nested commands even when the substitution
+    sits in a double-quoted word.
+    """
+
+    rendered = list(value)
+    quote: str | None = None
+    escaped = False
+    pending: list[tuple[str, str | None]] = []
+    index = 0
+    while index < len(value):
+        character = value[index]
+        if escaped:
+            escaped = False
+            index += 1
+            continue
+        if character == "\\" and quote != "'":
+            escaped = True
+            index += 1
+            continue
+        if quote != "'" and (value.startswith("$(", index) or character == "`"):
+            if character == "`":
+                if pending and pending[-1][0] == "`":
+                    _, quote = pending.pop()
+                else:
+                    pending.append(("`", quote))
+                    quote = None
+                index += 1
+                continue
+            pending.append((")", quote))
+            quote = None
+            index += 2
+            continue
+        if quote is not None:
+            if character in ";|&":
+                rendered[index] = " "
+            if character == quote:
+                quote = None
+            index += 1
+            continue
+        if character in "'\"":
+            quote = character
+            index += 1
+            continue
+        if pending and character == pending[-1][0]:
+            _, quote = pending.pop()
+            index += 1
+            continue
+        if character == "(" or (
+            character in "<>" and value.startswith("(", index + 1)
+        ):
+            pending.append((")", quote))
+            index += 2 if character in "<>" else 1
+            continue
+        index += 1
+    return re.sub(r"[\\'\"]", "", "".join(rendered))
+
+
 def has_cross_command_context(
     candidate: str,
     *,
@@ -9007,7 +9076,7 @@ def has_cross_command_context(
         CROSS_COMMAND_CONTEXT.search(variant)
         for variant in (
             executable_text,
-            re.sub(r"[\\'\"]", "", executable_text),
+            quote_stripped_command_scan_text(executable_text),
         )
     )
 
@@ -22431,6 +22500,46 @@ pre_build = []
         failures.append(
             "an unquoted heredoc body lost its generated inline shell surface"
         )
+    # Quote-stripping that joins `cr"oss"` used to expose a quoted `;` as an
+    # outer statement separator. The live DTLS assertion records a data
+    # message plus SPIFFE substitutions; that is not an executable slot.
+    # Physical `tests/k8s/node_waypoint_ebpf_live/run.sh` spells this across
+    # backslash continuations; the scanner joins those before classification.
+    benign_quoted_separator_assertion = (
+        "record_live_assertion "
+        "node_waypoint.dtls.reload_permissive_to_strict pass "
+        "dtls-src-a dtls-echo "
+        '"generated listener moved to STRICT; unauthenticated handshake '
+        'failed closed; backend_hits=0" '
+        '"$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" '
+        '"node-waypoint-dtls-reload"\n'
+    )
+    if contains_direct_trusted_shell_cross_surface(
+        benign_quoted_separator_assertion
+    ):
+        failures.append(
+            "a quoted assertion message with a data command substitution was "
+            "reported as a generated inline shell surface"
+        )
+    # The same assignment-prefixed substitution is an executable when the
+    # semicolon is real outer-shell syntax. Split quotes that assemble the
+    # Cross word must keep failing closed after the quoted-separator walk.
+    for attack_label, attack_program in (
+        (
+            "assignment-prefixed quoted substitution executable",
+            f'echo safe; backend_hits=0 "$(pick-cross)" build --target {TARGET}\n',
+        ),
+        (
+            "quoted substitution occupying the command word",
+            f'"$(pick-cross)" build --target {TARGET}\n',
+        ),
+        (
+            "split-quoted Cross executable",
+            f'cr"oss" build --target {TARGET}\n',
+        ),
+    ):
+        if not contains_direct_trusted_shell_cross_surface(attack_program):
+            failures.append(f"a {attack_label} stopped failing closed")
 
     # Interpreter provenance can arrive after a file was already reached. A
     # suffixless script popped first is read as shell; a later `python3 <path>`
