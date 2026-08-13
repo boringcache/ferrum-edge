@@ -27,6 +27,12 @@ CI_CD_DOC = REPO_ROOT / "docs" / "ci_cd.md"
 MESH_BASELINE = REPO_ROOT / "tests" / "performance" / "mesh" / "baseline.md"
 HBONE_BASELINE = REPO_ROOT / "tests" / "performance" / "mesh-hbone-e2e" / "baseline.md"
 DNS_BASELINE = REPO_ROOT / "tests" / "performance" / "mesh-dns-e2e" / "baseline.md"
+HBONE_LOADGEN = (
+    REPO_ROOT / "tests" / "performance" / "mesh-hbone-e2e" / "src" / "bin" / "hbone_loadgen.rs"
+)
+DNS_LOADGEN = (
+    REPO_ROOT / "tests" / "performance" / "mesh-dns-e2e" / "src" / "bin" / "dns_loadgen.rs"
+)
 
 EXTERNAL_ACTION = re.compile(
     r"uses:\s*(?P<action>(?!\./)[^@\s]+)@(?P<ref>[^\s#]+)",
@@ -406,6 +412,21 @@ def check_scripts(failures: list[str]) -> None:
     require("archive_failure_diagnostics" in hbone_run, "HBONE harness must copy logs before deleting runtime", failures)
     require("archive_failure_diagnostics" in dns_run, "DNS harness must copy logs into the artifact destination", failures)
     require("certs" in hbone_run and "Never copy certs" in hbone_run, "HBONE diagnostics must not archive certs", failures)
+
+    hbone_loadgen = HBONE_LOADGEN.read_text(encoding="utf-8")
+    dns_loadgen = DNS_LOADGEN.read_text(encoding="utf-8")
+    require(
+        "worker_join_failed" in hbone_loadgen
+        and "one or more HBONE load-generator workers failed" in hbone_loadgen,
+        "HBONE load-generator worker join failures must fail the collection",
+        failures,
+    )
+    require(
+        "worker_join_failed" in dns_loadgen
+        and "one or more DNS load-generator workers failed" in dns_loadgen,
+        "DNS load-generator worker join failures must fail the collection",
+        failures,
+    )
 
 
 def check_pr_ci_wiring(failures: list[str]) -> None:

@@ -114,11 +114,18 @@ async fn run(args: &RunArgs) -> Result<()> {
     }
 
     let mut combined = BenchMetrics::new();
+    let mut worker_join_failed = false;
     for h in handles {
         match h.await {
             Ok(m) => combined.merge(&m),
-            Err(e) => eprintln!("join error: {e}"),
+            Err(e) => {
+                eprintln!("join error: {e}");
+                worker_join_failed = true;
+            }
         }
+    }
+    if worker_join_failed {
+        return Err(anyhow::anyhow!("one or more HBONE load-generator workers failed"));
     }
 
     let label = "hbone_e2e";
