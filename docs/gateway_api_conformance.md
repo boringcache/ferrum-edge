@@ -164,7 +164,10 @@ GEP-713 Direct Policy Attachment:
 5. Controller default `8.0`
 
 Same attachment level is oldest-wins (`creationTimestamp`, then
-`{namespace}/{name}`). Cross-namespace `targetRefs` require a `ReferenceGrant`
+`{namespace}/{name}`). A Direct policy that loses any named target is
+`Conflicted` and occupies none of its targets, so a later eligible policy can
+still govern a remaining target. `GatewayClass.parametersRef` ignores a
+conflicted Direct policy. Cross-namespace `targetRefs` require a `ReferenceGrant`
 from `gateway.ferrum.io`/`UDPResponseAmplificationPolicy` to `Gateway` or
 `UDPRoute`. A missing, invalid, unauthorized, or deleted policy never programs
 unlimited amplification — the next precedence level, ultimately the finite
@@ -181,7 +184,11 @@ existing idle-timeout path; no extra maps keyed by client or route are added.
 
 `UDPRoute.status.parents[].conditions` includes Ferrum
 `UDPAmplificationProtection` with reasons `FiniteDefault`, `FinitePolicy`, or
-`ExplicitUnlimited`. Condition messages do not echo the numeric factor.
+`ExplicitUnlimited`. Condition messages do not echo the numeric factor. When
+one parentRef materializes on several UDP listeners, that parent reports the
+conservative aggregate: `ExplicitUnlimited` if any listener is unlimited,
+`FinitePolicy` only when every listener uses a finite policy, and
+`FiniteDefault` when at least one uses the controller default.
 Process-wide unlabeled counters
 `ferrum_udp_amplification_responses_allowed_total`,
 `ferrum_udp_amplification_responses_dropped_total`,

@@ -12,7 +12,7 @@ use ferrum_edge::config_sources::k8s::{
 };
 use ferrum_edge::identity::spiffe::TrustDomain;
 use ferrum_edge::k8s_controller::status::{
-    FERRUM_GATEWAY_CONTROLLER_NAME, plan_gateway_api_status_updates,
+    FERRUM_GATEWAY_CONTROLLER_NAME, GatewayApiStatusUpdate, plan_gateway_api_status_updates,
 };
 use ferrum_edge::udp_amplification::{
     GATEWAY_API_UDP_AMPLIFICATION_DEFAULT_FACTOR, UDP_AMPLIFICATION_POLICY_KIND,
@@ -117,6 +117,14 @@ fn udp_route_on(name: &str, section: &str) -> K8sObject {
 }
 
 fn udp_gateway_two_listeners(name: &str) -> K8sObject {
+    udp_gateway_two_listeners_in_order(name, ("dns", 15353), ("alt", 15354))
+}
+
+fn udp_gateway_two_listeners_in_order(
+    name: &str,
+    first: (&str, u16),
+    second: (&str, u16),
+) -> K8sObject {
     object_in(
         "Gateway",
         "gateway.networking.k8s.io/v1",
@@ -126,8 +134,8 @@ fn udp_gateway_two_listeners(name: &str) -> K8sObject {
             "gatewayClassName": "ferrum",
             "listeners": [
                 {
-                    "name": "dns",
-                    "port": 15353,
+                    "name": first.0,
+                    "port": first.1,
                     "protocol": "UDP",
                     "allowedRoutes": {
                         "kinds": [{"kind": "UDPRoute"}],
@@ -135,8 +143,8 @@ fn udp_gateway_two_listeners(name: &str) -> K8sObject {
                     }
                 },
                 {
-                    "name": "alt",
-                    "port": 15354,
+                    "name": second.0,
+                    "port": second.1,
                     "protocol": "UDP",
                     "allowedRoutes": {
                         "kinds": [{"kind": "UDPRoute"}],
@@ -144,6 +152,51 @@ fn udp_gateway_two_listeners(name: &str) -> K8sObject {
                     }
                 }
             ]
+        }),
+    )
+}
+
+fn udp_route_wildcard_parent(name: &str) -> K8sObject {
+    object_in(
+        "UDPRoute",
+        "gateway.networking.k8s.io/v1alpha2",
+        "default",
+        name,
+        json!({
+            "parentRefs": [{"name": "edge"}],
+            "rules": [{"backendRefs": [{"name": "coredns", "port": 5353}]}]
+        }),
+    )
+}
+
+fn finite_gateway_section_policy(name: &str, section: &str, factor: f64) -> K8sObject {
+    amp_policy(
+        name,
+        json!({
+            "targetRefs": [{
+                "group": "gateway.networking.k8s.io",
+                "kind": "Gateway",
+                "name": "edge",
+                "sectionName": section
+            }],
+            "mode": "Finite",
+            "maxResponseAmplificationFactor": factor
+        }),
+    )
+}
+
+fn unlimited_gateway_section_policy(name: &str, section: &str) -> K8sObject {
+    amp_policy(
+        name,
+        json!({
+            "targetRefs": [{
+                "group": "gateway.networking.k8s.io",
+                "kind": "Gateway",
+                "name": "edge",
+                "sectionName": section
+            }],
+            "mode": "Unlimited",
+            "acknowledgeUnsafeAmplification": true
         }),
     )
 }
@@ -227,9 +280,15 @@ fn route_protection_reason_named(objects: &[K8sObject], route: &str) -> String {
 
 fn route_protection_reason(objects: &[K8sObject]) -> String {
     let updates = plan_gateway_api_status_updates(objects, options(), &[]);
-    updates
-        .iter()
-        .find(|update| update.kind == "UDPRoute")
+    protection_condition(updates.iter().find(|update| update.kind == "UDPRoute"))
+        .map(|(_, reason, _)| reason)
+        .unwrap_or_else(|| "missing".to_string())
+}
+
+fn protection_condition(
+    update: Option<&GatewayApiStatusUpdate>,
+) -> Option<(bool, String, String)> {
+    update
         .and_then(|update| update.status.get("parents")?.as_array()?.first())
         .and_then(|parent| parent.get("conditions")?.as_array())
         .into_iter()
@@ -237,9 +296,23 @@ fn route_protection_reason(objects: &[K8sObject]) -> String {
         .find(|entry| {
             entry.get("type").and_then(Value::as_str) == Some("UDPAmplificationProtection")
         })
-        .and_then(|entry| entry.get("reason").and_then(Value::as_str))
-        .unwrap_or("missing")
-        .to_string()
+        .and_then(|entry| {
+            Some((
+                entry.get("status").and_then(Value::as_str)? == "True",
+                entry.get("reason").and_then(Value::as_str)?.to_string(),
+                entry.get("message").and_then(Value::as_str)?.to_string(),
+            ))
+        })
+}
+
+fn route_protection_named(objects: &[K8sObject], route: &str) -> (bool, String, String) {
+    let updates = plan_gateway_api_status_updates(objects, options(), &[]);
+    protection_condition(
+        updates
+            .iter()
+            .find(|update| update.kind == "UDPRoute" && update.name == route),
+    )
+    .unwrap_or((false, "missing".to_string(), String::new()))
 }
 
 #[test]
@@ -855,4 +928,244 @@ fn conflicted_direct_policy_is_withdrawn_from_gatewayclass_lookup() {
     let loser = policy_status_named(&objects, "class-default");
     assert!(!loser.accepted);
     assert_eq!(loser.accepted_reason, "Conflicted");
+}
+
+fn udp_route_target(name: &str) -> Value {
+    json!({
+        "group": "gateway.networking.k8s.io",
+        "kind": "UDPRoute",
+        "name": name
+    })
+}
+
+fn assert_no_numeric_factor(message: &str) {
+    assert!(
+        !message.chars().any(|ch| ch.is_ascii_digit()),
+        "UDPAmplificationProtection message must not echo a numeric factor: {message}"
+    );
+}
+
+fn assert_three_policy_cascade(objects: &[K8sObject], label: &str) {
+    assert_eq!(
+        translated_factor_on_port(objects, 15353),
+        Some(4.0),
+        "{label}: route a must take the promoted P2 factor"
+    );
+    assert_eq!(
+        translated_factor_on_port(objects, 15354),
+        Some(2.0),
+        "{label}: route b must keep the oldest P0 factor"
+    );
+    let p0 = policy_status_named(objects, "p0");
+    assert!(p0.accepted, "{label}: P0 must stay Accepted");
+    assert_eq!(p0.accepted_reason, "Accepted", "{label}");
+    let p1 = policy_status_named(objects, "p1");
+    assert!(!p1.accepted, "{label}: P1 must be Conflicted");
+    assert_eq!(p1.accepted_reason, "Conflicted", "{label}");
+    let p2 = policy_status_named(objects, "p2");
+    assert!(p2.accepted, "{label}: P2 must be promoted Accepted");
+    assert_eq!(p2.accepted_reason, "Accepted", "{label}");
+    let (on_a, reason_a, message_a) = route_protection_named(objects, "a");
+    assert!(on_a, "{label}: route a protection must stay on");
+    assert_eq!(reason_a, "FinitePolicy", "{label}");
+    assert_no_numeric_factor(&message_a);
+    let (on_b, reason_b, message_b) = route_protection_named(objects, "b");
+    assert!(on_b, "{label}: route b protection must stay on");
+    assert_eq!(reason_b, "FinitePolicy", "{label}");
+    assert_no_numeric_factor(&message_b);
+}
+
+#[test]
+fn atomic_multi_target_conflict_promotes_next_eligible_candidate() {
+    // Oldest P0 owns B, middle P1 targets A+B and must lose atomically, newest
+    // P2 must then govern A. Translation runs finalize_conflicts twice, so a
+    // passing case also pins idempotent rebuild.
+    let p0 = amp_policy_at(
+        "p0",
+        "2024-01-01T00:00:00Z",
+        json!({
+            "targetRefs": [udp_route_target("b")],
+            "mode": "Finite",
+            "maxResponseAmplificationFactor": 2.0
+        }),
+    );
+    let p1 = amp_policy_at(
+        "p1",
+        "2024-02-01T00:00:00Z",
+        json!({
+            "targetRefs": [udp_route_target("a"), udp_route_target("b")],
+            "mode": "Finite",
+            "maxResponseAmplificationFactor": 32.0
+        }),
+    );
+    let p2 = amp_policy_at(
+        "p2",
+        "2024-03-01T00:00:00Z",
+        json!({
+            "targetRefs": [udp_route_target("a")],
+            "mode": "Finite",
+            "maxResponseAmplificationFactor": 4.0
+        }),
+    );
+    let policies = [p0, p1, p2];
+    let orders = [
+        [0usize, 1, 2],
+        [0, 2, 1],
+        [1, 0, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
+    ];
+    for order in orders {
+        let mut objects = vec![
+            gateway_class_with_parameters("default", "p1"),
+            udp_gateway_two_listeners("edge"),
+            udp_gateway("other", "dns", 15355),
+            udp_route_on("a", "dns"),
+            udp_route_on("b", "alt"),
+            object_in(
+                "UDPRoute",
+                "gateway.networking.k8s.io/v1alpha2",
+                "default",
+                "c",
+                json!({
+                    "parentRefs": [{"name": "other", "sectionName": "dns"}],
+                    "rules": [{"backendRefs": [{"name": "coredns", "port": 5353}]}]
+                }),
+            ),
+        ];
+        for index in order {
+            objects.push(policies[index].clone());
+        }
+        assert_three_policy_cascade(&objects, &format!("order {order:?}"));
+        assert_eq!(
+            translated_factor_on_port(&objects, 15355),
+            Some(GATEWAY_API_UDP_AMPLIFICATION_DEFAULT_FACTOR),
+            "order {order:?}: conflicted P1 must not win through GatewayClass.parametersRef"
+        );
+        let (on_c, reason_c, message_c) = route_protection_named(&objects, "c");
+        assert!(
+            on_c,
+            "order {order:?}: class-default fallback must stay protected"
+        );
+        assert_eq!(reason_c, "FiniteDefault", "order {order:?}");
+        assert_no_numeric_factor(&message_c);
+    }
+}
+
+fn wildcard_listener_orders() -> [((&'static str, u16), (&'static str, u16)); 2] {
+    [
+        (("dns", 15353), ("alt", 15354)),
+        (("alt", 15354), ("dns", 15353)),
+    ]
+}
+
+fn wildcard_parent_objects(
+    listener_order: ((&str, u16), (&str, u16)),
+    policies: impl IntoIterator<Item = K8sObject>,
+) -> Vec<K8sObject> {
+    let mut objects = vec![
+        gateway_class(),
+        udp_gateway_two_listeners_in_order("edge", listener_order.0, listener_order.1),
+        udp_route_wildcard_parent("wild"),
+    ];
+    objects.extend(policies);
+    objects
+}
+
+#[test]
+fn wildcard_parent_unlimited_listener_dominates_status_regardless_of_order() {
+    let policy_orders = [
+        vec![
+            finite_gateway_section_policy("tight", "dns", 2.0),
+            unlimited_gateway_section_policy("open", "alt"),
+        ],
+        vec![
+            unlimited_gateway_section_policy("open", "alt"),
+            finite_gateway_section_policy("tight", "dns", 2.0),
+        ],
+    ];
+    for listeners in wildcard_listener_orders() {
+        for policies in &policy_orders {
+            let objects = wildcard_parent_objects(listeners, policies.clone());
+            assert_eq!(
+                translated_factor_on_port(&objects, 15353),
+                Some(2.0),
+                "dns listener must keep its finite policy"
+            );
+            assert_eq!(
+                translated_factor_on_port(&objects, 15354),
+                None,
+                "alt listener must stay unlimited"
+            );
+            let (protected, reason, message) = route_protection_named(&objects, "wild");
+            assert!(
+                !protected,
+                "any unlimited listener must make the parent unprotected"
+            );
+            assert_eq!(reason, "ExplicitUnlimited");
+            assert_no_numeric_factor(&message);
+        }
+    }
+}
+
+#[test]
+fn wildcard_parent_mixed_finite_and_default_reports_finite_default() {
+    let section_policies = ["dns", "alt"];
+    for listeners in wildcard_listener_orders() {
+        for section in section_policies {
+            let objects = wildcard_parent_objects(
+                listeners,
+                [finite_gateway_section_policy("tight", section, 2.0)],
+            );
+            let dns_factor = translated_factor_on_port(&objects, 15353);
+            let alt_factor = translated_factor_on_port(&objects, 15354);
+            if section == "dns" {
+                assert_eq!(dns_factor, Some(2.0));
+                assert_eq!(
+                    alt_factor,
+                    Some(GATEWAY_API_UDP_AMPLIFICATION_DEFAULT_FACTOR)
+                );
+            } else {
+                assert_eq!(
+                    dns_factor,
+                    Some(GATEWAY_API_UDP_AMPLIFICATION_DEFAULT_FACTOR)
+                );
+                assert_eq!(alt_factor, Some(2.0));
+            }
+            let (protected, reason, message) = route_protection_named(&objects, "wild");
+            assert!(protected, "mixed finite listeners must stay protection-on");
+            assert_eq!(reason, "FiniteDefault");
+            assert_no_numeric_factor(&message);
+            assert_eq!(
+                message,
+                "Ferrum applied a finite UDP response-amplification limit"
+            );
+        }
+    }
+}
+
+#[test]
+fn wildcard_parent_all_finite_policies_report_finite_policy() {
+    let policy_orders = [
+        vec![
+            finite_gateway_section_policy("dns-limit", "dns", 2.0),
+            finite_gateway_section_policy("alt-limit", "alt", 4.0),
+        ],
+        vec![
+            finite_gateway_section_policy("alt-limit", "alt", 4.0),
+            finite_gateway_section_policy("dns-limit", "dns", 2.0),
+        ],
+    ];
+    for listeners in wildcard_listener_orders() {
+        for policies in &policy_orders {
+            let objects = wildcard_parent_objects(listeners, policies.clone());
+            assert_eq!(translated_factor_on_port(&objects, 15353), Some(2.0));
+            assert_eq!(translated_factor_on_port(&objects, 15354), Some(4.0));
+            let (protected, reason, message) = route_protection_named(&objects, "wild");
+            assert!(protected);
+            assert_eq!(reason, "FinitePolicy");
+            assert_no_numeric_factor(&message);
+        }
+    }
 }

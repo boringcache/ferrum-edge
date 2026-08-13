@@ -45,11 +45,13 @@ const DUPLICATE_TARGET_MESSAGE: &str =
 /// published on `UDPRoute.status.parents[].conditions`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UdpAmplificationPosture {
-    /// Controller default (`8.0`). Protection is on.
+    /// Controller default (`8.0`), or a mixed finite-policy / default parent.
+    /// Protection is on.
     FiniteDefault,
-    /// A valid finite policy won. Protection is on.
+    /// Every matching listener won a valid finite policy. Protection is on.
     FinitePolicy,
-    /// Dual-acknowledged `mode: Unlimited`. Protection is off.
+    /// Dual-acknowledged `mode: Unlimited` on any matching listener.
+    /// Protection is off.
     ExplicitUnlimited,
 }
 
@@ -68,9 +70,7 @@ impl UdpAmplificationPosture {
 
     pub fn message(self) -> &'static str {
         match self {
-            Self::FiniteDefault => {
-                "Ferrum applied the controller default UDP response-amplification limit"
-            }
+            Self::FiniteDefault => "Ferrum applied a finite UDP response-amplification limit",
             Self::FinitePolicy => "Ferrum applied a finite UDPResponseAmplificationPolicy",
             Self::ExplicitUnlimited => {
                 "Ferrum programmed this UDPRoute without a response-amplification limit because an attached policy acknowledged unsafe amplification"
@@ -150,6 +150,12 @@ struct TargetRef {
     cross_namespace: bool,
 }
 
+#[derive(Debug, Clone)]
+struct DirectPolicyCandidate {
+    policy: IndexedPolicy,
+    targets: Vec<AttachmentKey>,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct UdpAmplificationPolicyIndex {
     by_attachment: HashMap<AttachmentKey, IndexedPolicy>,
@@ -157,21 +163,10 @@ pub(crate) struct UdpAmplificationPolicyIndex {
     /// A Direct policy that lost any named target is withdrawn here as well so
     /// a Conflicted resource cannot still win through `parametersRef`.
     by_name: HashMap<(String, String), IndexedPolicy>,
-}
-
-impl UdpAmplificationPolicyIndex {
-    fn insert_winner(&mut self, key: AttachmentKey, candidate: IndexedPolicy) {
-        match self.by_attachment.get(&key) {
-            None => {
-                self.by_attachment.insert(key, candidate);
-            }
-            Some(existing) => {
-                if policy_is_preferred(&candidate, existing) {
-                    self.by_attachment.insert(key, candidate);
-                }
-            }
-        }
-    }
+    /// Every valid Direct-attachment candidate. `finalize_conflicts` rebuilds
+    /// `by_attachment` from this set in oldest-wins order so an atomic loser
+    /// never consumes a target a later eligible policy can still govern.
+    candidates: Vec<DirectPolicyCandidate>,
 }
 
 fn policy_is_preferred(candidate: &IndexedPolicy, existing: &IndexedPolicy) -> bool {
@@ -329,27 +324,22 @@ fn collect_one(
         indexed.clone(),
     );
 
-    for target in &targets {
-        let key = match target.kind.as_str() {
-            "UDPRoute" => AttachmentKey::Route {
-                namespace: target.namespace.clone(),
-                name: target.name.clone(),
-            },
-            "Gateway" => AttachmentKey::Gateway {
-                namespace: target.namespace.clone(),
-                name: target.name.clone(),
-                section: target.section_name.clone(),
-            },
-            _ => continue,
-        };
-        acc.udp_amplification_policies
-            .insert_winner(key, indexed.clone());
-    }
+    let target_keys: Vec<AttachmentKey> = targets
+        .iter()
+        .filter_map(attachment_key_for_target)
+        .collect();
+    acc.udp_amplification_policies
+        .candidates
+        .push(DirectPolicyCandidate {
+            policy: indexed,
+            targets: target_keys,
+        });
 
-    // Conflicted losers are finalized after every policy is indexed so status
-    // is stable under input reorder. Record a provisional Accepted here;
-    // finalize_conflicts flips any policy that lost any named target and
-    // withdraws it from every live lookup, including GatewayClass.parametersRef.
+    // Conflicted losers are finalized after every valid candidate is stored so
+    // status is stable under input reorder. Record a provisional Accepted here;
+    // finalize_conflicts rebuilds Direct-attachment winners in oldest-wins
+    // order, flips any policy that lost any named target, and withdraws it
+    // from every live lookup, including GatewayClass.parametersRef.
     acc.record_udp_amplification_policy_status(GatewayApiUdpAmplificationPolicyStatus {
         policy: K8sResourceKey::from_object(object),
         accepted: true,
@@ -631,49 +621,71 @@ fn authorize_and_resolve_target(
     None
 }
 
-/// Mark policies that lost any named attachment under GEP-713 oldest-wins
-/// and withdraw them from every slot (atomic Direct attachment).
+fn attachment_key_for_target(target: &TargetRef) -> Option<AttachmentKey> {
+    match target.kind.as_str() {
+        "UDPRoute" => Some(AttachmentKey::Route {
+            namespace: target.namespace.clone(),
+            name: target.name.clone(),
+        }),
+        "Gateway" => Some(AttachmentKey::Gateway {
+            namespace: target.namespace.clone(),
+            name: target.name.clone(),
+            section: target.section_name.clone(),
+        }),
+        _ => None,
+    }
+}
+
+fn policy_order(left: &IndexedPolicy, right: &IndexedPolicy) -> Ordering {
+    if policy_is_preferred(left, right) {
+        Ordering::Less
+    } else if policy_is_preferred(right, left) {
+        Ordering::Greater
+    } else {
+        Ordering::Equal
+    }
+}
+
+/// Rebuild Direct-attachment winners in GEP-713 oldest-wins order.
+///
+/// A policy that cannot claim every named target is atomic: it occupies none
+/// of them, so a later eligible candidate can still be promoted onto a target
+/// the loser would otherwise have consumed. Conflicted Direct policies are
+/// withdrawn from GatewayClass.parametersRef lookup as well. Repeated calls
+/// are idempotent because winners are rebuilt from the same candidate set.
 pub(crate) fn finalize_conflicts(acc: &mut K8sAccumulator) {
+    acc.udp_amplification_policies
+        .candidates
+        .sort_by(|left, right| policy_order(&left.policy, &right.policy));
+
+    let mut winners: HashMap<AttachmentKey, IndexedPolicy> = HashMap::new();
     let mut lost_any: HashSet<K8sResourceKey> = HashSet::new();
-    for status in &acc.udp_amplification_policy_statuses {
-        if !status.accepted || status.ancestors.is_empty() {
+    for candidate in &acc.udp_amplification_policies.candidates {
+        if candidate.targets.is_empty() {
             continue;
         }
-        let lost = status.ancestors.iter().any(|ancestor| {
-            let key = match ancestor.kind.as_str() {
-                "UDPRoute" => AttachmentKey::Route {
-                    namespace: ancestor.namespace.clone(),
-                    name: ancestor.name.clone(),
-                },
-                "Gateway" => AttachmentKey::Gateway {
-                    namespace: ancestor.namespace.clone(),
-                    name: ancestor.name.clone(),
-                    section: ancestor.section_name.clone(),
-                },
-                _ => return false,
-            };
-            acc.udp_amplification_policies
-                .by_attachment
-                .get(&key)
-                .is_some_and(|winner| winner.resource != status.policy)
-        });
-        if lost {
-            lost_any.insert(status.policy.clone());
+        let blocked = candidate
+            .targets
+            .iter()
+            .any(|target| winners.contains_key(target));
+        if blocked {
+            lost_any.insert(candidate.policy.resource.clone());
+            continue;
+        }
+        for target in &candidate.targets {
+            winners.insert(target.clone(), candidate.policy.clone());
         }
     }
-    if !lost_any.is_empty() {
-        acc.udp_amplification_policies
-            .by_attachment
-            .retain(|_, policy| !lost_any.contains(&policy.resource));
-        acc.udp_amplification_policies
-            .by_name
-            .retain(|_, policy| !lost_any.contains(&policy.resource));
-        for status in &mut acc.udp_amplification_policy_statuses {
-            if lost_any.contains(&status.policy) {
-                status.accepted = false;
-                status.accepted_reason = "Conflicted".to_string();
-                status.accepted_message = CONFLICTED_MESSAGE.to_string();
-            }
+
+    acc.udp_amplification_policies.by_attachment = winners;
+    acc.udp_amplification_policies
+        .by_name
+        .retain(|_, policy| !lost_any.contains(&policy.resource));
+    for status in &mut acc.udp_amplification_policy_statuses {
+        if lost_any.contains(&status.policy) {
+            status.accepted = false;
+            status.accepted_reason = "Conflicted".to_string();
+            status.accepted_message = CONFLICTED_MESSAGE.to_string();
         }
     }
 }
@@ -794,19 +806,42 @@ fn posture_from_body(
     }
 }
 
+/// Aggregate every exact `(route, parent_ref)` posture.
+///
+/// A wildcard parentRef can materialize on several UDP listeners, each with
+/// its own effective policy. Status is conservative and order-independent:
+/// any `ExplicitUnlimited` makes the parent unprotected; otherwise protection
+/// stays on, with `FinitePolicy` only when every matching listener won a
+/// finite policy and `FiniteDefault` when at least one uses the controller
+/// default. A missing exact parent does not inherit another parentRef.
 pub(crate) fn lookup_route_posture(
     postures: &[GatewayApiUdpAmplificationRoutePosture],
     route: &K8sResourceKey,
     parent_ref: &str,
 ) -> Option<UdpAmplificationPosture> {
-    postures
-        .iter()
-        .find(|entry| entry.route == *route && entry.parent_ref == parent_ref)
-        .map(|entry| entry.posture)
-        .or_else(|| {
-            postures
-                .iter()
-                .find(|entry| entry.route == *route)
-                .map(|entry| entry.posture)
-        })
+    let mut saw_exact = false;
+    let mut saw_unlimited = false;
+    let mut saw_finite_default = false;
+    let mut saw_finite_policy = false;
+    for entry in postures {
+        if entry.route != *route || entry.parent_ref != parent_ref {
+            continue;
+        }
+        saw_exact = true;
+        match entry.posture {
+            UdpAmplificationPosture::ExplicitUnlimited => saw_unlimited = true,
+            UdpAmplificationPosture::FiniteDefault => saw_finite_default = true,
+            UdpAmplificationPosture::FinitePolicy => saw_finite_policy = true,
+        }
+    }
+    if !saw_exact {
+        return None;
+    }
+    if saw_unlimited {
+        return Some(UdpAmplificationPosture::ExplicitUnlimited);
+    }
+    if saw_finite_policy && !saw_finite_default {
+        return Some(UdpAmplificationPosture::FinitePolicy);
+    }
+    Some(UdpAmplificationPosture::FiniteDefault)
 }

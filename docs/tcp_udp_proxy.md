@@ -838,7 +838,10 @@ proxy. Ferrum projects a finite controller default of `8.0` unless a Ferrum
 5. Controller default `8.0`
 
 Same attachment level uses GEP-713 oldest-wins (`creationTimestamp`, then
-`{namespace}/{name}`). Cross-namespace `targetRefs` require a `ReferenceGrant`
+`{namespace}/{name}`). A Direct policy that loses any named target is
+`Conflicted` and occupies none of its targets, so a later eligible policy can
+still govern a remaining target. `GatewayClass.parametersRef` ignores a
+conflicted Direct policy. Cross-namespace `targetRefs` require a `ReferenceGrant`
 from `gateway.ferrum.io`/`UDPResponseAmplificationPolicy`. Invalid, zero,
 negative, non-finite, or factors above 1024 never program the listener; the
 route still materializes with the next valid precedence (ultimately the finite
@@ -848,7 +851,12 @@ listener to the finite default on the next reconcile without a process restart.
 
 `UDPRoute.status.parents[].conditions` includes Ferrum
 `UDPAmplificationProtection` (`FiniteDefault` / `FinitePolicy` /
-`ExplicitUnlimited`) without echoing the numeric factor. Runtime accounting is
+`ExplicitUnlimited`) without echoing the numeric factor. When one parentRef
+materializes on several UDP listeners, that parent reports the conservative
+aggregate: `ExplicitUnlimited` if any listener is unlimited, `FinitePolicy`
+only when every listener uses a finite policy, and `FiniteDefault` when at
+least one uses the controller default. A missing exact parent does not inherit
+another parentRef's posture. Runtime accounting is
 cumulative per admitted request; see [`docs/tcp_udp_proxy.md`](tcp_udp_proxy.md).
 
 For a `UDPRoute` the rule's `backendRefs` is a weighted **set**. A single
