@@ -8186,6 +8186,46 @@ pub mod _test_support {
         crate::proxy::tcp_proxy::AuthorizationDeadlineStream::new(inner, deadline_at, expired)
     }
 
+    /// Production TCP/TLS userspace relay under an authorization deadline with
+    /// every ordinary relay timeout disabled, so tests can prove a stalled
+    /// opposite endpoint cannot starve the bound (issue #3816).
+    pub async fn bidirectional_copy_with_authorization_for_test<C, B>(
+        client: C,
+        backend: B,
+        deadline_at: tokio::time::Instant,
+        expired: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        buf_size: usize,
+    ) -> crate::proxy::tcp_proxy::StreamCopyResult
+    where
+        C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+        B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        crate::proxy::tcp_proxy::bidirectional_copy_with_authorization_for_test(
+            client,
+            backend,
+            deadline_at,
+            expired,
+            buf_size,
+        )
+        .await
+    }
+
+    /// Race one H3 streaming response HEADERS write against a composed
+    /// authorization bound, matching the native-H3 streaming relays.
+    pub use crate::http3::stream_util::H3AuthorizedHeadersWrite;
+
+    pub async fn await_authorized_headers_write_for_test<F, T, E>(
+        bound: crate::proxy::auth_lifetime::ComposedAuthBound,
+        family: crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
+        latch: &crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+        write: F,
+    ) -> H3AuthorizedHeadersWrite
+    where
+        F: std::future::Future<Output = Result<T, E>>,
+    {
+        crate::http3::stream_util::await_authorized_headers_write(bound, family, latch, write).await
+    }
+
     /// Wait out one connect-retry backoff exactly as the TCP setup loop does,
     /// so an external test can prove the backoff is bounded by the admitted
     /// stream's authorization deadline (issue #3816). Returns the bounded

@@ -821,6 +821,14 @@ enum StreamClientLeg<S> {
 /// `select!`) is what preserves that accounting: cancelling the relay future
 /// would drop its stack-local byte counters.
 ///
+/// The wrapper alone is not sufficient. `bidirectional_copy` parks a direction
+/// on the *opposite* endpoint's `poll_write` / `poll_read` once a chunk is
+/// buffered, so neither half may poll this client leg — and tokio's
+/// `copy_bidirectional_with_sizes` fast path has the same gap. Production
+/// therefore also passes the same instant into [`bidirectional_copy`] as
+/// `auth_deadline`, which races the deadline as a top-level bound in both
+/// relay phases and refuses that fast path.
+///
 /// Carries no credential material — only a monotonic instant.
 pub struct AuthorizationDeadlineStream<S> {
     inner: S,
@@ -859,6 +867,27 @@ fn authorization_expired_io_error() -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::TimedOut,
         "authenticated stream terminated: authorization lifetime reached",
+    )
+}
+
+/// Absolute authorization bound raced at the top of [`bidirectional_copy`] so
+/// a stalled opposite endpoint cannot starve the deadline that
+/// [`AuthorizationDeadlineStream`] can only observe while the client leg is
+/// itself being polled.
+struct AuthorizationCopyBound {
+    at: tokio::time::Instant,
+    expired: Arc<AtomicBool>,
+}
+
+fn authorization_expired_first_failure() -> StreamFirstFailure {
+    let err = authorization_expired_io_error();
+    let msg = err.to_string();
+    let classified = anyhow::Error::new(err);
+    (
+        Direction::ClientToBackend,
+        classify_stream_error(&classified),
+        Some(StreamIoSide::Read),
+        msg,
     )
 }
 
@@ -935,6 +964,7 @@ where
         backend_read_timeout,
         backend_write_timeout,
         buf_size,
+        None,
     )
     .await
 }
@@ -996,6 +1026,43 @@ where
         backend_read_timeout,
         backend_write_timeout,
         buf_size,
+        None,
+    )
+    .await
+}
+
+/// Crate-visible entry point that wraps the client leg and races the
+/// authorization deadline as a top-level bound of [`bidirectional_copy`],
+/// matching the production TLS userspace path (issue #3816). All ordinary
+/// relay timeouts are disabled so the test can prove the authorization
+/// bound is not starved by a stalled opposite endpoint and does not take
+/// the `copy_bidirectional_with_sizes` fast path.
+#[allow(dead_code)]
+pub(crate) async fn bidirectional_copy_with_authorization_for_test<C, B>(
+    client: C,
+    backend: B,
+    deadline_at: tokio::time::Instant,
+    expired: Arc<AtomicBool>,
+    buf_size: usize,
+) -> StreamCopyResult
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    let bound = AuthorizationCopyBound {
+        at: deadline_at,
+        expired: Arc::clone(&expired),
+    };
+    let client = AuthorizationDeadlineStream::new(client, deadline_at, expired);
+    bidirectional_copy(
+        client,
+        backend,
+        None,
+        None,
+        None,
+        None,
+        buf_size,
+        Some(bound),
     )
     .await
 }
@@ -3490,6 +3557,7 @@ async fn handle_tcp_connection_inner(
             backend_read_timeout,
             backend_write_timeout,
             buf_size,
+            None,
         )
         .await;
 
@@ -4422,6 +4490,7 @@ async fn handle_tcp_connection_inner(
                         backend_read_timeout,
                         backend_write_timeout,
                         buf_size,
+                        None,
                     )
                     .await
                 }
@@ -4434,6 +4503,7 @@ async fn handle_tcp_connection_inner(
                         backend_read_timeout,
                         backend_write_timeout,
                         buf_size,
+                        None,
                     )
                     .await
                 }
@@ -4446,6 +4516,10 @@ async fn handle_tcp_connection_inner(
                         backend_read_timeout,
                         backend_write_timeout,
                         buf_size,
+                        stream_auth_deadline.map(|plan| AuthorizationCopyBound {
+                            at: plan.at,
+                            expired: Arc::clone(&stream_auth_expired),
+                        }),
                     )
                     .await
                 }
@@ -4458,6 +4532,10 @@ async fn handle_tcp_connection_inner(
                         backend_read_timeout,
                         backend_write_timeout,
                         buf_size,
+                        stream_auth_deadline.map(|plan| AuthorizationCopyBound {
+                            at: plan.at,
+                            expired: Arc::clone(&stream_auth_expired),
+                        }),
                     )
                     .await
                 }
@@ -4524,6 +4602,7 @@ async fn handle_tcp_connection_inner(
                         backend_read_timeout,
                         backend_write_timeout,
                         buf_size,
+                        None,
                     )
                     .await
                 }
@@ -4572,6 +4651,7 @@ async fn handle_tcp_connection_inner(
                             backend_read_timeout,
                             backend_write_timeout,
                             buf_size,
+                            None,
                         )
                         .await
                     }
@@ -7330,18 +7410,22 @@ fn poll_ready_watchdog_ticks(
 /// if no data is received on either side for the given duration.
 ///
 /// **Fast path**: When `idle_timeout`, `half_close_cap`,
-/// `backend_read_timeout`, and `backend_write_timeout` are all `None` or zero,
-/// the function delegates to `tokio::io::copy_bidirectional_with_sizes`,
-/// skipping the Phase 1/Phase 2 machinery. This restores the historical
-/// zero-overhead behaviour for deployments that explicitly disable all relay
-/// bounds. The trade-off: on error the fast path loses `first_failure`
-/// direction attribution (reports `Direction::Unknown`) and reports zero
-/// per-direction byte counts — tokio's bidirectional copy does not expose
-/// partial totals on `Err`. That zero-on-error shape is intentional and
-/// reachable only when the operator sets idle timeout, half-close cap, and
-/// both backend inactivity timeouts to `0`; any non-zero bound opts into
-/// the direction-tracking path which preserves counters. Clean completion
-/// preserves per-direction byte counts.
+/// `backend_read_timeout`, and `backend_write_timeout` are all `None` or zero
+/// *and* no authorization bound is armed, the function delegates to
+/// `tokio::io::copy_bidirectional_with_sizes`, skipping the Phase 1/Phase 2
+/// machinery. This restores the historical zero-overhead behaviour for
+/// deployments that explicitly disable all relay bounds. The trade-off: on
+/// error the fast path loses `first_failure` direction attribution (reports
+/// `Direction::Unknown`) and reports zero per-direction byte counts — tokio's
+/// bidirectional copy does not expose partial totals on `Err`. That
+/// zero-on-error shape is intentional and reachable only when the operator
+/// sets idle timeout, half-close cap, and both backend inactivity timeouts
+/// to `0`; any non-zero bound opts into the direction-tracking path which
+/// preserves counters. An authorization-bound stream never takes this fast
+/// path: tokio's copy can park both halves on the opposite endpoint and
+/// starve the client-leg wrapper. Clean completion preserves per-direction
+/// byte counts.
+#[allow(clippy::too_many_arguments)]
 async fn bidirectional_copy<C, B>(
     mut client: C,
     mut backend: B,
@@ -7350,6 +7434,7 @@ async fn bidirectional_copy<C, B>(
     backend_read_timeout: Option<Duration>,
     backend_write_timeout: Option<Duration>,
     buf_size: usize,
+    auth_deadline: Option<AuthorizationCopyBound>,
 ) -> StreamCopyResult
 where
     C: AsyncRead + AsyncWrite + Unpin,
@@ -7365,12 +7450,19 @@ where
     // `backend_read_timeout` / `backend_write_timeout` inherently require the
     // direction-tracking path — they wrap individual `read`/`write` polls,
     // which tokio's bidirectional copy does not expose. Any non-zero timeout
-    // here opts out of the fast path.
+    // here opts out of the fast path. An authorization bound also opts out:
+    // the fast path can park both halves on the opposite endpoint and never
+    // poll the wrapped client leg.
     let idle_disabled = idle_timeout.is_none_or(|d| d.is_zero());
     let cap_disabled = half_close_cap.is_none_or(|d| d.is_zero());
     let read_to_disabled = backend_read_timeout.is_none_or(|d| d.is_zero());
     let write_to_disabled = backend_write_timeout.is_none_or(|d| d.is_zero());
-    if idle_disabled && cap_disabled && read_to_disabled && write_to_disabled {
+    if idle_disabled
+        && cap_disabled
+        && read_to_disabled
+        && write_to_disabled
+        && auth_deadline.is_none()
+    {
         return match tokio::io::copy_bidirectional_with_sizes(
             &mut client,
             &mut backend,
@@ -7466,6 +7558,13 @@ where
             backend_write_timeout,
         ]))
     });
+    // Top-level authorization timer: polled even when both copy halves are
+    // parked on the opposite endpoint, so a stalled backend cannot starve
+    // the admitted credential's deadline. Direct Instant race, not a
+    // periodic watchdog tick.
+    let mut auth_deadline_sleep = auth_deadline
+        .as_ref()
+        .map(|bound| Box::pin(tokio::time::sleep_until(bound.at)));
 
     // Phase 1: race the two directions (plus optional idle check).
     let mut first_failure: Option<(Direction, ErrorClass, Option<StreamIoSide>, String)> = None;
@@ -7485,6 +7584,19 @@ where
     let phase1_outcome = poll_fn(|cx| {
         // Fairness invariant: each live direction is polled exactly once per
         // poll_fn invocation; the first-polled direction alternates each call.
+        // The authorization deadline is polled FIRST so a simultaneously ready
+        // write cannot escape after the credential has expired.
+        if let Some(sleep) = auth_deadline_sleep.as_mut()
+            && std::future::Future::poll(sleep.as_mut(), cx).is_ready()
+        {
+            if let Some(bound) = auth_deadline.as_ref() {
+                bound.expired.store(true, Ordering::Release);
+            }
+            return Poll::Ready(Phase1Outcome::Watchdog(
+                authorization_expired_first_failure(),
+            ));
+        }
+
         let poll_c2b_this_turn = poll_c2b_first;
         poll_c2b_first = !poll_c2b_first;
 
@@ -7600,20 +7712,24 @@ where
     let clean_eof = first_failure.is_none();
     if !c2b_done {
         if clean_eof {
-            first_failure = drain_half_close_direction(
-                &mut client,
-                &mut backend,
-                &mut c2b_state,
-                &c2b_bytes,
-                last_activity,
-                idle_timeout,
-                timeout_ms,
-                half_close_cap,
-                Direction::ClientToBackend,
-                c2b_write_watermark,
-                backend_write_timeout_ms,
-                &c2b_bytes,
-                &b2c_bytes,
+            first_failure = drain_remaining_or_authorization_expire(
+                auth_deadline.as_ref(),
+                auth_deadline_sleep.as_mut(),
+                drain_half_close_direction(
+                    &mut client,
+                    &mut backend,
+                    &mut c2b_state,
+                    &c2b_bytes,
+                    last_activity,
+                    idle_timeout,
+                    timeout_ms,
+                    half_close_cap,
+                    Direction::ClientToBackend,
+                    c2b_write_watermark,
+                    backend_write_timeout_ms,
+                    &c2b_bytes,
+                    &b2c_bytes,
+                ),
             )
             .await;
         } else {
@@ -7662,20 +7778,24 @@ where
     }
     if !b2c_done {
         if clean_eof {
-            first_failure = drain_half_close_direction(
-                &mut backend,
-                &mut client,
-                &mut b2c_state,
-                &b2c_bytes,
-                last_activity,
-                idle_timeout,
-                timeout_ms,
-                half_close_cap,
-                Direction::BackendToClient,
-                b2c_read_watermark,
-                backend_read_timeout_ms,
-                &c2b_bytes,
-                &b2c_bytes,
+            first_failure = drain_remaining_or_authorization_expire(
+                auth_deadline.as_ref(),
+                auth_deadline_sleep.as_mut(),
+                drain_half_close_direction(
+                    &mut backend,
+                    &mut client,
+                    &mut b2c_state,
+                    &b2c_bytes,
+                    last_activity,
+                    idle_timeout,
+                    timeout_ms,
+                    half_close_cap,
+                    Direction::BackendToClient,
+                    b2c_read_watermark,
+                    backend_read_timeout_ms,
+                    &c2b_bytes,
+                    &b2c_bytes,
+                ),
             )
             .await;
         } else {
@@ -7717,6 +7837,31 @@ where
         bytes_client_to_backend: c2b_bytes.load(Ordering::Relaxed),
         bytes_backend_to_client: b2c_bytes.load(Ordering::Relaxed),
         first_failure,
+    }
+}
+
+/// Race a Phase-2 half-close drain against the remaining authorization
+/// deadline. When no bound is armed this is exactly `drain.await`.
+async fn drain_remaining_or_authorization_expire<F>(
+    bound: Option<&AuthorizationCopyBound>,
+    sleep: Option<&mut Pin<Box<tokio::time::Sleep>>>,
+    drain: F,
+) -> Option<StreamFirstFailure>
+where
+    F: std::future::Future<Output = Option<StreamFirstFailure>>,
+{
+    let Some(sleep) = sleep else {
+        return drain.await;
+    };
+    tokio::select! {
+        biased;
+        () = sleep.as_mut() => {
+            if let Some(bound) = bound {
+                bound.expired.store(true, Ordering::Release);
+            }
+            Some(authorization_expired_first_failure())
+        }
+        result = drain => result,
     }
 }
 

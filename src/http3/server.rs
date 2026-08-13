@@ -6144,15 +6144,46 @@ async fn handle_h3_request(
         // relays in `proxy_to_backend_h3_streaming` /
         // `stream_h3_open_response_to_client` handle explicitly). Fall through
         // to the outcome-recording block below instead.
+        //
+        // HEADERS themselves are authorization-bounded (issue #3815). Compute
+        // the plan BEFORE the write and race `send_response` against that exact
+        // bound: a client that withholds QPACK/QUIC credit can park the head
+        // write past the credential's lifetime.
         let mut client_disconnected = false;
         let mut body_error_class: Option<crate::retry::ErrorClass> = None;
-        if let Err(e) = stream.send_response(resp).await {
-            debug!(
-                "HTTP/3 client disconnected before streaming response headers: {}",
-                e
-            );
-            client_disconnected = true;
-            body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+        let headers_commit =
+            crate::http3::stream_util::commit_authorized_streaming_response_headers(
+                &mut stream,
+                resp,
+                &mut ctx,
+                state.env_config.authenticated_stream_max_lifetime_seconds,
+            )
+            .await;
+        let mut headers_committed = false;
+        match headers_commit.outcome {
+            crate::http3::stream_util::H3AuthorizedHeadersWrite::Written => {
+                headers_committed = true;
+            }
+            crate::http3::stream_util::H3AuthorizedHeadersWrite::ClientWriteFailed => {
+                debug!(
+                    "HTTP/3 client disconnected before streaming response headers"
+                );
+                client_disconnected = true;
+                body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+            }
+            crate::http3::stream_util::H3AuthorizedHeadersWrite::ProtocolDeadlineExceeded => {
+                crate::http3::stream_util::abort_response_stream(&mut stream);
+                client_disconnected = true;
+                body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+            }
+            crate::http3::stream_util::H3AuthorizedHeadersWrite::AuthorizationExpired(_) => {
+                warn!(
+                    "HTTP/3 streaming response reached its authorization lifetime before \
+                     response headers committed; resetting the stream"
+                );
+                crate::http3::stream_util::abort_response_stream(&mut stream);
+                body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+            }
         }
 
         // Stream response body from backend h3 recv_stream to frontend h3 stream.
@@ -6180,15 +6211,12 @@ async fn handle_h3_request(
             backend_read_timeout_ms.max(1),
         ));
         tokio::pin!(read_deadline);
-        // Absolute AUTHORIZATION deadline for this admitted native-H3 streaming
-        // response (issue #3815), including SSE and any plugin-inspected
-        // stream. Anchored once from the accepted credential; relayed frames,
+        // Absolute AUTHORIZATION deadline captured at the HEADERS write above
+        // (issue #3815), including SSE and any plugin-inspected stream.
+        // Anchored once from the accepted credential; relayed frames,
         // inspector windows, and flushes never refresh it. Inert (arm guard
         // permanently false) for an unauthenticated request.
-        let auth_deadline_plan = crate::proxy::auth_lifetime::effective_request_auth_deadline(
-            &ctx,
-            state.env_config.authenticated_stream_max_lifetime_seconds,
-        );
+        let auth_deadline_plan = headers_commit.plan;
         let auth_deadline_active = auth_deadline_plan.is_some();
         let auth_deadline_sleep =
             tokio::time::sleep_until(auth_deadline_plan.map(|plan| plan.at).unwrap_or_else(|| {
@@ -6211,14 +6239,14 @@ async fn handle_h3_request(
         // that stops reading parks every `send_data`/`finish` in QUIC flow
         // control, so the loop never returns to its timer at all. Every write
         // therefore races the same absolute authorization plan. Response
-        // HEADERS are already committed, so the expired branch RESETS — never a
-        // fabricated clean finish — and the buffered coalesce tail is dropped
-        // because those bytes are no longer authorized.
+        // HEADERS are already committed on this loop, so the expired branch
+        // RESETS — never a fabricated clean finish — and the buffered coalesce
+        // tail is dropped because those bytes are no longer authorized.
         // The REQUEST's shared once-only termination latch, cloned once per
         // relay (an `Arc` bump) so every write below records through it instead
         // of the bare counter. Concurrent upload / response / terminal paths on
         // one stream therefore cannot double count.
-        let auth_latch = ctx.authorization_termination_latch();
+        let auth_latch = headers_commit.latch;
         macro_rules! authorized_send {
             ($write:expr) => {
                 match crate::http3::stream_util::await_authorized_response_write(
@@ -6254,10 +6282,11 @@ async fn handle_h3_request(
                 }
             };
         }
-        // Skipped entirely when send_response already failed above — the
-        // relay loop would only rediscover the dead stream on its first
-        // send_data and there is no backend data worth pulling for it.
-        'outer: while !client_disconnected {
+        // Skipped entirely when send_response already failed or the
+        // authorization bound cancelled the HEADERS write — the relay loop
+        // would only rediscover the dead stream on its first send_data and
+        // there is no backend data worth pulling for it.
+        'outer: while headers_committed && !client_disconnected {
             // Re-arm the read deadline only once the previous backend frame has
             // actually been flushed downstream (`coalesce_buf` empty), so neither
             // the direct send NOR a slow flush of a buffered sub-target chunk is
@@ -9812,18 +9841,53 @@ async fn stream_h3_open_response_to_client(
     let resp = resp_builder
         .body(())
         .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 streaming response: {}", e))?;
-    if h3_stream.send_response(resp).await.is_err() {
-        return Ok(H3StreamResult {
-            status: response_status,
-            backend_status: response_status,
-            error_class: None,
-            body_completed: false,
-            bytes_streamed: 0,
-            client_disconnected: true,
-            body_error_class: Some(crate::retry::ErrorClass::ClientDisconnect),
-            request_on_wire: true,
-            backend_admission_elapsed,
-        });
+    let headers_commit = crate::http3::stream_util::commit_authorized_streaming_response_headers(
+        h3_stream,
+        resp,
+        ctx,
+        state.env_config.authenticated_stream_max_lifetime_seconds,
+    )
+    .await;
+    match headers_commit.outcome {
+        crate::http3::stream_util::H3AuthorizedHeadersWrite::Written => {}
+        crate::http3::stream_util::H3AuthorizedHeadersWrite::ClientWriteFailed
+        | crate::http3::stream_util::H3AuthorizedHeadersWrite::ProtocolDeadlineExceeded => {
+            if matches!(
+                headers_commit.outcome,
+                crate::http3::stream_util::H3AuthorizedHeadersWrite::ProtocolDeadlineExceeded
+            ) {
+                crate::http3::stream_util::abort_response_stream(h3_stream);
+            }
+            return Ok(H3StreamResult {
+                status: response_status,
+                backend_status: response_status,
+                error_class: None,
+                body_completed: false,
+                bytes_streamed: 0,
+                client_disconnected: true,
+                body_error_class: Some(crate::retry::ErrorClass::ClientDisconnect),
+                request_on_wire: true,
+                backend_admission_elapsed,
+            });
+        }
+        crate::http3::stream_util::H3AuthorizedHeadersWrite::AuthorizationExpired(_) => {
+            warn!(
+                "HTTP/3 streaming response reached its authorization lifetime before \
+                 response headers committed; resetting the stream"
+            );
+            crate::http3::stream_util::abort_response_stream(h3_stream);
+            return Ok(H3StreamResult {
+                status: response_status,
+                backend_status: response_status,
+                error_class: None,
+                body_completed: false,
+                bytes_streamed: 0,
+                client_disconnected: false,
+                body_error_class: Some(crate::retry::ErrorClass::ClientDisconnect),
+                request_on_wire: true,
+                backend_admission_elapsed,
+            });
+        }
     }
 
     let coalesce_min_bytes = state.env_config.http3_coalesce_min_bytes;
@@ -9844,16 +9908,13 @@ async fn stream_h3_open_response_to_client(
         backend_read_timeout_ms.max(1),
     ));
     tokio::pin!(read_deadline);
-    // Absolute AUTHORIZATION deadline for this admitted native-H3 response
-    // relay (issue #3815) — generic streaming HTTP and SSE included. Anchored
+    // Absolute AUTHORIZATION deadline captured at the HEADERS write above
+    // (issue #3815) — generic streaming HTTP and SSE included. Anchored
     // once from the accepted credential and never refreshed by relayed frames,
     // unlike the per-frame backend read deadline beside it. Inert (arm guard
     // permanently false) for an unauthenticated request, which carries no
     // authorization lifetime to enforce.
-    let auth_deadline_plan = crate::proxy::auth_lifetime::effective_request_auth_deadline(
-        ctx,
-        state.env_config.authenticated_stream_max_lifetime_seconds,
-    );
+    let auth_deadline_plan = headers_commit.plan;
     let auth_deadline_active = auth_deadline_plan.is_some();
     let auth_deadline_sleep =
         tokio::time::sleep_until(auth_deadline_plan.map(|plan| plan.at).unwrap_or_else(|| {
@@ -9883,7 +9944,7 @@ async fn stream_h3_open_response_to_client(
     // (an `Arc` bump) so every write below records through it instead of the
     // bare counter. Concurrent upload / response / terminal paths on one stream
     // therefore cannot double count.
-    let auth_latch = ctx.authorization_termination_latch();
+    let auth_latch = headers_commit.latch;
     macro_rules! authorized_send {
         ($write:expr) => {
             match crate::http3::stream_util::await_authorized_response_write(
@@ -13427,21 +13488,53 @@ async fn proxy_to_backend_h3_streaming(
     let resp = resp_builder
         .body(())
         .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 streaming response: {}", e))?;
-    if h3_stream.send_response(resp).await.is_err() {
-        // Client QUIC stream is already gone — nothing streamed.
-        return Ok(H3StreamResult {
-            status: response_status,
-            backend_status: response_status,
-            error_class: None,
-            body_completed: false,
-            bytes_streamed: 0,
-            client_disconnected: true,
-            body_error_class: Some(crate::retry::ErrorClass::ClientDisconnect),
-            // Headers came back from the backend; the request reached
-            // the wire. The client gave up on us between then and now.
-            request_on_wire: true,
-            backend_admission_elapsed,
-        });
+    let headers_commit = crate::http3::stream_util::commit_authorized_streaming_response_headers(
+        h3_stream,
+        resp,
+        ctx,
+        state.env_config.authenticated_stream_max_lifetime_seconds,
+    )
+    .await;
+    match headers_commit.outcome {
+        crate::http3::stream_util::H3AuthorizedHeadersWrite::Written => {}
+        crate::http3::stream_util::H3AuthorizedHeadersWrite::ClientWriteFailed
+        | crate::http3::stream_util::H3AuthorizedHeadersWrite::ProtocolDeadlineExceeded => {
+            if matches!(
+                headers_commit.outcome,
+                crate::http3::stream_util::H3AuthorizedHeadersWrite::ProtocolDeadlineExceeded
+            ) {
+                crate::http3::stream_util::abort_response_stream(h3_stream);
+            }
+            return Ok(H3StreamResult {
+                status: response_status,
+                backend_status: response_status,
+                error_class: None,
+                body_completed: false,
+                bytes_streamed: 0,
+                client_disconnected: true,
+                body_error_class: Some(crate::retry::ErrorClass::ClientDisconnect),
+                request_on_wire: true,
+                backend_admission_elapsed,
+            });
+        }
+        crate::http3::stream_util::H3AuthorizedHeadersWrite::AuthorizationExpired(_) => {
+            warn!(
+                "HTTP/3 streaming response reached its authorization lifetime before \
+                 response headers committed; resetting the stream"
+            );
+            crate::http3::stream_util::abort_response_stream(h3_stream);
+            return Ok(H3StreamResult {
+                status: response_status,
+                backend_status: response_status,
+                error_class: None,
+                body_completed: false,
+                bytes_streamed: 0,
+                client_disconnected: false,
+                body_error_class: Some(crate::retry::ErrorClass::ClientDisconnect),
+                request_on_wire: true,
+                backend_admission_elapsed,
+            });
+        }
     }
 
     // Stream response body chunks from the h3 backend recv_stream with adaptive
@@ -13465,16 +13558,13 @@ async fn proxy_to_backend_h3_streaming(
         backend_read_timeout_ms.max(1),
     ));
     tokio::pin!(read_deadline);
-    // Absolute AUTHORIZATION deadline for this admitted native-H3 response
-    // relay (issue #3815) — generic streaming HTTP and SSE included. Anchored
+    // Absolute AUTHORIZATION deadline captured at the HEADERS write above
+    // (issue #3815) — generic streaming HTTP and SSE included. Anchored
     // once from the accepted credential and never refreshed by relayed frames,
     // unlike the per-frame backend read deadline beside it. Inert (arm guard
     // permanently false) for an unauthenticated request, which carries no
     // authorization lifetime to enforce.
-    let auth_deadline_plan = crate::proxy::auth_lifetime::effective_request_auth_deadline(
-        ctx,
-        state.env_config.authenticated_stream_max_lifetime_seconds,
-    );
+    let auth_deadline_plan = headers_commit.plan;
     let auth_deadline_active = auth_deadline_plan.is_some();
     let auth_deadline_sleep =
         tokio::time::sleep_until(auth_deadline_plan.map(|plan| plan.at).unwrap_or_else(|| {
@@ -13504,7 +13594,7 @@ async fn proxy_to_backend_h3_streaming(
     // (an `Arc` bump) so every write below records through it instead of the
     // bare counter. Concurrent upload / response / terminal paths on one stream
     // therefore cannot double count.
-    let auth_latch = ctx.authorization_termination_latch();
+    let auth_latch = headers_commit.latch;
     macro_rules! authorized_send {
         ($write:expr) => {
             match crate::http3::stream_util::await_authorized_response_write(

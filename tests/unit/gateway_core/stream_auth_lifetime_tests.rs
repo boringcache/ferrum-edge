@@ -10,11 +10,12 @@ use std::time::Duration;
 
 use ferrum_edge::_test_support::{
     BufferedUploadWaitOutcomeForTest, DtlsAuthorizationExpiryForTest, EarlyUploadBoundKind,
-    H3UploadWaitOutcomeForTest, ProbePumpOutcome, ProbeTransportPoll, ResponseCollectBoundForTest,
-    UploadPumpProbe, attribute_dispatch_phase_bound_for_test,
-    authorization_bounded_header_deadline_for_test,
+    H3AuthorizedHeadersWrite, H3UploadWaitOutcomeForTest, ProbePumpOutcome, ProbeTransportPoll,
+    ResponseCollectBoundForTest, StreamIoSide, UploadPumpProbe,
+    attribute_dispatch_phase_bound_for_test, authorization_bounded_header_deadline_for_test,
     authorization_expired_dispatch_placeholder_for_test,
     authorization_expired_pre_commitment_response_for_test,
+    await_authorized_headers_write_for_test, bidirectional_copy_with_authorization_for_test,
     collect_buffered_upload_under_authorization_for_test,
     collect_buffered_upload_under_composed_bound_for_test,
     collect_h3_upload_under_authorization_for_test, compose_buffered_upload_bound_for_test,
@@ -22,16 +23,18 @@ use ferrum_edge::_test_support::{
     direct_h2_upload_join_bound_for_test, dispatch_phase_authorization_expiry_for_test,
     dtls_authorization_expired_before_relay_for_test,
     dtls_setup_stage_under_authorization_for_test, precommit_authorization_gate_for_test,
-    request_received_at_for_test, request_upload_auth_deadline_for_test,
-    set_grpc_deadline_budget_for_test, set_request_credential_deadline_for_test,
-    settle_dtls_relay_authorization_expiry_for_test, within_stream_auth_deadline_for_test,
+    relay_failure_is_client_facing, request_received_at_for_test,
+    request_upload_auth_deadline_for_test, set_grpc_deadline_budget_for_test,
+    set_request_credential_deadline_for_test, settle_dtls_relay_authorization_expiry_for_test,
+    within_stream_auth_deadline_for_test,
 };
 use ferrum_edge::config::types::Consumer;
 use ferrum_edge::plugins::{Direction, DisconnectCause, RequestContext};
 use ferrum_edge::proxy::auth_lifetime::{
     ComposedAuthBound, StreamAuthDeadline, StreamAuthProtocolFamily, StreamAuthTermination,
-    counters, effective_request_auth_deadline, effective_stream_auth_deadline,
-    expired_authorization, record_termination, request_is_authenticated,
+    StreamAuthTerminationLatch, counters, effective_request_auth_deadline,
+    effective_stream_auth_deadline, expired_authorization, record_termination,
+    request_is_authenticated,
 };
 use ferrum_edge::proxy::stream_error::StreamSetupKind;
 use ferrum_edge::retry::ErrorClass;
@@ -520,6 +523,177 @@ async fn the_userspace_frontend_leg_terminates_both_directions_at_the_deadline()
     // Shutdown is always allowed through: it is the teardown the deadline is
     // trying to reach, so refusing it would leave the socket half-open.
     leg.shutdown().await.expect("shutdown after deadline");
+}
+
+/// A backend write stall after a client chunk is buffered must still terminate
+/// at the authorization deadline with ordinary relay timeouts disabled.
+///
+/// Once `bidirectional_copy` has a client chunk, that direction parks on
+/// backend `poll_write`; the other direction parks on backend `poll_read`.
+/// Neither polls the wrapped client leg, so only a top-level authorization
+/// timer can latch expiry. The fast path is refused because first-failure
+/// direction is the typed client-side `TimedOut`, not `Unknown`.
+#[tokio::test(start_paused = true)]
+async fn a_stalled_backend_write_cannot_starve_the_tcp_authorization_deadline() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::io::AsyncWriteExt;
+
+    let _guard = counter_delta_guard().await;
+    let before = counters();
+
+    let (client, mut client_peer) = tokio::io::duplex(64 * 1024);
+    let (backend, _backend_peer) = tokio::io::duplex(32);
+    let expired = Arc::new(AtomicBool::new(false));
+    let deadline_at = tokio::time::Instant::now() + Duration::from_secs(2);
+    client_peer
+        .write_all(&[0xab; 1024])
+        .await
+        .expect("buffer a client chunk before the backend write stalls");
+
+    let copy = tokio::spawn(bidirectional_copy_with_authorization_for_test(
+        client,
+        backend,
+        deadline_at,
+        Arc::clone(&expired),
+        8 * 1024,
+    ));
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let result = tokio::time::timeout(Duration::from_secs(1), copy)
+        .await
+        .expect("authorization expiry must terminate both relay halves")
+        .expect("copy task");
+
+    assert!(
+        expired.load(Ordering::Acquire),
+        "the shared authorization-expiry flag must latch exactly once"
+    );
+    let (dir, class, side, msg) = result
+        .first_failure
+        .as_ref()
+        .expect("expiry must surface a typed client-side TimedOut result");
+    assert_eq!(*dir, Direction::ClientToBackend);
+    assert_eq!(*class, ErrorClass::ReadWriteTimeout);
+    assert_eq!(*side, Some(StreamIoSide::Read));
+    assert!(
+        msg.contains("authorization lifetime reached"),
+        "failure message must be the fixed authorization lifetime text, got {msg}"
+    );
+    assert!(
+        relay_failure_is_client_facing(result.first_failure.as_ref().expect("failure")),
+        "authorization expiry must stay health-neutral as a client-facing failure"
+    );
+    assert!(
+        result.bytes_client_to_backend > 0,
+        "the buffered client chunk must be counted; a fast-path error reports zero"
+    );
+
+    record_termination(
+        StreamAuthTermination::CredentialExpired,
+        StreamAuthProtocolFamily::StreamTcp,
+    );
+    let after = counters();
+    assert_eq!(
+        after.credential_expired["stream_tcp"] - before.credential_expired["stream_tcp"],
+        1,
+        "post-relay accounting must record the session exactly once"
+    );
+}
+
+/// A backend read stall after the client has half-closed must still terminate
+/// at the authorization deadline with ordinary relay timeouts disabled.
+///
+/// Client EOF completes c2b; Phase 2 then parks solely on backend `poll_read`
+/// and never polls the wrapped client leg. The top-level authorization timer
+/// is what ends both halves.
+#[tokio::test(start_paused = true)]
+async fn a_stalled_backend_read_cannot_starve_the_tcp_authorization_deadline() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let _guard = counter_delta_guard().await;
+    let before = counters();
+
+    let (client, mut client_peer) = tokio::io::duplex(64 * 1024);
+    let (backend, mut backend_peer) = tokio::io::duplex(64 * 1024);
+    let expired = Arc::new(AtomicBool::new(false));
+    let deadline_at = tokio::time::Instant::now() + Duration::from_secs(2);
+
+    tokio::spawn(async move {
+        let mut buf = [0u8; 16];
+        let _ = backend_peer.read(&mut buf).await;
+        std::future::pending::<()>().await
+    });
+    client_peer.write_all(b"hello").await.expect("client chunk");
+    client_peer.shutdown().await.expect("client half-close");
+
+    let copy = tokio::spawn(bidirectional_copy_with_authorization_for_test(
+        client,
+        backend,
+        deadline_at,
+        Arc::clone(&expired),
+        8 * 1024,
+    ));
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let result = tokio::time::timeout(Duration::from_secs(1), copy)
+        .await
+        .expect("authorization expiry must terminate both relay halves")
+        .expect("copy task");
+
+    assert!(expired.load(Ordering::Acquire));
+    let (dir, class, side, msg) = result
+        .first_failure
+        .as_ref()
+        .expect("expiry must surface a typed client-side TimedOut result");
+    assert_eq!(*dir, Direction::ClientToBackend);
+    assert_eq!(*class, ErrorClass::ReadWriteTimeout);
+    assert_eq!(*side, Some(StreamIoSide::Read));
+    assert!(msg.contains("authorization lifetime reached"));
+    assert!(relay_failure_is_client_facing(
+        result.first_failure.as_ref().expect("failure")
+    ));
+    assert_eq!(
+        result.bytes_client_to_backend, 5,
+        "the half-closed client payload must be counted exactly once"
+    );
+
+    record_termination(
+        StreamAuthTermination::CredentialExpired,
+        StreamAuthProtocolFamily::StreamTcp,
+    );
+    let after = counters();
+    assert_eq!(
+        after.credential_expired["stream_tcp"] - before.credential_expired["stream_tcp"],
+        1
+    );
+}
+
+/// The userspace fast path parks both halves on the opposite endpoint and
+/// cannot observe the client-leg wrapper. An authorization-bound session
+/// must take the direction-tracking path and pass the deadline into both
+/// TLS Deadline arms.
+#[test]
+fn an_authorization_bound_tcp_relay_refuses_the_unbounded_fast_path() {
+    let src = include_str!("../../../src/proxy/tcp_proxy.rs");
+    assert!(
+        src.contains("&& auth_deadline.is_none()"),
+        "the copy_bidirectional_with_sizes fast path must refuse an authorization bound"
+    );
+    assert!(src.contains("copy_bidirectional_with_sizes"));
+    assert!(src.contains("drain_remaining_or_authorization_expire"));
+    let tls = src
+        .split("ClientRelayStream::Tls(tls_stream) => {")
+        .nth(1)
+        .expect("TLS userspace relay");
+    assert!(
+        tls.contains("stream_auth_deadline.map(|plan| AuthorizationCopyBound {"),
+        "both TLS Deadline arms must race the authorization instant as a top-level copy bound"
+    );
 }
 
 /// A session with no authorization deadline is untouched: the wrapper is only
@@ -3156,6 +3330,149 @@ fn the_h3_grpc_response_head_write_is_bounded_by_the_composed_deadline() {
         "an authorization expiry on the head write must not be misreported as the \
          client's own DEADLINE_EXCEEDED"
     );
+}
+
+/// A stalled (never-ready) streaming response HEADERS write expires at the
+/// authorization deadline, latches exactly once, and never treats the write as
+/// committed.
+#[tokio::test(start_paused = true)]
+async fn a_stalled_h3_streaming_headers_write_expires_at_the_authorization_deadline() {
+    let _guard = counter_delta_guard().await;
+    let before = counters();
+    let now = tokio::time::Instant::now();
+    let plan = plan_at(
+        now + Duration::from_secs(2),
+        StreamAuthTermination::CredentialExpired,
+    );
+    let bound = ComposedAuthBound::compose(None, Some(plan));
+    let latch = StreamAuthTerminationLatch::default();
+
+    let write = std::future::pending::<Result<(), &'static str>>();
+    let started = tokio::time::Instant::now();
+    let outcome = await_authorized_headers_write_for_test(
+        bound,
+        StreamAuthProtocolFamily::Http,
+        &latch,
+        write,
+    )
+    .await;
+    assert_eq!(
+        tokio::time::Instant::now() - started,
+        Duration::from_secs(2)
+    );
+    assert_eq!(
+        outcome,
+        H3AuthorizedHeadersWrite::AuthorizationExpired(StreamAuthTermination::CredentialExpired)
+    );
+    assert_eq!(
+        latch.observed(),
+        Some(StreamAuthTermination::CredentialExpired)
+    );
+    let after = counters();
+    assert_eq!(
+        after.credential_expired["http"] - before.credential_expired["http"],
+        1,
+        "HEADERS expiry must record through the request latch exactly once"
+    );
+
+    // A second observer of the same expired bound must not increment again.
+    let second = await_authorized_headers_write_for_test(
+        bound,
+        StreamAuthProtocolFamily::Http,
+        &latch,
+        std::future::pending::<Result<(), &'static str>>(),
+    )
+    .await;
+    assert_eq!(
+        second,
+        H3AuthorizedHeadersWrite::AuthorizationExpired(StreamAuthTermination::CredentialExpired)
+    );
+    let after_second = counters();
+    assert_eq!(
+        after_second.credential_expired["http"] - after.credential_expired["http"],
+        0,
+        "a second HEADERS expiry on the same latch must not double-count"
+    );
+}
+
+/// An already-elapsed authorization bound must not poll the HEADERS write at
+/// all, so no protected response head can commit after expiry.
+#[tokio::test(start_paused = true)]
+async fn an_elapsed_authorization_bound_never_polls_the_streaming_headers_write() {
+    let polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = Arc::clone(&polled);
+    let write = std::future::poll_fn(move |_cx| {
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        std::task::Poll::Ready(Ok::<(), &'static str>(()))
+    });
+    let plan = plan_at(
+        tokio::time::Instant::now(),
+        StreamAuthTermination::AuthenticatedStreamMaxLifetime,
+    );
+    let bound = ComposedAuthBound::compose(None, Some(plan));
+    let latch = StreamAuthTerminationLatch::default();
+    let outcome = await_authorized_headers_write_for_test(
+        bound,
+        StreamAuthProtocolFamily::Http,
+        &latch,
+        write,
+    )
+    .await;
+    assert_eq!(
+        outcome,
+        H3AuthorizedHeadersWrite::AuthorizationExpired(
+            StreamAuthTermination::AuthenticatedStreamMaxLifetime
+        )
+    );
+    assert!(
+        !polled.load(std::sync::atomic::Ordering::SeqCst),
+        "an already-elapsed bound must not poll send_response, or a protected head could commit"
+    );
+}
+
+/// Every native-H3 streaming HTTP/SSE family races `send_response` through the
+/// shared HEADERS helper, so the three call sites cannot drift apart.
+#[test]
+fn every_native_h3_streaming_response_headers_write_uses_the_shared_helper() {
+    let helper = include_str!("../../../src/http3/stream_util.rs");
+    assert!(helper.contains("pub(crate) async fn await_authorized_headers_write<"));
+    assert!(helper.contains("pub(crate) async fn commit_authorized_streaming_response_headers<"));
+    assert!(helper.contains("stream.send_response(resp)"));
+
+    for (name, marker, next) in [
+        (
+            "handle_h3_request inline native-H3 streaming",
+            "async fn handle_h3_request(",
+            "async fn run_h3_backend_path_plugins_or_send_reject(",
+        ),
+        (
+            "stream_h3_open_response_to_client",
+            "async fn stream_h3_open_response_to_client(",
+            "async fn run_h3_grpc_upload_pump(",
+        ),
+        (
+            "proxy_to_backend_h3_streaming",
+            "async fn proxy_to_backend_h3_streaming(",
+            "async fn proxy_to_backend_h3(",
+        ),
+    ] {
+        let region = H3_SERVER_SOURCE
+            .split(marker)
+            .nth(1)
+            .unwrap_or_else(|| panic!("{name} present"))
+            .split(next)
+            .next()
+            .unwrap_or_else(|| panic!("{name} bounded"));
+        assert!(
+            region.contains("commit_authorized_streaming_response_headers("),
+            "{name} must race streaming response HEADERS through the shared helper"
+        );
+        assert!(
+            !region.contains("h3_stream.send_response(resp).await")
+                && !region.contains("stream.send_response(resp).await"),
+            "{name} still awaits send_response unbounded"
+        );
+    }
 }
 
 /// Every HTTP/3 authorization exit records through the REQUEST's shared latch,

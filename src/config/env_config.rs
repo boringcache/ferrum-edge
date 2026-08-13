@@ -2588,9 +2588,11 @@ pub struct EnvConfig {
     /// The effective bound is the EARLIEST of this value and the accepted
     /// credential's own authoritative expiry, so a credential with a short TTL
     /// always wins. A credential accepted WITHOUT an authoritative expiry
-    /// (`key_auth`, `basic_auth`, `hmac_auth`, LDAP, an `mtls_auth` leaf with an
-    /// unusable validity horizon) is bounded by this value alone — there is no
-    /// indefinite authenticated-stream bypass and no "unbounded" setting.
+    /// (`key_auth`, `basic_auth`, `hmac_auth`, LDAP) is bounded by this value
+    /// alone — there is no indefinite authenticated-stream bypass and no
+    /// "unbounded" setting. An `mtls_auth` leaf whose validity interval is
+    /// missing, inverted, or otherwise unusable is rejected outright rather
+    /// than admitted without an authoritative expiry.
     ///
     /// Unauthenticated streams are not bounded by this value; they carry no
     /// authorization lifetime to enforce.

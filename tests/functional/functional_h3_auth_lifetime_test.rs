@@ -26,6 +26,11 @@
 //!   native-H3 relay, and for the plain/SSE cross-protocol relay, each with a
 //!   4 KiB per-stream receive window so the very first downstream write
 //!   provably parks.
+//! * The same native-H3 streaming relay stalled specifically at response
+//!   HEADERS (`stream_util::commit_authorized_streaming_response_headers`):
+//!   a non-reading client plus an oversized HEADERS block that exceeds the
+//!   4 KiB stream window parks `send_response` itself, so no protected head
+//!   can commit after the credential expires.
 //! * The request direction under CONTINUOUS activity as well as under a stall,
 //!   proving relayed request DATA cannot buy extra authorized lifetime.
 //!
@@ -1027,6 +1032,107 @@ async fn h3_auth_lifetime_stalled_plain_sse_response_cannot_outlive_the_credenti
                 harness.captured_combined().unwrap_or_default()
             ),
         }
+    }
+}
+
+/// Backend script that answers with an oversized streaming HEADERS block and
+/// then stalls. The pad is larger than the stalled client's 4 KiB per-stream
+/// receive window so `send_response` itself parks in QUIC flow control — the
+/// HEADERS write, not a later DATA frame, is the bound under test.
+fn h3_oversized_sse_headers() -> Vec<H3Step> {
+    let pad: String = (0..24_000)
+        .map(|i| char::from(b'!' + (i % 90) as u8))
+        .collect();
+    vec![
+        H3Step::AcceptStream,
+        H3Step::RespondHeaders(vec![
+            (":status", "200".to_string()),
+            ("content-type", "text/event-stream".to_string()),
+            ("cache-control", "no-cache".to_string()),
+            ("x-auth-lifetime-pad", pad),
+        ]),
+        H3Step::StallFor(Duration::from_secs(45)),
+    ]
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// 7b. Regression: a NON-READING client stalled at streaming response HEADERS
+//     must not observe a protected head after the credential expires.
+//
+//     Test 7 parks a later DATA write. This one parks `send_response` itself:
+//     the backend HEADERS block is larger than the client's 4 KiB stream
+//     window, and the client never calls `recv_response`. Only the
+//     authorization bound around the HEADERS write can end the stream, and
+//     no 200 / `text/event-stream` head may commit afterwards.
+//
+//     Production path: `http3::stream_util::commit_authorized_streaming_response_headers`
+//     from `handle_h3_request`'s inline native-H3 streaming relay.
+// ────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn h3_auth_lifetime_stalled_plain_sse_headers_cannot_outlive_the_credential() {
+    let ca = TestCa::new("h3-auth-lifetime-stalled-headers").expect("ca");
+    let (cert, key) = ca.valid().expect("leaf");
+    let (tcp_res, udp_res) = reserve_colocated_tcp_udp()
+        .await
+        .expect("colocated tcp/udp");
+    let backend_port = tcp_res.port;
+
+    let _tcp_backend = ScriptedTlsBackend::builder(
+        tcp_res.into_listener(),
+        TlsConfig::new(cert.clone(), key.clone())
+            .with_alpn(vec![b"h2".to_vec(), b"http/1.1".to_vec()]),
+    )
+    .step(TcpStep::ReadUntil(b"\r\n\r\n".to_vec()))
+    .step(TcpStep::Write(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec(),
+    ))
+    .step(TcpStep::Drop)
+    .spawn()
+    .expect("spawn tls probe backend");
+
+    let backend_tls = H3TlsConfig::new(cert.clone(), key.clone());
+    let _h3_backend = ScriptedH3Backend::builder(udp_res.into_socket(), backend_tls)
+        .steps(h3_oversized_sse_headers())
+        .spawn()
+        .expect("spawn oversized-headers h3 backend");
+
+    let (harness, https_port) = spawn_h3_gateway(protected_proxy_yaml(backend_port), false).await;
+    let entry = wait_for_h3_supported(&harness, Duration::from_secs(20)).await;
+    assert!(
+        entry.is_some(),
+        "capability registry must classify the backend h3=supported so the request takes the \
+         native-H3 relay; logs:\n{}",
+        harness.captured_combined().unwrap_or_default()
+    );
+
+    let client = Http3Client::insecure_with_stream_receive_window(4 * 1024).expect("H3 client");
+    let token = mint_short_lived_token();
+    let mut stream = client
+        .open_response_stream(
+            &proxy_url(https_port, "/api/events"),
+            GetOptions::default().header("authorization", format!("Bearer {token}")),
+        )
+        .await
+        .expect("open native-H3 streaming response");
+
+    // Never recv_response: HEADERS must not become a committed protected head.
+    assert_credential_expired_exactly(&harness, "http", 1).await;
+
+    match tokio::time::timeout(TERMINATION_GRACE, stream.recv_response()).await {
+        Ok(Ok((status, headers))) => panic!(
+            "protected streaming response HEADERS committed after authorization expiry \
+             (status={status}, content-type={:?}); logs:\n{}",
+            headers
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            harness.captured_combined().unwrap_or_default()
+        ),
+        Ok(Err(_)) => {}
+        Err(_) => panic!(
+            "the stalled HEADERS write was not reset within the bounded grace; logs:\n{}",
+            harness.captured_combined().unwrap_or_default()
+        ),
     }
 }
 

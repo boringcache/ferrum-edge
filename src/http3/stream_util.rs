@@ -201,6 +201,113 @@ where
     }
 }
 
+/// Outcome of a native-H3 streaming response HEADERS write raced against the
+/// composed authorization / client-RPC bound (issue #3815).
+///
+/// Distinct from [`H3AuthorizedWrite`] because a HEADERS write can also lose
+/// to a strictly earlier protocol deadline, and because an authorization
+/// expiry here means no protected response head exists on the wire yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum H3AuthorizedHeadersWrite {
+    /// The response head reached the QUIC send half.
+    Written,
+    /// The client's stream is gone; this is an ordinary disconnect.
+    ClientWriteFailed,
+    /// The admitted credential's authorization lifetime is the bound that
+    /// established the deadline, and that instant elapsed before HEADERS
+    /// committed. The termination has ALREADY been recorded through the
+    /// REQUEST's shared latch. The caller must not let the protected head
+    /// commit: abort/reset fail-closed unless a bounded post-deadline
+    /// terminal write is still protocol-legal.
+    AuthorizationExpired(crate::proxy::auth_lifetime::StreamAuthTermination),
+    /// A strictly earlier protocol deadline (for example a client
+    /// `grpc-timeout`) elapsed. Not an authorization termination.
+    ProtocolDeadlineExceeded,
+}
+
+/// Race a native-H3 streaming response HEADERS write against the composed
+/// authorization / client-RPC bound, attributing the winner from the captured
+/// composition rather than from a second clock read.
+///
+/// QPACK encoding plus a QUIC stream the client is not reading can park
+/// `send_response` indefinitely. Later DATA/FIN writes already race
+/// [`await_authorized_response_write`]; the HEADERS write itself must use
+/// the same absolute plan (never a refreshed one) so a stalled head cannot
+/// retain upstream bodies, miss precommit semantics, or evade accounting.
+///
+/// The deadline arm is biased: once the budget is spent, a simultaneously
+/// writable HEADERS frame must not escape. An already-elapsed bound therefore
+/// never polls `write`, so no protected head can commit after expiry.
+pub(crate) async fn await_authorized_headers_write<F, T, E>(
+    bound: crate::proxy::auth_lifetime::ComposedAuthBound,
+    family: crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
+    latch: &crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+    write: F,
+) -> H3AuthorizedHeadersWrite
+where
+    F: std::future::Future<Output = Result<T, E>>,
+{
+    match await_response_write_before_deadline(bound.deadline(), write).await {
+        Ok(_) => H3AuthorizedHeadersWrite::Written,
+        Err(H3ResponseWriteError::Write(_)) => H3AuthorizedHeadersWrite::ClientWriteFailed,
+        Err(H3ResponseWriteError::DeadlineExceeded) => {
+            if let Some(termination) = bound.expired_authorization() {
+                latch.record_once(termination, family);
+                H3AuthorizedHeadersWrite::AuthorizationExpired(termination)
+            } else {
+                H3AuthorizedHeadersWrite::ProtocolDeadlineExceeded
+            }
+        }
+    }
+}
+
+/// Capture the admitted stream's authorization plan, race `send_response`
+/// against that exact plan composed with any client RPC deadline, and latch
+/// an authorization expiry through the request. Used by every native-H3
+/// streaming HTTP/SSE path so the three call sites cannot drift.
+pub(crate) async fn commit_authorized_streaming_response_headers<S>(
+    stream: &mut RequestStream<S, Bytes>,
+    resp: http::Response<()>,
+    ctx: &mut crate::plugins::RequestContext,
+    max_lifetime_seconds: u64,
+) -> AuthorizedStreamingHeadersCommit
+where
+    S: RecvStream + SendStream<Bytes>,
+{
+    let plan = crate::proxy::auth_lifetime::effective_request_auth_deadline(
+        ctx,
+        max_lifetime_seconds,
+    );
+    let latch = ctx.authorization_termination_latch();
+    let bound = crate::proxy::auth_lifetime::ComposedAuthBound::compose(
+        ctx.grpc_deadline_at(),
+        plan,
+    );
+    let outcome = await_authorized_headers_write(
+        bound,
+        crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
+        &latch,
+        stream.send_response(resp),
+    )
+    .await;
+    if let H3AuthorizedHeadersWrite::AuthorizationExpired(termination) = outcome {
+        ctx.latch_authorization_termination(termination);
+    }
+    AuthorizedStreamingHeadersCommit {
+        plan,
+        latch,
+        outcome,
+    }
+}
+
+/// Plan, latch, and HEADERS-write outcome captured together so the body relay
+/// cannot re-derive or refresh the lifetime that just bounded the head.
+pub(crate) struct AuthorizedStreamingHeadersCommit {
+    pub plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+    pub latch: crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+    pub outcome: H3AuthorizedHeadersWrite,
+}
+
 /// Signal the peer that we are done with the receive side of the
 /// request stream. Without this call, dropping the `RequestStream`
 /// surfaces as `RESET_STREAM(0x0)` on the QUIC wire — QUIC has no
