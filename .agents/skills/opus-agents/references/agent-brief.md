@@ -7,9 +7,10 @@ through the prompt's stopping point before ending. Never merge a PR yourself.
 ## Implement directly
 
 Complete the implementation and assigned validation yourself in this session. Do not stop at
-analysis, partial work, or a handoff for the controller to finish. Perform commit, push, PR, review,
-and CI actions only when the dispatch prompt assigns them. Do not invoke any agent-dispatch skill
-or script in the environment, including `sol-agents`, `opus-agents`, `fable-agents`, `grok-agents`,
+analysis, partial work, or a handoff for the controller to finish. Perform commit, push, PR, review
+handling, and CI repair actions only when the dispatch prompt assigns them. Do not invoke any
+agent-dispatch skill or script in the environment, including `sol-agents`, `opus-agents`,
+`fable-agents`, `grok-agents`,
 `.agents/skills/*/scripts/dispatch-agent.sh`, Codex CLI workers, or Claude CLI workers. Do not spawn
 nested workers. The orchestrator chose this session's model and reasoning effort deliberately. If
 a skill registry entry is stale or unavailable, ignore it and continue with this brief and the
@@ -64,8 +65,9 @@ that cannot be settled by inspection. Remote CI is the normal validator for a pa
 ## Finish and report
 
 Follow the exact stopping point in the dispatch prompt. Finish every assigned implementation and
-validation item before ending, then perform only the requested delivery actions. Do not request or
-wait for a separate review-bot pass unless the prompt explicitly assigns one.
+validation item before ending, then perform only the requested delivery actions. Do not request a
+separate review-bot pass unless the prompt explicitly assigns one. After the final requested push
+and report, exit; the controller owns post-push CI and review monitoring.
 
 1. Review `git diff` and `git status`; remove accidental artifacts.
 2. When asked to commit or push, use a concise imperative commit message and push the assigned
