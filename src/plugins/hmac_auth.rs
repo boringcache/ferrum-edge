@@ -647,7 +647,9 @@ impl HmacAuth {
     /// Admin config validation and direct/test construction take this path. A
     /// `replay_scope: process` policy then gets a **private** lane keyed by the
     /// standalone placeholder id, so a validation call can neither read,
-    /// mutate, nor consume a live proxy's replay history.
+    /// mutate, nor consume a live proxy's replay history. A `shared` policy
+    /// gets a detached fail-closed authority: validation neither publishes a
+    /// process readiness dependency nor arms a Redis recovery task.
     #[allow(dead_code)] // exercised by external unit tests
     pub fn new(config: &Value) -> Result<Self, String> {
         Self::build(config, None, None)
@@ -862,15 +864,21 @@ impl HmacAuth {
                 })?;
                 // Classification-only diagnostics: never raw RedisError text or
                 // the operator key prefix.
-                Some(Arc::new(ReplayAuthority::shared(
-                    Arc::new(RedisRateLimitClient::for_replay_authority(
-                        redis_config,
-                        http_client.and_then(|client| client.dns_cache().cloned()),
-                        http_client.is_some_and(|client| client.tls_no_verify()),
-                        http_client.and_then(|client| client.tls_ca_bundle_path()),
-                    )),
-                    retention,
-                )))
+                let client = Arc::new(RedisRateLimitClient::for_replay_authority(
+                    redis_config,
+                    http_client.and_then(|client| client.dns_cache().cloned()),
+                    http_client.is_some_and(|client| client.tls_no_verify()),
+                    http_client.and_then(|client| client.tls_ca_bundle_path()),
+                ));
+                let authority = if plugin_config_id.is_some() {
+                    ReplayAuthority::shared(client, retention)
+                } else {
+                    // Admin/config validation and direct tests must not make an
+                    // unpublished candidate a process readiness dependency or
+                    // arm its Redis recovery task.
+                    ReplayAuthority::shared_detached(client, retention)
+                };
+                Some(Arc::new(authority))
             }
             _ => None,
         };

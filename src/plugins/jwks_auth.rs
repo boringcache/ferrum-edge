@@ -344,7 +344,9 @@ impl JwksAuth {
     /// Admin config validation and direct/test construction take this path. A
     /// `dpop_replay_scope: process` provider then gets a **private** lane keyed
     /// by the standalone placeholder id, so a validation call can neither read,
-    /// mutate, nor consume a live proxy's replay history.
+    /// mutate, nor consume a live proxy's replay history. A `shared` provider
+    /// gets a detached fail-closed authority: validation neither publishes a
+    /// process readiness dependency nor arms a Redis recovery task.
     #[allow(dead_code)] // exercised by external unit tests
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
         Self::new_with_config_id(config, http_client, None)
@@ -653,10 +655,16 @@ impl JwksAuth {
                     // Redis backend, so an absent client here cannot silently
                     // become a process lane.
                     shared_replay_client.as_ref().map(|client| {
-                        Arc::new(ReplayAuthority::shared(
-                            Arc::clone(client),
-                            Duration::from_secs(DPOP_MARKER_RETENTION_SECONDS),
-                        ))
+                        let retention = Duration::from_secs(DPOP_MARKER_RETENTION_SECONDS);
+                        let authority = if plugin_config_id.is_some() {
+                            ReplayAuthority::shared(Arc::clone(client), retention)
+                        } else {
+                            // Shape-only validation/direct construction must
+                            // not publish an unpublished candidate into global
+                            // readiness or arm its Redis recovery task.
+                            ReplayAuthority::shared_detached(Arc::clone(client), retention)
+                        };
+                        Arc::new(authority)
                     })
                 }
                 _ => None,

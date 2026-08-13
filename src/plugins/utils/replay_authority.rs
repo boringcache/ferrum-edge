@@ -762,6 +762,23 @@ impl ReplayAuthority {
         Self::Shared { client, retention }
     }
 
+    /// Build a shared authority without publishing it as a live readiness
+    /// dependency.
+    ///
+    /// This is only for shape-only validation and direct/test plugin
+    /// construction, where the temporary candidate is never installed in a
+    /// runtime plugin cache. It still fails closed if a caller invokes
+    /// [`Self::admit`]: the client starts unproven and a miss may arm recovery,
+    /// but merely validating configuration cannot change process readiness or
+    /// dial the candidate backend. Production plugin construction must use
+    /// [`Self::shared`].
+    pub(crate) fn shared_detached(
+        client: Arc<RedisRateLimitClient>,
+        retention: Duration,
+    ) -> Self {
+        Self::Shared { client, retention }
+    }
+
     /// Fixed-cardinality mode label.
     pub fn mode(&self) -> &'static str {
         match self {

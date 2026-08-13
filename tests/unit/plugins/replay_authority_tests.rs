@@ -962,6 +962,71 @@ fn unreachable_shared_client(prefix: &str) -> Arc<RedisRateLimitClient> {
     ))
 }
 
+/// Shape-only validation constructs the real plugin so config admission stays
+/// aligned with runtime parsing, but that temporary object is not a live
+/// policy. It must neither enter the process readiness aggregate nor arm a
+/// backend probe. Supplying a stable config id is the production boundary and
+/// does register exactly one dependency per plugin-owned Redis client.
+#[test]
+fn validation_construction_does_not_publish_shared_replay_readiness() {
+    let _serialized = shared_health_guard();
+    let baseline = shared_health_snapshot();
+    let hmac_config = serde_json::json!({
+        "replay_scope": "shared",
+        "sync_mode": "redis",
+        "redis_url": "redis://127.0.0.1:1",
+        "redis_health_check_interval_seconds": 3600
+    });
+    let jwks_config = serde_json::json!({
+        "providers": [{
+            "jwks": {"keys": []},
+            "require_dpop": true,
+            "dpop_replay_scope": "shared"
+        }],
+        "sync_mode": "redis",
+        "redis_url": "redis://127.0.0.1:1",
+        "redis_health_check_interval_seconds": 3600
+    });
+
+    let detached_hmac = ferrum_edge::plugins::hmac_auth::HmacAuth::new(&hmac_config)
+        .expect("shape-only HMAC validation");
+    let detached_jwks = ferrum_edge::plugins::jwks_auth::JwksAuth::new(
+        &jwks_config,
+        ferrum_edge::plugins::utils::PluginHttpClient::default(),
+    )
+    .expect("shape-only JWKS validation");
+    assert_eq!(
+        shared_health_snapshot(),
+        baseline,
+        "unpublished validation candidates must not affect readiness"
+    );
+
+    let live_hmac =
+        ferrum_edge::plugins::hmac_auth::HmacAuth::new_with_http_client_and_config_id(
+            &hmac_config,
+            ferrum_edge::plugins::utils::PluginHttpClient::default(),
+            Some("live-hmac-replay-policy"),
+        )
+        .expect("runtime HMAC construction");
+    let live_jwks = ferrum_edge::plugins::jwks_auth::JwksAuth::new_with_config_id(
+        &jwks_config,
+        ferrum_edge::plugins::utils::PluginHttpClient::default(),
+        Some("live-jwks-replay-policy"),
+    )
+    .expect("runtime JWKS construction");
+    let registered = shared_health_snapshot();
+    assert_eq!(registered.shared_authorities, baseline.shared_authorities + 2);
+    assert_eq!(
+        registered.shared_authorities_unavailable,
+        baseline.shared_authorities_unavailable + 2,
+        "both unproven runtime dependencies fail readiness closed"
+    );
+
+    drop((live_hmac, live_jwks));
+    assert_eq!(shared_health_snapshot(), baseline);
+    drop((detached_hmac, detached_jwks));
+}
+
 /// The bounded aggregate readiness consumes: an unavailable shared authority is
 /// visible, recovery clears it, and a retired plugin generation stops counting.
 #[test]
