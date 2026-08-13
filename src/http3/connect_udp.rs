@@ -1252,10 +1252,11 @@ impl SessionEnd {
 
     /// How the CONNECT stream's send half must be closed for this outcome.
     ///
-    /// This is the ONE mapping: the client-bound relay classifies the outcomes
-    /// it decides for itself through this function, and the supervisor hands
-    /// the same function's result over for the outcomes it observes. Nothing
-    /// re-derives it inline, so no arm can drift into presenting a clean FIN.
+    /// This is the ONE mapping. The send-half owner applies it to whichever
+    /// [`SessionEnd`] it is closing with — a halt it decided for itself, or a
+    /// supervisor command it consumed — and teardown reports that same
+    /// outcome. Nothing re-derives the mapping inline, so no arm can drift
+    /// into presenting a clean FIN.
     pub fn close_kind(self) -> StreamCloseKind {
         match self {
             // RFC 9297 §3.3 / §3.5: a malformed or truncated capsule stream is
@@ -1328,6 +1329,84 @@ pub fn classify_relay_join(
                  internal failure rather than presented as a completed session"
             );
             SessionEnd::RelayTaskFailed
+        }
+    }
+}
+
+/// How teardown observed the send-half owner's join.
+///
+/// The target-to-client relay owns the QUIC send half. A completed
+/// [`SessionEnd`] is the close it applied; a panic or a cancellation means
+/// that close did not land, including when teardown aborts the task after
+/// `CLOSE_GRACE`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendHalfTeardownJoin {
+    /// The task returned this outcome after applying [`SessionEnd::close_kind`].
+    Completed(SessionEnd),
+    /// The task panicked; the send half was dropped mid-unwind.
+    Panicked,
+    /// The task was cancelled. After a `CLOSE_GRACE` abort this means the
+    /// intended FIN or reset was not applied.
+    Cancelled,
+}
+
+/// Pick the [`SessionEnd`] the send-half owner will apply.
+///
+/// `consumed_command` is `Some` when this task received the supervisor oneshot
+/// before reaching a terminal recv/send of its own; that command is what it
+/// applies and returns. `None` keeps `self_decided` — the task halted on its
+/// own, or the sender was dropped without a command.
+pub fn resolve_send_half_close_command(
+    consumed_command: Option<SessionEnd>,
+    self_decided: SessionEnd,
+) -> SessionEnd {
+    consumed_command.unwrap_or(self_decided)
+}
+
+/// Authoritative [`SessionEnd`] for a send-half teardown join.
+///
+/// A completed task's outcome is taken verbatim: that is the close it applied,
+/// whether it consumed a supervisor command or decided for itself. A panic or
+/// a cancellation — including abort after `CLOSE_GRACE` — means the intended
+/// close was not applied, so the session is [`SessionEnd::RelayTaskFailed`]
+/// rather than a clean supervisor verdict the client never saw.
+pub fn classify_send_half_teardown(joined: SendHalfTeardownJoin) -> SessionEnd {
+    match joined {
+        SendHalfTeardownJoin::Completed(end) => end,
+        SendHalfTeardownJoin::Panicked | SendHalfTeardownJoin::Cancelled => {
+            SessionEnd::RelayTaskFailed
+        }
+    }
+}
+
+fn observe_send_half_join(
+    joined: Result<SessionEnd, tokio::task::JoinError>,
+    relay: RelayDirection,
+    proxy_id: &str,
+    grace_timed_out: bool,
+) -> SendHalfTeardownJoin {
+    match joined {
+        Ok(end) => SendHalfTeardownJoin::Completed(end),
+        Err(error) if error.is_panic() => {
+            warn!(
+                proxy_id = %proxy_id,
+                relay = relay.as_str(),
+                reason = SessionEnd::RelayTaskFailed.as_str(),
+                "H3 CONNECT-UDP relay task panicked during teardown"
+            );
+            SendHalfTeardownJoin::Panicked
+        }
+        Err(_) => {
+            warn!(
+                proxy_id = %proxy_id,
+                relay = relay.as_str(),
+                grace_timed_out,
+                reason = SessionEnd::RelayTaskFailed.as_str(),
+                "H3 CONNECT-UDP send-half close was not applied; the tunnel is torn \
+                 down as an internal failure rather than a supervisor outcome the \
+                 client never saw"
+            );
+            SendHalfTeardownJoin::Cancelled
         }
     }
 }
@@ -2011,7 +2090,7 @@ async fn relay(
         }
     });
 
-    let (close_tx, mut close_rx) = tokio::sync::oneshot::channel::<StreamCloseKind>();
+    let (close_tx, mut close_rx) = tokio::sync::oneshot::channel::<SessionEnd>();
     let from_target_socket = Arc::clone(&socket);
     let from_target_activity = Arc::clone(&last_activity);
     let from_target_proxy_id = proxy.id.clone();
@@ -2021,13 +2100,6 @@ async fn relay(
         // silently truncated into a corrupted tunnel payload.
         let mut buf = vec![0u8; max_payload + 1];
         let mut out = BytesMut::with_capacity(4096);
-        // How the send half must be closed, when the SUPERVISOR is the one that
-        // decided. It cannot classify an outcome this task reached on its own:
-        // by the time the supervisor observes the join, this task has already
-        // returned, the send half is gone, and `close_tx.send` has no receiver.
-        // So a self-decided outcome classifies itself below, through the same
-        // `SessionEnd::close_kind` mapping the supervisor's verdict comes from.
-        let mut supervisor_close_kind: Option<StreamCloseKind> = None;
         // Consecutive `recv` rounds that reported "not ready" without any
         // datagram in between. Reset by every other outcome, so only an
         // unbroken run can reach the bound.
@@ -2036,8 +2108,13 @@ async fn relay(
             let received = tokio::select! {
                 biased;
                 supervisor = &mut close_rx => {
-                    supervisor_close_kind = supervisor.ok();
-                    break SessionEnd::ClientClosed;
+                    // Consuming the oneshot makes the supervisor outcome the
+                    // close this task will apply and return. A dropped sender
+                    // (no command) keeps a self-decided client close.
+                    break resolve_send_half_close_command(
+                        supervisor.ok(),
+                        SessionEnd::ClientClosed,
+                    );
                 }
                 received = from_target_socket.recv(&mut buf) => received,
             };
@@ -2122,12 +2199,11 @@ async fn relay(
                 },
             }
         };
-        // A supervisor verdict applies only to the outcome the supervisor
-        // observed; anything this task decided for itself carries its own
-        // classification, because that decision is already final by the time
-        // the supervisor could speak.
-        let close_kind = supervisor_close_kind.unwrap_or_else(|| end.close_kind());
-        match close_kind {
+        // `end` is whichever halt won: a consumed supervisor command, or a
+        // recv/send this task decided for itself before that command arrived.
+        // Apply that outcome's mapping; the supervisor cannot change a send
+        // half after this task has already returned.
+        match end.close_kind() {
             // Ordinary end of tunnel: FIN so the client sees an orderly end of
             // the capsule stream.
             StreamCloseKind::Clean => {
@@ -2167,7 +2243,7 @@ async fn relay(
     // polled after completion, so the teardown below must never re-await one.
     let mut to_target_finished = false;
     let mut from_target_finished = false;
-    let end = loop {
+    let mut end = loop {
         tokio::select! {
             // Neither handle has been aborted yet — teardown below is the only
             // place that does — so a join failure here is a panic or an
@@ -2260,18 +2336,15 @@ async fn relay(
     if !to_target_finished {
         to_target.abort();
     }
-    let _ = close_tx.send(end.close_kind());
-    // A relay that PANICS during teardown is not the cancellation this session
-    // requested: the client-bound task's panic drops the QUIC send half mid
-    // unwind, so the client observes a reset rather than the close this
-    // function decided. Reporting `end` unchanged would describe a clean
-    // lifecycle outcome the client never saw, so the outcome is downgraded to
-    // the internal failure it is.
-    let mut teardown_panicked = false;
+    // The oneshot carries the supervisor [`SessionEnd`], not only its
+    // close-kind. If the send-half task consumes it, that is the outcome it
+    // applies and returns. If the task already halted on its own, this send
+    // is a no-op and teardown keeps the joined self-decided outcome.
+    let _ = close_tx.send(end);
     if !from_target_finished {
         let graceful = tokio::time::timeout(CLOSE_GRACE, &mut from_target).await;
-        let joined = match graceful {
-            Ok(joined) => joined,
+        let (joined, grace_timed_out) = match graceful {
+            Ok(joined) => (joined, false),
             Err(_) => {
                 // Still running after the flush grace. Abort, then join: an
                 // aborted handle resolves as `Err(JoinError::cancelled)` only
@@ -2283,13 +2356,20 @@ async fn relay(
                 // Awaiting the cancellation acknowledgement itself matters: a
                 // second timeout would be allowed to drop this handle and
                 // detach the task, releasing the session permit while it could
-                // still own the QUIC send half and socket clone. A `cancelled`
-                // join is exactly what was requested and is not a failure.
+                // still own the QUIC send half and socket clone. A cancelled
+                // join here means the intended FIN/reset was not applied, so
+                // it is classified as an internal failure rather than the
+                // supervisor's pending clean outcome.
                 from_target.abort();
-                from_target.await
+                (from_target.await, true)
             }
         };
-        teardown_panicked = join_panicked(joined, RelayDirection::TargetToClient, &proxy.id);
+        end = classify_send_half_teardown(observe_send_half_join(
+            joined,
+            RelayDirection::TargetToClient,
+            &proxy.id,
+            grace_timed_out,
+        ));
     }
     if !to_target_finished {
         // Aborted above and never polled to completion, so joining it here is
@@ -2298,17 +2378,14 @@ async fn relay(
         // does not change what the client saw — it is logged, not promoted.
         join_panicked(to_target.await, RelayDirection::ClientToTarget, &proxy.id);
     }
-    if teardown_panicked {
-        SessionEnd::RelayTaskFailed
-    } else {
-        end
-    }
+    end
 }
 
-/// Log a teardown join and report whether the task PANICKED.
+/// Log a receive-half teardown join and report whether the task PANICKED.
 ///
-/// A `cancelled` join is the acknowledgement of this session's own `abort()`
-/// and is the expected outcome; only a panic is an internal failure. The
+/// This relay owns no send half, so a panic does not change what the client
+/// saw — it is logged, not promoted. A `cancelled` join is the acknowledgement
+/// of this session's own `abort()` and is the expected outcome. The
 /// `JoinError` is never resumed — re-raising a relay's panic in the supervisor
 /// would take the session permit and connection guard down with it.
 fn join_panicked(

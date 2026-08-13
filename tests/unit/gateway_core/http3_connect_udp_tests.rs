@@ -13,12 +13,13 @@ use ferrum_edge::http3::connect_udp::{
     AdmittedConnectUdpDestination, CONNECT_UDP_MAX_PAYLOAD_BYTES,
     CONNECT_UDP_NON_FRAGMENTATION_ENFORCEABLE, CapsuleDecodeError, CapsuleDecoder, CapsuleEvent,
     ConnectUdpDestinationRefusal, ConnectUdpRequestRejection, ConnectUdpTargetRejection,
-    H3ExtendedConnect, RelayDirection, SessionEnd, StreamCloseKind, UdpRecvFault, UdpSendFault,
-    admit_connect_udp_destination, classify_h3_extended_connect, classify_relay_join,
-    classify_udp_recv_error, classify_udp_send_error, destination_is_configured,
-    dns_override_pin_unchanged, encode_udp_datagram_capsule,
-    first_forbidden_capsule_protocol_field, parse_connect_udp_target,
-    strip_forbidden_capsule_protocol_response_fields, validate_connect_udp_request_shape,
+    H3ExtendedConnect, RelayDirection, SendHalfTeardownJoin, SessionEnd, StreamCloseKind,
+    UdpRecvFault, UdpSendFault, admit_connect_udp_destination, classify_h3_extended_connect,
+    classify_relay_join, classify_send_half_teardown, classify_udp_recv_error,
+    classify_udp_send_error, destination_is_configured, dns_override_pin_unchanged,
+    encode_udp_datagram_capsule, first_forbidden_capsule_protocol_field, parse_connect_udp_target,
+    resolve_send_half_close_command, strip_forbidden_capsule_protocol_response_fields,
+    validate_connect_udp_request_shape,
 };
 use ferrum_edge::load_balancer::{LoadBalancerCache, LoadBalancerCacheInner};
 use ferrum_edge::proxy::backend_dispatch::detect_http_flavor;
@@ -1374,6 +1375,183 @@ async fn a_relay_that_ran_to_completion_keeps_its_own_verdict() {
             end.as_str()
         );
     }
+}
+
+#[test]
+fn a_consumed_supervisor_close_command_is_the_applied_send_half_outcome() {
+    // If the send-half task consumes the oneshot, that command is what it
+    // applies and returns — even when a competing self-decided halt exists as
+    // a hypothetical alternative. Teardown then takes the completed join
+    // verbatim, so the reported SessionEnd matches the close that landed.
+    for command in EVERY_SESSION_END {
+        assert_eq!(
+            resolve_send_half_close_command(Some(command), SessionEnd::TargetSocketUnusable),
+            command,
+            "{} consumed from the supervisor must be applied, not a stale \
+             self-decided socket failure",
+            command.as_str()
+        );
+        assert_eq!(
+            classify_send_half_teardown(SendHalfTeardownJoin::Completed(command)),
+            command,
+            "{} applied by the send-half owner must survive teardown",
+            command.as_str()
+        );
+    }
+}
+
+#[test]
+fn a_self_decided_send_half_halt_survives_a_stale_supervisor_verdict() {
+    // The race: the supervisor selected idle/drain/withdrawal (or an ordinary
+    // client close), then the send-half task reached its own terminal outcome
+    // before consuming the oneshot. The task applies its own close_kind; the
+    // unread command is discarded. Teardown must keep that joined outcome —
+    // including a socket failure that resets and a client close that FINs —
+    // rather than reporting the supervisor's pending verdict.
+    let self_decided = [
+        SessionEnd::TargetSocketUnusable,
+        SessionEnd::ClientClosed,
+        SessionEnd::CapsuleProtocolError,
+        SessionEnd::RelayTaskFailed,
+    ];
+    for end in self_decided {
+        assert_eq!(
+            resolve_send_half_close_command(None, end),
+            end,
+            "{} must be kept when the supervisor command was not consumed",
+            end.as_str()
+        );
+        assert_eq!(
+            classify_send_half_teardown(SendHalfTeardownJoin::Completed(end)),
+            end,
+            "a completed send-half join is authoritative; a stale supervisor \
+             Idle cannot overwrite {}",
+            end.as_str()
+        );
+    }
+    // Pin the security-visible half of the race: a self-decided socket
+    // failure resets, and that reset must not be reported as a clean idle FIN.
+    assert_eq!(
+        classify_send_half_teardown(SendHalfTeardownJoin::Completed(
+            SessionEnd::TargetSocketUnusable,
+        ))
+        .close_kind(),
+        StreamCloseKind::InternalError
+    );
+    assert_eq!(SessionEnd::Idle.close_kind(), StreamCloseKind::Clean);
+}
+
+#[test]
+fn aborting_the_send_half_after_close_grace_is_not_a_clean_supervisor_fin() {
+    // CLOSE_GRACE expiry aborts the send-half task and always joins it. A
+    // cancelled join means finish()/reset did not complete, so a clean
+    // supervisor reason (idle, drain, withdrawal, ordinary client close) must
+    // not be reported: the client never saw that FIN.
+    for supervisor in [
+        SessionEnd::Idle,
+        SessionEnd::Draining,
+        SessionEnd::RouteWithdrawn,
+        SessionEnd::RouteTargetPinChanged,
+        SessionEnd::RouteAuthorizationUnreconstructable,
+        SessionEnd::ClientClosed,
+    ] {
+        assert_eq!(
+            supervisor.close_kind(),
+            StreamCloseKind::Clean,
+            "{} is a clean supervisor outcome",
+            supervisor.as_str()
+        );
+        let reported = classify_send_half_teardown(SendHalfTeardownJoin::Cancelled);
+        assert_eq!(reported, SessionEnd::RelayTaskFailed);
+        assert_eq!(reported.close_kind(), StreamCloseKind::InternalError);
+        assert_ne!(
+            reported.close_kind(),
+            supervisor.close_kind(),
+            "aborting after grace must not report the clean FIN {} never applied",
+            supervisor.as_str()
+        );
+    }
+    assert_eq!(
+        classify_send_half_teardown(SendHalfTeardownJoin::Panicked),
+        SessionEnd::RelayTaskFailed
+    );
+    // When the task DID consume the command and complete, the joined clean
+    // reason is kept — grace abort is the only path that drops it.
+    for end in [
+        SessionEnd::Idle,
+        SessionEnd::Draining,
+        SessionEnd::RouteWithdrawn,
+        SessionEnd::ClientClosed,
+    ] {
+        assert_eq!(
+            classify_send_half_teardown(SendHalfTeardownJoin::Completed(end)),
+            end
+        );
+        assert_eq!(end.close_kind(), StreamCloseKind::Clean);
+    }
+}
+
+#[tokio::test]
+async fn a_cancelled_send_half_join_is_never_the_task_pending_clean_reason() {
+    // Abort-then-join is deterministic: the task has not reached its return,
+    // so the JoinError is cancellation, not the Idle it would have returned.
+    // Mapping that to RelayTaskFailed is what keeps a grace-timeout abort
+    // from being logged as a clean supervisor FIN.
+    let handle = tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        SessionEnd::Idle
+    });
+    handle.abort();
+    let joined = handle.await;
+    assert!(joined.is_err(), "the aborted task must not have completed");
+    let observed = match joined {
+        Ok(_) => unreachable!("asserted is_err"),
+        Err(error) if error.is_panic() => SendHalfTeardownJoin::Panicked,
+        Err(_) => SendHalfTeardownJoin::Cancelled,
+    };
+    assert_eq!(observed, SendHalfTeardownJoin::Cancelled);
+    assert_eq!(
+        classify_send_half_teardown(observed),
+        SessionEnd::RelayTaskFailed
+    );
+    assert_eq!(
+        SessionEnd::RelayTaskFailed.close_kind(),
+        StreamCloseKind::InternalError
+    );
+}
+
+#[test]
+fn send_half_teardown_wires_the_joined_outcome_as_authoritative() {
+    // Production wiring for the race the classifiers above pin down: the
+    // oneshot carries SessionEnd, the send-half task resolves command vs
+    // self-decided halt, teardown classifies the joined result (never
+    // discarding a successful SessionEnd via join_panicked), and CLOSE_GRACE
+    // expiry aborts then joins rather than detaching.
+    let squeezed = squeeze(include_str!("../../../src/http3/connect_udp.rs"));
+    assert!(
+        squeezed.contains("tokio::sync::oneshot::channel::<SessionEnd>()"),
+        "the close command must carry SessionEnd so a consumed command is unambiguous"
+    );
+    assert!(
+        squeezed.contains("breakresolve_send_half_close_command("),
+        "the send-half task must resolve a consumed supervisor command vs a self-decided halt"
+    );
+    assert!(
+        squeezed.contains("let_=close_tx.send(end);"),
+        "teardown must send the supervisor SessionEnd, not only its close-kind"
+    );
+    assert!(
+        squeezed.contains("end=classify_send_half_teardown(observe_send_half_join("),
+        "teardown must take the send-half join as the authoritative SessionEnd"
+    );
+    assert!(
+        !squeezed.contains("join_panicked(joined,RelayDirection::TargetToClient"),
+        "join_panicked discards a successful joined SessionEnd and must not classify the send half"
+    );
+    assert!(
+        squeezed.contains("from_target.abort();(from_target.await,true)"),
+        "CLOSE_GRACE expiry must abort then join the send-half task, never detach"
+    );
 }
 
 #[test]

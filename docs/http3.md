@@ -1048,15 +1048,18 @@ How the stream is closed depends on why:
   are the same condition, and neither may present a clean FIN. The relay task
   that owns the QUIC send half classifies its own terminal outcomes through the
   single `SessionEnd::close_kind` mapping, because the supervisor cannot change
-  a send half after that task has already returned.
+  a send half after that task has already returned. The close command carries
+  the supervisor `SessionEnd`; if the send-half task consumes it, that is the
+  outcome it applies and returns. If the task reaches its own halt first, teardown
+  keeps the joined self-decided outcome rather than a stale supervisor verdict.
 - A relay task that fails to **join** — it panicked, or it was cancelled by
   something other than this session's own teardown — is likewise an internal
   failure (`SessionEnd::RelayTaskFailed`), never a client FIN. The supervisor
   reaches that classification only for a handle it has not aborted, so it
-  cannot mistake its own requested cancellation for a fault; a panic observed
-  during teardown downgrades the reported outcome to the same internal failure,
-  because the client-bound task's panic drops the QUIC send half mid-unwind and
-  the client therefore sees a reset rather than the close the supervisor
+  cannot mistake its own requested cancellation for a fault. A panic, or a
+  `CLOSE_GRACE` abort of the send-half task whose `finish()`/`reset` did not
+  complete, downgrades the reported outcome to the same internal failure,
+  because the client then sees a reset rather than the close the supervisor
   decided. The request additionally returns an error to the H3 request loop so
   the failure is visible instead of indistinguishable from a clean close.
 
