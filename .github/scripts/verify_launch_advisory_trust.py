@@ -82,15 +82,19 @@ workflow definitions as text — it executes nothing — and asserts:
   environment mapping, never as a checkout ref, and no candidate-derived
   environment variable is ever expanded on an executable line anywhere in that
   job — including inside a multiline block of a secretless step;
-* the tag-triggered release job consumes the trusted verdict as a published
-  commit status instead of evaluating advisories itself;
-* that verdict is bound to the exact Release run ID and run attempt on both
-  sides — the publisher derives the context from the triggering run, the release
-  gate accepts only the context carrying its own `github.run_id` /
-  `github.run_attempt`, and the scheduled default-branch audit uses a context of
-  a different shape. A commit-wide context would be replayable: a daily audit, an
-  earlier tag release on the same commit, or an earlier attempt of the same
-  Release run would satisfy a later release before its own evaluation finished;
+* the tag-triggered release job consumes a run-owned, authenticated verdict
+  artifact instead of evaluating advisories itself or trusting a forgeable
+  commit status;
+* that artifact is bound to the exact Release run ID and run attempt on both
+  sides — the publisher derives the name from the triggering run, the release
+  gate accepts only the name carrying its own `github.run_id` /
+  `github.run_attempt`, and then authenticates the owning run's immutable
+  workflow path, `workflow_run` event, successful conclusion, and the fixed
+  record. Artifact name alone is never authority. The scheduled default-branch
+  audit uses a name of a different shape. A commit-wide status or an
+  attempt-less artifact would be replayable: a daily audit, an earlier tag
+  release on the same commit, or an earlier attempt of the same Release run
+  would satisfy a later release before its own evaluation finished;
 * the trusted workflow triggers on `workflow_run: in_progress`, because GitHub
   documents that `requested` does not fire for a re-run;
 * the untrusted standalone gate holds no credential on any event.
@@ -111,9 +115,9 @@ or `PATH` redirect on the credential step, a duplicated or unparseable env
 entry, a workflow-level `env:` or `defaults:` shell/working-directory, an
 anchor/alias/merge-key bypass, either secretless self-test dropped, commented
 out, or relocated into the credential job, a dropped trusted-anchor ancestry
-proof, a missing environment binding, a dropped trust edge, a constant
-commit-wide status context, an omitted run-attempt binding, a `requested`-only
-trigger, a release gate that reuses another run's status, a release job that
+proof, a missing environment binding, a dropped trust edge, a reintroduced
+commit-status handoff, an omitted run-attempt binding, a `requested`-only
+trigger, a release gate that reuses another run's artifact, a release job that
 stops requiring the trusted verdict, a safe block-form `on:` followed by a
 duplicate `on: [push]` (and the reversed ordering), a duplicate `jobs:`,
 `advisory-verdict`, `needs`, `environment`, `steps`, step key, or checkout input,
@@ -153,10 +157,16 @@ SECRET_JOB = "advisory-verdict"
 PUBLISH_JOB = "publish-verdict"
 RELEASE_GATE_JOB = "validate-launch-readiness"
 PROTECTED_ENVIRONMENT = "launch-advisory"
-STATUS_CONTEXT_PREFIX = "trusted-launch-advisory-gate"
-# The scheduled default-branch audit's context. Deliberately not of the release
+VERDICT_ARTIFACT_PREFIX = "trusted-launch-advisory-verdict"
+# The scheduled default-branch audit's artifact. Deliberately not of the release
 # shape, so an audit verdict can never satisfy a release gate.
-AUDIT_STATUS_CONTEXT = f"{STATUS_CONTEXT_PREFIX}/main-audit"
+AUDIT_ARTIFACT_PREFIX = f"{VERDICT_ARTIFACT_PREFIX}-main-audit-"
+UPLOAD_ARTIFACT_PIN = (
+    "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
+)
+TRUSTED_WORKFLOW_PATH = ".github/workflows/launch-advisory-trust.yml"
+# Retained so a reintroduced forgeable commit-status handoff is still detected.
+STATUS_CONTEXT_PREFIX = "trusted-launch-advisory-gate"
 TRUSTED_CHECKER = "python3 -I scripts/check_launch_readiness.py"
 SELF_TEST_STEP = "python3 -I .github/scripts/verify_launch_advisory_trust.py --self-test"
 # The secretless checker self-test. It belongs to the trust job: hosted in the
@@ -199,31 +209,33 @@ PUBLISH_ENV_BINDING = re.compile(
     r"^\s*CANDIDATE_SHA:\s*\$\{\{\s*needs\.establish-trust\.outputs\."
     r"candidate_sha\s*\}\}\s*$"
 )
-PUBLISH_CONTEXT_BINDING = re.compile(
-    r"^\s*STATUS_CONTEXT:\s*\$\{\{\s*needs\.establish-trust\.outputs\."
-    r"status_context\s*\}\}\s*$"
+PUBLISH_ARTIFACT_BINDING = re.compile(
+    r"^\s*VERDICT_ARTIFACT:\s*\$\{\{\s*needs\.establish-trust\.outputs\."
+    r"verdict_artifact\s*\}\}\s*$"
 )
 
-# The publisher derives the release context from its own shell operands; the
-# release gate derives the identical string from its own run. Both derivations
-# are pinned here so neither side can silently drop the run or attempt operand.
-TRUSTED_RUN_CONTEXT_DERIVATION = re.compile(
-    re.escape(STATUS_CONTEXT_PREFIX)
-    + r"/release-\$\{?release_run_id\}?-attempt-\$\{?release_run_attempt\}?"
+# The publisher derives the release artifact name from its own shell operands;
+# the release gate derives the identical string from its own run. Both
+# derivations are pinned here so neither side can silently drop the run or
+# attempt operand.
+TRUSTED_RUN_ARTIFACT_DERIVATION = re.compile(
+    re.escape(VERDICT_ARTIFACT_PREFIX)
+    + r"-release-\$\{?release_run_id\}?-attempt-\$\{?release_run_attempt\}?"
 )
-RELEASE_GATE_CONTEXT_DERIVATION = re.compile(
-    re.escape(STATUS_CONTEXT_PREFIX)
-    + r"/release-\$\{?RELEASE_RUN_ID\}?-attempt-\$\{?RELEASE_RUN_ATTEMPT\}?"
+RELEASE_GATE_ARTIFACT_DERIVATION = re.compile(
+    re.escape(VERDICT_ARTIFACT_PREFIX)
+    + r"-release-\$\{?RELEASE_RUN_ID\}?-attempt-\$\{?RELEASE_RUN_ATTEMPT\}?"
 )
 # The shape a published release verdict may take. Used to prove statically that
-# the audit context can never be mistaken for one.
-RELEASE_CONTEXT_SHAPE = re.compile(
-    re.escape(STATUS_CONTEXT_PREFIX)
-    + r"/release-[1-9][0-9]{0,17}-attempt-[1-9][0-9]{0,17}$"
+# the audit artifact can never be mistaken for one.
+RELEASE_ARTIFACT_SHAPE = re.compile(
+    re.escape(VERDICT_ARTIFACT_PREFIX)
+    + r"-release-[1-9][0-9]{0,17}-attempt-[1-9][0-9]{0,17}$"
 )
-# Any use of the bare prefix that is not the run-bound release namespace. In the
-# release gate that is a commit-wide, replayable context.
-COMMIT_WIDE_CONTEXT = re.compile(re.escape(STATUS_CONTEXT_PREFIX) + r"(?!/release-)")
+AUDIT_ARTIFACT_SHAPE = re.compile(
+    re.escape(VERDICT_ARTIFACT_PREFIX)
+    + r"-main-audit-[1-9][0-9]{0,17}-attempt-[1-9][0-9]{0,17}$"
+)
 
 # ---------------------------------------------------------------------------
 # Step-level structure for the credential-bearing job
@@ -1522,8 +1534,6 @@ def check_trusted_workflow(text: str) -> list[str]:
                 "does not satisfy it"
             )
 
-    artifact_handoff = "verdict_artifact" in trust_text
-
     # The verdict must be bound to the exact Release run AND run attempt that
     # asked for it, or an older success on the same commit satisfies a newer
     # release before its own evaluation has run.
@@ -1536,22 +1546,27 @@ def check_trusted_workflow(text: str) -> list[str]:
                 f"{TRUSTED_WORKFLOW} job `{TRUST_JOB}` must bind {detail} "
                 f"(`{expression}`) so the published verdict cannot be replayed"
             )
-    if not artifact_handoff and "status_context:" not in trust_text:
+    if "verdict_artifact:" not in trust_text:
         errors.append(
             f"{TRUSTED_WORKFLOW} job `{TRUST_JOB}` must export the derived "
-            "`status_context` for the publisher"
+            "`verdict_artifact` for the publisher"
         )
-    if not artifact_handoff and not TRUSTED_RUN_CONTEXT_DERIVATION.search(trust_text):
+    if not TRUSTED_RUN_ARTIFACT_DERIVATION.search(trust_text):
         errors.append(
-            f"{TRUSTED_WORKFLOW} job `{TRUST_JOB}` must derive a status context "
-            f"of the form `{STATUS_CONTEXT_PREFIX}/release-<run id>-attempt-"
-            "<run attempt>`; a commit-wide or attempt-less context is replayable"
+            f"{TRUSTED_WORKFLOW} job `{TRUST_JOB}` must derive an artifact name "
+            f"of the form `{VERDICT_ARTIFACT_PREFIX}-release-<run id>-attempt-"
+            "<run attempt>`; a commit-wide or attempt-less artifact is replayable"
         )
-    if not artifact_handoff and AUDIT_STATUS_CONTEXT not in trust_text:
+    if AUDIT_ARTIFACT_PREFIX not in trust_text:
         errors.append(
             f"{TRUSTED_WORKFLOW} job `{TRUST_JOB}` must publish default-branch "
-            f"audits under the distinct `{AUDIT_STATUS_CONTEXT}` context so an "
+            f"audits under the distinct `{AUDIT_ARTIFACT_PREFIX}` artifact so an "
             "audit can never satisfy a release"
+        )
+    if "status_context" in trust_text or STATUS_CONTEXT_PREFIX in trust_text:
+        errors.append(
+            f"{TRUSTED_WORKFLOW} job `{TRUST_JOB}` must not use a forgeable "
+            "commit status handoff"
         )
 
     secret_lines = code_lines(jobs[SECRET_JOB])
@@ -1664,43 +1679,39 @@ def check_trusted_workflow(text: str) -> list[str]:
                 f"{TRUSTED_WORKFLOW} job `{PUBLISH_JOB}` must publish the verdict "
                 "without any credential"
             )
-        if artifact_handoff:
-            publish_text = "\n".join(publish_lines)
-            for required in (
-                "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
-                "needs.establish-trust.outputs.verdict_artifact",
-                "verdict=PASS",
-                "release_sha=%s",
-                "release_run_id=%s",
-                "release_run_attempt=%s",
-            ):
-                if required not in publish_text:
-                    errors.append(
-                        f"{TRUSTED_WORKFLOW} job `{PUBLISH_JOB}` must publish the "
-                        f"authenticated verdict artifact with binding {required!r}"
-                    )
-            if any("statuses: write" in line or "/statuses/" in line for line in publish_lines):
+        publish_text = "\n".join(publish_lines)
+        for required in (
+            UPLOAD_ARTIFACT_PIN,
+            "needs.establish-trust.outputs.verdict_artifact",
+            "verdict=PASS",
+            "release_sha=%s",
+            "release_run_id=%s",
+            "release_run_attempt=%s",
+        ):
+            if required not in publish_text:
                 errors.append(
-                    f"{TRUSTED_WORKFLOW} job `{PUBLISH_JOB}` must not use a forgeable commit status handoff"
+                    f"{TRUSTED_WORKFLOW} job `{PUBLISH_JOB}` must publish the "
+                    f"authenticated verdict artifact with binding {required!r}"
                 )
-            return errors
-        context_lines = [line for line in publish_lines if "context=" in line]
-        if not context_lines:
+        if any(
+            "statuses: write" in line
+            or "/statuses/" in line
+            or "status_context" in line
+            for line in publish_lines
+        ):
             errors.append(
-                f"{TRUSTED_WORKFLOW} job `{PUBLISH_JOB}` must publish the "
-                f"`{STATUS_CONTEXT_PREFIX}` commit status"
+                f"{TRUSTED_WORKFLOW} job `{PUBLISH_JOB}` must not use a "
+                "forgeable commit status handoff"
             )
-        for line in context_lines:
-            if "$STATUS_CONTEXT" not in line and "${STATUS_CONTEXT}" not in line:
-                errors.append(
-                    f"{TRUSTED_WORKFLOW} job `{PUBLISH_JOB}` publishes a constant "
-                    "commit-wide status context; it must publish the run-bound "
-                    "context established by the trust job"
-                )
-        if not any(PUBLISH_CONTEXT_BINDING.match(line) for line in publish_lines):
+        if any("actions/checkout@" in line for line in publish_lines):
+            errors.append(
+                f"{TRUSTED_WORKFLOW} job `{PUBLISH_JOB}` must not check out "
+                "repository code"
+            )
+        if not any(PUBLISH_ARTIFACT_BINDING.match(line) for line in publish_lines):
             errors.append(
                 f"{TRUSTED_WORKFLOW} job `{PUBLISH_JOB}` must consume the "
-                "established `status_context` output"
+                "established `verdict_artifact` output"
             )
         if not any(PUBLISH_ENV_BINDING.match(line) for line in publish_lines):
             errors.append(
@@ -1717,43 +1728,47 @@ def check_release_workflow(text: str) -> list[str]:
         errors.append(f"{RELEASE_WORKFLOW} is missing job `{RELEASE_GATE_JOB}`")
         return errors
     gate = "\n".join(code_lines(jobs[RELEASE_GATE_JOB]))
-    if "trusted-launch-advisory-verdict-release-" in gate:
-        for required in (
-            "/actions/artifacts?name=",
-            "/actions/runs/${owner_run_id}",
-            "/actions/workflows/${workflow_id}",
-            ".github/workflows/launch-advisory-trust.yml",
-            '"$owner_event" = workflow_run',
-            '"$owner_conclusion" = success',
-            "release_sha=${release_sha}",
-            "release_run_id=${RELEASE_RUN_ID}",
-            "release_run_attempt=${RELEASE_RUN_ATTEMPT}",
-            "verdict=PASS",
-        ):
-            if required not in gate:
-                errors.append(
-                    f"{RELEASE_WORKFLOW} job `{RELEASE_GATE_JOB}` must authenticate "
-                    f"the trusted artifact with binding {required!r}"
-                )
-        if "/commits/${release_sha}/statuses" in gate:
-            errors.append(
-                f"{RELEASE_WORKFLOW} job `{RELEASE_GATE_JOB}` must not trust forgeable commit statuses"
-            )
-        return errors
-    if not RELEASE_GATE_CONTEXT_DERIVATION.search(gate):
+    if not RELEASE_GATE_ARTIFACT_DERIVATION.search(gate):
         errors.append(
             f"{RELEASE_WORKFLOW} job `{RELEASE_GATE_JOB}` must require the "
-            f"`{STATUS_CONTEXT_PREFIX}` verdict published for its own run ID and "
-            "run attempt"
+            f"authenticated `{VERDICT_ARTIFACT_PREFIX}` artifact published for "
+            "its own run ID and run attempt"
         )
-    # Any surviving bare use of the context prefix is a commit-wide status the
-    # daily audit or an earlier release/attempt on the same commit already
-    # satisfies.
-    if COMMIT_WIDE_CONTEXT.search(gate):
+    for required in (
+        "/actions/artifacts?name=",
+        "total_count",
+        "pagination truncated",
+        "duplicate live verdict artifacts",
+        TRUSTED_WORKFLOW_PATH,
+        '!= "workflow_run"',
+        '!= "success"',
+        '!= "completed"',
+        "release_sha=%s",
+        "release_run_id=%s",
+        "release_run_attempt=%s",
+        "verdict=PASS",
+        "duplicate zip members",
+        "zip traversal",
+        "zip symlink",
+        "off-origin redirect",
+        "api.github.com",
+        "Request(newurl, method=\"GET\")",
+    ):
+        if required not in gate:
+            errors.append(
+                f"{RELEASE_WORKFLOW} job `{RELEASE_GATE_JOB}` must authenticate "
+                f"the trusted artifact with binding {required!r}"
+            )
+    if (
+        "/commits/${release_sha}/statuses" in gate
+        or "/statuses/" in gate
+        or "statuses: write" in gate
+        or "statuses: read" in gate
+        or STATUS_CONTEXT_PREFIX in gate
+    ):
         errors.append(
-            f"{RELEASE_WORKFLOW} job `{RELEASE_GATE_JOB}` must not accept a "
-            "commit-wide advisory status context; a stale or replayed verdict "
-            "from another run or attempt would satisfy this release"
+            f"{RELEASE_WORKFLOW} job `{RELEASE_GATE_JOB}` must not trust "
+            "forgeable commit statuses"
         )
     for expression in ("github.run_id", "github.run_attempt"):
         if expression not in gate:
@@ -1842,7 +1857,7 @@ jobs:
     outputs:
       candidate_sha: ${{ steps.candidate.outputs.candidate_sha }}
       trusted_sha: ${{ steps.candidate.outputs.trusted_sha }}
-      status_context: ${{ steps.candidate.outputs.status_context }}
+      verdict_artifact: ${{ steps.candidate.outputs.verdict_artifact }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
@@ -1860,10 +1875,10 @@ jobs:
           trusted_sha="$(git rev-parse HEAD)"
           [[ "$trusted_sha" =~ ^[0-9a-f]{40}$ ]] || exit 1
           git merge-base --is-ancestor "$trusted_sha" "$main_tip" || exit 1
-          status_context="trusted-launch-advisory-gate/main-audit"
-          status_context="trusted-launch-advisory-gate/release-${release_run_id}-attempt-${release_run_attempt}"
+          verdict_artifact="trusted-launch-advisory-verdict-main-audit-${GITHUB_RUN_ID}-attempt-${GITHUB_RUN_ATTEMPT}"
+          verdict_artifact="trusted-launch-advisory-verdict-release-${release_run_id}-attempt-${release_run_attempt}"
           echo "trusted_sha=${trusted_sha}" >> "$GITHUB_OUTPUT"
-          echo "status_context=${status_context}" >> "$GITHUB_OUTPUT"
+          echo "verdict_artifact=${verdict_artifact}" >> "$GITHUB_OUTPUT"
 
   advisory-verdict:
     name: Evaluate advisories from trusted code
@@ -1894,13 +1909,17 @@ jobs:
       - advisory-verdict
     runs-on: ubuntu-latest
     permissions:
-      statuses: write
+      contents: read
     steps:
       - name: Publish
         env:
           CANDIDATE_SHA: ${{ needs.establish-trust.outputs.candidate_sha }}
-          STATUS_CONTEXT: ${{ needs.establish-trust.outputs.status_context }}
-        run: gh api --method POST "repos/x/statuses/$CANDIDATE_SHA" -f "context=${STATUS_CONTEXT}"
+          VERDICT_ARTIFACT: ${{ needs.establish-trust.outputs.verdict_artifact }}
+        run: printf 'release_sha=%s\\nrelease_run_id=%s\\nrelease_run_attempt=%s\\nverdict=PASS\\n' "$CANDIDATE_SHA" "$id" "$attempt" > verdict.txt
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ${{ needs.establish-trust.outputs.verdict_artifact }}
+          path: verdict.txt
 """
 
 FIXTURE_RELEASE = """name: Release
@@ -1920,8 +1939,22 @@ jobs:
           RELEASE_RUN_ID: ${{ github.run_id }}
           RELEASE_RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
-          expected_context="trusted-launch-advisory-gate/release-${RELEASE_RUN_ID}-attempt-${RELEASE_RUN_ATTEMPT}"
-          gh api statuses | jq --arg ctx "$expected_context" 'select(.context == $ctx)'
+          artifact_name="trusted-launch-advisory-verdict-release-${RELEASE_RUN_ID}-attempt-${RELEASE_RUN_ATTEMPT}"
+          listing="$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=${artifact_name}&per_page=100")"
+          total_count=1
+          echo pagination truncated
+          echo duplicate live verdict artifacts
+          path=".github/workflows/launch-advisory-trust.yml"
+          [ "$event" != "workflow_run" ]
+          [ "$conclusion" != "success" ]
+          [ "$status" != "completed" ]
+          printf 'release_sha=%s\\nrelease_run_id=%s\\nrelease_run_attempt=%s\\nverdict=PASS\\n'
+          echo duplicate zip members
+          echo zip traversal
+          echo zip symlink
+          echo off-origin redirect
+          echo https://api.github.com
+          urllib.request.Request(newurl, method="GET")
 """
 
 FIXTURE_STANDALONE = """name: Launch Readiness
@@ -2933,7 +2966,7 @@ def run_self_test() -> int:  # noqa: C901 — a flat fixture table stays readabl
     )
 
     trust_job_tail = (
-        '          echo "status_context=${status_context}" >> "$GITHUB_OUTPUT"\n'
+        '          echo "verdict_artifact=${verdict_artifact}" >> "$GITHUB_OUTPUT"\n'
         "\n  advisory-verdict:"
     )
     check(
@@ -2947,7 +2980,7 @@ def run_self_test() -> int:  # noqa: C901 — a flat fixture table stays readabl
     # out and executes.
     duplicate_trust_steps = FIXTURE_TRUSTED.replace(
         trust_job_tail,
-        '          echo "status_context=${status_context}" >> "$GITHUB_OUTPUT"\n'
+        '          echo "verdict_artifact=${verdict_artifact}" >> "$GITHUB_OUTPUT"\n'
         "    steps:\n"
         "      - id: candidate\n"
         '        run: echo "trusted_sha=$(cat ./candidate/sha)" >> "$GITHUB_OUTPUT"\n'
@@ -2989,7 +3022,7 @@ def run_self_test() -> int:  # noqa: C901 — a flat fixture table stays readabl
         "    outputs:\n"
         "      candidate_sha: ${{ steps.candidate.outputs.candidate_sha }}\n"
         "      trusted_sha: ${{ steps.candidate.outputs.trusted_sha }}\n"
-        "      status_context: ${{ steps.candidate.outputs.status_context }}\n"
+        "      verdict_artifact: ${{ steps.candidate.outputs.verdict_artifact }}\n"
     )
     check(
         "the fixture's trust outputs block is the one the contract reads",
@@ -3084,10 +3117,10 @@ def run_self_test() -> int:  # noqa: C901 — a flat fixture table stays readabl
         "every publisher binding still reads as satisfied, so only the structural "
         "pass catches a second `steps:`",
         not any(
-            "must consume the established `status_context` output" in err
+            "must consume the established `verdict_artifact` output" in err
             or "must publish against the established candidate SHA" in err
-            or "publishes a constant commit-wide status context" in err
-            or "must publish the `trusted-launch-advisory-gate` commit status" in err
+            or "must not use a forgeable commit status handoff" in err
+            or "authenticated verdict artifact with binding" in err
             for err in duplicate_publisher_steps_errors
         ),
         str(duplicate_publisher_steps_errors),
@@ -3096,7 +3129,7 @@ def run_self_test() -> int:  # noqa: C901 — a flat fixture table stays readabl
     publisher_env_block = (
         "        env:\n"
         "          CANDIDATE_SHA: ${{ needs.establish-trust.outputs.candidate_sha }}\n"
-        "          STATUS_CONTEXT: ${{ needs.establish-trust.outputs.status_context }}\n"
+        "          VERDICT_ARTIFACT: ${{ needs.establish-trust.outputs.verdict_artifact }}\n"
     )
     check(
         "the fixture's publisher env block is the one the contract reads",
@@ -3131,7 +3164,7 @@ def run_self_test() -> int:  # noqa: C901 — a flat fixture table stays readabl
         "the publisher's established bindings still read as satisfied under the "
         "duplicate env",
         not any(
-            "must consume the established `status_context` output" in err
+            "must consume the established `verdict_artifact` output" in err
             or "must publish against the established candidate SHA" in err
             for err in duplicate_publisher_env_errors
         ),
@@ -3391,18 +3424,19 @@ def run_self_test() -> int:  # noqa: C901 — a flat fixture table stays readabl
         ),
     )
 
-    dropped_gate = FIXTURE_RELEASE.replace("trusted-launch-advisory-gate", "anything")
+    dropped_gate = FIXTURE_RELEASE.replace("trusted-launch-advisory-verdict", "anything")
     check(
         "a release gate that stops requiring the trusted verdict is rejected",
         any(
-            "must require the `trusted-launch-advisory-gate` verdict" in err
+            f"must require the authenticated `{VERDICT_ARTIFACT_PREFIX}` artifact"
+            in err
             for err in evaluate(mutated(RELEASE_WORKFLOW, dropped_gate))
         ),
     )
 
     reevaluating_release = FIXTURE_RELEASE.replace(
-        "          gh api statuses | jq --arg ctx \"$expected_context\" "
-        "'select(.context == $ctx)'",
+        "          printf 'release_sha=%s\\nrelease_run_id=%s\\n"
+        "release_run_attempt=%s\\nverdict=PASS\\n'",
         "          python3 -I scripts/check_launch_readiness.py --verify",
     )
     check(
@@ -3424,15 +3458,19 @@ def run_self_test() -> int:  # noqa: C901 — a flat fixture table stays readabl
         ),
     )
 
-    constant_context = FIXTURE_TRUSTED.replace(
-        '-f "context=${STATUS_CONTEXT}"',
+    status_handoff = FIXTURE_TRUSTED.replace(
+        "        run: printf 'release_sha=%s\\nrelease_run_id=%s\\n"
+        "release_run_attempt=%s\\nverdict=PASS\\n' "
+        '"$CANDIDATE_SHA" "$id" "$attempt" > verdict.txt',
+        '        run: gh api --method POST "repos/x/statuses/$CANDIDATE_SHA" '
         '-f "context=trusted-launch-advisory-gate"',
     )
     check(
-        "publishing a constant commit-wide status context is rejected",
+        "reintroducing a forgeable commit-status publisher is rejected",
         any(
-            "publishes a constant commit-wide status context" in err
-            for err in evaluate(mutated(TRUSTED_WORKFLOW, constant_context))
+            "must not use a forgeable commit status handoff" in err
+            or "authenticated verdict artifact with binding" in err
+            for err in evaluate(mutated(TRUSTED_WORKFLOW, status_handoff))
         ),
     )
 
@@ -3448,43 +3486,44 @@ def run_self_test() -> int:  # noqa: C901 — a flat fixture table stays readabl
         ),
     )
 
-    attemptless_context = FIXTURE_TRUSTED.replace(
-        "trusted-launch-advisory-gate/release-${release_run_id}"
+    attemptless_artifact = FIXTURE_TRUSTED.replace(
+        "trusted-launch-advisory-verdict-release-${release_run_id}"
         "-attempt-${release_run_attempt}",
-        "trusted-launch-advisory-gate/release-${release_run_id}",
+        "trusted-launch-advisory-verdict-release-${release_run_id}",
     )
     check(
-        "a published context that omits the run attempt is rejected",
+        "a published artifact that omits the run attempt is rejected",
         any(
-            "attempt-less context is replayable" in err
-            for err in evaluate(mutated(TRUSTED_WORKFLOW, attemptless_context))
+            "attempt-less artifact is replayable" in err
+            for err in evaluate(mutated(TRUSTED_WORKFLOW, attemptless_artifact))
         ),
     )
 
-    audit_context_dropped = FIXTURE_TRUSTED.replace(
-        'status_context="trusted-launch-advisory-gate/main-audit"',
-        'status_context="trusted-launch-advisory-gate"',
+    audit_artifact_dropped = FIXTURE_TRUSTED.replace(
+        "trusted-launch-advisory-verdict-main-audit-",
+        "trusted-launch-advisory-verdict-shared-",
     )
     check(
-        "a default-branch audit sharing the release context namespace is rejected",
+        "a default-branch audit sharing the release artifact namespace is rejected",
         any(
-            "distinct `trusted-launch-advisory-gate/main-audit` context" in err
-            for err in evaluate(mutated(TRUSTED_WORKFLOW, audit_context_dropped))
+            f"distinct `{AUDIT_ARTIFACT_PREFIX}` artifact" in err
+            for err in evaluate(mutated(TRUSTED_WORKFLOW, audit_artifact_dropped))
         ),
     )
 
     # Cross-run reuse: the gate stops naming its own run and accepts whatever
-    # success is already on the commit.
-    reused_status = FIXTURE_RELEASE.replace(
-        "trusted-launch-advisory-gate/release-${RELEASE_RUN_ID}"
+    # similarly named artifact is already in the repository.
+    reused_artifact = FIXTURE_RELEASE.replace(
+        "trusted-launch-advisory-verdict-release-${RELEASE_RUN_ID}"
         "-attempt-${RELEASE_RUN_ATTEMPT}",
-        "trusted-launch-advisory-gate",
+        "trusted-launch-advisory-verdict",
     )
     check(
-        "a release gate accepting any run's advisory status is rejected",
+        "a release gate accepting any run's advisory artifact is rejected",
         any(
-            "must not accept a commit-wide advisory status context" in err
-            for err in evaluate(mutated(RELEASE_WORKFLOW, reused_status))
+            f"must require the authenticated `{VERDICT_ARTIFACT_PREFIX}` artifact"
+            in err
+            for err in evaluate(mutated(RELEASE_WORKFLOW, reused_artifact))
         ),
     )
 
@@ -3499,16 +3538,74 @@ def run_self_test() -> int:  # noqa: C901 — a flat fixture table stays readabl
         ),
     )
 
-    check(
-        "the default-branch audit context cannot satisfy a release gate",
-        not RELEASE_CONTEXT_SHAPE.match(AUDIT_STATUS_CONTEXT)
-        and COMMIT_WIDE_CONTEXT.search(AUDIT_STATUS_CONTEXT) is not None,
+    status_gate = FIXTURE_RELEASE.replace(
+        '          listing="$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=${artifact_name}&per_page=100")"',
+        '          listing="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${release_sha}/statuses?per_page=100")"',
     )
     check(
-        "a run-bound release context is of the admitted shape",
-        RELEASE_CONTEXT_SHAPE.match(f"{STATUS_CONTEXT_PREFIX}/release-42-attempt-2")
+        "a release gate that reintroduces forgeable commit statuses is rejected",
+        any(
+            "must not trust forgeable commit statuses" in err
+            for err in evaluate(mutated(RELEASE_WORKFLOW, status_gate))
+        ),
+    )
+
+    truncated_gate = FIXTURE_RELEASE.replace("pagination truncated", "ok")
+    check(
+        "a release gate that does not fail closed on pagination truncation is rejected",
+        any(
+            "pagination truncated" in err
+            for err in evaluate(mutated(RELEASE_WORKFLOW, truncated_gate))
+        ),
+    )
+
+    duplicate_gate = FIXTURE_RELEASE.replace("duplicate live verdict artifacts", "ok")
+    check(
+        "a release gate that does not fail closed on duplicate artifacts is rejected",
+        any(
+            "duplicate live verdict artifacts" in err
+            for err in evaluate(mutated(RELEASE_WORKFLOW, duplicate_gate))
+        ),
+    )
+
+    zip_gate = FIXTURE_RELEASE.replace("duplicate zip members", "ok")
+    check(
+        "a release gate that does not fail closed on duplicate ZIP members is rejected",
+        any(
+            "duplicate zip members" in err
+            for err in evaluate(mutated(RELEASE_WORKFLOW, zip_gate))
+        ),
+    )
+
+    redirect_gate = FIXTURE_RELEASE.replace("off-origin redirect", "ok")
+    check(
+        "a release gate that does not fail closed on off-origin redirects is rejected",
+        any(
+            "off-origin redirect" in err
+            for err in evaluate(mutated(RELEASE_WORKFLOW, redirect_gate))
+        ),
+    )
+
+    check(
+        "the default-branch audit artifact cannot satisfy a release gate",
+        AUDIT_ARTIFACT_SHAPE.match(
+            f"{VERDICT_ARTIFACT_PREFIX}-main-audit-42-attempt-2"
+        )
         is not None
-        and COMMIT_WIDE_CONTEXT.search(f"{STATUS_CONTEXT_PREFIX}/release-42-attempt-2")
+        and RELEASE_ARTIFACT_SHAPE.match(
+            f"{VERDICT_ARTIFACT_PREFIX}-main-audit-42-attempt-2"
+        )
+        is None,
+    )
+    check(
+        "a run-bound release artifact is of the admitted shape",
+        RELEASE_ARTIFACT_SHAPE.match(
+            f"{VERDICT_ARTIFACT_PREFIX}-release-42-attempt-2"
+        )
+        is not None
+        and AUDIT_ARTIFACT_SHAPE.match(
+            f"{VERDICT_ARTIFACT_PREFIX}-release-42-attempt-2"
+        )
         is None,
     )
 

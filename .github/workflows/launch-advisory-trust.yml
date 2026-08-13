@@ -35,9 +35,12 @@ name: Trusted Launch Advisory Gate
 #      `defaults:`, because the anchored command is only as exact as the
 #      environment that resolves it.
 #   3. `publish-verdict` holds no secret and uploads a fixed-text artifact
-#      bound to the exact Release run and attempt. `release.yml` authenticates
-#      the artifact's owning workflow ID and path before consuming it. Unlike a
-#      commit status, a tag-controlled workflow cannot forge that provenance.
+#      bound to the exact Release run and attempt. Artifact names are
+#      repository-wide and forgeable, so `release.yml` authenticates the
+#      owning run's immutable workflow path, `workflow_run` event, successful
+#      conclusion, and the fixed record before accepting PASS. A tag-controlled
+#      workflow cannot make its run acquire that trusted identity, and a
+#      commit-status shortcut is refused.
 #
 # Nothing here prints the credential or any private advisory identifier.
 
@@ -123,8 +126,8 @@ jobs:
 
           # Strict positive decimal: no sign, no leading zero, no whitespace, no
           # separators, bounded so the value stays inside 64-bit shell
-          # arithmetic and cannot lengthen or reshape the derived status
-          # context. Anything else is refused before it reaches a context.
+          # arithmetic and cannot lengthen or reshape the derived artifact
+          # name. Anything else is refused before it reaches a name.
           require_run_number() {
             [[ "$1" =~ ^[1-9][0-9]{0,17}$ ]] || fail "$2"
           }
@@ -357,7 +360,15 @@ jobs:
     if: always() && needs.establish-trust.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # No statuses: write. The verdict is a run-owned artifact, not a forgeable
+    # commit status. Artifact upload uses the runner's artifact service token,
+    # not this GITHUB_TOKEN.
+    permissions:
+      contents: read
     steps:
+      # No checkout: this job runs no repository code. The record is a constant
+      # four-line binding, so neither the credential nor any advisory identifier
+      # can reach the artifact.
       - name: Write fixed verdict record
         env:
           CANDIDATE_SHA: ${{ needs.establish-trust.outputs.candidate_sha }}
@@ -370,8 +381,18 @@ jobs:
           [[ "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
           [[ "$VERDICT_ARTIFACT" =~ ^trusted-launch-advisory-verdict-(main-audit-[1-9][0-9]{0,17}-attempt-[1-9][0-9]{0,17}|release-[1-9][0-9]{0,17}-attempt-[1-9][0-9]{0,17})$ ]] || exit 1
           [ "$VERDICT_RESULT" = success ] || exit 1
+          if [[ "$VERDICT_ARTIFACT" =~ ^trusted-launch-advisory-verdict-(main-audit|release)-([1-9][0-9]{0,17})-attempt-([1-9][0-9]{0,17})$ ]]; then
+            record_run_id="${BASH_REMATCH[2]}"
+            record_attempt="${BASH_REMATCH[3]}"
+          else
+            exit 1
+          fi
+          [[ "$RELEASE_RUN_ID" =~ ^[1-9][0-9]{0,17}$ ]] || exit 1
+          [[ "$RELEASE_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,17}$ ]] || exit 1
+          [ "$RELEASE_RUN_ID" = "$record_run_id" ] || exit 1
+          [ "$RELEASE_RUN_ATTEMPT" = "$record_attempt" ] || exit 1
           printf 'release_sha=%s\nrelease_run_id=%s\nrelease_run_attempt=%s\nverdict=PASS\n' \
-            "$CANDIDATE_SHA" "$RELEASE_RUN_ID" "$RELEASE_RUN_ATTEMPT" > verdict.txt
+            "$CANDIDATE_SHA" "$record_run_id" "$record_attempt" > verdict.txt
 
       - name: Publish authenticated verdict artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

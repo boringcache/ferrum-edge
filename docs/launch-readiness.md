@@ -260,9 +260,28 @@ verdict for the same commit from being replayed after advisory state changes.
 The release gate does not trust the name alone: artifact names are repository-
 wide and forgeable. It resolves the artifact's owning Actions run and requires
 the immutable workflow path `.github/workflows/launch-advisory-trust.yml`, the
-`workflow_run` event, and a successful conclusion before reading the fixed
-record. The record then independently binds the release SHA, run ID, attempt,
-and `PASS`. Every missing or mismatched field fails closed.
+`workflow_run` event, a completed `success` conclusion, and then the fixed
+record. The record independently binds the release SHA, run ID, attempt, and
+`PASS`. Artifact name alone is never authority.
+
+| Lane | Artifact name |
+|------|----------------|
+| Release (`workflow_run: in_progress`) | `trusted-launch-advisory-verdict-release-<run id>-attempt-<attempt>` |
+| Scheduled default-branch audit | `trusted-launch-advisory-verdict-main-audit-<run id>-attempt-<attempt>` |
+
+Both operands are validated as strict positive decimals (`^[1-9][0-9]{0,17}$`)
+on both sides, and the whole derived name is re-checked against the admitted
+shape before it is published. The audit name is not of the release shape, so an
+audit verdict can never satisfy a release gate. A tag-controlled workflow may
+upload an artifact with the same name, but cannot make its run acquire that
+trusted workflow identity.
+
+The consumer fails closed on ambiguity, duplicates, stale or wrong attempts,
+pagination truncation, missing or expired artifacts, malformed JSON or ZIP,
+duplicate ZIP members, traversal, symlinks or special entries,
+decompression/size abuse, off-origin redirects, API/schema errors, or any
+candidate/tag-controlled workflow or run. A reintroduced commit-status shortcut
+is refused.
 
 ### The credential job is a closed step sequence, and the verifier checks the whole sequence
 
@@ -490,10 +509,11 @@ ancestry proof or without coming from the protected-branch checkout, a
 commented-out credential binding, a self-test surviving only as a comment, a
 tag-reachable trust workflow, a tag checkout in the secretless trust job, a
 dropped environment binding, a dropped provenance edge, an unpinned action, a
-constant commit-wide status context, an omitted run-attempt binding, a
-`requested`-only trigger, a default-branch audit sharing the release context
-namespace, a release gate that accepts another run's status, a release gate
-that stops requiring the trusted verdict, a safe block-form `on:` followed by a
+reintroduced commit-status handoff, an omitted run-attempt binding, a
+`requested`-only trigger, a default-branch audit sharing the release artifact
+namespace, a release gate that accepts another run's artifact, a release gate
+that stops requiring the trusted verdict, a release gate that skips owning-run
+authentication, pagination, duplicate, ZIP, or redirect fail-closed checks, a safe block-form `on:` followed by a
 duplicate `on: [push]` and the reversed ordering, a duplicate `jobs:`, a
 duplicate `workflow_run` trigger, a duplicate `advisory-verdict` job ID, a
 duplicate `needs`, `environment`, or `steps` on the credential job, a duplicate
@@ -583,11 +603,14 @@ future provisioning safe rather than exploitable.
   Its secretless `establish-trust` job runs both self-tests on the trusted tree
   before the protected environment can release the credential. Its schedule
   publishes the live private-advisory re-audit of protected `main` under the
-  separate `.../main-audit` context.
+  distinct `trusted-launch-advisory-verdict-main-audit-...` artifact, which
+  cannot satisfy a release gate.
 - `.github/workflows/release.yml` — the `validate-launch-readiness` job gates
-  every tag release on the exact trusted
-  `trusted-launch-advisory-gate/release-<run id>-attempt-<attempt>` verdict for
-  the commit its tag resolves to, accepts no other context, and holds no
+  every tag release on the authenticated
+  `trusted-launch-advisory-verdict-release-<run id>-attempt-<attempt>` artifact
+  for the commit its tag resolves to. It authenticates the owning run's
+  immutable workflow path, `workflow_run` event, and successful conclusion
+  before matching the fixed record, accepts no other provenance, and holds no
   advisory credential. Every other release job is downstream of it, which the
   integrity verifier re-checks as a `needs` reachability property.
 - Every checkout on the advisory trust boundary uses
