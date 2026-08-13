@@ -394,23 +394,64 @@ async fn continuous_traffic_does_not_refresh_the_authorization_deadline() {
     .await
     .expect("probe session binds loopback UDP sockets");
 
+    // In-window commits must not await OS UDP readiness. Under paused time a
+    // pending socket send/recv lets Tokio auto-advance to the next timer —
+    // here the 300 ms authorization deadline — so a supposedly in-window
+    // round can lose to expiry regardless of wall-clock milliseconds.
+    // `forward_commit_with` still drives production
+    // `forward_client_datagram_commit` (refuse-if-expired, amplification
+    // budget, `udp_frontend_send_until_expiry`, and `bytes_sent` accounting);
+    // the send future is caller-owned and immediately Ready so the paused
+    // clock cannot jump. Real loopback UDP coverage stays in the
+    // unauthenticated tests in this module.
+    let mut committed = 0u64;
     for round in 0..3u8 {
+        let payload = [round];
         session
-            .forward(&[round])
+            .forward_commit_with(
+                &payload,
+                std::future::ready(Ok::<usize, std::io::Error>(payload.len())),
+            )
             .await
             .expect("traffic inside the lifetime is forwarded");
-        let received = session.backend_recv().await.expect("backend datagram");
-        assert_eq!(received, vec![round]);
+        committed += payload.len() as u64;
+        assert_eq!(
+            session.bytes_sent(),
+            committed,
+            "a successful in-window commit accounts the datagram"
+        );
         tokio::time::advance(Duration::from_millis(90)).await;
     }
     assert_eq!(session.observed_termination(), None, "still authorized");
+    assert_eq!(
+        session.bytes_sent(),
+        3,
+        "three in-window commits were accepted"
+    );
 
     // 270ms of continuous activity did not move the absolute deadline.
     tokio::time::advance(Duration::from_millis(60)).await;
+    let send_polled = Arc::new(AtomicBool::new(false));
+    let send_polled_flag = Arc::clone(&send_polled);
     session
-        .forward(b"past-deadline")
+        .forward_commit_with(
+            b"past-deadline",
+            std::future::poll_fn(move |_| {
+                send_polled_flag.store(true, Ordering::SeqCst);
+                std::task::Poll::Ready(Ok::<usize, std::io::Error>(13))
+            }),
+        )
         .await
         .expect_err("relayed datagrams never extend an anchored authorization deadline");
+    assert!(
+        !send_polled.load(Ordering::SeqCst),
+        "an elapsed plan must refuse before polling the backend send"
+    );
+    assert_eq!(
+        session.bytes_sent(),
+        3,
+        "a refused post-deadline datagram must not be accounted"
+    );
     assert!(session.backend_received().is_none());
     assert_eq!(
         session.observed_termination(),
